@@ -391,7 +391,7 @@ pub(crate) fn reml_laml_evaluate(
     // One-shot structured log of the IFT gate. Debug-level so it doesn't
     // spam normal runs but is immediately greppable when debugging an
     // envelope-gradient consistency failure (search for `[ift-gate]`).
-    log::debug!(
+    log::trace!(
         "[ift-gate] kkt_residual.is_some()={} kkt_residual.subspace={:?} dispersion={} correction_active={} subspace_trace.is_some()={} hop.dim()={} k={}",
         solution.kkt_residual.is_some(),
         solution
@@ -433,9 +433,9 @@ pub(crate) fn reml_laml_evaluate(
                 reason: format!("inner-mode fold verdict (gam#2765): {reason}"),
             },
         )?;
-        log::info!("[inner-mode fold] {fold}");
+        log::debug!("[inner-mode fold] {fold}");
         if !fold.is_valid() {
-            log::warn!("[inner-mode fold] refusing this trial point: {fold}");
+            log::debug!("[inner-mode fold] refusing this trial point: {fold}");
             return Err(RemlLamlError::InnerModeFold(fold));
         }
     }
@@ -537,7 +537,7 @@ pub(crate) fn reml_laml_evaluate(
         let cost_correction = cost_correction + moving_hessian_logdet_response;
         inner_polish_step = polish_step_for_warm_start;
         let residual_energy = -cost_correction;
-        log::info!(
+        log::debug!(
             "[IFT-ENERGY] residual_energy={:.3e} cost_correction={:.3e} branch={}",
             residual_energy,
             cost_correction,
@@ -631,7 +631,7 @@ pub(crate) fn reml_laml_evaluate(
                 &cone_solve,
             )
             .map_err(RemlLamlError::ConeNormalizer)?;
-            log::info!(
+            log::debug!(
                 "[2765-CONE] value={:.9e} log_mass={:.9e} retained_rows={} ep_sweeps={} ep_fraction={:e}",
                 normalizer.value(),
                 normalizer.log_mass(),
@@ -676,7 +676,7 @@ pub(crate) fn reml_laml_evaluate(
         });
     }
 
-    log::info!(
+    log::debug!(
         "[STAGE] reml_laml cost_only_done k={} ext_dim={} dim={} elapsed={:.3}s",
         k,
         solution.ext_coords.len(),
@@ -695,7 +695,7 @@ pub(crate) fn reml_laml_evaluate(
         {
             Ok(bdp) => Some(bdp),
             Err(e) => {
-                log::warn!("BarrierDerivativeProvider skipped (infeasible): {e}");
+                log::debug!("BarrierDerivativeProvider skipped (infeasible): {e}");
                 None
             }
         }
@@ -866,7 +866,7 @@ pub(crate) fn reml_laml_evaluate(
         // (`active_threads=0`) while each thin single-direction crossproduct
         // failed to fill the pool — into one wide, fully-occupied pass.
         if effective_deriv.has_batched_hessian_derivative_corrections() {
-            log::info!(
+            log::debug!(
                 "[STAGE] reml_laml coord_corrections mode=batched(row-parallel) k={} ext_dim={} n={} dim={} work={}",
                 k,
                 ext_dim,
@@ -902,7 +902,7 @@ pub(crate) fn reml_laml_evaluate(
                     .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
                     .collect::<Result<Vec<_>, _>>()?
             } else {
-                log::info!(
+                log::debug!(
                     "[STAGE] reml_laml coord_corrections mode=serial(inner-parallel) k={} ext_dim={} n={} dim={} work={}",
                     k,
                     ext_dim,
@@ -1627,7 +1627,7 @@ pub(crate) fn reml_laml_evaluate(
                 "[EXT-GRAD] ext_idx={} value={:+.6e} coord.a={:+.6e} trace_logdet={:+.6e} ld_s={:+.6e} incl_h={} incl_s={}",
                 ext_idx, value, coord.a, trace_logdet_i, coord.ld_s, incl_logdet_h, incl_logdet_s
             );
-            log::info!(
+            log::debug!(
                 "[STAGE] reml_laml ext_coord_trace ext_idx={} elapsed={:.3}s",
                 ext_idx,
                 ext_coord_start.elapsed().as_secs_f64(),
@@ -1676,10 +1676,15 @@ pub(crate) fn reml_laml_evaluate(
     if let Some((input, normalizer)) = cone_normalizer.as_ref() {
         let drifts = build_trace_drifts();
         let y = normalizer.solved_gradient();
-        let r = normalizer.normal_solves();
+        let basis = normalizer.covariance_basis();
         let rho_vs = rho_v_ks
             .as_ref()
             .expect("the constrained normalizer requests every rho mode response");
+        // Where `cone_solve` is the kernel's pseudo-inverse its derivative carries the kernel's
+        // kept–dropped rotation, read off the drift on the dropped basis (gam#2952). The kernel
+        // prices operator units, so the rotation takes the curvature scale like `cone_solve`.
+        let pseudo_inverse_kernel = solution.penalty_subspace_trace.as_deref();
+        let generator = normalizer.covariance_generator();
         for coordinate in 0..(k + ext_dim) {
             let (response, fixed_beta_rate) = if coordinate < k {
                 (&rho_vs[coordinate], &rho_curvature_a_k_betas[coordinate])
@@ -1696,17 +1701,36 @@ pub(crate) fn reml_laml_evaluate(
             };
             let drift = &drifts[coordinate];
             let precision_rate_on_y = drift.apply(y) / cone_scale;
-            let mut precision_rate_on_r = Array2::<f64>::zeros(r.raw_dim());
-            for column in 0..r.ncols() {
-                precision_rate_on_r
+            let mut precision_rate_on_basis = Array2::<f64>::zeros(basis.raw_dim());
+            for column in 0..basis.ncols() {
+                precision_rate_on_basis
                     .column_mut(column)
-                    .assign(&(drift.apply(&r.column(column).to_owned()) / cone_scale));
+                    .assign(&(drift.apply(&basis.column(column).to_owned()) / cone_scale));
             }
+            let (inverse_rotation_on_gradient, inverse_rotation_on_generator) =
+                match pseudo_inverse_kernel {
+                    Some(kernel) => {
+                        let mut rate_on_dropped = Array2::<f64>::zeros(kernel.dropped_basis.raw_dim());
+                        for column in 0..kernel.dropped_basis.ncols() {
+                            rate_on_dropped
+                                .column_mut(column)
+                                .assign(&drift.apply(&kernel.dropped_basis.column(column).to_owned()));
+                        }
+                        let rotation = kernel.pseudo_inverse_rotation(&rate_on_dropped)?;
+                        (
+                            rotation.apply(&input.gradient) * cone_scale,
+                            rotation.apply_columns(generator) * cone_scale,
+                        )
+                    }
+                    None => (Array1::zeros(y.len()), Array2::zeros(generator.raw_dim())),
+                };
             let motion = crate::constrained_posterior::ConeCoordinateMotion {
                 mode_response,
                 gradient_rate,
                 precision_rate_on_y,
-                precision_rate_on_r,
+                precision_rate_on_basis,
+                inverse_rotation_on_gradient,
+                inverse_rotation_on_generator,
             };
             let first = normalizer.first_order(&motion, &cone_solve);
             grad[coordinate] += first.derivative;
@@ -1836,7 +1860,7 @@ pub(crate) fn reml_laml_evaluate(
                 &mode_kernel,
                 cone_scale,
             )?;
-            log::info!(
+            log::debug!(
                 "[OUTER hessian-elapsed] constrained normalizer k={} ext={} elapsed={:.3}s",
                 k,
                 ext_dim,
@@ -1867,7 +1891,7 @@ pub(crate) fn reml_laml_evaluate(
                 .unwrap_or(solution.n_observations);
             let p_dim = hop.dim();
             let k_outer = k + solution.ext_coords.len();
-            log::info!(
+            log::debug!(
                 "[OUTER hessian-route] choice=operator reason=family_op \
                  n={n_obs} p={p_dim} k={k_outer} \
                  callback_kernel=false subspace_trace={subspace} \
@@ -1900,7 +1924,7 @@ pub(crate) fn reml_laml_evaluate(
             if let Some(ref normalizer_hessian) = cone_hessian {
                 crate::objective_base::add_rho_block_dense_to_hessian(&mut hessian, normalizer_hessian)?;
             }
-            log::info!(
+            log::debug!(
                 "[OUTER hessian-elapsed] choice=operator reason=family_op \
                  n={n_obs} p={p_dim} k={k_outer} elapsed={:.3}s",
                 assembly_start.elapsed().as_secs_f64(),
@@ -1955,7 +1979,7 @@ pub(crate) fn reml_laml_evaluate(
             || (solution.contracted_psi_second_order.is_some() && hessian_kernel.is_some());
         let route_choice = route_plan.choice();
         let route_reason = route_plan.reason;
-        log::info!(
+        log::debug!(
             "[OUTER hessian-route] choice={route_choice} reason={route_reason} \
              n={n_obs} p={p_dim} k={k_outer} \
              callback_kernel={callback_operator_kernel} subspace_trace={has_subspace_trace} \
@@ -2071,7 +2095,7 @@ pub(crate) fn reml_laml_evaluate(
                 Err(err) => return Err(err.into()),
             }
         };
-        log::info!(
+        log::debug!(
             "[OUTER hessian-elapsed] choice={route_choice} reason={route_reason} \
              n={n_obs} p={p_dim} k={k_outer} elapsed={:.3}s",
             assembly_start.elapsed().as_secs_f64(),
@@ -2103,7 +2127,7 @@ pub(crate) fn reml_laml_evaluate(
                 DispersionHandling::ProfiledGaussian => "ProfiledGaussian",
             };
             let kernel_present = solution.penalty_subspace_trace.is_some();
-            log::warn!(
+            log::debug!(
                 "[reml_laml envelope-gradient consistency] |g|∞ = {:.3e} at coord {} predicts \
                  |Δcost| ≈ {:.3e} along a √ε step while |cost| = {:.3e} (ratio {:.2e}). \
                  Envelope formula contaminated by inner KKT residual on ill-conditioned H block; \
@@ -2179,7 +2203,7 @@ fn cone_normalizer_outer_hessian(
     let k = curvature_lambdas.len();
     let total = mode_responses.len();
     let y = normalizer.solved_gradient();
-    let r = normalizer.normal_solves();
+    let basis = normalizer.covariance_basis();
     let mode_rhs_correction = effective_deriv.mode_response_rhs_correction();
     // The family's fixed-β pair objects, fetched across the pool as the dense Hessian fetches its
     // own; the solution memoizes them, so the log-determinant's Hessian reads these same objects.
@@ -2316,6 +2340,31 @@ fn cone_normalizer_outer_hessian(
         .zip(moving_drift_values.iter())
         .filter_map(|(&key, value)| value.as_ref().map(|drift| (key, drift)))
         .collect();
+    // Where `M⁻¹` is the kernel's kept-spectrum pseudo-inverse, each pair also carries its second
+    // rotation (`PenaltySubspaceTrace::pseudo_inverse_second_rotation`), read off the drifts on the
+    // dropped basis in operator units and scaled like the solves (gam#2952).
+    let pseudo_inverse_kernel = solution.penalty_subspace_trace.as_deref();
+    let probes = pseudo_inverse_kernel.map(|_| {
+        let generator = normalizer.covariance_generator();
+        let mut probes = Array2::<f64>::zeros((y.len(), 1 + generator.ncols()));
+        probes.column_mut(0).assign(&input.gradient);
+        probes.slice_mut(ndarray::s![.., 1..]).assign(generator);
+        probes
+    });
+    let dropped_rates: Vec<Array2<f64>> = match pseudo_inverse_kernel {
+        Some(kernel) => drifts
+            .iter()
+            .map(|drift| {
+                let mut rate = Array2::<f64>::zeros(kernel.dropped_basis.raw_dim());
+                for column in 0..kernel.dropped_basis.ncols() {
+                    rate.column_mut(column)
+                        .assign(&drift.apply(&kernel.dropped_basis.column(column).to_owned()));
+                }
+                rate
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     let mut hessian = Array2::<f64>::zeros((total, total));
     for (state, correction) in states.iter().zip(corrections.iter()) {
         let (i, j) = (state.i, state.j);
@@ -2358,17 +2407,43 @@ fn cone_normalizer_outer_hessian(
             }
             ConeGradientMotion::Pinned => -&state.rhs / scale,
         };
-        let mut precision_rate_on_r = Array2::<f64>::zeros(r.raw_dim());
-        for column in 0..r.ncols() {
-            precision_rate_on_r
+        let mut precision_rate_on_basis = Array2::<f64>::zeros(basis.raw_dim());
+        for column in 0..basis.ncols() {
+            precision_rate_on_basis
                 .column_mut(column)
-                .assign(&second_drift(&r.column(column).to_owned()));
+                .assign(&second_drift(&basis.column(column).to_owned()));
         }
+        let (inverse_rotation_on_gradient, inverse_rotation_on_generator) =
+            match (pseudo_inverse_kernel, probes.as_ref()) {
+                (Some(kernel), Some(probes)) => {
+                    let mut second_on_dropped = Array2::<f64>::zeros(kernel.dropped_basis.raw_dim());
+                    for column in 0..kernel.dropped_basis.ncols() {
+                        second_on_dropped.column_mut(column).assign(
+                            &(second_drift(&kernel.dropped_basis.column(column).to_owned()) * scale),
+                        );
+                    }
+                    let turned = kernel.pseudo_inverse_second_rotation(
+                        &|v: &Array1<f64>| drifts[i].apply(v),
+                        &|v: &Array1<f64>| drifts[j].apply(v),
+                        &dropped_rates[i],
+                        &dropped_rates[j],
+                        &second_on_dropped,
+                        probes,
+                    )? * scale;
+                    (
+                        turned.column(0).to_owned(),
+                        turned.slice(ndarray::s![.., 1..]).to_owned(),
+                    )
+                }
+                _ => (Array1::zeros(y.len()), Array2::zeros(normalizer.covariance_generator().raw_dim())),
+            };
         let pair_motion = crate::constrained_posterior::ConePairMotion {
             mode_response: state.second_response.clone(),
             gradient_rate,
             precision_rate_on_y: second_drift(y),
-            precision_rate_on_r,
+            precision_rate_on_basis,
+            inverse_rotation_on_gradient,
+            inverse_rotation_on_generator,
         };
         let value = normalizer
             .second_order(

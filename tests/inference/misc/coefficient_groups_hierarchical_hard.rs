@@ -68,12 +68,11 @@ fn mixed_term_spec() -> TermCollectionSpec {
         random_effect_terms: vec![RandomEffectTermSpec {
             name: "re_g".to_string(),
             feature_col: 2,
-            drop_first_level: false,
-            penalized: true,
             frozen_levels: None,
             lenient_unseen: true,
         }],
         smooth_terms: Vec::new(),
+        level: Default::default(),
     }
 }
 
@@ -507,6 +506,7 @@ fn three_linear_spec() -> (TermCollectionSpec, Array2<f64>) {
         ],
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     };
     (spec, x)
 }

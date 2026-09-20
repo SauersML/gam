@@ -19,10 +19,6 @@ use crate::estimate::EstimationError;
 
 use crate::estimate::reml::reml_outer_engine::BarrierConfig;
 
-use crate::priority_selection::{
-    PriorityBudgetStage, PriorityStageSummary, rank_indices_with_budget_cascade,
-};
-
 use crate::startup_stats::{
     SeedRejection, StartupStats, format_no_seeds_passed, uniform_structural_key,
 };
@@ -55,6 +51,9 @@ mod decrement_bands;
 mod efs_fallback_routing_tests;
 mod hessian_operator;
 #[cfg(test)]
+#[path = "rho_optimizer/ladder_incumbent_resume_3306_tests.rs"]
+mod ladder_incumbent_resume_3306_tests;
+#[cfg(test)]
 #[path = "rho_optimizer/logdet_forward_error_1b_tests.rs"]
 mod logdet_forward_error_1b_tests;
 mod newton_polish;
@@ -67,13 +66,13 @@ pub mod rail_face;
 mod rail_projection_tests;
 mod run;
 mod run_plan;
+mod inner_progress;
 mod saddle_escape_latch;
-mod seed_screening;
 
 pub(crate) use crate::model_types::CERTIFICATE_RAIL_MARGIN;
 pub use crate::model_types::{
     CurvatureFloorClearance, OuterCriterionCertificate, OuterStationarityCertificate,
-    CertifiedRung, CurvatureEvidence, RailCoordinate, RailTailEvidence,
+    CertifiedRung, CurvatureEvidence, FacePositivityRoute, RailCoordinate, RailTailEvidence,
     RailedCoordinateFact,
 };
 pub(crate) use bridges::*;
@@ -99,4 +98,4 @@ pub use run::{
     OuterStationaryPointRejection, audit_stationary_point, outer_value_agreement_bound,
 };
 pub(crate) use run_plan::*;
-pub(crate) use seed_screening::*;
+pub(crate) use inner_progress::*;

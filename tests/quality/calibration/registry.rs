@@ -238,13 +238,17 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
                          (skovgaard_rstar_corrected_pvalue_is_not_oversized_under_the_null) \
                          + bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test",
         },
-        // Wood smooth Wald test + Bartlett/Lawley LR correction (#1873).
+        // Summary smooth-term p-value (the variance-component score test) +
+        // Bartlett/Lawley LR correction (#1873). The family sweep gates the
+        // null p-value's uniformity per response family (IRLS weights, scale
+        // predicate and reference law all change with the family).
         CalibrationTarget {
             name: "wood_smooth_test_pvalue",
             kind: SurfaceKind::TestPValue,
             mode: AuditMode::TestSizeCurve,
             guards: &[1873],
-            audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test",
+            audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test \
+                         + sbc_wood_smooth_test_family_size_curve",
         },
         // Multinomial per-class Wood smooth test (#1891 follow-up): the SAME
         // shared `wood_smooth_test` primitive as `wood_smooth_test_pvalue`

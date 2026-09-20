@@ -20,7 +20,7 @@ import gamfit
 def test_all_zero_count_response_is_rejected_before_fit(formula: str, family: str) -> None:
     data = {"x": np.linspace(0.0, 1.0, 200), "y": np.zeros(200)}
 
-    with pytest.raises(gamfit.GamError) as excinfo:
+    with pytest.raises(gamfit.errors.GamfitError) as excinfo:
         gamfit.fit(data, formula, family=family)
 
     message = str(excinfo.value)

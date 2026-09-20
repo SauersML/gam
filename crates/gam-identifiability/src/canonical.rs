@@ -549,7 +549,7 @@ pub fn channel_aware_audit_at_operating_scalars(
         .map_err(|reason| CustomFamilyError::DimensionMismatch {
             reason: format!("pre-fit channel-aware identifiability audit failed: {reason}"),
         })?;
-    log::info!(
+    log::debug!(
         "[CANON] channel-aware audit: {} blocks, joint_rank={}/{} \
          (flat audit NOT used; effective Jacobians linearized at {})",
         specs.len(),
@@ -835,7 +835,7 @@ fn canonicalize_for_identifiability_inner(
         .unwrap_or(1);
     let use_channel_aware = max_n_outputs > 1;
 
-    log::debug!(
+    log::trace!(
         "[CANON] canonicalize_for_identifiability_with_operating_scalars: blocks={} n_rows={} \
          max_n_outputs={} route={}",
         specs.len(),
@@ -855,14 +855,14 @@ fn canonicalize_for_identifiability_inner(
     // audits are visible in the log stream.
     //
     // This is purely diagnostic: the only consumer of `frob_sq` is the
-    // `log::debug!` below.  A full `effective_jacobian_at` probe materialises
+    // `log::trace!` below.  A full `effective_jacobian_at` probe materialises
     // the block's entire `(n·k, p)` effective Jacobian — an `(n, p, k)`-class
     // transient that at biobank scale is hundreds of MiB per block, paid every
     // canonicalisation even when debug logging is OFF (#979).  Gate the whole
     // loop behind the log level so production fits (info/warn) pay nothing, and
     // when it does run, accumulate the Frobenius norm by streaming 4096-row
     // chunks instead of holding the full Jacobian.
-    if log::log_enabled!(log::Level::Debug) {
+    if log::log_enabled!(log::Level::Trace) {
         const FROB_CHUNK: usize = 4096;
         for spec in specs.iter() {
             let k = spec
@@ -906,11 +906,11 @@ fn canonicalize_for_identifiability_inner(
                 }
             }
             match probe_err {
-                Some(e) => log::debug!(
+                Some(e) => log::trace!(
                     "[CANON]   block '{}': effective_jacobian probe failed: {e}",
                     spec.name,
                 ),
-                None => log::debug!(
+                None => log::trace!(
                     "[CANON]   block '{}': p={} jac_nrows={} frob_norm={:.4e}",
                     spec.name,
                     p,
@@ -942,7 +942,7 @@ fn canonicalize_for_identifiability_inner(
                 reason: format!("pre-fit identifiability audit failed: {reason}"),
             }
         })?;
-        log::debug!(
+        log::trace!(
             "[CANON] flat audit: {} blocks, joint_rank={}",
             specs.len(),
             audit_result
@@ -1161,7 +1161,7 @@ fn canonicalize_for_identifiability_inner(
             .map(|drop| format!("{}[{}]", drop.block, drop.column))
             .collect::<Vec<_>>()
             .join(", ");
-        log::info!(
+        log::debug!(
             "[CANON] width-preserving family-owned geometry path: audit attributed \
              dropped columns [{dropped_summary}], at least one of which falls on a block \
              that owns its effective geometry via jacobian_callback or a multi-channel \
@@ -1277,13 +1277,18 @@ fn canonicalize_for_identifiability_inner(
             design: reduced_design,
             offset: spec.offset.clone(),
             penalties: reduced_penalties,
-            // Pulled-back penalties may carry an enlarged structural
-            // nullspace (a column dropped from a smooth's pure-span
-            // basis adds that direction to the penalty kernel).
-            // Falling back to eigenvalue-based rank detection in the
-            // pseudo-logdet path is the safe choice when the
-            // selection-T pullback changes the kernel structurally.
-            nullspace_dims: Vec::new(),
+            // With no dropped column `T` is the identity, so each declared
+            // nullity is a structural fact about the reduced penalty too
+            // (gam#3023). A selection `S_KK` has nullity
+            // `nullity(S) − rank(N_D)` for a null basis `N` restricted to
+            // the dropped rows, which a dimension alone does not determine:
+            // until blocks declare null bases, those ranks come from the
+            // spectrum.
+            nullspace_dims: if dropped_sorted.is_empty() {
+                spec.nullspace_dims.clone()
+            } else {
+                Vec::new()
+            },
             initial_log_lambdas: spec.initial_log_lambdas.clone(),
             initial_beta: reduced_initial_beta,
             gauge_priority: spec.gauge_priority,
@@ -1460,7 +1465,7 @@ fn canonicalize_for_identifiability_inner(
         let mut j_can_reduced: Option<Array2<f64>> = None;
 
         if t_is_identity {
-            log::info!(
+            log::debug!(
                 "[CANON] post-T invariant: T=identity (all blocks full-width) — \
                  J_can≡J_pre, rank preserved by construction; skipping J_can \
                  materialise + double RRQR (p_raw={p_total_raw} p_red={p_total_red} k={k})",
@@ -1600,7 +1605,7 @@ fn canonicalize_for_identifiability_inner(
             // column-selection `T`.
             let audit_kept_rank: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
 
-            log::info!(
+            log::debug!(
                 "[CANON] post-T invariant ({} convention): \
                  rank(J_can)={rank_j_can} rank(J_pre)={rank_j_pre} \
                  rank_target={rank_target} p_red={p_total_red} \
@@ -1707,11 +1712,11 @@ fn canonicalize_for_identifiability_inner(
                 &red_col_offsets,
             )
             .map_err(|error| {
-                log::warn!("[CANON] MAP uniqueness check failed: {}", error.message,);
+                log::debug!("[CANON] MAP uniqueness check failed: {}", error.message,);
                 CustomFamilyError::MapUniquenessFailure { error }
             })?;
 
-            log::debug!(
+            log::trace!(
                 "[CANON] MAP uniqueness check passed \
                  (p_red={p_total_red} penalty_blocks={})",
                 reduced_specs
@@ -1854,7 +1859,7 @@ fn try_orthogonalize_blocks(
                 && priority[other] == priority[absorbed]
         });
         if equal_priority_anchor_exists {
-            log::info!(
+            log::debug!(
                 "[CANON] orthogonalisation declined: block {} (priority {}) was absorbed into an \
                  equal-priority anchor — exact alias has no gauge ordering; deferring to the fatal \
                  audit gate instead of arbitrarily dropping the later block's column",
@@ -1895,7 +1900,7 @@ fn try_orthogonalize_blocks(
             .get(absorbed)
             .is_some_and(|coordinate| coordinate.is_structural())
         {
-            log::info!(
+            log::debug!(
                 "[CANON] orthogonalisation declined: block {} ('{}') would lose {} of its {} \
                  columns, but its COEFFICIENT COORDINATE is structural (a componentwise cone, a \
                  projected box, or a family geometry rebuilt at raw width), so no change of \
@@ -1917,7 +1922,7 @@ fn try_orthogonalize_blocks(
         .iter()
         .filter(|annotation| annotation.absorbed_width > 0)
     {
-        log::info!(
+        log::debug!(
             "[IDENT] structural direction annotation: block={} raw_width={} kept_width={} absorbed_width={} kind={:?}",
             annotation.block_idx,
             annotation.raw_width,
@@ -1998,7 +2003,16 @@ fn try_orthogonalize_blocks(
             design: reduced_design,
             offset: spec.offset.clone(),
             penalties: reduced_penalties,
-            nullspace_dims: Vec::new(),
+            // A square `V_b` has orthonormal columns, so it is orthogonal and
+            // `V_bᵀ S V_b` is a congruence: every declared nullity carries
+            // exactly (gam#3023). A narrowed `V_b` leaves
+            // `dim(ker S ∩ range V_b)`, which needs a declared null basis, not
+            // a dimension; until then that rank comes from the spectrum.
+            nullspace_dims: if v_b.ncols() == p_b {
+                spec.nullspace_dims.clone()
+            } else {
+                Vec::new()
+            },
             initial_log_lambdas: spec.initial_log_lambdas.clone(),
             initial_beta: reduced_initial_beta,
             gauge_priority: spec.gauge_priority,
@@ -2038,7 +2052,7 @@ fn try_orthogonalize_blocks(
         composed_transform.push(v_b.dot(&t_inner));
     }
 
-    log::info!(
+    log::debug!(
         "[CANON] orthogonalisation applied: {} block(s) shed overlap directions {:?}; \
          p_raw={} → p_reduced={}",
         ortho.dropped.len(),
@@ -2541,6 +2555,65 @@ mod tests {
             canon.reduced_specs[0].design.ncols(),
             specs[0].design.ncols(),
             "the higher-priority mean block keeps its columns",
+        );
+    }
+
+    /// A declared penalty nullity survives an orthogonal pullback and only that
+    /// (gam#3023). The mean block keeps its width, so `V_b` is square and
+    /// orthonormal, and `V_bᵀ S V_b` is a congruence with the same nullity. The
+    /// narrowed warp block's nullity is `dim(ker S ∩ range V_b)`, which its
+    /// declared dimension does not determine, so it is not carried.
+    #[test]
+    fn declared_nullity_carries_through_an_orthogonal_pullback_only_3023() {
+        use gam_problem::test_support::spec_from_dense_with_priority;
+        let n = 240;
+        let t = linspace(n);
+        let mut mean = Array2::<f64>::zeros((n, 3));
+        let mut warp = Array2::<f64>::zeros((n, 4));
+        for i in 0..n {
+            mean[[i, 0]] = 1.0;
+            mean[[i, 1]] = t[i];
+            mean[[i, 2]] = (2.0 * t[i]).sin();
+            warp[[i, 0]] = t[i];
+            warp[[i, 1]] = t[i] * t[i];
+            warp[[i, 2]] = t[i] * t[i] * t[i];
+            warp[[i, 3]] = (3.0 * t[i]).cos();
+        }
+        let penalized = |name: &str, design: Array2<f64>, priority: u8| {
+            let p = design.ncols();
+            let mut spec = spec_from_dense_with_priority(name, design, priority);
+            // Nullity 1: the first coefficient is unpenalized.
+            let mut penalty = Array2::<f64>::eye(p);
+            penalty[[0, 0]] = 0.0;
+            spec.penalties = vec![PenaltyMatrix::Dense(penalty)];
+            spec.initial_log_lambdas = Array1::zeros(1);
+            spec.nullspace_dims = vec![1];
+            spec
+        };
+        let specs = [penalized("eta", mean, 100), penalized("wiggle", warp, 80)];
+        let canon = canonicalize_for_identifiability_with_operating_scalars(
+            &specs,
+            &[CoefficientCoordinate::Spanning; 2],
+            None,
+        )
+        .expect("a rank-deficient overlap must canonicalise");
+        let (eta, wiggle) = (&canon.reduced_specs[0], &canon.reduced_specs[1]);
+        assert_eq!(eta.design.ncols(), 3, "the anchor keeps its width");
+        assert_eq!(wiggle.design.ncols(), 3, "the warp sheds one direction");
+        assert_eq!(eta.nullspace_dims, vec![1]);
+        assert!(
+            wiggle.nullspace_dims.is_empty(),
+            "a narrowed pullback must not carry a dimension-only declaration"
+        );
+        // The carried declaration is the reduced penalty's resolved nullity.
+        use gam_linalg::faer_ndarray::FaerEigh;
+        let reduced = eta.penalties[0].as_dense_cow().into_owned();
+        let (values, _) = FaerEigh::eigh(&reduced, faer::Side::Lower)
+            .expect("reduced penalty spectrum");
+        assert_eq!(
+            gam_linalg::roundoff::resolved_eigenvalue_count(&values.to_vec(), 0.0),
+            2,
+            "{values:?}"
         );
     }
 

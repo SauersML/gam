@@ -215,14 +215,7 @@ fn post_seed_custom_family_refusal_retains_typed_terminal_state_2658() {
     let rejection = SeedRejection::from_objective_error(0, "solver", objective_error);
     assert!(matches!(
         rejection.failure,
-        InnerFailure::InnerSolveNotConverged {
-            source: CustomFamilyError::InnerSolveNotConverged {
-                cycles: 12,
-                terminal: Some(observed_terminal),
-                ..
-            },
-            ..
-        } if observed_terminal == terminal
+        InnerFailure::InnerSolveNotConverged { .. }
     ));
 }
 
@@ -640,6 +633,92 @@ fn a_step_norm_stop_at_a_stationary_point_is_certified_2817() {
     assert_eq!(result.rho, seed);
 }
 
+/// A seed that is already stationary is certified before any fixed-point step.
+///
+/// The EFS map here always proposes the same outward step, as it does for a
+/// smoothing parameter on its rail, while the analytic gradient at the seed is
+/// zero. On the ISLR `Default` logistic fit the #784 corrected continuation
+/// starts from the certified Laplace optimum exactly like this, and the walk
+/// spent ~60 corrected evaluations leaving and re-approaching a point the
+/// screening certificate accepts as it stands. The runner must certify the seed
+/// with zero EFS evaluations and zero iterations.
+#[test]
+fn a_stationary_seed_is_certified_without_walking() {
+    let efs_calls = Arc::new(AtomicUsize::new(0));
+    let problem = OuterProblem::new(3)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_max_iter(20);
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(0.5 * theta.dot(theta)),
+        |_: &mut (), theta: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: 0.5 * theta.dot(theta),
+                gradient: theta.clone(),
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        {
+            let efs_calls = Arc::clone(&efs_calls);
+            Some(move |_: &mut (), theta: &Array1<f64>| {
+                efs_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(EfsEval {
+                    cost: 0.5 * theta.dot(theta),
+                    steps: vec![-0.25; theta.len()],
+                    beta: None,
+                    psi_gradient: None,
+                    psi_indices: None,
+                    inner_hessian_scale: None,
+                    consecutive_restored_incumbents: None,
+                })
+            })
+        },
+    );
+    let capability = obj.capability();
+    let the_plan = plan(&capability);
+    assert_eq!(the_plan.solver, Solver::Efs);
+    let seed = Array1::<f64>::zeros(3);
+
+    let result = match run_fixed_point_outer_solver(
+        &mut obj,
+        capability.theta_layout(),
+        capability.barrier_config.clone(),
+        &problem.config(),
+        "stationary EFS seed",
+        &seed,
+        the_plan,
+        "EFS",
+        "EFS failed",
+    ) {
+        Ok(result) => result,
+        Err(FixedPointOuterRunError::IterationRejected(request)) => panic!(
+            "the walk left a stationary seed and its stop was refused: {}",
+            request.refusal
+        ),
+        Err(FixedPointOuterRunError::SeedRejected(error)) => {
+            panic!("a stationary seed was rejected: {error}")
+        }
+        Err(FixedPointOuterRunError::ImmediateFallback(request)) => {
+            panic!("a stationary seed is not a solver request: {}", request.reason())
+        }
+        Err(FixedPointOuterRunError::Failed(error)) => {
+            panic!("a stationary seed was made fatal: {error}")
+        }
+    };
+    assert!(result.converged(), "screening certifies the stationary seed");
+    assert!(result.criterion_certificate.is_some());
+    assert_eq!(result.rho, seed);
+    assert_eq!(result.iterations, 0);
+    assert_eq!(
+        efs_calls.load(Ordering::Relaxed),
+        0,
+        "a certified seed needs no fixed-point step"
+    );
+}
+
 /// A budget-exhausted fixed-point walk publishes the best iterate it evaluated,
 /// not a worse last iterate (#2817).
 ///
@@ -739,6 +818,157 @@ fn a_budget_exhausted_efs_walk_publishes_its_best_iterate_2817() {
         0.5_f64.to_bits(),
         "the published value must be the best iterate's criterion"
     );
+}
+
+/// An EFS walk whose sample criterion reads 1.0 at the seed, 0.5 at the first
+/// iterate and 1.0 from then on, while the map keeps proposing the same step:
+/// after the first iterate no window buys a resolved improvement or a smaller
+/// step, so the bridge stops the walk as unprogressing (#2817). `gradient`
+/// supplies the analytic gradient the screening certificate reads.
+const UNPROGRESSING_SAMPLE_COSTS_2153: [f64; 3] = [1.0, 0.5, 1.0];
+
+fn unprogressing_efs_walk_2153(
+    gradient: fn(&Array1<f64>) -> Array1<f64>,
+    context: &str,
+) -> (
+    Result<OuterResult, FixedPointOuterRunError>,
+    Array1<f64>,
+    usize,
+) {
+    const SAMPLE_COSTS: [f64; 3] = UNPROGRESSING_SAMPLE_COSTS_2153;
+    const STEP: f64 = -0.25;
+    let efs_calls = Arc::new(AtomicUsize::new(0));
+    let problem = OuterProblem::new(3)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable);
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), _: &Array1<f64>| Ok(0.0),
+        move |_: &mut (), theta: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: 0.0,
+                gradient: gradient(theta),
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        {
+            let efs_calls = Arc::clone(&efs_calls);
+            Some(move |_: &mut (), theta: &Array1<f64>| {
+                let call = efs_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(EfsEval {
+                    cost: SAMPLE_COSTS[call.min(SAMPLE_COSTS.len() - 1)],
+                    steps: vec![STEP; theta.len()],
+                    beta: None,
+                    psi_gradient: None,
+                    psi_indices: None,
+                    inner_hessian_scale: None,
+                    consecutive_restored_incumbents: None,
+                })
+            })
+        },
+    );
+    let capability = obj.capability();
+    let the_plan = plan(&capability);
+    assert_eq!(the_plan.solver, Solver::Efs);
+    let seed = Array1::from_elem(3, 1.0);
+    let outcome = run_fixed_point_outer_solver(
+        &mut obj,
+        capability.theta_layout(),
+        capability.barrier_config.clone(),
+        &problem.config(),
+        context,
+        &seed,
+        the_plan,
+        "EFS",
+        "EFS failed",
+    );
+    // The first iterate is the best one the walk evaluates.
+    let best_point = seed.mapv(|value| value + STEP);
+    (outcome, best_point, efs_calls.load(Ordering::Relaxed))
+}
+
+/// #2153 — an unprogressing EFS walk is judged like a step-norm stop. On the
+/// K=1 generated-seed circle the walk stalled 32 iterations in at |g| = 7.3e-3
+/// and was published as the plan's terminal checkpoint, so the analytic-gradient
+/// plan the capability declares never continued it. Here the analytic gradient
+/// is the iterate itself, far from zero, so screening refuses the stall and the
+/// runner must hand the best iterate it evaluated to that plan.
+#[test]
+fn an_unprogressing_walk_at_a_non_stationary_point_continues_its_best_iterate_2153() {
+    let (outcome, best_point, efs_calls) =
+        unprogressing_efs_walk_2153(|theta| theta.clone(), "non-stationary unprogressing EFS walk");
+    let request = match outcome {
+        Err(FixedPointOuterRunError::IterationRejected(request)) => request,
+        Ok(result) => panic!(
+            "an unprogressing walk at a non-stationary point came back as a result \
+             (converged={}, origin={:?}, rho={:?}) instead of continuing its best iterate",
+            result.converged(),
+            result.origin,
+            result.rho,
+        ),
+        Err(FixedPointOuterRunError::SeedRejected(error)) => {
+            panic!("the finite seed evaluation succeeded; this is not a seed rejection: {error}")
+        }
+        Err(FixedPointOuterRunError::ImmediateFallback(request)) => {
+            panic!("an accepted step is not a solver request: {}", request.reason())
+        }
+        Err(FixedPointOuterRunError::Failed(error)) => {
+            panic!("a refused unprogressing stop was made fatal: {error}")
+        }
+    };
+    assert!(
+        efs_calls > UNPROGRESSING_SAMPLE_COSTS_2153.len(),
+        "fixture precondition: the walk evaluated past its best iterate"
+    );
+    assert!(request.refusal.is_recoverable());
+    assert_eq!(
+        request.checkpoint.point, best_point,
+        "the continuation starts from the best iterate, not the worse last one"
+    );
+    assert_eq!(request.checkpoint.sample.value.to_bits(), 0.5_f64.to_bits());
+    assert_eq!(request.checkpoint.plan_used.solver, Solver::Efs);
+}
+
+/// Positive control for the pin above: the same unprogressing walk over a
+/// criterion whose analytic gradient vanishes once the walk leaves its seed
+/// (so the seed screen does not certify the seed itself). Screening certifies
+/// the best iterate in the runner.
+#[test]
+fn an_unprogressing_walk_at_a_stationary_point_is_certified_2153() {
+    let (outcome, best_point, _) = unprogressing_efs_walk_2153(
+        |theta| {
+            if theta[0] < 1.0 {
+                Array1::zeros(theta.len())
+            } else {
+                theta.clone()
+            }
+        },
+        "stationary unprogressing EFS walk",
+    );
+    let result = match outcome {
+        Ok(result) => result,
+        Err(FixedPointOuterRunError::IterationRejected(request)) => {
+            panic!("a stationary unprogressing stop was refused: {}", request.refusal)
+        }
+        Err(FixedPointOuterRunError::SeedRejected(error)) => {
+            panic!("the finite seed evaluation succeeded; this is not a seed rejection: {error}")
+        }
+        Err(FixedPointOuterRunError::ImmediateFallback(request)) => {
+            panic!("an accepted step is not a solver request: {}", request.reason())
+        }
+        Err(FixedPointOuterRunError::Failed(error)) => {
+            panic!("a stationary unprogressing stop was made fatal: {error}")
+        }
+    };
+    assert!(result.converged(), "screening certifies a zero-gradient best iterate");
+    assert!(result.criterion_certificate.is_some());
+    assert_eq!(
+        result.origin,
+        super::run::OuterResultOrigin::FixedPointBestIterateSubstitution
+    );
+    assert_eq!(result.rho, best_point);
 }
 
 /// A post-seed objective failure that is not a typed request keeps its

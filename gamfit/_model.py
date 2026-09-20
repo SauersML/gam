@@ -11,7 +11,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Literal, Sequence, cast
+from typing import Any, Iterator, Literal, Sequence, cast, overload
 
 import numpy as np
 from numpy.typing import NDArray
@@ -33,7 +33,9 @@ from ._survival import (
     term_blocks_for_model,
 )
 from ._tables import (
+    detect_table_kind,
     normalize_table,
+    numpy_table_width,
     restore_output_table,
     table_columns,
 )
@@ -119,13 +121,21 @@ class Model:
 
     __slots__ = ("_model_bytes", "_prediction_model", "_training_table_kind")
 
-    def __init__(self, *, _model_bytes: bytes, _training_table_kind: str) -> None:
+    def __init__(
+        self, *, _model_bytes: bytes, _training_table_kind: str | None = None
+    ) -> None:
         self._model_bytes = _model_bytes
         try:
             self._prediction_model = rust_module().compile_model(_model_bytes)
         except Exception as exc:
             raise map_exception(exc) from exc
-        self._training_table_kind = _training_table_kind
+        # allow-list (a): a reloaded model reads its training table kind from
+        # the compiled payload instead of re-parsing the saved bytes.
+        self._training_table_kind = (
+            self._prediction_model.training_table_kind
+            if _training_table_kind is None
+            else _training_table_kind
+        )
 
     def __reduce__(self) -> tuple[Any, tuple[bytes]]:
         """Pickle (and ``copy.copy`` / ``copy.deepcopy``) through the saved-model
@@ -140,9 +150,10 @@ class Model:
         self,
         data: Any,
         *,
-        interval: float | str | None = None,
+        interval: float | Literal["conformal"] | None = None,
         conformal_level: float = 0.9,
         calibration: Any | None = None,
+        training_data: Any | None = None,
         covariance_mode: str | None = None,
         observation_interval: bool = False,
         return_type: str | None = None,
@@ -156,12 +167,18 @@ class Model:
             Input rows in any format accepted by :func:`gamfit.fit`
             (``pandas.DataFrame``, ``pyarrow.Table``, ``polars.DataFrame``,
             ``dict`` of columns, ``list`` of record dicts, ...). Columns must
-            cover every predictor referenced by the fitted formula.
+            cover every predictor referenced by the fitted formula. A 2-D
+            NumPy array is positional: a model fitted from an array reads its
+            columns as ``x0, x1, ...``; a model fitted from a named table binds
+            them to its predictor columns in training-table order, and needs
+            exactly that many columns.
         interval : float, "conformal", or None, default None
             Single uncertainty knob. ``None`` returns the point prediction(s)
             only. A float in ``(0, 1)`` (e.g. ``0.95``) requests the full
             uncertainty decomposition at that pointwise coverage; the output
-            gains ``posterior_mean_standard_error``,
+            gains ``linear_predictor_standard_error`` (the posterior SD of η),
+            ``posterior_mean_standard_error`` (the posterior SD of the
+            response, from the same η integral as ``posterior_mean``),
             ``posterior_mean_lower``, and ``posterior_mean_upper`` columns
             alongside ``linear_predictor_plugin`` / ``mean_plugin`` /
             ``posterior_mean``. On survival models it
@@ -173,21 +190,25 @@ class Model:
             Pass ``interval="conformal"`` for a distribution-free conformal
             band at ``conformal_level`` coverage in ``posterior_mean_lower`` /
             ``posterior_mean_upper`` — the same routes as ``gam predict
-            --conformal``. Without ``calibration`` it is the exact
-            full-conformal set at the fitted (frozen) smoothing parameters
-            (#942 Layer 1): every observation is used for both fitting and
-            calibration, the set is exact *given* the frozen penalty, and it
-            costs one Cholesky per test point with zero refits. It needs a
-            Gaussian-identity model fitted without prior weights, offsets, or a
-            link wiggle, that precomputed its substrate at fit time. Because the
-            smoothing parameters were selected from all training responses, the
-            finite-sample ``conformal_level`` coverage theorem applies only
-            where the per-row ``frozen_rho_certified`` output column is 1.0 (the
-            Layer-3 certificate that freezing the global smoothing parameter
-            matches the honest ρ-re-selecting set, under a grid-checked
-            Lipschitz assumption); rows with 0.0 carry no finite-sample
-            guarantee, and the bounds report the outer envelope of the
-            (possibly multi-interval) set. With ``calibration`` it is the
+            --conformal``. Exactly one of ``training_data`` or ``calibration``
+            is required. With ``training_data`` it is the full-conformal set of
+            the fit that re-selects the smoothing strength by REML on the
+            training rows plus the candidate test row (#942 Layer 3): every
+            labeled row is used for both fitting and calibration, and the test
+            row is treated exactly like a training row, so the finite-sample
+            ``conformal_level`` coverage theorem holds. It costs one Cholesky
+            per test point plus a cold REML refit at each finite endpoint. It
+            needs a Gaussian-identity model fitted without prior weights,
+            offsets, or a link wiggle. The saved model carries only the
+            ``p x p`` frozen penalty and its smoothing-parameter count, never
+            per-row training data, so the labeled rows are passed again here.
+            The per-row ``conformal_certificate`` output column is 0
+            (exact_frozen: nothing to re-select) or 1 (honest_refit) where the
+            guarantee holds; a negative code is a typed refusal (several
+            smoothing parameters, a payload without the count, a degenerate
+            criterion) where the row carries the frozen-smoothing set with no
+            finite-sample guarantee. The bounds report the outer envelope of
+            the (possibly multi-interval) set. With ``calibration`` it is the
             split-conformal band ``mu_hat(x) +/- q_hat * s(x)`` calibrated on
             that held-out fold, with finite-sample marginal coverage
             ``>= conformal_level`` regardless of model misspecification, for
@@ -201,6 +222,11 @@ class Model:
             split-conformal band; ``interval="conformal"`` only. It must contain
             the response column in addition to the predictors, and may be of
             any size independent of the training set.
+        training_data : table-like, optional
+            Labeled rows (predictors and response) for the exact full-conformal
+            set; ``interval="conformal"`` only, and exclusive with
+            ``calibration``. Normally the training table the model was fitted
+            on (``gam predict --conformal --training-data``).
         covariance_mode : {"conditional", "smoothing"}, optional
             Posterior covariance source for the interval (CLI<->Python parity
             with ``gam predict --covariance-mode``). ``"conditional"`` uses the
@@ -231,6 +257,9 @@ class Model:
         return_type : {"dict", "pandas", "numpy", "polars", "pyarrow", "list"}, optional
             Force a specific output container. ``None`` (default) mirrors the
             shape of ``data`` (and the training table where unambiguous).
+            ``"numpy"`` is a structured array with one named field per output
+            column, read by the same names as a DataFrame
+            (``pred["posterior_mean_lower"]``).
         id_column : str or None, default None
             Name of an identifier column in ``data`` to propagate as a row key
             in the output (so predictions can be joined back to the input).
@@ -249,8 +278,10 @@ class Model:
               ``linear_predictor_plugin`` (``X·beta_hat``), ``mean_plugin``
               (its inverse-link image), and ``posterior_mean`` (the default
               response-scale point prediction). When ``interval`` is set it
-              adds ``posterior_mean_standard_error`` plus
-              ``posterior_mean_lower`` / ``posterior_mean_upper``.
+              adds ``linear_predictor_standard_error`` (``SE(η)``),
+              ``posterior_mean_standard_error`` (``√Var[link^{-1}(η)]``) plus
+              ``posterior_mean_lower`` / ``posterior_mean_upper`` (the
+              inverse link of the η credible quantiles).
               When the requested table container is ``"dict"``, the return is
               a ``PredictionResult``: it supports normal mapping access
               (``pred["posterior_mean"]``) and column attributes
@@ -282,34 +313,56 @@ class Model:
         distinction instead of presenting two different estimands as a generic
         ``linear_predictor`` / ``mean`` pair (#2785).
         """
-        required = rust_module().required_model_columns(self._model_bytes, False)
+        required = rust_module().required_model_columns(self._prediction_model, False)
         if required is not None and id_column is not None:
             required = sorted(set(required) | {id_column})
-        headers, rows, table_kind = normalize_table(data, required_columns=required)
+        positional_headers = None
+        if detect_table_kind(data) == "numpy":
+            try:
+                positional_headers = rust_module().positional_prediction_headers(
+                    self._prediction_model, numpy_table_width(data)
+                )
+            except Exception as exc:
+                raise map_exception(exc) from exc
+        headers, rows, table_kind = normalize_table(
+            data, required_columns=required, positional_headers=positional_headers
+        )
         row_ids = extract_row_ids(headers, rows, id_column)
         # interval='conformal' runs the gam_predict::conformal_routes column
         # builders `gam predict --conformal` uses: the exact full-conformal set
         # without a calibration fold, the split-conformal band with one. The
-        # returned JSON has the model-based predict column schema, so
+        # returned payload has the model-based predict column schema, so
         # shape_predict_response is unchanged.
         if interval == "conformal":
+            # allow-list (a): FFI input validation.
+            if (training_data is None) == (calibration is None):
+                raise ValueError(
+                    'interval="conformal" requires exactly one of training_data= '
+                    "(exact full conformal) or calibration= (split conformal)"
+                )
             try:
-                if calibration is None:
-                    raw = rust_module().predict_table_full_conformal(
-                        self._model_bytes, headers, rows, conformal_level
+                if training_data is not None:
+                    train_headers, train_rows, _ = normalize_table(training_data)
+                    payload = rust_module().predict_table_full_conformal(
+                        self._prediction_model,
+                        headers,
+                        rows,
+                        train_headers,
+                        train_rows,
+                        conformal_level,
                     )
                 else:
                     cal_headers, cal_rows, _ = normalize_table(calibration)
                     opts_json = rust_module().build_model_predict_payload_json(
-                        self._model_bytes,
+                        self._prediction_model,
                         headers,
                         rows,
                         conformal_level,
                         covariance_mode,
                         observation_interval,
                     )
-                    raw = rust_module().predict_table_conformal(
-                        self._model_bytes,
+                    payload = rust_module().predict_table_conformal(
+                        self._prediction_model,
                         headers,
                         rows,
                         cal_headers,
@@ -320,9 +373,7 @@ class Model:
             except Exception as exc:
                 raise map_exception(exc) from exc
             return shape_predict_response(
-                raw,
-                headers=headers,
-                rows=rows,
+                payload,
                 table_kind=table_kind,
                 training_table_kind=self._training_table_kind,
                 interval=conformal_level,
@@ -333,8 +384,10 @@ class Model:
             )
         if calibration is not None:
             raise ValueError('calibration= applies only to interval="conformal"')
+        if training_data is not None:
+            raise ValueError('training_data= applies only to interval="conformal"')
         try:
-            raw = rust_module().predict_table(
+            payload = rust_module().predict_table(
                 self._prediction_model,
                 headers,
                 rows,
@@ -345,9 +398,7 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
         return shape_predict_response(
-            raw,
-            headers=headers,
-            rows=rows,
+            payload,
             table_kind=table_kind,
             training_table_kind=self._training_table_kind,
             interval=interval,
@@ -378,20 +429,62 @@ class Model:
         array; ``return_type=`` or ``id_column=`` requests a one-column table
         named ``score`` (plus the requested identifier).
         """
-        required = rust_module().required_model_columns(self._model_bytes, True)
-        if id_column is not None:
+        required = rust_module().required_model_columns(self._prediction_model, True)
+        if required is not None and id_column is not None:
             required = sorted(set(required) | {id_column})
         headers, rows, table_kind = normalize_table(data, required_columns=required)
         row_ids = extract_row_ids(headers, rows, id_column)
         try:
             scores = rust_module().transformation_score_table(
-                self._model_bytes, headers, rows
+                self._prediction_model, headers, rows
             )
         except Exception as exc:
             raise map_exception(exc) from exc
         if return_type is None and id_column is None:
             return scores
         columns: dict[str, list[Any]] = {"score": scores.tolist()}
+        if id_column is not None:
+            columns = {id_column: list(row_ids or []), **columns}
+        return restore_output_table(
+            columns,
+            requested=return_type,
+            input_kind=table_kind,
+            training_kind=self._training_table_kind,
+        )
+
+    def latent_conditional_residual(
+        self,
+        data: Any,
+        *,
+        return_type: str | None = None,
+        id_column: str | None = None,
+    ) -> Any:
+        """Evaluate the conditional latent residual ``(z - m(a)) / sqrt(v(a))``.
+
+        This method is defined for marginal-slope models fitted with a
+        conditional latent law (``latent_measure="conditional-location-scale"``).
+        It applies the map the fit applied to its own score, so at the
+        training rows it returns the fit's standardized score bit for bit, and
+        on new rows it returns the residual a held-out adequacy check compares
+        with the training residual law. The rows need the score column and the
+        conditioning covariates; a survival model's time columns are not read.
+
+        Returns ``None`` when the fit consumed no conditional latent law. By
+        default the residual is a one-dimensional NumPy array;
+        ``return_type=`` or ``id_column=`` requests a one-column table named
+        ``residual`` (plus the requested identifier).
+        """
+        headers, rows, table_kind = normalize_table(data)
+        row_ids = extract_row_ids(headers, rows, id_column)
+        try:
+            residual = rust_module().latent_conditional_residual_table(
+                self._prediction_model, headers, rows
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        if residual is None or (return_type is None and id_column is None):
+            return residual
+        columns: dict[str, list[Any]] = {"residual": residual.tolist()}
         if id_column is not None:
             columns = {id_column: list(row_ids or []), **columns}
         return restore_output_table(
@@ -433,7 +526,7 @@ class Model:
         try:
             rust = rust_module()
             result = rust.predict_array(
-                self._model_bytes,
+                self._prediction_model,
                 rust.numeric_matrix_f64(X, "X"),
                 json.dumps(options),
             )
@@ -444,29 +537,132 @@ class Model:
             # the 1-D response-scale prediction vector, not the engine's
             # full estimand-explicit column matrix. The FFI returns the lone
             # response-scale `posterior_mean` column as `(n, 1)`; drop the
-            # trailing axis.
+            # trailing axis. A joint expectile fit's point is its `(n, K)`
+            # level curves, returned as is.
             import numpy as np
 
-            return np.asarray(result).reshape(-1)
+            result = np.asarray(result)
+            return result.reshape(-1) if result.shape[1] == 1 else result
         return result
 
     def summary(self) -> Summary:
         """Return the model summary (coefficients, family, deviance, REML score)."""
         try:
-            payload = rust_module().summary_payload_from_model(self._model_bytes)
+            payload = rust_module().summary_payload_from_model(self._prediction_model)
         except Exception as exc:
             raise map_exception(exc) from exc
         return Summary.from_dict(payload)
 
     def smoothing_parameters(self) -> dict[int, float]:
         """Return fitted smoothing/precision parameters by penalty index."""
-        return dict(rust_module().smoothing_parameters_from_model(self._model_bytes))
+        return dict(rust_module().smoothing_parameters_from_model(self._prediction_model))
+
+    # -- fitted-result accessors -------------------------------------------------
+    # Each reads one field of the Rust ``SummaryPayload`` (the same document
+    # ``gam summary`` prints); nothing is recomputed here.
+
+    @property
+    def coefficients(self) -> NDArray[np.float64]:
+        """Fitted coefficient vector ``beta_hat`` in design-column order."""
+        return np.asarray(
+            [record["estimate"] for record in self.summary().coefficients], dtype=float
+        )
+
+    @property
+    def edf_total(self) -> float | None:
+        """Total effective degrees of freedom
+        ``tr(H^-1 X'WX) = p - sum_k tr(lambda_k H^-1 S_k)``; ``n - edf_total``
+        is the residual degrees of freedom behind :attr:`scale`."""
+        return self.summary().edf_total
+
+    @property
+    def smooth_edf(self) -> dict[str, float]:
+        """Effective degrees of freedom of each smooth / random-effect term,
+        keyed by term name (the ``edf`` column of
+        :meth:`Summary.smooth_terms_frame`)."""
+        return {
+            str(record["name"]): float(record["edf"])
+            for record in self.summary().smooth_terms
+        }
+
+    @property
+    def scale(self) -> float | None:
+        """Estimated dispersion ``phi_hat`` of the fitted family.
+
+        Gaussian: ``sigma_hat^2 = RSS_w / (n - edf_total)`` (mgcv's
+        ``gam.scale``); Gamma: ``1 / shape``; fixed-scale families (Poisson,
+        binomial): ``1``. ``None`` exactly when the family's scale contract
+        has no scalar dispersion: a custom family that declares none, or
+        Royston-Parmar survival.
+        """
+        return self.summary().scale
+
+    @property
+    def log_likelihood(self) -> float | None:
+        """Ordinary log-likelihood at the fitted coefficients and :attr:`scale`."""
+        return self.summary().log_likelihood
+
+    @property
+    def deviance(self) -> float | None:
+        """Model deviance at the fitted coefficients (prior weights included)."""
+        return self.summary().deviance
+
+    @property
+    def n_obs(self) -> int | None:
+        """Number of training rows the model was fitted on."""
+        return self.summary().n_obs
+
+    @property
+    def convergence(self) -> dict[str, Any] | None:
+        """The optimizer's convergence certificate; see :attr:`Summary.convergence`."""
+        return self.summary().convergence
+
+    @property
+    def outer_iterations(self) -> int | None:
+        """Outer (smoothing-parameter) iterations the convergence proof covers."""
+        convergence = self.convergence
+        return None if convergence is None else convergence["outer_iterations"]
+
+    @property
+    def inner_iterations(self) -> int | None:
+        """Inner P-IRLS iterations of the final coefficient solve."""
+        convergence = self.convergence
+        return None if convergence is None else convergence["inner_iterations"]
+
+    def residuals(
+        self,
+        data: Any,
+        type: Literal["response", "working", "deviance", "pearson"] = "deviance",
+    ) -> NDArray[np.float64]:
+        """Per-row residuals of the fit on the labelled rows ``data``.
+
+        The saved model carries no per-row training data, so the rows are
+        passed back: the training table gives in-sample residuals, any other
+        labelled table gives residuals at the fitted coefficients. The Rust
+        core evaluates ``eta = X beta_hat + offset`` and the family's residual
+        kernel, with prior weights as at fit time:
+
+        - ``"response"``: ``y - mu``
+        - ``"working"``: ``(y - mu) / (dmu/deta)``
+        - ``"deviance"``: ``sign(y - mu) sqrt(d_i)``, so
+          ``sum(r**2) == deviance`` on the training rows
+        - ``"pearson"``: ``(y - mu) sqrt(w / V(mu))``
+
+        ``gam residuals MODEL DATA --type TYPE`` returns the same values.
+        """
+        headers, rows, _ = normalize_table(data)
+        try:
+            return rust_module().residuals_table(
+                self._prediction_model, headers, rows, type
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
 
     def check(self, data: Any) -> SchemaCheck:
         """Validate ``data`` against the model's training schema."""
         headers, rows, _ = normalize_table(data)
         try:
-            payload = rust_module().check_payload_from_model(self._model_bytes, headers, rows)
+            payload = rust_module().check_payload_from_model(self._prediction_model, headers, rows)
         except Exception as exc:
             raise map_exception(exc) from exc
         return SchemaCheck.from_dict(payload)
@@ -508,7 +704,7 @@ class Model:
         headers, rows, _ = normalize_table(data)
         try:
             raw = rust_module().curvature_inference_json(
-                self._model_bytes, headers, rows, level
+                self._prediction_model, headers, rows, level
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -518,15 +714,16 @@ class Model:
     def smooth_significance(self, data: Any) -> list[dict[str, Any]]:
         """Per-term likelihood-ratio significance for every penalized smooth (#1063).
 
-        :meth:`summary` reports Wood's rank-truncated *Wald* statistic
-        :math:`T = \\hat\\beta'\\hat\\Sigma^- \\hat\\beta`. The exact Lawley /
-        Bartlett factor corrects the *likelihood-ratio* statistic, and under
-        penalization the Wald form is already a weighted :math:`\\chi^2` whose
-        second-order mean is not :math:`d + \\Delta\\varepsilon`, so dividing
-        :math:`T` by the LR factor would correct the wrong statistic. This method
+        :meth:`summary` reports a variance-component *score* statistic. The
+        exact Lawley / Bartlett factor corrects the *likelihood-ratio*
+        statistic, and a score statistic's second-order mean is not
+        :math:`d + \\Delta\\varepsilon`, so dividing it by the LR factor would
+        correct the wrong statistic. This method
         instead computes a genuine per-term LR statistic
         :math:`W = 2(\\ell_{\\text{full}} - \\ell_{\\text{null}})` by a
-        constrained refit dropping the smooth, then Bartlett-corrects *that*:
+        constrained fit that fixes the smooth's coefficients at zero while
+        holding every other smoothing parameter at the full fit's
+        :math:`\\hat\\lambda`, then Bartlett-corrects *that*:
         :math:`W^* = W / c`, :math:`c = 1 + \\Delta\\varepsilon / d`.
 
         The reference :math:`W` is scored against is the statistic's own null
@@ -569,7 +766,24 @@ class Model:
         :math:`\\alpha = 0.05` and up to 1.6x anti-conservative at
         :math:`10^{-4}`), or ``"unit_weight_fallback"``.
 
-        For each penalized (shape-unconstrained) smooth term it returns
+        It returns one row per tested smooth term, always with the same keys.
+        The published p-value is exactly one of:
+
+        * ``p_value`` — the tail of the Bartlett-corrected statistic, resolved
+          to within ``p_value_bound``;
+        * ``p_value_upper_bound`` — the published accuracy does not separate
+          the tail from zero, so it is reported as ``p < p_value_upper_bound``
+          (the top of the certified interval) rather than as a residue such
+          as ``0.0``;
+        * ``unavailable_reason`` — a stable label
+          (``"empty_coefficient_block"``, ``"degenerate_reference"``,
+          ``"full_refit_failed"``, ``"null_fit_not_converged"``,
+          ``"null_fit_unsupported"``,
+          ``"null_log_likelihood_not_finite"``, ``"tail_not_computable"``)
+          with ``unavailable_message`` saying what happened; every inference
+          field of such a row is ``None``.
+
+        For a term with an inference row it also carries
         ``statistic_lr`` (the raw :math:`W`), ``ref_df`` (the null mean
         :math:`d = \\sum_j w_j`, which is what the Bartlett factor is
         denominated in — *not* a chi-square degrees of freedom),
@@ -579,27 +793,38 @@ class Model:
         estimated-scale channel above, ``None`` off the profiled Gaussian),
         ``bartlett_factor``
         :math:`c`, ``statistic_corrected`` :math:`W^*`, ``p_value_uncorrected``,
-        ``p_value_corrected`` (the magic-by-default value), ``material`` (the
+        ``p_value_corrected`` (the raw evaluated tail behind ``p_value`` /
+        ``p_value_upper_bound``), ``material`` (the
         n-too-small-here diagnostic — ``True`` when the correction moves the
         Bartlett factor or the p-value by more than 10%), and
-        ``correction_provenance`` — ``"lawley_lr"`` when the family carries
+        ``correction_provenance`` — ``"lawley_lr_estimated_lambda"`` or
+        ``"lawley_lr_fixed_lambda"`` when the family carries
         closed-form cumulant jets (gaussian / poisson / binomial / gamma) and the
-        null refit converged, else ``"none"`` (the uncorrected reference stands,
-        never weakened).
+        factor is computable at this ``n``, else
+        ``"none"`` (the uncorrected reference stands, never weakened).
+
+        A shape-constrained smooth (``shape=...``) gets no LR p-value. Its null
+        :math:`f = 0` is the apex of the constraint cone and the fitted
+        coefficients are a truncated posterior mean, so no :math:`\\chi^2`,
+        spectral or chi-bar-square reference is calibrated. Such a term appears
+        as a row with only ``name``, ``term_idx``, ``p_value_unavailable``
+        (``"shape_constrained"``) and ``explanation``; every tested row carries
+        no ``p_value_unavailable`` key.
 
         Needs the training ``data`` for the per-term null refits, exactly as
-        :meth:`curvature` does. Returns an empty list when the model has no
-        penalized smooth term.
+        :meth:`curvature` does. Rows are in term order. Returns an empty list
+        when the model has no penalized smooth term.
         """
         headers, rows, _ = normalize_table(data)
         try:
             raw = rust_module().smooth_term_lr_inference_json(
-                self._model_bytes, headers, rows
+                self._prediction_model, headers, rows
             )
         except Exception as exc:
             raise map_exception(exc) from exc
         payload = json.loads(raw)
-        return list(payload.get("smooth_terms", []))
+        terms = list(payload["smooth_terms"]) + list(payload["unavailable"])
+        return sorted(terms, key=lambda row: row["term_idx"])
 
     def basis_check(self, data: Any) -> list[dict[str, Any]]:
         r"""Per-smooth basis-adequacy report: is each smooth's basis big enough (#2774)?
@@ -639,8 +864,9 @@ class Model:
         * ``provenance`` — ``"radial_enrichment"`` when a test ran, else the
           NAME of the evidence that was missing (``"no_continuous_covariates"``,
           ``"enrichment_budget_below_realized_width"``, ``"no_irls_row_state"``,
-          ``"design_gram_unavailable"``, ...). ``p_value`` is present exactly
-          when a test ran, so "adequate" and "not measured" are never
+          ``"design_gram_unavailable"``, ``"null_fit_unavailable"``,
+          ``"conditional_reference_unavailable"``, ...). ``p_value`` is present
+          exactly when a test ran, so "adequate" and "not measured" are never
           confusable.
 
         Method
@@ -650,8 +876,21 @@ class Model:
         in the fit's own IRLS weight metric. The statistic is
         :math:`T = U^{\top} V^{-} U / \hat\varphi` with
         :math:`U = \tilde Z^{\top} s` and :math:`V = \tilde Z^{\top} W \tilde Z`,
-        referred to :math:`\chi^2_r` (known dispersion) or :math:`F(r, \nu)`
-        (estimated).
+        referred to :math:`\chi^2_r` (known dispersion) or, with the scale
+        estimated on :math:`\nu` residual degrees of freedom, as the
+        added-variable :math:`(T/r)(\nu - r)/(\nu - T)` to :math:`F(r, \nu - r)`.
+
+        For a canonical binomial (logit) or Poisson (log) fit that reference is
+        only first order, and at small ``n`` its error is not small (a
+        conservative test is as miscalibrated as an anti-conservative one).
+        There the score is instead evaluated at the unpenalized null MLE on the
+        test's rows and referred to its law CONDITIONAL on the sufficient
+        statistic :math:`X^{\top}(w \circ y)`, which removes the nuisance
+        :math:`\beta` exactly: the score's conditional mean and covariance are
+        corrected to :math:`O(1/n)` and its fourth cumulant matched by a scaled
+        :math:`c\,\chi^2_{r/c}`. Where that expansion leaves its range of
+        validity (high-leverage rows at an extreme fitted mean) the row reports
+        ``"conditional_reference_unavailable"`` rather than a number.
 
         The projection is **orthogonal in the weight metric**, not the fit's
         penalized :math:`H^{-1}`. That is deliberate and it is what the test
@@ -690,7 +929,7 @@ class Model:
         """
         headers, rows, _ = normalize_table(data)
         try:
-            raw = rust_module().basis_adequacy_json(self._model_bytes, headers, rows)
+            raw = rust_module().basis_adequacy_json(self._prediction_model, headers, rows)
         except Exception as exc:
             raise map_exception(exc) from exc
         payload = json.loads(raw)
@@ -769,7 +1008,7 @@ class Model:
             spec["deriv_var"] = deriv_var
         try:
             raw = rust_module().model_debiased_functional_json(
-                self._model_bytes, headers, rows, json.dumps(spec)
+                self._prediction_model, headers, rows, json.dumps(spec)
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -778,7 +1017,7 @@ class Model:
     def report(self, path: str | Path | None = None) -> str:
         """Generate a standalone HTML report of the fitted model."""
         try:
-            html = rust_module().report_html(self._model_bytes)
+            html = rust_module().report_html(self._prediction_model)
         except Exception as exc:
             raise map_exception(exc) from exc
         # allow-list (a): FFI response marshaling for optional file output.
@@ -800,14 +1039,14 @@ class Model:
             ffi = rust_module()
             options_json = ffi.build_sample_payload_json(samples, seed)
             payload = ffi.sample_table(
-                self._model_bytes,
+                self._prediction_model,
                 headers,
                 rows,
                 options_json,
             )
         except Exception as exc:
             raise map_exception(exc) from exc
-        return PosteriorSamples.from_ffi_payload(payload, model_bytes=self._model_bytes)
+        return PosteriorSamples.from_ffi_payload(payload, model=self._prediction_model)
 
     def sample_replicates(
         self,
@@ -860,7 +1099,7 @@ class Model:
         headers, rows, _ = normalize_table(data)
         try:
             return rust_module().generative_replicates(
-                self._model_bytes, headers, rows, n_draws, int(seed)
+                self._prediction_model, headers, rows, n_draws, int(seed)
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -920,7 +1159,7 @@ class Model:
                 draw_count = min(chunk_size, n_draws - draw_start)
                 try:
                     chunk = ffi.generative_replicate_chunk(
-                        self._model_bytes,
+                        self._prediction_model,
                         headers,
                         rows,
                         draw_start,
@@ -956,7 +1195,7 @@ class Model:
         """
         headers, rows, _ = normalize_table(data)
         try:
-            payload = rust_module().affine_design_table(self._model_bytes, headers, rows)
+            payload = rust_module().affine_design_table(self._prediction_model, headers, rows)
             return _affine_design_from_payload(payload)
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -967,7 +1206,7 @@ class Model:
             rust = rust_module()
             return _affine_design_from_payload(
                 rust.affine_design_array(
-                    self._model_bytes,
+                    self._prediction_model,
                     rust.numeric_matrix_f64(X, "X"),
                 )
             )
@@ -1027,7 +1266,7 @@ class Model:
                 template_arg,
             )
             rows_out = rust_module().difference_smooth_rows(
-                self._model_bytes, request_json
+                self._prediction_model, request_json
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -1041,8 +1280,12 @@ class Model:
         return pd.DataFrame(rows_out)
 
     def save(self, path: str | Path) -> None:
-        """Serialise the fitted model to ``path``."""
-        Path(path).write_bytes(self._model_bytes)
+        """Serialise the fitted model to ``path``.
+
+        The save is atomic: a failed save leaves the file at ``path`` as it
+        was. On Unix it is durable before it returns.
+        """
+        rust_module().write_saved_model_file(path, self._model_bytes)
 
     def extend_with_group(
         self,
@@ -1066,7 +1309,7 @@ class Model:
                 prior_json,
             )
             model_bytes = bytes(
-                rust.extend_model_with_group(self._model_bytes, payload_json)
+                rust.extend_model_with_group(self._prediction_model, payload_json)
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -1081,42 +1324,62 @@ class Model:
 
     @property
     def formula(self) -> str:
-        return rust_module().required_saved_model_payload_string(
-            self._model_bytes, "formula"
-        )
+        return self._prediction_model.formula
 
     @property
     def family_name(self) -> str:
         return self.summary().family_name
 
     @property
-    def notes(self) -> list[str]:
-        """Inference advisories recorded while this model was fit.
+    def student_t_sigma(self) -> float | None:
+        """LAML-estimated scale σ of a ``family="student-t"`` fit; ``None`` otherwise."""
+        params = rust_module().student_t_parameters_from_model(self._prediction_model)
+        return None if params is None else params[0]
 
-        Each note is an mgcv-style advisory that the fitted model differs from
-        what was literally requested — e.g. ``"... basis reduced from k=10 to
-        k=3 to match the covariate's 3 distinct value(s)"`` when a cubic-
-        regression marginal is capped to the data support, or a basis-
-        degradation note when a low-cardinality covariate cannot support the
-        requested smooth. :func:`gamfit.fit` also emits these as
-        :class:`gamfit.GamInferenceWarning` at fit time; this property lets a
-        caller inspect them after the fact (or after loading a saved model).
-        Empty when the fit used exactly the requested configuration.
+    @property
+    def student_t_nu(self) -> float | None:
+        """LAML-estimated degrees of freedom ν of a ``family="student-t"`` fit; ``None`` otherwise."""
+        params = rust_module().student_t_parameters_from_model(self._prediction_model)
+        return None if params is None else params[1]
+
+    @property
+    def notes(self) -> list[str]:
+        """Notes recorded while this model was fit, advisories first.
+
+        An *advisory* says the fitted model differs from what was literally
+        requested — e.g. ``"... basis reduced from k=10 to k=3 to match the
+        covariate's 3 distinct value(s)"`` when a cubic-regression marginal is
+        capped to the data support, or a basis-degradation note when a
+        low-cardinality covariate cannot support the requested smooth.
+        :func:`gamfit.fit` also emits each advisory as a
+        :class:`gamfit.errors.GamInferenceWarning` at fit time.
+
+        An *informational* note records a default the engine chose on the
+        caller's behalf — e.g. the internal-knot count of a default B-spline
+        smooth. These are not warnings; they are listed here and in
+        :meth:`summary` so the choice stays inspectable (also after loading a
+        saved model).
+
+        Empty when the fit used exactly the requested configuration and chose
+        no defaults worth recording.
         """
-        return list(rust_module().inference_notes_from_model(self._model_bytes))
+        advisories, informational = self._fit_notes()
+        return [*advisories, *informational]
+
+    def _fit_notes(self) -> tuple[list[str], list[str]]:
+        compiled = self._prediction_model
+        return list(compiled.inference_notes), list(compiled.informational_notes)
 
     @property
     def used_device(self) -> bool:
-        return rust_module().required_saved_model_payload_string(
-            self._model_bytes, "used_device"
-        ) == "true"
+        return self._prediction_model.used_device
 
     @property
     def model_class(self) -> str:
         return self._model_class_from_payload()
 
     def _class_traits(self) -> dict[str, Any]:
-        return rust_module().saved_model_class_traits(self._model_bytes)
+        return rust_module().saved_model_class_traits(self._prediction_model)
 
     @property
     def is_survival(self) -> bool:
@@ -1140,26 +1403,32 @@ class Model:
 
     @property
     def group_metadata(self) -> dict[str, Any] | None:
-        return rust_module().model_group_metadata(self._model_bytes)
+        metadata: dict[str, Any] | None = rust_module().model_group_metadata(
+            self._prediction_model
+        )
+        return metadata
 
     @property
     def deployment_extensions(self) -> tuple[dict[str, Any], ...]:
-        return tuple(rust_module().model_deployment_extensions(self._model_bytes))
+        return tuple(rust_module().model_deployment_extensions(self._prediction_model))
 
     @property
     def term_blocks(self) -> tuple[TermBlock, ...]:
         """Per-term coefficient column ranges in fitted coefficient order."""
         try:
-            return term_blocks_for_model(self._model_bytes)
+            return term_blocks_for_model(self._prediction_model)
         except Exception as exc:
             raise map_exception(exc) from exc
 
     def _coefficient_state(self) -> dict[str, Any]:
         """Decode the Rust coefficient-state JSON payload."""
         try:
-            return json.loads(rust_module().coefficient_state_json(self._model_bytes))
+            state: dict[str, Any] = json.loads(
+                rust_module().coefficient_state_json(self._prediction_model)
+            )
         except Exception as exc:
             raise map_exception(exc) from exc
+        return state
 
     def partial_dependence(
         self,
@@ -1223,7 +1492,7 @@ class Model:
             grid_matrix = np.ascontiguousarray(grid_matrix)
         result = dict(
             rust_module().model_partial_dependence(
-                self._model_bytes, term, grid_matrix, int(n_points)
+                self._prediction_model, term, grid_matrix, int(n_points)
             )
         )
         grid_out = np.asarray(result["grid"], dtype=float)
@@ -1251,7 +1520,7 @@ class Model:
         """
         headers, rows, _ = normalize_table(data)
         pairs = rust_module().model_variance_share(
-            self._model_bytes, headers, rows, term
+            self._prediction_model, headers, rows, term
         )
         shares = {str(name): float(frac) for name, frac in pairs}
         if term is not None:
@@ -1263,39 +1532,18 @@ class Model:
             return shares[term]
         return shares
 
-    @property
-    def conditional_aic(self) -> float:
-        """Model-selection cost for this fit, on the same rank scale used by
-        ``gamfit.compare_models`` to pick its winner: the Occam-penalised
-        conditional AIC (``-2*loglik + 2*edf``). Both the ordinary
-        log-likelihood and effective degrees of freedom are required; raw REML /
-        LAML is a different estimand and is never used as a fallback (#2079).
-        It is a *cost*, so **lower is better** -- the model with the smaller
-        ``conditional_aic`` is the better-supported one, agreeing with the
-        winner reported by ``gamfit.compare_models``. It is not a marginal
-        likelihood or evidence (#2946). Use :meth:`evidence_ratio_vs` or
-        ``gamfit.compare_models`` for a direct comparison. (The raw REML/LAML
-        criterion remains available as ``Summary.reml_score`` and the
-        ``score_table`` column of ``gamfit.compare_models``.)
-        """
-        return float(rust_module().model_conditional_aic(self._model_bytes))
-
     def evidence_ratio_vs(self, other: "Model") -> float:
         """Akaike evidence ratio of this fit over ``other``.
 
-        ``exp(-(self.conditional_aic - other.conditional_aic) / 2)``: the
-        relative likelihood of the two fits under the conditional-AIC criterion that
-        ``gamfit.compare_models`` ranks on (Burnham & Anderson). Returns ``> 1``
-        when this fit is better supported than ``other`` (i.e. has the lower
-        :attr:`conditional_aic` cost) and ``< 1`` otherwise, agreeing with the winner
-        reported by ``gamfit.compare_models``.
+        ``exp((other_aic - self_aic) / 2)`` on the smoothing-corrected AIC
+        (``Summary.aic_corrected``) that ``gamfit.compare_models`` ranks on
+        (Burnham & Anderson's relative likelihood). Returns ``> 1`` when this
+        fit is better supported than ``other`` and ``< 1`` otherwise, agreeing
+        with the winner ``gamfit.compare_models`` reports. Both fits must share
+        the response family and the number of observations.
 
-        This is **not** a Bayes factor. A Bayes factor is a ratio of
-        prior-integrated marginal likelihoods; this quantity integrates over no
-        prior and must not be read against Jeffreys / Kass-Raftery thresholds.
-        (The raw REML/LAML headline in the ``score_table`` of
-        ``gamfit.compare_models`` is the Laplace-approximate marginal-likelihood
-        diagnostic, kept on its own labelled scale.)
+        This is **not** a Bayes factor: it integrates over no prior and must
+        not be read against Jeffreys / Kass-Raftery thresholds.
         """
         # allow-list (a): FFI input validation.
         if not isinstance(other, Model):
@@ -1303,17 +1551,15 @@ class Model:
                 f"evidence_ratio_vs expects a gamfit.Model, got {type(other).__name__}"
             )
         log_ratio = rust_module().log_evidence_ratio(
-            self._model_bytes, other._model_bytes
+            self._prediction_model, other._prediction_model
         )
         return math.exp(log_ratio)
 
     def _model_class_from_payload(self) -> str:
-        return rust_module().saved_model_predict_class_name(self._model_bytes)
+        return self._prediction_model.predict_class_name
 
     def _family_from_payload(self) -> str:
-        return rust_module().required_saved_model_payload_string(
-            self._model_bytes, "family"
-        )
+        return self._prediction_model.family
 
     def diagnose(
         self,
@@ -1343,11 +1589,16 @@ class Model:
         return _plot(self, data, x=x, y=y, interval=interval, kind=kind, ax=ax)
 
     def __repr__(self) -> str:
+        summary = self.summary()
         parts = [
             f"formula={self.formula!r}",
-            f"family_name={self.family_name!r}",
+            f"family_name={summary.family_name!r}",
             f"training_table_kind={self._training_table_kind!r}",
         ]
+        # The objective's name is rendered in Rust (`SummaryEstimator`), so the
+        # repr, `print(model)` and `gam summary` print the same words.
+        if summary.convergence is not None:
+            parts.append(f"estimator={summary.convergence['estimator']['text']!r}")
         return f"Model({', '.join(parts)})"
 
     def __str__(self) -> str:
@@ -1377,7 +1628,16 @@ class MultinomialPrediction:
 
     __slots__ = ("classes", "mean", "std_error", "mean_lower", "mean_upper", "level")
 
-    def __init__(self, *, classes, mean, std_error, mean_lower, mean_upper, level):
+    def __init__(
+        self,
+        *,
+        classes: Sequence[Any],
+        mean: NDArray[np.float64],
+        std_error: NDArray[np.float64],
+        mean_lower: NDArray[np.float64],
+        mean_upper: NDArray[np.float64],
+        level: float,
+    ) -> None:
         self.classes = list(classes)
         self.mean = mean
         self.std_error = std_error
@@ -1399,17 +1659,15 @@ class MultinomialModel:
     Returned by ``gamfit.fit(data, formula, family='multinomial')``. The
     underlying solver is the canonical
     ``gam::families::multinomial::fit_penalized_multinomial`` Newton solve
-    against a reference-coded softmax likelihood; the reference class is the
-    last level recorded in the dataset schema (i.e. order of first appearance
-    in the training table, which is stable across runs).
+    against a reference-coded softmax likelihood with ``K − 1`` linear
+    predictors; every (class, term) penalty carries its own smoothing
+    parameter, selected jointly by REML/LAML. Class levels are the sorted label
+    set of the categorical response column and the reference class is the last
+    of them.
 
     Class names are preserved verbatim from the categorical response column,
     so :attr:`classes_` matches what ``predict`` columns line up with — no
     silent permutation.
-
-    Slice A of issue #328: a single uniform smoothing parameter is shared
-    across every penalty block and every active class. REML / LAML λ
-    selection lands in the follow-up slice.
     """
 
     __slots__ = ("_model_bytes", "_training_table_kind", "_metadata")
@@ -1468,17 +1726,30 @@ class MultinomialModel:
     def save(self, path: str | Path) -> None:
         """Serialise the fitted multinomial model to ``path``.
 
-        Mirrors :meth:`Model.save`; the resulting file round-trips through
-        :func:`gamfit.load`, which reconstructs a :class:`MultinomialModel`.
+        Mirrors :meth:`Model.save`, atomic and durable alike; the resulting
+        file round-trips through :func:`gamfit.load`, which reconstructs a
+        :class:`MultinomialModel`.
         """
-        Path(path).write_bytes(self._model_bytes)
+        rust_module().write_saved_model_file(path, self._model_bytes)
 
     def dumps(self) -> bytes:
         """Return the serialised multinomial model as raw bytes."""
         return self._model_bytes
 
     # ------------------------------------------------------------------ predict
-    def predict(self, data: Any, *, interval: str | None = None, level: float = 0.95) -> Any:
+    @overload
+    def predict(
+        self, data: Any, *, interval: None = None, level: float = 0.95
+    ) -> NDArray[np.float64]: ...
+
+    @overload
+    def predict(
+        self, data: Any, *, interval: Literal["confidence"], level: float = 0.95
+    ) -> MultinomialPrediction: ...
+
+    def predict(
+        self, data: Any, *, interval: Literal["confidence"] | None = None, level: float = 0.95
+    ) -> NDArray[np.float64] | MultinomialPrediction:
         """Predict class probabilities for new rows.
 
         With ``interval=None`` (default) returns an ``(N, K)`` numpy array whose
@@ -1588,12 +1859,12 @@ class MultinomialModel:
             labels[idx == c] = name
         return labels
 
-    def smooth_significance(self) -> list[dict]:
+    def smooth_significance(self) -> list[dict[str, Any]]:
         """Wood rank-truncated Wald smooth-term significance table (#1101).
 
         One row per ``(active class, smooth term)`` with keys ``class``,
-        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value`` — the same
-        kernel the scalar :meth:`Model.summary` smooth-term p-values use. Empty
+        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value`` from the Wood
+        rank-truncated Wald kernel. Empty
         when the model has no smooth terms or no stored covariance.
         """
         try:

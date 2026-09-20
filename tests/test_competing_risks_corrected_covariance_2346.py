@@ -67,7 +67,7 @@ def test_competing_risks_default_mode_uses_smoothing_corrected_covariance() -> N
     # (1) DEFAULT mode: no covariance_mode argument. Must succeed and carry
     # the corrected provenance, with usable uncertainty on every surface.
     pred = model.predict(rows, interval=0.9)
-    assert isinstance(pred, gamfit.CompetingRisksPrediction)
+    assert isinstance(pred, gamfit.results.CompetingRisksPrediction)
     assert pred.interval_level == 0.9
     assert pred.covariance_source == "smoothing-corrected", (
         "default covariance mode must be the smoothing-corrected matrix "

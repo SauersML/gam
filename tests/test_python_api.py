@@ -4,6 +4,7 @@ import json
 import typing
 
 import pathlib
+import re
 import time
 
 pytest = typing.cast(typing.Any, importlib.import_module("pytest"))
@@ -103,6 +104,13 @@ def test_build_info_reports_real_extension() -> None:
     assert info["module"] == "gamfit._rust"
     assert "fit" in info["capabilities"]
     assert "validate_formula" in info["capabilities"]
+    # gam#3007: the build names its commit, so engines that share a version
+    # string can be told apart. The tests run from a gam checkout.
+    commit = info["commit"]
+    assert isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit), info
+    assert isinstance(info["dirty"], bool), info
+    assert isinstance(info["model_payload_version"], int), info
+    assert info["model_payload_version"] >= 29, info
     assert info["supported_model_classes"] == [
         "standard",
         "transformation-normal",
@@ -137,7 +145,7 @@ def test_derive_ivae_aux_scale_matches_old_numpy_formula() -> None:
     freq = np.arange(1, aux2d.shape[1] + 1, dtype=float).reshape(1, -1)
     expected = np.ascontiguousarray(np.exp(amplitude * np.tanh(freq * z)))
 
-    actual = np.asarray(gamfit.derive_ivae_aux_scale(aux2d))
+    actual = np.asarray(gamfit.identifiability.derive_ivae_aux_scale(aux2d))
     np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1.0e-12)
 
 
@@ -167,7 +175,7 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
     assert model.training_table_kind == "records"
     assert not model.is_survival
     assert not model.is_transformation_normal
-    assert summary["iterations"] >= 0
+    assert summary["convergence"]["outer_iterations"] >= 0
     assert not summary.coefficients_frame().empty
 
     predicted = model.predict(prediction_rows())
@@ -206,6 +214,7 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
         "linear_predictor_plugin",
         "mean_plugin",
         "posterior_mean",
+        "linear_predictor_standard_error",
         "posterior_mean_standard_error",
         "posterior_mean_lower",
         "posterior_mean_upper",
@@ -372,40 +381,42 @@ def test_numpy_inputs_and_outputs() -> None:
         "y ~ x0",
         family="gaussian",
     )
-    raw = np.asarray(model.predict(x_test, return_type="numpy"), dtype=float)
+    raw = model.predict(x_test, return_type="numpy")
     table = model.predict(x_test, return_type="pandas")
     # A plain Gaussian fit publishes the estimand-explicit schema (#2785). Under
     # the identity link its plug-in linear predictor and its posterior mean
     # agree, and the posterior mean must match the analytic predictions.
-    assert raw.shape == (2, len(table.columns))
+    assert raw.shape == (2,)
+    assert raw.dtype.names == tuple(table.columns)
     posterior_mean = table["posterior_mean"].to_numpy(dtype=float)
     np.testing.assert_allclose(
         table["linear_predictor_plugin"].to_numpy(dtype=float), posterior_mean, atol=1e-9
     )
     np.testing.assert_allclose(posterior_mean, [2.5, 3.5], atol=1e-3)
 
-    # The numpy-return contract is the prediction table's columns stacked in the
-    # table's fixed order (docs/data-input.md). The identity link makes every
-    # point column coincide, so the order is checked on a log-link fit, whose
-    # plug-in linear predictor, plug-in mean and posterior mean differ. The
-    # pandas table is the reference: it keeps covariance provenance in `attrs`,
-    # where a dict result carries it as extra scalar keys.
+    # The numpy-return contract is a structured array with one named field per
+    # prediction-table column (docs/data-input.md). The identity link makes
+    # every point column coincide, so the field-to-column binding is checked on
+    # a log-link fit, whose plug-in linear predictor, plug-in mean and
+    # posterior mean differ. The pandas table is the reference: it keeps
+    # covariance provenance in `attrs`, where a dict result carries it as extra
+    # scalar keys.
     counts = gamfit.fit(
         {"x0": x_train[:, 0].tolist(), "y": [1.0, 2.0, 4.0, 7.0]},
         "y ~ x0",
         family="poisson",
     )
-    raw_counts = np.asarray(counts.predict(x_test, return_type="numpy"), dtype=float)
+    raw_counts = counts.predict(x_test, return_type="numpy")
     frame = counts.predict(x_test, return_type="pandas")
     columns = [frame[name].to_numpy(dtype=float) for name in frame.columns]
-    assert raw_counts.shape == (2, len(columns))
+    assert raw_counts.dtype.names == tuple(frame.columns)
     assert not any(
         np.allclose(columns[i], columns[j])
         for i in range(len(columns))
         for j in range(i + 1, len(columns))
-    ), "the log-link table's columns must differ pairwise for the order check to have power"
-    for index, values in enumerate(columns):
-        np.testing.assert_array_equal(raw_counts[:, index], values)
+    ), "the log-link table's columns must differ pairwise for the binding check to have power"
+    for name, values in zip(frame.columns, columns):
+        np.testing.assert_array_equal(raw_counts[name], values)
 
 
 def test_sklearn_regressor_accepts_rhs_only_formula_with_separate_target() -> None:
@@ -421,13 +432,13 @@ def test_sklearn_regressor_accepts_rhs_only_formula_with_separate_target() -> No
 
 def test_sklearn_classifier_roundtrip() -> None:
     # `y ~ x` is an unpenalized parametric term, so its logistic MLE diverges
-    # under perfect separation and the engine's pre-fit separation guard
-    # (PrefitPerfectSeparationDetected) rejects such a design by design. The two
-    # observations at x=2.0 with opposite labels break separation (the MLE is
-    # finite) while preserving the monotone-increasing P(y=1 | x) trend this
-    # roundtrip asserts; the test targets the sklearn wrapper mechanics
-    # (predict_proba shape, class ordering, argmax hard labels, weighted score),
-    # not the degenerate infinite-slope fit.
+    # under perfect separation, and the engine's pre-fit separation certificate
+    # then fits the Jeffreys-prior estimator instead. The two observations at
+    # x=2.0 with opposite labels break separation (the MLE is finite) while
+    # preserving the monotone-increasing P(y=1 | x) trend this roundtrip
+    # asserts; the test targets the sklearn wrapper mechanics (predict_proba
+    # shape, class ordering, argmax hard labels, weighted score), not the
+    # separated-design estimator.
     train = pd.DataFrame(
         [
             {"y": 0.0, "x": 0.0},
@@ -557,7 +568,7 @@ def test_predict_rejects_schema_mismatch() -> None:
     model = gamfit.fit(training_rows(), "y ~ x")
 
     # 1) Wrong column name (no required feature present).
-    with pytest.raises(gamfit.SchemaMismatchError) as exc_info:
+    with pytest.raises(gamfit.errors.SchemaMismatchError) as exc_info:
         model.predict([{"z": 1.0}])
     assert "x" in str(exc_info.value), (
         f"schema-mismatch error must name the missing column; got: {exc_info.value}"
@@ -565,7 +576,7 @@ def test_predict_rejects_schema_mismatch() -> None:
 
     # 2) Required column missing in a row that has *other* columns. The
     # presence of unrelated keys must not silently mask the missing feature.
-    with pytest.raises(gamfit.SchemaMismatchError):
+    with pytest.raises(gamfit.errors.SchemaMismatchError):
         model.predict([{"y": 0.0, "irrelevant": 7.0}])
 
     # 3) An empty row list. The runtime is allowed to either reject it
@@ -573,7 +584,7 @@ def test_predict_rejects_schema_mismatch() -> None:
     # no input would be silently inventing rows.
     try:
         empty_pred = model.predict([])
-    except (ValueError, gamfit.SchemaMismatchError, RuntimeError):
+    except (ValueError, gamfit.errors.SchemaMismatchError, RuntimeError):
         return
     else:
         if isinstance(empty_pred, dict):
@@ -983,7 +994,7 @@ def test_survival_prediction_dense_surfaces_smoke() -> None:
         ],
         dtype=float,
     )
-    pred = gamfit.SurvivalPrediction(
+    pred = gamfit.results.SurvivalPrediction(
         model_class="survival marginal-slope",
         parameters=np.zeros((2, 1), dtype=float),
         parameter_names=("linear_predictor",),
@@ -1044,12 +1055,12 @@ def test_survival_prediction_dense_surfaces_smoke() -> None:
 def test_competing_risks_cif_matches_constant_hazard_closed_form() -> None:
     disease_rates = np.array([0.12, 0.06], dtype=float)
     death_rates = np.array([0.05, 0.02], dtype=float)
-    disease_pred = gamfit.SurvivalPrediction(
+    disease_pred = gamfit.results.SurvivalPrediction(
         model_class="survival",
         parameters=np.log(disease_rates).reshape(-1, 1),
         parameter_names=("log_hazard",),
     )
-    death_pred = gamfit.SurvivalPrediction(
+    death_pred = gamfit.results.SurvivalPrediction(
         model_class="survival",
         parameters=np.log(death_rates).reshape(-1, 1),
         parameter_names=("log_hazard",),
@@ -1061,7 +1072,7 @@ def test_competing_risks_cif_matches_constant_hazard_closed_form() -> None:
         times=times,
     )
 
-    assert isinstance(result, gamfit.CompetingRisksCIF)
+    assert isinstance(result, gamfit.results.CompetingRisksCIF)
     assert result.endpoint_names == ("disease", "death")
     np.testing.assert_allclose(result.times, times)
     assert result.cif.shape == (2, 2, times.size)
@@ -1089,12 +1100,12 @@ def test_competing_risks_cif_matches_constant_hazard_closed_form() -> None:
 
 
 def test_competing_risks_cif_validates_inputs() -> None:
-    pred = gamfit.SurvivalPrediction(
+    pred = gamfit.results.SurvivalPrediction(
         model_class="survival",
         parameters=np.array([[np.log(0.10)]], dtype=float),
         parameter_names=("log_hazard",),
     )
-    two_row_pred = gamfit.SurvivalPrediction(
+    two_row_pred = gamfit.results.SurvivalPrediction(
         model_class="survival",
         parameters=np.array([[np.log(0.10)], [np.log(0.20)]], dtype=float),
         parameter_names=("log_hazard",),
@@ -1125,7 +1136,7 @@ def test_competing_risks_cif_plateaus_and_probability_bounds() -> None:
         dtype=float,
     )
     preds = {
-        f"cause_{idx + 1}": gamfit.SurvivalPrediction(
+        f"cause_{idx + 1}": gamfit.results.SurvivalPrediction(
             model_class="survival",
             parameters=np.zeros((2, 1), dtype=float),
             parameter_names=("linear_predictor",),
@@ -1148,7 +1159,7 @@ def test_competing_risks_cif_plateaus_and_probability_bounds() -> None:
 
 
 def test_survival_prediction_write_csv_preserves_ids(tmp_path: pathlib.Path) -> None:
-    pred = gamfit.SurvivalPrediction(
+    pred = gamfit.results.SurvivalPrediction(
         model_class="survival",
         parameters=np.array([[np.log(0.10)], [np.log(0.20)]], dtype=float),
         parameter_names=("log_hazard",),
@@ -1215,7 +1226,7 @@ def test_survival_prediction_write_csv_matches_survival_at_at_extrapolation_edge
     query_times = np.array([0.5, 1.0, 1.5, 3.0, 10.0, np.inf], dtype=float)
 
     def check(id_column: object, row_ids: object, header_prefix: list[str]) -> None:
-        pred = gamfit.SurvivalPrediction(
+        pred = gamfit.results.SurvivalPrediction(
             model_class="survival",
             parameters=np.zeros((2, 1), dtype=float),
             parameter_names=("linear_predictor",),
@@ -1259,7 +1270,7 @@ def test_survival_prediction_write_csv_matches_survival_at_at_extrapolation_edge
 
 
 def test_survival_prediction_large_curves_auto_chunk_dense_output(tmp_path: pathlib.Path) -> None:
-    pred = gamfit.SurvivalPrediction(
+    pred = gamfit.results.SurvivalPrediction(
         model_class="survival marginal-slope",
         parameters=np.zeros((1_001, 1), dtype=float),
         parameter_names=("linear_predictor",),
@@ -1283,7 +1294,7 @@ def test_survival_prediction_large_curves_auto_chunk_dense_output(tmp_path: path
     source_grid = np.array([0.0, 10.0, 20.0], dtype=float)
     row_rates = np.linspace(0.01, 0.03, 1_001, dtype=float).reshape(-1, 1)
     ffi_survival = np.exp(-row_rates * source_grid.reshape(1, -1))
-    ffi_pred = gamfit.SurvivalPrediction(
+    ffi_pred = gamfit.results.SurvivalPrediction(
         model_class="survival marginal-slope",
         parameters=row_rates,
         parameter_names=("rate",),
@@ -1409,7 +1420,7 @@ def test_duchon_function_norm_penalty_2d_smoke() -> None:
         [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
         dtype=float,
     )
-    s = gamfit.duchon_function_norm_penalty(centers=centers, m=2)
+    s = gamfit.basis.duchon_function_norm_penalty(centers=centers, m=2)
     s = np.asarray(s, dtype=float)
     assert s.shape == (3, 3), f"expected (3, 3) penalty, got {s.shape}"
     _assert_symmetric_psd(s, "2D Duchon penalty")
@@ -1418,7 +1429,7 @@ def test_duchon_function_norm_penalty_2d_smoke() -> None:
 def test_duchon_function_norm_penalty_1d_public_wrapper_arity_issue_880() -> None:
     """The public wrapper must match the PyO3 binding arity for 1-D centers."""
     centers = np.linspace(-1.0, 1.0, 16).reshape(-1, 1)
-    s = np.asarray(gamfit.duchon_function_norm_penalty(centers, m=2), dtype=float)
+    s = np.asarray(gamfit.basis.duchon_function_norm_penalty(centers, m=2), dtype=float)
     assert s.shape == (16, 16)
     _assert_symmetric_psd(s, "1D Duchon penalty")
 
@@ -1452,9 +1463,9 @@ def test_duchon_function_norm_penalty_matches_basis_order_resolution_issue_880(
     centers = rng.uniform(-1.0, 1.0, size=(n_centers, d))
     pts = rng.uniform(-1.0, 1.0, size=(40, d))
 
-    basis = np.asarray(gamfit.duchon_basis(pts, centers, m=2), dtype=float)
+    basis = np.asarray(gamfit.basis.duchon_basis(pts, centers, m=2), dtype=float)
     penalty = np.asarray(
-        gamfit.duchon_function_norm_penalty(centers, m=2), dtype=float
+        gamfit.basis.duchon_function_norm_penalty(centers, m=2), dtype=float
     )
 
     assert basis.shape == (40, n_centers), basis.shape
@@ -1491,7 +1502,7 @@ def test_duchon_function_norm_penalty_2d_low_center_counts_issue_880(
     rng = np.random.default_rng(7 + n_centers)
     centers = rng.uniform(-1.0, 1.0, size=(n_centers, 2))
     penalty = np.asarray(
-        gamfit.duchon_function_norm_penalty(centers, m=2), dtype=float
+        gamfit.basis.duchon_function_norm_penalty(centers, m=2), dtype=float
     )
     assert penalty.shape == (n_centers, n_centers), penalty.shape
     assert np.all(np.isfinite(penalty)), "penalty has non-finite entries"
@@ -1511,7 +1522,7 @@ def test_duchon_function_norm_penalty_2d_cylinder_periodic() -> None:
     centers = np.column_stack([theta, y])
     K = centers.shape[0]
 
-    s = gamfit.duchon_function_norm_penalty(
+    s = gamfit.basis.duchon_function_norm_penalty(
         centers=centers,
         m=2,
         periodic_per_axis=(True, False),
@@ -1526,11 +1537,11 @@ def test_duchon_function_norm_penalty_2d_cylinder_periodic() -> None:
     pts_lo = np.array([[0.0, 0.5]], dtype=float)
     pts_hi = np.array([[2.0 * np.pi, 0.5]], dtype=float)
     b_lo = np.asarray(
-        gamfit.duchon_basis(pts_lo, centers, m=2, periodic_per_axis=(True, False)),
+        gamfit.basis.duchon_basis(pts_lo, centers, m=2, periodic_per_axis=(True, False)),
         dtype=float,
     )
     b_hi = np.asarray(
-        gamfit.duchon_basis(pts_hi, centers, m=2, periodic_per_axis=(True, False)),
+        gamfit.basis.duchon_basis(pts_hi, centers, m=2, periodic_per_axis=(True, False)),
         dtype=float,
     )
     assert np.allclose(b_lo, b_hi, atol=1e-9), (
@@ -1550,7 +1561,7 @@ def test_duchon_function_norm_penalty_2d_torus_periodic() -> None:
     centers = np.column_stack([theta, phi])
     K = centers.shape[0]
 
-    s = gamfit.duchon_function_norm_penalty(
+    s = gamfit.basis.duchon_function_norm_penalty(
         centers=centers,
         m=2,
         periodic_per_axis=(True, True),
@@ -1564,15 +1575,15 @@ def test_duchon_function_norm_penalty_2d_torus_periodic() -> None:
     pts_hi_x = np.array([[2.0 * np.pi, 1.2]], dtype=float)
     pts_hi_y = np.array([[0.0, 1.2 + 2.0 * np.pi]], dtype=float)
     b_lo = np.asarray(
-        gamfit.duchon_basis(pts_lo, centers, m=2, periodic_per_axis=(True, True)),
+        gamfit.basis.duchon_basis(pts_lo, centers, m=2, periodic_per_axis=(True, True)),
         dtype=float,
     )
     b_hi_x = np.asarray(
-        gamfit.duchon_basis(pts_hi_x, centers, m=2, periodic_per_axis=(True, True)),
+        gamfit.basis.duchon_basis(pts_hi_x, centers, m=2, periodic_per_axis=(True, True)),
         dtype=float,
     )
     b_hi_y = np.asarray(
-        gamfit.duchon_basis(pts_hi_y, centers, m=2, periodic_per_axis=(True, True)),
+        gamfit.basis.duchon_basis(pts_hi_y, centers, m=2, periodic_per_axis=(True, True)),
         dtype=float,
     )
     assert np.allclose(b_lo, b_hi_x, atol=1e-9), (
@@ -1586,7 +1597,7 @@ def test_duchon_function_norm_penalty_2d_torus_periodic() -> None:
 def test_periodic_spline_curve_basis_is_periodic_and_partitions_unity() -> None:
     """Cyclic B-spline basis wraps cleanly and rows sum to one."""
     t = np.array([0.0, 0.07, 0.5, 0.999_999, 1.0, 1.07, -0.93], dtype=float)
-    basis, penalty = gamfit.periodic_spline_curve_basis(t, n_knots=12, degree=3)
+    basis, penalty = gamfit.basis.periodic_spline_curve_basis(t, n_knots=12, degree=3)
     assert basis.shape == (t.size, 12)
     assert penalty.shape == (12, 12)
     # partition of unity
@@ -1601,7 +1612,7 @@ def test_periodic_spline_curve_basis_is_periodic_and_partitions_unity() -> None:
 def test_periodic_spline_curve_torch_fit_closes_a_circle_in_r2() -> None:
     """End-to-end PeriodicSplineCurve fit through gamfit.torch.fit on a circle."""
     torch = pytest.importorskip("torch")
-    from gamfit import PeriodicSplineCurve
+    from gamfit.smooth import PeriodicSplineCurve
     from gamfit.torch import fit as torch_fit
 
     rng = np.random.default_rng(0)
@@ -1630,7 +1641,7 @@ def test_periodic_spline_curve_torch_fit_closes_a_circle_in_r2() -> None:
 def test_sphere_torch_fit_smoke_all_kernels() -> None:
     """End-to-end Sphere fit through gamfit.torch.fit on a spherical cap."""
     torch = pytest.importorskip("torch")
-    from gamfit import Sphere
+    from gamfit.smooth import Sphere
     from gamfit.torch import fit as torch_fit
 
     rng = np.random.default_rng(7)
@@ -1680,7 +1691,7 @@ def test_torch_monotone_increasing_smooth() -> None:
     """Constrained BSpline fit through gamfit.torch.fit enforces monotone
     non-decreasing fitted values on x ∈ [0, 1]."""
     torch = pytest.importorskip("torch")
-    from gamfit import BSpline
+    from gamfit.smooth import BSpline
     from gamfit.torch import fit as torch_fit
 
     rng = np.random.default_rng(0)
@@ -1705,7 +1716,7 @@ def test_torch_convex_smooth() -> None:
     """Constrained BSpline fit through gamfit.torch.fit enforces convexity
     (second differences ≥ 0) on x ∈ [0, 1]."""
     torch = pytest.importorskip("torch")
-    from gamfit import BSpline
+    from gamfit.smooth import BSpline
     from gamfit.torch import fit as torch_fit
 
     rng = np.random.default_rng(1)
@@ -1729,7 +1740,7 @@ def test_torch_monotone_smooth_backward_finite_gradient() -> None:
     interior cert (empty active set), and the envelope-theorem backward
     must succeed with finite gradients."""
     torch = pytest.importorskip("torch")
-    from gamfit import BSpline
+    from gamfit.smooth import BSpline
     from gamfit.torch import fit as torch_fit
 
     rng = np.random.default_rng(2)
@@ -1756,7 +1767,7 @@ def test_constrained_reml_backward_envelope_at_interior_cert() -> None:
     that match the unconstrained ``gaussian_reml_fit_backward`` to
     round-off — both invoke the same envelope-theorem identity in p-space.
     """
-    from gamfit import (
+    from gamfit.reml import (
         gaussian_reml_fit,
         gaussian_reml_fit_backward,
         gaussian_reml_fit_with_constraints_backward,
@@ -2043,7 +2054,7 @@ def test_duchon_function_norm_penalty_3d_non_periodic_psd() -> None:
     """3D centers, no periodic axis — penalty must build and be SPD-like."""
     rng = np.random.default_rng(2)
     centers = rng.uniform(-1.0, 1.0, size=(7, 3))
-    s = gamfit.duchon_function_norm_penalty(
+    s = gamfit.basis.duchon_function_norm_penalty(
         centers=centers,
         m=2,
         periodic_per_axis=(False, False, False),
@@ -2062,7 +2073,7 @@ def test_duchon_basis_hybrid_high_d_builds(d: int) -> None:
     n_centers = 4 * d
     pts = rng.uniform(-1.0, 1.0, size=(64, d))
     centers = rng.uniform(-1.0, 1.0, size=(n_centers, d))
-    basis = gamfit.duchon_basis(
+    basis = gamfit.basis.duchon_basis(
         pts, centers, m=2,
         length_scale=1.0, nullspace_order="linear",
     )
@@ -2081,7 +2092,7 @@ def test_duchon_function_norm_penalty_hybrid_high_d_psd(d: int) -> None:
     """Hybrid function-norm penalty at high d builds + symmetric PSD."""
     rng = np.random.default_rng(11 + d)
     centers = rng.uniform(-1.0, 1.0, size=(4 * d, d))
-    penalty = gamfit.duchon_function_norm_penalty(
+    penalty = gamfit.basis.duchon_function_norm_penalty(
         centers, m=2,
         length_scale=1.0, nullspace_order="linear",
     )
@@ -2092,7 +2103,7 @@ def test_duchon_function_norm_penalty_hybrid_high_d_psd(d: int) -> None:
 
 
 def test_sphere_basis_each_kernel_shapes_and_psd() -> None:
-    """`gamfit.sphere_basis` returns (N, K) basis and (K, K) PSD penalty."""
+    """`gamfit.basis.sphere_basis` returns (N, K) basis and (K, K) PSD penalty."""
     rng = np.random.default_rng(11)
     n = 50
     lat = np.degrees(np.arcsin(rng.uniform(-1.0, 1.0, size=n)))
@@ -2101,7 +2112,7 @@ def test_sphere_basis_each_kernel_shapes_and_psd() -> None:
 
     for kernel in ("sobolev", "pseudo", "harmonic"):
         n_centers = 10 if kernel != "harmonic" else 4
-        design, penalty = gamfit.sphere_basis(
+        design, penalty = gamfit.basis.sphere_basis(
             points,
             n_centers=n_centers,
             penalty_order=2,
@@ -2151,7 +2162,7 @@ def test_periodic_spline_curve_basis_constant_nullspace_and_shapes() -> None:
     inspecting penalty shape and nullspace directly on a smaller knot count.
     """
     t = np.linspace(0.0, 1.0, 32, endpoint=False)
-    basis, penalty = gamfit.periodic_spline_curve_basis(t, n_knots=8, degree=3)
+    basis, penalty = gamfit.basis.periodic_spline_curve_basis(t, n_knots=8, degree=3)
     basis = np.asarray(basis, dtype=float)
     penalty = np.asarray(penalty, dtype=float)
     assert basis.shape == (32, 8)
@@ -2175,7 +2186,7 @@ def test_gaussian_reml_fit_blocks_forward_recovers_per_smooth_lambda_numpy() -> 
     s2 = np.eye(p_per)
     y = rng.standard_normal((n, 1))
 
-    out = gamfit.gaussian_reml_fit_blocks_forward([x1, x2], [s1, s2], y)
+    out = gamfit.reml.gaussian_reml_fit_blocks_forward([x1, x2], [s1, s2], y)
     assert "lambdas" in out and out["lambdas"].shape == (2,)
     assert np.all(np.isfinite(out["lambdas"]))
     assert np.all(out["lambdas"] > 0.0)
@@ -2195,10 +2206,10 @@ def test_gaussian_reml_fit_blocks_backward_returns_finite_grads_numpy() -> None:
     s1 = np.eye(p_per)
     s2 = np.eye(p_per)
     y = rng.standard_normal((n, 1))
-    fwd = gamfit.gaussian_reml_fit_blocks_forward([x1, x2], [s1, s2], y)
+    fwd = gamfit.reml.gaussian_reml_fit_blocks_forward([x1, x2], [s1, s2], y)
     log_lam = np.log(np.maximum(fwd["lambdas"], 1e-12))
     grad_fitted = np.ones((n, 1), dtype=float)
-    back = gamfit.gaussian_reml_fit_blocks_backward(
+    back = gamfit.reml.gaussian_reml_fit_blocks_backward(
         [x1, x2], [s1, s2], y, log_lam,
         grad_fitted=grad_fitted,
     )
@@ -2326,8 +2337,8 @@ def test_gaussian_reml_fit_with_constraints_forward_no_constraints_matches_uncon
     y = rng.standard_normal((n, 1))
     s = np.eye(p)
 
-    a = gamfit.gaussian_reml_fit_with_constraints_forward(x, y, s)
-    b = gamfit.gaussian_reml_fit(x, y, s)
+    a = gamfit.reml.gaussian_reml_fit_with_constraints_forward(x, y, s)
+    b = gamfit.reml.gaussian_reml_fit(x, y, s)
     fit_a = np.asarray(a["fitted"], dtype=float).reshape(-1)
     fit_b = np.asarray(b["fitted"], dtype=float).reshape(-1)
     np.testing.assert_allclose(fit_a, fit_b, rtol=1e-6, atol=1e-8)
@@ -2347,7 +2358,7 @@ def test_model_term_blocks_sorted_and_typed() -> None:
     assert isinstance(blocks, tuple)
     assert len(blocks) >= 2
     for blk in blocks:
-        assert isinstance(blk, gamfit.TermBlock), (
+        assert isinstance(blk, gamfit.results.TermBlock), (
             f"term_blocks entries must be TermBlock; got {type(blk).__name__}"
         )
         assert isinstance(blk.name, str)
@@ -2428,7 +2439,7 @@ def test_model_variance_share_is_a_decomposition_summing_to_one() -> None:
 
 def test_smooth_dataclass_subclasses_construct_with_shape_constraint() -> None:
     """Every Smooth subclass constructs with each ShapeConstraintLiteral value."""
-    from gamfit import (
+    from gamfit.smooth import (
         BSpline,
         Categorical,
         Duchon,
@@ -2502,7 +2513,7 @@ def test_smooth_dataclass_subclasses_construct_with_shape_constraint() -> None:
 def test_torch_fit_single_bspline_recovers_quadratic() -> None:
     """`fit(x, y, BSpline(...))` returns finite fitted values + coefficients."""
     torch = pytest.importorskip("torch")
-    from gamfit import BSpline
+    from gamfit.smooth import BSpline
     from gamfit.torch import fit as torch_fit
 
     rng = np.random.default_rng(2026052204)
@@ -2525,7 +2536,7 @@ def test_torch_fit_single_bspline_recovers_quadratic() -> None:
 def test_torch_fit_additive_duchon_plus_bspline() -> None:
     """Additive fit through `gamfit.torch.fit` with a Duchon + a BSpline."""
     torch = pytest.importorskip("torch")
-    from gamfit import BSpline, Duchon
+    from gamfit.smooth import BSpline, Duchon
     from gamfit.torch import fit as torch_fit
 
     rng = np.random.default_rng(2026052205)
@@ -2557,7 +2568,7 @@ def test_torch_fit_additive_duchon_plus_bspline() -> None:
 def test_torch_fit_periodic_spline_curve_multi_output_coefficients_shape() -> None:
     """PeriodicSplineCurve fit through `torch.fit` returns (K, D) coefficients."""
     torch = pytest.importorskip("torch")
-    from gamfit import PeriodicSplineCurve
+    from gamfit.smooth import PeriodicSplineCurve
     from gamfit.torch import fit as torch_fit
 
     rng = np.random.default_rng(2026052206)
@@ -2592,7 +2603,7 @@ def test_torch_fit_sphere_each_kernel_basic_fit() -> None:
     single-output (D=1) code path for every kernel.
     """
     torch = pytest.importorskip("torch")
-    from gamfit import Sphere
+    from gamfit.smooth import Sphere
     from gamfit.torch import fit as torch_fit
 
     rng = np.random.default_rng(2026052207)
@@ -2620,7 +2631,7 @@ def test_torch_fit_rejects_shape_constraint_with_multi_smooth_list() -> None:
     """`shape_constraint` on the torch fit path is single-smooth only;
     a list of smooths with any non-None constraint must raise."""
     torch = pytest.importorskip("torch")
-    from gamfit import BSpline
+    from gamfit.smooth import BSpline
     from gamfit.torch import fit as torch_fit
 
     rng = np.random.default_rng(2026052208)
@@ -2680,9 +2691,9 @@ def test_diagnose_keeps_regression_metrics_for_gaussian_family() -> None:
     assert "auc" not in diag.metrics
 
 
-def test_gamclassifier_score_is_auc_and_metrics_panel_is_sane() -> None:
-    """`GAMClassifier.score` returns AUC over `classification_metrics`, and
-    `.metrics` surfaces the full panel on a separable case."""
+def test_gamclassifier_score_is_accuracy_and_metrics_panel_is_sane() -> None:
+    """`GAMClassifier.score` is ClassifierMixin accuracy (the sklearn classifier
+    contract), and `.metrics` surfaces the full AUC/Brier/... panel."""
     _require_extension()
     rng = np.random.default_rng(20260602)
     n = 200
@@ -2693,25 +2704,28 @@ def test_gamclassifier_score_is_auc_and_metrics_panel_is_sane() -> None:
 
     clf = GAMClassifier(formula="y ~ s(x)", family="binomial").fit(X, y)
 
-    auc = clf.score(X, y)
-    assert 0.0 <= auc <= 1.0
-    assert auc > 0.85, f"GAMClassifier.score (AUC) unexpectedly low: {auc:.3f}"
+    accuracy = clf.score(X, y)
+    np.testing.assert_allclose(accuracy, float(np.mean(clf.predict(X) == y)), atol=0.0)
+    assert accuracy > 0.8, f"GAMClassifier.score (accuracy) unexpectedly low: {accuracy:.3f}"
 
     panel = clf.metrics(X, y)
     for key in ("auc", "pr_auc", "brier", "logloss", "nagelkerke_r2", "ece"):
         assert key in panel, f"missing classification metric {key!r}"
-    # .score must agree with the AUC entry of the full panel.
-    np.testing.assert_allclose(auc, float(panel["auc"]), atol=1e-9)
+    assert float(panel["auc"]) > 0.85
 
-    # A perfectly-separable, perfectly-ranked subset scores AUC == 1.0, and
-    # sample_weight==0 rows are dropped before scoring (sklearn scorer
-    # contract compatibility).
+    # Accuracy and AUC must be distinguishable here: relabelling y as the
+    # sign of x keeps the ranking perfect (AUC 1) but is not what score
+    # reports unless every hard label is right.
     y_ranked = (x > 0.0).astype(int)
-    perfect = clf.score(X, y_ranked)
-    assert perfect == 1.0, f"separable ranking must give AUC 1.0; got {perfect}"
-    weights = np.ones(n, dtype=float)
-    weights[0] = 0.0
-    assert clf.score(X, y_ranked, sample_weight=weights) == 1.0
+    assert float(clf.metrics(X, y_ranked)["auc"]) == 1.0
+    np.testing.assert_allclose(
+        clf.score(X, y_ranked), float(np.mean(clf.predict(X) == y_ranked)), atol=0.0
+    )
+    weights = np.zeros(n, dtype=float)
+    weights[0] = 1.0
+    assert clf.score(X, y_ranked, sample_weight=weights) == float(
+        clf.predict(X.iloc[:1])[0] == y_ranked[0]
+    )
 
 
 def test_survival_prediction_concordance_recovers_known_ordering() -> None:
@@ -2731,7 +2745,7 @@ def test_survival_prediction_concordance_recovers_known_ordering() -> None:
         dtype=float,
     )
     survival_surface = np.exp(-cumulative)
-    pred = gamfit.SurvivalPrediction(
+    pred = gamfit.results.SurvivalPrediction(
         model_class="survival marginal-slope",
         parameters=np.zeros((3, 1), dtype=float),
         parameter_names=("linear_predictor",),

@@ -833,8 +833,12 @@ impl ArrowSchurSystem {
             });
         } else {
             self.penalty_matvec_add(x, y);
-            for a in 0..k {
-                y[a] += ridge * x[a];
+            // The ridge spans the whole border, not `hbb`'s rows: a system whose
+            // penalty lives in `penalty_op` carries an empty `hbb`, and sizing the
+            // shift by it dropped `ridge·I` from the reduced Schur entirely, so
+            // every proximal ridge solved the same undamped Δβ.
+            for (ya, xa) in y.iter_mut().zip(x.iter()) {
+                *ya += ridge * xa;
             }
         }
     }

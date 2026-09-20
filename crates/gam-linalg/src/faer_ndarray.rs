@@ -4,7 +4,7 @@ use faer::linalg::solvers;
 use faer::linalg::svd::{self, ComputeSvdVectors};
 use faer::perm::{Perm, PermRef};
 use faer::prelude::ReborrowMut;
-use faer::{Conj, Mat, MatMut, MatRef, Par, Side, get_global_parallelism};
+use faer::{Conj, Mat, MatMut, MatRef, Par, Side, get_global_parallelism, unzip, zip};
 use ndarray::{Array1, Array2, ArrayBase, ArrayView1, ArrayViewMut1, Data, Ix1, Ix2};
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -406,7 +406,7 @@ impl Drop for FaerSequentialScope {
 ///
 /// The depth is what distinguishes "faer is sequential because a solve here
 /// asked for it" from "faer is sequential and nobody knows who did it", and it
-/// is readable without a logger, which `log::info!` is not under `cargo test`.
+/// is readable without a logger, which `log::debug!` is not under `cargo test`.
 pub(crate) fn faer_sequential_scope_depth() -> usize {
     FAER_SEQ_STATE
         .lock()
@@ -777,6 +777,62 @@ impl FaerLblt {
     }
 }
 
+/// `⌊log₂ |x|⌋` of a finite nonzero `x`, subnormals included.
+fn binary_exponent(x: f64) -> i32 {
+    let significand_bits = f64::MANTISSA_DIGITS - 1;
+    let exponent_bias = f64::MAX_EXP - 1;
+    let bits = x.to_bits() & !(1u64 << 63);
+    let biased = (bits >> significand_bits) as i32;
+    if biased == 0 {
+        // A subnormal is `significand · 2^(1 − bias − significand_bits)`.
+        let leading_bit = 63 - bits.leading_zeros() as i32;
+        leading_bit + 1 - exponent_bias - significand_bits as i32
+    } else {
+        biased - exponent_bias
+    }
+}
+
+/// `target ← 2^exponent · target`, exactly: the factor is applied as normal
+/// powers of two, so no entry rounds unless it leaves the normal range.
+fn scale_by_power_of_two(mut target: MatMut<'_, f64>, mut exponent: i32) {
+    let exponent_bias = f64::MAX_EXP - 1;
+    let significand_bits = f64::MANTISSA_DIGITS - 1;
+    while exponent != 0 {
+        let step = exponent.clamp(f64::MIN_EXP - 1, exponent_bias);
+        let factor = f64::from_bits(((step + exponent_bias) as u64) << significand_bits);
+        zip!(target.rb_mut()).for_each(|unzip!(entry)| *entry *= factor);
+        exponent -= step;
+    }
+}
+
+/// Scale a matrix about to be Householder-factored so its largest entry lies
+/// in `[2^k, 2^(k+1))`, `2^k ≤ √f64::MAX`, and return the exponent applied.
+///
+/// faer's column norm (`norm_l2`, once per reflector) accumulates
+/// `Σ (x·√f64::MIN_POSITIVE)²` alongside `Σ x²`, and every product of the
+/// first sum with `|x| < 1` is subnormal: on x86 each one costs a microcode
+/// assist, measured at 7–38 ns per entry for columns of magnitude 0.3 to
+/// 0.003 against 0.8 ns once the entries are at least one. A penalized
+/// least-squares root with entries of order `√w ≤ 1/2` pays it on every
+/// entry of every PIRLS step.
+///
+/// The scaling is exact, `Q` is scale-free (the reflector essentials and
+/// block coefficients are ratios), and `R` scales with `A`, so the caller
+/// unscales `R` and nothing else. No step overflows: orthogonal transforms
+/// keep every entry within its column's norm, at most `√m · 2^(k+1)`,
+/// reflector essentials are at most one in magnitude, and `norm_l2` switches
+/// to its small-scaled accumulator whenever `Σ x²` could overflow.
+fn scale_for_householder(target: MatMut<'_, f64>) -> i32 {
+    let mut largest = 0.0_f64;
+    zip!(target.as_ref()).for_each(|unzip!(entry)| largest = largest.max(entry.abs()));
+    if largest == 0.0 || !largest.is_finite() {
+        return 0;
+    }
+    let exponent = binary_exponent(f64::MAX.sqrt()) - binary_exponent(largest);
+    scale_by_power_of_two(target, exponent);
+    exponent
+}
+
 /// Householder QR `A = Q R` at [`decomposition_parallelism`]: the unit lower
 /// trapezoidal reflector basis (`m × min(m, n)`), its block coefficients, and the
 /// upper trapezoidal `R` (`min(m, n) × n`).
@@ -785,6 +841,7 @@ fn householder_qr(a: MatRef<'_, f64>) -> (Mat<f64>, Mat<f64>, Mat<f64>) {
     let size = m.min(n);
     let par = decomposition_parallelism();
     let mut qr = a.to_owned();
+    let exponent = scale_for_householder(qr.as_mut());
     let block_size = faer::linalg::qr::no_pivoting::factor::recommended_block_size::<f64>(m, n);
     let mut coeff = Mat::<f64>::zeros(block_size, size);
     let mut mem = MemBuffer::new(faer::linalg::qr::no_pivoting::factor::qr_in_place_scratch::<f64>(
@@ -801,7 +858,8 @@ fn householder_qr(a: MatRef<'_, f64>) -> (Mat<f64>, Mat<f64>, Mat<f64>) {
         MemStack::new(&mut mem),
         Default::default(),
     );
-    let (basis, r) = split_householder(qr.as_ref());
+    let (basis, mut r) = split_householder(qr.as_ref());
+    scale_by_power_of_two(r.as_mut(), -exponent);
     (basis, coeff, r)
 }
 
@@ -900,6 +958,7 @@ impl ColumnPivotedQr {
         let size = m.min(n);
         let par = decomposition_parallelism();
         let mut qr = a.to_owned();
+        let exponent = scale_for_householder(qr.as_mut());
         let block_size = faer::linalg::qr::no_pivoting::factor::recommended_block_size::<f64>(m, n);
         let mut coeff = Mat::<f64>::zeros(block_size, size);
         let mut forward = vec![0usize; n];
@@ -922,7 +981,8 @@ impl ColumnPivotedQr {
             MemStack::new(&mut mem),
             Default::default(),
         );
-        let (basis, r) = split_householder(qr.as_ref());
+        let (basis, mut r) = split_householder(qr.as_ref());
+        scale_by_power_of_two(r.as_mut(), -exponent);
         Self {
             basis,
             coeff,
@@ -1089,12 +1149,15 @@ const fn should_use_faer_matmul(m: usize, n: usize, k: usize) -> bool {
         && m.saturating_mul(n).saturating_mul(k) >= MIN_FLOP_SCALE
 }
 
+/// Multiply-adds below which a product runs sequentially: the parallel split
+/// costs more than it saves.
+const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
+
 #[inline]
 pub fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
     // Prefer a work-based policy over per-dimension thresholds.
     // Tall/skinny products (e.g. N x p with large N, modest p) should still
     // parallelize when total work is high.
-    const PAR_MIN_FLOP_SCALE: usize = 2_000_000;
     const PAR_MIN_LONG_DIM: usize = 256;
     let flop_scale = m.saturating_mul(n).saturating_mul(k);
     let long_dim = m.max(n).max(k);
@@ -1105,6 +1168,115 @@ pub fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
         pool_parallelism()
     } else {
         Par::Seq
+    }
+}
+
+/// Rows per block when the `m×n` product of a `k`-row contraction runs as a
+/// row-block reduction ([`row_block_contraction`]), or `None` when it runs as one
+/// faer GEMM at [`matmul_parallelism`].
+///
+/// faer parallelizes a GEMM over output tiles, and every `k`-block of the
+/// contraction ends in a gang barrier across the whole pool. A reduction-shaped
+/// product — a Gram or cross-product of a tall design, `p×q` output from `n`
+/// rows — has one or two output tiles, so the other workers spin at a barrier
+/// several hundred times per product, and under oversubscription (joblib
+/// `n_jobs=-1`, `cross_val_score(n_jobs=-1)`) the gang waits on descheduled
+/// members: four concurrent `n = 1e5` fits took 3× the wall of one-thread fits.
+/// These products split the rows instead ([`crate::parallel::row_contraction_block_rows`]).
+#[inline]
+fn row_contraction_rows(m: usize, n: usize, k: usize) -> Option<usize> {
+    if m.saturating_mul(n).saturating_mul(k) < PAR_MIN_FLOP_SCALE {
+        return None;
+    }
+    crate::parallel::row_contraction_block_rows(m.saturating_mul(n))
+}
+
+/// `out (+)= lhsᵀ·diag(w)·rhs` (`diag(w)` omitted when `weights` is `None`) as a
+/// row-block reduction: rows `[b·block_rows, (b+1)·block_rows)` form block `b`,
+/// each block is one sequential GEMM into a private partial, and the partials
+/// are combined over [`crate::pairwise_reduce::par_deterministic_block_fold_by_work`].
+///
+/// **Determinism.** The blocks come from the shape alone and the combine tree
+/// from the block count alone, so the product is bit-identical at every pool
+/// width and whichever worker runs which block; faer's sequential GEMM is
+/// deterministic within a block. The rows are summed in a different order than
+/// one faer GEMM over all `k` rows, so the words differ from that path once,
+/// by summation order only, and are invariant across thread counts after.
+///
+/// **Scheduling.** The fold is `rayon::join` work stealing, never a barrier: a
+/// worker that is descheduled delays only the block it holds, and a call from
+/// inside a saturated pool runs its blocks inline. The same holds when the
+/// caller asked for [`Par::Seq`] from an outer parallel region, so no degree is
+/// taken from the caller: the split, and so the bits, never depend on it.
+///
+/// With [`BlockStructure::TriangularLower`] only the lower triangle of each
+/// partial is formed; the caller mirrors.
+fn row_block_contraction(
+    out: &mut Array2<f64>,
+    accum: faer::Accum,
+    lhs: MatRef<'_, f64>,
+    rhs: MatRef<'_, f64>,
+    weights: Option<&[f64]>,
+    structure: faer::linalg::matmul::triangular::BlockStructure,
+    block_rows: usize,
+) {
+    use faer::Accum;
+    use faer::linalg::matmul::triangular::{BlockStructure, matmul as tri_matmul};
+
+    let k = lhs.nrows();
+    let (m, n) = (lhs.ncols(), rhs.ncols());
+    assert_eq!(rhs.nrows(), k, "row-block contraction operands must share rows");
+    assert_eq!(out.dim(), (m, n), "row-block contraction output shape");
+    if let Some(w) = weights {
+        assert_eq!(w.len(), k, "row-block contraction weights must match rows");
+    }
+    let n_blocks = k.div_ceil(block_rows.max(1));
+    let block_product = |part: &mut Array2<f64>, block: usize| {
+        let start = block * block_rows;
+        let rows = block_rows.min(k - start);
+        let lhs_block = lhs.subrows(start, rows).transpose();
+        let rhs_block = rhs.subrows(start, rows);
+        let scaled;
+        let rhs_block = match weights {
+            None => rhs_block,
+            Some(w) => {
+                let w = &w[start..start + rows];
+                scaled = Mat::<f64>::from_fn(rows, n, |i, j| w[i] * rhs_block[(i, j)]);
+                scaled.as_ref()
+            }
+        };
+        tri_matmul(
+            array2_to_matmut(part),
+            structure,
+            Accum::Add,
+            lhs_block,
+            BlockStructure::Rectangular,
+            rhs_block,
+            BlockStructure::Rectangular,
+            1.0,
+            Par::Seq,
+        );
+    };
+    let total = crate::pairwise_reduce::par_deterministic_block_fold_by_work(
+        n_blocks,
+        block_rows,
+        |blocks: core::ops::Range<usize>| {
+            let mut part = Array2::<f64>::zeros((m, n));
+            for block in blocks {
+                block_product(&mut part, block);
+            }
+            part
+        },
+        |mut left: Array2<f64>, right: Array2<f64>| {
+            left += &right;
+            left
+        },
+    );
+    match (total, accum) {
+        (Some(total), Accum::Replace) => out.assign(&total),
+        (Some(total), Accum::Add) => *out += &total,
+        (None, Accum::Replace) => out.fill(0.0),
+        (None, Accum::Add) => {}
     }
 }
 
@@ -1182,10 +1354,23 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
         return;
     }
 
-    let mut outview = array2_to_matmut(out);
-
     let aview = FaerArrayView::new(a);
     let a_ref = aview.as_ref();
+    if let Some(block_rows) = row_contraction_rows(p, p, n) {
+        row_block_contraction(
+            out,
+            Accum::Replace,
+            a_ref,
+            a_ref,
+            None,
+            BlockStructure::TriangularLower,
+            block_rows,
+        );
+        mirror_lower_to_upper(out);
+        return;
+    }
+
+    let mut outview = array2_to_matmut(out);
     let a_t = a_ref.transpose();
     let par = matmul_parallelism(p, p, n);
     tri_matmul(
@@ -1199,7 +1384,13 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
         1.0,
         par,
     );
-    // Mirror lower triangle to upper to populate the full symmetric output.
+    mirror_lower_to_upper(out);
+}
+
+/// Copy the lower triangle of a square matrix onto its upper triangle.
+#[inline]
+fn mirror_lower_to_upper(out: &mut Array2<f64>) {
+    let p = out.nrows();
     for i in 0..p {
         for j in (i + 1)..p {
             out[[i, j]] = out[[j, i]];
@@ -1245,12 +1436,28 @@ pub fn fast_atb_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return a.t().dot(b);
     }
 
-    let mut result = Mat::<f64>::zeros(p, q);
-
     let aview = FaerArrayView::new(a);
     let bview = FaerArrayView::new(b);
     let a_ref = aview.as_ref();
     let b_ref = bview.as_ref();
+
+    // A reduction-shaped product splits its rows whatever `par` says; see
+    // `row_block_contraction` for why the caller's degree cannot enter.
+    if let Some(block_rows) = row_contraction_rows(p, q, n_a) {
+        let mut out = Array2::<f64>::zeros((p, q));
+        row_block_contraction(
+            &mut out,
+            Accum::Replace,
+            a_ref,
+            b_ref,
+            None,
+            faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+            block_rows,
+        );
+        return out;
+    }
+
+    let mut result = Mat::<f64>::zeros(p, q);
 
     // dst = A^T * B
     matmul(
@@ -2231,6 +2438,42 @@ pub fn stream_weighted_crossprod_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>
         return;
     }
 
+    if let Some(block_rows) = row_contraction_rows(p, p, n) {
+        // Row-block reduction: each block row-scales at most `block_rows × p`
+        // cells, the same bound on the working set as the streamed chunk below.
+        let x_view = FaerArrayView::new(x);
+        let x_ref = x_view.as_ref();
+        let w_owned;
+        let w_slice = match w.as_slice() {
+            Some(slice) => slice,
+            None => {
+                w_owned = w.to_vec();
+                w_owned.as_slice()
+            }
+        };
+        let accum = match accum {
+            CrossprodAccum::Replace => Accum::Replace,
+            CrossprodAccum::Add => Accum::Add,
+        };
+        let block_structure = match structure {
+            CrossprodStructure::SymmetricLower => BlockStructure::TriangularLower,
+            CrossprodStructure::Full => BlockStructure::Rectangular,
+        };
+        row_block_contraction(
+            out,
+            accum,
+            x_ref,
+            x_ref,
+            Some(w_slice),
+            block_structure,
+            block_rows,
+        );
+        if structure == CrossprodStructure::SymmetricLower {
+            mirror_lower_to_upper(out);
+        }
+        return;
+    }
+
     // Streaming chunked: peak allocation is chunk_rows × p instead of n × p.
     let chunk_rows = streaming_chunk_rows(p, n);
 
@@ -2373,6 +2616,30 @@ fn fast_xt_diag_y_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem
     if !should_use_faer_matmul(px, q, n) {
         let w_y = Array2::from_shape_fn((n, q), |(i, j)| w[i] * y[[i, j]]);
         return x.t().dot(&w_y);
+    }
+
+    if let Some(block_rows) = row_contraction_rows(px, q, n) {
+        let x_view = FaerArrayView::new(x);
+        let y_view = FaerArrayView::new(y);
+        let w_owned;
+        let w_slice = match w.as_slice() {
+            Some(slice) => slice,
+            None => {
+                w_owned = w.to_vec();
+                w_owned.as_slice()
+            }
+        };
+        let mut out = Array2::<f64>::zeros((px, q));
+        row_block_contraction(
+            &mut out,
+            Accum::Replace,
+            x_view.as_ref(),
+            y_view.as_ref(),
+            Some(w_slice),
+            faer::linalg::matmul::triangular::BlockStructure::Rectangular,
+            block_rows,
+        );
+        return out;
     }
 
     // Streaming: only allocate chunk_rows × q for the weighted Y slice.
@@ -3525,7 +3792,7 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
             let eigh_nanos_total = EIGH_NANOS
                 .fetch_add(eigh_elapsed.as_nanos() as u64, Ordering::Relaxed)
                 + eigh_elapsed.as_nanos() as u64;
-            log::debug!(
+            log::trace!(
                 "[eigh] dim={} elapsed={:.3}s faer_parallelism={:?} \
                  calls_so_far={eigh_calls} cumulative={:.3}s",
                 matrix.nrows(),
@@ -5863,5 +6130,310 @@ mod lblt_inertia_2901_tests {
         let inertia = FaerLblt::new(mixed.as_ref(), Side::Lower).inertia();
         assert_eq!((inertia.negative, inertia.zero, inertia.positive), (1, 1, 1), "{inertia:?}");
         assert_eq!(inertia.smallest_pivot, -2.0, "{inertia:?}");
+    }
+}
+
+#[cfg(test)]
+mod pool_width_invariance_tests {
+    use super::*;
+
+    /// A deterministic `n × p` design whose entries span several binades, so a
+    /// change of summation order moves low-order bits.
+    fn design(n: usize, p: usize, seed: u64) -> Array2<f64> {
+        let mut state = seed;
+        Array2::from_shape_fn((n, p), |_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let unit = (state >> 11) as f64 / (1_u64 << 53) as f64;
+            (unit - 0.5) * (1.0 + 7.0 * unit)
+        })
+    }
+
+    fn signed_weights(n: usize) -> Array1<f64> {
+        Array1::from_shape_fn(n, |i| (0.37 * i as f64).sin() + 0.25)
+    }
+
+    fn words(a: &Array2<f64>) -> Vec<u64> {
+        a.iter().map(|v| v.to_bits()).collect()
+    }
+
+    fn assert_same_words_at_every_pool_width(
+        label: &str,
+        product: impl Fn() -> Array2<f64> + Sync,
+    ) {
+        let at_width = |width: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .expect("pool");
+            pool.install(|| words(&product()))
+        };
+        let single = at_width(1);
+        for width in [2, 3, 8] {
+            assert!(
+                single == at_width(width),
+                "{label}: pool width {width} changed the words"
+            );
+        }
+    }
+
+    fn naive_xt_diag_y(x: &Array2<f64>, w: Option<&Array1<f64>>, y: &Array2<f64>) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((x.ncols(), y.ncols()));
+        for i in 0..x.nrows() {
+            let wi = w.map_or(1.0, |w| w[i]);
+            for a in 0..x.ncols() {
+                for b in 0..y.ncols() {
+                    out[[a, b]] += x[[i, a]] * wi * y[[i, b]];
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_close(label: &str, got: &Array2<f64>, want: &Array2<f64>) {
+        let scale = want.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
+        let err = (got - want).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            err <= 1e-11 * scale,
+            "{label}: max error {err:e} against scale {scale:e}"
+        );
+    }
+
+    /// Every reduction-shaped product — Gram, cross-product and their weighted
+    /// forms of a tall design — carries the same words on pools of width 1, 2, 3
+    /// and 8, on both sides of the row-split output bound: `p·q ≤ 31 250` runs
+    /// as shape-sized row blocks, `200 × 200` as faer's output-tiled GEMM.
+    #[test]
+    fn reduction_products_carry_the_same_words_at_every_pool_width() {
+        for &(n, p, q) in &[
+            (50_000usize, 10usize, 7usize),
+            (50_000, 50, 50),
+            (12_000, 200, 200),
+        ] {
+            let x = design(n, p, 0x5EED ^ p as u64);
+            let y = design(n, q, 0xBEEF ^ q as u64);
+            let w = signed_weights(n);
+            let shape = format!("n={n} p={p} q={q}");
+
+            assert_same_words_at_every_pool_width(&format!("fast_ata {shape}"), || fast_ata(&x));
+            assert_same_words_at_every_pool_width(&format!("fast_atb {shape}"), || {
+                fast_atb(&x, &y)
+            });
+            assert_same_words_at_every_pool_width(&format!("fast_xt_diag_x {shape}"), || {
+                fast_xt_diag_x(&x, &w)
+            });
+            assert_same_words_at_every_pool_width(&format!("fast_xt_diag_y {shape}"), || {
+                fast_xt_diag_y(&x, &w, &y)
+            });
+            assert_same_words_at_every_pool_width(&format!("stream Full/Add {shape}"), || {
+                let mut out = Array2::<f64>::from_elem((p, p), 0.5);
+                stream_weighted_crossprod_into(
+                    &x,
+                    &w,
+                    &mut out,
+                    CrossprodStructure::Full,
+                    CrossprodAccum::Add,
+                    matmul_parallelism(p, p, n),
+                );
+                out
+            });
+
+            assert_close(
+                &format!("fast_ata {shape}"),
+                &fast_ata(&x),
+                &naive_xt_diag_y(&x, None, &x),
+            );
+            assert_close(
+                &format!("fast_atb {shape}"),
+                &fast_atb(&x, &y),
+                &naive_xt_diag_y(&x, None, &y),
+            );
+            assert_close(
+                &format!("fast_xt_diag_y {shape}"),
+                &fast_xt_diag_y(&x, &w, &y),
+                &naive_xt_diag_y(&x, Some(&w), &y),
+            );
+            let gram = fast_xt_diag_x(&x, &w);
+            assert_close(
+                &format!("fast_xt_diag_x {shape}"),
+                &gram,
+                &naive_xt_diag_y(&x, Some(&w), &x),
+            );
+            assert!(
+                gram == gram.t(),
+                "fast_xt_diag_x {shape} must be exactly symmetric"
+            );
+        }
+    }
+
+    /// A caller inside an outer parallel region asks for `Par::Seq`; the row
+    /// split is taken from the shape, not from that degree, so the nested call
+    /// and the top-level call agree word for word.
+    #[test]
+    fn a_sequential_caller_gets_the_same_words_as_the_pool() {
+        let (n, p, q) = (50_000usize, 12usize, 9usize);
+        let x = design(n, p, 11);
+        let y = design(n, q, 13);
+        let w = signed_weights(n);
+        assert!(
+            words(&fast_atb_with_parallelism(&x, &y, Par::Seq)) == words(&fast_atb(&x, &y)),
+            "fast_atb must not depend on the caller's degree"
+        );
+        assert!(
+            words(&fast_xt_diag_x_with_parallelism(&x, &w, Par::Seq))
+                == words(&fast_xt_diag_x(&x, &w)),
+            "fast_xt_diag_x must not depend on the caller's degree"
+        );
+    }
+}
+
+#[cfg(test)]
+mod householder_scaling_tests {
+    use super::*;
+
+    /// A stacked penalized-IRLS root `[√w X; √λ D]` at a rare-event Bernoulli
+    /// fit: `√w = √(μ(1 − μ))` with `μ` about 0.01, so every design row is of
+    /// order 0.1 and every entry sits where faer's small-scaled norm
+    /// accumulator is subnormal. Deterministic golden-ratio covariates.
+    fn rare_event_root(rows: usize, cols: usize) -> Mat<f64> {
+        let inv_phi = 2.0 / (1.0 + 5.0_f64.sqrt());
+        let mut root = Mat::<f64>::zeros(rows + cols - 2, cols);
+        for i in 0..rows {
+            let x = (0.5 + i as f64 * inv_phi).fract();
+            let eta = -4.6 + 1.5 * (2.0 * std::f64::consts::PI * x).sin();
+            let mu = 1.0 / (1.0 + (-eta).exp());
+            let sqrt_w = (mu * (1.0 - mu)).sqrt();
+            for j in 0..cols {
+                let centre = j as f64 / (cols - 1) as f64;
+                let basis = (-((x - centre) * cols as f64).powi(2)).exp();
+                root[(i, j)] = sqrt_w * if j == 0 { 1.0 } else { basis };
+            }
+        }
+        let sqrt_lambda = 0.03;
+        for k in 0..cols - 2 {
+            root[(rows + k, k)] = sqrt_lambda;
+            root[(rows + k, k + 1)] = -2.0 * sqrt_lambda;
+            root[(rows + k, k + 2)] = sqrt_lambda;
+        }
+        root
+    }
+
+    fn words(m: MatRef<'_, f64>) -> Vec<u64> {
+        (0..m.ncols())
+            .flat_map(|j| (0..m.nrows()).map(move |i| m[(i, j)].to_bits()))
+            .collect()
+    }
+
+    #[test]
+    fn binary_exponent_is_the_floor_of_log2_through_the_subnormals() {
+        let mut probes = vec![f64::MAX, f64::MIN_POSITIVE, 5e-324, 1.0, 0.75, -3.0];
+        for e in -1074..=1023 {
+            probes.push(2.0_f64.powi(e));
+            probes.push(-1.5 * 2.0_f64.powi(e));
+        }
+        for x in probes.into_iter().filter(|x| x.is_finite() && *x != 0.0) {
+            // Halving a value of at least two and doubling one below one are
+            // exact, so counting them to reach `[1, 2)` is the exponent.
+            let (mut mantissa, mut exponent) = (x.abs(), 0);
+            while mantissa >= 2.0 {
+                mantissa /= 2.0;
+                exponent += 1;
+            }
+            while mantissa < 1.0 {
+                mantissa *= 2.0;
+                exponent -= 1;
+            }
+            assert_eq!(binary_exponent(x), exponent, "binary exponent of {x:e}");
+        }
+    }
+
+    /// Every scale of the same matrix normalizes to the same words, whose
+    /// largest entry shares the binade of `√f64::MAX`. On the unscaled
+    /// rare-event root faer's small-scaled norm accumulator
+    /// `(x·√f64::MIN_POSITIVE)²` is subnormal for every entry; once scaled,
+    /// every column reaches the normal range.
+    #[test]
+    fn householder_scaling_normalizes_every_scale_to_one_binade() {
+        let a = rare_event_root(300, 16);
+        let small_accumulator_is_subnormal =
+            |x: f64| x != 0.0 && (x * f64::MIN_POSITIVE.sqrt()).powi(2) < f64::MIN_POSITIVE;
+        assert!(
+            a.col_iter().all(|col| col.iter().all(|&x| x == 0.0 || small_accumulator_is_subnormal(x))),
+            "the fixture must reproduce the subnormal accumulator it pins"
+        );
+        let mut reference = a.to_owned();
+        let reference_exponent = scale_for_householder(reference.as_mut());
+        let target = binary_exponent(f64::MAX.sqrt());
+        let largest = reference.norm_max();
+        assert_eq!(binary_exponent(largest), target);
+        assert!(
+            reference
+                .col_iter()
+                .all(|col| col.iter().any(|&x| x != 0.0 && !small_accumulator_is_subnormal(x))),
+            "every column must reach the normal accumulator range once scaled"
+        );
+        for k in [-600, -40, -3, 3, 40, 600, 900] {
+            let mut scaled = a.to_owned();
+            scale_by_power_of_two(scaled.as_mut(), k);
+            let exponent = scale_for_householder(scaled.as_mut());
+            assert_eq!(exponent + k, reference_exponent, "exponent at 2^{k}");
+            assert!(words(scaled.as_ref()) == words(reference.as_ref()), "words at 2^{k}");
+        }
+        for mut degenerate in [Mat::<f64>::zeros(4, 3), Mat::<f64>::full(4, 3, f64::NAN)] {
+            assert_eq!(scale_for_householder(degenerate.as_mut()), 0);
+        }
+    }
+
+    /// The factorization runs on the matrix normalized to one binade, so `R`
+    /// of `2^k A` is `2^k` times `R` of `A` word for word at every `k`, from a
+    /// subnormal-ranged `A` to one near overflow, and `Q R` reconstructs `A`.
+    #[test]
+    fn householder_r_is_exactly_scale_equivariant_on_a_rare_event_root() {
+        let a = rare_event_root(600, 24);
+        let base = HouseholderQr::new(a.as_ref());
+        let mut reconstruction = Mat::<f64>::zeros(a.nrows(), a.ncols());
+        reconstruction
+            .as_mut()
+            .submatrix_mut(0, 0, a.ncols(), a.ncols())
+            .copy_from(base.r());
+        apply_householder_on_the_left(base.basis.as_ref(), base.coeff.as_ref(), reconstruction.as_mut());
+        let residual = (&reconstruction - &a).norm_max();
+        assert!(
+            residual <= 64.0 * f64::EPSILON * a.norm_l2(),
+            "Q R misses A by {residual:e} (‖A‖ = {:e})",
+            a.norm_l2()
+        );
+        // At `-600` the normalizing factor is past the largest normal power
+        // of two, so it is applied in two exact steps.
+        for k in [-600, -40, -3, 3, 40, 600, 900] {
+            let mut scaled = a.to_owned();
+            scale_by_power_of_two(scaled.as_mut(), k);
+            let factored = HouseholderQr::new(scaled.as_ref());
+            let mut expected = factored.r().to_owned();
+            scale_by_power_of_two(expected.as_mut(), -k);
+            assert!(
+                words(expected.as_ref()) == words(base.r()),
+                "R of 2^{k}·A is not 2^{k}·R(A) word for word"
+            );
+        }
+    }
+
+    #[test]
+    fn column_pivoted_r_is_exactly_scale_equivariant_on_a_rare_event_root() {
+        let a = rare_event_root(300, 16);
+        let base = ColumnPivotedQr::new(a.as_ref());
+        for k in [-600, -7, 7, 600] {
+            let mut scaled = a.to_owned();
+            scale_by_power_of_two(scaled.as_mut(), k);
+            let factored = ColumnPivotedQr::new(scaled.as_ref());
+            assert_eq!(factored.forward, base.forward, "pivots of 2^{k}·A");
+            let mut expected = factored.thin_r().to_owned();
+            scale_by_power_of_two(expected.as_mut(), -k);
+            assert!(
+                words(expected.as_ref()) == words(base.thin_r()),
+                "pivoted R of 2^{k}·A is not 2^{k}·R(A) word for word"
+            );
+        }
     }
 }

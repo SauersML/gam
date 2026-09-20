@@ -488,11 +488,6 @@ fn run_wide_outer_fit(
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
     let result = OuterProblem::new(n_params)
         .with_initial_rho(seed)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold")
         .expect("#2080 wide-p outer penalized quasi-Laplace fit must terminate, not hang / abort");
     assert!(
@@ -665,11 +660,6 @@ fn run_k1_generated_seed_outer_fit(
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
     let mut ledger = LivelockLedger::default();
     let result = OuterProblem::new(n_params)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(
             &mut LivelockRecorder {
                 inner: &mut objective,
@@ -866,12 +856,7 @@ fn run_ceiling_vs_pathology_instrument(cfg: CeilingPathologyConfig) -> CeilingPa
     // engine's typed non-convergence, as the acceptances in this file do since 9d46bfa66.
     // Under an 8-iteration budget the run stopped at that budget before its certificate
     // (job 1230144: termination=iteration_budget); without it the run certifies (job 1264867).
-    let mut problem = OuterProblem::new(n_params)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+    let mut problem = OuterProblem::new(n_params);
     if cfg.pin_initial_rho {
         problem = problem.with_initial_rho(seed.clone());
     }
@@ -1215,11 +1200,6 @@ fn entangled_two_circle_outer_reml_separates_2080() {
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
     let result = OuterProblem::new(n_params)
         .with_initial_rho(seed)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold entangled two-circle")
         .expect("#2080 entangled two-circle outer penalized quasi-Laplace fit must terminate, not abort");
     assert!(
@@ -3189,7 +3169,7 @@ fn zz_measure_wide_p_cost_exponent_2080() {
 /// the Value lane goes red here instead of silently shipping the desync.
 #[test]
 fn value_lane_prices_at_shared_fixed_point_2228() {
-    // #2228 — the acceptance and criterion lines this pin needs are `log::info!`.
+    // #2228 — the acceptance and criterion lines this pin needs are `log::debug!`.
     gam_runtime::test_support::install_diagnostic_logger();
     let n = 96usize;
     let p = 48usize;
@@ -3448,5 +3428,68 @@ fn value_lane_prices_at_shared_fixed_point_2228() {
          certification roundoff bound: value_lane={value_lane:.16e}, \
          analytic={analytic:.16e}, diff={:.3e}, bound={cert_bound:.3e}",
         (value_lane - analytic).abs()
+    );
+}
+
+/// Whether the state an evaluation left installed is one the native inner solve may price:
+/// inside the raw / quotient KKT band, or with an exact Newton decrement inside the decrement
+/// tolerance (`SaeInstalledInnerKktAudit::certifies`, #2933 F08).
+fn installed_state_certifies_3327(obj: &SaeManifoldOuterObjective) -> Result<(), String> {
+    let mut term = obj.term.clone();
+    let target = obj.target.view();
+    let rho = &obj.current_rho;
+    let registry = obj.registry.as_ref();
+    let system = term.assemble_arrow_schur(target, rho, registry)?;
+    let raw_sq = SaeManifoldTerm::system_grad_norm_sq(&system);
+    let lambda_smooth = rho.lambda_smooth_vec()?;
+    let quotient = term.quotient_gradient_norm_from_system(&system, raw_sq, &lambda_smooth);
+    let bound = SAE_MANIFOLD_INNER_GRAD_REL_TOL * term.inner_iterate_scale();
+    if SaeManifoldTerm::quasi_laplace_kkt_stationary(raw_sq.sqrt(), quotient, bound) {
+        return Ok(());
+    }
+    match term.installed_newton_decrement_relative(target, rho, registry) {
+        Ok(relative) if SaeManifoldTerm::inner_decrement_certifies(relative) => Ok(()),
+        decrement => Err(format!(
+            "‖g‖={:.6e} ‖Π⊥null g‖={quotient:.6e} band={bound:.6e} exact decrement {decrement:?}",
+            raw_sq.sqrt()
+        )),
+    }
+}
+
+/// #3327 / #2933 F08 — at the K=1 #2153 checkpoint ρ, every evaluation must price a state the
+/// exact information certifies.
+///
+/// Before the fix, the stall lane accepted a state at `‖g‖` 1.74e-2, 140× the gradient band.
+/// It accepted on the majorizer decrement `½λ²/scale` ≈ 5e-9, while the exact decrement at the
+/// same state read 1.7e-7 to 7.2e-7. That state was priced as the criterion, and a repeat
+/// evaluation at the same ρ moved the cost by 1.67e-5.
+#[test]
+fn k1_checkpoint_evaluations_price_exact_certified_states_3327() {
+    let z = one_circle_wide_target(32, 24, 0.05);
+    let (term, seed_dispersion) = two_circle_periodic_term(z.view(), 1, 1);
+    let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
+        .seed_scaled_by_dispersion_for_assignment(seed_dispersion, &term.assignment)
+        .expect("seed");
+    let mut obj =
+        SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
+    let r0 = array![-2.312600042551264, -3.6111532480686805];
+    let mut probes = vec![("checkpoint", r0.clone()), ("repeat", r0.clone())];
+    for axis in 0..r0.len() {
+        for sign in [1.0, -1.0] {
+            let mut probe = r0.clone();
+            probe[axis] += sign * 1.0e-3;
+            probes.push(("checkpoint", r0.clone()));
+            probes.push(("probe", probe));
+        }
+    }
+    for (label, rho) in &probes {
+        obj.eval(rho).unwrap_or_else(|err| panic!("{label} eval at {rho}: {err}"));
+        if let Err(state) = installed_state_certifies_3327(&obj) {
+            panic!("{label} eval at {rho} priced a state the exact information refuses: {state}");
+        }
+    }
+    assert!(
+        obj.probe_telemetry().root_exact_refused_acceptances > 0,
+        "the #3327 checkpoint reaches a majorizer-decrement acceptance the exact information refuses"
     );
 }

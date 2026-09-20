@@ -31,7 +31,7 @@ def test_value_grad_refuses_an_isometry_penalty_without_a_decoder_jacobian() -> 
     t = np.linspace(-1.0, 1.0, 12).reshape(6, 2)
 
     with pytest.raises(ValueError, match="decoder Jacobian J"):
-        gamfit.IsometryPenalty(weight=1.0).value_grad(t)
+        gamfit.penalties.IsometryPenalty(weight=1.0).value_grad(t)
 
 
 def test_an_independent_decoder_jacobian_gives_the_value_and_a_zero_target_gradient(
@@ -83,19 +83,19 @@ def test_the_latent_coordinate_fit_refuses_an_isometry_penalty_by_name() -> None
     y = np.sin(2.0 * t0[:, 0]) + 0.1 * rng.normal(size=n)
 
     with pytest.raises(
-        gamfit.GamError, match="supplies no decoder jets for an isometry penalty"
+        gamfit.errors.GamfitError, match="supplies no decoder jets for an isometry penalty"
     ):
         gamfit.fit(
             pd.DataFrame({"y": y}),
             "y ~ s(t, type='duchon', centers=12)",
             family="gaussian",
             latents={
-                "t": gamfit.LatentCoord(
+                "t": gamfit.smooth.LatentCoord(
                     n=n,
                     d=1,
                     init=t0,
                     aux_prior={"u": t0, "family": "ridge", "strength": "auto"},
                 )
             },
-            penalties=[gamfit.IsometryPenalty(weight=10.0)],
+            penalties=[gamfit.penalties.IsometryPenalty(weight=10.0)],
         )

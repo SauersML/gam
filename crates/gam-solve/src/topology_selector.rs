@@ -552,7 +552,6 @@ pub struct TopologyAutoFailedCandidate {
 pub enum TopologySelectionScoreKind {
     Reml,
     Laml,
-    Bic,
     Tk,
 }
 
@@ -561,7 +560,6 @@ impl TopologySelectionScoreKind {
         match self {
             Self::Reml => "reml",
             Self::Laml => "laml",
-            Self::Bic => "bic",
             Self::Tk => "tk",
         }
     }
@@ -587,8 +585,8 @@ impl TopologySelectionScoreScale {
 
 /// Typed metadata extracted from one completed candidate fit.
 ///
-/// Optional fields are score-specific: LAML requires `laml`, BIC requires
-/// `deviance`, and TK/LAML require `null_dim` (plus `null_space_logdet` when the
+/// Optional fields are score-specific: LAML requires `laml`, and TK/LAML
+/// require `null_dim` (plus `null_space_logdet` when the
 /// null dimension is non-zero). The lifecycle selector validates only the
 /// requested headline score; unavailable secondary scores are omitted from the
 /// disagreement diagnostic instead of changing candidate eligibility.
@@ -597,7 +595,6 @@ pub struct TopologyCandidateEvidence {
     pub name: String,
     pub raw_reml: f64,
     pub laml: Option<f64>,
-    pub deviance: Option<f64>,
     pub null_dim: Option<f64>,
     pub null_space_logdet: Option<f64>,
     pub effective_dim: f64,
@@ -1014,7 +1011,7 @@ where
     }
     // Sign convention (issue #396, see `solver::evidence`): `tk_score` is a
     // minimised TK / REML cost, so LOWER is better. Route through the shared
-    // priority selector so topology ranking, seed screening, and model
+    // priority selector so topology ranking, candidate selection, and model
     // comparison share one deterministic ordering contract (#782).
     ranked = rank_priority_candidates(
         ranked
@@ -1107,9 +1104,9 @@ pub(crate) fn tk_normalized_score_with_resolution(
     let tk = raw_reml + normalizer;
     // The normalizer is itself a rounded sum of two products; the addition that
     // folds it into `raw_reml` rounds on the magnitude of the result.
-    let unit_roundoff = 0.5 * f64::EPSILON;
-    let tk_roundoff = raw_reml_roundoff
-        .map(|bound| bound + unit_roundoff * (3.0 * normalizer.abs() + tk.abs()));
+    let tk_roundoff = raw_reml_roundoff.map(|bound| {
+        bound + gam_linalg::roundoff::UNIT_ROUNDOFF * (3.0 * normalizer.abs() + tk.abs())
+    });
     let scale = match score_scale {
         TopologyScoreScale::PerObservation => {
             if n_obs == 0 {
@@ -1127,7 +1124,8 @@ pub(crate) fn tk_normalized_score_with_resolution(
         }
     };
     let score = tk / scale;
-    let resolution = tk_roundoff.map(|bound| bound / scale + unit_roundoff * score.abs());
+    let resolution =
+        tk_roundoff.map(|bound| bound / scale + gam_linalg::roundoff::UNIT_ROUNDOFF * score.abs());
     Ok((score, resolution))
 }
 
@@ -1192,15 +1190,6 @@ fn topology_candidate_raw_score(
                 ));
             }
             Ok(laml + topology_tk_normalizer(evidence.null_dim, evidence.null_space_logdet)?)
-        }
-        TopologySelectionScoreKind::Bic => {
-            let deviance = evidence.deviance.ok_or_else(|| {
-                format!(
-                    "candidate {:?} is missing deviance metadata required for BIC",
-                    evidence.name
-                )
-            })?;
-            bic_score(deviance, evidence.n_obs, evidence.basis_size)
         }
     }
 }
@@ -1337,7 +1326,7 @@ fn topology_score_disagreement_warnings(
     for kind in [
         TopologySelectionScoreKind::Reml,
         TopologySelectionScoreKind::Laml,
-        TopologySelectionScoreKind::Bic,
+        TopologySelectionScoreKind::Tk,
     ] {
         let scored: Result<Vec<_>, _> = evidence
             .iter()
@@ -1366,24 +1355,14 @@ fn topology_score_disagreement_warnings(
         .join("; ");
     if score_scale == TopologySelectionScoreScale::Raw {
         vec![format!(
-            "Topology score rankings differ across score kinds ({detail}). BIC and REML can disagree when candidate basis sizes differ wildly."
+            "Topology score rankings differ across score kinds ({detail}). REML, LAML and the Tierney-Kadane normalized evidence disagree when candidate null-space dimensions differ."
         )]
     } else {
         vec![format!(
-            "Scaled topology score rankings still differ across score kinds under score_scale={:?} ({detail}). Treat BIC as a secondary diagnostic; the Tierney-Kadane Laplace normalizer handles the known cross-basis evidence scale issue.",
+            "Scaled topology score rankings still differ across score kinds under score_scale={:?} ({detail}). The Tierney-Kadane Laplace normalizer handles the known cross-basis evidence scale issue.",
             score_scale.as_str()
         )]
     }
-}
-
-pub(crate) fn bic_score(deviance: f64, n_obs: usize, basis_size: usize) -> Result<f64, String> {
-    if n_obs <= 1 {
-        return Err("BIC scoring requires at least two observations".to_string());
-    }
-    if !deviance.is_finite() {
-        return Err("BIC scoring requires finite deviance".to_string());
-    }
-    Ok(deviance + (n_obs as f64).ln() * basis_size as f64)
 }
 
 // ===========================================================================
@@ -2522,14 +2501,12 @@ mod tests {
         name: &str,
         raw_reml: f64,
         laml: Option<f64>,
-        deviance: Option<f64>,
         effective_dim: f64,
     ) -> TopologyCandidateOutcome {
         TopologyCandidateOutcome::Fitted(TopologyCandidateEvidence {
             name: name.to_string(),
             raw_reml,
             laml,
-            deviance,
             null_dim: Some(0.0),
             null_space_logdet: None,
             effective_dim,
@@ -2542,8 +2519,8 @@ mod tests {
     fn typed_lifecycle_owns_score_scaling_and_deterministic_winner() {
         let result = select_topology_candidate_lifecycle(
             vec![
-                lifecycle_evidence("larger_raw", 5.0, Some(5.0), Some(6.0), 10.0),
-                lifecycle_evidence("smaller_raw", 3.0, Some(3.0), Some(4.0), 2.0),
+                lifecycle_evidence("larger_raw", 5.0, Some(5.0), 10.0),
+                lifecycle_evidence("smaller_raw", 3.0, Some(3.0), 2.0),
             ],
             TopologySelectionScoreKind::Reml,
             TopologySelectionScoreScale::PerEffectiveDim,
@@ -2567,8 +2544,8 @@ mod tests {
                     message: "dimension mismatch".to_string(),
                     evidence_at_failure: None,
                 }),
-                lifecycle_evidence("evidence_bad", f64::NAN, None, None, 2.0),
-                lifecycle_evidence("winner", 2.0, None, None, 2.0),
+                lifecycle_evidence("evidence_bad", f64::NAN, None, 2.0),
+                lifecycle_evidence("winner", 2.0, None, 2.0),
             ],
             TopologySelectionScoreKind::Reml,
             TopologySelectionScoreScale::Raw,
@@ -2588,12 +2565,35 @@ mod tests {
         assert!(result.failed[1].message.contains("non-finite REML"));
     }
 
+    /// The disagreement diagnostic compares only the evidence families the
+    /// selector can rank by (REML, LAML, Tierney-Kadane). A deviance-plus-
+    /// `log n` surrogate is not one of them and must not appear in the report.
+    #[test]
+    fn typed_lifecycle_disagreement_compares_only_evidence_families() {
+        let result = select_topology_candidate_lifecycle(
+            vec![
+                lifecycle_evidence("reml_winner", 1.0, Some(9.0), 1.0),
+                lifecycle_evidence("laml_winner", 2.0, Some(3.0), 1.0),
+            ],
+            TopologySelectionScoreKind::Reml,
+            TopologySelectionScoreScale::Raw,
+        )
+        .expect("typed lifecycle");
+        assert_eq!(result.ranked[0].name, "reml_winner");
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        let warning = &result.warnings[0];
+        assert!(warning.contains("reml: reml_winner, laml_winner"), "{warning}");
+        assert!(warning.contains("laml: laml_winner, reml_winner"), "{warning}");
+        assert!(warning.contains("tk: reml_winner, laml_winner"), "{warning}");
+        assert!(!warning.to_ascii_lowercase().contains("bic"), "{warning}");
+    }
+
     #[test]
     fn typed_lifecycle_rejects_duplicate_terminal_outcomes() {
         let error = select_topology_candidate_lifecycle(
             vec![
-                lifecycle_evidence("circle", 1.0, None, None, 1.0),
-                lifecycle_evidence("circle", 2.0, None, None, 1.0),
+                lifecycle_evidence("circle", 1.0, None, 1.0),
+                lifecycle_evidence("circle", 2.0, None, 1.0),
             ],
             TopologySelectionScoreKind::Reml,
             TopologySelectionScoreScale::Raw,

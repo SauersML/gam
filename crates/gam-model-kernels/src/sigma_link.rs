@@ -191,81 +191,124 @@ pub fn exp_sigma_derivs_up_to_fourth_scalar(eta: f64) -> (f64, f64, f64, f64, f6
     (jet.sigma, jet.d1, jet.d2, jet.d3, jet.d4)
 }
 
-/// Lower bound on σ in *response-scaled* units for the location-scale GAMLSS
-/// noise link σ = LOGB_SIGMA_FLOOR + exp(η). Mirrors mgcv's `gaulss(b=0.01)`
-/// default. The Gaussian location-scale log-likelihood
+/// The location-scale noise link is σ = b + exp(η), with the lower bound `b`
+/// derived from the response's measurement resolution.
 ///
-///   ℓ = −½ Σ (y−μ)²/σ² − Σ log σ
+/// # Why there is a bound at all
 ///
-/// is unbounded *above* as σ → 0 with μ → y on any single observation
-/// (the −log σ term goes to +∞), so the *negative* log-likelihood is
-/// unbounded below and the unconstrained MLE does not exist. With
-/// σ ≥ b > 0 the −log σ term is bounded above by −log b, so the joint
-/// penalized objective stays finite for any finite data and the working
-/// weight 1/σ² is bounded by 1/b².
+/// The Gaussian location-scale log-likelihood
 ///
-/// # Scale invariance
+///   ℓ = −½ Σ w_i (y_i−μ_i)²/σ_i² − Σ w_i log σ_i
 ///
-/// This 0.01 looks absolute but is *operationally* scale-relative: the single
-/// Gaussian location-scale model entry point
-/// (`fit_gaussian_location_scale_model` in `solver::fit_orchestration`) first computes
-/// `response_scale = sample_std(y)` and fits on `y → y / response_scale`,
-/// then maps the fitted coefficients back to raw response units (the
-/// Location/Mean block scaled by `response_scale`, the log-σ block intercept
-/// shifted by `+ln(response_scale)`) via `rescale_gaussian_location_scale_to_raw`.
-/// Reconstructing σ from the returned coefficients is therefore
+/// has no maximum when σ can reach 0. If the mean model fits a subset of rows
+/// exactly (tied responses in a small group, an interpolating smooth), shrinking
+/// σ on those rows sends −log σ to +∞. With σ ≥ b > 0, each row's log-likelihood
+/// is at most −log b, so the penalized objective is bounded for any finite data
+/// and the working weight 1/σ² is at most 1/b².
 ///
-///   σ_response = response_scale · σ_internal
-///              = response_scale · (LOGB_SIGMA_FLOOR + exp(η_internal))
-///              = (response_scale · LOGB_SIGMA_FLOOR) + exp(η_internal + ln(response_scale)),
+/// # Where `b` comes from
 ///
-/// so the effective floor in response units is `0.01 · sample_std(y)` — exactly
-/// 1 % of the spread of `y`. This keeps κ = dlogσ/dη ≈ 1 across the realistic σ
-/// range, so the scale-block Fisher information matches gamlss's floorless 2a
-/// and the log-σ smooth traces the variance envelope instead of being
-/// over-smoothed. Under a rescaling `y → c·y` the prefit divides by `c` again,
-/// leaving the dimensionless internal floor unchanged. There is no underflow
-/// guard: a response without a finite positive spread has no scale to
-/// standardise by and is refused, so the floor tracks the data scale at every
-/// spread the fit accepts.
+/// A recorded response is only known to within its measurement resolution δ,
+/// the grid the values were recorded on. Model the recorded value as the latent
+/// value plus a rounding error that is uniform on (−δ/2, δ/2). That error
+/// carries Sheppard's variance δ²/12 on top of any modelled noise, whatever the
+/// covariates. So no standard deviation below δ/√12 is supported by the data:
 ///
-/// Equivariance requires the floor to scale **with** the response, not just the
-/// `exp(η)` term: the `+ln(response_scale)` intercept shift only multiplies the
-/// exponential by `response_scale`, leaving a residual `0.01·(1 − response_scale)`
-/// if the floor stayed at a raw `0.01`. The reconstruction therefore carries an
-/// explicit floor `response_scale · 0.01`
-/// ([`logb_sigma_from_eta_with_floor_scalar`]) so that
-/// `σ̂_{c·y}(x) = c · σ̂_y(x)` holds exactly (#884).
-pub const LOGB_SIGMA_FLOOR: f64 = 0.01;
-
+///   b = δ / √12.
+///
+/// δ is estimated as the smallest positive gap between distinct recorded
+/// responses among the rows that enter the likelihood
+/// ([`gaussian_resolution_sigma_floor`]). The grid spacing divides every gap
+/// between grid values, so this is the finest difference the data resolve:
+///
+/// * Rounded data (e.g. to 0.1) with any two neighbours one step apart give
+///   δ equal to that step.
+/// * Continuous data give a δ of order range/n², so the bound is effectively
+///   absent: κ = dlogσ/dη = exp(η)/σ ≈ 1 wherever the data inform σ, and the fit
+///   is the log-link fit.
+///
+/// Why this bound rarely binds: for a correctly specified model on data rounded
+/// to δ, the residual variance is at least the quantization variance δ²/12, so
+/// the maximum-likelihood σ exceeds b and exp(η) stays in the interior. It binds
+/// only where the fit would otherwise claim more precision than the recording
+/// resolution allows, which is exactly the degenerate direction the bound
+/// exists to close.
+///
+/// # Scale equivariance
+///
+/// `fit_gaussian_location_scale_model` fits on y / s with s = sample_std(y), and
+/// computes `b` from that standardized response. Under y → c·y, both δ and s
+/// scale by c, so the dimensionless `b` is unchanged and σ̂_{c·y} = c·σ̂_y
+/// exactly. Mapping back to raw units shifts the log-σ intercept by +ln(s),
+/// which scales only the exp(η) term. The floor is therefore reconstructed
+/// explicitly at s·b ([`logb_sigma_from_eta_scalar`] with `floor = s·b`), which
+/// is δ_raw/√12 in the response's own units.
 #[inline]
-pub fn logb_sigma_jet1_scalar(eta: f64) -> SigmaJet1 {
+pub fn logb_sigma_jet1_scalar(floor: f64, eta: f64) -> SigmaJet1 {
     let s = safe_exp(eta);
     SigmaJet1 {
-        sigma: LOGB_SIGMA_FLOOR + s,
+        sigma: floor + s,
         d1: s,
     }
 }
 
+/// σ = floor + exp(η) for the logb noise link.
+///
+/// `floor` is in the same units as σ: the fit-time floor b on the standardized
+/// response, or s·b for raw response units (see [`logb_sigma_jet1_scalar`]).
 #[inline]
-pub fn logb_sigma_from_eta_scalar(eta: f64) -> f64 {
-    LOGB_SIGMA_FLOOR + safe_exp(eta)
+pub fn logb_sigma_from_eta_scalar(floor: f64, eta: f64) -> f64 {
+    floor + safe_exp(eta)
 }
 
-/// Reconstruct σ from η with an explicit, response-scale-relative floor.
+/// Lower bound b = δ/√12 on the location-scale σ, where δ is the smallest
+/// positive gap between distinct responses on rows with positive weight.
 ///
-/// The internal fit standardizes the response by `s = response_scale` and is
-/// solved with the dimensionless floor [`LOGB_SIGMA_FLOOR`]. Mapping back to
-/// raw response units the σ surface must scale uniformly,
-/// `σ_raw(η) = s · σ_internal(η)`, i.e. **both** the `exp(η)` term and the floor
-/// are multiplied by `s`. The `exp` term is carried by shifting the log-σ
-/// intercept by `+ln(s)`; the floor cannot ride an intercept shift (it sits
-/// outside the exponential), so the equivariant floor `floor = s · 0.01` is
-/// supplied here directly. With `floor = LOGB_SIGMA_FLOOR` this reduces to
-/// [`logb_sigma_from_eta_scalar`].
+/// The derivation is on [`logb_sigma_jet1_scalar`]. The result is in the units
+/// of `y`, so the location-scale fit calls this on its standardized response.
+/// A response with fewer than two distinct values on positively weighted rows
+/// has no resolution to derive a bound from, and is refused.
+pub fn gaussian_resolution_sigma_floor(
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> Result<f64, String> {
+    if y.len() != weights.len() {
+        return Err(format!(
+            "Gaussian location-scale σ floor needs one weight per response: {} responses, {} weights",
+            y.len(),
+            weights.len()
+        ));
+    }
+    let mut values: Vec<f64> = Vec::with_capacity(y.len());
+    for (i, (&yi, &wi)) in y.iter().zip(weights.iter()).enumerate() {
+        if !yi.is_finite() || !wi.is_finite() || wi < 0.0 {
+            return Err(format!(
+                "Gaussian location-scale σ floor needs finite responses and finite non-negative weights; row {i} has y={yi}, weight={wi}"
+            ));
+        }
+        if wi > 0.0 {
+            values.push(yi);
+        }
+    }
+    values.sort_unstable_by(f64::total_cmp);
+    let resolution = values
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .filter(|gap| *gap > 0.0)
+        .min_by(f64::total_cmp)
+        .ok_or_else(|| {
+            "Gaussian location-scale σ floor: the positively weighted responses take fewer than two distinct values, so they carry no measurement resolution to bound σ by".to_string()
+        })?;
+    Ok(resolution / 12.0_f64.sqrt())
+}
+
+/// Posterior mean `E[σ]` of `σ = floor + exp(η)` when the log-σ predictor has
+/// the Gaussian posterior `η ~ N(mean, variance)`: the lognormal first moment
+/// gives exactly `floor + exp(mean + variance/2)`. At `variance = 0` this is
+/// the plug-in [`logb_sigma_from_eta_with_floor_scalar`].
 #[inline]
-pub fn logb_sigma_from_eta_with_floor_scalar(floor: f64, eta: f64) -> f64 {
-    floor + safe_exp(eta)
+pub fn logb_sigma_posterior_mean_with_floor_scalar(floor: f64, mean: f64, variance: f64) -> f64 {
+    floor + safe_exp(mean + 0.5 * variance)
 }
 
 #[cfg(test)]
@@ -390,19 +433,50 @@ mod tests {
 
     #[test]
     fn logb_sigma_floor_bounds_below_for_arbitrarily_negative_eta() {
+        let floor = 0.25;
         for &eta in &[-1000.0, -100.0, -50.0, -10.0] {
-            let sigma = logb_sigma_from_eta_scalar(eta);
-            assert!(sigma >= LOGB_SIGMA_FLOOR);
+            let sigma = logb_sigma_from_eta_scalar(floor, eta);
+            assert!(sigma >= floor);
             assert!(sigma.is_finite());
             let inv_s2 = (sigma * sigma).recip();
-            assert!(inv_s2 <= LOGB_SIGMA_FLOOR.powi(-2) + 1e-12);
+            assert!(inv_s2 <= floor.powi(-2) + 1e-12);
         }
+    }
+
+    #[test]
+    fn resolution_sigma_floor_is_sheppard_bound_of_the_recording_grid() {
+        // Values recorded to a 0.5 grid, in shuffled order, with ties, and one
+        // zero-weight row off the grid that must not enter the resolution.
+        let y = ndarray::array![2.0, 0.5, 3.5, 2.0, 1.0, 0.5, 1.2345];
+        let w = ndarray::array![1.0, 2.0, 1.0, 1.0, 0.5, 1.0, 0.0];
+        let floor = gaussian_resolution_sigma_floor(y.view(), w.view()).expect("resolution");
+        assert!((floor - 0.5 / 12.0_f64.sqrt()).abs() <= 1e-15);
+    }
+
+    #[test]
+    fn resolution_sigma_floor_scales_with_the_response() {
+        let y = ndarray::array![0.3, 1.7, 0.9, 2.4, 1.1];
+        let w = ndarray::Array1::<f64>::ones(y.len());
+        let base = gaussian_resolution_sigma_floor(y.view(), w.view()).expect("resolution");
+        for &c in &[1e-4, 1e4] {
+            let scaled = y.mapv(|v| c * v);
+            let floor = gaussian_resolution_sigma_floor(scaled.view(), w.view()).expect("resolution");
+            assert!((floor / (c * base) - 1.0).abs() <= 1e-12, "c={c}: {floor} vs {}", c * base);
+        }
+    }
+
+    #[test]
+    fn resolution_sigma_floor_refuses_a_response_without_two_distinct_values() {
+        let y = ndarray::array![1.0, 1.0, 1.0, 4.0];
+        let w = ndarray::array![1.0, 2.0, 1.0, 0.0];
+        let err = gaussian_resolution_sigma_floor(y.view(), w.view()).expect_err("no resolution");
+        assert!(err.contains("fewer than two distinct values"), "{err}");
     }
 
     #[test]
     fn logb_sigma_recovers_exp_link_in_upper_regime() {
         for &eta in &[3.0, 5.0, 10.0] {
-            let logb = logb_sigma_from_eta_scalar(eta);
+            let logb = logb_sigma_from_eta_scalar(0.1, eta);
             let pure_exp = exp_sigma_from_eta_scalar(eta);
             let rel_err = (logb - pure_exp).abs() / pure_exp;
             assert!(rel_err < 1e-2);

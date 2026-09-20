@@ -18,9 +18,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 gam = { path = "../.." }
+gam-build-identity = { path = "../gam-build-identity" }
 gam-math = { path = "../gam-math" }
+gam-model-api = { path = "../gam-model-api" }
 gam-predict = { path = "../gam-predict" }
 gam-runtime = { path = "../gam-runtime" }
+log = "0.4.33"
 # `extension-module` tells PyO3 NOT to link libpython (the host interpreter
 # supplies the symbols at import time). That is correct for the published wheel
 # but makes a standalone `cargo test` binary fail to link. So it lives behind a

@@ -56,12 +56,23 @@ S(t) = exp(-integral exp(eta0(s)) ds).
 
 This identity describes the continuous model. Finite numerical steps approximate
 it. Reference evolution uses symmetric OU splitting and a midpoint killing
-equation, evaluated on a grid that includes both reference endpoints. The
-driver compares log normalisers and log risk masses on a twice-finer time grid,
-then raises the latent integration order on that finer grid at the **same
-coefficients**. It refines the larger error contribution until the sum is below
-`reference_tolerance` (default `1e-4` nats), or returns an unresolved numerical
-error. A discrepancy above tolerance is not a successful certificate.
+equation, evaluated on a grid that includes both reference endpoints. The driver
+certifies that grid the way the fit certifies its latent order and time mesh: at
+the **same coefficients**, it measures how far each finer grid would move the
+penalised mode, to first order, in posterior standard deviations. Halving the
+grid shrinks these moves, so the first two, `d1` and `d2`, estimate the move to
+the limit grid by their geometric tail `d1 + d2/(1 - q)` with `q = d2/d1`, each
+read at the edge of its rounding band. The estimate is a bound only while the
+later moves contract at least that fast, which they need not; the fit log prints
+every move read. A grid is accepted when the tail is within the certificate's
+tolerance. A grid that fails is not refitted one halving at a time: the
+fixed-coefficient moves continue to the first finer grid whose tail is within
+tolerance, and the fit, rank selection included, is repeated once on that grid.
+Moves that are not resolved above their rounding, or a grid past the
+materialisation budget, return a numerical error instead of a certificate. The
+reference law is integrated at the fit's own Gauss-Hermite order, which the
+order check already certifies. The fit log also reports how far the next grid
+moves the log normalisers, in nats; nothing is gated on that number.
 
 The reference law is a differentiable part of the objective. Its sensitivities
 propagate through evolution and interpolation into the likelihood gradient,
@@ -70,9 +81,11 @@ normaliser and no compensator argument used to discard its observed score.
 
 The normaliser and risk masses exported with a fit are evaluated at the returned
 coefficient state using that fit's reference grid. Forecasting reads those
-values and uses the same interpolation. `reference_refinements` records
-fixed-parameter time-plus-latent discrepancies; `reference_certificate` records
-the accepted final discrepancy.
+values and uses the same interpolation. `reference_refinements` records, for
+each grid the fit ran on, the move the next grid makes at its fitted
+coefficients; `reference_certificate` records the accepted grid's certificate: its steps to
+the first finer grid whose steps contract, plus that grid's tail estimate.
+Both are in posterior standard deviations.
 
 The reference interval is the cohort's overall follow-up interval. A reference
 forecast outside that interval is rejected. Endpoint clamping does not extend
@@ -161,6 +174,7 @@ events before termination.
 ```python
 import numpy as np
 import pandas as pd
+import gamfit
 
 rng = np.random.default_rng(0)
 n = 200

@@ -752,7 +752,7 @@ fn zz_measure_hifreq_tensor_k8_lambda_readout() {
 //       would be a serious statement about the criterion, not about this fixture.
 //
 // `d71fb42f2` made the prepass report every candidate's cost next to the point it
-// scored, but `log::info!` needs a backend and this harness installs none, so that
+// scored, but `log::debug!` needs a backend and this harness installs none, so that
 // line is invisible here. This probe installs a capturing logger for exactly that
 // one line. If `base` is finite and merely larger, that is reading (2); if it is
 // non-finite or on an incomparable scale, that is reading (1). One run separates
@@ -772,9 +772,10 @@ fn zz_measure_hifreq_tensor_k8_lambda_readout() {
 //
 // So un-saturating the design did NOT move this heuristic's preference, and the
 // issue's premise needs one more correction on top of the saturation one: THIS
-// LINE DOES NOT NAME THE OPTIMIZER'S STARTING POINT. `initial.sp` contributes ONE
-// candidate to a 5-seed screening cascade (`rho_optimizer/seed_screening.rs`),
-// and the cascade's ranking is what picks the start. The two report on different
+// LINE DID NOT NAME THE OPTIMIZER'S STARTING POINT. `initial.sp` contributed ONE
+// candidate to a 5-seed screening cascade whose ranking picked the start (that
+// cascade is gone: the outer search now enters from the one derived start,
+// `rho_optimizer::run_plan::outer_start_point`). The two reported on different
 // evaluators -- a `compute_cost` score against a cap-3 PIRLS cost -- so the
 // numbers above are NOT comparable across that boundary and no ratio between them
 // means anything. What is legitimate to conclude is narrower and still useful:
@@ -800,7 +801,7 @@ static SEED_COST_LOGGER: SeedCostLogger = SeedCostLogger;
 
 impl log::Log for SeedCostLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
     fn log(&self, record: &log::Record<'_>) {
         let message = format!("{}", record.args());
@@ -831,7 +832,7 @@ fn zz_measure_hifreq_tensor_k10_seed_costs() {
              seed-cost capture is off for this run"
         );
     }
-    log::set_max_level(log::LevelFilter::Info);
+    log::set_max_level(log::LevelFilter::Debug);
 
     let (data, formula, n_train, sigma) = hifreq_tensor_dataset(10);
     let cfg = FitConfig {

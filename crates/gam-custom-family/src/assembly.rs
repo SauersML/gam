@@ -46,31 +46,46 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
     CustomFamilyError,
 > {
     use gam_problem::PenaltyCoordinate;
-    use gam_solve::estimate::reml::assembly::{
-        InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
-    };
+    use gam_solve::estimate::reml::assembly::InnerAssembly;
 
-    // Collect dense penalty matrices so references stay valid for the assembler.
-    let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = {
+    // The penalty's structural roots (#2954): the criterion's value (the inner
+    // result's `penalty_value`), its ρ-gradient coordinates and its `log|S|₊`
+    // below all read these, so they describe one function. Each block's roots
+    // depend only on that block's penalties.
+    let per_block_roots = {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         (0..specs.len())
             .into_par_iter()
-            .map(|b| specs[b].penalties.iter().map(|p| p.to_dense()).collect())
-            .collect()
+            .map(|b| crate::blockwise_solve::block_penalty_roots(b, &specs[b], &per_block[b]))
+            .collect::<Result<Vec<_>, CustomFamilyError>>()?
     };
-    let block_descs: Vec<PenaltyBlockDesc> = (0..specs.len())
-        .flat_map(|b| {
-            let (start, end) = ranges[b];
-            per_block_penalties_dense[b]
+    // Each penalty as `RᵀR`, the matrix its root defines, for the pseudo-logdet.
+    let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = per_block_roots
+        .iter()
+        .enumerate()
+        .map(|(b, (_, terms))| {
+            let width = ranges[b].1 - ranges[b].0;
+            terms
                 .iter()
-                .map(move |dense| PenaltyBlockDesc {
-                    matrix: dense,
-                    range_start: start,
-                    range_end: end,
-                })
+                .map(|term| term.embedded_penalty(width))
+                .collect()
         })
         .collect();
-    let mut penalty_coords = penalty_coords_from_blocks(&block_descs, total)?;
+    let mut penalty_coords: Vec<PenaltyCoordinate> = per_block_roots
+        .iter()
+        .enumerate()
+        .flat_map(|(b, (_, terms))| {
+            let start = ranges[b].0;
+            terms.iter().map(move |term| {
+                PenaltyCoordinate::from_block_root(
+                    term.root.as_ref().clone(),
+                    start + term.columns.start,
+                    start + term.columns.end,
+                    total,
+                )
+            })
+        })
+        .collect();
 
     // Compute penalty logdet derivatives.
     let mut per_block_penalties: Vec<&[Array2<f64>]> = per_block_penalties_dense
@@ -506,7 +521,7 @@ pub(crate) fn unified_joint_cost_gradient(
     let gradient = result
         .gradient_for_mode(eval_mode, rho.len() + n_joint + ext_dim)
         .map_err(|reason| CustomFamilyError::TrialPointRefused { reason })?;
-    log::debug!(
+    log::trace!(
         "[UNIFIED-GRAD] mode={eval_mode:?} present={gradient_present} trace_skip={trace_skip} \
          |g|={:.6e} len={} n_joint={n_joint} rho_len={} ext={ext_dim}",
         gradient.iter().map(|g| g * g).sum::<f64>().sqrt(),
@@ -1285,7 +1300,7 @@ pub(crate) fn joint_outer_evaluate(
             .and_then(|cache| cache.get(operator_fingerprint));
 
         let assembled: Arc<dyn HessianFactorization> = if let Some(cached) = cached_operator {
-            log::debug!(
+            log::trace!(
                 "[OUTER hessian-route] reusing cached same-ρ assembled operator (fingerprint hit)"
             );
             cached
@@ -1400,7 +1415,7 @@ pub(crate) fn joint_outer_evaluate(
     // price it with the SAME logdet kernel the operator route uses for this
     // `pseudo_logdet_mode`, and compare its logdet to the assembled operator's. An
     // apples-to-apples match proves no collapse entered the assembly; a divergence
-    // is a true defect. We `log::error!` and then `assert!`, so the regression is
+    // is a true defect. We `log::debug!` and then `assert!`, so the regression is
     // never silent. This makes the gam#1395 collapse structurally observable at
     // its source rather than only at the far-downstream objective value.
     //
@@ -1459,7 +1474,7 @@ pub(crate) fn joint_outer_evaluate(
                         let tol = 1e-7 * (total as f64) * (1.0 + reference_logdet.abs());
                         let gap = (assembled_logdet - reference_logdet).abs();
                         if gap > tol {
-                            log::error!(
+                            log::debug!(
                                 "[gam#1395] assembled joint-Hessian logdet diverges from the \
                                  ground-truth penalized Hessian: assembled={assembled_logdet:.9e} \
                                  reference={reference_logdet:.9e} gap={gap:.3e} tol={tol:.3e} \
@@ -1477,7 +1492,7 @@ pub(crate) fn joint_outer_evaluate(
                     }
                 }
                 Err(error) => {
-                    log::debug!(
+                    log::trace!(
                         "[gam#1395] logdet guard skipped: ground-truth factorization failed: {error}"
                     );
                 }
@@ -1506,7 +1521,7 @@ pub(crate) fn joint_outer_evaluate(
         )?;
         kernel.map(|mut kernel| {
             kernel.logdet_correction = projected_logdet - hessian_op.logdet();
-            log::debug!(
+            log::trace!(
                 "[OUTER hessian-route] joint penalty subspace trace installed correction={:.6e}",
                 kernel.logdet_correction
             );
@@ -1517,7 +1532,7 @@ pub(crate) fn joint_outer_evaluate(
     };
     if let Some(kernel) = penalty_subspace_trace.as_ref() {
         for (psi, partial) in completion_psi_partials.iter().enumerate() {
-            log::info!(
+            log::debug!(
                 "[2930-COMPLETION-PSI] psi={psi} half_trace={:.6e}",
                 0.5 * rho_curvature_scale * kernel.trace_projected_logdet(partial)
             );
@@ -1605,7 +1620,7 @@ pub(crate) fn joint_outer_evaluate(
             robust_jeffreys_phi,
         )?;
     if !objective.is_finite() {
-        log::warn!(
+        log::debug!(
             "joint outer evaluation produced non-finite objective: log_likelihood={} penalty_value={} block_logdet_h={:?} block_logdet_s={:?} include_logdet_h={} include_logdet_s={} rho_curvature_scale={}",
             inner.log_likelihood,
             inner.penalty_value,
@@ -1828,7 +1843,7 @@ pub(crate) fn joint_outer_evaluate_efs(
         )?;
         kernel.map(|mut kernel| {
             kernel.logdet_correction = projected_logdet - hessian_op.logdet();
-            log::debug!(
+            log::trace!(
                 "[OUTER hessian-route] joint EFS penalty subspace trace installed correction={:.6e}",
                 kernel.logdet_correction
             );
@@ -1877,38 +1892,6 @@ fn criterion_face_tangent(
     })
 }
 
-/// Evaluate the rho-only custom-family outer objective through the unified
-/// joint hyperpath with no external ψ coordinates attached.
-pub(crate) fn outerobjectivegradienthessian_internal<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    penalty_counts: &[usize],
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: gam_problem::RhoPrior,
-    eval_mode: EvalMode,
-) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
-    let hyper_layout = CustomFamilyHyperLayout::new(
-        vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()],
-        Vec::new(),
-        Array1::zeros(0),
-    )?;
-    evaluate_custom_family_hyper_internal(
-        family,
-        specs,
-        options,
-        penalty_counts,
-        rho,
-        &hyper_layout,
-        warm_start,
-        rho_prior,
-        eval_mode,
-    )
-}
-
 pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -1931,7 +1914,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
     let per_block = split_log_lambdas(rho, penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
     if !inner.converged {
-        log::warn!(
+        log::debug!(
             "[OUTER] custom-family EFS inner solve did not converge after {} cycle(s); \
              skipping EFS derivative assembly for theta_dim={}",
             inner.cycles,
@@ -2895,7 +2878,10 @@ pub(crate) struct CachedInnerMode {
     pub(crate) converged: bool,
     pub(crate) block_logdet_h: Option<f64>,
     pub(crate) block_logdet_s: Option<f64>,
-    pub(crate) joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    // No joint Hessian workspace (#2996): a warm start keeps only arrays. The
+    // reuse path re-certifies the cached mode and takes the certificate's
+    // fresh workspace, so a filed workspace was never read, but it pinned an
+    // n-row cache per warm-start carrier past the exact-cache store's bound.
     pub(crate) kkt_residual: Option<ProjectedKktResidual>,
     pub(crate) active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
     pub(crate) terminal_working_sets: Option<Vec<BlockWorkingSet>>,

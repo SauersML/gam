@@ -92,7 +92,7 @@ fn cli_fit_reports_family_support_weight_and_row_errors_at_the_shared_boundary()
             &["column 'w'", "must be non-negative; found -1 at row 3"],
         ),
         (zero_weights, "gaussian", true, &["column 'w'", "no positive weight"]),
-        ("y,x\n0.3,0.5\n", "gaussian", false, &["only one observation"]),
+        ("y,x\n0.3,0.5\n", "gaussian", false, &["too few rows"]),
     ];
     for (csv, family, weighted, needles) in cases {
         let dir = tempfile::tempdir().unwrap();

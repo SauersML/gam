@@ -33,8 +33,8 @@ pow_op = { "^" }
 unary = { unary_op* ~ primary }
 unary_op = _{ "+" | "-" }
 
-primary = { function_call | list_lit | tuple_lit | ident | number | string_lit | "(" ~ expr ~ ")" }
-list_lit = @{ "[" ~ (!"]" ~ ANY)* ~ "]" }
+primary = { function_call | list_lit | tuple_lit | ident | backtick_ident | number | string_lit | "(" ~ expr ~ ")" }
+list_lit = @{ "[" ~ (list_lit | !"]" ~ ANY)* ~ "]" }
 tuple_lit = @{ "(" ~ (!("," | ")") ~ ANY)+ ~ "," ~ (!")" ~ ANY)* ~ ")" }
 function_call = { ident ~ "(" ~ arg_list? ~ ")" }
 arg_list = { arg ~ ("," ~ arg)* }
@@ -44,6 +44,7 @@ named_arg = { ident ~ "=" ~ expr }
 ident = @{ ident_start ~ ident_continue* }
 ident_start = _{ ASCII_ALPHA | "_" }
 ident_continue = _{ ASCII_ALPHANUMERIC | "_" | "." }
+backtick_ident = @{ "`" ~ (!"`" ~ ANY)+ ~ "`" }
 
 number = @{
     "-"?
@@ -144,7 +145,9 @@ pub(crate) fn parse_formula_dsl(formula: &str) -> Result<FormulaDslParse, String
         if part.as_rule() == Rule::rhs {
             rhs_terms = Some(extract_rhs_terms(part)?);
         } else if part.as_rule() == Rule::expr && response_expr.is_none() {
-            response_expr = Some(part.as_str().trim().to_string());
+            // A backtick-quoted response (`` `my y` ~ x ``) names its column
+            // verbatim; any other response expression is kept as written.
+            response_expr = Some(unquote_column(part.as_str()));
         }
     }
 
@@ -167,6 +170,40 @@ pub(crate) fn parse_formula_dsl(formula: &str) -> Result<FormulaDslParse, String
     })
 }
 
+/// Quote state for the scanners that walk raw formula text before (or instead
+/// of) the grammar: `'...'` and `"..."` string literals and `` `...` ``
+/// backtick-quoted column names. Delimiters, operators and whitespace inside
+/// any of them are literal text, so `s(`my col`)` never splits on the space
+/// and `` `a+b` `` is one column, not a sum.
+#[derive(Default)]
+struct QuoteTracker {
+    open: Option<char>,
+}
+
+impl QuoteTracker {
+    /// Advance past `ch`. Returns `true` when `ch` is a quote delimiter or
+    /// lies inside a quoted span, i.e. when it is not formula syntax.
+    fn step(&mut self, ch: char) -> bool {
+        match self.open {
+            Some(q) => {
+                if ch == q {
+                    self.open = None;
+                }
+                true
+            }
+            None if matches!(ch, '\'' | '"' | '`') => {
+                self.open = Some(ch);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+}
+
 fn delimiter_balance_error(prefix: &str) -> String {
     format!("{prefix}: unbalanced parentheses or quotes")
 }
@@ -176,18 +213,15 @@ fn delimiter_balance_error(prefix: &str) -> String {
 // parentheses/quotes instead of whichever grammar branch happened to fail last.
 fn validate_balanced_delimiters(input: &str, prefix: &str) -> Result<(), String> {
     let mut stack = Vec::<char>::new();
-    let mut in_single = false;
-    let mut in_double = false;
+    let mut quotes = QuoteTracker::default();
 
     for ch in input.chars() {
-        let quoted = in_single || in_double;
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-        } else if ch == '"' && !in_single {
-            in_double = !in_double;
-        } else if !quoted && matches!(ch, '(' | '[' | '{') {
+        if quotes.step(ch) {
+            continue;
+        }
+        if matches!(ch, '(' | '[' | '{') {
             stack.push(ch);
-        } else if !quoted && matches!(ch, ')' | ']' | '}') {
+        } else if matches!(ch, ')' | ']' | '}') {
             let expected = match ch {
                 ')' => '(',
                 ']' => '[',
@@ -203,7 +237,7 @@ fn validate_balanced_delimiters(input: &str, prefix: &str) -> Result<(), String>
         }
     }
 
-    if in_single || in_double || !stack.is_empty() {
+    if quotes.is_open() || !stack.is_empty() {
         return Err(FormulaDslError::ParseError {
             reason: delimiter_balance_error(prefix),
         }
@@ -215,8 +249,7 @@ fn validate_balanced_delimiters(input: &str, prefix: &str) -> Result<(), String>
 fn extract_rhs_terms(rhs: Pair<'_, Rule>) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut depth = 0_i32;
-    let mut in_single = false;
-    let mut in_double = false;
+    let mut quotes = QuoteTracker::default();
     let mut start = 0_usize;
     // Last non-whitespace character seen at depth 0 outside quotes. A top-level
     // `+` only separates terms when it follows a completed operand; when it
@@ -232,20 +265,16 @@ fn extract_rhs_terms(rhs: Pair<'_, Rule>) -> Result<Vec<String>, String> {
     // intact flow for unary `+`.
     let mut last_significant: Option<char> = None;
     let text = rhs.as_str();
-    let bytes = text.as_bytes();
-    for (idx, &b) in bytes.iter().enumerate() {
-        let ch = b as char;
-        let quoted = in_single || in_double;
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-        } else if ch == '"' && !in_single {
-            in_double = !in_double;
-        } else if !quoted && matches!(ch, '(' | '[' | '{') {
+    for (idx, ch) in text.char_indices() {
+        if quotes.step(ch) {
+            last_significant = Some(ch);
+            continue;
+        }
+        if matches!(ch, '(' | '[' | '{') {
             depth += 1;
-        } else if !quoted && matches!(ch, ')' | ']' | '}') && depth > 0 {
+        } else if matches!(ch, ')' | ']' | '}') && depth > 0 {
             depth -= 1;
         } else if ch == '+'
-            && !quoted
             && depth == 0
             && !matches!(
                 last_significant,
@@ -266,7 +295,7 @@ fn extract_rhs_terms(rhs: Pair<'_, Rule>) -> Result<Vec<String>, String> {
             last_significant = Some(ch);
         }
     }
-    if in_single || in_double || depth != 0 {
+    if quotes.is_open() || depth != 0 {
         return Err(FormulaDslError::ParseError {
             reason: "formula RHS has unbalanced quotes or parentheses".to_string(),
         }
@@ -634,7 +663,7 @@ fn wr_interact(
             // These would build design columns that are not simple products
             // (factors, smooths) and need a dedicated constructor.
             for atom in &combined {
-                if atom.contains('(') {
+                if !is_backtick_ident(atom) && atom.contains('(') {
                     return Err(FormulaDslError::IncompatibleTerm {
                         reason: format!(
                             "interaction operator `:` with function-call atom is not supported in `{raw}`. \
@@ -698,6 +727,50 @@ fn wr_power(base: Vec<WrAtomList>, n: usize) -> Vec<WrAtomList> {
         }
     }
     out
+}
+
+/// A backtick-quoted column reference: `` `my col` ``, `` `x.1` ``, `` `2020` ``,
+/// `` `höhe` ``. Everything between the backticks is the column name verbatim,
+/// so names with spaces, operators, leading digits or non-ASCII characters can
+/// be used anywhere a bare column name can (R's non-syntactic-name quoting).
+fn is_backtick_ident(raw: &str) -> bool {
+    raw.len() >= 3
+        && raw.starts_with('`')
+        && raw.ends_with('`')
+        && !raw[1..raw.len() - 1].contains('`')
+}
+
+/// A column reference: a bare identifier or a backtick-quoted name.
+fn is_column_ref(raw: &str) -> bool {
+    is_exact_ident(raw) || is_backtick_ident(raw)
+}
+
+/// The column name a reference denotes: backticks are removed, a bare
+/// identifier is returned unchanged.
+fn unquote_column(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if is_backtick_ident(trimmed) {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Split `a:b:c` on the `:` separators that sit outside backtick quotes.
+fn split_outside_backticks(raw: &str, sep: char) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    for (i, ch) in raw.char_indices() {
+        if ch == '`' {
+            quoted = !quoted;
+        } else if ch == sep && !quoted {
+            pieces.push(&raw[start..i]);
+            start = i + ch.len_utf8();
+        }
+    }
+    pieces.push(&raw[start..]);
+    pieces
 }
 
 fn is_exact_ident(raw: &str) -> bool {
@@ -976,15 +1049,17 @@ mod tests {
 
     #[test]
     fn parse_formula_rejects_unsupported_top_level_rhs_expressions() {
-        // Binary `-`, unary `-`, bare parens, and `-1` intercept removal are
-        // not supported as top-level RHS expressions; they must surface
-        // through the bare-identifier check in `parse_term` with the same
-        // diagnostic. WR operators `:`, `*`, `/`, and `^` are intentionally
-        // supported by `expand_wr_term` and are exercised by
+        // Binary `-`, unary `-` and bare parens are not supported as top-level
+        // RHS expressions; they must surface through the bare-identifier
+        // check in `parse_term` with the same diagnostic. A trailing `- 1` is
+        // intercept removal, not term subtraction, and is covered by
+        // `intercept_removal_spellings_all_lower_to_the_no_intercept_marker`.
+        // WR operators `:`, `*`, `/`, and `^` are intentionally supported by
+        // `expand_wr_term` and are exercised by
         // `parse_formula_supports_wr_slash_nesting` /
         // `parse_formula_supports_wr_star_crossing`; they must NOT appear in
         // this list.
-        for formula in ["y ~ x - z", "y ~ -x", "y ~ (x)", "y ~ x - 1"] {
+        for formula in ["y ~ x - z", "y ~ -x", "y ~ (x)", "y ~ x - 2"] {
             let err = parse_formula(formula).expect_err("expected formula parse failure");
             assert!(err.to_string().contains("unsupported top-level RHS term"));
         }
@@ -1333,8 +1408,8 @@ mod tests {
 
     #[test]
     fn factor_wrapper_is_strict_on_unseen_levels_while_group_re_are_lenient() {
-        // Regression for #2137 (sibling of #2102): `factor(g)` is a FIXED
-        // categorical factor (R `factor()` / patsy `C()`), so an out-of-vocabulary
+        // Regression for #2137 (sibling of #2102): `factor(g)` names the
+        // categorical level effect of a column seen in training, so an out-of-vocabulary
         // level at predict is a schema mismatch that must raise — NOT be shrunk to
         // the centering point. `group(g)`/`re(g)`/`s(g, bs="re")` are genuine
         // random effects that tolerate a held-out group (→ population mean). The
@@ -1343,12 +1418,33 @@ mod tests {
         // policy at the parse layer, where the whole distinction now lives.
         assert!(
             !random_effect_lenient_unseen("y ~ factor(g)"),
-            "factor(g) is a fixed categorical factor: strict (lenient_unseen=false) on unseen levels"
+            "factor(g) is strict (lenient_unseen=false) on unseen levels"
         );
         for lenient in ["y ~ group(g)", "y ~ re(g)", "y ~ s(g, bs=re)"] {
             assert!(
                 random_effect_lenient_unseen(lenient),
                 "{lenient} is a genuine random effect: lenient (lenient_unseen=true) on unseen levels"
+            );
+        }
+    }
+
+    #[test]
+    fn categorical_wrappers_reject_unknown_options() {
+        // pyGAM audit F3: `factor()`/`group()`/`re()` accept no options, so a
+        // stray keyword must be a typed parse error instead of being dropped.
+        for formula in [
+            "y ~ factor(g, foo=1)",
+            "y ~ factor(g, double_penalty=false)",
+            "y ~ group(g, bogus=3)",
+            "y ~ re(g, k=4)",
+        ] {
+            let err = match parse_formula(formula) {
+                Ok(_) => panic!("{formula} must reject its unknown option"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains("does not accept option"),
+                "{formula}: unexpected error {err}"
             );
         }
     }
@@ -1369,6 +1465,177 @@ mod tests {
             assert_eq!(formula_response_column(survival), None, "{survival}");
         }
         assert_eq!(formula_response_column("s(x) + z"), None);
+    }
+
+    fn has_no_intercept_marker(parsed: &super::ParsedFormula) -> bool {
+        parsed
+            .terms
+            .iter()
+            .any(|t| matches!(t, ParsedTerm::NoIntercept))
+    }
+
+    #[test]
+    fn intercept_removal_spellings_all_lower_to_the_no_intercept_marker() {
+        // R/patsy spellings of "no intercept": a leading `0 +`, a trailing or
+        // standalone `- 1`, and `-1 +`. Each must drop the token from the term
+        // list and append exactly one `NoIntercept` marker; the remaining terms
+        // must be exactly what the formula without the token lowers to.
+        for (formula, plain) in [
+            ("y ~ 0 + x", "y ~ x"),
+            ("y ~ x - 1", "y ~ x"),
+            ("y ~ x + z - 1", "y ~ x + z"),
+            ("y ~ -1 + x", "y ~ x"),
+            ("y ~ x + 0", "y ~ x"),
+            ("y ~ 0 + s(x) + z", "y ~ s(x) + z"),
+            ("y ~ a*b - 1", "y ~ a*b"),
+            ("y ~ s(x, k=5) - 1", "y ~ s(x, k=5)"),
+        ] {
+            let removed = parse_formula(formula).unwrap_or_else(|e| panic!("{formula}: {e}"));
+            let kept = parse_formula(plain).unwrap_or_else(|e| panic!("{plain}: {e}"));
+            assert!(has_no_intercept_marker(&removed), "{formula} lost its marker");
+            assert!(!has_no_intercept_marker(&kept), "{plain} gained a marker");
+            let markers = removed
+                .terms
+                .iter()
+                .filter(|t| matches!(t, ParsedTerm::NoIntercept))
+                .count();
+            assert_eq!(markers, 1, "{formula} must carry exactly one marker");
+            let without_marker: Vec<String> = removed
+                .terms
+                .iter()
+                .filter(|t| !matches!(t, ParsedTerm::NoIntercept))
+                .map(|t| format!("{t:?}"))
+                .collect();
+            let plain_terms: Vec<String> = kept.terms.iter().map(|t| format!("{t:?}")).collect();
+            assert_eq!(without_marker, plain_terms, "{formula} vs {plain}");
+        }
+        // An explicit `1` is the default and adds no marker.
+        let explicit = parse_formula("y ~ 1 + x").expect("explicit intercept parses");
+        assert!(!has_no_intercept_marker(&explicit));
+    }
+
+    #[test]
+    fn intercept_removal_rejects_contradictions_and_degenerate_uses() {
+        let cases: [(&str, &str); 4] = [
+            ("y ~ 1 + x - 1", "both includes the intercept"),
+            ("y ~ 0", "no other term"),
+            ("y ~ x:0", "cannot take part in an interaction"),
+            ("y ~ 0 + 1 + x", "both includes the intercept"),
+        ];
+        for (formula, needle) in cases {
+            let err = parse_formula(formula)
+                .expect_err(formula)
+                .to_string();
+            assert!(err.contains(needle), "{formula}: expected `{needle}` in `{err}`");
+        }
+    }
+
+    #[test]
+    fn intercept_removal_is_rejected_in_auxiliary_formulas() {
+        let parsed = parse_formula("y ~ 0 + x").expect("parses");
+        let err = super::validate_auxiliary_formula_controls(&parsed, "--predict-noise")
+            .expect_err("auxiliary formulas cannot drop the intercept");
+        assert!(err.contains("only supported in the main formula"), "{err}");
+        assert!(err.contains("--predict-noise"), "{err}");
+    }
+
+    #[test]
+    fn backtick_quoted_columns_name_non_identifier_columns_verbatim() {
+        // Column names with spaces, dots, a leading digit or non-ASCII letters
+        // are written between backticks; everything inside is the name.
+        let parsed = parse_formula(
+            "`log y` ~ s(`my col`) + `x.1` + te(`2nd`, `température`) \
+             + s(`a b`, by=`grp id`) + linear(`z z`)",
+        )
+        .expect("backtick formula parses");
+        assert_eq!(parsed.response, "log y");
+        let mut cols = BTreeSet::<String>::new();
+        parsed_term_column_names(&parsed.terms, &mut cols);
+        for expected in ["my col", "x.1", "2nd", "température", "a b", "grp id", "z z"] {
+            assert!(cols.contains(expected), "missing `{expected}` in {cols:?}");
+        }
+        assert!(
+            cols.iter().all(|c| !c.contains('`')),
+            "backticks leaked into column names: {cols:?}"
+        );
+        match &parsed.terms[0] {
+            ParsedTerm::Smooth { label, vars, .. } => {
+                assert_eq!(vars, &vec!["my col".to_string()]);
+                assert!(label.contains("`my col`"), "label keeps source text: {label}");
+            }
+            other => panic!("expected smooth, got {other:?}"),
+        }
+        match &parsed.terms[1] {
+            ParsedTerm::Linear { name, .. } => assert_eq!(name, "x.1"),
+            other => panic!("expected linear, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backtick_columns_take_part_in_interactions_and_crossing() {
+        let labels = wr_term_labels("y ~ `a a`:b + `c.1`*d");
+        // Interaction vars are sorted; the backtick column sorts by its bare name.
+        assert_eq!(
+            labels,
+            vec![
+                "a a:b".to_string(),
+                "c.1".to_string(),
+                "d".to_string(),
+                "c.1:d".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn backtick_quoting_protects_operators_inside_the_name() {
+        // `a:b` between backticks is ONE column, not an interaction; `x + 1`
+        // is one column, not two terms.
+        let parsed = parse_formula("y ~ `a:b` + `x + 1`").expect("parses");
+        let names: Vec<String> = parsed
+            .terms
+            .iter()
+            .map(|t| match t {
+                ParsedTerm::Linear { name, .. } => name.clone(),
+                other => format!("Other({other:?})"),
+            })
+            .collect();
+        assert_eq!(names, vec!["a:b".to_string(), "x + 1".to_string()]);
+    }
+
+    #[test]
+    fn backtick_columns_work_in_survival_responses() {
+        let parsed =
+            parse_formula("Surv(`entry t`, `exit t`, `event flag`) ~ s(x)").expect("parses");
+        let mut cols = BTreeSet::<String>::new();
+        parsed_term_column_names(&parsed.terms, &mut cols);
+        assert!(cols.contains("x"));
+        let (entry, exit, event) = super::parse_surv_response(&parsed.response)
+            .expect("Surv response parses")
+            .expect("response is a Surv triple");
+        assert_eq!(
+            (entry.as_deref(), exit.as_str(), event.as_str()),
+            (Some("entry t"), "exit t", "event flag")
+        );
+    }
+
+    #[test]
+    fn empty_or_unterminated_backticks_are_rejected() {
+        for formula in ["y ~ s(``)", "y ~ `x", "y ~ s(`x)"] {
+            assert!(parse_formula(formula).is_err(), "{formula} must not parse");
+        }
+    }
+
+    #[test]
+    fn capital_c_is_refused_with_a_pointer_to_factor() {
+        // `factor(g)` is the only categorical level-effect spelling; `C(g)`
+        // names nothing else, so it is an error that says what to write.
+        let err = parse_formula("y ~ C(g) + x").expect_err("C() is not a term");
+        let err = err.to_string();
+        assert!(err.contains("`C()` is not a term function"), "{err}");
+        assert!(err.contains("factor(g)"), "{err}");
+        // Lowercase `c()` only appears inside option values (`k=c(5, 5)`).
+        let err = parse_formula("y ~ c(g)").expect_err("c() is not a term");
+        assert!(err.to_string().contains("unknown term function"), "{err}");
     }
 }
 
@@ -1479,9 +1746,9 @@ pub enum ParsedTerm {
         /// Unseen-level policy, fixed at parse time by the wrapper the user
         /// wrote. `group(g)`/`re(g)`/`s(g, bs="re")` are genuine **random
         /// effects**: a held-out group is shrunk to the population mean, so an
-        /// unseen level at predict is tolerated (`true`). `factor(g)` is a
-        /// **fixed** categorical factor (R `factor()` / patsy `C()`
-        /// convention): like a bare `+ g` categorical main effect, an unseen
+        /// unseen level at predict is tolerated (`true`). `factor(g)` names a
+        /// categorical level effect: like a bare `+ g` categorical main
+        /// effect, an unseen
         /// level is a schema mismatch that must raise rather than collapse onto
         /// the factor's centering point (`false`, #2137/#2102). Both wrappers
         /// share the penalized-categorical materialization; only this policy
@@ -1521,6 +1788,12 @@ pub enum ParsedTerm {
         vars: Vec<String>,
         double_penalty: bool,
     },
+    /// Model-level marker for `0 + ...` / `... - 1`: the formula removes the
+    /// global intercept. It consumes no column and builds no design block;
+    /// `term_builder` turns it into [`crate::smooth::ModelLevel::NoIntercept`]
+    /// unless a remaining term spans the constant, in which case the intercept
+    /// stays (see `docs/formulas.md`, "Removing the intercept").
+    NoIntercept,
 }
 
 /// Collect the names of every data column the parsed terms consume.
@@ -1554,7 +1827,8 @@ pub fn parsed_term_column_names(
             ParsedTerm::LinkWiggle { .. }
             | ParsedTerm::TimeWiggle { .. }
             | ParsedTerm::LinkConfig { .. }
-            | ParsedTerm::SurvivalConfig { .. } => {}
+            | ParsedTerm::SurvivalConfig { .. }
+            | ParsedTerm::NoIntercept => {}
             ParsedTerm::SlopeSurface { z_column, terms } => {
                 out.insert(z_column.clone());
                 parsed_term_column_names(terms, out);
@@ -1576,7 +1850,8 @@ pub(crate) fn parsed_terms_reference_column(terms: &[ParsedTerm], column_name: &
         ParsedTerm::LinkWiggle { .. }
         | ParsedTerm::TimeWiggle { .. }
         | ParsedTerm::LinkConfig { .. }
-        | ParsedTerm::SurvivalConfig { .. } => false,
+        | ParsedTerm::SurvivalConfig { .. }
+        | ParsedTerm::NoIntercept => false,
         ParsedTerm::SlopeSurface { z_column, terms } => {
             z_column == column_name || parsed_terms_reference_column(terms, column_name)
         }
@@ -1845,10 +2120,6 @@ pub fn joint_wiggle_unsupported_link_message(context: &str) -> String {
 // Option-map helpers (shared by formula parsing and term construction)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn option_usize(map: &BTreeMap<String, String>, key: &str) -> Option<usize> {
-    map.get(key).and_then(|v| v.parse::<usize>().ok())
-}
-
 /// Local sibling of `term_builder::validate_known_options` used by the
 /// parser-side `linear / bounded / constrain / nonnegative / nonpositive`
 /// branches (which build their `ParsedTerm` here and never enter
@@ -1885,22 +2156,13 @@ fn validate_known_term_options(
     Ok(())
 }
 
-pub(crate) fn option_usize_any(map: &BTreeMap<String, String>, keys: &[&str]) -> Option<usize> {
-    for key in keys {
-        if let Some(v) = option_usize(map, key) {
-            return Some(v);
-        }
-    }
-    None
-}
-
-/// Strict integer option: returns `Ok(None)` if not present, `Ok(Some(n))` if
-/// it parses as a non-negative integer, and `Err(msg)` if the user supplied a
-/// value that isn't a valid usize (negative, decimal, garbage). Without this
-/// the lenient `option_usize` silently drops invalid values and reverts to
-/// the default — `k=-1` and `k=1.5` were both accepted as "k not specified"
+/// Integer option: returns `Ok(None)` if not present, `Ok(Some(n))` if it
+/// parses as a non-negative integer, and `Err(msg)` if the user supplied a
+/// value that isn't a valid usize (negative, decimal, garbage). There is
+/// deliberately no lenient reader: dropping an invalid value would revert to
+/// the default, so `k=-1` or `degree=cubic` would fit as "not specified"
 /// instead of being flagged as user mistakes.
-pub(crate) fn option_usize_strict(
+pub(crate) fn option_usize(
     map: &BTreeMap<String, String>,
     key: &str,
 ) -> Result<Option<usize>, String> {
@@ -1918,28 +2180,23 @@ pub(crate) fn option_usize_strict(
     }
 }
 
-/// Strict variant of `option_usize_any` that errors on the first present-but-
-/// unparseable key rather than silently falling through.
-pub(crate) fn option_usize_any_strict(
+/// [`option_usize`] over several alias spellings; errors on the first
+/// present-but-unparseable key rather than silently falling through.
+pub(crate) fn option_usize_any(
     map: &BTreeMap<String, String>,
     keys: &[&str],
 ) -> Result<Option<usize>, String> {
     for key in keys {
-        if let Some(v) = option_usize_strict(map, key)? {
+        if let Some(v) = option_usize(map, key)? {
             return Ok(Some(v));
         }
     }
     Ok(None)
 }
 
-pub(crate) fn option_f64(map: &BTreeMap<String, String>, key: &str) -> Option<f64> {
-    map.get(key).and_then(|v| v.parse::<f64>().ok())
-}
-
-/// Strict float option: `Ok(None)` if absent, `Ok(Some(n))` if parses as a
-/// finite f64, `Err` if the user passed an unparseable value (rather than
-/// silently dropping it like the lenient `option_f64`).
-pub(crate) fn option_f64_strict(map: &BTreeMap<String, String>, key: &str) -> Result<Option<f64>, String> {
+/// Float option: `Ok(None)` if absent, `Ok(Some(n))` if parses as a finite
+/// f64, `Err` if the user passed an unparseable or non-finite value.
+pub(crate) fn option_f64(map: &BTreeMap<String, String>, key: &str) -> Result<Option<f64>, String> {
     match map.get(key) {
         None => Ok(None),
         Some(raw) => match raw.parse::<f64>() {
@@ -1958,21 +2215,10 @@ pub(crate) fn option_f64_strict(map: &BTreeMap<String, String>, key: &str) -> Re
     }
 }
 
-pub(crate) fn option_bool(map: &BTreeMap<String, String>, key: &str) -> Option<bool> {
-    map.get(key)
-        .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "y" => Some(true),
-            "false" | "0" | "no" | "n" => Some(false),
-            _ => None,
-        })
-}
-
-/// Strict boolean option: `Ok(None)` if absent, `Ok(Some(b))` for a recognized
-/// truthy/falsy token, and `Err(msg)` for a present-but-unparseable value. The
-/// lenient `option_bool` maps an unrecognized value to `None`, which callers
-/// then silently treat as "not specified" — masking user typos like
-/// `double_penalty=ture`.
-pub(crate) fn option_bool_strict(
+/// Boolean option: `Ok(None)` if absent, `Ok(Some(b))` for a recognized
+/// truthy/falsy token, and `Err(msg)` for a present-but-unparseable value, so
+/// a typo like `double_penalty=ture` is never treated as "not specified".
+pub(crate) fn option_bool(
     map: &BTreeMap<String, String>,
     key: &str,
 ) -> Result<Option<bool>, String> {
@@ -2166,7 +2412,7 @@ pub fn parse_linkwiggle_formulaspec(
     let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
     // Strict parsing: a present-but-unparseable value (`degree=abc`, `=-3`,
     // `=6.5`) must be rejected, not silently dropped and replaced by the
-    // default as the lossy `option_usize`/`option_bool` readers would do.
+    // default.
     //
     // This parser is shared by *all* wiggle grammars: `linkwiggle` and
     // `timewiggle` (see `parse_formula`), the standard-model flexible-link
@@ -2179,7 +2425,7 @@ pub fn parse_linkwiggle_formulaspec(
     // parser — it is enforced at the routing layer that feeds the cubic-only
     // runtime (`deviation_block_config_from_formula_linkwiggle`). Here we only
     // enforce the universal lower bound that a polynomial degree is positive.
-    let degree = option_usize_strict(options, "degree")?.unwrap_or(defaults.degree);
+    let degree = option_usize(options, "degree")?.unwrap_or(defaults.degree);
     if degree < 1 {
         return Err(FormulaDslError::InvalidArgument {
             reason: format!("{term_name}() requires degree >= 1: {raw}"),
@@ -2187,7 +2433,7 @@ pub fn parse_linkwiggle_formulaspec(
         .into());
     }
     let num_internal_knots =
-        option_usize_strict(options, "internal_knots")?.unwrap_or(defaults.num_internal_knots);
+        option_usize(options, "internal_knots")?.unwrap_or(defaults.num_internal_knots);
     if num_internal_knots == 0 {
         return Err(FormulaDslError::InvalidArgument {
             reason: format!("{term_name}() requires internal_knots > 0: {raw}"),
@@ -2235,7 +2481,7 @@ pub fn parse_linkwiggle_formulaspec(
         penalty_orders = supported;
     }
     let double_penalty =
-        option_bool_strict(options, "double_penalty")?.unwrap_or(defaults.double_penalty);
+        option_bool(options, "double_penalty")?.unwrap_or(defaults.double_penalty);
     Ok(LinkWiggleFormulaSpec {
         degree,
         num_internal_knots,
@@ -2324,6 +2570,7 @@ fn parse_bounded_priorspec(
 
     if let Some(priorname) = prior_mode {
         return match priorname.as_str() {
+            "shrinkage" => Ok(BoundedCoefficientPriorSpec::Shrinkage),
             "none" => Ok(BoundedCoefficientPriorSpec::None),
             "uniform" | "log-jacobian" | "log_jacobian" | "jacobian" => {
                 Ok(BoundedCoefficientPriorSpec::Uniform)
@@ -2331,7 +2578,7 @@ fn parse_bounded_priorspec(
             "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
             _ => Err(FormulaDslError::InvalidArgument {
                 reason: format!(
-                    "bounded() prior must currently be one of none|uniform|log-jacobian|center, got '{}': {raw}",
+                    "bounded() prior must currently be one of shrinkage|none|uniform|log-jacobian|center, got '{}': {raw}",
                     priorname
                 ),
             }
@@ -2380,7 +2627,8 @@ fn parse_bounded_priorspec(
         return Ok(BoundedCoefficientPriorSpec::Beta { a, b });
     }
 
-    Ok(BoundedCoefficientPriorSpec::None)
+    // No prior option: shrink toward the null with a REML-estimated strength.
+    Ok(BoundedCoefficientPriorSpec::Shrinkage)
 }
 
 // ---------------------------------------------------------------------------
@@ -2419,7 +2667,7 @@ pub fn parse_surv_response(
         .args
         .iter()
         .filter_map(|arg| match arg {
-            CallArgSpec::Positional(v) => Some(v.trim().to_string()),
+            CallArgSpec::Positional(v) => Some(unquote_column(v)),
             CallArgSpec::Named { .. } => None,
         })
         .filter(|s| !s.is_empty())
@@ -2472,7 +2720,7 @@ pub fn parse_surv_interval_response(
         .args
         .iter()
         .filter_map(|arg| match arg {
-            CallArgSpec::Positional(v) => Some(v.trim().to_string()),
+            CallArgSpec::Positional(v) => Some(unquote_column(v)),
             CallArgSpec::Named { .. } => None,
         })
         .filter(|s| !s.is_empty())
@@ -2515,25 +2763,22 @@ pub fn formula_response_column(formula: &str) -> Option<String> {
 
 fn top_level_formula_separator(input: &str) -> Result<Option<usize>, String> {
     let mut depth = 0_i32;
-    let mut in_single = false;
-    let mut in_double = false;
+    let mut quotes = QuoteTracker::default();
 
     for (idx, ch) in input.char_indices() {
-        let quoted = in_single || in_double;
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-        } else if ch == '"' && !in_single {
-            in_double = !in_double;
-        } else if !quoted && matches!(ch, '(' | '[' | '{') {
+        if quotes.step(ch) {
+            continue;
+        }
+        if matches!(ch, '(' | '[' | '{') {
             depth += 1;
-        } else if !quoted && matches!(ch, ')' | ']' | '}') && depth > 0 {
+        } else if matches!(ch, ')' | ']' | '}') && depth > 0 {
             depth -= 1;
-        } else if ch == '~' && !quoted && depth == 0 {
+        } else if ch == '~' && depth == 0 {
             return Ok(Some(idx));
         }
     }
 
-    if in_single || in_double || depth != 0 {
+    if quotes.is_open() || depth != 0 {
         return Err(FormulaDslError::ParseError {
             reason: "invalid auxiliary formula syntax: unbalanced parentheses or quotes"
                 .to_string(),
@@ -2572,6 +2817,19 @@ pub fn validate_auxiliary_formula_controls(
         }
         .into());
     }
+    if parsed_formula
+        .terms
+        .iter()
+        .any(|term| matches!(term, ParsedTerm::NoIntercept))
+    {
+        return Err(FormulaDslError::IncompatibleTerm {
+            reason: format!(
+                "intercept removal (`0 +` / `- 1`) is only supported in the main formula, \
+                 not {flag_name}"
+            ),
+        }
+        .into());
+    }
     if parsed_formula.timewiggle.is_some() {
         return Err(FormulaDslError::IncompatibleTerm {
             reason: format!(
@@ -2605,6 +2863,45 @@ pub fn validate_auxiliary_formula_controls(
     Ok::<(), _>(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterceptToken {
+    Keep,
+    Remove,
+}
+
+/// Classify a whole top-level RHS term as an intercept switch (R/patsy
+/// convention): `1`/`+1` keeps the intercept, `0`/`+0`/`-1` removes it.
+fn intercept_token(term: &str) -> Option<InterceptToken> {
+    let compact: String = term.chars().filter(|c| !c.is_whitespace()).collect();
+    match compact.as_str() {
+        "1" | "+1" => Some(InterceptToken::Keep),
+        "0" | "+0" | "-1" => Some(InterceptToken::Remove),
+        _ => None,
+    }
+}
+
+/// Strip a trailing binary `- 1` from a raw RHS term (`x - 1`, `a*b - 1`),
+/// returning the operand in front of it. The top-level splitter never cuts
+/// on `-`, so this is where `y ~ x - 1` loses its intercept. The `1` must be
+/// a whole token directly after the `-`, and the text before the `-` must be
+/// a complete operand (not end in an operator or an opening delimiter).
+fn strip_trailing_intercept_removal(term: &str) -> Option<&str> {
+    let rest = term
+        .trim_end()
+        .strip_suffix('1')?
+        .trim_end()
+        .strip_suffix('-')?
+        .trim_end();
+    let last = rest.chars().last()?;
+    if matches!(
+        last,
+        ':' | '*' | '/' | '^' | '+' | '-' | '(' | '[' | '{' | ',' | '=' | '~'
+    ) {
+        return None;
+    }
+    Some(rest)
+}
+
 pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
     let parsed_dsl =
         parse_formula_dsl(formula).map_err(|reason| FormulaDslError::ParseError { reason })?;
@@ -2626,8 +2923,28 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
     // fit is over-parameterized.
     let mut seen_term_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut expanded_terms = Vec::<String>::new();
+    // Intercept tokens (`1`, `0`, `-1`, and a trailing `- 1` on a term) are
+    // model-level switches, not terms. They are consumed here, before WR
+    // expansion, so `y ~ x - 1` reaches the expander as plain `x`.
+    let mut explicit_intercept = false;
+    let mut intercept_removed = false;
     for raw in parsed_dsl.rhs_terms {
-        let trimmed = raw.trim();
+        let mut trimmed = raw.trim();
+        while let Some(rest) = strip_trailing_intercept_removal(trimmed) {
+            intercept_removed = true;
+            trimmed = rest;
+        }
+        match intercept_token(trimmed) {
+            Some(InterceptToken::Keep) => {
+                explicit_intercept = true;
+                continue;
+            }
+            Some(InterceptToken::Remove) => {
+                intercept_removed = true;
+                continue;
+            }
+            None => {}
+        }
         if trimmed.is_empty() {
             expanded_terms.push(String::new());
             continue;
@@ -2640,15 +2957,19 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
         let needs_expansion = !is_call
             && trimmed
                 .chars()
-                .scan(0i32, |depth, ch| {
+                .scan((0i32, QuoteTracker::default()), |(depth, quotes), ch| {
+                    if quotes.step(ch) {
+                        return Some(None);
+                    }
                     let d_before = *depth;
                     if matches!(ch, '(' | '[' | '{') {
                         *depth += 1;
                     } else if matches!(ch, ')' | ']' | '}') && *depth > 0 {
                         *depth -= 1;
                     }
-                    Some((d_before, ch))
+                    Some(Some((d_before, ch)))
                 })
+                .flatten()
                 .any(|(d, ch)| d == 0 && matches!(ch, ':' | '*' | '/' | '^'));
         if needs_expansion {
             for atoms in
@@ -2664,15 +2985,29 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
         }
     }
 
+    if explicit_intercept && intercept_removed {
+        return Err(FormulaDslError::IncompatibleTerm {
+            reason: format!(
+                "formula `{formula}` both includes the intercept (`1`) and removes it \
+                 (`0` / `-1`); keep exactly one of them"
+            ),
+        });
+    }
     for raw in expanded_terms {
         let t = raw.trim();
-        if t.is_empty() || t == "1" {
+        if t.is_empty() {
             continue;
         }
-        if t == "0" || t == "-1" {
+        if split_outside_backticks(t, ':')
+            .into_iter()
+            .any(|atom| intercept_token(atom).is_some())
+        {
             return Err(FormulaDslError::IncompatibleTerm {
-                reason: "formula terms '0'/'-1' (intercept removal) are not supported yet"
-                    .to_string(),
+                reason: format!(
+                    "intercept token `{t}` in formula `{formula}` cannot take part in an \
+                     interaction or nesting operator; write `0 +` or `- 1` as its own \
+                     top-level term"
+                ),
             });
         }
         if t == AUTOMATIC_REST_TERM {
@@ -2687,20 +3022,10 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
         // `bs="a b"` and `bs="ab"` do not collide.
         let key: String = {
             let mut acc = String::with_capacity(t.len());
-            let mut in_single = false;
-            let mut in_double = false;
+            let mut quotes = QuoteTracker::default();
             for ch in t.chars() {
-                match ch {
-                    '\'' if !in_double => {
-                        in_single = !in_single;
-                        acc.push(ch);
-                    }
-                    '"' if !in_single => {
-                        in_double = !in_double;
-                        acc.push(ch);
-                    }
-                    c if c.is_whitespace() && !in_single && !in_double => {}
-                    _ => acc.push(ch),
+                if quotes.step(ch) || !ch.is_whitespace() {
+                    acc.push(ch);
                 }
             }
             acc
@@ -2770,6 +3095,28 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
             ),
         });
     }
+    if intercept_removed {
+        let has_model_term = terms.iter().any(|term| {
+            matches!(
+                term,
+                ParsedTerm::Linear { .. }
+                    | ParsedTerm::BoundedLinear { .. }
+                    | ParsedTerm::RandomEffect { .. }
+                    | ParsedTerm::Smooth { .. }
+                    | ParsedTerm::Interaction { .. }
+            )
+        });
+        if !has_model_term {
+            return Err(FormulaDslError::IncompatibleTerm {
+                reason: format!(
+                    "formula `{formula}` removes the intercept and has no other term, so \
+                     the model would have no coefficients; drop `0` / `-1` for an \
+                     intercept-only model"
+                ),
+            });
+        }
+        terms.push(ParsedTerm::NoIntercept);
+    }
     Ok(ParsedFormula {
         response: lhs.to_string(),
         terms,
@@ -2782,6 +3129,82 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
 }
 
 pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
+    parse_term_quoted(raw).map(unquote_parsed_term)
+}
+
+/// Resolve backtick-quoted column references (`` s(`my col`) ``) to the bare
+/// column names the term builder looks up. Labels keep the text the user wrote.
+fn unquote_parsed_term(term: ParsedTerm) -> ParsedTerm {
+    match term {
+        ParsedTerm::Linear {
+            name,
+            explicit,
+            double_penalty,
+            coefficient_min,
+            coefficient_max,
+        } => ParsedTerm::Linear {
+            name: unquote_column(&name),
+            explicit,
+            double_penalty,
+            coefficient_min,
+            coefficient_max,
+        },
+        ParsedTerm::BoundedLinear {
+            name,
+            min,
+            max,
+            prior,
+            double_penalty,
+        } => ParsedTerm::BoundedLinear {
+            name: unquote_column(&name),
+            min,
+            max,
+            prior,
+            double_penalty,
+        },
+        ParsedTerm::RandomEffect {
+            name,
+            lenient_unseen,
+        } => ParsedTerm::RandomEffect {
+            name: unquote_column(&name),
+            lenient_unseen,
+        },
+        ParsedTerm::Smooth {
+            label,
+            vars,
+            kind,
+            mut options,
+        } => {
+            if let Some(by) = options.get_mut("by") {
+                *by = unquote_column(by);
+            }
+            ParsedTerm::Smooth {
+                label,
+                vars: vars.iter().map(|v| unquote_column(v)).collect(),
+                kind,
+                options,
+            }
+        }
+        ParsedTerm::Interaction {
+            vars,
+            double_penalty,
+        } => {
+            let mut vars: Vec<String> = vars.iter().map(|v| unquote_column(v)).collect();
+            vars.sort();
+            ParsedTerm::Interaction {
+                vars,
+                double_penalty,
+            }
+        }
+        ParsedTerm::SlopeSurface { z_column, terms } => ParsedTerm::SlopeSurface {
+            z_column: unquote_column(&z_column),
+            terms,
+        },
+        other => other,
+    }
+}
+
+fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
     fn split_call_args(call: &FunctionCallSpec) -> (Vec<String>, BTreeMap<String, String>) {
         let mut vars = Vec::<String>::new();
         let mut options = BTreeMap::<String, String>::new();
@@ -2799,12 +3222,10 @@ pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
     // Wilkinson-Rogers `:` interaction term. The expander in `parse_formula`
     // produces `a:b[:c...]` for these; parse_term is also reached directly
     // from tests, so handle the syntax here as well.
-    if raw.contains(':')
-        && !raw.contains('(')
-        && raw.split(':').all(|piece| is_exact_ident(piece.trim()))
-    {
-        let vars: Vec<String> = raw
-            .split(':')
+    let operands = split_outside_backticks(raw, ':');
+    if operands.len() > 1 && operands.iter().all(|piece| is_column_ref(piece.trim())) {
+        let vars: Vec<String> = operands
+            .iter()
             .map(|piece| piece.trim().to_string())
             .collect();
         if vars.len() >= 2 {
@@ -2830,6 +3251,16 @@ pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
     // the plain-variable handling below is the answer, so there is no error here
     // to report.
     if let Ok(call) = parse_function_call(raw) {
+        // `factor(g)` is the one spelling of a categorical level effect. A
+        // second name for it would be an option with nothing to choose, so
+        // `C(g)` is refused with the spelling to use instead.
+        if call.name == "C" {
+            let target = split_call_args(&call).0.join(", ");
+            return Err(format!(
+                "`C()` is not a term function in '{raw}'; write factor({target}) for a \
+                 categorical level effect"
+            ));
+        }
         let name = call.name.to_ascii_lowercase();
         let (vars, mut options) = split_call_args(&call);
         match name.as_str() {
@@ -2865,7 +3296,7 @@ pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 return Ok(ParsedTerm::Linear {
                     name: vars[0].clone(),
                     explicit: true,
-                    double_penalty: option_bool_strict(&options, "double_penalty")?
+                    double_penalty: option_bool(&options, "double_penalty")?
                         .unwrap_or(true),
                     coefficient_min,
                     coefficient_max,
@@ -2882,7 +3313,7 @@ pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 return Ok(ParsedTerm::Linear {
                     name: vars[0].clone(),
                     explicit: true,
-                    double_penalty: option_bool_strict(&options, "double_penalty")?
+                    double_penalty: option_bool(&options, "double_penalty")?
                         .unwrap_or(true),
                     coefficient_min: Some(0.0),
                     coefficient_max: None,
@@ -2899,7 +3330,7 @@ pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 return Ok(ParsedTerm::Linear {
                     name: vars[0].clone(),
                     explicit: true,
-                    double_penalty: option_bool_strict(&options, "double_penalty")?
+                    double_penalty: option_bool(&options, "double_penalty")?
                         .unwrap_or(true),
                     coefficient_min: None,
                     coefficient_max: Some(0.0),
@@ -2949,7 +3380,7 @@ pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     // "bounded linear term ... cannot also use double_penalty"),
                     // so the default must be `false`, not the `linear()`/`s()`
                     // convention of `true`.
-                    double_penalty: option_bool_strict(&options, "double_penalty")?
+                    double_penalty: option_bool(&options, "double_penalty")?
                         .unwrap_or(false),
                 });
             }
@@ -2963,13 +3394,17 @@ pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
-                // `factor(g)` is a FIXED categorical factor (R `factor()` /
-                // patsy `C()`): it forces categorical encoding of the column
-                // but, like a bare `+ g` main effect, is strict on unseen
-                // levels. `group(g)`/`re(g)` are genuine random effects that
-                // shrink a held-out group to the population mean, so they
-                // tolerate unseen levels. Both share the penalized-categorical
-                // block; only the unseen policy differs (#2137/#2102).
+                // None of the categorical wrappers take options: every one
+                // lowers to a level block whose ridge strength is
+                // REML-estimated, so `factor(g, foo=1)` or
+                // `group(g, double_penalty=false)` is a typo, not a request.
+                validate_known_term_options(&name, &options, &[], raw)?;
+                // `factor(g)` forces categorical encoding of the column and,
+                // like a bare `+ g` main effect, is strict on unseen levels.
+                // `group(g)`/`re(g)` are genuine random effects that shrink a
+                // held-out group to the population mean, so they tolerate
+                // unseen levels. Both share the penalized-categorical block;
+                // only the unseen policy differs (#2137/#2102).
                 let lenient_unseen = name != "factor";
                 return Ok(ParsedTerm::RandomEffect {
                     name: vars[0].clone(),
@@ -3184,8 +3619,8 @@ pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
-                if option_bool(&options, "cyclic").unwrap_or(false)
-                    || option_bool(&options, "periodic").unwrap_or(false)
+                if option_bool(&options, "cyclic")?.unwrap_or(false)
+                    || option_bool(&options, "periodic")?.unwrap_or(false)
                 {
                     options.insert("cyclic".to_string(), "true".to_string());
                 }
@@ -3267,7 +3702,7 @@ pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     .into());
                 }
                 let z_column = vars[0].trim();
-                if !is_exact_ident(z_column) {
+                if !is_column_ref(z_column) {
                     return Err(FormulaDslError::InvalidArgument {
                         reason: format!(
                             "slope() z column must be a bare column name, got `{z_column}` in {raw}"
@@ -3307,8 +3742,8 @@ pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 let (coefficient_min, coefficient_max) =
                     parse_linear_constraint_bounds(&options, raw)?;
                 let double_penalty =
-                    option_bool_strict(&options, "double_penalty")?.unwrap_or(true);
-                if vars[0].contains(':') {
+                    option_bool(&options, "double_penalty")?.unwrap_or(true);
+                if split_outside_backticks(&vars[0], ':').len() > 1 {
                     if coefficient_min.is_some() || coefficient_max.is_some() {
                         return Err(FormulaDslError::IncompatibleTerm {
                             reason: format!(
@@ -3317,13 +3752,13 @@ pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                         }
                         .into());
                     }
-                    let mut interaction_vars = vars[0]
-                        .split(':')
+                    let mut interaction_vars = split_outside_backticks(&vars[0], ':')
+                        .into_iter()
                         .map(str::trim)
                         .map(str::to_string)
                         .collect::<Vec<_>>();
                     if interaction_vars.len() < 2
-                        || interaction_vars.iter().any(|var| !is_exact_ident(var))
+                        || interaction_vars.iter().any(|var| !is_column_ref(var))
                     {
                         return Err(FormulaDslError::InvalidArgument {
                             reason: format!(
@@ -3365,7 +3800,7 @@ pub(crate) fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
     }
 
     let ident = raw.trim();
-    if !is_exact_ident(ident) {
+    if !is_column_ref(ident) {
         return Err(FormulaDslError::UnknownIdentifier {
             reason: format!("unsupported top-level RHS term: {raw}"),
         }
@@ -3473,25 +3908,17 @@ pub fn parse_link_choice(
     }))
 }
 
+/// Parse a link name through the canonical vocabulary in
+/// [`LinkFunction::from_name`]; the error lists [`LinkFunction::ALL`].
 pub fn parse_linkname(v: &str) -> Result<LinkFunction, FormulaDslError> {
-    match v.trim() {
-        "identity" => Ok(LinkFunction::Identity),
-        "log" => Ok(LinkFunction::Log),
-        "logit" | "binomial-logit" => Ok(LinkFunction::Logit),
-        "probit" | "binomial-probit" => Ok(LinkFunction::Probit),
-        "cloglog" | "binomial-cloglog" => Ok(LinkFunction::CLogLog),
-        "loglog" => Ok(LinkFunction::LogLog),
-        "cauchit" => Ok(LinkFunction::Cauchit),
-        "sas" => Ok(LinkFunction::Sas),
-        "beta-logistic" => Ok(LinkFunction::BetaLogistic),
-        other => Err(FormulaDslError::UnknownIdentifier {
-            reason: format!(
-                "unsupported link type '{other}'; \
-                 use one of identity|log|logit|probit|cloglog|loglog|cauchit|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...). \
-                 Both `--link <type>` (CLI flag) and `link(type=<type>)` (formula term) accept the same set."
-            ),
-        }),
-    }
+    LinkFunction::from_name(v).ok_or_else(|| FormulaDslError::UnknownIdentifier {
+        reason: format!(
+            "{}, blended(...)/mixture(...) or flexible(...). \
+             The formula term `link(type=<type>)`, the mgcv-style `family(<type>)` and \
+             Python's `link=` accept the same set.",
+            gam_problem::types::UnknownLinkName(v.trim().to_string())
+        ),
+    })
 }
 
 pub(crate) fn parse_link_component(v: &str) -> Result<LinkComponent, String> {

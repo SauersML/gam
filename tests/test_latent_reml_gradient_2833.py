@@ -21,25 +21,25 @@ def _problem(n, dim, k, outputs, weighted):
 )
 def test_latent_reml_score_gradient_and_descent(shape):
     t, args, kwargs = _problem(*shape)
-    fit = gamfit.gaussian_reml_fit_latent(t.ravel(), *args, **kwargs)
+    fit = gamfit.reml.gaussian_reml_fit_latent(t.ravel(), *args, **kwargs)
     assert fit["cache_penalty_rank"] == shape[2]
     assert fit["cache_nullity"] == 0
     assert abs(fit["reml_grad_rho"]) < 1e-7
     initial_gradient = np.asarray(
-        gamfit.gaussian_reml_fit_latent_backward(
+        gamfit.reml.gaussian_reml_fit_latent_backward(
             t.ravel(), *args, grad_reml_score=1.0, **kwargs
         )["grad_t"]
     )
     kwargs["init_lambda"] = fit["lambda"]
     gradient = np.asarray(
-        gamfit.gaussian_reml_fit_latent_backward(
+        gamfit.reml.gaussian_reml_fit_latent_backward(
             t.ravel(), *args, grad_reml_score=1.0, **kwargs
         )["grad_t"]
     )
     np.testing.assert_allclose(gradient, initial_gradient, rtol=1e-7, atol=1e-8)
 
     def score(point):
-        return gamfit.gaussian_reml_fit_latent(point.ravel(), *args, **kwargs)[
+        return gamfit.reml.gaussian_reml_fit_latent(point.ravel(), *args, **kwargs)[
             "reml_score"
         ]
 
@@ -66,7 +66,7 @@ def test_latent_design_coefficient_frame_is_independent_of_other_rows():
     t, args, kwargs = _problem(20, 1, 5, 5, True)
 
     def design(point):
-        fit = gamfit.gaussian_reml_fit_latent(point.ravel(), *args, **kwargs)
+        fit = gamfit.reml.gaussian_reml_fit_latent(point.ravel(), *args, **kwargs)
         return np.linalg.solve(
             np.asarray(fit["coefficients"]).T, np.asarray(fit["fitted"]).T
         ).T
@@ -85,10 +85,10 @@ def test_cached_adjoint_cannot_drop_an_identity_penalty_mode():
     x = t[:, None] ** powers * 10.0 ** -powers
     y = np.sin(9 * t)[:, None]
     penalty = np.eye(5)
-    fit = gamfit.gaussian_reml_fit(x, y, penalty)
+    fit = gamfit.reml.gaussian_reml_fit(x, y, penalty)
     assert fit["cache_penalty_rank"] == 5
     corrupted = dict(fit, cache_penalty_rank=4, cache_nullity=1)
-    with pytest.raises(gamfit.GamError, match="null modes must be exactly zero"):
-        gamfit.gaussian_reml_fit_backward(
+    with pytest.raises(gamfit.errors.GamfitError, match="null modes must be exactly zero"):
+        gamfit.reml.gaussian_reml_fit_backward(
             x, y, penalty, grad_reml_score=1.0, forward_state=corrupted
         )

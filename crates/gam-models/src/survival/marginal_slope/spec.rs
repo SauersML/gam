@@ -379,9 +379,22 @@ pub(crate) fn split_persisted_latent_calibrations(
     }
 }
 
+/// Why a learned Gaussian-shift frailty is refused where the likelihood does not
+/// identify it (gam#2938); see
+/// [`crate::survival::lognormal_kernel::frailty_identification`].
+pub(crate) const LEARNED_FRAILTY_NOT_IDENTIFIED: &str =
+    "a learned Gaussian-shift frailty σ is refused: σ is not identified by the likelihood. The \
+     survival marginal-slope likelihood reads σ only through the probit scale \
+     s(σ) = 1/√(1+σ²) on the observed slope s(σ)·(o + Xβ), and with the slope offset o inside \
+     every slope surface's span (a constant offset beside an intercept, by default), \
+     (σ, β, λ) ↦ (σ′, β′, λ/c²) with o + Xβ′ = c·(o + Xβ), c = s(σ)/s(σ′), leaves the \
+     likelihood and the slope penalty unchanged. The criterion then moves with σ only through \
+     the slope block's prior and Laplace terms (by −m·ln c for m unpenalized slope directions \
+     while λ is free). A fixed σ only rescales the reported slope (gam#2938)";
+
 pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     let n = spec.age_entry.len();
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope] fit start n={} marginal_terms={} slope_terms={}",
         n,
         spec.marginalspec.linear_terms.len()
@@ -473,17 +486,6 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
             .into());
         }
     }
-    if matches!(
-        &spec.baseline_hyper,
-        SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear { .. }
-    ) && !spec.time_block.time_monotonicity.is_coordinate_cone()
-    {
-        return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
-            reason: "learned survival marginal-slope baseline coordinates require a StructuralISpline coordinate cone; rowwise derivative constraints would move with the baseline offsets"
-                .to_string(),
-        }
-        .into());
-    }
     if spec.event_target.iter().any(|&d| d != 0.0 && d != 1.0) {
         return Err(SurvivalMarginalSlopeError::InvalidInput {
             reason: "survival-marginal-slope requires binary event indicators (0.0 or 1.0)"
@@ -544,125 +546,78 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
         }
         .into());
     }
-    if !spec.time_block.time_monotonicity.requires_row_constraints()
-        && !spec.time_block.time_monotonicity.is_coordinate_cone()
-    {
-        return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
-            reason: format!(
-                "survival-marginal-slope requires a row-constraint or coordinate-cone time block; got {:?}",
-                spec.time_block.time_monotonicity
-            ),
+    for (row, &offset) in spec.time_block.derivative_offset_exit.iter().enumerate() {
+        if !offset.is_finite() {
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival-marginal-slope coordinate-cone time block has non-finite derivative offset at row {row}: {offset}"
+                ),
+            }
+            .into());
         }
-        .into());
+        if offset < spec.derivative_guard - 1e-12 {
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival-marginal-slope coordinate-cone time block requires derivative offset >= guard at row {row}: offset={offset:.3e}, guard={:.3e}",
+                    spec.derivative_guard
+                ),
+            }
+            .into());
+        }
     }
-    if spec.time_block.time_monotonicity.is_coordinate_cone() {
-        for (row, &offset) in spec.time_block.derivative_offset_exit.iter().enumerate() {
-            if !offset.is_finite() {
-                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-                    reason: format!(
-                        "survival-marginal-slope coordinate-cone time block has non-finite derivative offset at row {row}: {offset}"
-                    ),
-                }
-                .into());
+    let derivative_design = spec
+        .time_block
+        .design_derivative_exit
+        .try_to_dense_by_chunks("survival marginal-slope coordinate-cone derivative audit")
+        .map_err(|reason| SurvivalMarginalSlopeError::IncompatibleDimensions { reason })?;
+    for ((row, col), &value) in derivative_design.indexed_iter() {
+        if !value.is_finite() {
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival-marginal-slope coordinate-cone time block has non-finite derivative design entry at row {row}, col {col}: {value}"
+                ),
             }
-            if offset < spec.derivative_guard - 1e-12 {
-                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-                    reason: format!(
-                        "survival-marginal-slope coordinate-cone time block requires derivative offset >= guard at row {row}: offset={offset:.3e}, guard={:.3e}",
-                        spec.derivative_guard
-                    ),
-                }
-                .into());
-            }
+            .into());
         }
-        let derivative_design = spec
-            .time_block
-            .design_derivative_exit
-            .try_to_dense_by_chunks("survival marginal-slope coordinate-cone derivative audit")
-            .map_err(|reason| SurvivalMarginalSlopeError::IncompatibleDimensions { reason })?;
-        for ((row, col), &value) in derivative_design.indexed_iter() {
-            if !value.is_finite() {
-                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-                    reason: format!(
-                        "survival-marginal-slope coordinate-cone time block has non-finite derivative design entry at row {row}, col {col}: {value}"
-                    ),
-                }
-                .into());
+        if value < -1e-12 {
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival-marginal-slope coordinate-cone time block requires nonnegative derivative design entries; row {row}, col {col} = {value:.3e}"
+                ),
             }
-            if value < -1e-12 {
-                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-                    reason: format!(
-                        "survival-marginal-slope coordinate-cone time block requires nonnegative derivative design entries; row {row}, col {col} = {value:.3e}"
-                    ),
-                }
-                .into());
-            }
+            .into());
         }
     }
     if let Some(beta0) = &spec.time_block.initial_beta {
-        match spec.time_block.time_monotonicity {
-            monotonicity if monotonicity.is_coordinate_cone() => {
-                // Under a coordinate-cone time basis, the solver enforces β ≥ 0
-                // directly. The row-wise derivative guard is redundant because
-                // validation above proves D ≥ 0 and offset ≥ guard.
-                if spec.time_block.design_derivative_exit.ncols() != beta0.len() {
-                    return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-                        reason: format!(
-                            "survival-marginal-slope time_block initial_beta length mismatch under coordinate-cone monotonicity: got {}, expected {}",
-                            beta0.len(),
-                            spec.time_block.design_derivative_exit.ncols()
-                        ),
-                    }
-                    .into());
-                }
-                for (j, &g) in beta0.iter().enumerate() {
-                    if !g.is_finite() {
-                        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-                            reason: format!(
-                                "survival-marginal-slope time_block initial_beta is non-finite at coordinate {j} under coordinate-cone monotonicity: got {g}"
-                            ),
-                        }
-                        .into());
-                    }
-                    if g < -1e-12 {
-                        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-                            reason: format!(
-                                "survival-marginal-slope time_block initial_beta violates β ≥ 0 at coordinate {j} under coordinate-cone monotonicity: got {g:.3e}"
-                            ),
-                        }
-                        .into());
-                    }
-                }
+        // Under a coordinate-cone time basis, the solver enforces β ≥ 0
+        // directly. The row-wise derivative guard is redundant because
+        // validation above proves D ≥ 0 and offset ≥ guard.
+        if spec.time_block.design_derivative_exit.ncols() != beta0.len() {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival-marginal-slope time_block initial_beta length mismatch under coordinate-cone monotonicity: got {}, expected {}",
+                    beta0.len(),
+                    spec.time_block.design_derivative_exit.ncols()
+                ),
             }
-            _ => {
-                let derivative_constraints = time_derivative_guard_constraints(
-                    &spec.time_block.design_derivative_exit,
-                    &spec.time_block.derivative_offset_exit,
-                    spec.derivative_guard,
-                )?;
-                if let Some(constraints) = derivative_constraints.as_ref() {
-                    if beta0.len() != constraints.a.ncols() {
-                        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-                            reason: format!(
-                                "survival-marginal-slope time_block initial_beta length mismatch: got {}, expected {}",
-                                beta0.len(),
-                                constraints.a.ncols()
-                            ),
-                        }
-                        .into());
-                    }
-                    for row in 0..constraints.a.nrows() {
-                        let slack = constraints.a.row(row).dot(beta0) - constraints.b[row];
-                        if slack < -1e-10 {
-                            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-                                reason: format!(
-                                    "survival-marginal-slope time_block initial_beta violates derivative guard constraint at row {row}: slack={slack:.3e}"
-                                ),
-                            }
-                            .into());
-                        }
-                    }
+            .into());
+        }
+        for (j, &g) in beta0.iter().enumerate() {
+            if !g.is_finite() {
+                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                    reason: format!(
+                        "survival-marginal-slope time_block initial_beta is non-finite at coordinate {j} under coordinate-cone monotonicity: got {g}"
+                    ),
                 }
+                .into());
+            }
+            if g < -1e-12 {
+                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                    reason: format!(
+                        "survival-marginal-slope time_block initial_beta violates β ≥ 0 at coordinate {j} under coordinate-cone monotonicity: got {g:.3e}"
+                    ),
+                }
+                .into());
             }
         }
     }

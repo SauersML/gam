@@ -9,16 +9,13 @@ use super::evaluation::{
     sas_effective_epsilon, sas_effective_epsilon_second, sas_log_delta_edge_barriercostgrad,
     sas_log_delta_edge_barriercostgradhess,
 };
-use super::external_options::resolve_external_family;
-use super::optimizer::{
-    external_reml_seed_config, freeze_lambda_search_nuisance_at_canonical_anchor,
-    standard_reml_search_prefers_gradient_only,
-};
-use super::penalty::REML_SEED_SCREENING_RHO_CAP;
+use super::external_options::{resolve_external_family, resolved_external_config};
+use super::optimizer::freeze_lambda_search_nuisance_at_canonical_anchor;
 use super::prefit::{
-    PrefitRegularityDiagnostic, detect_prefit_binomial_single_column_separation_in_design,
+    PrefitRegularityDiagnostic, arm_jeffreys_on_prefit_binomial_separation,
+    detect_prefit_binomial_single_column_separation_in_design,
     detect_prefit_unpenalized_rank_deficiency_in_design, reject_prefit_binomial_separation,
-    reject_prefit_unpenalized_rank_deficiency,
+    reject_prefit_unidentifiable_unpenalized_space, reject_prefit_unpenalized_rank_deficiency,
 };
 use super::reml::hyper::link_binomial_aux;
 use super::*;
@@ -26,80 +23,134 @@ use crate::mixture_link::{
     sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials, sas_link_complement,
 };
 use gam_linalg::utils::StableSolver;
-use gam_problem::{
-    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, SeedRiskProfile, StandardLink,
-};
+use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::sync::atomic::Ordering;
 
-#[test]
-fn gaussian_external_reml_uses_one_analytic_seed() {
-    // The profiled-Gaussian path scores its data-derived `initial.sp` and
-    // summed-penalty diagonal candidates before constructing the outer
-    // problem.  The generic lattice must not repeat that basin decision.
-    let cfg = external_reml_seed_config(2, LinkFunction::Identity);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
-    assert_eq!(cfg.max_seeds, 1);
-    assert_eq!(cfg.seed_budget, 3);
-    assert_eq!(cfg.over_smoothing_probe_rho, None);
+/// Two-smooth fixture for the outer-curvature routing check: an intercept plus
+/// one Gaussian-bump block per covariate, each block under its own
+/// second-difference penalty.
+fn two_smooth_bump_design(n: usize) -> (Array2<f64>, Vec<Array2<f64>>, Vec<f64>) {
+    const BUMPS: usize = 8;
+    let width = 0.14;
+    let p = 1 + 2 * BUMPS;
+    let mut x = Array2::<f64>::zeros((n, p));
+    let mut signal = Vec::with_capacity(n);
+    for i in 0..n {
+        let x1 = (i as f64 + 0.5) / n as f64;
+        let x2 = ((i * 7919) % n) as f64 / n as f64;
+        x[[i, 0]] = 1.0;
+        for k in 0..BUMPS {
+            let c = k as f64 / (BUMPS - 1) as f64;
+            x[[i, 1 + k]] = (-(x1 - c).powi(2) / (2.0 * width * width)).exp();
+            x[[i, 1 + BUMPS + k]] = (-(x2 - c).powi(2) / (2.0 * width * width)).exp();
+        }
+        signal.push(1.3 * (2.0 * std::f64::consts::PI * x1).sin() + 0.8 * (x2 - 0.5));
+    }
+    let mut d = Array2::<f64>::zeros((BUMPS - 2, BUMPS));
+    for r in 0..BUMPS - 2 {
+        d[[r, r]] = 1.0;
+        d[[r, r + 1]] = -2.0;
+        d[[r, r + 2]] = 1.0;
+    }
+    let local = d.t().dot(&d);
+    let penalties = (0..2)
+        .map(|block| {
+            let mut s = Array2::<f64>::zeros((p, p));
+            let off = 1 + block * BUMPS;
+            s.slice_mut(ndarray::s![off..off + BUMPS, off..off + BUMPS])
+                .assign(&local);
+            s
+        })
+        .collect();
+    (x, penalties, signal)
 }
 
+/// Every standard family's λ-search consumes the declared exact outer
+/// Hessian (ARC/Newton), exactly as profiled Gaussian identity does. The
+/// retired #2359 split held non-Gaussian links to gradient-only BFGS, which
+/// rebuilt that curvature from secant pairs and needed 48-61 outer
+/// iterations on a one-smooth n=1000 logistic fit. Newton steps on the exact
+/// surface converge in a handful per seed.
+///
+/// `fit.iterations` sums the seeds the multi-start budget runs (two here).
+/// Since #2954 the search stops at the caller's `tol` on each component's own
+/// scale rather than at `tol·(1 + |V|)`, a band ~340× looser at this fit's
+/// `V ≈ 341`: each binomial seed now takes 12 exact-Newton iterations (an
+/// `e⁻¹`-per-step approach along the heavily penalised coordinate, then the
+/// quadratic phase), 24 in all, where the looser band stopped each at ~10. The
+/// bound is two seeds of fifteen, still under the secant rebuild's count at
+/// the looser band.
 #[test]
-fn high_dimensional_gaussian_external_reml_does_not_restore_a_lattice() {
-    // Coordinate count must not silently re-enable heuristic global shifts:
-    // the coupled analytic candidates own the same decision at every k.
-    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, LinkFunction::Identity);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
-    assert_eq!(cfg.max_seeds, 1);
-    assert_eq!(cfg.seed_budget, 3);
-    assert_eq!(cfg.over_smoothing_probe_rho, None);
-}
-
-#[test]
-fn high_dimensional_glm_external_reml_requests_arc_seed_pair() {
-    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, LinkFunction::Logit);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
-    assert_eq!(
-        cfg.max_seeds, 2,
-        "high-dimensional GLM REML must generate the alternate ARC startup basin"
-    );
-    assert_eq!(
-        cfg.seed_budget, 2,
-        "high-dimensional GLM REML must request both generated starts so ARC's GLM cap is not nullified"
-    );
-}
-
-#[test]
-fn generalized_external_reml_keeps_multistart_policy() {
-    let cfg = external_reml_seed_config(2, LinkFunction::Logit);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
-    assert!(cfg.max_seeds > 1);
-    assert_eq!(
-        cfg.seed_budget, 2,
-        "GLM REML must request the alternate ARC startup basin"
-    );
-}
-
-#[test]
-fn profiled_gaussian_search_consumes_exact_outer_curvature() {
-    assert!(
-        !standard_reml_search_prefers_gradient_only(LinkFunction::Identity),
-        "quadratic Gaussian identity REML must route its available exact Hessian into search"
-    );
-}
-
-#[test]
-fn non_gaussian_search_reserves_order_four_for_mint() {
-    for link in [
-        LinkFunction::Logit,
-        LinkFunction::Probit,
-        LinkFunction::Log,
-    ] {
+fn non_gaussian_search_converges_in_newton_iterations() {
+    let n = 600;
+    let (x, penalties, signal) = two_smooth_bump_design(n);
+    let w = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    let mut rng = StdRng::seed_from_u64(0x9a11_0c0de);
+    let binomial_y = Array1::from_iter(signal.iter().map(|&eta| {
+        let mu = 1.0 / (1.0 + (-eta).exp());
+        f64::from(u8::from(rng.random::<f64>() < mu))
+    }));
+    let poisson_y = Array1::from_iter(signal.iter().enumerate().map(|(i, &eta)| {
+        let mu = (0.4 + 0.6 * eta).exp();
+        (mu + if i % 2 == 0 { 0.5 } else { -0.5 }).max(0.0).round()
+    }));
+    let cases: [(&str, LikelihoodSpec, &Array1<f64>); 2] = [
+        (
+            "binomial-logit",
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            ),
+            &binomial_y,
+        ),
+        (
+            "poisson-log",
+            LikelihoodSpec::new(
+                ResponseFamily::Poisson,
+                InverseLink::Standard(StandardLink::Log),
+            ),
+            &poisson_y,
+        ),
+    ];
+    for (name, family, y) in cases {
+        let opts = ExternalOptimOptions {
+            family,
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            skip_rho_posterior_inference: true,
+            max_iter: 200,
+            tol: 1e-7,
+            nullspace_dims: vec![2, 2],
+            linear_constraints: None,
+            firth_bias_reduction: None,
+            rho_prior: Default::default(),
+            persistent_warm_start_store: None,
+        };
+        let fit = optimize_external_designwith_heuristic_log_lambdas_andwarm_start(
+            y.view(),
+            w.view(),
+            x.clone(),
+            offset.view(),
+            penalties.iter().cloned().map(PenaltySpec::Dense).collect(),
+            None,
+            None,
+            &opts,
+        )
+        .unwrap_or_else(|error| panic!("{name}: fit failed: {error:?}"));
+        assert!(fit.outer_converged, "{name}: outer search must converge");
         assert!(
-            standard_reml_search_prefers_gradient_only(link),
-            "{link:?} must retain the optimize-3 / certify-4 derivative ceiling"
+            fit.iterations <= 30,
+            "{name}: {} outer iterations; the exact-Hessian search converges in a \
+             handful, a secant rebuild of the same curvature takes several dozen",
+            fit.iterations
         );
     }
 }
@@ -403,6 +454,154 @@ fn prefit_binomial_logit_rejects_before_outer_solver() {
     ));
 }
 
+fn binomial_arming_options(link: InverseLink, sas_link: Option<SasLinkSpec>) -> ExternalOptimOptions {
+    ExternalOptimOptions {
+        family: LikelihoodSpec::new(ResponseFamily::Binomial, link),
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        optimize_sas: sas_link.is_some(),
+        sas_link,
+        compute_inference: false,
+        skip_rho_posterior_inference: false,
+        max_iter: 50,
+        tol: 1e-7,
+        nullspace_dims: Vec::new(),
+        linear_constraints: None,
+        firth_bias_reduction: None,
+        rho_prior: Default::default(),
+        persistent_warm_start_store: None,
+    }
+}
+
+fn dense_design(x: Array2<f64>) -> DesignMatrix {
+    DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x))
+}
+
+/// #3129: the prior is decided from the realized design before any solve. A
+/// certified separator arms the Jeffreys prior and returns the certificate as
+/// the recorded reason; a design with a finite maximum likelihood keeps the
+/// flat prior and records nothing.
+#[test]
+fn prefit_separation_certificate_arms_jeffreys_before_any_solve_3129() {
+    let w = Array1::<f64>::ones(4);
+    for link in [StandardLink::Logit, StandardLink::Probit, StandardLink::CLogLog] {
+        let opts = binomial_arming_options(InverseLink::Standard(link), None);
+
+        let separated = dense_design(array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]]);
+        let y = array![0.0, 0.0, 1.0, 1.0];
+        let (mut cfg, _) = resolved_external_config(&opts).expect("binomial config");
+        assert!(!cfg.firth_bias_reduction);
+        let evidence = arm_jeffreys_on_prefit_binomial_separation(
+            &mut cfg,
+            &opts,
+            y.view(),
+            w.view(),
+            &separated,
+            &[],
+        )
+        .expect("a Firth-capable separated design is fitted, not refused");
+        assert!(
+            matches!(
+                evidence,
+                Some(gam_problem::jeffreys_arming::JeffreysArmingEvidence::PrefitColumnSeparation {
+                    column_index: 1,
+                    ..
+                })
+            ),
+            "{link:?}: {evidence:?}"
+        );
+        assert!(cfg.firth_bias_reduction, "{link:?}: the Jeffreys prior must be armed");
+
+        // The class supports interleave, so no line separates them and the
+        // MLE is finite.
+        let overlapping = dense_design(array![[1.0, -2.0], [1.0, 1.0], [1.0, -1.0], [1.0, 2.0]]);
+        let y = array![0.0, 0.0, 1.0, 1.0];
+        let (mut cfg, _) = resolved_external_config(&opts).expect("binomial config");
+        let evidence = arm_jeffreys_on_prefit_binomial_separation(
+            &mut cfg,
+            &opts,
+            y.view(),
+            w.view(),
+            &overlapping,
+            &[],
+        )
+        .expect("an overlapping design has a finite maximum likelihood");
+        assert!(evidence.is_none(), "{link:?}: {evidence:?}");
+        assert!(!cfg.firth_bias_reduction, "{link:?}: the flat prior must be kept");
+    }
+}
+
+/// #3129: the decision is a function of the design, so a perturbation of the
+/// covariate far below any separating gap cannot switch the estimator. The
+/// old reactive rescue switched on whether the flat-prior solve happened to
+/// fail, which such a perturbation can change.
+#[test]
+fn prefit_jeffreys_decision_is_stable_under_covariate_perturbation_3129() {
+    let n = 40;
+    let mut rng = StdRng::seed_from_u64(3129);
+    let opts = binomial_arming_options(InverseLink::Standard(StandardLink::Logit), None);
+    let w = Array1::<f64>::ones(n);
+    let base: Vec<f64> = (0..n).map(|i| -2.0 + 4.0 * i as f64 / (n as f64 - 1.0)).collect();
+    // Separated at 0, and overlapping through two swapped labels at the ends.
+    let separated_y = Array1::from_iter(base.iter().map(|&x| if x > 0.0 { 1.0 } else { 0.0 }));
+    let mut overlapping_y = separated_y.clone();
+    overlapping_y[0] = 1.0;
+    overlapping_y[n - 1] = 0.0;
+    for (y, expect_armed) in [(&separated_y, true), (&overlapping_y, false)] {
+        for trial in 0..8 {
+            let jitter = if trial == 0 { 0.0 } else { 1e-9 };
+            let mut x = Array2::<f64>::ones((n, 2));
+            for (i, &value) in base.iter().enumerate() {
+                x[[i, 1]] = value + jitter * (rng.random::<f64>() - 0.5);
+            }
+            let (mut cfg, _) = resolved_external_config(&opts).expect("binomial config");
+            let evidence = arm_jeffreys_on_prefit_binomial_separation(
+                &mut cfg,
+                &opts,
+                y.view(),
+                w.view(),
+                &dense_design(x),
+                &[],
+            )
+            .expect("a Firth-capable binomial design is never refused");
+            assert_eq!(evidence.is_some(), expect_armed, "trial {trial}: {evidence:?}");
+            assert_eq!(cfg.firth_bias_reduction, expect_armed, "trial {trial}");
+        }
+    }
+}
+
+/// #2654: an optimized SAS link appends outer coordinates the Firth outer
+/// derivative does not define, so its separation certificate stays a
+/// refusal instead of arming a prior the fit cannot carry.
+#[test]
+fn prefit_separation_with_optimized_sas_link_stays_a_refusal_3129() {
+    let sas = SasLinkSpec {
+        initial_epsilon: 0.0,
+        initial_log_delta: 0.0,
+    };
+    let state = crate::mixture_link::state_from_sasspec(sas).expect("valid SAS state");
+    let opts = binomial_arming_options(InverseLink::Sas(state), Some(sas));
+    let (mut cfg, _) = resolved_external_config(&opts).expect("SAS binomial config");
+    let design = dense_design(array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]]);
+    let y = array![0.0, 0.0, 1.0, 1.0];
+    let w = Array1::<f64>::ones(4);
+    let err = arm_jeffreys_on_prefit_binomial_separation(
+        &mut cfg,
+        &opts,
+        y.view(),
+        w.view(),
+        &design,
+        &[],
+    )
+    .expect_err("an optimized SAS link cannot carry the Jeffreys prior");
+    assert!(matches!(
+        err,
+        EstimationError::PrefitPerfectSeparationDetected { column_index: 1, .. }
+    ));
+    assert!(!cfg.firth_bias_reduction);
+}
+
 #[test]
 fn prefit_binomial_probit_rejects_before_outer_solver() {
     let x = array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]];
@@ -517,6 +716,268 @@ fn prefit_binomial_separation_reads_through_a_scalar_ridge_but_not_a_basis_penal
     let basis = canonical_block(1..3);
     reject_prefit_binomial_separation(&cfg, y.view(), w.view(), &design, &basis)
         .expect("a multi-column basis penalty keeps its columns out of the certificate");
+}
+
+/// A double penalty's null-space ridge bounds its block's kernel the way a
+/// one-column ridge bounds a parametric column: the certificate reads the
+/// design along that kernel, and only along it. The block is three basis
+/// columns `(a, b, c)` with the roughness penalty on `u = (a − b)/√2` and `c`,
+/// and the ridge on `v = (a + b)/√2`. Neither `a` nor `b` separates alone.
+#[test]
+fn prefit_binomial_separation_reads_a_smooth_penalty_null_space_only() {
+    let y = array![0.0, 0.0, 1.0, 1.0];
+    let w = Array1::ones(y.len());
+    let cfg = RemlConfig::external(
+        GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Logit),
+        )),
+        1e-7,
+        false,
+    );
+    let half = std::f64::consts::FRAC_1_SQRT_2;
+    let v = array![half, half, 0.0];
+    let u = array![half, -half, 0.0];
+    let e = array![0.0, 0.0, 1.0];
+    let outer = |a: &Array1<f64>| {
+        let column = a.view().insert_axis(ndarray::Axis(1));
+        column.dot(&column.t())
+    };
+    let roughness = outer(&u) + outer(&e);
+    let ridge = outer(&v);
+    let double_penalty = gam_terms::construction::canonicalize_penalty_specs(
+        &[roughness.clone(), ridge]
+            .into_iter()
+            .map(|local| PenaltySpec::Block {
+                local,
+                col_range: 1..4,
+                prior_mean: gam_problem::CoefficientPriorMean::Zero,
+                structure_hint: None,
+                op: None,
+            })
+            .collect::<Vec<_>>(),
+        &[1, 2],
+        4,
+        "prefit separation null-space ridge",
+    )
+    .expect("canonicalize the double penalty")
+    .0;
+    let design_from = |a: [f64; 4], b: [f64; 4]| {
+        let mut x = Array2::<f64>::ones((4, 4));
+        for row in 0..4 {
+            x[[row, 1]] = a[row];
+            x[[row, 2]] = b[row];
+            x[[row, 3]] = [0.5, -0.5, 0.25, -0.25][row];
+        }
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x))
+    };
+
+    // a + b = (−2, −1, 1, 2) separates along the ridge's direction.
+    let kernel_separated = design_from([1.0, -2.0, 2.0, -1.0], [-3.0, 1.0, -1.0, 3.0]);
+    let err = reject_prefit_binomial_separation(
+        &cfg,
+        y.view(),
+        w.view(),
+        &kernel_separated,
+        &double_penalty,
+    )
+    .expect_err("separation along the penalty null space must be certified");
+    match err {
+        EstimationError::PrefitLinearSeparationDetected {
+            min_signed_margin,
+            column_indices,
+            ..
+        } => {
+            assert!(min_signed_margin > 0.0, "margin {min_signed_margin}");
+            assert_eq!(column_indices, vec![0, 1, 2, 3]);
+        }
+        other => panic!("expected a linear separation certificate, got {other:?}"),
+    }
+
+    // a − b = (−2, −1, 1, 2) separates only along the roughness penalty's range.
+    let range_separated = design_from([1.0, -2.0, 2.0, -1.0], [3.0, -1.0, 1.0, -3.0]);
+    reject_prefit_binomial_separation(
+        &cfg,
+        y.view(),
+        w.view(),
+        &range_separated,
+        &double_penalty,
+    )
+    .expect("a direction the roughness penalty bounds certifies nothing");
+
+    // Alone on its block, the roughness penalty leaves `v` unpenalized.
+    let roughness_only = gam_terms::construction::canonicalize_penalty_specs(
+        &[PenaltySpec::Block {
+            local: roughness,
+            col_range: 1..4,
+            prior_mean: gam_problem::CoefficientPriorMean::Zero,
+            structure_hint: None,
+            op: None,
+        }],
+        &[1],
+        4,
+        "prefit separation unpenalized kernel",
+    )
+    .expect("canonicalize the roughness penalty")
+    .0;
+    assert!(matches!(
+        reject_prefit_binomial_separation(
+            &cfg,
+            y.view(),
+            w.view(),
+            &kernel_separated,
+            &roughness_only,
+        ),
+        Err(EstimationError::PrefitLinearSeparationDetected { .. })
+    ));
+}
+
+/// F4 (bench/pygam_audit): a smooth's null space is penalized only by its
+/// double-penalty ridge, which REML releases along a separator, so a separator
+/// in that null space certifies like one in a parametric column, and so does a
+/// quasi-complete one (margin zero) that the strict certificate cannot claim. A
+/// response only the smooth's roughness-penalized directions can follow keeps
+/// them out, as do classes that interleave.
+#[test]
+fn prefit_binomial_separation_reads_a_smooth_null_space_but_not_its_range() {
+    // An intercept and seven hat functions on the knots 0, 1/6, ..., 1. The
+    // second-difference penalty leaves the linear functions of x unpenalized.
+    let n = 40;
+    let k = 7;
+    let p = 1 + k;
+    let hat_design = |xs: &[f64]| {
+        let mut x = Array2::<f64>::zeros((xs.len(), p));
+        for (row, &xi) in xs.iter().enumerate() {
+            x[[row, 0]] = 1.0;
+            for j in 0..k {
+                let knot = j as f64 / (k - 1) as f64;
+                x[[row, 1 + j]] = (1.0 - (k - 1) as f64 * (xi - knot).abs()).max(0.0);
+            }
+        }
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x))
+    };
+    let xs: Vec<f64> = (0..n).map(|i| i as f64 / (n - 1) as f64).collect();
+    let design = hat_design(&xs);
+    let w = Array1::ones(n);
+    let cfg = RemlConfig::external(
+        GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Logit),
+        )),
+        1e-7,
+        false,
+    );
+
+    let mut d2 = Array2::<f64>::zeros((k - 2, k));
+    for r in 0..k - 2 {
+        d2[[r, r]] = 1.0;
+        d2[[r, r + 1]] = -2.0;
+        d2[[r, r + 2]] = 1.0;
+    }
+    let bending = d2.t().dot(&d2);
+    // The projector onto the bending penalty's null space, span{1, j}.
+    let constant = Array1::from_elem(k, 1.0 / (k as f64).sqrt());
+    let centered = Array1::from_shape_fn(k, |j| j as f64 - 0.5 * (k - 1) as f64);
+    let slope = &centered / centered.dot(&centered).sqrt();
+    let null_ridge = {
+        let c = constant.view().insert_axis(ndarray::Axis(1));
+        let s = slope.view().insert_axis(ndarray::Axis(1));
+        c.dot(&c.t()) + s.dot(&s.t())
+    };
+    let canonical = |locals: &[Array2<f64>]| {
+        let specs: Vec<PenaltySpec> = locals
+            .iter()
+            .map(|local| PenaltySpec::Block {
+                local: local.clone(),
+                col_range: 1..p,
+                prior_mean: gam_problem::CoefficientPriorMean::Zero,
+                structure_hint: None,
+                op: None,
+            })
+            .collect();
+        gam_terms::construction::canonicalize_penalty_specs(
+            &specs,
+            &vec![0; specs.len()],
+            p,
+            "prefit separation null-space pin",
+        )
+        .expect("canonicalize the smooth's penalties")
+        .0
+    };
+    let double_penalty = canonical(&[bending.clone(), null_ridge]);
+    let bending_only = canonical(&[bending]);
+
+    let step: Array1<f64> = xs.iter().map(|&xi| f64::from(u8::from(xi > 0.5))).collect();
+    for (label, penalties) in [
+        ("double penalty", &double_penalty),
+        ("bending only", &bending_only),
+    ] {
+        let err = reject_prefit_binomial_separation(&cfg, step.view(), w.view(), &design, penalties)
+            .expect_err("a separator in the smooth's null space must be certified");
+        assert!(
+            matches!(err, EstimationError::PrefitLinearSeparationDetected { .. }),
+            "{label}: expected a linear-separation certificate, got {err:?}"
+        );
+    }
+
+    let bump: Array1<f64> = xs
+        .iter()
+        .map(|&xi| f64::from(u8::from((xi - 0.5).abs() < 0.2)))
+        .collect();
+    reject_prefit_binomial_separation(&cfg, bump.view(), w.view(), &design, &double_penalty)
+        .expect("no linear function of x separates a bump; the bending penalty bounds the rest");
+
+    // Quasi-complete separation: x on the tenths grid, y = 1{x > 0.5} except
+    // that the rows tied at x = 0.5 alternate between the classes. No direction
+    // separates strictly, but x − 0.5 is ≥ 0 on the positives, ≤ 0 on the
+    // negatives and nonzero off the tie, so the likelihood has no maximizer.
+    let tenths: Vec<f64> = (0..44).map(|i| (i % 11) as f64 / 10.0).collect();
+    let tenths_design = hat_design(&tenths);
+    let tenths_w = Array1::ones(tenths.len());
+    let mut tie = 0usize;
+    let quasi: Array1<f64> = tenths
+        .iter()
+        .map(|&xi| {
+            if xi == 0.5 {
+                tie += 1;
+                f64::from(u8::from(tie % 2 == 1))
+            } else {
+                f64::from(u8::from(xi > 0.5))
+            }
+        })
+        .collect();
+    for (label, penalties) in [
+        ("double penalty", &double_penalty),
+        ("bending only", &bending_only),
+    ] {
+        let err = reject_prefit_binomial_separation(
+            &cfg,
+            quasi.view(),
+            tenths_w.view(),
+            &tenths_design,
+            penalties,
+        )
+        .expect_err("a quasi-complete separator in the smooth's null space must be certified");
+        assert!(
+            matches!(
+                err,
+                EstimationError::PrefitLinearSeparationDetected { min_signed_margin, .. }
+                    if min_signed_margin == 0.0
+            ),
+            "{label}: expected a quasi-separation certificate, got {err:?}"
+        );
+    }
+    // One positive below the tie leaves the classes interleaved: the MLE exists.
+    let mut overlapped = quasi.clone();
+    overlapped[1] = 1.0;
+    reject_prefit_binomial_separation(
+        &cfg,
+        overlapped.view(),
+        tenths_w.view(),
+        &tenths_design,
+        &double_penalty,
+    )
+    .expect("classes that cross the threshold are not quasi-separated");
 }
 
 #[test]
@@ -791,6 +1252,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
             dispersion: Dispersion::estimated(1.1 * 1.1)
                 .expect("profiled Gaussian phi-hat = sigma-hat^2 is a valid estimate"),
             factorized_standard_errors: None,
+            smoothing_correction_factorized: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
@@ -1944,7 +2406,7 @@ fn cubature_pirls_uses_lambda_search_frozen_beta_precision_2632() {
         .store(frozen_phi.to_bits(), Ordering::Relaxed);
 
     let result = state
-        .execute_pirls_stateless_for_cubature(&array![0.0], None)
+        .execute_pirls_stateless_for_test(&array![0.0])
         .expect("the Beta cubature sigma-point fit must converge");
     let (realized_phi, estimated) = match result
         .likelihood
@@ -2002,10 +2464,9 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         ),
         "fixture precondition: the freeze under test only exists for an ESTIMATED Beta precision"
     );
-    let seed_config = external_reml_seed_config(1, LinkFunction::Logit);
 
     let pristine = beta_precision_anchor_state(&y, &w, &x, &cfg);
-    freeze_lambda_search_nuisance_at_canonical_anchor(&pristine, &resolved, 1, None, &seed_config)
+    freeze_lambda_search_nuisance_at_canonical_anchor(&pristine, &resolved, 1, None)
         .expect("the anchor must succeed on a pristine state");
     let anchored_bits = pristine.frozen_beta_phi.load(Ordering::Relaxed);
     assert_ne!(
@@ -2033,7 +2494,6 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         &resolved,
         1,
         Some(&[3.0]),
-        &seed_config,
     )
     .expect("the anchor must succeed regardless of what a caller donated");
     assert_eq!(
@@ -2078,7 +2538,6 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         &resolved,
         1,
         None,
-        &seed_config,
     );
     assert!(
         matches!(refusal, Err(EstimationError::InvalidInput(_))),
@@ -2380,7 +2839,7 @@ fn estimated_nuisance_fits_land_in_the_same_place_cold_and_warm_2363() {
         // the seeded optimum, or re-certify it in place?
         //
         // The cache hit logs `action=resume-and-recertify` and installs the
-        // prior fit's ρ as `initial_rho` with `screen_initial_rho = false`
+        // prior fit's ρ as `initial_rho`
         // (`rho_optimizer/run.rs`, the `CacheSeedDecision::ExactFinal` arm),
         // plus the prior β as an inner seed. If that point is already
         // certified, the outer search has nothing to do and must return it
@@ -2408,4 +2867,116 @@ fn estimated_nuisance_fits_land_in_the_same_place_cold_and_warm_2363() {
         "a warm cache changed WHERE the fit landed, not just how fast it got there:\n{}",
         failures.join("\n")
     );
+}
+
+/// A 10-column second-difference penalty block at `start..start + 10` of a
+/// `p`-column model, plus (double penalty) the projector onto its linear null
+/// space `span{1, t}`, as canonical penalties.
+fn wide_smooth_block_penalties(
+    start: usize,
+    p: usize,
+    double_penalty: bool,
+) -> Vec<gam_terms::construction::CanonicalPenalty> {
+    let k = 10;
+    let mut d = Array2::<f64>::zeros((k - 2, k));
+    for row in 0..k - 2 {
+        d[[row, row]] = 1.0;
+        d[[row, row + 1]] = -2.0;
+        d[[row, row + 2]] = 1.0;
+    }
+    let mut specs = vec![PenaltySpec::Block {
+        local: d.t().dot(&d),
+        col_range: start..start + k,
+        prior_mean: gam_problem::CoefficientPriorMean::Zero,
+        structure_hint: None,
+        op: None,
+    }];
+    if double_penalty {
+        let ones = Array1::<f64>::from_elem(k, 1.0 / (k as f64).sqrt());
+        let mut t = Array1::from_iter((0..k).map(|i| i as f64));
+        t -= t.mean().expect("nonempty");
+        t /= t.dot(&t).sqrt();
+        let mut null_projector = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            for j in 0..k {
+                null_projector[[i, j]] = ones[i] * ones[j] + t[i] * t[j];
+            }
+        }
+        specs.push(PenaltySpec::Block {
+            local: null_projector,
+            col_range: start..start + k,
+            prior_mean: gam_problem::CoefficientPriorMean::Zero,
+            structure_hint: None,
+            op: None,
+        });
+    }
+    let nullspace_dims = vec![0; specs.len()];
+    gam_terms::construction::canonicalize_penalty_specs(
+        &specs,
+        &nullspace_dims,
+        p,
+        "sample-size identifiability",
+    )
+    .expect("canonicalize the smooth block penalties")
+    .0
+}
+
+#[test]
+fn prefit_sample_size_gate_counts_the_unpenalized_space_not_the_columns() {
+    // Intercept + one parametric slope (unpenalized) and two 10-column smooths:
+    // p = 22 columns. Double-penalized, the only unpenalized directions are the
+    // two parametric ones, so M_p = 2 and n = 3 rows already identify the fit
+    // even though p = 22 > n.
+    let p = 22;
+    let mut penalties = wide_smooth_block_penalties(2, p, true);
+    penalties.extend(wide_smooth_block_penalties(12, p, true));
+    reject_prefit_unidentifiable_unpenalized_space(Array1::ones(3).view(), p, &penalties)
+        .expect("n = 3 > M_p = 2 is identified at p = 22");
+    let err =
+        reject_prefit_unidentifiable_unpenalized_space(Array1::ones(2).view(), p, &penalties)
+            .expect_err("n = 2 = M_p leaves no residual contrast for REML");
+    assert!(matches!(
+        err,
+        EstimationError::PrefitUnpenalizedSpaceExceedsObservations {
+            n_observations: 2,
+            unpenalized_dim: 2,
+            total_columns: 22,
+        }
+    ));
+    // Zero-weight rows carry no information and do not count toward n.
+    let err = reject_prefit_unidentifiable_unpenalized_space(
+        array![1.0, 0.0, 1.0, 0.0].view(),
+        p,
+        &penalties,
+    )
+    .expect_err("two positive-weight rows are n = 2 whatever the row count");
+    assert!(matches!(
+        err,
+        EstimationError::PrefitUnpenalizedSpaceExceedsObservations {
+            n_observations: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn prefit_sample_size_gate_adds_single_penalty_null_spaces() {
+    // Singly penalized, each smooth leaves its linear trend {1, t} unpenalized:
+    // M_p = 2 parametric + 2 + 2 = 6.
+    let p = 22;
+    let mut penalties = wide_smooth_block_penalties(2, p, false);
+    penalties.extend(wide_smooth_block_penalties(12, p, false));
+    reject_prefit_unidentifiable_unpenalized_space(Array1::ones(7).view(), p, &penalties)
+        .expect("n = 7 > M_p = 6 is identified");
+    let err =
+        reject_prefit_unidentifiable_unpenalized_space(Array1::ones(6).view(), p, &penalties)
+            .expect_err("n = 6 = M_p is not identified");
+    assert!(matches!(
+        err,
+        EstimationError::PrefitUnpenalizedSpaceExceedsObservations {
+            n_observations: 6,
+            unpenalized_dim: 6,
+            total_columns: 22,
+        }
+    ));
 }

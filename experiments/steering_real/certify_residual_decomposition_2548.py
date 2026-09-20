@@ -68,7 +68,7 @@ def certify_raw(gamfit, X, t, B, *, lam=-40.0, identity_frame=True, **over):
         kw["tier0_mean"] = np.zeros(p)
         kw["tier0_scale"] = np.ones(p)
     kw.update(over)
-    report = gamfit.sae_manifold_certify_external(np.ascontiguousarray(X), **kw)
+    report = gamfit.sae.sae_manifold_certify_external(np.ascontiguousarray(X), **kw)
     inner = report.get("inner_kkt") or {}
     return inner.get("raw_gradient_norm"), inner.get("stationarity_bound")
 

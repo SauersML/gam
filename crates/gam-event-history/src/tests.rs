@@ -7,7 +7,8 @@ use super::cohort::{
     design_rows, expand_nodes,
 };
 use super::covariance::{
-    DirectionEvidence, DirectionProfile, empirical_bayes_ridge, quartic_moments,
+    DirectionEvidence, DirectionProfile, empirical_bayes_ridge, quartic_direction_moments,
+    ridge_profile,
 };
 use super::family::{
     DecisionIntegral, Directional, EventHistoryFamily, EventHistoryFit, EventHistorySpec,
@@ -984,6 +985,7 @@ fn linear_spec() -> TermCollectionSpec {
         }],
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     }
 }
 
@@ -1280,7 +1282,7 @@ static STDOUT_LOGGER: StdoutLogger = StdoutLogger;
 
 fn install_test_logger() {
     if log::set_logger(&STDOUT_LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(log::LevelFilter::Debug);
     }
 }
 
@@ -1751,7 +1753,7 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
     emit(&format!("[four] reference strata present: {}", spec.reference.is_some()));
     assert!(spec.reference.is_none(), "this cohort has no reference population");
     let refit_at = |mesh: usize| {
-        super::family::fit_at_rank(&cohort, &spec, fit.rank(), Some(&start), Some((order, mesh)), mesh, 2)
+        super::family::fit_at_rank(&cohort, &spec, fit.rank(), Some(&start), Some((order, mesh)), None, mesh, 2)
             .unwrap_or_else(|error| panic!("the certified model refitted at mesh refinement {mesh}: {error}"))
     };
     let certified = refit_at(refinement);
@@ -3354,6 +3356,7 @@ fn intercept_only_spec() -> TermCollectionSpec {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     }
 }
 
@@ -3903,6 +3906,12 @@ fn the_latent_block_carries_fixed_loading_priors_and_free_rates() {
     assert_eq!(latent.nullspace_dims, vec![3, 3]);
 }
 
+/// [`quartic_direction_moments`] as `(ln ∫, E[t²], E[t⁴])`.
+fn quartic_moments(mu: f64, information: f64, lambda: f64) -> (f64, f64, f64) {
+    let moments = quartic_direction_moments(mu, information, lambda);
+    (moments.log_integral, moments.second, moments.fourth)
+}
+
 #[test]
 fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mode() {
     // A negligible quartic reduces the marginal to the Gaussian one.
@@ -3933,8 +3942,10 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
         eigenvalue,
         information,
     };
-    let below = empirical_bayes_ridge(&[quartic(0.9 * threshold * information.sqrt())]);
-    let above = empirical_bayes_ridge(&[quartic(1.1 * threshold * information.sqrt())]);
+    let below = empirical_bayes_ridge(&[quartic(0.9 * threshold * information.sqrt())])
+        .expect("certified empirical-Bayes prior");
+    let above = empirical_bayes_ridge(&[quartic(1.1 * threshold * information.sqrt())])
+        .expect("certified empirical-Bayes prior");
     emit(&format!("[ridge] below {below:?} above {above:?}"));
     assert!(
         !below.accepted,
@@ -3947,7 +3958,7 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
     assert!(above.log_lambda.exp() < 1.1 * threshold * information.sqrt());
     assert!(above.gain > 0.0 && above.mode_scale > 0.0);
     // A strong direction lands near the Laplace-scale prior `λ = J / μ`.
-    let strong = empirical_bayes_ridge(&[quartic(400.0)]);
+    let strong = empirical_bayes_ridge(&[quartic(400.0)]).expect("certified empirical-Bayes prior");
     assert!(strong.accepted);
     assert!(
         (strong.log_lambda - (information / 400.0).ln()).abs() < 0.2,
@@ -3959,7 +3970,8 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
         strong.gain
     );
     // No positive direction: no finite prior raises the evidence.
-    let none = empirical_bayes_ridge(&[quartic(-5.0), quartic(-40.0)]);
+    let none = empirical_bayes_ridge(&[quartic(-5.0), quartic(-40.0)])
+        .expect("certified empirical-Bayes prior");
     assert!(!none.accepted && none.log_lambda.is_infinite() && none.gain == 0.0);
     // Other directions charge their Occam factor: the same strong direction
     // beside three strongly negative ones is still accepted, and a marginal
@@ -3969,13 +3981,15 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
         quartic(-300.0),
         quartic(-300.0),
         quartic(-300.0),
-    ]);
+    ])
+    .expect("certified empirical-Bayes prior");
     assert!(beside.accepted);
     let marginal = empirical_bayes_ridge(&[
         quartic(1.1 * threshold * information.sqrt()),
         quartic(-300.0),
         quartic(-300.0),
-    ]);
+    ])
+    .expect("certified empirical-Bayes prior");
     emit(&format!("[ridge] marginal beside negatives {marginal:?}"));
     assert!(!marginal.accepted);
 
@@ -4002,7 +4016,7 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
         values,
         slopes,
     });
-    let from_profile = empirical_bayes_ridge(&[exact]);
+    let from_profile = empirical_bayes_ridge(&[exact]).expect("certified empirical-Bayes prior");
     emit(&format!(
         "[ridge] quartic {strong:?} profile {from_profile:?}"
     ));
@@ -4013,6 +4027,208 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
     );
     assert!((from_profile.gain - strong.gain).abs() < 1e-2 * strong.gain);
     assert!((from_profile.mode_scale - strong.mode_scale).abs() < 1e-3);
+}
+
+/// Every empirical-Bayes prior is either a stationary point `opt` certifies
+/// on the exact profile, with a positive gain, or the refusal `λ = ∞` with
+/// no gain. A positive first direction beside negative ones whose Occam
+/// factors outweigh it has its infimum at `λ → ∞`: the hand-rolled secant
+/// this replaced stopped at a finite `ρ` there once the slope fell under a
+/// seed-relative tolerance and reported that finite prior with a negative
+/// gain. A profile whose value carries more rounding than that tolerance
+/// (a small minimum among large channel magnitudes) must still certify.
+#[test]
+fn the_empirical_bayes_prior_is_a_certified_minimum_or_a_refusal() {
+    let quartic = |eigenvalue: f64, information: f64| DirectionEvidence::Quartic {
+        eigenvalue,
+        information,
+    };
+    let assert_certified_or_refused = |directions: &[DirectionEvidence]| {
+        let ridge = empirical_bayes_ridge(directions).unwrap_or_else(|error| {
+            panic!("{directions:?} has no certified empirical-Bayes prior: {error}")
+        });
+        if ridge.log_lambda.is_infinite() {
+            assert!(
+                ridge.log_lambda > 0.0 && ridge.gain == 0.0 && !ridge.accepted,
+                "{directions:?}: a refusal is λ = ∞ with no gain, got {ridge:?}"
+            );
+            return ridge;
+        }
+        let (sample, _) = ridge_profile(directions, ridge.log_lambda);
+        let verdict = opt::newton_decrement_verdict(
+            sample
+                .hessian
+                .as_ref()
+                .expect("the profile has an exact curvature"),
+            &sample.gradient,
+            None,
+            sample
+                .decrement_bands
+                .as_ref()
+                .expect("the profile carries its rounding bands"),
+        );
+        assert!(
+            verdict.is_certified(),
+            "{directions:?}: the prior {ridge:?} is not certified stationary: {verdict:?}"
+        );
+        assert!(
+            ridge.gain > 0.0 && ridge.gain == -sample.value,
+            "{directions:?}: a finite prior buys evidence, got {ridge:?}"
+        );
+        ridge
+    };
+
+    let outweighed = assert_certified_or_refused(&[
+        quartic(0.087_776_022_525_470_23, 0.071_663_948_857_696_47),
+        quartic(-42.451_280_621_543_155, 24.034_589_866_078_31),
+        quartic(-27.985_945_809_076_46, 0.280_927_402_614_955),
+        quartic(-309.233_908_949_846_35, 1_158.957_268_798_450_5),
+    ]);
+    assert!(outweighed.log_lambda.is_infinite(), "{outweighed:?}");
+
+    // The minimum `c ≈ −0.904` sits among channels of magnitude about 7.5,
+    // so the value's rounding exceeds `√ε` of the seed's slope scale.
+    let resolved = assert_certified_or_refused(&[
+        quartic(43.258, 73.916),
+        quartic(-404.07, 8.53),
+        quartic(-37.0, 1.56),
+        quartic(-0.1265, 1.18e-4),
+        quartic(-2.64, 0.163),
+    ]);
+    assert!(
+        resolved.accepted && resolved.log_lambda.is_finite(),
+        "{resolved:?}"
+    );
+
+    // A deterministic sweep over strengths, informations and ranks.
+    let mut state: u64 = 7;
+    let mut uniform = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let (mut certified, mut refused) = (0usize, 0usize);
+    for _ in 0..3000 {
+        let rank = 1 + (uniform() * 5.0) as usize;
+        let directions: Vec<DirectionEvidence> = (0..rank)
+            .map(|i| {
+                let information = 10f64.powf(uniform() * 8.0 - 4.0);
+                let strength = if i == 0 {
+                    uniform() * 6.0
+                } else {
+                    uniform() * 12.0 - 10.0
+                };
+                quartic(
+                    strength * information.sqrt() * 10f64.powf(uniform() * 2.0),
+                    information,
+                )
+            })
+            .collect();
+        if assert_certified_or_refused(&directions)
+            .log_lambda
+            .is_infinite()
+        {
+            refused += 1;
+        } else {
+            certified += 1;
+        }
+    }
+    emit(&format!(
+        "[ridge] sweep certified {certified} refused {refused}"
+    ));
+    assert!(certified > 0 && refused > 0);
+}
+
+/// A sampled profile's evidence tends to the current rank's `c = 0` as the
+/// prior pins the loading to zero, however coarse its sampling. Its
+/// likelihood integral is a trapezoidal rule of fixed spacing `h`; once the
+/// prior's width `λ^{−1/2}` falls below `h` that rule collapses onto the
+/// node at zero, and the prior's normaliser must be formed by the same rule
+/// or the ratio reads `c ≈ −½ ln(λh²/2π)`, falling without bound: the
+/// search then ran to `ρ → ∞` and ended at the trust region's floor, so a
+/// fit with such a proposal failed instead of refusing the atom. The
+/// derivatives are the exact ones of that value, tail included.
+#[test]
+fn a_sampled_profile_normalises_its_prior_by_its_own_rule() {
+    let profile = |mu: f64, j: f64, per_mode: f64, reach: f64| {
+        let mode = (mu / j).sqrt();
+        let step = mode / per_mode;
+        let (mut points, mut values, mut slopes) = (vec![0.0], vec![0.0], vec![0.0]);
+        let mut t = 0.0;
+        while t < reach * mode {
+            t += step;
+            points.push(t);
+            values.push(0.5 * mu * t * t - 0.25 * j * t * t * t * t);
+            slopes.push(mu * t - j * t * t * t);
+        }
+        DirectionEvidence::Sampled(DirectionProfile {
+            points,
+            values,
+            slopes,
+        })
+    };
+    let information: f64 = 100.0;
+    let gamma_quarter = 3.625_609_908_221_908_3_f64;
+    let gamma_three_quarters = 1.225_416_702_465_177_6_f64;
+    let threshold = gamma_quarter / (2.0 * gamma_three_quarters) * information.sqrt();
+    for (mu, per_mode, reach) in [
+        (400.0, 1.0, 2.0),
+        (400.0, 0.25, 2.0),
+        (1.1 * threshold, 1.0, 3.0),
+        (0.9 * threshold, 0.5, 3.0),
+        (2.0, 1.0, 6.0),
+    ] {
+        let directions = [
+            profile(mu, information, per_mode, reach),
+            DirectionEvidence::Quartic {
+                eigenvalue: -30.0,
+                information: 5.0,
+            },
+        ];
+        // The limit: at a prior far narrower than the spacing the value is
+        // within its own rounding of zero, not tens of nats below it.
+        let (pinned, _) = ridge_profile(&directions[..1], 80.0);
+        let band = pinned.decrement_bands.as_ref().expect("bands").objective;
+        assert!(
+            pinned.value.abs() <= band,
+            "mu {mu}: c(ρ = 80) = {} outside its band {band}",
+            pinned.value
+        );
+        // The slope and curvature are the value's.
+        for rho in [-4.0, 0.0, 3.0, 8.0, 14.0] {
+            let at = |r: f64| ridge_profile(&directions, r).0;
+            let step = 1e-5;
+            let (lo, mid, hi) = (at(rho - step), at(rho), at(rho + step));
+            let slope = (hi.value - lo.value) / (2.0 * step);
+            let curvature = (hi.gradient[0] - lo.gradient[0]) / (2.0 * step);
+            let scale = 1.0 + mid.gradient[0].abs();
+            assert!(
+                (slope - mid.gradient[0]).abs() < 1e-5 * scale,
+                "mu {mu} ρ {rho}: slope {} vs difference {slope}",
+                mid.gradient[0]
+            );
+            let hessian = mid.hessian.as_ref().expect("curvature")[[0, 0]];
+            assert!(
+                (curvature - hessian).abs() < 1e-5 * (1.0 + hessian.abs()),
+                "mu {mu} ρ {rho}: curvature {hessian} vs difference {curvature}"
+            );
+        }
+        // And the search ends at a certified prior or refuses the atom.
+        for directions in [&directions[..1], &directions[..]] {
+            let ridge = empirical_bayes_ridge(directions).unwrap_or_else(|error| {
+                panic!("mu {mu} per_mode {per_mode}: no certified prior: {error}")
+            });
+            emit(&format!(
+                "[ridge] sampled mu {mu} per_mode {per_mode} ranks {} {ridge:?}",
+                directions.len()
+            ));
+            assert!(
+                ridge.log_lambda.is_infinite() == (ridge.gain == 0.0),
+                "{ridge:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -4591,7 +4807,7 @@ fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
         !centred.reference_refinements.is_empty(),
         "a risk-set centred fit must have refreshed its normaliser at least once"
     );
-    assert!(centred.reference_certificate.is_some_and(|gap| gap <= 1e-4));
+    assert!(centred.reference_certificate.is_some_and(|certificate| certificate <= spec.quadrature_tolerance));
     let reevaluated = centred.family.refresh_normaliser(&centred.fit.block_states).unwrap();
     assert_eq!(centred.centring.as_ref().unwrap().log_normaliser, reevaluated.log_normaliser);
     assert_eq!(centred.centring.as_ref().unwrap().log_risk_mass, reevaluated.log_risk_mass);
@@ -4829,6 +5045,335 @@ fn reference_midpoint_derivative_channels_converge_with_the_value_2627() {
         }
         assert!(moves, "no log normaliser moves along the {name} by more than its bar, so the agreement is vacuous");
     }
+}
+
+/// Certifying an accepted candidate admits the candidate's converged fit as the
+/// ladder's first rung instead of solving the same objective again (#2627,
+/// #2986). The rank path's certification refit duplicated the candidate: job
+/// 1230177 spent 36.785 s and 36.359 s on the two, both ending at 6.513812e2.
+///
+/// The candidate is a rank-one model with a static frailty, the atom the rank
+/// path accepts on this cohort (job 1264849), pinned at the setting the ladder
+/// starts from, as the rank path fits it. Nothing about the population
+/// surfaces is carried. Its fits take seconds. The same pin on a fitted rate
+/// took 401 s, 272 s of it the order-17 ladder (job 1333087), and pins nothing
+/// more: every clause it reads is the static fixture's. The marks carry free `s(time)` smoothing
+/// strengths, so a ladder that re-solved would walk its own outer path from
+/// the reset strengths, to its own coefficients and solve counts; with none, a
+/// re-solve from the candidate's mode could return it bit for bit, and the pin
+/// could not tell the two apart.
+/// - Where the ladder's checks hold at the candidate's setting, the certified
+///   model is the admitted fit: coefficients, strengths and solve counts.
+/// - A ladder whose atom carries another loading prior, or whose first rung is
+///   another Gauss-Hermite order, defines another objective, so it solves its
+///   own fit there rather than reading the one it is offered: the certified
+///   fit, then that other prior's.
+///
+/// Everything is printed before anything is asserted.
+#[test]
+fn a_certified_rank_is_the_admitted_candidate_2627() {
+    install_test_logger();
+    let loadings = [1.4, 1.1, 1.2];
+    let rate = 0.5;
+    let cohort = simulate_marked_cohort(
+        60,
+        4.0,
+        &[-1.2, -1.8, -0.5],
+        0.4,
+        &loadings,
+        rate,
+        &[MarkKind::Terminal, MarkKind::Once, MarkKind::Recurrent],
+        41,
+    );
+    let mut spec = EventHistorySpec::new(Vec::new());
+    let rows = design_rows(&cohort, spec.quadrature_order).expect("design rows");
+    spec.covariates = vec![
+        super::formula::covariate_spec_from_formula("s(time)", rows.view(), &cohort)
+            .expect("baseline formula"),
+    ];
+    let marks = cohort.marks();
+    let setting = (spec.gauss_hermite_order, 0);
+    // The loading prior's variance is the simulated loadings' mean square.
+    let mean_square = loadings.iter().map(|a| a * a).sum::<f64>() / loadings.len() as f64;
+    let start = RankStart::carried(
+        Vec::new(),
+        loadings.to_vec(),
+        vec![f64::NEG_INFINITY],
+        vec![-mean_square.ln()],
+        vec![true],
+    );
+    let carried = |model: &EventHistoryFit| {
+        RankStart::carried(
+            model.fit.block_states[..marks].iter().map(|s| s.beta.clone()).collect(),
+            model.loadings.iter().copied().collect(),
+            model.log_rates.clone(),
+            model.atom_log_lambdas.clone(),
+            model.rate_held.clone(),
+        )
+    };
+    let solved = |model: &EventHistoryFit| {
+        (
+            model.fit.block_states.iter().map(|s| s.beta.to_vec()).collect::<Vec<_>>(),
+            model.fit.log_lambdas.to_vec(),
+            (
+                model.fit.outer_iterations,
+                model.fit.outer_cost_evals,
+                model.fit.inner_cycles,
+                model.fit.inner_pirls_solves,
+            ),
+        )
+    };
+    let setting_of = |model: &EventHistoryFit| {
+        (model.quadrature.gauss_hermite_order, model.quadrature.mesh_refinement)
+    };
+    let clock = std::time::Instant::now();
+    let candidate =
+        super::family::fit_at_rank(&cohort, &spec, 1, Some(&start), Some(setting), None, setting.1, 2)
+            .expect("the candidate at the ladder's first setting");
+    let candidate_seconds = clock.elapsed().as_secs_f64();
+    let admitted = solved(&candidate);
+    let certify_from = carried(&candidate);
+    let clock = std::time::Instant::now();
+    let certified = super::family::fit_at_rank(
+        &cohort,
+        &spec,
+        1,
+        Some(&certify_from),
+        None,
+        Some(super::family::Admitted::of(candidate)),
+        setting.1,
+        2,
+    )
+    .expect("the ladder from the admitted candidate");
+    let certified_seconds = clock.elapsed().as_secs_f64();
+    let published = solved(&certified);
+    emit(&format!(
+        "[admit] candidate at {setting:?} in {candidate_seconds:.3} s, strengths {:?}, solves (outer iterations, cost evals, inner cycles, pirls) {:?}; certified at {:?} in {certified_seconds:.3} s, strengths {:?}, solves {:?}; shifts GH {:.3e} at {}, mesh {:.3e} at {}",
+        admitted.1,
+        admitted.2,
+        setting_of(&certified),
+        published.1,
+        published.2,
+        certified.quadrature.gauss_hermite.coefficient_shift,
+        certified.quadrature.gauss_hermite.candidate,
+        certified.quadrature.mesh.coefficient_shift,
+        certified.quadrature.mesh.candidate
+    ));
+    let certified_setting = setting_of(&certified);
+    // A ladder whose atom carries another loading prior defines another
+    // objective at the same setting: the prior's precision is doubled.
+    let offered_prior = published.clone();
+    let mut reprior_from = carried(&certified);
+    reprior_from.log_lambdas[0] += 2.0_f64.ln();
+    let clock = std::time::Instant::now();
+    let reprior = super::family::fit_at_rank(
+        &cohort,
+        &spec,
+        1,
+        Some(&reprior_from),
+        None,
+        Some(super::family::Admitted::of(certified)),
+        setting.1,
+        2,
+    )
+    .expect("the ladder under another loading prior");
+    let reprior_seconds = clock.elapsed().as_secs_f64();
+    let solved_reprior = solved(&reprior);
+    emit(&format!(
+        "[admit] ladder under the doubled prior: certified at {:?} in {reprior_seconds:.3} s, strengths {:?}, solves {:?}; offered solves {:?}",
+        setting_of(&reprior),
+        solved_reprior.1,
+        solved_reprior.2,
+        offered_prior.2
+    ));
+    let reprior_setting = setting_of(&reprior);
+    let finer_order = 2 * setting.0 - 1;
+    let mut finer = spec.clone();
+    finer.gauss_hermite_order = finer_order;
+    let offered_order = solved_reprior.clone();
+    let order_from = carried(&reprior);
+    let clock = std::time::Instant::now();
+    let elsewhere = super::family::fit_at_rank(
+        &cohort,
+        &finer,
+        1,
+        Some(&order_from),
+        None,
+        Some(super::family::Admitted::of(reprior)),
+        setting.1,
+        2,
+    )
+    .expect("the ladder from another order");
+    let elsewhere_seconds = clock.elapsed().as_secs_f64();
+    let solved_elsewhere = solved(&elsewhere);
+    emit(&format!(
+        "[admit] ladder from order {finer_order}: certified at {:?} in {elsewhere_seconds:.3} s, strengths {:?}, solves {:?}; offered at {reprior_setting:?}, solves {:?}",
+        setting_of(&elsewhere),
+        solved_elsewhere.1,
+        solved_elsewhere.2,
+        offered_order.2
+    ));
+    assert!(
+        published == admitted,
+        "the certified model must be the admitted candidate: certified at {certified_setting:?}, coefficients {:?} vs {:?}, log strengths {:?} vs {:?}, solves {:?} vs {:?}",
+        published.0,
+        admitted.0,
+        published.1,
+        admitted.1,
+        published.2,
+        admitted.2
+    );
+    assert!(
+        solved_reprior != offered_prior,
+        "a ladder under another loading prior must not read the candidate fitted under its own"
+    );
+    assert!(
+        solved_elsewhere != offered_order,
+        "a ladder starting at order {finer_order} must not read the order-{} candidate as its fit",
+        reprior_setting.0
+    );
+}
+
+/// A reference grid is certified by the geometric tail of its fixed-coefficient
+/// refinement steps (#2986): `d₁ + d₂/(1 − q)`, `q = d₂/d₁`, with each step at
+/// the edge of its rounding band. The steps are dyadic, so every certificate
+/// is exact. Steps that do not contract have no tail, two exact zeros are a
+/// grid the objective does not read, and a first step inside its band leaves
+/// the ratio unresolved, which is refused.
+#[test]
+fn a_reference_grid_is_certified_by_the_geometric_tail_of_its_steps_2986() {
+    use super::family::{Shift, reference_tail};
+    let exact = |value: f64| Shift { value, band: 0.0 };
+    let tail = |first: Shift, second: Shift| {
+        let certificate = reference_tail(first, second);
+        emit(&format!("[2986 tail] {first:?}, {second:?}: {certificate:?}"));
+        certificate
+    };
+    let halving = tail(exact(1.0), exact(0.5)).expect("a contracting pair");
+    let banded = tail(Shift { value: 1.25, band: 0.25 }, Shift { value: 0.25, band: 0.25 }).expect("a banded pair");
+    let flat = tail(exact(0.5), exact(0.5)).expect("a pair that does not contract");
+    let unread = tail(exact(0.0), exact(0.0)).expect("an unread grid");
+    let inside = tail(Shift { value: 1e-3, band: 1e-3 }, exact(1e-4));
+    let vanished = tail(exact(0.0), exact(1e-4));
+    // 1 + (1/2)/(1/2).
+    assert_eq!(halving, Some(2.0), "the tail of steps 1 and 1/2 is 2");
+    // (5/4 + 1/4) + (1/4 + 1/4)/(1 − (1/2)/(5/4 − 1/4)): the bands are charged.
+    assert_eq!(banded, Some(2.5), "the tail of banded steps reads each at its band's edge");
+    assert_eq!(flat, None, "steps that do not contract have no tail");
+    assert_eq!(unread, Some(0.0), "a grid the objective does not read is certified at zero");
+    for (label, refusal) in [("inside its band", inside), ("vanished", vanished)] {
+        assert!(
+            matches!(refusal, Err(super::cohort::EventHistoryError::NumericalFailure { .. })),
+            "a first step {label} leaves the ratio unresolved and must be refused: {refusal:?}"
+        );
+    }
+}
+
+/// The reference grid is chosen from fixed-coefficient steps, not by refitting
+/// rung by rung (#2986): the first grid whose tail certifies, with every step
+/// asked once, in order, and none past the one after the chosen grid. Grid 3's
+/// first step alone is within the tolerance, but its steps contract too slowly
+/// for their tail to be (`0.04 + 0.03/0.25 = 0.16`); grid 4's tail is
+/// `0.03 + 0.001/(1 − 1/30)`.
+#[test]
+fn the_reference_grid_is_the_first_whose_tail_certifies_2986() {
+    use super::family::{Shift, reference_tail, select_reference_grid};
+    let tolerance = 0.05;
+    let steps = [0.5, 0.04, 0.03, 0.001];
+    let mut asked = Vec::new();
+    let (chosen, certificate, read) = select_reference_grid(2, tolerance, |level| {
+        asked.push(level);
+        steps
+            .get(level - 2)
+            .map(|&value| Shift { value, band: 0.0 })
+            .ok_or_else(|| super::cohort::EventHistoryError::NumericalFailure {
+                reason: format!("grid {level} was asked past the fixture's steps"),
+            })
+    })
+    .expect("a grid certifies within the fixture's steps");
+    let expected = reference_tail(Shift { value: steps[2], band: 0.0 }, Shift { value: steps[3], band: 0.0 })
+        .expect("grid 4's tail")
+        .expect("grid 4's steps contract");
+    emit(&format!("[2986 select] chose grid {chosen} at {certificate:e} (expected {expected:e}); asked {asked:?}; read {read:?}"));
+    assert_eq!(chosen, 4, "the chosen grid must be the first whose tail certifies, grid 4");
+    assert_eq!(certificate, expected, "the chosen grid's certificate must be its tail");
+    assert_eq!(asked, vec![2, 3, 4, 5], "each step is asked once, in order, and none past the chosen grid's second");
+    assert_eq!(read.iter().map(|step| step.value).collect::<Vec<_>>(), steps.to_vec());
+}
+
+/// A grid whose own steps do not contract is charged its step and certified by
+/// the finer grid's tail, not refitted (#2986, seed 4: grid-2 steps 2.40e-4
+/// and 2.45e-4 posterior sd have no tail, and grid 3's certifies grid 2 two
+/// hundred times inside the tolerance). With steps `1/64, 1/64, 1/128` grid
+/// 3's tail is `1/64 + (1/128)/(1/2)`, and grid 2 is certified at `3/64`.
+/// With steps `1/32, 1/32, 1/128` the charge `1/32` takes grid 2 past the
+/// tolerance, and the coarsest grid certified is grid 3, at its own tail.
+#[test]
+fn a_grid_whose_steps_do_not_contract_is_charged_its_step_2986() {
+    use super::family::{Shift, reference_tail, select_reference_grid};
+    let tolerance = 0.05;
+    let select = |steps: [f64; 3]| {
+        let mut asked = Vec::new();
+        let selected = select_reference_grid(2, tolerance, |level| {
+            asked.push(level);
+            steps
+                .get(level - 2)
+                .map(|&value| Shift { value, band: 0.0 })
+                .ok_or_else(|| super::cohort::EventHistoryError::NumericalFailure {
+                    reason: format!("grid {level} was asked past the fixture's steps"),
+                })
+        })
+        .expect("a grid certifies within the fixture's steps");
+        emit(&format!("[2986 charged] steps {steps:?}: chose grid {} at {:e}; asked {asked:?}", selected.0, selected.1));
+        (selected.0, selected.1, asked)
+    };
+    let tail_of = |first: f64, second: f64| {
+        reference_tail(Shift { value: first, band: 0.0 }, Shift { value: second, band: 0.0 })
+            .expect("a resolved first step")
+            .expect("contracting steps")
+    };
+    let flat = [1.0 / 64.0, 1.0 / 64.0, 1.0 / 128.0];
+    assert_eq!(
+        reference_tail(Shift { value: flat[0], band: 0.0 }, Shift { value: flat[1], band: 0.0 }).expect("resolved"),
+        None,
+        "grid 2's own steps do not contract"
+    );
+    let (chosen, certificate, asked) = select(flat);
+    assert_eq!(chosen, 2, "the fitted grid is certified through grid 3's tail, not refitted at grid 3");
+    assert_eq!(certificate, 3.0 / 64.0, "grid 2 is charged its step plus grid 3's tail");
+    assert_eq!(asked, vec![2, 3, 4], "no step past the one after the grid whose tail certifies");
+    let steep = [1.0 / 32.0, 1.0 / 32.0, 1.0 / 128.0];
+    let (chosen, certificate, _) = select(steep);
+    assert_eq!(chosen, 3, "a charge past the tolerance leaves the coarsest certified grid, grid 3");
+    assert_eq!(certificate, tail_of(steep[1], steep[2]), "grid 3 is certified at its own tail");
+}
+
+/// A refinement's coefficient move is `max_q |(V (g′ − g))_q| / sd_q` with its
+/// rounding band `γ_{p+3} max_q Σ_r |V_qr| |g′_r − g_r| / sd_q`, on a 2×2
+/// posterior whose arithmetic is exact (#2986). A gradient that is not finite
+/// is a typed failure, never a move a maximum skips, and a gradient of the
+/// wrong length is refused.
+#[test]
+fn a_refinement_shift_is_the_posterior_move_with_its_rounding_band_2986() {
+    use super::family::refinement_shift;
+    let covariance = array![[4.0, 2.0], [2.0, 9.0]];
+    let sd = [2.0, 3.0];
+    let shift = refinement_shift(&covariance, &sd, &[0.0, 0.0], &[0.5, -0.25]).expect("a finite move");
+    let poisoned = refinement_shift(&covariance, &sd, &[0.0, 0.0], &[f64::NAN, -0.25]);
+    let short = refinement_shift(&covariance, &sd, &[0.0, 0.0], &[0.5]);
+    emit(&format!("[2986 shift] {shift:?}; poisoned {poisoned:?}; short {short:?}"));
+    // V δ = (3/2, −5/4): 3/4 and 5/12 posterior sd.
+    assert_eq!(shift.value, 0.75, "the move is the largest |V δ| / sd");
+    // Σ |V δ| / sd = (5/2)/2 and (13/4)/3.
+    assert_eq!(shift.band, 1.25 * gam_math::roundoff::accumulation_growth(5), "the band is γ_(p+3) max Σ|V δ| / sd");
+    assert!(
+        matches!(poisoned, Err(super::cohort::EventHistoryError::NumericalFailure { .. })),
+        "a refined gradient that is not finite must be a typed failure: {poisoned:?}"
+    );
+    assert!(
+        matches!(short, Err(super::cohort::EventHistoryError::Fit { .. })),
+        "a refined gradient of the wrong length must be refused: {short:?}"
+    );
 }
 
 /// One latent atom injected into a rank-zero fit: loadings `a_d` per mark and
@@ -5304,4 +5849,133 @@ fn a_finer_rule_resolves_a_static_factor_forecasts_change_from_the_coarser_one()
 fn a_finer_rule_keeps_a_dynamic_factor_forecast_within_the_coarser_ones_error() {
     install_test_logger();
     assert_the_finer_rule_is_within_the_coarser_ones_error("dynamic", true, false);
+}
+
+/// The constant-hazard fixture made risk-set centred by a reference snapshot
+/// whose normaliser `log M(t)` is `log_normaliser` at `times`, the same for
+/// every mark, and linear between them. At rank zero the model's intensities
+/// are then `r_d e^{−log M(t)}`, with a kink at every interior grid time.
+fn kinked_constant_hazard_fit(times: &[f64], log_normaliser: &[f64]) -> (EventHistoryCohort, EventHistoryFit, Vec<f64>) {
+    let (cohort, mut fit, rates) = constant_hazard_fit();
+    let marks = fit.marks();
+    let gaps = times.windows(2).map(|w| w[1] - w[0]).collect();
+    fit.centring = Some(super::family::RiskSetCentring {
+        grid: ReferenceGrid { times: times.to_vec(), gaps },
+        profiles: Array2::zeros((1, cohort.covariates.ncols())),
+        coefficients: Vec::new(),
+        node_stratum: vec![0; times.len()],
+        log_normaliser: log_normaliser.iter().flat_map(|&m| std::iter::repeat_n(m, marks)).collect(),
+        log_risk_mass: vec![0.0; times.len() * marks],
+        masks: 0,
+        mask_of_mark: vec![0; marks],
+    });
+    (cohort, fit, rates)
+}
+
+/// Every reference-grid time strictly inside a window is one of its level-0
+/// breakpoints, beside its start, its covariate changes and its last horizon.
+/// A grid time outside the window is not, and no horizon is.
+#[test]
+fn every_reference_grid_time_inside_a_window_is_a_level_zero_breakpoint() {
+    let fit = kinked_constant_hazard_fit(&[0.0, 0.7, 1.9, 3.1, 6.0], &[0.0, 0.4, -0.3, 0.2, 0.0]).1;
+    let window = SubjectHistory {
+        id: "window".to_string(),
+        entry: 1.0,
+        exit: 3.5,
+        events: Vec::new(),
+        segments: vec![CovariateSegment { start: 1.0, row: 0 }, CovariateSegment { start: 2.5, row: 0 }],
+    };
+    let breakpoints = super::forecast::window_breakpoints(&fit, &window);
+    emit(&format!("[2963 breakpoints] {breakpoints:?}"));
+    assert_eq!(breakpoints, vec![1.0, 1.9, 2.5, 3.1, 3.5]);
+}
+
+/// `∫₀ʰ e^{−m(t)} dt` for `m` linear between `times` with values `values`,
+/// piece by piece in closed form, with its first-order running bound `μ`
+/// (Higham, *Accuracy and Stability*, ch. 3): the value is within `ε μ`. The
+/// grid's times and values and `h` are exact inputs; every operation charges
+/// its operands' propagated bounds and its result's magnitude, a quotient
+/// through its operands' relative bounds, an exponential the propagated bound
+/// times its value plus one rounding of it.
+fn kinked_exposure(times: &[f64], values: &[f64], h: f64) -> (f64, f64) {
+    let (mut total, mut total_mu) = (0.0_f64, 0.0_f64);
+    for i in 0..times.len() - 1 {
+        let (a, b) = (times[i], times[i + 1].min(h));
+        if !(b > a) {
+            break;
+        }
+        let rise = values[i + 1] - values[i];
+        let span = times[i + 1] - times[i];
+        let slope = rise / span;
+        let slope_mu = slope.abs() * 3.0;
+        let width = b - a;
+        let step = slope * width;
+        let step_mu = width.abs() * slope_mu + step.abs() * 2.0;
+        let end = values[i] + step;
+        let end_mu = step_mu + end.abs();
+        let (e0, e1) = ((-values[i]).exp(), (-end).exp());
+        let num = e0 - e1;
+        let num_mu = e0 + e1 * end_mu + e1 + num.abs();
+        let piece = num / slope;
+        let piece_mu = num_mu / slope.abs() + piece.abs() * (slope_mu / slope.abs() + 1.0);
+        total += piece;
+        total_mu += piece_mu + total.abs();
+    }
+    (total, total_mu)
+}
+
+/// A rank-zero window from the risk-set centred fit's origin across its
+/// reference grid's kinks is its closed form to the checked error. The
+/// survival is `e^{−Λ ∫ e^{−m}}`, and every mark takes its share `r_d/Λ` of
+/// `1 − S`, since all the marks share the one normaliser. The kinks move the
+/// survival away from the constant-rate model's by more than the checked
+/// error: the magnitude floor. The closed forms carry their running bounds
+/// ([`kinked_exposure`]); the fitted rates are exact inputs to both routes.
+#[test]
+fn a_centred_forecast_across_its_reference_grid_matches_its_closed_form() {
+    install_test_logger();
+    let times = [0.0, 0.7, 1.9, 3.1, 6.0];
+    let values = [0.0, 0.4, -0.3, 0.2, 0.0];
+    let (cohort, fit, rates) = kinked_constant_hazard_fit(&times, &values);
+    let total = rates[0] + rates[1];
+    let horizons = [1.3, 2.6, 4.4];
+    let f = constant_hazard_population(&fit, &cohort, &horizons);
+    for (i, &h) in horizons.iter().enumerate() {
+        let (exposure, exposure_mu) = kinked_exposure(&times, &values, h);
+        let total_mu = total.abs();
+        let hazard = total * exposure;
+        let hazard_mu = total.abs() * exposure_mu + exposure.abs() * total_mu + hazard.abs();
+        let survival = (-hazard).exp();
+        let survival_mu = survival * hazard_mu + survival;
+        let decrement = -(-hazard).exp_m1();
+        let decrement_mu = survival * hazard_mu + decrement;
+        let mut closed = [survival, 0.0, 0.0, 0.0];
+        let mut closed_bound = [f64::EPSILON * survival_mu, 0.0, 0.0, 0.0];
+        for d in 0..3 {
+            let share = rates[d] / total;
+            let share_mu = share * (total_mu / total + 1.0);
+            closed[d + 1] = share * decrement;
+            closed_bound[d + 1] = f64::EPSILON * (share * decrement_mu + decrement * share_mu + closed[d + 1]);
+        }
+        let (forecast, errors) = forecast_quantities(&f, i);
+        emit(&format!(
+            "[2963 kinked] h {h}: forecast {forecast:?} errors {errors:?} closed {closed:?} closed bound {closed_bound:?}"
+        ));
+        let constant_rate = (-total * h).exp();
+        assert!(
+            (survival - constant_rate).abs() > errors[0] + closed_bound[0],
+            "h {h}: the kinks move survival from {constant_rate} to {survival} only, within the checked error {}",
+            errors[0]
+        );
+        for q in 0..4 {
+            assert!(
+                (forecast[q] - closed[q]).abs() <= errors[q] + closed_bound[q],
+                "quantity {q} at h {h}: forecast {} vs closed form {}, checked error {} + closed-form bound {}",
+                forecast[q],
+                closed[q],
+                errors[q],
+                closed_bound[q]
+            );
+        }
+    }
 }

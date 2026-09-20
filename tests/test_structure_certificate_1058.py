@@ -19,7 +19,7 @@ def _fit():
     mixing /= np.linalg.norm(mixing, axis=0, keepdims=True)
     target = harmonic @ mixing + 0.05 * rng.normal(size=(200, 16))
     target -= target.mean(axis=0, keepdims=True)
-    return gamfit.sae_manifold_fit(
+    return gamfit.sae.sae_manifold_fit(
         X=target,
         K=2,
         atom_basis="periodic",
@@ -75,5 +75,5 @@ def test_contested_entries_are_the_unconfirmed_complement() -> None:
 
 def test_certificate_round_trips_through_native_payload() -> None:
     fit = _fit()
-    restored = gamfit.ManifoldSAE.from_dict(fit.to_dict())
+    restored = gamfit.sae.ManifoldSAE.from_dict(fit.to_dict())
     assert restored.structure_certificate_json == fit.structure_certificate_json

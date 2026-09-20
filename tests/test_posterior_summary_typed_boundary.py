@@ -26,6 +26,7 @@ def _draws() -> PosteriorSamples:
         ess=240.0,
         converged=True,
         method="nuts",
+        acceptance_rate=None,
         exact=True,
         covariance_source="conditional",
         model_class="standard",
@@ -35,7 +36,6 @@ def _draws() -> PosteriorSamples:
             n_samples=3,
             n_warmup=2,
             n_chains=1,
-            target_accept=0.8,
             seed=7,
         ),
     )
@@ -122,6 +122,7 @@ def test_posterior_payloads_require_exact_fitted_link_identity(
         "ess": 2.0,
         "converged": True,
         "method": "laplace",
+        "acceptance_rate": None,
         "exact": False,
         "covariance_source": "conditional",
         "model_class": "standard",
@@ -136,7 +137,7 @@ def test_posterior_payloads_require_exact_fitted_link_identity(
         PosteriorSamples.from_ffi_payload(payload)
 
     draws = _draws()
-    object.__setattr__(draws, "_model_bytes", b"model")
+    object.__setattr__(draws, "_model", object())
     monkeypatch.setattr(
         PosteriorSamples,
         "_normalize",

@@ -590,8 +590,9 @@ pub enum EstimationError {
     #[error(
         "Pre-fit perfect separation detected in the realized binomial inverse-link design: column {column_index} \
         has a threshold {threshold:.6e} that separates the binary outcomes \
-        (positive_above_threshold={positive_above_threshold}). The likelihood has no finite maximizer along that column; \
-        enable Firth/Jeffreys bias reduction or remove/reparameterize the separating column."
+        (positive_above_threshold={positive_above_threshold}). The likelihood has no finite maximizer along that column, and the Jeffreys prior that bounds it \
+        cannot be combined with optimized SAS or mixture link parameters; fix the link parameters or \
+        remove/reparameterize the separating column."
     )]
     PrefitPerfectSeparationDetected {
         column_index: usize,
@@ -601,15 +602,32 @@ pub enum EstimationError {
 
     #[error(
         "Pre-fit linear separation detected in the realized binomial inverse-link design: \
-        {num_unpenalized_columns} parametric columns (unpenalized, or penalized only by a one-column ridge) admit a separating direction \
-        with minimum signed margin {min_signed_margin:.6e} (columns {column_indices:?}). \
-        The likelihood has no finite maximizer along that direction; enable Firth/Jeffreys bias reduction or \
+        {num_unpenalized_columns} directions no roughness penalty bounds (parametric columns, and a smooth's penalty null space, \
+        unpenalized or penalized only by a ridge) admit a separating direction \
+        with minimum signed margin {min_signed_margin:.6e}, zero for quasi-complete separation (columns {column_indices:?}). \
+        The likelihood has no finite maximizer along that direction, and the Jeffreys prior that bounds it \
+        cannot be combined with optimized SAS or mixture link parameters; fix the link parameters or \
         remove/reparameterize the separating columns."
     )]
     PrefitLinearSeparationDetected {
         min_signed_margin: f64,
         num_unpenalized_columns: usize,
         column_indices: Vec<usize>,
+    },
+
+    #[error(
+        "Not enough observations to identify the model: {n_observations} positive-weight rows but \
+        {unpenalized_dim} unpenalized coefficient directions (intercept, parametric terms and the \
+        penalty null spaces, out of {total_columns} columns). REML/LAML estimate the smoothing \
+        parameters from the n − {unpenalized_dim} residual contrasts the unpenalized directions \
+        cannot absorb, so n must exceed {unpenalized_dim}; the total column count need not be below n. \
+        Add observations, drop parametric terms, or penalize the unpenalized directions \
+        (double-penalty smooths contribute none)."
+    )]
+    PrefitUnpenalizedSpaceExceedsObservations {
+        n_observations: usize,
+        unpenalized_dim: usize,
+        total_columns: usize,
     },
 
     #[error(
@@ -993,6 +1011,31 @@ pub enum EstimationError {
         upper: f64,
     },
 
+    /// The penalized likelihood of a link whose range overshoots the family's
+    /// mean domain (identity Poisson, log binomial, ...) increases toward the
+    /// edge of the link's feasibility set, so its maximum is on that edge and
+    /// not at an interior stationary point. P-IRLS detects it at the iterate
+    /// where the Newton decrement has collapsed — the curvature diverges as a
+    /// mean approaches the edge of its domain — while the gradient has not,
+    /// and the step toward it was rejected for leaving the feasible set in the
+    /// same iteration. No interior mode exists to report, and a clamped one
+    /// would be a spurious mean.
+    #[error(
+        "The {link} link's likelihood maximum lies on the boundary of its feasibility set: \
+         after {iterations} P-IRLS iteration(s) the gradient norm is still \
+         {gradient_norm:.6e}, and the step toward the maximum leaves the feasible linear \
+         predictor (eta={eta:?}, feasible set {}). There is no interior maximum to report.",
+        feasible_eta_set(*.lower, *.upper)
+    )]
+    LinkFeasibilityBoundaryOptimum {
+        link: &'static str,
+        eta: f64,
+        lower: f64,
+        upper: f64,
+        iterations: usize,
+        gradient_norm: f64,
+    },
+
     #[error(
         "PIRLS row geometry is not representable at row {row}: {quantity} evaluated from \
          eta={eta:?} produced {value:?}"
@@ -1050,6 +1093,18 @@ pub enum EstimationError {
     PredictionError,
 }
 
+/// The open feasibility interval `(lower, upper)` of a link's linear predictor,
+/// written as the inequality it imposes. An endpoint at `±f64::MAX` or beyond
+/// is the unbounded side, so `(0, f64::MAX)` reads `eta > 0`.
+fn feasible_eta_set(lower: f64, upper: f64) -> String {
+    match (lower > -f64::MAX, upper < f64::MAX) {
+        (true, true) => format!("{lower} < eta < {upper}"),
+        (true, false) => format!("eta > {lower}"),
+        (false, true) => format!("eta < {upper}"),
+        (false, false) => "every finite eta".to_string(),
+    }
+}
+
 // Ensure Debug prints with actual line breaks by delegating to Display
 impl core::fmt::Debug for EstimationError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1090,6 +1145,12 @@ impl EstimationError {
     pub fn advice(&self) -> Option<String> {
         const SEPARATION: &str = "Enable Firth/Jeffreys bias reduction, remove or regularize \
              the separating predictor, or switch link via link(type=...).";
+        // A Firth-capable binomial fit adopts the Jeffreys prior on a pre-fit
+        // certificate (#3129), so the certificate reaches the caller only when
+        // the prior cannot be armed: optimized link parameters (#2654).
+        const PREFIT_SEPARATION: &str = "Fix the SAS or mixture link parameters instead of \
+             optimizing them so the Jeffreys prior can be fitted, remove or regularize the \
+             separating predictor, or switch link via link(type=...).";
         const CONDITIONING: &str = "Check for collinear or constant predictors and overly \
              complex smooth bases.";
         match self {
@@ -1102,10 +1163,16 @@ impl EstimationError {
                 Some(format!("Detected (quasi-)separation. {SEPARATION}"))
             }
             Self::PrefitPerfectSeparationDetected { column_index, .. } => Some(format!(
-                "Detected separation driven by unpenalized column {column_index}. {SEPARATION}"
+                "Detected separation driven by unpenalized column {column_index}. {PREFIT_SEPARATION}"
             )),
             Self::PrefitLinearSeparationDetected { column_indices, .. } => Some(format!(
-                "Detected separation driven by unpenalized columns {column_indices:?}. {SEPARATION}"
+                "Detected separation driven by unpenalized columns {column_indices:?}. {PREFIT_SEPARATION}"
+            )),
+            Self::LinkFeasibilityBoundaryOptimum { link, .. } => Some(format!(
+                "The {link} link's range exceeds the family's mean domain and the data put \
+                 a fitted mean on the edge of that domain. Use a link whose range is the \
+                 whole mean domain (the canonical link), or remove the predictor or rows \
+                 that force the mean to the boundary."
             )),
             Self::PrefitRankDeficientDesignDetected { column_indices, .. }
             | Self::PrefitNearDegenerateDesignDetected { column_indices, .. } => Some(format!(
@@ -1163,6 +1230,10 @@ impl EstimationError {
             | Self::MultinomialSeparationDetected { .. }
             | Self::PirlsDidNotConverge { .. }
             | Self::FixedLambdaNewtonDidNotConverge { .. } => true,
+            // The inner maximum at THIS rho is on the link's feasibility
+            // boundary; a heavier penalty can pull it inside, as it can pull a
+            // quasi-separated fit back from infinity.
+            Self::LinkFeasibilityBoundaryOptimum { .. } => true,
             // A structural failure, an already-terminal outer verdict, or a
             // statement about the configuration, the data, or the prediction
             // request: none of these becomes true or false by moving rho.
@@ -1178,6 +1249,7 @@ impl EstimationError {
             | Self::BetaPrecisionRefinementDidNotConverge { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::HessianNotPositiveDefinite { .. }
@@ -1365,8 +1437,10 @@ impl EstimationError {
             Self::InvalidStabilization(_)
             | Self::BasisError(_)
             | Self::PerfectSeparationDetected { .. }
+            | Self::LinkFeasibilityBoundaryOptimum { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::MultinomialSeparationDetected { .. }
@@ -1393,6 +1467,22 @@ impl EstimationError {
             | Self::MonotoneRoot(_) => FailureCategory::Numerical,
             // Prose from the calibrator's own trainer; no producer names a kind.
             Self::CalibratorTrainingFailed(_) => FailureCategory::Unclassified,
+        }
+    }
+
+    /// The user-facing category of this failure: [`Self::failure_category`]
+    /// read at the coarser grain every front end classifies by, except that
+    /// a model specification the engine refuses before any data is looked at
+    /// is a defect of the request rather than of the data.
+    #[must_use]
+    pub fn error_category(&self) -> crate::ErrorCategory {
+        let decisive = self.innermost_estimation_error();
+        match decisive {
+            Self::InvalidSpecification(_) | Self::InvalidStabilization(_) | Self::BasisError(_) => {
+                crate::ErrorCategory::Formula
+            }
+            Self::CustomFamily(err) => err.error_category(),
+            _ => decisive.failure_category().error_category(),
         }
     }
 
@@ -1431,6 +1521,9 @@ impl EstimationError {
             }
             Self::PrefitLinearSeparationDetected { .. } => {
                 "EstimationError::PrefitLinearSeparationDetected"
+            }
+            Self::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
+                "EstimationError::PrefitUnpenalizedSpaceExceedsObservations"
             }
             Self::PrefitRankDeficientDesignDetected { .. } => {
                 "EstimationError::PrefitRankDeficientDesignDetected"
@@ -1471,6 +1564,9 @@ impl EstimationError {
             Self::FitResultInvariantViolated(_) => "EstimationError::FitResultInvariantViolated",
             Self::ProfiledResidualUnresolved { .. } => "EstimationError::ProfiledResidualUnresolved",
             Self::InverseLinkDomainViolation { .. } => "EstimationError::InverseLinkDomainViolation",
+            Self::LinkFeasibilityBoundaryOptimum { .. } => {
+                "EstimationError::LinkFeasibilityBoundaryOptimum"
+            }
             Self::PirlsRowGeometryUnrepresentable { .. } => {
                 "EstimationError::PirlsRowGeometryUnrepresentable"
             }
@@ -1625,6 +1721,29 @@ impl From<LinalgError> for EstimationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A boundary optimum is an input-class, trial-infeasible refusal whose
+    /// message states the feasible set as an inequality, not as an interval
+    /// with a `f64::MAX` endpoint spelled out in full.
+    #[test]
+    fn link_feasibility_boundary_optimum_reads_its_feasible_set() {
+        let boundary = |lower, upper| EstimationError::LinkFeasibilityBoundaryOptimum {
+            link: "identity",
+            eta: 0.0,
+            lower,
+            upper,
+            iterations: 2,
+            gradient_norm: 282.8,
+        };
+        let above = boundary(0.0, f64::MAX);
+        assert!(above.is_trial_point_infeasible());
+        assert_eq!(above.failure_category(), FailureCategory::Input);
+        let message = above.to_string();
+        assert!(message.contains("feasible set eta > 0)"), "{message}");
+        assert!(!message.contains("1797693"), "{message}");
+        assert!(boundary(-f64::MAX, 0.0).to_string().contains("feasible set eta < 0)"));
+        assert!(boundary(0.0, 1.0).to_string().contains("feasible set 0 < eta < 1)"));
+    }
 
     // ── stationarity rung provenance (#2458) ─────────────────────────────────
 
@@ -1946,7 +2065,7 @@ mod tests {
     #[test]
     fn block_quadrature_correction_refusals_back_off_only_at_rho_local_stages_784() {
         use crate::laplace_sampler_contract::{BlockQuadratureOrderRefusal, BlockQuadratureRefusal};
-        // The five stages that are facts about the trial point back the outer search off it,
+        // The six stages that are facts about the trial point back the outer search off it,
         // as a convergence-class refusal (#784 ruling A).
         let rho_local = [
             BlockQuadratureCorrectionStage::OrderSearchRefused(BlockQuadratureOrderRefusal {
@@ -1974,6 +2093,7 @@ mod tests {
                 gap: 1e-12,
                 tolerance: 1e-10,
             },
+            BlockQuadratureCorrectionStage::AxisSplitWithoutExactCurvature { block_dim: 2 },
         ];
         for stage in rho_local {
             let error = EstimationError::BlockQuadratureCorrectionRefused { stage };
@@ -2073,6 +2193,10 @@ pub enum BlockQuadratureCorrectionStage {
         gap: f64,
         tolerance: f64,
     },
+    /// The admission latched the axis-by-axis block marginal, whose analytic mixed-axis term
+    /// requires the Laplace Hessian weights to be the likelihood's own second derivative, and
+    /// this rho's inner solve converged under the expected-information surrogate instead.
+    AxisSplitWithoutExactCurvature { block_dim: usize },
 }
 
 impl BlockQuadratureCorrectionStage {
@@ -2086,7 +2210,8 @@ impl BlockQuadratureCorrectionStage {
             | Self::UnresolvedAtAdmission { .. }
             | Self::NonPositivePenalizedCurvature { .. }
             | Self::EigenpairResolutionUnavailable { .. }
-            | Self::EigenframeNearDegeneracy { .. } => true,
+            | Self::EigenframeNearDegeneracy { .. }
+            | Self::AxisSplitWithoutExactCurvature { .. } => true,
             Self::CorrectorReturnedNoMoments { .. } => false,
         }
     }
@@ -2132,6 +2257,12 @@ impl std::fmt::Display for BlockQuadratureCorrectionStage {
                 "block eigenvalue {block_eigenvalue:.6e} and eigenvalue {other_eigenvalue:.6e} \
                  differ by {gap:.3e}, within their summed resolution {tolerance:.3e}, where the \
                  eigenframe is not differentiable"
+            ),
+            Self::AxisSplitWithoutExactCurvature { block_dim } => write!(
+                f,
+                "the {block_dim}-direction block was admitted axis by axis, whose mixed-axis term \
+                 needs the observed Hessian, and this rho's inner solve converged under the \
+                 expected-information surrogate"
             ),
         }
     }

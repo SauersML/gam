@@ -7,9 +7,11 @@ pub(crate) fn materialize_location_scale<'a>(
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
-    let y = resolve_continuous_column(data, col_map, &parsed.response, "response")?;
+    let mut y = resolve_continuous_column(data, col_map, &parsed.response, "response")?;
     let y_kind = response_column_kind(data, y_col);
-    let mut inference_notes = Vec::new();
+    let mut inference_notes = FitNotes::default();
+    let weights = resolve_fit_weight_column(data, col_map, config.weight_column.as_deref())?;
+    reject_too_few_rows_for_formula(parsed, weights.view())?;
 
     let noise_formula = config
         .noise_formula
@@ -24,13 +26,20 @@ pub(crate) fn materialize_location_scale<'a>(
         config.negative_binomial_theta,
         link_choice.as_ref(),
         y.view(),
-        y_kind,
+        y_kind.clone(),
         &parsed.response,
     )?;
+    code_two_level_label_response(
+        &family,
+        &y_kind,
+        &mut y,
+        &parsed.response,
+        &mut inference_notes,
+    );
 
-    // Prior weights first: a zero weight excludes its row from the family's
-    // support and degeneracy rules (see `validate_response_against_family`).
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    // The prior weights resolved above decide which rows are judged: a zero
+    // weight excludes its row from the family's support and degeneracy rules
+    // (see `validate_response_against_family`).
     validate_response_against_family(&family, y.view(), weights.view(), &parsed.response)?;
 
     // An explicit `linkwiggle(...)` term is only wired into the fit below for a
@@ -60,10 +69,6 @@ pub(crate) fn materialize_location_scale<'a>(
         config.smooth_overrides.as_ref(),
         None,
     )?;
-    // Sample size vs basis rank, summed across the mean and log-σ smooths
-    // (#309). Both designs share the same n_rows.
-    check_smooth_capacity(&meanspec, y.len(), &parsed.response)?;
-    check_smooth_capacity(&log_sigmaspec, y.len(), &parsed.response)?;
 
     let mean_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let noise_offset = resolve_offset_column(data, col_map, config.noise_offset_column.as_deref())?;

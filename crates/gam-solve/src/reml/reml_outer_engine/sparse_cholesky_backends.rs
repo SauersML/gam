@@ -18,6 +18,10 @@ pub struct SparseCholeskyOperator {
     pub(crate) cached_logdet: f64,
     /// Dimension of H.
     pub(crate) n_dim: usize,
+    /// The factored `H` in upper-triangular CSC storage, when the caller has
+    /// it. Its pattern lets block-root cross traces split off a block of `H`
+    /// that is diagonal (see [`DiagonalBlockSchur`]).
+    pub(crate) hessian: Option<std::sync::Arc<faer::sparse::SparseColMat<usize, f64>>>,
 }
 
 impl SparseCholeskyOperator {
@@ -32,7 +36,28 @@ impl SparseCholeskyOperator {
             takahashi: None,
             cached_logdet: logdet_h,
             n_dim: dim,
+            hessian: None,
         }
+    }
+
+    /// Attach the factored `H`, stored as its upper triangle (`row ≤ col`)
+    /// like `SparsePenalizedSystem::h_sparse`.
+    pub(crate) fn with_hessian(
+        mut self,
+        hessian: std::sync::Arc<faer::sparse::SparseColMat<usize, f64>>,
+    ) -> Self {
+        assert_eq!(hessian.nrows(), self.n_dim);
+        assert_eq!(hessian.ncols(), self.n_dim);
+        let col_ptr = hessian.symbolic().col_ptr();
+        let row_idx = hessian.symbolic().row_idx();
+        assert!(
+            (0..self.n_dim).all(|col| row_idx[col_ptr[col]..col_ptr[col + 1]]
+                .iter()
+                .all(|&row| row <= col)),
+            "SparseCholeskyOperator::with_hessian expects upper-triangular storage"
+        );
+        self.hessian = Some(hessian);
+        self
     }
 
     pub(crate) fn with_takahashi(
@@ -394,6 +419,329 @@ impl SparseCholeskyOperator {
     }
 }
 
+/// Nonzeros of a penalty root, row by row: `(local column, value)` pairs in
+/// CSR layout, so a contraction against the root touches only its support.
+struct RootRows {
+    ptr: Vec<usize>,
+    entries: Vec<(usize, f64)>,
+}
+
+impl RootRows {
+    fn new(root: ArrayView2<'_, f64>) -> Self {
+        let mut ptr = Vec::with_capacity(root.nrows() + 1);
+        let mut entries = Vec::new();
+        ptr.push(0);
+        for row in root.outer_iter() {
+            entries.extend(
+                row.iter()
+                    .enumerate()
+                    .filter(|&(_, &value)| value != 0.0)
+                    .map(|(col, &value)| (col, value)),
+            );
+            ptr.push(entries.len());
+        }
+        Self { ptr, entries }
+    }
+
+    fn rows(&self) -> usize {
+        self.ptr.len() - 1
+    }
+
+    fn row(&self, row: usize) -> &[(usize, f64)] {
+        &self.entries[self.ptr[row]..self.ptr[row + 1]]
+    }
+}
+
+/// The block of `H` on the support `G` of two diagonal penalty Grams, when
+/// that block is itself diagonal: `H_GG = D`.
+///
+/// This is the random-effect shape. A factor's level indicators never share a
+/// row of `X`, and its ridge penalty is diagonal, so `H` is diagonal on the
+/// levels and couples them only to the few other coefficients `N` that share
+/// rows with them. With `U = D⁻¹ H_GN` and `W = (H⁻¹)_NN`, the block inverse
+/// gives exactly
+///
+/// ```text
+/// (H⁻¹)_GG = D⁻¹ + U W Uᵀ,
+/// ```
+///
+/// and for diagonal `A = diag(a)`, `B = diag(b)` supported on `G`
+///
+/// ```text
+/// tr(H⁻¹ A H⁻¹ B) = Σ_g a_g b_g / d_g² + 2 Σ_g a_g b_g (u_gᵀ W u_g) / d_g
+///                   + tr(W Uᵀ A U W Uᵀ B).
+/// ```
+///
+/// Every term is a sum of nonnegative products, so nothing cancels. The cost
+/// is `|N|` solves for `W` plus `O(Σ_g |u_g|² + |N|³)`, independent of the
+/// number of levels beyond the scan, where the generic route needs one solve
+/// per root row: one per level.
+pub(crate) struct DiagonalBlockSchur {
+    /// `(d_g, a_g, b_g)` for each index of `G`.
+    nodes: Vec<(f64, f64, f64)>,
+    /// `N`, the indices outside `G` that `H` couples to it.
+    coupled: Vec<usize>,
+    /// Row `g` of `U`, CSR over `nodes`: `(position in coupled, H_gn / d_g)`.
+    u_ptr: Vec<usize>,
+    u_entries: Vec<(usize, f64)>,
+}
+
+impl DiagonalBlockSchur {
+    /// `None` when either Gram is not diagonal by structure or `H_GG` is not
+    /// diagonal.
+    pub(crate) fn plan(
+        hessian: &faer::sparse::SparseColMat<usize, f64>,
+        a: &BlockRootDrift<'_>,
+        b: &BlockRootDrift<'_>,
+    ) -> Option<Self> {
+        let p = hessian.nrows();
+        let gram_a = gam_problem::penalty_coordinate::penalty_root_gram_diagonal(a.root)?;
+        let gram_b = gam_problem::penalty_coordinate::penalty_root_gram_diagonal(b.root)?;
+        let mut weight_a = vec![0.0; p];
+        let mut weight_b = vec![0.0; p];
+        for (offset, &value) in gram_a.iter().enumerate() {
+            weight_a[a.start + offset] = value;
+        }
+        for (offset, &value) in gram_b.iter().enumerate() {
+            weight_b[b.start + offset] = value;
+        }
+        let in_g = |index: usize| weight_a[index] != 0.0 || weight_b[index] != 0.0;
+
+        // One pass over the stored upper triangle reads `D`, rejects any
+        // `G–G` coupling, and collects every `G–N` coupling.
+        let col_ptr = hessian.symbolic().col_ptr();
+        let row_idx = hessian.symbolic().row_idx();
+        let values = hessian.val();
+        let mut diagonal = vec![0.0; p];
+        let mut couplings: Vec<(usize, usize, f64)> = Vec::new();
+        for col in 0..p {
+            let col_in_g = in_g(col);
+            for idx in col_ptr[col]..col_ptr[col + 1] {
+                let (row, value) = (row_idx[idx], values[idx]);
+                if value == 0.0 {
+                    continue;
+                }
+                if row == col {
+                    diagonal[col] = value;
+                    continue;
+                }
+                match (in_g(row), col_in_g) {
+                    (true, true) => return None,
+                    (true, false) => couplings.push((row, col, value)),
+                    (false, true) => couplings.push((col, row, value)),
+                    (false, false) => {}
+                }
+            }
+        }
+
+        let mut coupled: Vec<usize> = couplings.iter().map(|&(_, n, _)| n).collect();
+        coupled.sort_unstable();
+        coupled.dedup();
+        let mut coupled_position = vec![usize::MAX; p];
+        for (position, &index) in coupled.iter().enumerate() {
+            coupled_position[index] = position;
+        }
+        couplings.sort_unstable_by_key(|&(g, n, _)| (g, n));
+
+        let mut nodes = Vec::new();
+        let mut u_ptr = vec![0];
+        let mut u_entries = Vec::with_capacity(couplings.len());
+        let mut cursor = 0;
+        for g in (0..p).filter(|&index| in_g(index)) {
+            let d = diagonal[g];
+            nodes.push((d, weight_a[g], weight_b[g]));
+            while cursor < couplings.len() && couplings[cursor].0 == g {
+                let (_, n, value) = couplings[cursor];
+                u_entries.push((coupled_position[n], value / d));
+                cursor += 1;
+            }
+            u_ptr.push(u_entries.len());
+        }
+        Some(Self {
+            nodes,
+            coupled,
+            u_ptr,
+            u_entries,
+        })
+    }
+
+    fn u_row(&self, node: usize) -> &[(usize, f64)] {
+        &self.u_entries[self.u_ptr[node]..self.u_ptr[node + 1]]
+    }
+
+    /// Flops after the plan: `|N|` solves, the `U`-weighted Grams, and the
+    /// `|N|³` products.
+    fn flops(&self, solve_flops: usize) -> usize {
+        let m = self.coupled.len();
+        let gram_flops: usize = (0..self.nodes.len())
+            .map(|node| {
+                let c = self.u_ptr[node + 1] - self.u_ptr[node];
+                3 * c * c
+            })
+            .sum();
+        m * solve_flops + gram_flops + 4 * m * m * m
+    }
+
+    pub(crate) fn trace(&self, op: &SparseCholeskyOperator) -> f64 {
+        let m = self.coupled.len();
+        let w = op.inverse_principal_block(&self.coupled);
+        let mut gram_a = Array2::<f64>::zeros((m, m));
+        let mut gram_b = Array2::<f64>::zeros((m, m));
+        let mut direct = 0.0;
+        let mut mixed = 0.0;
+        for (node, &(d, a, b)) in self.nodes.iter().enumerate() {
+            let u = self.u_row(node);
+            let mut quadratic = 0.0;
+            for &(j, u_j) in u {
+                for &(k, u_k) in u {
+                    quadratic += u_j * w[[j, k]] * u_k;
+                    gram_a[[j, k]] += a * u_j * u_k;
+                    gram_b[[j, k]] += b * u_j * u_k;
+                }
+            }
+            direct += a * b / (d * d);
+            mixed += a * b * quadratic / d;
+        }
+        let w_a = w.dot(&gram_a);
+        let w_b = w.dot(&gram_b);
+        direct + 2.0 * mixed + (&w_a * &w_b.t()).sum()
+    }
+}
+
+impl SparseCholeskyOperator {
+    /// Flops of one solve pair against the factor.
+    fn solve_flops(&self) -> usize {
+        4 * self.factor.factor_nnz() + self.n_dim
+    }
+
+    /// `(H⁻¹)_NN` for the listed indices, by one solve per index.
+    fn inverse_principal_block(&self, indices: &[usize]) -> Array2<f64> {
+        let m = indices.len();
+        let chunk = Self::OPERATOR_SOLVE_CHUNK;
+        let columns: Vec<Array2<f64>> = (0..m.div_ceil(chunk))
+            .into_par_iter()
+            .map(|block| {
+                let cols = &indices[block * chunk..((block + 1) * chunk).min(m)];
+                let mut rhs = Array2::<f64>::zeros((self.n_dim, cols.len()));
+                for (c, &index) in cols.iter().enumerate() {
+                    rhs[[index, c]] = 1.0;
+                }
+                let solved = gam_linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs)
+                    .unwrap_or_else(|e| {
+                        // SAFETY: self.factor is validated SPD; unit-column solves only fail on corruption.
+                        panic!("SparseCholeskyOperator principal inverse block solve failed: {e}")
+                    });
+                let mut out = Array2::<f64>::zeros((m, cols.len()));
+                for (r, &index) in indices.iter().enumerate() {
+                    out.row_mut(r).assign(&solved.row(index));
+                }
+                out
+            })
+            .collect();
+        let mut w = Array2::<f64>::zeros((m, m));
+        for (block, solved) in columns.iter().enumerate() {
+            let start = block * chunk;
+            w.slice_mut(ndarray::s![.., start..start + solved.ncols()])
+                .assign(solved);
+        }
+        w
+    }
+
+    /// `tr(H⁻¹ RaᵀRa H⁻¹ RbᵀRb) = ‖Ra (H⁻¹)_{Ia,Ib} Rbᵀ‖_F²`: one solve per row
+    /// of the root with fewer rows, each contracted against the other root on
+    /// its support.
+    pub(crate) fn trace_hinv_block_root_cross_by_rows(
+        &self,
+        a: &BlockRootDrift<'_>,
+        b: &BlockRootDrift<'_>,
+    ) -> f64 {
+        if a.root.nrows() <= b.root.nrows() {
+            self.trace_hinv_block_root_cross_solving(a, b)
+        } else {
+            self.trace_hinv_block_root_cross_solving(b, a)
+        }
+    }
+
+    /// [`Self::trace_hinv_block_root_cross_by_rows`] solving on `solved`'s rows.
+    fn trace_hinv_block_root_cross_solving(
+        &self,
+        solved: &BlockRootDrift<'_>,
+        other: &BlockRootDrift<'_>,
+    ) -> f64 {
+        let solved_rows = RootRows::new(solved.root);
+        let other_rows = RootRows::new(other.root);
+        let chunk = Self::OPERATOR_SOLVE_CHUNK;
+        let rows = solved_rows.rows();
+        let chunk_sums: Vec<f64> = (0..rows.div_ceil(chunk))
+            .into_par_iter()
+            .map(|block| {
+                let first = block * chunk;
+                let last = (first + chunk).min(rows);
+                let mut rhs = Array2::<f64>::zeros((self.n_dim, last - first));
+                for (c, row) in (first..last).enumerate() {
+                    for &(col, value) in solved_rows.row(row) {
+                        rhs[[solved.start + col, c]] = value;
+                    }
+                }
+                // (H⁻¹)_{Ib,Ia} Raᵀ for this chunk of Ra's rows.
+                let z = gam_linalg::sparse_exact::solve_sparse_spdmulti_rows(
+                    &self.factor,
+                    &rhs,
+                    other.start,
+                    other.end,
+                )
+                .unwrap_or_else(|e| {
+                    // SAFETY: self.factor is validated SPD; root-row solves only fail on corruption.
+                    panic!("SparseCholeskyOperator block-root cross solve failed: {e}")
+                });
+                let mut sum = 0.0;
+                for other_row in 0..other_rows.rows() {
+                    let support = other_rows.row(other_row);
+                    for c in 0..z.ncols() {
+                        let entry: f64 = support
+                            .iter()
+                            .map(|&(col, value)| value * z[[col, c]])
+                            .sum();
+                        sum += entry * entry;
+                    }
+                }
+                sum
+            })
+            .collect();
+        chunk_sums.iter().sum()
+    }
+
+    /// `tr(H⁻¹ RaᵀRa H⁻¹ RbᵀRb)`, by whichever exact route costs fewer flops.
+    pub(crate) fn trace_hinv_block_root_cross(
+        &self,
+        a: &BlockRootDrift<'_>,
+        b: &BlockRootDrift<'_>,
+    ) -> f64 {
+        assert_eq!(a.root.ncols(), a.end - a.start);
+        assert_eq!(b.root.ncols(), b.end - b.start);
+        let solve_flops = self.solve_flops();
+        let nnz = |root: ArrayView2<'_, f64>| root.iter().filter(|&&value| value != 0.0).count();
+        let (solved_rows, other_nnz) = if a.root.nrows() <= b.root.nrows() {
+            (a.root.nrows(), nnz(b.root))
+        } else {
+            (b.root.nrows(), nnz(a.root))
+        };
+        let by_rows_flops = solved_rows * (solve_flops + 2 * other_nnz);
+        if let Some(hessian) = self.hessian.as_deref() {
+            // The plan's own scan reads all of `H`; skip it when the row route
+            // is already cheaper than that scan.
+            let scan_flops = hessian.compute_nnz() + a.root.len() + b.root.len();
+            if scan_flops < by_rows_flops
+                && let Some(schur) = DiagonalBlockSchur::plan(hessian, a, b)
+                && scan_flops + schur.flops(solve_flops) < by_rows_flops
+            {
+                return schur.trace(self);
+            }
+        }
+        self.trace_hinv_block_root_cross_by_rows(a, b)
+    }
+}
+
 impl HessianFactorization for SparseCholeskyOperator {
     fn logdet(&self) -> f64 {
         self.cached_logdet
@@ -464,6 +812,41 @@ impl HessianFactorization for SparseCholeskyOperator {
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
         self.trace_hinv_operator(op)
+    }
+
+    fn trace_logdet_block_local(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        assert_eq!(block.nrows(), end - start);
+        match self.takahashi {
+            // `A_block` shares `H`'s pattern on its block, so every entry of
+            // `H⁻¹` it meets is a selected-inverse lookup.
+            Some(ref taka) => scale * Self::takahashi_block_trace(taka, block, start),
+            None => {
+                let mut full = Array2::<f64>::zeros((self.n_dim, self.n_dim));
+                full.slice_mut(ndarray::s![start..end, start..end])
+                    .scaled_add(scale, block);
+                self.trace_hinv_product(&full)
+            }
+        }
+    }
+
+    fn trace_logdet_block_root(
+        &self,
+        root: ndarray::ArrayView2<'_, f64>,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        assert_eq!(root.ncols(), end - start);
+        let Some(ref taka) = self.takahashi else {
+            let block = root.t().dot(&root);
+            return self.trace_logdet_block_local(&block, 1.0, start, end);
+        };
+        taka.trace_root_gram(root, start)
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
@@ -551,12 +934,65 @@ impl HessianFactorization for SparseCholeskyOperator {
         -self.trace_hinv_operator_cross(h_i, h_j)
     }
 
+    fn contracts_block_root_drifts(&self) -> bool {
+        true
+    }
+
+    fn trace_logdet_hessian_cross_block_roots(
+        &self,
+        a: BlockRootDrift<'_>,
+        b: BlockRootDrift<'_>,
+    ) -> f64 {
+        -(a.scale * b.scale) * self.trace_hinv_block_root_cross(&a, &b)
+    }
+
     fn active_rank(&self) -> usize {
         self.n_dim
     }
 
     fn dim(&self) -> usize {
         self.n_dim
+    }
+
+    /// Componentwise (#2954), the sparse form of [`DenseCholeskyOperator`]'s
+    /// bound. The computed factor is exact for `H + δH` with
+    /// `|δH| ≤ γ_(r+1)·|L||Lᵀ|` (Higham, *Accuracy and Stability of Numerical
+    /// Algorithms*, Thm 10.3, whose `n`-term inner products are here at most
+    /// `r`-term, `r` the most entries in a row of `L`:
+    /// [`gam_linalg::sparse_exact::SparseExactFactor::factor_max_row_nnz`]).
+    /// With `D = diag(H)^(1/2)` and `H̃ = D⁻¹HD⁻¹` the dense argument carries
+    /// over unchanged: `δ log|H| = tr(H⁻¹δH) ≤ p·γ_(r+1)·‖H̃⁻¹‖_F` and
+    /// `‖H̃⁻¹‖_F ≤ tr H̃⁻¹ = Σ_i H_ii·(H⁻¹)_ii`, whose diagonal the selected
+    /// inverse holds exactly.
+    ///
+    /// Without it the sparse exact path published no log-determinant error,
+    /// so the Newton-decrement verdict was never taken there and the same REML
+    /// fit stopped by a different rung on the sparse and the dense design
+    /// (#3294).
+    fn logdet_forward_error(&self) -> Option<f64> {
+        let hessian = self.hessian.as_deref()?;
+        let computed;
+        let inverse = match self.takahashi.as_deref() {
+            Some(inverse) => inverse,
+            None => {
+                computed = self.factor.selected_inverse().ok()?;
+                &computed
+            }
+        };
+        let col_ptr = hessian.symbolic().col_ptr();
+        let row_idx = hessian.symbolic().row_idx();
+        let values = hessian.val();
+        let mut scaled_inverse_trace = 0.0_f64;
+        for i in 0..self.n_dim {
+            let diagonal = (col_ptr[i]..col_ptr[i + 1])
+                .find(|&entry| row_idx[entry] == i)
+                .map(|entry| values[entry])?;
+            scaled_inverse_trace += diagonal.abs() * inverse.get(i, i);
+        }
+        let bound = self.n_dim as f64
+            * gam_linalg::roundoff::accumulation_growth(self.factor.factor_max_row_nnz() + 1)
+            * scaled_inverse_trace;
+        (bound.is_finite() && bound > 0.0).then_some(bound)
     }
 }
 

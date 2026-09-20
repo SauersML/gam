@@ -462,6 +462,23 @@ pub(crate) fn penalty_subspace_reduce_drifts_batched(
         .collect()
 }
 
+/// The kept–dropped blocks `U_Kᵀ · Ḣ · U_D` of every drift, which the exact pseudo-logdet cross
+/// term pairs with the reduced blocks (`PenaltySubspaceTrace::pseudo_logdet_cross`, gam#2952).
+/// Operators are probed through `U_D` the way [`penalty_subspace_reduce_drifts_batched`] probes
+/// them through `U_S`.
+pub(crate) fn penalty_subspace_couple_dropped_drifts_batched(
+    kernel: &PenaltySubspaceTrace,
+    drifts: &[DriftDerivResult],
+) -> Vec<Array2<f64>> {
+    drifts
+        .iter()
+        .map(|drift| match drift {
+            DriftDerivResult::Dense(matrix) => kernel.couple_dropped(matrix),
+            DriftDerivResult::Operator(op) => kernel.couple_dropped_operator(op.as_ref()),
+        })
+        .collect()
+}
+
 pub(crate) fn dense_spectral_trace_logdet_operators_batched(
     ds: &DenseSpectralOperator,
     operators: &[Arc<dyn HyperOperator>],
@@ -469,7 +486,7 @@ pub(crate) fn dense_spectral_trace_logdet_operators_batched(
     if operators.is_empty() {
         return Vec::new();
     }
-    if log::log_enabled!(log::Level::Info) {
+    if log::log_enabled!(log::Level::Debug) {
         let start = std::time::Instant::now();
         let out =
             trace_projected_factors_batched(operators, &ds.g_factor, &ds.projected_factor_cache);

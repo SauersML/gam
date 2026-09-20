@@ -290,10 +290,6 @@ pub struct IntegratedMomentsJet {
     pub mode: IntegratedExpectationMode,
 }
 
-const LOGIT_ERFCX_SIGMA_MIN: f64 = 2.5e-1;
-const LOGIT_TAIL_LOG_MAX: f64 = -18.0;
-const LOGIT_ERFCX_MU_MAX: f64 = 40.0;
-const LOGIT_ERFCX_SIGMA_MAX: f64 = 6.0;
 /// Latent SD above which the logistic-normal *jet* stops trusting Gauss–Hermite
 /// quadrature. The jet integrands are the localized inverse-link derivatives
 /// `sigmoid^(k)` (bumps of characteristic width O(1) in η, hence width O(1/σ) in
@@ -439,23 +435,6 @@ pub(crate) const LOG_SURVIVAL_MAX_MU_DERIVATIVE_ORDER: usize = 8;
 /// region where the tower is equally well conditioned and the rung basis was
 /// being used only because `σ < 8`.
 const LOG_SURVIVAL_TOWER_MAX_LOG_CANCELLATION: f64 = 6.1;
-const LOGIT_MAX_TERMS: usize = 160;
-/// Documented absolute-accuracy contract of the erfcx logistic-normal
-/// backend. The series truncation bound (see `logistic_normal_series_cutoff`)
-/// is guaranteed to be below this tolerance on the mean and its μ-derivative
-/// whenever the backend
-/// returns a value. Beyond the eligibility window or when the a-priori
-/// truncation index would exceed LOGIT_MAX_TERMS, the backend rejects and
-/// the caller routes to GHQ.
-///
-/// Set to 1e-11 so that the erfcx branch only commits to a value when it
-/// can honor the sharp tolerances used by downstream consumers. Oracle and
-/// jet-match tests pin to `max_relative = 1e-10`; at 1e-11 the series rejects
-/// in the central
-/// band near (μ=1.1, σ=0.8) where the tail bound reaches ~2.6e-5 at
-/// N=160, correctly deferring to GHQ which is accurate to ~1e-13 in that
-/// regime after the QR eigenvector fix.
-const LOGIT_ERFCX_ACCURACY_TARGET: f64 = 1.0e-11;
 
 impl QuadratureContext {
     pub fn new() -> Self {
@@ -615,24 +594,17 @@ pub(crate) fn compute_gauss_hermite_n(n: usize) -> GaussHermiteRule {
 /// - μ = ∫ σ(η) × N(η; m, SE²) dη
 /// - dμ/dm = ∫ σ'(η) × N(η; m, SE²) dη = ∫ σ(η)(1-σ(η)) × N(η; m, SE²) dη
 ///
+/// Both come from one pass of the accelerated moment series in
+/// [`logit_posterior_meanwith_deriv_exact`], accurate to working precision at
+/// every finite `(eta, se_eta)`.
+///
 /// Returns: (μ, dμ/dm)
 #[inline]
 pub fn logit_posterior_meanwith_deriv(
     eta: f64,
     se_eta: f64,
 ) -> Result<(f64, f64), EstimationError> {
-    // Production routing for the integrated logistic-normal mean and its
-    // location derivative.
-    //
-    // The backend ladder is:
-    // - exact point-mass limit when sigma ~= 0
-    // - adaptive quadrature at small sigma, where the erfcx series is
-    //   cancellation-prone
-    // - exact erfcx/Faddeeva series on the moderate domain
-    // - a certified extreme-tail asymptotic
-    // - adaptive quadrature wherever no analytic representation carries the
-    //   required accuracy certificate.
-    let out = logit_posterior_meanwith_deriv_controlled(eta, se_eta)?;
+    let out = logit_posterior_meanwith_deriv_exact(eta, se_eta)?;
     Ok((out.mean, out.dmean_dmu))
 }
 
@@ -683,180 +655,167 @@ pub(crate) fn probit_posterior_meanwith_deriv_exact(mu: f64, sigma: f64) -> Inte
     }
 }
 
-#[inline]
-fn logistic_normal_exact_eligible(mu: f64, sigma: f64) -> bool {
-    mu.is_finite()
-        && sigma.is_finite()
-        && mu.abs() <= LOGIT_ERFCX_MU_MAX
-        && (LOGIT_ERFCX_SIGMA_MIN..=LOGIT_ERFCX_SIGMA_MAX).contains(&sigma)
-}
-
-/// A-priori truncation index for the erfcx series of the logistic-normal mean
-/// **and its μ-derivative**, or `None` when no index ≤ `LOGIT_MAX_TERMS` can
-/// certify both to `target_accuracy`.
-///
-/// The representation is
-///
-/// ```text
-/// E[sigmoid(η)] = Φ(m/s)
-///     + (1/2) · exp(-m²/(2s²))
-///       · Σ_{k≥1} (-1)^(k-1) · [erfcx((k s² + m)/(√2 s))
-///                             − erfcx((k s² − m)/(√2 s))]
-/// ```
-///
-/// with m = |μ|, s = σ > 0 (the reflection μ→−μ is applied at the callsite).
-/// The two erfcx arguments scale as k·s/√2 with a fixed offset, so both tend
-/// to +∞ linearly in k. Using the asymptotic erfcx(x) = (1/(x√π))·[1 + O(1/x²)]
-/// for large x, the k-th (signed) term and its μ-derivative have magnitudes
-///
-/// ```text
-/// |T_k|  = m · √(2/π) · exp(-m²/(2s²)) / (k² · s³)        + O(1/k⁴)
-/// |T_k'| = 2 · exp(-m²/(2s²)) · |m²−s²| / (√(2π) · s⁵ · k²) + O(1/k⁴)
-/// ```
-///
-/// Because the series alternates in sign, the truncation tail after N terms is
-/// bounded by the first omitted term — **but only once the terms are past their
-/// magnitude peak**, which sits near k ≈ m/s² (where the erfcx argument
-/// `(k s² − m)/(√2 s)` crosses zero). Below the peak the term magnitudes can
-/// *grow* with k, so the alternating-series remainder bound is invalid there;
-/// truncating before the peak would silently undersell the tail. We therefore
-/// require N to exceed the peak in addition to satisfying both tail bounds:
-///
-/// ```text
-/// |R_N(mean)|  ≤ coeff_mean  / (N+1)²   with coeff_mean  = m·√(2/π)·e^{-m²/2s²}/s³
-/// |R_N(deriv)| ≤ coeff_deriv / (N+1)²   with coeff_deriv = 2·|m²−s²|·e^{-m²/2s²}/(√(2π)·s⁵)
-/// N ≥ ⌈m/s²⌉ + 1                         (past the magnitude peak)
-/// ```
-///
-/// Solving each tail bound for the smallest admissible N and taking the maximum
-/// (also with the peak floor) yields the returned index. Reaching it bounds the
-/// leading-order truncation error of *both* outputs; the adaptive-Simpson
-/// drift-check in `logit_posterior_meanwith_deriv_controlled` remains the hard
-/// backstop for the residual higher-order terms (notably near m ≈ s, where the
-/// `|m²−s²|` derivative coefficient vanishes and the next order dominates).
-#[inline]
-fn logistic_normal_series_cutoff(mu: f64, sigma: f64, target_accuracy: f64) -> Option<usize> {
-    assert!(sigma > 0.0);
-    assert!(target_accuracy > 0.0);
-    let m = mu.abs();
-    let s = sigma;
-    let gauss = (-(m * m) / (2.0 * s * s)).exp();
-    let coeff_mean = m * (2.0_f64 / std::f64::consts::PI).sqrt() * gauss / (s * s * s);
-    let coeff_deriv =
-        2.0 * gauss * (m * m - s * s).abs() / ((2.0 * std::f64::consts::PI).sqrt() * s.powi(5));
-    // Index past which the first-omitted-term bound for a given leading
-    // coefficient drops to `target_accuracy`. A non-finite or already-tiny
-    // coefficient imposes no constraint (returns 0).
-    let asymptotic_index = |coeff: f64| -> f64 {
-        if !coeff.is_finite() || coeff <= target_accuracy {
-            0.0
-        } else {
-            (coeff / target_accuracy).sqrt() - 1.0
-        }
-    };
-    // The alternating-tail bound is only valid past the magnitude peak at
-    // k ≈ m/s²; enforce N strictly beyond it so the remainder ≤ first-omitted
-    // term argument holds for both the mean and the derivative series.
-    let peak_floor = m / (s * s) + 1.0;
-    let required = asymptotic_index(coeff_mean)
-        .max(asymptotic_index(coeff_deriv))
-        .max(peak_floor);
-    if !required.is_finite() || required > LOGIT_MAX_TERMS as f64 {
-        return None;
-    }
-    // Evaluate at least a few pairs to pick up short-range structure the
-    // asymptotic bound undersells; this only ever runs extra certified terms.
-    Some((required.ceil() as usize).max(4))
-}
-
+/// `σ(x)` and `σ'(x) = σ(x)σ(-x)` from `z = e^{-|x|} ∈ (0, 1]`, which never
+/// overflows: `σ(x) = 1/(1+z)` for `x ≥ 0` and `z/(1+z)` otherwise, and
+/// `σ'(x) = z/(1+z)²` on both sides. The tails keep their full relative
+/// accuracy down to the subnormal range and underflow to zero only where
+/// `e^{-|x|}` itself does.
 #[inline]
 fn stable_sigmoidwith_derivative(x: f64) -> (f64, f64) {
-    let x_clamped = x.clamp(-QUADRATURE_EXP_LOG_MAX, QUADRATURE_EXP_LOG_MAX);
-    if x_clamped != x {
-        return (sigmoid(x), 0.0);
-    }
-    if x_clamped >= 0.0 {
-        let z = (-x_clamped).exp();
-        let denom = 1.0 + z;
-        (1.0 / denom, z / (denom * denom))
-    } else {
-        let z = x_clamped.exp();
-        let denom = 1.0 + z;
-        (z / denom, z / (denom * denom))
+    let z = (-x.abs()).exp();
+    let denom = 1.0 + z;
+    let mean = if x >= 0.0 { 1.0 / denom } else { z / denom };
+    (mean, z / (denom * denom))
+}
+
+// ── Logistic-normal integral (F7) ───────────────────────────────────────────
+//
+// `E[σ(η)]` and `E[σ'(η)]`, `η ~ N(μ, s²)`, from ONE accelerated series whose
+// error is bounded a priori, uniformly over `(μ, s)`.
+//
+// Split the real line at the kink-free point `η = 0` and write `t = e^{−|η|}`,
+// so `t ∈ (0, 1]` on both halves. There the logistic and its slope are
+//
+// ```text
+//   η ≤ 0:  σ(η)  = t/(1+t)       η > 0:  σ(η) = 1 − t/(1+t)
+//   both:   σ'(η) = t/(1+t)²
+// ```
+//
+// and every Gaussian expectation of a power `t^j` on a half-line is closed form:
+//
+// ```text
+//   m_j⁻(μ) = E[e^{jη}; η ≤ 0] = e^{jμ + j²s²/2} · Φ(−(μ + j s²)/s),
+//   m_j⁺(μ) = E[e^{−jη}; η > 0] = m_j⁻(−μ).
+// ```
+//
+// The Cohen–Rodriguez Villegas–Zagier weights `w_k` (Experimental Math. 9,
+// 2000, Algorithm 1) define a degree-`n` polynomial `Q(t) = Σ w_k t^k` with
+//
+// ```text
+//   1/(1+t) − Q(t) = P_n(t) / (T_n(3) (1+t)),   |P_n| ≤ 1 on [0, 1],
+// ```
+//
+// `T_n(3) = cosh(n·ln(3+√8))` the Chebyshev polynomial. Integrating against
+// the POSITIVE measures of `t` on each half-line gives
+//
+// ```text
+//   E[σ(η)]  = Φ(μ/s) − Σ_k w_k m⁺_{k+1} + Σ_k w_k m⁻_{k+1},
+//   E[σ'(η)] = −Σ_{k≥1} k w_k (m⁺_k + m⁻_k)          (t/(1+t)² = −t·d/dt 1/(1+t)),
+// ```
+//
+// with RELATIVE errors at most `1/T_n(3)` for the mean (both truncated sums are
+// bounded by the mean itself, since `t/(1+t) ≤ σ` pointwise) and
+// `(4n²+1)/T_n(3)` for the slope (Markov's inequality `|P_n'| ≤ 2n²` on the
+// unit interval). Both are pointwise-in-`t` bounds, so they hold for every
+// `(μ, s)` — there is no regime split, no eligibility window, and nothing for a
+// second evaluator to cross-check. The series this replaces (a heat-kernel /
+// erfcx / tail-asymptotic ladder behind an adaptive-Simpson drift check) spent
+// ~70 µs per row on the check alone.
+
+/// Geometric convergence rate `3 + √8` of the CRVZ acceleration: the degree-`n`
+/// error denominator is `T_n(3) = ((3+√8)^n + (3+√8)^{−n}) / 2`.
+const LOGISTIC_NORMAL_CRVZ_RATE: f64 = 3.0 + 2.0 * SQRT_2;
+
+/// Smallest degree whose a-priori slope bound `(4n²+1)/T_n(3)` (which also
+/// dominates the mean bound `1/T_n(3)`) is at or below the unit roundoff.
+const LOGISTIC_NORMAL_SERIES_TERMS: usize = logistic_normal_series_terms();
+
+const fn logistic_normal_series_terms() -> usize {
+    let unit_roundoff = gam_linalg::roundoff::UNIT_ROUNDOFF;
+    let mut n = 1usize;
+    let mut rate_pow = LOGISTIC_NORMAL_CRVZ_RATE;
+    loop {
+        let chebyshev = 0.5 * (rate_pow + 1.0 / rate_pow);
+        let nf = n as f64;
+        if (4.0 * nf * nf + 1.0) / chebyshev <= unit_roundoff {
+            return n;
+        }
+        n += 1;
+        rate_pow *= LOGISTIC_NORMAL_CRVZ_RATE;
     }
 }
 
-#[inline]
-fn logit_tail_asymptotic(mu: f64, sigma: f64) -> Option<IntegratedMeanDerivative> {
-    // When mu is far out in either logistic tail, sigmoid(eta) is
-    // exponentially close to either exp(eta) or 1 - exp(-eta). Those Gaussian
-    // expectations collapse to lognormal moments, so we can route extreme-|mu|
-    // cases away from both erfcx and GHQ.
-    if mu <= 0.0 {
-        let log_mean = mu + 0.5 * sigma * sigma;
-        if log_mean <= LOGIT_TAIL_LOG_MAX {
-            let mean = safe_exp(log_mean);
-            return Some(IntegratedMeanDerivative {
-                mean,
-                dmean_dmu: mean,
-                mode: IntegratedExpectationMode::ControlledAsymptotic,
-            });
-        }
-    } else {
-        let log_tail = -mu + 0.5 * sigma * sigma;
-        if log_tail <= LOGIT_TAIL_LOG_MAX {
-            let tail = safe_exp(log_tail);
-            return Some(IntegratedMeanDerivative {
-                mean: 1.0 - tail,
-                dmean_dmu: tail,
-                mode: IntegratedExpectationMode::ControlledAsymptotic,
-            });
-        }
-    }
-    None
+/// CRVZ weights `w_k`, plus the suffix sums `Σ_{i≥k} |w_i|` and
+/// `Σ_{i≥k} i·|w_i|` that bound the part of either series not yet summed.
+struct LogisticNormalSeriesWeights {
+    weight: [f64; LOGISTIC_NORMAL_SERIES_TERMS],
+    abs_tail: [f64; LOGISTIC_NORMAL_SERIES_TERMS + 1],
+    index_abs_tail: [f64; LOGISTIC_NORMAL_SERIES_TERMS + 1],
 }
 
+const LOGISTIC_NORMAL_SERIES_WEIGHTS: LogisticNormalSeriesWeights =
+    logistic_normal_series_weights();
+
+const fn logistic_normal_series_weights() -> LogisticNormalSeriesWeights {
+    const N: usize = LOGISTIC_NORMAL_SERIES_TERMS;
+    let nf = N as f64;
+    let mut d = 1.0;
+    let mut i = 0;
+    while i < N {
+        d *= LOGISTIC_NORMAL_CRVZ_RATE;
+        i += 1;
+    }
+    d = 0.5 * (d + 1.0 / d);
+    let mut b = -1.0;
+    let mut c = -d;
+    let mut weight = [0.0; N];
+    let mut k = 0;
+    while k < N {
+        c = b - c;
+        weight[k] = c / d;
+        let kf = k as f64;
+        b = (kf + nf) * (kf - nf) * b / ((kf + 0.5) * (kf + 1.0));
+        k += 1;
+    }
+    let mut abs_tail = [0.0; N + 1];
+    let mut index_abs_tail = [0.0; N + 1];
+    let mut k = N;
+    while k > 0 {
+        k -= 1;
+        abs_tail[k] = abs_tail[k + 1] + weight[k].abs();
+        index_abs_tail[k] = index_abs_tail[k + 1] + (k as f64) * weight[k].abs();
+    }
+    LogisticNormalSeriesWeights {
+        weight,
+        abs_tail,
+        index_abs_tail,
+    }
+}
+
+/// Half-line lognormal moment `m_j⁻(μ) = E[e^{jη}; η ≤ 0]`, `η ~ N(μ, s²)`.
+///
+/// With `x = (μ + j s²)/(√2 s)`, `m = ½ e^{jμ + j²s²/2} erfc(x)`. For `x ≥ 0`
+/// the exponent collapses exactly, `jμ + j²s²/2 − x² = −μ²/(2s²)`, so the
+/// moment is `½ e^{−μ²/(2s²)} erfcx(x)`: no overflow and full relative
+/// accuracy however deep the tail. For `x < 0` the exponent `j(μ + j s²/2)`
+/// is negative and `1 − ½ erfc(|x|) ∈ [½, 1]`, so the direct form loses at most
+/// one bit. `half_gauss = ½ e^{−μ²/(2s²)}` is shared by every `j` and both
+/// halves.
 #[inline]
-fn scaled_erfcx_termwith_derivative(m: f64, s: f64, x: f64, dxdm: f64) -> (f64, f64) {
-    let pref = 0.5 * (-(m * m) / (2.0 * s * s)).exp();
+fn logistic_normal_half_moment(mu: f64, j: f64, s2: f64, sqrt2_s: f64, half_gauss: f64) -> f64 {
+    let x = (mu + j * s2) / sqrt2_s;
     if x >= 0.0 {
-        let ex = erfcx_nonnegative(x);
-        let term = pref * ex;
-        let ex_prime = 2.0 * x * ex - std::f64::consts::FRAC_2_SQRT_PI;
-        let dterm = pref * ((-m / (s * s)) * ex + ex_prime * dxdm);
-        (term, dterm)
+        half_gauss * erfcx_nonnegative(x)
     } else {
-        let lead = (x * x - (m * m) / (2.0 * s * s)).exp();
-        let dlead = lead * (2.0 * x * dxdm - m / (s * s));
-        let (rest, drest) = scaled_erfcx_termwith_derivative(m, s, -x, -dxdm);
-        (lead - rest, dlead - drest)
+        (j * (mu + 0.5 * j * s2)).exp() - half_gauss * erfcx_nonnegative(-x)
     }
 }
 
+/// Logistic-normal mean and location derivative, exact to working precision.
+///
+/// The CRVZ series above, summed until the unsummed remainder — bounded by the
+/// suffix weight sums times the current (largest remaining) moment, since
+/// `m_j` decreases in `j` — falls below the unit roundoff of a lower bound of
+/// each output (`E[σ] ≥ ½(Φ(μ/s) + m_1⁻)` and `E[σ'] ≥ ¼(m_1⁺ + m_1⁻)`, from
+/// `σ ≥ ½` on `η > 0`, `σ ≥ t/2` on `η ≤ 0`, and `σ' ≥ t/4`). Central rows use
+/// all `LOGISTIC_NORMAL_SERIES_TERMS` pairs; tail rows stop early. No
+/// allocation: the weights are compile-time constants.
 pub(crate) fn logit_posterior_meanwith_deriv_exact(
     mu: f64,
     sigma: f64,
 ) -> Result<IntegratedMeanDerivative, EstimationError> {
-    // Analytic entry point for the logistic-normal mean.
-    //
-    // The target objects are
-    //
-    //   mean(mu, sigma)   = E[sigmoid(eta)],
-    //   dmean/dmu         = E[sigmoid(eta) * (1 - sigmoid(eta))],
-    //   eta ~ N(mu, sigma^2).
-    //
-    // No single representation is numerically dominant everywhere:
-    // - sigma ~= 0 is the exact point-mass limit,
-    // - small sigma uses adaptive quadrature because the erfcx series is
-    //   cancellation-prone and a finite heat-kernel truncation is not exact,
-    // - moderate central cases prefer the exact erfcx/Faddeeva series,
-    // - and extreme tails / very large sigma prefer controlled asymptotics.
-    //
-    // Validation target for this ladder: compare against high-order GHQ
-    // (e.g. 128 nodes) on sigma in {0.01, 0.1, 1, 5, 20, 100} and mu on
-    // [-10, 10] to confirm the regime transitions.
     if !(mu.is_finite() && sigma.is_finite()) {
-        crate::bail_invalid_estim!("logit exact expectation requires finite mu and sigma");
+        crate::bail_invalid_estim!("logit integrated moments require finite mu and sigma");
     }
     // The point-mass limit `σ(μ)` differs from `E[σ(μ + σZ)]` by `½σ²σ''(μ) + O(σ⁴)`,
     // and the logistic has `|σ''/σ| ≤ 1` (and `|σ'''/σ'| ≤ 1` for the derivative),
@@ -869,159 +828,47 @@ pub(crate) fn logit_posterior_meanwith_deriv_exact(
             mode: IntegratedExpectationMode::ExactClosedForm,
         });
     }
-    if let Some(out) = logit_tail_asymptotic(mu, sigma) {
-        return Ok(out);
-    }
-    if logistic_normal_exact_eligible(mu, sigma)
-        && let Ok(out) = logit_posterior_meanwith_deriv_exact_erfcx(mu, sigma)
-    {
-        return Ok(out);
-    }
-    // No analytic representation carries an accuracy certificate here: the
-    // erfcx series was ineligible or could not certify its truncation within
-    // LOGIT_MAX_TERMS. We deliberately return Err rather than fall back to the
-    // Monahan-Stefanski probit approximation (Φ(μκ)), which carries ~1e-1
-    // absolute error at moderate σ and, being returned as `Ok`, would bypass
-    // the controlled router's drift-check and corrupt the posterior mean
-    // (#571). The router maps this Err to the accurate adaptive-Simpson
-    // fallback instead.
-    Err(EstimationError::InvalidInput(
-        "logit analytic expectation has no certified representation in this regime".to_string(),
-    ))
-}
+    const N: usize = LOGISTIC_NORMAL_SERIES_TERMS;
+    let weights = &LOGISTIC_NORMAL_SERIES_WEIGHTS;
+    let unit_roundoff = gam_linalg::roundoff::UNIT_ROUNDOFF;
+    let s2 = sigma * sigma;
+    let sqrt2_s = SQRT_2 * sigma;
+    let standardized = mu / sigma;
+    let half_gauss = 0.5 * (-0.5 * standardized * standardized).exp();
+    let upper_mass = gam_math::probability::normal_cdf(standardized);
 
-fn logit_posterior_meanwith_deriv_exact_erfcx(
-    mu: f64,
-    sigma: f64,
-) -> Result<IntegratedMeanDerivative, EstimationError> {
-    // Real-valued erfcx-series implementation for the logistic-normal mean.
-    //
-    //   sigmoid(x) = 1/2 + (1/2)·tanh(x/2),
-    //
-    // the partial-fraction expansion of tanh over its odd imaginary poles
-    // ±i·(2n−1)π turns E[sigmoid(η)] into a convergent alternating series of
-    // scaled-erfcx terms:
-    //
-    //   E[sigmoid(η)] = Φ(m/s)
-    //     + (1/2)·exp(−m²/(2s²)) · Σ_{k≥1} (−1)^(k−1)
-    //       · [erfcx((k s² + m)/(√2 s)) − erfcx((k s² − m)/(√2 s))],
-    //
-    // with m = |μ|, s = σ, and the sign of μ recovered by mean ↦ 1 − mean
-    // below. Differentiating term-by-term in μ gives the derivative sum
-    // produced by `scaled_erfcx_termwith_derivative`.
-    //
-    // The truncation index N* is chosen so that the alternating-series tail
-    // bound for BOTH the mean and its μ-derivative, evaluated past the series
-    // magnitude peak (see `logistic_normal_series_cutoff`), is below the
-    // documented `LOGIT_ERFCX_ACCURACY_TARGET`. Reaching N* is thus an a-priori
-    // estimate of accuracy for both outputs; the adaptive-Simpson drift-check
-    // in the controlled router is the hard backstop. The only way this routine
-    // rejects is when N* would exceed LOGIT_MAX_TERMS, at which point the
-    // accuracy contract cannot be honored and the caller routes elsewhere.
-    let m = mu.abs();
-    let s = sigma;
-    let z = SQRT_2 * s;
-    let phi_term = gam_math::probability::normal_cdf(m / s);
-    let phi_prime = gam_math::probability::normal_pdf(m / s) / s;
-    let Some(max_k) = logistic_normal_series_cutoff(mu, sigma, LOGIT_ERFCX_ACCURACY_TARGET) else {
-        crate::bail_invalid_estim!(
-            "logit erfcx series truncation bound exceeds LOGIT_MAX_TERMS at the required accuracy"
-                .to_string(),
-        );
-    };
-
-    let mut sum = 0.0_f64;
-    let mut dsum = 0.0_f64;
-    // Run to the a-priori truncation index. No empirical early exit: the pair
-    // magnitude inside the loop decays as O(1/k³) (the leading 1/k² cancels
-    // between consecutive-sign terms) while the truncation tail after index k
-    // only decays as O(1/k²), so pair-magnitude is anti-conservative as an
-    // exit criterion — stopping early when `|pair| < δ` would leave a tail
-    // much larger than δ. `max_k` was chosen so that the tail bound itself is
-    // below the accuracy target, and that is the stopping rule we honor here.
-    let mut k = 1usize;
-    while k <= max_k {
-        for kk in [k, k + 1].into_iter().filter(|kk| *kk <= max_k) {
-            let kf = kk as f64;
-            let a = (kf * s * s + m) / z;
-            let b = (kf * s * s - m) / z;
-            let sign = if kk % 2 == 1 { 1.0 } else { -1.0 };
-            let (va, dva) = scaled_erfcx_termwith_derivative(m, s, a, 1.0 / z);
-            let (vb, dvb) = scaled_erfcx_termwith_derivative(m, s, b, -1.0 / z);
-            sum += sign * (va - vb);
-            dsum += sign * (dva - dvb);
+    let mut mean_series = 0.0;
+    let mut slope_series = 0.0;
+    let mut mean_floor = 0.0;
+    let mut slope_floor = 0.0;
+    for j in 1..=N {
+        let jf = j as f64;
+        let lower = logistic_normal_half_moment(mu, jf, s2, sqrt2_s, half_gauss);
+        let upper = logistic_normal_half_moment(-mu, jf, s2, sqrt2_s, half_gauss);
+        // m_j enters the mean with w_{j−1} and the slope with j·w_j.
+        mean_series += weights.weight[j - 1] * (lower - upper);
+        if j < N {
+            slope_series += jf * weights.weight[j] * (lower + upper);
         }
-        k += 2;
+        if j == 1 {
+            mean_floor = 0.5 * (upper_mass + lower);
+            slope_floor = 0.25 * (lower + upper);
+        }
+        let largest_remaining = lower + upper;
+        if largest_remaining * weights.abs_tail[j] <= unit_roundoff * mean_floor
+            && largest_remaining * weights.index_abs_tail[(j + 1).min(N)]
+                <= unit_roundoff * slope_floor
+        {
+            break;
+        }
     }
-
-    let mut mean = phi_term + sum;
-    let dmean = (phi_prime + dsum).max(0.0);
-    if mu < 0.0 {
-        mean = 1.0 - mean;
-    }
-    if !(mean.is_finite() && dmean.is_finite() && dmean >= 0.0) {
-        crate::bail_invalid_estim!("logit erfcx expectation produced non-finite values");
-    }
+    let mean = (upper_mass + mean_series).clamp(0.0, 1.0);
+    let dmean_dmu = (-slope_series).max(0.0);
     Ok(IntegratedMeanDerivative {
         mean,
-        dmean_dmu: dmean,
+        dmean_dmu,
         mode: IntegratedExpectationMode::ExactSpecialFunction,
     })
-}
-
-/// Accurate logistic-normal mean and location-derivative via adaptive Simpson.
-/// `sigmoid` and `sigmoid' = sigmoid·(1−sigmoid)` are smooth and bounded, so
-/// `integrate_normal_adaptive` resolves both to ~1e-12 at every sigma — the
-/// trusted reference / fallback when the closed-form ladder is out of regime.
-#[inline]
-fn logit_posterior_meanwith_deriv_quadrature(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
-    let mean = integrate_normal_adaptive(mu, sigma, |x| stable_sigmoidwith_derivative(x).0);
-    let dmean_dmu =
-        integrate_normal_adaptive(mu, sigma, |x| stable_sigmoidwith_derivative(x).1).max(0.0);
-    IntegratedMeanDerivative {
-        mean,
-        dmean_dmu,
-        mode: IntegratedExpectationMode::QuadratureFallback,
-    }
-}
-
-#[inline]
-fn logit_posterior_meanwith_deriv_controlled(
-    mu: f64,
-    sigma: f64,
-) -> Result<IntegratedMeanDerivative, EstimationError> {
-    if !(mu.is_finite() && sigma.is_finite()) {
-        crate::bail_invalid_estim!("logit integrated moments require finite mu and sigma");
-    }
-    let candidate = match logit_posterior_meanwith_deriv_exact(mu, sigma) {
-        Ok(out) => out,
-        Err(_) => return Ok(logit_posterior_meanwith_deriv_quadrature(mu, sigma)),
-    };
-    // Defense-in-depth drift-check. The erfcx series now sizes its truncation
-    // from the per-output tail bounds past the magnitude peak (mean AND
-    // derivative — see `logistic_normal_series_cutoff`), so the
-    // `ExactSpecialFunction` candidate is accurate by construction; the
-    // adaptive-Simpson reference confirms it and absorbs the residual
-    // higher-order terms (e.g. near m ≈ s where the derivative coefficient
-    // vanishes). `ControlledAsymptotic` covers only the extreme-|μ|
-    // lognormal-collapse approximation, which is likewise confirmed against
-    // the reference. Small-σ, exact point-mass, and erfcx-ineligible regimes
-    // route to their mathematically appropriate implementations rather than
-    // returning a tolerance-accepted finite Taylor truncation (#571, #2623).
-    match candidate.mode {
-        IntegratedExpectationMode::ExactSpecialFunction
-        | IntegratedExpectationMode::ControlledAsymptotic => {
-            let reference = logit_posterior_meanwith_deriv_quadrature(mu, sigma);
-            if integrated_mean_derivative_drift_exceeds(
-                &candidate, &reference, 1e-6, 1e-4, 1e-7, 1e-3,
-            ) {
-                Ok(reference)
-            } else {
-                Ok(candidate)
-            }
-        }
-        _ => Ok(candidate),
-    }
 }
 
 /// One Laplace-localized Clenshaw–Curtis panel for the log-space survival
@@ -1781,6 +1628,17 @@ fn adaptive_simpson_refine(
         + adaptive_simpson_refine(g, m, b, fm, fb, frm, right, 0.5 * tol, depth - 1)
 }
 
+/// Standardized half-width of the adaptive Gaussian window: `φ(15)/φ(0) =
+/// e^{-112.5}`, far below f64 resolution of any integral it bounds.
+const NORMAL_ADAPTIVE_HALF_WIDTH: f64 = 15.0;
+/// Initial panel count of the adaptive Gaussian window, fine enough that a
+/// transition cannot fall entirely between sampled points.
+const NORMAL_ADAPTIVE_INITIAL_PANELS: usize = 24;
+/// Adaptive-Simpson acceptance tolerance on the (peak-normalized) integrand.
+const NORMAL_ADAPTIVE_TOL: f64 = 1e-12;
+/// Adaptive-Simpson bisection depth limit.
+const NORMAL_ADAPTIVE_MAX_DEPTH: i32 = 40;
+
 /// Accurate Gaussian expectation `E[f(mu + sigma·Z)]`, `Z ~ N(0,1)`, via
 /// panelized adaptive Simpson over the standardized window `u ∈ [-K, K]`.
 ///
@@ -1802,10 +1660,10 @@ fn integrate_normal_adaptive(mu: f64, sigma: f64, f: impl Fn(f64) -> f64) -> f64
     if !(sigma.is_finite()) || sigma <= 0.0 {
         return f(mu);
     }
-    const K: f64 = 15.0;
-    const INITIAL_PANELS: usize = 24;
-    const TOL: f64 = 1e-12;
-    const MAX_DEPTH: i32 = 40;
+    const K: f64 = NORMAL_ADAPTIVE_HALF_WIDTH;
+    const INITIAL_PANELS: usize = NORMAL_ADAPTIVE_INITIAL_PANELS;
+    const TOL: f64 = NORMAL_ADAPTIVE_TOL;
+    const MAX_DEPTH: i32 = NORMAL_ADAPTIVE_MAX_DEPTH;
     let inv_sqrt_2pi = 1.0 / (2.0 * std::f64::consts::PI).sqrt();
     // Integrand in standardized coordinates: f(mu + sigma·u) · φ(u). A coarse
     // initial panel grid guarantees the transition cannot fall entirely
@@ -2074,7 +1932,7 @@ pub fn integrated_inverse_link_mean_and_derivative(
             })
         }
         LinkFunction::Probit => Ok(probit_posterior_meanwith_deriv_exact(mu, sigma)),
-        LinkFunction::Logit => logit_posterior_meanwith_deriv_controlled(mu, sigma),
+        LinkFunction::Logit => logit_posterior_meanwith_deriv_exact(mu, sigma),
         LinkFunction::CLogLog => Ok(cloglog_posterior_meanwith_deriv_controlled(quadctx, mu, sigma)),
         LinkFunction::LogLog | LinkFunction::Cauchit => {
             // The outer arm restricts `link` to exactly these two variants.
@@ -2107,7 +1965,156 @@ pub fn integrated_inverse_link_mean_and_derivative(
             dmean_dmu: 1.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
         }),
+        LinkFunction::Sqrt => {
+            let jet = sqrt_link_posterior_jet(mu, sigma)?;
+            Ok(IntegratedMeanDerivative {
+                mean: jet.mean,
+                dmean_dmu: jet.d1,
+                mode: jet.mode,
+            })
+        }
+        LinkFunction::Inverse | LinkFunction::InverseSquared => {
+            let jet = reciprocal_link_posterior_jet(link, mu, sigma)?;
+            Ok(IntegratedMeanDerivative {
+                mean: jet.mean,
+                dmean_dmu: jet.d1,
+                mode: jet.mode,
+            })
+        }
     }
+}
+
+/// Posterior mean of the square-root link's inverse `μ = η²` under
+/// `η ~ N(mu, sigma²)`, with its `mu`-derivatives: `E[η²] = mu² + sigma²`,
+/// exactly, so the jet is `(mu² + sigma², 2 mu, 2, 0)`.
+///
+/// The linear predictor itself must lie in the link's domain `η > 0`: the
+/// square-root link is the branch `η = √μ`, and a posterior centred on or
+/// below zero describes no mean on that branch.
+fn sqrt_link_posterior_jet(mu: f64, sigma: f64) -> Result<IntegratedInverseLinkJet, EstimationError> {
+    if !(mu.is_finite() && mu > 0.0 && sigma.is_finite() && sigma >= 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "{} link posterior mean requires a finite linear predictor inside its domain eta > 0 \
+             and a finite nonnegative standard error; got eta = {mu}, se = {sigma}",
+            LinkFunction::Sqrt.name()
+        )));
+    }
+    Ok(IntegratedInverseLinkJet {
+        mean: mu.mul_add(mu, sigma * sigma),
+        d1: 2.0 * mu,
+        d2: 2.0,
+        d3: 0.0,
+        mode: IntegratedExpectationMode::ExactClosedForm,
+    })
+}
+
+/// Posterior mean of a reciprocal-power inverse link, `μ = η^{-1}` or
+/// `μ = η^{-1/2}`, under `η ~ N(mu, sigma²)`, with its `mu`-derivatives.
+///
+/// The Gaussian has mass on `η ≤ 0`, where `1/η` is not integrable and
+/// `η^{-1/2}` is not real, so the mean is the real part of `E[g⁻¹(η + i0)]`:
+/// the Cauchy principal value (via Dawson's integral) for `1/η` and the
+/// positive-half integral for `η^{-1/2}`. Both reduce to the plug-in at
+/// `sigma = 0` and match the moment expansion of `g⁻¹` about `mu` to every
+/// order (see `gam_math::gaussian_reciprocal`).
+///
+/// The linear predictor itself must lie in the link's domain `η > 0`: a
+/// posterior centred on or below zero describes no positive mean.
+fn reciprocal_link_posterior_jet(
+    link: LinkFunction,
+    mu: f64,
+    sigma: f64,
+) -> Result<IntegratedInverseLinkJet, EstimationError> {
+    if !(mu.is_finite() && mu > 0.0 && sigma.is_finite() && sigma >= 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "{} link posterior mean requires a finite linear predictor inside its domain eta > 0 \
+             and a finite nonnegative standard error; got eta = {mu}, se = {sigma}",
+            link.name()
+        )));
+    }
+    let [mean, d1, d2, d3] = match link {
+        LinkFunction::Inverse => gam_math::gaussian_reciprocal::principal_value_inverse_normal_jet(mu, sigma),
+        LinkFunction::InverseSquared => {
+            // `η^{-1/2}` is the inverse of the `1/μ²` link.
+            gam_math::gaussian_reciprocal::positive_part_inverse_sqrt_normal_jet(mu, sigma)
+        }
+        other => {
+            return Err(EstimationError::InvalidInput(format!(
+                "reciprocal-link posterior mean reached non-reciprocal link {other:?}"
+            )));
+        }
+    };
+    if ![mean, d1, d2, d3].iter().all(|value| value.is_finite()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "{} link posterior mean is not representable at eta = {mu}, se = {sigma}",
+            link.name()
+        )));
+    }
+    Ok(IntegratedInverseLinkJet {
+        mean,
+        d1,
+        d2,
+        d3,
+        mode: if sigma == 0.0 {
+            IntegratedExpectationMode::ExactClosedForm
+        } else {
+            IntegratedExpectationMode::ExactSpecialFunction
+        },
+    })
+}
+
+/// Posterior mean and variance of a reciprocal-power inverse link under
+/// `η ~ N(mu, sigma²)`, on the same analytic continuation `η + i0` that
+/// defines the posterior mean (`reciprocal_link_posterior_jet`).
+///
+/// The second moment is `Re E[g⁻¹(η + i0)²]`:
+///
+/// - inverse link: `(η + i0)^{-2}`, whose real expectation is the Hadamard
+///   finite part `−d/dm PV E[1/η]`, i.e. minus the first derivative of the
+///   principal-value jet;
+/// - inverse-squared link: `((η + i0)^{-1/2})² = (η + i0)^{-1}`, whose real
+///   expectation is the principal value `PV E[1/η]`.
+///
+/// Both match the moment expansion of `g⁻¹(η)²` about `mu` to every order, so
+/// the variance agrees with the exact moments of any posterior that keeps its
+/// mass away from the pole. A negative difference means the posterior reaches
+/// the pole so closely that no response-scale variance exists; that is
+/// reported as an error rather than clamped.
+pub fn reciprocal_link_posterior_meanvariance(
+    link: LinkFunction,
+    mu: f64,
+    sigma: f64,
+) -> Result<(f64, f64), EstimationError> {
+    let mean = reciprocal_link_posterior_jet(link, mu, sigma)?.mean;
+    let second_moment = match link {
+        LinkFunction::Inverse => {
+            -gam_math::gaussian_reciprocal::principal_value_inverse_normal_jet(mu, sigma)[1]
+        }
+        LinkFunction::InverseSquared => {
+            gam_math::gaussian_reciprocal::principal_value_inverse_normal_jet(mu, sigma)[0]
+        }
+        other => {
+            return Err(EstimationError::InvalidInput(format!(
+                "reciprocal-link posterior variance reached non-reciprocal link {other:?}"
+            )));
+        }
+    };
+    if sigma == 0.0 {
+        return Ok((mean, 0.0));
+    }
+    // `second_moment − mean²` cancels when `sigma ≪ mu`; a difference below
+    // the rounding of its two operands is a zero variance, not a missing one.
+    let rounding = 4.0 * f64::EPSILON * second_moment.abs().max(mean * mean);
+    let variance = second_moment - mean * mean;
+    let variance = if variance < 0.0 && -variance <= rounding { 0.0 } else { variance };
+    if !(variance.is_finite() && variance >= 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "{} link posterior variance does not exist at eta = {mu}, se = {sigma}: the \
+             linear-predictor posterior reaches the link's pole at eta = 0",
+            link.name()
+        )));
+    }
+    Ok((mean, variance))
 }
 
 #[inline]
@@ -2150,13 +2157,7 @@ pub(crate) fn integrated_inverse_link_jet(
             let mode = if sigma <= 0.0 {
                 IntegratedExpectationMode::ExactClosedForm
             } else {
-                // Mirror the scalar controlled-path mode when it accepts the
-                // exact erfcx backend; otherwise the node-sum above is a
-                // quadrature fallback.
-                match logit_posterior_meanwith_deriv_controlled(mu, sigma) {
-                    Ok(scalar) => scalar.mode,
-                    Err(_) => IntegratedExpectationMode::QuadratureFallback,
-                }
+                IntegratedExpectationMode::QuadratureFallback
             };
             Ok(IntegratedInverseLinkJet {
                 mean,
@@ -2207,6 +2208,10 @@ pub(crate) fn integrated_inverse_link_jet(
             d3: 0.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
         }),
+        LinkFunction::Sqrt => sqrt_link_posterior_jet(mu, sigma),
+        LinkFunction::Inverse | LinkFunction::InverseSquared => {
+            reciprocal_link_posterior_jet(link, mu, sigma)
+        }
     }
 }
 
@@ -2222,7 +2227,7 @@ pub(crate) fn integrated_inverse_link_jet(
 /// scalar backend's mode for the regime.
 #[inline]
 fn logit_wide_sigma_jet(mu: f64, sigma: f64) -> Result<IntegratedInverseLinkJet, EstimationError> {
-    let scalar = logit_posterior_meanwith_deriv_controlled(mu, sigma)?;
+    let scalar = logit_posterior_meanwith_deriv_exact(mu, sigma)?;
     let d2 = integrate_normal_adaptive(mu, sigma, |x| {
         component_point_jet(LinkComponent::Logit, x).2
     });
@@ -2260,37 +2265,6 @@ fn worse_integrated_expectation_mode(
 }
 
 #[inline]
-fn integrated_scalar_drift_exceeds(
-    candidate: f64,
-    reference: f64,
-    abs_tol: f64,
-    rel_tol: f64,
-) -> bool {
-    if !(candidate.is_finite() && reference.is_finite()) {
-        return true;
-    }
-    (candidate - reference).abs() > abs_tol.max(rel_tol * reference.abs().max(candidate.abs()))
-}
-
-#[inline]
-fn integrated_mean_derivative_drift_exceeds(
-    candidate: &IntegratedMeanDerivative,
-    reference: &IntegratedMeanDerivative,
-    mean_abs_tol: f64,
-    mean_rel_tol: f64,
-    deriv_abs_tol: f64,
-    deriv_rel_tol: f64,
-) -> bool {
-    integrated_scalar_drift_exceeds(candidate.mean, reference.mean, mean_abs_tol, mean_rel_tol)
-        || integrated_scalar_drift_exceeds(
-            candidate.dmean_dmu,
-            reference.dmean_dmu,
-            deriv_abs_tol,
-            deriv_rel_tol,
-        )
-}
-
-#[inline]
 fn component_point_jet(component: LinkComponent, x: f64) -> (f64, f64, f64, f64) {
     // Keep the point-mass quadrature kernels wired to the same inverse-link
     // implementation used by mixture links and survival residual distributions.
@@ -2312,7 +2286,7 @@ fn integrated_mixture_component_jet(
     match component {
         LinkComponent::Logit => integrated_inverse_link_jet(ctx, LinkFunction::Logit, mu, sigma)
             .unwrap_or_else(|error| {
-                log::debug!(
+                log::trace!(
                     "integrated logit jet at (mu={mu}, sigma={sigma}) fell back to GHQ: {error}"
                 );
                 integrated_logit_jet_ghq(ctx, mu, sigma)
@@ -2614,9 +2588,63 @@ pub fn integrated_family_moments_jet(
             let variance = resolved_scale
                 .gaussian_phi()
                 .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            // Identity or the reciprocal link; the legality table admits no other.
+            let jet = integrated_inverse_link_jet(quadctx, spec.link.link_function(), e, se)?;
+            Ok(IntegratedMomentsJet {
+                mean: jet.mean,
+                variance,
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            })
+        }
+        ResponseFamily::Gamma | ResponseFamily::InverseGaussian
+            if !matches!(spec.link, InverseLink::Standard(StandardLink::Log)) =>
+        {
+            // Reciprocal links: `1/μ` (Gamma) or `1/μ²` (inverse Gaussian).
+            let jet = integrated_inverse_link_jet(quadctx, spec.link.link_function(), e, se)?;
+            let mean = jet.mean;
+            let variance = if matches!(spec.response, ResponseFamily::Gamma) {
+                resolved_scale
+                    .gamma_phi()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?
+                    * mean
+                    * mean
+            } else {
+                resolved_scale
+                    .dispersion_phi()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?
+                    * mean
+                    * mean
+                    * mean
+            };
+            if !(variance.is_finite() && variance >= 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "integrated {} variance is not representable: {variance:?}",
+                    spec.response.name()
+                )));
+            }
+            Ok(IntegratedMomentsJet {
+                mean,
+                variance,
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            })
+        }
+        ResponseFamily::StudentT { sigma, nu } => {
+            // Identity link: the mean is exact; the response variance
+            // `σ²ν/(ν−2)` exists only for `ν > 2`.
+            if !(*nu > 2.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Student-t response variance does not exist at nu={nu} (requires nu > 2)"
+                )));
+            }
             Ok(IntegratedMomentsJet {
                 mean: e,
-                variance,
+                variance: sigma * sigma * nu / (nu - 2.0),
                 d1: 1.0,
                 d2: 0.0,
                 d3: 0.0,
@@ -2660,8 +2688,9 @@ pub fn integrated_family_moments_jet(
         ResponseFamily::Poisson
         | ResponseFamily::Tweedie { .. }
         | ResponseFamily::NegativeBinomial { .. }
-        | ResponseFamily::Gamma => {
-            // Log-normal MGF: E[exp(η)] = exp(e + s²/2)
+        | ResponseFamily::Gamma
+        | ResponseFamily::InverseGaussian => {
+            // Log link. Log-normal MGF: E[exp(η)] = exp(e + s²/2)
             // d/de = exp(e + s²/2)   (same as the mean)
             // d²/de² = exp(e + s²/2)
             // d³/de³ = exp(e + s²/2)
@@ -2672,6 +2701,7 @@ pub fn integrated_family_moments_jet(
             //   Tweedie(p):        Var = φ · m^p           (φ from `scale`)
             //   NegativeBinomial:  Var = m + m² / theta    (φ ≡ 1, overdispersion in theta)
             //   Gamma (shape k):   Var = m² / k = φ · m²   (k from `scale`, φ = 1/k)
+            //   InverseGaussian:   Var = φ · m³            (φ from `scale`)
             // The Tweedie φ and Gamma shape are genuine free dispersion parameters
             // (see `LikelihoodScaleMetadata`), so they are read from `scale` rather
             // than assumed unit. A Gamma/Tweedie response whose `scale` does not
@@ -2697,9 +2727,15 @@ pub fn integrated_family_moments_jet(
                         .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
                     phi * mean * mean
                 }
-                // Unreachable: this match arm is only entered for the four families
-                // in the enclosing `Poisson | Tweedie | NegativeBinomial | Gamma`
-                // pattern, all handled above.
+                ResponseFamily::InverseGaussian => {
+                    let phi = resolved_scale
+                        .dispersion_phi()
+                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+                    phi * mean * mean * mean
+                }
+                // Unreachable: this match arm is only entered for the five families
+                // in the enclosing `Poisson | Tweedie | NegativeBinomial | Gamma |
+                // InverseGaussian` pattern, all handled above.
                 other => {
                     return Err(EstimationError::InvalidInput(format!(
                         "integrated log-normal moments reached unexpected family {other:?}"
@@ -3427,26 +3463,212 @@ pub(crate) fn probit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
     gam_math::probability::normal_cdf(eta / denom)
 }
 
-#[inline]
-pub fn logit_posterior_meanvariance(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> (f64, f64) {
-    let (m1, m2) = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
-        let p = sigmoid(x);
-        (p, p * p)
-    });
-    let m1 = m1.clamp(0.0, 1.0);
-    let m2 = m2.clamp(0.0, 1.0);
-    (m1, (m2 - m1 * m1).max(0.0))
+/// Integral `∫_{t ≥ 0} exp(log_h(t)) dt / √(2π)` of one lobe of a Gaussian
+/// central-moment integrand over the half-line, where `log_h` is strongly
+/// concave with curvature `≤ −1` (it carries the standard-normal kernel
+/// `−t²/2` plus a concave log-gap) and rises to `+∞` slope as `t → 0⁺`.
+///
+/// `jet(t)` returns `(log_h, log_h′, log_h″)` at `t > 0`.
+///
+/// Strong log-concavity makes the integral a well-conditioned target: the lobe
+/// is unimodal with peak `t̂`, and `h(t) ≤ h(t̂)·exp(−(t − t̂)²/2)`, so the
+/// window `[max(0, t̂ − K), t̂ + K]` holds all of its mass to `exp(−K²/2)`
+/// relative. The integrand is normalized by its peak before integration, so
+/// the result keeps full relative precision however far below the f64 floor
+/// the lobe's absolute magnitude sits once exponentiated at the end — the log
+/// of the result is returned so callers can combine lobes before leaving the
+/// log domain.
+fn strongly_log_concave_half_line_log_integral(
+    start: f64,
+    jet: impl Fn(f64) -> (f64, f64, f64),
+) -> f64 {
+    // Peak: Newton on `log_h′ = 0` with the analytic curvature, kept inside a
+    // bracket `(a, b)` on which `log_h′` changes sign. `log_h′ → +∞` at `0⁺`
+    // gives `a = 0`; wherever `log_h′(t) > 0`, curvature `≤ −1` gives
+    // `t̂ ≤ t + log_h′(t)`, and wherever `log_h′(t) < 0`, `t̂ < t`. A Newton
+    // iterate outside the bracket is replaced by its midpoint, so the bracket
+    // shrinks every step and the iteration ends at f64 resolution of `t̂`.
+    let (mut a, mut b) = (0.0_f64, f64::INFINITY);
+    let mut t = start;
+    let (log_peak, curvature) = loop {
+        let (lh, d1, d2) = jet(t);
+        if !(lh.is_finite() && d1.is_finite() && d2.is_finite()) {
+            // `mu ± sigma·t` rounds to `mu`: the lobe sits below the f64
+            // resolution of the linear predictor and carries no mass there.
+            return f64::NEG_INFINITY;
+        }
+        if d1 > 0.0 {
+            a = t;
+            b = b.min(t + d1);
+        } else if d1 < 0.0 {
+            b = t;
+        } else {
+            break (lh, d2);
+        }
+        let newton = t - d1 / d2;
+        let next = if newton > a && newton <= b { newton } else { 0.5 * (a + b) };
+        if (next - t).abs() <= f64::EPSILON * t {
+            break (lh, d2);
+        }
+        t = next;
+    };
+    let t_hat = t;
+    let lh = |t: f64| jet(t).0;
+    let g = |t: f64| (lh(t) - log_peak).exp();
+    let lo = (t_hat - NORMAL_ADAPTIVE_HALF_WIDTH).max(0.0);
+    let hi = t_hat + NORMAL_ADAPTIVE_HALF_WIDTH;
+    // The peak-normalized lobe has Laplace mass `√(2π/|log_h″(t̂)|)`; scaling
+    // the tolerance by it makes the acceptance test relative, so a lobe
+    // sharper than the kernel is resolved as tightly as a wide one.
+    let tol = NORMAL_ADAPTIVE_TOL * (2.0 * std::f64::consts::PI / -curvature).sqrt();
+    // Split the window at the peak so the maximum is a panel node and each
+    // side is monotone.
+    let half_panels = NORMAL_ADAPTIVE_INITIAL_PANELS / 2;
+    let mut normalized = 0.0;
+    for (left, right) in [(lo, t_hat), (t_hat, hi)] {
+        if right <= left {
+            continue;
+        }
+        let panel = (right - left) / half_panels as f64;
+        for p in 0..half_panels {
+            let pa = left + p as f64 * panel;
+            let pb = if p + 1 == half_panels { right } else { pa + panel };
+            let (fa, fb, fm) = (g(pa), g(pb), g(0.5 * (pa + pb)));
+            let whole = (pb - pa) / 6.0 * (fa + 4.0 * fm + fb);
+            normalized += adaptive_simpson_refine(
+                &g,
+                pa,
+                pb,
+                fa,
+                fb,
+                fm,
+                whole,
+                tol,
+                NORMAL_ADAPTIVE_MAX_DEPTH,
+            );
+        }
+    }
+    log_peak + normalized.ln() - 0.5 * (2.0 * std::f64::consts::PI).ln()
 }
 
+/// Log-domain local jet of an increasing inverse link `p` about the centre
+/// `mu`, at the offset `u = x − mu ≠ 0`: `(ln|p(x) − p(mu)|, ln p′(x),
+/// p″(x)/p′(x))`.
+type LinkGapJet = (f64, f64, f64);
+
+/// `Var[p(η)]` for `η ~ N(mu, sigma²)` and an increasing inverse link `p`
+/// whose values `p` and `1 − p` are both log-concave (logit and probit).
+///
+/// The raw-moment form `E[p²] − E[p]²` cancels catastrophically once the
+/// posterior SD of `p` falls below `√ε` of its mean — exactly the saturated
+/// regime (separation, `|η| ≫ 1`) where a response-scale SD matters most.
+/// Instead the moments are taken about `p(mu)`: with `d(x) = p(x) − p(mu)`,
+/// `Var[p] = E[d²] − E[d]²`, and Cauchy–Schwarz on each half-line gives
+/// `E[d]² ≤ E[d²]/2`, so the subtraction loses at most one bit.
+///
+/// Splitting at `x = mu` gives two lobes in standardized coordinates
+/// `x = mu + s·sigma·t`, `s = ±1`, `t ≥ 0`, with log-integrand
+/// `−t²/2 + k·ln|d|`. On each side `ln|d|` is concave (`ln(p(x) − p(mu))` for
+/// `x > mu` by log-concavity of `p`, `ln(p(mu) − p(x))` for `x < mu` by
+/// log-concavity of `1 − p`), so every lobe is strongly log-concave and is
+/// integrated in the log domain by
+/// [`strongly_log_concave_half_line_log_integral`]. With `q = p′(x)/|d(x)|`
+/// and `ℓ = p″(x)/p′(x)`, the lobe's derivatives in `t` are
+/// `−t + k·sigma·q` and `−1 + k·sigma·q·(s·sigma·ℓ − sigma·q)`; concavity of
+/// `ln|d|` is exactly `s·ℓ·q − q² ≤ 0`. `gap_jet(u)` returns the [`LinkGapJet`] at
+/// `x = mu + u`, evaluated without forming either probability so the gap keeps
+/// full relative precision in the tails.
+fn log_concave_link_posterior_variance(
+    sigma: f64,
+    gap_jet: impl Fn(f64) -> LinkGapJet,
+) -> f64 {
+    if !(sigma.is_finite()) || sigma <= 0.0 {
+        return 0.0;
+    }
+    let lobe = |side: f64, k: f64| {
+        // As `sigma → 0` the gap is `p′(mu)·sigma·t` and the lobe is
+        // `t^k·e^{−t²/2}`, whose peak `√k` starts the peak iteration.
+        strongly_log_concave_half_line_log_integral(k.sqrt(), |t: f64| {
+            let (log_gap, log_density, density_log_slope) = gap_jet(side * sigma * t);
+            // `sigma·q ~ 1/t` near the centre, so it is formed in the log
+            // domain rather than as a product with the unbounded `q`.
+            let sq = (sigma.ln() + log_density - log_gap).exp();
+            (
+                -0.5 * t * t + k * log_gap,
+                -t + k * sq,
+                -1.0 + k * sq * (side * sigma * density_log_slope - sq),
+            )
+        })
+    };
+    let (log_r1, log_l1) = (lobe(1.0, 1.0), lobe(-1.0, 1.0));
+    let (log_r2, log_l2) = (lobe(1.0, 2.0), lobe(-1.0, 2.0));
+    let first = log_r1.exp() - log_l1.exp();
+    let second = log_r2.exp() + log_l2.exp();
+    // `first² ≤ second/2`, so the difference is at least half of `second`.
+    second - first * first
+}
+
+/// [`LinkGapJet`] of the logistic `σ` about `mu`, from
+/// `σ(x) − σ(mu) = σ(x)σ(mu)(e^{−mu} − e^{−x})` with every factor kept in the
+/// log domain (`ln σ(z) = −softplus(−z)`), `σ′ = σ(x)σ(−x)` and
+/// `σ″/σ′ = 1 − 2σ(x) = −tanh(x/2)`.
 #[inline]
-pub fn probit_posterior_meanvariance(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> (f64, f64) {
-    let m1 = probit_posterior_mean(eta, se_eta);
-    let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
-        let p = gam_math::probability::normal_cdf(x);
-        p * p
-    })
-    .clamp(0.0, 1.0);
-    (m1, (m2 - m1 * m1).max(0.0))
+fn logit_gap_jet(mu: f64, u: f64) -> LinkGapJet {
+    use gam_math::special::softplus;
+    let x = mu + u;
+    let log_gap = if u > 0.0 {
+        -softplus(-x) - softplus(mu) + (-(-u).exp_m1()).ln()
+    } else if u < 0.0 {
+        -softplus(-mu) - softplus(x) + (-(u).exp_m1()).ln()
+    } else {
+        f64::NEG_INFINITY
+    };
+    (log_gap, -softplus(-x) - softplus(x), -(0.5 * x).tanh())
+}
+
+/// [`LinkGapJet`] of `Φ` about `mu`, taking the difference on whichever tail
+/// keeps both probabilities away from `1` so it retains full relative
+/// precision; `Φ′ = φ` and `φ′/φ = −x`.
+#[inline]
+fn probit_gap_jet(mu: f64, u: f64) -> LinkGapJet {
+    use gam_math::probability::{normal_cdf, normal_logcdf};
+    let x = mu + u;
+    let (lo, hi) = if x < mu { (x, mu) } else { (mu, x) };
+    let log_gap = if !(hi > lo) {
+        f64::NEG_INFINITY
+    } else if hi <= 0.0 {
+        let l_hi = normal_logcdf(hi);
+        l_hi + (-(normal_logcdf(lo) - l_hi).exp_m1()).ln()
+    } else if lo >= 0.0 {
+        let l_lo = normal_logcdf(-lo);
+        l_lo + (-(normal_logcdf(-hi) - l_lo).exp_m1()).ln()
+    } else {
+        (-(normal_cdf(lo) + normal_cdf(-hi))).ln_1p()
+    };
+    let log_density = -0.5 * x * x - 0.5 * (2.0 * std::f64::consts::PI).ln();
+    (log_gap, log_density, -x)
+}
+
+/// Posterior mean and variance of `σ(η)`, `η ~ N(eta, se_eta²)`.
+///
+/// The mean is the integral used for the posterior-mean prediction itself,
+/// so the two agree; the variance is the central-moment lobe integral of
+/// [`log_concave_link_posterior_variance`].
+pub fn logit_posterior_meanvariance(eta: f64, se_eta: f64) -> Result<(f64, f64), EstimationError> {
+    let (mean, _) = logit_posterior_meanwith_deriv(eta, se_eta)?;
+    let var = log_concave_link_posterior_variance(se_eta, |u| logit_gap_jet(eta, u));
+    // `E[σ(η)]` averages values in `[0, 1]`; projecting the ~1e-12-accurate
+    // integral onto that support can only move it toward the true value.
+    Ok((mean.clamp(0.0, 1.0), var))
+}
+
+/// Posterior mean and variance of `Φ(η)`, `η ~ N(eta, se_eta²)`: the exact
+/// closed-form mean and the central-moment lobe variance of
+/// [`log_concave_link_posterior_variance`].
+pub fn probit_posterior_meanvariance(eta: f64, se_eta: f64) -> (f64, f64) {
+    let mean = probit_posterior_mean(eta, se_eta);
+    let var = log_concave_link_posterior_variance(se_eta, |u| probit_gap_jet(eta, u));
+    (mean, var)
 }
 
 #[inline]
@@ -3513,13 +3735,6 @@ pub fn survival_posterior_meanvariance(
     let (m1, _) = cloglog_survival_term_controlled(ctx, eta, se_eta);
     let (m2, _) = cloglog_survivalsecond_moment_controlled(ctx, eta, se_eta);
     (m1.clamp(0.0, 1.0), (m2 - m1 * m1).max(0.0))
-}
-
-/// Standard sigmoid function with numerical stability.
-#[inline]
-fn sigmoid(x: f64) -> f64 {
-    let x_clamped = x.clamp(-QUADRATURE_EXP_LOG_MAX, QUADRATURE_EXP_LOG_MAX);
-    1.0 / (1.0 + f64::exp(-x_clamped))
 }
 
 // CLogLog Gaussian convolution via differentiated Gauss-Hermite quadrature
@@ -3703,6 +3918,103 @@ mod tests {
         }
     }
 
+    /// Direct raw-moment reference `Var[p(mu + sigma·Z)]` by fine composite
+    /// Simpson over `|z| ≤ 40`. Only valid where the coefficient of variation is
+    /// not tiny (so `E[p²] − E[p]²` does not cancel) and `p` itself carries full
+    /// relative precision, i.e. at `mu ≤ 0`.
+    fn raw_moment_reference_variance(mu: f64, sigma: f64, p: impl Fn(f64) -> f64) -> f64 {
+        let panels = 400_000_usize;
+        let (lo, hi) = (-40.0_f64, 40.0_f64);
+        let h = (hi - lo) / panels as f64;
+        let (mut m1, mut m2) = (0.0_f64, 0.0_f64);
+        for i in 0..=panels {
+            let z = lo + h * i as f64;
+            let w = if i == 0 || i == panels {
+                1.0
+            } else if i % 2 == 1 {
+                4.0
+            } else {
+                2.0
+            };
+            let density = (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt();
+            let v = p(mu + sigma * z);
+            m1 += w * density * v;
+            m2 += w * density * v * v;
+        }
+        m1 *= h / 3.0;
+        m2 *= h / 3.0;
+        m2 - m1 * m1
+    }
+
+    fn logistic(x: f64) -> f64 {
+        (-gam_math::special::softplus(-x)).exp()
+    }
+
+    /// The response-scale posterior variance must be the variance of the same
+    /// law whose mean is reported, in every regime — including separation,
+    /// saturation and vanishing σ, where the delta method (and the raw-moment
+    /// `E[p²] − E[p]²` of a fixed Gauss–Hermite rule) collapse.
+    #[test]
+    fn logit_and_probit_posterior_variance_match_reference_in_every_regime() {
+        // Moderate-CV cases, where a fine raw-moment integral is a trustworthy
+        // reference: separation-scale SE, ordinary, tail, and very wide.
+        for &(mu, sigma) in &[(-30.0, 12.0), (0.4, 1.3), (-6.0, 0.8), (-2.0, 25.0)] {
+            let (_, var) = logit_posterior_meanvariance(mu, sigma).expect("logit moments");
+            let reference = raw_moment_reference_variance(mu, sigma, logistic);
+            assert_relative_eq!(var, reference, max_relative = 1e-8);
+            // Var[p] = Var[1 − p]: the upper tail is the mirror image.
+            let (_, mirrored) = logit_posterior_meanvariance(-mu, sigma).expect("logit moments");
+            assert_relative_eq!(mirrored, var, max_relative = 1e-10);
+        }
+        for &(mu, sigma) in &[(-4.0, 3.0), (0.4, 1.3), (-8.0, 0.5), (-2.0, 25.0)] {
+            let (_, var) = probit_posterior_meanvariance(mu, sigma);
+            let reference =
+                raw_moment_reference_variance(mu, sigma, gam_math::probability::normal_cdf);
+            assert_relative_eq!(var, reference, max_relative = 1e-8);
+            let (_, mirrored) = probit_posterior_meanvariance(-mu, sigma);
+            assert_relative_eq!(mirrored, var, max_relative = 1e-10);
+        }
+        // Saturation: 1 − σ(η) = e^{−η}(1 + O(e^{−η})), so for μ = 100 the
+        // variance is the lognormal variance of e^{−η} to relative e^{−90}.
+        for &(mu, sigma) in &[(100.0, 2.0), (-100.0, 2.0), (100.0, 0.3)] {
+            let (_, var) = logit_posterior_meanvariance(mu, sigma).expect("logit moments");
+            let s2 = sigma * sigma;
+            let lognormal = (-2.0 * f64::abs(mu)).exp() * ((2.0 * s2).exp() - s2.exp());
+            assert_relative_eq!(var, lognormal, max_relative = 1e-9);
+        }
+        // Vanishing σ: the variance tends to the delta-method (p'(μ)σ)² with
+        // relative error O(σ²), where raw moments would cancel to noise.
+        let (mu, sigma) = (0.3_f64, 1e-5_f64);
+        let (_, var) = logit_posterior_meanvariance(mu, sigma).expect("logit moments");
+        let slope = logistic(mu) * logistic(-mu);
+        assert_relative_eq!(var, (slope * sigma).powi(2), max_relative = 1e-8);
+        let (_, var) = probit_posterior_meanvariance(mu, sigma);
+        let density = (-0.5 * mu * mu).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        assert_relative_eq!(var, (density * sigma).powi(2), max_relative = 1e-8);
+        // Degenerate σ is a point mass.
+        assert_eq!(logit_posterior_meanvariance(0.7, 0.0).expect("logit moments").1, 0.0);
+        assert_eq!(probit_posterior_meanvariance(0.7, 0.0).1, 0.0);
+    }
+
+    /// `E[σ(η)]` is an average of values in `[0, 1]`; the reported mean may
+    /// never leave that interval however saturated the predictor is.
+    #[test]
+    fn logit_posterior_meanvariance_mean_stays_in_unit_interval_under_saturation() {
+        for &mu in &[10.0, 30.0, 60.0, 100.0, 300.0, 780.0] {
+            for &sigma in &[0.0, 1e-3, 0.5, 3.0, 20.0, 50.0] {
+                for signed in [mu, -mu] {
+                    let (mean, var) =
+                        logit_posterior_meanvariance(signed, sigma).expect("logit moments");
+                    assert!(
+                        (0.0..=1.0).contains(&mean),
+                        "E[sigmoid(eta)] at mu={signed}, sigma={sigma} left [0, 1]: {mean:e}"
+                    );
+                    assert!(var >= 0.0 && var <= 0.25, "Var at mu={signed}, sigma={sigma}: {var:e}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_logit_posterior_derivative_remains_positive_in_positive_tail() {
         let eta = 20.0;
@@ -3818,18 +4130,10 @@ mod tests {
 
     #[test]
     fn test_integrated_logit_jet_matches_central_differences() {
-        // Assertion redesign (see task #21 / inference-auditor finding):
-        // At (μ=1.1, σ=0.8) the logistic-normal erfcx alternating series has
-        // a tail bound |R_N| ≤ |m|·√(2/π)·exp(−m²/(2s²))/((N+1)²·s³). Plugging
-        // in gives a k=2 coefficient ≈ 0.67, so reaching the EPSILON=1e-10
-        // accuracy contract would require N ≈ √(0.67/1e-10) − 1 ≈ 81619
-        // terms, far beyond LOGIT_MAX_TERMS=160. The dispatcher therefore
-        // legitimately routes this input to the GHQ fallback; the resulting
-        // `mode` field is an implementation detail reflecting a correct
-        // regime decision, not the property we care about. The mathematical
-        // contract is VALUE accuracy of the mean and its μ-derivatives, so
-        // we assert those directly against a high-resolution Simpson
-        // reference (independent of erfcx / Taylor / asymptotics).
+        // At σ ≤ 1 the logit jet integrates all four orders by Gauss-Hermite.
+        // The contract is VALUE accuracy of the mean and its μ-derivatives, so
+        // assert those directly against an independent high-resolution Simpson
+        // reference.
         let ctx = QuadratureContext::new();
         let mu = 1.1;
         let sigma = 0.8;
@@ -3917,16 +4221,9 @@ mod tests {
 
     #[test]
     fn test_logit_exact_derivative_matches_finite_difference() {
-        // Assertion redesign: at (μ=1.1, σ=0.8) the erfcx series cannot
-        // reach its EPSILON=1e-10 tail bound within LOGIT_MAX_TERMS=160
-        // (|R_N| ≈ 0.67/(N+1)², so N* ≈ 81619), and
-        // `logit_posterior_meanwith_deriv_exact` correctly returns Err.
-        // The value-accuracy contract lives at the controlled dispatcher,
-        // which falls back to GHQ when the exact series cannot honor the
-        // contract; that is what we validate here, against an independent
-        // high-resolution Simpson reference for BOTH the mean and its
-        // μ-derivative (d/dμ E[sigmoid] = E[sigmoid']).
-        let out = logit_posterior_meanwith_deriv_controlled(1.1, 0.8).expect("controlled logit");
+        // Value and μ-derivative (d/dμ E[sigmoid] = E[sigmoid']) of the series
+        // against an independent high-resolution Simpson reference.
+        let out = logit_posterior_meanwith_deriv_exact(1.1, 0.8).expect("exact logit");
         let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(1.1, 0.8);
         assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-11, max_relative = 1e-10);
         assert!(out.dmean_dmu > 0.0);
@@ -3935,11 +4232,10 @@ mod tests {
 
     #[test]
     fn test_logit_small_sigma_returns_quadrature_truth_2623() {
-        // A second-order heat-kernel truncation has O(sigma^4) error. The old
-        // dispatcher computed this accurate reference but returned the
-        // truncation whenever it was merely within 1e-6, enough to reverse a
-        // near-tied posterior-probability pair in issue #2623. Small-sigma
-        // logistic-normal means now return the quadrature value itself.
+        // A second-order heat-kernel truncation has O(sigma^4) error, enough to
+        // reverse a near-tied posterior-probability pair in issue #2623. The
+        // series carries no small-sigma truncation: it must match an
+        // independent quadrature to working precision here too.
         for &(mu, sigma) in &[
             (-3.0, 0.05),
             (-0.5, 0.10),
@@ -3947,33 +4243,30 @@ mod tests {
             (0.5, 0.24),
             (3.0, 0.15),
         ] {
-            let out =
-                logit_posterior_meanwith_deriv_controlled(mu, sigma).expect("controlled logit");
+            let out = logit_posterior_meanwith_deriv_exact(mu, sigma).expect("exact logit");
             let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(mu, sigma);
-            assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
+            assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
             assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-12, max_relative = 1e-11);
-            assert_relative_eq!(
-                out.dmean_dmu,
-                ref_d1,
-                epsilon = 1e-12,
-                max_relative = 1e-11
-            );
+            assert_relative_eq!(out.dmean_dmu, ref_d1, epsilon = 1e-12, max_relative = 1e-11);
         }
     }
 
     #[test]
-    fn test_logit_exact_clamped_degenerate_branch_is_locally_flat() {
-        let out = logit_posterior_meanwith_deriv_exact(-710.0, 0.0).expect("exact logit");
-        let h = 1e-6;
-        let plus = logit_posterior_meanwith_deriv_exact(-710.0 + h, 0.0)
-            .expect("exact logit plus")
-            .mean;
-        let minus = logit_posterior_meanwith_deriv_exact(-710.0 - h, 0.0)
-            .expect("exact logit minus")
-            .mean;
-        let fd = (plus - minus) / (2.0 * h);
-        assert_eq!(fd, 0.0);
-        assert_eq!(out.dmean_dmu, 0.0);
+    fn test_logit_exact_point_mass_keeps_its_tails_past_the_exp_log_limit() {
+        // Beyond |μ| = 700 the logistic tail is still e^{-|μ|} to full relative
+        // accuracy (subnormal, not zero), and so is its slope: the point-mass
+        // branch is not flat there.
+        for magnitude in [710.0f64, 720.0] {
+            let tail = (-magnitude).exp();
+            assert!(tail > 0.0);
+            assert_eq!(stable_sigmoidwith_derivative(-magnitude), (tail, tail));
+            assert_eq!(stable_sigmoidwith_derivative(magnitude), (1.0, tail));
+            let lower = logit_posterior_meanwith_deriv_exact(-magnitude, 0.0).expect("exact logit");
+            assert_eq!(lower.mode, IntegratedExpectationMode::ExactClosedForm);
+            assert_eq!((lower.mean, lower.dmean_dmu), (tail, tail));
+            let upper = logit_posterior_meanwith_deriv_exact(magnitude, 0.0).expect("exact logit");
+            assert_eq!((upper.mean, upper.dmean_dmu), (1.0, tail));
+        }
     }
 
     fn simpson_integrate<F>(a: f64, b: f64, n_intervals: usize, f: F) -> f64
@@ -4023,8 +4316,7 @@ mod tests {
     /// 16384 intervals. Simpson's error bound is (b-a)·h^4·max|f^(4)|/180;
     /// at h = 28/16384 ≈ 1.7e-3 this gives ~1e-13 absolute for sigmoid and its
     /// low-order derivatives (all bounded by constants ≤ 1 on ℝ). This is
-    /// mathematically independent of the erfcx-series / Taylor / asymptotic
-    /// implementations under test.
+    /// mathematically independent of the moment series under test.
     fn logit_reference_jet_highres_simpson(mu: f64, sigma: f64) -> (f64, f64, f64, f64) {
         let z_max = 14.0;
         let n_intervals = 16384;
@@ -4348,36 +4640,27 @@ mod tests {
     }
 
     #[test]
-    fn test_logit_dispatch_uses_tail_asymptotic_outside_old_guard() {
+    fn test_logit_dispatch_is_exact_deep_in_the_tail() {
+        // (35, 1) used to leave the series for a tail asymptotic. The CRVZ
+        // series has no regime split: the same pass is exact here, and the
+        // complement is the leading moment `E[e^{−η}] = e^{−μ+σ²/2}` to within
+        // the next term `e^{−2μ+2σ²}`.
         let ctx = QuadratureContext::new();
         let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 35.0, 1.0)
             .expect("logit integrated inverse-link moments should evaluate");
-        assert_eq!(out.mode, IntegratedExpectationMode::ControlledAsymptotic);
-        assert!(out.mean.is_finite());
-        assert!(out.dmean_dmu.is_finite());
-        assert!(out.dmean_dmu >= 0.0);
+        assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
+        assert_relative_eq!(out.mean, 1.0 - (-34.5_f64).exp(), max_relative = 1e-15);
+        assert_relative_eq!(out.dmean_dmu, (-34.5_f64).exp(), max_relative = 1e-13);
     }
 
     #[test]
-    fn test_logit_dispatch_prefers_erfcx_in_moderate_regime() {
-        // Assertion redesign: this test was originally checking that the
-        // dispatcher DOESN'T degrade to `QuadratureFallback` in the
-        // moderate regime. The erfcx-series branch genuinely cannot meet
-        // the EPSILON=1e-10 accuracy contract at (μ=1.1, σ=0.8) inside
-        // LOGIT_MAX_TERMS=160 (tail bound |R_N| ≤ 0.67/(N+1)² → N* ≈ 81619),
-        // so routing to GHQ is the correct response. The property we
-        // actually care about is accuracy — assert it here against an
-        // independent high-resolution Simpson reference, and document
-        // that either ExactSpecialFunction or QuadratureFallback is an
-        // acceptable route so long as the value is correct.
+    fn test_logit_dispatch_is_exact_in_moderate_regime() {
+        // (1.1, 0.8) is where the old erfcx series could not certify and the
+        // dispatcher routed to quadrature. The CRVZ series needs no fallback.
         let ctx = QuadratureContext::new();
         let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 1.1, 0.8)
             .expect("logit integrated inverse-link moments should evaluate");
-        assert!(matches!(
-            out.mode,
-            IntegratedExpectationMode::ExactSpecialFunction
-                | IntegratedExpectationMode::QuadratureFallback
-        ));
+        assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
         assert!(out.mean.is_finite());
         assert!(out.dmean_dmu.is_finite());
         assert!(out.dmean_dmu >= 0.0);
@@ -4387,19 +4670,15 @@ mod tests {
     }
 
     #[test]
-    fn test_logit_dispatch_large_sigma_uses_accurate_quadrature_not_monahan() {
-        // Regression for #571. At (μ=0.5, σ=20) the case is erfcx-ineligible
-        // (σ > LOGIT_ERFCX_SIGMA_MAX) and not in any tail/Taylor regime. The
-        // old code returned the Monahan–Stefanski probit Φ(μκ) here — wrong by
-        // ~6e-3 absolute — as a trusted `Ok`, bypassing the drift-check. The
-        // corrected path returns `Err` from the analytic ladder, so the
-        // controlled router routes straight to accurate adaptive-Simpson
-        // quadrature. Assert the route is GHQ/quadrature (NOT a trusted
-        // asymptotic) and that the value matches an independent reference.
+    fn test_logit_dispatch_large_sigma_is_exact_not_monahan() {
+        // Regression for #571. At (μ=0.5, σ=20) the old code returned the
+        // Monahan–Stefanski probit Φ(μκ), wrong by ~6e-3 absolute, as a
+        // trusted `Ok`. The CRVZ series is exact at every σ; assert the value
+        // against an independent reference and that it is not Monahan's.
         let ctx = QuadratureContext::new();
         let out = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, 0.5, 20.0)
             .expect("logit integrated inverse-link moments should evaluate");
-        assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
+        assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
         let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(0.5, 20.0);
         assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-9, max_relative = 1e-7);
         assert_relative_eq!(out.dmean_dmu, ref_d1, epsilon = 1e-9, max_relative = 1e-7);
@@ -4417,37 +4696,26 @@ mod tests {
     }
 
     #[test]
-    fn test_logit_controlled_path_keeps_exact_backend_in_moderate_regime() {
-        // Assertion redesign: the erfcx-series branch cannot honor its
-        // EPSILON=1e-10 accuracy contract at (μ=1.1, σ=0.8) within
-        // LOGIT_MAX_TERMS=160 (tail bound |R_N| ≤ 0.67/(N+1)² → N* ≈ 81619),
-        // so `logit_posterior_meanwith_deriv_controlled` legitimately falls
-        // through to GHQ. The controlled path's contract is that it returns
-        // a correct value via *some* principled route; "which route" is an
-        // implementation detail. We assert value accuracy against an
-        // independent high-resolution Simpson reference, and document the
-        // acceptable modes.
-        let out = logit_posterior_meanwith_deriv_controlled(1.1, 0.8).expect("logit controlled");
-        assert!(matches!(
-            out.mode,
-            IntegratedExpectationMode::ExactSpecialFunction
-                | IntegratedExpectationMode::QuadratureFallback
-        ));
-        let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(1.1, 0.8);
-        assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-11, max_relative = 1e-10);
-        assert_relative_eq!(out.dmean_dmu, ref_d1, epsilon = 1e-11, max_relative = 1e-10);
+    fn test_logit_public_entry_point_is_the_exact_series() {
+        // `logit_posterior_meanwith_deriv` (used by the multinomial posterior)
+        // and the link dispatcher are the same single pass, bit for bit.
+        let ctx = QuadratureContext::new();
+        for &(mu, sigma) in &[(1.1, 0.8), (-4.0, 0.2), (0.0, 7.0), (25.0, 3.0)] {
+            let public = logit_posterior_meanwith_deriv(mu, sigma).expect("public logit moments");
+            let dispatched =
+                integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, mu, sigma)
+                    .expect("dispatched logit moments");
+            assert_eq!(public.0.to_bits(), dispatched.mean.to_bits());
+            assert_eq!(public.1.to_bits(), dispatched.dmean_dmu.to_bits());
+        }
     }
 
     #[test]
     fn test_logit_dispatch_derivative_correct_at_mu_zero_small_sigma() {
-        // Regression for #572. On the erfcx branch at μ=0 the old mean-only
-        // truncation cutoff returned the clamp floor (4 terms), leaving the
-        // derivative series uncancelled: it reported dmean_dmu ≈ 0.58 at
-        // (0, 0.3) — a factor ~2.4 too large and physically impossible, since
-        // sigmoid'(0)=0.25 and averaging over a Gaussian can only shrink it.
-        // The corrected cutoff sizes the truncation from the derivative tail
-        // bound past the series peak; at small σ this exceeds LOGIT_MAX_TERMS,
-        // so the branch honestly bails to accurate quadrature.
+        // Regression for #572. An old erfcx branch at μ=0 truncated on a
+        // mean-only cutoff and reported dmean_dmu ≈ 0.58 at (0, 0.3), a factor
+        // ~2.4 too large and physically impossible, since sigmoid'(0)=0.25 and
+        // averaging over a Gaussian can only shrink it.
         let ctx = QuadratureContext::new();
         for &(mu, sigma) in &[(0.0, 0.3), (0.0, 0.4), (0.0, 0.5)] {
             let out =
@@ -4467,37 +4735,210 @@ mod tests {
     }
 
     #[test]
-    fn test_logit_erfcx_exact_branch_is_self_certified() {
-        // Regression for #572: the `ExactSpecialFunction` branch must be
-        // accurate *by itself*, not merely rescued by the controlled router's
-        // drift-check. Call `logit_posterior_meanwith_deriv_exact` directly
-        // (no quadrature net) in the large-|μ| band where the erfcx series
-        // certifies within LOGIT_MAX_TERMS, and require both the mean and the
-        // μ-derivative to match an independent high-resolution reference.
-        for &(mu, sigma) in &[(8.0, 1.0), (10.0, 1.0), (15.0, 2.0)] {
-            let out = logit_posterior_meanwith_deriv_exact(mu, sigma)
-                .expect("erfcx branch should certify");
+    fn test_logit_exact_series_is_self_certified() {
+        // The production path has no second evaluator behind it, so the
+        // series must be accurate by itself everywhere, including (0, 0.3),
+        // the #572 point the old erfcx branch had to reject.
+        for &(mu, sigma) in &[
+            (8.0, 1.0),
+            (10.0, 1.0),
+            (15.0, 2.0),
+            (0.0, 0.3),
+            (0.4, 0.05),
+        ] {
+            let out = logit_posterior_meanwith_deriv_exact(mu, sigma).expect("series evaluates");
             assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
             let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(mu, sigma);
-            assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-9, max_relative = 1e-7);
-            assert_relative_eq!(out.dmean_dmu, ref_d1, epsilon = 1e-9, max_relative = 1e-7);
+            assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-12, max_relative = 1e-11);
+            assert_relative_eq!(out.dmean_dmu, ref_d1, epsilon = 1e-12, max_relative = 1e-11);
         }
-        // Where the series cannot certify the derivative within LOGIT_MAX_TERMS
-        // it must reject (Err) rather than return a wrong "exact" value — the
-        // router then routes to quadrature. (0, 0.3) is the #572 point.
+    }
+
+    #[test]
+    fn test_logistic_normal_series_degree_is_the_smallest_meeting_its_bound() {
+        // The degree is the smallest n whose a-priori relative slope bound
+        // (4n²+1)/T_n(3) reaches the unit roundoff; one less must miss it.
+        let bound = |n: usize| {
+            let nf = n as f64;
+            let rate_pow = LOGISTIC_NORMAL_CRVZ_RATE.powi(n as i32);
+            (4.0 * nf * nf + 1.0) / (0.5 * (rate_pow + rate_pow.recip()))
+        };
+        let n = LOGISTIC_NORMAL_SERIES_TERMS;
+        assert!(bound(n) <= 0.5 * f64::EPSILON);
+        assert!(bound(n - 1) > 0.5 * f64::EPSILON);
+        // The weights are the coefficients of a polynomial Σ_k w_k t^k equal to
+        // 1/(1+t) on [0, 1] to relative error 1/T_n(3), far below roundoff.
+        for i in 0..=64 {
+            let t = f64::from(i) / 64.0;
+            let poly = LOGISTIC_NORMAL_SERIES_WEIGHTS
+                .weight
+                .iter()
+                .rev()
+                .fold(0.0, |acc, w| acc * t + w);
+            assert_relative_eq!(poly, 1.0 / (1.0 + t), max_relative = 1e-13);
+        }
+    }
+
+    #[test]
+    fn test_logit_exact_series_matches_high_precision_reference() {
+        // Reference values of E[σ(η)] and E[σ'(η)], η ~ N(μ, s²), computed
+        // with mpmath at 40 digits by tanh-sinh quadrature in η with
+        // breakpoints resolving both the Gaussian (every s/2 around μ) and the
+        // logistic transition (every ½ around 0); a 50-digit rerun with a
+        // denser breakpoint grid agrees to 5e-16 relative on every entry.
+        // Rows span s from 1e-6 to 100 and η means out to e^{−700}.
+        let table: &[(f64, &[(f64, f64, f64)])] = &[
+            (
+                1e-6,
+                &[
+                    (-700.0, 9.8596765437650614e-305, 9.8596765437650614e-305),
+                    (-300.0, 5.1482002224147762e-131, 5.1482002224147762e-131),
+                    (-40.0, 4.2483542552937132e-18, 4.2483542552937131e-18),
+                    (-3.0, 4.7425873177587227e-2, 4.5176659730928598e-2),
+                    (0.0, 5.0e-1, 2.499999999999375e-1),
+                    (0.7, 6.6818777216812882e-1, 2.2171287329307244e-1),
+                    (8.0, 9.9966464986953335e-1, 3.352376707566415e-4),
+                    (300.0, 1.0, 5.1482002224147762e-131),
+                ],
+            ),
+            (
+                1e-3,
+                &[
+                    (-700.0, 9.8596814735996359e-305, 9.8596814735996359e-305),
+                    (-300.0, 5.1482027965129569e-131, 5.1482027965129569e-131),
+                    (-40.0, 4.2483563794692477e-18, 4.2483563794692476e-18),
+                    (-3.0, 4.7425893623356452e-2, 4.5176676196449621e-2),
+                    (0.0, 5.0e-1, 2.4999993750003125e-1),
+                    (0.7, 6.6818773487878737e-1, 2.21712836679758e-1),
+                    (8.0, 9.9966464970202707e-1, 3.3523783803819819e-4),
+                    (300.0, 1.0, 5.1482027965129569e-131),
+                ],
+            ),
+            (
+                0.05,
+                &[
+                    (-700.0, 9.8720088455226649e-305, 9.8720088455226649e-305),
+                    (-300.0, 5.1546394963980114e-131, 5.1546394963980114e-131),
+                    (-40.0, 4.2536680185208255e-18, 4.2536680185208255e-18),
+                    (-3.0, 4.7477002260580676e-2, 4.5217819654717117e-2),
+                    (0.0, 5.0e-1, 2.498439449674203e-1),
+                    (0.7, 6.6809464530355158e-1, 2.2162138280372003e-1),
+                    (8.0, 9.996642308427173e-1, 3.3565613434122228e-4),
+                    (300.0, 1.0, 5.1546394963980114e-131),
+                ],
+            ),
+            (
+                0.3,
+                &[
+                    (-700.0, 1.0313496354461585e-304, 1.0313496354461585e-304),
+                    (-300.0, 5.3851608610314164e-131, 5.3851608610314164e-131),
+                    (-40.0, 4.4438969097967517e-18, 4.4438969097967517e-18),
+                    (-3.0, 4.9284332741628111e-2, 4.6652337487348473e-2),
+                    (0.0, 5.0e-1, 2.446131934965273e-1),
+                    (0.7, 6.6495133115389394e-1, 2.1847509919777044e-1),
+                    (8.0, 9.9964923141774624e-1, 3.5063396631200147e-4),
+                    (300.0, 1.0, 5.3851608610314164e-131),
+                ],
+            ),
+            (
+                1.0,
+                &[
+                    (-700.0, 1.6255858439920452e-304, 1.6255858439920452e-304),
+                    (-300.0, 8.4879472125141282e-131, 8.4879472125141282e-131),
+                    (-40.0, 7.0043520261686451e-18, 7.004352026168645e-18),
+                    (-3.0, 6.9323858004285768e-2, 5.9821864078413161e-2),
+                    (0.0, 5.0e-1, 2.0662096414190704e-1),
+                    (0.7, 6.4115588112722935e-1, 1.919583592786463e-1),
+                    (8.0, 9.9944774379699383e-1, 5.5143136174432282e-4),
+                    (300.0, 1.0, 8.4879472125141282e-131),
+                ],
+            ),
+            (
+                3.0,
+                &[
+                    (-700.0, 8.8753979802033087e-303, 8.8753979802033087e-303),
+                    (-300.0, 4.634262153822548e-129, 4.634262153822548e-129),
+                    (-40.0, 3.8242466280852847e-16, 3.8242466280734341e-16),
+                    (-3.0, 1.9438573608839076e-1, 7.8734608818823313e-2),
+                    (0.0, 5.0e-1, 1.1483790477391054e-1),
+                    (0.7, 5.7983742037389368e-1, 1.124944095508057e-1),
+                    (8.0, 9.883210832830183e-1, 8.3539748503936299e-3),
+                    (300.0, 1.0, 4.634262153822548e-129),
+                ],
+            ),
+            (
+                10.0,
+                &[
+                    (-700.0, 5.1119519486513433e-283, 5.1119519486513433e-283),
+                    (-300.0, 2.669190215541374e-109, 2.669190215541374e-109),
+                    (-40.0, 4.1914830581518058e-5, 1.7123017772409959e-5),
+                    (-3.0, 3.8391056883627619e-1, 3.7584931138428607e-2),
+                    (0.0, 5.0e-1, 3.9259560109364077e-2),
+                    (0.7, 5.2745996633197458e-1, 3.9166493970108451e-2),
+                    (8.0, 7.8443209202037574e-1, 2.8795653215573714e-2),
+                    (300.0, 1.0, 2.669190215541374e-109),
+                ],
+            ),
+            (
+                30.0,
+                &[
+                    (-700.0, 3.7982149710920399e-120, 2.9391251210845267e-120),
+                    (-300.0, 9.2215466208430222e-24, 3.0919158374860069e-24),
+                    (-40.0, 9.1610277587177178e-2, 5.4747168305465195e-3),
+                    (-3.0, 4.6024443796996282e-1, 1.3207900139307798e-2),
+                    (0.0, 5.0e-1, 1.3273863811395113e-2),
+                    (0.7, 5.0929086466429572e-1, 1.3270263990900267e-2),
+                    (8.0, 6.0495014107041604e-1, 1.2811851472565363e-2),
+                    (300.0, 1.0, 3.0919158374860069e-24),
+                ],
+            ),
+            (
+                100.0,
+                &[
+                    (-700.0, 1.2903867081808531e-12, 9.2072118515853982e-14),
+                    (-300.0, 1.3520865722746964e-3, 4.4376830081080204e-5),
+                    (-40.0, 3.4460248167363889e-1, 3.6821926917715808e-3),
+                    (-3.0, 4.8803549372221685e-1, 3.9869728455162543e-3),
+                    (0.0, 5.0e-1, 3.9887667968355803e-3),
+                    (0.7, 5.0279211396299996e-1, 3.9886691053786453e-3),
+                    (8.0, 5.3187614071964734e-1, 3.9760273273959502e-3),
+                    (300.0, 9.986479134277253e-1, 4.4376830081080204e-5),
+                ],
+            ),
+        ];
+        let mut worst_mean = 0.0_f64;
+        let mut worst_slope = 0.0_f64;
+        for &(sigma, rows) in table {
+            for &(mu, ref_mean, ref_slope) in rows {
+                let out =
+                    logit_posterior_meanwith_deriv_exact(mu, sigma).expect("series evaluates");
+                assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
+                let mean_error = ((out.mean - ref_mean) / ref_mean).abs();
+                let slope_error = ((out.dmean_dmu - ref_slope) / ref_slope).abs();
+                worst_mean = worst_mean.max(mean_error);
+                worst_slope = worst_slope.max(slope_error);
+                assert!(
+                    mean_error <= 1e-13 && slope_error <= 1e-12,
+                    "logit({mu}, {sigma}): mean {:.17e} against {ref_mean:.17e} (error \
+                     {mean_error:.3e}), slope {:.17e} against {ref_slope:.17e} (error \
+                     {slope_error:.3e})",
+                    out.mean,
+                    out.dmean_dmu
+                );
+            }
+        }
         assert!(
-            logit_posterior_meanwith_deriv_exact(0.0, 0.3).is_err(),
-            "erfcx branch must not claim ExactSpecialFunction when it cannot certify the derivative"
+            worst_mean > 0.0 || worst_slope > 0.0,
+            "every row reproduced bit-exactly: the table tests nothing"
         );
     }
 
     #[test]
     fn test_logit_integrated_derivative_is_even_in_mu() {
         // d/dμ E[sigmoid(η)] = E[sigmoid'(η)] and sigmoid' is even, so the
-        // location-derivative is even in μ. The erfcx series works in m=|μ|;
-        // #572 originated in a botched sign/reflection of that derivative.
-        // Pin exact symmetry across regimes (erfcx-success, erfcx-bail/GHQ,
-        // and tail-asymptotic).
+        // location-derivative is even in μ. #572 originated in a botched
+        // sign/reflection of that derivative. Pin the symmetry from central
+        // rows out to the deep tail.
         let ctx = QuadratureContext::new();
         for &(mu, sigma) in &[(0.3, 0.3), (1.1, 0.8), (10.0, 1.0), (3.0, 3.0), (35.0, 1.0)] {
             let pos =
@@ -4506,18 +4947,13 @@ mod tests {
             let neg =
                 integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, -mu, sigma)
                     .expect("logit moments (-μ)");
-            assert_relative_eq!(
-                pos.dmean_dmu,
-                neg.dmean_dmu,
-                epsilon = 1e-9,
-                max_relative = 1e-7
-            );
+            assert_relative_eq!(pos.dmean_dmu, neg.dmean_dmu, max_relative = 1e-13);
             // And the mean reflects: E[sigmoid] at -μ equals 1 - E[sigmoid] at μ.
             assert_relative_eq!(
                 neg.mean,
                 1.0 - pos.mean,
-                epsilon = 1e-9,
-                max_relative = 1e-7
+                epsilon = 1e-15,
+                max_relative = 1e-13
             );
         }
     }
@@ -4531,25 +4967,20 @@ mod tests {
         // public `mean` is an end-to-end check that is blind to *which* internal
         // branch produced the value — it would have caught the #572 erfcx
         // derivative (2.4× too large) and any future formula that returns a
-        // derivative inconsistent with its own mean. Grid points are chosen well
-        // inside single regimes (away from the σ∈{0.25,6} and |μ|=40 branch
-        // seams) so the mean is locally smooth and a tight FD is meaningful:
-        //   - quadrature-fallback band (erfcx-eligible but un-certifiable),
-        //   - erfcx self-certified band (large |μ|),
-        //   - small-σ quadrature band,
-        //   - large-σ (erfcx-ineligible) band.
+        // derivative inconsistent with its own mean. The grid keeps the rows
+        // of the regimes the retired ladder used to split into.
         let ctx = QuadratureContext::new();
         let h = 1e-4;
         let cases = [
-            (0.0, 0.8),  // quadrature fallback, μ=0 (the #572 failure family)
-            (0.7, 0.8),  // quadrature fallback, off-center
-            (1.5, 1.2),  // quadrature fallback
-            (-1.1, 0.9), // quadrature fallback, μ<0 (reflection path)
-            (8.0, 1.0),  // erfcx self-certified
-            (10.0, 1.5), // erfcx self-certified
-            (-9.0, 1.0), // erfcx self-certified, μ<0
-            (0.5, 0.05), // small-σ quadrature
-            (0.5, 20.0), // large-σ, erfcx-ineligible → quadrature
+            (0.0, 0.8),  // μ=0 (the #572 failure family)
+            (0.7, 0.8),  // off-center
+            (1.5, 1.2),  // moderate
+            (-1.1, 0.9), // μ<0
+            (8.0, 1.0),  // tail, series exits early
+            (10.0, 1.5), // tail, series exits early
+            (-9.0, 1.0), // tail, μ<0
+            (0.5, 0.05), // small σ
+            (0.5, 20.0), // large σ
         ];
         for &(mu, sigma) in &cases {
             let at = |m: f64| {
@@ -4591,9 +5022,9 @@ mod tests {
                     .expect("scalar logit moments");
             let jet = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu, sigma)
                 .expect("jet logit moments");
-            // The scalar path now routes to accurate adaptive-Simpson, matching
-            // the independent high-resolution Simpson reference (truth) to ~1e-10
-            // — the Monahan ~0.11 error is gone.
+            // The scalar path is the exact CRVZ series, matching the independent
+            // high-resolution Simpson reference (truth); the Monahan ~0.11 error
+            // is gone.
             let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(mu, sigma);
             assert_relative_eq!(scalar.mean, ref_mean, epsilon = 1e-9, max_relative = 1e-8);
             assert_relative_eq!(

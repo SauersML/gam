@@ -14,6 +14,7 @@ use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::row_kernel::*;
 use super::*;
+use crate::latent_anchor::{anchor_residual_resolution, smaller_tail_log_target, solve_log_tail_root};
 use gam_math::probability::normal_logcdf_derivatives;
 
 #[inline]
@@ -227,21 +228,6 @@ mod empirical_cubic_moment_tests {
     }
 }
 
-/// Residual tolerance at which a Bernoulli marginal-slope intercept is accepted as
-/// the root of its calibration `F(a) = Σ∫Φ(η) − μ(q) = 0`.
-///
-/// The analytic implicit-function gradient and Hessian (`a_u = −F_u/F_a`,
-/// `a_uv = …`) are valid only at `F = 0`, so an acceptance band leaves `a` off the
-/// root by `O(residual)`, and that offset propagates linearly into every one of
-/// them: a `~1e-4·μ` band showed up as a `~5e-5` gap in the q-axis second
-/// derivative against the finite difference of the gradient (#1607). The fit's
-/// row solve and a saved model's prediction read the same root through the same
-/// derivatives, so both accept at this one tolerance. The relative component keeps
-/// genuinely flat (extreme-slope) rows solvable.
-pub(crate) fn bernoulli_intercept_residual_tolerance(target_mu: f64) -> f64 {
-    1e-12_f64.max(1e-10 * target_mu.abs())
-}
-
 impl BernoulliMarginalSlopeFamily {
     pub(super) fn intercept_primary_point(
         q: f64,
@@ -306,34 +292,17 @@ impl BernoulliMarginalSlopeFamily {
             .unwrap_or(0.0)
     }
 
-    pub(super) fn near_zero_deviation_residual_bound(
-        &self,
-        slope: f64,
-        beta_h_linf: f64,
-        beta_w_linf: f64,
-    ) -> f64 {
-        let score_basis_sup = self
-            .score_warp
-            .as_ref()
-            .map(|runtime| runtime.value_basis_l1_sup_norm())
-            .unwrap_or(0.0);
-        let link_basis_sup = self
-            .link_dev
-            .as_ref()
-            .map(|runtime| runtime.value_basis_l1_sup_norm())
-            .unwrap_or(0.0);
-        // At the rigid intercept, deviations perturb the probit argument by at
-        // most `s * (|b|·||h||∞ + ||w||∞)`.  Since `Φ` is globally
-        // `φ(0)`-Lipschitz, the calibration residual changes by no more than
-        // `φ(0)` times this argument bound after integrating against the unit
-        // normal density.  The L1 basis sup-norms give
-        // `||h||∞ <= K_h ||β_h||∞` and `||w||∞ <= K_w ||β_w||∞`; if this is
-        // below the solver's `abs_tol`, the rigid root is already acceptable.
-        normal_pdf(0.0)
-            * self.probit_frailty_scale()
-            * (slope.abs() * score_basis_sup * beta_h_linf + link_basis_sup * beta_w_linf)
-    }
-
+    /// The row's calibrated intercept `a(β)`, the root of `P(a) = Φ(q)` with
+    /// `P(a) = E[Φ(η(a, Z))]` over the row's latent law, and `P′(a)` there.
+    ///
+    /// The root is solved on the smaller marginal tail in log units,
+    /// `log E[Φ(∓η)] = log Φ(∓q)` (gam#3216), by the safeguarded solve the
+    /// survival anchor uses ([`solve_log_tail_root`]): accepted at the
+    /// residual the arithmetic resolves and finished by a Newton step. So the
+    /// root is a function of `β` to rounding whatever the seed, and every
+    /// evaluator of the row — the line search's cached and cold paths, the
+    /// saved model's prediction — reads one root (gam#3333). The
+    /// implicit-function derivatives `a_u = −P_u/P′` hold only there.
     pub(super) fn solve_row_intercept_base(
         &self,
         row: usize,
@@ -345,217 +314,100 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<(f64, f64, bool), String> {
         let marginal = self.marginal_link_map(marginal_eta)?;
         let probit_scale = self.probit_frailty_scale();
-        let target = marginal.mu;
-        // The calibrated intercept is consumed as the root of `F(a) = 0` by the
-        // implicit-function derivatives; see `bernoulli_intercept_residual_tolerance`.
-        let abs_tol = bernoulli_intercept_residual_tolerance(target);
-        let rigid_a = rigid_prescale_intercept_from_marginal(marginal.q, slope, probit_scale);
-        let rigid_abs_deriv =
-            rigid_prescale_intercept_derivative_abs(marginal.q, slope, probit_scale);
-
-        let beta_h_linf = Self::beta_linf(beta_h);
-        let beta_w_linf = Self::beta_linf(beta_w);
-        let exact_zero_deviation = beta_h_linf == 0.0 && beta_w_linf == 0.0;
-        let standard_normal_law = matches!(self.latent_measure, LatentMeasureKind::StandardNormal);
-        if exact_zero_deviation && standard_normal_law {
+        let exact_zero_deviation = Self::beta_linf(beta_h) == 0.0 && Self::beta_linf(beta_w) == 0.0;
+        if exact_zero_deviation && matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
+            let rigid_a = rigid_prescale_intercept_from_marginal(marginal.q, slope, probit_scale);
+            let rigid_abs_deriv =
+                rigid_prescale_intercept_derivative_abs(marginal.q, slope, probit_scale);
             self.cache_row_intercept(row, rigid_a, marginal_eta, slope, beta_h, beta_w);
             return Ok((rigid_a, rigid_abs_deriv, true));
         }
 
-        let beta_linf_max = beta_h_linf.max(beta_w_linf);
-        // The perturbation bound walks every span of every deviation basis column and
-        // only the StandardNormal law reads it, so an empirical-law row never pays for it.
-        if standard_normal_law
-            && beta_linf_max <= f64::EPSILON.sqrt()
-            && self.near_zero_deviation_residual_bound(slope, beta_h_linf, beta_w_linf) <= abs_tol
-        {
-            // Numerical guardrail for the conservative perturbation bound: the
-            // exact-zero path above avoids all cell machinery, while this
-            // near-zero path spends one evaluator call to guarantee that every
-            // accepted row satisfies the same residual contract as the solver.
-            // The extra `sqrt(eps)` coefficient cap keeps numerical
-            // derivative probes out of this value-only acceptance path;
-            // mathematically nonzero deviations still fall through unless they
-            // are too small to carry stable derivative information.
-            let (f_rigid, _, _) = self.evaluate_calibration_newton(
-                row,
-                rigid_a,
-                marginal_eta,
-                slope,
-                beta_h,
-                beta_w,
-            )?;
-            if f_rigid.abs() <= abs_tol {
-                self.cache_row_intercept(row, rigid_a, marginal_eta, slope, beta_h, beta_w);
-                return Ok((rigid_a, rigid_abs_deriv, true));
-            }
-        }
-
-        // Use the Newton-only calibration evaluator: `solve_monotone_root`
-        // safely degrades its Halley step to Newton when `F''(a) = 0`, and
-        // dropping the second derivative lets us skip order-9 value-bearing
-        // cell moments in favour of degree-4 moments.
-        let eval = |a: f64| -> Result<(f64, f64, f64), String> {
-            self.evaluate_calibration_newton(row, a, marginal_eta, slope, beta_h, beta_w)
-        };
-
-        // Closed-form fallback initial guess: rigid probit in pre-scale
-        // denested coordinates:
-        //   a₀ = q·√(1 + (s_f b)²) / s_f,  s_f = 1/√(1+σ²).
-        // When link deviation is active, upgrade to affine-link warm start:
-        //   s_f·L(u) ≈ s_f·(ℓ₀ + ℓ₁·u)
-        //   ⟹  a = (q·√(1 + (s_f ℓ₁ b)²) / s_f − ℓ₀) / ℓ₁
+        // Closed-form initial guess: rigid probit in pre-scale denested
+        // coordinates, `a₀ = q·√(1 + (s_f b)²) / s_f` with `s_f = 1/√(1+σ²)`,
+        // upgraded under a link deviation to the affine-link inversion
+        //   s_f·L(u) ≈ s_f·(ℓ₀ + ℓ₁·u)  ⟹  a = (q·√(1 + (s_f ℓ₁ b)²) / s_f − ℓ₀) / ℓ₁.
         let a_closed_form = self.row_intercept_closed_form_seed(row, marginal, slope, beta_w)?;
-
-        // Prefer the previous PIRLS iter's converged intercept as the
-        // initial guess; β changes only a little between consecutive PIRLS
-        // iterations, so the previous answer is typically within a few
-        // root-solver steps of the new one. If the cache slot is NaN
-        // (uninitialised) or non-finite (stale), fall back to the closed-
-        // form seed.
+        // Prefer the predictor or the previous iterate's root: β moves little
+        // between consecutive inner iterations, so either sits a step or two
+        // from the new root. The cache slot is tagged with β_h and β_w, since
+        // under link deviation and score warp the root depends on the joint
+        // coefficient vector, not just `(marginal_eta, slope)`. The seed only
+        // decides where the solve starts; the root it returns does not depend
+        // on it.
         let current_primary_point =
             Self::intercept_primary_point(marginal_eta, slope, beta_h, beta_w);
         let predictor_a = self
             .intercept_warm_starts
             .as_ref()
             .and_then(|cache| cache.predictor_seed(row, &current_primary_point));
-        // FLEX cache slot must include β_h and β_w: under link-deviation and
-        // score-warp the root depends on the joint coefficient vector, not
-        // just `(marginal_eta, slope)`. Without the tag a TR trial at one β
-        // can read back a converged value from a different trial at the same
-        // row and poison the solve.
         let flex_beta_tag = hash_intercept_warm_start_key_flex(marginal_eta, slope, beta_h, beta_w);
         let cached_a = self
             .intercept_warm_starts
             .as_ref()
             .and_then(|cache| cache.load_tagged(row, flex_beta_tag));
+        let warm = predictor_a.is_some() || cached_a.is_some();
         let a_init = predictor_a.or(cached_a).unwrap_or(a_closed_form);
 
-        // Note: an explicit `eval(a_closed_form)` short-circuit at this point
-        // would be redundant. On cold cycle-0 `cached_a` is None, so `a_init`
-        // already equals `a_closed_form` and the two-step Newton probe below
-        // evaluates there with the residual contract from
-        // `row_intercept_newton_is_converged`, matching the exact-root path
-        // in `monotone_root::solve_monotone_root` (see monotone_root.rs:50-66).
-        // On warm cycles, evaluating at `a_closed_form` would add an extra
-        // cell-moment call even when the cached seed is already the root.
-
-        // Adaptive acceptance tolerance: for extreme slopes the intercept
-        // equation becomes numerically flat and tight absolute precision is
-        // not achievable. We accept any bracketed solution at this level, so
-        // pass the same tolerance to the root solver — driving it tighter
-        // than `abs_tol` is wasted cell-moment work, since at large scale
-        // (n=320k, FLEX active with linkwiggle + score-warp) the solver is
-        // called once per row per Hessian build and the per-row cell-moment
-        // kernel dominates wall time. With this tolerance the closed-form /
-        // affine warm start short-circuits at `monotone_root.rs:26` for the
-        // common case, instead of forcing 30+ refinement iters down to 1e-10.
-
-        // Local Newton probe before paying for the safeguarded bracket.
-        // Cycle-0 is cold at large scale, so forcing every row through the
-        // bracket spends most of the wall time rebuilding identical cell
-        // value integrals. The rigid/affine seed is exact when deviations vanish
-        // and first-order accurate when they are small; probe that local
-        // Newton basin first. The convergence test uses the same residual
-        // contract as the safeguarded solver plus a tight relative-correction
-        // gate, so any accept here satisfies the existing final check. Hard
-        // cases still fall through unchanged.
-        let probe_result = (|| -> Result<(Option<(f64, f64, f64)>, f64), String> {
-            let mut a = a_init;
-            let mut seed_residual = None;
-            for _ in 0..6 {
-                let (f, f_a, _) = eval(a)?;
-                if seed_residual.is_none() {
-                    seed_residual = Some(f);
-                }
-                if Self::row_intercept_newton_is_converged(a, f, f_a, abs_tol) {
-                    return Ok((Some((a, f_a.abs(), f)), seed_residual.unwrap_or(f)));
-                }
-                if !(f_a.is_finite() && f_a != 0.0) {
-                    break;
-                }
-                let next_a = a - f / f_a;
-                if !next_a.is_finite() {
-                    break;
-                }
-                a = next_a;
-            }
-            Ok((None, seed_residual.unwrap_or(f64::INFINITY)))
-        })();
-
-        if let Ok((accepted, seed_residual)) = &probe_result {
-            if let Some(stats) = stats {
-                stats.record_seed_residual(*seed_residual, abs_tol);
-            }
-            if let Some((a, abs_deriv, _)) = accepted {
-                if let Some(stats) = stats {
-                    if predictor_a.is_some() || cached_a.is_some() {
-                        stats.cached_short_circuit.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        stats
-                            .closed_form_short_circuit
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                self.cache_row_intercept(row, *a, marginal_eta, slope, beta_h, beta_w);
-                return Ok((*a, *abs_deriv, false));
-            }
-        }
-
-        let mut solve_result = crate::monotone_root::solve_monotone_root_detailed(
-            eval,
+        let survival_side = marginal.q >= 0.0;
+        let log_target = smaller_tail_log_target(marginal.q);
+        let grid = self.training_row_grid(row)?;
+        let mut seed_residual = None;
+        let mut density = f64::NAN;
+        let (a, evaluations) = solve_log_tail_root(
             a_init,
-            "bernoulli intercept",
-            abs_tol,
-            64,
-            48,
-        );
-
-        // If the warm-started solve failed, retry once from the closed-form
-        // seed. Cached `a` from a prior PIRLS iter can be far enough from
-        // the current root (e.g., after a large β step) that the bracketing
-        // search exhausts; the closed-form seed always sits in the correct
-        // basin.
-        if (predictor_a.is_some() || cached_a.is_some()) && solve_result.is_err() {
-            solve_result = crate::monotone_root::solve_monotone_root_detailed(
-                eval,
-                a_closed_form,
-                "bernoulli intercept",
-                abs_tol,
-                64,
-                48,
-            );
-        }
-        // Routine emits its own format!()-based String errors below
-        // (residual rejection); enclosing return type stays Result<_, String>.
-        let solve_solution = solve_result.map_err(|e| e.to_string())?;
+            survival_side,
+            |a| {
+                let tail = match grid.as_deref() {
+                    None => self.evaluate_denested_calibration_tail(
+                        a,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        survival_side,
+                    )?,
+                    Some(grid) => self.evaluate_empirical_grid_calibration_tail(
+                        a,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        grid,
+                        survival_side,
+                    )?,
+                };
+                let residual = tail.log_residual(survival_side, log_target)?;
+                seed_residual.get_or_insert((
+                    residual.value,
+                    anchor_residual_resolution(a, residual.first, residual.rounding),
+                ));
+                density = tail.density;
+                Ok(residual)
+            },
+            "bernoulli marginal-slope intercept",
+            || format!("row {row}, q={}, b={slope}", marginal.q),
+        )?;
         if let Some(stats) = stats {
-            stats.record_full_solver(solve_solution.refine_iters);
+            if let Some((residual, resolution)) = seed_residual {
+                stats.record_seed_residual(residual, resolution);
+            }
+            if evaluations == 1 && warm {
+                stats.cached_short_circuit.fetch_add(1, Ordering::Relaxed);
+            } else if evaluations == 1 {
+                stats
+                    .closed_form_short_circuit
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                stats.record_full_solver(evaluations);
+            }
         }
-        let (a, abs_deriv, f_best) = (
-            solve_solution.root,
-            solve_solution.abs_deriv,
-            solve_solution.residual,
-        );
-
-        if f_best.abs() > abs_tol {
-            return Err(format!(
-                "bernoulli marginal-slope intercept solve failed: \
-                     residual={f_best:.3e} at a={a:.6}, target mu={target:.6}"
-            ));
-        }
-
-        // Cache the converged intercept for the next PIRLS iter.
         self.cache_row_intercept(row, a, marginal_eta, slope, beta_h, beta_w);
-
-        Ok((a, abs_deriv, false))
+        Ok((a, density, false))
     }
-    pub(super) fn build_row_exact_context_with_stats_and_cell_cache(
+    pub(super) fn build_row_exact_context(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
         stats: Option<&BernoulliInterceptSolveStats>,
-        cache_degree9_cells: bool,
     ) -> Result<BernoulliMarginalSlopeRowExactContext, String> {
         let marginal_eta = block_states[0].eta[row];
         let marginal = self.marginal_link_map(marginal_eta)?;
@@ -580,56 +432,10 @@ impl BernoulliMarginalSlopeFamily {
             };
             (intercept, f64::NAN, false)
         };
-        // Cache degree-9 cell moments at the converged intercept so the
-        // many gradient/diagonal/matvec passes that run *after* this point
-        // for the same (row, β) don't re-evaluate `evaluate_cell_moments` /
-        // `bivariate_normal_cdf` on identical inputs. This matters for the
-        // FLEX path (linkwiggle + score-warp), where each per-row Hessian
-        // build runs the cell-moment kernel once per cell per closure call.
-        let degree9_cells = if cache_degree9_cells
-            && self.effective_flex_active(block_states)?
-            && matches!(self.latent_measure, LatentMeasureKind::StandardNormal)
-        {
-            let cells = self.denested_partition_cells(intercept, slope, beta_h, beta_w)?;
-            // Per-row dedup: within ONE row's denested-partition output, the
-            // score-warp and link-wiggle bases occasionally produce cells
-            // whose `(left, right, c0, c1, c2, c3)` are bit-equal. Evaluating
-            // moments once and cloning the result into the other slots is
-            // numerically identical to evaluating each cell independently
-            // (`evaluate_cell_moments_lru` is a pure function of the cell), and
-            // skips redundant work. The dedup is purely intra-row, so it is
-            // orthogonal to the per-family LRU (which is keyed across rows)
-            // and the affine tail-cell memo (a separate mechanism).
-            let mut dedup: HashMap<
-                exact_kernel::CellFingerprint,
-                exact_kernel::CellDerivativeMomentState,
-            > = HashMap::new();
-            let mut out: Vec<CachedDenestedCellMoments> = Vec::with_capacity(cells.len());
-            for partition_cell in cells.into_iter() {
-                let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
-                let state: exact_kernel::CellDerivativeMomentState =
-                    if let Some(existing) = dedup.get(&key) {
-                        existing.clone()
-                    } else {
-                        let computed =
-                            self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?;
-                        dedup.insert(key, computed.clone());
-                        computed
-                    };
-                out.push(CachedDenestedCellMoments {
-                    partition_cell,
-                    state,
-                });
-            }
-            Some(out)
-        } else {
-            None
-        };
         Ok(BernoulliMarginalSlopeRowExactContext {
             intercept,
             m_a,
             intercept_fast_path,
-            degree9_cells,
         })
     }
 
@@ -698,7 +504,7 @@ impl BernoulliMarginalSlopeFamily {
             slices.total
         ));
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-cache] build start n={} context_rows={} p={} flex={}",
                 n,
                 context_row_count,
@@ -713,7 +519,7 @@ impl BernoulliMarginalSlopeFamily {
             self.preseed_intercept_warm_starts(block_states)?;
         }
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-cache] preseed done n={} context_rows={} elapsed={:.3}s",
                 n,
                 context_row_count,
@@ -725,17 +531,6 @@ impl BernoulliMarginalSlopeFamily {
         }
         let stats = BernoulliInterceptSolveStats::default();
         let cell_cache_before = self.cell_moment_cache_stats.snapshot();
-        // Suppress per-row `degree9_cells` caching during the parallel context
-        // build: when flex is active *and* the latent measure is StandardNormal
-        // (i.e. exactly when `degree9_cells` would be populated), the top-of-
-        // cycle `build_row_cell_moments_bundle` invocation below also calls
-        // `denested_partition_cells` for every row. Suppressing the per-row
-        // cache here avoids the duplicate partition computation and the
-        // unused degree-9 moment evaluations whenever the bundle succeeds.
-        // When the bundle returns `None` (budget exceeded), the per-row
-        // `degree9_cells` cache is reconstructed below so the row-evaluation
-        // fast path that consults `row_ctx.degree9_cells` still has its
-        // cache. Numerical results are unchanged either way.
         let context_started = std::time::Instant::now();
         let progress_step = (context_row_count / 10).max(1);
         let completed_rows = AtomicUsize::new(0);
@@ -744,16 +539,11 @@ impl BernoulliMarginalSlopeFamily {
                 .par_iter()
                 .copied()
                 .map(|row| {
-                    let ctx = self.build_row_exact_context_with_stats_and_cell_cache(
-                        row,
-                        block_states,
-                        Some(&stats),
-                        false,
-                    )?;
+                    let ctx = self.build_row_exact_context(row, block_states, Some(&stats))?;
                     if log_exact_work(n) {
                         let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
                         if done == context_row_count || done % progress_step == 0 {
-                            log::info!(
+                            log::debug!(
                                 "[BMS exact-cache] row-context progress rows={}/{} elapsed={:.3}s",
                                 done,
                                 context_row_count,
@@ -769,7 +559,6 @@ impl BernoulliMarginalSlopeFamily {
                     intercept: f64::NAN,
                     m_a: f64::NAN,
                     intercept_fast_path: false,
-                    degree9_cells: None,
                 };
                 n
             ];
@@ -781,16 +570,11 @@ impl BernoulliMarginalSlopeFamily {
             (0..n)
                 .into_par_iter()
                 .map(|row| {
-                    let ctx = self.build_row_exact_context_with_stats_and_cell_cache(
-                        row,
-                        block_states,
-                        Some(&stats),
-                        false,
-                    )?;
+                    let ctx = self.build_row_exact_context(row, block_states, Some(&stats))?;
                     if log_exact_work(n) {
                         let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
                         if done == context_row_count || done % progress_step == 0 {
-                            log::info!(
+                            log::debug!(
                                 "[BMS exact-cache] row-context progress rows={}/{} elapsed={:.3}s",
                                 done,
                                 context_row_count,
@@ -807,22 +591,22 @@ impl BernoulliMarginalSlopeFamily {
             .filter(|ctx| ctx.intercept_fast_path)
             .count();
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-cache] row-context done rows={} fast_path_rows={} elapsed={:.3}s",
                 context_row_count,
                 fast_path_rows,
                 context_started.elapsed().as_secs_f64()
             );
         } else {
-            log::debug!(
+            log::trace!(
                 "[BMS exact-cache] row-intercept zero-deviation fast path rows={}/{}",
                 fast_path_rows,
                 n
             );
         }
         if flex_active {
-            log::info!(
-                "bernoulli marginal-slope intercept seed short-circuit: cached={}, closed_form={}, full_solver={}, max_full_solver_iters={}, seed_residual_bins={{<=1e-12:{}, <=1e-10:{}, <=1e-8:{}, <=abs_tol:{}, >abs_tol:{}}}",
+            log::debug!(
+                "bernoulli marginal-slope intercept seed short-circuit: cached={}, closed_form={}, full_solver={}, max_full_solver_iters={}, seed_residual_bins={{<=1e-12:{}, <=1e-10:{}, <=1e-8:{}, <=resolution:{}, >resolution:{}}}",
                 stats.cached_short_circuit.load(Ordering::Relaxed),
                 stats.closed_form_short_circuit.load(Ordering::Relaxed),
                 stats.full_solver.load(Ordering::Relaxed),
@@ -830,15 +614,15 @@ impl BernoulliMarginalSlopeFamily {
                 stats.seed_residual_le_1e12.load(Ordering::Relaxed),
                 stats.seed_residual_le_1e10.load(Ordering::Relaxed),
                 stats.seed_residual_le_1e8.load(Ordering::Relaxed),
-                stats.seed_residual_le_abs_tol.load(Ordering::Relaxed),
-                stats.seed_residual_gt_abs_tol.load(Ordering::Relaxed),
+                stats.seed_residual_le_resolution.load(Ordering::Relaxed),
+                stats.seed_residual_gt_resolution.load(Ordering::Relaxed),
             );
         }
         if flex_active {
             let (cell_hits, cell_misses, cell_hit_rate) = self
                 .cell_moment_cache_stats
                 .hit_rate_delta(cell_cache_before);
-            log::info!(
+            log::debug!(
                 "[BMS cell-moment LRU] cycle hits={} misses={} hit_rate={:.1}% entries={} resident_mib={:.1}/{:.1}",
                 cell_hits,
                 cell_misses,
@@ -848,7 +632,7 @@ impl BernoulliMarginalSlopeFamily {
                 self.cell_moment_lru.max_bytes() as f64 / (1024.0 * 1024.0),
             );
             let tail_stats = exact_kernel::tail_cell_moment_cache_stats();
-            log::info!(
+            log::debug!(
                 "[BMS exact-cache] affine tail-cell memo: hits={} misses={} entries={} hit_rate={:.3}%",
                 tail_stats.hits,
                 tail_stats.misses,
@@ -873,7 +657,7 @@ impl BernoulliMarginalSlopeFamily {
             None
         };
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-cache] row-cell phase done n={} selected_rows={} built={} forest={} elapsed={:.3}s",
                 n,
                 row_cell_mask.map_or(n, <[usize]>::len),
@@ -889,10 +673,10 @@ impl BernoulliMarginalSlopeFamily {
             let (ladder_hist, ladder_terminal) = exact_kernel::non_affine_ladder_cert_histogram();
             let (forest_hits, forest_fallbacks) =
                 crate::cell_moment_family::forest_coverage_counts();
-            log::info!(
+            log::debug!(
                 "[BMS ladder/forest stats] ladder_cert_by_rung={ladder_hist:?} ladder_terminal_384={ladder_terminal} forest_covered_rows={forest_hits} forest_fallback_rows={forest_fallbacks}"
             );
-            log::info!(
+            log::debug!(
                 "[BMS exact-cache] build done n={} context_rows={} p={} flex={} elapsed={:.3}s",
                 n,
                 context_row_count,
@@ -973,7 +757,7 @@ impl BernoulliMarginalSlopeFamily {
             match CellFamilyForest::partition(&a_rows, &b_rows, &score_breaks, &link_breaks) {
                 Ok(forest) => forest,
                 Err(reason) => {
-                    log::debug!("[BMS cell-family-forest] partition skipped: {reason}");
+                    log::trace!("[BMS cell-family-forest] partition skipped: {reason}");
                     return Ok(None);
                 }
             };
@@ -1008,7 +792,7 @@ impl BernoulliMarginalSlopeFamily {
                 Ok(left)
             })?;
         forest.build_families(demands);
-        log::info!(
+        log::debug!(
             "[BMS cell-family-forest] built n={} leaves={} eligible={} elapsed={:.3}s",
             n,
             forest.total_leaves(),
@@ -1022,9 +806,9 @@ impl BernoulliMarginalSlopeFamily {
     /// `max_degree`. Returns `None` when the FLEX path is inactive, when an
     /// empirical latent grid is in effect (the row kernel takes a non-cell
     /// path), or when the estimated resident bytes exceed the active
-    /// resource-policy budget. Numerical equivalence with the legacy per-row
-    /// path is unconditional: callers always fall back to
-    /// `degree9_cells`/on-demand cell evaluation when the bundle is absent.
+    /// resource-policy budget. Numerical equivalence with the per-row path is
+    /// unconditional: callers fall back to on-demand cell evaluation when the
+    /// bundle is absent.
     pub(super) fn build_row_cell_moments_bundle(
         &self,
         block_states: &[ParameterBlockState],
@@ -1058,7 +842,7 @@ impl BernoulliMarginalSlopeFamily {
             RowCellMomentsBundle::estimated_resident_bytes(n, max_n_cells, max_degree);
         let limit_bytes = self.policy.max_operator_cache_bytes;
         if upper_bound_bytes > limit_bytes {
-            log::info!(
+            log::debug!(
                 "[BMS row-cell-moments] skip precompute n={} selected_rows={} max_cells_per_row={} degree={} upper_bound_bytes={} limit_bytes={}",
                 n,
                 selected_row_count,
@@ -1074,7 +858,7 @@ impl BernoulliMarginalSlopeFamily {
             "BMS row-cell-moments n={n} selected_rows={selected_row_count} degree={max_degree}"
         ));
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS row-cell-moments] partition start n={} selected_rows={} degree={}",
                 n,
                 selected_row_count,
@@ -1099,7 +883,7 @@ impl BernoulliMarginalSlopeFamily {
             .map(|(_, cells)| cells.len())
             .sum::<usize>();
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS row-cell-moments] partition done n={} selected_rows={} cells={} elapsed={:.3}s",
                 n,
                 selected_n,
@@ -1110,7 +894,7 @@ impl BernoulliMarginalSlopeFamily {
         let estimated_bytes =
             RowCellMomentsBundle::estimated_resident_bytes(n, n_cells, max_degree);
         if estimated_bytes > limit_bytes {
-            log::warn!(
+            log::debug!(
                 "[BMS row-cell-moments] skip precompute n={} selected_rows={} cells={} degree={} estimated_bytes={} limit_bytes={}",
                 n,
                 selected_n,
@@ -1152,7 +936,7 @@ impl BernoulliMarginalSlopeFamily {
             rows[row] = Some(moments);
         }
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS row-cell-moments] precomputed n={} selected_rows={} cells={} degree={} estimated_bytes={} elapsed={:.3}s",
                 n,
                 selected_n,
@@ -1197,7 +981,7 @@ impl BernoulliMarginalSlopeFamily {
             RowCellMomentsBundle::estimated_resident_bytes(n, n_cells, required_degree);
         let limit_bytes = self.policy.max_operator_cache_bytes;
         if estimated_bytes > limit_bytes {
-            log::info!(
+            log::debug!(
                 "[BMS row-cell-moments] skip upgrade n={} selected_rows={} cells={} from_degree={} degree={} estimated_bytes={} limit_bytes={}",
                 n,
                 base.selected_rows,
@@ -1241,7 +1025,7 @@ impl BernoulliMarginalSlopeFamily {
             })
             .collect::<Result<Vec<_>, String>>()?;
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS row-cell-moments] upgraded n={} selected_rows={} cells={} from_degree={} degree={} estimated_bytes={} elapsed={:.3}s",
                 n,
                 base.selected_rows,
@@ -1261,11 +1045,11 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// BMS-FLEX GPU milestone 1: pack the row-primary Hessian inputs for the
-    /// Stage-2 device kernel in `crate::bms::gpu::row`. Returns `None`
-    /// when any precondition fails (latent is not StandardNormal, the
-    /// row-cell-moments bundle was not materialised, or score-warp /
-    /// link-deviation runtimes are missing). A caller that selected GPU
-    /// execution treats `None` as an unsupported-input error.
+    /// Stage-2 device kernel in `crate::bms::gpu::row`. Total over the models
+    /// the kernel declares (`BMS_FLEX_ROW_KERNEL_CAPABILITY`), which are the
+    /// only models selection hands it: any other model, or a primary layout
+    /// that disagrees with the family's blocks, is an engine defect and an
+    /// `Err` (gam#3000).
     ///
     /// The packed bundle mirrors `lower_bms_flex_row_order2_from_parts`
     /// (`StandardNormal` branch at lines 9047–9314) field-for-field. The
@@ -1276,37 +1060,35 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
-    ) -> Result<Option<crate::bms::gpu::row::BmsFlexRowKernelInputsOwned>, String> {
+    ) -> Result<crate::bms::gpu::row::BmsFlexRowKernelInputsOwned, String> {
         use super::exact_kernel as exact;
         use crate::marginal_slope_shared::SparsePrimaryCoeffJetView;
 
-        // ── Preconditions: the Stage-2 kernel only handles the StandardNormal
-        //    cell-loop branch with a pre-built row-cell-moments bundle. The
-        //    empirical-grid branch and the per-row degree-9 path both
-        //    require additional packing the kernel does not consume yet.
-        if !matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
-            return Ok(None);
+        if let Some(missing) = crate::bms::gpu::flex::BMS_FLEX_ROW_KERNEL_CAPABILITY
+            .missing_for(&self.flex_row_model())
+        {
+            return Err(format!(
+                "bms_flex_row pack: the row kernel was handed a model it does not compute \
+                 (it lacks {missing}); selection reads the same declaration, so this is an \
+                 engine defect"
+            ));
         }
-        let Some(bundle) = cache.row_cell_moments.as_ref() else {
-            return Ok(None);
-        };
         let primary = &cache.primary;
         let r = primary.total;
-        if r < 2 {
-            return Ok(None);
-        }
         let h_range = primary.h.clone();
         let w_range = primary.w.clone();
         let p_h = h_range.as_ref().map(|range| range.len()).unwrap_or(0);
         let p_w = w_range.as_ref().map(|range| range.len()).unwrap_or(0);
-        if r != 2 + p_h + p_w {
-            return Ok(None);
-        }
-        if p_h > 0 && self.score_warp.is_none() {
-            return Ok(None);
-        }
-        if p_w > 0 && self.link_dev.is_none() {
-            return Ok(None);
+        if r != 2 + p_h + p_w
+            || (p_h > 0 && self.score_warp.is_none())
+            || (p_w > 0 && self.link_dev.is_none())
+        {
+            return Err(format!(
+                "bms_flex_row pack: primary layout r={r} p_h={p_h} p_w={p_w} disagrees with the \
+                 family's blocks (score-warp={}, link-deviation={})",
+                self.score_warp.is_some(),
+                self.link_dev.is_some()
+            ));
         }
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
@@ -1330,17 +1112,40 @@ impl BernoulliMarginalSlopeFamily {
         #[cfg(not(target_os = "linux"))]
         let build_device_moments = false;
 
+        // ── Each row's denested partition. The row-cell-moments bundle
+        //    memoizes `denested_partition_cells` at the row's `(a, b)` with its
+        //    degree-9 moments. A row the bundle does not hold (the bundle was
+        //    refused on its byte budget, or built for an outer-score
+        //    subsample) is partitioned here by that same function, as the CPU
+        //    row lowering does for it, so the packing never depends on what the
+        //    memo happens to cover.
+        let moment_degree = crate::bms::gpu::row::MOMENT_STRIDE - 1;
+        let memo_row = |row: usize| {
+            cache
+                .row_cell_moments
+                .as_ref()
+                .and_then(|bundle| bundle.row(row, moment_degree))
+        };
+        let partitions: Vec<Vec<exact::DenestedPartitionCell>> = (0..n)
+            .into_par_iter()
+            .map(|row| match memo_row(row) {
+                Some(entries) => Ok(entries.iter().map(|entry| entry.partition_cell).collect()),
+                None => self.denested_partition_cells(
+                    Self::row_ctx(cache, row).intercept,
+                    block_states[1].eta[row],
+                    beta_h,
+                    beta_w,
+                ),
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
         // ── First pass: row offsets + total cell count. The Stage-2 kernel
         //    consumes a CSR `cell_offsets[n+1]` with `total_cells =
-        //    cell_offsets[n]`; reject up front any row whose cells were
-        //    not materialised at degree ≥ 9 (the kernel needs `m_0..m_9`).
+        //    cell_offsets[n]`.
         let mut cell_offsets: Vec<u32> = Vec::with_capacity(n + 1);
         cell_offsets.push(0);
         let mut total_cells: u32 = 0;
-        for row in 0..n {
-            let Some(row_cells) = bundle.row(row, 9) else {
-                return Ok(None);
-            };
+        for (row, row_cells) in partitions.iter().enumerate() {
             let len_u32 = u32::try_from(row_cells.len()).map_err(|_| {
                 format!("bms_flex_row pack: row {row} cell count exceeds u32 range")
             })?;
@@ -1426,12 +1231,11 @@ impl BernoulliMarginalSlopeFamily {
             row_w.push(self.weights[row]);
 
             let start = cell_offsets[row] as usize;
-            let row_cells = bundle
-                .row(row, 9)
-                .expect("row cell moments presence verified above");
-            for (local_idx, entry) in row_cells.iter().enumerate() {
+            let row_cells = &partitions[row];
+            let row_memo = memo_row(row);
+            for (local_idx, partition_cell) in row_cells.iter().enumerate() {
                 let cell_idx = start + local_idx;
-                let cell = entry.partition_cell.cell;
+                let cell = partition_cell.cell;
                 let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
                 let u_mid = a + b * z_mid;
 
@@ -1442,16 +1246,16 @@ impl BernoulliMarginalSlopeFamily {
 
                 // dc_da, dc_db (scaled)
                 let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
-                    entry.partition_cell.score_span,
-                    entry.partition_cell.link_span,
+                    partition_cell.score_span,
+                    partition_cell.link_span,
                     a,
                     b,
                 );
                 let dc_da = scale_coeff4(dc_da_raw, scale);
                 let dc_db = scale_coeff4(dc_db_raw, scale);
                 let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) = exact::denested_cell_second_partials(
-                    entry.partition_cell.score_span,
-                    entry.partition_cell.link_span,
+                    partition_cell.score_span,
+                    partition_cell.link_span,
                     a,
                     b,
                 );
@@ -1574,10 +1378,17 @@ impl BernoulliMarginalSlopeFamily {
                 // when host moments are selected. When the device-moment
                 // build is selected, this storage is
                 // skipped entirely and the substrate produces moments
-                // directly on the GPU below.
+                // directly on the GPU below. A row outside the memo takes the
+                // bundle's own evaluator at the bundle's degree.
                 if !build_device_moments {
+                    let state = match row_memo {
+                        Some(entries) => std::borrow::Cow::Borrowed(&entries[local_idx].state),
+                        None => std::borrow::Cow::Owned(
+                            exact::evaluate_cell_derivative_moments_uncached(cell, moment_degree)?,
+                        ),
+                    };
                     let mom_base = cell_idx * moment_stride;
-                    let src_moments: &[f64] = &entry.state.moments;
+                    let src_moments: &[f64] = &state.moments;
                     let copy_len = src_moments.len().min(moment_stride);
                     for k in 0..copy_len {
                         cell_moments[mom_base + k] = src_moments[k];
@@ -1587,11 +1398,9 @@ impl BernoulliMarginalSlopeFamily {
 
             // Moving-boundary terms of the link-knot crossings (#2901), the same
             // closed form `lower_bms_flex_row_order2_from_parts` adds.
-            let partition: Vec<exact::DenestedPartitionCell> =
-                row_cells.iter().map(|entry| entry.partition_cell).collect();
             let crossing =
                 super::standard_normal_flex_fifth::standard_normal_flex_crossing_second_partials(
-                    &partition, a, b, scale,
+                    row_cells, a, b, scale,
                 );
             row_crossing[row * 3..row * 3 + 3].copy_from_slice(&crossing);
 
@@ -1760,7 +1569,7 @@ impl BernoulliMarginalSlopeFamily {
         // Free the now-unneeded scratch.
         drop(gpu_cells);
 
-        Ok(Some(crate::bms::gpu::row::BmsFlexRowKernelInputsOwned {
+        Ok(crate::bms::gpu::row::BmsFlexRowKernelInputsOwned {
             n_rows: n,
             r,
             p_h,
@@ -1795,7 +1604,63 @@ impl BernoulliMarginalSlopeFamily {
             rho_u: row_rho,
             tau_u: row_tau,
             r_uv: row_ruv,
-        }))
+        })
+    }
+
+    /// The model this family asks a FLEX row kernel to evaluate. The law and the
+    /// blocks are fixed when the family is made, so every call answers the same.
+    pub(super) fn flex_row_model(&self) -> crate::bms::gpu::flex::BmsFlexRowModel {
+        crate::bms::gpu::flex::BmsFlexRowModel {
+            latent_integral: self.latent_measure.integral(),
+            score_warp: self.score_warp.is_some(),
+            link_deviation: self.link_dev.is_some(),
+            residual_repair: self.residual.is_some(),
+        }
+    }
+
+    /// The contiguous row-major dense views of both designs, which the
+    /// device-resident executor keeps on the device; `None` when either design
+    /// has none.
+    fn flex_dense_designs(&self) -> Option<(&[f64], &[f64])> {
+        Some((
+            self.marginal_design.as_dense_ref()?.as_slice()?,
+            self.slope_design.as_dense_ref()?.as_slice()?,
+        ))
+    }
+
+    /// The shape this family's row-primary Hessian is raced and recorded on
+    /// (gam#3024): the device executor the designs admit (resident with dense
+    /// designs, a host pin otherwise), the rows, the primary, marginal, slope
+    /// and total coefficient widths, and the CPU executor's threads.
+    fn flex_row_kernel_shape(&self) -> gam_gpu::RowKernelShape {
+        let slices = block_slices(self);
+        let primary = primary_slices(&slices);
+        let resident = cfg!(target_os = "linux") && self.flex_dense_designs().is_some();
+        gam_gpu::RowKernelShape {
+            kernel: if resident {
+                gam_gpu::GpuKernel::MarginalSlopeRows
+            } else {
+                gam_gpu::GpuKernel::MarginalSlopeRowsHostPin
+            },
+            rows: self.y.len(),
+            widths: [
+                primary.total,
+                slices.marginal.len(),
+                slices.slope.len(),
+                slices.total,
+            ],
+            threads: rayon::current_num_threads(),
+        }
+    }
+
+    /// Which kernel builds this family's row-primary Hessian: the one decision,
+    /// read at fit entry (where `gpu=required` for a model the device kernel
+    /// does not compute is refused before any seed) and by every cache build.
+    pub(super) fn flex_row_kernel_decision(&self) -> Result<gam_gpu::GpuDecision, String> {
+        crate::bms::gpu::flex::require_row_primary_hessian_supported(
+            &self.flex_row_model(),
+            self.flex_row_kernel_shape(),
+        )
     }
 
     pub(super) fn build_row_primary_hessian_cache(
@@ -1807,8 +1672,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(RowPrimaryEvalCache::Empty);
         }
         let n = self.y.len();
-        let primary = &cache.primary;
-        let r = primary.total;
+        let r = cache.primary.total;
         // On its own, the live reading folded into the monotone capacity floor
         // keeps the per-shape single-cache budget stable across workspace
         // rebuilds while the live reading drives the global-pin OOM guard. In a
@@ -1824,22 +1688,203 @@ impl BernoulliMarginalSlopeFamily {
             runtime_available,
             workspace_pinned,
         );
-        let gpu_decision = crate::bms::gpu::flex::require_row_primary_hessian_supported(n, r)?;
-        // When policy selects GPU, backend readiness is part of the execution
-        // contract. A failed probe is surfaced immediately; silently changing
-        // algorithms after selection would make both performance and failure
-        // semantics data-dependent.
-        if gpu_decision.use_gpu {
+        let gpu_decision = self.flex_row_kernel_decision()?;
+        let resident = gpu_decision.kernel == gam_gpu::GpuKernel::MarginalSlopeRows;
+        // The host-pin device executor builds the pin the memory plan sizes, so
+        // under `auto` it is raced or run only where the plan materializes one,
+        // and raced only where the discarded device pin fits beside the kept
+        // CPU pin. `required` runs it wherever it is selected.
+        let host_pin_admitted =
+            plan.materialize || matches!(gpu_decision.policy, gam_gpu::GpuPolicy::Required);
+        let host_pin_race_fits = plan.materialize
+            && plan
+                .workspace_pinned_bytes
+                .saturating_add(plan.bytes.saturating_mul(2))
+                <= plan.global_pin_budget_bytes;
+        let race = gpu_decision.race.filter(|_| resident || host_pin_race_fits);
+        let use_gpu = gpu_decision.use_gpu && (resident || host_pin_admitted);
+        let gpu_decision = if (use_gpu, race) == (gpu_decision.use_gpu, gpu_decision.race) {
+            gpu_decision
+        } else {
+            gam_gpu::GpuDecision {
+                use_gpu,
+                race,
+                reason: "cpu-device-host-pin-outside-memory-plan",
+                ..gpu_decision
+            }
+        };
+        // When policy selects GPU, or races it, backend readiness is part of the
+        // execution contract. A failed probe is surfaced immediately; silently
+        // changing algorithms after selection would make both performance and
+        // failure semantics data-dependent.
+        if use_gpu || race.is_some() {
             let backend = crate::bms::gpu::flex::BmsFlexGpuBackend::probe()
                 .map_err(|err| format!("BMS FLEX GPU backend probe failed: {err}"))?;
             if log_exact_work(n) {
-                log::info!(
+                log::debug!(
                     "[BMS row-primary-hessian-cache] gpu_backend_ready: {}",
                     backend.describe()
                 );
             }
         }
-        if !plan.materialize && !gpu_decision.use_gpu {
+        // GPU selection is fail-closed: every backend error is returned to the
+        // caller. The device kernel is selected only for a model it declares,
+        // and the packer is total over those models, so no input it is handed
+        // can send the build back to the CPU. CPU execution remains a separate
+        // policy decision, never an implicit retry of a selected GPU algorithm.
+        if let Some(shape) = race {
+            // A race times the whole inner step each executor would run: the
+            // resident device state serves every inner CG HVP, so both builds
+            // and every HVP against them are timed; the host pin serves the
+            // same HVPs either way, so its build is the race.
+            #[cfg(target_os = "linux")]
+            if resident {
+                let (race, cpu, device) = gam_gpu::ReusedStateRace::build(
+                    shape,
+                    || {
+                        self.build_row_primary_hessian_cpu_cache(
+                            block_states,
+                            cache,
+                            &plan,
+                            &gpu_decision,
+                        )
+                    },
+                    || self.build_row_primary_hessian_device_resident(block_states, cache),
+                )?;
+                return Ok(RowPrimaryEvalCache::Racing(Box::new(RowPrimaryEvalRace {
+                    cpu,
+                    device,
+                    race,
+                })));
+            }
+            return gam_gpu::race_row_kernel(
+                shape,
+                || {
+                    self.build_row_primary_hessian_cpu_cache(
+                        block_states,
+                        cache,
+                        &plan,
+                        &gpu_decision,
+                    )
+                },
+                || {
+                    self.build_row_primary_hessian_device_outputs(block_states, cache)
+                        .map(drop)
+                },
+            );
+        }
+        if !use_gpu {
+            return self.build_row_primary_hessian_cpu_cache(
+                block_states,
+                cache,
+                &plan,
+                &gpu_decision,
+            );
+        }
+        let started = std::time::Instant::now();
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
+            "BMS row-primary-hessian-device n={n} r={r} kernel={}",
+            gpu_decision.kernel.as_str()
+        ));
+        #[cfg(target_os = "linux")]
+        if resident {
+            let device_state =
+                self.build_row_primary_hessian_device_resident(block_states, cache)?;
+            if log_exact_work(n) {
+                log::debug!(
+                    "[BMS row-primary-hessian-cache] gpu_device_resident_ok rows={} r={} elapsed={:.3}s",
+                    n,
+                    r,
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            drop(process_monitor_guard);
+            return Ok(RowPrimaryEvalCache::Device(device_state));
+        }
+        let outputs = self.build_row_primary_hessian_device_outputs(block_states, cache)?;
+        if log_exact_work(n) {
+            log::debug!(
+                "[BMS row-primary-hessian-cache] gpu_launch_ok rows={} r={} elapsed={:.3}s",
+                n,
+                r,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        let packed_neglog = Array1::<f64>::from_vec(outputs.neglog);
+        let packed_grad = Array2::<f64>::from_shape_vec((n, r), outputs.grad)
+            .map_err(|err| format!("bms_flex_row grad shape: {err}"))?;
+        let packed_hess = Array2::<f64>::from_shape_vec((n, r * r), outputs.hess)
+            .map_err(|err| format!("bms_flex_row hess shape: {err}"))?;
+        drop(process_monitor_guard);
+        Ok(RowPrimaryEvalCache::Host(RowPrimaryEvalPin::new(
+            packed_neglog,
+            packed_grad,
+            packed_hess,
+            plan.bytes,
+            self.search.as_ref().map(|member| Arc::clone(&member.lane)),
+        )))
+    }
+
+    /// The device-resident executor's state: the n×r² row Hessian and both
+    /// dense designs, kept on the device for every subsequent HVP, diagonal
+    /// and gradient launch.
+    #[cfg(target_os = "linux")]
+    fn build_row_primary_hessian_device_resident(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<crate::bms::gpu::row::DeviceResidentRowHess, String> {
+        let (md_slice, gd_slice) = self
+            .flex_dense_designs()
+            .ok_or("BMS FLEX device-resident row kernel needs contiguous dense designs")?;
+        let owned = self.pack_bms_flex_row_kernel_inputs(block_states, cache)?;
+        let block_layout = crate::bms::gpu::row::BmsFlexBlockLayout {
+            p_m: cache.slices.marginal.len(),
+            p_g: cache.slices.slope.len(),
+            h: cache.slices.h.clone(),
+            w: cache.slices.w.clone(),
+            p_total: cache.slices.total,
+        };
+        let primary_layout = crate::bms::gpu::row::BmsFlexPrimaryLayout {
+            h: cache.primary.h.clone(),
+            w: cache.primary.w.clone(),
+            r: cache.primary.total,
+        };
+        crate::bms::gpu::row::launch_bms_flex_row_kernel_device_resident(
+            owned.as_borrowed(),
+            md_slice,
+            gd_slice,
+            block_layout,
+            primary_layout,
+        )
+        .map_err(|err| format!("BMS FLEX device-resident row launch failed: {err}"))
+    }
+
+    /// The host-pin device executor's rows: the device kernel's neglog,
+    /// gradient and row Hessian, copied back to the host.
+    fn build_row_primary_hessian_device_outputs(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<crate::bms::gpu::row::BmsFlexRowKernelOutputs, String> {
+        let owned = self.pack_bms_flex_row_kernel_inputs(block_states, cache)?;
+        crate::bms::gpu::row::launch_bms_flex_row_kernel(owned.as_borrowed())
+            .map_err(|err| format!("BMS FLEX row launch failed: {err}"))
+    }
+
+    /// The CPU executor's cache under the memory plan: a pin when the plan
+    /// materializes one, tiles when reuse pays for them and they fit, otherwise
+    /// nothing, and the rows are streamed.
+    fn build_row_primary_hessian_cpu_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        plan: &RowPrimaryHessianCachePlan,
+        gpu_decision: &gam_gpu::GpuDecision,
+    ) -> Result<RowPrimaryEvalCache, String> {
+        let n = self.y.len();
+        let r = cache.primary.total;
+        if !plan.materialize {
             let tiled_budget_bytes = plan
                 .global_pin_budget_bytes
                 .saturating_sub(plan.workspace_pinned_bytes);
@@ -1853,7 +1898,7 @@ impl BernoulliMarginalSlopeFamily {
                     plan.bytes, BMS_ROW_PRIMARY_HESSIAN_TILE_ROWS, plan.global_pin_budget_bytes
                 ));
                 if log_exact_work(n) {
-                    log::info!(
+                    log::debug!(
                         "[BMS row-primary-hessian-cache] decision=tile need_bytes={} avail_bytes={} stable_capacity={} workspace_pinned={} single_cache_budget={} global_pin_budget={} tile_rows={} n={} r={} expected_reuse_passes={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
                         plan.bytes,
                         plan.runtime_available_bytes,
@@ -1888,7 +1933,7 @@ impl BernoulliMarginalSlopeFamily {
                     row_start = row_end;
                 }
                 if log_exact_work(n) {
-                    log::info!(
+                    log::debug!(
                         "[BMS row-primary-hessian-cache] tiled build done n={} r={} tiles={} bytes={} elapsed={:.3}s",
                         n,
                         r,
@@ -1906,7 +1951,7 @@ impl BernoulliMarginalSlopeFamily {
                 )));
             }
             if log_exact_work(n) {
-                log::info!(
+                log::debug!(
                     "[BMS row-primary-hessian-cache] decision=stream need_bytes={} avail_bytes={} stable_capacity={} workspace_pinned={} single_cache_budget={} global_pin_budget={} n={} r={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
                     plan.bytes,
                     plan.runtime_available_bytes,
@@ -1933,7 +1978,7 @@ impl BernoulliMarginalSlopeFamily {
             plan.bytes, plan.single_cache_budget_bytes, plan.global_pin_budget_bytes
         ));
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS row-primary-hessian-cache] decision=materialize need_bytes={} avail_bytes={} stable_capacity={} workspace_pinned={} single_cache_budget={} global_pin_budget={} n={} r={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
                 plan.bytes,
                 plan.runtime_available_bytes,
@@ -1952,91 +1997,6 @@ impl BernoulliMarginalSlopeFamily {
                 gpu_decision.reason,
             );
         }
-        // GPU selection is fail-closed: unsupported packed inputs and every
-        // backend error are returned to the caller. CPU execution remains a
-        // separate policy decision, never an implicit retry of a selected GPU
-        // algorithm.
-        if gpu_decision.use_gpu {
-            let owned = self
-                .pack_bms_flex_row_kernel_inputs(block_states, cache)?
-                .ok_or_else(|| {
-                    "BMS FLEX GPU selected for inputs unsupported by the row kernel".to_string()
-                })?;
-            // When both marginal/slope designs expose a contiguous dense
-            // view, keep the n×r² row Hessian + designs resident for all
-            // subsequent HVP / diagonal launches.
-            #[cfg(target_os = "linux")]
-            {
-                let marginal_dense = self.marginal_design.as_dense_ref();
-                let slope_dense = self.slope_design.as_dense_ref();
-                if let (Some(md), Some(gd)) = (marginal_dense, slope_dense) {
-                    if md.is_standard_layout() && gd.is_standard_layout() {
-                        let block_layout = crate::bms::gpu::row::BmsFlexBlockLayout {
-                            p_m: cache.slices.marginal.len(),
-                            p_g: cache.slices.slope.len(),
-                            h: cache.slices.h.clone(),
-                            w: cache.slices.w.clone(),
-                            p_total: cache.slices.total,
-                        };
-                        let primary_layout = crate::bms::gpu::row::BmsFlexPrimaryLayout {
-                            h: primary.h.clone(),
-                            w: primary.w.clone(),
-                            r: primary.total,
-                        };
-                        let md_slice = md
-                            .as_slice()
-                            .expect("dense marginal_design is row-major contiguous");
-                        let gd_slice = gd
-                            .as_slice()
-                            .expect("dense slope_design is row-major contiguous");
-                        let device_state =
-                            crate::bms::gpu::row::launch_bms_flex_row_kernel_device_resident(
-                                owned.as_borrowed(),
-                                md_slice,
-                                gd_slice,
-                                block_layout,
-                                primary_layout,
-                            )
-                            .map_err(|err| {
-                                format!("BMS FLEX device-resident row launch failed: {err}")
-                            })?;
-                        if log_exact_work(n) {
-                            log::info!(
-                                "[BMS row-primary-hessian-cache] gpu_device_resident_ok rows={} r={} elapsed={:.3}s",
-                                n,
-                                r,
-                                started.elapsed().as_secs_f64()
-                            );
-                        }
-                        drop(process_monitor_guard);
-                        return Ok(RowPrimaryEvalCache::Device(device_state));
-                    }
-                }
-            }
-            let outputs = crate::bms::gpu::row::launch_bms_flex_row_kernel(owned.as_borrowed())
-                .map_err(|err| format!("BMS FLEX row launch failed: {err}"))?;
-            if log_exact_work(n) {
-                log::info!(
-                    "[BMS row-primary-hessian-cache] gpu_launch_ok rows={} r={} elapsed={:.3}s",
-                    n,
-                    r,
-                    started.elapsed().as_secs_f64()
-                );
-            }
-            let packed_neglog = Array1::<f64>::from_vec(outputs.neglog);
-            let packed_grad = Array2::<f64>::from_shape_vec((n, r), outputs.grad)
-                .map_err(|err| format!("bms_flex_row grad shape: {err}"))?;
-            let packed_hess = Array2::<f64>::from_shape_vec((n, r * r), outputs.hess)
-                .map_err(|err| format!("bms_flex_row hess shape: {err}"))?;
-            drop(process_monitor_guard);
-            return Ok(RowPrimaryEvalCache::Host(RowPrimaryEvalPin::new(
-                packed_neglog,
-                packed_grad,
-                packed_hess,
-                plan.bytes,
-                self.search.as_ref().map(|member| Arc::clone(&member.lane)),
-            )));
-        }
         let completed_rows = AtomicUsize::new(0);
         let progress_step = (n / 10).max(1);
         let rows = self.build_row_primary_hessian_pin(
@@ -2049,7 +2009,7 @@ impl BernoulliMarginalSlopeFamily {
             plan.bytes,
         )?;
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS row-primary-hessian-cache] build done n={} r={} elapsed={:.3}s",
                 n,
                 r,
@@ -2156,7 +2116,7 @@ impl BernoulliMarginalSlopeFamily {
                         if log_exact_work(n) {
                             let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
                             if done == n || done % progress_step == 0 {
-                                log::info!(
+                                log::debug!(
                                     "[BMS row-primary-hessian-cache] progress rows={}/{} elapsed={:.3}s",
                                     done,
                                     n,
@@ -3145,16 +3105,6 @@ impl BernoulliMarginalSlopeFamily {
                     !cached.is_empty(),
                     "row cell moments bundle was selected but row {row} has no cells"
                 );
-                cached
-                    .iter()
-                    .map(|entry| {
-                        (
-                            entry.partition_cell,
-                            std::borrow::Cow::Borrowed(&entry.state),
-                        )
-                    })
-                    .collect()
-            } else if let Some(cached) = row_ctx.degree9_cells.as_ref() {
                 cached
                     .iter()
                     .map(|entry| {
@@ -7392,6 +7342,7 @@ impl BernoulliMarginalSlopeFamily {
                         &ordered_pairs,
                         primary,
                         lanes,
+                        &self.jet_scratch.batch,
                     )
                 }
             }?;
@@ -7639,7 +7590,7 @@ impl BernoulliMarginalSlopeFamily {
             "row-stream"
         };
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS dense-H] build start n={} p={} source={} route=workspace-dense",
                 n,
                 slices.total,
@@ -7786,7 +7737,7 @@ impl BernoulliMarginalSlopeFamily {
                     if log_exact_work(n) {
                         let done = completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
                         if done == n_chunks || done % progress_step == 0 {
-                            log::info!(
+                            log::debug!(
                                 "[BMS dense-H] progress chunks={}/{} rows={}/{} elapsed={:.3}s",
                                 done,
                                 n_chunks,
@@ -7808,7 +7759,7 @@ impl BernoulliMarginalSlopeFamily {
             )?;
         let dense = acc.to_dense(slices);
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS dense-H] build done n={} p={} source={} route=workspace-dense elapsed={:.3}s",
                 n,
                 slices.total,
@@ -7859,7 +7810,7 @@ impl BernoulliMarginalSlopeFamily {
             slices.total
         ));
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS fused exact-gradient+dense-H] eval start n={} p={} source=cache row_primary_hessian_cache={}",
                 n,
                 slices.total,
@@ -8095,7 +8046,7 @@ impl BernoulliMarginalSlopeFamily {
                     if log_exact_work(n) {
                         let done = completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
                         if done == n_chunks || done % progress_step == 0 {
-                            log::info!(
+                            log::debug!(
                                 "[BMS fused exact-gradient+dense-H] progress chunks={}/{} rows={}/{} elapsed={:.3}s",
                                 done,
                                 n_chunks,
@@ -8136,7 +8087,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         let hessian = hessian_acc.to_dense(slices);
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS fused exact-gradient+dense-H] eval done n={} p={} source=cache elapsed={:.3}s",
                 n,
                 slices.total,
@@ -8178,7 +8129,7 @@ impl BernoulliMarginalSlopeFamily {
             cache.slices.total
         ));
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-loglik] eval start n={} p={} source=cache",
                 n,
                 cache.slices.total
@@ -8213,7 +8164,7 @@ impl BernoulliMarginalSlopeFamily {
             );
         let log_likelihood = total?;
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-loglik] eval done n={} p={} source=cache elapsed={:.3}s",
                 n,
                 cache.slices.total,

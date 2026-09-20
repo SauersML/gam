@@ -1089,13 +1089,13 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
             {
                 Ok(warm_start) => {
                     if !exact_mode_branch.borrow_mut().install_seed(warm_start) {
-                        log::debug!(
+                        log::trace!(
                             "[latent] ignored a late outer ρ-cache β seed: an accepted outer iterate already owns the coefficient-mode anchor"
                         );
                     }
                 }
                 Err(error) => {
-                    log::warn!(
+                    log::debug!(
                         "[latent] outer ρ-cache β warm start rejected: {error}; the next solve starts cold"
                     );
                 }
@@ -1119,11 +1119,9 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
         &[Vec::new()],
         &kappa_options,
         &setup,
-        crate::seeding::SeedRiskProfile::Survival,
         true,
         analytic_outer_hessian_available,
         true,
-        None,
         Some(walk_signals),
         outer_policy,
         // The final fit: the solver's error is carried whole (#2937). The family
@@ -1173,7 +1171,7 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
                     .borrow_mut()
                     .candidates(eval_mode, theta, &rho);
             if first_iterate {
-                log::info!(
+                log::debug!(
                     "[latent] first derivative-bearing outer evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
                 );
             }
@@ -1451,14 +1449,6 @@ fn prepare_latent_time_block(
     design_right: Option<&DesignMatrix>,
     derivative_guard: f64,
 ) -> Result<PreparedLatentTimeBlock, LatentSurvivalError> {
-    if !input.time_monotonicity.is_coordinate_cone() {
-        return Err(LatentSurvivalError::UnsupportedConfiguration {
-            reason: format!(
-                "latent survival requires a coordinate-cone monotonicity strategy; got {:?}",
-                input.time_monotonicity
-            ),
-        });
-    }
     let design_entry = input
         .design_entry
         .try_to_dense_by_chunks("latent survival entry time design")?;
@@ -1661,9 +1651,7 @@ fn build_log_sigma_blockspec(initial_sigma: f64, n_obs: usize) -> ParameterBlock
 /// (`gam_identifiability::check_map_uniqueness`: the affine null direction of
 /// `Jᵀ W J` carries `nᵀ S n < tol`, dominant block `time_transform`).
 ///
-/// This is the treatment the survival marginal-slope time block already installs
-/// (`install_time_nullspace_shrinkage_penalty`): the shared
-/// [`gam_terms::basis::function_space_nullspace_shrinkage`] builds the
+/// The shared [`gam_terms::basis::function_space_nullspace_shrinkage`] builds the
 /// function-metric ridge `G Z (ZᵀGZ)⁻¹ ZᵀG` (`Z` spanning the primary penalty's
 /// null space, `G` the endpoint-averaged basis Gram), whose range is exactly that
 /// null direction, so `nᵀ S n > 0` there. It is a *second* REML coordinate:
@@ -5094,7 +5082,7 @@ fn logk_q_derivatives(
     let second_cumulant = match bundle.second_cumulant_ratio(k, sigma) {
         Some(value) => value,
         None => {
-            log::warn!(
+            log::debug!(
                 "[#2610] cancellation-free second cumulant unavailable at k={k} \
                  (sigma={sigma:.6e}, mass={mass:.6e}); falling back to the \
                  differencing form, whose relative error grows without bound past \

@@ -65,6 +65,126 @@ pub enum JeffreysArmingEvidence {
         lineality_negative: usize,
         copositive_minimum: Option<f64>,
     },
+    /// The fit certified an unconstrained mode whose penalized information is
+    /// singular on `ker(S_λ)`, the `unreached_dim` directions no smoothing
+    /// parameter reaches (#3164): `λ_min` of the reduced information there is at
+    /// or below the Jeffreys plan's own numerical zero `information_floor`. No
+    /// `λ` can bound those directions, so the Laplace posterior is improper and
+    /// the certified mode is a point on a likelihood ray the solve stopped on
+    /// once its decrement fell below the objective's resolution.
+    ImproperPenaltyNullPosterior {
+        unreached_dim: usize,
+        information_min: f64,
+        information_floor: f64,
+    },
+    /// The pre-fit certificate found a threshold on one realized design column
+    /// that separates the binary outcomes, so the likelihood has no finite
+    /// maximizer along that column.
+    PrefitColumnSeparation {
+        column_index: usize,
+        threshold: f64,
+        positive_above_threshold: bool,
+    },
+    /// The pre-fit certificate found a direction in the realized design's
+    /// parametric columns that separates the binary outcomes with this minimum
+    /// signed margin, so the likelihood has no finite maximizer along it.
+    PrefitLinearSeparation {
+        column_indices: Vec<usize>,
+        min_signed_margin: f64,
+    },
+}
+
+impl JeffreysArmingEvidence {
+    /// One sentence naming why the Jeffreys prior was armed, written for a
+    /// fit's summary. Every surface that reports the estimator reads this, so
+    /// the Python summary, the model repr and the CLI say the same thing.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::PrefitColumnSeparation {
+                column_index,
+                threshold,
+                positive_above_threshold,
+            } => {
+                let side = if *positive_above_threshold { "above" } else { "below" };
+                format!(
+                    "separation: design column {column_index} puts every success {side} \
+                     {threshold:.6e}"
+                )
+            }
+            Self::PrefitLinearSeparation {
+                column_indices,
+                min_signed_margin,
+            } => format!(
+                "separation: a combination of design columns {column_indices:?} separates \
+                 the outcomes with margin {min_signed_margin:.3e}"
+            ),
+            Self::DescendingRay { block, .. } => format!(
+                "the likelihood kept improving along a direction block {block}'s penalty \
+                 does not close"
+            ),
+            Self::UnpenalizedDescendingRay { .. } => {
+                "the likelihood kept improving along a direction no penalty opposes".to_string()
+            }
+            Self::NullPenalizedHessian { nullity: Some(nullity) } => format!(
+                "the penalized information is singular at the fitted mode (nullity {nullity})"
+            ),
+            Self::NullPenalizedHessian { nullity: None } => {
+                "the penalized information is singular at the fitted mode".to_string()
+            }
+            Self::DivergentInnerState { .. } => {
+                "the coefficients diverged without the Jeffreys prior".to_string()
+            }
+            Self::StrictSaddle { .. } => {
+                "the fit without the Jeffreys prior stopped at a saddle point".to_string()
+            }
+            Self::ImproperConePosterior { .. } => {
+                "the constrained posterior without the Jeffreys prior is improper".to_string()
+            }
+            Self::ImproperPenaltyNullPosterior { .. } => {
+                "the posterior without the Jeffreys prior is improper along a direction no \
+                 penalty reaches"
+                    .to_string()
+            }
+        }
+    }
+}
+
+impl crate::EstimationError {
+    /// The separation certificate this refusal carries, or `None` when it does
+    /// not prove the binomial likelihood has no finite maximizer.
+    ///
+    /// Only the pre-fit separation certificates are proofs. A solve that did
+    /// not converge, a railed smoothing strength or a refused cubature says the
+    /// fit did not finish, not that the likelihood is unbounded, so none of
+    /// them may switch the estimator. A wrapper is read through to the error
+    /// that decided it, and a declined plateau through its terminal refusal.
+    #[must_use]
+    pub fn separation_arming_evidence(&self) -> Option<JeffreysArmingEvidence> {
+        match self.innermost_estimation_error() {
+            Self::PrefitPerfectSeparationDetected {
+                column_index,
+                threshold,
+                positive_above_threshold,
+            } => Some(JeffreysArmingEvidence::PrefitColumnSeparation {
+                column_index: *column_index,
+                threshold: *threshold,
+                positive_above_threshold: *positive_above_threshold,
+            }),
+            Self::PrefitLinearSeparationDetected {
+                min_signed_margin,
+                column_indices,
+                ..
+            } => Some(JeffreysArmingEvidence::PrefitLinearSeparation {
+                column_indices: column_indices.clone(),
+                min_signed_margin: *min_signed_margin,
+            }),
+            Self::DominatedCertifiedPlateau {
+                terminal_refusal, ..
+            } => terminal_refusal.separation_arming_evidence(),
+            _ => None,
+        }
+    }
 }
 
 impl CustomFamilyError {
@@ -487,10 +607,68 @@ mod tests {
         );
 
         // The evidence survives a saved model's JSON round trip.
-        for evidence in [ray_evidence, divergent_evidence] {
+        let separation = JeffreysArmingEvidence::PrefitLinearSeparation {
+            column_indices: vec![0, 2],
+            min_signed_margin: 0.125,
+        };
+        for evidence in [ray_evidence, divergent_evidence, separation] {
             let wire = serde_json::to_string(&evidence).unwrap();
             let restored: JeffreysArmingEvidence = serde_json::from_str(&wire).unwrap();
             assert_eq!(restored, evidence);
         }
+    }
+
+    #[test]
+    fn only_a_separation_certificate_switches_the_standard_estimator() {
+        use crate::EstimationError;
+        let column = EstimationError::PrefitPerfectSeparationDetected {
+            column_index: 1,
+            threshold: 0.5,
+            positive_above_threshold: true,
+        };
+        let column_evidence = JeffreysArmingEvidence::PrefitColumnSeparation {
+            column_index: 1,
+            threshold: 0.5,
+            positive_above_threshold: true,
+        };
+        assert_eq!(column.separation_arming_evidence(), Some(column_evidence.clone()));
+        assert!(
+            column_evidence.reason().contains("design column 1"),
+            "{}",
+            column_evidence.reason()
+        );
+        let linear = EstimationError::PrefitLinearSeparationDetected {
+            min_signed_margin: 0.25,
+            num_unpenalized_columns: 2,
+            column_indices: vec![0, 1],
+        };
+        assert_eq!(
+            linear.separation_arming_evidence(),
+            Some(JeffreysArmingEvidence::PrefitLinearSeparation {
+                column_indices: vec![0, 1],
+                min_signed_margin: 0.25,
+            })
+        );
+        // A fit that did not finish proves nothing about the likelihood.
+        for unfinished in [
+            EstimationError::RemlOptimizationFailed("railed rho".to_string()),
+            EstimationError::PerfectSeparationDetected {
+                iteration: 4,
+                max_abs_eta: 40.0,
+            },
+            EstimationError::TrialPointRefused {
+                reason: "cubature refused".to_string(),
+            },
+        ] {
+            assert_eq!(unfinished.separation_arming_evidence(), None, "{unfinished}");
+        }
+        // A custom-family whole-search refusal is read through to its outer error.
+        let wrapped = EstimationError::CustomFamily(CustomFamilyError::OuterSmoothingFailed {
+            reason: "outer smoothing optimization failed".to_string(),
+            last_refusal: None,
+            search_inner_refusal: None,
+            outer_error: std::sync::Arc::new(column),
+        });
+        assert_eq!(wrapped.separation_arming_evidence(), Some(column_evidence));
     }
 }

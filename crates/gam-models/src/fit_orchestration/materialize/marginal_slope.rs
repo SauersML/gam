@@ -213,7 +213,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         "Bernoulli marginal-slope",
     )?;
 
-    let mut inference_notes = Vec::new();
+    let mut inference_notes = FitNotes::default();
     // Bernoulli marginal-slope: structurally operator-only at large scale, so
     // flip the hint regardless of n to keep dense fallbacks blocked.
     let policy = resolved_resource_policy(
@@ -253,7 +253,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         "bernoulli marginal-slope slope_formula",
         &mut inference_notes,
     )?);
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let weights = resolve_fit_weight_column(data, col_map, config.weight_column.as_deref())?;
     let marginal_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let slope_offset =
         resolve_offset_column(data, col_map, config.noise_offset_column.as_deref())?;

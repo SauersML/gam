@@ -6,7 +6,7 @@ Issue #2114: `gamfit.fit(..., response_geometry=...)` returns a
 Poincaré / constant-curvature responses) that fits and predicts in memory, but
 the public persistence API could not round-trip it:
 
-  * `ResponseGeometryModel` defined no `save`/`dumps`, so `gamfit.save(m, path)`
+  * `ResponseGeometryModel` defined no `save`/`dumps`, so `m.save(path)`
     raised `TypeError` and `m.dumps()` raised `AttributeError`.
   * `gamfit.loads` only ever rebuilt a plain `Model` (or a `MultinomialModel`);
     the response-geometry payload has a different on-disk schema, so no branch
@@ -80,7 +80,7 @@ def test_response_geometry_model_save_load_round_trip() -> None:
 
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "response_geometry.gam"
-        gamfit.save(m, path)          # raised TypeError before the fix
+        m.save(path)          # raised TypeError before the fix
         m2 = gamfit.load(path)
 
     assert type(m2) is ResponseGeometryModel

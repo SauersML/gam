@@ -1044,7 +1044,7 @@ pub(crate) fn auto_outer_score_subsample(
 /// > together so two threads cannot both decide "new ρ" and double-bump.
 ///
 /// The transition at `phase_idx == AUTO_OUTER_PHASE1_BUDGET` is logged exactly
-/// once via `log::info!` with the supplied `family_label`. Each phase-1
+/// once via `log::debug!` with the supplied `family_label`. Each phase-1
 /// install also logs the planned mask size and predicted gradient
 /// noise. Callers running with auto-subsample disabled see no logging.
 pub(crate) fn maybe_install_auto_outer_subsample(
@@ -1117,7 +1117,7 @@ pub(crate) fn maybe_install_auto_outer_subsample(
             std::sync::atomic::Ordering::SeqCst,
         );
         if phase_idx == AUTO_OUTER_PHASE1_BUDGET {
-            log::info!(
+            log::debug!(
                 "[{family_label} auto-subsample] Phase 1 budget exhausted after {} evals; \
                  Phase 2 (full data) for remaining iterations",
                 AUTO_OUTER_PHASE1_BUDGET
@@ -1128,7 +1128,7 @@ pub(crate) fn maybe_install_auto_outer_subsample(
     let mask = auto_outer_score_subsample(z, stratum_secondary, outer_work_per_k_unit)?;
     let n_full = mask.n_full;
     let k = mask.len();
-    log::info!(
+    log::debug!(
         "[{family_label} auto-subsample] phase=1 eval={}/{} n={} K={} fraction={:.3} expected_grad_noise={:.2}% work_per_k_unit={} k_noise={} k_work={} cap_reason={}",
         phase_idx + 1,
         AUTO_OUTER_PHASE1_BUDGET,
@@ -1772,7 +1772,7 @@ pub(crate) fn chunked_row_reduction<Item, Acc, Init, Process, Combine>(
     rows: &[Item],
     init: Init,
     process_row: Process,
-    mut combine: Combine,
+    combine: Combine,
 ) -> Result<Acc, String>
 where
     Item: Sync + Copy,
@@ -1784,7 +1784,7 @@ where
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = rows.len();
     if n == 0 {
-        return Ok(init());
+        return Ok(combine_in_order(&init, Vec::new(), combine));
     }
     // The chunk count is sized so the heavy reduction phases actually saturate
     // the rayon pool: a fixed `32` left half of a 64-core box idle whenever the
@@ -1821,18 +1821,57 @@ where
         .map(|chunk_idx| -> Result<Acc, String> {
             let start = chunk_idx * chunk_size;
             let end = (start + chunk_size).min(n);
-            let mut acc = init();
-            for &item in &rows[start..end] {
-                process_row(item, &mut acc)?;
-            }
-            Ok(acc)
+            reduce_row_chunk(&rows[start..end], &init, &process_row)
         })
         .collect::<Result<Vec<Acc>, String>>()?;
+    Ok(combine_in_order(&init, chunk_states, combine))
+}
+
+/// One chunk of [`chunked_row_reduction`]: a fresh accumulator folded over the
+/// chunk's rows, in order.
+///
+/// Out of line on purpose (gam#2967). The chunk is mapped inside Rayon's split
+/// frame, and a split frame stays live across every join below it, so a worker
+/// that steals while it waits stacks one split frame per nesting level. With the
+/// row program inlined into the map closure, its by-value locals (the survival
+/// marginal-slope fifth- and sixth-order row tensors among them) became part of
+/// every split frame: 77,824 to 98,304 bytes each in gnomon's release build,
+/// which overflowed 2 MiB default workers. Here they sit in this leaf frame, which
+/// is live at most once per stack whatever the inliner does, and the split frame
+/// holds the chunk bounds and three references.
+#[inline(never)]
+fn reduce_row_chunk<Item, Acc, Init, Process>(
+    rows: &[Item],
+    init: &Init,
+    process_row: &Process,
+) -> Result<Acc, String>
+where
+    Item: Copy,
+    Init: Fn() -> Acc,
+    Process: Fn(Item, &mut Acc) -> Result<(), String>,
+{
+    let mut acc = init();
+    for &item in rows {
+        process_row(item, &mut acc)?;
+    }
+    Ok(acc)
+}
+
+/// The chunk accumulators of [`chunked_row_reduction`] merged in chunk-index
+/// order into a fresh one. Out of line for the reason [`reduce_row_chunk`] gives:
+/// the reduction's own frame is live across the collect's joins, and a caller that
+/// runs inside a Rayon job is stacked once per nesting level.
+#[inline(never)]
+fn combine_in_order<Acc, Init, Combine>(init: &Init, chunks: Vec<Acc>, mut combine: Combine) -> Acc
+where
+    Init: Fn() -> Acc,
+    Combine: FnMut(&mut Acc, Acc),
+{
     let mut total = init();
-    for chunk in chunk_states {
+    for chunk in chunks {
         combine(&mut total, chunk);
     }
-    Ok(total)
+    total
 }
 
 #[cfg(test)]

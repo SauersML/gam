@@ -1,12 +1,20 @@
 pub mod bivariate_normal;
 pub mod categorical;
 pub mod constrained_partition;
+// The generic variance-function × inverse-link exponential-dispersion row
+// kernel (families.md F2/F3).
+pub mod edm_row;
 pub mod fast_channel;
+pub mod fractional_rank;
 pub mod gaussian_activation;
+pub mod gaussian_reciprocal;
 mod jet_algebra;
 pub mod jet_partitions;
 pub mod jet_scalar;
 pub mod jet_tower;
+pub mod jet_trace;
+#[cfg(test)]
+mod jet_trace_tests;
 pub mod nested_dual;
 // One paired, interleaved, order-randomised timing harness for every "does A
 // beat B" gate in the workspace. Fifteen separate harnesses in three
@@ -28,6 +36,8 @@ pub mod score_opt;
 pub mod serial_dependence;
 pub mod special;
 
+#[cfg(test)]
+mod edm_row_oracle_tests;
 #[cfg(test)]
 mod jet_gamma_oracle_tests;
 #[cfg(test)]

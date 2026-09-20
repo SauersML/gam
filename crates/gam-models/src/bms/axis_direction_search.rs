@@ -79,7 +79,7 @@ impl BernoulliMarginalSlopeFamily {
             slices.total
         ));
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-gradient] eval start n={} p={} source=cache",
                 n,
                 slices.total
@@ -202,7 +202,7 @@ impl BernoulliMarginalSlopeFamily {
             gradient.slice_mut(s![range.clone()]).assign(grad_w);
         }
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-gradient] eval done n={} p={} source=cache elapsed={:.3}s",
                 n,
                 slices.total,
@@ -243,7 +243,6 @@ impl BernoulliMarginalSlopeFamily {
         out: &mut Array1<f64>,
     ) -> Result<(), String> {
         let slices = &cache.slices;
-        let primary = &cache.primary;
         let n = self.y.len();
 
         out.fill(0.0);
@@ -325,6 +324,49 @@ impl BernoulliMarginalSlopeFamily {
                 return Ok(());
             }
         }
+
+        // A racing inner step applies both executors' states and returns the
+        // CPU executor's image; the race times each (gam#3024).
+        #[cfg(target_os = "linux")]
+        if let Some(racing) = cache.row_primary_hessians.race() {
+            let direction_slice = direction.as_slice().expect("direction is contiguous");
+            return racing.race.apply(
+                || {
+                    self.exact_newton_joint_hessian_matvec_host_into(
+                        direction,
+                        block_states,
+                        cache,
+                        out,
+                    )
+                },
+                || {
+                    crate::bms::gpu::flex::require_selected_gpu_result(
+                        "raced joint-Hessian HVP",
+                        crate::bms::gpu::row::launch_bms_flex_row_hvp(
+                            &racing.device,
+                            direction_slice,
+                        ),
+                    )
+                    .map(|_| ())
+                },
+            );
+        }
+        self.exact_newton_joint_hessian_matvec_host_into(direction, block_states, cache, out)
+    }
+
+    /// The host executor's joint-Hessian HVP over the flexible row-primary
+    /// cache: its host pin, its tiles, or rows lowered as they stream. `out`
+    /// is zero on entry.
+    fn exact_newton_joint_hessian_matvec_host_into(
+        &self,
+        direction: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        out: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let n = self.y.len();
 
         // Host-pin shortcut: when the per-row Hessian is materialised on host
         // (the legacy path before Phase 3), build the joint-β image by
@@ -491,7 +533,7 @@ impl BernoulliMarginalSlopeFamily {
                 return Ok(());
             }
             if log_exact_work(n) {
-                log::info!(
+                log::debug!(
                     "[BMS exact-newton HVP] route=tiled-host rows={} r={} tiles={} bytes={}",
                     n,
                     tiles.r,
@@ -1026,7 +1068,7 @@ impl BernoulliMarginalSlopeFamily {
                 ));
             }
             if log_exact_work(n) {
-                log::info!(
+                log::debug!(
                     "[BMS exact-newton diag] route=tiled-host rows={} r={} tiles={} bytes={}",
                     n,
                     tiles.r,
@@ -3257,7 +3299,7 @@ impl BernoulliMarginalSlopeFamily {
             "BMS batched dH n={n} rows={n_rows} p={} dirs={n_dirs} flex={flex_active} cell_moments_bundle={bundle_present}",
             slices.total
         ));
-        log::info!(
+        log::debug!(
             "[BMS batched dH start] n={} rows={} p={} dirs={} flex={} cell_moments_bundle={}",
             n,
             n_rows,
@@ -3272,7 +3314,7 @@ impl BernoulliMarginalSlopeFamily {
         let bump_progress = |progress: &AtomicUsize| {
             let now = progress.fetch_add(1, Ordering::Relaxed) + 1;
             if now == n_rows || now.is_multiple_of(progress_step) {
-                log::info!(
+                log::debug!(
                     "[BMS batched dH progress] rows={}/{} dirs={} elapsed={:.3}s",
                     now,
                     n_rows,
@@ -3380,7 +3422,7 @@ impl BernoulliMarginalSlopeFamily {
                 .step_by(chunk_rows)
                 .map(|start| (start, (start + chunk_rows).min(n)))
                 .collect::<Vec<_>>();
-            log::info!(
+            log::debug!(
                 "[BMS batched dH chunks] mode=rigid-blas3 rows_per_chunk={} chunks={}",
                 chunk_rows,
                 chunks.len(),
@@ -3568,7 +3610,7 @@ impl BernoulliMarginalSlopeFamily {
                 .step_by(chunk_rows)
                 .map(|start| (start, (start + chunk_rows).min(n)))
                 .collect::<Vec<_>>();
-            log::info!(
+            log::debug!(
                 "[BMS batched dH chunks] rows_per_chunk={} chunks={} gpu_sized={}",
                 chunk_rows,
                 chunks.len(),
@@ -3754,7 +3796,7 @@ impl BernoulliMarginalSlopeFamily {
         };
 
         let elapsed = started.elapsed().as_secs_f64();
-        log::info!(
+        log::debug!(
             "[BMS batched dH] n={} rows={} p={} dirs={} elapsed={:.3}s",
             n,
             n_rows,
@@ -4054,7 +4096,7 @@ impl BernoulliMarginalSlopeFamily {
             "BMS batched d2H n={n} rows={n_rows} p={} pairs={n_pairs} unique_dirs={n_unique_dirs} flex={flex_active} cell_moments_bundle={bundle_present}",
             slices.total
         ));
-        log::info!(
+        log::debug!(
             "[BMS batched d2H start] n={} rows={} p={} pairs={} unique_dirs={} flex={} cell_moments_bundle={}",
             n,
             n_rows,
@@ -4069,7 +4111,7 @@ impl BernoulliMarginalSlopeFamily {
         let bump_progress = |progress: &AtomicUsize| {
             let now = progress.fetch_add(1, Ordering::Relaxed) + 1;
             if now == n_rows || now.is_multiple_of(progress_step) {
-                log::info!(
+                log::debug!(
                     "[BMS batched d2H progress] rows={}/{} pairs={} unique_dirs={} elapsed={:.3}s",
                     now,
                     n_rows,
@@ -4256,7 +4298,7 @@ impl BernoulliMarginalSlopeFamily {
             )?
             .unwrap_or_else(make_accs)
         };
-        log::info!(
+        log::debug!(
             "[BMS batched d2H done] n={} rows={} p={} pairs={} unique_dirs={} elapsed={:.3}s",
             n,
             n_rows,

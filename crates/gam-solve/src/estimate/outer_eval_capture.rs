@@ -345,11 +345,14 @@ pub struct QuadratureMarginalAudit {
     /// `Δ_b` as the corrector reports it: added to the block marginal
     /// log-likelihood, SUBTRACTED from the criterion.
     pub delta_b: f64,
-    /// The largest per-axis paired-rule difference on `delta_b`.
+    /// The paired-rule error on `delta_b`: summed over the separately
+    /// integrated pieces (one per axis when the block is split axis by axis,
+    /// the whole block otherwise), each piece contributing its largest
+    /// per-axis paired difference.
     pub quadrature_error: f64,
-    /// Number of nodes in the product rule.
+    /// Nodes evaluated, summed over those pieces.
     pub node_count: usize,
-    /// Per-axis Gauss–Hermite orders of that rule, as latched at admission.
+    /// Per-axis Gauss–Hermite orders, as latched at admission.
     pub axis_orders: Vec<usize>,
     /// Per-axis paired differences with that axis one order lower.
     pub axis_quadrature_errors: Vec<f64>,
@@ -364,6 +367,11 @@ pub struct QuadratureMarginalAudit {
     /// block membership is differencing two different functions and its
     /// quotient is not a derivative of either.
     pub block_cols: Vec<usize>,
+    /// Per separately integrated piece, whether it was integrated on a feasible
+    /// interval with at least one finite end
+    /// (`BlockExcessTarget::axis_truncation`), so its ends, transported nodes
+    /// and mass `ln Z` move with ρ.
+    pub truncated_pieces: Vec<bool>,
     /// Channel (a), `∂Δ_b/∂ρ_j` — the corrector's explicit penalty-score channel,
     /// raw.
     pub explicit_a: Vec<f64>,
@@ -604,7 +612,9 @@ pub(crate) fn certificate_parts_capture_enabled() -> bool {
 }
 
 /// Publish one evaluation's parts to an armed capture (no-op when disarmed).
-pub(crate) fn record_certificate_parts(parts: &[RhoGradientParts]) {
+/// Public so an outer objective outside this crate publishes the same channels
+/// the REML engine does (#2954).
+pub fn record_certificate_parts(parts: &[RhoGradientParts]) {
     CERTIFICATE_EVIDENCE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut() {
             state.parts = parts.to_vec();
@@ -623,8 +633,11 @@ pub(crate) fn record_certificate_inner_factor(factor: InnerFactorCondition) {
 }
 
 /// Publish the inner-mode error an evaluation's value carries to an armed
-/// capture (no-op when disarmed).
-pub(crate) fn record_certificate_inner_residual(charge: InnerResidualCharge) {
+/// capture (no-op when disarmed). Public for the reason
+/// [`record_certificate_parts`] is: without it an outer objective outside this
+/// crate forms no objective band, and every comparison of its values falls back
+/// to the criterion's statistical resolution (#3340).
+pub fn record_certificate_inner_residual(charge: InnerResidualCharge) {
     CERTIFICATE_EVIDENCE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut() {
             state.inner_residual = Some(charge);

@@ -8,7 +8,7 @@ case.
 
 Observed (with 300 groups):
 
-    GamError: fit_table panicked inside Rust boundary: Assertion failed at
+    GamfitError: fit_table panicked inside Rust boundary: Assertion failed at
     faer-0.24.0/.../cholesky/llt/solve.rs:20
     Assertion failed: rhs.nrows() == n
     - rhs.nrows() = 301
@@ -71,8 +71,9 @@ def test_group_random_intercept_fits_large_panel() -> None:
 
     model = gamfit.fit(df, "y ~ group(site)", family="gaussian")
 
-    # The fit must produce a usable model with a finite conditional-AIC score.
-    assert np.isfinite(model.conditional_aic)
+    # The fit must produce a usable model with a finite corrected-AIC score.
+    aic_corrected = model.summary().aic_corrected
+    assert aic_corrected is not None and np.isfinite(aic_corrected)
 
     # And it must actually recover the group structure it was generated from:
     # one prediction per group should track the true per-group mean closely.

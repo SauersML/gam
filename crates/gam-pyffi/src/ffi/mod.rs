@@ -4,7 +4,7 @@
 //!
 //! These are re-exported at the crate root (see `lib.rs`) under their historical
 //! flat names so the `include!`-fragment entrypoint code keeps reaching them
-//! through `crate::py_value_error`, `crate::GamError`, `crate::PyObject`,
+//! through `crate::py_value_error`, `crate::GamfitError`, `crate::PyObject`,
 //! `crate::finite_safe_json::…`, etc. The Rust module *paths* gained the `ffi::`
 //! prefix; the Python surface is unchanged.
 
@@ -14,3 +14,5 @@ pub(crate) mod ffi_errors;
 
 
 pub(crate) mod finite_safe_json;
+
+pub(crate) mod python_log;

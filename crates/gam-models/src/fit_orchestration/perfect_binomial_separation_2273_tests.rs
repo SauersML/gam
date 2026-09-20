@@ -19,8 +19,8 @@
 //!   1. `FitConvergenceEvidence::try_from_parts` mints a
 //!      `StalledAtValidMinimum` fit when the analytic outer criterion
 //!      certificate certifies (measurement over status-enum taxonomy) — this
-//!      is what lets the automatic Firth retry actually rescue a fit instead
-//!      of reaching a certified-but-refused inner state.
+//!      is what lets the automatically armed Jeffreys-prior fit certify
+//!      instead of reaching a certified-but-refused inner state.
 //!   2. `run_outer`'s stale-tolerance desync fix (7e6af6e): a solver
 //!      convergence claim that fails analytic certification is retried once,
 //!      re-seeded at the refused checkpoint, so the retry's tolerance anchor
@@ -77,12 +77,16 @@ use super::request::{FitConfig, FitResult, StandardFitResult};
 use csv::StringRecord;
 use gam_data::encode_recordswith_inferred_schema;
 
-/// Build the issue's EXACT (not statistically near-) separation fixture:
-/// `n/2` rows of class 0 at `x = 1.0, 1.1, 1.2, ...` and `n/2` rows of class
-/// 1 at `x = 10.0, 10.1, 10.2, ...` — a genuine gap between the two support
-/// intervals `[1, 1+0.1·(n/2−1)]` and `[10, 10+0.1·(n/2−1)]`, deterministic
-/// (no RNG), mirroring the issue's `sep_n6.csv`/n-sweep table verbatim. `n`
-/// must be even (every n the issue reports, 6..400, is).
+/// Build the issue's separation fixture: `n/2` rows of class 0 at
+/// `x = 1.0, 1.1, 1.2, ...` and `n/2` rows of class 1 at
+/// `x = 10.0, 10.1, 10.2, ...`, deterministic (no RNG), mirroring the issue's
+/// `sep_n6.csv`/n-sweep table verbatim. `n` must be even (every n the issue
+/// reports, 6..400, is).
+///
+/// The support intervals `[1, 1+0.1·(n/2−1)]` and `[10, 10+0.1·(n/2−1)]` have
+/// a genuine gap only while `1+0.1·(n/2−1) < 10`, i.e. `n < 182`
+/// ([`fixture_is_separated`]). The issue's n=400 row overlaps: its classes
+/// share `x ∈ [10, 20.9]` and it has a finite maximum likelihood.
 fn perfectly_separated_binomial(n: usize) -> gam_data::EncodedDataset {
     assert_eq!(n % 2, 0, "perfectly_separated_binomial requires an even n");
     let half = n / 2;
@@ -99,12 +103,18 @@ fn perfectly_separated_binomial(n: usize) -> gam_data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
+/// Whether [`perfectly_separated_binomial`]'s two class supports are
+/// disjoint, i.e. the largest class-0 `x` lies below the smallest class-1 `x`.
+fn fixture_is_separated(n: usize) -> bool {
+    1.0 + 0.1 * ((n / 2 - 1) as f64) < 10.0
+}
+
 /// Fit `formula` on the exact-separation fixture at `n` through the
 /// production formula-fit entry point and assert a MODEL is minted (not a
 /// hard error) — the #2273 contract. `firth` mirrors the CLI's `--firth`
-/// flag; `false` is the default CLI path (automatic Firth retry still
-/// engages internally when the base error is Firth-retryable, per
-/// `firth_can_rescue` in `fit_orchestration/fit.rs`).
+/// flag; `false` is the default CLI path, where the solver arms the Jeffreys
+/// prior before its first solve when the realized design certifies separation
+/// (`arm_jeffreys_on_prefit_binomial_separation`, #3129).
 fn assert_exact_separation_mints(n: usize, formula: &str, firth: bool) {
     let ds = perfectly_separated_binomial(n);
     let cfg = FitConfig {
@@ -140,15 +150,35 @@ fn assert_exact_separation_mints(n: usize, formula: &str, firth: bool) {
         "#2273: minted fit (n={n}, formula={formula:?}) must report a finite \
          positive edf, got {edf}"
     );
+    // #3129: the estimator is a function of the data. A separated design is
+    // fitted under the Jeffreys prior from the first solve: without `--firth`
+    // the prefit certificate armed it and is the recorded reason; with
+    // `--firth` the caller asked for it and no certificate was needed. An
+    // overlapping design keeps the flat prior unless the caller asked.
+    let separated = fixture_is_separated(n);
+    assert_eq!(
+        fit.artifacts.firth_bias_reduction,
+        firth || separated,
+        "#3129: fit (n={n}, formula={formula:?}, firth={firth}, separated={separated}) \
+         chose the wrong prior"
+    );
+    assert_eq!(
+        fit.artifacts.jeffreys_arming_evidence.is_some(),
+        !firth && separated,
+        "#3129: fit (n={n}, formula={formula:?}, firth={firth}, separated={separated}) \
+         recorded arming evidence {:?}",
+        fit.artifacts.jeffreys_arming_evidence
+    );
 }
 
 /// The issue's exact n-sweep table for the default `y ~ x` formula
-/// (automatic-retry path, no explicit `--firth`): every listed n — both the
+/// (automatic arming, no explicit `--firth`): every listed n — both the
 /// ones that hard-failed pre-fix (6, 10, 20, 30, 40, 100, 150) and the ones
 /// that happened to already converge (60, 80, 400) — must mint a model.
 /// The non-monotonic fail/pass-by-n pattern in the original report is
 /// exactly why every one of these is asserted individually rather than
-/// spot-checking a single n.
+/// spot-checking a single n. The n=400 row overlaps, so it is also the
+/// control for arming: it is fitted under the flat prior.
 #[test]
 fn exact_separation_linear_n_sweep_mints_2273() {
     for &n in &[6usize, 10, 20, 30, 40, 60, 80, 100, 150, 400] {
@@ -172,7 +202,7 @@ fn exact_separation_smooth_n_sweep_mints_2273() {
 /// which pre-fix reached exactly `StalledAtValidMinimum` and was refused by
 /// the strict fit-assembly gate even though the certified stationarity
 /// residual was five orders of magnitude inside its own bound). Explicit
-/// Firth must mint here too, independent of the automatic-retry path
+/// Firth must mint here too, independent of the automatic arming
 /// exercised by the two sweeps above.
 #[test]
 fn exact_separation_explicit_firth_mints_2273() {
@@ -181,21 +211,21 @@ fn exact_separation_explicit_firth_mints_2273() {
 
 /// The coefficient-runaway / Fisher-weight-collapse separation pathology is
 /// NOT logit-specific — it afflicts every binomial inverse link. Before the
-/// link-general rescue, the reactive Firth retry in `fit_from_formula` was
+/// link-general arming, the Firth path in `fit_from_formula` was
 /// gated on `is_binomial_logit`, so a NON-logit binomial fit
 /// (`link(type=probit)`, `link(type=cloglog)`) on exactly-separated data
-/// produced a retryable `RemlDidNotConverge`/PrefitSeparation error that the
+/// produced a `RemlDidNotConverge`/PrefitSeparation error that the
 /// link gate then refused to act on — a hard failure with no model, off the
 /// default link, despite the README promising Firth handles binomial
 /// separation.
 ///
 /// The headline case is probit at n=6: measured to halt on a flat-valley
 /// outer stall (|g|≈1.9e2 ≫ bound=1.0) and mint only under Firth, with the
-/// automatic retry never engaging pre-fix. After gating the rescue on
+/// Jeffreys prior never engaging pre-fix. With arming gated on
 /// `LikelihoodSpec::supports_firth()` (Binomial + Fisher-weight-jet link),
 /// every one of these mints through the same no-explicit-`--firth`
-/// automatic-retry path the default-link sweeps use. This test goes red if
-/// the rescue is ever narrowed back to the logit special case.
+/// automatic arming the default-link sweeps use. This test goes red if
+/// arming is ever narrowed back to the logit special case.
 #[test]
 fn exact_separation_nonlogit_links_rescued_by_firth_2273() {
     for link in ["probit", "cloglog"] {

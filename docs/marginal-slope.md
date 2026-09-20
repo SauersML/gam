@@ -61,6 +61,20 @@ both columns are present. All fitting data must belong to the outer training
 sample. Fold-local knots and geometry never use the outer test sample.
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+from scipy.stats import norm
+
+rng = np.random.default_rng(0)
+n = 600
+df = pd.DataFrame(rng.normal(0, 1, (n, 4)), columns=["pc1", "pc2", "pc3", "pc4"])
+df["age"], df["family_id"] = rng.uniform(40, 70, n), np.arange(n) // 2
+z = rng.normal(0, 1, n)                              # latent score, N(0, 1) given the PCs
+df["raw_score"] = 0.5 * df["pc1"] + np.exp(0.3 * z)  # observed score: shifted and skewed
+df["case"] = (rng.uniform(size=n) < norm.cdf(-0.5 + 0.03 * (df["age"] - 55) + (0.6 + 0.3 * df["pc2"]) * z)).astype(float)
+test_df = df.iloc[:100]
+
 model = gamfit.fit(
     df,
     "case ~ s(age) + matern(pc1, pc2, pc3)",
@@ -128,6 +142,20 @@ entry, condition on surviving to entry. Competing-risk incidence needs separate
 cause components and a CIF, not one minus disease-only net survival.
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 600
+df = pd.DataFrame({"bmi": rng.normal(27, 4, n), "hba1c": rng.normal(6, 0.8, n), "family_id": np.arange(n) // 2})
+z = rng.normal(0, 1, n)
+df["raw_score"] = 0.1 * (df["bmi"] - 27) + np.exp(0.3 * z)
+t = rng.exponential(10 * np.exp(-0.05 * (df["bmi"] - 27) - 0.3 * (df["hba1c"] - 6) - 0.5 * z))
+c = rng.uniform(2, 25, n)
+df["entry"], df["exit"], df["event"] = 0.0, np.minimum(t, c), (t <= c).astype(float)
+test_df = df.iloc[:100].assign(exit=10.0)   # prospective frame: exit = prediction horizon
+
 model = gamfit.fit(
     df,
     "Surv(entry, exit, event) ~ s(bmi) + s(hba1c)",
@@ -202,6 +230,16 @@ likelihood it can also be a surface in *follow-up time*, which is the natural
 question for a score whose effect is thought to attenuate with age:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 500
+bmi, z = rng.normal(27, 4, n), rng.normal(0, 1, n)
+t = rng.weibull(1.5, n) * 10 * np.exp(-0.05 * (bmi - 27) - 0.6 * z)
+c = rng.uniform(2, 25, n)
+df = {"entry": np.zeros(n), "exit": np.minimum(t, c), "event": (t <= c).astype(float), "bmi": bmi, "z": z}
+
 model = gamfit.fit(
     df,
     "Surv(entry, exit, event) ~ s(bmi)",
@@ -271,6 +309,17 @@ chain when the fitted transformation should travel with the outcome
 predictor.
 
 ```python
+import numpy as np
+import gamfit
+from scipy.stats import norm
+
+rng = np.random.default_rng(0)
+n = 500
+pc, age, z = rng.normal(0, 1, (n, 3)), rng.uniform(40, 70, n), rng.normal(0, 1, n)
+p = norm.cdf(-0.5 + 0.03 * (age - 55) + 0.3 * pc[:, 0] + (0.6 + 0.3 * pc[:, 1]) * z)
+df = {"age": age, "pc1": pc[:, 0], "pc2": pc[:, 1], "pc3": pc[:, 2], "z": z,
+      "case": (rng.uniform(size=n) < p).astype(float)}
+
 model = gamfit.fit(
     df,
     "case ~ s(age) + matern(pc1, pc2, pc3)",
@@ -343,6 +392,19 @@ on its own axis:
    being one of the four nearest, and the pooled share keeps the mixture
    defined where contexts tie, so the law, the anchor and the prediction are
    continuous in the covariates everywhere.
+
+   Where a moment moves the law is chosen among nested arms, simplest first:
+   the Gaussian law, the location-scale law `m(a) + √v(a)·ε` with a Gaussian
+   `ε`, the same with `ε` on its estimated law, and the local laws. An arm
+   that anchors on a Gaussian residual (the score for the Gaussian arm, `ε`
+   for the location-scale Gaussian arm) is a candidate only if that residual
+   passes the standard-normal adequacy screen. The fit is solved on the
+   simplest candidate of the location-scale structure, and at the converged
+   fit the certificate takes the simplest candidate whose cross-fitted
+   excess anchoring loss is within one paired standard error of the lowest
+   candidate's, re-solving on it when it is another arm. A heavy-tailed or
+   skewed `ε` therefore anchors on its estimated law even where the
+   cross-fitted loss does not resolve the Gaussian arm from it.
 
 The conditional test comes first because a score can be exactly `N(0, 1)`
 overall while every conditional law `z | a` is shifted. One pooled law then
@@ -582,6 +644,19 @@ of `r` removes from squared risk is exactly `c_rᵀ Σ_r⁺ c_r` with
 (`Descent.Portability.ResidualGeneticRepair.residual_repair_law`).
 
 ```python
+import numpy as np
+import gamfit
+from scipy.stats import norm
+
+rng = np.random.default_rng(0)
+n = 500
+pc, age, z = rng.normal(0, 1, (n, 3)), rng.uniform(40, 70, n), rng.normal(0, 1, n)
+r = rng.normal(0, 1, (n, 3))                      # conditionally centred residual features
+p = norm.cdf(-0.5 + 0.03 * (age - 55) + (0.6 + 0.3 * pc[:, 1]) * z + 0.4 * r[:, 0])
+df = {"age": age, "pc1": pc[:, 0], "pc2": pc[:, 1], "pc3": pc[:, 2], "z": z,
+      "chr6_partial": r[:, 0], "chr11_partial": r[:, 1], "afr_contrast": r[:, 2],
+      "case": (rng.uniform(size=n) < p).astype(float)}
+
 model = gamfit.fit(
     df,
     "case ~ s(age) + matern(pc1, pc2, pc3)",
@@ -690,7 +765,18 @@ a baseline known from outside the data — a published prevalence
 intercept-only marginal formula, leaving the slope surface free:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
 from scipy.stats import norm
+
+rng = np.random.default_rng(0)
+n = 500
+df = pd.DataFrame({"x": rng.uniform(0, 1, n), "z": rng.normal(0, 1, n)})
+df["prev"] = 0.1 + 0.2 * df["x"]                                  # published prevalence prev(x)
+b = 0.5 + 0.5 * df["x"]                                           # true slope surface
+p = norm.cdf(norm.ppf(df["prev"]) * np.sqrt(1 + b**2) + b * df["z"])
+df["case"] = (rng.uniform(size=n) < p).astype(float)
 
 df["baseline"] = norm.ppf(df["prev"])
 model = gamfit.fit(
@@ -715,9 +801,27 @@ are `--offset-column` and `--noise-offset-column`.
 Survival marginal-slope supports no frailty, or
 `frailty_kind="gaussian-shift"` with a fixed `frailty_sd`.
 `"hazard-multiplier"` and a learnable gaussian-shift sigma are rejected
-at fit time.
+at fit time. With the default slope (an intercept in every slope surface and
+no offset, or a constant one), a learnable sigma is rejected because the
+likelihood does not identify it: it reads the frailty only as the observed
+slope `s(σ)·g`, `s(σ) = 1/√(1+σ²)`, so rescaling the slope undoes any change of
+σ and the data cannot tell two values apart (gam#2938). A fixed `frailty_sd`
+only rescales the reported slope.
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 600
+df = pd.DataFrame({"age": rng.uniform(40, 70, n), "family_id": np.arange(n) // 2})
+z = rng.normal(0, 1, n)
+df["raw_score"] = 0.02 * (df["age"] - 55) + np.exp(0.3 * z)
+t = rng.exponential(10 * np.exp(-0.04 * (df["age"] - 55) - 0.5 * z + rng.normal(0, 0.3, n)))
+c = rng.uniform(2, 25, n)
+df["entry"], df["exit"], df["event"] = 0.0, np.minimum(t, c), (t <= c).astype(float)
+
 gamfit.fit(df,
     "Surv(entry, exit, event) ~ s(age)",
     survival_likelihood="marginal-slope",
@@ -734,6 +838,15 @@ gamfit.fit(df,
 ## Detecting marginal-slope models after loading
 
 ```python
+import numpy as np
+import gamfit
+from scipy.stats import norm
+
+rng = np.random.default_rng(0)
+age, z = rng.uniform(40, 70, 400), rng.normal(0, 1, 400)
+df = {"age": age, "z": z, "case": (rng.uniform(size=400) < norm.cdf(0.03 * (age - 55) + 0.7 * z)).astype(float)}
+model = gamfit.fit(df, "case ~ s(age)", family="bernoulli-marginal-slope", z_column="z", slope_formula="s(age)")
+
 model.save("model.gam")            # a model saved earlier
 model = gamfit.load("model.gam")
 model.is_marginal_slope            # True if a marginal-slope family
@@ -773,7 +886,8 @@ df = pd.DataFrame({
     "pc2":  rng.normal(0, 1, n),
     "pc3":  rng.normal(0, 1, n),
 })
-df["disease"] = (rng.uniform(0, 1, n) < 0.25).astype(float)
+risk = -1.1 + 0.8 * df["PGS"] + 0.4 * df["pc1"]
+df["disease"] = (rng.uniform(0, 1, n) < 1 / (1 + np.exp(-risk))).astype(float)
 df["family_id"] = np.arange(n)  # This illustrative sample is unrelated.
 
 # Condition the score on the PCs and fit the slope surface in one

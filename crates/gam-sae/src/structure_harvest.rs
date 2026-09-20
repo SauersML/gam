@@ -108,7 +108,8 @@ use gam_solve::{
 use gam_terms::inference::structure_evidence::{ClaimKind, StructureLedger};
 use gam_terms::latent::{LatentIdMode, LatentManifold};
 use gam_terms::structure::anova_atom::{
-    CarveReport, FissionDecision, carve, carve_input_from_fitted_atom, fission_decision,
+    BindingTestUnavailable, CarveReport, FissionDecision, carve, carve_input_from_fitted_atom,
+    fission_decision,
 };
 use opt::{BracketedRootConfig, FirstOrderSample, ObjectiveEvalError, find_root_bracketed};
 
@@ -665,7 +666,7 @@ pub fn harvest_move_proposals(
     // for a bound atom. A carve that does NOT prove binding rides as a fission
     // proposal whose trigger is the carve's interaction fraction (ascending —
     // the most-separable atom sorts first), and whose binding evidence is the
-    // carve's `edge_p_value`, recorded for the ledger.
+    // carve's edge test, recorded for the ledger.
     //
     // A candidate that is NOT a recoverable product atom (single-axis, sphere
     // chart, monomial patch — `factor_basis_sizes() == None`), or whose carve
@@ -684,8 +685,8 @@ pub fn harvest_move_proposals(
             Some(Ok(report)) => {
                 fission_carve_ran_count += 1;
                 let decision = fission_decision(&report, None);
-                let edge_p = report.edge_p_value;
                 let interaction = report.interaction_fraction;
+                let edge_p = report.edge_p_value();
                 carve_results.push(FissionCarveResult {
                     atom,
                     edge_p_value: edge_p,
@@ -697,7 +698,7 @@ pub fn harvest_move_proposals(
                         // Binding proven (or interaction non-negligible): the
                         // atom is irreducible. Do NOT propose a fission.
                         fission_carve_blocked_count += 1;
-                        log::debug!(
+                        log::trace!(
                             "[structure-harvest] #993 carve KEEPS atom {atom}: binding proven \
                              (edge_p={edge_p:?}, interaction_fraction={interaction:.3e}); no fission proposed",
                         );
@@ -712,7 +713,7 @@ pub fn harvest_move_proposals(
             }
             Some(Err(err)) => {
                 fission_carve_unavailable_count += 1;
-                log::debug!(
+                log::trace!(
                     "[structure-harvest] #993 carve could not run on atom {atom}: {err}; \
                      fission audit rides on co-activation significance, e-gate owns acceptance",
                 );
@@ -746,11 +747,12 @@ pub fn harvest_move_proposals(
     let mut birth_skipped_reason: Option<String> = None;
     if params.max_births > 0 && n > 0 && residuals.ncols() > 0 {
         let p = residuals.ncols();
-        let max_rank = params.max_births.min(p.saturating_sub(1));
+        // The evidence ranks every identifiable factor count; `max_births` is a
+        // per-round admission budget applied to the scored proposals below, not
+        // a cap on the model comparison.
         match StructuredResidualModel::fit(ResidualFactorInput {
             residuals,
             activity: activity.view(),
-            max_factor_rank: max_rank,
         }) {
             Ok(model) => {
                 let factor = model.factor();
@@ -881,7 +883,7 @@ pub fn harvest_move_proposals(
                     deferred_predicted_bits += priority.bits().unwrap_or(0.0);
                 }
                 if births_deferred > 0 {
-                    log::debug!(
+                    log::trace!(
                         "[structure-harvest] #2233 deferred {births_deferred} birth(s) (zero \
                          residual energy or past the max_births budget; total priority \
                          {deferred_predicted_bits:.1} bits) of {r} residual factors; proposed \
@@ -923,9 +925,12 @@ pub fn harvest_move_proposals(
 pub struct FissionCarveResult {
     /// The audited product atom.
     pub atom: usize,
-    /// Edge-level representational binding p-value (the carve's joint Wald over
-    /// the gauge-projected interaction block). `None` when the test degenerated.
-    pub edge_p_value: Option<f64>,
+    /// Edge-level representational binding p-value: the carve's exact
+    /// sample-space test of the atom's interaction directions against its
+    /// additive fit, joint over the decoder outputs. `Err` names why the
+    /// sample could not carry the test (for instance, a re-fit that
+    /// reproduces the decoder exactly leaves no residual variation).
+    pub edge_p_value: Result<f64, BindingTestUnavailable>,
     /// Fraction of centered surface energy carried by the interaction
     /// (0 = perfectly additive / separable, 1 = pure interaction).
     pub interaction_fraction: f64,
@@ -4440,7 +4445,7 @@ fn birth_atlas(
         // that owns `HarvestReport`, so the debug log — the channel the #2233
         // birth pre-screen already reports through — is the additive diagnostic
         // surface here; each `RejectedCenter` is `Display`-legible.
-        log::debug!(
+        log::trace!(
             "#2280 atlas dropped {} uncertifiable center(s) on a birth residual: {}",
             dropped.len(),
             dropped
@@ -4456,7 +4461,7 @@ fn birth_atlas(
 /// The atlas's topology readout, logged, or `None` when it cannot be computed.
 fn atlas_readout(atlas: &crate::manifold::LocalAtlas) -> Option<AtlasTopologyReadout> {
     let readout = crate::manifold::observe_atlas_topology(atlas).ok()?;
-    log::debug!("#2280 {readout}");
+    log::trace!("#2280 {readout}");
     Some(readout)
 }
 
@@ -4532,7 +4537,7 @@ fn atlas_reorder_specs(
     let named = observed.and_then(observed_kind_to_auto_topology);
     if let Some(named) = named {
         if specs.iter().any(|spec| spec.kind == named) {
-            log::debug!(
+            log::trace!(
                 "#2280 atlas topology prior: the charts and their transition holonomy measure \
                  {named:?}; floating it ahead of the menu so the REML race breaks an exact tie \
                  toward the measured manifold"
@@ -4554,13 +4559,13 @@ fn atlas_reorder_specs(
         return specs;
     }
     if !specs.iter().any(|spec| kind_is_non_orientable(spec.kind)) {
-        log::debug!(
+        log::trace!(
             "#2280 atlas topology prior: measured a non-orientable manifold, but this menu \
              realizes no twisted candidate; menu unchanged"
         );
         return specs;
     }
-    log::debug!(
+    log::trace!(
         "#2280 atlas topology prior: measured a non-orientable manifold the menu cannot realize \
          exactly; floating the twisted candidate(s) ahead of the orientable menu"
     );
@@ -5189,7 +5194,7 @@ fn log_atlas_evidence_agreement(atlas: Option<&AtlasTopologyReadout>, ranking: &
         && measured_entry.kind != winner_kind
         && !winner.is_resolvably_better_than(&measured_entry)
     {
-        log::info!(
+        log::debug!(
             "#2729 atlas/evidence TIE: the charts measured {measured:?} (tk \
              {:.17e}, resolution {:?}) and the race ranked {winner_kind:?} first (tk \
              {winner_score:.17e}, resolution {:?}); the {:.6e} gap is INSIDE the combined \
@@ -5207,14 +5212,14 @@ fn log_atlas_evidence_agreement(atlas: Option<&AtlasTopologyReadout>, ranking: &
         // resolved it against the field; `log_unresolved_topology_race` has
         // already reported the unresolved case, and a tie between OTHER
         // candidates does not weaken this datum, so the AGREE branch stands.
-        log::debug!(
+        log::trace!(
             "#2280 atlas/evidence AGREE: the charts measured {measured:?} and the REML race \
              independently ranked it first (tk {winner_score:.6})"
         );
         return;
     }
     match measured_entry {
-        Some(measured_entry) => log::info!(
+        Some(measured_entry) => log::debug!(
             "#2280 atlas/evidence DISAGREE: the charts measured {measured:?} (tk \
              {:.6}) but the REML race ranked {winner_kind:?} first (tk \
              {winner_score:.6}); evidence margin {:.6} against the measured manifold, \
@@ -5224,7 +5229,7 @@ fn log_atlas_evidence_agreement(atlas: Option<&AtlasTopologyReadout>, ranking: &
             measured_entry.tk_score_resolution.unwrap_or(f64::NAN)
                 + winner.tk_score_resolution.unwrap_or(f64::NAN)
         ),
-        None => log::info!(
+        None => log::debug!(
             "#2280 atlas/evidence DISAGREE: the charts measured {measured:?}, which this race \
              did not realize as a candidate at all; the race ranked {winner_kind:?} first (tk \
              {winner_score:.6})"
@@ -5251,7 +5256,7 @@ fn log_unresolved_topology_race(ranking: &[RankedTopology]) {
     if tied.is_empty() {
         return;
     }
-    log::info!(
+    log::debug!(
         "#2729 topology race UNRESOLVED: {:?} (tk {:.17e}, resolution {:?}) is not resolvably \
          better than {:?}; every listed gap is inside the combined resolution of the two scores, \
          so the ordering among them is set by floating-point roundoff, not by the data. The \
@@ -7331,8 +7336,8 @@ pub fn run_structure_search_rounds(
         // p ≈ 1 (additive) absorbs evidence AGAINST it. This makes the binding
         // verdict not merely observable on the `HarvestReport` but BANKED in
         // the persisted ledger, so the dictionary certificate covers it and the
-        // evidence resumes across corpus shards. A `None` p-value (the Wald
-        // test degenerated) is skipped — no fabricated evidence.
+        // evidence resumes across corpus shards. An unavailable test (`Err`,
+        // naming why) is skipped — no fabricated evidence.
 
         // Pre-build the birth-SEED list ONCE per round: the residual-factor
         // births first (indices `0..r`), then — when curl is enabled — the
@@ -7587,18 +7592,16 @@ fn build_residual_factor_births(
     }
     let assignments = term.assignment.assignments();
     let activity: Array1<f64> = (0..n).map(|r| assignments.row(r).sum()).collect();
-    let max_rank = params.max_births.min(p.saturating_sub(1));
     // Propagate a genuine fit failure instead of degrading to "no births".
-    // The evidence ladder already includes the rank-0 rung, so a true "no
-    // structure to harvest" outcome returns `Ok` (an empty/zero-rank factor);
-    // an `Err` here signals a numerical/degenerate failure (non-finite inputs,
-    // an empty ladder, a broken alternation), and swallowing it into
+    // The rank search always scores rank 0, so a true "no structure to
+    // harvest" outcome returns `Ok` (an empty/zero-rank factor); an `Err` here
+    // signals a numerical/degenerate failure (non-finite inputs, a rank whose
+    // posterior mode could not be certified), and swallowing it into
     // `Ok(Vec::new())` would silently paper over that non-convergence
     // (the #2069/#2070 accept-on-failure genus). Surface it.
     let model = StructuredResidualModel::fit(ResidualFactorInput {
         residuals,
         activity: activity.view(),
-        max_factor_rank: max_rank,
     })
     .map_err(|e| format!("build_residual_factor_births: structured-residual fit failed: {e}"))?;
     let factor = model.factor();

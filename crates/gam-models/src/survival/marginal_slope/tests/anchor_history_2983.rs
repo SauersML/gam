@@ -1,5 +1,6 @@
 //! gam#2983: the anchored family's value, score and Hessian at a coefficient
-//! iterate do not depend on thread scheduling.
+//! iterate do not depend on thread scheduling, and gam#2991: nor on which
+//! iterates the family evaluated before it.
 //!
 //! On a declared or empirical latent law every row's location channel is the
 //! root of the anchoring equation, and the law's root slots keep those roots
@@ -10,14 +11,17 @@
 //! into it: 12-thread truth2370 fits of one input diverged run to run from
 //! ~1e-11 at an inner solve's second cycle. Rows here come in tied pairs, so
 //! the cross-row table serves every equation twice. Each quantity is compared
-//! bit for bit for one history at a time, on 12, 4 and 1 threads and repeated:
-//! a fresh family, and a family that walked to the iterate.
+//! bit for bit on 12, 4 and 1 threads and repeated, and across histories: a
+//! fresh family, a family that walked to the iterate, and one that walked away
+//! from it and back.
 //!
-//! The two histories are not compared with each other. A walked family's
-//! gradient and Hessian differ from a fresh one's by up to ~4e-15 relative
-//! while its log-likelihood is identical, because some state other than the
-//! anchor roots is carried between evaluations. The roots themselves are a
-//! function of their equation alone, which the latent_anchor pins hold.
+//! A walk's last point is the iterate itself, never `start + (target − start)·1`.
+//! That sum rounds: on this fixture's slope block `0.52 − 0.22` and
+//! `0.13 + 0.17` are exact ties between two floats that round to `0.3 + ulp`,
+//! so it lands one ulp off both slope coefficients. Evaluated there, a walked
+//! family's gradient and Hessian differed from a fresh one's at the iterate by
+//! up to ~4e-15 relative while the log-likelihood matched, which gam#2991 first
+//! read as state carried between evaluations.
 
 use super::*;
 use crate::custom_family::CustomFamily;
@@ -118,6 +122,7 @@ fn family() -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -171,33 +176,57 @@ fn evaluate(family: &SurvivalMarginalSlopeFamily, marginal: &Array1<f64>, slope:
         .collect()
 }
 
-#[test]
-fn anchored_family_arithmetic_does_not_depend_on_thread_scheduling_2983() {
-    let target = (ndarray::array![0.35, -0.18], ndarray::array![0.22, 0.13]);
-    let start = (ndarray::array![0.05, 0.12], ndarray::array![0.52, -0.17]);
-    // An inner-solve-like walk from `start` onto `target`, every step a new
-    // equation per row, so each root after the first had a stored neighbour.
-    let walk: Vec<(Array1<f64>, Array1<f64>)> = (0..=8)
+/// The coefficient point `(β_m, β_g)` every pin evaluates at.
+fn target() -> (Array1<f64>, Array1<f64>) {
+    (ndarray::array![0.35, -0.18], ndarray::array![0.22, 0.13])
+}
+
+/// Where the walks onto [`target`] start.
+fn start() -> (Array1<f64>, Array1<f64>) {
+    (ndarray::array![0.05, 0.12], ndarray::array![0.52, -0.17])
+}
+
+/// An inner-solve-like walk from `from` onto `to` in `steps` equal steps,
+/// every step a new equation per row, so each root after the first had a
+/// stored neighbour. Its last point is `to` itself (see the module doc).
+fn walk(
+    from: &(Array1<f64>, Array1<f64>),
+    to: &(Array1<f64>, Array1<f64>),
+    steps: u32,
+) -> Vec<(Array1<f64>, Array1<f64>)> {
+    (0..steps)
         .map(|k| {
-            let s = f64::from(k) / 8.0;
+            let s = f64::from(k) / f64::from(steps);
             (
-                &start.0 + &((&target.0 - &start.0) * s),
-                &start.1 + &((&target.1 - &start.1) * s),
+                &from.0 + &((&to.0 - &from.0) * s),
+                &from.1 + &((&to.1 - &from.1) * s),
             )
         })
-        .collect();
-    let fresh_at_target = || {
-        let family = family();
-        evaluate(&family, &target.0, &target.1)
-    };
-    let walked_to_target = || {
-        let family = family();
-        let mut last = Vec::new();
-        for (marginal, slope) in &walk {
-            last = evaluate(&family, marginal, slope);
-        }
-        last
-    };
+        .chain(std::iter::once(to.clone()))
+        .collect()
+}
+
+/// The bits of every coefficient of a point `(β_m, β_g)`.
+fn point_bits(point: &(Array1<f64>, Array1<f64>)) -> Vec<u64> {
+    point.0.iter().chain(point.1.iter()).map(|value| value.to_bits()).collect()
+}
+
+/// A new family evaluated at each point of `path` in turn: the bits at the last.
+fn evaluate_along(path: &[(Array1<f64>, Array1<f64>)]) -> Vec<u64> {
+    let family = family();
+    let mut last = Vec::new();
+    for (marginal, slope) in path {
+        last = evaluate(&family, marginal, slope);
+    }
+    last
+}
+
+#[test]
+fn anchored_family_arithmetic_does_not_depend_on_thread_scheduling_2983() {
+    let target = target();
+    let walked = walk(&start(), &target, 8);
+    let fresh_at_target = || evaluate_along(std::slice::from_ref(&target));
+    let walked_to_target = || evaluate_along(&walked);
     let pool = |threads: usize| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -231,5 +260,44 @@ fn anchored_family_arithmetic_does_not_depend_on_thread_scheduling_2983() {
                 "{history}, {label}: a different number of entries"
             );
         }
+    }
+}
+
+/// gam#2991: a family evaluated at one iterate gives one answer, whatever it
+/// evaluated before, so an outer search's trajectory cannot depend on its own
+/// path through the anchor slots.
+#[test]
+fn anchored_family_arithmetic_is_a_function_of_the_iterate_2991() {
+    let target = target();
+    let onto = walk(&start(), &target, 8);
+    // From the iterate out to `start` and back: when the family returns, every
+    // row's slots and the cross-row table hold other equations than its own.
+    let away_and_back: Vec<_> = walk(&target, &start(), 8)
+        .into_iter()
+        .chain(onto.iter().skip(1).cloned())
+        .collect();
+    for (history, path) in [("onto", &onto), ("away and back", &away_and_back)] {
+        assert_eq!(
+            path.last().map(point_bits),
+            Some(point_bits(&target)),
+            "the {history} walk must end at bitwise the iterate the fresh family is evaluated at"
+        );
+    }
+    let fresh = evaluate_along(std::slice::from_ref(&target));
+    assert!(fresh.len() > 1, "the evaluation publishes a value and derivatives");
+    for (history, path) in [
+        ("walked to the iterate", &onto),
+        ("walked away from the iterate and back", &away_and_back),
+    ] {
+        let bits = evaluate_along(path);
+        let first = fresh.iter().zip(&bits).position(|(a, b)| a != b);
+        assert_eq!(
+            first,
+            None,
+            "{history}: entry {first:?} differs from a fresh family's evaluation at the iterate \
+             ({} entries: value, gradient, Hessian)",
+            fresh.len()
+        );
+        assert_eq!(bits.len(), fresh.len(), "{history}: a different number of entries");
     }
 }

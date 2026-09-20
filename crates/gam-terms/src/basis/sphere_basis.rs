@@ -613,27 +613,26 @@ pub(crate) fn fill_real_spherical_harmonics_row(
     }
 }
 
-/// Default L for the harmonic basis when the user does not set `max_degree`.
-/// Targets ~k = 50 columns (mgcv `sos` default) for sample sizes large enough
-/// to support that many parameters, scaling down toward L=2 for small n
-/// (target ≈ n/4 columns), and capped at L=12 (168 cols) at the upper end.
+/// Highest spherical-harmonic degree the dense harmonic engine evaluates.
+pub(crate) const SPHERICAL_HARMONIC_MAX_DEGREE: usize = 32;
+
+/// Pilot degree `L` of the harmonic sphere basis when the user does not set
+/// `max_degree`, for `n_rows` rows under an order-`penalty_order` Laplace–
+/// Beltrami penalty.
 ///
-/// Why these choices:
-/// - mgcv's `bs="sos"` defaults to k=50 columns → L=6 (L(L+2)=48 ≈ 50).
-/// - On tiny datasets (n=20) a 50-column basis would overfit; rule-of-thumb
-///   keeps ≥ ~4 obs per basis column.
-/// - The L=12 cap (168 cols) matches the historical wisdom that beyond
-///   degree 12 the spherical-harmonic Gram conditioning starts to suffer
-///   under realistic data densities.
-pub(crate) fn default_spherical_harmonic_degree(n_rows: usize) -> usize {
-    // Convert a target column count into the smallest L with L(L+2) >= target.
-    // L=2 → 8 cols; L=3 → 15; L=4 → 24; L=5 → 35; L=6 → 48; L=7 → 63; L=12 → 168.
-    let target_cols = ((n_rows as f64) * 0.25).min(50.0).max(3.0);
-    let mut l = 1usize;
-    while (l as f64) * (l as f64 + 2.0) < target_cols && l < 12 {
-        l += 1;
-    }
-    l.max(2)
+/// The degree-`1..=L` harmonics span `L(L+2)` functions (the constant is the
+/// identifiability constraint's), and the order-`m` penalty's eigenvalues
+/// `(ℓ(ℓ+1))^m` grow on the two-dimensional sphere like those of an order-`m`
+/// penalty in the plane, so the fit resolves
+/// `penalized_resolution_rank(n, 2, m)` penalized directions. The pilot is the
+/// least degree whose span holds them; the formula workflow refines it while
+/// the fit's own REML evidence prefers the richer basis. It is never above the
+/// engine's [`SPHERICAL_HARMONIC_MAX_DEGREE`].
+pub(crate) fn default_spherical_harmonic_degree(n_rows: usize, penalty_order: usize) -> usize {
+    let rank = penalized_resolution_rank(n_rows, 2, penalty_order.max(1));
+    (1..=SPHERICAL_HARMONIC_MAX_DEGREE)
+        .find(|&l| l * (l + 2) >= rank)
+        .unwrap_or(SPHERICAL_HARMONIC_MAX_DEGREE)
 }
 
 /// Build the spherical-harmonic basis (alternative `method == Harmonic`).
@@ -645,12 +644,14 @@ pub(crate) fn build_spherical_harmonic_basis(
     let n = data.nrows();
     let l_max = spec
         .max_degree
-        .unwrap_or_else(|| default_spherical_harmonic_degree(n));
+        .unwrap_or_else(|| default_spherical_harmonic_degree(n, spec.penalty_order));
     if l_max < 1 {
         crate::bail_invalid_basis!("spherical-harmonic max_degree must be >= 1");
     }
-    if l_max > 32 {
-        crate::bail_invalid_basis!("spherical-harmonic max_degree {l_max} too large; cap is 32");
+    if l_max > SPHERICAL_HARMONIC_MAX_DEGREE {
+        crate::bail_invalid_basis!(
+            "spherical-harmonic max_degree {l_max} too large; cap is {SPHERICAL_HARMONIC_MAX_DEGREE}"
+        );
     }
     if !(1..=4).contains(&spec.penalty_order) {
         crate::bail_invalid_basis!(
@@ -918,7 +919,7 @@ pub(crate) fn build_matern_basis_seeded(
     let use_lazy = !use_streaming
         && should_use_lazy_spatial_design(data.nrows(), design_cols, workspace.policy());
     let (design, candidates) = if let Some(chunk) = matern_auto_chunk {
-        log::info!(
+        log::debug!(
             "Matérn basis auto-streaming evaluator: n={} p={} chunk_size={}",
             data.nrows(),
             design_cols,
@@ -964,8 +965,8 @@ pub(crate) fn build_matern_basis_seeded(
         };
         (design, candidates)
     } else if use_lazy {
-        // log::info! — deliberate memory-saving choice, not an anomaly.
-        log::info!(
+        // log::debug! — deliberate memory-saving choice, not an anomaly.
+        log::debug!(
             "Matérn basis switching to lazy chunked design: n={} p={} ({:.1} MiB dense)",
             data.nrows(),
             design_cols,
@@ -3908,6 +3909,7 @@ mod wahba_penalty_invariants_tests {
             max_degree: None,
             wahba_kernel: SphereWahbaKernel::Sobolev,
             identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+            adaptive_degree: false,
         };
         let error = build_spherical_spline_basis(data.view(), &spec)
             .expect_err("m = 1 Sobolev has no Gram diagonal and must be refused");
@@ -3947,6 +3949,7 @@ mod wahba_penalty_invariants_tests {
             max_degree: None,
             wahba_kernel: SphereWahbaKernel::Sobolev,
             identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+            adaptive_degree: false,
         };
         let built = build_spherical_spline_basis(data.view(), &spec).expect("Wahba basis");
         assert_eq!(built.active_penalties.len(), 1);
@@ -4252,6 +4255,7 @@ mod harmonic_penalty_invariants_tests {
             max_degree: Some(3),
             wahba_kernel: SphereWahbaKernel::Sobolev,
             identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+            adaptive_degree: false,
         };
         let built = build_spherical_harmonic_basis(data.view(), &spec).expect("harmonic basis");
         assert_eq!(built.active_penalties.len(), 2);

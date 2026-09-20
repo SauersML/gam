@@ -307,7 +307,7 @@ fn weighted_crossprod_dense_view(
     let work = (n as u64)
         .saturating_mul(p_left as u64)
         .saturating_mul(p_right as u64);
-    if rayon::current_num_threads() <= 1 || work < WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS {
+    if work < WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS {
         return weighted_crossprod_dense_rows(left, weights, right, 0..n);
     }
 
@@ -320,18 +320,25 @@ fn weighted_crossprod_dense_view(
     ) else {
         return weighted_crossprod_dense_rows(left, weights, right, 0..n);
     };
-    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
-    let partials: Vec<Array2<f64>> = starts
-        .into_par_iter()
-        .map(|start| {
-            weighted_crossprod_dense_rows(left, weights, right, start..(start + chunk_rows).min(n))
-        })
-        .collect();
-    let mut out = Array2::<f64>::zeros((p_left, p_right));
-    for partial in &partials {
-        out += partial;
-    }
-    out
+    // The chunking and the pairwise combine tree are functions of the shape
+    // alone, so the sum's bits are the same at every thread count.
+    crate::pairwise_reduce::par_deterministic_block_fold_by_work(
+        crate::parallel::row_reduction_chunk_count(n, chunk_rows),
+        chunk_rows,
+        |chunks| {
+            weighted_crossprod_dense_rows(
+                left,
+                weights,
+                right,
+                chunks.start * chunk_rows..(chunks.end * chunk_rows).min(n),
+            )
+        },
+        |mut acc, partial| {
+            acc += &partial;
+            acc
+        },
+    )
+    .unwrap_or_else(|| Array2::<f64>::zeros((p_left, p_right)))
 }
 
 fn weighted_crossprod_dense_rows(
@@ -627,7 +634,7 @@ fn sparse_csr_weighted_xtwx(
     let nnz = vals.len() as u64;
     let avg = nnz.checked_div(n.max(1) as u64).unwrap_or(0);
     let work = (n as u64).saturating_mul(avg.saturating_mul(avg));
-    if rayon::current_num_threads() <= 1 || work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
+    if work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
         return sparse_csr_weighted_xtwx_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     }
 
@@ -640,25 +647,25 @@ fn sparse_csr_weighted_xtwx(
     ) else {
         return sparse_csr_weighted_xtwx_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     };
-    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
-    let partials: Vec<Array2<f64>> = starts
-        .into_par_iter()
-        .map(|start| {
+    crate::pairwise_reduce::par_deterministic_block_fold_by_work(
+        crate::parallel::row_reduction_chunk_count(n, chunk_rows),
+        chunk_rows,
+        |chunks| {
             sparse_csr_weighted_xtwx_rows(
                 row_ptr,
                 col_idx,
                 vals,
                 p,
                 weights,
-                start..(start + chunk_rows).min(n),
+                chunks.start * chunk_rows..(chunks.end * chunk_rows).min(n),
             )
-        })
-        .collect();
-    let mut xtwx = Array2::<f64>::zeros((p, p));
-    for partial in &partials {
-        xtwx += partial;
-    }
-    xtwx
+        },
+        |mut acc, partial| {
+            acc += &partial;
+            acc
+        },
+    )
+    .unwrap_or_else(|| Array2::<f64>::zeros((p, p)))
 }
 
 fn sparse_csr_weighted_xtwx_rows(
@@ -770,7 +777,7 @@ fn sparse_csr_diag_gram(
     weights: ArrayView1<'_, f64>,
 ) -> Array1<f64> {
     let work = vals.len() as u64;
-    if rayon::current_num_threads() <= 1 || work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
+    if work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
         return sparse_csr_diag_gram_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     }
     let min_parallel_work = SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
@@ -778,25 +785,25 @@ fn sparse_csr_diag_gram(
     else {
         return sparse_csr_diag_gram_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     };
-    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
-    let partials: Vec<Array1<f64>> = starts
-        .into_par_iter()
-        .map(|start| {
+    crate::pairwise_reduce::par_deterministic_block_fold_by_work(
+        crate::parallel::row_reduction_chunk_count(n, chunk_rows),
+        chunk_rows,
+        |chunks| {
             sparse_csr_diag_gram_rows(
                 row_ptr,
                 col_idx,
                 vals,
                 p,
                 weights,
-                start..(start + chunk_rows).min(n),
+                chunks.start * chunk_rows..(chunks.end * chunk_rows).min(n),
             )
-        })
-        .collect();
-    let mut diag = Array1::<f64>::zeros(p);
-    for partial in &partials {
-        diag += partial;
-    }
-    diag
+        },
+        |mut acc, partial| {
+            acc += &partial;
+            acc
+        },
+    )
+    .unwrap_or_else(|| Array1::<f64>::zeros(p))
 }
 
 fn sparse_csr_diag_gram_rows(
@@ -3238,6 +3245,45 @@ impl DenseDesignOperator for BlockDesignOperator {
         Ok(out)
     }
 
+    fn apply_columns(&self, cols: &[usize]) -> Array2<f64> {
+        // Each requested column lives in exactly one block, so read it from that
+        // block's own storage instead of one full matvec per unit vector.
+        for &j in cols {
+            assert!(
+                j < self.total_cols,
+                "BlockDesignOperator::apply_columns: column index {j} out of bounds (ncols={})",
+                self.total_cols
+            );
+        }
+        let mut out = Array2::<f64>::zeros((self.n, cols.len()));
+        for (idx, block) in self.blocks.iter().enumerate() {
+            let cs = self.col_offsets[idx];
+            let ce = self.col_offsets[idx + 1];
+            let (targets, local): (Vec<usize>, Vec<usize>) = cols
+                .iter()
+                .enumerate()
+                .filter(|&(_, &j)| cs <= j && j < ce)
+                .map(|(k, &j)| (k, j - cs))
+                .unzip();
+            if local.is_empty() {
+                continue;
+            }
+            let block_cols = match block {
+                DesignBlock::Dense(DenseDesignMatrix::Materialized(mat)) => {
+                    mat.select(Axis(1), &local)
+                }
+                DesignBlock::Dense(DenseDesignMatrix::Lazy(op)) => op.apply_columns(&local),
+                DesignBlock::Sparse(s) => DesignMatrix::Sparse(s.clone()).extract_columns(&local),
+                DesignBlock::RandomEffect(op) => op.apply_columns(&local),
+                DesignBlock::Intercept(n) => Array2::ones((*n, local.len())),
+            };
+            for (src, &k) in targets.iter().enumerate() {
+                out.column_mut(k).assign(&block_cols.column(src));
+            }
+        }
+        out
+    }
+
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
@@ -4114,7 +4160,7 @@ pub trait LinearOperator {
         if !solution.iter().all(|value| value.is_finite()) {
             return Err("matrix-free PCG produced a non-finite solution".to_string());
         }
-        log::debug!(
+        log::trace!(
             "[matrix-free PCG] solved: p={p} ridge={baseridge:.3e} iters={} rel_resid={:.3e} elapsed={:.3}s",
             info.iterations,
             info.relative_residual_norm,
@@ -4214,13 +4260,13 @@ pub trait LinearOperator {
                     && let Some((solution, info)) = self
                         .solve_system_matrix_free_pcg_within(weights, rhs, penalty, ridge, products)?
                 {
-                    log::debug!(
+                    log::trace!(
                         "[normal-equations] route=pcg p={p} cg_iterations={} budget={products}",
                         info.iterations
                     );
                     return Ok(solution);
                 }
-                log::debug!("[normal-equations] route=dense p={p} budget={products}");
+                log::trace!("[normal-equations] route=dense p={p} budget={products}");
             }
         }
         let mut system = self.diag_xtw_x(weights)?;
@@ -4944,6 +4990,27 @@ impl DesignMatrix {
         <Self as DenseDesignOperator>::row_chunk_into(self, rows, out)
     }
 
+    /// Gather the listed rows, in the listed order, into a dense
+    /// `(rows.len(), ncols())` array. Each maximal run of consecutive indices
+    /// is materialized with one [`Self::try_row_chunk`], so a contiguous list
+    /// costs exactly one row-chunk read and an operator-backed design never
+    /// materializes rows outside the list.
+    pub fn try_row_gather(&self, rows: &[usize]) -> Result<Array2<f64>, MatrixMaterializationError> {
+        let mut out = Array2::<f64>::zeros((rows.len(), self.ncols()));
+        let mut run_start = 0;
+        while run_start < rows.len() {
+            let mut run_end = run_start + 1;
+            while run_end < rows.len() && rows[run_end] == rows[run_end - 1] + 1 {
+                run_end += 1;
+            }
+            let first = rows[run_start];
+            let chunk = self.try_row_chunk(first..first + (run_end - run_start))?;
+            out.slice_mut(s![run_start..run_end, ..]).assign(&chunk);
+            run_start = run_end;
+        }
+        Ok(out)
+    }
+
     /// `rows · rhs` for a row range, written into `out`; see
     /// [`DenseDesignOperator::row_chunk_matmul_into`]. An operator-backed
     /// design keeps its own association.
@@ -5646,6 +5713,30 @@ impl DesignMatrix {
         }
     }
 
+    /// The design restricted to `cols` (in that order), as a design of the
+    /// same storage class: a sparse design stays sparse — its kept columns'
+    /// stored entries are copied verbatim — and a dense or operator-backed
+    /// design yields the dense block [`Self::extract_columns`] returns.
+    pub fn select_columns(&self, cols: &[usize]) -> Result<DesignMatrix, String> {
+        match self {
+            Self::Dense(_) => Ok(DesignMatrix::from(self.extract_columns(cols))),
+            Self::Sparse(sp) => {
+                let (symbolic, values) = sp.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                let mut triplets = Vec::new();
+                for (k, &j) in cols.iter().enumerate() {
+                    for idx in col_ptr[j]..col_ptr[j + 1] {
+                        triplets.push(Triplet::new(row_idx[idx], k, values[idx]));
+                    }
+                }
+                SparseColMat::try_new_from_triplets(sp.nrows(), cols.len(), &triplets)
+                    .map(DesignMatrix::from)
+                    .map_err(|error| format!("column-restricted sparse design: {error:?}"))
+            }
+        }
+    }
+
     /// Returns a reference to the inner dense array if this is a `Dense` variant.
     pub fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         match self {
@@ -6007,6 +6098,92 @@ impl From<&DesignMatrix> for DesignBlock {
 
 #[cfg(test)]
 mod tests {
+    /// Words of `product()` on a fresh pool of `width` threads.
+    fn words_at_width<T: Sync>(
+        width: usize,
+        product: impl Fn() -> T + Sync,
+        words: impl Fn(&T) -> Vec<u64> + Sync,
+    ) -> Vec<u64> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(width)
+            .build()
+            .expect("pool");
+        pool.install(|| words(&product()))
+    }
+
+    fn assert_pool_width_invariant<T: Sync>(
+        label: &str,
+        product: impl Fn() -> T + Sync,
+        words: impl Fn(&T) -> Vec<u64> + Sync,
+    ) {
+        let single = words_at_width(1, &product, &words);
+        for width in [2, 3, 8] {
+            assert!(
+                single == words_at_width(width, &product, &words),
+                "{label}: pool width {width} changed the words"
+            );
+        }
+    }
+
+    /// The dense and sparse row reductions chunk their rows by shape alone, so
+    /// their sums carry the same words at every pool width, and agree with a
+    /// single serial pass to rounding.
+    #[test]
+    fn row_reductions_carry_the_same_words_at_every_pool_width() {
+        use ndarray::{Array1, Array2};
+        let n = 200_000usize;
+        let p = 40usize;
+        let weights = Array1::from_shape_fn(n, |i| (0.29 * i as f64).sin() + 0.2);
+
+        let left = Array2::from_shape_fn((60_000, 20), |(i, j)| {
+            ((i * 7 + j * 13) % 29) as f64 / 29.0 - 0.4 + 1e-3 * (i as f64).sqrt()
+        });
+        let right = Array2::from_shape_fn((60_000, 7), |(i, j)| {
+            ((i * 11 + j * 5) % 31) as f64 / 31.0 - 0.6
+        });
+        let dense_weights = weights.slice(ndarray::s![..60_000]).to_owned();
+        let matrix_words = |a: &Array2<f64>| a.iter().map(|v| v.to_bits()).collect::<Vec<u64>>();
+        assert_pool_width_invariant(
+            "weighted_crossprod_dense",
+            || super::weighted_crossprod_dense_view(&left, dense_weights.view(), &right),
+            matrix_words,
+        );
+        let chunked = super::weighted_crossprod_dense_view(&left, dense_weights.view(), &right);
+        let serial =
+            super::weighted_crossprod_dense_rows(&left, dense_weights.view(), &right, 0..60_000);
+        let err = (&chunked - &serial)
+            .iter()
+            .fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            err <= 1e-9,
+            "chunked dense reduction drifted {err:e} from one serial pass"
+        );
+
+        // Four entries per row at shifting columns: a banded CSR.
+        let mut row_ptr = Vec::with_capacity(n + 1);
+        let mut col_idx = Vec::with_capacity(4 * n);
+        let mut vals = Vec::with_capacity(4 * n);
+        row_ptr.push(0);
+        for i in 0..n {
+            let first = (i * 3) % (p - 4);
+            for k in 0..4 {
+                col_idx.push(first + k);
+                vals.push(((i + 17 * k) % 23) as f64 / 23.0 - 0.3);
+            }
+            row_ptr.push(col_idx.len());
+        }
+        assert_pool_width_invariant(
+            "sparse_csr_weighted_xtwx",
+            || super::sparse_csr_weighted_xtwx(&row_ptr, &col_idx, &vals, n, p, weights.view()),
+            matrix_words,
+        );
+        assert_pool_width_invariant(
+            "sparse_csr_diag_gram",
+            || super::sparse_csr_diag_gram(&row_ptr, &col_idx, &vals, n, p, weights.view()),
+            |d: &Array1<f64>| d.iter().map(|v| v.to_bits()).collect(),
+        );
+    }
+
     #[test]
     fn array2_bits_fingerprint_is_a_value_identity_not_an_address() {
         use ndarray::array;
@@ -6370,6 +6547,124 @@ mod tests {
             max_diff < 1e-12,
             "streamed sparse weighted Gram mismatch: max_diff={max_diff}"
         );
+    }
+
+    struct ColumnReadOperator {
+        values: Array2<f64>,
+        apply_calls: AtomicUsize,
+    }
+
+    impl LinearOperator for ColumnReadOperator {
+        fn nrows(&self) -> usize {
+            self.values.nrows()
+        }
+
+        fn ncols(&self) -> usize {
+            self.values.ncols()
+        }
+
+        fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+            self.apply_calls.fetch_add(1, Ordering::SeqCst);
+            self.values.dot(vector)
+        }
+
+        fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+            self.values.t().dot(vector)
+        }
+
+        fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+            let weighted = &self.values * &weights.view().insert_axis(Axis(1));
+            Ok(self.values.t().dot(&weighted))
+        }
+    }
+
+    impl DenseDesignOperator for ColumnReadOperator {
+        fn row_chunk_into(
+            &self,
+            rows: Range<usize>,
+            mut out: ArrayViewMut2<'_, f64>,
+        ) -> Result<(), MatrixMaterializationError> {
+            out.assign(&self.values.slice(s![rows, ..]));
+            Ok(())
+        }
+
+        fn apply_columns(&self, cols: &[usize]) -> Array2<f64> {
+            self.values.select(Axis(1), cols)
+        }
+
+        fn to_dense(&self) -> Array2<f64> {
+            self.values.clone()
+        }
+    }
+
+    #[test]
+    fn block_design_apply_columns_reads_owning_blocks_without_matvecs() {
+        let eager = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
+        let lazy = Arc::new(ColumnReadOperator {
+            values: array![[10.0, 11.0], [12.0, 13.0], [14.0, 15.0], [16.0, 17.0]],
+            apply_calls: AtomicUsize::new(0),
+        });
+        let sparse = SparseColMat::<usize, f64>::try_new_from_triplets(
+            4,
+            3,
+            &[
+                Triplet::new(0, 0, 20.0),
+                Triplet::new(1, 1, 21.0),
+                Triplet::new(2, 2, 22.0),
+                Triplet::new(3, 0, 23.0),
+            ],
+        )
+        .expect("sparse block");
+        let random_effect = Arc::new(RandomEffectOperator::new(
+            vec![Some(0), None, Some(1), Some(0)],
+            2,
+        ));
+        let op = BlockDesignOperator::new(vec![
+            DesignBlock::Intercept(4),
+            DesignBlock::Dense(DenseDesignMatrix::from(eager)),
+            DesignBlock::Dense(DenseDesignMatrix::from(Arc::clone(&lazy))),
+            DesignBlock::Sparse(SparseDesignMatrix::new(sparse)),
+            DesignBlock::RandomEffect(random_effect),
+        ])
+        .expect("mixed block design");
+        let dense = DenseDesignOperator::to_dense(&op);
+        lazy.apply_calls.store(0, Ordering::SeqCst);
+
+        let cols = [9, 3, 0, 4, 2, 7, 5, 3];
+        let got = op.apply_columns(&cols);
+
+        assert_eq!(got, dense.select(Axis(1), &cols));
+        assert_eq!(lazy.apply_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn select_columns_keeps_the_storage_class_and_the_entries() {
+        let sparse = SparseColMat::try_new_from_triplets(
+            3,
+            4,
+            &[
+                Triplet::new(0, 0, 1.0),
+                Triplet::new(2, 0, -2.0),
+                Triplet::new(1, 1, 3.0),
+                Triplet::new(0, 2, 0.5),
+                Triplet::new(1, 3, -1.5),
+                Triplet::new(2, 3, 4.0),
+            ],
+        )
+        .expect("sparse matrix");
+        let design = DesignMatrix::from(sparse);
+        let ledger = ledger_read_guard();
+        assert_eq!(*ledger, (), "ledger read guard is held for this test");
+        let full = design.to_dense();
+        let cols = [3, 0, 2];
+        let selected = design.select_columns(&cols).expect("select columns");
+        assert!(selected.is_sparse(), "a sparse design stays sparse");
+        assert_eq!(selected.to_dense(), full.select(Axis(1), &cols));
+
+        let dense = DesignMatrix::from(full.clone());
+        let selected = dense.select_columns(&cols).expect("select columns");
+        assert!(!selected.is_sparse());
+        assert_eq!(selected.to_dense(), full.select(Axis(1), &cols));
     }
 
     #[test]

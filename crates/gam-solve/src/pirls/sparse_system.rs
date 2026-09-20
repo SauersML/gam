@@ -7,7 +7,7 @@ pub(crate) struct SparsePirlsDecision {
     pub path: PirlsLinearSolvePath,
     pub reason: &'static str,
     pub p: usize,
-    pub nnz_x: usize,
+    pub nnz_x: Option<usize>,
     pub nnz_xtwx_symbolic: Option<usize>,
     pub nnz_s_lambda: usize,
     pub nnz_h_est: Option<usize>,
@@ -36,7 +36,7 @@ impl SparsePirlsDecision {
             "path={path} reason={} p={} nnz_x={} nnz_xtwx_symbolic={} nnz_s_lambda={} nnz_h_est={} density_h_est={}",
             self.reason,
             self.p,
-            self.nnz_x,
+            fmt_opt_usize(self.nnz_x),
             fmt_opt_usize(self.nnz_xtwx_symbolic),
             self.nnz_s_lambda,
             fmt_opt_usize(self.nnz_h_est),
@@ -44,10 +44,10 @@ impl SparsePirlsDecision {
         )
     }
 
-    /// Emit at `info`, beside the `[reml-geometry]` verdict this is the twin
+    /// Emit at `debug`, beside the `[reml-geometry]` verdict this is the twin
     /// of (#2569). Both gates ask "is this design's penalized Hessian sparse
-    /// enough", and only this one measures a density — but it sat at `debug`,
-    /// so an `--log-level info` trace showed the REML gate saying
+    /// enough", and only this one measures a density — but it once sat a level
+    /// below, so a `-v` trace showed the REML gate saying
     /// `density_h_est=na` on a route that decided before measuring, with the
     /// measurement that would have answered the question suppressed one gate
     /// away. Volume stays bounded by the dedup below: a distinct decision logs
@@ -57,12 +57,12 @@ impl SparsePirlsDecision {
         let key = self.format_fields(path);
         let repetition_count = pirls_decision_repetition_count(key.clone());
         if repetition_count == 1 {
-            log::info!("[pirls-path] {key}");
+            log::debug!("[pirls-path] {key}");
             return;
         }
 
         if should_log_pirls_decision_summary(repetition_count) {
-            log::info!(
+            log::debug!(
                 "[pirls-path] repeated path={} reason={} count={} (suppressing identical decisions)",
                 path,
                 self.reason,
@@ -238,7 +238,7 @@ impl SparsePenalizedSystemCache {
                     self.xtwx_cache.xtwxvalues.copy_from_slice(&pre.xtwxvalues);
                     true
                 } else {
-                    log::warn!(
+                    log::debug!(
                         "[sparse-xtwx-cache] precomputed XᵀWX pattern mismatch; \
                          falling back to per-call recompute"
                     );
@@ -377,7 +377,7 @@ pub fn assemble_and_factor_sparse_penalized_system(
         sparse_reml_penalized_hessian(workspace, x, weights, s_lambda, precomputed_xtwx)?;
     let factor = factorize_sparse_spd(&h_sparse)?;
     let logdet_h = logdet_from_factor(&factor)?;
-    log::info!(
+    log::debug!(
         "[STAGE] logdet H (sparse Cholesky) p={} elapsed={:.3}s",
         h_sparse.nrows(),
         logdet_h_start.elapsed().as_secs_f64(),

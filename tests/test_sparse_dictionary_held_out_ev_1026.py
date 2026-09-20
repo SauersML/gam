@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from gamfit import sparse_dictionary_fit
+from gamfit.sae import sparse_dictionary_fit
 
 
 def _planted(rng, k, p, n, second_share=0.2):

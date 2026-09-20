@@ -1142,6 +1142,32 @@ pub fn solve_spd_pcg_with_info_into<F>(
 where
     F: Fn(&Array1<f64>, &mut Array1<f64>),
 {
+    solve_spd_pcg_bounded_into(apply, rhs, preconditioner_diag, rel_tol, max_iter)
+        .filter(|(_, _, stop)| *stop == PcgStop::Converged)
+        .map(|(x, info, _)| (x, info))
+}
+
+/// [`solve_spd_pcg_with_info_into`] that also returns the iterate of a run that
+/// did not converge.
+///
+/// `max_iter` is a budget, not a convergence claim. On [`PcgStop::MaxIters`] the
+/// iterate is the last CG iterate, and on [`PcgStop::Breakdown`] it is the last
+/// iterate before the recurrence lost positive curvature or finiteness (the zero
+/// start when that happened at the first iteration). From `x₀ = 0` every CG
+/// iterate of an SPD system lowers the quadratic model `½xᵀAx − rhsᵀx`, so a
+/// truncated-Newton caller can take it as an inexact step. `None` when the
+/// inputs are malformed, the preconditioner is not positive, or the iterate is
+/// not finite.
+pub fn solve_spd_pcg_bounded_into<F>(
+    apply: F,
+    rhs: &Array1<f64>,
+    preconditioner_diag: &Array1<f64>,
+    rel_tol: f64,
+    max_iter: usize,
+) -> Option<(Array1<f64>, PcgSolveInfo, PcgStop)>
+where
+    F: Fn(&Array1<f64>, &mut Array1<f64>),
+{
     let p = rhs.len();
     if p == 0 || preconditioner_diag.len() != p || max_iter == 0 {
         return None;
@@ -1153,22 +1179,23 @@ where
         &preconditioner_diag.view(),
         rel_tol,
         max_iter,
-        32,
+        crate::pcg::PCG_RESIDUAL_REFRESH_PERIOD,
         true,
         &mut x.view_mut(),
     );
-    if result.stop == PcgStop::Converged && x.iter().all(|v| v.is_finite()) {
-        Some((x, pcg_solve_info(&result)))
-    } else {
-        if result.stop == PcgStop::BadPreconditioner {
-            log::warn!(
-                "SPD PCG rejected: preconditioner diagonal contained a non-positive or \
-                 non-finite entry; caller should route to a direct factorization \
-                 or indefinite Krylov path."
-            );
-        }
-        None
+    if result.stop == PcgStop::BadPreconditioner {
+        log::debug!(
+            "SPD PCG rejected: preconditioner diagonal contained a non-positive or \
+             non-finite entry; caller should route to a direct factorization \
+             or indefinite Krylov path."
+        );
+        return None;
     }
+    if !x.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let info = pcg_solve_info(&result);
+    Some((x, info, result.stop))
 }
 
 /// Weighted ridge (penalized least-squares) solve for a multi-output Gaussian

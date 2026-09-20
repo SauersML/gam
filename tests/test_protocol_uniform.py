@@ -57,7 +57,7 @@ def test_circle_cylinder_ambient_dim_matches_rust_source_of_truth() -> None:
     """Regression for issue #397: the Python descriptor's documented contract
     must agree with the Rust manifold, which uses the 1-D angle
     parameterization (ambient == intrinsic). Following the old ``R^2``
-    "unit 2-vector" docstring raised a hard ``GamError``."""
+    "unit 2-vector" docstring raised a hard ``GamfitError``."""
     from gamfit.manifolds import CylinderManifold
 
     circle = ManifoldCircle()
@@ -98,7 +98,7 @@ def test_sphere_metric_is_symmetric_psd() -> None:
 
 
 def test_periodic_harmonic_evaluate_width_and_callable_surface() -> None:
-    ph = gamfit.PeriodicHarmonic(harmonics=3)
+    ph = gamfit.basis.PeriodicHarmonic(harmonics=3)
     theta = torch.linspace(0.0, 2.0 * math.pi, 32, dtype=torch.float64)
     phi = ph.evaluate(theta)
     assert phi.shape == (32, 7)
@@ -107,8 +107,8 @@ def test_periodic_harmonic_evaluate_width_and_callable_surface() -> None:
 
 
 def test_penalty_composition_hvp_is_sum_of_parts() -> None:
-    pa = gamfit.ARDPenalty(weight=0.1)
-    pb = gamfit.OrderedBetaBernoulliPenalty(k_max=3, alpha=1.0, tau=1.0)
+    pa = gamfit.penalties.ARDPenalty(weight=0.1)
+    pb = gamfit.penalties.OrderedBetaBernoulliPenalty(k_max=3, alpha=1.0, tau=1.0)
     composite = pa + pb
     from gamfit._composite_penalty import CompositePenalty
     assert isinstance(composite, CompositePenalty)
@@ -123,10 +123,10 @@ def test_penalty_composition_hvp_is_sum_of_parts() -> None:
 
 
 def test_smooth_compose_circle_periodic_harmonic_evaluate_matches_basis() -> None:
-    sm = gamfit.Smooth(
+    sm = gamfit.basis.Smooth(
         latent=ManifoldCircle(),
-        basis=gamfit.PeriodicHarmonic(harmonics=3),
-        penalty=gamfit.ARDPenalty(weight=0.1),
+        basis=gamfit.basis.PeriodicHarmonic(harmonics=3),
+        penalty=gamfit.penalties.ARDPenalty(weight=0.1),
     )
     theta = torch.linspace(0.0, 2.0 * math.pi, 16, dtype=torch.float64)
     phi_sm = sm.evaluate(theta)
@@ -136,7 +136,7 @@ def test_smooth_compose_circle_periodic_harmonic_evaluate_matches_basis() -> Non
 
 
 def test_basis_jacobian_evaluates_descriptor_once() -> None:
-    class CountingBasis(gamfit.BasisDescriptor):
+    class CountingBasis(gamfit.basis.BasisDescriptor):
         def __init__(self) -> None:
             self.evaluate_calls = 0
 
@@ -156,16 +156,16 @@ def test_basis_jacobian_evaluates_descriptor_once() -> None:
 def test_smooth_dim_mismatch_raises_eagerly() -> None:
     # Sphere has dimension=2; PeriodicHarmonic(harmonics=3) has input_dim=1.
     with pytest.raises(ValueError, match="incompatible|input_dim|dimension"):
-        gamfit.Smooth(
+        gamfit.basis.Smooth(
             latent=ManifoldSphere(intrinsic_dim=2),
-            basis=gamfit.PeriodicHarmonic(harmonics=3),
+            basis=gamfit.basis.PeriodicHarmonic(harmonics=3),
         )
 
 
 def test_smooth_to_dict_roundtrip() -> None:
-    sm = gamfit.Smooth(
+    sm = gamfit.basis.Smooth(
         latent=ManifoldCircle(),
-        basis=gamfit.PeriodicHarmonic(harmonics=3),
+        basis=gamfit.basis.PeriodicHarmonic(harmonics=3),
         name="phase",
     )
     d = sm.to_dict()
@@ -174,6 +174,6 @@ def test_smooth_to_dict_roundtrip() -> None:
     assert d["latent"]["kind"] == "circle"
     assert d["basis"]["kind"] == "periodic_harmonic"
 
-    sm2 = gamfit.Smooth.from_dict(d)
+    sm2 = gamfit.basis.Smooth.from_dict(d)
     theta = torch.linspace(0.0, 2.0 * math.pi, 8, dtype=torch.float64)
     assert torch.allclose(sm.evaluate(theta), sm2.evaluate(theta), atol=1e-14)

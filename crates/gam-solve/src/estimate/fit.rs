@@ -119,34 +119,11 @@ where
             offset.len(),
         );
     }
-    // #2607: a design with at least as many coefficients as observations is
-    // SATURATED -- it can interpolate the response, leaving no residual degrees
-    // of freedom for the restricted likelihood to estimate a scale from. REML is
-    // then not a well-behaved model selector, and driving every lambda to its
-    // ceiling is a legitimate optimum OF THE CRITERION rather than a search
-    // failing.
-    //
-    // Measured on `hifreq_tensor_k10` (n = 576, p = 576 exactly): the seed
-    // prepass scores the rho ceiling at 4.3974e2 against the neutral origin's
-    // 8.5493e2 -- it prefers maximum smoothing by 415 nats -- and the fit then
-    // "converges" in ONE outer iteration at edf = 1.294 of 576. That is the
-    // intercept, reported as a success, with nothing anywhere saying why.
-    //
-    // This warns rather than refuses on purpose. p >= n is a legitimate thing to
-    // ASK for (it is the p >= n corner #2585 and #2355 both work in), and a
-    // caller who has chosen it should not be blocked. What was missing is that
-    // the resulting collapse looked identical to a healthy fit.
-    if x.ncols() >= x.nrows() {
-        log::warn!(
-            "saturated design: {} coefficients for {} observations (p >= n). The \
-             restricted likelihood has no residual degrees of freedom here, so REML \
-             lambda-selection is degenerate and may prefer maximum smoothing -- a \
-             converged fit with effective df near 1 is the criterion's optimum, not \
-             a solver failure (#2607).",
-            x.ncols(),
-            x.nrows(),
-        );
-    }
+    // `p >= n` is not saturation for a penalized fit: REML/LAML keep the
+    // `n - M_p` residual contrasts of the unpenalized space, and
+    // `reject_prefit_unidentifiable_unpenalized_space` refuses the fits where
+    // that count is zero. A fit that nonetheless collapses onto its penalty
+    // null space is reported where it happens, by the edf accounting (#2607).
     if family.is_binomial_mixture() && opts.mixture_link.is_none() {
         crate::bail_invalid_estim!("BinomialMixture requires mixture_link specification");
     }
@@ -327,6 +304,12 @@ where
     let penalized_objective = result.reml_score;
     let outer_cost_evals = result.outer_cost_evals;
     let inner_pirls_solves = result.inner_pirls_solves;
+    // The final certified P-IRLS solve is the inner iterate the fit reports.
+    let inner_cycles = result
+        .artifacts
+        .pirls
+        .as_ref()
+        .map_or(0, |pirls| pirls.iteration);
     UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks: vec![FittedBlock {
             beta: result.beta.clone(),
@@ -360,7 +343,7 @@ where
         max_abs_eta: result.max_abs_eta,
         constraint_kkt: result.constraint_kkt,
         artifacts: result.artifacts,
-        inner_cycles: 0,
+        inner_cycles,
     })
     .map(|mut unified| {
         // Surface the optimizer's outer cost-eval count (not carried by the

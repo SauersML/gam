@@ -1,43 +1,51 @@
 # Diagnostics, summaries, plots, reports
 
-A fitted `Model` exposes five inspection methods:
+A fitted `Model` exposes six inspection methods:
 
 | Method | Returns | Contents |
 | --- | --- | --- |
 | `summary()` | `Summary` | Formula, family/link name, model class, deviance, REML/LAML score (in the `reml_score` field), per-coefficient table, smoothing parameters (`lambdas`), group metadata, and deployment extensions. |
-
-`reml_score` and `raw_reml_score` are `None` when the fit has **no**
-criterion, which is a different statement from "not recorded". A Gaussian
-fit whose fitted mean reproduces the response to floating-point resolution
-has `sigma_hat = 0`, so its restricted likelihood is unbounded and every
-score derived from it — the comparable REML/LAML headline, `Model.conditional_aic`,
-`Model.evidence_ratio_vs`, `gamfit.compare_models` — is undefined rather than
-large. `Summary.reml_score_unavailable` then carries the explanation, and
-those ranking surfaces raise it instead of ranking a stand-in value. Compare
-such a model on predictive accuracy, or refit on data whose response is not
-an exact function of the design.
 | `basis_check(data)` | `list[dict]` | Per-smooth basis-adequacy report: is each smooth's basis rich enough for the function it was asked to represent? |
 | `diagnose(data)` | `Diagnostics` | Observed values, predicted columns, residuals, and aggregate metrics for point-payload models (the point column is the one the model's class publishes: `posterior_mean`, or `mean` for the transformation-normal and Bernoulli marginal-slope classes). |
 | `check(data)` | `SchemaCheck` | Schema validation result with structured issues. |
 | `plot(data, x=, kind=)` | `matplotlib.axes.Axes` | Prediction / residual / observed-vs-predicted plot. |
 | `report(path=None)` | `str` | Self-contained HTML report (string, or written path). |
 
+`reml_score` and `raw_reml_score` are `None` when the fit has **no**
+criterion, which is a different statement from "not recorded". A Gaussian
+fit whose fitted mean reproduces the response to floating-point resolution
+has `sigma_hat = 0`, so its restricted likelihood is unbounded and every
+score derived from it — the comparable REML/LAML headline, `Summary.aic_corrected`,
+`Model.evidence_ratio_vs`, `gamfit.compare_models` — is undefined rather than
+large. `Summary.reml_score_unavailable` then carries the explanation, and
+those ranking surfaces raise it instead of ranking a stand-in value. Compare
+such a model on predictive accuracy, or refit on data whose response is not
+an exact function of the design.
+
 `gamfit.validate_formula(...)` validates a formula and data against the
 parser and schema without fitting.
 
-The top-level package also exposes research/inference instruments used by
-the SAE and structure-discovery workflows: `split_likelihood_log_e`,
+Research/inference instruments used by the SAE and structure-discovery
+workflows live in submodules: `gamfit.sae` has `split_likelihood_log_e`,
 `e_bh_dictionary_certificate`, `log_e_from_p_value`,
-`select_probe_by_expected_evidence`, `expected_resolution_budget`,
-`plan_probe_for_contested_claim`, `lawley_bartlett_factor`, and
-`glm_full_conformal`. These are low-level building blocks rather than
-`Model` methods; see the [API reference](api-reference.md) for signatures.
-(`debiased_functional`, by contrast, is a `Model` method, not a
-top-level export.)
+`select_probe_by_expected_evidence`, `expected_resolution_budget`, and
+`plan_probe_for_contested_claim`; `gamfit.inference` has
+`lawley_bartlett_factor` and `glm_full_conformal`. These are low-level
+building blocks rather than `Model` methods; see the
+[API reference](api-reference.md) for signatures. (`debiased_functional`, by
+contrast, is a `Model` method.)
 
 ## summary()
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 s = model.summary()
 print(s)                       # text repr; HTML in notebooks
 s["formula"]
@@ -45,7 +53,8 @@ s["family_name"]
 s["model_class"]
 s["deviance"]
 s["reml_score"]
-s["iterations"]
+s["scale"]                     # dispersion phi-hat (Gaussian sigma^2)
+s["convergence"]               # certificate incl. outer/inner iteration counts
 s["coefficients"]              # list of dicts (per-term records)
 s.coefficients                 # same list via property
 s.to_dict()                    # full payload as a dict
@@ -57,6 +66,61 @@ s.coefficients_frame()         # pandas.DataFrame; requires pandas
 `model.smoothing_parameters()` returns a `{penalty_index: lambda}` dict of
 the fitted smoothing/precision parameters by penalty index (via a dedicated
 FFI call), the same values surfaced under `summary()["lambdas"]`.
+
+### Fit notes, warnings, and solver logs
+
+A fit records two kinds of notes, both listed in `model.notes` and
+`summary().notes` (and printed under `Notes:` in the text summary):
+
+- **advisories** — the fitted model differs from the literal request (a `k`
+  capped to the covariate's distinct values, a basis too small for the
+  residuals). These are also raised as `gamfit.errors.GamInferenceWarning`, attributed
+  to your calling line; the CLI prints them to stderr.
+- **informational notes** — a default the engine chose for you, such as the
+  internal-knot count of a default `s(x)`. These are never warned.
+
+A default fit writes nothing to stdout or stderr. The engine's solver trace
+(`[OUTER …]`, `[PIRLS …]`, …) goes to the `gamfit` Python logger at `DEBUG`
+(finer records below that), which is silent unless you opt in:
+
+```python
+import logging
+logging.basicConfig()
+logging.getLogger("gamfit").setLevel(logging.DEBUG)
+```
+
+The CLI equivalent is `gam -v …` (`-vv` for the finer records).
+
+### Shape-constrained smooths have no significance p-value
+
+A smooth with `shape=monotone_increasing` (or `monotone_decreasing`, `convex`,
+`concave`) reports `edf` and `ref_df` in `summary().smooth_terms` but no
+`chi_sq` or `p_value`. The row carries `p_value_unavailable =
+"shape_constrained"` instead, and `model.smooth_significance(data)` returns the
+same reason in place of an LR row. The printed summary (Python and CLI) names
+the reason under the smooth table.
+
+Why the number is withheld:
+
+- The null `f = 0` is the apex of the constraint cone. Under a flat truth the
+  estimator sits on the cone boundary, so neither the Wald χ² nor the LR's
+  spectral reference describes the statistic's null law.
+- Chi-bar-square (a mixture of χ² laws weighted by the cone's face
+  probabilities) and tests conditional on the active set are the textbook fixes.
+  Both are the null law of the **cone projection** with a fixed cone. The
+  coefficients here are the **truncated posterior mean**, which lies strictly
+  inside the cone and has no active set. Its λ is selected by REML on the same
+  data. Neither reference applies.
+
+`basis_check` still reports for these terms. It tests structure outside the
+term's column span, which the cone does not restrict: its score is built from
+enrichment columns made orthogonal (in the working weights) to the whole
+design, so for a Gaussian identity fit the score equals the enrichment
+projection of `y` and does not depend on the shape term's coefficients at all.
+The fit enters only through the dispersion estimate, as it does for an
+unconstrained term. For other families the score uses the fitted mean, which
+is consistent under the null for the truncated posterior mean as it is for the
+unconstrained one.
 
 ## basis_check() — is the basis big enough?
 
@@ -70,6 +134,16 @@ covariates**.
 That is what `basis_check` measures, and what every fit now measures for itself:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+pcs = rng.normal(0, 1, (400, 4))
+dose = rng.uniform(0, 2, 400)
+eta = -0.5 + 0.8 * dose + np.sin(pcs[:, 0]) + 0.5 * pcs[:, 1] * pcs[:, 2]
+data = {"dose": dose, **{f"pc{j + 1}": pcs[:, j] for j in range(4)},
+        "case": (rng.uniform(size=400) < 1 / (1 + np.exp(-eta))).astype(float)}
+
 model = gamfit.fit(data, "case ~ dose + duchon(pc1, pc2, pc3, pc4, centers=24)",
                    family="binomial")
 # 1. when the basis is too small, the fit already told you, as a GamInferenceWarning:
@@ -115,6 +189,28 @@ own IRLS weight metric**. That projection is the whole design of the statistic:
 a penalized fit is biased, and its shrinkage bias lives entirely inside the span
 of the fitted design, so projecting it out makes the test blind to "λ is large"
 and sensitive only to structure the design *cannot represent at all*.
+
+For a Gaussian response the score is exactly normal and the `χ²`/`F` reference
+is exact. For a canonical binomial (logit) or Poisson (log) fit it is only first
+order, and at small `n` it is visibly off (on `n = 200` binomial rows it was
+conservative: size `0.032` at `0.05`, which is as much a miscalibration as an
+anti-conservative test). There the score is evaluated at the unpenalized null
+MLE and referred to its law **conditional on the sufficient statistic**
+`Xᵀ(w∘y)`, which does not depend on the nuisance coefficients at all; its mean,
+covariance and fourth cumulant are corrected to `O(1/n)`. Where that expansion
+leaves its range of validity — high-leverage rows at an extreme fitted mean —
+the row reports `provenance = "conditional_reference_unavailable"` and no
+`p_value` (about 7% of null replicates of a default `s(x)` binomial fit at
+`n = 200`; none at `n = 2000`). `"null_fit_unavailable"` means the null MLE
+itself could not be certified. The refused share grows as events get rarer:
+15–19% of `n = 200` rows at Poisson means or success probabilities around
+`0.1–1`, and two-thirds with 28–34 expected events in 200 rows. In that
+last regime the p-values that are reported are **not calibrated** (Poisson:
+size `0.030` at `0.05`, KS `p = 2e-4` against uniformity); treat them as
+unmeasured. The conditional law reads prior weights as frequency weights (as
+the likelihood does), and its calibration was measured on designs of about 10
+columns; much wider designs are tested on a row sample capped by the
+reference's cost, a regime that has not been measured.
 
 Asking whether a direction the basis HAS is being over-smoothed is a
 smoothing-parameter question, and this report declines to answer it. It is also
@@ -170,6 +266,15 @@ the model's class publishes through `predict(..., return_type="dict")`.
 ## check()
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+
 check = model.check(test_df)
 
 if check.ok:
@@ -188,6 +293,14 @@ and `schema_error`.
 ## validate_formula()
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+site = rng.choice(["a", "b", "c"], 300)
+data = {"x": x, "site": site, "y": np.sin(x) + (site == "b") + rng.normal(0, 0.3, 300)}
+
 v = gamfit.validate_formula(
     data,
     "y ~ s(x) + group(site)",
@@ -206,11 +319,10 @@ Returns a `FormulaValidation` dataclass that wraps the parsed payload.
 Accepts these parser/materialization keyword arguments from `gamfit.fit`,
 with the same semantics, and does no fitting:
 `family`, `negative_binomial_theta`, `expectile_tau`, `offset`, `weights`,
-`persistent_warm_start_root`,
 `transformation_normal`, `transformation_normal_stage1`,
 `survival_likelihood`, `survival_time_anchor`, `baseline_target`,
 `baseline_scale`, `baseline_shape`, `baseline_rate`, `baseline_makeham`,
-`z_column`, `link`, `slope_formula`, `frailty_kind`, `frailty_sd`,
+`z_column`, `residual_columns`, `link`, `slope_formula`, `frailty_kind`, `frailty_sd`,
 `hazard_loading`, `scale_dimensions`, `firth`, `noise_formula`,
 `noise_offset`, `flexible_link`, `config`.
 
@@ -224,6 +336,13 @@ fit-only objects `constraints`, `latents`, `penalties`, `smooths`,
 
 ```python
 import matplotlib.pyplot as plt
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(train_df, "y ~ s(x)")
 
 fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 model.plot(train_df, x="x", kind="prediction",            ax=axes[0])
@@ -254,6 +373,14 @@ matplotlib (install `gamfit[plot]`).
 ## report()
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 model.report("report.html")       # writes the file and returns its path
 html = model.report()             # returns the HTML string
 ```
@@ -267,6 +394,14 @@ for notebook display.
 ## Inspecting the model object
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 model.formula                   # str
 model.family_name               # str, e.g. "Gaussian Identity"
 model.model_class               # str, e.g. "standard", "survival marginal-slope"
@@ -285,8 +420,8 @@ These are read-only properties.
 
 | Symptom | Try this |
 | --- | --- |
-| `diag.metrics["r_squared"]` low on training | The model is under-flexed. Raise `k` on smooths or add interactions via `te(...)` / multi-d smooths. |
-| `rmse` low on training, high on test | Over-flexed. Reduce `k` or rely on the default complexity. |
+| `diag.metrics["r_squared"]` low on training | A fixed basis may be too small for the function. A default `s(x)` grows its own basis, but an explicit `k`, a `by=` smooth and the tensor-product, cyclic, factor-smooth and Matérn bases do not. Run `basis_check(data)`; where it reports a fixed basis is inadequate, drop the `k=` on an `s(x)` or give the other bases a larger `k`. Or add interactions via `te(...)` / multi-d smooths. See [Choosing k](formulas.md#choosing-k). |
+| `rmse` low on training, high on test | Lowering `k` is not the fix: REML already penalizes wiggliness the data do not support. Check for leakage between training and test rows, for a shift between them, and for terms that should not be in the model. |
 | `diagnose()` raises about the response column | Pass `y="column_name"` explicitly. |
 | `check()` reports `missing_column` | The prediction data is missing a required feature. |
 | `predict` raises `SchemaMismatchError` | Run `check()` first to identify the offending column. |

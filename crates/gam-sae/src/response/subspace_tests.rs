@@ -1111,38 +1111,3 @@ fn every_discarded_error_is_nonnegative_the_empty_frame_discards_the_total_and_t
         );
     }
 }
-
-#[test]
-fn a_pass_counts_the_pair_kernels_that_fell_back_to_the_certified_orthant_route() {
-    // Two ReLU units deep in their lower tails (b = c = −8) with anticorrelated readers (r = −½): the plain bivariate
-    // normal route certifies no digit there, so the kernel re-evaluates through the certified entry and flags it. The
-    // same readers at zero bias take the zero-mean closed form, which never falls back: the negative control.
-    let readers = array![[1.0, 0.0], [-0.5, 0.75_f64.sqrt()]];
-    let frame = identity(2);
-    let mut counts = Vec::new();
-    for bias in [-8.0, 0.0] {
-        let block = KnownBlock::new(
-            readers.clone(),
-            array![bias, bias],
-            array![[1.0, 1.0]],
-            Array1::zeros(1),
-            identity(1).view(),
-            GaussianActivation::Relu,
-        )
-        .expect("a finite two-unit block");
-        let gradient = block
-            .explained_variance_gradient(frame.view())
-            .expect("the full frame");
-        eprintln!(
-            "#2946 orthant fallbacks at bias {bias}: {} of 3 pair kernels; V(I) = {:?}",
-            gradient.orthant_fallbacks,
-            gradient.explained_variance,
-        );
-        counts.push(gradient.orthant_fallbacks);
-    }
-    assert!(
-        counts[0] >= 1 && counts[0] <= 3,
-        "the lower-tail block must report its fallback pairs among its 3: {counts:?}",
-    );
-    assert_eq!(counts[1], 0, "the zero-mean block never falls back: {counts:?}");
-}

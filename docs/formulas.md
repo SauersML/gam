@@ -23,21 +23,44 @@ This page lists each right-hand-side term, its options, and the
 formula-level configuration terms (`link(...)`, `linkwiggle(...)`,
 `timewiggle(...)`, `survmodel(...)`).
 
+### Column names that are not identifiers
+
+A column whose name is not a plain identifier — it has a space, a dot, a
+hyphen, a leading digit, or non-ASCII letters — is written in backticks,
+anywhere a column name is accepted, the response included:
+
+```
+`body mass` ~ s(`flipper.length`) + `2nd dose` + factor(`site id`)
+```
+
+Everything between the backticks is the column name, verbatim. Plain
+identifiers need no quoting (`s(x)` and ``s(`x`)`` are the same term).
+
+### Option values are checked
+
+Every option a term accepts is parsed strictly. An unknown option name, a
+value of the wrong type (`k=ten`, `double_penalty=maybe`), and an
+out-of-range value (`k=0`, `degree=-1`) are errors that name the term and
+the option, e.g. ``in term s(x, k=ten): option `k=ten` is not a
+non-negative integer``. Nothing is silently clamped or ignored; in
+particular `penalty_order` must satisfy `1 <= penalty_order <= degree`,
+because the `m`-th derivative of a degree-`d` spline is identically zero
+for `m > d` and such a penalty would penalize nothing.
+
 ## Response (left of `~`)
 
 | Response | Default behaviour |
 | --- | --- |
 | `y` continuous | Gaussian family, identity link. |
 | `y` binary `{0, 1}` | Binomial family, logit link. |
-| `y` non-negative integer, with `link(type=log)` | Poisson. |
-| `y` positive continuous, with `link(type=log)` | Gamma. |
+| `y` non-negative integer count (at least one value `>= 2`) | Poisson family, log link. |
 | `Surv(entry, exit, event)` | Survival model. See [survival.md](survival.md). |
 
-The family is inferred from the response. When `link(type=log)` is set,
-Poisson vs Gamma is chosen by whether `y` is integer-valued — `family=`
-is optional in that case. `family=` accepts `gaussian`, `binomial`
+The family is inferred from the response. A link that several families admit
+(`link(type=log)`, `link(type=inverse)`) does not choose the family: set with
+no `family=`, it is an error that names the admitting families. `family=` accepts `gaussian`, `binomial`
 (aliases `binomial-logit`, `binomial-probit`, `binomial-cloglog`),
-`latent-cloglog-binomial`, `poisson`, `negative-binomial`, `gamma`,
+`latent-cloglog-binomial`, `poisson`, `negative-binomial`, `gamma`, `inverse-gaussian`,
 `beta`, `tweedie`, `royston-parmar`, and `multinomial`. Survival,
 transformation-normal, and Bernoulli
 marginal-slope families are selected through `Surv(...)` or dedicated
@@ -101,9 +124,10 @@ Required options: `min` and `max` (finite, `min < max`).
 ### bounded() priors
 
 `bounded()` accepts one of `prior=`, `target=`+`strength=`, or no
-prior:
+prior option:
 
 ```
+bounded(x, min=-1, max=1)                  # default: prior=shrinkage
 bounded(x, min=0, max=1, prior=uniform)
 bounded(x, min=0, max=1, prior=center)
 bounded(x, min=0, max=1, target=0.5, strength=3)
@@ -111,7 +135,16 @@ bounded(x, min=0, max=1, target=0.5, strength=3)
 
 `prior=` values:
 
-- `none` — flat on the transformed scale, no penalty.
+- `shrinkage` (the default when no prior option is given) — a Gaussian
+  prior on the latent logit coordinate of the interval transform,
+  centred at the null, with its precision estimated by REML like any
+  other smoothing parameter. A coefficient the data do not support is
+  shrunk back to the null. The null is `0` when `min < 0 < max`. When
+  zero lies outside the box it is not an admissible value, and the
+  prior centres at the box midpoint `(min + max) / 2`, the point of the
+  interval map that favours neither bound.
+- `none` — flat on the transformed scale, no penalty: the constrained
+  maximum-likelihood fit.
 - `uniform` (aliases `log-jacobian`, `log_jacobian`, `jacobian`) — flat
   on the original scale, applied as a log-Jacobian correction.
 - `center` — `Beta(2, 2)` toward the midpoint.
@@ -124,12 +157,60 @@ bounded(x, min=0, max=1, target=0.5, strength=3)
 `prior=`, `target`/`strength`, and the (legacy) `pull=` shorthand are
 mutually exclusive.
 
+## Removing the intercept {#removing-the-intercept}
+
+```
+y ~ 0 + x                 # regression through the origin (penalized slope)
+y ~ x - 1                 # the same model
+y ~ 0 + linear(x, double_penalty=false)   # unpenalized: OLS through the origin
+y ~ 0 + g                 # g spans the constant: the same model as y ~ g
+y ~ 0 + s(x) + s(z)       # s(x) spans the constant: the same model as y ~ s(x) + s(z)
+```
+
+`0 + …`, `… + 0` and `… - 1` remove the global intercept; `1 + …` (or
+`+ 1`) keeps it, which is the default. The constant is never penalized: a
+shift of the response shifts the fit and nothing else. Every other
+direction keeps its penalty, so a term with no support in the data can
+still be shrunk to zero.
+
+Removing the intercept therefore removes the constant only when no term
+could represent it. A term that spans the constant keeps the intercept, and
+the model is exactly the one written with it:
+
+- **A fixed factor** — `+ g`, `factor(g)`, or the main effect of a
+  factor `by=` smooth. `0 + g` is `g`: every level keeps its column and its
+  REML-estimated ridge. Beside the free intercept that ridge shrinks only the
+  contrasts between levels, so the overall level is free and the level
+  differences shrink toward zero when the data do not support them.
+- **A pure-indicator interaction over every level** (`g:h` with no `g` or
+  `h` main effect). `0 + g:h` is `g:h`: one reference cell is absorbed by the
+  intercept and every other cell keeps its ridge.
+- **A B-spline or tensor smooth** (`s(x)`, `te(x, z)`, …) with the default
+  centring or `identifiability=none`. `0 + s(x)` is `s(x)`: the smooth stays
+  centred and keeps its null-space ridge, so its linear part is shrunk like
+  any other and only the constant is free.
+
+The column space is the one the formula wrote; the coefficients are
+parametrized as the intercept plus centred effects, and the fit reports an
+inference note naming the term that kept the intercept.
+
+A random effect (`group(g)`, `re(g)`, `s(g, bs="re")`) never spans the
+constant: its levels are mean-zero deviations. When no term spans it, the
+model has no constant at all and every effect passes through the origin,
+exactly as a parametric no-intercept fit does. `y ~ 0 + linear(x,
+double_penalty=false)` is ordinary least squares through the origin, to
+rounding. The default `y ~ 0 + x` also passes through the origin, but its
+slope carries the same REML-selected shrinkage ridge as `x` in `y ~ x`
+(see [Linear and constrained coefficients](#linear-and-constrained-coefficients)),
+so it sits slightly toward zero from the least-squares slope when the data
+support shrinkage.
+
 ## Random effects and factor smooths
 
 ```
 y ~ x + group(site)                      # random intercept per level
 y ~ x + re(site)                         # random-intercept alias of group()
-y ~ x + factor(site)                     # FIXED categorical factor (like bare `+ site`)
+y ~ x + factor(site)                     # same penalized block as bare `+ site`; forces categorical encoding
 y ~ s(time, by=treatment) + treatment    # separate smooth per factor level
 y ~ s(time, by=dose)                     # numeric varying-coefficient smooth: f(time)·dose, f keeps its constant
 y ~ s(time, subject, bs="fs")           # partial-pooling random smooths
@@ -142,15 +223,50 @@ y ~ group(subject) + s(subject, time, bs="re")  # random intercept + slope
 `group(g)`/`re(g)`/`s(g, bs="re")` add a random intercept per level of the
 grouping column. The column may be string- or integer-valued. Random slopes are
 supported with `s(x, group, bs="re")`, usually paired with `group(group)` for
-random intercepts. As random effects, they shrink a held-out group toward the
-population mean, so a level seen only at prediction time is tolerated.
+random intercepts.
 
-`factor(g)`, by contrast, is a **fixed** categorical factor — the same fixed
-main effect as a bare `+ g`, but with categorical encoding forced even when the
-column is numeric (so `factor(year)` treats `year` as levels, not a slope). Like
-any fixed factor, a level that never appeared in training is a schema mismatch:
-`predict` raises and `check()` reports it, rather than silently returning the
-factor's centering point (#2137).
+### How categorical terms are estimated {#factor-terms}
+
+A bare string column (`+ site`), `factor(site)` and `group(site)` all build
+the same term: one coefficient per level, with a ridge penalty on those
+coefficients whose strength REML estimates along with every other smoothing
+parameter. On the same data the three spellings choose the same smoothing
+parameter and give the same predictions for every level seen in training.
+No spelling fits an unpenalized fixed effect, with or without an intercept
+in the formula (see [Removing the intercept](#removing-the-intercept)).
+
+They differ in two ways only:
+
+| Spelling | Numeric column | Level unseen in training |
+| --- | --- | --- |
+| `+ site` | used as a numeric slope | `predict` raises `gamfit.errors.PredictionError` (a `DataError`); `check()` reports it |
+| `factor(site)` | forced to categorical levels | `predict` raises `gamfit.errors.PredictionError` (a `DataError`); `check()` reports it |
+| `group(site)`, `re(site)` | forced to categorical levels | predicted at the population level (the level effect is 0) |
+
+So `factor(year)` treats `year` as levels rather than as a slope, and a
+held-out level is a schema mismatch for `+ site` and `factor(site)` but an
+expected new group for `group(site)`.
+
+`factor()`, `group()` and `re()` take no options: the penalty
+strength is always estimated, so `factor(site, k=3)` is rejected as an
+unknown option instead of being ignored. `factor(site)` is the only
+spelling of the level effect: `C(site)` is rejected with an error that
+points to `factor(site)`. A categorical column is also
+refused inside a term that treats its inputs as numeric axes (`linear()`,
+`s()`, `te()`, `thinplate()`, `matern()`, cyclic smooths and the other
+non-factor bases): the error points to `factor(site)` or `group(site)` for
+the level effect, or `s(x, by=site)` / `fs(x, site)` for a per-level
+smooth of a numeric `x`.
+
+Why estimate the penalty rather than leave the levels unpenalized? The
+penalized estimate is the random-effect (partial-pooling) estimate, and
+REML decides how much pooling the data support. When every level has plenty
+of rows, the estimated penalty is weak and the level effects match the
+unpenalized ones almost exactly; in the `Wage` data the five education
+levels keep an edf of about 3.98 of a possible 4. When some levels have
+few rows, their effects are pulled toward the overall mean instead of
+resting on a handful of observations. Both cases use one rule and no
+tuning, the same rule every smooth in the model uses.
 
 ## Univariate smooths {#univariate-smooths}
 
@@ -188,11 +304,44 @@ difference-penalized P-spline of the same dimension.
 | `bc` | `none` | Boundary condition for both endpoints: `none`, `clamped` (zero first derivative), or `anchored` (fixed value and zero first derivative). Combine with `side=left`/`right` for half-open smooths. |
 | `bc_left`, `bc_right` | inherit from `bc` | Per-endpoint overrides, with aliases `start_bc`/`end_bc`. |
 | `anchor`, `anchor_left`, `anchor_right` | `0` for anchored endpoints | Fixed endpoint value(s) when an endpoint uses `anchored`. |
+| `domain` | data range | `[lower, upper]` interval the spline is built on. See [Fixing the spline's interval](#spline-domain). |
+| `shape` | `none` | Shape constraint: `monotone_increasing`, `monotone_decreasing`, `convex`, `concave`, or a list of them that must all hold (`[monotone_increasing, concave]`). See [Shape-constrained smooths](#shape-constrained-smooths). |
 
 Boundary conditions are available for 1-D P-spline smooths. They are useful for trajectories with a known start or end: `bc_left=anchored, anchor_left=0` fixes the left endpoint value and slope while leaving the right endpoint open; `bc_right=clamped` forces a flat terminal slope.
 
 The 1-D B-spline path accepts these options plus `periodic`, `period`,
 `periods`, `period_start`, `period_end`, `origin`, `identifiability`.
+
+### Fixing the spline's interval (`domain=`) {#spline-domain}
+
+```
+y ~ s(age, domain=[0, 100])             # basis spans [0, 100], not min..max(age)
+y ~ s(x, bs=cr, k=8, domain=[0, 1])     # cr end knots at 0 and 1
+y ~ te(x, z, domain=[[0, 1], none])     # per margin: fix x, z keeps its data range
+```
+
+By default an open (non-periodic) spline's boundary knots sit at the minimum
+and maximum of the fitted column, so the basis — and therefore the fit —
+depends on which rows happened to be sampled. `domain=[lower, upper]`
+declares the interval instead: the clamped boundary knots are placed at
+`lower` and `upper`, generated interior knots are spread over it, and a
+`bs=cr`/`cs` basis puts its end value-knots there. Quantile knot placement
+keeps its interior knots at data quantiles and moves only the boundary knots
+to the domain. Explicit interior `knots=[...]` must lie inside it. Two
+samples of different extent inside the same domain therefore build exactly
+the same basis. Bounds accept numeric expressions (`domain=[0, 2*pi]`).
+
+On `te()`/`ti()` the option takes one entry per margin, each an interval or
+`none` (keep that margin's data range): `domain=[[0, 1], [-5, 5]]`.
+
+Fitted data must lie inside the domain: a row outside it is an error that
+names the column and its observed span, rather than a silent widening.
+At **prediction** time a point outside the domain is evaluated by linear
+extrapolation from the boundary, as for any clamped B-spline. `domain=` is
+for open splines only; a periodic axis takes its interval from
+`period=`/`period_start=`/`period_end=` (or `origins=` on a tensor margin),
+and combining the two is an error. (`boundary=` is unrelated: it sets the
+endpoint condition, e.g. `boundary=periodic` or `bc=clamped`.)
 
 `identifiability=` selects the smooth's own gauge. On the 1-D B-spline path —
 `s()` and `cyclic()` — and on `matern()`, the vocabulary is:
@@ -227,15 +376,158 @@ does, so `cyclic(x, period=2*pi)` and `cyclic(x, period_start=0,
 period_end=2*pi)` describe the same `[0, 2π)` smooth. An unparseable
 endpoint or an unknown option is rejected rather than silently dropped.
 
-Default interior knots: `clamp(unique_values / 4, 4, 8)` — a lean default
-of about twelve cubic basis functions, close to mgcv's `k = 10`; the cap is
-flat in `n`, so a wigglier fit is an explicit `k=` away rather than the
-default (#1680). With 32 or fewer rows and five or more smooth coordinates
-the inferred count is further reduced to at most 1. The basis dimension is
-then `k = internal_knots + degree + 1`, and an explicit `k` is honoured
-exactly down to `k = degree + 1` (zero interior knots). Passing both `k`
-and `knots` is an error. The fit's inference note prints the rule it
-applied.
+Default basis of a 1-D `s(x)`: the data size it. The fit starts from a
+pilot of `clamp(unique_values / 4, 4, 8)` interior knots (at most twelve
+cubic basis functions). With 32 or fewer rows and five or more smooth
+coordinates the pilot is reduced to at most 1 interior knot. After the fit
+converges, the basis is checked for two signs that it is too small: an edf
+pressed against the basis dimension, and a rejection by the residual
+lack-of-fit test that
+[`basis_check()`](diagnostics.md#basis_check-is-the-basis-big-enough)
+reports, at a family-wise level of `1e-3` Bonferroni-corrected over the
+tested smooths. If either appears, the knot count doubles and the model is
+refit, until neither does. Only the data bound the growth:
+
+- a smooth never gets more coefficients than its covariate has distinct
+  values, which is the interpolating limit;
+- the whole model keeps at least one residual degree of freedom.
+
+A null or linear truth passes at the pilot, and REML shrinks it to about 0
+or 1 edf. The larger basis is built only where the fit shows it is needed.
+
+The basis dimension is `k = internal_knots + degree + 1`. Setting `k=` or
+`knots=` fixes the size: an explicit `k` is honoured exactly, down to
+`k = degree + 1` (zero interior knots), and never grows. Passing both `k`
+and `knots` is an error. A Python smooth override (`smooths=`) also keeps
+its size. So do a `by=` smooth (only the rows its gate selects support it)
+and the cyclic, factor-smooth and tensor-product bases, which take the
+pilot count as a fixed default. Thin-plate, Duchon and the other radial
+smooths with automatic centers grow their center count by the same
+adequacy loop. Matérn is the exception and keeps its default count.
+
+### Choosing `k` {#choosing-k}
+
+For a default `s(x)` there is nothing to choose. Leave `k` unset and the
+fit sizes the basis from the data, as described above.
+
+Setting `k` fixes the basis dimension. That is an upper bound on how
+flexible the smooth can be, not the flexibility itself. REML chooses the
+smoothing parameter, and so how much of the basis the fit uses: the
+smooth's effective degrees of freedom (edf) can sit anywhere from its
+unpenalized null space up to the basis dimension. A `k` above what the data
+need changes the fit very little, because the penalty holds the extra basis
+functions back. It costs time, not accuracy.
+
+A fixed basis can fail in one way: it can be too small for the truth. An edf
+close to the basis dimension is the symptom, and
+[`basis_check()`](diagnostics.md#basis_check-is-the-basis-big-enough)
+is the test: it looks for structure left in the residuals along the
+covariate. A small p-value means the basis ran out. For `s(x)`, drop the
+`k=` and let the default grow. A basis that never grows by itself (a `by=`
+smooth, or a tensor-product, cyclic, factor-smooth or Matérn smooth) needs a
+larger `k`.
+
+```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+x = np.sort(rng.uniform(0, 1, 1000))
+truth = np.sin(12 * np.pi * x)
+data = pd.DataFrame({"x": x, "y": truth + rng.normal(0, 0.3, x.size)})
+
+for formula in ["y ~ s(x, k=12)", "y ~ s(x)"]:
+    model = gamfit.fit(data, formula)
+    check = model.basis_check(data)[0]
+    error = np.sqrt(np.mean((model.predict(data) - truth) ** 2))
+    print(f"{formula:16s} basis_dim={check['basis_dim']:2d}  edf={check['edf']:5.1f}  "
+          f"basis check p={check['p_value']:.2g}  RMSE vs truth={error:.3f}")
+```
+
+Six full periods of a sine need more than a dozen basis functions. The
+fixed `k=12` basis runs out: its edf (10.4) presses against the basis
+dimension (11 after centering), the basis check's p-value is about
+`1e-309`, and the error against the truth is 0.63. The default `s(x)`
+starts from the same dozen functions, sees the same rejection, and doubles
+its knots until the check's p-value clears the engine's basis-adequacy
+level (`1e-3`, Bonferroni-corrected over the tested smooths). Here it
+stops at 19 dimensions with an edf of 17.8, a basis check p of about
+0.007, and an error of 0.07. Nobody had to tell it how many.
+
+### Shape-constrained smooths {#shape-constrained-smooths}
+
+```
+y ~ s(x, shape=monotone_increasing)   # f'(x) >= 0 on the knot range
+y ~ s(x, shape=monotone_decreasing)   # f'(x) <= 0
+y ~ s(x, shape=convex)                # f''(x) >= 0
+y ~ s(x, shape=concave, k=12)         # f''(x) <= 0
+y ~ s(x, shape=[monotone_increasing, concave])      # both at once
+y ~ te(x, z, shape=[monotone_increasing, none])     # increasing in x at every z
+y ~ s(x, by=g, shape=monotone_increasing)           # every level of factor g
+```
+
+Accepted spellings (case and hyphens are ignored): `none`;
+`monotone_increasing` (`monotonic_increasing`, `increasing`, `mono_inc`,
+`mpi`); `monotone_decreasing` (`monotonic_decreasing`, `decreasing`,
+`mono_dec`, `mpd`); `convex` (`cvx`); `concave` (`ccv`). From Python,
+`gamfit.fit(..., constraints={"s(x)": "monotone_increasing"})` rewrites the
+formula into the same `shape=` option; a Python list or tuple value becomes a
+bracketed list.
+
+The constraint is exact, not a penalty and not a check on a grid of points.
+The B-spline coefficients are written as `β = C·δ`, where `δ` holds
+successive coefficient differences (monotone) or knot-scaled slope
+differences (convex/concave), and the solver enforces `δ ≥ 0`. A
+non-negative control-polygon difference makes the spline itself monotone
+(or convex) everywhere on the knot range. The roughness penalty stays the
+function penalty `βᵀSβ`, carried into `δ` coordinates by congruence.
+
+A shape-constrained smooth is centred like an unconstrained one. The chart
+drops the constant ("level") direction, which the B-spline partition of
+unity would otherwise make identical to the intercept. It also subtracts
+each increment column's weighted training mean, which leaves every
+coefficient difference, and so the cone, unchanged. The fitted term then
+sums to zero over the training rows and the intercept carries the level.
+`identifiability=` takes `sum_tozero` (the default) or `none`. With `none`,
+the constant stays in the chart as an unbounded level coordinate. `linear`
+is refused because removing a linear trend is not compatible with the cone.
+
+**Lists.** `shape=[a, b]` imposes every listed shape. A single shape keeps
+the `δ ≥ 0` chart above; a list enters the solver as the merged inequality
+rows `A·β ≥ 0`, written in the same centred chart (difference rows annihilate
+constants, so centring leaves them exact). Duplicate atoms are merged, and a
+monotone row made redundant by a curvature constraint is dropped: under
+`concave` a spline is non-decreasing exactly when its last slope is, so only
+that endpoint row is kept. Contradictions are refused with the class they
+would force: `monotone_increasing` with `monotone_decreasing` leaves only a
+constant, `convex` with `concave` only an affine function.
+
+**Tensor products.** `te(x, z, shape=[s_x, s_z])` takes one entry per
+margin, in margin order; each is a shape, `none`, or a list. A constrained
+margin contributes its exact 1-D cone Kroneckered with identities on the
+other margins (`I ⊗ A_x ⊗ I`), so the surface has that shape along the
+margin at every value of the others. Every margin of a shaped `te()` is an
+open B-spline: with no `bs=` all margins default to `ps` rather than `cr`,
+and `bs='cr'` on a shaped margin is refused (its coefficients are knot
+values, not control points). `ti()` is refused, because its slices average
+to zero over the other margins, and a monotone slice with zero average is
+identically zero. A single entry for a multi-margin `te()` is refused with
+the entry count it needs.
+
+**`by=`.** With a factor `by=`, every level's curve carries the full cone
+on its own coefficient block. With a numeric `by=z` the cone constrains
+`f` in `z·f(x)`, so the product has the stated shape in `x` only where
+`z ≥ 0`, and the mirrored shape where `z < 0`.
+
+Only open 1-D B-spline `s(x)` smooths, `te()` products of them, and either
+with `by=` accept `shape=`. Periodic (`cyclic()`), cubic-regression
+(`bs='cr'`/`'cs'`) and boundary-conditioned bases, and
+thin-plate/Duchon/Matérn/sphere smooths reject a non-`none` shape with an
+error.
+
+The [tour](tour.md#shape-constraints-a-monotone-curve-cars) fits a
+monotone curve to real data.
 
 ### Boundary-conditioned 1-D smooths {#boundary-conditioned-1d-smooths}
 
@@ -449,6 +741,8 @@ takes the same options as `te(...)`.
 | `double_penalty` | `true` | Ridge alongside per-margin penalties. |
 | `bc` | none | Per-margin margin kind. A `periodic` / `cyclic` / `cc` token makes that margin wrap; `clamped` / `open` / `natural` / `free` / `none` all mark an ordinary non-periodic margin (`clamped` here is the *clamped knot vector* of an open spline, not a zero-derivative endpoint pin — for that, use a 1-D `s(x, bc=clamped)` term). `anchored` is rejected. A single token applies to every margin; any other length is an error. |
 | `periodic`, `period`, `periods`, `origin`, `origins` | — | Per-margin periodicity (see below). |
+| `bs` (`type`) | `cr` per margin | Margin basis: `tp`/`tps`, `ps`, `bs`, `cr`, `cs`, `cc`. A scalar `bs=ps` applies to every margin; `bs=c('cc', 'ps')` sets them per margin. `te()` is always a tensor product — `bs=` never turns it into a different smooth. |
+| `domain` | data range, per margin | One `[lower, upper]` interval (or `none`) per margin: `domain=[[0, 1], none]`. See [Fixing the spline's interval](#spline-domain). |
 | `by` | — | See [univariate smooths](#univariate-smooths). |
 | `identifiability` | `sum_tozero` (`te`), `marginal_sum_tozero` (`ti`) | `none`, `sum_tozero`, or `marginal_sum_tozero`. |
 
@@ -457,7 +751,7 @@ value are broadcast across all margins.
 
 ### What the default margin is, and when it changes {#tensor-default-margin}
 
-Following mgcv, an unset `bs=` gives each margin a **natural cubic regression
+An unset `bs=` gives each margin a **natural cubic regression
 spline**: `k` value-knots at data quantiles, penalized by the exact integrated
 squared second derivative. `degree` and `penalty_order` are not adjustable
 properties of that basis — a cubic regression spline *is* cubic and *is*
@@ -477,6 +771,17 @@ so naming an option never changes a fit by itself.
 Examples:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+space, time, x, z, h = (rng.uniform(0, 1, n) for _ in range(5))
+theta, u, v = (rng.uniform(0, 2 * np.pi, n) for _ in range(3))
+df = {"space": space, "time": time, "x": x, "z": z, "h": h, "theta": theta, "u": u, "v": v,
+      "y": np.sin(2 * np.pi * space) * time + np.sin(theta) * h + np.cos(u) + np.sin(v)
+           + x * z + rng.normal(0, 0.3, n)}
+
 gamfit.fit(df, "y ~ te(space, time, k=[12, 8])")
 gamfit.fit(df, "y ~ te(space, time, k=(12, 8))")
 gamfit.fit(df, "y ~ te(space, time, k_space=12, k_time=8)")
@@ -531,6 +836,14 @@ per-axis shrinkage. Setting `scale_dimensions=True` on `fit()`
 enables it globally across compatible spatial smooths.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+pc = rng.normal(0, 1, (400, 4))
+df = {"pc1": pc[:, 0], "pc2": pc[:, 1], "pc3": pc[:, 2], "pc4": pc[:, 3],
+      "y": np.sin(pc[:, 0]) + 0.5 * pc[:, 1] ** 2 + rng.normal(0, 0.3, 400)}
+
 gamfit.fit(df, "y ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
 ```
 
@@ -581,6 +894,13 @@ y ~ x + link(type=flexible(probit))
 The formula value wins if both are set.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+age = rng.uniform(30, 80, 400)
+df = {"age": age, "case": (rng.uniform(size=age.size) < 1 / (1 + np.exp(-(age - 55) / 8))).astype(float)}
+
 gamfit.fit(df, "case ~ s(age)", link="logit")
 ```
 

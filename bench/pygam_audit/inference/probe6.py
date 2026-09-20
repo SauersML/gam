@@ -1,0 +1,22 @@
+import numpy as np, gamfit, warnings, time
+warnings.simplefilter("ignore")
+rng=np.random.default_rng(3)
+n=200
+X=rng.uniform(0,1,(n,3))
+y=np.sin(2*np.pi*X[:,0])+0.3*np.cos(2*np.pi*X[:,2])+rng.normal(0,0.7,n)
+d=dict(x1=X[:,0],x2=X[:,1],x3=X[:,2],y=y)
+t=time.time(); m=gamfit.fit(d,"y ~ s(x1)+s(x2)+s(x3)"); print("fit",time.time()-t)
+t=time.time(); pdp=m.partial_dependence("s(x1)",d,grid=X[:,0]); print("pdp",time.time()-t, "mean over train", pdp['predicted'].mean())
+t=time.time(); ss=m.smooth_significance(d); print("lr",time.time()-t)
+for r in ss: print({k:r[k] for k in ('name','statistic_lr','ref_df','p_value_uncorrected','p_value_corrected','reference_source','correction_provenance')})
+print(m.summary().smooth_terms)
+t=time.time(); ps=m.sample(d,samples=500,seed=1); print("sample",time.time()-t, type(ps), [a for a in dir(ps) if not a.startswith('_')])
+print(ps.method, ps.covariance_source, ps.is_exact, ps.n_draws, ps.shape)
+print(ps.summary() if callable(ps.summary) else ps.summary)
+import inspect; print(inspect.signature(ps.predict)); print(inspect.signature(ps.interval))
+r=ps.predict(dict(x1=X[:5,0],x2=X[:5,1],x3=X[:5,2]))
+print(r)
+yb=(rng.uniform(size=n)<1/(1+np.exp(-np.sin(2*np.pi*X[:,0])))).astype(float)
+db=dict(d); db['y']=yb
+mb=gamfit.fit(db,"y ~ s(x1)+s(x2)+s(x3)",family="binomial")
+t=time.time(); pb=mb.sample(db,samples=500,seed=1); print("sample binom",time.time()-t, pb.method, pb.covariance_source, pb.is_exact, pb.rhat if not callable(pb.rhat) else '')

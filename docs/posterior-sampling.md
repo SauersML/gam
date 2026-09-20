@@ -5,19 +5,35 @@ and then draws from the posterior of the coefficients. The sampler
 dispatches among NUTS, Polya-Gamma Gibbs, and a Gaussian Laplace
 approximation based on model class; see
 [Sampler dispatch](#sampler-dispatch) below. The MCMC routes sample the
-exact likelihood conditional on the fitted smoothing parameters; the
-Laplace route draws from the covariance the fit *publishes* — the
-smoothing-corrected `Vp` whenever the fit carries one — so its draw spread
-agrees with `summary().std_error` and with the default
+exact likelihood at the fitted smoothing parameters; on a standard GLM
+(NUTS and Pólya-Gamma) the draws are then mapped about their mean through
+the linear optimal-transport map `T = Vb^{-1/2}(Vb^{1/2} V_c Vb^{1/2})^{1/2}
+Vb^{-1/2}` that carries the conditional `Vb` onto the published
+smoothing-corrected `V_c` (`T Vb T = V_c`), so the draws integrate the
+smoothing uncertainty for every family while keeping the exact likelihood's
+shape. `V_c` may be wider or narrower than `Vb` in a given direction (the
+sigma-point cubature correction averages the curvature over `ρ`); the map
+reaches it either way. The Laplace route draws from the covariance the
+fit *publishes* — the smoothing-corrected `Vp` whenever the fit carries one —
+so its draw spread agrees with `summary().std_error` and with the default
 `predict(interval=...)` band on the same object. Every draw set reports
 which covariance it describes in `covariance_source`.
 
 ## Quick start
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 posterior = model.sample(train_df, seed=42)
 print(posterior)
-# PosteriorSamples(n_draws=..., n_coeffs=8, method='laplace',
+# PosteriorSamples(n_draws=..., n_coeffs=12, method='laplace',
 #                  rhat=1.0000, ess=..., converged=True)   # a Gaussian fit
 
 bands = posterior.predict(test_df, level=0.95)
@@ -54,6 +70,18 @@ synthetic responses from the fitted predictive distribution, use
 `sample_replicates`:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
+def consume(chunk):
+    pass  # e.g. accumulate a posterior-predictive statistic
+
 rep = model.sample_replicates(test_df, n_draws=200, seed=42)
 # shape: (200, n_rows)
 
@@ -93,6 +121,14 @@ draws replicate class-label vectors (`Categorical(softmax(X·beta_hat))`) you ca
 feed into your own posterior-predictive check:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(-3, 3, 300)
+site = np.array(["A", "B", "C"])[np.digitize(x + rng.normal(0, 1, 300), [-1, 1])]
+train_df = {"x": x, "site": site}
+
 model = gamfit.fit(train_df, "site ~ s(x)", family="multinomial")
 reps = model.posterior_predict(train_df, n_draws=200, seed=42)
 # shape: (200, n_rows); object array of class labels
@@ -106,7 +142,8 @@ The dispatch is in `crates/gam-inference/src/sample.rs::sample_saved_model`:
 | --- | --- |
 | Gaussian-identity standard GLM | Laplace (closed form; see note below) |
 | Standard GLM (binomial probit/cloglog/latent-cloglog, Poisson, Tweedie, negative-binomial, Gamma) | NUTS |
-| Bernoulli-logit standard GLM (no Firth, no offset, unit weights) | Polya-Gamma Gibbs |
+| Bernoulli-logit standard GLM (no offset, unit weights) | Polya-Gamma Gibbs |
+| Bernoulli-logit standard GLM under the Jeffreys prior (Firth fit; no offset, unit weights) | Polya-Gamma Gibbs with a Jeffreys Metropolis step |
 | Bounded-coefficient standard GLM | Laplace (latent logit scale) |
 | Standard GLM with beta regression or binomial SAS / beta-logistic / blended links | Not implemented; raises |
 | Standard GLM with link-wiggle | NUTS (joint link-wiggle path) |
@@ -139,6 +176,7 @@ model class, so it is always one of:
 | --- | --- | --- |
 | `"nuts"` | No-U-Turn HMC on the exact posterior | `True` |
 | `"polya-gamma"` | Polya-Gamma Gibbs on the exact Bernoulli-logit posterior | `True` |
+| `"polya-gamma-jeffreys"` | Polya-Gamma Gibbs on the exact Bernoulli-logit posterior under the Jeffreys prior `det I(β)^½` (a Firth fit): each Gibbs coefficient draw is an independence proposal accepted with probability `min(1, det I(β')^½ / det I(β)^½)`; `acceptance_rate` is reported | `True` |
 | `"laplace"` | Independent draws from the Gaussian (Laplace) approximation, including the Gaussian-identity closed form, the bounded latent-chart draws, and the transformation-normal rejection draws | `False` |
 | `"truncated-laplace"` | Reflective HMC on the inequality-truncated Gaussian approximation (shape-constrained standard fits); `rhat` / `ess` are measured | `False` |
 
@@ -157,7 +195,6 @@ Fields:
 | `n_samples` | `int` |
 | `n_warmup` | `int` |
 | `n_chains` | `int` |
-| `target_accept` | `float` |
 | `seed` | `int` |
 
 `n_warmup` is the warmup the run spent per chain (`0` for independent
@@ -178,9 +215,10 @@ Frozen dataclass holding the draws and convergence diagnostics.
 | `rhat` | `float` | Maximum split-Rhat. `1.0` exactly for Laplace draws. |
 | `ess` | `float` | Minimum effective sample size across coefficients. For Laplace draws this is `2 * samples`. |
 | `converged` | `bool` | Sampler convergence flag. Laplace draws set this to `True`; NUTS and Gibbs paths require `rhat < 1.1` and `ess > 100`. |
-| `method` | `str` | `"nuts"`, `"polya-gamma"`, `"laplace"`, or `"truncated-laplace"` — the sampler that ran (table above). |
+| `method` | `str` | `"nuts"`, `"polya-gamma"`, `"polya-gamma-jeffreys"`, `"laplace"`, or `"truncated-laplace"` — the sampler that ran (table above). |
+| `acceptance_rate` | `float \| None` | Fraction of Metropolis proposals accepted over the kept draws, for a sampler with an accept/reject step (`"polya-gamma-jeffreys"`); `None` otherwise. |
 | `exact` | `bool` | Whether `method` targets the exact posterior; the value behind `is_exact`. |
-| `covariance_source` | `str` | `"conditional"` (MCMC routes, and Laplace draws on a fit without a smoothing correction) or `"smoothing-corrected"` (Laplace draws from the published `Vp`). Same vocabulary as `predict()`. |
+| `covariance_source` | `str` | `"smoothing-corrected"` (standard-GLM NUTS / Pólya-Gamma draws transported onto `V_c`, and Laplace draws from the published `Vp`) or `"conditional"` (the other MCMC routes, and any fit without a smoothing correction). Same vocabulary as `predict()`. |
 | `model_class` | `str` | Saved-model predictive class. |
 | `family_kind` | `str` | Inverse-link tag (`"identity"`, `"logit"`, `"probit"`, `"cloglog"`, `"log"`, ...). |
 | `config` | `SamplingConfig` | Echo of the sampler configuration. |
@@ -190,6 +228,16 @@ Properties: `n_draws`, `n_coeffs`, `shape`, `is_exact` (the `exact` flag).
 ### Indexing
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+posterior = model.sample(train_df, samples=200, seed=42)
+
 posterior["beta_1"]                    # (n_draws,)
 posterior[0]                           # (n_coeffs,)
 posterior[:100]                        # (100, n_coeffs)
@@ -201,6 +249,16 @@ A string key raises `KeyError` if it does not match `coefficient_names`.
 ### Summary and credible intervals
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+posterior = model.sample(train_df, samples=200, seed=42)
+
 ci = posterior.interval(level=0.95)        # (n_coeffs, 2)
 summary = posterior.summary(level=0.95)    # Summary object
 print(summary)                             # text repr; HTML in notebooks
@@ -211,6 +269,16 @@ print(summary)                             # text repr; HTML in notebooks
 ### Conversion
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+posterior = model.sample(train_df, samples=200, seed=42)
+
 posterior.to_numpy()          # samples (no copy)
 posterior.to_pandas()         # DataFrame with coefficient_names columns
 ```
@@ -218,6 +286,16 @@ posterior.to_pandas()         # DataFrame with coefficient_names columns
 ### Posterior credible bands on new data
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+posterior = model.sample(train_df, samples=200, seed=42)
+
 bands = posterior.predict(test_df, level=0.95)
 # {"linear_predictor", "linear_predictor_lower", "linear_predictor_upper",
 #  "posterior_mean",   "posterior_mean_lower",   "posterior_mean_upper"}
@@ -236,6 +314,16 @@ the FFI; use `Model.predict(...)` for those.
 ### Full draws
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+posterior = model.sample(train_df, samples=200, seed=42)
+
 pp = posterior.predict_draws(test_df)   # PosteriorPredictive
 pp.eta      # (n_draws, n_rows), link scale
 pp.mean     # (n_draws, n_rows), response scale (inverse link applied)
@@ -247,11 +335,21 @@ pp.summary(level=0.95)   # same dict as posterior.predict
 large prediction sets prefer `posterior.predict(...)`.
 
 The response-scale inverse link supports `identity`, `logit`, `probit`,
-`cloglog`, and `log`; other tags raise a `gamfit.GamError`.
+`cloglog`, and `log`; other tags raise a `gamfit.errors.GamfitError`.
 
 ### Trace plots
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+posterior = model.sample(train_df, samples=200, seed=42)
+
 fig = posterior.plot_trace(coefficients=["beta_0", "beta_1"], max_panels=4)
 ```
 
@@ -269,7 +367,12 @@ use `Model.predict(...)` for those.
 
 `rhat < 1.01` is typical for well-mixed NUTS chains; `rhat < 1.1` is
 the split-Rhat threshold used by `converged`. NUTS and Polya-Gamma Gibbs
-paths also require `ess > 100`. The same two targets end warmup. NUTS warms
+paths also require `ess > 100`. The same two targets end warmup. Under the
+Jeffreys prior a coefficient draw changes only when its proposal is
+accepted, so the kept draws hold at most `accepted + chains` distinct
+vectors; when that bound cannot exceed the `ess > 100` target the run ends
+with an error naming the acceptance count rather than returning draws that
+cannot mix. NUTS warms
 up in doubling windows until its step size and metric have stabilized and a
 window meets both targets; Gibbs burns in the same way. When two consecutive
 windows have chains that each mix on their own but disagree with one
@@ -288,7 +391,6 @@ from the coefficient count `p`:
 | Parameter | Rule |
 | --- | --- |
 | `n_samples` | `clamp(floor(100 * p * (1 + 2 * max(1, sqrt(p))) * 1.5), 500, 10_000)`. |
-| `target_accept` | `0.9`, not user-settable; `robust_target_accept` floors it by dimension and caps it. |
 | `seed` | `42` unless `seed=` is passed. |
 
 Every keyword on `Model.sample`, and the matching `gam sample` flag, overrides the corresponding default.
@@ -298,6 +400,15 @@ Every keyword on `Model.sample`, and the matching `gam sample` flag, overrides t
 ### Derived quantity (odds ratio)
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.normal(0, 1, 400)
+train_df = {"x": x, "y": (rng.uniform(size=400) < 1 / (1 + np.exp(-0.8 * x))).astype(float)}
+model = gamfit.fit(train_df, "y ~ x", family="binomial")
+posterior = model.sample(train_df, samples=200, seed=42)
+
 beta_contrast = posterior["beta_1"]
 or_draws = np.exp(beta_contrast)
 or_mean = or_draws.mean()
@@ -308,6 +419,16 @@ print(f"OR = {or_mean:.2f} (95% CI {or_lo:.2f}-{or_hi:.2f})")
 ### Posterior fitted-mean residual check
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = pd.DataFrame({"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)})
+model = gamfit.fit(train_df, "y ~ s(x)")
+posterior = model.sample(train_df, samples=200, seed=42)
+
 pp = posterior.predict_draws(train_df)
 y = train_df["y"].to_numpy()
 fitted_mean = pp.mean.mean(axis=0)
@@ -319,7 +440,15 @@ tail_area = (sse_draw > sse_obs).mean()
 ### Reproducibility
 
 ```python
-posterior_a = model.sample(df, seed=12345)
-posterior_b = model.sample(df, seed=12345)
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(df, "y ~ s(x)")
+
+posterior_a = model.sample(df, samples=200, seed=12345)
+posterior_b = model.sample(df, samples=200, seed=12345)
 assert np.allclose(posterior_a.samples, posterior_b.samples)
 ```

@@ -174,6 +174,10 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
         "cache_coefficient_basis",
         Array2::<f64>::zeros((0, 0)).into_pyarray(py),
     )?;
+    out.set_item(
+        "cache_data_null_basis",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
     out.set_item("cache_xtwx_fingerprint", 0_u64)?;
     out.set_item("cache_penalty_fingerprint", 0_u64)?;
     out.set_item("cache_logdet_xtwx", f64::NAN)?;
@@ -256,10 +260,7 @@ fn latent_multi_output_fit_to_pydict<'py>(
         )));
     }
     let normalized = family_name.to_ascii_lowercase().replace('_', "-");
-    let multinomial = matches!(
-        normalized.as_str(),
-        "multinomial" | "multinomial-logit" | "softmax" | "categorical-logit"
-    );
+    let multinomial = gam::families::fit_orchestration::is_multinomial_family_name(&normalized);
     let binomial_multi = matches!(
         normalized.as_str(),
         "binomial" | "binomial-logit" | "logistic"
@@ -268,29 +269,6 @@ fn latent_multi_output_fit_to_pydict<'py>(
         return Err(py_value_error(
             "multinomial-logit requires at least two response columns".to_string(),
         ));
-    }
-    if multinomial {
-        // The softmax cross-entropy −Σ_c y_c log p_c has residual gradient
-        // y_a − p_a and Fisher block p_a δ_ab − p_a p_b only when each row is a
-        // point on the probability simplex (Σ_c y_c = 1; nonnegativity is
-        // already enforced by the per-entry [0,1] loop above). A row with mass
-        // s ≠ 1 has true gradient y_a − s p_a, so accepting it would fit with a
-        // curvature that disagrees with the objective. Reject before solving.
-        // (Binomial-multi treats the K columns as independent Bernoulli draws,
-        // for which the per-entry [0,1] constraint alone is correct.)
-        for n in 0..n_obs {
-            let mut row_sum = 0.0_f64;
-            for a in 0..n_outputs {
-                row_sum += y[[n, a]];
-            }
-            if (row_sum - 1.0).abs() > 1.0e-9 {
-                return Err(py_value_error(format!(
-                    "multinomial-logit response rows must sum to 1 (one-hot for hard \
-                     labels, or a label-smoothed probability vector); row {n} sums to \
-                     {row_sum}"
-                )));
-            }
-        }
     }
     if !(multinomial || binomial_multi) {
         return Err(py_value_error(format!(
@@ -321,8 +299,8 @@ fn latent_multi_output_fit_to_pydict<'py>(
     // `(N, K, K)`; validate finiteness + non-negative diagonal here, then adapt
     // to each branch's curvature gauge:
     //   - multinomial: the fitter consumes the active `(N, K-1, K-1)` leading
-    //     sub-block (the reference class K-1 is dropped); require each per-row
-    //     active block to be symmetric.
+    //     sub-block (the reference class K-1 is dropped) through its symmetric
+    //     part, the only part the block's quadratic form reads.
     //   - binomial-multi: the K columns are fit independently, so off-diagonal
     //     cross terms cannot be represented — require them to be zero — and the
     //     full `(N, K, K)` array is forwarded for its diagonal.
@@ -335,16 +313,6 @@ fn latent_multi_output_fit_to_pydict<'py>(
                     for a in 0..active_outputs {
                         for b in 0..active_outputs {
                             active[[n, a, b]] = fw[[n, a, b]];
-                        }
-                    }
-                    for a in 0..active_outputs {
-                        for b in (a + 1)..active_outputs {
-                            if (fw[[n, a, b]] - fw[[n, b, a]]).abs() > 1.0e-9 {
-                                return Err(py_value_error(format!(
-                                    "fisher_w active block[{n}] must be symmetric for the \
-                                     multinomial path; entries [{a},{b}] and [{b},{a}] differ"
-                                )));
-                            }
                         }
                     }
                 }
@@ -461,6 +429,10 @@ fn latent_multi_output_fit_to_pydict<'py>(
         "cache_coefficient_basis",
         Array2::<f64>::zeros((0, 0)).into_pyarray(py),
     )?;
+    out.set_item(
+        "cache_data_null_basis",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
     out.set_item("cache_xtwx_fingerprint", 0_u64)?;
     out.set_item("cache_penalty_fingerprint", 0_u64)?;
     out.set_item("cache_logdet_xtwx", f64::NAN)?;
@@ -557,7 +529,8 @@ fn fit_penalized_multinomial_pyfunc<'py>(
 // ---------------------------------------------------------------------------
 //
 // The high-level `gamfit.fit(data, formula, family='multinomial')` Python
-// entry routes through `fit_multinomial_formula_pyfunc` below. The Rust core
+// entry routes through `fit_table`, which calls `fit_multinomial_dataset`
+// below. The Rust core
 // in `gam::families::multinomial::fit_penalized_multinomial_formula` parses
 // the formula, materialises the term-collection design + penalty blocks the
 // same way the standard workflow does, one-hot-encodes the categorical
@@ -575,57 +548,40 @@ fn fit_penalized_multinomial_pyfunc<'py>(
 // FFI share one on-disk contract.
 use gam::families::multinomial::MultinomialModelEnvelope;
 
-/// Fit a penalized multinomial-logit GAM from a Wilkinson formula against
-/// a `headers + rows` table. Returns the bincode-free, serde-JSON model
-/// payload that `gamfit.MultinomialModel` deserialises and stores under
-/// `Model._model_bytes`.
+/// Fit a penalized multinomial-logit GAM from a Wilkinson formula against an
+/// encoded table and return the serde-JSON `MultinomialModelEnvelope` that
+/// `gamfit.MultinomialModel` stores under `_model_bytes`.
 ///
-/// `config_json` is the same canonical fit-config document every formula
-/// family consumes (`gam::config_resolve`). The typed core request honors
-/// `weights` as per-row case weights and rejects fields the softmax family
-/// cannot consume (offsets, noise formulas, manual Firth, ...) instead of
-/// silently dropping them.
-#[pyfunction(signature = (
-    headers,
-    rows,
-    formula,
-    config_json = None,
-))]
-fn fit_multinomial_formula_pyfunc<'py>(
-    py: Python<'py>,
-    headers: Vec<String>,
-    rows: PyRef<'py, PyEncodedTable>,
-    formula: String,
-    config_json: Option<String>,
-) -> PyResult<Py<PyBytes>> {
-    rows.require_headers(&headers).map_err(py_value_error)?;
-    let dataset = rows.dataset.clone();
-    let bytes = detach_pyresult(py, "fit_multinomial_formula", move || {
-        let fit_config = gam::config_resolve::parse_fit_config_json(config_json.as_deref())
-            .map_err(py_value_error)?;
-        let automatic = gam::families::fit_orchestration::expand_automatic_fit_formula(
-            &formula,
-            &dataset,
-            &fit_config,
-        )
-        .map_err(|err| py_value_error(err.to_string()))?;
-        // Typed engine path: `EstimationError` → matching `gamfit.*Error`
-        // subclass via `estimation_error_to_pyerr` (issue #343). The request
-        // carries the same defaults the CLI's `run_fit_multinomial` uses.
-        let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
-            &gam::families::multinomial::MultinomialFitRequest::new(
-                &dataset,
-                &automatic.formula,
-                &fit_config,
-            ),
-        )
-        .map_err(estimation_error_to_pyerr)?;
-        MultinomialModelEnvelope::new(saved)
-            .map_err(estimation_error_to_pyerr)?
-            .to_json_bytes()
-            .map_err(estimation_error_to_pyerr)
-    })?;
-    Ok(PyBytes::new(py, &bytes).unbind())
+/// `fit_table` calls this when the config family names the multinomial
+/// family (`is_multinomial_family_name`), the same predicate the CLI routes
+/// on. `fit_config` is the canonical fit-config document every formula family
+/// consumes; the typed core request honors `weights` as per-row case weights
+/// and rejects fields the softmax family cannot consume (offsets, noise
+/// formulas, manual Firth, ...) instead of silently dropping them. An automatic
+/// `.` term is expanded with the engine rule every front door shares.
+fn fit_multinomial_dataset(
+    dataset: &EncodedDataset,
+    formula: &str,
+    fit_config: &FitConfig,
+) -> PyResult<Vec<u8>> {
+    let automatic =
+        gam::families::fit_orchestration::expand_automatic_fit_formula(formula, dataset, fit_config)
+            .map_err(|err| py_value_error(err.to_string()))?;
+    // Typed engine path: `EstimationError` → matching `gamfit.*Error`
+    // subclass via `estimation_error_to_pyerr` (issue #343). The request
+    // carries the same defaults the CLI's `run_fit_multinomial` uses.
+    let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
+        &gam::families::multinomial::MultinomialFitRequest::new(
+            dataset,
+            &automatic.formula,
+            fit_config,
+        ),
+    )
+    .map_err(estimation_error_to_pyerr)?;
+    MultinomialModelEnvelope::new(saved)
+        .map_err(estimation_error_to_pyerr)?
+        .to_json_bytes()
+        .map_err(estimation_error_to_pyerr)
 }
 
 /// Predict class probabilities for a saved multinomial model. The returned
@@ -1137,8 +1093,8 @@ fn structured_residual_pass_diagnostics_dict<'py>(
         item.set_item("gamma", d.gamma)?;
         item.set_item("factor_rank", d.factor_rank)?;
         item.set_item(
-            "bic_penalized_log_likelihood",
-            d.bic_penalized_log_likelihood,
+            "log_evidence",
+            d.log_evidence,
         )?;
         item.set_item("factor_energy", d.factor_energy)?;
         item.set_item("diagonal_mean", d.diagonal_mean)?;
@@ -1289,7 +1245,6 @@ fn sae_manifold_fit_inner<'py>(
         seed_refine_random_state,
         fit_config: gam::terms::sae::manifold::SaeFitConfig {
             separation_barrier_strength_override,
-            ordered_beta_bernoulli_alpha_override: None,
             gpu_policy,
         },
         temperature_schedule,
@@ -1840,7 +1795,7 @@ fn sae_fit_report_into_dict<'py>(
         .collect::<Vec<_>>();
     let geometry_value = serde_json::to_value(geometry_plans)
         .map_err(|error| py_value_error(format!("failed to serialize geometry plans: {error}")))?;
-    out.set_item("geometry_plans", json_value_to_py(py, geometry_value)?)?;
+    out.set_item("geometry_plans", json_value_to_py(py, &geometry_value)?)?;
 
     // Contract keys the python `ManifoldSAE.from_payload` boundary reads
     // unconditionally (tightened in 23db2c80a, which rejected stale payload
@@ -1863,10 +1818,10 @@ fn sae_fit_report_into_dict<'py>(
     let collapse_events = serde_json::to_value(term.collapse_events()).map_err(|error| {
         py_value_error(format!("failed to serialize collapse events: {error}"))
     })?;
-    out.set_item("collapse_events", json_value_to_py(py, collapse_events)?)?;
+    out.set_item("collapse_events", json_value_to_py(py, &collapse_events)?)?;
     // #2023 criterion 3: the fit's migration account on every fit, the nursery's
     // promotions and the structure search's moves, with its `pc_reseed_events`.
-    out.set_item("migration", json_value_to_py(py, migration.to_json())?)?;
+    out.set_item("migration", json_value_to_py(py, &migration.to_json())?)?;
     match structure_search_json {
         Some(json) => out.set_item("structure_search", json)?,
         None => out.set_item("structure_search", py.None())?,
@@ -3180,4 +3135,66 @@ fn intervention_calibration_plan<'py>(
     let inner = prepare_intervention_calibration(&shard, spec)
         .map_err(|err| py_value_error(err.to_string()))?;
     Ok(PyInterventionCalibrationPlan { inner })
+}
+
+/// What one KL measurement resolves, in nats, from the one Rust owner
+/// (`kl_measurement_floor`, gh#2263): the float64 evaluation band `E₆₄`, the
+/// measurement band `B`, and the floor `max(B, control_nats)` a measured KL must
+/// exceed to resolve a dose. The logits are of `logit_format` over `vocab_size`
+/// entries, with largest `|logit|` `logit_max_abs` over the clean and patched vectors
+/// and largest `|patched − clean|` `logit_max_abs_change`.
+#[pyfunction]
+fn kl_measurement_floor(
+    py: Python<'_>,
+    logit_format: &str,
+    vocab_size: usize,
+    logit_max_abs: f64,
+    logit_max_abs_change: f64,
+    control_nats: f64,
+) -> PyResult<Py<PyDict>> {
+    use gam::terms::sae::inference::intervention_shard::{
+        LogitFormat, kl_measurement_floor as measurement_floor,
+    };
+
+    let format = logit_format
+        .parse::<LogitFormat>()
+        .map_err(|message: String| py_value_error(message))?;
+    if vocab_size == 0 {
+        return Err(py_value_error(
+            "kl_measurement_floor: vocab_size must be positive".to_string(),
+        ));
+    }
+    for (name, value) in [
+        ("logit_max_abs", logit_max_abs),
+        ("logit_max_abs_change", logit_max_abs_change),
+    ] {
+        if !(value.is_finite() && value >= 0.0) {
+            return Err(py_value_error(format!(
+                "kl_measurement_floor: {name} must be finite and non-negative; got {value}"
+            )));
+        }
+    }
+    if logit_max_abs_change > 2.0 * logit_max_abs {
+        return Err(py_value_error(format!(
+            "kl_measurement_floor: a logit change of {logit_max_abs_change} exceeds twice the \
+             largest |logit| {logit_max_abs}"
+        )));
+    }
+    if !control_nats.is_finite() {
+        return Err(py_value_error(format!(
+            "kl_measurement_floor: control_nats must be finite; got {control_nats}"
+        )));
+    }
+    let floor = measurement_floor(
+        format,
+        vocab_size,
+        logit_max_abs,
+        logit_max_abs_change,
+        control_nats,
+    );
+    let out = PyDict::new(py);
+    out.set_item("evaluation_band_nats", floor.evaluation_band_nats)?;
+    out.set_item("measurement_band_nats", floor.measurement_band_nats)?;
+    out.set_item("floor_nats", floor.floor_nats)?;
+    Ok(out.unbind())
 }

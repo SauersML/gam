@@ -304,7 +304,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             if let Some(&declared_nullity) = opts.nullspace_dims.get(idx)
                 && block_dim.saturating_sub(declared_nullity) != rank
             {
-                log::info!(
+                log::debug!(
                     "[FROZEN-RANK] {context}: penalty {idx} is frozen at structural rank {rank} \
                      from its rounding band, but the design declares nullity {declared_nullity} of \
                      {block_dim} (rank {})",
@@ -324,13 +324,14 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let x_fit = conditioning.apply_to_design(x);
         let fit_linear_constraints =
             conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
-        let (config, _) = resolved_external_config(opts)?;
+        let (mut config, _) = resolved_external_config(opts)?;
         // Every entry that builds a REML state certifies binomial separation up
         // front, as the scalar-rho route does: a separated unpenalized design has
-        // no finite mode, and the post-solve heuristic that used to guess it is
-        // gone (#2469).
-        crate::estimate::prefit::reject_prefit_binomial_separation(
-            &config, y, w, &x_fit, &canonical,
+        // no finite flat-prior mode (#2469), so the certificate arms the Jeffreys
+        // prior before the first solve (#3129). The evaluator is built once, at
+        // the baseline design, so the whole joint search prices one objective.
+        crate::estimate::prefit::arm_jeffreys_on_prefit_binomial_separation(
+            &mut config, opts, y, w, &x_fit, &canonical,
         )?;
         let config = Arc::new(config);
 
@@ -430,10 +431,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .resolved_scale()
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
         let k = self.reml_state.canonical_penalties.len();
-        let seed_config = super::optimizer::external_reml_seed_config(
-            k,
-            self.reml_state.config.link_function(),
-        );
 
         self.reml_state.without_persistent_warm_start_store(|| {
             super::optimizer::freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
@@ -441,7 +438,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 &resolved_likelihood_scale,
                 k,
                 None,
-                &seed_config,
                 external_hyper_count,
             )
         })
@@ -558,7 +554,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 // back to the exact per-trial design path. Record WHY so the
                 // fast-path coverage (#1264/#1216) is diagnosable instead of a
                 // silent non-attachment.
-                log::debug!("ψ-Gram tensor not attached over [{psi_lo}, {psi_hi}]: {why}");
+                log::trace!("ψ-Gram tensor not attached over [{psi_lo}, {psi_hi}]: {why}");
                 false
             }
         }
@@ -908,7 +904,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // is being computed from was pinned to an exact anchor or is running on
         // its own certified interpolation — the one fact that separates "the
         // two routes evaluate different functions" from "the arithmetic differs".
-        log::info!(
+        log::debug!(
             "[PSI-GRAM-INSTALL] psi={psi:.9} last_reset_psi={:?} corrected={:?}",
             self.last_reset_psi,
             corrected_at,
@@ -929,7 +925,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 &self.reml_state.config.link_kind,
             ) {
                 Ok(rows) => self.psi_gram_frozen_rows = Some(Arc::new(rows)),
-                Err(e) => log::warn!(
+                Err(e) => log::debug!(
                     "[psi-gram-tensor] frozen-row bundle build failed ({e}); the n-free skip \
                      path will fall back to re-materialising rows per trial (correct, but O(n))"
                 ),
@@ -943,7 +939,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             self.reml_state.clear_gaussian_fixed_cache();
             return false;
         }
-        log::debug!(
+        log::trace!(
             "[psi-gram-tensor] installed n-free Gaussian sufficient statistics at psi={psi:.6}"
         );
         // Install the conditioned-frame EXACT ANALYTIC ψ-derivatives so the
@@ -958,7 +954,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 tensor.drhs_dpsi(psi),
             )))
         {
-            log::debug!(
+            log::trace!(
                 "[psi-gram-tensor] installed n-free analytic ψ-gradient derivatives at \
                  psi={psi:.6}"
             );
@@ -998,7 +994,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             std::sync::Arc::try_unwrap(staged).unwrap_or_else(|arc| (*arc).clone());
         self.reml_state
             .refresh_canonical_penalty_surface(Arc::new(canonical), nullspace_dims)?;
-        log::debug!(
+        log::trace!(
             "[nfree-psi-penalty] re-installed exact n-free canonical penalty surface S(psi) \
              on the design-revision fast path"
         );
@@ -1097,7 +1093,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 // n×k `∂X/∂ψ` slab into the inner solver's frame as before.
                 let t_condition = std::time::Instant::now();
                 self.condition_hyper_dirs(&mut hyper_dirs);
-                log::info!(
+                log::debug!(
                     "[STAGE] joint hyper conditioning (design-revision fast path, {} directions): {:.3}s",
                     hyper_dirs.len(),
                     t_condition.elapsed().as_secs_f64(),
@@ -1126,7 +1122,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 ),
                 _ => (None, None, false),
             };
-            log::info!(
+            log::debug!(
                 "[NFREE-RESET] n_rows={} trial_psi={psi:.6} ref_psi={:?} trial_rank={trial_rank:?} \
                  ref_rank={ref_rank:?} subspace_dist={subspace_dist:?} witness_accepts={accepts} \
                  covers_value={} covers_skip={}",

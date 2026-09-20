@@ -358,7 +358,7 @@ impl TransformationNormalFamily {
             }
         }
 
-        log::info!(
+        log::debug!(
             "[STAGE] CTN scop_hessian_matvec n={} p={} elapsed={:.3}s",
             n,
             p_total,

@@ -170,7 +170,7 @@ pub(crate) fn pullback_labeled_outer_eval(
         let raw_len = result.gradient.len();
         let raw_head: Vec<f64> = result.gradient.iter().take(6).copied().collect();
         result.gradient = aggregate_labeled_gradient(&result.gradient, layout)?;
-        log::debug!(
+        log::trace!(
             "[LABELED-EVAL] mode={eval_mode:?} rho0={:.4} |g_physical|={raw:.6e} len={raw_len} \
              head={raw_head:?} |g_outer|={:.6e}",
             rho[0],
@@ -196,7 +196,7 @@ pub(crate) fn pullback_labeled_outer_eval(
 /// problem. Per-block penalties already travel through `physical_rho`; joint
 /// penalties need this full-width bundle so coefficient correction and endpoint
 /// criterion assembly see exactly the same objective.
-fn labeled_options_for_rho<'a>(
+pub(crate) fn labeled_options_for_rho<'a>(
     options: &'a BlockwiseFitOptions,
     specs: &[ParameterBlockSpec],
     layout: &PenaltyLabelLayout,
@@ -218,41 +218,6 @@ fn labeled_options_for_rho<'a>(
     Ok(std::borrow::Cow::Owned(owned))
 }
 
-pub(crate) fn outerobjectivegradienthessian_labeled<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    layout: &PenaltyLabelLayout,
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: &gam_problem::RhoPrior,
-    eval_mode: EvalMode,
-) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
-    let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
-    let physical_warm_start = physical_warm_start_for_labeled(warm_start, &physical_rho, layout);
-    // gam#1587: build the per-eval joint penalty bundle from the current outer ρ
-    // (each joint spec's λ pulled from its tied outer coordinate) and attach it
-    // to the inner-solve options so BOTH the inner β̂ AND the outer evaluator
-    // (penalty coords / logdet / operator) see the full-width centered penalty.
-    // No joint specs ⇒ `options` is passed through untouched (byte-identical).
-    let labeled_options = labeled_options_for_rho(options, specs, layout, rho)?;
-    let options = labeled_options.as_ref();
-    let base = outerobjectivegradienthessian_internal(
-        family,
-        specs,
-        options,
-        &layout.penalty_counts,
-        &physical_rho,
-        physical_warm_start.as_ref().or(warm_start),
-        gam_problem::RhoPrior::Flat,
-        eval_mode,
-    )?;
-    pullback_labeled_outer_eval(base, rho, layout, rho_prior, eval_mode)
-        .map_err(CustomFamilyError::from)
-}
-
 /// Correct one labeled-rho continuation waypoint to its certified coefficient
 /// mode, without constructing a Laplace scalar that an interior waypoint would
 /// discard.
@@ -266,11 +231,61 @@ pub(crate) fn correct_labeled_coefficient_mode<
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
 ) -> Result<(BlockwiseInnerResult, ConstrainedWarmStart), CustomFamilyError> {
+    correct_labeled_mode(
+        family,
+        specs,
+        options,
+        layout,
+        rho,
+        warm_start,
+        inner_blockwise_coefficient_mode::<F>,
+    )
+}
+
+/// Correct a labeled-rho continuation endpoint to its certified mode with the
+/// determinant artifacts an ordinary inner solve carries, so the published mode
+/// is the same reusable seed a direct evaluation files (gam#2973).
+pub(crate) fn correct_labeled_laplace_mode<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    layout: &PenaltyLabelLayout,
+    rho: &Array1<f64>,
+    warm_start: Option<&ConstrainedWarmStart>,
+) -> Result<(BlockwiseInnerResult, ConstrainedWarmStart), CustomFamilyError> {
+    correct_labeled_mode(
+        family,
+        specs,
+        options,
+        layout,
+        rho,
+        warm_start,
+        inner_blockwise_fit::<F>,
+    )
+}
+
+type InnerModeSolve<F> = fn(
+    &F,
+    &[ParameterBlockSpec],
+    &[Array1<f64>],
+    &BlockwiseFitOptions,
+    Option<&ConstrainedWarmStart>,
+) -> Result<BlockwiseInnerResult, CustomFamilyError>;
+
+fn correct_labeled_mode<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    layout: &PenaltyLabelLayout,
+    rho: &Array1<f64>,
+    warm_start: Option<&ConstrainedWarmStart>,
+    solve: InnerModeSolve<F>,
+) -> Result<(BlockwiseInnerResult, ConstrainedWarmStart), CustomFamilyError> {
     let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
     let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
     let physical_warm_start = physical_warm_start_for_labeled(warm_start, &physical_rho, layout);
     let labeled_options = labeled_options_for_rho(options, specs, layout, rho)?;
-    let inner = inner_blockwise_coefficient_mode(
+    let inner = solve(
         family,
         specs,
         &per_block,
@@ -296,7 +311,7 @@ pub(crate) fn correct_labeled_coefficient_mode<
     Ok((inner, warm_start))
 }
 
-/// Complete the value-only endpoint criterion from a continuation-owned mode.
+/// Complete the endpoint criterion in `eval_mode` from a continuation-owned mode.
 /// The mode is consumed, so it cannot accidentally be paired with a different
 /// endpoint after the call.
 pub(crate) fn outerobjective_from_coefficient_mode_labeled<
@@ -309,6 +324,7 @@ pub(crate) fn outerobjective_from_coefficient_mode_labeled<
     rho: &Array1<f64>,
     rho_prior: &gam_problem::RhoPrior,
     inner: BlockwiseInnerResult,
+    eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
     let labeled_options = labeled_options_for_rho(options, specs, layout, rho)?;
@@ -320,86 +336,10 @@ pub(crate) fn outerobjective_from_coefficient_mode_labeled<
         &physical_rho,
         gam_problem::RhoPrior::Flat,
         inner,
+        eval_mode,
     )?;
-    pullback_labeled_outer_eval(base, rho, layout, rho_prior, EvalMode::ValueOnly)
+    pullback_labeled_outer_eval(base, rho, layout, rho_prior, eval_mode)
         .map_err(CustomFamilyError::from)
-}
-
-pub(crate) fn custom_family_seed_screening_proxy_labeled<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    layout: &PenaltyLabelLayout,
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: &gam_problem::RhoPrior,
-) -> Result<(f64, ConstrainedWarmStart, bool), CustomFamilyError> {
-    let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
-    let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
-    let physical_warm_start = physical_warm_start_for_labeled(warm_start, &physical_rho, layout);
-    // Seed screening only RANKS candidate seeds by their penalized inner merit;
-    // it is capped and never produces the final fit. Mark the inner solve as a
-    // screening solve so it skips the O(p · per-axis-Hdot) full Jeffreys/Firth
-    // curvature loop and keeps only the cheap value-only Jeffreys term in the
-    // score (gam#729/#808). For a K-block coupled family (Dirichlet/multinomial)
-    // each per-axis directional derivative is O(K²·n·p), so paying the full term
-    // for every cascade candidate over the joint width is the wrong cost class
-    // and made the coupled fit non-completing in screening alone. The real fit
-    // (after a seed is selected) runs with `seed_screening = false`, so the
-    // load-bearing Firth curvature is fully present where it matters.
-    let mut screening_options = BlockwiseFitOptions {
-        seed_screening: true,
-        ..options.clone()
-    };
-    // gam#1587: the screening inner solve must apply the same full-width joint
-    // penalty so the ranked proxy objective matches the real penalized fit.
-    if !layout.joint_specs.is_empty() {
-        let total_compiled: usize = specs.iter().map(|s| s.design.ncols()).sum();
-        let joint_log_lambdas = layout.joint_log_lambdas(rho);
-        let bundle = gam_problem::JointPenaltyBundle::from_validated_geometry(
-            std::sync::Arc::clone(&layout.joint_specs),
-            std::sync::Arc::clone(&layout.joint_roots),
-            joint_log_lambdas,
-            total_compiled,
-        )?;
-        screening_options.joint_penalties = Some(std::sync::Arc::new(bundle));
-    }
-    let mut inner = inner_blockwise_fit(
-        family,
-        specs,
-        &per_block,
-        &screening_options,
-        physical_warm_start.as_ref().or(warm_start),
-    )?;
-    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-    let prior_terms = rho_prior_cost_gradient_hessian(rho_prior, rho)?;
-    // A capped screening iterate is deliberately not a certified coefficient
-    // mode. Its Laplace determinants are therefore undefined, and using them
-    // here would either rank noisy partial-fit curvature or (correctly) fail
-    // once determinant construction is restricted to converged modes. Rank on
-    // the same curvature-free penalized merit minimized by the inner solver.
-    // Accepted inner steps decrease this quantity, so the terminal capped
-    // iterate is a meaningful seed-quality signal. Full outer evaluations keep
-    // requiring convergence and certified REML/LAML determinants.
-    let score = checked_penalizedobjective(
-        inner.log_likelihood,
-        inner.penalty_value,
-        0.0,
-        "custom-family labeled seed-screening proxy",
-    )? + prior_terms.0;
-    let warm = ConstrainedWarmStart {
-        rho: rho.clone(),
-        block_beta: inner
-            .block_states
-            .iter()
-            .map(|state| state.beta.clone())
-            .collect(),
-        active_sets: inner.active_sets.clone(),
-        cached_inner: Some(cached_inner_mode_from_result(&inner)),
-    };
-    Ok((score, warm, inner.converged))
 }
 
 pub(crate) fn split_log_lambdas(
@@ -522,18 +462,6 @@ pub(crate) fn refresh_single_block_eta<F: CustomFamily + Clone + Send + Sync + '
         Ok(x.matrixvectormultiply(&beta) + off)
     })?;
     Ok(())
-}
-
-#[inline]
-pub(crate) fn capped_inner_max_cycles(options: &BlockwiseFitOptions, base_cycles: usize) -> usize {
-    let mut cap = base_cycles;
-    if let Some(screening) = options.screening_max_inner_iterations.as_ref() {
-        let screening_cap = screening.load(Ordering::Relaxed);
-        if screening_cap > 0 {
-            cap = cap.min(screening_cap);
-        }
-    }
-    cap.max(1)
 }
 
 pub(crate) fn weighted_normal_equations(
@@ -1538,6 +1466,14 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
         &self,
         ctx: &BlockUpdateContext<'_>,
     ) -> Result<BlockUpdateResult, CustomFamilyError> {
+        self.solve_for_rhs(ctx, self.newton_rhs(ctx)?)
+            .map(|(_, step)| step)
+    }
+}
+
+impl ExactNewtonBlockUpdater<'_> {
+    /// The Newton update's right-hand side `gradient − S_λβ`.
+    fn newton_rhs(&self, ctx: &BlockUpdateContext<'_>) -> Result<Array1<f64>, CustomFamilyError> {
         let p = ctx.spec.design.ncols();
         if self.gradient.len() != p {
             return Err(CustomFamilyError::DimensionMismatch {
@@ -1548,15 +1484,92 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                 ),
             });
         }
-        if self.hessian.nrows() != p || self.hessian.ncols() != p {
+        // Solve in delta-space for both constrained and unconstrained blocks.
+        // That keeps the linear system consistent even when we add a
+        // numerical ridge to stabilize an indefinite exact-Newton Hessian.
+        Ok(self.gradient - &ctx.s_lambda.dot(&ctx.states[ctx.block_idx].beta))
+    }
+
+    /// The block step `δ` for the right-hand side `rhs_step`: `(H + S_λ) δ = rhs_step` on the
+    /// stabilized penalized curvature and under the block's linear constraints, returned as
+    /// `β + δ`. The Newton update takes it with `rhs_step = gradient − S_λβ`; a branch
+    /// continuation's IFT predictor takes it with `−Σ_k Δρ_k λ_k S_k β̂` (gam#2973), so both
+    /// steps are solved by one solver on one curvature.
+    pub(crate) fn step_for_rhs(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+        rhs_step: Array1<f64>,
+    ) -> Result<BlockUpdateResult, CustomFamilyError> {
+        self.solve_for_rhs(ctx, rhs_step).map(|(_, step)| step)
+    }
+
+    /// The one exact-Newton block step routine: the stabilized curvature and the step on it for
+    /// `rhs_step`. Every block step comes from here, and the curvature is returned for a caller
+    /// that also sizes the step's resolution on it.
+    fn solve_for_rhs(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+        rhs_step: Array1<f64>,
+    ) -> Result<(Array2<f64>, BlockUpdateResult), CustomFamilyError> {
+        let lhs_dense = self.stabilized_penalized_lhs(ctx, rhs_step.len())?;
+        let step = self.step_on_lhs(ctx, &lhs_dense, rhs_step)?;
+        Ok((lhs_dense, step))
+    }
+
+    /// The Newton update step at `ctx` ([`ParameterBlockUpdater::compute_update_step`], through
+    /// the same routine) beside its arithmetic resolution (gam#2973), for the right-hand side
+    /// `gradient − S_λβ` known to within `rhs_band` per coordinate.
+    ///
+    /// The resolution is the largest Euclidean norm the step can take from that rounding alone:
+    /// the solve's image of the band on the face the step ends on
+    /// ([`newton_step_rounding_image`]), plus the rounding of forming `β + δ`. A step within it
+    /// is zero on this arithmetic, so the iterate it starts from is at its root. The band is the
+    /// caller's; the rounding of the curvature, of the solve and of forming `S_λ` from its terms
+    /// is not charged, so the resolution can only be too narrow, never resolve a correction the
+    /// arithmetic cannot.
+    pub(crate) fn update_step_with_resolution(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+        rhs_band: &Array1<f64>,
+    ) -> Result<(BlockUpdateResult, f64), CustomFamilyError> {
+        let (lhs_dense, step) = self.solve_for_rhs(ctx, self.newton_rhs(ctx)?)?;
+        let face = match (ctx.linear_constraints, step.active_set.as_deref()) {
+            (Some(constraints), Some(active)) => {
+                let rows = constraints.gather_rows(active)?;
+                match active_constraint_tangent_geometry(&rows.a)? {
+                    ActiveConstraintTangentGeometry::Tangent(z) => NewtonStepFace::Tangent(z),
+                    ActiveConstraintTangentGeometry::FullyPinned => NewtonStepFace::Pinned,
+                }
+            }
+            _ => NewtonStepFace::Free,
+        };
+        let solve = newton_step_rounding_image(&lhs_dense, &face, rhs_band)?;
+        let landing = gam_linalg::roundoff::UNIT_ROUNDOFF
+            * step
+                .beta_new_raw
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
+        Ok((step, solve + landing))
+    }
+
+    /// `H + S_λ` stabilized as every exact-Newton block step solves on it.
+    fn stabilized_penalized_lhs(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+        rhs_len: usize,
+    ) -> Result<Array2<f64>, CustomFamilyError> {
+        let p = ctx.spec.design.ncols();
+        if self.hessian.nrows() != p || self.hessian.ncols() != p || rhs_len != p {
             return Err(CustomFamilyError::DimensionMismatch {
                 reason: format!(
-                    "block {} exact-newton Hessian shape mismatch: got {}x{}, expected {}x{}",
+                    "block {} exact-newton step shape mismatch: Hessian {}x{} and right-hand \
+                     side {}, expected {p}",
                     ctx.block_idx,
                     self.hessian.nrows(),
                     self.hessian.ncols(),
-                    p,
-                    p
+                    rhs_len,
                 ),
             });
         }
@@ -1572,10 +1585,6 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
         // direction (gam#1088).
         exact_newton_hessian_finite_check(self.hessian, ctx.block_idx)?;
         let lhs = self.hessian.add_dense(ctx.s_lambda)?;
-        // Solve in delta-space for both constrained and unconstrained blocks.
-        // That keeps the linear system consistent even when we add a
-        // numerical ridge to stabilize an indefinite exact-Newton Hessian.
-        let rhs_step = self.gradient - &ctx.s_lambda.dot(&ctx.states[ctx.block_idx].beta);
         let mut lhs_dense = lhs.to_dense();
         // `lhs_dense = H_data + S` is penalized by the PSD block penalty `S`.
         // Bound the stabilizing ridge by the DATA Hessian's curvature, not the
@@ -1591,7 +1600,17 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
             &data_hessian_dense,
             ctx.options.ridge_floor,
         );
+        Ok(lhs_dense)
+    }
 
+    /// The block step for `rhs_step` on the stabilized curvature `lhs_dense`.
+    fn step_on_lhs(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+        lhs_dense: &Array2<f64>,
+        rhs_step: Array1<f64>,
+    ) -> Result<BlockUpdateResult, CustomFamilyError> {
+        let p = ctx.spec.design.ncols();
         if let Some(constraints) = ctx.linear_constraints {
             check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints).map_err(
                 |e| {
@@ -1608,9 +1627,9 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                 )
             })?;
             let (beta_new_raw, active_set) = if let Some(bounds) = lower_bounds.as_ref() {
-                let rhs_beta = &lhs_dense.dot(&ctx.states[ctx.block_idx].beta) + &rhs_step;
+                let rhs_beta = lhs_dense.dot(&ctx.states[ctx.block_idx].beta) + &rhs_step;
                 solve_quadratic_with_simple_lower_bounds(
-                    &lhs_dense,
+                    lhs_dense,
                     &rhs_beta,
                     &ctx.states[ctx.block_idx].beta,
                     bounds,
@@ -1628,7 +1647,7 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                 let delta_start = Array1::zeros(p);
                 let (delta, active_set) =
                     gam_solve::active_set::solve_quadratic_with_constraint_set(
-                        &lhs_dense,
+                        lhs_dense,
                         &rhs_step,
                         &delta_start,
                         &delta_constraints,
@@ -1678,7 +1697,7 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
             // the failure is returned, not traded for a diagonally scaled
             // steepest-descent step. β is recovered in the raw basis, so
             // dimensionality and identifiability are untouched.
-            let delta = strict_solve_spd_or_spectral_step(&lhs_dense, &rhs_step)?;
+            let delta = strict_solve_spd_or_spectral_step(lhs_dense, &rhs_step)?;
             let beta = &ctx.states[ctx.block_idx].beta + &delta;
             Ok(BlockUpdateResult {
                 beta_new_raw: beta,
@@ -1686,6 +1705,74 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
             })
         }
     }
+}
+
+/// The face an exact-Newton block step ends on, which its right-hand side's rounding moves it
+/// along.
+enum NewtonStepFace {
+    /// No active constraint: every coordinate is free.
+    Free,
+    /// The orthonormal tangent `Z` of the active constraint rows.
+    Tangent(Array2<f64>),
+    /// The active rows pin every coordinate, so the step does not depend on the right-hand side.
+    Pinned,
+}
+
+/// The largest Euclidean norm the step on `face`, `Z (ZᵀAZ)⁻¹ Zᵀ e` with `A = lhs`, reaches over
+/// right-hand-side errors `|e_i| ≤ band_i` (gam#2973).
+///
+/// With `ZᵀAZ = VΓVᵀ` and `W = ZV` (`Z = I` on a free block), each coordinate of the image is
+/// `|Σ_k w_jk (Σ_i w_ik e_i) / γ_k| ≤ Σ_k |w_jk| (Σ_i |w_ik| band_i) / |γ_k|`, a componentwise bound
+/// that holds for every sign pattern of `e`. An exactly singular face system resolves no step, so
+/// its image is unbounded.
+fn newton_step_rounding_image(
+    lhs: &Array2<f64>,
+    face: &NewtonStepFace,
+    band: &Array1<f64>,
+) -> Result<f64, CustomFamilyError> {
+    if band.len() != lhs.nrows() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-Newton step resolution: right-hand-side band has {} coordinates for a \
+                 {}-coefficient block",
+                band.len(),
+                lhs.nrows()
+            ),
+        });
+    }
+    let mut reduced = match face {
+        NewtonStepFace::Pinned => return Ok(0.0),
+        NewtonStepFace::Free => lhs.clone(),
+        NewtonStepFace::Tangent(z) => z.t().dot(lhs).dot(z),
+    };
+    symmetrize_dense_in_place(&mut reduced);
+    let (eigenvalues, eigenvectors) = FaerEigh::eigh(&reduced, Side::Lower).map_err(|error| {
+        CustomFamilyError::NumericalFailure {
+            reason: format!("exact-Newton step resolution: eigendecomposition failed: {error}"),
+        }
+    })?;
+    if eigenvalues.iter().any(|&gamma| gamma == 0.0) {
+        return Ok(f64::INFINITY);
+    }
+    let w = match face {
+        NewtonStepFace::Tangent(z) => z.dot(&eigenvectors),
+        NewtonStepFace::Free | NewtonStepFace::Pinned => eigenvectors,
+    };
+    let modes: Vec<f64> = (0..w.ncols())
+        .map(|k| {
+            (0..w.nrows())
+                .map(|i| w[[i, k]].abs() * band[i])
+                .sum::<f64>()
+                / eigenvalues[k].abs()
+        })
+        .collect();
+    Ok((0..w.nrows())
+        .map(|j| {
+            let coordinate: f64 = (0..w.ncols()).map(|k| w[[j, k]].abs() * modes[k]).sum();
+            coordinate * coordinate
+        })
+        .sum::<f64>()
+        .sqrt())
 }
 
 /// Extension trait providing `updater()` on the relocated `gam_problem::BlockWorkingSet`.
@@ -1805,57 +1892,409 @@ pub(crate) fn check_linear_feasibility(
     Ok(())
 }
 
-pub(crate) fn block_quadratic_penalty(beta: &Array1<f64>, s_lambda: &Array2<f64>) -> f64 {
-    0.5 * beta.dot(&s_lambda.dot(beta))
-}
-
-/// [`block_quadratic_penalty`] beside the magnitude its summation accumulates,
-/// `½ Σ_ij |β_i S_ij β_j|`, from one explicit pass over the entries.
+/// One additive term `½·λ·‖R·β‖²` of the custom-family penalty (#2954), with
+/// `S = RᵀR` the structural root [`gam_problem::structural_penalty_root`] forms.
 ///
-/// The value is the same `½βᵀS_λβ` summed in a different order, so the two agree
-/// within `accumulation_growth(p²)` of that magnitude on each side. The magnitude,
-/// not `max|S_λ|·‖β‖₁²`, is what bounds the rounding of the value (gam#2959). The
-/// constrained fixed-point certificate reads it once per accepted cycle; the
-/// objective evaluation itself stays on the BLAS form.
-pub(crate) fn block_quadratic_penalty_with_accumulation(
-    beta: &Array1<f64>,
-    s_lambda: &Array2<f64>,
-) -> (f64, f64) {
-    let mut value = 0.0_f64;
-    let mut magnitude = 0.0_f64;
-    for ((row, column), &entry) in s_lambda.indexed_iter() {
-        let term = beta[row] * entry * beta[column];
-        value += term;
-        magnitude += term.abs();
-    }
-    (0.5 * value, 0.5 * magnitude)
+/// A block-local penalty reads its block's coefficients (`block = Some(b)`); a
+/// joint-bundle penalty reads every block's coefficients concatenated in block
+/// order (`block = None`), the layout `flatten_state_betas` writes. `columns`
+/// are the columns of that vector `root` acts on.
+#[derive(Clone, Debug)]
+pub struct PenaltyRootTerm {
+    pub block: Option<usize>,
+    pub columns: std::ops::Range<usize>,
+    pub lambda: f64,
+    pub root: Arc<Array2<f64>>,
 }
 
-/// [`total_quadratic_penalty`] beside the magnitude its summations accumulate, for
-/// block coefficients given per block. The full-width bundle reads the blocks
-/// concatenated in block order, which is the layout `flatten_state_betas` writes.
-pub(crate) fn total_quadratic_penalty_with_accumulation(
-    betas: &[Array1<f64>],
-    s_lambdas: &[Array2<f64>],
-    joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
-) -> (f64, f64) {
-    let mut value = 0.0_f64;
-    let mut magnitude = 0.0_f64;
-    for (beta, s_lambda) in betas.iter().zip(s_lambdas.iter()) {
-        let (block_value, block_magnitude) =
-            block_quadratic_penalty_with_accumulation(beta, s_lambda);
-        value += block_value;
-        magnitude += block_magnitude;
+impl PenaltyRootTerm {
+    /// `RᵀR` embedded at [`Self::columns`] of a `width × width` matrix: the penalty
+    /// matrix this term's root defines, in its block's (or the joint vector's)
+    /// coordinates.
+    pub fn embedded_penalty(&self, width: usize) -> Array2<f64> {
+        let mut matrix = Array2::<f64>::zeros((width, width));
+        matrix
+            .slice_mut(ndarray::s![self.columns.clone(), self.columns.clone()])
+            .assign(&self.root.t().dot(self.root.as_ref()));
+        matrix
     }
-    if let Some(bundle) = joint_full_width
-        && !bundle.is_empty()
+}
+
+/// The penalty `½Σ_k λ_k‖R_kβ‖²` at one coefficient vector, beside the bound on
+/// its rounding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PenaltyValue {
+    pub value: f64,
+    /// Depth `m` of the accumulation that formed `value`, for the growth factor
+    /// `γ_m` (see [`BlockPenaltyRoots::value`]).
+    pub depth: usize,
+    /// The magnitude that accumulation carries: `|fl(value) − value| ≤
+    /// γ_depth·magnitude` for the roots as given.
+    pub magnitude: f64,
+}
+
+impl PenaltyValue {
+    /// `γ_depth·magnitude`: the bound on the value's rounding.
+    pub fn band(&self) -> f64 {
+        gam_linalg::roundoff::accumulation_growth(self.depth) * self.magnitude
+    }
+}
+
+/// `value(β + δ) − value(β)`, formed without differencing two values, beside
+/// the bound on its rounding (#2954, for #2977's trust-region acceptance).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PenaltyIncrement {
+    pub increment: f64,
+    pub band: f64,
+}
+
+/// The custom-family penalty as one function (#2954): every value, increment,
+/// gradient and curvature of `½Σ_k λ_k β_kᵀS_kβ_k` (plus the joint bundle's
+/// full-width terms) is formed from the same structural roots `S_k = R_kᵀR_k`.
+///
+/// The dense `½βᵀS_λβ` this replaces was an unstable formula for a
+/// well-conditioned quantity. The stored `S_k`'s null eigenvalues are
+/// `O(u·‖S_k‖)`, so near the `λ → ∞` limit, where `β` lies in `S_k`'s null
+/// space, the dense value carries `½λσ_null(uᵀβ)²` while the structural value
+/// vanishes. On `declared_latent_law_2923` that is `λ·2.14e-16` at every point,
+/// 1.8e-3 at `ρ = 29.78`, and the root form's error there is 2.8e-15. The
+/// curvature `S_λ = Σ_k λ_k R_kᵀR_k` and the gradient `S_λβ` are the exact
+/// Hessian and gradient of the root value, so an inner Newton model and the
+/// objective it is accepted against describe one function, and the outer
+/// criterion's value and its ρ-gradient read the same roots.
+#[derive(Clone, Debug)]
+pub struct BlockPenaltyRoots {
+    terms: Vec<PenaltyRootTerm>,
+    s_lambdas: Vec<Array2<f64>>,
+    /// Whether any term is a joint-bundle term, which reads the concatenated
+    /// coefficients.
+    has_joint: bool,
+}
+
+impl BlockPenaltyRoots {
+    /// Root every block penalty of `specs` at the strengths `block_log_lambdas`,
+    /// and take the joint bundle's own validated roots.
+    ///
+    /// A block penalty's rank is [`gam_problem::structural_penalty_root`]'s: the
+    /// one rank rule's resolved count, capped by a declared nullity
+    /// (`nullspace_dims`, one per penalty), each of which only removes
+    /// directions. Undeclared, the count is the rank; that is a named step toward
+    /// declared null bases (gam#3023), not a second rule.
+    pub fn new(
+        specs: &[ParameterBlockSpec],
+        block_log_lambdas: &[Array1<f64>],
+        joint: Option<&gam_problem::JointPenaltyBundle>,
+    ) -> Result<Self, CustomFamilyError> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        if block_log_lambdas.len() != specs.len() {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "penalty roots: {} log-smoothing blocks for {} parameter blocks",
+                    block_log_lambdas.len(),
+                    specs.len()
+                ),
+            });
+        }
+        // Each block's roots depend only on that block's penalties, so blocks are
+        // rooted on rayon workers and collected in block order.
+        let per_block = (0..specs.len())
+            .into_par_iter()
+            .map(|b| block_penalty_roots(b, &specs[b], &block_log_lambdas[b]))
+            .collect::<Result<Vec<_>, CustomFamilyError>>()?;
+        let total: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+        let mut s_lambdas = Vec::with_capacity(specs.len());
+        let mut terms = Vec::new();
+        for (s_lambda, block_terms) in per_block {
+            s_lambdas.push(s_lambda);
+            terms.extend(block_terms);
+        }
+        if let Some(bundle) = joint {
+            for (root, &lambda) in bundle.roots().iter().zip(bundle.lambdas().iter()) {
+                terms.push(PenaltyRootTerm {
+                    block: None,
+                    columns: 0..total,
+                    lambda,
+                    root: Arc::new(root.clone()),
+                });
+            }
+        }
+        let has_joint = terms.iter().any(|term| term.block.is_none());
+        Ok(Self {
+            terms,
+            s_lambdas,
+            has_joint,
+        })
+    }
+
+    /// Each block's curvature `S_λ = Σ_k λ_k R_kᵀR_k`: the Hessian of the block
+    /// terms of [`Self::value`]. The joint bundle's terms act on the full width
+    /// and are applied by the bundle itself.
+    pub fn s_lambdas(&self) -> &[Array2<f64>] {
+        &self.s_lambdas
+    }
+
+    /// Every term of the penalty, block terms in block order, then the joint
+    /// bundle's: the root accessor a caller that forms its own contraction
+    /// reads, so it prices exactly the function this evaluator does.
+    pub fn terms(&self) -> &[PenaltyRootTerm] {
+        &self.terms
+    }
+
+    /// The depth of the accumulation [`Self::value`] charges, which the roots'
+    /// shapes alone fix: the deepest term's `q + r + 2`, plus one per term summed.
+    pub fn accumulation_depth(&self) -> usize {
+        self.terms
+            .iter()
+            .map(|term| term.root.ncols() + term.root.nrows() + 2)
+            .max()
+            .unwrap_or(0)
+            + self.terms.len()
+    }
+
+    /// The concatenated coefficients a joint term reads, formed only when a
+    /// joint term exists (an empty vector otherwise, which no term reads).
+    fn joint_coefficients<'a, B>(&self, block_beta: &B) -> Array1<f64>
+    where
+        B: Fn(usize) -> ndarray::ArrayView1<'a, f64>,
     {
-        let beta_flat: Array1<f64> = betas.iter().flat_map(|beta| beta.iter().copied()).collect();
-        let (joint_value, joint_magnitude) = bundle.quadratic_with_accumulation(beta_flat.view());
-        value += joint_value;
-        magnitude += joint_magnitude;
+        if !self.has_joint {
+            return Array1::zeros(0);
+        }
+        (0..self.s_lambdas.len())
+            .flat_map(|block| block_beta(block).to_vec())
+            .collect()
     }
-    (value, magnitude)
+
+    fn value_with<'a, B>(&self, block_beta: B) -> PenaltyValue
+    where
+        B: Fn(usize) -> ndarray::ArrayView1<'a, f64>,
+    {
+        let joint = self.joint_coefficients(&block_beta);
+        let mut value = 0.0_f64;
+        let mut magnitude = 0.0_f64;
+        for term in &self.terms {
+            let coefficients = match term.block {
+                Some(block) => block_beta(block),
+                None => joint.view(),
+            };
+            let term_value =
+                root_term_value(term, coefficients.slice(ndarray::s![term.columns.clone()]));
+            value += term_value.value;
+            magnitude += term_value.magnitude;
+        }
+        PenaltyValue {
+            value,
+            depth: self.accumulation_depth(),
+            magnitude,
+        }
+    }
+
+    /// `½Σ_k λ_k‖R_kβ‖²` over every term, with the accumulation that bounds its
+    /// rounding.
+    ///
+    /// Error model (Higham, *ASNA* 2nd ed., §3.1 and 3.5), for the roots as given.
+    /// Forming `y = R_kβ` by `q`-term dot products leaves `|ŷ_i − y_i| ≤ γ_q·m_i`
+    /// with `m = |R_k||β|`, so `|ŷ_i² − y_i²| ≤ γ_q·m_i(2|ŷ_i| + γ_q·m_i)`.
+    /// Squaring and summing the `r` rows, scaling by `λ_k` and halving add at most
+    /// `γ_(r+2)` of `½λ_k‖ŷ‖²`. Since `γ_a + γ_b ≤ γ_(a+b)`, a term rounds by at most
+    /// `γ_(q+r+2)·½λ_k(2|ŷ|ᵀm + γ_q‖m‖² + ‖ŷ‖²)`, and summing the `T` terms raises
+    /// the depth by `T`. That is [`PenaltyValue`]'s `(depth, magnitude)`, whose
+    /// `γ_depth·magnitude` is its [`PenaltyValue::band`].
+    ///
+    /// On a null direction `ŷ ≈ 0` and the magnitude is `½λγ_q‖m‖²`, so the band
+    /// is `O(λu²)`: the root form carries no first-order `λ`-amplified term, which
+    /// the dense `½βᵀS_λβ` could not avoid.
+    pub fn value(&self, betas: &[Array1<f64>]) -> PenaltyValue {
+        self.value_with(|block| betas[block].view())
+    }
+
+    /// [`Self::value`] at the coefficients `states` carry.
+    pub fn value_of_states(&self, states: &[ParameterBlockState]) -> PenaltyValue {
+        self.value_with(|block| states[block].beta.view())
+    }
+
+    /// Block `block`'s own terms of [`Self::value`] at `beta`, excluding the joint
+    /// bundle's full-width terms. A blockwise update that changes one block
+    /// replaces exactly this part of the total.
+    pub fn block_value(&self, block: usize, beta: &Array1<f64>) -> f64 {
+        self.block_penalty_value(block, beta).value
+    }
+
+    /// [`Self::block_value`] with the accumulation that bounds its rounding, at
+    /// the depth [`Self::value`] charges.
+    pub fn block_penalty_value(&self, block: usize, beta: &Array1<f64>) -> PenaltyValue {
+        let mut value = 0.0_f64;
+        let mut magnitude = 0.0_f64;
+        for term in self.terms.iter().filter(|term| term.block == Some(block)) {
+            let term_value = root_term_value(term, beta.slice(ndarray::s![term.columns.clone()]));
+            value += term_value.value;
+            magnitude += term_value.magnitude;
+        }
+        PenaltyValue {
+            value,
+            depth: self.accumulation_depth(),
+            magnitude,
+        }
+    }
+
+    /// `value(β + δ) − value(β) = Σ_k λ_k[(R_kδ)ᵀ(R_kβ) + ½‖R_kδ‖²]`, formed
+    /// directly (#2954, for #2977), over the block and joint terms in the order
+    /// [`Self::value`] sums them.
+    ///
+    /// With `a = R_kβ`, `d = R_kδ` formed with errors `e_a = γ_q|R_k||β|` and
+    /// `e_d = γ_q|R_k||δ|`, the formation moves the term by at most
+    /// `λ_k[|d̂|ᵀe_a + e_dᵀ|â| + e_dᵀe_a + |d̂|ᵀe_d + ½‖e_d‖²]`, and the `r`-term
+    /// sums with the scaling round by `γ_(r+2)·λ_k(|d̂|ᵀ|â| + ½‖d̂‖²)`; the sum
+    /// over terms adds `γ_T` of the total's magnitude.
+    pub fn penalty_increment(
+        &self,
+        betas: &[Array1<f64>],
+        deltas: &[Array1<f64>],
+    ) -> PenaltyIncrement {
+        let joint_betas = self.joint_coefficients(&|block| betas[block].view());
+        let joint_deltas = self.joint_coefficients(&|block| deltas[block].view());
+        let mut increment = 0.0_f64;
+        let mut magnitude = 0.0_f64;
+        let mut band = 0.0_f64;
+        for term in &self.terms {
+            let (beta, delta) = match term.block {
+                Some(block) => (betas[block].view(), deltas[block].view()),
+                None => (joint_betas.view(), joint_deltas.view()),
+            };
+            let beta = beta.slice(ndarray::s![term.columns.clone()]);
+            let delta = delta.slice(ndarray::s![term.columns.clone()]);
+            let root = term.root.as_ref();
+            let growth_q = gam_linalg::roundoff::accumulation_growth(root.ncols());
+            let abs_root = root.mapv(f64::abs);
+            let a = root.dot(&beta);
+            let d = root.dot(&delta);
+            let e_a = abs_root.dot(&beta.mapv(f64::abs)) * growth_q;
+            let e_d = abs_root.dot(&delta.mapv(f64::abs)) * growth_q;
+            let abs_a = a.mapv(f64::abs);
+            let abs_d = d.mapv(f64::abs);
+            let own = 0.5 * d.dot(&d);
+            increment += term.lambda * (d.dot(&a) + own);
+            let term_magnitude = term.lambda * (abs_d.dot(&abs_a) + own);
+            magnitude += term_magnitude;
+            band += term.lambda
+                * (abs_d.dot(&e_a)
+                    + e_d.dot(&abs_a)
+                    + e_d.dot(&e_a)
+                    + abs_d.dot(&e_d)
+                    + 0.5 * e_d.dot(&e_d))
+                + gam_linalg::roundoff::accumulation_growth(root.nrows() + 2) * term_magnitude;
+        }
+        PenaltyIncrement {
+            increment,
+            band: band + gam_linalg::roundoff::accumulation_growth(self.terms.len()) * magnitude,
+        }
+    }
+}
+
+/// Block `b`'s roots at `log_lambdas` and its curvature `S_λ = Σ_k λ_k R_kᵀR_k`
+/// ([`BlockPenaltyRoots::new`] for one block). Every consumer of a block's
+/// assembled penalty reads this, so the curvature, the pseudo-log-determinant
+/// and the value describe one function.
+pub(crate) fn block_penalty_roots(
+    b: usize,
+    spec: &ParameterBlockSpec,
+    log_lambdas: &Array1<f64>,
+) -> Result<(Array2<f64>, Vec<PenaltyRootTerm>), CustomFamilyError> {
+    if log_lambdas.len() != spec.penalties.len() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "block {b} log-smoothing parameter length {} does not match \
+                 penalties {}",
+                log_lambdas.len(),
+                spec.penalties.len()
+            ),
+        });
+    }
+    let lambdas =
+        exact_lambdas_from_log_strengths(log_lambdas, &format!("inner block {b} log strength"))?;
+    let declared = spec.nullspace_dims.len() == spec.penalties.len();
+    let p = spec.design.ncols();
+    let mut s_lambda = Array2::<f64>::zeros((p, p));
+    let mut terms = Vec::with_capacity(spec.penalties.len());
+    for (k, penalty) in spec.penalties.iter().enumerate() {
+        // A block-local penalty declares the nullity of its own local matrix, the
+        // convention the standard route's rank analysis reads
+        // (`penalty_spec_local_matrix`), so it is rooted on those columns alone;
+        // every other form is rooted as the block-wide matrix it is. No producer
+        // carries its construction's formation band yet, so it is 0 here and a
+        // declared nullity removes the structural zeros that rounding left
+        // resolved (#2954).
+        let (matrix, columns) = penalty_structure(penalty, p);
+        let root = gam_problem::structural_penalty_root(
+            &matrix,
+            declared.then(|| spec.nullspace_dims[k]),
+            0.0,
+        )
+        .map_err(|error| CustomFamilyError::InvalidInput {
+            context: "custom-family penalty root",
+            reason: format!("block {b} ({}) penalty {k}: {error}", spec.name),
+        })?;
+        s_lambda
+            .slice_mut(ndarray::s![columns.clone(), columns.clone()])
+            .scaled_add(lambdas[k], &root.t().dot(&root));
+        terms.push(PenaltyRootTerm {
+            block: Some(b),
+            columns,
+            lambda: lambdas[k],
+            root: Arc::new(root),
+        });
+    }
+    Ok((s_lambda, terms))
+}
+
+/// The matrix a penalty's declared nullity describes and the block columns it
+/// acts on: a block-local penalty's own local matrix at its column range, and the
+/// block-wide dense form of every other kind. Precision labels and fixed
+/// strengths wrap the matrix without changing it.
+fn penalty_structure(
+    penalty: &PenaltyMatrix,
+    width: usize,
+) -> (Array2<f64>, std::ops::Range<usize>) {
+    match penalty {
+        PenaltyMatrix::Blockwise {
+            local, col_range, ..
+        } => (local.clone(), col_range.clone()),
+        PenaltyMatrix::Labeled { inner, .. } | PenaltyMatrix::Fixed { inner, .. } => {
+            penalty_structure(inner, width)
+        }
+        PenaltyMatrix::Dense(_)
+        | PenaltyMatrix::Diagonal(_)
+        | PenaltyMatrix::KroneckerFactored { .. } => (penalty.to_dense(), 0..width),
+    }
+}
+
+/// The curvature half of [`block_penalty_roots`].
+pub(crate) fn block_s_lambda(
+    b: usize,
+    spec: &ParameterBlockSpec,
+    log_lambdas: &Array1<f64>,
+) -> Result<Array2<f64>, CustomFamilyError> {
+    block_penalty_roots(b, spec, log_lambdas).map(|(s_lambda, _)| s_lambda)
+}
+
+/// `½λ‖Rβ‖²` for one term, with its accumulation, by the error model at
+/// [`BlockPenaltyRoots::value`].
+fn root_term_value(term: &PenaltyRootTerm, beta: ndarray::ArrayView1<'_, f64>) -> PenaltyValue {
+    let root = term.root.as_ref();
+    let (r, q) = root.dim();
+    let y = root.dot(&beta);
+    // `m = |R||β|`: the magnitude each `q`-term row product accumulates.
+    let m = root.mapv(f64::abs).dot(&beta.mapv(f64::abs));
+    let squares = y.dot(&y);
+    PenaltyValue {
+        value: 0.5 * term.lambda * squares,
+        depth: q + r + 2,
+        magnitude: 0.5
+            * term.lambda
+            * (2.0 * y.mapv(f64::abs).dot(&m)
+                + gam_linalg::roundoff::accumulation_growth(q) * m.dot(&m)
+                + squares),
+    }
 }
 
 pub(crate) fn block_penalized_hessian_vector(
@@ -1963,83 +2402,6 @@ pub(crate) fn truncate_block_step_to_metric_radius(
     } else {
         Ok((delta, norm))
     }
-}
-
-/// Fewest blocks for which [`total_quadratic_penalty`] maps the per-block penalties
-/// on rayon workers.
-///
-/// Work bound (#2469): result-invariant. Both sides evaluate every block with
-/// `block_quadratic_penalty` and sum the values in block order with the same
-/// `Iterator::sum`, so the total is bit-identical on either side.
-pub(crate) const TOTAL_QUADRATIC_PENALTY_PAR_MIN_BLOCKS: usize = 4;
-
-/// Least dense mat-vec work in `βᵀSβ` for which [`total_quadratic_penalty`] maps the
-/// per-block penalties on rayon workers, so a few tiny blocks avoid the fork/join cost.
-///
-/// Work bound (#2469): result-invariant, for the reason at
-/// [`TOTAL_QUADRATIC_PENALTY_PAR_MIN_BLOCKS`].
-pub(crate) const TOTAL_QUADRATIC_PENALTY_PAR_MIN_DENSE_WORK: usize = 16_384;
-
-pub(crate) fn total_quadratic_penalty_parallel_worthwhile(
-    states: &[ParameterBlockState],
-    s_lambdas: &[Array2<f64>],
-) -> bool {
-    let n_blocks = states.len().min(s_lambdas.len());
-    if n_blocks < TOTAL_QUADRATIC_PENALTY_PAR_MIN_BLOCKS || rayon::current_num_threads() <= 1 {
-        return false;
-    }
-
-    states
-        .iter()
-        .zip(s_lambdas.iter())
-        .map(|(state, s_lambda)| {
-            let p = state.beta.len().min(s_lambda.ncols());
-            p.saturating_mul(s_lambda.nrows())
-        })
-        .try_fold(0usize, |acc, work| {
-            let next = acc.saturating_add(work);
-            (next < TOTAL_QUADRATIC_PENALTY_PAR_MIN_DENSE_WORK).then_some(next)
-        })
-        .is_none()
-}
-
-pub(crate) fn total_quadratic_penalty(
-    states: &[ParameterBlockState],
-    s_lambdas: &[Array2<f64>],
-    joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
-    specs: Option<&[ParameterBlockSpec]>,
-) -> f64 {
-    let per_block: f64 = if total_quadratic_penalty_parallel_worthwhile(states, s_lambdas) {
-        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
-
-        states
-            .par_iter()
-            .zip(s_lambdas.par_iter())
-            .map(|(state, s_lambda)| {
-                block_quadratic_penalty(&state.beta, s_lambda)
-            })
-            // Collect in block order and sum serially, the order the serial side sums
-            // in, so the parallel map changes the schedule and never the total.
-            .collect::<Vec<f64>>()
-            .into_iter()
-            .sum()
-    } else {
-        states
-            .iter()
-            .zip(s_lambdas.iter())
-            .map(|(state, s_lambda)| {
-                block_quadratic_penalty(&state.beta, s_lambda)
-            })
-            .sum()
-    };
-    let joint = match (joint_full_width, specs) {
-        (Some(bundle), Some(specs)) if !bundle.is_empty() => {
-            let beta_flat = flatten_state_betas(states, specs);
-            bundle.quadratic(beta_flat.view())
-        }
-        _ => 0.0,
-    };
-    per_block + joint
 }
 
 /// Locate the first non-finite entry in a Hessian and report it as a
@@ -2301,16 +2663,50 @@ pub(crate) fn strict_solve_spd_or_spectral_step(
 /// put that cutoff at `4.5e4` beside eigenvalues of `0.013`–`0.5`. The band
 /// there is `450`, and the eigensolver's backward error bounds each computed
 /// eigenvalue only to within it.
+///
+/// Every eigenvalue the rank drops must itself lie inside that band. A dropped
+/// positive eigenvalue always does (every resolved positive one is kept), but a
+/// negative one below `−band` is resolved curvature: `M` is indefinite, `β̂` is
+/// a saddle of the penalized objective, and no Laplace approximation exists
+/// there. Pricing `log|M₊|` over the positive part would be a different
+/// criterion, so that precision is refused by name, as
+/// `DenseSpectralOperator::from_eigenpairs` refuses an excluded eigenvalue
+/// outside the band (#3303). At the survival location-scale link-wiggle modes
+/// of #3303 the floor kept 8 of 10 eigenpairs and silently dropped `−4.577` and
+/// `−2.217` against a band of `1.3e-11`.
 pub(crate) fn laplace_precision_kept_eigenpairs(
     eigenvalues: &[f64],
     penalty_rank: usize,
-) -> Vec<usize> {
+) -> Result<Vec<usize>, String> {
     let rank = DenseSpectralOperator::identified_rank(eigenvalues, penalty_rank);
-    let mut kept: Vec<usize> = (0..eigenvalues.len()).collect();
-    kept.sort_by(|&a, &b| eigenvalues[b].total_cmp(&eigenvalues[a]));
+    let mut order: Vec<usize> = (0..eigenvalues.len()).collect();
+    order.sort_by(|&a, &b| eigenvalues[b].total_cmp(&eigenvalues[a]));
+    let rounding_band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(eigenvalues);
+    let material_negative: Vec<f64> = order[rank..]
+        .iter()
+        .map(|&index| eigenvalues[index])
+        .filter(|&value| !(value >= -rounding_band))
+        .collect();
+    if !material_negative.is_empty() {
+        return Err(format!(
+            "Laplace precision M is indefinite: {} dropped eigenvalue(s) lie below its \
+             rounding band -p*eps*||M||_2 = {:.6e} (lowest {:.6e}; kept rank {rank} of {}), so \
+             the mode is a saddle of the penalized objective and no Laplace approximation \
+             exists here; log|M+| over the positive part is a different criterion and is not \
+             priced in its place (#3303)",
+            material_negative.len(),
+            -rounding_band,
+            material_negative
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min),
+            eigenvalues.len(),
+        ));
+    }
+    let mut kept = order;
     kept.truncate(rank);
     kept.sort_unstable();
-    kept
+    Ok(kept)
 }
 
 /// Rank of a penalty `S_λ` at its own rounding band `p·ε·‖S_λ‖₂`: the
@@ -2327,8 +2723,10 @@ pub(crate) fn penalty_rank_at_rounding_band(penalty: &Array2<f64>) -> Result<usi
     let eigenvalues = spectrum
         .as_slice()
         .ok_or_else(|| "penalty rank: the eigenvalue array is not contiguous".to_string())?;
-    let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(eigenvalues);
-    Ok(eigenvalues.iter().filter(|&&sigma| sigma > band).count())
+    Ok(gam_linalg::roundoff::resolved_eigenvalue_count(
+        eigenvalues,
+        0.0,
+    ))
 }
 
 /// Exact pseudo-Laplace log-determinant `log|H + S_λ|` of the REML/LAML
@@ -2411,6 +2809,9 @@ pub(crate) fn strict_exact_pseudo_logdet(
         });
     }
     Ok(laplace_precision_kept_eigenpairs(evals_slice, penalty_rank)
+        .map_err(|reason| CustomFamilyError::NumericalFailure {
+            reason: format!("strict pseudo-laplace logdet: {reason}"),
+        })?
         .into_iter()
         .map(|index| evals[index].ln())
         .sum())
@@ -2639,39 +3040,229 @@ pub(crate) fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<u
 }
 
 #[cfg(test)]
-mod quadratic_penalty_accumulation_tests {
+mod block_penalty_roots_tests {
     use super::*;
     use ndarray::array;
 
-    /// gam#2959. The explicit entry pass returns the BLAS form's value within the
-    /// rounding both evaluations can carry, `γ_{p²}` of the accumulated magnitude
-    /// for each, and a magnitude that is the real summed scale: on this cancelling
-    /// block the value is orders below it.
+    /// Error-free double-double accumulation for the references below: `TwoSum`
+    /// and an FMA `TwoProd` keep each partial result's rounding as a second word,
+    /// so a dot product of `q` terms is accurate to `O(q·u²)` relative, far below
+    /// every band these pins compare against.
+    #[derive(Clone, Copy)]
+    struct DoubleDouble {
+        hi: f64,
+        lo: f64,
+    }
+
+    impl DoubleDouble {
+        const ZERO: Self = Self { hi: 0.0, lo: 0.0 };
+
+        fn two_sum(a: f64, b: f64) -> Self {
+            let hi = a + b;
+            let bb = hi - a;
+            Self {
+                hi,
+                lo: (a - (hi - bb)) + (b - bb),
+            }
+        }
+
+        fn add(self, other: Self) -> Self {
+            let s = Self::two_sum(self.hi, other.hi);
+            let lo = s.lo + self.lo + other.lo;
+            Self::two_sum(s.hi, lo)
+        }
+
+        fn product(a: f64, b: f64) -> Self {
+            let hi = a * b;
+            Self {
+                hi,
+                lo: a.mul_add(b, -hi),
+            }
+        }
+
+        fn mul(self, other: Self) -> Self {
+            let p = Self::product(self.hi, other.hi);
+            let lo = p.lo + self.hi * other.lo + self.lo * other.hi;
+            Self::two_sum(p.hi, lo)
+        }
+
+        fn scale(self, factor: f64) -> Self {
+            self.mul(Self {
+                hi: factor,
+                lo: 0.0,
+            })
+        }
+
+        fn value(self) -> f64 {
+            self.hi + self.lo
+        }
+    }
+
+    fn dd_rows(root: &Array2<f64>, vector: &Array1<f64>) -> Vec<DoubleDouble> {
+        root.rows()
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .zip(vector.iter())
+                    .fold(DoubleDouble::ZERO, |acc, (&r, &v)| {
+                        acc.add(DoubleDouble::product(r, v))
+                    })
+            })
+            .collect()
+    }
+
+    /// A first-difference penalty on reweighted coefficients: `A = D·W` with
+    /// `W = diag(1/(j+3))` rounded to f64, stored as the formed `AᵀA`. Its null
+    /// space is `W⁻¹·1` up to that rounding, and the stored matrix, like the
+    /// 2923 time block's, is not exactly singular there.
+    fn reweighted_difference_block(log_lambda: f64) -> (Vec<ParameterBlockSpec>, Vec<Array1<f64>>) {
+        let p = 7;
+        let mut a = Array2::<f64>::zeros((p - 1, p));
+        for i in 0..p - 1 {
+            a[[i, i]] = 1.0 / (i as f64 + 3.0);
+            a[[i, i + 1]] = -1.0 / (i as f64 + 4.0);
+        }
+        let penalty = a.t().dot(&a);
+        let spec = ParameterBlockSpec {
+            name: "reweighted_difference".to_string(),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::<f64>::eye(p),
+            )),
+            offset: Array1::zeros(p),
+            penalties: vec![PenaltyMatrix::Dense(penalty)],
+            nullspace_dims: vec![1],
+            initial_log_lambdas: array![log_lambda],
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+        (vec![spec], vec![array![log_lambda]])
+    }
+
+    /// Coefficients along the stored penalty's near-null direction `W⁻¹·1`, plus
+    /// a small range component: the `λ → ∞` geometry a smoothing parameter
+    /// crawling to its limit face produces.
+    fn near_null_beta() -> Array1<f64> {
+        Array1::from_iter((0..7).map(|j| (j as f64 + 3.0) + 1.0e-3 * (j as f64 - 3.0)))
+    }
+
+    /// #2954 (supersedes gam#2959's `block_quadratic_penalty_accumulation_matches_
+    /// the_blas_value_2959`): the root-form value matches a double-double reference
+    /// of `½λ‖Rβ‖²` on the evaluator's own roots within the band it states, at
+    /// every strength up to the `λ = e³⁰` edge. The dense form of the same stored
+    /// matrix, evaluated exactly, departs from it by more than that band there:
+    /// the stored null eigenvalue times `λ`.
     #[test]
-    fn block_quadratic_penalty_accumulation_matches_the_blas_value_2959() {
-        let s_lambda = array![
-            [4.0e6, -3.99e6, 0.0],
-            [-3.99e6, 4.0e6, 1.0],
-            [0.0, 1.0, 2.0]
-        ];
-        let beta = array![237.0, 236.5, -0.25];
-        let (value, magnitude) = block_quadratic_penalty_with_accumulation(&beta, &s_lambda);
-        let blas = block_quadratic_penalty(&beta, &s_lambda);
-        let p = beta.len();
-        let band = 2.0 * gam_linalg::roundoff::accumulation_growth(p * p) * magnitude;
-        let gap = (value - blas).abs();
+    fn the_root_form_value_is_within_its_band_of_a_double_double_reference_2954() {
+        let beta = near_null_beta();
+        for log_lambda in [0.0, 15.0, 30.0] {
+            let (specs, log_lambdas) = reweighted_difference_block(log_lambda);
+            let roots = BlockPenaltyRoots::new(&specs, &log_lambdas, None).expect("roots");
+            let evaluated = roots.value(std::slice::from_ref(&beta));
+            let term = &roots.terms()[0];
+            assert_eq!(term.root.nrows(), 6, "declared nullity 1 keeps rank 6");
+            let reference = dd_rows(&term.root, &beta)
+                .into_iter()
+                .fold(DoubleDouble::ZERO, |acc, y| acc.add(y.mul(y)))
+                .scale(0.5 * term.lambda)
+                .value();
+            let gap = (evaluated.value - reference).abs();
+            assert!(
+                gap <= evaluated.band(),
+                "log λ={log_lambda}: root value {:e} against double-double {reference:e}: gap \
+                 {gap:.3e} exceeds its band {:.3e}",
+                evaluated.value,
+                evaluated.band()
+            );
+            if log_lambda == 30.0 {
+                let stored = specs[0].penalties[0].to_dense();
+                let dense_exact = dd_rows(&stored, &beta)
+                    .into_iter()
+                    .zip(beta.iter())
+                    .fold(DoubleDouble::ZERO, |acc, (row, &b)| acc.add(row.scale(b)))
+                    .scale(0.5 * term.lambda)
+                    .value();
+                assert!(
+                    (dense_exact - reference).abs() > evaluated.band(),
+                    "the stored matrix's exact dense value {dense_exact:e} must depart from \
+                     the root form {reference:e} by more than the root band {:.3e} at λ = e³⁰",
+                    evaluated.band()
+                );
+            }
+        }
+    }
+
+    /// #2954 for #2977: `penalty_increment(β, δ)` is `value(β + δ) − value(β)`
+    /// against a double-double reference of `λ[(Rδ)ᵀ(Rβ) + ½‖Rδ‖²]`, which is that
+    /// difference exactly, within the band it states; and it is formed without
+    /// differencing two values, so its band is far below the values' own.
+    #[test]
+    fn the_penalty_increment_is_the_value_difference_within_its_band_2954() {
+        let (specs, log_lambdas) = reweighted_difference_block(30.0);
+        let roots = BlockPenaltyRoots::new(&specs, &log_lambdas, None).expect("roots");
+        let beta = near_null_beta();
+        let delta = Array1::from_iter((0..7).map(|j| 1.0e-4 * ((j * j) as f64 - 5.0)));
+        let increment =
+            roots.penalty_increment(std::slice::from_ref(&beta), std::slice::from_ref(&delta));
+        let term = &roots.terms()[0];
+        let a = dd_rows(&term.root, &beta);
+        let d = dd_rows(&term.root, &delta);
+        let reference = a
+            .iter()
+            .zip(d.iter())
+            .fold(DoubleDouble::ZERO, |acc, (&a_i, &d_i)| {
+                acc.add(d_i.mul(a_i)).add(d_i.mul(d_i).scale(0.5))
+            })
+            .scale(term.lambda)
+            .value();
+        let gap = (increment.increment - reference).abs();
         assert!(
-            gap <= band,
-            "explicit value {value:e} against BLAS {blas:e}: gap {gap:.3e} exceeds {band:.3e}"
+            gap <= increment.band,
+            "increment {:e} against double-double {reference:e}: gap {gap:.3e} exceeds its band \
+             {:.3e}",
+            increment.increment,
+            increment.band
         );
+        let value = roots.value(std::slice::from_ref(&beta));
         assert!(
-            magnitude >= value.abs(),
-            "the accumulated magnitude {magnitude:e} must bound the value {value:e}"
+            increment.band < value.band(),
+            "the direct increment's band {:.3e} must be below the value's own band {:.3e}",
+            increment.band,
+            value.band()
         );
+    }
+
+    /// #2954: value, gradient and curvature are one function. For a quadratic,
+    /// `value(β + δ) − value(β) = gᵀδ + ½δᵀHδ` exactly, with `g = S_λβ` and `H =
+    /// S_λ` from [`BlockPenaltyRoots::s_lambdas`]. At `λ = e³⁰` the two sides agree
+    /// within the increment's band plus the matrix products' own rounding,
+    /// `γ_(r+p+1)·λ(|δ|ᵀ|R|ᵀ|R||β| + ½|δ|ᵀ|R|ᵀ|R||δ|)`.
+    #[test]
+    fn the_curvature_is_the_hessian_of_the_root_value_at_large_lambda_2954() {
+        let (specs, log_lambdas) = reweighted_difference_block(30.0);
+        let roots = BlockPenaltyRoots::new(&specs, &log_lambdas, None).expect("roots");
+        let beta = near_null_beta();
+        let delta = Array1::from_iter((0..7).map(|j| 1.0e-4 * ((j * j) as f64 - 5.0)));
+        let increment =
+            roots.penalty_increment(std::slice::from_ref(&beta), std::slice::from_ref(&delta));
+        let s_lambda = &roots.s_lambdas()[0];
+        let model = delta.dot(&s_lambda.dot(&beta)) + 0.5 * delta.dot(&s_lambda.dot(&delta));
+        let term = &roots.terms()[0];
+        let abs_gram = term.root.mapv(f64::abs).t().dot(&term.root.mapv(f64::abs));
+        let abs_delta = delta.mapv(f64::abs);
+        let product_band =
+            gam_linalg::roundoff::accumulation_growth(term.root.nrows() + term.root.ncols() + 1)
+                * term.lambda
+                * (abs_delta.dot(&abs_gram.dot(&beta.mapv(f64::abs)))
+                    + 0.5 * abs_delta.dot(&abs_gram.dot(&abs_delta)));
+        let gap = (increment.increment - model).abs();
         assert!(
-            magnitude > 100.0 * value.abs(),
-            "the fixture must cancel, or it cannot show the magnitude is the summed scale \
-             (value {value:e}, magnitude {magnitude:e})"
+            gap <= increment.band + product_band,
+            "increment {:e} against gᵀδ + ½δᵀHδ = {model:e}: gap {gap:.3e} exceeds {:.3e}",
+            increment.increment,
+            increment.band + product_band
         );
     }
 }

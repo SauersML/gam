@@ -674,7 +674,7 @@
 
     // --- shared latent-interval validation engine: parity / contract tests ---
 
-    use crate::survival::location_scale::{TimeBlockInput, TimeBlockMonotonicity};
+    use crate::survival::location_scale::TimeBlockInput;
 
     /// Minimal, structurally valid `TimeBlockInput` for `n` rows and `p_time`
     /// columns, used to exercise the shared validation driver without standing
@@ -693,7 +693,6 @@
             offset_entry: Array1::zeros(n),
             offset_exit: Array1::zeros(n),
             derivative_offset_exit: Array1::zeros(n),
-            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
             penalties: Vec::new(),
             nullspace_dims: Vec::new(),
             initial_log_lambdas: None,
@@ -706,6 +705,7 @@
             linear_terms: Vec::new(),
             random_effect_terms: Vec::new(),
             smooth_terms: Vec::new(),
+            level: Default::default(),
         }
     }
 
@@ -761,7 +761,6 @@
             offset_entry: Array1::zeros(n),
             offset_exit: Array1::zeros(n),
             derivative_offset_exit: Array1::zeros(n),
-            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
             penalties: vec![penalty.clone()],
             nullspace_dims: vec![1],
             initial_log_lambdas: Some(Array1::from_elem(1, 0.5)),

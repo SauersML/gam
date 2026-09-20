@@ -92,6 +92,11 @@ A 2-D smooth fit to scattered observations:
 ## Predict
 
 ```python
+import gamfit
+
+train = {"x": list(range(12)), "y": [1.2, 1.9, 3.1, 4.5, 5.0, 5.4, 5.6, 5.5, 5.2, 4.8, 4.4, 4.1]}
+model = gamfit.fit(train, "y ~ s(x)")   # the first model above
+
 preds = model.predict([{"x": 1.5}, {"x": 2.5}])
 ```
 
@@ -102,6 +107,11 @@ response-scale point predictions by default. Ask for a table with
 For pointwise Wald intervals, pass `interval=`:
 
 ```python
+import gamfit
+
+train = {"x": list(range(12)), "y": [1.2, 1.9, 3.1, 4.5, 5.0, 5.4, 5.6, 5.5, 5.2, 4.8, 4.4, 4.1]}
+model = gamfit.fit(train, "y ~ s(x)")
+
 preds = model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95)
 # Columns: linear_predictor_plugin, mean_plugin, posterior_mean,
 #          posterior_mean_standard_error, posterior_mean_lower, posterior_mean_upper
@@ -119,6 +129,12 @@ See [predictions.md](predictions.md) for details on `return_type`,
 ## Inspect
 
 ```python
+import gamfit
+
+train = {"x": list(range(12)), "y": [1.2, 1.9, 3.1, 4.5, 5.0, 5.4, 5.6, 5.5, 5.2, 4.8, 4.4, 4.1]}
+test = {"x": [1.5, 2.5]}
+model = gamfit.fit(train, "y ~ s(x)")
+
 model.summary()                     # Summary object
 model.diagnose(train).metrics       # n_obs, mae, rmse, bias, optional r_squared
 model.check(test).ok                # schema check against training
@@ -126,19 +142,34 @@ model.plot(train, x="x")            # matplotlib (requires gamfit[plot])
 model.report("out.html")            # standalone HTML report
 ```
 
-`Model.summary()` returns a `Summary` carrying the formula, family
-name, model class, deviance, REML/LAML criterion (in the `reml_score`
-field), per-coefficient estimates with optional standard errors,
-smoothing parameters, covariance metadata, deployment extensions, and
-group metadata. `reml_score` is `None` on an exactly-interpolating fit,
-whose restricted likelihood is unbounded — see
-[diagnostics.md](diagnostics.md).
+`Model.summary()` returns a `Summary`. `print(model.summary())` shows the
+report rendered by the engine — the same text `gam summary model.gam`
+prints: family, link, formula and `n`; the parametric coefficient table
+(estimate, standard error, `t` or `z`, p-value); the smooth-term table
+(`edf`, reference df, `F` or `Chi.sq`, one Wald p-value, and the term's
+smoothing parameters); deviance explained `1 − D/D₀`, adjusted R² for a
+Gaussian response, the scale `φ̂`, the REML/LAML score, the
+log-likelihood, conditional and corrected AIC, and the optimizer's
+convergence certificate. Every number is also a typed field
+(`summary.deviance_explained`, `summary.parametric_terms`,
+`summary.smooth_terms`, ...), and `summary.to_dict()` returns them all. A
+quantity that does not exist for a fit is `None` with its reason beside
+it: `reml_score` is `None` on an exactly-interpolating fit, whose
+restricted likelihood is unbounded — see [diagnostics.md](diagnostics.md).
+The summary's p-value is the Wald reference computed from the saved model;
+the likelihood-ratio p-value, which refits, comes from
+`model.smooth_significance(train)`.
 
 See [diagnostics.md](diagnostics.md) for the full list.
 
 ## Persist
 
 ```python
+import gamfit
+
+train = {"x": list(range(12)), "y": [1.2, 1.9, 3.1, 4.5, 5.0, 5.4, 5.6, 5.5, 5.2, 4.8, 4.4, 4.1]}
+model = gamfit.fit(train, "y ~ s(x)")
+
 model.save("model.gam")
 loaded = gamfit.load("model.gam")
 ```
@@ -153,10 +184,16 @@ Smoothing parameters are point estimates from REML. To draw from the
 posterior of the coefficients conditional on those estimates:
 
 ```python
+import gamfit
+
+train = {"x": list(range(12)), "y": [1.2, 1.9, 3.1, 4.5, 5.0, 5.4, 5.6, 5.5, 5.2, 4.8, 4.4, 4.1]}
+test = {"x": [1.5, 2.5]}
+model = gamfit.fit(train, "y ~ s(x)")
+
 posterior = model.sample(train, seed=42)
 print(posterior)
-# PosteriorSamples(n_draws=..., n_coeffs=8, method='nuts',
-#                  rhat=1.0040, ess=..., converged=True)
+# PosteriorSamples(n_draws=..., n_coeffs=8, method='laplace',
+#                  rhat=1.0000, ess=..., converged=True)
 
 bands = posterior.predict(test, level=0.95)
 ```

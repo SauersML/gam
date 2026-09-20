@@ -328,7 +328,7 @@ pub(super) fn working_deriv_slices<'a>(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct WorkingBernoulliGeometry {
     pub(crate) mu: f64,
     pub(crate) weight: f64,
@@ -376,6 +376,19 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
         integrated: Option<IntegratedWorkingInput<'_>>,
         derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
     ) -> Result<(), EstimationError> {
+        if let Some(cell) = self.spec.generic_edm_cell() {
+            return write_generic_edm_working_state(
+                cell,
+                fixed_glm_dispersion(self)?,
+                y,
+                eta,
+                priorweights,
+                mu,
+                weights,
+                z,
+                derivatives,
+            );
+        }
         match (&self.spec.response, &self.spec.link, integrated) {
             (ResponseFamily::Binomial, _, Some(integ)) => {
                 update_glmvectors_integrated_by_family(
@@ -413,6 +426,40 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
+            (ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian, link, _)
+                if reciprocal_power_link(link).is_some() =>
+            {
+                let (standard, exponent) =
+                    reciprocal_power_link(link).expect("guarded by reciprocal_power_link");
+                let family = match self.spec.response {
+                    ResponseFamily::Gaussian => PowerVarianceEdm::Gaussian,
+                    ResponseFamily::Gamma => PowerVarianceEdm::Gamma,
+                    _ => PowerVarianceEdm::InverseGaussian,
+                };
+                write_reciprocal_link_working_state(
+                    family,
+                    standard,
+                    exponent,
+                    fixed_glm_dispersion(self)?,
+                    y,
+                    eta,
+                    priorweights,
+                    mu,
+                    weights,
+                    z,
+                    derivatives,
+                )
+            }
+            (ResponseFamily::InverseGaussian, _, _) => write_inverse_gaussian_log_working_state(
+                y,
+                eta,
+                priorweights,
+                fixed_glm_dispersion(self)?,
+                mu,
+                weights,
+                z,
+                derivatives,
+            ),
             (ResponseFamily::Gaussian, _, _) => {
                 let resolved_scale = self
                     .resolved_scale()
@@ -511,6 +558,19 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                     eta,
                     priorweights,
                     shape,
+                    mu,
+                    weights,
+                    z,
+                    derivatives,
+                )
+            }
+            (ResponseFamily::StudentT { .. }, _, _) => {
+                let scale = StudentTScale::from_likelihood(self)?;
+                write_student_t_working_state(
+                    y,
+                    eta,
+                    priorweights,
+                    &scale,
                     mu,
                     weights,
                     z,

@@ -114,6 +114,15 @@ pub struct MovingLawArmScore {
     pub row_se: f64,
     /// The standard error of `difference` from its fold means.
     pub fold_se: f64,
+    /// The standard-normal adequacy screen of the residual an arm anchors on the
+    /// Gaussian law: the score itself for the Gaussian arm, the location-scale
+    /// residual `ζ` for the location-scale Gaussian arm; `None` for an arm that
+    /// anchors on an estimated law. An arm whose screen fails is scored and
+    /// recorded, but it is not a candidate: it would anchor on a law the data
+    /// reject. `None` in a payload written before the screen was recorded, whose
+    /// rule took every arm as a candidate.
+    #[serde(default)]
+    pub adequacy: Option<LatentNormalAdequacy>,
 }
 
 impl MovingLawArmScore {
@@ -121,6 +130,12 @@ impl MovingLawArmScore {
     /// row- and fold-level ones.
     pub fn rule_se(&self) -> f64 {
         self.row_se.max(self.fold_se)
+    }
+
+    /// Whether the rule may choose this arm: its Gaussian residual, if it anchors
+    /// on one, passes the adequacy screen.
+    pub fn admissible(&self) -> bool {
+        self.adequacy.as_ref().is_none_or(LatentNormalAdequacy::passes)
     }
 }
 
@@ -135,10 +150,11 @@ pub struct MovingLawCertificate {
     pub rows: usize,
     /// The arm the certified fit was solved on.
     pub fitted: MovingLawArm,
-    /// The arm with the lowest mean loss.
+    /// The admissible arm ([`MovingLawArmScore::admissible`]) with the lowest mean
+    /// loss.
     pub argmin: MovingLawArm,
-    /// The simplest arm whose difference to the argmin is within its rule
-    /// standard error ([`MovingLawArmScore::rule_se`]).
+    /// The simplest admissible arm whose difference to the argmin is within its
+    /// rule standard error ([`MovingLawArmScore::rule_se`]).
     pub chosen: MovingLawArm,
     /// Every arm, simplest first.
     pub arms: Vec<MovingLawArmScore>,
@@ -147,10 +163,12 @@ pub struct MovingLawCertificate {
 impl MovingLawCertificate {
     /// Apply the rule to every row's losses under `ladder` (simplest first;
     /// `None` for a row nothing scored), with `fitted` the arm the losses were
-    /// taken at. Sums run in row order, so the choice is the same at every thread
-    /// count.
+    /// taken at and `adequacy` each arm's Gaussian-residual screen
+    /// ([`MovingLawArmScore::adequacy`]). Sums run in row order, so the choice is
+    /// the same at every thread count.
     pub(crate) fn from_row_losses(
         ladder: &[MovingLawArm],
+        adequacy: &[Option<LatentNormalAdequacy>],
         fitted: MovingLawArm,
         folds: &MovingLawFolds,
         weights: &Array1<f64>,
@@ -158,6 +176,22 @@ impl MovingLawCertificate {
     ) -> Result<Self, MovingLawError> {
         if !ladder.contains(&fitted) {
             return Err(MovingLawError::FittedArmOffLadder(fitted));
+        }
+        if adequacy.len() != ladder.len() {
+            return Err(MovingLawError::ArmCount {
+                row: None,
+                expected: ladder.len(),
+                found: adequacy.len(),
+            });
+        }
+        let admissible: Vec<bool> = adequacy
+            .iter()
+            .map(|screen| screen.as_ref().is_none_or(LatentNormalAdequacy::passes))
+            .collect();
+        if let Some(position) = ladder.iter().position(|&arm| arm == fitted)
+            && !admissible[position]
+        {
+            return Err(MovingLawError::FittedArmInadmissible(fitted));
         }
         let scored: Vec<(usize, f64, &Vec<f64>)> = losses
             .iter()
@@ -182,9 +216,14 @@ impl MovingLawCertificate {
         let mean_loss: Vec<f64> = (0..ladder.len())
             .map(|arm| scored.iter().map(|&(_, w, loss)| w * loss[arm]).sum::<f64>() / total_weight)
             .collect();
-        let argmin = (0..ladder.len()).fold(0, |best, arm| {
-            if mean_loss[arm] < mean_loss[best] { arm } else { best }
-        });
+        // The fitted arm is admissible, so an admissible argmin exists.
+        let argmin = (0..ladder.len())
+            .filter(|&arm| admissible[arm])
+            .fold(None, |best: Option<usize>, arm| match best {
+                Some(best) if mean_loss[best] <= mean_loss[arm] => Some(best),
+                _ => Some(arm),
+            })
+            .ok_or(MovingLawError::FittedArmInadmissible(fitted))?;
         let count = scored.len() as f64;
         let arms: Vec<MovingLawArmScore> = (0..ladder.len())
             .map(|arm| {
@@ -226,6 +265,7 @@ impl MovingLawCertificate {
                     difference,
                     row_se,
                     fold_se,
+                    adequacy: adequacy[arm].clone(),
                 }
             })
             .collect();
@@ -234,11 +274,11 @@ impl MovingLawCertificate {
         }) {
             return Err(MovingLawError::NonFiniteScore(arms));
         }
-        // The argmin's own difference is exactly zero, so the scan always stops,
-        // at the argmin at the latest.
+        // The argmin's own difference is exactly zero and it is admissible, so the
+        // scan always stops, at the argmin at the latest.
         let chosen = arms
             .iter()
-            .find(|score| score.difference <= score.rule_se())
+            .find(|score| score.admissible() && score.difference <= score.rule_se())
             .map(|score| score.arm)
             .ok_or_else(|| MovingLawError::NoArmWithinStandardError(arms.clone()))?;
         Ok(Self {
@@ -259,8 +299,14 @@ impl MovingLawCertificate {
             .map(|score| {
                 let se = score.rule_se();
                 let ratio = if se > 0.0 { score.difference / se } else { 0.0 };
+                let screen = match &score.adequacy {
+                    Some(adequacy) if !adequacy.passes() => {
+                        format!("; not a candidate, its Gaussian residual fails the screen: {}", adequacy.ledger())
+                    }
+                    _ => String::new(),
+                };
                 format!(
-                    "{} loss={:.4e} d={:+.3e} ({ratio:.2} se; row se={:.3e}, fold se={:.3e})",
+                    "{} loss={:.4e} d={:+.3e} ({ratio:.2} se; row se={:.3e}, fold se={:.3e}{screen})",
                     score.arm.label(),
                     score.loss,
                     score.difference,
@@ -272,8 +318,8 @@ impl MovingLawCertificate {
             .join(" | ");
         format!(
             "cross-fitted excess anchoring loss over {} rows in {} folds: {arms}; lowest {}, \
-             chosen {} (the simplest arm within one paired se of the lowest, the larger of \
-             row- and fold-level), fitted {}",
+             chosen {} (the simplest admissible arm within one paired se of the lowest \
+             admissible, the larger of row- and fold-level), fitted {}",
             self.rows,
             self.folds,
             self.argmin.label(),
@@ -411,6 +457,8 @@ pub(crate) enum MovingLawError {
     OneFold { rows: usize },
     /// The fitted arm is not on the ladder.
     FittedArmOffLadder(MovingLawArm),
+    /// The fitted arm anchors on a Gaussian residual its adequacy screen rejects.
+    FittedArmInadmissible(MovingLawArm),
     /// A row's losses, or two of its anchors, carry another number of arms than
     /// the ladder (`row` is `None` inside one row's anchors).
     ArmCount { row: Option<usize>, expected: usize, found: usize },
@@ -450,6 +498,7 @@ impl MovingLawError {
             | Self::NonFiniteScore(_) => FailureCategory::Numerical,
             Self::LengthMismatch { .. }
             | Self::FittedArmOffLadder(_)
+            | Self::FittedArmInadmissible(_)
             | Self::ArmCount { .. }
             | Self::NoArmWithinStandardError(_)
             | Self::NoLocationScale(_)
@@ -481,6 +530,12 @@ impl std::fmt::Display for MovingLawError {
             Self::FittedArmOffLadder(arm) => write!(
                 f,
                 "moving-law certificate: the fitted {} arm is not on the ladder",
+                arm.label()
+            ),
+            Self::FittedArmInadmissible(arm) => write!(
+                f,
+                "moving-law certificate: the fitted {} arm anchors on a Gaussian residual its \
+                 adequacy screen rejects",
                 arm.label()
             ),
             Self::ArmCount { row: Some(row), expected, found } => write!(
@@ -675,6 +730,11 @@ struct FoldLaws {
 /// Fit-time only; the certificate is what persists.
 pub(crate) struct MovingLawCandidates {
     evidence: ConditionalLawEvidence,
+    /// The adequacy screen of the Gaussian arm's residual, the score as given.
+    gaussian_screen: LatentNormalAdequacy,
+    /// The adequacy screen of the location-scale Gaussian arm's residual `ζ`;
+    /// `None` without a calibration.
+    location_scale_screen: Option<LatentNormalAdequacy>,
     /// The full-data calibration; `Some` makes the fitted arm location-scale
     /// Gaussian on the `ζ` axis.
     calibration: Option<LatentZConditionalCalibration>,
@@ -751,6 +811,7 @@ impl MovingLawCandidates {
         conditioning: ArrayView2<'_, f64>,
         local_context: &estimated_latent_law::LocalLawContext<'_>,
         grid_size: usize,
+        policy: &LatentZPolicy,
         evidence: ConditionalLawEvidence,
         context: &str,
     ) -> Result<Self, MovingLawError> {
@@ -762,17 +823,25 @@ impl MovingLawCandidates {
             .as_ref()
             .map(|cal| (0..n).map(|row| location_at(cal, conditioning, row)).collect())
             .unwrap_or_default();
-        let residual = match &calibration {
+        let gaussian_screen =
+            latent_z_normal_adequacy(z, weights, policy).map_err(law("score adequacy screen"))?;
+        let (residual, location_scale_screen) = match &calibration {
             Some(cal) => {
-                let zeta = cal
-                    .apply(z.view(), conditioning)
+                let zeta = FittedLatentScoreMap::conditional_only(cal)
+                    .calibrate(z.view(), Some(conditioning))
                     .map_err(law("location-scale score"))?;
-                Some(
-                    build_global_empirical_latent_measure(&zeta, weights, grid_size)
-                        .map_err(law("location-scale residual law"))?,
+                (
+                    Some(
+                        build_global_empirical_latent_measure(&zeta, weights, grid_size)
+                            .map_err(law("location-scale residual law"))?,
+                    ),
+                    Some(
+                        latent_z_normal_adequacy(&zeta, weights, policy)
+                            .map_err(law("location-scale residual adequacy screen"))?,
+                    ),
                 )
             }
-            None => None,
+            None => (None, None),
         };
         let pooled = estimated_latent_law::build_empirical_law_on_own_axis(
             z.view(),
@@ -830,8 +899,8 @@ impl MovingLawCandidates {
                     for &row in rows {
                         fold_location[row] = location_at(&cal, conditioning, row);
                     }
-                    let zeta = cal
-                        .apply(z.view(), conditioning)
+                    let zeta = FittedLatentScoreMap::conditional_only(&cal)
+                        .calibrate(z.view(), Some(conditioning))
                         .map_err(|reason| refusal(held_out, arm, reason))?;
                     let (kind, _) =
                         build_global_empirical_latent_measure(&zeta, &fold_weights, grid_size)
@@ -868,6 +937,8 @@ impl MovingLawCandidates {
         }
         Ok(Self {
             evidence,
+            gaussian_screen,
+            location_scale_screen,
             calibration,
             location,
             fold_location,
@@ -901,13 +972,39 @@ impl MovingLawCandidates {
         }
     }
 
-    /// The arm the default fits first: the location-scale Gaussian law where a
-    /// conditional moment moves, the Gaussian law otherwise.
+    /// The adequacy screen of the Gaussian residual `arm` anchors on: the score for
+    /// the Gaussian arm, `ζ` for the location-scale Gaussian arm, `None` for an arm
+    /// on an estimated law.
+    pub(crate) fn screen_of(&self, arm: MovingLawArm) -> Option<LatentNormalAdequacy> {
+        match arm {
+            MovingLawArm::Gaussian => Some(self.gaussian_screen.clone()),
+            MovingLawArm::LocationScaleGaussian => self.location_scale_screen.clone(),
+            MovingLawArm::PooledEmpirical
+            | MovingLawArm::LocationScaleEmpirical
+            | MovingLawArm::Local => None,
+        }
+    }
+
+    /// The arm the default fits first: where a conditional moment moves, the
+    /// location-scale Gaussian law if its residual `ζ` passes the adequacy screen
+    /// and the location-scale law on `ζ`'s estimated law otherwise; where neither
+    /// moves, the Gaussian law if the score passes the screen and the pooled
+    /// estimated law otherwise. It is the simplest admissible arm of its structure,
+    /// so the certificate never has to re-solve off an arm the data reject.
     pub(crate) fn fitted_arm(&self) -> MovingLawArm {
-        if self.calibration.is_some() {
-            MovingLawArm::LocationScaleGaussian
+        let (gaussian, estimated) = if self.calibration.is_some() {
+            (MovingLawArm::LocationScaleGaussian, MovingLawArm::LocationScaleEmpirical)
         } else {
-            MovingLawArm::Gaussian
+            (MovingLawArm::Gaussian, MovingLawArm::PooledEmpirical)
+        };
+        if self
+            .screen_of(gaussian)
+            .as_ref()
+            .is_some_and(LatentNormalAdequacy::passes)
+        {
+            gaussian
+        } else {
+            estimated
         }
     }
 
@@ -984,8 +1081,11 @@ impl MovingLawCandidates {
         weights: &Array1<f64>,
         losses: &[Option<Vec<f64>>],
     ) -> Result<MovingLawCertificate, MovingLawError> {
+        let screens: Vec<Option<LatentNormalAdequacy>> =
+            self.arms().iter().map(|&arm| self.screen_of(arm)).collect();
         MovingLawCertificate::from_row_losses(
             self.arms(),
+            &screens,
             self.fitted_arm(),
             &self.folds,
             weights,
@@ -1174,12 +1274,109 @@ mod tests {
     ) -> MovingLawCertificate {
         MovingLawCertificate::from_row_losses(
             &LADDER,
+            &[const { None }; LADDER.len()],
             MovingLawArm::LocationScaleGaussian,
             &folds,
             &weights,
             &losses,
         )
         .expect("certificate")
+    }
+
+    /// The standard-normal adequacy screen of `n` draws: normal quantiles pass it,
+    /// and their squares (a chi-square with one degree of freedom, standardized)
+    /// fail it on every shape clause.
+    fn screen(gaussian: bool) -> LatentNormalAdequacy {
+        let n = 2000;
+        let quantile = |k: usize| {
+            crate::probability::standard_normal_quantile((k as f64 + 0.5) / n as f64)
+                .expect("a probability inside (0, 1)")
+        };
+        let z = Array1::from_iter((0..n).map(|k| {
+            let x = quantile(k);
+            if gaussian { x } else { (x * x - 1.0) / 2.0_f64.sqrt() }
+        }));
+        latent_z_normal_adequacy(&z, &Array1::ones(n), &LatentZPolicy::default())
+            .expect("the screen measures a finite sample")
+    }
+
+    /// gam#2926: an arm whose Gaussian residual the adequacy screen rejects is
+    /// scored and recorded but never chosen, and never the argmin. On the losses
+    /// where the rule takes the location-scale Gaussian arm (0.79 se behind the
+    /// local arm), a failing `ζ` screen makes it take the next admissible arm; the
+    /// Gaussian arm, rejected on the score, is passed over even at the lowest loss;
+    /// and a fit solved on a rejected arm is refused by name.
+    #[test]
+    fn the_rule_never_chooses_an_arm_whose_gaussian_residual_the_screen_rejects_2926() {
+        let (passing, failing) = (screen(true), screen(false));
+        assert!(passing.passes() && !failing.passes(), "{} | {}", passing.ledger(), failing.ledger());
+        let mixed = |row: usize| (row / 2) % MOVING_LAW_FOLDS;
+        let rule = |screens: [Option<LatentNormalAdequacy>; 4], means: [f64; 4], fitted| {
+            let (folds, weights, losses) = ladder(means, mixed);
+            MovingLawCertificate::from_row_losses(&LADDER, &screens, fitted, &folds, &weights, &losses)
+        };
+        let admitted = rule(
+            [Some(passing.clone()), Some(passing.clone()), None, None],
+            [0.5, 0.05, 0.02, 0.0],
+            MovingLawArm::LocationScaleEmpirical,
+        )
+        .expect("certificate");
+        assert_eq!(admitted.chosen, MovingLawArm::LocationScaleGaussian);
+
+        let rejected = rule(
+            [Some(passing.clone()), Some(failing.clone()), None, None],
+            [0.5, 0.05, 0.02, 0.0],
+            MovingLawArm::LocationScaleEmpirical,
+        )
+        .expect("certificate");
+        assert_eq!(rejected.chosen, MovingLawArm::LocationScaleEmpirical, "{}", rejected.summary());
+        assert!(!rejected.arms[1].admissible() && rejected.arms[1].adequacy.is_some());
+        assert_eq!(rejected.arms[1].difference, admitted.arms[1].difference);
+
+        let lowest_rejected = rule(
+            [Some(failing.clone()), Some(passing.clone()), None, None],
+            [-1.0, 0.05, 0.02, 0.0],
+            MovingLawArm::LocationScaleGaussian,
+        )
+        .expect("certificate");
+        assert_eq!(lowest_rejected.argmin, MovingLawArm::Local, "{}", lowest_rejected.summary());
+        assert_eq!(lowest_rejected.chosen, MovingLawArm::LocationScaleGaussian);
+
+        assert_eq!(
+            rule(
+                [Some(passing), Some(failing), None, None],
+                [0.5, 0.05, 0.02, 0.0],
+                MovingLawArm::LocationScaleGaussian,
+            ),
+            Err(MovingLawError::FittedArmInadmissible(MovingLawArm::LocationScaleGaussian))
+        );
+    }
+
+    /// An arm score saved before the screen was recorded loads with none, and reads
+    /// as admissible, the rule it was chosen by; a current one round-trips with its
+    /// screen.
+    #[test]
+    fn an_arm_score_saved_before_its_screen_loads_as_admissible_2926() {
+        let score = MovingLawArmScore {
+            arm: MovingLawArm::LocationScaleGaussian,
+            loss: 0.65,
+            difference: 4.7e-6,
+            row_se: 8.0e-6,
+            fold_se: 7.9e-6,
+            adequacy: Some(screen(false)),
+        };
+        let text = serde_json::to_string(&score).expect("serialize");
+        let reloaded: MovingLawArmScore = serde_json::from_str(&text).expect("round-trip");
+        assert_eq!(reloaded, score);
+        assert!(!reloaded.admissible());
+        let mut older: serde_json::Value = serde_json::to_value(&score).expect("serialize");
+        older
+            .as_object_mut()
+            .expect("a score is an object")
+            .remove("adequacy")
+            .expect("the screen is written");
+        let loaded: MovingLawArmScore = serde_json::from_value(older).expect("an older score");
+        assert!(loaded.adequacy.is_none() && loaded.admissible());
     }
 
     /// With fold means that carry no shared error the rule reads the row-level
@@ -1362,6 +1559,7 @@ mod tests {
                 feature_cols: vec![0],
             },
             DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
+            &LatentZPolicy::default(),
             evidence,
             "survival anchor-time pin",
         )
@@ -1379,8 +1577,10 @@ mod tests {
                         weights: vec![1.0],
                     };
                     let anchor = |law: &EmpiricalZGrid| {
-                        estimated_latent_law::closed_form_survival_anchor_log_probabilities(
-                            q, slope, law,
+                        estimated_latent_law::survival_anchor_log_probabilities(
+                            q * (1.0 + slope * slope).sqrt(),
+                            slope,
+                            law,
                         )
                         .expect("anchor log probabilities")
                     };

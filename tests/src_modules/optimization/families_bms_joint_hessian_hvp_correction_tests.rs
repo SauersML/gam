@@ -805,6 +805,7 @@ fn bernoulli_value_cell_moments_use_shared_lru() {
         jeffreys_armed: true,
         cell_moment_lru: Arc::new(exact_kernel::CellMomentLruCache::new(16 * 1024 * 1024)),
         cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
+        jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
         ..default_test_family()
     };
     let cell = exact_kernel::DenestedCubicCell {
@@ -1513,7 +1514,7 @@ fn auto_outer_subsample_two_phase_converges_to_full_data_optimum() {
     // (`AUTO_OUTER_MIN_K = 10_000`), so `auto_outer_score_subsample`
     // would actually return `Some(mask)` if invoked — i.e. the
     // Phase-1 branch reaches the mask-installing arm and the
-    // log::info! lines fire. Specs/derivative_blocks are empty so
+    // log::debug! lines fire. Specs/derivative_blocks are empty so
     // the function exits via the `total == 0` early return after the
     // guard runs; that lets us focus on counter semantics with no
     // FLEX-cache plumbing.
@@ -2421,6 +2422,7 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
     let marginal_cov: Array1<f64> = data.column(2).to_owned();
     let base_length_scale = 1.1_f64;
     let make_spec = |length_scale: f64| TermCollectionSpec {
+        level: Default::default(),
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![SmoothTermSpec {
@@ -2442,7 +2444,7 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -2641,6 +2643,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     // centers ⇒ fewer penalty components ⇒ less marginal/slope coupling.
     let base_length_scale = 1.1_f64;
     let make_spec = |length_scale: f64| TermCollectionSpec {
+        level: Default::default(),
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![SmoothTermSpec {
@@ -2660,7 +2663,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };

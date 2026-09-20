@@ -131,38 +131,55 @@ pub(crate) fn apply_linear_extension_from_first_derivative(
         crate::bail_dim_basis!("basis row count must match z length");
     }
 
-    let mut needs_ext = false;
-    for i in 0..z_raw.len() {
-        if z_raw[i] != z_clamped[i] {
-            needs_ext = true;
-            break;
-        }
-    }
-    if !needs_ext {
+    let Some((exterior, b_prime)) =
+        exterior_boundary_slopes(z_raw, z_clamped, knot_vector, degree)?
+    else {
         return Ok(());
+    };
+    if b_prime.ncols() != basisvalues.ncols() {
+        crate::bail_dim_basis!("basis derivative shape mismatch");
     }
 
+    for (slope_row, &i) in exterior.iter().enumerate() {
+        let dz = z_raw[i] - z_clamped[i];
+        for j in 0..basisvalues.ncols() {
+            basisvalues[[i, j]] += dz * b_prime[[slope_row, j]];
+        }
+    }
+    Ok(())
+}
+
+/// Returns the rows whose point was clamped, together with the first-derivative
+/// basis evaluated at those rows' clamped points (one derivative row per
+/// exterior row, in the same order), or `None` when every point is interior.
+///
+/// Each basis row depends on its own point only, so these rows equal the
+/// matching rows of a full-length derivative basis. Evaluating only the
+/// exterior rows keeps a design with a few out-of-range points from paying for
+/// a second complete basis evaluation.
+pub(crate) fn exterior_boundary_slopes(
+    z_raw: ArrayView1<f64>,
+    z_clamped: ArrayView1<f64>,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+) -> Result<Option<(Vec<usize>, Arc<Array2<f64>>)>, BasisError> {
+    let exterior: Vec<usize> = (0..z_raw.len())
+        .filter(|&i| z_raw[i] != z_clamped[i])
+        .collect();
+    if exterior.is_empty() {
+        return Ok(None);
+    }
+    let exterior_clamped: Array1<f64> = exterior.iter().map(|&i| z_clamped[i]).collect();
     let (b_prime_arc, _) = create_basis::<Dense>(
-        z_clamped,
+        exterior_clamped.view(),
         KnotSource::Provided(knot_vector),
         degree,
         BasisOptions::first_derivative(),
     )?;
-    let b_prime = b_prime_arc.as_ref();
-    if b_prime.nrows() != basisvalues.nrows() || b_prime.ncols() != basisvalues.ncols() {
+    if b_prime_arc.nrows() != exterior.len() {
         crate::bail_dim_basis!("basis derivative shape mismatch");
     }
-
-    for i in 0..z_raw.len() {
-        let dz = z_raw[i] - z_clamped[i];
-        if dz == 0.0 {
-            continue;
-        }
-        for j in 0..basisvalues.ncols() {
-            basisvalues[[i, j]] += dz * b_prime[[i, j]];
-        }
-    }
-    Ok(())
+    Ok(Some((exterior, b_prime_arc)))
 }
 
 /// Storage layout discriminant for [`BasisOutputFormat`] impls. Encoded as an
@@ -1032,104 +1049,6 @@ pub(crate) fn should_use_sparse_basis(num_basis_cols: usize, degree: usize, dim:
     let density = support_perrow / num_basis_cols as f64;
 
     density < 0.20 && num_basis_cols > 32
-}
-
-/// Creates the discrete coefficient-sequence operator `S = D' * D`, penalizing
-/// squared `order`-th differences of the supplied coordinates.
-///
-/// This is **not** a B-spline roughness functional: for a spline use
-/// [`bspline_derivative_penalty_matrix`], which assembles
-/// `S_ij = ∫ B_i^(order) B_j^(order)` from the actual knot vector. This
-/// discrete operator remains for models whose coordinates themselves form the
-/// object being differenced (including explicitly declared latent priors).
-///
-/// # Arguments
-/// * `num_coefficients`: Length of the coefficient sequence.
-/// * `order`: Order of the discrete difference.
-/// * `coefficient_abscissae`: Optional coordinate attached to each coefficient.
-///   `None` uses ordinary integer-grid differences; `Some` uses divided
-///   differences scaled by relative coordinate spans.
-///
-/// # Returns
-/// A square `Array2<f64>` of shape `[num_coefficients, num_coefficients]`.
-pub fn create_difference_penalty_matrix(
-    num_coefficients: usize,
-    order: usize,
-    coefficient_abscissae: Option<ArrayView1<f64>>,
-) -> Result<Array2<f64>, BasisError> {
-    if order == 0 || order >= num_coefficients {
-        return Err(BasisError::InvalidPenaltyOrder {
-            order,
-            num_basis: num_coefficients,
-        });
-    }
-
-    if let Some(g) = coefficient_abscissae
-        && g.len() != num_coefficients
-    {
-        crate::bail_dim_basis!(
-            "coefficient abscissae length {} does not match coefficient count {}",
-            g.len(),
-            num_coefficients
-        );
-    }
-
-    // Start with the identity matrix
-    let mut d = Array2::<f64>::eye(num_coefficients);
-
-    // Apply the differencing operation `order` times.
-    // Each `diff` reduces the number of rows by 1.
-    for o in 1..=order {
-        // Calculate the difference between adjacent rows: D^{(o)} = Delta * D^{(o-1)}
-        d = &d.slice(s![1.., ..]) - &d.slice(s![..-1, ..]);
-
-        // If using non-uniform coefficient coordinates, apply divided-difference scaling:
-        // D^{(o)}_i = D^{(o)}_i / (xi_{i+o} - xi_i)
-        //
-        // The raw divided-difference divisor `g[i+o] - g[i]` carries the units
-        // of the covariate, so a pure rescaling `g -> c*g` (a change of physical
-        // units for `x`) would multiply every divisor by `c` and hence scale
-        // `S = DᵀD` by `c^(-2*order)`. This discrete operator uses only relative
-        // coefficient spacing, so normalize each order's spans by their
-        // geometric mean. The divisor is then invariant to a global rescaling
-        // and identically one on a uniform coordinate grid.
-        if let Some(g) = coefficient_abscissae {
-            let nrows = d.nrows();
-            let mut log_span_sum = 0.0_f64;
-            for i in 0..nrows {
-                let span = g[i + o] - g[i];
-                if span == 0.0 {
-                    return Err(BasisError::InvalidKnotVector(format!(
-                        "singular divided-difference span at order {o}, row {i}: coefficient coordinates g[{}]={:.6e} and g[{i}]={:.6e} coincide",
-                        i + o,
-                        g[i + o],
-                        g[i]
-                    )));
-                }
-                if !span.is_finite() || span < 0.0 {
-                    return Err(BasisError::InvalidKnotVector(format!(
-                        "divided-difference coordinates must be finite and strictly increasing at order {o}, row {i}: g[{}]={:.6e}, g[{i}]={:.6e}",
-                        i + o,
-                        g[i + o],
-                        g[i]
-                    )));
-                }
-                log_span_sum += span.abs().ln();
-            }
-            // Geometric mean of the spans at this order; scales as `c` under
-            // `g -> c*g`, so dividing each span by it cancels the units exactly.
-            let ref_span = (log_span_sum / nrows as f64).exp();
-            for i in 0..nrows {
-                let span = (g[i + o] - g[i]) / ref_span;
-                let mut row = d.row_mut(i);
-                row /= span;
-            }
-        }
-    }
-
-    // The penalty matrix S = D' * D
-    let s = fast_ata(&d);
-    Ok(s)
 }
 
 pub(crate) fn bspline_raw_column_count(

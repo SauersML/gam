@@ -48,7 +48,7 @@ def _scalar(out: dict[str, Any], key: str) -> float:
 
 def _base_problem(n: int = 120, knots: int = 8, seed: int = 0):
     x = np.linspace(0.0, 1.0, n)
-    design = np.asarray(gamfit.bspline_basis(x, knots=knots))
+    design = np.asarray(gamfit.basis.bspline_basis(x, knots=knots))
     penalty = _pspline_penalty(design.shape[1])
     y = (
         np.sin(2 * np.pi * x)
@@ -62,14 +62,14 @@ def test_zero_by_padding_matches_baseline() -> None:
     design, penalty, y = _base_problem()
     n = design.shape[0]
 
-    base = gamfit.gaussian_reml_fit(design, y, penalty, by=np.ones(n))
+    base = gamfit.reml.gaussian_reml_fit(design, y, penalty, by=np.ones(n))
 
     g = 30
     rng = np.random.default_rng(1)
     design_aug = np.vstack([design, rng.normal(0.0, 5.0, (g, design.shape[1]))])
     y_aug = np.vstack([y, rng.normal(0.0, 1e3, (g, 1))])
     by_aug = np.concatenate([np.ones(n), np.zeros(g)])
-    aug = gamfit.gaussian_reml_fit(design_aug, y_aug, penalty, by=by_aug)
+    aug = gamfit.reml.gaussian_reml_fit(design_aug, y_aug, penalty, by=by_aug)
 
     np.testing.assert_allclose(
         np.asarray(aug["coefficients"]).ravel(),
@@ -102,8 +102,8 @@ def test_zero_by_rows_response_is_irrelevant() -> None:
     y_a = np.vstack([y, rng.normal(0.0, 1.0, (g, 1))])
     y_b = np.vstack([y, rng.normal(0.0, 1e5, (g, 1))])
 
-    fit_a = gamfit.gaussian_reml_fit(design_aug, y_a, penalty, by=by_aug)
-    fit_b = gamfit.gaussian_reml_fit(design_aug, y_b, penalty, by=by_aug)
+    fit_a = gamfit.reml.gaussian_reml_fit(design_aug, y_a, penalty, by=by_aug)
+    fit_b = gamfit.reml.gaussian_reml_fit(design_aug, y_b, penalty, by=by_aug)
 
     np.testing.assert_allclose(
         np.asarray(fit_a["coefficients"]).ravel(),
@@ -129,8 +129,8 @@ def test_nonzero_by_matches_manual_design_gate() -> None:
 
     manual = design.copy()
     manual *= by[:, None]  # by_start_col=0: gate all columns
-    reference = gamfit.gaussian_reml_fit(manual, y, penalty)
-    gated = gamfit.gaussian_reml_fit(design, y, penalty, by=by)
+    reference = gamfit.reml.gaussian_reml_fit(manual, y, penalty)
+    gated = gamfit.reml.gaussian_reml_fit(design, y, penalty, by=by)
 
     np.testing.assert_allclose(
         np.asarray(gated["coefficients"]),
@@ -153,7 +153,7 @@ def test_by_mask_composes_with_prior_weights() -> None:
     rng = np.random.default_rng(31)
     weights = rng.uniform(0.5, 2.0, n)
 
-    base = gamfit.gaussian_reml_fit(
+    base = gamfit.reml.gaussian_reml_fit(
         design, y, penalty, weights=weights, by=np.ones(n)
     )
 
@@ -164,7 +164,7 @@ def test_by_mask_composes_with_prior_weights() -> None:
     # The gated-off rows carry large *positive* prior weights: they must still
     # be dropped, because a zero-`by` row is inert regardless of prior weight.
     weights_aug = np.concatenate([weights, rng.uniform(5.0, 20.0, g)])
-    aug = gamfit.gaussian_reml_fit(
+    aug = gamfit.reml.gaussian_reml_fit(
         design_aug, y_aug, penalty, weights=weights_aug, by=by_aug
     )
 
@@ -195,7 +195,7 @@ def test_zero_by_rows_inert_under_partial_column_gate() -> None:
     n, n_cols = design.shape
     by_start_col = max(1, n_cols // 2)  # leave a nonempty ungated leading block
 
-    base = gamfit.gaussian_reml_fit(
+    base = gamfit.reml.gaussian_reml_fit(
         design, y, penalty, by=np.ones(n), by_start_col=by_start_col
     )
 
@@ -206,7 +206,7 @@ def test_zero_by_rows_inert_under_partial_column_gate() -> None:
     design_aug = np.vstack([design, rng.normal(0.0, 6.0, (g, n_cols))])
     y_aug = np.vstack([y, rng.normal(0.0, 1e3, (g, 1))])
     by_aug = np.concatenate([np.ones(n), np.zeros(g)])
-    aug = gamfit.gaussian_reml_fit(
+    aug = gamfit.reml.gaussian_reml_fit(
         design_aug, y_aug, penalty, by=by_aug, by_start_col=by_start_col
     )
 

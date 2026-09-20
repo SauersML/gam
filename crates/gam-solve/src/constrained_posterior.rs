@@ -127,12 +127,12 @@
 //! that carries the answer back out of those coordinates cannot be formed at
 //! all when `W` is numerically singular. The alternatives are therefore a
 //! subset-truncated posterior or none, not a subset-truncated posterior or an
-//! exact one. Which rows survived is reported (`log::info!`) whenever the
+//! exact one. Which rows survived is reported (`log::debug!`) whenever the
 //! whole-face check dropped anything, so the choice is visible on the fit that
 //! made it rather than inferable from this file.
 
 use gam_math::probability::{
-    normal_cdf, normal_logsf, signed_probit_logcdf_and_mills_ratio, standard_normal_quantile,
+    normal_cdf_and_pdf, normal_logsf, signed_probit_logcdf_and_mills_ratio, standard_normal_quantile,
     standard_normal_quantile_from_log_cdf,
 };
 use gam_problem::LinearInequalityConstraints;
@@ -149,7 +149,8 @@ fn log1mexp_of_log_removed_mass(d: f64) -> f64 {
     }
     gam_math::probability::log1mexp_positive(-d)
 }
-use ndarray::{Array1, Array2, ArrayView2, Zip};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Zip};
+use std::sync::OnceLock;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -159,6 +160,11 @@ mod cone_normalizer;
 pub use cone_normalizer::{
     ConeCoordinateMotion, ConeFirstOrder, ConeNormalizer, ConeNormalizerRefusal, ConePairMotion,
     OrthantLogMass,
+};
+mod cone_laplace;
+pub use cone_laplace::{
+    ConeLaplace, ConeLaplaceFirstOrder, ConeLaplaceMotion, ConeLaplacePairMotion, ConeLaplaceRefusal,
+    ConeRowMotion,
 };
 
 /// Relative accuracy demanded of the orthant-moment cubature, measured against
@@ -1006,44 +1012,48 @@ impl ConstrainedPosteriorGeometry {
     }
 }
 
-/// Equal-tailed interval for one linear projection of an inequality-truncated
-/// Gaussian posterior.
+/// Every scalar projection `cᵀβ` of one inequality-truncated Gaussian posterior,
+/// prepared once and read for many contrasts.
 ///
 /// `ambient_covariance` is the pre-truncation covariance `Σ` in the active
-/// coefficient frame and `contrast` defines the scalar `cᵀβ`.  The affine
-/// shift of a saved coefficient gauge is deliberately not accepted here:
-/// callers add that deterministic shift to both returned endpoints.
-///
-/// The decomposition in this module makes the projection
+/// coefficient frame and a contrast `c` defines the scalar `cᵀβ`. The
+/// decomposition in this module makes the projection
 ///
 /// ```text
 /// cᵀβ = cᵀβ_unc + cᵀt + (Gᵀc)ᵀ(u - E_untrunc[u]),
 /// ```
 ///
 /// where `cᵀt` is an independent scalar Gaussian and `u` is the retained
-/// orthant-truncated Gaussian.  The interval therefore comes from the quantiles
+/// orthant-truncated Gaussian. An interval therefore comes from the quantiles
 /// of that convolution, not from `posterior_mean ± z·posterior_sd`.
-/// The decomposition every scalar-projection consumer in this module needs, in
-/// one place.
 ///
-/// The equal-tailed interval reads it, and it is exactly the kind of derivation
-/// that is individually reasonable and quietly different when written twice.
-/// That is the failure genus this sweep is about (#2385), so it is written once.
-struct TruncatedProjection {
-    /// `E_π[cᵀβ]`.
-    posterior_mean: f64,
-    /// Retained constraint-normal coordinates `u`: centre, covariance, walls.
+/// Only `c` varies between the rows of a prediction. The centre, the retained
+/// normals' centre, covariance and walls, and the certified cubature over `u`
+/// are properties of the fit — and the cubature's certificate is decided on
+/// the replicates' spread in the moments of `u`, not on any contrast, so the
+/// node set that certifies one row is the node set every row reads. It is built
+/// once, on the first contrast that needs it; a law that rebuilt it per row paid
+/// a million-node cubature for every prediction row.
+pub struct ConstrainedProjectionLaw<'a> {
+    ambient_covariance: &'a Array2<f64>,
+    unconstrained_center: &'a Array1<f64>,
+    /// `max_i |Σ_ii|`, the scale the ambient-variance floor is stated in.
+    covariance_scale: f64,
+    truncation: Option<ProjectionTruncation<'a>>,
+}
+
+/// The retained constraint-normal coordinates `u` of a truncated law.
+struct ProjectionTruncation<'a> {
+    correction: &'a ConstrainedPosteriorCorrection,
     normal_center: Array1<f64>,
     normal_covariance: Array2<f64>,
     upper_limits: Vec<f64>,
-    /// `Gᵀc`: how a displacement of `u` moves the projection.
-    projection_lift: Array1<f64>,
-    /// `Var(cᵀt)`, the tangent component that stays Gaussian and independent of
-    /// `u`. Exactly zero when `c` is carried entirely by the retained
-    /// constraint normals, which is the case a product cone on one block gives.
-    residual_variance: f64,
+    nodes: OnceLock<Result<NormalNodes, String>>,
 }
 
+/// The decomposition of one projection, in one place: the equal-tailed interval
+/// reads it, and it is exactly the kind of derivation that is individually
+/// reasonable and quietly different when written twice (#2385).
 struct ProjectionDecomposition {
     ambient_mean: f64,
     ambient_variance: f64,
@@ -1052,105 +1062,148 @@ struct ProjectionDecomposition {
     truncated: Option<TruncatedProjection>,
 }
 
-fn decompose_projection(
-    ambient_covariance: &Array2<f64>,
-    geometry: &ConstrainedPosteriorGeometry,
-    contrast: &Array1<f64>,
-) -> Result<ProjectionDecomposition, String> {
-    let p = contrast.len();
-    geometry.validate_for_dimension(p)?;
-    if ambient_covariance.dim() != (p, p) {
-        return Err(format!(
-            "constrained projection needs a {p}x{p} ambient covariance, got {:?}",
-            ambient_covariance.dim()
-        ));
-    }
-    if ambient_covariance.iter().any(|value| !value.is_finite())
-        || contrast.iter().any(|value| !value.is_finite())
-    {
-        return Err(
-            "constrained projection received a non-finite covariance or contrast".to_string(),
-        );
+struct TruncatedProjection {
+    /// `E_π[cᵀβ]`.
+    posterior_mean: f64,
+    /// `Gᵀc`: how a displacement of `u` moves the projection.
+    projection_lift: Array1<f64>,
+    /// `Var(cᵀt)`, the tangent component that stays Gaussian and independent of
+    /// `u`. Exactly zero when `c` is carried entirely by the retained
+    /// constraint normals, which is the case a product cone on one block gives.
+    residual_variance: f64,
+}
+
+impl<'a> ConstrainedProjectionLaw<'a> {
+    pub fn new(
+        ambient_covariance: &'a Array2<f64>,
+        geometry: &'a ConstrainedPosteriorGeometry,
+    ) -> Result<Self, String> {
+        let p = ambient_covariance.nrows();
+        if ambient_covariance.ncols() != p {
+            return Err(format!(
+                "constrained projection needs a square ambient covariance, got {:?}",
+                ambient_covariance.dim()
+            ));
+        }
+        geometry.validate_for_dimension(p)?;
+        if ambient_covariance.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "constrained projection received a non-finite covariance or contrast".to_string(),
+            );
+        }
+        let unconstrained_center = geometry.unconstrained_center()?;
+        let covariance_scale = ambient_covariance
+            .diag()
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0, f64::max);
+        let truncation = match geometry.correction()? {
+            None => None,
+            Some(correction) => {
+                let q = correction.rows.len();
+                let mut normal_center = Array1::<f64>::zeros(q);
+                let mut normal_covariance = Array2::<f64>::zeros((q, q));
+                let mut sigma_a = Array2::<f64>::zeros((p, q));
+                for (position, &row) in correction.rows.iter().enumerate() {
+                    let a = geometry.constraints.a.row(row);
+                    normal_center[position] =
+                        a.dot(unconstrained_center) - geometry.constraints.b[row];
+                    sigma_a
+                        .column_mut(position)
+                        .assign(&ambient_covariance.dot(&a));
+                }
+                for i in 0..q {
+                    let ai = geometry.constraints.a.row(correction.rows[i]);
+                    for j in 0..=i {
+                        let value = ai.dot(&sigma_a.column(j));
+                        normal_covariance[[i, j]] = value;
+                        normal_covariance[[j, i]] = value;
+                    }
+                }
+                let upper_limits = correction.upper_limits();
+                if upper_limits.len() != q {
+                    return Err(format!(
+                        "constrained projection: {q} retained rows carry {} upper limits",
+                        upper_limits.len()
+                    ));
+                }
+                Some(ProjectionTruncation {
+                    correction,
+                    normal_center,
+                    normal_covariance,
+                    upper_limits,
+                    nodes: OnceLock::new(),
+                })
+            }
+        };
+        Ok(Self {
+            ambient_covariance,
+            unconstrained_center,
+            covariance_scale,
+            truncation,
+        })
     }
 
-    let ambient_mean = contrast.dot(geometry.unconstrained_center()?);
-    let sigma_c = ambient_covariance.dot(contrast);
-    let ambient_variance = contrast.dot(&sigma_c);
-    let covariance_scale = ambient_covariance
-        .diag()
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0, f64::max);
-    let contrast_scale = contrast.dot(contrast);
-    let variance_floor = (p.max(1) as f64) * f64::EPSILON * covariance_scale * contrast_scale;
-    if ambient_variance < -variance_floor || !ambient_variance.is_finite() {
-        return Err(format!(
-            "constrained projection has invalid ambient variance {ambient_variance:.6e}"
-        ));
-    }
-    let ambient_variance = ambient_variance.max(0.0);
+    fn decompose(&self, contrast: ArrayView1<'_, f64>) -> Result<ProjectionDecomposition, String> {
+        let p = self.ambient_covariance.nrows();
+        if contrast.len() != p {
+            return Err(format!(
+                "constrained projection needs a {p}x{p} ambient covariance, got {:?}",
+                self.ambient_covariance.dim()
+            ));
+        }
+        if contrast.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "constrained projection received a non-finite covariance or contrast".to_string(),
+            );
+        }
 
-    let Some(correction) = geometry.correction()? else {
-        return Ok(ProjectionDecomposition {
+        let ambient_mean = contrast.dot(self.unconstrained_center);
+        let sigma_c = self.ambient_covariance.dot(&contrast);
+        let ambient_variance = contrast.dot(&sigma_c);
+        let contrast_scale = contrast.dot(&contrast);
+        let variance_floor =
+            (p.max(1) as f64) * f64::EPSILON * self.covariance_scale * contrast_scale;
+        if ambient_variance < -variance_floor || !ambient_variance.is_finite() {
+            return Err(format!(
+                "constrained projection has invalid ambient variance {ambient_variance:.6e}"
+            ));
+        }
+        let ambient_variance = ambient_variance.max(0.0);
+
+        let Some(truncation) = &self.truncation else {
+            return Ok(ProjectionDecomposition {
+                ambient_mean,
+                ambient_variance,
+                truncated: None,
+            });
+        };
+        let q = truncation.normal_center.len();
+        let correction = truncation.correction;
+        let projection_lift = correction.lift.t().dot(&contrast);
+        let normal_component_variance =
+            projection_lift.dot(&truncation.normal_covariance.dot(&projection_lift));
+        let residual_variance = ambient_variance - normal_component_variance;
+        let residual_floor =
+            (p.max(q).max(1) as f64) * f64::EPSILON * ambient_variance.max(normal_component_variance);
+        if residual_variance < -residual_floor || !residual_variance.is_finite() {
+            return Err(format!(
+                "constrained projection decomposition produced residual variance \
+                 {residual_variance:.6e} from ambient {ambient_variance:.6e}"
+            ));
+        }
+        let residual_variance = residual_variance.max(0.0);
+        let posterior_mean = ambient_mean + projection_lift.dot(&correction.normal_mean_shift);
+        Ok(ProjectionDecomposition {
             ambient_mean,
             ambient_variance,
-            truncated: None,
-        });
-    };
-
-    let q = correction.rows.len();
-    let mut normal_center = Array1::<f64>::zeros(q);
-    let mut normal_covariance = Array2::<f64>::zeros((q, q));
-    let mut sigma_a = Array2::<f64>::zeros((p, q));
-    for (position, &row) in correction.rows.iter().enumerate() {
-        let a = geometry.constraints.a.row(row);
-        normal_center[position] =
-            a.dot(geometry.unconstrained_center()?) - geometry.constraints.b[row];
-        sigma_a
-            .column_mut(position)
-            .assign(&ambient_covariance.dot(&a));
+            truncated: Some(TruncatedProjection {
+                posterior_mean,
+                projection_lift,
+                residual_variance,
+            }),
+        })
     }
-    for i in 0..q {
-        let ai = geometry.constraints.a.row(correction.rows[i]);
-        for j in 0..=i {
-            let value = ai.dot(&sigma_a.column(j));
-            normal_covariance[[i, j]] = value;
-            normal_covariance[[j, i]] = value;
-        }
-    }
-
-    let projection_lift = correction.lift.t().dot(contrast);
-    let normal_component_variance = projection_lift.dot(&normal_covariance.dot(&projection_lift));
-    let residual_variance = ambient_variance - normal_component_variance;
-    let residual_floor =
-        (p.max(q).max(1) as f64) * f64::EPSILON * ambient_variance.max(normal_component_variance);
-    if residual_variance < -residual_floor || !residual_variance.is_finite() {
-        return Err(format!(
-            "constrained projection decomposition produced residual variance \
-             {residual_variance:.6e} from ambient {ambient_variance:.6e}"
-        ));
-    }
-    let residual_variance = residual_variance.max(0.0);
-    let posterior_mean = ambient_mean + projection_lift.dot(&correction.normal_mean_shift);
-    let upper_limits = correction.upper_limits();
-    if upper_limits.len() != q {
-        return Err(format!(
-            "constrained projection: {q} retained rows carry {} upper limits",
-            upper_limits.len()
-        ));
-    }
-    Ok(ProjectionDecomposition {
-        ambient_mean,
-        ambient_variance,
-        truncated: Some(TruncatedProjection {
-            posterior_mean,
-            normal_center,
-            normal_covariance,
-            upper_limits,
-            projection_lift,
-            residual_variance,
-        }),
-    })
 }
 
 /// A single low-discrepancy rule over the constraint-normal AND tangent
@@ -1298,84 +1351,134 @@ impl<F: FnMut(f64, &Array1<f64>, &[f64]) -> Result<(), String>> OrthantNodeSink
 /// `ambient_covariance` is the pre-truncation covariance `Σ` in the active
 /// coefficient frame and `contrast` defines the scalar `cᵀβ`.  The affine
 /// shift of a saved coefficient gauge is deliberately not accepted here:
-/// callers add that deterministic shift to both returned endpoints.
-///
-/// The interval comes from the quantiles of the convolution
-/// `decompose_projection` produces, not from `posterior_mean ± z·posterior_sd`.
+/// callers add that deterministic shift to both returned endpoints. A caller
+/// with many contrasts of one law prepares a [`ConstrainedProjectionLaw`] once
+/// and reads [`ConstrainedProjectionLaw::equal_tailed_intervals`].
 pub fn constrained_projection_equal_tailed_interval(
     ambient_covariance: &Array2<f64>,
     geometry: &ConstrainedPosteriorGeometry,
     contrast: &Array1<f64>,
     level: f64,
 ) -> Result<(f64, f64), String> {
-    if !(level.is_finite() && level > 0.0 && level < 1.0) {
-        return Err(format!(
-            "constrained projection interval level must lie in (0, 1), got {level}"
-        ));
-    }
-    let decomposition = decompose_projection(ambient_covariance, geometry, contrast)?;
-    let ambient_mean = decomposition.ambient_mean;
-    let ambient_variance = decomposition.ambient_variance;
-    let alpha = 0.5 * (1.0 - level);
+    let intervals = ConstrainedProjectionLaw::new(ambient_covariance, geometry)?
+        .equal_tailed_intervals(contrast.view().insert_axis(ndarray::Axis(0)), level)?;
+    Ok(intervals[0])
+}
 
-    let Some(truncated) = decomposition.truncated else {
-        let sd = ambient_variance.sqrt();
-        if sd == 0.0 {
-            return Ok((ambient_mean, ambient_mean));
+impl ProjectionTruncation<'_> {
+    /// The certified node set over `u`, built on first use and shared by every
+    /// contrast after it.
+    fn certified_nodes(&self) -> Result<&NormalNodes, String> {
+        self.nodes
+            .get_or_init(|| {
+                NormalNodes::certified(&self.normal_center, &self.normal_covariance, &self.upper_limits)
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+}
+
+impl ConstrainedProjectionLaw<'_> {
+
+    /// Equal-tailed intervals for the projections `contrasts.row(r)ᵀβ`, one per
+    /// row, at `level`.
+    ///
+    /// The quantiles of every row whose projection keeps a tangent residual are
+    /// settled together against the one cached node set
+    /// ([`settle_mixture_quantiles`]).
+    pub fn equal_tailed_intervals(
+        &self,
+        contrasts: ArrayView2<'_, f64>,
+        level: f64,
+    ) -> Result<Vec<(f64, f64)>, String> {
+        if !(level.is_finite() && level > 0.0 && level < 1.0) {
+            return Err(format!(
+                "constrained projection interval level must lie in (0, 1), got {level}"
+            ));
         }
+        let alpha = 0.5 * (1.0 - level);
         let z = standard_normal_quantile(1.0 - alpha)
             .map_err(|error| format!("constrained projection normal quantile: {error}"))?;
-        return Ok((ambient_mean - z * sd, ambient_mean + z * sd));
-    };
-
-    let TruncatedProjection {
-        posterior_mean,
-        normal_center,
-        normal_covariance,
-        upper_limits,
-        projection_lift,
-        residual_variance,
-    } = truncated;
-    let q = normal_center.len();
-    if q == 1 && residual_variance == 0.0 && projection_lift[0] != 0.0 {
-        let scalar_quantile = |probability: f64| -> Result<f64, String> {
-            let normal_probability = if projection_lift[0] > 0.0 {
-                probability
-            } else {
-                1.0 - probability
+        let mut intervals = vec![(f64::NAN, f64::NAN); contrasts.nrows()];
+        let mut mixtures = Vec::new();
+        for (row, contrast) in contrasts.outer_iter().enumerate() {
+            let decomposition = self.decompose(contrast)?;
+            let ambient_mean = decomposition.ambient_mean;
+            let ambient_variance = decomposition.ambient_variance;
+            let Some(truncated) = decomposition.truncated else {
+                let sd = ambient_variance.sqrt();
+                intervals[row] = (ambient_mean - z * sd, ambient_mean + z * sd);
+                continue;
             };
-            let value = scalar_truncated_quantile(
-                normal_center[0],
-                normal_covariance[[0, 0]],
-                upper_limits[0],
-                normal_probability,
-            )?;
-            Ok(ambient_mean + projection_lift[0] * (value - normal_center[0]))
-        };
-        return Ok((scalar_quantile(alpha)?, scalar_quantile(1.0 - alpha)?));
+            let truncation = self
+                .truncation
+                .as_ref()
+                .expect("a truncated decomposition comes from a truncated law");
+            let TruncatedProjection {
+                posterior_mean,
+                projection_lift,
+                residual_variance,
+            } = truncated;
+            if truncation.normal_center.len() == 1
+                && residual_variance == 0.0
+                && projection_lift[0] != 0.0
+            {
+                let scalar_quantile = |probability: f64| -> Result<f64, String> {
+                    let normal_probability = if projection_lift[0] > 0.0 {
+                        probability
+                    } else {
+                        1.0 - probability
+                    };
+                    let value = scalar_truncated_quantile(
+                        truncation.normal_center[0],
+                        truncation.normal_covariance[[0, 0]],
+                        truncation.upper_limits[0],
+                        normal_probability,
+                    )?;
+                    Ok(ambient_mean + projection_lift[0] * (value - truncation.normal_center[0]))
+                };
+                intervals[row] = (scalar_quantile(alpha)?, scalar_quantile(1.0 - alpha)?);
+                continue;
+            }
+            let nodes = truncation.certified_nodes()?;
+            if residual_variance == 0.0 {
+                intervals[row] = nodes.step_quantiles(&projection_lift, ambient_mean, alpha);
+                continue;
+            }
+            // Start each quantile at the moment-matched normal's, the point the
+            // Newton iteration then corrects.
+            let residual_sd = residual_variance.sqrt();
+            let scale = ambient_variance.sqrt().max(residual_sd);
+            let spread = (projection_lift.dot(&nodes.covariance.dot(&projection_lift))
+                + residual_variance)
+                .sqrt();
+            mixtures.push(MixtureProjection {
+                row,
+                ambient_mean,
+                projection_lift,
+                residual_sd,
+                quantiles: [
+                    MixtureQuantile::new(alpha, posterior_mean - z * spread, scale),
+                    MixtureQuantile::new(1.0 - alpha, posterior_mean + z * spread, scale),
+                ],
+            });
+        }
+        if !mixtures.is_empty() {
+            let truncation = self
+                .truncation
+                .as_ref()
+                .expect("a mixture projection comes from a truncated law");
+            settle_mixture_quantiles(truncation.certified_nodes()?, &mut mixtures)?;
+            for mixture in &mixtures {
+                let [lower, upper] = &mixture.quantiles;
+                intervals[mixture.row] = (
+                    lower.value.expect("settled quantile"),
+                    upper.value.expect("settled quantile"),
+                );
+            }
+        }
+        Ok(intervals)
     }
-    let nodes = converged_projection_nodes(
-        &normal_center,
-        &normal_covariance,
-        &upper_limits,
-        &projection_lift,
-        ambient_mean,
-    )?;
-    let lower = projection_quantile(
-        &nodes,
-        residual_variance,
-        alpha,
-        posterior_mean,
-        ambient_variance.sqrt(),
-    )?;
-    let upper = projection_quantile(
-        &nodes,
-        residual_variance,
-        1.0 - alpha,
-        posterior_mean,
-        ambient_variance.sqrt(),
-    )?;
-    Ok((lower, upper))
 }
 
 /// Quantile of `N(mean, variance)` restricted to `[0, upper]`.
@@ -1479,7 +1582,7 @@ pub fn constrained_posterior_correction_from_covariance(
 /// `Σ Aᵀ` — column `j` is `Σ a_j`, `W_ij = a_iᵀ(Σ a_j)`, and the lift is
 /// `(Σ Aᵀ)W⁻¹` — so a factorized inference path supplies `m` solves instead of
 /// a `p × p` inverse.
-pub(crate) fn constrained_posterior_correction(
+pub fn constrained_posterior_correction(
     sigma_times_constraint_transpose: ArrayView2<'_, f64>,
     unconstrained_center: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
@@ -1666,7 +1769,7 @@ pub(crate) fn constrained_posterior_correction(
             // not about the solve — the dropped rows are within `O(θ)` of the
             // span of the retained ones, but "within `O(θ)`" is a claim the
             // reader is entitled to see stated on their own fit.
-            log::info!(
+            log::debug!(
                 "[CONSTRAINED-FACE] {} of {} candidate constraint row(s) retained after \
                  dropping {} nearly dependent direction(s) over {faces_tried} face(s); the \
                  retained lift satisfies its identity to {departure:.3e}",
@@ -1773,7 +1876,7 @@ fn render_ladder(ladder: &[LadderRung], candidates: usize) -> String {
 /// produced `W` costs three quarters of an hour to reach this line on the
 /// #2714 witness. Printing it there turns that refusal into a unit fixture.
 fn log_refused_face(face: &RefusedFace, departure: f64, excluded: usize) {
-    if !log::log_enabled!(log::Level::Warn) {
+    if !log::log_enabled!(log::Level::Debug) {
         return;
     }
     let q = face.rows.len();
@@ -1783,7 +1886,7 @@ fn log_refused_face(face: &RefusedFace, departure: f64, excluded: usize) {
             rendered.push_str(&format!("{:.17e},", face.w[[i, j]]));
         }
     }
-    log::warn!(
+    log::debug!(
         "[CONSTRAINED-FACE] refused excluded={excluded} departure={departure:.6e} \
          q={q} rows={:?} w=[{rendered}]",
         face.rows
@@ -2335,7 +2438,7 @@ fn box_truncated_moments(
         .map(|_| OrthantAccumulator::new(q))
         .collect();
     let certified = certified_orthant_moments(&rule, covariance, &mut sinks)?;
-    log::debug!(
+    log::trace!(
         "[orthant-cubature] q={q} certified at {} nodes over {ORTHANT_MOMENT_REPLICATES} \
          replicate lattices: replicate standard error {:.3e} (target \
          {ORTHANT_MOMENT_RELATIVE_TOLERANCE:.1e}), proposal efficiency {:.3}%, tilt {}",
@@ -3327,7 +3430,7 @@ impl OrthantRule {
         let face = ordered_face(mean, upper, covariance)?;
         let (tilt, tilt_status) = saddle_point_tilt(&face.mean, &face.upper, &face.factor);
         if let TiltStatus::Untilted { reason } = &tilt_status {
-            log::debug!("[orthant-cubature] q={q} runs untilted: {reason}");
+            log::trace!("[orthant-cubature] q={q} runs untilted: {reason}");
         }
         Ok(Self::from_face(face, tilt, tilt_status, tangent_dimension))
     }
@@ -3596,7 +3699,7 @@ impl OrthantRule {
         for (position, &original) in self.face.order.iter().enumerate() {
             original_mean[original] = self.face.mean[position];
         }
-        log::debug!(
+        log::trace!(
             "[orthant-face] q={q} mean={:?} covariance={:?}",
             original_mean.as_slice().map(<[f64]>::to_vec),
             covariance.as_slice().map(<[f64]>::to_vec),
@@ -3627,42 +3730,81 @@ fn folded_lattice_coordinate(offset: f64, generator: f64, shift: f64) -> (f64, f
     (1.0 - upper_side, upper_side)
 }
 
-#[derive(Clone, Copy)]
-struct WeightedProjectionNode {
-    conditional_mean: f64,
-    weight: f64,
+/// The certified orthant cubature over the retained constraint normals `u`, kept
+/// node by node so every scalar projection of the law reads the same nodes.
+struct NormalNodes {
+    /// `u − E_untrunc[u]` at each node, one row per node, replicate lattices in
+    /// order.
+    displacement: Array2<f64>,
+    /// Node weights normalized on one common scale over the pooled replicates:
+    /// the pooled law is the union of the replicate lattices' nodes, exactly as
+    /// the pooled moments are the union's moments.
+    weight: Array1<f64>,
+    /// Certified covariance of `u`, from the same run.
+    covariance: Array2<f64>,
 }
 
-struct ProjectionNodeAccumulator<'a> {
+struct NormalNodeAccumulator<'a> {
     moments: OrthantAccumulator,
     normal_center: &'a Array1<f64>,
-    projection_lift: &'a Array1<f64>,
-    ambient_mean: f64,
-    nodes: Vec<(f64, f64)>,
+    displacement: Vec<f64>,
+    log_weight: Vec<f64>,
 }
 
-impl<'a> ProjectionNodeAccumulator<'a> {
-    fn new(
-        normal_center: &'a Array1<f64>,
-        projection_lift: &'a Array1<f64>,
-        ambient_mean: f64,
-    ) -> Self {
-        Self {
-            moments: OrthantAccumulator::new(normal_center.len()),
-            normal_center,
-            projection_lift,
-            ambient_mean,
-            nodes: Vec::new(),
-        }
+impl ReplicateSink for NormalNodeAccumulator<'_> {
+    fn accumulator(&self) -> &OrthantAccumulator {
+        &self.moments
     }
+}
 
-    /// The nodes of every replicate, normalized on one common scale: the
-    /// pooled law is the union of the replicate lattices' nodes, exactly as the
-    /// pooled moments are the union's moments.
-    fn normalized_nodes(sinks: Vec<Self>) -> Result<Vec<WeightedProjectionNode>, String> {
+impl OrthantNodeSink for NormalNodeAccumulator<'_> {
+    fn push(&mut self, log_weight: f64, point: &Array1<f64>) {
+        self.moments.push(log_weight, point);
+        self.displacement.extend(
+            point
+                .iter()
+                .zip(self.normal_center.iter())
+                .map(|(&value, &center)| value - center),
+        );
+        self.log_weight.push(log_weight);
+    }
+}
+
+impl NormalNodes {
+    fn certified(
+        mean: &Array1<f64>,
+        covariance: &Array2<f64>,
+        upper: &[f64],
+    ) -> Result<Self, String> {
+        let q = mean.len();
+        if covariance.dim() != (q, q) || upper.len() != q {
+            return Err(format!(
+                "truncated projection geometry mismatch: mean={q}, covariance={:?}, \
+                 upper limits={}",
+                covariance.dim(),
+                upper.len()
+            ));
+        }
+        // The nodes are read off the same certified run that produces the
+        // moments: one sink per replicate lattice, every node kept, and the
+        // certificate decided on the replicates' moment spread exactly as
+        // `box_truncated_moments` decides it. Nothing in that decision depends
+        // on which projection is read afterwards.
+        let rule = OrthantRule::new(mean, upper, covariance, 0)?;
+        let mut sinks: Vec<NormalNodeAccumulator<'_>> = (0..ORTHANT_MOMENT_REPLICATES)
+            .map(|_| NormalNodeAccumulator {
+                moments: OrthantAccumulator::new(q),
+                normal_center: mean,
+                displacement: Vec::new(),
+                log_weight: Vec::new(),
+            })
+            .collect();
+        let certified = certified_orthant_moments(&rule, covariance, &mut sinks).map_err(
+            |error| format!("orthant projection for a {q}-dimensional constraint face: {error}"),
+        )?;
         let max_log_weight = sinks
             .iter()
-            .flat_map(|sink| sink.nodes.iter().map(|(_, log_weight)| *log_weight))
+            .flat_map(|sink| sink.log_weight.iter().copied())
             .fold(f64::NEG_INFINITY, f64::max);
         if !max_log_weight.is_finite() {
             return Err(
@@ -3671,7 +3813,7 @@ impl<'a> ProjectionNodeAccumulator<'a> {
         }
         let weight_sum = sinks
             .iter()
-            .flat_map(|sink| sink.nodes.iter().map(|(_, log_weight)| *log_weight))
+            .flat_map(|sink| sink.log_weight.iter())
             .map(|log_weight| (log_weight - max_log_weight).exp())
             .sum::<f64>();
         if !(weight_sum.is_finite() && weight_sum > 0.0) {
@@ -3679,140 +3821,222 @@ impl<'a> ProjectionNodeAccumulator<'a> {
                 "orthant projection cubature has invalid normalized weight sum {weight_sum:?}"
             ));
         }
-        Ok(sinks
-            .into_iter()
-            .flat_map(|sink| sink.nodes.into_iter())
-            .map(|(conditional_mean, log_weight)| WeightedProjectionNode {
-                conditional_mean,
-                weight: (log_weight - max_log_weight).exp() / weight_sum,
-            })
-            .collect())
+        let node_count = sinks.iter().map(|sink| sink.log_weight.len()).sum::<usize>();
+        let mut displacement = Vec::with_capacity(node_count * q);
+        let mut weight = Vec::with_capacity(node_count);
+        for sink in sinks {
+            displacement.extend(sink.displacement);
+            weight.extend(
+                sink.log_weight
+                    .into_iter()
+                    .map(|log_weight| (log_weight - max_log_weight).exp() / weight_sum),
+            );
+        }
+        let displacement = Array2::from_shape_vec((node_count, q), displacement)
+            .map_err(|error| format!("orthant projection node layout: {error}"))?;
+        Ok(Self {
+            displacement,
+            weight: Array1::from(weight),
+            covariance: certified.covariance,
+        })
+    }
+
+    /// `m_i = ambient_mean + liftᵀ(u_i − E_untrunc[u])` over nodes `range`: the
+    /// projection's conditional mean at each node.
+    fn conditional_means(
+        &self,
+        range: std::ops::Range<usize>,
+        lift: &Array1<f64>,
+        ambient_mean: f64,
+    ) -> Array1<f64> {
+        self.displacement
+            .slice(ndarray::s![range, ..])
+            .dot(lift)
+            .mapv_into(|value| ambient_mean + value)
+    }
+
+    /// Both equal-tailed quantiles of a projection with no tangent residual. Its
+    /// law is the node set itself, a step CDF, so each quantile is the first
+    /// node, in value order, whose cumulative weight reaches the probability.
+    fn step_quantiles(&self, lift: &Array1<f64>, ambient_mean: f64, alpha: f64) -> (f64, f64) {
+        let means = self.conditional_means(0..self.weight.len(), lift, ambient_mean);
+        let mut ordered: Vec<(f64, f64)> = means
+            .iter()
+            .copied()
+            .zip(self.weight.iter().copied())
+            .collect();
+        ordered.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+        let quantile = |probability: f64| {
+            let mut cumulative = 0.0;
+            for &(value, weight) in &ordered {
+                cumulative += weight;
+                if cumulative >= probability {
+                    return value;
+                }
+            }
+            ordered.last().expect("a certified node set is non-empty").0
+        };
+        (quantile(alpha), quantile(1.0 - alpha))
     }
 }
 
-impl ReplicateSink for ProjectionNodeAccumulator<'_> {
-    fn accumulator(&self) -> &OrthantAccumulator {
-        &self.moments
-    }
-}
-
-impl OrthantNodeSink for ProjectionNodeAccumulator<'_> {
-    fn push(&mut self, log_weight: f64, point: &Array1<f64>) {
-        self.moments.push(log_weight, point);
-        let conditional_mean = self.ambient_mean
-            + self
-                .projection_lift
-                .iter()
-                .zip(point.iter().zip(self.normal_center.iter()))
-                .map(|(&lift, (&value, &center))| lift * (value - center))
-                .sum::<f64>();
-        self.nodes.push((conditional_mean, log_weight));
-    }
-}
-
-fn converged_projection_nodes(
-    mean: &Array1<f64>,
-    covariance: &Array2<f64>,
-    upper: &[f64],
-    projection_lift: &Array1<f64>,
+/// One projection whose law is the node mixture `Σ_i w_i N(m_i, s²)`: the
+/// orthant nodes convolved with the independent tangent residual.
+struct MixtureProjection {
+    /// Where the endpoints go.
+    row: usize,
     ambient_mean: f64,
-) -> Result<Vec<WeightedProjectionNode>, String> {
-    let q = mean.len();
-    if covariance.dim() != (q, q) || projection_lift.len() != q || upper.len() != q {
-        return Err(format!(
-            "truncated projection geometry mismatch: mean={q}, covariance={:?}, lift={}, \
-             upper limits={}",
-            covariance.dim(),
-            projection_lift.len(),
-            upper.len()
-        ));
-    }
-    // The projection law is read off the same certified run that produces the
-    // moments: one sink per replicate lattice, every node kept, and the
-    // certificate decided on the replicates' moment spread exactly as
-    // `box_truncated_moments` decides it.
-    let rule = OrthantRule::new(mean, upper, covariance, 0)?;
-    let mut sinks: Vec<ProjectionNodeAccumulator<'_>> = (0..ORTHANT_MOMENT_REPLICATES)
-        .map(|_| ProjectionNodeAccumulator::new(mean, projection_lift, ambient_mean))
-        .collect();
-    certified_orthant_moments(&rule, covariance, &mut sinks).map_err(|error| {
-        format!("orthant projection for a {q}-dimensional constraint face: {error}")
-    })?;
-    ProjectionNodeAccumulator::normalized_nodes(sinks)
+    projection_lift: Array1<f64>,
+    residual_sd: f64,
+    /// Lower and upper equal-tailed quantiles.
+    quantiles: [MixtureQuantile; 2],
 }
 
-fn projection_quantile(
-    nodes: &[WeightedProjectionNode],
-    residual_variance: f64,
+/// Safeguarded Newton iteration for one quantile of a node mixture.
+///
+/// The mixture CDF is smooth and strictly increasing, and its derivative is the
+/// mixture density, which the same pass over the nodes returns, so Newton from
+/// the moment-matched normal quantile converges quadratically. Every pass also
+/// tightens a bracket `[lower, upper]` around the root; a Newton step that leaves
+/// it, or that fails to halve the step before it, is replaced by bisection, and
+/// an unbracketed side is approached by doubling steps. The iteration stops at
+/// the resolution `√ε·max(ambient sd, residual sd)`, which is the resolution the
+/// quantile is stated at.
+struct MixtureQuantile {
     probability: f64,
-    posterior_mean: f64,
-    ambient_sd: f64,
-) -> Result<f64, String> {
-    if nodes.is_empty() {
-        return Err("orthant projection quantile received no cubature nodes".to_string());
+    point: f64,
+    lower: f64,
+    upper: f64,
+    previous_step: f64,
+    expansion: f64,
+    resolution: f64,
+    value: Option<f64>,
+}
+
+impl MixtureQuantile {
+    fn new(probability: f64, start: f64, scale: f64) -> Self {
+        Self {
+            probability,
+            point: start,
+            lower: f64::NEG_INFINITY,
+            upper: f64::INFINITY,
+            previous_step: f64::INFINITY,
+            expansion: scale,
+            resolution: f64::EPSILON.sqrt() * scale,
+            value: None,
+        }
     }
-    if residual_variance == 0.0 {
-        let mut ordered = nodes.to_vec();
-        ordered.sort_by(|left, right| left.conditional_mean.total_cmp(&right.conditional_mean));
-        let mut cumulative = 0.0;
-        for node in &ordered {
-            cumulative += node.weight;
-            if cumulative >= probability {
-                return Ok(node.conditional_mean);
+
+    /// Fold the mixture's CDF and density at `self.point` into the bracket and
+    /// choose the next point, or settle the quantile.
+    fn advance(&mut self, cdf: f64, density: f64) -> Result<(), String> {
+        let point = self.point;
+        if cdf == self.probability {
+            self.value = Some(point);
+            return Ok(());
+        }
+        let below = cdf < self.probability;
+        if below {
+            self.lower = point;
+        } else {
+            self.upper = point;
+        }
+        if self.upper - self.lower <= self.resolution {
+            self.value = Some(self.lower + 0.5 * (self.upper - self.lower));
+            return Ok(());
+        }
+        let newton = point - (cdf - self.probability) / density;
+        let newton = if density > 0.0 && newton.is_finite() {
+            Some(newton)
+        } else {
+            None
+        };
+        let unbracketed = if below {
+            self.upper == f64::INFINITY
+        } else {
+            self.lower == f64::NEG_INFINITY
+        };
+        let next = if unbracketed {
+            match newton {
+                Some(newton) if (newton - point).abs() < self.expansion => newton,
+                _ => {
+                    let direction = if below { 1.0 } else { -1.0 };
+                    let next = point + direction * self.expansion;
+                    self.expansion *= 2.0;
+                    next
+                }
+            }
+        } else {
+            match newton {
+                Some(newton)
+                    if newton > self.lower
+                        && newton < self.upper
+                        && (newton - point).abs() <= 0.5 * self.previous_step =>
+                {
+                    newton
+                }
+                _ => self.lower + 0.5 * (self.upper - self.lower),
+            }
+        };
+        if !next.is_finite() {
+            return Err(format!(
+                "orthant projection quantile could not bracket probability {}",
+                self.probability
+            ));
+        }
+        let step = (next - point).abs();
+        if step <= self.resolution || next == self.lower || next == self.upper {
+            self.value = Some(next);
+            return Ok(());
+        }
+        self.previous_step = step;
+        self.point = next;
+        Ok(())
+    }
+}
+
+/// Settle every quantile of `projections` against the one cached node set.
+///
+/// Rows are independent, so they settle in parallel, and each row forms its
+/// conditional means `m_i` once and then iterates both of its quantiles to
+/// convergence over them. A pass sums over the nodes in their fixed order, so
+/// an endpoint does not depend on the thread count or on which other rows
+/// share the batch.
+fn settle_mixture_quantiles(
+    nodes: &NormalNodes,
+    projections: &mut [MixtureProjection],
+) -> Result<(), String> {
+    projections.par_iter_mut().try_for_each(|projection| {
+        let means = nodes.conditional_means(
+            0..nodes.weight.len(),
+            &projection.projection_lift,
+            projection.ambient_mean,
+        );
+        let scale = projection.residual_sd;
+        loop {
+            let open: Vec<usize> = (0..projection.quantiles.len())
+                .filter(|&side| projection.quantiles[side].value.is_none())
+                .collect();
+            if open.is_empty() {
+                return Ok(());
+            }
+            let points: Vec<f64> = open
+                .iter()
+                .map(|&side| projection.quantiles[side].point)
+                .collect();
+            let mut sums = vec![(0.0, 0.0); open.len()];
+            for (&mean, &weight) in means.iter().zip(nodes.weight.iter()) {
+                for (sum, &point) in sums.iter_mut().zip(points.iter()) {
+                    let (phi_cdf, phi_pdf) = normal_cdf_and_pdf((point - mean) / scale);
+                    sum.0 += weight * phi_cdf;
+                    sum.1 += weight * phi_pdf;
+                }
+            }
+            for (&side, &(cdf, density)) in open.iter().zip(sums.iter()) {
+                projection.quantiles[side].advance(cdf, density / scale)?;
             }
         }
-        return Ok(ordered
-            .last()
-            .expect("non-empty projection node set")
-            .conditional_mean);
-    }
-
-    let residual_sd = residual_variance.sqrt();
-    let cdf = |value: f64| {
-        nodes
-            .iter()
-            .map(|node| {
-                node.weight * normal_cdf((value - node.conditional_mean) / residual_sd)
-            })
-            .sum::<f64>()
-    };
-    // `residual_variance == 0` returned above, so `residual_sd > 0` and every
-    // doubling below moves the bracket (#2469).
-    let mut step = ambient_sd.max(residual_sd);
-    let mut lower = posterior_mean - step;
-    let mut upper = posterior_mean + step;
-    while cdf(lower) > probability {
-        step *= 2.0;
-        lower = posterior_mean - step;
-        if !lower.is_finite() {
-            return Err(format!(
-                "orthant projection quantile could not bracket lower probability {probability}"
-            ));
-        }
-    }
-    step = ambient_sd.max(residual_sd);
-    while cdf(upper) < probability {
-        step *= 2.0;
-        upper = posterior_mean + step;
-        if !upper.is_finite() {
-            return Err(format!(
-                "orthant projection quantile could not bracket upper probability {probability}"
-            ));
-        }
-    }
-
-    let resolution = f64::EPSILON.sqrt() * ambient_sd.max(residual_sd);
-    loop {
-        let midpoint = lower + 0.5 * (upper - lower);
-        if midpoint == lower || midpoint == upper || upper - lower <= resolution {
-            return Ok(midpoint);
-        }
-        if cdf(midpoint) < probability {
-            lower = midpoint;
-        } else {
-            upper = midpoint;
-        }
-    }
+    })
 }
 
 /// Closed-form moments of `N(mean, variance)` restricted to `[0, upper]`.
@@ -4028,6 +4252,7 @@ mod tests_orthant_rule_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gam_math::probability::normal_cdf;
     use ndarray::array;
 
 
@@ -4269,6 +4494,107 @@ mod tests {
             saw_repaired_short_symmetric_band,
             "the sweep must include its 3-SE regression cell"
         );
+    }
+
+    /// Prediction reads many contrasts of one law: the batched intervals must
+    /// be the single-contrast intervals exactly, and both must carry the
+    /// posterior mass an independent sampler of the truncated law puts there.
+    ///
+    /// Two monotone-difference walls are both active, so the retained face is
+    /// two-dimensional and neither the scalar closed form nor a Gaussian
+    /// shortcut applies. The contrasts cover both batched paths: coordinates and
+    /// a generic mix keep a tangent residual (the node mixture `Σ w_i N(m_i, s²)`),
+    /// and a wall normal is carried entirely by the face (the step law of the
+    /// nodes themselves).
+    #[test]
+    fn batched_projection_intervals_match_single_rows_and_rejection_sampling() {
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use rand_distr::{Distribution, StandardNormal};
+
+        let covariance = array![[1.0, 0.3, 0.1], [0.3, 1.0, 0.2], [0.1, 0.2, 1.0]];
+        let center = array![0.0, -0.2, 0.1];
+        let constraints = LinearInequalityConstraints::new(
+            array![[-1.0, 1.0, 0.0], [0.0, -1.0, 1.0]],
+            array![0.0, 0.0],
+        )
+        .expect("monotone difference walls");
+        let correction =
+            constrained_posterior_correction_from_covariance(&covariance, &center, &constraints)
+                .expect("correction")
+                .expect("active walls");
+        let geometry = ConstrainedPosteriorGeometry {
+            constraints: constraints.clone(),
+            mode: array![-0.05, -0.05, 0.1],
+            unconstrained_center: Some(center.clone()),
+            correction: Some(correction),
+            moment_status: ConstrainedPosteriorMomentStatus::Available,
+            mode_log_likelihood: None,
+        };
+        let contrasts = array![
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.5, -0.3, 0.8],
+            [-1.0, 1.0, 0.0],
+        ];
+        let level = 0.95;
+        let law = ConstrainedProjectionLaw::new(&covariance, &geometry).expect("projection law");
+        let retained = law.truncation.as_ref().expect("truncated law").normal_center.len();
+        assert_eq!(retained, 2, "both walls must be retained for a two-dimensional face");
+        let batched = law
+            .equal_tailed_intervals(contrasts.view(), level)
+            .expect("batched intervals");
+
+        let mut factor = Array2::<f64>::zeros((3, 3));
+        for i in 0..3 {
+            for j in 0..=i {
+                let partial = covariance[[i, j]]
+                    - (0..j).map(|k| factor[[i, k]] * factor[[j, k]]).sum::<f64>();
+                factor[[i, j]] = if i == j { partial.sqrt() } else { partial / factor[[j, j]] };
+            }
+        }
+        let mut rng = StdRng::seed_from_u64(20_260_919);
+        let mut accepted: Vec<Array1<f64>> = Vec::new();
+        while accepted.len() < 400_000 {
+            let z = Array1::from_shape_simple_fn(3, || StandardNormal.sample(&mut rng));
+            let draw = &center + &factor.dot(&z);
+            if constraints.a.dot(&draw).iter().zip(constraints.b.iter()).all(|(v, b)| v >= b) {
+                accepted.push(draw);
+            }
+        }
+
+        for (row, contrast) in contrasts.outer_iter().enumerate() {
+            let single = constrained_projection_equal_tailed_interval(
+                &covariance,
+                &geometry,
+                &contrast.to_owned(),
+                level,
+            )
+            .expect("single-row interval");
+            assert_eq!(
+                batched[row], single,
+                "row {row}: the batched interval must be the single-row interval exactly"
+            );
+            let (lower, upper) = batched[row];
+            let mut projections: Vec<f64> =
+                accepted.iter().map(|draw| contrast.dot(draw)).collect();
+            projections.sort_unstable_by(f64::total_cmp);
+            let below = |value: f64| {
+                projections.partition_point(|&projection| projection < value) as f64
+                    / projections.len() as f64
+            };
+            // Binomial sampling error of a tail fraction near 0.025 over 4e5
+            // draws is 2.5e-4; five of those bound the check.
+            for (endpoint, probability) in [(lower, 0.025), (upper, 0.975)] {
+                assert!(
+                    (below(endpoint) - probability).abs() < 1.25e-3,
+                    "row {row}: endpoint {endpoint} carries sampled mass {} below it, not \
+                     {probability}",
+                    below(endpoint)
+                );
+            }
+        }
     }
 
     /// A constraint row whose normal is nearly a combination of the accepted
@@ -6374,6 +6700,7 @@ mod coverage_gate_tests {
 #[cfg(test)]
 mod affine_ceiling_tests {
     use super::*;
+    use gam_math::probability::normal_cdf;
     use ndarray::array;
 
     /// Run the cubature over `{u >= 0}` intersected with an optional affine

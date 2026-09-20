@@ -12,7 +12,7 @@ pub(crate) fn materialize_survival<'a>(
     interval_right_col: Option<&str>,
     structural_only: bool,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
-    let mut inference_notes = Vec::new();
+    let mut inference_notes = FitNotes::default();
 
     // Extract columns. `entry_col == None` is the right-censored shorthand
     // `Surv(time, event)`: every subject enters at time zero, so we
@@ -173,7 +173,7 @@ pub(crate) fn materialize_survival<'a>(
     // builders — free to materialize models on censored fixtures (which the
     // engine's structural unit tests rely on) without losing the user-facing
     // safety on real fits.
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let weights = resolve_fit_weight_column(data, col_map, config.weight_column.as_deref())?;
     let weighted_event_mass: f64 = event_codes
         .iter()
         .zip(weights.iter())
@@ -441,11 +441,13 @@ pub(crate) fn materialize_survival<'a>(
     }
 
     // `survmodel(distribution=...)` in the formula names the residual law, as
-    // `survival_distribution` does in the configuration, and the formula's
-    // `link(...)` with its initialization options names the inverse link, as
-    // `link` does; the formula wins in both. A fit without a link takes its
-    // inverse link from the residual law.
+    // `survival_distribution` does in the configuration, and the formula wins.
+    // The formula's `link(...)` with its initialization options names the
+    // inverse link, as `link` does; both are read, and a `link` argument that
+    // names a different link from the formula's is refused by name. A fit
+    // without a link takes its inverse link from the residual law.
     let formula_link = parsed.linkspec.as_ref();
+    resolve_link_spellings(formula_link, config.link.as_deref(), false)?;
     let link_name = formula_link
         .map(|spec| spec.link.as_str())
         .or(config.link.as_deref());
@@ -583,6 +585,7 @@ pub(crate) fn materialize_survival<'a>(
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         }
     };
     // Both supplied and CTN-generated scores have an explicit column here.
@@ -718,21 +721,21 @@ pub(crate) fn materialize_survival<'a>(
 
     if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         if marginal_slope_link_dev.is_some() {
-            inference_notes.push(
+            inference_notes.inform(
                 "survival marginal-slope routes its link deviation (formula-level linkwiggle(...) or a flexible link) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
             );
         }
         if marginal_slope_score_warp.is_some() {
-            inference_notes.push(
+            inference_notes.inform(
                 "survival marginal-slope routes slope_formula linkwiggle(...) into its anchored internal score-warp block while keeping the probit survival base link".to_string(),
             );
         }
         if marginal_slope_link_dev.is_none() && marginal_slope_score_warp.is_none() {
-            inference_notes.push(
+            inference_notes.inform(
                 "survival marginal-slope rigid mode is algebraic closed-form exact".to_string(),
             );
         } else {
-            inference_notes.push(
+            inference_notes.inform(
                 "survival marginal-slope flexible score/link mode uses calibrated de-nested cubic transport cells with analytic value evaluation and calibrated survival normalization"
                     .to_string(),
             );
@@ -853,8 +856,6 @@ pub(crate) fn materialize_survival<'a>(
             offset_entry: prepared.eta_offset_entry.clone(),
             offset_exit: prepared.eta_offset_exit.clone(),
             derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-            time_monotonicity:
-                crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
             penalties: prepared.time_penalties.clone(),
             nullspace_dims: prepared.time_nullspace_dims.clone(),
             initial_log_lambdas: time_initial_log_lambdas,
@@ -907,6 +908,16 @@ pub(crate) fn materialize_survival<'a>(
                 kappa_options: config.spatial_optimization.clone(),
             })
         };
+    let location_scale_collapses_time_warp =
+        |candidate: &crate::survival::construction::SurvivalBaselineConfig| -> Result<bool, WorkflowError> {
+            let request = build_location_scale_request(candidate)
+                .map_err(|reason| WorkflowError::InvalidConfig { reason })?;
+            crate::survival::location_scale::survival_location_scale_terms_collapse_time_warp(
+                request.data,
+                &request.spec,
+            )
+            .map_err(WorkflowError::from)
+        };
 
     let build_marginal_slope_request = || {
         let (prepared, baseline_hyper) = marginal_slope_time_state.as_ref().ok_or_else(|| {
@@ -921,8 +932,6 @@ pub(crate) fn materialize_survival<'a>(
             offset_entry: prepared.eta_offset_entry.clone(),
             offset_exit: prepared.eta_offset_exit.clone(),
             derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-            time_monotonicity:
-                crate::survival::location_scale::TimeBlockMonotonicity::StructuralISpline,
             penalties: prepared.time_penalties.clone(),
             nullspace_dims: prepared.time_nullspace_dims.clone(),
             initial_log_lambdas: time_initial_log_lambdas,
@@ -1047,8 +1056,6 @@ pub(crate) fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity:
-                    crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
@@ -1109,8 +1116,6 @@ pub(crate) fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity:
-                    crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
@@ -1155,6 +1160,23 @@ pub(crate) fn materialize_survival<'a>(
             | SurvivalLikelihoodMode::MarginalSlope
     ) {
         baseline_cfg
+    } else if baseline_cfg.target != SurvivalBaselineTarget::Linear
+        && survival_mode == SurvivalLikelihoodMode::LocationScale
+        && location_scale_collapses_time_warp(&baseline_cfg)?
+    {
+        // The constant-scale fit replaces its time warp with `−log t` on the
+        // location channel (#892) and reads none of the time block's offsets,
+        // so a target's parameters do not enter its likelihood.
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "survival location-scale: baseline_target='{}' has no parameter in this \
+                 likelihood. With a constant scale and no time wiggle the fit replaces its \
+                 time warp with -log t on the location channel and reads no time offset. \
+                 Drop the target, or fit a scale (noise_formula) or a timewiggle(...) so a \
+                 warp is estimated",
+                crate::survival::construction::survival_baseline_targetname(baseline_cfg.target)
+            ),
+        });
     } else if baseline_cfg.target != SurvivalBaselineTarget::Linear
         && survival_mode == SurvivalLikelihoodMode::LocationScale
     {

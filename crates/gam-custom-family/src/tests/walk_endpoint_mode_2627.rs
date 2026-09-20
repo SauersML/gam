@@ -13,6 +13,7 @@
 //! sequence against `CustomOuterState` and counts the family evaluations.
 use super::*;
 use crate::penalty_labels::penalty_label_layout_with_joint;
+use crate::test_support::outerobjectivegradienthessian_labeled;
 
 /// The Gaussian fixture, counting every family evaluation. The inner solve's
 /// share of the count is the work a cold re-solve repeats.

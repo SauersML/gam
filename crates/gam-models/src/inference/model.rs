@@ -120,10 +120,70 @@ use std::path::Path;
 // family objective homotopy, a unique mode, or the caller's seed when no rule applied. The field
 // carries a serde default, so an older payload loads as `NotRecorded`, which claims nothing; a
 // v26 binary refuses a v27 payload by version.
-pub const MODEL_PAYLOAD_VERSION: u32 = 27;
+// v28 records, beside a certified outer point, the criterion value certified there and the
+// fingerprint of the fit's inputs (`OuterWarmStartRecord::{value, input_fingerprint}`, gam#3002),
+// and names its coordinates `theta` (the `rho` of a v25 to v27 record reads as its alias). Both
+// fields carry serde defaults, so an older point loads without them and can only join a search,
+// never resume one; a v27 binary refuses a v28 payload by version.
+// v29 stops persisting per-row training data in a standard fit (speed F6): the exact
+// full-conformal field keeps only the p × p frozen penalty `s_lambda` (the labeled rows are
+// supplied again at prediction time), and `FitGeometry::working` (the final PIRLS weights and
+// working response, n each) is no longer serialized, so a saved standard GAM no longer grows
+// with the training rows. A v28 or older payload still loads: its conformal `x` and `y` and
+// its working geometry are read past and dropped. A v28 binary refuses a v29 payload by
+// version instead of failing on the conformal field's missing `x`.
+// v30 records whether the certificate's Newton polish ended on a settling step, in place of
+// the step budget it no longer has (`NewtonPolishRecord::settled`, #3012). 996d0af2c1 made
+// that change at v29, so a v29 payload has two shapes (gam#3166): one written before it
+// carries `step_budget`, which this binary reads past, and one written after it carries
+// `settled`. Both load, and `settled` reads as false where it is absent. A v29 binary
+// refuses a v30 payload by version instead of failing on the missing `step_budget`.
+// v31 records the Gaussian location-scale σ floor (`gaussian_sigma_floor`): the recording-grid
+// bound δ/√12 of the standardized response, which replaced the fixed floor 0.01. The field carries
+// a serde default so every other family's older payload reads through; a Gaussian location-scale
+// payload without it was fitted under the old floor, and the saved-fit validator refuses it by name.
+// v32 records each moving-law arm's Gaussian-residual adequacy screen
+// (`MovingLawArmScore::adequacy`, gam#2926): an arm whose residual the screen rejects is
+// scored but not a candidate. It carries a serde default, so an older payload loads with no
+// screen, which reads as the rule it was chosen by, where every arm was a candidate; a v31
+// binary refuses a v32 payload by version.
+// v33 records, beside the exact full-conformal frozen penalty, the fit's smoothing-parameter
+// count (`ExactFullConformalPenalty::penalty_count`, gam#3296), which decides whether the REML
+// re-selecting map is computable. It carries a serde default, so an older payload loads with no
+// count and its conformal rows are refused by name (`UnknownPenaltyStructure`); a v32 binary
+// refuses a v33 payload by version instead of publishing its frozen-λ set for a fit whose
+// selection it cannot see.
+pub const MODEL_PAYLOAD_VERSION: u32 = 33;
 
-/// The schema before the coefficient-mode record (gam#2661), whose only difference is that
-/// field's absence.
+/// The schema before the full-conformal penalty count (gam#3296), whose only difference
+/// is that field's absence.
+const CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION: u32 = 32;
+
+/// The schema before the moving-law arms' adequacy screens (gam#2926), whose only
+/// difference from [`CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION`] is that field's absence.
+const MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION: u32 = 31;
+
+/// The schema before the Gaussian location-scale σ floor record, whose only difference
+/// from [`MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION`] is that field's absence.
+const SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 30;
+
+/// The schema whose Newton-polish record may carry its step budget (#2954), or already
+/// its settling flag (#3012, from 996d0af2c1 on; gam#3166). Its only difference from
+/// [`SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION`] is that record's `step_budget`, which
+/// this binary reads past.
+const POLISH_STEP_BUDGET_PAYLOAD_VERSION: u32 = 29;
+
+/// The schema before the saved model stopped persisting training rows (speed F6), whose
+/// only difference is the conformal field's `x` and `y` and the serialized working
+/// geometry, both of which this binary reads past.
+const TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION: u32 = 28;
+
+/// The schema before the certified point's value and input fingerprint (gam#3002), whose only
+/// difference from [`TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION`] is those fields' absence.
+const WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION: u32 = 27;
+
+/// The schema before the coefficient-mode record (gam#2661), whose only difference from
+/// [`WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION`] is that field's absence.
 const MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 26;
 
 /// The first payload version whose survival location-scale kernel divides the whole
@@ -136,7 +196,7 @@ const LOCATION_ONLY_SCALE_PAYLOAD_VERSION: u32 = 25;
 
 /// The schema before the certified outer point (`warm_start_from`), whose only difference
 /// from [`LOCATION_ONLY_SCALE_PAYLOAD_VERSION`] is that record's absence.
-const OUTER_WARM_START_ABSENT_PAYLOAD_VERSION: u32 = 24;
+pub(crate) const OUTER_WARM_START_ABSENT_PAYLOAD_VERSION: u32 = 24;
 
 /// The schema before the residual repair block's covariance declination (gam#2985),
 /// whose only difference is that variant's absence.
@@ -168,8 +228,14 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 10] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 16] = [
     MODEL_PAYLOAD_VERSION,
+    CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
+    MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
+    SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
+    POLISH_STEP_BUDGET_PAYLOAD_VERSION,
+    TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
+    WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
     MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
     LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
     OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
@@ -372,6 +438,36 @@ impl_reason_error_boilerplate! {
     }
 }
 
+impl FittedModelError {
+    /// Who has to act on a saved model this binary refuses: the one category
+    /// every front end classifies it by. Each variant refuses the saved
+    /// payload's own contents (its schema, bytes, fields, options or values),
+    /// so each is a data refusal, remedied by refitting or re-saving the model
+    /// (gam#3008). Exhaustive with no wildcard arm.
+    #[must_use]
+    pub fn error_category(&self) -> gam_problem::ErrorCategory {
+        match self {
+            Self::SchemaMismatch { .. }
+            | Self::PayloadCorrupt { .. }
+            | Self::MissingField { .. }
+            | Self::IncompatibleConfig { .. }
+            | Self::InvalidInput { .. } => gam_problem::ErrorCategory::Data,
+        }
+    }
+
+    /// The `Enum::Variant` name a front end reports beside the category.
+    #[must_use]
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::SchemaMismatch { .. } => "FittedModelError::SchemaMismatch",
+            Self::PayloadCorrupt { .. } => "FittedModelError::PayloadCorrupt",
+            Self::MissingField { .. } => "FittedModelError::MissingField",
+            Self::IncompatibleConfig { .. } => "FittedModelError::IncompatibleConfig",
+            Self::InvalidInput { .. } => "FittedModelError::InvalidInput",
+        }
+    }
+}
+
 // Boundary conversions so external `Result<_, EstimationError>` /
 // `Result<_, SurvivalPredictError>` call sites can propagate with `?`.
 // Survival prediction keeps the model-layer source so the chain identifies
@@ -518,7 +614,8 @@ pub struct FittedModelPayload {
     pub estimator: FittedEstimator,
     /// Human-readable advisories produced while materializing this model —
     /// e.g. an mgcv-style "k was reduced to the data support" note when a
-    /// cubic-regression marginal is capped, or a basis-degradation note. These
+    /// cubic-regression marginal is capped, or a basis-degradation note: each
+    /// says the model differs from what was literally requested. These
     /// are surfaced to CLI users via `print_inference_summary`; persisting them
     /// here lets the Python (gamfit) interface surface the SAME advisories as
     /// warnings / `model.notes` instead of silently dropping them at the FFI
@@ -526,6 +623,14 @@ pub struct FittedModelPayload {
     /// such field) deserializing cleanly as "no notes".
     #[serde(default)]
     pub inference_notes: Vec<String>,
+    /// Defaults the engine chose on the user's behalf while building the
+    /// model — the internal-knot count of a default B-spline, per-margin
+    /// tensor sizes, how an interaction was wired. Part of the fit's record
+    /// (`model.notes`, the summary) but, unlike [`Self::inference_notes`],
+    /// not an advisory: front ends do not warn about them. `#[serde(default)]`
+    /// keeps payloads written before the split loading as "none".
+    #[serde(default)]
+    pub informational_notes: Vec<String>,
     /// Scalar terms the training rows could not identify and materialization
     /// removed before the fit, each with the formula it came from and the residual
     /// norm and rank tolerance that decided it (#2627). `#[serde(default)]` keeps
@@ -604,13 +709,18 @@ pub struct FittedModelPayload {
     pub noise_scale: Option<Vec<f64>>,
     #[serde(default)]
     pub noise_non_intercept_start: Option<usize>,
-    /// Tikhonov ridge alpha used by `solve_scale_projection` when fitting
-    /// `noise_projection`.  Persisted so prediction-time replay is identical
-    /// to fit-time projection.
+    /// The squared SVD cutoff a saved `noise_projection` was fitted with, by the
+    /// transform-fitting route #3015 retired. Persisted so a saved model's replay
+    /// reads exactly what it wrote.
     #[serde(default)]
     pub noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
     pub gaussian_response_scale: Option<f64>,
+    /// Gaussian location-scale σ floor `b` of σ = b + exp(η) in standardized response
+    /// units (`sigma_link::gaussian_resolution_sigma_floor`); the raw-unit floor is
+    /// `gaussian_response_scale · gaussian_sigma_floor`. Required for that family.
+    #[serde(default)]
+    pub gaussian_sigma_floor: Option<f64>,
     #[serde(default)]
     pub linkwiggle_knots: Option<Vec<f64>>,
     #[serde(default)]
@@ -860,25 +970,26 @@ pub struct FittedModelPayload {
     pub resolved_slopespec: Option<TermCollectionSpec>,
     #[serde(default)]
     pub resolved_slopespecs: Option<Vec<TermCollectionSpec>>,
-    /// Precomputed substrate for the EXACT Gaussian-identity full-conformal set
+    /// Frozen penalty `Sλ` for the EXACT Gaussian-identity full-conformal set
     /// (#942 Layer 1 + the frozen-ρ self-diagnostic).
     ///
     /// Populated only for a standard Gaussian-identity fit with unit prior
-    /// weights, no offset and no link wiggle. It
-    /// persists the training design + response + frozen penalty `Sλ` so the
-    /// prediction set that is exact GIVEN `Sλ` (a union of intervals, valid for
-    /// any penalized smooth) can be replayed per test point — one Cholesky each,
-    /// zero refits. Because λ̂ was selected from all training responses, the
-    /// frozen-λ construction is not permutation symmetric in the augmented
-    /// points; the distribution-free finite-sample coverage theorem is asserted
-    /// only per row where the surfaced frozen-ρ certificate accepts (under the
-    /// global-ρ grid-Lipschitz assumption). `None` for any
-    /// ineligible model or an older payload, in which case the exact-set predict
-    /// path errors with a clear message and the caller uses split conformal or
-    /// the posterior band. `#[serde(default)]` so pre-existing models deserialize
-    /// as no exact substrate available.
+    /// weights, no offset and no link wiggle. It persists only the p × p frozen
+    /// penalty: the prediction set that is exact GIVEN `Sλ` (a union of
+    /// intervals, valid for any penalized smooth) is replayed per test point
+    /// against labeled rows the caller supplies again at prediction time — one
+    /// Cholesky each, zero refits — so the saved model never grows with the
+    /// training rows. Because λ̂ was selected from all training responses, the
+    /// frozen-λ construction on the training rows is not permutation symmetric
+    /// in the augmented points; the distribution-free finite-sample coverage
+    /// theorem is asserted only per row where the surfaced frozen-ρ certificate
+    /// accepts (under the global-ρ grid-Lipschitz assumption). `None` for any
+    /// ineligible model, in which case the exact-set predict path errors with a
+    /// clear message and the caller uses split conformal or the posterior band.
+    /// Payloads through version 28 stored the training `x` and `y` beside
+    /// `s_lambda` here; only `s_lambda` is read back.
     #[serde(default)]
-    pub full_conformal: Option<crate::inference::full_conformal::ExactFullConformalSubstrate>,
+    pub full_conformal: Option<crate::inference::full_conformal::ExactFullConformalPenalty>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1029,6 +1140,7 @@ impl FittedModelPayload {
             family,
             estimator: FittedEstimator::Likelihood,
             inference_notes: Vec::new(),
+            informational_notes: Vec::new(),
             unidentified_scalar_terms: Vec::new(),
             basis_adequacy: Vec::new(),
             used_device: false,
@@ -1053,6 +1165,7 @@ impl FittedModelPayload {
             noise_non_intercept_start: None,
             noise_projection_ridge_alpha: None,
             gaussian_response_scale: None,
+            gaussian_sigma_floor: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             linkwiggle_penalty_metadata: None,
@@ -1154,7 +1267,32 @@ impl FittedModelPayload {
                 linear_terms: Vec::new(),
                 smooth_terms: Vec::new(),
                 random_effect_terms: Vec::new(),
+                level: Default::default(),
             });
+    }
+
+    /// Offsets and prior weights are real-valued by role, whatever values the
+    /// training rows happened to hold: an all-zero or 0/1 offset column infers
+    /// as `Binary` at load time, and that kind must not refuse a prediction
+    /// with any other offset. Role columns are stored as `Continuous`, here and
+    /// on the frozen score transform.
+    fn synchronize_role_column_kinds(&mut self) {
+        if let Some(schema) = self.data_schema.as_mut() {
+            let roles = [
+                self.offset_column.as_deref(),
+                self.noise_offset_column.as_deref(),
+                self.weight_column.as_deref(),
+            ];
+            for column in &mut schema.columns {
+                if column.kind == ColumnKindTag::Binary && roles.contains(&Some(column.name.as_str()))
+                {
+                    column.kind = ColumnKindTag::Continuous;
+                }
+            }
+        }
+        if let Some(transform) = self.score_transform.as_mut() {
+            transform.synchronize_role_column_kinds();
+        }
     }
 
     /// Write the persistable time-basis snapshot for a survival model.
@@ -1267,16 +1405,40 @@ pub enum ModelKind {
     TransformationNormal,
 }
 
+/// Saved-family tag of a joint multi-level expectile location-scale fit.
+pub const JOINT_EXPECTILE_FAMILY_TAG: &str = "expectile-location-scale";
+
+/// Prediction column carrying the level-`tau` curve of a joint expectile fit.
+pub fn expectile_curve_column_name(tau: f64) -> String {
+    format!("expectile_{tau}")
+}
+
 /// Statistical criterion represented by a saved fitted surface.
 ///
 /// `Likelihood` means the persisted [`LikelihoodSpec`] is also the fitted
 /// observation law. `Expectile` records the asymmetric least-squares target;
 /// it intentionally defines no observation sampler on its own.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+/// `ExpectileLocationScale` records a joint multi-level expectile fit on a
+/// Gaussian location-scale surface: level `levels[k]` is the curve
+/// `μ(x) + standardized_expectiles[k]·E[σ(x)]`. The standardized expectiles
+/// are strictly increasing, which is what makes the curves non-crossing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "estimator_kind", rename_all = "kebab-case")]
 pub enum FittedEstimator {
     Likelihood,
-    Expectile { tau: f64 },
+    Expectile {
+        tau: f64,
+    },
+    ExpectileLocationScale {
+        levels: Vec<f64>,
+        standardized_expectiles: Vec<f64>,
+    },
+}
+
+/// The family name every surface (summary, CLI fit line, Python
+/// `family_name`) reports for an expectile fit.
+pub fn expectile_display_name(tau: f64) -> String {
+    format!("Expectile(tau={tau})")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1614,6 +1776,29 @@ fn validate_location_scale_saved_fit(
         });
     }
     Ok(())
+}
+
+/// The saved σ floor of a Gaussian location-scale model, in standardized response
+/// units. A payload without one was fitted before the floor became a property of
+/// the data (payload version 28) and predicts through a link this binary no longer
+/// has, so it is refused by name rather than read under any substitute floor.
+pub fn gaussian_location_scale_saved_sigma_floor(
+    payload: &FittedModelPayload,
+) -> Result<f64, FittedModelError> {
+    match payload.gaussian_sigma_floor {
+        Some(floor) if floor.is_finite() && floor > 0.0 => Ok(floor),
+        Some(floor) => Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "gaussian-location-scale gaussian_sigma_floor must be finite and positive, got {floor}"
+            ),
+        }),
+        None => Err(FittedModelError::MissingField {
+            reason: "gaussian-location-scale model is missing gaussian_sigma_floor: it was saved \
+                     before payload version 30, when σ = b + exp(η) used a fixed floor b instead \
+                     of the response's recording-grid bound. Refit with the current version."
+                .to_string(),
+        }),
+    }
 }
 
 fn validate_survival_saved_block_matches_payload(
@@ -2304,10 +2489,19 @@ impl SavedLinkWiggleRuntime {
                 ),
             });
         }
+        Ok(base + &self.contribution(warp_index)?)
+    }
+
+    /// The wiggle's share `B(warp_index)·β` of the link, certified monotone at
+    /// `warp_index`. This is the one evaluation of that share:
+    /// [`Self::apply_with_index`] adds it to the base predictor, and a Gaussian
+    /// location-scale fit publishes it as its wiggle block's state, so the saved
+    /// model reproduces the fit's own mean bit for bit (#3001).
+    pub fn contribution(&self, warp_index: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
         self.validate_monotone_derivative(warp_index)?;
         let xwiggle = self.constrained_basis(warp_index, BasisOptions::value())?;
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
-        Ok(base + &xwiggle.dot(&beta_link_wiggle))
+        Ok(xwiggle.dot(&beta_link_wiggle))
     }
 
     pub fn derivative_q0(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
@@ -3544,6 +3738,7 @@ impl FittedModel {
             .or(payload.unified.as_ref())
             .is_some_and(|fit| fit.used_device);
         payload.synchronize_empty_feature_contract();
+        payload.synchronize_role_column_kinds();
         let Some(fit) = payload.fit_result.as_ref().or(payload.unified.as_ref()) else {
             return;
         };
@@ -3574,7 +3769,7 @@ impl FittedModel {
                 if likelihood.is_latent_cloglog() {
                     *latent_cloglog_state = Some(*state);
                 } else {
-                    log::warn!(
+                    log::debug!(
                         "fitted latent-cloglog link state discarded: likelihood {likelihood:?} \
                          has no latent-cloglog slot"
                     );
@@ -3585,7 +3780,7 @@ impl FittedModel {
                     *sas_state = Some(*state);
                     payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
                 } else {
-                    log::warn!(
+                    log::debug!(
                         "fitted SAS link state discarded: likelihood {likelihood:?} is not \
                          binomial-SAS"
                     );
@@ -3596,7 +3791,7 @@ impl FittedModel {
                     *sas_state = Some(*state);
                     payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
                 } else {
-                    log::warn!(
+                    log::debug!(
                         "fitted beta-logistic link state discarded: likelihood {likelihood:?} is \
                          not binomial beta-logistic"
                     );
@@ -3608,7 +3803,7 @@ impl FittedModel {
                     payload.mixture_link_param_covariance =
                         covariance.as_ref().map(array2_to_nested_vec);
                 } else {
-                    log::warn!(
+                    log::debug!(
                         "fitted mixture link state discarded: likelihood {likelihood:?} is not a \
                          binomial mixture link"
                     );
@@ -3648,6 +3843,11 @@ impl FittedModel {
     /// than to a blank family.
     pub fn display_family_name(&self) -> String {
         let payload = self.payload();
+        // An expectile fit's persisted likelihood is its Gaussian-identity
+        // working model; the estimator tag names what was actually fitted.
+        if let FittedEstimator::Expectile { tau } = payload.estimator {
+            return expectile_display_name(tau);
+        }
         match &payload.family_state {
             FittedFamily::LocationScale { .. } if !payload.family.is_empty() => {
                 payload.family.clone()
@@ -3657,8 +3857,34 @@ impl FittedModel {
     }
 
     #[inline]
-    pub fn estimator(&self) -> FittedEstimator {
-        self.payload().estimator
+    pub fn estimator(&self) -> &FittedEstimator {
+        &self.payload().estimator
+    }
+
+    /// Point-payload shape this model's prediction publishes. A joint expectile
+    /// fit publishes one curve per level (`expectile_curves`); every other
+    /// model publishes its class shape (`PredictModelClass::point_shape`).
+    pub fn prediction_point_shape(&self) -> &'static str {
+        match self.estimator() {
+            FittedEstimator::ExpectileLocationScale { .. } => "expectile_curves",
+            FittedEstimator::Likelihood | FittedEstimator::Expectile { .. } => {
+                self.predict_model_class().point_shape()
+            }
+        }
+    }
+
+    /// Point columns of a joint expectile fit, one per level in increasing
+    /// level order; `None` for every other estimator.
+    pub fn expectile_curve_columns(&self) -> Option<Vec<String>> {
+        match self.estimator() {
+            FittedEstimator::ExpectileLocationScale { levels, .. } => Some(
+                levels
+                    .iter()
+                    .map(|&tau| expectile_curve_column_name(tau))
+                    .collect(),
+            ),
+            FittedEstimator::Likelihood | FittedEstimator::Expectile { .. } => None,
+        }
     }
 
     /// Columns this model consumes from a prediction frame — its *input
@@ -3750,6 +3976,37 @@ impl FittedModel {
             required.extend(transform.prediction_required_columns()?);
             let parsed = parse_formula(&transform.formula).map_err(|error| error.to_string())?;
             required.insert(parsed.response);
+        }
+        Ok(required)
+    }
+
+    /// Columns [`Self::latent_conditional_residual`] reads: the prediction
+    /// columns less a survival response's time columns, since ζ is a function
+    /// of the score and the conditioning covariates alone (gam#3016). A time
+    /// column the formula also names as a covariate stays. The CLI and PyFFI
+    /// residual commands project their frames onto this one set.
+    pub fn latent_conditional_residual_columns(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        let mut required = self.prediction_required_columns()?;
+        let parsed = parse_formula(self.payload().formula.as_str()).map_err(|e| e.to_string())?;
+        let mut covariates = std::collections::BTreeSet::<String>::new();
+        parsed_term_column_names(&parsed.terms, &mut covariates);
+        let mut time_columns = Vec::new();
+        if let Some((entry, exit, _event)) =
+            parse_surv_response(parsed.response.as_str()).map_err(|e| e.to_string())?
+        {
+            time_columns.extend(entry);
+            time_columns.push(exit);
+        } else if let Some((left, right, _event)) =
+            parse_surv_interval_response(parsed.response.as_str()).map_err(|e| e.to_string())?
+        {
+            time_columns.extend([left, right]);
+        }
+        for column in time_columns {
+            if !covariates.contains(&column) {
+                required.remove(&column);
+            }
         }
         Ok(required)
     }
@@ -4103,13 +4360,14 @@ impl FittedModel {
     /// `E[g⁻¹(η)] ≠ g⁻¹(E[η])` by Jensen. The curvature-based classification is:
     ///   * all log-link families (Poisson / Gamma / Tweedie / NegativeBinomial):
     ///     `E[exp η] = exp(η + se²/2) ≠ exp(η)` (log-normal MGF);
+    ///   * the reciprocal links (`1/η` for Gaussian / Gamma, `η^{-1/2}` for
+    ///     Inverse-Gaussian) and Inverse-Gaussian's log link;
     ///   * all Binomial links (logit / probit / cloglog / SAS / BetaLogistic /
     ///     Mixture / LatentCLogLog): bounded sigmoidal inverse links;
     ///   * Beta (logit link): `E[σ(η)] ≠ σ(E[η])`;
     ///   * Royston–Parmar (curved survival-probability inverse link).
     /// The integral collapses to the plug-in (so the cheaper plug-in path is
-    /// exact and taken instead) only for the effectively-linear identity-link
-    /// Gaussian. Any model carrying a link wiggle or baseline-time wiggle is
+    /// exact and taken instead) only for the linear identity-link Gaussian. Any model carrying a link wiggle or baseline-time wiggle is
     /// curved regardless of family. This curvature partition mirrors
     /// `families::family_runtime::posterior_mean`, the compute path that produces the
     /// corrected mean for each of these families.
@@ -4122,11 +4380,18 @@ impl FittedModel {
         let family = self.likelihood();
         let curved_family = match &family.response {
             // Identity-link Gaussian: inverse link is linear, so the posterior
-            // mean equals the plug-in and the cheaper exact path is taken.
-            ResponseFamily::Gaussian => false,
-            // Log-link families: E[exp η] = exp(η + se²/2) ≠ exp(η).
+            // mean equals the plug-in and the cheaper exact path is taken. The
+            // inverse link `1/η` is curved. Student-t is identity-only.
+            ResponseFamily::StudentT { .. } => false,
+            ResponseFamily::Gaussian => {
+                !matches!(&family.link, InverseLink::Standard(StandardLink::Identity))
+            }
+            // Log-link families: E[exp η] = exp(η + se²/2) ≠ exp(η). Gamma's
+            // inverse link and both Inverse-Gaussian links (`η^{-1/2}`, `exp`)
+            // are curved as well.
             ResponseFamily::Poisson
             | ResponseFamily::Gamma
+            | ResponseFamily::InverseGaussian
             | ResponseFamily::Tweedie { .. }
             | ResponseFamily::NegativeBinomial { .. } => true,
             // Beta (logit link): E[σ(η)] ≠ σ(E[η]).
@@ -4201,6 +4466,9 @@ impl FittedModel {
                 runtime.model_class,
                 runtime.link_wiggle.as_ref(),
             )?;
+            if matches!(runtime.model_class, PredictModelClass::GaussianLocationScale) {
+                gaussian_location_scale_saved_sigma_floor(self.payload())?;
+            }
         } else if matches!(runtime.model_class, PredictModelClass::Survival)
             && self
                 .payload()
@@ -4461,7 +4729,7 @@ impl FittedModel {
         // predictor goes through the generic interval drivers, which refuse it, so
         // pricing it here would turn such a model's interval into an error.
         if self.predict_model_class() != PredictModelClass::Standard || self.has_link_wiggle() {
-            log::warn!(
+            log::debug!(
                 "measure-jet extrapolation variance is fused only by the standard, \
                  link-wiggle-free predictor; the {:?} model's interval omits it",
                 self.predict_model_class()
@@ -4531,7 +4799,7 @@ impl FittedModel {
             let (Some(frozen), CenterStrategy::UserProvided(centers)) =
                 (mj.frozen_quadrature.as_ref(), &mj.center_strategy)
             else {
-                log::warn!(
+                log::debug!(
                     "measure-jet term '{}' is not frozen (UserProvided centers + frozen \
                     quadrature); skipping its extrapolation variance",
                     term.name
@@ -4602,7 +4870,7 @@ impl FittedModel {
             let mut lambda_phys = Vec::with_capacity(n_levels);
             let spectrum = if per_scale.is_empty() {
                 let Some(lam) = fused else {
-                    log::warn!(
+                    log::debug!(
                         "measure-jet term '{}' has no fitted amplitude in the penalty \
                         layout; skipping its extrapolation variance",
                         term.name
@@ -4610,7 +4878,7 @@ impl FittedModel {
                     continue;
                 };
                 let Some(c) = frozen.fused_penalty_normalization_scale else {
-                    log::warn!(
+                    log::debug!(
                         "measure-jet term '{}' is missing the fused penalty normalization scale; \
                         skipping its extrapolation variance",
                         term.name
@@ -4626,7 +4894,7 @@ impl FittedModel {
                         .enumerate()
                         .all(|(i, &(level, _))| level == i);
                 if !levels_complete {
-                    log::warn!(
+                    log::debug!(
                         "measure-jet term '{}': {} fitted per-scale amplitudes for {} band \
                         scales; skipping its extrapolation variance",
                         term.name,
@@ -4636,7 +4904,7 @@ impl FittedModel {
                     continue;
                 }
                 if frozen.penalty_normalization_scales.len() != n_levels {
-                    log::warn!(
+                    log::debug!(
                         "measure-jet term '{}': {} frozen penalty normalization scales for {} \
                         band scales; skipping its extrapolation variance",
                         term.name,
@@ -4723,7 +4991,7 @@ impl FittedModel {
                     let MeasureJetIdentifiability::FrozenTransform { transform } =
                         &mj.identifiability
                     else {
-                        log::warn!(
+                        log::debug!(
                             "measure-jet term '{}': identifiability is not a frozen transform; \
                              skipping its input-measurement-error variance",
                             term.name
@@ -4732,7 +5000,7 @@ impl FittedModel {
                     };
                     let full_cols = design.design.ncols();
                     if fit.beta.len() != full_cols {
-                        log::warn!(
+                        log::debug!(
                             "measure-jet term '{}': joint coefficient vector length {} disagrees \
                              with the replayed design's {} columns; skipping its \
                              input-measurement-error variance",
@@ -4743,7 +5011,7 @@ impl FittedModel {
                         break 'input_var;
                     }
                     if design.smooth.term_designs.len() != spec.smooth_terms.len() {
-                        log::warn!(
+                        log::debug!(
                             "measure-jet term '{}': smooth design/term count mismatch ({} vs {}); \
                              skipping its input-measurement-error variance",
                             term.name,
@@ -4757,7 +5025,7 @@ impl FittedModel {
                     let reduced = transform.ncols();
                     let term_cols = design.smooth.term_designs[smooth_idx].ncols();
                     if term_cols != reduced {
-                        log::warn!(
+                        log::debug!(
                             "measure-jet term '{}': replayed reduced width {term_cols} disagrees \
                              with the frozen transform ({m_aug}×{reduced}); skipping its \
                              input-measurement-error variance",
@@ -4792,7 +5060,7 @@ impl FittedModel {
                     };
                     if let Some(t) = head_t.as_ref() {
                         if t.ncols() != head_width {
-                            log::warn!(
+                            log::debug!(
                                 "measure-jet term '{}': reconstructed head lift width {} disagrees \
                                  with the frozen head block {head_width}; skipping its \
                                  input-measurement-error variance",
@@ -4819,7 +5087,7 @@ impl FittedModel {
                                 input_var[i] = sigma2 * norm_sq;
                             }
                             Err(e) => {
-                                log::warn!(
+                                log::debug!(
                                     "measure-jet term '{}': ambient gradient failed ({e}); \
                                      skipping its input-measurement-error variance",
                                     term.name
@@ -4915,14 +5183,14 @@ impl FittedModel {
             // neither of these may replace it. Log them so a temp file left
             // behind in the model directory is explainable.
             if let Err(flush_err) = std::io::Write::flush(&mut writer) {
-                log::debug!(
+                log::trace!(
                     "model publish: flushing the failed temp '{}' errored: {flush_err}",
                     tmp.display()
                 );
             }
             drop(writer);
             if let Err(rm_err) = fs::remove_file(&tmp) {
-                log::debug!(
+                log::trace!(
                     "model publish: could not remove the failed temp '{}': {rm_err}",
                     tmp.display()
                 );
@@ -4944,7 +5212,7 @@ impl FittedModel {
             // The rename below still publishes the model, so this is not fatal
             // — but the contents are no longer known to have reached disk, and
             // that is exactly what a post-crash truncated model looks like.
-            log::warn!(
+            log::debug!(
                 "model publish: fsync of '{}' failed, contents may not survive a crash: {sync_err}",
                 tmp.display()
             );
@@ -4952,7 +5220,7 @@ impl FittedModel {
         drop(inner);
         if let Err(e) = fs::rename(&tmp, path) {
             if let Err(rm_err) = fs::remove_file(&tmp) {
-                log::debug!(
+                log::trace!(
                     "model publish: could not remove the unpublished temp '{}': {rm_err}",
                     tmp.display()
                 );
@@ -4971,7 +5239,7 @@ impl FittedModel {
             // Platforms that cannot fsync a directory land here; the model file
             // itself is already durable, only the rename's durability is
             // unconfirmed.
-            log::debug!(
+            log::trace!(
                 "model publish: directory fsync of '{}' failed: {sync_err}",
                 parent.display()
             );
@@ -5064,34 +5332,40 @@ impl FittedModel {
         out
     }
 
-    /// Frozen level vocabularies for FIXED-factor terms (`factor(g)` or a bare
-    /// `+ g`, i.e. `lenient_unseen == false`) whose feature column is *numeric*
-    /// in the data schema.
+    /// Refuse the out-of-vocabulary levels of FIXED-factor terms (`factor(g)`
+    /// or a bare `+ g`, i.e. `lenient_unseen == false`) whose feature column is
+    /// *numeric* in the data schema, one error per such column naming its first
+    /// unseen level.
     ///
-    /// A string factor is a `Categorical` schema column, so the strict schema
-    /// re-encode already rejects (and `check` reports) an out-of-vocabulary
-    /// label. A numeric-coded `factor(year)`, however, reaches the model as a
-    /// `Continuous`/`Binary` column with no categorical schema, so the encode
-    /// path has no level set to validate against — the unseen-level guard is
-    /// silently skipped (#2137). This exposes each such column's frozen numeric
-    /// vocabulary (canonical `f64` bit patterns, signed-zero/NaN normalized) so
-    /// the `check`/`predict` schema layer can enforce the same fixed-factor
-    /// contract the design operator (`build_random_effect_block`) enforces.
+    /// A string factor is a `Categorical` schema column, so the schema
+    /// projection already refuses an out-of-vocabulary label. A numeric-coded
+    /// `factor(year)`, however, reaches the model as a `Continuous`/`Binary`
+    /// column with no categorical schema, so the projection has no level set to
+    /// validate against (#2137). This checks each such column against its frozen
+    /// numeric vocabulary (canonical `f64` bit patterns, signed-zero/NaN
+    /// normalized) with the same typed [`gam_data::DataError::InvalidCell`] the
+    /// projection gives a string factor, so `predict` and `check` on every front
+    /// end refuse the level before the design operator
+    /// (`build_random_effect_block`) is reached.
     ///
-    /// Only terms with concrete `frozen_levels` (captured at fit) and the full
-    /// one-hot block (`!drop_first_level`, so the frozen set is the complete
-    /// training vocabulary) are returned, matching the operator's strict gate.
-    pub fn numeric_fixed_factor_vocabularies(&self) -> Vec<(String, HashSet<u64>)> {
+    /// Only strict terms with concrete `frozen_levels` (captured at fit, the
+    /// complete training vocabulary) are checked, matching the operator's
+    /// strict gate.
+    pub fn unseen_numeric_factor_levels(
+        &self,
+        headers: &[String],
+        values: ndarray::ArrayView2<'_, f64>,
+    ) -> Vec<gam_data::DataError> {
         let Some(training_headers) = self.training_headers.as_ref() else {
             return Vec::new();
         };
         let Some(schema) = self.data_schema.as_ref() else {
             return Vec::new();
         };
-        let mut out = Vec::<(String, HashSet<u64>)>::new();
+        let mut out = Vec::new();
         for spec in self.saved_term_specs() {
             for term in &spec.random_effect_terms {
-                if term.lenient_unseen || term.drop_first_level {
+                if term.lenient_unseen {
                     continue;
                 }
                 let Some(levels) = term.frozen_levels.as_ref() else {
@@ -5101,7 +5375,7 @@ impl FittedModel {
                     continue;
                 };
                 // Skip string factors: they are Categorical in the schema and
-                // are already validated by the typed encode.
+                // are already validated by the schema projection.
                 let is_numeric = schema
                     .columns
                     .iter()
@@ -5111,11 +5385,31 @@ impl FittedModel {
                 if !is_numeric {
                     continue;
                 }
+                let Some(index) = headers.iter().position(|header| header == name) else {
+                    continue;
+                };
                 let vocab: HashSet<u64> = levels
                     .iter()
                     .map(|&b| gam_data::canonical_level_bits(f64::from_bits(b)))
                     .collect();
-                out.push((name.clone(), vocab));
+                let column = values.column(index);
+                let Some((row, value)) = column
+                    .iter()
+                    .enumerate()
+                    .find(|(_, value)| !vocab.contains(&gam_data::canonical_level_bits(**value)))
+                else {
+                    continue;
+                };
+                let known_levels = levels
+                    .iter()
+                    .map(|&b| f64::from_bits(b).to_string())
+                    .collect::<Vec<_>>();
+                out.push(gam_data::DataError::unseen_level_cell(
+                    name,
+                    row + 1,
+                    &value.to_string(),
+                    &known_levels,
+                ));
             }
         }
         out
@@ -5164,12 +5458,15 @@ impl FittedModel {
                 ),
             });
         }
-        let expectile_family_tag = {
+        let (expectile_family_tag, joint_expectile_family_tag) = {
             let family = self.family.trim().to_ascii_lowercase();
-            family == "expectile" || family.starts_with("expectile(")
+            (
+                family == "expectile" || family.starts_with("expectile("),
+                family == JOINT_EXPECTILE_FAMILY_TAG,
+            )
         };
-        match self.estimator {
-            FittedEstimator::Likelihood if expectile_family_tag => {
+        match &self.estimator {
+            FittedEstimator::Likelihood if expectile_family_tag || joint_expectile_family_tag => {
                 return Err(FittedModelError::SchemaMismatch {
                     reason:
                         "saved family is tagged expectile but estimator metadata says likelihood"
@@ -5178,6 +5475,7 @@ impl FittedModel {
             }
             FittedEstimator::Likelihood => {}
             FittedEstimator::Expectile { tau } => {
+                let tau = *tau;
                 if !tau.is_finite() || tau <= 0.0 || tau >= 1.0 {
                     return Err(FittedModelError::SchemaMismatch {
                         reason: format!(
@@ -5199,6 +5497,62 @@ impl FittedModel {
                             self.model_kind,
                             self.family,
                             self.family_state.likelihood(),
+                        ),
+                    });
+                }
+            }
+            FittedEstimator::ExpectileLocationScale {
+                levels,
+                standardized_expectiles,
+            } => {
+                let gaussian_identity_location_scale = self.model_kind == ModelKind::LocationScale
+                    && matches!(
+                        &self.family_state,
+                        FittedFamily::LocationScale { likelihood, .. }
+                            if likelihood == &LikelihoodSpec::gaussian_identity()
+                    );
+                if !gaussian_identity_location_scale || !joint_expectile_family_tag {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile estimator requires a \
+                             `{JOINT_EXPECTILE_FAMILY_TAG}`-tagged Gaussian location-scale fit; \
+                             got model_kind={:?}, family={:?}, likelihood={:?}",
+                            self.model_kind,
+                            self.family,
+                            self.family_state.likelihood(),
+                        ),
+                    });
+                }
+                if levels.len() < 2 || levels.len() != standardized_expectiles.len() {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile estimator needs at least two levels, each with \
+                             one standardized expectile; got {} levels and {} expectiles",
+                            levels.len(),
+                            standardized_expectiles.len()
+                        ),
+                    });
+                }
+                if levels.iter().any(|tau| !tau.is_finite() || *tau <= 0.0 || *tau >= 1.0)
+                    || levels.windows(2).any(|pair| !(pair[0] < pair[1]))
+                {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile levels must be strictly increasing and \
+                             strictly inside (0, 1), got {levels:?}"
+                        ),
+                    });
+                }
+                if standardized_expectiles.iter().any(|c| !c.is_finite())
+                    || standardized_expectiles
+                        .windows(2)
+                        .any(|pair| !(pair[0] < pair[1]))
+                {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile standardized expectiles must be finite and \
+                             strictly increasing (the non-crossing guarantee), got \
+                             {standardized_expectiles:?}"
                         ),
                     });
                 }
@@ -5870,6 +6224,17 @@ impl FittedModel {
                 ),
             });
         }
+        // A converged constrained fit whose posterior moments were declined is
+        // persisted as its optimizer mode under that typed decline (#979 ruling
+        // (c)): the decline is the saved statement of why no posterior mean
+        // exists, and every posterior-mean consumer refuses by it through
+        // `require_posterior_mean`. The penalized precision of such a fit is
+        // not positive definite by construction — that is what was declined —
+        // so factoring it here would only re-derive the decline as an untyped
+        // "corrupt payload" and lose the certified fit (gam#3008).
+        if fit.posterior_moment_decline().is_some() {
+            return Ok(());
+        }
 
         if fit
             .geometry
@@ -6014,6 +6379,9 @@ impl FittedModel {
         if let Some(v) = self.gaussian_response_scale {
             ensure_finite_scalar("gaussian_response_scale", v).map_err(corrupt)?;
         }
+        if let Some(v) = self.gaussian_sigma_floor {
+            ensure_finite_scalar("gaussian_sigma_floor", v).map_err(corrupt)?;
+        }
         if let Some(v) = self.beta_link_wiggle.as_ref() {
             validate_all_finite("beta_link_wiggle", v.iter().copied()).map_err(corrupt)?;
         }
@@ -6079,17 +6447,38 @@ fn validate_frozen_term_collectionspec(
 /// saved before that has one λ fewer for each such term. The refusal names those
 /// terms when the spec has any.
 ///
-/// `spec` is the mean predictor's spec, so the saved count is the Mean block's
-/// λ when the fit records one, and the fit's λ otherwise.
+/// `spec` is the mean predictor's spec, so the saved count is the λ of the
+/// block that spec builds: the Mean block of a single-predictor fit, or the
+/// Location block of a location-scale fit, whose trailing Scale block carries
+/// the noise predictor's own λ. Counting every λ of a location-scale fit against
+/// the location spec refused every such summary as a stale layout. The walk
+/// reads λ from global index 0, so that block must lead the fit; a fit with
+/// neither role counts all of its λ.
 pub fn saved_lambdas_index_rebuilt_layout(
     spec: &TermCollectionSpec,
     rebuilt_penalties: usize,
     fit: &UnifiedFitResult,
     context: &str,
 ) -> Result<(), FittedModelError> {
-    let saved_lambdas = fit
+    let spec_block = fit
         .block_by_role(BlockRole::Mean)
-        .map_or(fit.lambdas.len(), |block| block.lambdas.len());
+        .or_else(|| fit.block_by_role(BlockRole::Location));
+    if let Some(block) = spec_block {
+        if !fit
+            .blocks
+            .first()
+            .is_some_and(|first| std::ptr::eq(first, block))
+        {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "{context}: the {} block the saved spec builds is not the fit's leading block, \
+                     so its smoothing parameters do not start at global index 0",
+                    block.role.name()
+                ),
+            });
+        }
+    }
+    let saved_lambdas = spec_block.map_or(fit.lambdas.len(), |block| block.lambdas.len());
     if rebuilt_penalties == saved_lambdas {
         return Ok(());
     }
@@ -6276,6 +6665,7 @@ mod tests {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         }
     }
 
@@ -6646,9 +7036,12 @@ mod tests {
                 firth_bias_reduction: false,
                 covariance_declined: None,
                 jeffreys_arming_evidence: None,
+                improper_penalty_null_posterior: None,
                 outer_warm_start: None,
+                null_deviance: None,
                 coefficient_mode_selection:
                     gam_solve::model_types::CoefficientModeSelection::NotRecorded,
+                random_effect_tests: Vec::new(),
             },
             inner_cycles: 0,
         })
@@ -6840,6 +7233,62 @@ mod tests {
             .expect_err("active-frame precision cannot be paired with raw prediction rows");
         assert!(error.to_string().contains("active gauge"));
         assert!(error.to_string().contains("lifted"));
+    }
+
+    /// gam#3008: a curved-link fit that converged on a constraint boundary and
+    /// declined its posterior moments (indefinite precision) persists as its
+    /// mode under the typed decline. Save/load validation accepts it, and the
+    /// posterior-mean refusal is the decline's own reason, never a strict
+    /// Cholesky of the declined precision reported as a corrupt payload.
+    #[test]
+    fn curved_link_persistence_keeps_a_declined_boundary_mode_3008() {
+        use gam_solve::constrained_posterior::{
+            ConePosteriorMomentDecline, ConePropernessEvidence, ConstrainedPosteriorGeometry,
+        };
+        let mut fit = saved_fit(vec![FittedBlock {
+            beta: array![0.0, 0.5],
+            role: BlockRole::Mean,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        }]);
+        fit.covariance_conditional = None;
+        fit.covariance_corrected = None;
+        fit.geometry = Some(gam_solve::estimate::FitGeometry {
+            coefficient_gauge: gam_problem::gauge::Gauge::identity(&[2]),
+            penalized_hessian: array![[1.0, 0.0], [0.0, -2.0]].into(),
+            constrained_posterior: Some(ConstrainedPosteriorGeometry::with_decline(
+                gam_problem::LinearInequalityConstraints::new(array![[1.0, 0.0]], array![0.0])
+                    .expect("a 1x2 inequality system with a matching bound is well formed"),
+                array![0.0, 0.5],
+                ConePosteriorMomentDecline {
+                    ambient_precision_failure: "fixture: the ambient precision is indefinite"
+                        .to_string(),
+                    properness: ConePropernessEvidence::CertificationFailed {
+                        reason: "fixture: the cone-truncated posterior is improper".to_string(),
+                    },
+                    active_rows: vec![0],
+                    boundary_approximation_refusal: None,
+                },
+            )),
+            working: None,
+        });
+        let model = standard_binomial_model(fit);
+        model
+            .validate_required_posterior_mean_state()
+            .expect("a declined boundary mode is a persistable converged fit");
+        let refusal = model
+            .payload()
+            .fit_result
+            .as_ref()
+            .expect("the model carries its fit")
+            .require_posterior_mean("posterior-mean prediction")
+            .expect_err("a declined fit has no posterior mean")
+            .to_string();
+        assert!(
+            refusal.contains("the ambient precision is indefinite"),
+            "the refusal must carry the decline's reason, got: {refusal}"
+        );
+        assert!(!refusal.contains("Cholesky"), "got: {refusal}");
     }
 
     fn marginal_slope_payload(version: u32, fit: UnifiedFitResult) -> FittedModelPayload {
@@ -7062,8 +7511,6 @@ mod tests {
             .push(gam_terms::smooth::RandomEffectTermSpec {
                 name: "g".to_string(),
                 feature_col: 0,
-                drop_first_level: false,
-                penalized: true,
                 frozen_levels: Some(vec![0.0_f64.to_bits(), 7.0_f64.to_bits()]),
                 lenient_unseen: true,
             });
@@ -7485,6 +7932,12 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
+            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
+            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
+            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
+            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
+            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
             MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
             LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
             OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
@@ -7500,9 +7953,30 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
+        assert_eq!(CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(
+            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
+            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
+            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
+            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
+            POLISH_STEP_BUDGET_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
+            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION - 1
+        );
         assert_eq!(
             MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
-            MODEL_PAYLOAD_VERSION - 1
+            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION - 1
         );
         assert_eq!(
             WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION,
@@ -7528,6 +8002,29 @@ mod tests {
         assert_eq!(RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION, NEWTON_POLISH_ABSENT_PAYLOAD_VERSION - 1);
         assert_eq!(EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION, RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION - 1);
         assert_eq!(COVARIANCE_COPIES_PAYLOAD_VERSION, EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION - 1);
+    }
+
+    /// gam#3002: a certified point saved before v28 reads with its `rho` as `theta` and with
+    /// no value or fingerprint, so a warm start from it can only join a search; a v28 point
+    /// round-trips whole.
+    #[test]
+    fn a_certified_point_before_v28_loads_without_its_value_or_fingerprint_3002() {
+        use gam_solve::model_types::OuterWarmStartRecord;
+        let record: OuterWarmStartRecord =
+            serde_json::from_str(r#"{"rho":[1.5,-2.0],"beta":[0.25]}"#).expect("a v27 point reads");
+        assert_eq!(record.theta, vec![1.5, -2.0]);
+        assert_eq!(
+            (record.value, record.input_fingerprint.as_deref()),
+            (None, None)
+        );
+        let current = OuterWarmStartRecord {
+            value: Some(3.0),
+            input_fingerprint: Some("00ff".to_string()),
+            ..record
+        };
+        let text = serde_json::to_string(&current).expect("a v28 point writes");
+        let read: OuterWarmStartRecord = serde_json::from_str(&text).expect("a v28 point reads");
+        assert_eq!(read, current);
     }
 
     /// #2954: a payload written before the certificate recorded its Newton polish and each
@@ -7616,6 +8113,123 @@ mod tests {
                 MODEL_PAYLOAD_VERSION + 1
             )),
             "{err}"
+        );
+    }
+
+    /// gam#3166: 996d0af2c1 replaced the Newton-polish record's `step_budget` with
+    /// `settled` without a version bump, so v29 has two shapes.
+    /// - A v29 payload written before that commit carries `step_budget` and no `settled`.
+    ///   It loads with `settled` false.
+    /// - A v29 payload written after it carries `settled` and no `step_budget`. It loads
+    ///   as written.
+    /// - A payload claiming the version after this binary's is refused by the named
+    ///   version error, as a v29 binary refuses a v30 payload.
+    #[test]
+    fn both_v29_polish_record_shapes_load_and_a_later_version_is_refused_by_name_3166() {
+        use gam_solve::model_types::NewtonPolishRecord;
+        let blocks = || {
+            vec![FittedBlock {
+                beta: array![0.1],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            }]
+        };
+        let polish = NewtonPolishRecord {
+            lambda_sq_before: 1.5e-6,
+            lambda_sq_after: 2.0e-9,
+            decreases: vec![7.0e-7, -3.0e-8],
+            settled: true,
+            rails: Vec::new(),
+            entry: vec![0.3],
+        };
+        let mut fit = saved_fit(blocks());
+        fit.artifacts.criterion_certificate =
+            Some(gam_solve::rho_optimizer::OuterCriterionCertificate {
+                stationarity:
+                    gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
+                        grad_norm: 2e-7,
+                        projected_grad_norm: 2e-7,
+                        bound: 1e-5,
+                        rung: gam_solve::rho_optimizer::CertifiedRung {
+                            label: "newton-decrement".to_string(),
+                            derived_standard: true,
+                        },
+                    },
+                curvature: gam_solve::rho_optimizer::CurvatureEvidence::Measured { psd: true },
+                lambdas_railed: Vec::new(),
+                railed_facts: Vec::new(),
+                newton_polish: Some(polish.clone()),
+                curvature_floor: None,
+            });
+        let written = serde_json::to_value(marginal_slope_payload(
+            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
+            fit,
+        ))
+        .expect("serialize a v29 payload");
+        // The record as each v29 writer left it: before 996d0af2c1 it held the step
+        // budget and no settling flag.
+        let as_written = |before_996d: bool| {
+            let mut value = written.clone();
+            let mut records = 0;
+            for materialization in ["fit_result", "unified"] {
+                if let Some(record) = value
+                    .get_mut(materialization)
+                    .and_then(|fit| fit.get_mut("artifacts"))
+                    .and_then(|artifacts| artifacts.get_mut("criterion_certificate"))
+                    .and_then(|certificate| certificate.get_mut("newton_polish"))
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    records += 1;
+                    if before_996d {
+                        record
+                            .remove("settled")
+                            .expect("the settling flag was written");
+                        record.insert("step_budget".to_string(), serde_json::json!(2));
+                    }
+                }
+            }
+            assert!(records > 0, "the payload carries the polish record");
+            value
+        };
+        for (before_996d, settled) in [(true, false), (false, true)] {
+            let loaded: FittedModelPayload = serde_json::from_value(as_written(before_996d))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "a v29 payload (written before 996d0af2c1: {before_996d}) parses: {error}"
+                    )
+                });
+            FittedModel::from_payload(loaded.clone())
+                .payload()
+                .validate_payload_version()
+                .expect("a v29 payload is readable");
+            let record = loaded
+                .fit_result
+                .as_ref()
+                .and_then(|fit| fit.artifacts.criterion_certificate.as_ref())
+                .and_then(|certificate| certificate.newton_polish.as_ref())
+                .expect("the loaded certificate keeps its polish");
+            assert_eq!(
+                record,
+                &NewtonPolishRecord {
+                    settled,
+                    ..polish.clone()
+                },
+                "written before 996d0af2c1: {before_996d}"
+            );
+        }
+
+        let newer = MODEL_PAYLOAD_VERSION + 1;
+        let err = FittedModel::from_payload(marginal_slope_payload(newer, saved_fit(blocks())))
+            .payload()
+            .validate_payload_version()
+            .expect_err("a payload from a later schema is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("payload schema mismatch")
+                && message.contains(&format!("file has version={newer}"))
+                && message.contains(&format!("MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}")),
+            "a later payload must be refused by its version: {message}"
         );
     }
 
@@ -7877,9 +8491,10 @@ mod tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         }
     }
 
@@ -7913,6 +8528,39 @@ mod tests {
                 .to_string();
         assert!(generic.contains("different penalty layout"), "{generic}");
         assert!(!generic.contains("third-order"), "{generic}");
+    }
+
+    /// A location-scale fit's resolved spec is the location predictor's, so the
+    /// rebuilt layout is checked against the Location block's λ alone; the
+    /// trailing Scale block's λ belong to the noise predictor. Counting both
+    /// refused every Gaussian location-scale summary table as a stale layout.
+    #[test]
+    fn a_location_scale_fit_checks_the_location_block_lambdas() {
+        let block = |role, width: usize, lambdas: usize| FittedBlock {
+            beta: Array1::zeros(width),
+            role,
+            edf: 1.0,
+            lambdas: Array1::ones(lambdas),
+        };
+        let spec = matern_termspec_2953(None);
+        let fit = saved_fit(vec![
+            block(BlockRole::Location, 3, 4),
+            block(BlockRole::Scale, 2, 2),
+        ]);
+        assert!(saved_lambdas_index_rebuilt_layout(&spec, 4, &fit, "replay").is_ok());
+        let stale = saved_lambdas_index_rebuilt_layout(&spec, 6, &fit, "replay")
+            .expect_err("a rebuild that disagrees with the Location block must refuse")
+            .to_string();
+        assert!(stale.contains("4 smoothing parameters"), "{stale}");
+
+        let scale_first = saved_fit(vec![
+            block(BlockRole::Scale, 2, 2),
+            block(BlockRole::Location, 3, 4),
+        ]);
+        let shifted = saved_lambdas_index_rebuilt_layout(&spec, 4, &scale_first, "replay")
+            .expect_err("a Location block that does not lead the fit must refuse")
+            .to_string();
+        assert!(shifted.contains("not the fit's leading block"), "{shifted}");
     }
 
     /// #2953, through a real replay: the saved per-smooth summary rebuilds the

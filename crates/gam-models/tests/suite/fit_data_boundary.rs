@@ -232,8 +232,8 @@ fn invalid_prior_weights_are_data_errors_at_the_weight_column() {
 fn degenerate_tables_are_data_errors() {
     let one_row = table(&[("y", vec![0.3]), ("x", vec![0.5])]);
     let error = materialize_error(&one_row, &FitConfig::default());
-    assert!(matches!(&error, WorkflowError::InvalidData { column, .. } if column == "<table>"));
-    assert!(error.to_string().contains("only one observation"), "{error}");
+    assert!(matches!(&error, WorkflowError::InvalidData { column, .. } if column == "y"));
+    assert!(error.to_string().contains("too few rows"), "{error}");
 
     let y = vec![0.3, 1.1, 0.7, 1.9];
     for (x, y, column, needle) in [

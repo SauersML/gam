@@ -380,7 +380,7 @@ fn survival_time_anchor_rejected_on_nonsurvival_response_2631() {
 #[test]
 fn an_absent_warm_start_attaches_no_cache_session() {
     let absent = blockwise_fit_options(&FitConfig::default());
-    assert!(absent.cache_session.is_none() && absent.required_warm_start.is_none());
+    assert!(absent.cache_session.is_none() && absent.warm_start.is_none());
 }
 
 /// The carrier is survival-only: a standard fit has no survival time basis to
@@ -396,67 +396,138 @@ fn materialized_standard_fit_carries_no_survival_time_basis_2470() {
     );
 }
 
-/// #2633: `FitConfig::precompute_conformal = Some(false)` must drop the exact
-/// full-conformal substrate from the saved payload, and nothing else about the
-/// fit.
-///
-/// The substrate grows with the training rows. The knob lets a caller that
-/// keeps its training data decline it. Both arms are asserted so the test
-/// proves the FLAG is what removed it, rather than the fit having been
-/// ineligible for a substrate all along — an assertion on the off-arm alone
-/// would pass just as well against a model that never qualified.
+/// Speed F6: a saved standard GAM carries only O(p²) state and term metadata,
+/// never per-row training data, so its size does not grow with the training
+/// rows. The same formula is fit at two training sizes; the longest array
+/// anywhere in the serialized payload must be the same length at both, and the
+/// exact full-conformal field must hold only the p × p frozen penalty. Before
+/// the fix the payload persisted the training design and response for the
+/// conformal set and the final PIRLS working weights and response (twice, once
+/// under `unified` and once under `fit_result`), each of length n.
 #[test]
-fn precompute_conformal_false_drops_the_full_conformal_substrate_2633() {
+fn saved_standard_payload_carries_no_per_row_training_data() {
     use crate::inference::model_payload_builders::fit_formula_to_payload;
 
-    let td = tempdir().expect("tempdir");
-    let data_path = td.path().join("conformal_optout.csv");
-    let mut csv = String::from("y,x1,x2\n");
-    for i in 0..80u32 {
-        let t = f64::from(i) / 80.0;
-        let x1 = t * 10.0;
-        let x2 = f64::from((i * 7) % 40) / 4.0;
-        let y = (x1 * 0.7).sin() * 2.0 + (x2 * 0.4).cos();
-        csv.push_str(&format!("{y:.6},{x1:.6},{x2:.6}\n"));
+    fn longest_array(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(longest_array)
+                .max()
+                .unwrap_or(0)
+                .max(items.len()),
+            serde_json::Value::Object(fields) => {
+                fields.values().map(longest_array).max().unwrap_or(0)
+            }
+            _ => 0,
+        }
     }
-    fs::write(&data_path, csv).expect("write conformal opt-out csv");
-    let data = load_dataset_projected(
-        &data_path,
-        &["y".to_string(), "x1".to_string(), "x2".to_string()],
-    )
-    .expect("load conformal opt-out dataset");
-    // Two smooths, so the single-smooth spline-scan fast path (which produces a
-    // payload with no fit_result and therefore no substrates for an unrelated
-    // reason) is not taken.
+
+    let td = tempdir().expect("tempdir");
     let formula = "y ~ s(x1, k=6) + s(x2, k=6)".to_string();
-
-    let on = fit_formula_to_payload(formula.clone(), &data, &FitConfig::default())
-        .expect("eligible gaussian fit should materialize and fit");
-    assert!(
-        on.full_conformal.is_some(),
-        "precondition: this fit must be substrate-eligible by default, otherwise the \
-         opt-out arm below proves nothing"
-    );
-
-    let config = FitConfig {
-        precompute_conformal: Some(false),
-        ..FitConfig::default()
+    let fit_at = |n: u32| {
+        let data_path = td.path().join(format!("rows_{n}.csv"));
+        let mut csv = String::from("y,x1,x2\n");
+        for i in 0..n {
+            let t = f64::from(i) / f64::from(n);
+            let x1 = t * 10.0;
+            let x2 = f64::from((i * 7) % 40) / 4.0;
+            let y = (x1 * 0.7).sin() * 2.0 + (x2 * 0.4).cos() + 0.3 * (f64::from(i) * 1.7).sin();
+            csv.push_str(&format!("{y:.6},{x1:.6},{x2:.6}\n"));
+        }
+        fs::write(&data_path, csv).expect("write training csv");
+        let data = load_dataset_projected(
+            &data_path,
+            &["y".to_string(), "x1".to_string(), "x2".to_string()],
+        )
+        .expect("load training dataset");
+        let payload = fit_formula_to_payload(formula.clone(), &data, &FitConfig::default())
+            .expect("gaussian fit should materialize and fit");
+        serde_json::to_value(&payload).expect("payload serializes")
     };
-    let off = fit_formula_to_payload(formula, &data, &config)
-        .expect("opting out of the substrate must not affect fittability");
-    assert!(
-        off.full_conformal.is_none(),
-        "precompute_conformal=false must drop the exact full-conformal substrate"
-    );
-    // The knob is about what is PERSISTED, not about how the model was fitted.
-    assert!(
-        off.unified.is_some() && off.fit_result.is_some(),
-        "opting out of the substrates must leave the fit itself on the payload"
+    let small_rows = 400u32;
+    let large_rows = 4 * small_rows;
+    let small = fit_at(small_rows);
+    let large = fit_at(large_rows);
+
+    // Two smooths, so the single-smooth spline-scan path is not taken and the
+    // payload is the standard one that carries the conformal penalty.
+    let conformal = large
+        .get("full_conformal")
+        .and_then(serde_json::Value::as_object)
+        .expect("an eligible gaussian fit persists its exact full-conformal penalty");
+    // The field holds the p × p frozen penalty and the fit's smoothing-parameter
+    // count (a scalar, gam#3296), and nothing else: no labeled rows.
+    assert_eq!(
+        conformal.keys().collect::<Vec<_>>(),
+        vec!["penalty_count", "s_lambda"],
+        "the exact full-conformal field must persist only the frozen penalty and its count"
     );
     assert_eq!(
-        on.formula, off.formula,
-        "the knob must not disturb anything else on the payload"
+        conformal.get("penalty_count").and_then(serde_json::Value::as_u64),
+        Some(4),
+        "the conformal penalty count is the fit's four smoothing parameters \
+         (two smooths, each carrying a wiggliness and a null-space penalty under \
+         the default double penalty)"
     );
+    assert!(
+        longest_array(&large) < small_rows as usize,
+        "a saved standard payload must hold no array as long as the training rows \
+         (longest array {} at n={large_rows})",
+        longest_array(&large)
+    );
+    assert_eq!(
+        longest_array(&small),
+        longest_array(&large),
+        "the longest array in the saved payload must not depend on the training rows"
+    );
+
+    // A v28 payload of the same fit carried the per-row data this version no
+    // longer writes: the conformal training `x` and `y`, and the working PIRLS
+    // geometry under every fit geometry. It must still load.
+    fn insert_working_geometry(value: &mut serde_json::Value, rows: usize) -> usize {
+        match value {
+            serde_json::Value::Object(fields) => {
+                let mut inserted = 0;
+                if fields.contains_key("coefficient_gauge") && fields.contains_key("penalized_hessian")
+                {
+                    fields.insert(
+                        "working".to_string(),
+                        serde_json::json!({
+                            "weights": vec![1.0; rows],
+                            "working_response": vec![0.5; rows],
+                        }),
+                    );
+                    inserted += 1;
+                }
+                inserted + fields.values_mut().map(|v| insert_working_geometry(v, rows)).sum::<usize>()
+            }
+            serde_json::Value::Array(items) => {
+                items.iter_mut().map(|v| insert_working_geometry(v, rows)).sum()
+            }
+            _ => 0,
+        }
+    }
+    let rows = large_rows as usize;
+    let mut legacy = large.clone();
+    legacy["version"] = serde_json::json!(28);
+    let p = conformal["s_lambda"]["dim"][0].as_u64().expect("s_lambda dim") as usize;
+    legacy["full_conformal"]["x"] = serde_json::to_value(Array2::<f64>::zeros((rows, p))).expect("x");
+    legacy["full_conformal"]["y"] = serde_json::to_value(ndarray::Array1::<f64>::zeros(rows)).expect("y");
+    assert!(
+        insert_working_geometry(&mut legacy, rows) > 0,
+        "the fit payload must carry a fit geometry to plant the v28 working rows in"
+    );
+    let loaded: crate::inference::model::FittedModelPayload =
+        serde_json::from_value(legacy).expect("a v28 standard payload with training rows must load");
+    let penalty = loaded
+        .full_conformal
+        .as_ref()
+        .expect("the v28 conformal field loads as the frozen penalty");
+    assert_eq!(penalty.p(), p);
+    crate::inference::model::FittedModel::from_payload(loaded)
+        .validate_for_persistence()
+        .expect("a loaded v28 standard payload passes the saved-model gate");
 }
 
 #[test]
@@ -1426,12 +1497,12 @@ fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1
         "implicit {label} centers must retain Auto provenance"
     );
     assert!(
-        raw_centers > starting_num_centers(data.values.nrows(), 1),
+        raw_centers >= starting_num_centers(data.values.nrows(), 1, 2),
         "{label} formula default must retain its derived univariate resolution floor"
     );
 
     let initial_config = FitConfig {
-        spatial_center_counts: Some(Vec::new()),
+        adaptive_resolution: Some(Vec::new()),
         ..FitConfig::default()
     };
     let initial = materialize(formula, &data, &initial_config)
@@ -1456,7 +1527,9 @@ fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1
         "test data must leave room for a genuine {label} growth proposal"
     );
     let growth_config = FitConfig {
-        spatial_center_counts: Some(vec![Some(proposed_centers)]),
+        adaptive_resolution: Some(vec![Some(
+            gam_terms::smooth::AdaptiveResolution::Centers(proposed_centers),
+        )]),
         ..FitConfig::default()
     };
     let grown = materialize(formula, &data, &growth_config)
@@ -1494,7 +1567,9 @@ fn matern_is_excluded_from_generic_adaptive_center_growth() {
         formula,
         &data,
         &FitConfig {
-            spatial_center_counts: Some(vec![Some(raw_centers.saturating_mul(2))]),
+            adaptive_resolution: Some(vec![Some(
+                gam_terms::smooth::AdaptiveResolution::Centers(raw_centers.saturating_mul(2)),
+            )]),
             ..FitConfig::default()
         },
     )
@@ -1532,7 +1607,7 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     let raw_centers = raw_spec.center_strategy.planned_num_centers(2);
 
     let adaptive_config = FitConfig {
-        spatial_center_counts: Some(Vec::new()),
+        adaptive_resolution: Some(Vec::new()),
         ..FitConfig::default()
     };
     let adaptive = materialize("y ~ duchon(ct, st)", &data, &adaptive_config)
@@ -1550,16 +1625,13 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     let adaptive_centers = adaptive_spec.center_strategy.planned_num_centers(2);
     assert_eq!(
         adaptive_centers,
-        starting_num_centers(data.values.nrows(), 2)
+        starting_num_centers(data.values.nrows(), 2, 3)
     );
-    // #1757 made the IMPLICIT 2-D Duchon default the low-rank thin-plate
-    // representer rank `10 * 3^(d - 1)`, which is where `starting_num_centers`
-    // starts the adaptive pilot while the sample holds at most eight rows per
-    // pilot center (240 rows in 2-D; above that the pilot grows at the
-    // production budget's `n^0.4` rate, #1561). At this 72-row fixture the raw
-    // default and the pilot start therefore COINCIDE — so the
-    // `raw_centers > adaptive_centers` this replaces was unsatisfiable rather
-    // than merely unmet, and could not have distinguished the two paths.
+    // #1757 made the IMPLICIT 2-D Duchon default low-rank; that rank is the
+    // rate-derived pilot `starting_num_centers(n, d, nullspace)` — the affine
+    // null space plus the penalized resolution rank at `n` rows — which is
+    // also where the adaptive pilot starts. The raw default and the pilot
+    // start therefore COINCIDE at every n.
     // What separates them is the grow CEILING, not the start: only the
     // orchestrated request has an owner that may escalate toward
     // `default_num_centers`, and the raw request stays pinned at the low-rank
@@ -1591,15 +1663,12 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     assert!(!center_strategy_is_auto(&explicit_spec.center_strategy));
 
     // Second arm, at an n where the `n / COND_N_DIVISOR` conditioning cap in
-    // `default_num_centers` no longer binds: the low-rank rule `10 * 3^(d - 1)`
-    // is then STRICTLY below the production ceiling, so the orchestrator's grow
-    // loop has something to escalate. At the 72-row fixture above both numbers
-    // collapse onto the conditioning cap and the headroom is legitimately zero,
-    // which is why the strict statement needs its own, larger, fixture rather
-    // than a wider bar on the small one.
+    // `default_num_centers` no longer binds: the rate pilot is then STRICTLY
+    // below the production ceiling, so the orchestrator's grow loop has
+    // something to escalate.
     let wide = duchon_workflow_dataset_with_rows(200);
     let wide_rows = wide.values.nrows();
-    let low_rank_representer_rank = 10usize * 3usize.pow(1);
+    let low_rank_representer_rank = starting_num_centers(wide_rows, 2, 3);
     let wide_raw = materialize("y ~ duchon(ct, st)", &wide, &FitConfig::default())
         .expect("raw Duchon materialization at 200 rows");
     let FitRequest::Standard(wide_raw_request) = wide_raw.request else {
@@ -1615,12 +1684,7 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     assert_eq!(
         wide_raw_spec.center_strategy.planned_num_centers(2),
         low_rank_representer_rank,
-        "the implicit 2-D Duchon default is the low-rank representer rank (#1757)"
-    );
-    assert_eq!(
-        starting_num_centers(wide_rows, 2),
-        low_rank_representer_rank,
-        "the adaptive pilot start uses the same low-rank rule"
+        "the implicit 2-D Duchon default is the rate-derived low-rank pilot (#1757)"
     );
     assert!(
         default_num_centers(wide_rows, 2) > low_rank_representer_rank,
@@ -2160,8 +2224,9 @@ fn bernoulli_marginal_slope_prune_drops_penalized_redundant_scalar_term() {
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     };
-    let mut notes = Vec::new();
+    let mut notes = crate::fit_orchestration::FitNotes::default();
     let removed = prune_unidentified_linear_terms_for_marginal_slope(
         &mut spec,
         &data,
@@ -2737,7 +2802,11 @@ fn reference_gaussian_no_wiggle(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> GaussianLocationScaleFitResult {
+    let raw_offsets = GaussianLocationScaleRawOffsets::of(&spec);
     let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let sigma_floor =
+        crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+            .expect("gaussian location-scale resolution σ floor");
     let fit = fit_gaussian_location_scale_terms(data, spec, options, kappa_options)
         .expect("reference gaussian no-wiggle terms fit");
     let mut result = GaussianLocationScaleFitResult {
@@ -2746,8 +2815,10 @@ fn reference_gaussian_no_wiggle(
         wiggle_degree: None,
         beta_link_wiggle: None,
         response_scale: 1.0,
+        sigma_floor,
     };
-    rescale_gaussian_location_scale_to_raw(&mut result, s).expect("gaussian location-scale raw remap");
+    rescale_gaussian_location_scale_to_raw(&mut result, s, &raw_offsets)
+        .expect("gaussian location-scale raw remap");
     result
 }
 
@@ -2760,7 +2831,11 @@ fn reference_gaussian_wiggle(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> GaussianLocationScaleFitResult {
+    let raw_offsets = GaussianLocationScaleRawOffsets::of(&spec);
     let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let sigma_floor =
+        crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+            .expect("gaussian location-scale resolution σ floor");
     let ref_pilot = fit_gaussian_location_scale_terms(data, spec.clone(), options, kappa_options)
         .expect("reference gaussian pilot");
     let ref_basis = select_gaussian_location_scale_link_wiggle_basis_from_pilot(
@@ -2795,8 +2870,10 @@ fn reference_gaussian_wiggle(
         wiggle_degree: Some(ref_solved.wiggle_degree),
         beta_link_wiggle,
         response_scale: 1.0,
+        sigma_floor,
     };
-    rescale_gaussian_location_scale_to_raw(&mut result, s).expect("gaussian location-scale raw remap");
+    rescale_gaussian_location_scale_to_raw(&mut result, s, &raw_offsets)
+        .expect("gaussian location-scale raw remap");
     result
 }
 
@@ -2845,7 +2922,11 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
     // Fit in *standardized* units (the engine's internal state before the raw
     // remap) so the remap under test is applied exactly once, by this test.
     let mut spec = spec;
+    let raw_offsets = GaussianLocationScaleRawOffsets::of(&spec);
     let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let sigma_floor =
+        crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+            .expect("gaussian location-scale resolution σ floor");
     assert!(
         (s - 1.0).abs() > 10.0,
         "fixture response scale must make the remap non-trivial, got s={s}"
@@ -2858,6 +2939,7 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
         wiggle_degree: None,
         beta_link_wiggle: None,
         response_scale: 1.0,
+        sigma_floor,
     };
 
     // Install the #2346-shaped covariance state: the corrected matrix mirrored
@@ -2894,7 +2976,8 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
         );
     }
 
-    rescale_gaussian_location_scale_to_raw(&mut result, s).expect("gaussian location-scale raw remap");
+    rescale_gaussian_location_scale_to_raw(&mut result, s, &raw_offsets)
+        .expect("gaussian location-scale raw remap");
 
     let fit = &result.fit.fit;
     let top_conditional = fit
@@ -2986,7 +3069,11 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
         ..
     } = request;
     let mut spec = spec;
+    let raw_offsets = GaussianLocationScaleRawOffsets::of(&spec);
     let s = standardize_gaussian_spec_like_engine(&mut spec);
+    let sigma_floor =
+        crate::sigma_link::gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+            .expect("gaussian location-scale resolution σ floor");
     assert!(
         (s - 1.0).abs() > 10.0,
         "fixture response scale must make the remap non-trivial, got s={s}"
@@ -3012,6 +3099,7 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
         wiggle_degree: None,
         beta_link_wiggle: None,
         response_scale: 1.0,
+        sigma_floor,
     };
     let mut rescaled = wrap(fit.clone());
     let mut composed = wrap(fit);
@@ -3019,12 +3107,14 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
         &mut rescaled,
         s,
         ActiveFrameUnits::RescalePrecision,
+        &raw_offsets,
     )
     .expect("rescaled representation");
     rescale_gaussian_location_scale_to_raw_with_units(
         &mut composed,
         s,
         ActiveFrameUnits::ComposeIntoGauge,
+        &raw_offsets,
     )
     .expect("composed representation");
     let (a, b) = (&rescaled.fit.fit, &composed.fit.fit);
@@ -4374,4 +4464,96 @@ fn survival_marginal_slope_and_latent_refusals_raise_their_category_2937() {
         );
         assert_eq!(err.variant_name(), "FitFailure::Input", "{mode}: {err}");
     }
+}
+
+/// PKG-10: one predicate names the multinomial-logit family for the CLI, the
+/// Python `fit_table` entry and the latent fitters, and the scalar resolver
+/// refuses exactly those names.
+#[test]
+fn multinomial_family_names_are_one_predicate() {
+    for name in [
+        "multinomial",
+        "Multinomial_Logit",
+        "categorical",
+        "categorical-logit",
+        "SOFTMAX",
+    ] {
+        assert!(is_multinomial_family_name(name), "{name}");
+        assert!(
+            scalar_family_from_name(name, FamilyNuisanceOverrides::default()).is_err(),
+            "{name}"
+        );
+    }
+    for name in ["binomial", "gaussian", "poisson", "ordinal", "auto"] {
+        assert!(!is_multinomial_family_name(name), "{name}");
+    }
+}
+
+/// gam#3014: on the standard, location-scale and survival paths every link spelling
+/// is read. `flexible_link` flexes the formula's `link(...)` as it flexes a `link`
+/// argument, a `flexible(...)` in either place makes the choice flexible, and a `link`
+/// argument naming a different base link from the formula's is refused by name.
+#[test]
+fn every_link_spelling_is_read_and_a_disagreeing_link_argument_is_refused_3014() {
+    use gam_terms::inference::formula_dsl::LinkMode;
+    let resolve = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        let parsed =
+            gam_terms::inference::formula_dsl::parse_formula(formula).expect("main formula");
+        super::validation::resolve_link_spellings(parsed.linkspec.as_ref(), link, flexible_link)
+    };
+    let choice = |formula: &str, link: Option<&str>, flexible_link: bool| {
+        resolve(formula, link, flexible_link)
+            .unwrap_or_else(|err| {
+                panic!("{formula} link={link:?} flexible_link={flexible_link}: {err}")
+            })
+            .map(|choice| (choice.link, matches!(choice.mode, LinkMode::Flexible)))
+    };
+    assert_eq!(choice("y ~ x", None, false), None);
+    assert_eq!(choice("y ~ x", None, true), Some((LinkFunction::Probit, true)));
+    for (formula, link, flexible_link, expected) in [
+        ("y ~ x + link(type=probit)", None, false, (LinkFunction::Probit, false)),
+        ("y ~ x + link(type=probit)", None, true, (LinkFunction::Probit, true)),
+        ("y ~ x + link(type=logit)", None, true, (LinkFunction::Logit, true)),
+        ("y ~ x + link(type=probit)", Some("probit"), false, (LinkFunction::Probit, false)),
+        ("y ~ x + link(type=probit)", Some("probit"), true, (LinkFunction::Probit, true)),
+        (
+            "y ~ x + link(type=probit)",
+            Some("flexible(probit)"),
+            false,
+            (LinkFunction::Probit, true),
+        ),
+        (
+            "y ~ x + link(type=flexible(probit))",
+            Some("probit"),
+            false,
+            (LinkFunction::Probit, true),
+        ),
+        ("y ~ x", Some("logit"), false, (LinkFunction::Logit, false)),
+        ("y ~ x", Some("logit"), true, (LinkFunction::Logit, true)),
+    ] {
+        assert_eq!(
+            choice(formula, link, flexible_link),
+            Some(expected),
+            "{formula} link={link:?} flexible_link={flexible_link}"
+        );
+    }
+    for (formula, link) in [
+        ("y ~ x + link(type=probit)", "logit"),
+        ("y ~ x + link(type=probit)", "flexible(logit)"),
+        ("y ~ x + link(type=flexible(probit))", "cloglog"),
+        ("y ~ x + link(type=logit)", "blended(logit,probit)"),
+    ] {
+        let err = resolve(formula, Some(link), false)
+            .expect_err("a link argument that disagrees with the formula must be refused");
+        let message = err.to_string();
+        assert!(
+            matches!(err, WorkflowError::InvalidConfig { .. })
+                && message.contains("link(type=")
+                && message.contains(&format!("link=\"{link}\"")),
+            "{formula} link={link}: {message}"
+        );
+    }
+    // A flexible request of a link the joint wiggle cannot flex is still refused,
+    // now also when the link is named in the formula.
+    assert!(resolve("y ~ x + link(type=sas)", None, true).is_err());
 }

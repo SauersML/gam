@@ -32,13 +32,16 @@ use crate::survival::construction::{
     require_structural_survival_time_basis, resolved_survival_time_basis_config_from_build,
     survival_derivative_guard_for_likelihood, survival_likelihood_modename,
 };
-use crate::survival::location_scale::SurvivalCovariateTimeBasis;
+use crate::survival::location_scale::{
+    SurvivalCovariateTimeBasis, TruncatedCoefficientDraws, build_truncated_coefficient_draws,
+    replicate_standard_error,
+};
 use crate::survival::latent::fixed_latent_hazard_frailty;
 use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::survival::{CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints};
 use crate::wiggle::monotone_wiggle_basis_with_derivative_order;
 use gam_linalg::matrix::DesignMatrix;
-use gam_math::probability::{normal_cdf, normal_pdf};
+use gam_math::probability::normal_pdf;
 use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam_solve::mixture_link::inverse_link_jet_for_inverse_link;
 use gam_terms::smooth::TermCollectionSpec;
@@ -122,6 +125,12 @@ pub enum SurvivalPredictError {
     /// produced a non-finite or out-of-domain value that downstream code
     /// cannot consume.
     NumericalFailure { reason: String },
+    /// The reported survival curve would increase at a requested cell,
+    /// `dH/dt < 0`, so no non-negative hazard is the derivative of the
+    /// cumulative hazard reported beside it (gam#3026). The fit's likelihood is
+    /// defined only where the survival index increases, so the cell is refused
+    /// rather than published with a hazard that belongs to a different curve.
+    DecreasingSurvival { reason: String },
     /// Saved-model validation failed below this prediction layer; the model
     /// source error keeps its own payload/schema category.
     ModelPayload {
@@ -138,7 +147,8 @@ impl std::fmt::Display for SurvivalPredictError {
             | SurvivalPredictError::IncompatibleSchema { reason }
             | SurvivalPredictError::UnsupportedConfiguration { reason }
             | SurvivalPredictError::PosteriorCovariance { reason }
-            | SurvivalPredictError::NumericalFailure { reason } => f.write_str(reason),
+            | SurvivalPredictError::NumericalFailure { reason }
+            | SurvivalPredictError::DecreasingSurvival { reason } => f.write_str(reason),
             SurvivalPredictError::ModelPayload { context, source } => {
                 write!(f, "{context}: {source}")
             }
@@ -155,7 +165,8 @@ impl std::error::Error for SurvivalPredictError {
             | SurvivalPredictError::IncompatibleSchema { .. }
             | SurvivalPredictError::UnsupportedConfiguration { .. }
             | SurvivalPredictError::PosteriorCovariance { .. }
-            | SurvivalPredictError::NumericalFailure { .. } => None,
+            | SurvivalPredictError::NumericalFailure { .. }
+            | SurvivalPredictError::DecreasingSurvival { .. } => None,
         }
     }
 }
@@ -595,6 +606,13 @@ fn survival_prediction_posterior_factor(
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<(Array1<f64>, Array2<f64>, Vec<usize>), SurvivalPredictError> {
     let fit = fit_result_from_saved_model_for_prediction(model)?;
+    // A fit saved as its constrained mode under a typed posterior-moment
+    // decline has no posterior to integrate; refuse by the decline's own
+    // reason rather than by the covariance it therefore lacks (gam#3008).
+    fit.require_posterior_mean("survival posterior-mean prediction")
+        .map_err(|error| SurvivalPredictError::PosteriorCovariance {
+            reason: error.to_string(),
+        })?;
     let inactive_tail = if require_saved_survival_likelihood_mode(model)?
         == SurvivalLikelihoodMode::MarginalSlope
     {
@@ -657,30 +675,7 @@ fn saved_model_with_survival_coefficients(
                 reason: "saved survival model is missing canonical fit_result".to_string(),
             }
         })?;
-        if coefficients.len() != fit.beta.len() {
-            return Err(SurvivalPredictError::IncompatibleSchema {
-                reason: format!(
-                    "posterior survival coefficient draw has length {}, expected {}",
-                    coefficients.len(),
-                    fit.beta.len()
-                ),
-            });
-        }
-        fit.beta.assign(coefficients);
-        let mut cursor = 0usize;
-        for block in &mut fit.blocks {
-            let end = cursor + block.beta.len();
-            block.beta.assign(&coefficients.slice(s![cursor..end]));
-            cursor = end;
-        }
-        if cursor != coefficients.len() {
-            return Err(SurvivalPredictError::IncompatibleSchema {
-                reason: format!(
-                    "saved survival coefficient blocks total {cursor} entries, but the joint vector has {}",
-                    coefficients.len()
-                ),
-            });
-        }
+        assign_survival_fit_coefficients(fit, coefficients)?;
         (
             fit.block_by_role(BlockRole::Time)
                 .map(|block| block.beta.to_vec()),
@@ -750,6 +745,41 @@ fn saved_model_with_survival_coefficients(
     Ok(draw_model)
 }
 
+/// Set a fit's joint coefficient vector and every block's slice of it.
+fn assign_survival_fit_coefficients(
+    fit: &mut UnifiedFitResult,
+    coefficients: &Array1<f64>,
+) -> Result<(), SurvivalPredictError> {
+    if coefficients.len() != fit.beta.len() {
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "posterior survival coefficient draw has length {}, expected {}",
+                coefficients.len(),
+                fit.beta.len()
+            ),
+        });
+    }
+    fit.beta.assign(coefficients);
+    let mut cursor = 0usize;
+    for block in &mut fit.blocks {
+        let end = cursor + block.beta.len();
+        if end > coefficients.len() {
+            break;
+        }
+        block.beta.assign(&coefficients.slice(s![cursor..end]));
+        cursor = end;
+    }
+    if cursor != coefficients.len() {
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "saved survival coefficient blocks total {cursor} entries, but the joint vector has {}",
+                coefficients.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn conditional_event_density(
     survival: f64,
     cumulative_hazard: f64,
@@ -761,10 +791,12 @@ fn conditional_event_density(
     if survival > 0.0 && hazard.is_finite() {
         return Ok(survival * hazard);
     }
-    if cumulative_hazard.is_finite() && hazard > 0.0 {
-        return Ok((hazard.ln() - cumulative_hazard).exp());
+    // The node's hazard is signed where its law's survival rises
+    // ([`predict_survival_coefficient_law`]); its density `S·h` keeps that sign.
+    if cumulative_hazard.is_finite() && !hazard.is_nan() {
+        return Ok(hazard.signum() * (hazard.abs().ln() - cumulative_hazard).exp());
     }
-    if cumulative_hazard == f64::INFINITY && hazard.is_finite() && hazard >= 0.0 {
+    if cumulative_hazard == f64::INFINITY && hazard.is_finite() {
         return Ok(0.0);
     }
     Err(SurvivalPredictError::NumericalFailure {
@@ -1095,10 +1127,11 @@ pub enum SurvivalPosteriorIntegration {
     /// through the two primaries, both affine in `θ` (the slope's follow-up
     /// margin included), so their joint law is exactly bivariate Gaussian and
     /// the posterior mean is adaptive Gauss–Hermite over it with the anchor
-    /// re-solved at every node. The event density `φ(η)·max(η′, 0)` also reads
-    /// the tangents `(q′(t), b′(t))`: given the primaries they are Gaussian and
-    /// `η′ = η_q·q′ + η_b·b′` is linear in them, so they enter through the
-    /// closed-form mean of the positive part of that conditional normal.
+    /// re-solved at every node. The event density `φ(η)·η′` also reads the
+    /// tangents `(q′(t), b′(t))`: given the primaries they are Gaussian and
+    /// `η′ = η_q·q′ + η_b·b′` is linear in them, so they enter through their
+    /// conditional mean alone ([`exact_anchor_node_moments`]), and the published
+    /// density is exactly `−dE_θ[S]/dt`.
     ///
     /// Survival and density are integrated separately under this one rule and
     /// the published hazard is their ratio `E_θ[f]/E_θ[S]`, the hazard of the
@@ -1106,14 +1139,40 @@ pub enum SurvivalPosteriorIntegration {
     /// per-coefficient hazard; the cumulative hazard is `−log E_θ[S]` and the
     /// cumulative incidence `1 − E_θ[S]`.
     ExactAnchor,
+    /// The inequality-truncated posterior a location-scale fit reports
+    /// (gam#3038): `N(β_unc, Σ)` truncated to the fit's cone, integrated on
+    /// the joint constraint-normal × tangent rule the location-scale response
+    /// moments use (#2679), every node a feasible coefficient vector replayed
+    /// through the plug-in location-scale surfaces. The moment-matched normal
+    /// [`Self::SigmaPoint`] integrates instead puts nodes outside the cone,
+    /// where the model has no hazard.
+    ///
+    /// Survival, event density and the linear predictor are integrated under
+    /// the one rule, each cell certified on the spread of the rule's replicate
+    /// lattices to the law's own relative accuracy, and published as under
+    /// [`Self::ExactAnchor`]: `E_θ[S]`, `−log E_θ[S]` and `E_θ[f]/E_θ[S]`.
+    TruncatedLaw,
 }
 
 impl SurvivalPosteriorIntegration {
-    /// The integration [`predict_survival`] runs for `model`: exact wherever the
-    /// saved model is a function of `(q(t), b(t))`, sigma-point otherwise.
-    pub fn default_for(model: &SavedModel) -> Result<Self, SurvivalPredictError> {
-        if require_saved_survival_likelihood_mode(model)? != SurvivalLikelihoodMode::MarginalSlope {
-            return Ok(Self::SigmaPoint);
+    /// The integration [`predict_survival`] runs for `model` under
+    /// `covariance_mode`: exact wherever the saved model is a function of
+    /// `(q(t), b(t))`, the truncated law wherever a location-scale posterior is
+    /// cone-truncated, sigma-point otherwise.
+    pub fn default_for(
+        model: &SavedModel,
+        covariance_mode: SurvivalPredictionCovarianceMode,
+    ) -> Result<Self, SurvivalPredictError> {
+        match require_saved_survival_likelihood_mode(model)? {
+            SurvivalLikelihoodMode::MarginalSlope => {}
+            SurvivalLikelihoodMode::LocationScale => {
+                return Ok(if truncated_survival_posterior_draws(model, covariance_mode)?.is_some() {
+                    Self::TruncatedLaw
+                } else {
+                    Self::SigmaPoint
+                });
+            }
+            _ => return Ok(Self::SigmaPoint),
         }
         let runtime = model.saved_prediction_runtime()?;
         let affine_primaries = runtime.baseline_time_wiggle.is_none()
@@ -1130,7 +1189,8 @@ impl SurvivalPosteriorIntegration {
 
 /// [`predict_survival`] under [`SurvivalPredictEstimand::PosteriorMean`] with a
 /// named `integration` (`req.estimand` is not consulted).
-/// [`SurvivalPosteriorIntegration::ExactAnchor`] is refused for a model it does
+/// [`SurvivalPosteriorIntegration::ExactAnchor`] and
+/// [`SurvivalPosteriorIntegration::TruncatedLaw`] are refused for a model they do
 /// not cover.
 pub fn predict_survival_posterior_mean_with(
     req: SurvivalPredictRequest<'_>,
@@ -1144,6 +1204,9 @@ pub fn predict_survival_posterior_mean_with(
         SurvivalPosteriorIntegration::ExactAnchor => {
             predict_survival_exact_anchor_posterior_mean(req, covariance_mode)
         }
+        SurvivalPosteriorIntegration::TruncatedLaw => {
+            predict_survival_truncated_law_posterior_mean(req, covariance_mode)
+        }
     }
 }
 
@@ -1151,7 +1214,7 @@ fn predict_survival_posterior_mean(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let integration = SurvivalPosteriorIntegration::default_for(req.model)?;
+    let integration = SurvivalPosteriorIntegration::default_for(req.model, covariance_mode)?;
     predict_survival_posterior_mean_with(req, covariance_mode, integration)
 }
 
@@ -1219,12 +1282,17 @@ fn publish_survival_posterior_moments(
         for time in 0..n_times {
             let survival = survival_mean[[row, time]].clamp(0.0, 1.0);
             let density = density_mean[[row, time]];
-            if !(density.is_finite() && density >= 0.0) {
+            if !density.is_finite() {
                 return Err(SurvivalPredictError::NumericalFailure {
                     reason: format!(
-                        "posterior survival density is invalid at row {row}, time column {time}: {density}"
+                        "posterior survival density is not finite at row {row}, time column {time}: {density}"
                     ),
                 });
+            }
+            if density < 0.0 {
+                return Err(decreasing_survival_refusal(format!(
+                    "posterior-mean event density {density:.3e} = -dE[S]/dt at row {row}, time column {time}"
+                )));
             }
             result.survival[[row, time]] = survival;
             result.cumulative_hazard[[row, time]] = -survival.ln();
@@ -1258,10 +1326,48 @@ fn publish_survival_posterior_moments(
 
 /// `(E S, E S², E f, E h, E η, E η²)` of one marginal-slope `(row, t)` cell over
 /// the coefficient posterior: survival `S = Φ(−η)`, event density
-/// `f = φ(η)·max(η′, 0)`, hazard `h = f/S`, and the linear predictor. The
-/// published hazard is `E f / E S` ([`publish_survival_posterior_moments`]);
-/// `E h` only decides between a zero and an infinite hazard where `E S = 0`.
-type ExactAnchorCellMoments = (f64, f64, f64, f64, f64, f64);
+/// `f = φ(η)·η′`, hazard `h = f/S`, and the linear predictor. The published
+/// hazard is `E f / E S` ([`publish_survival_posterior_moments`]); `E h` only
+/// decides between a zero and an infinite hazard where `E S = 0`.
+pub(crate) type ExactAnchorCellMoments = (f64, f64, f64, f64, f64, f64);
+
+/// One node of the exact anchored posterior integral at the primaries
+/// `(q, b)`: `(S, S², f, h, η, η²)` with `S = Φ(−η)`, event density
+/// `f = φ(η)·E[η′ | q, b]` and `h = f/S`.
+///
+/// `conditional_tangent` is `(E[q′ | q, b], E[b′ | q, b])`. The index rate
+/// `η′ = η_q·q′ + η_b·b′` is linear in the tangents, so its conditional mean is
+/// `η_q·E[q′ | q, b] + η_b·E[b′ | q, b]` and
+///
+/// ```text
+///   E_θ[φ(η)·η′] = E_{q,b}[φ(η)·E(η′ | q, b)] = −d/dt E_θ[Φ(−η(t))]
+/// ```
+///
+/// by differentiating under the integral (`φ ≤ 1/√(2π)`, `η′` Gaussian given
+/// the primaries). The published hazard `h̄ = E f / E S` is therefore exactly
+/// `dH̄/dt` for the published `H̄ = −log E S`. The density is signed: the mean
+/// of a positive part, `E[max(η′, 0)]`, is the expectation of a clamp, and the
+/// `h̄` it gives is the derivative of no reported curve (gam#3026). A cell whose
+/// integrated density is negative is refused by
+/// [`decreasing_survival_refusal`] where the moments are published.
+pub(crate) fn exact_anchor_node_moments(
+    eta: f64,
+    eta_q: f64,
+    eta_b: f64,
+    conditional_tangent: [f64; 2],
+) -> ExactAnchorCellMoments {
+    let rate = eta_q * conditional_tangent[0] + eta_b * conditional_tangent[1];
+    let (log_survival, mills_ratio) = signed_probit_logcdf_and_mills_ratio(-eta);
+    let survival = log_survival.exp();
+    (
+        survival,
+        survival * survival,
+        normal_pdf(eta) * rate,
+        mills_ratio * rate,
+        eta,
+        eta * eta,
+    )
+}
 
 /// The coefficient posterior [`SurvivalPosteriorIntegration::ExactAnchor`]
 /// pushes onto every cell's primaries: the active covariance over the
@@ -1308,9 +1414,10 @@ impl ExactAnchorPosterior {
     /// `x_q′ = [time′(t) | 0 | 0]` and `x_b′ = [0 | 0 | slope′(t)]`, so they are
     /// jointly Gaussian with covariance `X V Xᵀ`. The primaries are integrated
     /// by the projected bivariate Gauss–Hermite rule; given the primaries `y`
-    /// the tangents are `N(t̂ + B(y − ŷ), C)` with `B = Σ_ty Σ_yy⁻¹` and
-    /// `C = Σ_tt − B Σ_yt`, both taken over the support the rule integrates
-    /// (only the major axis when `Σ_yy` is singular in floating point).
+    /// the tangents have mean `t̂ + B(y − ŷ)` with `B = Σ_ty Σ_yy⁻¹`, taken over
+    /// the support the rule integrates (only the major axis when `Σ_yy` is
+    /// singular in floating point). The density is linear in the tangents, so
+    /// that conditional mean is all it reads ([`exact_anchor_node_moments`]).
     fn cell_moments(
         &self,
         quadctx: &gam_solve::quadrature::QuadratureContext,
@@ -1407,15 +1514,6 @@ impl ExactAnchorPosterior {
             }
             gam_solve::quadrature::BivariateNormalSupport::Point => [[0.0; 2]; 2],
         };
-        let mut conditional = [[0.0_f64; 2]; 2];
-        for k in 0..2 {
-            for l in 0..2 {
-                conditional[k][l] = sigma[[2 + k, 2 + l]]
-                    - regression[k][0] * sigma[[0, 2 + l]]
-                    - regression[k][1] * sigma[[1, 2 + l]];
-            }
-        }
-        let conditional_cross = 0.5 * (conditional[0][1] + conditional[1][0]);
         let tangent_hat = [cell.q_t, cell.b_t];
 
         gam_solve::quadrature::normal_expectation_2d_projected_result(
@@ -1436,38 +1534,9 @@ impl ExactAnchorPosterior {
                 let (dq, db) = (q - q_hat, b - b_hat);
                 let q_t = tangent_hat[0] + regression[0][0] * dq + regression[0][1] * db;
                 let b_t = tangent_hat[1] + regression[1][0] * dq + regression[1][1] * db;
-                let tangent_mean = eta_q * q_t + eta_b * b_t;
-                let tangent_variance = eta_q * eta_q * conditional[0][0]
-                    + 2.0 * eta_q * eta_b * conditional_cross
-                    + eta_b * eta_b * conditional[1][1];
-                // The plug-in kernel clamps `η′` at its physical floor 0
-                // (`clamp_marginal_slope_index_derivative_at_horizon`); this is
-                // that clamp's expectation over the conditional law of `η′`.
-                let positive_tangent = gaussian_positive_part_mean(tangent_mean, tangent_variance);
-                let (log_survival, mills_ratio) = signed_probit_logcdf_and_mills_ratio(-eta);
-                let survival = log_survival.exp();
-                Ok((
-                    survival,
-                    survival * survival,
-                    normal_pdf(eta) * positive_tangent,
-                    mills_ratio * positive_tangent,
-                    eta,
-                    eta * eta,
-                ))
+                Ok(exact_anchor_node_moments(eta, eta_q, eta_b, [q_t, b_t]))
             },
         )
-    }
-}
-
-/// `E[max(L, 0)]` for `L ~ N(mean, variance)`: `m·Φ(m/s) + s·φ(m/s)` with
-/// `s = √variance`, and `max(m, 0)` when the law is a point mass.
-fn gaussian_positive_part_mean(mean: f64, variance: f64) -> f64 {
-    if variance > 0.0 {
-        let sd = variance.sqrt();
-        let ratio = mean / sd;
-        (mean * normal_cdf(ratio) + sd * normal_pdf(ratio)).max(0.0)
-    } else {
-        mean.max(0.0)
     }
 }
 
@@ -1488,11 +1557,67 @@ fn predict_survival_exact_anchor_posterior_mean(
             ..req
         },
         covariance_mode,
-        Some(&posterior),
+        Some(SurvivalSurfacePosterior::ExactAnchor(&posterior)),
     )?;
     let moments = moments.ok_or_else(|| {
         "internal error: the exact anchored survival pass returned no posterior moments".to_string()
     })?;
+    // The plug-in survival is published beside the posterior mean
+    // (`survival_plugin`), so its curve is held to the same domain as when it
+    // is published alone.
+    refuse_decreasing_survival(&result)?;
+    publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
+    Ok(result)
+}
+
+/// The cone-truncated coefficient posterior of a location-scale fit under
+/// `covariance_mode`, as a rule over whole coefficient vectors, or `None` when
+/// the selected covariance is not one a cone truncated.
+fn truncated_survival_posterior_draws(
+    model: &SavedModel,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+) -> Result<Option<TruncatedCoefficientDraws>, SurvivalPredictError> {
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    fit.require_posterior_mean("survival posterior-mean prediction")
+        .map_err(|error| SurvivalPredictError::PosteriorCovariance {
+            reason: error.to_string(),
+        })?;
+    let covariance = select_survival_prediction_covariance(
+        fit.beta_covariance(),
+        fit.beta_covariance_corrected(),
+        covariance_mode,
+    )?;
+    build_truncated_coefficient_draws(&fit, covariance)
+        .map_err(|reason| SurvivalPredictError::PosteriorCovariance { reason })
+}
+
+fn predict_survival_truncated_law_posterior_mean(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    let with_uncertainty = req.with_uncertainty;
+    let draws = truncated_survival_posterior_draws(req.model, covariance_mode)?.ok_or_else(|| {
+        SurvivalPredictError::UnsupportedConfiguration {
+            reason: format!(
+                "the truncated-law survival posterior needs a location-scale fit whose {} \
+                 posterior carries an active inequality cone",
+                covariance_mode.as_str()
+            ),
+        }
+    })?;
+    let (mut result, moments) = predict_survival_surfaces(
+        SurvivalPredictRequest {
+            with_uncertainty: false,
+            estimand: SurvivalPredictEstimand::Plugin,
+            ..req
+        },
+        covariance_mode,
+        Some(SurvivalSurfacePosterior::TruncatedLaw(&draws)),
+    )?;
+    let moments = moments.ok_or_else(|| {
+        "internal error: the truncated-law survival pass returned no posterior moments".to_string()
+    })?;
+    refuse_decreasing_survival(&result)?;
     publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
     Ok(result)
 }
@@ -1530,7 +1655,7 @@ fn predict_survival_sigma_point_posterior_mean(
 
     for_each_survival_posterior_node(&posterior_mean, &active_covariance, &cone_coords, |node, weight| {
         let draw_model = saved_model_with_survival_coefficients(req.model, node)?;
-        let draw = predict_survival(
+        let draw = predict_survival_coefficient_law(
             SurvivalPredictRequest {
                 model: &draw_model,
                 data: req.data,
@@ -2520,7 +2645,8 @@ pub struct CompetingRisksPredictResult {
 ///
 /// Pure library function: no progress bars, no file I/O, no uncertainty
 /// bounds. The CLI wraps this with progress updates + CSV writes; the
-/// FFI wraps it with JSON serialization.
+/// FFI wraps it with JSON serialization. A surface whose survival curve
+/// increases at a requested cell is refused by name (gam#3026).
 pub fn predict_survival(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
@@ -2528,18 +2654,52 @@ pub fn predict_survival(
     if req.estimand == SurvivalPredictEstimand::PosteriorMean {
         return predict_survival_posterior_mean(req, covariance_mode);
     }
+    let result = predict_survival_coefficient_law(req, covariance_mode)?;
+    refuse_decreasing_survival(&result)?;
+    Ok(result)
+}
+
+/// The survival law at the coefficients `req.model` carries, for an integrator
+/// that sums it over coefficient draws or quadrature nodes: the sigma-point
+/// posterior rule's nodes and a Monte Carlo reference both read it. It is the
+/// plug-in pass of [`predict_survival`] without the refusal of a decreasing
+/// survival curve: where the law's survival rises, its hazard is the negative
+/// `dH/dt` it is, so a sum of `S·h` over draws is exactly `−d/dt` of the same
+/// sum of `S`, and the integrator refuses only the curve it publishes
+/// (gam#3026). It is not a survival prediction; publish through
+/// [`predict_survival`].
+pub fn predict_survival_coefficient_law(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+) -> Result<SurvivalPredictResult, SurvivalPredictError> {
     predict_survival_surfaces(req, covariance_mode, None).map(|(result, _)| result)
 }
 
-/// The plug-in pass of [`predict_survival`]. With `exact_posterior` it also
-/// integrates every marginal-slope cell over the coefficient posterior, anchor
-/// re-solved at each node, from the same assembled cell the plug-in kernel
+/// A coefficient posterior [`predict_survival_surfaces`] integrates beside the
+/// plug-in pass, from the same assembled designs.
+#[derive(Clone, Copy)]
+enum SurvivalSurfacePosterior<'a> {
+    /// [`SurvivalPosteriorIntegration::ExactAnchor`], marginal-slope only.
+    ExactAnchor(&'a ExactAnchorPosterior),
+    /// [`SurvivalPosteriorIntegration::TruncatedLaw`], location-scale only.
+    TruncatedLaw(&'a TruncatedCoefficientDraws),
+}
+
+/// The plug-in pass of [`predict_survival`]. With `posterior` it also
+/// integrates every cell over the coefficient posterior — a marginal-slope cell
+/// with the anchor re-solved at each node, a location-scale cell at every node
+/// of the truncated law — from the same assembled designs the plug-in kernel
 /// evaluates, and returns those moments beside the plug-in surfaces.
 fn predict_survival_surfaces(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-    exact_posterior: Option<&ExactAnchorPosterior>,
+    posterior: Option<SurvivalSurfacePosterior<'_>>,
 ) -> Result<(SurvivalPredictResult, Option<SurvivalPosteriorMoments>), SurvivalPredictError> {
+    let (exact_posterior, truncated_posterior) = match posterior {
+        None => (None, None),
+        Some(SurvivalSurfacePosterior::ExactAnchor(posterior)) => (Some(posterior), None),
+        Some(SurvivalSurfacePosterior::TruncatedLaw(draws)) => (None, Some(draws)),
+    };
     let SurvivalPredictRequest {
         model,
         data,
@@ -2629,6 +2789,12 @@ fn predict_survival_surfaces(
     // Location-scale: handled via a dedicated batch path that calls
     // `predict_survival_location_scale` directly.
     if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
+        if exact_posterior.is_some() {
+            return Err(SurvivalPredictError::UnsupportedConfiguration {
+                reason: "the exact anchored survival posterior covers marginal-slope models only"
+                    .to_string(),
+            });
+        }
         return predict_survival_location_scale_batch(
             model,
             &age_entry,
@@ -2642,9 +2808,15 @@ fn predict_survival_surfaces(
             time_grid,
             with_uncertainty,
             covariance_mode,
+            truncated_posterior,
         )
-        .map(|result| (result, None))
         .map_err(SurvivalPredictError::from);
+    }
+    if truncated_posterior.is_some() {
+        return Err(SurvivalPredictError::UnsupportedConfiguration {
+            reason: "the truncated-law survival posterior covers location-scale models only"
+                .to_string(),
+        });
     }
     if with_uncertainty {
         return Err(SurvivalPredictError::from(format!(
@@ -4040,8 +4212,7 @@ fn evaluate_joint_marginal_slope_row(
         &ctx.law,
         &mut workspace,
     )?;
-    let eta_derivative = clamp_marginal_slope_index_derivative_at_horizon(eta_t);
-    let (cum, haz) = probit_survival_hazard_components(eta, eta_derivative)?;
+    let (cum, haz) = probit_survival_hazard_components(eta, eta_t)?;
     Ok((eta, cum, haz))
 }
 
@@ -4278,52 +4449,78 @@ fn evaluate_marginal_slope_cell(
     // `+derivative_guard` offset are both already folded into `qd_exit_base`),
     // so there is no predict-vs-fit desync in the derivative reconstruction.
     //
-    // Fit enforces the monotonicity floor `q'(t) >= derivative_guard` ONLY at
-    // each training row's own exit time (one `t` per row), via the active-set
-    // guard constraints. A prediction horizon is an arbitrary `t` — typically a
-    // single CIF horizon evaluated for every row — which generally is NOT one of
-    // the constrained training exit times. Where that horizon lands in a region
-    // of sparse/no training exits, the penalized baseline spline can extrapolate
-    // to a locally decreasing survival index, so `q'(t) < 0` is a legitimate
-    // model statement ("no instantaneous hazard accrues here"), not a numerical
-    // bug. The instantaneous hazard rate is physically non-negative, so the
-    // truthful response is to clamp the index time-derivative at its floor 0
-    // (flat hazard, survival locally constant) rather than reject the whole
-    // prediction — clamping keeps the CIF well-posed and monotone. Only a
-    // non-finite derivative (a real numerical failure) is surfaced to the strict
-    // validator below.
-    let eta_derivative = clamp_marginal_slope_index_derivative_at_horizon(eta_t_arr[0]);
-    let (cum, haz) = probit_survival_hazard_components(eta, eta_derivative)?;
+    // The complete rate `η′ = η_q·q′ + η_b·b′` goes to the hazard unchanged: the
+    // hazard reported is the derivative of the cumulative hazard reported beside
+    // it, and a published surface whose index decreases at a cell is refused by
+    // name ([`refuse_decreasing_survival`]).
+    let (cum, haz) = probit_survival_hazard_components(eta, eta_t_arr[0])?;
     Ok((eta, cum, haz))
 }
 
-/// Reconstruct the marginal-slope survival index time-derivative `eta'(t)` at a
-/// prediction horizon and clamp it to its physical floor.
-///
-/// The complete derivative already contains both moving fitted coordinates,
-/// `eta'(t) = eta_q q'(t) + eta_b b'(t)`. The instantaneous hazard rate
-/// `h(t) = mills · eta'(t)` is physically non-negative, so a finite negative
-/// `eta'(t)` — which a
-/// penalized baseline spline can legitimately produce when the prediction
-/// horizon lands outside the training exit times the monotonicity guard
-/// constrains — is clamped to its floor 0 (flat hazard, locally constant
-/// survival), keeping the CIF well-posed. Non-finite values pass through
-/// unchanged so the strict validator rejects them as genuine numerical failures.
-#[inline]
-fn clamp_marginal_slope_index_derivative_at_horizon(eta_derivative: f64) -> f64 {
-    if eta_derivative.is_finite() {
-        eta_derivative.max(0.0)
-    } else {
-        eta_derivative
+/// The named refusal of a published survival surface whose curve increases,
+/// `dH/dt < 0` (gam#3026). Every survival surface that is published, the
+/// plug-in ([`refuse_decreasing_survival`]) and the posterior mean
+/// ([`publish_survival_posterior_moments`]), declines such a cell through this
+/// one route. `detail` names the quantity that went negative and where.
+#[cold]
+#[inline(never)]
+pub(crate) fn decreasing_survival_refusal(detail: String) -> SurvivalPredictError {
+    SurvivalPredictError::DecreasingSurvival {
+        reason: format!(
+            "survival prediction refused: the reported survival curve increases here ({detail}), \
+             so no hazard h >= 0 is the derivative dH/dt of the reported cumulative hazard; the \
+             fitted model is not a survival model at this cell"
+        ),
     }
 }
 
+/// Refuse a plug-in survival surface that reports a negative hazard anywhere.
+/// The hazard of every family is the derivative of the cumulative hazard
+/// reported beside it, sign included, so `h < 0` is a cell where the reported
+/// survival rises: no survival function reports it, and publishing `h = 0`
+/// there instead would pair the curve with the hazard of a different one.
+fn refuse_decreasing_survival(result: &SurvivalPredictResult) -> Result<(), SurvivalPredictError> {
+    match result
+        .hazard
+        .indexed_iter()
+        .find(|(_, hazard)| **hazard < 0.0)
+    {
+        Some(((row, time), hazard)) => Err(decreasing_survival_refusal(format!(
+            "hazard dH/dt={hazard:.6e} < 0 at row {row}, time column {time}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Cumulative hazard and hazard of the probit survival law `S(t) = Φ(−η(t))`
+/// at one cell, from the index and its complete time derivative:
+///
+/// ```text
+///   H = −log Φ(−η),   h = dH/dt = φ(η)/Φ(−η) · η′
+/// ```
+///
+/// `h` is the exact derivative of the `H` returned beside it for every finite
+/// rate, its sign included, so a consumer composing the two (the cumulative
+/// incidence `∫ exp(−Σ ΔH) h`) reads one curve, and an integrator summing
+/// `S·h` over coefficient draws or quadrature nodes obtains `−d/dt` of its sum
+/// of `S`. The survival domain is `η′ ≥ 0`, and it is the fit's own: its
+/// likelihood carries `log η′` at every event and holds
+/// `q′ ≥ derivative_guard ≥ 0` at every row. A time-constant slope has
+/// `η′ = α_q·q′ ≥ α_q·derivative_guard ≥ 0` at every `t` by construction (the
+/// I-spline time block has `M_k ≥ 0` on all of `ℝ` and is coned to `β ≥ 0`, the
+/// baseline offset's rate is `S₀h₀/φ ≥ 0`, and `α_q > 0`), so its fitted law
+/// never leaves the domain; `η′ = 0` is a flat stretch with `h = dH/dt = 0`
+/// exactly. A slope that varies along follow-up carries no such guarantee:
+/// `η′ = α_q·q′ + (α_b + z)·b′` is affine in `z` with an unsigned `b′(t)`
+/// (gam#2767). Where `η′ < 0` this returns the negative `h` it is; it is never
+/// clamped, and the surfaces that publish a hazard refuse it
+/// ([`decreasing_survival_refusal`]).
 #[inline]
-fn probit_survival_hazard_components(
+pub(crate) fn probit_survival_hazard_components(
     eta: f64,
     eta_derivative: f64,
 ) -> Result<(f64, f64), SurvivalPredictError> {
-    if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative >= 0.0) {
+    if !(eta.is_finite() && eta_derivative.is_finite()) {
         return Err(SurvivalPredictError::NumericalFailure {
             reason: format!(
                 "saved survival marginal-slope prediction produced invalid survival index derivative: eta={eta}, eta_t={eta_derivative}"
@@ -4343,12 +4540,13 @@ fn probit_survival_hazard_components(
         mills_ratio * eta_derivative
     };
     // `>= 0.0` rejects NaN (a programming-bug signal) and accepts the full
-    // mathematical range [0, +∞]. Saturated probit fits where the model
-    // genuinely says S(t)→0 produce a +∞ cumulative hazard — that is the
-    // truthful answer, and the consumer's `survival = exp(-cum).clamp(0,1)`
-    // handles it cleanly. Rejecting +∞ would force the predictor to fail on
-    // models that the inner solver has already certified as a valid fit.
-    if !(cumulative_hazard >= 0.0 && hazard >= 0.0) {
+    // mathematical range [0, +∞] of the cumulative hazard. Saturated probit
+    // fits where the model genuinely says S(t)→0 produce a +∞ cumulative
+    // hazard — that is the truthful answer, and the consumer's
+    // `survival = exp(-cum).clamp(0,1)` handles it cleanly. Rejecting +∞ would
+    // force the predictor to fail on models that the inner solver has already
+    // certified as a valid fit.
+    if !(cumulative_hazard >= 0.0 && !hazard.is_nan()) {
         return Err(SurvivalPredictError::NumericalFailure {
             reason: format!(
                 "saved survival marginal-slope prediction produced invalid survival components: eta={eta}, eta_t={eta_derivative}, log_survival={log_survival}, hazard={hazard}"
@@ -4462,7 +4660,7 @@ fn evaluate_rp_row_with_beta(
         let dtime = row_time.x_derivative_time.to_dense();
         let dmin = dtime.iter().copied().fold(f64::INFINITY, f64::min);
         let dmax = dtime.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        log::info!(
+        log::debug!(
             "[rp-predict/eta_t-refusal] eta_t={eta_derivative:.12e} = offset({offset_derivative_component:.12e}) + time({time_derivative_component:.12e}) + wiggle({wiggle_derivative_component:.12e}); p_time={p_time} p_timewiggle={p_timewiggle} p_cov={p_cov} time_beta=[{beta_min:.6e},{beta_max:.6e}] x_derivative_time=[{dmin:.6e},{dmax:.6e}] has_wiggle={}",
             saved_timewiggle.is_some(),
         );
@@ -4540,9 +4738,8 @@ fn royston_parmar_survival_hazard_components(
     // (`S(t)` locally constant). Any RP model predicted on a grid that extends
     // past its training support hits this regime on the tail nodes. The earlier
     // strict `> 0.0` gate spuriously failed those predictions (#1564). The
-    // probit / marginal-slope sibling guard
-    // (`probit_survival_hazard_components`) already accepts the full `[0, ∞)`
-    // range and maps a zero derivative to a zero hazard; the RP guard must match.
+    // probit / marginal-slope sibling (`probit_survival_hazard_components`)
+    // maps a zero derivative to a zero hazard; the RP guard must match.
     if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative >= 0.0) {
         return Err(SurvivalPredictError::NumericalFailure {
             reason: format!(
@@ -4600,7 +4797,8 @@ fn predict_survival_location_scale_batch(
     time_grid: Option<&[f64]>,
     with_uncertainty: bool,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, String> {
+    truncated_posterior: Option<&TruncatedCoefficientDraws>,
+) -> Result<(SurvivalPredictResult, Option<SurvivalPosteriorMoments>), String> {
     use crate::survival::construction::evaluate_survival_time_basis_row;
     use crate::survival::location_scale::{
         SurvivalLocationScalePredictInput, predict_survival_location_scale,
@@ -4959,87 +5157,98 @@ fn predict_survival_location_scale_batch(
         )
     };
 
-    let beta_threshold = saved_fit.beta_threshold();
-    let beta_log_sigma = saved_fit.beta_log_sigma();
-    let eta_threshold = threshold_replay
-        .design_exit
-        .matrixvectormultiply(&beta_threshold)
-        + &threshold_replay.offset;
-    let mut eta_threshold_derivative = threshold_replay
-        .design_derivative_exit
-        .as_ref()
-        .map(|design| design.matrixvectormultiply(&beta_threshold))
-        .unwrap_or_else(|| Array1::zeros(total_rows));
-    if reduced_parametric_aft {
-        for (slot, &time) in eta_threshold_derivative.iter_mut().zip(eval_exit.iter()) {
-            *slot -= 1.0 / time.max(crate::survival::construction::SURVIVAL_TIME_FLOOR);
-        }
-    }
-    let eta_log_sigma = sigma_replay
-        .design_exit
-        .matrixvectormultiply(&beta_log_sigma)
-        + &sigma_replay.offset;
-    let eta_log_sigma_derivative = sigma_replay
-        .design_derivative_exit
-        .as_ref()
-        .map(|design| design.matrixvectormultiply(&beta_log_sigma))
-        .unwrap_or_else(|| Array1::zeros(total_rows));
-    let hdot = if reduced_parametric_aft {
-        Array1::zeros(total_rows)
+    let x_time_derivative = if reduced_parametric_aft {
+        None
     } else {
-        let x_time_derivative = time_build
-            .x_derivative_time
-            .try_to_dense_by_chunks("survival location-scale prediction time-derivative design")?;
-        location_scale_eta_derivative_components(
-            &x_time_derivative,
-            &derivative_offset_exit,
+        Some(
+            time_build
+                .x_derivative_time
+                .try_to_dense_by_chunks("survival location-scale prediction time-derivative design")?,
+        )
+    };
+    // The rate `η′ = dη/dt` of the location-scale index at every cell, under the
+    // coefficients `fit` carries. The designs are fixed; only the coefficients
+    // vary between the plug-in and the posterior nodes.
+    let index_rate = |fit: &UnifiedFitResult| -> Result<Array1<f64>, String> {
+        let beta_threshold = fit.beta_threshold();
+        let beta_log_sigma = fit.beta_log_sigma();
+        let eta_threshold = threshold_replay
+            .design_exit
+            .matrixvectormultiply(&beta_threshold)
+            + &threshold_replay.offset;
+        let mut eta_threshold_derivative = threshold_replay
+            .design_derivative_exit
+            .as_ref()
+            .map(|design| design.matrixvectormultiply(&beta_threshold))
+            .unwrap_or_else(|| Array1::zeros(total_rows));
+        if reduced_parametric_aft {
+            for (slot, &time) in eta_threshold_derivative.iter_mut().zip(eval_exit.iter()) {
+                *slot -= 1.0 / time.max(crate::survival::construction::SURVIVAL_TIME_FLOOR);
+            }
+        }
+        let eta_log_sigma = sigma_replay
+            .design_exit
+            .matrixvectormultiply(&beta_log_sigma)
+            + &sigma_replay.offset;
+        let eta_log_sigma_derivative = sigma_replay
+            .design_derivative_exit
+            .as_ref()
+            .map(|design| design.matrixvectormultiply(&beta_log_sigma))
+            .unwrap_or_else(|| Array1::zeros(total_rows));
+        let hdot = match x_time_derivative.as_ref() {
+            None => Array1::zeros(total_rows),
+            Some(x_time_derivative) => location_scale_eta_derivative_components(
+                x_time_derivative,
+                &derivative_offset_exit,
+                &pred_input.x_time_exit,
+                &pred_input.eta_time_offset_exit,
+                time_wiggle_knots.as_ref(),
+                time_wiggle_degree,
+                time_wiggle_ncols,
+                fit,
+            )?,
+        };
+        let inv_sigma = eta_log_sigma.mapv(crate::sigma_link::exp_sigma_inverse_from_eta_scalar);
+        let q_base = -&eta_threshold * &inv_sigma;
+        let mut qdot =
+            &inv_sigma * &(&eta_threshold * &eta_log_sigma_derivative - &eta_threshold_derivative);
+        if let Some(beta_wiggle) = fit.beta_link_wiggle() {
+            let knots = link_wiggle_knots.as_ref().ok_or_else(|| {
+                "saved location-scale link-wiggle coefficients are missing knots".to_string()
+            })?;
+            let degree = link_wiggle_degree.ok_or_else(|| {
+                "saved location-scale link-wiggle coefficients are missing degree".to_string()
+            })?;
+            let derivative_basis = crate::wiggle::monotone_wiggle_basis_with_derivative_order(
+                q_base.view(),
+                knots,
+                degree,
+                1,
+            )?;
+            if derivative_basis.ncols() != beta_wiggle.len() {
+                return Err(format!(
+                    "saved location-scale link-wiggle derivative width mismatch: design={}, beta={}",
+                    derivative_basis.ncols(),
+                    beta_wiggle.len()
+                ));
+            }
+            qdot *= &(derivative_basis.dot(&beta_wiggle) + 1.0);
+        }
+        // The scale divides the time transform too (#2695):
+        // `g = e^{−η_σ}·(ḣ − h·η_σ') + qdot`, with `h` the same exit-time channel
+        // the predicted residual reads.
+        let h_exit = location_scale_time_warp_components(
             &pred_input.x_time_exit,
             &pred_input.eta_time_offset_exit,
             time_wiggle_knots.as_ref(),
             time_wiggle_degree,
             time_wiggle_ncols,
-            &saved_fit,
+            fit,
         )?
+        .h;
+        Ok(&inv_sigma * &(&hdot - &(&h_exit * &eta_log_sigma_derivative)) + qdot)
     };
-    let inv_sigma = eta_log_sigma.mapv(crate::sigma_link::exp_sigma_inverse_from_eta_scalar);
-    let q_base = -&eta_threshold * &inv_sigma;
-    let mut qdot =
-        &inv_sigma * &(&eta_threshold * &eta_log_sigma_derivative - &eta_threshold_derivative);
-    if let Some(beta_wiggle) = saved_fit.beta_link_wiggle() {
-        let knots = link_wiggle_knots.as_ref().ok_or_else(|| {
-            "saved location-scale link-wiggle coefficients are missing knots".to_string()
-        })?;
-        let degree = link_wiggle_degree.ok_or_else(|| {
-            "saved location-scale link-wiggle coefficients are missing degree".to_string()
-        })?;
-        let derivative_basis = crate::wiggle::monotone_wiggle_basis_with_derivative_order(
-            q_base.view(),
-            knots,
-            degree,
-            1,
-        )?;
-        if derivative_basis.ncols() != beta_wiggle.len() {
-            return Err(format!(
-                "saved location-scale link-wiggle derivative width mismatch: design={}, beta={}",
-                derivative_basis.ncols(),
-                beta_wiggle.len()
-            ));
-        }
-        qdot *= &(derivative_basis.dot(&beta_wiggle) + 1.0);
-    }
-    // The scale divides the time transform too (#2695):
-    // `g = e^{−η_σ}·(ḣ − h·η_σ') + qdot`, with `h` the same exit-time channel
-    // the predicted residual reads.
-    let h_exit = location_scale_time_warp_components(
-        &pred_input.x_time_exit,
-        &pred_input.eta_time_offset_exit,
-        time_wiggle_knots.as_ref(),
-        time_wiggle_degree,
-        time_wiggle_ncols,
-        &saved_fit,
-    )?
-    .h;
-    let eta_derivative_full = &inv_sigma * &(&hdot - &(&h_exit * &eta_log_sigma_derivative)) + qdot;
+    let eta_derivative_full = index_rate(&saved_fit)?;
     if eta_derivative_full
         .iter()
         .any(|value| !(value.is_finite() && *value > 0.0))
@@ -5054,6 +5263,62 @@ fn predict_survival_location_scale_batch(
         &eta_derivative_full,
         &saved_inverse_link,
     )?;
+
+    let posterior_moments = match truncated_posterior {
+        None => None,
+        Some(draws) => {
+            // One posterior node's cells: the plug-in surfaces replayed at the
+            // node's coefficients. The hazard keeps the sign of the node's rate,
+            // so the node's density `S·h` is exactly `−dS/dt` there and the
+            // integrated density is `−dE[S]/dt` ([`conditional_event_density`]).
+            let node_cells = |fit: &UnifiedFitResult| -> Result<LocationScaleNodeCells, String> {
+                let pred = predict_survival_location_scale(&pred_input, fit)
+                    .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
+                let rate = index_rate(fit)?;
+                let hazard = pred
+                    .eta
+                    .iter()
+                    .zip(rate.iter())
+                    .map(|(&eta, &rate)| {
+                        if rate == 0.0 {
+                            Ok(0.0)
+                        } else {
+                            location_scale_hazard_component(eta, rate.abs(), &saved_inverse_link)
+                                .map(|hazard| rate.signum() * hazard)
+                        }
+                    })
+                    .collect::<Result<Array1<f64>, String>>()?;
+                Ok(LocationScaleNodeCells {
+                    eta: pred.eta,
+                    log_survival: pred.log_survival_prob,
+                    hazard,
+                })
+            };
+            let surface_cells: Vec<(usize, usize, usize)> = (0..n)
+                .flat_map(|i| (0..t_cols).map(move |j| (i, j)))
+                .filter(|&(i, j)| {
+                    let query_time = if per_row_eval {
+                        age_exit[i]
+                    } else {
+                        eval_times[j]
+                    };
+                    query_time > 0.0
+                })
+                .map(|(i, j)| (i, j, if per_row_eval { i } else { i * eval_width + j }))
+                .collect();
+            let eta_cells: Vec<usize> = (0..n)
+                .map(|i| if per_row_eval { i } else { i * eval_width + t_cols })
+                .collect();
+            Some(truncated_location_scale_surface_moments(
+                draws,
+                &saved_fit,
+                &node_cells,
+                &surface_cells,
+                &eta_cells,
+                t_cols,
+            )?)
+        }
+    };
 
     let mut survival = Array2::<f64>::zeros((n, t_cols));
     let mut cumulative_hazard = Array2::<f64>::zeros((n, t_cols));
@@ -5141,19 +5406,404 @@ fn predict_survival_location_scale_batch(
         }
     });
 
-    Ok(SurvivalPredictResult {
-        times,
-        hazard,
-        survival,
-        cumulative_hazard,
-        linear_predictor,
-        likelihood_mode: saved_likelihood_mode,
-        survival_se,
-        eta_se: eta_se_per_row,
-        covariance_source: with_uncertainty.then_some(covariance_mode),
-        // This IS the plug-in prediction; `survival` carries it.
-        survival_plugin: None,
-    })
+    Ok((
+        SurvivalPredictResult {
+            times,
+            hazard,
+            survival,
+            cumulative_hazard,
+            linear_predictor,
+            likelihood_mode: saved_likelihood_mode,
+            survival_se,
+            eta_se: eta_se_per_row,
+            covariance_source: with_uncertainty.then_some(covariance_mode),
+            // This IS the plug-in prediction; `survival` carries it.
+            survival_plugin: None,
+        },
+        posterior_moments,
+    ))
+}
+
+/// One coefficient vector's location-scale cells, in the batch's flattened
+/// `(row, time)` layout: the index, `log S`, and the hazard with the sign of the
+/// index's rate.
+struct LocationScaleNodeCells {
+    eta: Array1<f64>,
+    log_survival: Array1<f64>,
+    hazard: Array1<f64>,
+}
+
+impl LocationScaleNodeCells {
+    /// `(S, f)` at flattened cell `k`, `f = S·h` the node's event density.
+    fn survival_and_density(&self, k: usize) -> Result<(f64, f64), String> {
+        let log_survival = self.log_survival[k];
+        let survival = log_survival.exp();
+        let density = conditional_event_density(survival, -log_survival, self.hazard[k])
+            .map_err(String::from)?;
+        Ok((survival, density))
+    }
+}
+
+/// The posterior moments of the location-scale surfaces over the
+/// cone-truncated coefficient law (gam#3038), certified per cell.
+///
+/// Every node of the law's joint rule is a feasible coefficient vector, and the
+/// surfaces are replayed at it through `node_cells`. Each replicate lattice keeps
+/// its own sums; a cell is retired once the replicate standard error of its
+/// moments, less the integrand's rounding, is within the law's certified
+/// relative accuracy — survival as a fraction of `sqrt(E[S](1 − E[S]))` (the
+/// largest standard deviation a variable in `[0, 1]` with that mean can have),
+/// the event density as a fraction of the larger of `|E[f]|` and its posterior
+/// standard deviation (the published hazard is `E[f]/E[S]`, a ratio, so the
+/// density is resolved relative to itself; where the posterior spread of `f`
+/// exceeds its mean — deep in a tail, where the survival certificate already
+/// resolves `E[S]` only to a fraction of `sqrt(E[S])` — resolving it to a
+/// fraction of that spread keeps the Monte Carlo error a fraction `tol` of the
+/// posterior uncertainty the surface carries), the linear predictor as a
+/// fraction of its posterior standard deviation. Past the rule's maximum node count the moments are
+/// refused, naming the worst cell, never reported.
+///
+/// `surface_cells` lists `(row, time column, flattened cell)` for every
+/// published cell after the origin; origin cells are `S = 1`, `f = h = 0`
+/// exactly. `eta_cells` is each row's linear-predictor cell.
+fn truncated_location_scale_surface_moments(
+    draws: &TruncatedCoefficientDraws,
+    fit: &UnifiedFitResult,
+    node_cells: &(dyn Fn(&UnifiedFitResult) -> Result<LocationScaleNodeCells, String> + Sync),
+    surface_cells: &[(usize, usize, usize)],
+    eta_cells: &[usize],
+    t_cols: usize,
+) -> Result<SurvivalPosteriorMoments, String> {
+    use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+
+    let rule = draws.rule();
+    let replicates = rule.replicates();
+    if replicates < 2 {
+        return Err(format!(
+            "survival location-scale truncated posterior surfaces need at least two replicate \
+             lattices to certify on; the joint rule carries {replicates}"
+        ));
+    }
+    let tolerance = rule.relative_tolerance();
+    // The sums run about the plug-in cells so their rounding is relative to the
+    // posterior spread, not to the values (see `ResponseMomentAccumulator`).
+    let reference = node_cells(fit)?;
+    let total_cells = reference.eta.len();
+    let reference_surface = surface_cells
+        .iter()
+        .map(|&(_, _, k)| reference.survival_and_density(k))
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut accumulators: Vec<SurfaceMomentAccumulator> =
+        std::iter::repeat_with(|| SurfaceMomentAccumulator::new(total_cells))
+            .take(replicates)
+            .collect();
+    let n_rows = eta_cells.len();
+    let mut moments = SurvivalPosteriorMoments::zeros(n_rows, t_cols);
+    moments.survival_mean.fill(1.0);
+    moments.survival_second.fill(1.0);
+    let mut active_surface: Vec<usize> = (0..surface_cells.len()).collect();
+    let mut active_eta: Vec<usize> = (0..n_rows).collect();
+    let mut evaluated = 0usize;
+    while !(active_surface.is_empty() && active_eta.is_empty()) {
+        let target = if evaluated == 0 {
+            rule.initial_points()
+        } else {
+            2 * evaluated
+        };
+        let cells = SurfaceMomentCells {
+            surface_cells,
+            eta_cells,
+            reference: &reference,
+            reference_surface: &reference_surface,
+            active_surface: &active_surface,
+            active_eta: &active_eta,
+        };
+        accumulators
+            .as_mut_slice()
+            .into_par_iter()
+            .enumerate()
+            .try_for_each(|(replicate, accumulator)| {
+                let mut node_fit = fit.clone();
+                rule.visit_nodes(
+                    replicate,
+                    evaluated,
+                    target,
+                    |log_weight, normal_coordinates, tangent| {
+                        let coefficients = draws.coefficients(normal_coordinates, tangent)?;
+                        assign_survival_fit_coefficients(&mut node_fit, &coefficients)
+                            .map_err(String::from)?;
+                        accumulator.push(&cells, log_weight, &node_cells(&node_fit)?)
+                    },
+                )
+            })?;
+        evaluated = target;
+        let pooled = PooledSurfaceMoments::new(&accumulators)?;
+        let mut worst: Option<(String, f64)> = None;
+        let mut note_uncertified = |label: String, error: f64| {
+            if worst.as_ref().is_none_or(|(_, current)| error > *current) {
+                worst = Some((label, error));
+            }
+        };
+        let mut uncertified_surface = Vec::with_capacity(active_surface.len());
+        for &cell in &active_surface {
+            let (row, time, k) = surface_cells[cell];
+            let (reference_survival, reference_density) = reference_surface[cell];
+            let survival =
+                pooled.moments(|a| (a.survival[k], a.survival_square[k]), reference_survival);
+            let density = pooled.moments(|a| (a.density[k], a.density_square[k]), reference_density);
+            let hazard = pooled.mean(|a| a.hazard[k]);
+            let first = survival.mean.clamp(0.0, 1.0);
+            let second = (survival.variance + first * first).clamp(0.0, 1.0);
+            // `S = exp(log S)` resolves a probability to `f64::EPSILON` absolute
+            // and `f` to one part in `f64::EPSILON` of itself: spread within that
+            // is the integrand's rounding, which no node count removes.
+            let survival_error = certified_fraction(
+                survival.mean_spread.max(survival.sd_spread) - f64::EPSILON,
+                (first * (1.0 - first)).sqrt(),
+            );
+            let density_error = certified_fraction(
+                density.mean_spread
+                    - f64::EPSILON * reference_density.abs().max(density.mean.abs()),
+                density.mean.abs().max(density.variance.sqrt()),
+            );
+            let error = survival_error.max(density_error);
+            if error <= tolerance {
+                moments.survival_mean[[row, time]] = first;
+                moments.survival_second[[row, time]] = second;
+                moments.density_mean[[row, time]] = density.mean;
+                moments.hazard_mean[[row, time]] = hazard;
+            } else {
+                uncertified_surface.push(cell);
+                note_uncertified(format!("row {row}, time column {time}"), error);
+            }
+        }
+        let mut uncertified_eta = Vec::with_capacity(active_eta.len());
+        for &row in &active_eta {
+            let k = eta_cells[row];
+            let reference_eta = reference.eta[k];
+            let eta = pooled.moments(|a| (a.eta[k], a.eta_square[k]), reference_eta);
+            let error = certified_fraction(
+                eta.mean_spread.max(eta.sd_spread)
+                    - f64::EPSILON * reference_eta.abs().max(eta.mean.abs()),
+                eta.variance.sqrt(),
+            );
+            if error <= tolerance {
+                moments.eta_mean[row] = eta.mean;
+                moments.eta_second[row] = eta.variance + eta.mean * eta.mean;
+            } else {
+                uncertified_eta.push(row);
+                note_uncertified(format!("row {row}'s linear predictor"), error);
+            }
+        }
+        active_surface = uncertified_surface;
+        active_eta = uncertified_eta;
+        let nodes = evaluated * replicates;
+        if let Some((cell, error)) = worst
+            && nodes >= rule.maximum_points()
+        {
+            return Err(format!(
+                "survival location-scale truncated posterior surfaces did not certify: after \
+                 {nodes} joint cubature nodes over {replicates} replicate lattices, the replicate \
+                 standard error at {cell}, less the integrand's rounding, is {error:.3e} of its \
+                 scale, above the law's certified relative accuracy {tolerance:.1e}"
+            ));
+        }
+    }
+    Ok(moments)
+}
+
+/// `excess / scale`, with an excess within rounding certified outright and a
+/// positive excess on a zero scale never certified.
+fn certified_fraction(excess: f64, scale: f64) -> f64 {
+    if excess <= 0.0 {
+        0.0
+    } else if scale > 0.0 {
+        excess / scale
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// What one node's accumulation reads, shared by every replicate.
+struct SurfaceMomentCells<'a> {
+    surface_cells: &'a [(usize, usize, usize)],
+    eta_cells: &'a [usize],
+    reference: &'a LocationScaleNodeCells,
+    reference_surface: &'a [(f64, f64)],
+    active_surface: &'a [usize],
+    active_eta: &'a [usize],
+}
+
+/// One replicate lattice's weighted sums, on one log scale, over the flattened
+/// cells: deviations of `S`, `f` and `η` from the plug-in cell and their
+/// squares, and the raw hazard, which only decides between a
+/// zero and an infinite published hazard where `E[S] = 0`.
+struct SurfaceMomentAccumulator {
+    log_scale: f64,
+    weight_sum: f64,
+    survival: Array1<f64>,
+    survival_square: Array1<f64>,
+    density: Array1<f64>,
+    density_square: Array1<f64>,
+    hazard: Array1<f64>,
+    eta: Array1<f64>,
+    eta_square: Array1<f64>,
+}
+
+impl SurfaceMomentAccumulator {
+    fn new(cells: usize) -> Self {
+        Self {
+            log_scale: f64::NEG_INFINITY,
+            weight_sum: 0.0,
+            survival: Array1::zeros(cells),
+            survival_square: Array1::zeros(cells),
+            density: Array1::zeros(cells),
+            density_square: Array1::zeros(cells),
+            hazard: Array1::zeros(cells),
+            eta: Array1::zeros(cells),
+            eta_square: Array1::zeros(cells),
+        }
+    }
+
+    fn push(
+        &mut self,
+        cells: &SurfaceMomentCells<'_>,
+        log_weight: f64,
+        node: &LocationScaleNodeCells,
+    ) -> Result<(), String> {
+        if log_weight > self.log_scale {
+            let rescale = (self.log_scale - log_weight).exp();
+            self.weight_sum *= rescale;
+            for sums in [
+                &mut self.survival,
+                &mut self.survival_square,
+                &mut self.density,
+                &mut self.density_square,
+                &mut self.hazard,
+                &mut self.eta,
+                &mut self.eta_square,
+            ] {
+                *sums *= rescale;
+            }
+            self.log_scale = log_weight;
+        }
+        let weight = (log_weight - self.log_scale).exp();
+        // A node whose weight underflowed on this scale contributes nothing, and
+        // must not turn an infinite hazard into `0·∞`.
+        if weight == 0.0 {
+            return Ok(());
+        }
+        self.weight_sum += weight;
+        for &cell in cells.active_surface {
+            let (_, _, k) = cells.surface_cells[cell];
+            let (reference_survival, reference_density) = cells.reference_surface[cell];
+            let (survival, density) = node.survival_and_density(k)?;
+            let survival_deviation = survival - reference_survival;
+            self.survival[k] += weight * survival_deviation;
+            self.survival_square[k] += weight * survival_deviation * survival_deviation;
+            let density_deviation = density - reference_density;
+            self.density[k] += weight * density_deviation;
+            self.density_square[k] += weight * density_deviation * density_deviation;
+            self.hazard[k] += weight * node.hazard[k];
+        }
+        for &row in cells.active_eta {
+            let k = cells.eta_cells[row];
+            let deviation = node.eta[k] - cells.reference.eta[k];
+            self.eta[k] += weight * deviation;
+            self.eta_square[k] += weight * deviation * deviation;
+        }
+        Ok(())
+    }
+}
+
+/// The replicate lattices pooled on the heaviest replicate's log scale.
+struct PooledSurfaceMoments<'a> {
+    accumulators: &'a [SurfaceMomentAccumulator],
+    pooling_scales: Vec<f64>,
+    pooled_weight: f64,
+}
+
+/// One quantity's pooled mean and variance, and the replicate standard errors
+/// of its mean and of its standard deviation.
+struct CellMoments {
+    mean: f64,
+    variance: f64,
+    mean_spread: f64,
+    sd_spread: f64,
+}
+
+impl<'a> PooledSurfaceMoments<'a> {
+    fn new(accumulators: &'a [SurfaceMomentAccumulator]) -> Result<Self, String> {
+        if let Some(accumulator) = accumulators
+            .iter()
+            .find(|accumulator| !(accumulator.weight_sum.is_finite() && accumulator.weight_sum > 0.0))
+        {
+            return Err(format!(
+                "survival location-scale truncated posterior surfaces: a replicate lattice \
+                 accumulated no finite node weight (weight sum {})",
+                accumulator.weight_sum
+            ));
+        }
+        let top = accumulators
+            .iter()
+            .map(|accumulator| accumulator.log_scale)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let pooling_scales: Vec<f64> = accumulators
+            .iter()
+            .map(|accumulator| (accumulator.log_scale - top).exp())
+            .collect();
+        let pooled_weight = accumulators
+            .iter()
+            .zip(&pooling_scales)
+            .map(|(accumulator, scale)| scale * accumulator.weight_sum)
+            .sum();
+        Ok(Self {
+            accumulators,
+            pooling_scales,
+            pooled_weight,
+        })
+    }
+
+    /// The pooled weighted mean of one raw sum.
+    fn mean(&self, sum: impl Fn(&SurfaceMomentAccumulator) -> f64) -> f64 {
+        self.accumulators
+            .iter()
+            .zip(&self.pooling_scales)
+            .filter(|(_, scale)| **scale > 0.0)
+            .map(|(accumulator, scale)| scale * sum(accumulator))
+            .sum::<f64>()
+            / self.pooled_weight
+    }
+
+    /// The moments of a quantity whose sums of deviations from `reference`, and
+    /// of their squares, `sums` reads.
+    fn moments(
+        &self,
+        sums: impl Fn(&SurfaceMomentAccumulator) -> (f64, f64),
+        reference: f64,
+    ) -> CellMoments {
+        let mut means = Vec::with_capacity(self.accumulators.len());
+        let mut standard_deviations = Vec::with_capacity(self.accumulators.len());
+        let mut pooled_deviation = 0.0;
+        let mut pooled_square = 0.0;
+        for (accumulator, scale) in self.accumulators.iter().zip(&self.pooling_scales) {
+            let (deviation, square) = sums(accumulator);
+            let mean = deviation / accumulator.weight_sum;
+            means.push(mean);
+            standard_deviations
+                .push((square / accumulator.weight_sum - mean * mean).max(0.0).sqrt());
+            pooled_deviation += scale * deviation;
+            pooled_square += scale * square;
+        }
+        let mean_deviation = pooled_deviation / self.pooled_weight;
+        CellMoments {
+            mean: reference + mean_deviation,
+            variance: (pooled_square / self.pooled_weight - mean_deviation * mean_deviation)
+                .max(0.0),
+            mean_spread: replicate_standard_error(&means),
+            sd_spread: replicate_standard_error(&standard_deviations),
+        }
+    }
 }
 
 pub(crate) struct LocationScaleEtaComponents {
@@ -5533,9 +6183,14 @@ fn remap_term_collectionspec_columns(
 pub fn fit_result_from_saved_model_for_prediction(
     model: &SavedModel,
 ) -> Result<UnifiedFitResult, String> {
+    saved_fit_result(model).cloned()
+}
+
+/// Borrow the saved canonical fit result, for readers that need no owned copy.
+pub fn saved_fit_result(model: &SavedModel) -> Result<&UnifiedFitResult, String> {
     model
         .fit_result
-        .clone()
+        .as_ref()
         .ok_or_else(|| "model is missing canonical fit_result payload; refit".to_string())
 }
 
@@ -6381,50 +7036,160 @@ mod tests {
         );
     }
 
+    /// gam#3026: the hazard is the derivative of the cumulative hazard reported
+    /// beside it, on both tails and through the bulk. `η(t) = a + c·log t` with
+    /// `c > 0`, `H(t) = −log Φ(−η(t))`, and `dH/dt` by a Richardson-extrapolated
+    /// central difference in `log t`, whose truncation error is `O(δ⁴)`.
     #[test]
-    fn marginal_slope_index_derivative_clamps_extrapolation_negative_to_flat_hazard() {
-        // The #1040 end-to-end blocker: at a prediction horizon outside the
-        // training exit times, the penalized baseline derivative q'(t) can dip
-        // negative (e.g. the reported eta_t=-0.00135), producing a negative
-        // index time-derivative the strict validator used to reject. The
-        // physical hazard floor is 0, so the clamp must turn it into a flat
-        // hazard the validator accepts — keeping predict/CIF runnable.
-        let eta_t = clamp_marginal_slope_index_derivative_at_horizon(-1.35e-3);
-        assert_eq!(
-            eta_t, 0.0,
-            "negative extrapolation derivative must clamp to 0"
-        );
-        // Downstream validator now accepts it as a flat-hazard point.
-        let (cum, hazard) = probit_survival_hazard_components(-0.563, eta_t)
-            .expect("clamped flat-hazard prediction must validate");
-        assert!(
-            cum >= 0.0,
-            "cumulative hazard must be well-posed, got {cum}"
-        );
-        assert_eq!(
-            hazard, 0.0,
-            "clamped derivative gives zero instantaneous hazard"
-        );
+    fn probit_survival_hazard_is_the_derivative_of_its_cumulative_hazard_3026() {
+        let (a, c) = (-1.15, 0.95);
+        let cumulative = |t: f64| {
+            probit_survival_hazard_components(a + c * t.ln(), c / t)
+                .expect("increasing index")
+                .0
+        };
+        let delta = 1e-3;
+        for t in [1e-4_f64, 1e-2, 0.3, 1.0, 5.0, 40.0, 1e3] {
+            let (_, hazard) =
+                probit_survival_hazard_components(a + c * t.ln(), c / t).expect("increasing index");
+            let at = |m: f64| cumulative(t * (m * delta).exp());
+            let d1 = (at(1.0) - at(-1.0)) / (2.0 * delta);
+            let d2 = (at(2.0) - at(-2.0)) / (4.0 * delta);
+            let derivative = (4.0 * d1 - d2) / 3.0 / t;
+            assert!(
+                (hazard - derivative).abs() <= 1e-8 * derivative.abs(),
+                "at t={t}: hazard {hazard} is not dH/dt {derivative}"
+            );
+        }
     }
 
+    /// gam#3026: where the index decreases the kernel returns the negative
+    /// hazard it is, still `dH/dt`, instead of a flat hazard:
+    /// `η(t) = a − c·log t` with `c > 0`, `dH/dt` by the same Richardson
+    /// difference in `log t`. The rate `−1.35e-3` is the one the deleted
+    /// clamp's test recorded (#1040), where the clamp reported `h = 0` beside
+    /// an `H` whose derivative is negative.
     #[test]
-    fn marginal_slope_index_derivative_preserves_positive_and_nonfinite() {
-        // A genuinely positive derivative passes through unchanged (scaled by
-        // the chain factor), and a non-finite value is left for the strict
-        // validator to reject as a real numerical failure rather than masked.
-        let positive = clamp_marginal_slope_index_derivative_at_horizon(1.0);
+    fn probit_survival_hazard_is_signed_where_the_index_decreases_3026() {
+        let (a, c) = (0.4, 0.3);
+        let cumulative = |t: f64| {
+            probit_survival_hazard_components(a - c * t.ln(), -c / t)
+                .expect("finite index")
+                .0
+        };
+        let delta = 1e-3;
+        for t in [1e-2_f64, 0.3, 1.0, 5.0, 40.0] {
+            let (_, hazard) =
+                probit_survival_hazard_components(a - c * t.ln(), -c / t).expect("finite index");
+            let at = |m: f64| cumulative(t * (m * delta).exp());
+            let d1 = (at(1.0) - at(-1.0)) / (2.0 * delta);
+            let d2 = (at(2.0) - at(-2.0)) / (4.0 * delta);
+            let derivative = (4.0 * d1 - d2) / 3.0 / t;
+            assert!(
+                hazard < 0.0 && (hazard - derivative).abs() <= 1e-8 * derivative.abs(),
+                "at t={t}: hazard {hazard} is not dH/dt {derivative}"
+            );
+        }
+        let (cumulative, hazard) =
+            probit_survival_hazard_components(-0.563, -1.35e-3).expect("finite index");
+        let (log_survival, mills_ratio) = signed_probit_logcdf_and_mills_ratio(0.563);
+        assert_eq!((cumulative, hazard), (-log_survival, mills_ratio * -1.35e-3));
+    }
+
+    /// gam#3026: a plug-in surface that reports a negative hazard at any cell
+    /// is refused by name, naming the cell, and one whose hazards are all
+    /// non-negative (a flat stretch's `0` included) publishes.
+    #[test]
+    fn a_surface_whose_survival_increases_is_refused_by_name_3026() {
+        let surface = |hazard: Array2<f64>| SurvivalPredictResult {
+            times: vec![1.0, 2.0],
+            survival: Array2::from_elem((2, 2), 0.5),
+            cumulative_hazard: Array2::from_elem((2, 2), 2.0_f64.ln()),
+            hazard,
+            linear_predictor: Array1::zeros(2),
+            likelihood_mode: SurvivalLikelihoodMode::MarginalSlope,
+            survival_se: None,
+            eta_se: None,
+            covariance_source: None,
+            survival_plugin: None,
+        };
+        refuse_decreasing_survival(&surface(ndarray::array![[0.3, 0.0], [0.1, 0.2]]))
+            .expect("non-negative hazards publish");
+        match refuse_decreasing_survival(&surface(ndarray::array![[0.3, 0.2], [0.1, -4.0e-3]])) {
+            Err(SurvivalPredictError::DecreasingSurvival { reason }) => assert!(
+                reason.contains("row 1, time column 1"),
+                "the refusal must name the cell: {reason}"
+            ),
+            other => panic!("a negative hazard must be refused by name, got {other:?}"),
+        }
+    }
+
+    /// gam#3026: the exact anchored posterior's density is `−d/dt E[S]`, so the
+    /// published hazard `E f / E S` is `dH̄/dt`. The law makes the rate negative
+    /// with visible probability: `q(t) = u + v·log t` with `(u, v)` bivariate
+    /// normal and `P(v < 0) = Φ(−0.5/0.6) ≈ 0.20`. On the rigid frame with
+    /// `b = 0`, `η = q`, `η_q = 1` and `η_b = 0`. Given `q(t)`, `v` has mean
+    /// `m_v + β(q − m_q)`, and `E[S]` and `E[f]` are integrated by the same
+    /// trapezoid over `q`, which is spectrally accurate for a Gaussian weight.
+    /// The positive-part rule the node replaced is measured too, so the fixture
+    /// can tell the two apart.
+    #[test]
+    fn exact_anchor_node_density_is_the_derivative_of_the_posterior_survival_3026() {
+        let (m_u, m_v) = (-0.4, 0.5);
+        let (s_u, s_v, rho) = (0.7_f64, 0.6_f64, -0.3_f64);
+        // Moments of (q(t), v) at log t = x.
+        let law = |x: f64| {
+            let mean_q = m_u + m_v * x;
+            let var_q = s_u * s_u + 2.0 * rho * s_u * s_v * x + s_v * s_v * x * x;
+            let cov_vq = rho * s_u * s_v + s_v * s_v * x;
+            let var_v_given_q = s_v * s_v - cov_vq * cov_vq / var_q;
+            (mean_q, var_q, cov_vq / var_q, var_v_given_q)
+        };
+        let nodes = 4001;
+        let integrate = |t: f64, signed: bool| -> (f64, f64) {
+            let x = t.ln();
+            let (mean_q, var_q, beta, var_v_given_q) = law(x);
+            let sd_q = var_q.sqrt();
+            let (mut survival, mut density) = (0.0, 0.0);
+            for k in 0..nodes {
+                let w = -12.0 + 24.0 * k as f64 / (nodes - 1) as f64;
+                let q = mean_q + sd_q * w;
+                let weight = normal_pdf(w) * 24.0 / (nodes - 1) as f64;
+                // d q / d t = v / t, so the tangent's conditional mean is E[v | q] / t.
+                let v_mean = m_v + beta * (q - mean_q);
+                let rate = if signed {
+                    v_mean / t
+                } else {
+                    let sd = var_v_given_q.max(0.0).sqrt();
+                    (v_mean * normal_cdf(v_mean / sd) + sd * normal_pdf(v_mean / sd)) / t
+                };
+                let moments = exact_anchor_node_moments(q, 1.0, 0.0, [rate, 0.0]);
+                survival += weight * moments.0;
+                density += weight * moments.2;
+            }
+            (survival, density)
+        };
+        let delta = 1e-3;
+        let mut positive_part_gap = 0.0_f64;
+        for t in [0.2_f64, 1.0, 3.0, 12.0] {
+            let (survival, density) = integrate(t, true);
+            let at = |m: f64| -(integrate(t * (m * delta).exp(), true).0).ln();
+            let d1 = (at(1.0) - at(-1.0)) / (2.0 * delta);
+            let d2 = (at(2.0) - at(-2.0)) / (4.0 * delta);
+            let derivative = (4.0 * d1 - d2) / 3.0 / t;
+            let hazard = density / survival;
+            assert!(
+                (hazard - derivative).abs() <= 1e-7 * derivative.abs(),
+                "at t={t}: posterior hazard E f / E S = {hazard} is not dH̄/dt = {derivative}"
+            );
+            let (_, positive_density) = integrate(t, false);
+            positive_part_gap =
+                positive_part_gap.max((positive_density / survival - derivative).abs() / derivative);
+        }
         assert!(
-            (positive - 1.0).abs() <= 1e-15,
-            "positive derivative scaled by chain factor"
-        );
-        let nonfinite = clamp_marginal_slope_index_derivative_at_horizon(f64::NAN);
-        assert!(
-            nonfinite.is_nan(),
-            "non-finite derivative passes through unclamped"
-        );
-        assert!(
-            probit_survival_hazard_components(0.5, nonfinite).is_err(),
-            "non-finite derivative must still be rejected by the validator"
+            positive_part_gap > 1e-3,
+            "the fixture must separate the signed density from the positive-part rule; the gap \
+             was {positive_part_gap:.3e}"
         );
     }
 
@@ -6457,19 +7222,6 @@ mod tests {
         assert!(
             err_dt
                 .to_string()
-                .contains("invalid survival index derivative")
-        );
-    }
-
-    #[test]
-    fn probit_survival_hazard_rejects_negative_time_derivative() {
-        // The CDF S(t) = Phi(-eta(t)) is monotone in t iff eta'(t) > 0. A
-        // negative slope would give a non-monotone survival curve, which is
-        // not a valid survival function.
-        let err = probit_survival_hazard_components(1.0, -0.5)
-            .expect_err("negative derivative should be invalid");
-        assert!(
-            err.to_string()
                 .contains("invalid survival index derivative")
         );
     }
@@ -7031,6 +7783,258 @@ mod tests {
         }
     }
 
+    /// Deterministic uniforms and normals for the gam#3038 fixture.
+    struct Lcg3038(u64);
+
+    impl Lcg3038 {
+        fn unit(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64 + 0.5) / ((1u64 << 53) as f64)
+        }
+
+        fn normal(&mut self) -> f64 {
+            let radius = (-2.0 * self.unit().ln()).sqrt();
+            radius * (2.0 * std::f64::consts::PI * self.unit()).cos()
+        }
+    }
+
+    /// gam#3038: a location-scale survival fit whose time channel sits against
+    /// its cone publishes its posterior-mean surfaces by integrating the
+    /// cone-truncated posterior `π = N(β_unc, Σ) | C` it reports, not the
+    /// moment-matched normal `N(E_π[β], Σ_π)`, whose sigma points leave `C`
+    /// where the model has no hazard.
+    ///
+    /// The reference is independent of the rule: rejection draws from the
+    /// ambient `N(β_unc, Σ)` kept only inside `C`, every draw replayed through
+    /// the per-coefficient survival law. The published survival must match the
+    /// Monte Carlo `E_π[S]` and the published density `h·S` its `E_π[f]`, each
+    /// within four Monte Carlo standard errors plus the rule's certified
+    /// relative accuracy.
+    #[test]
+    fn location_scale_posterior_mean_integrates_the_cone_truncated_law_3038() {
+        use crate::fit_orchestration::FitConfig;
+        use crate::inference::model::FittedModel;
+        use crate::inference::model_payload_builders::fit_formula_to_payload;
+        use crate::survival::location_scale::factorize_psd_covariance;
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+        // `log T = 0.4x + e^{−0.3 + 0.4x}·ε` with independent censoring: a
+        // linear log-scale, as in the report.
+        let n = 400;
+        let mut rng = Lcg3038(0x3038);
+        let mut records = Vec::with_capacity(n);
+        for _ in 0..n {
+            let x = rng.normal();
+            let log_t = 0.4 * x + (-0.3 + 0.4 * x).exp() * rng.normal();
+            let censor = (-0.5 + 2.5 * rng.unit()).exp();
+            let event_time = log_t.exp();
+            let (time, event) = if event_time <= censor {
+                (event_time, 1)
+            } else {
+                (censor, 0)
+            };
+            records.push(csv::StringRecord::from(vec![
+                format!("{time:.17e}"),
+                event.to_string(),
+                format!("{x:.17e}"),
+            ]));
+        }
+        let headers = ["time", "event", "x"].iter().map(|s| s.to_string()).collect();
+        let data = gam_data::encode_recordswith_inferred_schema(headers, records)
+            .expect("encode the #3038 fixture");
+        let config = FitConfig {
+            survival_likelihood: Some("location-scale".to_string()),
+            survival_distribution: "gaussian".to_string(),
+            noise_formula: Some("x".to_string()),
+            ..FitConfig::default()
+        };
+        let payload =
+            fit_formula_to_payload("Surv(time, event) ~ x".to_string(), &data, &config)
+                .expect("survival location-scale fit");
+        let model = FittedModel::from_payload(payload);
+        let mode = SurvivalPredictionCovarianceMode::Conditional;
+
+        assert_eq!(
+            SurvivalPosteriorIntegration::default_for(&model, mode).expect("default integration"),
+            SurvivalPosteriorIntegration::TruncatedLaw,
+            "the fixture's posterior must carry an active cone"
+        );
+
+        let frame = ndarray::array![[1.0, 0.0, -1.5], [1.0, 0.0, 0.0], [1.0, 0.0, 1.5]];
+        let col_map = data.column_map();
+        let zeros = Array1::<f64>::zeros(frame.nrows());
+        let times = [0.25, 0.5, 1.0, 2.0, 4.0];
+        let request = |estimand| SurvivalPredictRequest {
+            model: &model,
+            data: frame.view(),
+            col_map: &col_map,
+            training_headers: Some(&data.headers),
+            primary_offset: &zeros,
+            noise_offset: &zeros,
+            time_grid: Some(&times),
+            with_uncertainty: false,
+            estimand,
+        };
+        let published = predict_survival(request(SurvivalPredictEstimand::PosteriorMean), mode)
+            .expect("the posterior-mean surfaces integrate the truncated law");
+        let sigma_point = predict_survival_posterior_mean_with(
+            request(SurvivalPredictEstimand::PosteriorMean),
+            mode,
+            SurvivalPosteriorIntegration::SigmaPoint,
+        );
+        eprintln!(
+            "[3038] moment-matched normal sigma points: {}",
+            match &sigma_point {
+                Ok(_) => "published".to_string(),
+                Err(error) => format!("refused: {error}"),
+            }
+        );
+
+        // The ambient law the cone truncates, in raw coefficients.
+        let fit = fit_result_from_saved_model_for_prediction(&model).expect("saved fit");
+        let geometry = fit.geometry.as_ref().expect("fit geometry");
+        let constrained = geometry
+            .constrained_posterior
+            .as_ref()
+            .expect("constrained posterior");
+        let correction = constrained
+            .correction()
+            .expect("available moments")
+            .expect("an active cone");
+        let gauge = &geometry.coefficient_gauge;
+        let unconstrained = constrained.unconstrained_center().expect("ambient centre");
+        let lift = gauge.t_full.dot(&correction.lift);
+        let ambient = fit.beta_covariance().expect("conditional covariance")
+            + &lift
+                .dot(&correction.removed_normal_variance)
+                .dot(&lift.t());
+        let factor = factorize_psd_covariance(&ambient, "#3038 ambient covariance")
+            .expect("ambient factor")
+            .factor;
+        let center = gauge.t_full.dot(unconstrained) + &gauge.affine_shift;
+        // Raw to active coordinates: every raw displacement `L·z` lies in the
+        // range of the full-column-rank gauge `T`, so `T d_a = d_raw` is solved
+        // exactly through its normal equations.
+        let normal = gauge.t_full.t().dot(&gauge.t_full);
+        let normal_inverse = {
+            let eig = factorize_psd_covariance(&normal, "#3038 gauge normal equations")
+                .expect("gauge factor");
+            let scaled = &eig.eigenvectors * &eig.inv_sqrt_eigenvalues;
+            scaled.dot(&scaled.t())
+        };
+
+        let chunks = 16usize;
+        let per_chunk = 250usize;
+        let (n_rows, n_times) = published.survival.dim();
+        let sums = (0..chunks)
+            .into_par_iter()
+            .map(|chunk| {
+                let mut rng = Lcg3038(0x5eed_3038 ^ ((chunk as u64 + 1) << 32));
+                let mut s1 = Array2::<f64>::zeros((n_rows, n_times));
+                let mut s2 = Array2::<f64>::zeros((n_rows, n_times));
+                let mut f1 = Array2::<f64>::zeros((n_rows, n_times));
+                let mut f2 = Array2::<f64>::zeros((n_rows, n_times));
+                let mut proposals = 0usize;
+                let mut accepted = 0usize;
+                while accepted < per_chunk {
+                    proposals += 1;
+                    let z = Array1::from_shape_fn(factor.ncols(), |_| rng.normal());
+                    let displacement = factor.dot(&z);
+                    let active = unconstrained
+                        + &normal_inverse.dot(&gauge.t_full.t().dot(&displacement));
+                    let slack = constrained.constraints.a.dot(&active) - &constrained.constraints.b;
+                    if slack.iter().any(|&value| value < 0.0) {
+                        continue;
+                    }
+                    accepted += 1;
+                    let draw_model =
+                        saved_model_with_survival_coefficients(&model, &(&center + &displacement))
+                            .expect("draw model");
+                    let draw = predict_survival_coefficient_law(
+                        SurvivalPredictRequest {
+                            model: &draw_model,
+                            estimand: SurvivalPredictEstimand::Plugin,
+                            ..request(SurvivalPredictEstimand::Plugin)
+                        },
+                        mode,
+                    )
+                    .expect("per-coefficient survival law at a feasible draw");
+                    let density = &draw.survival * &draw.hazard;
+                    s1 += &draw.survival;
+                    s2 += &draw.survival.mapv(|s| s * s);
+                    f1 += &density;
+                    f2 += &density.mapv(|f| f * f);
+                }
+                (s1, s2, f1, f2, proposals)
+            })
+            .reduce(
+                || {
+                    (
+                        Array2::<f64>::zeros((n_rows, n_times)),
+                        Array2::<f64>::zeros((n_rows, n_times)),
+                        Array2::<f64>::zeros((n_rows, n_times)),
+                        Array2::<f64>::zeros((n_rows, n_times)),
+                        0usize,
+                    )
+                },
+                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3, a.4 + b.4),
+            );
+        let draws = (chunks * per_chunk) as f64;
+        eprintln!(
+            "[3038] Monte Carlo: {} feasible draws of {} ambient proposals",
+            chunks * per_chunk,
+            sums.4
+        );
+        let mut worst_survival_gap = 0.0_f64;
+        let mut largest_truncation_effect = 0.0_f64;
+        let plugin = published
+            .survival_plugin
+            .as_ref()
+            .expect("posterior-mean prediction carries the plug-in survival");
+        for row in 0..n_rows {
+            for time in 0..n_times {
+                let cell = [row, time];
+                let mc_survival = sums.0[cell] / draws;
+                let mc_survival_se =
+                    ((sums.1[cell] / draws - mc_survival * mc_survival).max(0.0) / draws).sqrt();
+                let mc_density = sums.2[cell] / draws;
+                let mc_density_se =
+                    ((sums.3[cell] / draws - mc_density * mc_density).max(0.0) / draws).sqrt();
+                let survival = published.survival[cell];
+                let density = published.hazard[cell] * survival;
+                let rule_accuracy = 2.0e-3 * (mc_survival * (1.0 - mc_survival)).sqrt();
+                eprintln!(
+                    "[3038] row {row} t={:.2}: E[S] rule {survival:.6} MC {mc_survival:.6} \
+                     (se {mc_survival_se:.1e}, plug-in {:.6}); E[f] rule {density:.6} MC \
+                     {mc_density:.6} (se {mc_density_se:.1e})",
+                    times[time], plugin[cell]
+                );
+                assert!(
+                    (survival - mc_survival).abs() <= 4.0 * mc_survival_se + rule_accuracy,
+                    "row {row}, t={}: published E[S] {survival:.6} vs Monte Carlo \
+                     {mc_survival:.6} (se {mc_survival_se:.2e})",
+                    times[time]
+                );
+                assert!(
+                    (density - mc_density).abs()
+                        <= 4.0 * mc_density_se + 2.0e-3 * mc_density.abs(),
+                    "row {row}, t={}: published E[f] {density:.6} vs Monte Carlo \
+                     {mc_density:.6} (se {mc_density_se:.2e})",
+                    times[time]
+                );
+                worst_survival_gap = worst_survival_gap.max((survival - mc_survival).abs());
+                largest_truncation_effect =
+                    largest_truncation_effect.max((plugin[cell] - mc_survival).abs());
+            }
+        }
+        eprintln!(
+            "[3038] max |E[S] rule − MC| {worst_survival_gap:.2e}; max |plug-in − MC| \
+             {largest_truncation_effect:.2e}"
+        );
+    }
 }
 
 /// Multiplier applied to the Weibull baseline scale when no time-basis knots are

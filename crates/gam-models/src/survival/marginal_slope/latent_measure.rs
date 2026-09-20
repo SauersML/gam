@@ -41,6 +41,7 @@ use crate::bms::{
     LatentMeasureSpec, LatentZConditionalCalibration, build_latent_measure_decision,
     estimated_latent_law,
 };
+use crate::inference::predict_io::FittedLatentScoreMap;
 
 /// Everything the fit and its persistence need from the latent-law gate: the
 /// per-coordinate decisions, the law the primary score consumed, the score the
@@ -227,7 +228,7 @@ pub(crate) fn resolve_survival_latent_score_calibration(
         // what the fit anchors on and persists.
         let kind = LatentMeasureKind::GlobalEmpirical { grid: grid.clone() };
         kind.validate("survival marginal-slope declared latent law")?;
-        log::info!(
+        log::debug!(
             "[survival-marginal-slope latent-z] the row index is anchored on a DECLARED latent \
              law of {} nodes; the automatic gate is not run (gam#2923)",
             grid.nodes.len(),
@@ -357,7 +358,7 @@ pub(crate) fn resolve_latent_score_calibration_from_parts(
                     .to_string(),
             );
         }
-        log::info!(
+        log::debug!(
             "[survival-marginal-slope latent-z] score column {col}: the row index consumed the \
              {} latent law (gam#2926)",
             decision.consumed.label(),
@@ -372,11 +373,12 @@ pub(crate) fn resolve_latent_score_calibration_from_parts(
                      marginal conditioning block"
                         .to_string()
                 })?;
-                cal.apply(raw.view(), a_block.view())?
+                FittedLatentScoreMap::conditional_only(cal)
+                    .calibrate(raw.view(), Some(a_block.view()))?
             }
         };
         if !matches!(decision.calibration, LatentMeasureCalibration::None) {
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope latent-z] score column {col}: applied the {} \
                  calibration before any downstream consumer saw the score",
                 calibration_label(&decision.calibration),
@@ -472,7 +474,7 @@ fn route_multi_score_latent_laws(
              residual law, which follows a moving covariance but not a moving mean or shape \
              (gam#2949)"
         );
-        log::warn!(
+        log::debug!(
             "[survival-marginal-slope latent-z] every score column keeps the closed form, \
              uncertified: {missing} (gam#2926)"
         );
@@ -543,7 +545,7 @@ pub(crate) fn resolve_score_covariance_field(
     };
     match crate::bms::ConditionalScoreCovariance::fit(scores, weights, conditioning)? {
         Some(model) => {
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope] conditional score covariance ENGAGED on K={} scores: \
                  pair Rao p-values {:?}",
                 model.score_dim,

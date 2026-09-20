@@ -21,7 +21,7 @@ const HEART_CSV: &str = concat!(
 struct StderrInfoLogger;
 impl log::Log for StderrInfoLogger {
     fn enabled(&self, m: &log::Metadata<'_>) -> bool {
-        m.level() <= log::Level::Info
+        m.level() <= log::Level::Debug
     }
     fn log(&self, r: &log::Record<'_>) {
         if self.enabled(r.metadata()) {
@@ -37,7 +37,7 @@ fn main() {
     gam::gpu::configure_global_policy(gam::gpu::GpuPolicy::Off);
     init_parallelism();
     if log::set_logger(&LOGGER)
-        .map(|()| log::set_max_level(log::LevelFilter::Info))
+        .map(|()| log::set_max_level(log::LevelFilter::Debug))
         .is_err()
     {
         eprintln!("a global logger was already installed; leaving it in place");

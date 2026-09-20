@@ -195,13 +195,7 @@ fn run_bimodal_terminal(owns_terminal: bool) -> (f64, f64) {
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_initial_rho(array![0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.0]);
     let result = problem
         .run(&mut obj, "bimodal-terminal")
         .expect("stationary seed must certify");
@@ -248,6 +242,12 @@ fn without_ownership_flag_bimodal_terminal_bind_fails() {
 
 // ─── #2357 interior strict-saddle escape ──────────────────────────
 
+/// The observations the audited saddle fixtures declare: `τ_stat = 1/(2n) = 1e-7`,
+/// the criterion resolution their wells and rungs are sized against.
+const SADDLE_FIXTURE_N_OBS: usize = 5_000_000;
+/// The coefficients those fixtures declare, one per smoothing coordinate.
+const SADDLE_FIXTURE_P: usize = 2;
+
 // A 2-D outer objective with a genuine interior saddle at ρ=(0,0) and a pair of
 // PSD minima at ρ=(0,±1):
 //
@@ -282,12 +282,6 @@ fn saddle_problem() -> OuterProblem {
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_initial_rho(array![0.0, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
 }
 
 #[test]
@@ -304,7 +298,12 @@ fn certify_mints_saddle_escape_reseed_at_interior_saddle() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let rejection = audit_stationary_point(&mut obj, array![0.0, 0.0], "saddle-escape #2357")
+    let rejection = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "saddle-escape #2357")
         .expect_err("an interior strict saddle must be refused, not certified");
     let result = &rejection.result;
     let cert = result
@@ -390,12 +389,6 @@ fn railed_saddle_problem() -> OuterProblem {
             Array1::from_elem(3, RAILED_SADDLE_FACE),
         )
         .with_initial_rho(array![0.0, 0.0, RAILED_SADDLE_FACE])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
 }
 
 #[test]
@@ -570,13 +563,7 @@ fn criterion_contradicts_a_lying_hessian_and_the_point_certifies_2612() {
     let problem = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
-        .with_initial_rho(array![0.0, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.0, 0.0]);
     let mut obj = problem.build_objective(
         (),
         |_: &mut (), rho: &Array1<f64>| Ok(lying_hessian_cost(rho)),
@@ -584,7 +571,12 @@ fn criterion_contradicts_a_lying_hessian_and_the_point_certifies_2612() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let result = audit_stationary_point(&mut obj, array![0.0, 0.0], "lying-hessian #2612")
+    let result = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "lying-hessian #2612")
         .expect("a global minimum must not be refused on curvature the criterion contradicts");
     let cert = result
         .criterion_certificate
@@ -633,7 +625,8 @@ fn criterion_contradicts_a_lying_hessian_and_the_point_certifies_2612() {
 // exploitable descent one halving further down.
 //
 // The derived ladder runs to `α_min = sqrt(2·objective_resolution/|λ_min|)`,
-// which at the default `1e-7` resolution and `|λ_min| = 0.01` is `4.5e-3`, so
+// which at the fixture's declared `τ_stat = 1e-7` (`n = 5e6`) and
+// `|λ_min| = 0.01` is `4.5e-3`, so
 // it reaches `0.03125` — inside the well — and mints the escape.
 fn narrow_well_cost(rho: &Array1<f64>) -> f64 {
     let r0 = rho[0];
@@ -670,13 +663,7 @@ fn escape_reaches_a_descent_below_the_old_fixed_ladder_2612() {
     let problem = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
-        .with_initial_rho(array![0.0, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.0, 0.0]);
     let mut obj = problem.build_objective(
         (),
         |_: &mut (), rho: &Array1<f64>| Ok(narrow_well_cost(rho)),
@@ -684,7 +671,12 @@ fn escape_reaches_a_descent_below_the_old_fixed_ladder_2612() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let rejection = audit_stationary_point(&mut obj, array![0.0, 0.0], "narrow-well #2612")
+    let rejection = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "narrow-well #2612")
         .expect_err("a saddle with a real descent must be refused, not certified");
     let result = &rejection.result;
     let cert = result
@@ -870,13 +862,7 @@ fn a_descent_below_the_criterion_resolution_is_not_an_escape_2612() {
     let problem = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
-        .with_initial_rho(array![0.0, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.0, 0.0]);
     let mut obj = problem.build_objective(
         (),
         |_: &mut (), rho: &Array1<f64>| Ok(unresolvable_well_cost(rho)),
@@ -884,7 +870,12 @@ fn a_descent_below_the_criterion_resolution_is_not_an_escape_2612() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let result = audit_stationary_point(&mut obj, array![0.0, 0.0], "unresolvable-well #2612")
+    let result = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "unresolvable-well #2612")
         .expect(
             "a point whose only available descent is below the criterion's own resolution must \
              not be refused: no optimizer can reach past it, so the negative direction has no \
@@ -980,12 +971,6 @@ fn ridge_problem() -> OuterProblem {
             array![RIDGE_BOX_FACE, RIDGE_BOX_FACE],
         )
         .with_initial_rho(array![0.0, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
 }
 
 #[test]
@@ -1064,7 +1049,12 @@ fn saddle_escape_expansion_does_not_overshoot_a_genuine_well_2612() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let rejection = audit_stationary_point(&mut obj, array![0.0, 0.0], "well-overshoot #2612")
+    let rejection = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "well-overshoot #2612")
         .expect_err("an interior strict saddle must be refused, not certified");
     let reseed = rejection
         .result
@@ -1198,12 +1188,6 @@ fn corner_problem() -> OuterProblem {
             Array1::from_elem(dim, CORNER_BOX_FACE),
         )
         .with_initial_rho(Array1::<f64>::zeros(dim))
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
 }
 
 #[test]
@@ -1263,16 +1247,18 @@ fn outer_search_reaches_a_corner_minimum_that_needs_more_than_one_escape_2612() 
 //   ∇f    = (A·u,  −2A·ρ₁·u + ρ₁³/s² − ρ₁)
 //   H     = [[A, −2A·ρ₁], [−2A·ρ₁, A·(4ρ₁² − 2u) + 3ρ₁²/s² − 1]]
 //
-// Every band is production's, derived at production's default tolerance
-// `τ = 1e−5` and the declared scale `V₀ = 3e4`: the solver band `τ·(1 + V₀) ≈ 0.30`
-// and the certificate band `τ·(1 + |V|)`. That is #2939's regime, where a
-// score-relative band (1.958) is wide against the curvature the escape follows
-// (λ_min = −4.2e−2).
+// #2939 was found under the score-relative band `τ·(1 + V₀)` that #2954
+// removed; the fixture now states that band as its declared tolerance,
+// `VALLEY_BAND = 1e−5·(1 + V₀) ≈ 0.30`, and declares `n = 167` observations,
+// so the criterion resolution is `τ_stat = 1/(2n) = 3.0e−3`, the magnitude the
+// removed `1e−7·(1 + V₀)` resolution had here. That is #2939's regime: a caller's band
+// wide against the curvature the escape follows (λ_min = −4.2e−2), which a caller
+// may still declare, so the latch must still hold there.
 //
 // At ρ = 0 the gradient vanishes and H = diag(A, −1). The escape ray along ρ₁
 // climbs the valley wall, `f(0, t) − V₀ = (A/2 + 1/(4s²))·t⁴ − t²/2`. The ladder's
 // first descending rung is t = ⅛ (−5.86e−3, above the criterion resolution
-// `1e−7·(1 + V₀) = 3.0e−3`), and doubling to ¼ buys nothing (+1.1e−4). At the
+// `τ_stat = 3.0e−3`), and doubling to ¼ buys nothing (+1.1e−4). At the
 // escape point ρ = (0, ⅛), |∇f| = 0.258 is inside the solver band, and
 // H = [[16, −4], [−4, 0.505]] is still indefinite (det −7.9), so a gradient-only
 // restart stops at iteration 0 and the next mint finds another saddle: #2939's
@@ -1280,6 +1266,12 @@ fn outer_search_reaches_a_corner_minimum_that_needs_more_than_one_escape_2612() 
 const VALLEY_WALL: f64 = 16.0;
 const VALLEY_SCALE: f64 = 3.0;
 const VALLEY_OFFSET: f64 = 3.0e4;
+/// The stationarity band the fixture declares: production's default tolerance
+/// scaled by `1 + V₀`, the band #2939 ran under before #2954.
+const VALLEY_BAND: f64 = 1.0e-5 * (1.0 + VALLEY_OFFSET);
+/// The observations the fixture declares: the criterion resolution is
+/// `τ_stat = 1/(2n) = 2.99e−3`.
+const VALLEY_N_OBS: usize = 167;
 
 fn valley_cost(rho: &Array1<f64>) -> f64 {
     let u = rho[0] - rho[1] * rho[1];
@@ -1317,23 +1309,16 @@ fn valley_eval(rho: &Array1<f64>) -> OuterEval {
 }
 
 /// The #2898 lifecycle (the exact Hessian declared, gradient-only search
-/// preferred) at production's default tolerance and the criterion's declared
-/// scale.
+/// preferred) at the fixture's declared band and statistical resolution.
 fn valley_problem(initial_rho: Array1<f64>) -> OuterProblem {
     OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_prefer_gradient_only(true)
-        .with_tolerance(OuterConfig::default().tolerance)
-        .with_objective_scale(Some(VALLEY_OFFSET))
+        .with_tolerance(VALLEY_BAND)
+        .with_problem_size(VALLEY_N_OBS, 2)
         .with_bounds(Array1::from_elem(2, -20.0), Array1::from_elem(2, 20.0))
         .with_initial_rho(initial_rho)
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
 }
 
 /// One request the valley objective served, in the order it was served.
@@ -1426,6 +1411,8 @@ impl OuterObjective for RecordingValley {
 struct ValleyRounds {
     saddle_rounds: usize,
     iteration_zero_restarts: usize,
+    /// Hessian-order requests over the whole run, the mint's included.
+    hessian_requests: usize,
 }
 
 fn valley_rounds(requests: &[ValleyRequest]) -> ValleyRounds {
@@ -1433,7 +1420,11 @@ fn valley_rounds(requests: &[ValleyRequest]) -> ValleyRounds {
     let mut derivative_points: Vec<Array1<f64>> = Vec::new();
     let mut previous_finalize: Option<Array1<f64>> = None;
     let mut iteration_zero_restarts = 0usize;
+    let mut hessian_requests = 0usize;
     for request in requests {
+        if matches!(request, ValleyRequest::Ordered(OuterEvalOrder::ValueGradientHessian, _)) {
+            hessian_requests += 1;
+        }
         match request {
             ValleyRequest::Cost | ValleyRequest::Ordered(OuterEvalOrder::Value, _) => {}
             ValleyRequest::Legacy(rho)
@@ -1463,6 +1454,7 @@ fn valley_rounds(requests: &[ValleyRequest]) -> ValleyRounds {
     ValleyRounds {
         saddle_rounds: saddle_points.len(),
         iteration_zero_restarts,
+        hessian_requests,
     }
 }
 
@@ -1531,8 +1523,7 @@ fn valley_minimum_and_slack() -> (f64, f64) {
     let trace = h[[0, 0]] + h[[1, 1]];
     let det = h[[0, 0]] * h[[1, 1]] - h[[0, 1]] * h[[1, 0]];
     let lambda_min = 0.5 * (trace - (trace * trace - 4.0 * det).sqrt());
-    let band =
-        outer_stationarity_band_and_rung_at(&valley_problem(minimum).config(), value).bound;
+    let band = outer_stationarity_band_and_rung(&valley_problem(minimum).config()).bound;
     (value, band * band / (2.0 * lambda_min))
 }
 
@@ -1619,5 +1610,152 @@ fn a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939() {
         result.plan_used.solver,
         Solver::Bfgs,
         "with no certified saddle the search must keep the gradient-only plan"
+    );
+    // #2898: the gradient-only lifecycle assembles the declared Hessian once, for the
+    // mint's certificate, and never while it searches.
+    assert_eq!(
+        rounds.hessian_requests, 1,
+        "the gradient-only search must request the declared Hessian exactly once, at the mint: \
+         {rounds:?}"
+    );
+    assert!(
+        result
+            .criterion_certificate
+            .as_ref()
+            .is_some_and(|c| c.hessian_psd() == Some(true)),
+        "the mint's one Hessian must price the certificate: rho={:?}",
+        result.rho
+    );
+}
+
+// ─── #3036 a curvature the criterion cannot resolve at any adjudication step ───
+//
+// gam#3036's instance, reduced to one coordinate. The declared curvature is the instance's
+// `λ = −1.294787e-6`: negative beyond the arithmetic shift `√ε`, so the raw verdict is
+// `hessian_psd=NO`. The planted point has no data, so its row count is chosen from the
+// regime the two pins must sit in, at the criterion's resolution `τ_stat = 1/(2n)` and the
+// ladder's largest step `α = 1`:
+// - unresolvable here: `½|λ| ≤ 1/(2n)`, i.e. `n ≤ 1/|λ| ≈ 7.72e5`;
+// - resolvable in the control (`λ = −1e-4`): `½·1e-4 > 1/(2n)`, i.e. `n > 10 000`.
+// `n = 100 000` sits well inside both. `τ_stat = 5e-6`, so this claim predicts
+// `½|λ| = 6.47e-7`, 7.7× under the resolution, and the control predicts `5e-5`, 10× over
+// it. Every trial point off ρ = 0 fails to evaluate, as the instance's probes did when
+// their inner solves stalled.
+const UNRESOLVABLE_VALUE_3036: f64 = -121.8631;
+const UNRESOLVABLE_N_OBS_3036: usize = 100_000;
+const UNRESOLVABLE_P_3036: usize = 1;
+
+fn stationary_point_with_refused_trials_3036(
+    curvature: f64,
+    off_point_evaluations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> impl OuterObjective {
+    // No search runs here (`audit_stationary_point` judges the one point), so the
+    // problem declares only its derivatives.
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense);
+    let refused = |rho: &Array1<f64>| {
+        EstimationError::RemlOptimizationFailed(format!(
+            "the planted #3036 trial point rho={:?} has no converged inner solve",
+            rho.to_vec()
+        ))
+    };
+    let cost_counter = std::sync::Arc::clone(&off_point_evaluations);
+    let eval_counter = off_point_evaluations;
+    problem.build_objective(
+        (),
+        move |_: &mut (), rho: &Array1<f64>| {
+            if rho.iter().all(|value| *value == 0.0) {
+                Ok(UNRESOLVABLE_VALUE_3036)
+            } else {
+                cost_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(refused(rho))
+            }
+        },
+        move |_: &mut (), rho: &Array1<f64>| {
+            if rho.iter().all(|value| *value == 0.0) {
+                Ok(OuterEval {
+                    cost: UNRESOLVABLE_VALUE_3036,
+                    gradient: array![0.0],
+                    hessian: HessianValue::Dense(array![[curvature]]),
+                    inner_beta_hint: None,
+                })
+            } else {
+                eval_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(refused(rho))
+            }
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    )
+}
+
+#[test]
+fn a_curvature_the_criterion_cannot_resolve_certifies_when_no_trial_evaluates_3036() {
+    let off_point = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut obj =
+        stationary_point_with_refused_trials_3036(-1.294787e-6, std::sync::Arc::clone(&off_point));
+    let result = audit_stationary_point(
+        &mut obj,
+        array![0.0],
+        UNRESOLVABLE_N_OBS_3036,
+        UNRESOLVABLE_P_3036,
+        "planted gam#3036 curvature",
+    )
+    .expect(
+        "a stationary point whose negative curvature the criterion cannot resolve at any \
+             adjudication step must not be refused on the matrix's word",
+    );
+    let cert = result
+        .criterion_certificate
+        .as_ref()
+        .expect("a certified point carries its certificate");
+    assert!(
+        cert.certifies(),
+        "the certificate must accept: {}",
+        cert.summary()
+    );
+    assert_eq!(
+        cert.curvature,
+        CurvatureEvidence::CriterionUnresolvable,
+        "the withdrawn verdict is recorded as unresolvable, not as a PSD claim: {}",
+        cert.summary()
+    );
+    assert_eq!(
+        cert.hessian_psd(),
+        None,
+        "an unresolvable verdict is not a PSD claim"
+    );
+    assert_eq!(
+        off_point.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "resolvability is decided from the eigenvalue and the resolution, before any trial"
+    );
+}
+
+// The control: the same stationary point with a curvature the criterion CAN resolve,
+// `½·1e-4 = 5e-5` against `τ_stat = 5e-6`, whose probes likewise fail to evaluate. The
+// adjudication declines, and the certificate refuses on the curvature it could not test.
+#[test]
+fn a_resolvable_curvature_whose_trials_cannot_be_evaluated_still_refuses_3036() {
+    let off_point = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut obj =
+        stationary_point_with_refused_trials_3036(-1.0e-4, std::sync::Arc::clone(&off_point));
+    let rejection = audit_stationary_point(
+        &mut obj,
+        array![0.0],
+        UNRESOLVABLE_N_OBS_3036,
+        UNRESOLVABLE_P_3036,
+        "planted gam#3036 control",
+    )
+    .expect_err("a resolvable negative curvature that no trial could test must still refuse");
+    assert!(
+        off_point.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the resolvable claim went to the probes: {}",
+        rejection
+    );
+    assert!(
+        rejection.to_string().contains("hessian_psd=NO"),
+        "the refusal is the curvature verdict's: {rejection}"
     );
 }

@@ -106,14 +106,14 @@ pub fn expand_automatic_fit_formula(
         formula_without_automatic_term,
     };
     let invalid = |reason: String| WorkflowError::InvalidConfig { reason };
-    if !formula_has_automatic_term(formula).map_err(invalid)? {
+    if !formula_has_automatic_term(formula)? {
         return Ok(AutomaticFormula {
             formula: formula.to_string(),
             notes: Vec::new(),
         });
     }
     let explicit = gam_terms::inference::formula_dsl::parse_formula(
-        &formula_without_automatic_term(formula).map_err(invalid)?,
+        &formula_without_automatic_term(formula)?,
     )?;
     let reserved = fit_required_columns(&explicit, config)?;
     expand_automatic_formula(formula, data, &reserved).map_err(invalid)
@@ -221,20 +221,23 @@ mod weight_row_index_tests {
     }
 
     /// Every row carrying zero weight leaves nothing in the likelihood; that
-    /// is a data error at the weight column, not a deep solver failure.
+    /// is a data error at the weight column, not a deep solver failure. A
+    /// single positive weight is a valid (if tiny) fit and passes.
     #[test]
     fn all_zero_weights_are_rejected_as_invalid_data() {
-        let zeros = weight_dataset(&[0.0, 0.0, 0.0]);
-        match resolve_weight_column(&zeros, &zeros.column_map(), Some("w")) {
+        let zeros = weight_dataset(&[0.0, 0.0, 0.0, 0.0]);
+        match resolve_fit_weight_column(&zeros, &zeros.column_map(), Some("w")) {
             Err(WorkflowError::InvalidData { column, problem }) => {
                 assert_eq!(column, "w");
                 assert!(problem.contains("no positive weight"), "{problem}");
             }
             other => panic!("expected InvalidData for all-zero weights, got {other:?}"),
         }
-        let some = weight_dataset(&[0.0, 2.0, 0.0]);
-        resolve_weight_column(&some, &some.column_map(), Some("w"))
+
+        let one_positive = weight_dataset(&[0.0, 0.0, 2.5, 0.0]);
+        let weights = resolve_fit_weight_column(&one_positive, &one_positive.column_map(), Some("w"))
             .expect("zero weights alongside a positive weight are valid exclusions");
+        assert_eq!(weights.to_vec(), vec![0.0, 0.0, 2.5, 0.0]);
     }
 }
 
@@ -271,13 +274,39 @@ pub fn resolve_weight_column(
             ),
         });
     }
-    if !values.iter().any(|v| *v > 0.0) {
-        return Err(WorkflowError::InvalidData {
-            column: column_name.to_string(),
-            problem: "is a prior-weight column with no positive weight; a zero weight \
-                      excludes its row, so every row would be excluded from the likelihood"
-                .to_string(),
-        });
+    Ok(values)
+}
+
+/// Fit-time weight column: [`resolve_weight_column`] plus the requirement that
+/// the weights leave a data term to fit.
+pub fn resolve_fit_weight_column(
+    data: &Dataset,
+    col_map: &HashMap<String, usize>,
+    column_name: Option<&str>,
+) -> Result<Array1<f64>, WorkflowError> {
+    let values = resolve_weight_column(data, col_map, column_name)?;
+    let Some(column_name) = column_name else {
+        return Ok(values);
+    };
+    // Every row's likelihood contribution is scaled by its prior weight, so an
+    // all-zero weight vector leaves no data term at all: the fit would be the
+    // prior alone. Reject it here rather than let the REML outer search fail
+    // on an objective with no data in it.
+    if !values.iter().any(|value| *value > 0.0) {
+        return Err(no_positive_weight_error(column_name, values.len()));
     }
     Ok(values)
+}
+
+/// The data error for a prior-weight column that excludes every one of its
+/// `nrows` rows; shared by the fit-time weight resolver and the zero-weight
+/// row seam so both report the same typed error.
+pub(crate) fn no_positive_weight_error(column_name: &str, nrows: usize) -> WorkflowError {
+    WorkflowError::InvalidData {
+        column: column_name.to_string(),
+        problem: format!(
+            "is a prior-weight column with no positive weight; a zero weight \
+             excludes its row, so all {nrows} rows would be excluded from the likelihood"
+        ),
+    }
 }

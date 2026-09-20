@@ -166,29 +166,13 @@ impl<'a> RemlState<'a> {
         p: &Array1<f64>,
         synthetic_ext_count: usize,
     ) -> Result<f64, EstimationError> {
-        self.compute_cost_charging(p, synthetic_ext_count, true)
-    }
-
-    /// Evaluate the outer criterion WITHOUT charging the outer-loop
-    /// cost-evaluation counter.
-    ///
-    /// `outer_cost_evals` measures the work the smoothing-parameter SEARCH did,
-    /// and is gated as such (`tests/perf_1689_pspline_thinplate_profile.rs`
-    /// caps it). Post-convergence covariance work — the sigma-node calibration
-    /// in [`super::eval::RemlState::calibrate_sigma_node`], which reads the
-    /// criterion at a handful of fixed ρ to find where one posterior sigma
-    /// actually is — is not part of that search, and charging it there would
-    /// make a work guard read a covariance refinement as an outer-loop
-    /// regression (#2728).
-    pub(crate) fn compute_cost_uncharged(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
-        self.compute_cost_charging(p, 0, false)
+        self.compute_cost_charging(p, synthetic_ext_count)
     }
 
     fn compute_cost_charging(
         &self,
         p: &Array1<f64>,
         synthetic_ext_count: usize,
-        charge: bool,
     ) -> Result<f64, EstimationError> {
         let cost_call_idx = {
             let mut calls = self
@@ -196,15 +180,13 @@ impl<'a> RemlState<'a> {
                 .cost_eval_count
                 .write()
                 .expect("cost-eval counter lock is never held across a panic");
-            if charge {
-                *calls += 1;
-            }
+            *calls += 1;
             *calls
         };
         let t_eval_start = std::time::Instant::now();
         {
             let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
-            log::debug!(
+            log::trace!(
                 "[REML] eval#{} begin cost-only | rho[..4]=[{}] | k={}",
                 cost_call_idx,
                 prefix.join(","),
@@ -213,7 +195,7 @@ impl<'a> RemlState<'a> {
         }
         let rho_key = self.rhokey_sanitized(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
-            log::debug!(
+            log::trace!(
                 "[REML] eval#{} cache hit | cost {:.6e} | elapsed {:.1}ms",
                 cost_call_idx,
                 eval.cost,
@@ -239,7 +221,7 @@ impl<'a> RemlState<'a> {
         // configured-prior cost from `ConfiguredRhoPriorAtom`).
         let prior_cost = self.configured_rho_prior_atom(p).cost();
         if !prior_cost.is_finite() {
-            log::debug!(
+            log::trace!(
                 "[REML] eval#{} prior short-circuit | prior_cost {:.6e} | rejecting step \
                  without inner solve | elapsed {:.1}ms",
                 cost_call_idx,
@@ -254,12 +236,12 @@ impl<'a> RemlState<'a> {
             return Ok(f64::INFINITY);
         }
         let t_pirls = std::time::Instant::now();
-        let bundle = match self.obtain_value_eval_bundle(p) {
+        let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
                 // Inner linear algebra says "too singular" — treat as barrier.
-                log::debug!(
+                log::trace!(
                     "P-IRLS flagged ill-conditioning for current rho; returning +inf cost to retreat."
                 );
                 return Ok(f64::INFINITY);
@@ -267,7 +249,7 @@ impl<'a> RemlState<'a> {
             Err(EstimationError::PerfectSeparationDetected { .. })
             | Err(EstimationError::PirlsDidNotConverge { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
-                log::debug!(
+                log::trace!(
                     "P-IRLS separation/non-convergence at current rho; returning +inf cost to retreat."
                 );
                 return Ok(f64::INFINITY);
@@ -282,9 +264,9 @@ impl<'a> RemlState<'a> {
         // tabulated `backend DenseSpectral` from THIS line on both sides of a
         // 12x per-trial cost change and could conclude only "it is not a
         // backend switch" -- the label is two-valued, so it cannot say which of
-        // the six routes to it was taken, nor whether a density was measured at
+        // the routes to it was taken, nor whether a density was measured at
         // all.
-        log::debug!(
+        log::trace!(
             "[REML] eval#{} pirls done | elapsed {:.1}ms | backend {:?} | {}",
             cost_call_idx,
             pirls_ms,
@@ -308,7 +290,7 @@ impl<'a> RemlState<'a> {
                 )?
             };
             let cost = result.cost;
-            log::debug!(
+            log::trace!(
                 "[REML] eval#{} sparse cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
                 cost_call_idx,
                 cost,
@@ -342,8 +324,8 @@ impl<'a> RemlState<'a> {
 
             // Hot diagnostics walk the Hessian eigenspectrum and emit
             // ill-conditioning warnings. They are only meaningful for fully
-            // converged inner modes — partial fits accepted from seed
-            // screening (cap=3) routinely yield indefinite Hessians, and
+            // converged inner modes — partial fits under an outer-imposed
+            // inner cap routinely yield indefinite Hessians, and
             // surfacing those as `Penalized Hessian not PD` warnings would
             // confuse log readers and mask real production-fit issues.
             let want_hot_diag = !pirls_result.status.is_failed_max_iterations()
@@ -356,13 +338,13 @@ impl<'a> RemlState<'a> {
                     && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
                 {
                     if gam_problem::diagnostics::should_emit_h_min_eig_diag(min_eig) {
-                        log::debug!(
+                        log::trace!(
                             "[Diag] H min_eig={:.3e}",
                             min_eig
                         );
                     }
                     if min_eig <= 0.0 {
-                        log::warn!(
+                        log::debug!(
                             "Penalized Hessian not PD (min eig <= 0)."
                         );
                     }
@@ -372,7 +354,7 @@ impl<'a> RemlState<'a> {
                     let resolvable_floor = eigs.len() as f64 * f64::EPSILON * spectral_scale;
                     if !min_eig.is_finite() || min_eig <= resolvable_floor {
                         let condition_number = symmetric_spectrum_condition_number(&pht_dense);
-                        log::warn!(
+                        log::debug!(
                             "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing.",
                             condition_number
                         );
@@ -394,7 +376,7 @@ impl<'a> RemlState<'a> {
             )?
         };
         let cost = result.cost;
-        log::debug!(
+        log::trace!(
             "[REML] eval#{} dense cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
             cost_call_idx,
             cost,
@@ -402,52 +384,6 @@ impl<'a> RemlState<'a> {
             t_eval_start.elapsed().as_secs_f64() * 1000.0
         );
         Ok(cost)
-    }
-
-    /// Seed-screening ranking proxy.
-    ///
-    /// In screening mode (`screening_max_inner_iterations > 0`), runs the
-    /// inner P-IRLS solve under the active iteration cap and returns the
-    /// minimum penalized deviance (`-2·log L + βᵀSβ`, plus the structural
-    /// ridge contribution carried in `stable_penalty_term`) observed across
-    /// all inner iterations. Penalized deviance descends monotonically along
-    /// any inner descent path P-IRLS takes, so this minimum is a meaningful
-    /// quality signal even when the inner solver was capped before reaching
-    /// the mode — strictly better than ranking by the partial-fit V_LAML
-    /// criterion, whose `0.5·log|H|` term is dominated by noise at a
-    /// poorly-conditioned partial β̂.
-    ///
-    /// Outside of screening mode this delegates to `Self::compute_cost` so
-    /// the optimization objective itself is never changed by this method's
-    /// presence.
-    pub(crate) fn compute_screening_proxy(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
-        let in_screening = self.screening_max_inner_iterations.load(Ordering::Relaxed) > 0;
-        if !in_screening {
-            return self.compute_cost(p);
-        }
-        // Use the same bundle pipeline as `compute_cost`, but read the proxy
-        // directly from `pirls_result.min_penalized_deviance` instead of
-        // assembling the LAML criterion. Bundle assembly already runs
-        // P-IRLS under the screening cap; reusing it keeps the screening
-        // path's behavioural invariants (no warm-start update, no LRU write,
-        // no KKT enforcement at partial fits).
-        let bundle = match self.obtain_eval_bundle(p) {
-            Ok(bundle) => bundle,
-            Err(err) if err.is_inner_solve_retreat() => {
-                self.cache_manager.invalidate_eval_bundle();
-                return Ok(f64::INFINITY);
-            }
-            Err(e) => {
-                self.cache_manager.invalidate_eval_bundle();
-                return Err(e);
-            }
-        };
-        let proxy = bundle.pirls_result.min_penalized_deviance;
-        if proxy.is_finite() {
-            Ok(proxy)
-        } else {
-            Ok(f64::INFINITY)
-        }
     }
 
     ///
@@ -1353,16 +1289,13 @@ impl<'a> RemlState<'a> {
 
         let c_nontrivial = pirls_result.solve_c_nontrivial;
 
-        // Only the penalty-side `log|S|₊` machinery consumes the penalty
-        // subspace now; the Hessian-side kernel is intrinsic to H_pen (#901)
-        // and no longer needs `range(S_+)`. Its rank bounds H's identified rank
+        // The Hessian-side kernel is intrinsic to H_pen (#901) and does not
+        // need `range(S_+)`. The penalty rank bounds H's identified rank
         // below, so it is computed before the Hessian operator.
-        let penalty_subspace = Some(self.compute_penalty_subspace(e_for_logdet.as_ref())?);
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             e_for_logdet.as_ref(),
             &[],
-            penalty_subspace.as_ref(),
             bundle,
             mode,
             free_basis_opt.as_ref(),
@@ -1465,10 +1398,10 @@ impl<'a> RemlState<'a> {
 
         // #1271 diagnostic: dump the REML logdet internals at every dense
         // evaluation so the rank/logdet mechanism is visible in the test log.
-        // Pure logging — no numeric behavior change. Routed through `log::info!`
+        // Pure logging — no numeric behavior change. Routed through `log::debug!`
         // so it is harmless in production (default off) and captured by a
         // test-installed logger in the #1271 probe.
-        if log::log_enabled!(log::Level::Info) {
+        if log::log_enabled!(log::Level::Debug) {
             use faer::Side;
             use gam_linalg::faer_ndarray::FaerEigh;
             let h_logdet = hessian_op.logdet();
@@ -1491,7 +1424,7 @@ impl<'a> RemlState<'a> {
                 .map(|r| format!("{:.3e}", r.exp()))
                 .collect::<Vec<_>>()
                 .join(",");
-            log::info!(
+            log::debug!(
                 "[#1271-diag] p={p} penalty_rank={pr} nullspace_dim={nd} \
                  logS={ls:.6} logH={lh:.6} half_diff={hd:.6} \
                  h_above1={ha} h_min={hmin:.3e} h_max={hmax:.3e} \
@@ -1576,6 +1509,7 @@ impl<'a> RemlState<'a> {
             if let Some(ref taka) = sparse.takahashi {
                 op = op.with_takahashi(taka.clone());
             }
+            op = op.with_hessian(sparse.hessian.clone());
             std::sync::Arc::new(op)
         };
 
@@ -1732,7 +1666,7 @@ impl<'a> RemlState<'a> {
                     h_total_original -= &rotated;
                 }
                 Err(e) => {
-                    log::warn!(
+                    log::debug!(
                         "Transformed-basis barrier-diagonal reconstruction failed ({e}); \
                          leaving bundle Hessian unchanged before adding original-basis barrier"
                     );
@@ -1745,7 +1679,7 @@ impl<'a> RemlState<'a> {
             .and_then(Self::barrier_config_from_constraints)
             && let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut h_total_original, &beta)
         {
-            log::warn!(
+            log::debug!(
                 "Original-basis barrier Hessian diagonal skipped: {e}; \
                      cost/gradient/logdet consistency may regress on infeasible \
                      candidates (slack ≤ 0).  BFGS line search must maintain \
@@ -1769,15 +1703,13 @@ impl<'a> RemlState<'a> {
             None
         };
         let e_for_logdet = &pirls_result.reparam_result.e_transformed;
-        // Penalty-side `log|S|₊` machinery only; the Hessian-side kernel is
-        // intrinsic to H_pen (#901) and no longer consumes `range(S_+)`. Its
-        // rank bounds H's identified rank, so it is computed before the operator.
-        let penalty_subspace = Some(self.compute_penalty_subspace(e_for_logdet)?);
+        // The Hessian-side kernel is intrinsic to H_pen (#901) and does not
+        // consume `range(S_+)`. The penalty rank bounds H's identified rank,
+        // so it is computed before the operator.
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             e_for_logdet,
             &[],
-            penalty_subspace.as_ref(),
             bundle,
             mode,
             // Original-basis assembly is only used when there are no active
@@ -1805,6 +1737,7 @@ impl<'a> RemlState<'a> {
             weights: pirls_result.finalweights.view(),
             penalties: root_penalties.as_slice(),
             lambdas: &root_lambdas,
+            data_root: Some(&self.data_root_cache),
         };
         let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = {
             use super::reml_outer_engine::HessianFactorization as _;
@@ -1926,8 +1859,8 @@ impl<'a> RemlState<'a> {
         // #1271 diagnostic (twin of the build_dense_assembly probe): this is the
         // path the unconstrained Gaussian tp fit actually takes. Dump REML
         // logdet internals per dense original-basis evaluation. Pure logging via
-        // log::info! (default-off in production, no numeric behavior change).
-        if log::log_enabled!(log::Level::Info) {
+        // log::debug! (default-off in production, no numeric behavior change).
+        if log::log_enabled!(log::Level::Debug) {
             use faer::Side;
             use gam_linalg::faer_ndarray::FaerEigh;
             let h_logdet = hessian_op.logdet();
@@ -1981,7 +1914,7 @@ impl<'a> RemlState<'a> {
             let pen = pirls_result.stable_penalty_term;
             let dp = rss + pen;
             let pedf = pirls_result.edf;
-            log::info!(
+            log::debug!(
                 "[#1271-diag] path=orig p={p} penalty_rank={pr} nullspace_dim={nd} \
                  rss={rss:.6} pen={pen:.6} Dp={dp:.6} pirls_edf={pedf:.4} \
                  logS={ls:.6} logH={lh:.6} half_diff={hd:.6} \
@@ -2240,12 +2173,23 @@ impl<'a> RemlState<'a> {
         // the same value+gradient splicing contract as the TK correction so the
         // outer REML/LAML stays consistent. A no-op when every direction is
         // Laplace-trustworthy.
-        let block_terms = self.block_local_quadrature_correction(rho, bundle, assembly_ext_len)?;
+        let block_terms = self.block_local_quadrature_correction(
+            rho,
+            bundle,
+            assembly_ext_len,
+            mode == super::reml_outer_engine::EvalMode::ValueGradientHessian,
+        )?;
         let block_atom = super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms(
             "sampled_block_marginal",
             block_terms,
         );
-        let result = self.apply_theta_correction_atom_to_result(result, &block_atom)?;
+        let mut result = self.apply_theta_correction_atom_to_result(result, &block_atom)?;
+        // A latched correction whose `Δ_b` has no closed-form ρ-Hessian: the
+        // spliced criterion declares none rather than the Laplace Hessian
+        // without `∂²Δ_b`. Otherwise the atom carried `∂²(−Δ_b)` in.
+        if self.block_correction_hessian_refusal().is_some() {
+            result.hessian = HessianValue::Unavailable;
+        }
         let components = [
             result.criterion_components.fixed_beta,
             result.criterion_components.logdet_h,
@@ -2361,12 +2305,17 @@ impl<'a> RemlState<'a> {
         // surface. The correction enters through the gradient channel exactly
         // like TK, which the universal EFS step already folds in. No-op when no
         // direction is non-Gaussian.
-        let block_terms = self.block_local_quadrature_correction(rho, bundle, assembly_ext_len)?;
+        let block_terms =
+            self.block_local_quadrature_correction(rho, bundle, assembly_ext_len, false)?;
         let block_atom = super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms(
             "sampled_block_marginal",
             block_terms,
         );
-        let cost_result = self.apply_theta_correction_atom_to_result(cost_result, &block_atom)?;
+        let mut cost_result =
+            self.apply_theta_correction_atom_to_result(cost_result, &block_atom)?;
+        if self.block_correction_hessian_refusal().is_some() {
+            cost_result.hessian = HessianValue::Unavailable;
+        }
         crate::estimate::outer_eval_capture::record_outer_criterion_components(
             cost_result.cost,
             [
@@ -2611,7 +2560,7 @@ impl<'a> RemlState<'a> {
         let result = self.assemble_and_evaluate(rho, &bundle, mode, assembly);
         let reml_eval_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
-        log::info!(
+        log::debug!(
             "[outer-timing] evaluate_unified_with_psi_ext: PIRLS={:.1}ms  tau_build={:.1}ms  reml_eval={:.1}ms  total={:.1}ms",
             pirls_ms,
             tau_build_ms,
@@ -2700,7 +2649,7 @@ impl<'a> RemlState<'a> {
         let t_eval_start = std::time::Instant::now();
         {
             let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
-            log::debug!(
+            log::trace!(
                 "[REML] grad-only begin | rho[..4]=[{}] | k={}",
                 prefix.join(","),
                 p.len()
@@ -2709,7 +2658,7 @@ impl<'a> RemlState<'a> {
         let rho_key = self.rhokey_sanitized(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
             let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-            log::debug!(
+            log::trace!(
                 "[REML] grad-only cache hit | |g| {:.3e} | elapsed {:.1}ms",
                 gnorm,
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
@@ -2717,7 +2666,7 @@ impl<'a> RemlState<'a> {
             return Ok(eval.gradient);
         }
         let t_pirls = std::time::Instant::now();
-        let bundle = match self.obtain_eval_bundle(p) {
+        let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(err @ EstimationError::ModelIsIllConditioned { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
@@ -2729,7 +2678,7 @@ impl<'a> RemlState<'a> {
             }
         };
         let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
-        log::debug!(
+        log::trace!(
             "[REML] grad-only pirls done | elapsed {:.1}ms | backend {:?} | {}",
             pirls_ms,
             bundle.backend_kind(),
@@ -2756,7 +2705,7 @@ impl<'a> RemlState<'a> {
                     mode: "ValueAndGradient",
                 })?;
             let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-            log::debug!(
+            log::trace!(
                 "[REML] grad-only sparse done | |g| {:.3e} | assemble {:.1}ms | total {:.1}ms",
                 gnorm,
                 t_assemble.elapsed().as_secs_f64() * 1000.0,
@@ -2776,7 +2725,7 @@ impl<'a> RemlState<'a> {
                 mode: "ValueAndGradient",
             })?;
         let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-        log::debug!(
+        log::trace!(
             "[REML] grad-only dense done | |g| {:.3e} | assemble {:.1}ms | total {:.1}ms",
             gnorm,
             t_assemble.elapsed().as_secs_f64() * 1000.0,
@@ -2811,7 +2760,7 @@ impl<'a> RemlState<'a> {
         let t_eval_start = std::time::Instant::now();
         {
             let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
-            log::debug!(
+            log::trace!(
                 "[REML] outer-eval begin {:?} | rho[..4]=[{}] | k={} | 2nd-order={}",
                 order,
                 prefix.join(","),
@@ -2824,7 +2773,7 @@ impl<'a> RemlState<'a> {
             let cache_satisfies_request = !allow_second_order || eval.hessian.is_analytic();
             if cache_satisfies_request {
                 let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-                log::debug!(
+                log::trace!(
                     "[REML] outer-eval cache hit | cost {:.6e} | |g| {:.3e} | elapsed {:.1}ms",
                     eval.cost,
                     gnorm,
@@ -2835,11 +2784,11 @@ impl<'a> RemlState<'a> {
         }
 
         let t_pirls = std::time::Instant::now();
-        let bundle = match self.obtain_eval_bundle(p) {
+        let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(err) if err.is_inner_solve_retreat() => {
                 self.cache_manager.invalidate_eval_bundle();
-                log::debug!(
+                log::trace!(
                     "P-IRLS inner-solve retreat at current rho ({}); returning infeasible outer eval.",
                     err
                 );
@@ -2852,7 +2801,7 @@ impl<'a> RemlState<'a> {
         };
 
         // Genuinely value-only fulfilment (#979). A `Value` request never needs
-        // the outer gradient. The inner solve above (`obtain_eval_bundle`) has
+        // the outer gradient. The inner solve above (`obtain_outer_eval_bundle`) has
         // already established its owned mode, so assemble only the scalar cost,
         // return a zero-length gradient, and surface the coefficient hint for a
         // typed reactive waypoint when one is active. Line-search, screening,
@@ -2870,7 +2819,7 @@ impl<'a> RemlState<'a> {
                 self.evaluate_unified(p, &bundle, super::reml_outer_engine::EvalMode::ValueOnly)?
             };
             let cost = result.cost;
-            log::debug!(
+            log::trace!(
                 // The four atoms, not just their sum. `cost` alone cannot say
                 // WHICH term moved, and #2748 spent a measurement cycle
                 // discovering that a 0.865 jump between two adjacent
@@ -2922,7 +2871,7 @@ impl<'a> RemlState<'a> {
         };
 
         let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
-        log::debug!(
+        log::trace!(
             "[REML] outer-eval pirls done | elapsed {:.1}ms | backend {:?} | mode {:?} | {}",
             pirls_ms,
             bundle.backend_kind(),
@@ -2959,7 +2908,7 @@ impl<'a> RemlState<'a> {
         };
         {
             let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-            log::debug!(
+            log::trace!(
                 "[REML] outer-eval done | cost {:.12e} | |g| {:.3e} | \
                  fixed_beta {:.12e} logdet_h {:.12e} logdet_s {:.12e} kkt {:.12e} | \
                  assemble {:.1}ms | total {:.1}ms",
@@ -3017,7 +2966,8 @@ impl<'a> RemlState<'a> {
         } else if let Some(mix_state) = &self.runtime_mixture_link_state {
             self.build_mixture_link_ext_coords(bundle, mix_state)
         } else {
-            Ok(Vec::new())
+            // Student-t (ln σ, ln ν); empty for every other family.
+            self.build_student_t_ext_coords(bundle)
         }
     }
 
@@ -4102,11 +4052,11 @@ mod ift_warm_start_tests {
         }
         let nullity = p - rank;
         CanonicalPenalty {
-            root,
+            root: root.into_shared(),
             col_range: 0..p,
             total_dim: p,
             nullity,
-            local,
+            local: local.into_shared(),
             prior_mean: Array1::zeros(p),
             positive_eigenvalues,
             op: None,

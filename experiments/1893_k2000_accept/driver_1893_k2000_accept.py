@@ -9,7 +9,7 @@ iterate (the #1995 throughput leg — closed in code by a215a7345 "Optimize spar
 SAE Schur block GEMM", but its K=2000 effect has never been MEASURED; this script
 produces that number).
 
-Uses gamfit's PUBLIC API only: `gamfit.sae_manifold_fit(..., assignment='topk',
+Uses gamfit's PUBLIC API only: `gamfit.sae.sae_manifold_fit(..., assignment='topk',
 top_k=...)` for the fit and `model.reconstruct(X_test)` for the out-of-sample
 reconstruction. Prints ONE verdict line.
 
@@ -221,13 +221,13 @@ def main() -> int:
     t0 = time.time()
     completed, err = True, ""
     try:
-        model = gamfit.sae_manifold_fit(
+        model = gamfit.sae.sae_manifold_fit(
             X_tr, K=args.K, d_atom=args.d_atom, atom_topology=args.atom_topology,
             assignment="topk", top_k=args.top_k, random_state=args.seed,
         )
         recon_te = np.asarray(model.reconstruct(X_te), dtype=np.float64)
         ev_ours = held_out_ev(X_te.astype(np.float64), recon_te, mean_tr.astype(np.float64))
-    except Exception as exc:  # noqa: BLE001 — a GamError / co-collapse refusal is a FAIL, not a crash
+    except Exception as exc:  # noqa: BLE001 — a GamfitError / co-collapse refusal is a FAIL, not a crash
         completed, err, ev_ours = False, f"{type(exc).__name__}: {exc}", float("nan")
     fit_seconds = time.time() - t0
 

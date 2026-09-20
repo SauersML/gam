@@ -72,7 +72,13 @@ pub(crate) fn build_term_collection_design_inner_with_policy(
     spec: &TermCollectionSpec,
     policy: &gam_runtime::resource::ResourcePolicy,
 ) -> Result<TermCollectionDesign, BasisError> {
-    build_term_collection_design_inner_with_policy_and_plan(data, spec, policy, false)
+    build_term_collection_design_inner_with_policy_and_plan(
+        data,
+        spec,
+        policy,
+        false,
+        SmoothPenaltyDemand::Realize,
+    )
 }
 
 /// Build a collection whose sweep-level spatial geometry has already been planned.
@@ -81,7 +87,13 @@ pub fn build_planned_term_collection_design_inner_with_policy(
     spec: &TermCollectionSpec,
     policy: &gam_runtime::resource::ResourcePolicy,
 ) -> Result<TermCollectionDesign, BasisError> {
-    build_term_collection_design_inner_with_policy_and_plan(data, spec, policy, true)
+    build_term_collection_design_inner_with_policy_and_plan(
+        data,
+        spec,
+        policy,
+        true,
+        SmoothPenaltyDemand::Realize,
+    )
 }
 
 fn build_term_collection_design_inner_with_policy_and_plan(
@@ -89,11 +101,12 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     spec: &TermCollectionSpec,
     policy: &gam_runtime::resource::ResourcePolicy,
     spatial_plan_is_resolved: bool,
+    demand: SmoothPenaltyDemand,
 ) -> Result<TermCollectionDesign, BasisError> {
     use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
     let n = data.nrows();
-    let p_intercept = usize::from(!term_collection_has_anchored_bspline(spec));
+    let p_intercept = usize::from(term_collection_has_global_intercept(spec));
     let p_lin = spec.linear_terms.len();
 
     // Smooth construction, random-effect construction, and linear-column
@@ -104,7 +117,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
         || {
             let mut ws = crate::basis::BasisWorkspace::with_policy(policy.clone());
             if spatial_plan_is_resolved {
-                build_smooth_design_from_planned_terms(data, &spec.smooth_terms, &mut ws)
+                build_smooth_design_from_planned_terms(data, &spec.smooth_terms, &mut ws, demand)
             } else {
                 build_smooth_design_withworkspace_unvalidated(data, &spec.smooth_terms, &mut ws)
             }
@@ -184,6 +197,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
         data,
         &spec.linear_terms,
         &spec.smooth_terms,
+        demand,
     )?;
 
     let p_rand: usize = random_blocks.iter().map(|b| b.num_groups).sum();
@@ -296,22 +310,38 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     // `β_j -> β_j/c`, the quadratic functional is unchanged. Keeping each
     // term in its own one-column block also lets REML remove unsupported
     // effects independently instead of forcing unrelated slopes to share λ.
+    //
+    // A `bounded()` coefficient under the default shrinkage prior instead owns
+    // a unit ridge on its latent logit coordinate, centred at the null. The
+    // latent coordinate is dimensionless, so the unit scale carries no
+    // covariate units; the bounded fit applies this block in latent space.
     for (j, linear) in spec.linear_terms.iter().enumerate() {
-        let Some(function_mass) = linear_function_masses.get(j).copied().flatten() else {
-            continue;
+        let (mass, source) = match linear_function_masses.get(j).copied().flatten() {
+            Some(function_mass) => (function_mass, "LinearTermRidge"),
+            None if matches!(
+                linear.coefficient_geometry,
+                LinearCoefficientGeometry::Bounded {
+                    prior: BoundedCoefficientPriorSpec::Shrinkage,
+                    ..
+                }
+            ) =>
+            {
+                (1.0, BOUNDED_SHRINKAGE_PENALTY_SOURCE)
+            }
+            None => continue,
         };
         let col = p_intercept + j;
         let global_index = penalties.len();
         penalties.push(BlockwisePenalty::new(
             col..(col + 1),
-            Array2::from_elem((1, 1), function_mass),
+            Array2::from_elem((1, 1), mass),
         ));
         nullspace_dims.push(0);
         penaltyinfo.push(PenaltyBlockInfo {
             global_index,
             termname: Some(linear.name.clone()),
             penalty: ActivePenaltyInfo {
-                source: PenaltySource::Other("LinearTermRidge".to_string()),
+                source: PenaltySource::Other(source.to_string()),
                 original_index: j,
                 effective_rank: 1,
                 normalization_scale: 1.0,
@@ -322,9 +352,6 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     }
 
     for (re_idx, (name, range)) in random_effect_ranges.iter().enumerate() {
-        if range.is_empty() || !spec.random_effect_terms[re_idx].penalized {
-            continue;
-        }
         let block_size = range.len();
         let global_index = penalties.len();
         penalties.push(BlockwisePenalty::ridge(range.clone(), 1.0));
@@ -458,6 +485,12 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     })
 }
 
+/// Whether the design leads with the global all-ones intercept column: the
+/// formula kept its intercept and no anchored B-spline pins the level.
+pub fn term_collection_has_global_intercept(spec: &TermCollectionSpec) -> bool {
+    matches!(spec.level, ModelLevel::Intercept) && !term_collection_has_anchored_bspline(spec)
+}
+
 /// Whether any smooth term carries an anchored B-spline endpoint (one *or* two
 /// sided). Such a term fixes the function's absolute level through its endpoint
 /// pin, so it becomes the model's level gauge: the global intercept is
@@ -556,6 +589,154 @@ pub fn build_term_collection_design_with_policy(
     let mut planned_spec = spec.clone();
     planned_spec.smooth_terms = planned_smooth_terms;
     build_term_collection_design_inner_with_policy(data, &planned_spec, policy)
+}
+
+/// Evaluate a fitted (frozen) spec's design and affine offset on new rows.
+///
+/// The result is the `design` and `affine_offset` that
+/// [`build_term_collection_design`] returns for the same rows, without
+/// realizing the penalties: prediction reads only the row map, and rebuilding
+/// the penalties re-ran their normalization, PSD projection and collection
+/// chart filtering on every call.
+pub fn build_term_collection_prediction_design(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+) -> Result<TermCollectionPredictionDesign, BasisError> {
+    validate_term_collection_finite_inputs(data, spec)?;
+    let mut planned_specs =
+        plan_joint_spatial_centers_for_term_blocks(data, &[spec.smooth_terms.clone()])?;
+    let planned_smooth_terms = planned_specs.pop().ok_or_else(|| {
+        BasisError::InvalidInput(
+            "joint spatial center planner returned no smooth terms for single-spec build"
+                .to_string(),
+        )
+    })?;
+    let mut planned_spec = spec.clone();
+    planned_spec.smooth_terms = planned_smooth_terms;
+    let policy = gam_runtime::resource::ResourcePolicy::default_library();
+    let TermCollectionDesign {
+        design,
+        affine_offset,
+        linear_ranges,
+        smooth,
+        ..
+    } = build_term_collection_design_inner_with_policy_and_plan(
+        data,
+        &planned_spec,
+        &policy,
+        true,
+        SmoothPenaltyDemand::DesignOnly,
+    )?;
+    // The smooth block closes the global layout, so its first column sits one
+    // smooth-block width before the design's last.
+    let smooth_start = design.ncols() - smooth.total_smooth_cols();
+    Ok(TermCollectionPredictionDesign {
+        design,
+        affine_offset,
+        linear_ranges,
+        smooth_ranges: smooth
+            .terms
+            .into_iter()
+            .map(|term| {
+                let range = term.coeff_range;
+                let columns = (smooth_start + range.start)..(smooth_start + range.end);
+                (term.name, columns)
+            })
+            .collect(),
+    })
+}
+
+/// One linear or smooth term's design columns on new rows: the columns
+/// [`build_term_collection_prediction_design`] realizes over that term's range,
+/// built without realizing the terms its columns do not read.
+///
+/// A smooth's realized block reads the blocks of the smooths it is
+/// residualized against (the owners a frozen chart names, or the ownership
+/// hierarchy when nothing is frozen) and, under an automatic center strategy,
+/// the joint spatial center plan; everything else — random effects and every
+/// unrelated smooth — only widens the rows' design. The fixed affine channel is
+/// not a column, so it is not part of the result.
+pub fn build_term_prediction_columns(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    term: &str,
+) -> Result<Array2<f64>, BasisError> {
+    let is_linear = spec.linear_terms.iter().any(|linear| linear.name == term);
+    let mut kept = vec![false; spec.smooth_terms.len()];
+    if !is_linear {
+        let target = spec
+            .smooth_terms
+            .iter()
+            .position(|smooth| smooth.name == term)
+            .ok_or_else(|| {
+                BasisError::InvalidInput(format!(
+                    "term {term:?} is neither a linear nor a smooth term of this model"
+                ))
+            })?;
+        let auto_centered = |smooth: &SmoothTermSpec| {
+            spatial_term_center_strategy(smooth).is_some_and(center_strategy_is_auto)
+        };
+        let mut ownership = None;
+        let mut pending = vec![target];
+        while let Some(idx) = pending.pop() {
+            if std::mem::replace(&mut kept[idx], true) {
+                continue;
+            }
+            let smooth = &spec.smooth_terms[idx];
+            if let Some(chart) = frozen_parametric_residualization(smooth) {
+                pending.extend(chart.owner_terms.iter().copied());
+            }
+            if frozen_global_orthogonality(smooth).is_none()
+                && !smooth_has_frozen_identifiability(smooth)
+            {
+                let SmoothStructureAnalysis { term_owners, .. } =
+                    ownership.get_or_insert_with(|| analyze_smooth_ownership(&spec.smooth_terms));
+                pending.extend(term_owners[idx].iter().copied());
+            }
+            if auto_centered(smooth) {
+                pending.extend(
+                    (0..spec.smooth_terms.len())
+                        .filter(|&other| auto_centered(&spec.smooth_terms[other])),
+                );
+            }
+        }
+    }
+    // Kept smooths keep their relative order, so the ownership order and every
+    // owner list restricted to them are the full spec's.
+    let mut new_index = vec![None; spec.smooth_terms.len()];
+    let mut smooth_terms = Vec::new();
+    for (idx, smooth) in spec.smooth_terms.iter().enumerate() {
+        if kept[idx] {
+            new_index[idx] = Some(smooth_terms.len());
+            smooth_terms.push(smooth.clone());
+        }
+    }
+    for smooth in &mut smooth_terms {
+        if let Some(chart) = smooth.frozen_parametric_residualization.as_mut() {
+            for owner in &mut chart.owner_terms {
+                *owner = new_index[*owner].expect("a kept smooth's chart owners are kept with it");
+            }
+        }
+    }
+    let reduced = TermCollectionSpec {
+        linear_terms: spec.linear_terms.clone(),
+        random_effect_terms: Vec::new(),
+        smooth_terms,
+        level: spec.level,
+    };
+    let design = build_term_collection_prediction_design(data, &reduced)?;
+    let range = design
+        .linear_ranges
+        .iter()
+        .chain(&design.smooth_ranges)
+        .find(|(name, _)| name == term)
+        .map(|(_, range)| range.clone())
+        .ok_or_else(|| {
+            BasisError::InvalidInput(format!(
+                "term {term:?} has no columns in its restricted design"
+            ))
+        })?;
+    Ok(design.design.extract_columns(&range.collect::<Vec<_>>()))
 }
 
 /// Exact analytic derivative of an affine term-collection realization.
@@ -1049,29 +1230,32 @@ fn derive_smooth_collection_coefficient_transform(
     design_local: &DesignMatrix,
     arm: SmoothCollectionGaugeArm,
     block: ArrayView2<'_, f64>,
-    has_owner_terms: bool,
+    block_is_owned: bool,
 ) -> Result<Array2<f64>, BasisError> {
-    match arm {
+    let derived = match arm {
         SmoothCollectionGaugeArm::Delete => {
-            match orthogonality_transform_for_design(design_local, block, None) {
-                Ok(transform) => Ok(transform),
-                // Mirrors the collection's historical fallback: a constraint
-                // block made entirely of owner columns may consume the whole
-                // dependent block.
-                Err(BasisError::ConstraintNullspaceCollapsed { .. }) if has_owner_terms => {
-                    Ok(Array2::zeros((design_local.ncols(), 0)))
-                }
-                Err(error) => Err(error),
-            }
+            orthogonality_transform_for_design(design_local, block, None)
         }
         SmoothCollectionGaugeArm::Residualize => {
-            Ok(crate::basis::parametric_residualization_for_design(
+            crate::basis::parametric_residualization_for_design(
                 design_local,
                 block,
                 None, // fixed subspace: never use iteration-varying PIRLS weights
-            )?
-            .coefficient_transform)
+            )
+            .map(|residualization| residualization.coefficient_transform)
         }
+    };
+    match derived {
+        Ok(transform) => Ok(transform),
+        // The design lies wholly inside a constraint block that other terms of
+        // the model carry, so it adds no function they do not already fit: every
+        // one of its coefficient directions is unidentified, and the realized
+        // block keeps none of them. This is the spectral frame's drop-the-null-
+        // directions rule at its extreme.
+        Err(BasisError::ConstraintNullspaceCollapsed { .. }) if block_is_owned => {
+            Ok(Array2::zeros((design_local.ncols(), 0)))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1158,6 +1342,10 @@ pub struct LocalTermRealization<'a> {
     /// A Duchon term's operator-penalty request, which its penalty set is
     /// re-derived from in the collection chart; `None` for every other kind.
     pub duchon_operator_penalties: Option<&'a crate::basis::DuchonOperatorPenaltySpec>,
+    /// A B-spline term's spec, whose double-penalty ridge is charged in the
+    /// collection chart as its frozen replay charges it; `None` for every other
+    /// kind.
+    pub bspline_null_ridge: Option<&'a crate::basis::BSplineBasisSpec>,
     pub termname: &'a str,
 }
 
@@ -1202,6 +1390,7 @@ pub fn place_term_in_collection_gauge(
         linear_constraints_local,
         joint_null_rotation,
         duchon_operator_penalties,
+        bspline_null_ridge,
         termname,
     } = local;
     let realized = realize_smooth_collection_gauge(design, gauge, termname)?;
@@ -1220,6 +1409,7 @@ pub fn place_term_in_collection_gauge(
         Some(&coefficient_gauge),
         &metadata,
         duchon_operator_penalties,
+        bspline_null_ridge,
         termname,
     )?;
     let linear_constraints_local = linear_constraints_local.map(|lin| {
@@ -1254,6 +1444,21 @@ pub fn duchon_operator_penalty_request(
     }
 }
 
+/// The B-spline spec of a 1-D B-spline term, bare or under a `by=` wrapper,
+/// which [`penalties_in_collection_chart`] charges the null ridge from.
+pub fn bspline_null_ridge_request(
+    termspec: &SmoothTermSpec,
+) -> Option<&crate::basis::BSplineBasisSpec> {
+    let basis = match &termspec.basis {
+        SmoothBasisSpec::ByVariable { inner, .. } => inner.as_ref(),
+        basis => basis,
+    };
+    match basis {
+        SmoothBasisSpec::BSpline1D { spec, .. } => Some(spec),
+        _ => None,
+    }
+}
+
 /// A smooth term's penalty set in its collection's coefficient chart: the active
 /// blocks, and the dropped ones following `local_dropped`.
 ///
@@ -1282,6 +1487,7 @@ fn penalties_in_collection_chart(
     coefficient_gauge: Option<&gam_problem::Gauge>,
     placed_metadata: &BasisMetadata,
     duchon_operator_penalties: Option<&crate::basis::DuchonOperatorPenaltySpec>,
+    bspline_null_ridge: Option<&crate::basis::BSplineBasisSpec>,
     term_name: &str,
 ) -> Result<(Vec<ActivePenalty>, Vec<DroppedPenaltyInfo>), BasisError> {
     if coefficient_gauge.is_some() && matches!(placed_metadata, BasisMetadata::Matern { .. }) {
@@ -1329,6 +1535,18 @@ fn penalties_in_collection_chart(
     }
     let candidates =
         penalty_candidates_under_collection_gauge(active_penalties, coefficient_gauge, term_name)?;
+    // A gauge rebuilt a B-spline ridge in the collection chart; charge it as the
+    // frozen replay of this chart does, so fit and rebuild agree.
+    let candidates = match bspline_null_ridge {
+        Some(spec) if coefficient_gauge.is_some() => {
+            crate::basis::charge_placed_bspline_null_ridge_along_mean_slope(
+                candidates,
+                spec,
+                placed_metadata,
+            )?
+        }
+        _ => candidates,
+    };
     // `filter_penalty_candidates` numbers its input from zero, but that input is
     // the term-local build's ACTIVE penalties, one candidate each and in order,
     // so it hands back the local build's numbering, whose dropped blocks travel
@@ -1542,6 +1760,7 @@ fn apply_global_smooth_identifiability(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     smoothspecs: &[SmoothTermSpec],
+    demand: SmoothPenaltyDemand,
 ) -> Result<(SmoothDesign, Array1<f64>), BasisError> {
     // Global smooth identifiability policy:
     //
@@ -1619,8 +1838,14 @@ fn apply_global_smooth_identifiability(
         // block. So it bypasses both the owner analysis and the frozen-skip
         // gate below.
         let replay_z = frozen_global_orthogonality(termspec);
+        // A shape cone (coordinate bounds or exact inequality rows) is written
+        // in the term's own coefficient chart; residualizing that chart against
+        // other blocks would move the constant and linear directions the cone
+        // is anchored on, so shaped terms keep their local chart.
         let skip_global_transform = replay_z.is_none()
-            && (smooth_has_frozen_identifiability(termspec) || term.lower_bounds_local.is_some());
+            && (smooth_has_frozen_identifiability(termspec)
+                || term.lower_bounds_local.is_some()
+                || term.linear_constraints_local.is_some());
         // A marginally-centered tensor interaction (`ti(...)`, MarginalSumToZero)
         // has ALREADY removed each axis's main effect analytically, in
         // coefficient space, via its per-margin sum-to-zero reparameterization
@@ -1776,6 +2001,16 @@ fn apply_global_smooth_identifiability(
         // is recomputed by projecting `X_local(psi) T0` through the fixed `C`.
         // This keeps the objective out of arbitrary moving RRQR/eigenvector
         // coordinates (#2760).
+        // Whether the whole constraint block is carried by other terms, so a
+        // design lying wholly inside it may be consumed entirely (see
+        // `derive_smooth_collection_coefficient_transform`). A factor-by level's
+        // block is its gated level indicator plus any owner smooths, and the
+        // indicator is that factor's main-effect column: the term builder
+        // always places a main effect beside the per-level smooths. Otherwise
+        // only a deletion against owner columns may consume the design, the
+        // collection's historical rule.
+        let factor_by_level = factor_by_level_gate(termspec).is_some();
+        let delete_block_is_owned = factor_by_level || !owner_indices.is_empty();
         // Read the term-local chart BEFORE the gauge composes its own into the
         // metadata below (gam#2760): after `with_identifiability_transform` the
         // two are one matrix and cannot be told apart.
@@ -1786,7 +2021,7 @@ fn apply_global_smooth_identifiability(
                     &design_local,
                     SmoothCollectionGaugeArm::Delete,
                     block.view(),
-                    !owner_indices.is_empty(),
+                    delete_block_is_owned,
                 )?,
             ),
             GlobalIdentifiabilityPlan::Residualize { block } => Some(
@@ -1794,7 +2029,7 @@ fn apply_global_smooth_identifiability(
                     &design_local,
                     SmoothCollectionGaugeArm::Residualize,
                     block.view(),
-                    !owner_indices.is_empty(),
+                    factor_by_level,
                 )?,
             ),
         };
@@ -1904,14 +2139,20 @@ fn apply_global_smooth_identifiability(
         } else {
             term.metadata.clone()
         };
-        let (active_penalties, dropped_penalties) = penalties_in_collection_chart(
-            &term.active_penalties,
-            term.dropped_penalties.clone(),
-            coefficient_gauge.as_ref(),
-            &placed_metadata,
-            duchon_operator_penalty_request(termspec),
-            &term.name,
-        )?;
+        let (active_penalties, dropped_penalties) = match demand {
+            SmoothPenaltyDemand::Realize => penalties_in_collection_chart(
+                &term.active_penalties,
+                term.dropped_penalties.clone(),
+                coefficient_gauge.as_ref(),
+                &placed_metadata,
+                duchon_operator_penalty_request(termspec),
+                bspline_null_ridge_request(termspec),
+                &term.name,
+            )?,
+            // The collection chart only relabels penalties; the design above
+            // is already placed.
+            SmoothPenaltyDemand::DesignOnly => (Vec::new(), Vec::new()),
+        };
         let linear_constraints_constrained =
             if let Some(lin_local) = term.linear_constraints_local.as_ref() {
                 if let Some(gauge) = coefficient_gauge.as_ref() {
@@ -2011,7 +2252,7 @@ fn apply_global_smooth_identifiability(
         terms_out.push(SmoothTerm {
             name: smooth.terms[idx].name.clone(),
             coeff_range: col_start..col_end,
-            shape: smooth.terms[idx].shape,
+            shape: smooth.terms[idx].shape.clone(),
             active_penalties: local_active_penalties[idx].clone(),
             dropped_penalties: local_dropped_penalties[idx].clone(),
             metadata: local_metadata[idx]
@@ -2604,7 +2845,7 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
                 frozen_parametric_residualization: None,
                 name: termspec.name.clone(),
                 basis: (**inner).clone(),
-                shape: termspec.shape,
+                shape: termspec.shape.clone(),
                 joint_null_rotation: None,
             })
         }
@@ -2613,7 +2854,7 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
                 frozen_parametric_residualization: None,
                 name: termspec.name.clone(),
                 basis: (**smooth).clone(),
-                shape: termspec.shape,
+                shape: termspec.shape.clone(),
                 joint_null_rotation: None,
             })
         }
@@ -3098,7 +3339,7 @@ mod sparse_transform_tests {
             identifiability: crate::smooth::TensorBSplineIdentifiability::None,
             penalty_decomposition: Default::default(),
         };
-        let built = crate::smooth::build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+        let built = crate::smooth::build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
             .expect("te(x, h) basis");
         let DesignMatrix::Sparse(sparse) = &built.design else {
             panic!("te(x, h) with no identifiability chart must build the sparse Khatri-Rao design; got {:?}", built.design);
@@ -3153,6 +3394,7 @@ mod frozen_linear_term_mass_rebuild_tests {
                     coefficient_min: None, coefficient_max: None, frozen_function_mass: None,
                 }).collect(),
                 random_effect_terms: vec![], smooth_terms: vec![],
+                level: Default::default(),
             };
             let before = hwm();
             let built = build_term_collection_design(data.view(), &spec).expect("million-row design");
@@ -3200,6 +3442,7 @@ mod frozen_linear_term_mass_rebuild_tests {
             }],
             random_effect_terms: Vec::new(),
             smooth_terms: Vec::new(),
+            level: Default::default(),
         }
     }
 

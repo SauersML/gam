@@ -107,7 +107,6 @@ fn firth_inner_solve(link: StandardLink) -> PirlsResult {
     };
     let penalty = PenaltyConfig {
         canonical_penalties: &canonical,
-        balanced_penalty_root: None,
         reparam_invariant: None,
         p,
         coefficient_lower_bounds: None,
@@ -239,8 +238,9 @@ fn objective_curvature_for_direction_subtracts_the_correction_2273() {
     );
 }
 
-/// #2273: the noncanonical observed-information tower must evaluate on a
-/// SATURATED Bernoulli row.
+/// #2273: the noncanonical observed information must evaluate on a SATURATED
+/// Bernoulli row. Since #3317 Binomial rows take it from the log-probability
+/// jets (`bernoulli_observed_information_jet`), so that is what is checked.
 ///
 /// Two independent oracles, neither of which shares code with the engine.
 ///
@@ -252,7 +252,7 @@ fn objective_curvature_for_direction_subtracts_the_correction_2273() {
 /// ```
 ///
 /// That identity holds at every `η`, including where `V = μ(1−μ)` is `3.6e-84`,
-/// so it pins the tower with no tolerance argument to make.
+/// so it pins the entries exactly.
 ///
 /// **The high-precision one.** For `y = 1` there is no such closed form, so the
 /// reference is `mpmath` at 220 decimal digits (needed to hold `1 − 3.6e-84`
@@ -263,7 +263,9 @@ fn objective_curvature_for_direction_subtracts_the_correction_2273() {
 /// divided by `φV²`, `φV³` and `φV⁴`, and at `η = 5.2593` `V⁴ = 1.7e-334`
 /// underflows to zero, so `d²W/dη²` came out NaN and the row was reported as
 /// `PIRLS row geometry is not representable` — aborting a whole fit over a
-/// number that is `3.87e-75`.
+/// number that is `3.87e-75`. The tower then answered to one lost digit per
+/// order here, and at `η = 6.6547`, where `μ'` and `1 − μ` both underflow,
+/// divided `0/0` (#3317).
 #[test]
 fn noncanonical_observed_tower_evaluates_on_a_saturated_row_2273() {
     use gam_problem::InverseLink;
@@ -280,87 +282,39 @@ fn noncanonical_observed_tower_evaluates_on_a_saturated_row_2273() {
         (0.19926932328323, 0.16289984062778, 0.091777041256882),
     ];
 
+    // Binomial rows take their observed information from the two sides'
+    // log-probability jets (#3317), which never divide by `V = μ(1−μ)`: on
+    // these rows `V` is as small as `2.9e-84`.
     let link = InverseLink::Standard(StandardLink::CLogLog);
-    let mut report = String::new();
     for (index, &eta) in ETAS.iter().enumerate() {
-        let jet = crate::mixture_link::inverse_link_jet_for_inverse_link(&link, eta)
-            .expect("the cloglog jet is defined at these eta");
-        let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(&link, eta)
-            .expect("the cloglog fourth derivative is defined at these eta");
-        let one_minus_mu =
-            crate::mixture_link::inverse_link_complement_for_inverse_link(&link, eta, jet.mu);
-        let vj = variance_jet_for_weight_family(WeightFamily::Binomial, jet.mu, one_minus_mu);
-
-        // y = 0: the exact identity.
-        let zero = observed_weight_dispatch(
-            WeightFamily::Binomial,
-            WeightLink::Other,
-            0.0,
-            jet.mu,
-            one_minus_mu,
-            1.0,
-            1.0,
-            jet,
-            h4,
+        // y = 0: `−log(1−μ) = e^η`, a closed form, so every entry is `e^η`
+        // exactly.
+        let zero = bernoulli_observed_information_jet(&link, eta, 0.0, 1.0, 1.0)
+            .expect("the cloglog observed information is defined at these eta");
+        assert_eq!(
+            [zero[0], zero[1], zero[2]],
+            [eta.exp(); 3],
+            "#2273: cloglog y=0 observed information at eta={eta} must be e^eta exactly"
         );
-        let exact = eta.exp();
-        report.push_str(&format!(
-            "\n  eta={eta:>20}  V={:.6e}  y=0 -> ({:.9e}, {:.9e}, {:.9e})  exact e^eta={exact:.9e}",
-            vj.v, zero.0, zero.1, zero.2,
-        ));
-        // The band widens by order, and the reason is arithmetic rather than
-        // policy. For cloglog the recurrence's terms nearly cancel — analytically
-        // `T₀ = T₁ = T₂ = T₃ = e^η/(1−(1−μ))`, and each order reaches it by
-        // subtracting `t²s` from `t²s + ts` with `t = e^η ≈ 192`, so ~log₁₀(t)
-        // ≈ 2.3 digits go per order. Measured worst case at this η: `w` to
-        // 3e-14, `c` to 1.0e-11, `d` to 6.2e-9 — one order of loss per order of
-        // derivative, exactly as the model predicts. That is the generic tower's
-        // honest accuracy on a row whose variance is 2.9e-84; the alternative it
-        // replaced was NaN.
-        for (label, value, band) in
-            [("w", zero.0, 1e-12), ("c", zero.1, 1e-10), ("d", zero.2, 1e-7)]
-        {
-            let relative = (value - exact).abs() / exact.abs();
-            assert!(
-                relative <= band,
-                "#2273: cloglog y=0 {label}_obs at eta={eta} is {value:.9e}, but -l = e^eta \
-                 exactly, so it must be {exact:.9e} (relative error {relative:.3e}, \
-                 band {band:.0e}){report}"
-            );
-        }
 
-        // y = 1: against the 220-digit reference.
-        let one = observed_weight_dispatch(
-            WeightFamily::Binomial,
-            WeightLink::Other,
-            1.0,
-            jet.mu,
-            one_minus_mu,
-            1.0,
-            1.0,
-            jet,
-            h4,
-        );
+        // y = 1: against the 220-digit reference. The reference carries 14
+        // significant digits, which sets the band; the measured error of the
+        // log-jet route here is at most 7e-14 (`1 − e^{−u}` at `u = e^η`
+        // conditions `log μ` by `u·ε`).
+        let one = bernoulli_observed_information_jet(&link, eta, 1.0, 1.0, 1.0)
+            .expect("the cloglog observed information is defined at these eta");
         let (rw, rc, rd) = Y1_REFERENCE[index];
-        report.push_str(&format!(
-            "\n  eta={eta:>20}          y=1 -> ({:.9e}, {:.9e}, {:.9e})  mpmath ({rw:.9e}, {rc:.9e}, {rd:.9e})",
-            one.0, one.1, one.2,
-        ));
-        for (label, value, reference, band) in [
-            ("w", one.0, rw, 1e-10),
-            ("c", one.1, rc, 1e-9),
-            ("d", one.2, rd, 1e-7),
-        ] {
+        for (label, value, reference) in
+            [("w", one[0], rw), ("c", one[1], rc), ("d", one[2], rd)]
+        {
             let relative = (value - reference).abs() / reference.abs();
             assert!(
-                relative <= band,
-                "#2273: cloglog y=1 {label}_obs at eta={eta} is {value:.9e} against the \
-                 220-digit reference {reference:.9e} (relative error {relative:.3e}, \
-                 band {band:.0e}){report}"
+                relative <= 1e-12,
+                "#2273: cloglog y=1 {label}_obs at eta={eta} is {value:.14e} against the \
+                 220-digit reference {reference:.14e} (relative error {relative:.3e})"
             );
         }
     }
-    eprintln!("#2273 noncanonical observed tower on saturated cloglog rows:{report}");
 }
 
 /// #2273: the complement must reach the variance, not just the working response.

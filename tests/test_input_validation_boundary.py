@@ -127,7 +127,7 @@ SUPPORT_CASES = [
 )
 def test_response_outside_family_support_is_a_data_error(family, y, row, value, label) -> None:
     x, _ = _base()
-    with pytest.raises(gamfit.DataError) as excinfo:
+    with pytest.raises(gamfit.errors.DataError) as excinfo:
         gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family=family)
     message = str(excinfo.value)
     assert message.startswith("column 'y' "), message
@@ -137,7 +137,7 @@ def test_response_outside_family_support_is_a_data_error(family, y, row, value, 
 
 def test_non_integer_counts_point_at_tweedie() -> None:
     x, _ = _base()
-    with pytest.raises(gamfit.DataError, match="tweedie"):
+    with pytest.raises(gamfit.errors.DataError, match="tweedie"):
         gamfit.fit({"x": x, "y": _counts() + 0.5}, "y ~ s(x)", family="poisson")
 
 
@@ -158,7 +158,7 @@ def test_non_integer_non_negative_data_fits_under_tweedie() -> None:
 )
 def test_degenerate_response_is_a_data_error(family, y, needle) -> None:
     x, _ = _base()
-    with pytest.raises(gamfit.DataError, match=needle):
+    with pytest.raises(gamfit.errors.DataError, match=needle):
         gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family=family)
 
 
@@ -180,7 +180,7 @@ def test_degeneracy_is_judged_over_positive_weight_rows() -> None:
     x, _ = _base()
     y = _with(np.ones(N), 5, 0.0)
     w = _with(np.ones(N), 5, 0.0)
-    with pytest.raises(gamfit.DataError, match="all values are 1"):
+    with pytest.raises(gamfit.errors.DataError, match="all values are 1"):
         gamfit.fit({"x": x, "y": y, "w": w}, "y ~ s(x)", family="binomial", weights="w")
 
 
@@ -196,7 +196,7 @@ def test_degeneracy_is_judged_over_positive_weight_rows() -> None:
 )
 def test_invalid_weights_are_data_errors(w, needle) -> None:
     x, y = _base()
-    with pytest.raises(gamfit.DataError) as excinfo:
+    with pytest.raises(gamfit.errors.DataError) as excinfo:
         gamfit.fit({"x": x, "y": y, "w": w}, "y ~ s(x)", weights="w")
     message = str(excinfo.value)
     assert message.startswith("column 'w' "), message
@@ -216,13 +216,13 @@ def test_weights_of_the_wrong_length_are_refused() -> None:
 
 @pytest.mark.parametrize("formula", ["y ~ 1", "y ~ x", "y ~ s(x)"])
 def test_single_observation_is_a_data_error(formula: str) -> None:
-    with pytest.raises(gamfit.DataError, match="only one observation"):
+    with pytest.raises(gamfit.errors.DataError, match="too few rows"):
         gamfit.fit({"x": np.array([0.5]), "y": np.array([0.3])}, formula)
 
 
 def test_all_nan_predictor_is_a_data_error() -> None:
     x, y = _base()
-    with pytest.raises(gamfit.DataError, match="column 'x' has no finite values"):
+    with pytest.raises(gamfit.errors.DataError, match="column 'x' has no finite values"):
         gamfit.fit({"x": np.full(N, np.nan), "y": y}, "y ~ s(x)")
 
 
@@ -240,6 +240,6 @@ def test_non_finite_cells_are_rejected_not_dropped(column, value, needle) -> Non
     x, y = _base()
     data = {"x": x.copy(), "y": y.copy()}
     data[column][9] = value
-    with pytest.raises(gamfit.DataError) as excinfo:
+    with pytest.raises(gamfit.errors.DataError) as excinfo:
         gamfit.fit(data, "y ~ s(x)")
     assert needle in str(excinfo.value), str(excinfo.value)
