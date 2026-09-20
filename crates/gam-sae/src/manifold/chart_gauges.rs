@@ -50,39 +50,12 @@ impl SaeManifoldTerm {
             // translation + scale gauge orbit on its tangent coordinate (its
             // constant column carries the translation gauge, its `t` column
             // the scale gauge), so it deflates the same step-gauge vectors.
+            // The Duchon sheet is a flat Euclidean chart as well and carries
+            // the identical translation + per-axis scale menu.
             SaeAtomBasisKind::Linear
             | SaeAtomBasisKind::EuclideanPatch
-            | SaeAtomBasisKind::Poincare => {
-                for axis in 0..d {
-                    let mut field = Array2::<f64>::zeros((n, d));
-                    field.column_mut(axis).fill(1.0);
-                    if let Some(g) = self.dense_step_gauge_vector_from_field(
-                        atom_idx,
-                        field.view(),
-                        &coord_offsets,
-                        &beta_offsets,
-                        total_len,
-                    )? {
-                        out.push(g);
-                    }
-                }
-                for axis in 0..d {
-                    let mut field = Array2::<f64>::zeros((n, d));
-                    for row in 0..n {
-                        field[[row, axis]] = coords[[row, axis]];
-                    }
-                    if let Some(g) = self.dense_step_gauge_vector_from_field(
-                        atom_idx,
-                        field.view(),
-                        &coord_offsets,
-                        &beta_offsets,
-                        total_len,
-                    )? {
-                        out.push(g);
-                    }
-                }
-            }
-            SaeAtomBasisKind::Duchon => {
+            | SaeAtomBasisKind::Poincare
+            | SaeAtomBasisKind::Duchon => {
                 for axis in 0..d {
                     let mut field = Array2::<f64>::zeros((n, d));
                     field.column_mut(axis).fill(1.0);
