@@ -927,6 +927,20 @@ impl DenestedCubicCell {
         let eta = self.eta(z);
         0.5 * (z * z + eta * eta)
     }
+
+    /// The cell with its index negated, `η ↦ −η`. Its value is the
+    /// complementary mass `∫φ(z)Φ(−η(z)) dz`, summed from positive terms, and
+    /// its moments `∫zᵏ·e^{−q(z)} dz` are this cell's, since `q` is even in `η`.
+    #[inline]
+    pub fn negated(self) -> Self {
+        Self {
+            c0: -self.c0,
+            c1: -self.c1,
+            c2: -self.c2,
+            c3: -self.c3,
+            ..self
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
