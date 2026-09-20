@@ -620,9 +620,9 @@ pub(crate) fn identity_face_tangent_reproduces_the_full_space_kernel_bit_for_bit
 /// gam#2894: on an active face the criterion prices `log|Zᵀ M Z|` and the kernel
 /// differentiates it. `M` is indefinite (one eigenvalue near `−1.02`) and positive definite
 /// on the face tangent. The face normal `e₃` is not an eigenvector of `M`, so the
-/// full-space pseudo-determinant, which keeps `M`'s two positive eigenvalues, prices
-/// `log(15.25 / 1.0209…) ≈ 2.70` where the face prices `log 4.75 ≈ 1.56`. That gap is the
-/// control that this fixture discriminates the two geometries.
+/// full-space geometry meets the negative eigenvalue and refuses the point (gam#3303)
+/// where the face prices `log 4.75 ≈ 1.56`. That refusal is the control that this
+/// fixture discriminates the two geometries.
 #[test]
 pub(crate) fn face_tangent_kernel_prices_and_differentiates_the_face_determinant_2894() {
     let ranges = vec![(0, 3)];
@@ -634,7 +634,7 @@ pub(crate) fn face_tangent_kernel_prices_and_differentiates_the_face_determinant
     else {
         panic!("one active row cannot pin a three-coefficient face");
     };
-    let parts = |h: &Array2<f64>, tangent: Option<&Array2<f64>>| {
+    let try_parts = |h: &Array2<f64>, tangent: Option<&Array2<f64>>| {
         joint_penalty_subspace_trace_parts(
             &JointHessianSource::Dense(h.clone()),
             &ranges,
@@ -645,7 +645,9 @@ pub(crate) fn face_tangent_kernel_prices_and_differentiates_the_face_determinant
             None,
             tangent,
         )
-        .expect("projection parts build")
+    };
+    let parts = |h: &Array2<f64>, tangent: Option<&Array2<f64>>| {
+        try_parts(h, tangent).expect("projection parts build")
     };
     let (logdet, kernel) = parts(&h, Some(&z));
     let kernel = kernel.expect("a positive-definite face precision has a kernel");
@@ -653,10 +655,13 @@ pub(crate) fn face_tangent_kernel_prices_and_differentiates_the_face_determinant
     // `M = H + S = [[5, 0.5, 0], [0.5, 1, 2], [0, 2, 1]]`; the face is `span(e₁, e₂)`, so
     // `Zᵀ M Z ≅ [[5, 0.5], [0.5, 1]]` with determinant `5 − 0.25`.
     assert_relative_eq!(logdet, 4.75_f64.ln(), epsilon = 1e-12);
-    let (full_logdet, _) = parts(&h, None);
+    // The full space sees `M`'s eigenvalue near `−1.02`: there the mode is a saddle and has no
+    // Laplace approximation, so the full-space geometry refuses the point (gam#3303) where the
+    // face prices it.
+    let full = try_parts(&h, None).expect_err("the full-space precision is indefinite");
     assert!(
-        (full_logdet - logdet).abs() > 1e-2,
-        "the full-space pseudo-determinant must differ on this fixture: full={full_logdet} face={logdet}"
+        full.is_trial_point_infeasible() && full.to_string().contains("indefinite"),
+        "the full-space geometry must refuse the indefinite precision: {full}"
     );
     let drift = array![[0.7, -0.4, 0.2], [-0.4, 1.3, 0.5], [0.2, 0.5, 2.0]];
     let analytic = kernel.trace_projected_logdet(&drift);
