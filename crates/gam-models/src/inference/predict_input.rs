@@ -1481,11 +1481,23 @@ fn build_predict_input_for_model_inner(
                 .map_err(|error| PredictInputError::InvalidInput {
                     reason: error.to_string(),
                 })?;
+            // The slope offset is a slope on the score as given; the model reads the
+            // score `(z − mean)/sd`, on which the same slope is `sd` times it, the
+            // factor the fit applied (gam#3231).
+            let score_sd = model
+                .latent_z_normalization
+                .as_ref()
+                .ok_or_else(|| PredictInputError::MissingMetadata {
+                    reason: "marginal-slope prediction requires the saved latent-z normalization"
+                        .to_string(),
+                })?
+                .sd;
             let slope_offset = design_slope
                 .compose_offset(offset_noise.view(), "marginal-slope slope prediction")
                 .map_err(|error| PredictInputError::InvalidInput {
                     reason: error.to_string(),
-                })?;
+                })?
+                * score_sd;
             let local = build_marginal_slope_local_auxiliary_matrix(model, design_input, col_map)?;
             let auxiliary_matrix = match model.residual_repair.as_ref() {
                 None => local,
