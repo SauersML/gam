@@ -49,11 +49,13 @@ def test_constant_prior_weight_scale_leaves_debiased_se_unchanged(target: str) -
     unit, scaled = results
     for key in ("theta_plugin", "theta_debiased", "se", "ci_lower", "ci_upper"):
         assert np.isfinite(unit[key]) and np.isfinite(scaled[key]), (key, unit, scaled)
-    # A factor-of-seven discrepancy is what the unweighted scores produced; the
-    # two fits are the same model, so agreement is limited only by the outer
-    # REML solve landing on the same λ̂ from ρ seeds that differ by ln 7.
-    assert scaled["se"] == pytest.approx(unit["se"], rel=1e-4), (unit, scaled)
-    assert scaled["theta_debiased"] == pytest.approx(unit["theta_debiased"], rel=1e-4, abs=1e-8)
+    # The unweighted scores were off by a factor of seven. The two fits are the
+    # same model, so they can differ only by how precisely the outer REML solve
+    # lands on the same λ̂. Measured agreement is about 1e-11 relative
+    # (average_derivative SE), which leaves more than two orders of magnitude of
+    # headroom under 1e-8.
+    for key in ("se", "ci_lower", "ci_upper", "theta_debiased"):
+        assert scaled[key] == pytest.approx(unit[key], rel=1e-8), (key, unit, scaled)
 
 
 def test_non_numeric_functional_weight_is_refused() -> None:
