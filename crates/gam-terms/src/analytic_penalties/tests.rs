@@ -2925,6 +2925,151 @@ fn frozen_penalty_diag_and_log_det_are_exact_past_dimension_1024_2900() {
     assert_abs_diff_eq!(log_det, exact, epsilon = 1e-9 * exact.abs().max(1.0));
 }
 
+/// Checks `grad_target`, `hvp` and `grad_rho` of a learnable-weight quadratic penalty
+/// `P(t, ρ) = ½·w·tᵀHt − ½·len·ln w`, `w = w₀·exp(ρ)`, against central differences
+/// of `value` and `grad_target`.
+///
+/// `unit_abs(x)` is `|H|·x` for `w = 1`: applied to `|t|` it bounds, entry by entry,
+/// the sums of absolute terms a component of `H·t` is formed from, so `k·ε·w·unit_abs`
+/// bounds the rounding of the analytic gradient (k = 32 covers the few rounded
+/// operations per term). The value rounds by at most `k·ε·value_scale`, with
+/// `value_scale(x, w) = ½·w·xᵀ·unit_abs(x) + ½·len·(|ln w| + 1)`.
+///
+/// * `P` is quadratic in `t`, so the central difference of the value along `e_i` has
+///   no truncation error; it rounds by at most `k·ε·value_scale(|t| + h, w)/h`.
+/// * `grad_target` is linear in `t`, so its central difference along `v` is exact in
+///   exact arithmetic and rounds by at most `k·ε·w·unit_abs(|t| + h|v|)_i/h`; the
+///   product itself rounds by `k·ε·w·unit_abs(|v|)_i`.
+/// * Along `ρ`, `∂³P/∂ρ³ = ½·w·tᵀHt`, so the central difference in `ρ` truncates by at
+///   most `h²/6·½·w(ρ + h)·|t|ᵀ·unit_abs(|t|)` and rounds by
+///   `k·ε·value_scale(|t|, w(ρ ± h))/h`.
+fn assert_learnable_quadratic_penalty_derivatives<P: AnalyticPenalty>(
+    penalty: &P,
+    base_weight: f64,
+    t: &Array1<f64>,
+    rho: f64,
+    v: &Array1<f64>,
+    unit_abs: impl Fn(&Array1<f64>) -> Array1<f64>,
+) {
+    let k = 32.0 * f64::EPSILON;
+    let n = t.len();
+    let len = n as f64;
+    let value_scale =
+        |x: &Array1<f64>, w: f64| 0.5 * w * x.dot(&unit_abs(x)) + 0.5 * len * (w.ln().abs() + 1.0);
+    let rho_at = |r: f64| array![r];
+    let rho_v = rho_at(rho);
+    let w = base_weight * rho.exp();
+    let t_abs = t.mapv(f64::abs);
+    let v_abs = v.mapv(f64::abs);
+
+    let h = 1e-3;
+    let grad = penalty.grad_target(t.view(), rho_v.view());
+    let grad_bound = unit_abs(&t_abs);
+    let value_round = k * value_scale(&t_abs.mapv(|x| x + h), w) / h;
+    for i in 0..n {
+        let mut tp = t.clone();
+        tp[i] += h;
+        let mut tm = t.clone();
+        tm[i] -= h;
+        let fd = (penalty.value(tp.view(), rho_v.view()) - penalty.value(tm.view(), rho_v.view()))
+            / (2.0 * h);
+        let tol = value_round + k * w * grad_bound[i];
+        assert!(
+            (grad[i] - fd).abs() <= tol,
+            "grad[{i}] = {:.15e}, central difference {fd:.15e}, bound {tol:.3e}",
+            grad[i]
+        );
+    }
+
+    let hv = penalty.hvp(t.view(), rho_v.view(), v.view());
+    let gp = penalty.grad_target((t + &(v * h)).view(), rho_v.view());
+    let gm = penalty.grad_target((t - &(v * h)).view(), rho_v.view());
+    let fd_bound = unit_abs(&(&t_abs + &(&v_abs * h)));
+    let hv_bound = unit_abs(&v_abs);
+    for i in 0..n {
+        let fd = (gp[i] - gm[i]) / (2.0 * h);
+        let tol = k * (w * fd_bound[i] / h + w * hv_bound[i]);
+        assert!(
+            (hv[i] - fd).abs() <= tol,
+            "hvp[{i}] = {:.15e}, directional difference {fd:.15e}, bound {tol:.3e}",
+            hv[i]
+        );
+    }
+
+    let h_rho = 1e-4;
+    let grad_rho = penalty.grad_rho(t.view(), rho_v.view());
+    assert_eq!(grad_rho.len(), 1);
+    let fd = (penalty.value(t.view(), rho_at(rho + h_rho).view())
+        - penalty.value(t.view(), rho_at(rho - h_rho).view()))
+        / (2.0 * h_rho);
+    let w_hi = base_weight * (rho + h_rho).exp();
+    let w_lo = base_weight * (rho - h_rho).exp();
+    let tol = k * value_scale(&t_abs, w_hi).max(value_scale(&t_abs, w_lo)) / h_rho
+        + h_rho * h_rho / 6.0 * 0.5 * w_hi * t_abs.dot(&grad_bound);
+    assert!(
+        (grad_rho[0] - fd).abs() <= tol,
+        "grad_rho = {:.15e}, central difference {fd:.15e}, bound {tol:.3e}",
+        grad_rho[0]
+    );
+}
+
+fn build_row_precision_fixture() -> RowPrecisionPriorPenalty {
+    let lambda = array![
+        [[2.0_f64, 0.3], [0.3, 1.0]],
+        [[1.5, -0.4], [-0.4, 0.9]],
+        [[0.8, 0.2], [0.2, 1.2]]
+    ];
+    RowPrecisionPriorPenalty::new(PsiSlice::full(6, Some(2)), lambda, 0.6, 3, true)
+        .expect("valid row precision prior")
+}
+
+/// The row-precision prior's gradient `w·Λ_n t_n`, its curvature `w·Λ_n v_n` and its
+/// strength derivative `½·w·Σ t_nᵀΛ_n t_n − ½·len` are the derivatives of its value.
+#[test]
+fn row_precision_prior_derivatives_match_finite_differences() {
+    let penalty = build_row_precision_fixture();
+    let t = array![0.4_f64, -0.3, 0.2, -0.1, 0.6, 0.5];
+    let v = Array1::from_shape_fn(t.len(), |i| 0.2 * ((i as f64) + 1.3).cos());
+    let lambda = penalty.lambda_per_row.clone();
+    assert_learnable_quadratic_penalty_derivatives(&penalty, 0.6, &t, -0.2, &v, |x| {
+        Array1::from_shape_fn(x.len(), |row| {
+            let (n, i) = (row / 2, row % 2);
+            (0..2)
+                .map(|j| lambda[[n, i, j]].abs() * x[n * 2 + j])
+                .sum::<f64>()
+        })
+    });
+}
+
+/// `as_dense` and `diag_target` of the row-precision prior feed the frozen operator's
+/// exact log-determinant and its diagonal. Every entry of all three is the single
+/// product `w·Λ_nij` (a column of `hvp` adds exact zeros to it), so they agree
+/// exactly; the off-diagonal `Λ` makes the diagonal-only `hessian_diag` decline.
+#[test]
+fn row_precision_prior_dense_hessian_and_diagonal_match_hvp() {
+    let penalty = build_row_precision_fixture();
+    let t = array![0.4_f64, -0.3, 0.2, -0.1, 0.6, 0.5];
+    let n = t.len();
+    let rho = array![-0.2_f64];
+    let dense = penalty.as_dense(t.view(), rho.view());
+    let diag = penalty.diag_target(t.view(), rho.view());
+    for j in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[j] = 1.0;
+        assert_eq!(
+            dense.column(j).to_owned(),
+            penalty.hvp(t.view(), rho.view(), e.view()),
+            "as_dense column {j} differs from hvp(e_{j})"
+        );
+        assert_eq!(
+            diag[j],
+            dense[[j, j]],
+            "diag_target[{j}] differs from as_dense"
+        );
+    }
+    assert!(penalty.hessian_diag(t.view(), rho.view()).is_none());
+}
+
 /// The row-precision energy ½ tᵀΛt reads only the symmetric part of Λ, so a
 /// penalty built from an asymmetric Λ is the penalty built from (Λ + Λᵀ)/2:
 /// value, gradient, curvature and the log-determinant agree exactly. An input
