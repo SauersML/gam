@@ -438,17 +438,10 @@ pub(crate) fn custom_family_joint_jeffreys_term_with_exact_completion<
     let (phi, gradient, hphi) = custom_family_joint_jeffreys_term_from_information(
         family, states, specs, &h_joint, z_joint,
     )?;
-    let completion = custom_family_joint_jeffreys_second_order_completion(
-        family,
-        states,
-        specs,
-        &h_joint,
-        z_joint,
-        JeffreysCompletionAssembly::Exact,
-    )?
-    .ok_or_else(|| {
-        "active Jeffreys term did not supply its exact second-order completion".to_string()
-    })?;
+    // An inactive plan has a vanishing completion.
+    let completion =
+        custom_family_joint_jeffreys_second_order_completion(family, states, specs, &h_joint, z_joint)?
+            .unwrap_or_else(|| Array2::zeros((total_p, total_p)));
     if completion.dim() != (total_p, total_p) || completion.iter().any(|value| !value.is_finite()) {
         return Err(CustomFamilyError::trial_point(format!(
             "exact Jeffreys completion is non-finite or has shape {:?}, expected ({total_p}, {total_p})",
@@ -458,21 +451,18 @@ pub(crate) fn custom_family_joint_jeffreys_term_with_exact_completion<
     Ok(Some((phi, gradient, hphi, completion)))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JeffreysCompletionAssembly {
-    /// Use only the family's fused contracted-trace implementation. This is the
-    /// outer-profile route, where the completion is an optional response
-    /// acceleration and a pairwise row stream would change the cost class.
-    Contracted,
-    /// Produce the exact objective Hessian. If the family has no fused
-    /// contracted implementation, assemble the mathematically identical
-    /// second-directional form: one pass per span direction when the information
-    /// is the observed Hessian, one per coefficient pair otherwise. Returned-mode
-    /// certification and the inner Newton endgame use this authority and may not
-    /// omit a term.
-    Exact,
-}
-
+/// The exact second-order Jeffreys completion `−½·G·⟨Z_J K Z_Jᵀ, H''⟩` plus the
+/// gate/floor motion, at one information snapshot.
+///
+/// A family with the fused contracted-trace hook supplies it in one pass.
+/// Otherwise the mathematically identical second-directional form is
+/// assembled: one pass per span direction when the information is the observed
+/// Hessian, one per coefficient pair otherwise. Every consumer (returned-mode
+/// certification, the inner Newton endgame, the outer mode response) reads the
+/// Hessian of one objective, so no route may omit a term (#3444).
+///
+/// `None` means the reduced-information plan is inactive: `Φ` is flat at this
+/// snapshot, the completion vanishes and `M_true = M_DD`.
 pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
@@ -481,7 +471,6 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
     specs: &[ParameterBlockSpec],
     h_joint: &Array2<f64>,
     z_joint: &Array2<f64>,
-    assembly: JeffreysCompletionAssembly,
 ) -> Result<Option<Array2<f64>>, CustomFamilyError> {
     let p = h_joint.nrows();
     // The one reduced-information spectrum (gam-solve's plan) gives the gate, the trace
@@ -492,11 +481,7 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
         z_joint.view(),
     )?;
     if !plan.is_active() {
-        return if assembly == JeffreysCompletionAssembly::Exact {
-            Ok(Some(Array2::zeros((p, p))))
-        } else {
-            Ok(None)
-        };
+        return Ok(None);
     }
     let gate_weight = plan.conditioning_gate_weight();
     let trace_weight = plan.contracted_trace_weight();
@@ -511,38 +496,32 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
     // outer gradient gaps of 3e-4 to 1.5e-2, independent of the FD step and of
     // the inner tolerance, while the value-path Jeffreys gradient and the
     // divided-difference drift were both finite-difference exact.
-    let motion = if assembly == JeffreysCompletionAssembly::Exact
-        || family.joint_jeffreys_information_contracted_trace_hessian_available()
-    {
-        if plan.hessian_motion_active() {
-            // A family that forms the rotated rows hands them over, and no `p × p` axis
-            // matrix is built (#1082).
-            match family.jeffreys_rotated_first_derivative() {
-                Some(rotated) => {
-                    let rows = rotated.first_directional_rotated_all_axes(
-                        states,
-                        specs,
-                        plan.ambient_eigenbasis().view(),
-                    )?;
-                    Some(plan.hessian_motion_from_rotated_rows(&rows)?)
-                }
-                None => {
-                    let axes = family
-                        .joint_jeffreys_information_directional_derivative_all_axes_with_specs(
-                            states, specs,
-                        )?
-                        .ok_or_else(|| {
-                            CustomFamilyError::trial_point(
-                                "active Jeffreys gate/floor motion requires exact first information \
-                                 derivatives"
-                                    .to_string(),
-                            )
-                        })?;
-                    Some(plan.hessian_motion(&axes)?)
-                }
+    let motion = if plan.hessian_motion_active() {
+        // A family that forms the rotated rows hands them over, and no `p × p` axis
+        // matrix is built (#1082).
+        match family.jeffreys_rotated_first_derivative() {
+            Some(rotated) => {
+                let rows = rotated.first_directional_rotated_all_axes(
+                    states,
+                    specs,
+                    plan.ambient_eigenbasis().view(),
+                )?;
+                Some(plan.hessian_motion_from_rotated_rows(&rows)?)
             }
-        } else {
-            None
+            None => {
+                let axes = family
+                    .joint_jeffreys_information_directional_derivative_all_axes_with_specs(
+                        states, specs,
+                    )?
+                    .ok_or_else(|| {
+                        CustomFamilyError::trial_point(
+                            "active Jeffreys gate/floor motion requires exact first information \
+                             derivatives"
+                                .to_string(),
+                        )
+                    })?;
+                Some(plan.hessian_motion(&axes)?)
+            }
         }
     } else {
         None
@@ -558,7 +537,7 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
         }
         None => trace_weight,
     };
-    let completion = match family.joint_jeffreys_information_contracted_trace_hessian_with_specs(
+    let mut completion = match family.joint_jeffreys_information_contracted_trace_hessian_with_specs(
         states,
         specs,
         &hook_weight,
@@ -574,15 +553,15 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
             if let Some(motion) = motion.as_ref() {
                 contracted -= &motion.remainder;
             }
-            Some(contracted)
+            contracted
         }
-        None if assembly == JeffreysCompletionAssembly::Exact => {
+        None => {
             let second_direction = |u: &Array1<f64>, v: &Array1<f64>| {
                 family.joint_jeffreys_information_second_directional_derivative_with_specs(
                     states, specs, u, v,
                 )
             };
-            if family.joint_jeffreys_information_matches_observed_hessian() {
+            let assembled = if family.joint_jeffreys_information_matches_observed_hessian() {
                 // The observed Hessian's fourth derivative is fully symmetric, so one pass per
                 // span direction replaces one per coefficient pair (#2893).
                 gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_observed_hessian_completion(
@@ -609,22 +588,29 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
                         )?
                     }
                 }
-            }
+            };
+            // An active term whose completion cannot be formed has no Hessian: solving its
+            // mode response or certifying its mode on `M_DD` would read another objective.
+            assembled.ok_or_else(|| {
+                CustomFamilyError::trial_point(
+                    "active Jeffreys term requires exact second directional information \
+                     derivatives for its second-order completion"
+                        .to_string(),
+                )
+            })?
         }
-        None => None,
     };
-    Ok(completion.map(|mut matrix| {
-        let strength = family.joint_jeffreys_term_strength();
-        if strength != 1.0 {
-            matrix *= strength;
-        }
-        matrix
-    }))
+    let strength = family.joint_jeffreys_term_strength();
+    if strength != 1.0 {
+        completion *= strength;
+    }
+    Ok(Some(completion))
 }
 
 /// Outer-REML full-span Jeffreys curvature `H_Φ` for the coupled joint Hessian.
 /// Returns `None` when there is no coefficient system or the family exposes no
-/// exact joint Hessian.
+/// exact joint Hessian; the completion is `None` only while the reduced-information
+/// plan is inactive.
 ///
 /// This is the OUTER-path companion to the inner-Newton wiring: the LAML score
 /// uses `log|H + S_λ + H_Φ|` and its analytic ρ-derivatives
@@ -654,15 +640,23 @@ pub(crate) fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send +
         Some(z) => z,
         None => return Ok(None),
     };
+    let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    if total_p == 0 || z_joint.ncols() == 0 {
+        return Ok(None);
+    }
+    let Some(h_joint) = family
+        .joint_jeffreys_information_with_specs(states, specs)?
+        .filter(|h_joint| h_joint.dim() == (total_p, total_p))
+    else {
+        return Ok(None);
+    };
     // Return the gated VALUE alongside the curvature: the outer LAML must fold
     // `−Φ(β̂)` into its cost (the inner mode is Φ-augmented-stationary, so the
     // envelope identity only holds for the Φ-folded criterion — gam#979), and
-    // value/curvature must come from the SAME term evaluation.
-    let phi_and_hphi = custom_family_joint_jeffreys_term(family, states, specs, ranges, &z_joint)?
-        .map(|(phi, _grad, hphi)| (phi, hphi));
-    let Some((phi, hphi)) = phi_and_hphi else {
-        return Ok(None);
-    };
+    // value, curvature and completion must come from the SAME information snapshot.
+    let (phi, _gradient, hphi) = custom_family_joint_jeffreys_term_from_information(
+        family, states, specs, &h_joint, &z_joint,
+    )?;
     // SECOND-ORDER COMPLETION AT THE MODE (gam#979), returned SEPARATELY. The
     // divided-difference `H_Φ` omits the second-directional-Hessian remainder
     // `½ tr(K·D_ab)`, so the TRUE Hessian of the Φ-augmented inner objective
@@ -678,36 +672,18 @@ pub(crate) fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send +
     //   * the mode response `v_k = ∂β̂/∂ρ_k = −(∇²f)⁻¹ Ṡ_k β̂` is always solved
     //     on `M_true`, since it is a property of the inner stationarity system
     //     (measured: ~10% uniform FD bias when solved on `M_DD`).
-    // The contracted trace hook may supply it in one family pass. The generic
-    // pairwise `p(p+1)/2` assembly is intentionally not selected here: in
-    // production large-n fits a "small" p still means hundreds of row-streamed
-    // second-directional Hessian passes. `None` degrades to the
-    // divided-difference solve, preserving the value/gradient contract.
-    let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    let mut completion: Option<Array2<f64>> = None;
-    // Objective geometry is independent of the requested derivative order.
-    // The one-step profile correction consumes the mode-response operator, and
-    // whether that correction is numerically visible is governed by the solved
-    // displacement H⁻¹r—not by a raw-residual threshold known at this layer.
-    // Always form the available true-Hessian completion for an active Jeffreys
-    // profile so value screening, finite differences, and analytic derivatives
-    // price one canonical objective (#2460).
-    let completion_requested =
-        family.joint_jeffreys_information_contracted_trace_hessian_available();
-    if completion_requested
-        && let Some(h_joint) = family.joint_jeffreys_information_with_specs(states, specs)?
-        && h_joint.nrows() == total_p
-        && h_joint.ncols() == total_p
-    {
-        completion = custom_family_joint_jeffreys_second_order_completion(
-            family,
-            states,
-            specs,
-            &h_joint,
-            &z_joint,
-            JeffreysCompletionAssembly::Contracted,
-        )?;
-    }
+    // The completion is formed whenever the term is active, whatever the requested
+    // derivative order, so value screening, finite differences and analytic
+    // derivatives price one canonical objective (#2460). A family with the
+    // contracted trace hook supplies it in one pass; otherwise it is assembled
+    // exactly, one pass per span direction for an observed-Hessian information.
+    // Skipping it for a family without the hook solved the mode response on
+    // `M_DD` and biased the analytic gradient (~1% on the armed quartic, #3444);
+    // an expected-information family that finds the pairwise assembly too costly
+    // needs the fused hook, not a different objective.
+    let completion = custom_family_joint_jeffreys_second_order_completion(
+        family, states, specs, &h_joint, &z_joint,
+    )?;
     Ok(Some((phi, hphi, completion)))
 }
 

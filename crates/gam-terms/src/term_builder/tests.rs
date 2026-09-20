@@ -5333,6 +5333,7 @@ fn prediction_design_matches_full_build_without_realizing_penalties() {
         _ => (i % 3) as f64,
     });
     for formula in [
+        "y ~ s(x) + g",
         "y ~ s(x) + s(z)",
         "y ~ x + s(x)",
         "y ~ s(x, double_penalty=true)",
@@ -5434,7 +5435,9 @@ fn term_prediction_columns_match_the_full_prediction_design() {
         1 | 2 => ((i * (j + 11)) % 37) as f64 / 36.0,
         _ => (i % 3) as f64,
     });
+    let mut random_effects_checked = 0;
     for formula in [
+        "y ~ s(x) + g",
         "y ~ s(x) + s(z)",
         "y ~ x + s(x)",
         "y ~ x + s(x) + s(z)",
@@ -5456,7 +5459,13 @@ fn term_prediction_columns_match_the_full_prediction_design() {
             .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
         let full = crate::smooth::build_term_collection_prediction_design(new_rows.view(), &frozen)
             .unwrap_or_else(|err| panic!("`{formula}` prediction design: {err}"));
-        for (name, range) in full.linear_ranges.iter().chain(&full.smooth_ranges) {
+        random_effects_checked += full.random_effect_ranges.len();
+        for (name, range) in full
+            .linear_ranges
+            .iter()
+            .chain(&full.random_effect_ranges)
+            .chain(&full.smooth_ranges)
+        {
             let columns =
                 crate::smooth::build_term_prediction_columns(new_rows.view(), &frozen, name)
                     .unwrap_or_else(|err| panic!("`{formula}` term {name}: {err}"));
@@ -5468,6 +5477,11 @@ fn term_prediction_columns_match_the_full_prediction_design() {
             );
         }
     }
+
+    assert!(
+        random_effects_checked > 0,
+        "the formulas must include a random-effect factor term"
+    );
 
     // `s(x)` reads nothing of `s(z)`, so a grid whose `z` the full build
     // rejects still evaluates it.
