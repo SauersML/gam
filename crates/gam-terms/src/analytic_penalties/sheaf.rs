@@ -619,18 +619,12 @@ impl AnalyticPenalty for SheafConsistencyPenalty {
         SheafConsistencyPenalty::gradient(self, target)
     }
 
-    fn hessian_diag(
-        &self,
-        target: ArrayView1<'_, f64>,
-        rho: ArrayView1<'_, f64>,
-    ) -> Option<Array1<f64>> {
-        assert!(
-            rho.iter().all(|x| x.is_finite()),
-            "SheafConsistencyPenalty: rho must be finite (got {rho:?})",
-        );
-        Some(SheafConsistencyPenalty::hessian_diag(self, target))
-    }
-
+    // `hessian_diag` keeps the trait default `None`: the Hessian `weight·L`
+    // couples every edge's endpoints, so it is not diagonal. That `None` is
+    // also what routes `psd_majorizer_hvp` to the exact Laplacian `hvp`,
+    // which is the PSD majorizer of this convex quadratic; a `Some(diag(L))`
+    // would make the trait default apply `diag(L) ⊙ v` and drop every edge
+    // coupling, and `diag(L)` is not `⪰ L` on any edge.
     fn hvp(
         &self,
         target: ArrayView1<'_, f64>,
@@ -642,20 +636,6 @@ impl AnalyticPenalty for SheafConsistencyPenalty {
             "SheafConsistencyPenalty: rho must be finite (got {rho:?})",
         );
         SheafConsistencyPenalty::hvp(self, target, v)
-    }
-
-    /// The penalty is the convex quadratic `½·weight·sᵀLs`, so its PSD
-    /// majorizer is the exact Hessian `weight·L` itself. That Hessian is not
-    /// diagonal, so there is no diagonal majorizer to report: `diag(weight·L)`
-    /// is not `⪰ weight·L` on any edge. Returning `None` routes
-    /// `psd_majorizer_hvp` to the exact Laplacian product in `hvp`, instead of
-    /// the trait default's `diag(L) ⊙ v`, which drops every edge coupling.
-    fn psd_majorizer_diag(
-        &self,
-        _target: ArrayView1<'_, f64>,
-        _rho: ArrayView1<'_, f64>,
-    ) -> Option<Array1<f64>> {
-        None
     }
 
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
@@ -1074,6 +1054,10 @@ mod tests {
         let n = pen.total_dim();
         let s = Array1::from_shape_fn(n, |i| 0.3 * i as f64 - 0.5);
         let rho = Array1::<f64>::zeros(0);
+        assert!(
+            AnalyticPenalty::hessian_diag(&pen, s.view(), rho.view()).is_none(),
+            "a non-diagonal Hessian has no diagonal to report"
+        );
         assert!(
             AnalyticPenalty::psd_majorizer_diag(&pen, s.view(), rho.view()).is_none(),
             "a non-diagonal Hessian has no diagonal majorizer to report"
