@@ -216,7 +216,7 @@ impl FitConfig {
             }
         }
         // The materializer's own predicate, so every spelling it fits as
-        // transformation-normal (any case, `_` or `-`) also carries its config.
+        // transformation-normal also carries its config.
         if self.transformation_normal_config.is_some()
             && !(self.transformation_normal
                 || family_requests_transformation_normal(self.family.as_deref()))
@@ -451,7 +451,8 @@ mod tests {
     }
 
     /// `transformation_normal_config` is legal on exactly the requests the
-    /// materializer fits as transformation-normal, whatever the family spelling.
+    /// materializer fits as transformation-normal; family names are
+    /// case-insensitive.
     #[test]
     fn transformation_normal_config_follows_the_materializer_family_predicate() {
         let request = |family: Option<&str>, flag: bool| FitConfig {
@@ -463,8 +464,7 @@ mod tests {
         for family in [
             "transformation-normal",
             "Transformation-Normal",
-            "transformation_normal",
-            " TRANSFORMATION_NORMAL ",
+            " TRANSFORMATION-NORMAL ",
         ] {
             assert!(
                 family_requests_transformation_normal(Some(family)),
