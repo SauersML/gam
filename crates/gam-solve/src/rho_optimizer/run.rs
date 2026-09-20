@@ -171,10 +171,17 @@ impl OuterProblemSize {
     ///
     /// `None` when the route declares no observation count.
     pub(crate) fn statistical_resolution(&self) -> Option<f64> {
-        self.n_obs
-            .filter(|&n| n > 0)
-            .map(|n| 0.5 / n as f64)
+        self.n_obs.and_then(outer_statistical_resolution)
     }
+}
+
+/// `τ_stat = 1/(2n)` for a criterion over `n_obs` observations — the single
+/// definition behind [`OuterProblemSize::statistical_resolution`], public so a
+/// consumer that re-examines an outer-certified point (the #944 curvature
+/// inference) judges it against the SAME resolution the outer certificate
+/// used rather than a second, independent bar (#3453). `None` for `n_obs = 0`.
+pub fn outer_statistical_resolution(n_obs: usize) -> Option<f64> {
+    (n_obs > 0).then(|| 0.5 / n_obs as f64)
 }
 
 /// Configuration for the outer optimization runner.
