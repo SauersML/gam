@@ -51,9 +51,6 @@ pub(crate) struct GamWorkingModel<'a> {
     pub(crate) last_d3mu_deta3: Array1<f64>,
     pub(crate) last_penalty_term: f64,
     pub(crate) x_original_csr: Option<SparseRowMat<usize, f64>>,
-    /// Optional per-observation SE for integrated (GHQ) likelihood.
-    /// When present, uses integrated family-dispatched working updates.
-    pub(crate) covariate_se: Option<Array1<f64>>,
     /// Whether the Gamma dispersion shape has been estimated and frozen for the
     /// duration of this inner P-IRLS solve. The shape (= 1/φ) is a nuisance
     /// scale that multiplies both the working weight (`w = shape·prior`) and the
@@ -99,7 +96,6 @@ pub(crate) struct GamWorkingModel<'a> {
     /// converged-η joint refresh in `loop_driver` re-arms this lock so the
     /// reported `theta` is exactly the ML estimate at the reported η. Issue #802.
     pub(crate) negbin_theta_locked: bool,
-    pub(crate) quadctx: crate::quadrature::QuadratureContext,
     /// Frozen-weight first-Fisher-step data-fit Gram `XᵀWX` (#1111 / #1033
     /// mechanism (c)), in the same *original* (conditioned `x_fit`) frame
     /// `penalized_hessian` forms `compute_xtwx_blas(self.x_original, ...)` in,
@@ -190,66 +186,39 @@ impl<'a> GamWorkingModel<'a> {
     }
 
     fn current_data_objective(&self) -> Result<(f64, f64), EstimationError> {
-        if self.covariate_se.is_some() {
-            if !matches!(self.likelihood.spec.response, ResponseFamily::Binomial) {
-                crate::bail_invalid_estim!(
-                    "integrated PIRLS objective requires a binomial response"
-                );
-            }
-            binomial_deviance_and_log_kernel_from_mean(
-                self.y,
-                &self.lastmu,
-                self.priorweights,
-            )
-        } else {
-            if let Some(objective) = unit_measure_deviance_and_log_kernel_from_eta(
-                self.y,
-                &self.workspace.eta_buf,
-                &self.likelihood,
-                &self.link_kind,
-                self.priorweights,
-            )? {
-                return Ok(objective);
-            }
-            let deviance = self.likelihood.loglik_deviance(
-                self.y,
-                &self.workspace.eta_buf,
-                &self.link_kind,
-                self.priorweights,
-            )?;
-            let log_kernel = pirls_data_log_kernel_from_eta(
-                self.y,
-                &self.workspace.eta_buf,
-                &self.likelihood,
-                &self.link_kind,
-                self.priorweights,
-                deviance,
-            )?;
-            Ok((deviance, log_kernel))
+        if let Some(objective) = unit_measure_deviance_and_log_kernel_from_eta(
+            self.y,
+            &self.workspace.eta_buf,
+            &self.likelihood,
+            &self.link_kind,
+            self.priorweights,
+        )? {
+            return Ok(objective);
         }
+        let deviance = self.likelihood.loglik_deviance(
+            self.y,
+            &self.workspace.eta_buf,
+            &self.link_kind,
+            self.priorweights,
+        )?;
+        let log_kernel = pirls_data_log_kernel_from_eta(
+            self.y,
+            &self.workspace.eta_buf,
+            &self.likelihood,
+            &self.link_kind,
+            self.priorweights,
+            deviance,
+        )?;
+        Ok((deviance, log_kernel))
     }
 
     fn current_deviance(&self) -> Result<f64, EstimationError> {
-        if self.covariate_se.is_some() {
-            if !matches!(self.likelihood.spec.response, ResponseFamily::Binomial) {
-                crate::bail_invalid_estim!(
-                    "integrated PIRLS objective requires a binomial response"
-                );
-            }
-            binomial_deviance_and_log_kernel_from_mean(
-                self.y,
-                &self.lastmu,
-                self.priorweights,
-            )
-            .map(|objective| objective.0)
-        } else {
-            self.likelihood.loglik_deviance(
-                self.y,
-                &self.workspace.eta_buf,
-                &self.link_kind,
-                self.priorweights,
-            )
-        }
+        self.likelihood.loglik_deviance(
+            self.y,
+            &self.workspace.eta_buf,
+            &self.link_kind,
+            self.priorweights,
+        )
     }
 
     pub(crate) fn new(
@@ -265,7 +234,6 @@ impl<'a> GamWorkingModel<'a> {
         link_kind: InverseLink,
         firth_bias_reduction: bool,
         transform: Option<WorkingReparamTransform>,
-        quadctx: crate::quadrature::QuadratureContext,
         glm_first_step_gram: Option<Array2<f64>>,
     ) -> Self {
         let coordinate_design = match coordinate_frame {
@@ -320,26 +288,17 @@ impl<'a> GamWorkingModel<'a> {
             last_d3mu_deta3: Array1::zeros(n),
             last_penalty_term: 0.0,
             x_original_csr,
-            covariate_se: None,
             gamma_shape_locked: false,
             beta_phi_locked: false,
             tweedie_phi_locked: false,
             dispersion_phi_locked: false,
             negbin_theta_locked: false,
-            quadctx,
             glm_first_step_gram,
             glm_first_step_gram_consumed: false,
             firth_design_factor: None,
             last_firth_hessian: None,
             working_array_beta_bits: Vec::new(),
         }
-    }
-
-    /// Set per-observation SE for integrated (GHQ) likelihood.
-    /// When set, the working model uses uncertainty-aware IRLS updates.
-    pub(crate) fn with_covariate_se(mut self, se: Array1<f64>) -> Self {
-        self.covariate_se = Some(se);
-        self
     }
 
     /// Build (once) and return the β-independent Firth/Jeffreys design factor for
@@ -1075,42 +1034,21 @@ impl<'a> GamWorkingModel<'a> {
         // is updated once per *accepted* iterate in `update_with_curvature`
         // (block-coordinate β | shape), exactly as mgcv holds the scale fixed
         // through the inner P-IRLS solve. See issue #511 (regression of #359).
-        let integrated = self.covariate_se.as_ref().map(|se| IntegratedWorkingInput {
-            quadctx: &self.quadctx,
-            se: se.view(),
-            mixture_link_state: self.link_kind.mixture_state(),
-            sas_link_state: self.link_kind.sas_state(),
-        });
         match &self.link_kind {
             InverseLink::Mixture(_)
             | InverseLink::LatentCLogLog(_)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_) => {
-                if let Some(integ) = integrated {
-                    update_glmvectors_integrated_for_link(
-                        integ.quadctx,
-                        self.y,
-                        &self.workspace.eta_buf,
-                        integ.se,
-                        &self.link_kind,
-                        self.priorweights,
-                        &mut self.lastmu,
-                        &mut self.lastweights,
-                        &mut self.lastz,
-                        None,
-                    )?;
-                } else {
-                    update_glmvectors(
-                        self.y,
-                        &self.workspace.eta_buf,
-                        &self.link_kind,
-                        self.priorweights,
-                        &mut self.lastmu,
-                        &mut self.lastweights,
-                        &mut self.lastz,
-                        None,
-                    )?;
-                }
+                update_glmvectors(
+                    self.y,
+                    &self.workspace.eta_buf,
+                    &self.link_kind,
+                    self.priorweights,
+                    &mut self.lastmu,
+                    &mut self.lastweights,
+                    &mut self.lastz,
+                    None,
+                )?;
             }
             InverseLink::Standard(_) => {
                 self.likelihood.irls_update(
@@ -1120,7 +1058,6 @@ impl<'a> GamWorkingModel<'a> {
                     &mut self.lastmu,
                     &mut self.lastweights,
                     &mut self.lastz,
-                    integrated,
                     None,
                 )?;
             }
@@ -1303,92 +1240,28 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             self.negbin_theta_locked = true;
         }
 
-        // Use integrated (GHQ) likelihood if per-observation SE is available.
-        // This coherently accounts for uncertainty in the base prediction.
-        let integrated = self.covariate_se.as_ref().map(|se| IntegratedWorkingInput {
-            quadctx: &self.quadctx,
-            se: se.view(),
-            mixture_link_state: self.link_kind.mixture_state(),
-            sas_link_state: self.link_kind.sas_state(),
-        });
+        let derivatives = WorkingDerivativeBuffersMut {
+            c: &mut self.last_c,
+            d: &mut self.last_d,
+            dmu_deta: &mut self.last_dmu_deta,
+            d2mu_deta2: &mut self.last_d2mu_deta2,
+            d3mu_deta3: &mut self.last_d3mu_deta3,
+        };
         match &self.link_kind {
-            InverseLink::Mixture(_) => {
-                if let Some(integ) = integrated {
-                    update_glmvectors_integrated_for_link(
-                        integ.quadctx,
-                        self.y,
-                        &self.workspace.eta_buf,
-                        integ.se,
-                        &self.link_kind,
-                        self.priorweights,
-                        &mut self.lastmu,
-                        &mut self.lastweights,
-                        &mut self.lastz,
-                        Some(WorkingDerivativeBuffersMut {
-                            c: &mut self.last_c,
-                            d: &mut self.last_d,
-                            dmu_deta: &mut self.last_dmu_deta,
-                            d2mu_deta2: &mut self.last_d2mu_deta2,
-                            d3mu_deta3: &mut self.last_d3mu_deta3,
-                        }),
-                    )?;
-                } else {
-                    update_glmvectors(
-                        self.y,
-                        &self.workspace.eta_buf,
-                        &self.link_kind,
-                        self.priorweights,
-                        &mut self.lastmu,
-                        &mut self.lastweights,
-                        &mut self.lastz,
-                        Some(WorkingDerivativeBuffersMut {
-                            c: &mut self.last_c,
-                            d: &mut self.last_d,
-                            dmu_deta: &mut self.last_dmu_deta,
-                            d2mu_deta2: &mut self.last_d2mu_deta2,
-                            d3mu_deta3: &mut self.last_d3mu_deta3,
-                        }),
-                    )?;
-                }
-            }
-            InverseLink::LatentCLogLog(_) | InverseLink::Sas(_) | InverseLink::BetaLogistic(_) => {
-                if let Some(integ) = integrated {
-                    update_glmvectors_integrated_for_link(
-                        integ.quadctx,
-                        self.y,
-                        &self.workspace.eta_buf,
-                        integ.se,
-                        &self.link_kind,
-                        self.priorweights,
-                        &mut self.lastmu,
-                        &mut self.lastweights,
-                        &mut self.lastz,
-                        Some(WorkingDerivativeBuffersMut {
-                            c: &mut self.last_c,
-                            d: &mut self.last_d,
-                            dmu_deta: &mut self.last_dmu_deta,
-                            d2mu_deta2: &mut self.last_d2mu_deta2,
-                            d3mu_deta3: &mut self.last_d3mu_deta3,
-                        }),
-                    )?;
-                } else {
-                    update_glmvectors(
-                        self.y,
-                        &self.workspace.eta_buf,
-                        &self.link_kind,
-                        self.priorweights,
-                        &mut self.lastmu,
-                        &mut self.lastweights,
-                        &mut self.lastz,
-                        Some(WorkingDerivativeBuffersMut {
-                            c: &mut self.last_c,
-                            d: &mut self.last_d,
-                            dmu_deta: &mut self.last_dmu_deta,
-                            d2mu_deta2: &mut self.last_d2mu_deta2,
-                            d3mu_deta3: &mut self.last_d3mu_deta3,
-                        }),
-                    )?;
-                }
+            InverseLink::Mixture(_)
+            | InverseLink::LatentCLogLog(_)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_) => {
+                update_glmvectors(
+                    self.y,
+                    &self.workspace.eta_buf,
+                    &self.link_kind,
+                    self.priorweights,
+                    &mut self.lastmu,
+                    &mut self.lastweights,
+                    &mut self.lastz,
+                    Some(derivatives),
+                )?;
             }
             InverseLink::Standard(_) => {
                 self.likelihood.irls_update(
@@ -1398,14 +1271,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     &mut self.lastmu,
                     &mut self.lastweights,
                     &mut self.lastz,
-                    integrated,
-                    Some(WorkingDerivativeBuffersMut {
-                        c: &mut self.last_c,
-                        d: &mut self.last_d,
-                        dmu_deta: &mut self.last_dmu_deta,
-                        d2mu_deta2: &mut self.last_d2mu_deta2,
-                        d3mu_deta3: &mut self.last_d3mu_deta3,
-                    }),
+                    Some(derivatives),
                 )?;
             }
         }

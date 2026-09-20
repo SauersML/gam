@@ -228,7 +228,6 @@ impl RemlState<'_> {
             offset: self.offset.view(),
             y: self.y,
             priorweights: self.weights,
-            covariate_se: None,
             gaussian_fixed_cache: None,
             glm_first_step_gram: None,
         };

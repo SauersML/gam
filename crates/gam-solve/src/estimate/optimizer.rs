@@ -2504,7 +2504,6 @@ where
                 offset: offset_o.view(),
                 y: y_o.view(),
                 priorweights: w_o.view(),
-                covariate_se: None,
                 gaussian_fixed_cache: final_cache_handle.as_deref(),
                 // The final reported fit must be exact at the converged ρ/ψ — never
                 // serve the frozen-W first-step approximation here.

@@ -144,7 +144,6 @@ fn fit_at_rho(
             offset: offset.view(),
             y: y.view(),
             priorweights: w.view(),
-            covariate_se: None,
             gaussian_fixed_cache: cache,
             glm_first_step_gram: None,
         },
