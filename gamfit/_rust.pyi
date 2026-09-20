@@ -307,7 +307,6 @@ __all__ = [
     "posterior_coefficient_names_json",
     "posterior_credible_interval",
     "posterior_draw_bands",
-    "posterior_eta_bands",
     "posterior_predict_bands_table",
     "posterior_predict_multinomial_pyfunc",
     "posterior_predict_table",
@@ -2005,8 +2004,6 @@ def posterior_coefficient_names_json(request_json: str) -> str: ...
 def posterior_credible_interval(samples: NDArray[np.float64], level: float) -> NDArray[np.float64]: ...
 
 def posterior_draw_bands(eta: NDArray[np.float64], mean: NDArray[np.float64], level: float) -> dict[Any, Any]: ...
-
-def posterior_eta_bands(eta: NDArray[np.float64], family_kind: str, level: float, link_spec: str | None = ...) -> dict[Any, Any]: ...
 
 def posterior_predict_bands_table(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable, samples: NDArray[np.float64], level: float) -> dict[Any, Any]: ...
 
