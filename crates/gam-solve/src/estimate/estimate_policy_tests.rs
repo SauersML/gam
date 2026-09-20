@@ -1103,6 +1103,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
             dispersion: Dispersion::estimated(1.1 * 1.1)
                 .expect("profiled Gaussian phi-hat = sigma-hat^2 is a valid estimate"),
             factorized_standard_errors: None,
+            smoothing_correction_factorized: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,

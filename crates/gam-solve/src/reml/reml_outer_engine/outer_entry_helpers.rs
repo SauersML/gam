@@ -293,6 +293,9 @@ pub(crate) fn penalty_coord_to_operator(
     coord: PenaltyCoordinate,
     scale: f64,
 ) -> Arc<dyn HyperOperator> {
+    use gam_linalg::faer_ndarray::{fast_ab, fast_ata, fast_atb};
+    use ndarray::s;
+
     struct OwnedPenaltyHyperOperator {
         pub(crate) coord: PenaltyCoordinate,
         pub(crate) scale: f64,
@@ -336,12 +339,47 @@ pub(crate) fn penalty_coord_to_operator(
                 .scaled_add_penalty_view(v, scale * self.scale, out);
         }
 
+        // `B = scale · RᵀR` on the root's column block, so every factor
+        // contraction is two GEMMs through the root `R` (rank × block) rather
+        // than the trait default's two matvecs per factor column.
+        fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
+            let (root, start, end) = self.root_block();
+            let root_factor = fast_ab(root, &factor.slice(s![start..end, ..]));
+            let mut out = Array2::<f64>::zeros(factor.dim());
+            let mut block = out.slice_mut(s![start..end, ..]);
+            block.assign(&fast_atb(root, &root_factor));
+            block *= self.scale;
+            out
+        }
+
+        fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+            let (root, start, end) = self.root_block();
+            let root_factor = fast_ab(root, &factor.slice(s![start..end, ..]));
+            self.scale * root_factor.iter().map(|&value| value * value).sum::<f64>()
+        }
+
+        fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
+            let (root, start, end) = self.root_block();
+            let root_factor = fast_ab(root, &factor.slice(s![start..end, ..]));
+            let mut projected = fast_ata(&root_factor);
+            projected *= self.scale;
+            projected
+        }
+
         fn to_dense(&self) -> Array2<f64> {
             self.coord.scaled_dense_matrix(self.scale)
         }
 
         fn is_implicit(&self) -> bool {
             false
+        }
+    }
+
+    impl OwnedPenaltyHyperOperator {
+        fn root_block(&self) -> (&Array2<f64>, usize, usize) {
+            self.coord
+                .block_local_root()
+                .expect("every penalty coordinate carries its root in a block chart")
         }
     }
 
@@ -1760,5 +1798,55 @@ mod profiled_gaussian_residual_dof_tests {
             profiled_gaussian_residual_dof(3, 2.0).expect("nu = 1"),
             1.0
         );
+    }
+}
+
+#[cfg(test)]
+mod penalty_hyper_operator_factor_tests {
+    use super::penalty_coord_to_operator;
+    use gam_problem::PenaltyCoordinate;
+    use ndarray::{Array2, s};
+
+    /// The penalty drift operator contracts a factor through its root with two
+    /// GEMMs; each contraction must equal the dense `scale · S` it stands for,
+    /// on a block root placed inside a wider coefficient vector (rows outside
+    /// the block must come back exactly zero) and on a full-width root.
+    #[test]
+    fn root_factor_contractions_match_the_dense_penalty() {
+        let (p, start, end, k) = (9usize, 2usize, 7usize, 4usize);
+        let root = Array2::from_shape_fn((3, end - start), |(i, j)| {
+            ((i * 7 + j * 3) % 5) as f64 - 1.5 + 0.1 * j as f64
+        });
+        let factor =
+            Array2::from_shape_fn((p, k), |(i, j)| ((i * 5 + j * 11) % 7) as f64 * 0.3 - 0.8);
+        let scale = 2.75;
+        let block = PenaltyCoordinate::from_block_root(root.clone(), start, end, p);
+        let mut full_root = Array2::<f64>::zeros((3, p));
+        full_root.slice_mut(s![.., start..end]).assign(&root);
+        let dense_coord = PenaltyCoordinate::from_dense_root(full_root);
+        for coord in [block, dense_coord] {
+            let dense = coord.scaled_dense_matrix(scale);
+            let op = penalty_coord_to_operator(coord, scale);
+            let expected_mul = dense.dot(&factor);
+            let expected_projected = factor.t().dot(&expected_mul);
+            let expected_trace: f64 = (0..k).map(|c| expected_projected[[c, c]]).sum();
+            let tol = 1e-12 * dense.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
+            let mul = op.mul_mat(&factor);
+            for (got, want) in mul.iter().zip(expected_mul.iter()) {
+                assert!((got - want).abs() <= tol * 10.0, "mul_mat {got} vs {want}");
+            }
+            for row in (0..start).chain(end..p) {
+                assert!(mul.row(row).iter().all(|&v| v == 0.0));
+            }
+            let projected = op.projected_matrix(&factor);
+            for (got, want) in projected.iter().zip(expected_projected.iter()) {
+                assert!((got - want).abs() <= tol * 100.0, "projected {got} vs {want}");
+            }
+            let trace = op.trace_projected_factor(&factor);
+            assert!(
+                (trace - expected_trace).abs() <= tol * 100.0,
+                "trace {trace} vs {expected_trace}"
+            );
+        }
     }
 }
