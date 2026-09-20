@@ -809,24 +809,21 @@ pub fn certified_spd_inverse(
     certified_spd_factorize(matrix, label)?.inverse()
 }
 
+/// Compensated scalar summation for the linear-algebra callers. It is the workspace owner
+/// [`gam_math::sparse_grid::CompensatedSum`] (Kahan–Babuška / Neumaier), so an addend larger than
+/// the running sum keeps the running sum's low-order bits and `sum()` folds the compensation back in.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct KahanSum {
-    sum: f64,
-    c: f64,
-}
+pub struct KahanSum(gam_math::sparse_grid::CompensatedSum);
 
 impl KahanSum {
     #[inline]
     pub fn add(&mut self, value: f64) {
-        let y = value - self.c;
-        let t = self.sum + y;
-        self.c = (t - self.sum) - y;
-        self.sum = t;
+        self.0.add(value);
     }
 
     #[inline]
     pub fn sum(self) -> f64 {
-        self.sum
+        self.0.value()
     }
 }
 
@@ -2125,5 +2122,32 @@ mod certified_log_det_tests {
             (raised_log_det - raised_reference).abs() <= raised_band,
             "raised log|A| {raised_log_det:e} against ln 67.015625 = {raised_reference:e}, band {raised_band:e}"
         );
+    }
+}
+
+#[cfg(test)]
+mod kahan_sum_tests {
+    use super::KahanSum;
+
+    #[test]
+    fn kahan_sum_keeps_the_running_sum_under_a_larger_addend() {
+        // Plain Kahan compensation returns 0 for this sequence; the exact sum is 2.
+        let mut sum = KahanSum::default();
+        for value in [1.0, 1e100, 1.0, -1e100] {
+            sum.add(value);
+        }
+        assert_eq!(sum.sum(), 2.0);
+    }
+
+    #[test]
+    fn kahan_sum_folds_the_final_compensation_into_its_total() {
+        // The last addition cancels the running sum, so the exact total 2^-60 lives only in the
+        // compensation; a total read off the running sum alone returns 0.
+        let tiny = 2.0_f64.powi(-60);
+        let mut sum = KahanSum::default();
+        for value in [1.0, tiny, -1.0] {
+            sum.add(value);
+        }
+        assert_eq!(sum.sum(), tiny);
     }
 }
