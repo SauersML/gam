@@ -4550,9 +4550,9 @@ impl SaeManifoldTerm {
             // bounds it for every row of this corpus. Any larger bound only inflates
             // each row's Kantorovich `h = β·η·L` and flags certifiable starts.
             // Posterior gates lie in `[0, 1]`, so a floor at 1 would replace every
-            // atom's bound by 1. An atom with no active row gets `L = 0`, and it is
-            // never certified from this corpus: a non-positive amplitude is always
-            // flagged.
+            // atom's bound by 1. An atom with no active row gets the exact `L` of
+            // its zero-amplitude objective (the data term's part vanishes), which
+            // is the only amplitude this corpus encodes it at.
             amplitude_bound[atom_idx] = bound;
         }
 
