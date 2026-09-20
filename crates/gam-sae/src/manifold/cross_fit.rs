@@ -34,13 +34,18 @@
 //! (all-rows discover + all-rows evaluate) artifact and the cross-fit aggregate
 //! is a direct, reportable **optimism** estimate.
 //!
-//! This module provides the fold machinery, a generic scalar cross-fit driver
-//! ([`cross_fit_scalar`]) that is agnostic to what "structure" and "artifact"
-//! mean (the caller supplies the discover/evaluate closures, so it wires onto
-//! EV, Θ, or dose forecasts identically), and the linear-subspace reconstruction
-//! ([`fit_subspace`] / `project_onto_subspace`) that is the honest minimal
-//! analog of a linear dictionary — used by the optimism test to exhibit the
-//! `q/n` naive inflation and the cross-fit's honesty.
+//! The aggregate is POOLED: every fold's held-out residual sum of squares is
+//! summed and divided by the same total sum of squares (about the full-data
+//! column means) the naive value uses, so `naive − cross_fit` is exactly the
+//! held-out minus held-in residual over one shared denominator. Averaging
+//! per-fold ratios instead — each over its own fold-mean TSS, which is short by
+//! about one row's worth of variance — biases every held-out value by `≈ K/n`,
+//! the same order as the `q/n` optimism being measured.
+//!
+//! This module provides the fold machinery and the linear-subspace
+//! reconstruction ([`fit_subspace`] / [`subspace_rss`]) that is the honest
+//! minimal analog of a linear dictionary, cross-fitted by
+//! [`cross_fit_reconstruction_ev`].
 //!
 //! No tuned constants (SPEC.md law): the only knob is `K`, a caller-owned
 //! resolution choice, and the fold assignment is a deterministic function of `K`
@@ -90,9 +95,7 @@ impl KFoldAssignment {
         for (rank, &row) in order.iter().enumerate() {
             fold_of_row[row] = rank % k_folds;
         }
-        Ok(KFoldAssignment {
-            fold_of_row,
-        })
+        Ok(KFoldAssignment { fold_of_row })
     }
 
     /// Rows held OUT in fold `f` (the evaluation rows).
@@ -116,78 +119,29 @@ fn splitmix64(x: u64) -> u64 {
     gam_linalg::utils::splitmix64_hash(x)
 }
 
-/// Result of a scalar cross-fit: the naive (double-use) artifact, the cross-fit
-/// (held-out) aggregate, the per-fold held-out values, and their difference (the
-/// optimism the naive path carries).
+/// Result of a reconstruction cross-fit: the naive (double-use) explained
+/// variance, the cross-fit (held-out) explained variance, the per-fold held-out
+/// values, and their difference (the optimism the naive path carries).
 #[derive(Debug, Clone)]
 pub struct CrossFitReport {
-    /// Structure discovered on ALL rows, artifact evaluated on ALL rows.
+    /// Structure discovered on ALL rows, `1 − RSS_in / TSS` evaluated on ALL rows.
     pub naive: f64,
-    /// Mean of the held-out per-fold evaluations (the honest estimate).
+    /// Pooled held-out explained variance `1 − Σ_f RSS_f / TSS`, over the same
+    /// `TSS` as [`Self::naive`]. Equal to the `TSS_f / TSS`-weighted mean of
+    /// [`Self::per_fold`].
     pub cross_fit: f64,
-    /// One held-out artifact value per fold, fold order.
+    /// One held-out explained variance per fold, fold order: `1 − RSS_f / TSS_f`
+    /// with `TSS_f` about the same full-data column means (`NaN` for a fold whose
+    /// held-out rows all sit exactly at those means). Every fold is present.
     pub per_fold: Vec<f64>,
-    /// `naive − cross_fit` — the post-selection optimism.
+    /// `naive − cross_fit = (Σ_f RSS_f − RSS_in) / TSS` — the post-selection
+    /// optimism.
     pub optimism: f64,
 }
 
-/// Generic K-fold cross-fit of a scalar artifact.
-///
-/// `discover(train_rows) -> S` fits the structure on the given rows and returns
-/// a discovered-structure handle `S`. `evaluate(&S, eval_rows) -> Option<f64>`
-/// applies that fixed structure to the given rows and returns the artifact (or
-/// `None` if it is undefined on those rows, e.g. a degenerate fold). The naive
-/// value uses the full row set for BOTH discover and evaluate; the cross-fit
-/// value discovers on each fold-complement and evaluates on the held-out fold,
-/// averaging the defined per-fold values.
-///
-/// Returns an error only if the fold split is ill-posed or EVERY fold is
-/// undefined; individual undefined folds are skipped and reported via a shorter
-/// `per_fold`.
-pub fn cross_fit_scalar<S, D, E>(
-    n: usize,
-    config: CrossFitConfig,
-    discover: D,
-    evaluate: E,
-) -> Result<CrossFitReport, String>
-where
-    D: Fn(&[usize]) -> Result<S, String>,
-    E: Fn(&S, &[usize]) -> Option<f64>,
-{
-    let all_rows: Vec<usize> = (0..n).collect();
-    let full_structure = discover(&all_rows)?;
-    let naive = evaluate(&full_structure, &all_rows)
-        .ok_or_else(|| "cross_fit_scalar: naive artifact undefined on full data".to_string())?;
-
-    let folds = KFoldAssignment::new(n, config.k_folds, config.seed)?;
-    let mut per_fold = Vec::with_capacity(config.k_folds);
-    for f in 0..config.k_folds {
-        let train = folds.complement(f);
-        let test = folds.held_out(f);
-        if train.is_empty() || test.is_empty() {
-            continue;
-        }
-        let structure = discover(&train)?;
-        if let Some(v) = evaluate(&structure, &test) {
-            if v.is_finite() {
-                per_fold.push(v);
-            }
-        }
-    }
-    if per_fold.is_empty() {
-        return Err("cross_fit_scalar: every fold's held-out artifact was undefined".to_string());
-    }
-    let cross_fit = per_fold.iter().sum::<f64>() / per_fold.len() as f64;
-    Ok(CrossFitReport {
-        naive,
-        cross_fit,
-        optimism: naive - cross_fit,
-        per_fold,
-    })
-}
-
-/// Row-subset implementation shared by the public full-data PCA seed and the
-/// honest cross-fit scorer below.
+/// Top-`q` linear reconstruction subspace of the selected rows: their column
+/// means and the leading right singular vectors of the centered rows (one
+/// orthonormal direction per row of the returned basis).
 pub(crate) fn fit_subspace(
     data: ArrayView2<'_, f64>,
     rows: &[usize],
@@ -225,28 +179,24 @@ pub(crate) fn fit_subspace(
     Ok((mean, basis))
 }
 
-/// Reconstruct the selected rows of `data` by projecting their centered form
-/// onto `basis` (rows = orthonormal directions) and adding `mean` back — then
-/// return the explained variance of that reconstruction ON those rows.
+/// Residual sum of squares of reconstructing the selected rows of `data` by
+/// projecting their centered form onto `basis` (rows = orthonormal directions)
+/// and adding `mean` back.
 ///
 /// This is the "apply fixed structure to held-out rows" step: `mean`/`basis`
 /// come from [`fit_subspace`] on the TRAIN rows, `rows` are the TEST rows.
-pub(crate) fn subspace_reconstruction_ev(
+pub(crate) fn subspace_rss(
     data: ArrayView2<'_, f64>,
     rows: &[usize],
     mean: ArrayView1<'_, f64>,
     basis: ArrayView2<'_, f64>,
-) -> Option<f64> {
+) -> f64 {
     let p = data.ncols();
-    if rows.is_empty() || mean.len() != p || basis.ncols() != p {
-        return None;
-    }
-    let n = rows.len();
-    let mut target = Array2::<f64>::zeros((n, p));
-    let mut fitted = Array2::<f64>::zeros((n, p));
-    for (i, &r) in rows.iter().enumerate() {
-        // centered row
-        let mut coeff = Array1::<f64>::zeros(basis.nrows());
+    assert_eq!(mean.len(), p);
+    assert_eq!(basis.ncols(), p);
+    let mut coeff = vec![0.0_f64; basis.nrows()];
+    let mut rss = 0.0_f64;
+    for &r in rows {
         for (b, dir) in basis.rows().into_iter().enumerate() {
             let mut acc = 0.0;
             for c in 0..p {
@@ -255,39 +205,97 @@ pub(crate) fn subspace_reconstruction_ev(
             coeff[b] = acc;
         }
         for c in 0..p {
-            target[[i, c]] = data[[r, c]];
             let mut recon = mean[c];
             for (b, dir) in basis.rows().into_iter().enumerate() {
                 recon += coeff[b] * dir[c];
             }
-            fitted[[i, c]] = recon;
+            let residual = data[[r, c]] - recon;
+            rss += residual * residual;
         }
     }
-    reconstruction_explained_variance(target.view(), fitted.view())
+    rss
+}
+
+/// Total sum of squares of the selected rows about a fixed `center`.
+fn total_sum_of_squares(
+    data: ArrayView2<'_, f64>,
+    rows: &[usize],
+    center: ArrayView1<'_, f64>,
+) -> f64 {
+    let mut tss = 0.0_f64;
+    for &r in rows {
+        for c in 0..data.ncols() {
+            let centered = data[[r, c]] - center[c];
+            tss += centered * centered;
+        }
+    }
+    tss
 }
 
 /// Cross-fitted reconstruction explained variance — the honest, optimism-free
 /// companion to the in-sample reconstruction EV the SAE headline reports.
 ///
-/// Discovers the top-`q` linear reconstruction subspace on each fold-complement
-/// and scores its EV on the held-out fold, aggregating across folds (see
-/// [`cross_fit_scalar`]). The returned [`CrossFitReport`] carries the naive
-/// (all-rows discover + score) EV, the cross-fit aggregate, and their difference
-/// — the post-selection optimism. This is the reconstruction analog of a linear
-/// dictionary; a curved/gated SAE plugs into [`cross_fit_scalar`] the same way by
-/// supplying its own discover/score closures.
+/// Discovers the top-`q` linear reconstruction subspace on each fold-complement,
+/// scores its residual on the held-out fold, and pools the held-out residuals
+/// over the naive value's own total sum of squares (see [`CrossFitReport`]).
+/// This is the reconstruction analog of a linear dictionary.
+///
+/// Every fold is scored. A target with no variance about its column means (no
+/// explained variance to define) or a non-finite residual is an error, never a
+/// silently shortened aggregate.
 pub(crate) fn cross_fit_reconstruction_ev(
     data: ArrayView2<'_, f64>,
     config: CrossFitConfig,
     q: usize,
 ) -> Result<CrossFitReport, String> {
-    let n = data.nrows();
-    cross_fit_scalar(
-        n,
-        config,
-        |train| fit_subspace(data, train, q),
-        |(mean, basis), test| subspace_reconstruction_ev(data, test, mean.view(), basis.view()),
-    )
+    let (n, p) = data.dim();
+    let folds = KFoldAssignment::new(n, config.k_folds, config.seed)?;
+    let all_rows: Vec<usize> = (0..n).collect();
+    let mut center = Array1::<f64>::zeros(p);
+    for c in 0..p {
+        let mut acc = 0.0;
+        for r in 0..n {
+            acc += data[[r, c]];
+        }
+        center[c] = acc / n as f64;
+    }
+    let tss = total_sum_of_squares(data, &all_rows, center.view());
+    if !(tss.is_finite() && tss > 0.0) {
+        return Err(format!(
+            "cross_fit_reconstruction_ev: total sum of squares {tss:e} about the column \
+             means is not positive and finite, so explained variance is undefined"
+        ));
+    }
+
+    let (mean, basis) = fit_subspace(data, &all_rows, q)?;
+    let naive_rss = subspace_rss(data, &all_rows, mean.view(), basis.view());
+
+    let mut per_fold = Vec::with_capacity(config.k_folds);
+    let mut held_out_rss = 0.0_f64;
+    for fold in 0..config.k_folds {
+        let (mean, basis) = fit_subspace(data, &folds.complement(fold), q)?;
+        let test = folds.held_out(fold);
+        let rss = subspace_rss(data, &test, mean.view(), basis.view());
+        held_out_rss += rss;
+        per_fold.push(crate::tiered::explained_variance_from_sums(
+            rss,
+            total_sum_of_squares(data, &test, center.view()),
+        ));
+    }
+    if !(naive_rss.is_finite() && held_out_rss.is_finite()) {
+        return Err(format!(
+            "cross_fit_reconstruction_ev: non-finite residual (held-in {naive_rss:e}, \
+             held-out {held_out_rss:e})"
+        ));
+    }
+    let naive = crate::tiered::explained_variance_from_sums(naive_rss, tss);
+    let cross_fit = crate::tiered::explained_variance_from_sums(held_out_rss, tss);
+    Ok(CrossFitReport {
+        naive,
+        cross_fit,
+        optimism: naive - cross_fit,
+        per_fold,
+    })
 }
 
 #[cfg(test)]
@@ -319,4 +327,70 @@ mod tests {
         assert!(hi - lo <= 1, "fold sizes must differ by ≤ 1, got {sizes:?}");
     }
 
+    /// A deterministic `(n, p)` target with a dominant direction plus spread in
+    /// every other column, so a `q = 1` subspace leaves a held-out residual.
+    fn structured_target(n: usize, p: usize) -> Array2<f64> {
+        Array2::from_shape_fn((n, p), |(r, c)| {
+            let t = r as f64 / n as f64;
+            let signal = (c as f64 + 1.0) * (2.0 * t - 1.0);
+            let spread = ((r * (c + 3) * 7919) % 97) as f64 / 97.0 - 0.5;
+            signal + 0.3 * spread
+        })
+    }
+
+    /// The cross-fit value shares the naive value's denominator, so it is the
+    /// `TSS_f / TSS`-weighted mean of the per-fold values (the per-fold `TSS_f`
+    /// are taken about the same full-data means and partition `TSS`), and every
+    /// fold is scored. The old mean of per-fold ratios, each over its own
+    /// fold-mean TSS, satisfied neither identity.
+    #[test]
+    fn cross_fit_pools_every_fold_over_the_naive_denominator() {
+        let (n, p, k) = (40usize, 4usize, 5usize);
+        let data = structured_target(n, p);
+        let report = cross_fit_reconstruction_ev(
+            data.view(),
+            CrossFitConfig {
+                k_folds: k,
+                seed: 7,
+            },
+            1,
+        )
+        .expect("cross-fit on a varying target");
+        assert_eq!(report.per_fold.len(), k, "every fold must be scored");
+
+        let center = data.mean_axis(ndarray::Axis(0)).expect("n > 0");
+        let all_rows: Vec<usize> = (0..n).collect();
+        let tss = total_sum_of_squares(data.view(), &all_rows, center.view());
+        let folds = KFoldAssignment::new(n, k, 7).expect("folds");
+        let weighted: f64 = (0..k)
+            .map(|f| {
+                let w = total_sum_of_squares(data.view(), &folds.held_out(f), center.view()) / tss;
+                w * report.per_fold[f]
+            })
+            .sum();
+        // Both sides are the same k-term sum of O(1) quantities, so they agree to
+        // a few ulps of each term.
+        let tol = 8.0 * k as f64 * f64::EPSILON;
+        assert!(
+            (weighted - report.cross_fit).abs() <= tol,
+            "cross_fit {} must equal the TSS-weighted per-fold mean {weighted}",
+            report.cross_fit
+        );
+        assert_eq!(report.optimism, report.naive - report.cross_fit);
+    }
+
+    #[test]
+    fn constant_target_has_no_explained_variance_to_cross_fit() {
+        let data = Array2::<f64>::from_elem((10, 3), 2.5);
+        let err = cross_fit_reconstruction_ev(
+            data.view(),
+            CrossFitConfig {
+                k_folds: 2,
+                seed: 0,
+            },
+            1,
+        )
+        .expect_err("a constant target has no explained variance");
+        assert!(err.contains("undefined"), "{err}");
+    }
 }

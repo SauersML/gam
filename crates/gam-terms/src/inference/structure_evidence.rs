@@ -552,6 +552,9 @@ pub fn run_atom_birth_gate<S, A>(
 pub enum EBhError {
     InvalidAlpha { alpha: f64 },
     InvalidLogEvidence { claim: usize, value: f64 },
+    /// The declared family is smaller than the number of claims that carry
+    /// evidence, so those claims cannot all be members of it.
+    FamilySmallerThanClaims { family_size: usize, claims: usize },
 }
 
 impl std::fmt::Display for EBhError {
@@ -569,6 +572,15 @@ impl std::fmt::Display for EBhError {
                     "e-BH log evidence for claim {claim} must be finite or -infinity; got {value}"
                 )
             }
+            Self::FamilySmallerThanClaims {
+                family_size,
+                claims,
+            } => {
+                write!(
+                    f,
+                    "e-BH family of {family_size} hypotheses cannot hold {claims} evidence-bearing claims"
+                )
+            }
         }
     }
 }
@@ -576,10 +588,38 @@ impl std::fmt::Display for EBhError {
 impl std::error::Error for EBhError {}
 
 pub fn e_benjamini_hochberg(log_e_values: &[f64], alpha: f64) -> Result<Vec<usize>, EBhError> {
+    e_benjamini_hochberg_in_family(log_e_values, log_e_values.len(), alpha)
+}
+
+/// e-BH over a declared family of `family_size` hypotheses, of which only the
+/// `log_e_values.len()` claims passed in carry evidence. Every other member of
+/// the family holds the exact zero e-value (`log e = −∞`): it can never be
+/// rejected and enters only through `m = family_size` in the `m/(α·k)`
+/// thresholds, so the family never has to be materialized.
+///
+/// This is the form a screen-then-test pipeline needs. A data-dependent screen
+/// `S_i` that decides which candidates get an e-value keeps validity when the
+/// screened-out candidates bank zero: `E_i·1{S_i}` is itself an e-value
+/// (`E[E_i·1{S_i}] ≤ E[E_i] ≤ 1`), and e-BH is valid under arbitrary dependence
+/// over a FIXED family. Running e-BH at `m = |screened|` instead redefines the
+/// family after the data have been seen and carries no FDR guarantee, so
+/// `family_size` must be the size of the universe the screen chooses from,
+/// fixed before the data are seen. Returned indices are into `log_e_values`.
+pub fn e_benjamini_hochberg_in_family(
+    log_e_values: &[f64],
+    family_size: usize,
+    alpha: f64,
+) -> Result<Vec<usize>, EBhError> {
     if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
         return Err(EBhError::InvalidAlpha { alpha });
     }
     let m = log_e_values.len();
+    if family_size < m {
+        return Err(EBhError::FamilySmallerThanClaims {
+            family_size,
+            claims: m,
+        });
+    }
     if m == 0 {
         return Ok(Vec::new());
     }
@@ -596,7 +636,7 @@ pub fn e_benjamini_hochberg(log_e_values: &[f64], alpha: f64) -> Result<Vec<usiz
     }
     let mut order: Vec<usize> = (0..m).collect();
     order.sort_by(|&a, &b| log_e_values[b].total_cmp(&log_e_values[a]));
-    let m_f = m as f64;
+    let m_f = family_size as f64;
     let mut k_star = 0usize;
     for (rank0, &idx) in order.iter().enumerate() {
         let k = (rank0 + 1) as f64;
@@ -971,6 +1011,49 @@ mod tests {
         assert!(matches!(
             error,
             EBhError::InvalidLogEvidence { claim: 1, value } if value.is_nan()
+        ));
+    }
+
+    /// Members of the declared family that carry no evidence still count in
+    /// `m`: the same evidence that clears the bar in a family of its own size
+    /// must not clear it once the family is the full screened universe.
+    #[test]
+    fn e_bh_in_family_counts_the_unscored_members() {
+        // Alone: m = 1, α = 0.1 → threshold 10; e = 45 is rejected.
+        let log_e = [45.0f64.ln(), 1.0f64.ln()];
+        assert_eq!(
+            e_benjamini_hochberg_in_family(&log_e[..1], 1, 0.1).unwrap(),
+            vec![0]
+        );
+        // Declared family of 10 (nine members banked zero): threshold 100 at
+        // k = 1, so the same e = 45 is no longer a discovery.
+        assert!(
+            e_benjamini_hochberg_in_family(&log_e[..1], 10, 0.1)
+                .unwrap()
+                .is_empty()
+        );
+        // family_size = len reproduces the plain rule exactly.
+        assert_eq!(
+            e_benjamini_hochberg_in_family(&log_e, log_e.len(), 0.1).unwrap(),
+            e_benjamini_hochberg(&log_e, 0.1).unwrap()
+        );
+        // Equivalent to materializing the zero-evidence members (m = 3:
+        // threshold 30 at k = 1, so e = 45 is rejected in both forms).
+        let padded = [45.0f64.ln(), 1.0f64.ln(), f64::NEG_INFINITY];
+        assert_eq!(
+            e_benjamini_hochberg_in_family(&log_e, 3, 0.1).unwrap(),
+            e_benjamini_hochberg(&padded, 0.1).unwrap()
+        );
+    }
+
+    #[test]
+    fn e_bh_in_family_refuses_a_family_smaller_than_its_claims() {
+        assert!(matches!(
+            e_benjamini_hochberg_in_family(&[1.0, 2.0], 1, 0.1),
+            Err(EBhError::FamilySmallerThanClaims {
+                family_size: 1,
+                claims: 2
+            })
         ));
     }
 
