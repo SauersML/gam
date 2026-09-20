@@ -1179,8 +1179,10 @@ fn dump_indefinite_rho_hessian_diagnostic(
     inverted: Option<&InvertedRhoHessian>,
     outer_gradient: &Array1<f64>,
 ) {
+    // Everything below exists only to be logged at debug level: an
+    // eigendecomposition and `O(K² block²)` pair traces nobody reads otherwise.
     let k = hessian_rho.nrows();
-    if k == 0 {
+    if k == 0 || !log::log_enabled!(log::Level::Debug) {
         return;
     }
 
@@ -1598,10 +1600,50 @@ pub(crate) fn compute_smoothing_correction(
     // many directions must be null?" and never "is THIS direction one of
     // them?". Nothing else about the count changes: with zero prior means the
     // augmented Gram is bit-identical to the `tr(S_i S_j)` one this replaces.
+    //
+    // The invariance is read in the ORIGINAL frame, from the block-local
+    // `S̃_k = Π S_k Π` the criterion applies there. `null(w ↦ Σ w_k A_k)` and the
+    // Gram `⟨A_i, A_j⟩` are invariant under the orthogonal congruence by `Qs`
+    // (`S_k ↦ QsᵀS_kQs`, `μ_k ↦ Qsᵀμ_k`), so this is the same subspace; but the
+    // rotated penalties are dense, and their double-double Gram costs
+    // `O(K² p²)` against `O(Σ_overlapping block²)`. On forty coordinates at
+    // `p = 221` that was two thirds of the post-fit correction.
+    let original_applied = match crate::estimate::reml::applied_canonical_penalties_for(
+        &final_fit.reparam_result,
+        &reml_state.canonical_penalties,
+    ) {
+        Ok(penalties) => penalties,
+        Err(error) => {
+            return SmoothingCorrectionComputation {
+                correction: None,
+                rho_covariance: None,
+                active_rank: None,
+                status: SmoothingCorrectionStatus::Unavailable(
+                    SmoothingCorrectionUnavailable::PenaltyStructure {
+                        error: error.to_string(),
+                    },
+                ),
+            };
+        }
+    };
+    if original_applied.len() != n_rho {
+        return SmoothingCorrectionComputation {
+            correction: None,
+            rho_covariance: None,
+            active_rank: None,
+            status: SmoothingCorrectionStatus::Unavailable(
+                SmoothingCorrectionUnavailable::PenaltyDimension {
+                    rho: n_rho,
+                    lambdas: lambdas.len(),
+                    canonical_penalties: original_applied.len(),
+                },
+            ),
+        };
+    }
     let invariance =
         match crate::penalty_invariance::PenaltyMapInvariance::from_canonical_penalties(
-            ct,
-            n_coeffs_trans,
+            &original_applied,
+            reml_state.p,
         ) {
             Ok(invariance) => invariance,
             Err(error) => {
