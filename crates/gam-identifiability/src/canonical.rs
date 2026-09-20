@@ -421,26 +421,47 @@ impl ConvergedChannelAwareVerdict {
     /// means its re-audit drops a column. Under the identity gauge (the width-preserving
     /// path) the reduced problem is the raw problem.
     ///
-    /// A recovered column refuses exactly when it moves a rank. Either the raw rank rose,
-    /// meaning the gauge removed a direction convergence identifies and the solve ran
-    /// over-reduced, or the reduced problem lost one. A column that another member of its
-    /// alias class replaced does neither.
+    /// Under a reducing gauge, a recovered column refuses exactly when it moves a rank.
+    /// Either the raw rank rose, meaning the gauge removed a direction convergence
+    /// identifies and the solve ran over-reduced, or the reduced problem lost one. A
+    /// column that another member of its alias class replaced does neither.
+    ///
+    /// Under the identity gauge the fit ran every raw column, so the gauge removed
+    /// nothing, and a raw rank that rose is a problem the fit ran that convergence
+    /// identifies better than the pilot did. That is not a refusal. The pilot of a
+    /// survival time-wiggle linearizes at the zero warp, where the wiggle columns act
+    /// as constants; at the converged warp they are identified (#3304). A rank that fell
+    /// still refuses: the fit then ran directions it no longer identifies.
     pub fn refuses(&self) -> bool {
         let gauge_fatal = self
             .pilot_gauge_reaudit
             .as_ref()
             .map_or(self.drift.current_fatal, |audit| audit.fatal);
-        self.drift.pilot_rank != self.drift.current_rank
-            || self.drift.pilot_fatal != self.drift.current_fatal
-            || self.pilot_gauge_rank() != self.drift.pilot_rank
-            || gauge_fatal != self.drift.pilot_fatal
+        let fatality_changed = self.drift.pilot_fatal != self.drift.current_fatal
+            || gauge_fatal != self.drift.pilot_fatal;
+        let rank_moved = if self.pilot_gauge_reaudit.is_some() {
+            self.drift.pilot_rank != self.drift.current_rank
+                || self.pilot_gauge_rank() != self.drift.pilot_rank
+        } else {
+            self.drift.current_rank < self.drift.pilot_rank
+        };
+        fatality_changed || rank_moved
     }
 
     /// The pivot picked other representatives of the same identified span: the drop
-    /// labels differ, and the verdict does not refuse.
+    /// labels differ at an unchanged rank, and the verdict does not refuse.
     pub fn representative_swap(&self) -> bool {
         !self.refuses()
+            && self.drift.pilot_rank == self.drift.current_rank
             && (!self.drift.newly_dropped.is_empty() || !self.drift.recovered.is_empty())
+    }
+
+    /// The fit ran every raw column (the identity gauge), and convergence identifies
+    /// columns the pilot dropped. The verdict does not refuse.
+    pub fn recovered_under_identity_gauge(&self) -> bool {
+        !self.refuses()
+            && self.pilot_gauge_reaudit.is_none()
+            && self.drift.current_rank > self.drift.pilot_rank
     }
 }
 
