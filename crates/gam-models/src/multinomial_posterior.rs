@@ -231,8 +231,13 @@ pub fn integrate_multinomial_design_moments(
         for a in 0..m {
             active_mean[a] = x.dot(&coefficients.column(a));
         }
+        // `V = (I_M ⊗ x)ᵀ Σ (I_M ⊗ x)` is a congruence of `Σ`, and a congruence
+        // of a symmetric matrix is symmetric. Form it from the symmetric part
+        // `½(Σ + Σᵀ)` and write each off-diagonal pair once, so `V` is symmetric
+        // BY CONSTRUCTION, bit for bit, and reads both triangles of `Σ` equally
+        // rather than whichever one a loop order happened to reach (gam#3245).
         for a in 0..m {
-            for b in 0..m {
+            for b in a..m {
                 let mut value = 0.0_f64;
                 let a_base = a * p;
                 let b_base = b * p;
@@ -243,11 +248,15 @@ pub fn integrate_multinomial_design_moments(
                     }
                     let mut row_product = 0.0_f64;
                     for j in 0..p {
-                        row_product += coefficient_covariance[[a_base + i, b_base + j]] * x[j];
+                        let sigma = 0.5
+                            * (coefficient_covariance[[a_base + i, b_base + j]]
+                                + coefficient_covariance[[b_base + j, a_base + i]]);
+                        row_product += sigma * x[j];
                     }
                     value += xi * row_product;
                 }
                 active_covariance[[a, b]] = value;
+                active_covariance[[b, a]] = value;
             }
         }
         let moments = integrate_logistic_normal_softmax_moments_with_rule_ladder(
@@ -474,43 +483,24 @@ fn validate_inputs(
         )));
     }
 
-    let scale = active_covariance
-        .iter()
-        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-    // STRUCTURAL asymmetry only. This covariance is symmetric by construction,
-    // so whatever difference survives between the triangles is roundoff from
-    // the chain that assembled it — and a `c·ε·m·scale` envelope silently
-    // encodes an assumed chain length. It fired at 51·ε on a 2×2 penguins
-    // posterior (asymmetry 5.218e-15 against a 3.260e-15 bound), refusing a
-    // correct fit over noise carrying no information.
-    //
-    // A caller error that this check exists to catch — a transposed factor,
-    // the wrong triangle — shows up at O(1) RELATIVE asymmetry, so gate there,
-    // using the same √ε relative convention `outer_value_agreement_bound` uses
-    // for two lanes that should agree up to roundoff. The matrix actually
-    // integrated is the symmetrized one (see `symmetrized_covariance`), so
-    // sub-threshold asymmetry is removed rather than propagated.
-    let symmetry_tolerance = f64::EPSILON.sqrt() * scale.max(1.0);
-    let mut maximum_asymmetry = 0.0_f64;
-    for row in 0..m {
-        for column in (row + 1)..m {
-            maximum_asymmetry = maximum_asymmetry
-                .max((active_covariance[[row, column]] - active_covariance[[column, row]]).abs());
-        }
-    }
-    if maximum_asymmetry > symmetry_tolerance {
-        return Err(EstimationError::InvalidInput(format!(
-            "multinomial posterior integration covariance is not symmetric: max asymmetry {maximum_asymmetry:.6e} exceeds structural tolerance {symmetry_tolerance:.6e} (scale {scale:.6e})"
-        )));
-    }
+    // No symmetry gate (gam#3245). A Gaussian's covariance is a symmetric
+    // bilinear form, and the matrix integrated is `½(C + Cᵀ)`
+    // (`symmetrized_covariance`), the unique symmetric matrix defining the same
+    // form `vᵀCv`. The production caller, `integrate_multinomial_design_moments`,
+    // forms `C` symmetric by construction, so there is no asymmetry to judge;
+    // the former `√ε·max(scale, 1)` refusal mixed an absolute and a relative
+    // floor under a machine constant, and a caller error it named — a transposed
+    // factor — yields `LᵀL` in place of `LLᵀ`, which is symmetric and was never
+    // caught by it.
     Ok(())
 }
 
-/// Nearest symmetric matrix to `covariance` in the Frobenius norm.
+/// Symmetric part `½(C + Cᵀ)` of `covariance`: the unique symmetric matrix
+/// with the same quadratic form, and the nearest one in the Frobenius norm.
 ///
-/// The inputs to this module are symmetric by construction; this removes the
-/// roundoff-level asymmetry their assembly chain leaves behind, so the
-/// integration cannot depend on which triangle a downstream routine reads.
+/// The integration then cannot depend on which triangle a downstream
+/// eigenroutine reads. On the design-moment path `C` is already symmetric by
+/// construction and this is the identity, bit for bit.
 fn symmetrized_covariance(covariance: ArrayView2<'_, f64>) -> Array2<f64> {
     let m = covariance.nrows();
     let mut out = covariance.to_owned();

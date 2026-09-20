@@ -1402,17 +1402,19 @@ fn validated_metric(mut metric: Array2<f64>, row: usize) -> Result<Array2<f64>, 
             "fisher_metric row {row} contains non-finite values"
         )));
     }
-    let scale = metric
-        .iter()
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    let tolerance = f64::EPSILON.sqrt() * metric.nrows().max(1) as f64 * scale;
+    // The metric enters the model only through the residual quadratic form
+    // `rᵀMr` (the Fisher Gram `Σ w xxᵀ ⊗ M`, the cross term `Σ w x ⊗ My` and the
+    // deviance `Σ w rᵀMr` are its polarizations), and `rᵀMr = rᵀ·½(M + Mᵀ)·r`
+    // for every `r`: the skew part contributes exactly zero. A supplied `M` and
+    // its symmetric part therefore define the SAME likelihood, so the symmetric
+    // part is the metric, with no asymmetry left to judge. The former gate —
+    // refuse above `√ε·d·max|M|`, else average — refused metrics that define a
+    // valid form, on a machine constant times the output count, and admitted
+    // the rest by the same averaging done here (gam#3245). What CAN be wrong
+    // with a metric is that its form is not positive definite, and the Cholesky
+    // factorization below decides that exactly.
     for a in 0..metric.nrows() {
         for b in (a + 1)..metric.ncols() {
-            if (metric[[a, b]] - metric[[b, a]]).abs() > tolerance {
-                return Err(invalid(format!(
-                    "fisher_metric row {row} is not symmetric at ({a}, {b})"
-                )));
-            }
             let average = 0.5 * (metric[[a, b]] + metric[[b, a]]);
             metric[[a, b]] = average;
             metric[[b, a]] = average;

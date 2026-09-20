@@ -243,46 +243,29 @@ fn try_exact_joint_spatial_length_scale_optimization(
 
     let baseline_score = fit_score(&best.fit);
 
-    // Compare the joint optimizer's certified cost (final_value at theta*)
-    // against the baseline. Tolerance ≥ options.tol because both endpoints
-    // are outer-BFGS approximations accurate to options.tol; a tighter
-    // gate would reject true improvements due to floating-point noise.
-    let accept_tol = options.tol.max(1e-8 * baseline_score.abs()).max(1e-12);
-    // The monotonicity certificate used to be ONE comparison —
-    // `joint_final_value <= baseline_score + accept_tol` — spanning TWO
-    // independent facts, and it therefore could not say which of them had
-    // failed. `joint_final_value` is this route's criterion at θ*;
-    // `baseline_score` is the scalar-ρ route's `fit_score` at θ0. A refusal
-    // could mean either "the optimizer ended above where it started" (a solver
-    // regression) or "the two routes disagree about the criterion at the SAME
-    // point" (a criterion inconsistency, which no amount of optimizer work can
-    // fix). `run_exact_joint_spatial_optimization` already evaluates its own
-    // criterion at θ0 to prime the evaluator, so both facts are available; state
-    // them separately so the refusal names the defect it found.
+    // No acceptance tolerance (gam#3245). Every comparison below is between
+    // two criterion values this routine has already EVALUATED, and it returns
+    // the better candidate; it never refuses a fit on the comparison. Choosing
+    // the smaller of two evaluated numbers needs no band: a band `t` only
+    // changes which candidate ships when they differ by less than `t`, and it
+    // then ships the WORSE one. The former
+    // `options.tol.max(1e-8·|baseline|).max(1e-12)` did exactly that — it let
+    // the κ search return a fit whose shipped score regressed on the incumbent
+    // by up to `1e-8` relative, a relative cost floor and two magic constants
+    // deciding a comparison that has an exact answer. Its stated premise, "both
+    // endpoints are outer-BFGS approximations accurate to options.tol", confuses
+    // the optimizer's stationarity band at θ* with the value it evaluated there:
+    // `joint_final_value`, `joint_seed_value`, `baseline_score` and
+    // `optimized_score` are each one evaluation of a criterion at one point,
+    // and the question asked of them is which point is better.
     //
-    // The route-agreement bound is the SAME derived quantity as the acceptance
-    // bound — no second tolerance is introduced. It is two-sided because a route
-    // disagreement is a disagreement in either direction, whereas the descent
-    // contract is one-sided by construction.
-    //
-    // MEASURED (2026-07-31, while working #2644). This half fires on
-    // `misc::broad_sweep_batch_h::matern_low_n_does_not_crash` and the numbers
-    // say the disagreement is SYSTEMATIC, not noise:
-    //
-    //   run 30602192415  joint_seed=2.787395886872e0  baseline=2.787395850137e0
-    //   run 30619084852  joint_seed=2.787290435812e0  baseline=2.787290399076e0
-    //   local, 4e7fd2ae1 joint_seed=2.787290435812e0  baseline=2.787290399076e0
-    //
-    // `gap = 3.674e-8` on all three — bit-identical across two nightlies on
-    // different runners AND a local run, at two different `theta0`. A
-    // deterministic `1.318e-8` RELATIVE offset against a `1e-8` relative
-    // tolerance, i.e. this refusal misses by 1.32x and would miss by 1.32x every
-    // time. So it is NOT the `O(ε·κ)` criterion-conditioning family #2644 turned
-    // out to be (that one is scattered and moves run to run); the two routes are
-    // evaluating slightly different functions, and the difference is reproducible
-    // enough to bisect directly by differencing the two criteria term by term at
-    // `theta0`. It survived the #2644 root-scale log-determinant work unchanged,
-    // which rules that mechanism out rather than leaving it open.
+    // The monotonicity certificate is two facts, stated separately so a
+    // record names the one that failed: "the optimizer ended above where it
+    // started" (a solver regression, one route) and "the two routes disagree
+    // about the criterion at the SAME point" (a criterion inconsistency, which no
+    // amount of optimizer work can fix). `run_exact_joint_spatial_optimization`
+    // already evaluates its own criterion at θ0 to prime the evaluator, so both
+    // facts are available.
     if !joint_seed_value.is_finite() {
         return Err(EstimationError::RemlOptimizationFailed(format!(
             "exact joint spatial optimization could not evaluate its own criterion at the \
@@ -290,40 +273,12 @@ fn try_exact_joint_spatial_length_scale_optimization(
              agreement with the scalar-rho route is checkable; baseline={baseline_score:.6e}"
         )));
     }
-    // The gap, emitted UNCONDITIONALLY rather than only when it happens to
-    // exceed (gam#2760, the same reasoning as `[CERTIFICATE-BOUND]`). The gate
-    // is a RELATIVE `1e-8` on a criterion whose magnitude grows with `n`, so
-    // whether it fires is a question about a trend, and a number a reader can
-    // only see on the run that already failed cannot show a trend. Measured on
-    // the #2760 ladder: `5.965e-8` relative at `n = 8 000`, i.e. the gap is
-    // itself above the `√ε ≈ 1.49e-8` forward-error scale of a
-    // matrix-factorization REML score — so it is not roundoff, and reading it at
-    // every `n` is how the residual half of #2671 gets bisected.
-    log::debug!(
-        "[spatial-kappa] route agreement at theta0: joint_seed={joint_seed_value:.12e} \
-         baseline={baseline_score:.12e} gap={:.6e} ({:.6e} relative) \
-         agreement_tolerance={accept_tol:.6e} ({}) sqrt_eps_scale={:.6e}",
-        joint_seed_value - baseline_score,
-        (joint_seed_value - baseline_score) / baseline_score.abs().max(f64::MIN_POSITIVE),
-        if (joint_seed_value - baseline_score).abs() > accept_tol {
-            "REFUSES"
-        } else {
-            "admits"
-        },
-        baseline_score.abs() * f64::EPSILON.sqrt(),
-    );
-    // WARNS, and no longer REFUSES (gam#2760). The gate's own complaint is
-    // right — "the joint search is minimizing a different function than the one
-    // its result is graded against" — and the response to it is to grade the
-    // result on the function it will SHIP with, which this routine can do
-    // exactly (see the acceptance comparison after the accept-fit below), not
-    // to refuse a whole REML fit on a cross-route scalar comparison no fixed
-    // relative constant can denominate.
-    //
-    // Why no constant can. `joint_seed_value` and `baseline_score` are two
-    // INDEPENDENT assemblies of a REML criterion whose forward error is the
-    // `O(ε·κ)` conditioning family #2644 named, and `κ` here is the penalized
-    // Hessian's. MEASURED on the #2760 ladder, same fixture, five rungs:
+    // Route agreement at θ0: a RECORD, never a gate (gam#2760), emitted
+    // unconditionally so the gap can be read as a trend in `n`. `joint_seed_value`
+    // and `baseline_score` are two INDEPENDENT assemblies of one REML criterion
+    // whose forward error is the `O(ε·κ)` conditioning family #2644 named, `κ`
+    // the penalized Hessian's, so no fixed relative constant denominates the
+    // disagreement. MEASURED on the #2760 ladder, same fixture, five rungs:
     //
     //   n =  1000   gap = −1.386e-13 relative     baseline rho: one coordinate at −RHO_BOUND
     //   n =  2000   gap = −1.667e-13 relative     one coordinate at −RHO_BOUND
@@ -335,30 +290,23 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // which a SECOND penalty block reaches `λ = e^−30 ≈ 9.4e-14` and stops
     // contributing to `H = XᵀWX + S_λ` at working precision. `log|H|` is then a
     // sum of logs across the raw Duchon Gram's ~1e15 spectrum and the two
-    // assemblies part company at exactly the scale `ε·κ` predicts. A `1e-8`
-    // relative demand cannot be met there by any correct implementation, and a
-    // constant loose enough to admit it would no longer catch the formula
-    // difference #2671 found (`5.047e-5` relative) that this gate exists for.
-    //
-    // So the number keeps its full decomposition and its loudness, and the
-    // REFUSAL moves to a comparison both sides of which come from ONE route.
-    if (joint_seed_value - baseline_score).abs() > accept_tol {
-        log::debug!(
-            "[spatial-kappa] the joint and scalar-rho routes disagree about the criterion AT \
-             THE SAME POINT theta0: joint_seed={joint_seed_value:.12e}, \
-             baseline={baseline_score:.12e}, gap={:.3e} ({:.3e} relative) against a \
-             {accept_tol:.3e} agreement tolerance. Two independent assemblies of one \
-             criterion; their forward error is O(eps*kappa) in the penalized Hessian, so this \
-             is only evidence of a formula difference when it exceeds what the conditioning \
-             explains. The joint result is graded on the SHIPPED scalar-route score below, \
-             which is a like-for-like comparison; this line is the record that the two \
-             assemblies parted company (joint_final={joint_final_value:.12e}, \
-             theta_checkpoint={:?}).",
-            joint_seed_value - baseline_score,
-            (joint_seed_value - baseline_score) / baseline_score.abs().max(f64::MIN_POSITIVE),
-            theta_star.to_vec(),
-        );
-    }
+    // assemblies part company at the scale `ε·κ` predicts. And a SYSTEMATIC
+    // disagreement exists besides (2026-07-31, #2644):
+    // `misc::broad_sweep_batch_h::matern_low_n_does_not_crash` shows
+    // `gap = 3.674e-8` bit-identical across two nightlies and a local run at two
+    // different θ0 (runs 30602192415 and 30619084852), so the two routes are
+    // evaluating slightly different functions there and the gap is reproducible
+    // enough to bisect term by term at θ0. The joint result is graded on the
+    // SHIPPED scalar-route score below, a like-for-like comparison; this line is
+    // the record of how far the two assemblies parted company.
+    log::debug!(
+        "[spatial-kappa] route agreement at theta0: joint_seed={joint_seed_value:.12e} \
+         baseline={baseline_score:.12e} gap={:.6e} ({:.6e} relative) \
+         joint_final={joint_final_value:.12e} theta_checkpoint={:?}",
+        joint_seed_value - baseline_score,
+        (joint_seed_value - baseline_score) / baseline_score.abs().max(f64::MIN_POSITIVE),
+        theta_star.to_vec(),
+    );
     // Descent contract. Measured on `b8745892a`, this is the half that actually
     // fires (`seed=6.613467e1, final=6.613469e1, initial=6.613467e1` on the
     // binomial-logit Matérn fixture): the two routes agree at θ0 to every
@@ -379,11 +327,11 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // construction rather than checked after the fact. The regression is still
     // a solver defect and must stay visible, so it is logged with both values
     // and the rejected checkpoint rather than silently absorbed.
-    let (theta_star, joint_final_value) = if joint_final_value > joint_seed_value + accept_tol {
+    let (theta_star, joint_final_value) = if joint_final_value > joint_seed_value {
         log::debug!(
             "[spatial-kappa] the exact joint search terminated ABOVE its own seed \
              (seed={joint_seed_value:.12e}, final={joint_final_value:.12e}, \
-             regression={:.3e}, acceptance_tolerance={accept_tol:.3e}); its terminal \
+             regression={:.3e}); its terminal \
              certificate is local/boundary at theta={:?} and does not dominate the seed, \
              so the seed is kept and joint kappa optimization is a no-op for this fit. \
              A descent method returning a point worse than its start is a solver defect \
@@ -448,11 +396,11 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // that lands above its own seed — and for the same reason: this routine
     // holds both candidates and can simply return the better one.
     let optimized_score = fit_score(&optimized.fit);
-    if optimized_score > baseline_score + accept_tol {
+    if optimized_score > baseline_score {
         log::debug!(
             "[spatial-kappa] joint kappa optimization did not improve the SHIPPED scalar-route \
              score (baseline={baseline_score:.12e}, at theta_star={optimized_score:.12e}, \
-             regression={:.3e}, acceptance_tolerance={accept_tol:.3e}); keeping the incumbent \
+             regression={:.3e}); keeping the incumbent \
              fit and treating joint kappa optimization as a no-op for this fit. Both numbers \
              are `fit_score` of a scalar-route fit, so unlike the theta0 cross-route line this \
              comparison is like-for-like and a regression here is a real one.",
