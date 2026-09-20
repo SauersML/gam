@@ -357,7 +357,13 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
     if GenericEdmCell::classify(&spec.response, inverse_link).is_some() {
         return true;
     }
-    if matches!(spec.response, ResponseFamily::NegativeBinomial { .. }) {
+    // NB-log and Tweedie-log (1<p<2; the canonical Tweedie link is
+    // μ^{1−p}/(1−p)) are non-canonical: their observed information carries the
+    // residual term and has a closed form in `observed_weight_dispatch`.
+    if matches!(
+        spec.response,
+        ResponseFamily::NegativeBinomial { .. } | ResponseFamily::Tweedie { .. }
+    ) {
         return matches!(inverse_link, InverseLink::Standard(StandardLink::Log));
     }
     // Every link of these continuous families has an analytic 5-jet, and the
@@ -796,8 +802,8 @@ pub(crate) fn e_obs_from_jets(
     pw * e_obs
 }
 
-// Closed-form observed-information weights for the log-link Gamma and
-// negative-binomial pairs: algebraically identical to the generic tower, but
+// Closed-form observed-information weights for the log-link Gamma, Tweedie
+// and negative-binomial pairs: algebraically identical to the generic tower, but
 // free of its large-η intermediates (each item states its algebra).
 
 /// Gamma family with log link: `V(μ)=μ²`, `μ=exp(η)`.
@@ -821,10 +827,59 @@ pub(crate) fn observed_weight_gamma_log(y: f64, mu: f64, phi: f64, pw: f64) -> (
     (w, -w, w)
 }
 
+/// Tweedie family (1<p<2) with log link: `V(μ)=μ^p`, `μ=exp(η)`.
+///
+/// Up to `ω/φ` the row's negative log-likelihood is
+/// `ψ(η) = e^{(2−p)η}/(2−p) − y e^{(1−p)η}/(1−p)`, so `W_obs = ψ''` is a sum
+/// of two exponentials of `η`:
+///
+/// ```text
+/// A = (ω/φ) (p−1) y μ^{1−p}   (η-rate 1−p),   B = (ω/φ) (2−p) μ^{2−p}   (η-rate 2−p)
+/// w_obs = A + B
+/// c_obs = (1−p) A + (2−p) B
+/// d_obs = (1−p)² A + (2−p)² B
+/// ```
+///
+/// `A, B ≥ 0`, so `w_obs` and `d_obs` are sums of non-negative terms, and the
+/// only sign change (in `c_obs`) is the true one. The generic tower forms the
+/// same `w_obs` as `W_F − (y−μ)·T₁`, which at `y = 0` subtracts two same-sign
+/// terms and keeps only a `(2−p)` fraction of them, amplifying the relative
+/// error by about `(2−p)^{−k}` in the k-th η-derivative. The closed form
+/// reduces to Gamma-log at `p = 2` and to Poisson-log at `p = 1`.
+#[inline]
+pub(crate) fn observed_weight_tweedie_log(
+    y: f64,
+    mu: f64,
+    p: f64,
+    phi: f64,
+    pw: f64,
+) -> (f64, f64, f64) {
+    let rate_y = 1.0 - p;
+    let rate_mu = 2.0 - p;
+    let scale = pw / phi;
+    // A zero row has no `y`-term; skipping it keeps an underflowed `μ = 0`
+    // from forming `0·∞`.
+    let term_y = if y == 0.0 {
+        0.0
+    } else {
+        scale * (p - 1.0) * y * mu.powf(rate_y)
+    };
+    let term_mu = scale * rate_mu * mu.powf(rate_mu);
+    let w = term_y + term_mu;
+    let c = rate_y * term_y + rate_mu * term_mu;
+    let d = rate_y * rate_y * term_y + rate_mu * rate_mu * term_mu;
+    (w, c, d)
+}
+
 /// NB2 observed information under the log link, evaluated through bounded
-/// ratios.  With `r = theta/(theta+mu)` and `s = 1-r`,
+/// ratios.  With `r = theta/(theta+mu)` and `s = mu/(theta+mu) = 1-r`,
 /// `W_obs = prior (y+theta) r s`, `W' = W(r-s)`, and
 /// `W'' = W((r-s)^2 - 2rs)`.
+///
+/// Both `r` and `s` are formed directly from the ratio `q = mu/theta` (or its
+/// reciprocal) instead of computing `s` as `1 - r`. In the Poisson limit
+/// `mu << theta`, `1 - r` would lose `log10(theta/mu)` digits, and it becomes
+/// exactly zero once `mu/theta < eps/2`.
 #[inline]
 pub(crate) fn observed_weight_negative_binomial_log(
     y: f64,
@@ -832,13 +887,19 @@ pub(crate) fn observed_weight_negative_binomial_log(
     theta: f64,
     prior_weight: f64,
 ) -> (f64, f64, f64) {
-    let r = if theta >= mu {
-        1.0 / (1.0 + mu / theta)
+    let (r, s) = if theta >= mu {
+        let mu_over_theta = mu / theta;
+        (
+            1.0 / (1.0 + mu_over_theta),
+            mu_over_theta / (1.0 + mu_over_theta),
+        )
     } else {
         let theta_over_mu = theta / mu;
-        theta_over_mu / (1.0 + theta_over_mu)
+        (
+            theta_over_mu / (1.0 + theta_over_mu),
+            1.0 / (1.0 + theta_over_mu),
+        )
     };
-    let s = 1.0 - r;
     let w = prior_weight * (y + theta) * r * s;
     let c = w * (r - s);
     let d = w * ((r - s) * (r - s) - 2.0 * r * s);
@@ -977,6 +1038,9 @@ pub(crate) fn observed_weight_dispatch(
         }
         (WeightFamily::NegativeBinomial { theta }, WeightLink::Log) => {
             observed_weight_negative_binomial_log(y, mu, theta, prior_weight)
+        }
+        (WeightFamily::Tweedie { p }, WeightLink::Log) => {
+            observed_weight_tweedie_log(y, mu, p, phi, prior_weight)
         }
         _ => {
             // Generic noncanonical path via the full variance-function jet.

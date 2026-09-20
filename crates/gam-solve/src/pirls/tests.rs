@@ -2510,6 +2510,134 @@ mod tests {
     }
 
     #[test]
+    fn tweedie_log_observed_curvature_matches_dual3() {
+        use num_dual::DualNum;
+        let (phi, prior_weight) = (0.6_f64, 1.4_f64);
+        for p in [1.2_f64, 1.5, 1.9] {
+            for y in [0.0_f64, 0.7, 3.0] {
+                for eta in [-2.0_f64, 0.3, 2.5] {
+                    let mu = eta.exp();
+                    let jet = MixtureInverseLinkJet {
+                        mu,
+                        d1: mu,
+                        d2: mu,
+                        d3: mu,
+                    };
+                    let dispatched = observed_weight_dispatch(
+                        WeightFamily::Tweedie { p },
+                        WeightLink::Log,
+                        y,
+                        mu,
+                        1.0 - mu,
+                        phi,
+                        prior_weight,
+                        jet,
+                        mu,
+                    );
+                    // −∂²ℓ/∂η² for ℓ = [y·e^{(1−p)η}/(1−p) − e^{(2−p)η}/(2−p)]/φ is
+                    // [(p−1)·y·e^{(1−p)η} + (2−p)·e^{(2−p)η}]/φ.
+                    assert_observed_tower_matches_dual3(
+                        &format!("Tweedie log p={p} y={y}"),
+                        dispatched,
+                        |x| {
+                            ((x * (1.0 - p)).exp() * ((p - 1.0) * y)
+                                + (x * (2.0 - p)).exp() * (2.0 - p))
+                                * (prior_weight / phi)
+                        },
+                        eta,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Tweedie with the log link is non-canonical for 1<p<2, so it must be
+    /// served observed information. On a zero row the observed weight is
+    /// `(2−p)` times the Fisher weight `ω μ^{2−p}/φ`.
+    #[test]
+    fn tweedie_log_is_served_observed_curvature() {
+        let p = 1.5_f64;
+        let link = InverseLink::Standard(StandardLink::Log);
+        let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Tweedie { p },
+            link.clone(),
+        ));
+        assert!(super::supports_observed_hessian_curvature_for_likelihood(
+            &likelihood,
+            &link
+        ));
+        let phi = super::fixed_glm_dispersion(&likelihood).expect("Tweedie dispersion");
+        let eta = array![0.4, -0.3, 1.1];
+        let mu = eta.mapv(f64::exp);
+        let y = array![0.0, 2.5, 0.2];
+        let prior = array![1.0, 0.8, 1.6];
+        let fisher = Array1::from_iter(
+            (0..eta.len()).map(|i| prior[i] * mu[i].powf(2.0 - p) / phi),
+        );
+        let (w_obs, _, _) = compute_observed_hessian_curvature_arrays(
+            &likelihood,
+            &link,
+            &eta,
+            y.view(),
+            &fisher,
+            prior.view(),
+        )
+        .expect("Tweedie-log observed curvature should evaluate");
+        for i in 0..eta.len() {
+            let expected = fisher[i] * ((p - 1.0) * y[i] / mu[i] + (2.0 - p));
+            assert_relative_eq!(w_obs[i], expected, epsilon = 0.0, max_relative = 1e-13);
+            assert!(
+                (w_obs[i] - fisher[i]).abs() > 1e-3 * fisher[i],
+                "row {i}: y != mu, so observed and Fisher weights must differ"
+            );
+        }
+        assert_relative_eq!(w_obs[0], (2.0 - p) * fisher[0], epsilon = 0.0, max_relative = 1e-13);
+    }
+
+    /// In the Poisson limit `mu << theta` the NB2 observed weight is
+    /// `≈ prior·mu·(y+theta)/theta`. Forming `s = 1 − r` there loses
+    /// `log10(theta/mu)` digits and returns exactly zero once `mu/theta < eps/2`.
+    #[test]
+    fn negative_binomial_log_observed_curvature_keeps_poisson_limit_precision() {
+        use num_dual::DualNum;
+        let prior_weight = 0.9;
+        for theta in [1.0e7_f64, 1.0e12] {
+            for y in [0.0_f64, 2.0] {
+                for eta in [-27.6_f64, -5.0, 0.0] {
+                    let mu = eta.exp();
+                    let jet = MixtureInverseLinkJet {
+                        mu,
+                        d1: mu,
+                        d2: mu,
+                        d3: mu,
+                    };
+                    let dispatched = observed_weight_dispatch(
+                        WeightFamily::NegativeBinomial { theta },
+                        WeightLink::Log,
+                        y,
+                        mu,
+                        1.0 - mu,
+                        1.0,
+                        prior_weight,
+                        jet,
+                        mu,
+                    );
+                    assert!(dispatched.0 > 0.0, "theta={theta} eta={eta}: W collapsed to {dispatched:?}");
+                    assert_observed_tower_matches_dual3(
+                        &format!("NB2 log Poisson limit theta={theta} y={y}"),
+                        dispatched,
+                        |x| {
+                            let mu = x.exp();
+                            (mu * theta) / ((mu + theta) * (mu + theta)) * (prior_weight * (y + theta))
+                        },
+                        eta,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     pub(crate) fn gamma_log_observed_curvature_dispatch_avoids_generic_overflow() {
         let y = 1.25;
         let phi = 0.5;
