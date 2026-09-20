@@ -2734,7 +2734,7 @@
     "evidence": "git grep finds no caller of posterior_eta_bands, posterior_eta_bands_impl, eta_bands_from_matrix_link, LinkSelector or posterior_quantile_from_sorted after the deletion."
   },
   {
-    "base": "0b9dc2c6b850eff58b11003192136420ef7233e7",
+    "base": "db8172c18d77f3cf412550268a6ce520be42b002",
     "items": [
       "crates/gam-inference/src/rho_posterior.rs:fn:normal",
       "crates/gam-models/src/bms/mod.rs:fn:signed_weighted_gram",
