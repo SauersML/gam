@@ -101,12 +101,8 @@ pub(crate) const ROW_CHUNK_BYTE_BUDGET: usize =
 pub(crate) const MONOTONICITY_GUARD_SLACK_REL: f64 = 1e-12;
 
 /// Location-scale guard policy: a degenerate `guard == 0` (a bare
-/// non-negativity request on `q'(t)`) is admissible here, and feasibility of
-/// coefficient-free rows uses the family's historical absolute slack.
-pub(crate) const LOCATION_SCALE_GUARD_POLICY: GuardConstraintPolicy = GuardConstraintPolicy {
-    guard_policy: GuardPolicy::NonNegative,
-    feasibility: FeasibilityTolerance::AbsoluteScaled,
-};
+/// non-negativity request on `q'(t)`) is admissible here.
+pub(crate) const LOCATION_SCALE_GUARD_POLICY: GuardPolicy = GuardPolicy::NonNegative;
 
 pub(crate) const DENSE_WEIGHTED_CROSSPROD_PARALLEL_FLOP_THRESHOLD: u64 = 200_000;
 

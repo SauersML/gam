@@ -57,8 +57,7 @@ use crate::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 use crate::survival::predict::{LocationScaleEtaComponents, location_scale_eta_components};
 
 use crate::survival::time_constraints::{
-    FeasibilityTolerance, GuardConstraintFailure, GuardConstraintPolicy, GuardPolicy,
-    build_time_derivative_guard_constraints,
+    GuardConstraintFailure, GuardPolicy, build_time_derivative_guard_constraints,
 };
 
 use crate::wiggle::{

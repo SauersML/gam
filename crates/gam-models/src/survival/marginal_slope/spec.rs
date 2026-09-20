@@ -112,24 +112,6 @@ pub struct SurvivalMarginalSlopeTermSpec {
 pub(crate) const DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD: f64 = 1e-6;
 
 #[inline]
-pub(crate) fn survival_derivative_guard_tolerance(qd1: f64, derivative_guard: f64) -> f64 {
-    // The monotonicity bound q'(t) >= derivative_guard is enforced by the inner
-    // active-set solver against SCALED constraint rows (each scaled by
-    // max(||row||, |guard-offset|, 1) >= 1) to ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
-    // so a converged active constraint legitimately sits up to that tolerance on
-    // the infeasible side of the exact bound. The likelihood-domain predicate must
-    // admit the same band the solver can certify -- matching validate_time_qd1_feasible
-    // -- otherwise boundary-feasible oversmoothed iterates are spuriously rejected and
-    // every outer seed fails (#788). log(c*qd1) is finite for any qd1 > 0, so this
-    // admits no numerically unsafe iterate; it only stops rejecting boundary-feasible
-    // points. The raw 256*eps band remains as a floor.
-    let magnitude = 1.0 + qd1.abs().max(derivative_guard.abs());
-    let solver_band = 4.0 * gam_solve::pirls::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL * magnitude;
-    let eps_floor = 256.0 * f64::EPSILON * magnitude;
-    solver_band.max(eps_floor)
-}
-
-#[inline]
 pub(crate) fn survival_derivative_guard_violated(qd1: f64, derivative_guard: f64) -> bool {
     if !qd1.is_finite() {
         return true;
@@ -141,8 +123,11 @@ pub(crate) fn survival_derivative_guard_violated(qd1: f64, derivative_guard: f64
     if derivative_guard == f64::NEG_INFINITY {
         return false;
     }
+    // The band is the builder's offset-only band, so the domain test and the
+    // constraint build agree; it admits the boundary-feasible iterates the
+    // solver certifies (#788), and log(c·qd1) stays finite for any qd1 > 0.
     !derivative_guard.is_finite()
-        || (qd1 + survival_derivative_guard_tolerance(qd1, derivative_guard) < derivative_guard)
+        || (qd1 + derivative_guard_feasibility_band(qd1, derivative_guard) < derivative_guard)
 }
 
 pub struct SurvivalMarginalSlopeFitResult {

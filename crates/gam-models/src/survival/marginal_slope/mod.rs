@@ -78,8 +78,8 @@ pub(crate) use crate::survival::location_scale::{
 };
 
 pub(crate) use crate::survival::time_constraints::{
-    FeasibilityTolerance, GuardConstraintFailure, GuardConstraintPolicy, GuardPolicy,
-    build_time_derivative_guard_constraints,
+    GuardConstraintFailure, GuardPolicy, build_time_derivative_guard_constraints,
+    derivative_guard_feasibility_band, derivative_row_is_immovable,
 };
 
 pub(crate) use crate::wiggle::monotone_wiggle_basis_with_derivative_order;
