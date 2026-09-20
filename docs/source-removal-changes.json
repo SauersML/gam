@@ -2225,6 +2225,15 @@
     "evidence": "Direct gate dy7 run w2tha-g1-predict (direct-dy7-w2tha-g1-predict.log) at 96a81f3bca on this change gave RC_CHECK 0, SCANNER_ERRORS 0 and RC_PYFFI 0. The gam-predict gamma, negbin and tweedie dispersion_location_scale_assembles_covariance_and_is_predictable tests passed 3 of 3; gamma had been red at 64f2129d00 (dy3 w2o-3140-basectl) and at 96a81f3bca (dy6 w2tha-pr1b). The guard's only hit is this override. The name's other occurrences are the trait declaration, its callers and other families' own overrides, none of which change."
   },
   {
+    "base": "45d1a4328ec82034e602ca762a1232a27a3934bc",
+    "items": [
+      "crates/gam-custom-family/src/inner_blockwise_fit.rs:const:POLISH_MAX_ITER",
+      "crates/gam-custom-family/src/inner_blockwise_fit.rs:fn:polish_joint_newton_step"
+    ],
+    "reason": "#2973 (comment 5745385706): polish_joint_newton_step was unreachable. Its only call sat under `if use_joint_newton && !converged` after the blockwise loop of inner_blockwise_fit_for_product, and use_joint_newton is an immutable let that, when true, has already returned through fit_exact_joint. The guard was always false, so the function, its POLISH_MAX_ITER iteration bound and its call block are deleted instead of flooring its stationarity test like the two live copies (718f9b6bc2).",
+    "evidence": "At the base both names occur only in inner_blockwise_fit.rs (the call, the fn, and the const inside it); at the head git grep -w finds neither under crates, src or tests. inner_blockwise_fit.rs at this base is byte-identical to the polishdel gate parent 148435843c (blob 210f50eece), where gam-custom-family check --all-targets, the lib suite (365/366, the one red is the main red a_refusal_with_evidence_refits_armed_once_and_publishes_it_2995), laml_inner_accuracy_2668, cargo check --workspace --all-targets and cargo build --workspace --lib all passed. Every helper the deleted body called keeps another caller."
+  },
+  {
     "base": "e8568910a946906a0cd9dc56ee1d988b8e45002f",
     "items": [
       "crates/gam-solve/src/arrow_schur/newton_step.rs:enum:MixedPrecisionAttempt",
