@@ -4421,21 +4421,23 @@ impl SaeSupportSparseTerm {
         Ok(solutions)
     }
 
-    /// Return `A^+ Gamma`, the one adjoint needed for the implicit derivative of
-    /// the Gauss--Newton arrow's log determinant
-    /// `log|H| = Σ_i log|H_tt^(i)| + log|S|` (#2933 F27 S2). `Gamma` is the exact
-    /// derivative, with respect to the fitted inner state, of the row blocks' log
-    /// determinants and of the frozen rational surrogate of `log|S|`. The latter is
-    /// assembled from the surrogate's own low-rank derivative vectors. `A` is the
-    /// exact stationarity Jacobian of the penalized inner objective, not its
-    /// Gauss--Newton majorizer.
+    /// Return `(Gamma, A^+ Gamma)`: the inner-state derivative of the
+    /// Gauss--Newton arrow's log determinant
+    /// `log|H| = Σ_i log|H_tt^(i)| + log|S|`, and the one adjoint needed for its
+    /// implicit derivative (#2933 F27 S2). `Gamma` is the exact derivative, with
+    /// respect to the fitted inner state, of the row blocks' log determinants and of
+    /// the frozen rational surrogate of `log|S|`. The latter is assembled from the
+    /// surrogate's own low-rank derivative vectors. `A` is the exact stationarity
+    /// Jacobian of the penalized inner objective, not its Gauss--Newton majorizer.
+    /// `Gamma` itself prices the log determinant's error at an inexact inner state
+    /// (#3340): it moves by `−⟨Gamma, Δ⟩` along the Newton displacement `Δ`.
     pub(crate) fn support_reduced_logdet_profile_adjoint(
         &self,
         target: ArrayView2<'_, f64>,
         ard_precisions: &[Vec<f64>],
         system: &ArrowSchurSystem,
         derivative: &RationalLogdetDerivativeBundle,
-    ) -> Result<SaeArrowVector, String> {
+    ) -> Result<(SaeArrowVector, SaeArrowVector), String> {
         let derivative_vectors = derivative.vectors.as_slice();
         if derivative_vectors.is_empty() {
             return Err(
@@ -4520,16 +4522,18 @@ impl SaeSupportSparseTerm {
                     .to_string(),
             );
         }
-        self.support_reduced_logdet_adjoint_solves(
-            system,
-            &rows,
-            std::slice::from_ref(&gamma),
-            derivative,
-        )?
-        .pop()
-        .ok_or_else(|| {
-            "support reduced-logdet profile adjoint solve returned no solution".to_string()
-        })
+        let adjoint = self
+            .support_reduced_logdet_adjoint_solves(
+                system,
+                &rows,
+                std::slice::from_ref(&gamma),
+                derivative,
+            )?
+            .pop()
+            .ok_or_else(|| {
+                "support reduced-logdet profile adjoint solve returned no solution".to_string()
+            })?;
+        Ok((gamma, adjoint))
     }
 
     /// Per-probe implicit responses of a surrogate `log|S|` derivative bundle

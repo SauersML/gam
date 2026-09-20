@@ -12,7 +12,8 @@
 use std::fmt::Write as _;
 
 use crate::cubic_cell_kernel::{
-    GL_NODES_FOR_GPU_KERNEL, GL_WEIGHTS_FOR_GPU_KERNEL, gaussian_moment_underflow_radius,
+    TERMINAL_GL_ORDER, gaussian_moment_underflow_radius, gl_nodes_for_gpu_kernel,
+    gl_weights_for_gpu_kernel,
 };
 
 /// Emit the full NVRTC source for one `max_degree` specialization. The kernel
@@ -30,16 +31,26 @@ pub(crate) fn build_cubic_deriv_moments_kernel_source(max_degree: usize) -> Stri
     )
     .expect("writes to String are infallible");
     src.push_str("#define MOMENT_STRIDE (MAX_DEGREE + 1)\n");
-    src.push_str("#define GL_N 384\n");
-    src.push_str("#define LANES_PER_WARP 32\n");
-    src.push_str("#define NODES_PER_LANE 12\n\n");
+    writeln!(src, "#define GL_N {TERMINAL_GL_ORDER}").expect("writes to String are infallible");
+    // One warp sweeps the terminal rule: every lane takes the same number of
+    // nodes, so the order must be a whole number of warps.
+    const LANES_PER_WARP: usize = 32;
+    const _: () = assert!(TERMINAL_GL_ORDER % LANES_PER_WARP == 0);
+    writeln!(src, "#define LANES_PER_WARP {LANES_PER_WARP}")
+        .expect("writes to String are infallible");
+    writeln!(
+        src,
+        "#define NODES_PER_LANE {}\n",
+        TERMINAL_GL_ORDER / LANES_PER_WARP
+    )
+    .expect("writes to String are infallible");
 
     src.push_str("__constant__ double GL_NODES[GL_N] = {\n");
-    emit_table(&mut src, GL_NODES_FOR_GPU_KERNEL);
+    emit_table(&mut src, gl_nodes_for_gpu_kernel());
     src.push_str("};\n\n");
 
     src.push_str("__constant__ double GL_WEIGHTS[GL_N] = {\n");
-    emit_table(&mut src, GL_WEIGHTS_FOR_GPU_KERNEL);
+    emit_table(&mut src, gl_weights_for_gpu_kernel());
     src.push_str("};\n\n");
 
     src.push_str(DEVICE_HELPERS);
@@ -55,7 +66,7 @@ pub(crate) fn build_cubic_deriv_moments_kernel_source(max_degree: usize) -> Stri
     src
 }
 
-fn emit_table(dst: &mut String, table: &[f64; 384]) {
+fn emit_table(dst: &mut String, table: &[f64]) {
     for value in table.iter() {
         writeln!(dst, "    {value:.17e},").expect("writes to String are infallible");
     }
@@ -219,7 +230,7 @@ const KERNEL_BODY: &str = r#"    const double* __restrict__ cell_left,
         #pragma unroll 1
         for (int j = 0; j < NODES_PER_LANE; ++j) {
             int idx = (int)lane + j * LANES_PER_WARP;
-            // idx in [0, 384).
+            // idx in [0, GL_N).
             double t = GL_NODES[idx];
             double w = GL_WEIGHTS[idx];
             double z = mid + half * t;
