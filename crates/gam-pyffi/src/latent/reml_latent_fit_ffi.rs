@@ -4647,13 +4647,12 @@ fn survival_concordance(
         )));
     }
     // Delegate to the single source of truth for Harrell's C-index in
-    // gam-models (`survival::predict::harrell_concordance`). The core counts
-    // tied event times as a comparable half-credit pair and returns None when
-    // there are no comparable pairs at all (e.g. every row censored); the old
-    // hand-rolled pair loop here dropped tied-time pairs entirely and returned
-    // a silent 0.5 sentinel. Where the two disagreed the core wins — a None
-    // degenerate result is surfaced as Python None, matching how the
-    // neighboring metric pyfunctions report an undefined score.
+    // gam-models (`survival::predict::harrell_concordance`), which applies the
+    // standard pair rules (tied events are not comparable; an event tied with a
+    // censoring is, the censored subject being the survivor) and returns None
+    // when the score is undefined (no comparable pair, or a non-finite input).
+    // None is surfaced as Python None, matching how the neighboring metric
+    // pyfunctions report an undefined score.
     Ok(gam::families::survival::predict::harrell_concordance(
         &event_times,
         &events,

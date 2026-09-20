@@ -437,12 +437,13 @@ fn summary_curvature_estimands(model: &FittedModel) -> Vec<SummaryCurvatureRow> 
         if !cc.kappa.is_finite() {
             continue;
         }
-        // Sign-of-κ̂ point tag. The flatness band is a fixed, small absolute
-        // window on the curvature scale — a screening label only; the
-        // statistically-honest "flat vs curved" call is the κ = 0 LR test.
-        let geometry = if cc.kappa > 1e-6 {
+        // Sign-of-κ̂ point tag, read off the exact sign. κ carries units of
+        // inverse squared length, so any fixed band around zero would move
+        // with the latent scale; the "flat vs curved" call belongs to the
+        // κ = 0 LR test, not to this label.
+        let geometry = if cc.kappa > 0.0 {
             "spherical"
-        } else if cc.kappa < -1e-6 {
+        } else if cc.kappa < 0.0 {
             "hyperbolic"
         } else {
             "flat"
@@ -1102,7 +1103,7 @@ pub struct SummaryCurvatureRow {
     pub term_idx: usize,
     /// Fitted signed sectional curvature κ̂.
     pub kappa_hat: f64,
-    /// Sign-of-κ̂ geometry tag: `"spherical"` (κ̂>0), `"flat"` (κ̂≈0), or
+    /// Sign-of-κ̂ geometry tag: `"spherical"` (κ̂>0), `"flat"` (κ̂=0), or
     /// `"hyperbolic"` (κ̂<0). A point estimate only — the level-α verdict comes
     /// from the profile-CI endpoints via `curvature_inference_json`.
     pub geometry: &'static str,

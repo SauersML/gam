@@ -19,6 +19,7 @@ from numpy.typing import NDArray
 from ._binding import rust_module
 from ._diagnostics import Diagnostics
 from ._exceptions import map_exception
+from ._partial_effect import PartialEffect
 from ._sampling import PosteriorSamples
 from ._schema import SchemaCheck
 from ._summary import Summary
@@ -191,24 +192,36 @@ class Model:
             band at ``conformal_level`` coverage in ``posterior_mean_lower`` /
             ``posterior_mean_upper`` — the same routes as ``gam predict
             --conformal``. Exactly one of ``training_data`` or ``calibration``
-            is required. With ``training_data`` it is the full-conformal set of
-            the fit that re-selects the smoothing strength by REML on the
-            training rows plus the candidate test row (#942 Layer 3): every
-            labeled row is used for both fitting and calibration, and the test
-            row is treated exactly like a training row, so the finite-sample
-            ``conformal_level`` coverage theorem holds. It costs one Cholesky
-            per test point plus a cold REML refit at each finite endpoint. It
-            needs a Gaussian-identity model fitted without prior weights,
-            offsets, or a link wiggle. The saved model carries only the
-            ``p x p`` frozen penalty and its smoothing-parameter count, never
-            per-row training data, so the labeled rows are passed again here.
-            The per-row ``conformal_certificate`` output column is 0
-            (exact_frozen: nothing to re-select) or 1 (honest_refit) where the
-            guarantee holds; a negative code is a typed refusal (several
-            smoothing parameters, a payload without the count, a degenerate
-            criterion) where the row carries the frozen-smoothing set with no
-            finite-sample guarantee. The bounds report the outer envelope of
-            the (possibly multi-interval) set. With ``calibration`` it is the
+            is required. With ``training_data`` it is the full-conformal set
+            built on the labeled rows plus the candidate test row: every
+            labeled row is used for both fitting and calibration. A
+            Gaussian-identity model gets the set of the fit that re-selects the
+            smoothing strength by REML on the augmented rows (#942 Layer 3), so
+            the finite-sample ``conformal_level`` coverage theorem holds; it
+            costs one Cholesky per test point plus a cold REML refit at each
+            finite endpoint. Bernoulli-logit (the set is a subset of
+            ``{0, 1}``), Poisson-log and negative-binomial-log (candidates
+            enumerated up to a data-derived tail beyond which none can conform;
+            NB theta frozen at its fitted value) and Gamma-log (Pearson score,
+            so the set is a band in ``y / mu``) refit the augmented penalized
+            likelihood per candidate at the frozen penalty. Discrete ties are
+            broken by a seeded uniform so the set is exact rather than
+            conservative. Offsets are honoured. A model fitted with prior
+            weights raises ``InvalidConfigurationError``: the candidate point
+            has no weight, so use ``calibration=`` (split conformal) instead.
+            The saved model carries only the ``p x p`` frozen penalty and its
+            smoothing-parameter count, never per-row training data, so the
+            labeled rows are passed again here. The per-row
+            ``conformal_certificate`` output column is 0 (exact_frozen: nothing
+            to re-select) or 1 (honest_refit) where the guarantee holds; a
+            negative code is a typed refusal where the row carries the
+            frozen-penalty set with no finite-sample guarantee for the
+            selection step (several smoothing parameters, a payload without the
+            count, a degenerate criterion, or ``-7`` glm_frozen_penalty for a
+            non-Gaussian fit that selected a smoothing parameter or NB theta).
+            The set is a union of ``conformal_set_components`` intervals and
+            the bounds report its outer envelope (NaN for an empty randomized
+            set). With ``calibration`` it is the
             split-conformal band ``mu_hat(x) +/- q_hat * s(x)`` calibrated on
             that held-out fold, with finite-sample marginal coverage
             ``>= conformal_level`` regardless of model misspecification, for
@@ -1435,14 +1448,18 @@ class Model:
         term: str,
         grid: Any | None = None,
         n_points: int = 100,
-    ) -> dict[str, Any]:
-        """A term's contribution to the linear predictor, with delta-method SE.
+        level: float = 0.95,
+    ) -> PartialEffect:
+        """A term's partial effect, with pointwise intervals and a simultaneous band.
 
-        For ``term`` this returns ``f_t(x) = X_t(x) β_t`` and the delta-method
-        standard error ``sqrt(diag(X_t V_t X_tᵀ))``. The Rust core
-        (``model_partial_dependence``) builds the grid from the saved term
-        specification and evaluates both. The term's axes sweep their training
-        range, or ``grid``. A factor ``by=`` block holds the level its
+        For ``term`` this returns ``f_t(x) = X_t(x) β_t``, its standard error
+        ``sqrt(diag(X_t V_t X_tᵀ))``, pointwise intervals and a simultaneous
+        band at ``level``, all from the Rust core
+        (``gam_predict::partial_effect::partial_effect``, the function the CLI's
+        ``gam partial-effect`` also reads). The grid comes from the saved term
+        specification: each numeric axis sweeps ``n_points`` values over its
+        training range and each factor axis takes every level, as a product grid
+        over the term's axes. A factor ``by=`` block holds the level its
         specification records. No other column enters ``X_t``, so the result
         never depends on a reference table.
 
@@ -1456,29 +1473,22 @@ class Model:
         Parameters
         ----------
         term:
-            Term name as it appears in :attr:`term_blocks` (e.g. ``"s(x1)"``).
+            Term name as it appears in :attr:`term_blocks` (e.g. ``"s(x1)"``,
+            ``"te(x1, x2)"`` or a factor such as ``"group"``).
         grid:
             Optional explicit grid: 1-D for a single-axis term, or 2-D
             ``(n_points, d)`` with columns in the order of the returned ``axes``.
-            When ``None``, ``n_points`` values span the one axis's training range.
+            A factor axis takes level codes, as ``axis_levels`` lists them.
         n_points:
-            Grid resolution when ``grid`` is ``None``.
+            Values per numeric axis when ``grid`` is ``None``.
+        level:
+            Coverage level of the pointwise intervals and the simultaneous band.
 
         Returns
         -------
-        dict
-            - ``grid``: 1-D for one axis, else ``(n, d)``.
-            - ``axes``: the term's axis columns, in grid-column order.
-            - ``predicted`` and ``standard_error``: the curve and its delta-method SE.
-            - ``covariance_source``: the covariance the SEs are priced off, the same
-              one ``summary()`` reports. It is ``"smoothing-corrected"`` whenever
-              the fit carries that matrix, otherwise ``"conditional"``.
-            - ``scale``: always ``"linear_predictor"``.
-            - ``quantity``: ``"term_contribution"``, or ``"coefficient_function"``
-              for a numeric ``by=`` smooth.
-            - ``contribution``: how the curve enters the predictor, e.g.
-              ``"z * f(x)"``.
-            - ``held``: the columns the term reads that every grid row fixes.
+        PartialEffect
+            See :class:`gamfit.results.PartialEffect`. ``surface()`` reshapes any series
+            of a multi-axis term onto its product grid.
         """
         import numpy as np
 
@@ -1490,16 +1500,37 @@ class Model:
             elif grid_matrix.ndim != 2:
                 raise ValueError("partial_dependence: grid must be 1-D or 2-D")
             grid_matrix = np.ascontiguousarray(grid_matrix)
-        result = dict(
-            rust_module().model_partial_dependence(
-                self._prediction_model, term, grid_matrix, int(n_points)
+        try:
+            raw = rust_module().model_partial_effect(
+                self._prediction_model, term, grid_matrix, int(n_points), float(level)
             )
-        )
-        grid_out = np.asarray(result["grid"], dtype=float)
-        result["grid"] = grid_out.reshape(-1) if grid_out.shape[1] == 1 else grid_out
-        result["predicted"] = np.asarray(result["predicted"], dtype=float)
-        result["standard_error"] = np.asarray(result["standard_error"], dtype=float)
-        return result
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        return PartialEffect._from_rust(dict(raw))
+
+    def plot_terms(
+        self,
+        terms: str | Sequence[str] | None = None,
+        *,
+        level: float = 0.95,
+        n_points: int = 100,
+        axes: Any | None = None,
+    ) -> Any:
+        """Draw each term's partial effect with matplotlib.
+
+        A one-axis numeric term is a line with its pointwise interval and its
+        simultaneous band; a factor term is one point per level with both
+        intervals as error bars; a two-axis term such as ``te(x, z)`` is a
+        filled contour of the surface with its standard-error contours. Every
+        number comes from :meth:`partial_dependence`.
+
+        ``terms`` defaults to every non-intercept term. ``axes`` is one
+        matplotlib axes per term; by default a new figure holds them. Returns
+        the list of axes drawn on.
+        """
+        from ._term_plot import plot_terms as _plot_terms
+
+        return _plot_terms(self, terms, level=level, n_points=n_points, axes=axes)
 
     def variance_share(
         self,
@@ -1577,16 +1608,21 @@ class Model:
         self,
         data: Any,
         *,
-        x: str | None = None,
         y: str | None = None,
         interval: float | None = 0.95,
         kind: str = "prediction",
         ax: Any | None = None,
     ) -> Any:
-        """Plot the model's behaviour on ``data`` with matplotlib."""
+        """Plot the model's behaviour on ``data`` with matplotlib.
+
+        ``kind="prediction"`` draws the fitted mean and its interval against the
+        data's one feature column, for a single-feature model; for a model with
+        several features use :meth:`plot_terms`, which draws each term's partial
+        effect. ``"residuals"`` and ``"observed_vs_predicted"`` take any model.
+        """
         from ._diagnose_plot import plot as _plot
 
-        return _plot(self, data, x=x, y=y, interval=interval, kind=kind, ax=ax)
+        return _plot(self, data, y=y, interval=interval, kind=kind, ax=ax)
 
     def __repr__(self) -> str:
         summary = self.summary()
