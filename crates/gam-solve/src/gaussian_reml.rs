@@ -1963,13 +1963,18 @@ fn block_orthogonal_profile_jet(
         }
     }
     let hessian_band = growth * hessian_magnitude.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let objective_band = growth * (determinant_magnitude + deviance_magnitude);
     Ok(BlockOrthogonalProfileJet {
         sample: SecondOrderSample {
             value,
             gradient,
             hessian: Some(hessian),
+            // The certificate's bar is the profile's own rounding band: the
+            // decrement left to the minimum is certified once it is below what
+            // one evaluation of `V` can resolve.
             decrement_bands: Some(DecrementBands {
-                objective: growth * (determinant_magnitude + deviance_magnitude),
+                objective: objective_band,
+                tolerance: objective_band,
                 gradient: gradient_band,
                 hessian: hessian_band,
             }),
