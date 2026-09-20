@@ -71,19 +71,6 @@
 struct ProfiledRemlPsiJet {
     /// `V(ψ)` — the λ-profiled REML negative log evidence.
     value: f64,
-    /// Did the inner `ρ̂` land on a bound?
-    ///
-    /// `V` is only a PROFILE where it does not: at a railed `ρ̂` the value is a
-    /// constrained minimum over a truncated λ range, and constrained and
-    /// unconstrained minima are not comparable to one another. That distinction
-    /// is a corner case in the κ direction, where the box is derived from the
-    /// geometry; it is decisive in the RANGE direction. Measured: `ρ̂ ≈ const −
-    /// ln ℓ` — each ×100 in `ℓ` costs 4.6 in `ρ̂`, which is `ln 100` exactly,
-    /// because the realized design scales like `1/ℓ` and λ has to follow it. So
-    /// a range box wide enough to be a pure floating-point wall ALWAYS walks
-    /// `ρ̂` into `RHO_LOWER`, and past that point the value moves spuriously by
-    /// tens of nats while the true criterion is flat.
-    rho_at_bound: bool,
     /// `∇V` in the coordinate order `(κ, η)`.
     gradient: [f64; 2],
     /// `∇²V`, symmetric, in the same order.
@@ -437,7 +424,6 @@ fn profiled_gaussian_reml_psi_jet(
     }
     Ok(ProfiledRemlPsiJet {
         value: fit.reml_score,
-        rho_at_bound,
         gradient,
         hessian,
     })
