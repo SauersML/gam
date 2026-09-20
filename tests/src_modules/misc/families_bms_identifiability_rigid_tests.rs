@@ -769,6 +769,29 @@ fn cross_block_identifiability_partial_alias_keeps_residual_rank() {
     let anchor_design = DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense.clone()));
     use super::deviation_runtime::ParametricAnchorBlock;
     let p_before = link_prepared.runtime.basis_dim();
+    // effective_rank(C): the same compile against the extra column alone, which
+    // lies outside span(C) and so aliases nothing. A simple-ended link basis's
+    // outermost ramps are nearly flat over the training rows, so this can sit
+    // below p_c (gam#3011).
+    let mut reference = link_prepared.clone();
+    let extra_design = DesignMatrix::Dense(DenseDesignMatrix::from(
+        extra_orth.clone().insert_axis(ndarray::Axis(1)),
+    ));
+    install_compiled_flex_block_into_runtime(
+        &mut reference,
+        &q0_seed,
+        &link_cfg,
+        &[(&extra_design, ParametricAnchorBlock::Marginal)],
+        &[],
+        &weights,
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "effective rank of the candidate", e));
+    let effective_rank = reference.runtime.basis_dim();
+    assert!(
+        effective_rank > k_alias && effective_rank <= p_before,
+        "partial-alias test needs effective_rank(C) > k_alias, got effective_rank={effective_rank}, \
+         k_alias={k_alias}, p_c={p_before}",
+    );
     install_compiled_flex_block_into_runtime(
         &mut link_prepared,
         &q0_seed,
@@ -786,11 +809,13 @@ fn cross_block_identifiability_partial_alias_keeps_residual_rank() {
     let p_after = link_prepared.runtime.basis_dim();
     assert_eq!(
         p_after,
-        p_before - k_alias,
-        "partial alias should drop exactly the {} aliased directions; got {} -> {}",
+        effective_rank - k_alias,
+        "partial alias should drop exactly the {} aliased directions; got {} -> {} \
+         (effective rank {})",
         k_alias,
         p_before,
         p_after,
+        effective_rank,
     );
     let new_design = link_prepared
         .runtime
@@ -3329,8 +3354,11 @@ fn observed_denested_partials_include_third_a_derivative_for_piecewise_cubic_lin
         },
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "link block", e));
+    // Not linear in the column index: on uniform simple-ended ramps a linear
+    // coefficient sequence reproduces a quadratic `w`, whose `w'''` is zero.
     let beta_w = Array1::from_iter(
-        (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+        (0..link_prepared.block.design.ncols())
+            .map(|idx| 0.01 * (1.5 + (1.7 * idx as f64).sin())),
     );
     let family =
         BernoulliMarginalSlopeFamily {
