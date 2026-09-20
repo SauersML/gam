@@ -1125,37 +1125,49 @@ mod tests {
         }
     }
 
-    /// #3090: the mass-matrix configs carry no jitter and no dense-metric cap.
-    /// Their diagonal metric is `(1 - regularize)·var + regularize` with
-    /// `var ≥ 0`, so its positive floor is the regularization itself, for every
-    /// dimension on both sides of the high-dimension threshold.
+    /// #3263: the whitened sampler has one metric configuration for every
+    /// family and dimension. At 100 coordinates, past the old dim=50 switch,
+    /// the open warmup under that configuration ends and its draws reproduce a
+    /// unit Gaussian's first two moments within five Monte Carlo standard
+    /// errors per coordinate. Before general-mcmc c6e415d no such warmup ended.
     #[test]
-    fn mass_matrix_configs_floor_by_regularization_not_jitter_3090() {
-        for dim in [
-            1usize,
-            super::HIGH_DIM_THRESHOLD,
-            super::HIGH_DIM_THRESHOLD + 1,
-            200,
-        ] {
-            for cfg in [
-                super::robust_mass_matrix_config(dim),
-                super::robust_survival_mass_matrix_config(dim),
-            ] {
-                assert_eq!(cfg.jitter, 0.0, "dim={dim}: mass-matrix jitter must be absent");
-                assert!(
-                    cfg.regularize > 0.0 && cfg.regularize < 1.0,
-                    "dim={dim}: regularize={} must bound the diagonal metric away from zero",
-                    cfg.regularize
-                );
-                assert!(matches!(
-                    cfg.adaptation,
-                    super::MassMatrixAdaptation::Diagonal
-                ));
-                assert_eq!(
-                    cfg.dense_max_dim, 0,
-                    "dim={dim}: no dense-metric cap under diagonal adaptation"
-                );
+    fn open_warmup_metric_samples_a_hundred_coordinate_unit_gaussian_3263() {
+        #[derive(Clone, Copy)]
+        struct UnitGaussian;
+        impl HamiltonianTarget<Array1<f64>> for UnitGaussian {
+            fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
+                grad.assign(&position.mapv(|z| -z));
+                -0.5 * position.dot(position)
             }
+        }
+        let dim = 100;
+        let config = super::NutsConfig {
+            n_samples: 400,
+            seed: 3263,
+        };
+        let (draws, run_stats, _) = super::run_whitened_nuts_samples(
+            UnitGaussian,
+            super::jittered_initial_positions(config.seed, dim, 0.1, 0x3263),
+            &config,
+            0x3263,
+            "unit Gaussian NUTS",
+        )
+        .expect("a 100-coordinate unit Gaussian warms up");
+        let squared = draws.mapv(|z| z * z);
+        let (_, ess) = super::compute_split_rhat_and_ess(&draws);
+        let (_, ess_squared) = super::compute_split_rhat_and_ess(&squared);
+        let n = (draws.shape()[0] * draws.shape()[1]) as f64;
+        for d in 0..dim {
+            let mean = draws.slice(ndarray::s![.., .., d]).sum() / n;
+            let second = squared.slice(ndarray::s![.., .., d]).sum() / n;
+            assert!(
+                mean.abs() <= 5.0 / ess.sqrt(),
+                "coordinate {d}: mean {mean}, ESS {ess}\n{run_stats}"
+            );
+            assert!(
+                (second - 1.0).abs() <= 5.0 * (2.0 / ess_squared).sqrt(),
+                "coordinate {d}: second moment {second}, ESS {ess_squared}\n{run_stats}"
+            );
         }
     }
 
@@ -4642,23 +4654,8 @@ fn draw_logit_pg1_omega(
 /// upper end is the choice robust to departures from Gaussianity (Betancourt,
 /// Byrne & Girolami 2014). Measured on general-mcmc's open warmup (#3263), the
 /// warmup ends fastest here (124 transitions on a 4-D Gaussian against 16380 at
-/// 0.6), while targets at or above 0.98 never end it, because the dual-averaging
-/// bias plateaus the acceptance statistic below the target.
+/// 0.6).
 const NUTS_TARGET_ACCEPT: f64 = 0.9;
-
-/// Parameter dimension above which the posterior is treated as "high-dimensional"
-/// for the mass-matrix regularization below.
-const HIGH_DIM_THRESHOLD: usize = 50;
-
-/// Mass-matrix ridge (added to the diagonal of the estimated metric) for the
-/// general (mean-family) sampler. The high-dimensional value is larger because
-/// the warmup metric estimate is noisier relative to its scale as `p` grows.
-const MASS_REGULARIZE_HIGH_DIM: f64 = 0.14;
-const MASS_REGULARIZE_LOW_DIM: f64 = 0.10;
-/// Mass-matrix ridge for survival posteriors, which are frequently skewed by
-/// censoring / rare events and so warrant a heavier ridge than the mean family.
-const SURVIVAL_MASS_REGULARIZE_HIGH_DIM: f64 = 0.18;
-const SURVIVAL_MASS_REGULARIZE_LOW_DIM: f64 = 0.12;
 
 fn jittered_initial_positions(
     seed: u64,
@@ -4674,46 +4671,20 @@ fn jittered_initial_positions(
         .collect()
 }
 
-/// Diagonal metric adaptation for the mean families. The open warmup chooses its
-/// own windows, so the fixed-schedule buffers stay zero.
-fn robust_mass_matrix_config(dim: usize) -> NUTSMassMatrixConfig {
+/// Diagonal metric adaptation for every whitened NUTS run. The open warmup
+/// chooses its own windows and shrinks each window's log variances toward the
+/// identity, the metric of the Laplace-whitened target, by that window's own
+/// James-Stein intensity (#3263), so the fixed-schedule buffers and the
+/// fixed-weight `regularize` it never reads stay zero. The metric's positive
+/// floor is general-mcmc's representability floor, so no jitter is set (#3090),
+/// and `dense_max_dim` is read only under dense adaptation.
+fn open_warmup_mass_matrix_config() -> NUTSMassMatrixConfig {
     NUTSMassMatrixConfig {
         adaptation: MassMatrixAdaptation::Diagonal,
         start_buffer: 0,
         end_buffer: 0,
         initial_window: 0,
-        regularize: if dim > HIGH_DIM_THRESHOLD {
-            MASS_REGULARIZE_HIGH_DIM
-        } else {
-            MASS_REGULARIZE_LOW_DIM
-        },
-        // No jitter: the diagonal metric is `(1 - regularize)·var + regularize`,
-        // so its entries are bounded below by `regularize > 0` and a floor could
-        // never bind (#3090). `dense_max_dim` is read only under dense
-        // adaptation, and both configs are diagonal.
-        jitter: 0.0,
-        dense_max_dim: 0,
-    }
-}
-
-/// Diagonal metric adaptation for survival posteriors, which censoring and rare
-/// events often skew. The open warmup chooses its own windows, so the
-/// fixed-schedule buffers stay zero.
-fn robust_survival_mass_matrix_config(dim: usize) -> NUTSMassMatrixConfig {
-    NUTSMassMatrixConfig {
-        adaptation: MassMatrixAdaptation::Diagonal,
-        start_buffer: 0,
-        end_buffer: 0,
-        initial_window: 0,
-        regularize: if dim > HIGH_DIM_THRESHOLD {
-            SURVIVAL_MASS_REGULARIZE_HIGH_DIM
-        } else {
-            SURVIVAL_MASS_REGULARIZE_LOW_DIM
-        },
-        // No jitter: the diagonal metric is `(1 - regularize)·var + regularize`,
-        // so its entries are bounded below by `regularize > 0` and a floor could
-        // never bind (#3090). `dense_max_dim` is read only under dense
-        // adaptation, and both configs are diagonal.
+        regularize: 0.0,
         jitter: 0.0,
         dense_max_dim: 0,
     }
@@ -4895,7 +4866,6 @@ fn run_whitened_nuts_samples<Target>(
     target: Target,
     initial_positions: Vec<Array1<f64>>,
     config: &NutsConfig,
-    mass_cfg: NUTSMassMatrixConfig,
     transition_seed_stream: u64,
     sampling_error_label: &str,
 ) -> Result<(Array3<f64>, String, usize), String>
@@ -4906,7 +4876,7 @@ where
         target,
         initial_positions,
         NUTS_TARGET_ACCEPT,
-        mass_cfg,
+        open_warmup_mass_matrix_config(),
     )
     .set_seed(nuts_transition_seed(config.seed, transition_seed_stream));
 
@@ -4980,7 +4950,6 @@ fn run_whitened_nuts_result<Target>(
     initial_positions: Vec<Array1<f64>>,
     config: &NutsConfig,
     dim: usize,
-    mass_cfg: NUTSMassMatrixConfig,
     transition_seed_stream: u64,
     sampling_error_label: &str,
     empty_mean: Array1<f64>,
@@ -4992,7 +4961,6 @@ where
         target,
         initial_positions,
         config,
-        mass_cfg,
         transition_seed_stream,
         sampling_error_label,
     )?;
@@ -5408,7 +5376,6 @@ pub(crate) fn run_nuts_sampling(
 
     let initial_positions =
         jittered_initial_positions(config.seed, dim, 0.1, 0x0F65_83B2_BC71_4D9E);
-    let mass_cfg = robust_mass_matrix_config(dim);
     let (result, run_stats) = run_whitened_nuts_result(
         target,
         &mode_arr,
@@ -5416,7 +5383,6 @@ pub(crate) fn run_nuts_sampling(
         initial_positions,
         config,
         dim,
-        mass_cfg,
         0xF1D3_C2B5_A697_804E,
         "NUTS sampling failed",
         Array1::zeros(dim),
@@ -7591,7 +7557,6 @@ mod survival_hmc {
         let initial_positions =
             jittered_initial_positions(config.seed, dim, 0.1, 0xEC2D_7A9B_4051_F638);
 
-        let mass_cfg = robust_survival_mass_matrix_config(dim);
         let (result, run_stats) = run_whitened_nuts_result(
             target,
             &mode_arr,
@@ -7599,7 +7564,6 @@ mod survival_hmc {
             initial_positions,
             config,
             dim,
-            mass_cfg,
             0x731B_60D4_AE52_9C8F,
             "NUTS sampling failed",
             Array1::zeros(dim),

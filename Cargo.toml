@@ -79,9 +79,11 @@ resolver = "3"
 # band (#3230). Pinning the source commit makes the line-search semantics
 # reproducible.
 opt = { version = "=0.9.0", git = "https://github.com/SauersML/opt.git", rev = "4d26c445cde3fccd62aedaa87910a85af734c69a" }
-# This general-mcmc revision adds GenericNUTS::run_adaptive, the open-ended
-# warmup gam-inference samples with. It is the one pin for every crate here.
-general-mcmc = { version = "=0.10.1", git = "https://github.com/SauersML/general-mcmc.git", rev = "adc78bb049a81da80089330f9db43d8a45d8ed2d", default-features = false }
+# This general-mcmc revision's GenericNUTS::run_adaptive is the open-ended
+# warmup gam-inference samples with. It ends at any target acceptance and
+# shrinks each window's metric toward the identity by the window's own
+# James-Stein intensity (#3263). It is the one pin for every crate here.
+general-mcmc = { version = "=0.10.1", git = "https://github.com/SauersML/general-mcmc.git", rev = "c6e415dc8fd7f0f88e191173688f418b176507ad", default-features = false }
 cudarc = { version = "0.19.8", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12000"] }
 
 [lints.rust]
