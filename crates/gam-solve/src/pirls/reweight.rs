@@ -151,6 +151,178 @@ pub(super) fn exact_newton_decrement_sq(
     (decrement_sq.is_finite() && decrement_sq >= 0.0).then_some(decrement_sq)
 }
 
+/// The objective PIRLS minimizes at `state`: `½(k·D + βᵀSβ) − Φ`, the Jeffreys
+/// term `Φ` entering only under Firth bias reduction (it is added to the
+/// log-likelihood, so the deviance drops by `2Φ`).
+fn penalized_objective_value(state: &WorkingState, dev_scale: f64, firth: bool) -> f64 {
+    let value = 0.5 * (dev_scale * state.deviance + state.penalty_term);
+    match state.jeffreys_logdet() {
+        Some(jeffreys_logdet) if firth => value - jeffreys_logdet,
+        _ => value,
+    }
+}
+
+/// The second-order half of the inner stationarity certificate (#3318).
+///
+/// Strict KKT and the exact Newton decrement are first-order: they certify
+/// `∇F = 0`, which a saddle satisfies as well as a minimum. The Firth/Jeffreys
+/// objective `−ℓ + ½βᵀSβ − Φ` is not convex, and on a design symmetric under a
+/// reflection (`(x, y) → (1 − x, 1 − y)` on a perfectly separated step) the
+/// iterates never leave the symmetric subspace: the gradient along the
+/// antisymmetric direction is zero at every iterate, so no first-order method
+/// can leave it, and the solve converged to the symmetric saddle with
+/// `λ_min(XᵀWX + S − HΦ) = −3.9e-4` while every other eigenvalue was positive.
+/// The Laplace layer then refused the indefinite Hessian and the fit failed.
+///
+/// A stationary point is a minimum only if the objective curvature is positive
+/// semidefinite. Its smallest eigenvalue `λ` is judged against the curvature's
+/// own rounding band `p·ε·‖H‖₂` (the band `certify_positive_semidefinite_hessian`
+/// accepts), and a materially negative one is followed along its eigenvector `v`,
+/// oriented so that `vᵀg ≤ 0`, where the quadratic model decreases by
+/// `½|λ|t²` beyond the linear term. Two evaluations of the objective, each
+/// carrying its own rounding band, resolve a decrease only beyond
+/// `band_ref + band_trial ≈ 2·band`; a step whose predicted decrease equals that
+/// resolution is undecidable, so the first step is the one whose predicted
+/// decrease is twice it, `½|λ|t² = 4·band`. Each accepted step is doubled while
+/// the true objective keeps falling by more than the resolution.
+/// That is the standard negative-curvature line search: it stops at the first
+/// trial that does not show a resolvable decrease, and on an objective bounded
+/// below it cannot run away.
+///
+/// Returns the lowest point reached and its state, evaluated last so the
+/// model's per-row buffers describe it. `None` when the curvature is positive
+/// semidefinite to rounding, or when no step along `v` produces a resolvable
+/// decrease: the objective's arithmetic then cannot tell this point from a
+/// minimum, the second-order analogue of the exact-decrement certificate. In
+/// that case the model is re-evaluated at `beta` if a trial moved it.
+///
+/// Dense coefficient Hessians only: the objective whose non-convexity this
+/// answers (Firth, with its omitted `HΦ`) is always assembled densely, and an
+/// eigendecomposition is the dense tool this certificate needs.
+fn resolvable_negative_curvature_step<M>(
+    model: &mut M,
+    beta: &Coefficients,
+    state: &WorkingState,
+    dev_scale: f64,
+    firth: bool,
+) -> Result<Option<(Coefficients, WorkingState)>, EstimationError>
+where
+    M: WorkingModel + ?Sized,
+{
+    let Some(hessian) = state.hessian.as_dense() else {
+        return Ok(None);
+    };
+    if !hessian.iter().all(|value| value.is_finite())
+        || !state.gradient.iter().all(|value| value.is_finite())
+    {
+        return Ok(None);
+    }
+    let correction = model.objective_hessian_matrix_correction().cloned();
+    let curvature = objective_curvature_for_direction(hessian, correction.as_ref())?;
+    if gam_linalg::faer_ndarray::FaerCholesky::cholesky(curvature.as_ref(), faer::Side::Lower)
+        .is_ok()
+    {
+        return Ok(None);
+    }
+    let Ok((eigenvalues, eigenvectors)) =
+        gam_linalg::faer_ndarray::FaerEigh::eigh(curvature.as_ref(), faer::Side::Lower)
+    else {
+        return Ok(None);
+    };
+    let p = eigenvalues.len();
+    let spectral_radius = eigenvalues.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let (min_index, min_eigenvalue) = eigenvalues
+        .iter()
+        .copied()
+        .enumerate()
+        .fold((0, f64::INFINITY), |best, (k, value)| {
+            if value < best.1 { (k, value) } else { best }
+        });
+    if !(min_eigenvalue < -f64::EPSILON * p as f64 * spectral_radius) {
+        return Ok(None);
+    }
+    let mut direction = eigenvectors.column(min_index).to_owned();
+    // Descend along `v`: `vᵀg ≤ 0`. At an exactly symmetric saddle `vᵀg`
+    // vanishes and either side descends equally; the tie is broken by making
+    // the largest-magnitude component positive, so the choice is deterministic.
+    let slope = direction.dot(&state.gradient);
+    let flip = if slope != 0.0 {
+        slope > 0.0
+    } else {
+        let lead = direction
+            .iter()
+            .copied()
+            .fold(0.0_f64, |acc, v| if v.abs() > acc.abs() { v } else { acc });
+        lead < 0.0
+    };
+    if flip {
+        direction.mapv_inplace(|v| -v);
+    }
+
+    let base_objective = penalized_objective_value(state, dev_scale, firth);
+    let base_band = penalized_objective_rounding_band(state, dev_scale);
+    let mut step = (8.0 * base_band / min_eigenvalue.abs()).sqrt();
+    if !(base_objective.is_finite() && step.is_finite() && step > 0.0) {
+        return Ok(None);
+    }
+    let mut best: Option<(Coefficients, WorkingState, f64)> = None;
+    let mut model_at_best = true;
+    loop {
+        let trial = Coefficients::new(beta.as_ref() + &(step * &direction));
+        if !trial.as_ref().iter().all(|v| v.is_finite()) {
+            break;
+        }
+        model_at_best = false;
+        let Ok(trial_state) = model.update_with_curvature(&trial, state.hessian_curvature) else {
+            break;
+        };
+        let trial_objective = penalized_objective_value(&trial_state, dev_scale, firth);
+        let (reference_objective, reference_band) = match best.as_ref() {
+            Some((_, best_state, best_objective)) => (
+                *best_objective,
+                penalized_objective_rounding_band(best_state, dev_scale),
+            ),
+            None => (base_objective, base_band),
+        };
+        let resolution =
+            reference_band + penalized_objective_rounding_band(&trial_state, dev_scale);
+        if !(trial_objective.is_finite() && reference_objective - trial_objective > resolution) {
+            break;
+        }
+        best = Some((trial, trial_state, trial_objective));
+        model_at_best = true;
+        step *= 2.0;
+    }
+    match best {
+        Some((best_beta, best_state, best_objective)) => {
+            log::debug!(
+                "[PIRLS] stationary point has negative objective curvature \
+                 (λ_min={min_eigenvalue:.3e}, ‖H‖₂={spectral_radius:.3e}): stepped \
+                 ‖Δβ‖={:.3e} along its eigenvector, objective {base_objective:.12e} -> \
+                 {best_objective:.12e}",
+                0.5 * step
+            );
+            let best_state = if model_at_best {
+                best_state
+            } else {
+                model.update_with_curvature(&best_beta, state.hessian_curvature)?
+            };
+            Ok(Some((best_beta, best_state)))
+        }
+        None => {
+            if !model_at_best {
+                model.update_with_curvature(beta, state.hessian_curvature)?;
+            }
+            log::debug!(
+                "[PIRLS] stationary point has negative objective curvature \
+                 (λ_min={min_eigenvalue:.3e}) but no step along it lowers the objective \
+                 beyond its rounding band; certified as a minimum to resolution"
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// Whether a constrained iterate `(beta, gradient)` sits within the SAME
 /// degeneracy-aware constraint-KKT acceptance band the outer REML startup gate
 /// (`enforce_constraint_kkt`) applies, and so may be soft-accepted as a valid
@@ -791,16 +963,7 @@ where
     // deviance while the step targets `k·D + penalty` freezes the Gamma smooth
     // at heavily-penalized ρ (issue #2128).
     let penalizedobjective = |state: &WorkingState, dev_scale: f64| {
-        let mut value = 0.5 * (dev_scale * state.deviance + state.penalty_term);
-        if options.firth_bias_reduction
-            && let Some(jeffreys_logdet) = state.jeffreys_logdet()
-        {
-            // Jeffreys/Firth adds the identifiable-subspace Jeffreys term
-            // Φ to the log-likelihood,
-            // so the PIRLS deviance is reduced by 2 * Φ.
-            value -= jeffreys_logdet;
-        }
-        value
+        penalized_objective_value(state, dev_scale, options.firth_bias_reduction)
     };
 
     // Initial Levenberg-Marquardt damping. A caller's `initial_lm_lambda` hint
@@ -983,17 +1146,20 @@ where
         }
 
         // Early exit: if the current state has non-finite gradient, the
-        // model evaluation has overflowed (eta too extreme).  No Newton
-        // step can recover — accept the best state we have.
+        // model evaluation has overflowed (eta too extreme). No Newton step
+        // can recover, and a non-finite gradient carries no stationarity
+        // information, so this state can never be certified as a mode — not
+        // even a near-stationary plateau, whose every other exit requires the
+        // projected gradient inside the KKT band. The evaluation became
+        // unstable: say so (#3525). Post-loop certification skips `Unstable`,
+        // and callers surface it as a named failure rather than consuming the
+        // overflowed state as a cost point or warm start.
         let current_grad_finite = state.gradient.iter().all(|g| g.is_finite());
         if !current_grad_finite {
             lastgradient_norm = f64::INFINITY;
             max_abs_eta = inf_norm(state.eta.iter().copied());
             final_state = Some(state);
-            // Non-finite-gradient rescue is deviance-plateau based, not a KKT certificate.
-            if last_deviance_change.abs() < options.convergence_tolerance {
-                status = PirlsStatus::StalledAtValidMinimum;
-            }
+            status = PirlsStatus::Unstable;
             break 'pirls_loop;
         }
 
@@ -1786,6 +1952,32 @@ where
                                 options.linear_constraints.as_ref(),
                             )
                         {
+                            // A first-order certificate holds at a saddle too
+                            // (#3318). Under inequality constraints the
+                            // second-order condition lives on the active face's
+                            // critical cone, which this unconstrained test does
+                            // not describe.
+                            if !has_explicit_constraints
+                                && let Some((escaped_beta, escaped_state)) =
+                                    resolvable_negative_curvature_step(
+                                        model,
+                                        &beta,
+                                        final_state_ref,
+                                        penalized_dev_scale,
+                                        options.firth_bias_reduction,
+                                    )?
+                            {
+                                final_state_cache_key = Some(
+                                    PirlsAcceptedStateCacheKey::accepted(
+                                        &escaped_beta,
+                                        &escaped_state,
+                                    ),
+                                );
+                                final_state = Some(escaped_state);
+                                beta = escaped_beta;
+                                exact_decrement_checked_at_plateau = false;
+                                continue 'pirls_loop;
+                            }
                             status = PirlsStatus::Converged;
                             break 'pirls_loop;
                         }
@@ -2536,6 +2728,27 @@ where
         }
     }
 
+    // A state the loop did not certify is certified below on first-order
+    // evidence alone, which a saddle satisfies too (#3318). The loop has ended,
+    // so a point with a resolvable descent along negative curvature cannot be
+    // continued from here: it is handed back at the lower point it reached and
+    // is never minted `Converged`.
+    let mut second_order_admits_certification = true;
+    if !status.is_converged() && status != PirlsStatus::Unstable && !has_explicit_constraints {
+        let final_dev_scale = model.penalized_deviance_scale()?;
+        if let Some((escaped_beta, escaped_state)) = resolvable_negative_curvature_step(
+            model,
+            &beta,
+            &state,
+            final_dev_scale,
+            options.firth_bias_reduction,
+        )? {
+            beta = escaped_beta;
+            state = escaped_state;
+            second_order_admits_certification = false;
+        }
+    }
+
     // Post-loop rescue: use the constrained stationarity residual in the
     // current PIRLS basis, not the raw gradient norm.
     let final_projected_grad = constrained_stationarity_norm(
@@ -2559,7 +2772,9 @@ where
     // keeps the live fit-minting contract identical to the serialized-model
     // contract: only a genuinely certified inner mode is recorded as
     // `Converged`.
-    let can_still_certify = !status.is_converged() && status != PirlsStatus::Unstable;
+    let can_still_certify = second_order_admits_certification
+        && !status.is_converged()
+        && status != PirlsStatus::Unstable;
     let final_exact_decrement_sq = if can_still_certify {
         let curvature_correction = model.objective_hessian_matrix_correction().cloned();
         if has_explicit_constraints {
