@@ -4024,8 +4024,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         format!("missing dynamic design for block {b} diagonal correction")
                     })?;
                     let wwork = certify_finite_working_weights(working_weights)?;
-                    let x_dense = x_dyn.to_dense();
-                    let n = x_dense.nrows();
+                    let n = x_dyn.nrows();
 
                     let mut d_eta = x_dyn.matrixvectormultiply(direction);
                     let geom = family.block_geometry_directional_derivative(
@@ -4034,28 +4033,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         spec,
                         direction,
                     )?;
-                    let mut correction_mat = Array2::<f64>::zeros((p, p));
+                    let mut d_design = None;
 
                     if let Some(geom_dir) = geom {
                         d_eta += &geom_dir.d_offset;
                         if let Some(dx) = geom_dir.d_design {
                             d_eta += &dx.dot(&beta_flat);
-                            let mut wx = x_dense.clone();
-                            let mut wdx = dx.clone();
-                            ndarray::Zip::from(wx.rows_mut())
-                                .and(wdx.rows_mut())
-                                .and(wwork.view())
-                                .par_for_each(|mut wxr, mut wdxr, &wi| {
-                                    if wi != 1.0 {
-                                        wxr.mapv_inplace(|v| v * wi);
-                                        wdxr.mapv_inplace(|v| v * wi);
-                                    }
-                                });
-                            // Same X'(W·Y) pattern as the parallel sibling at
-                            // line ~9258; route through faer for SIMD GEMM
-                            // (n × p² flops at large-scale moderate scale).
-                            correction_mat += &fast_atb(&dx, &wx);
-                            correction_mat += &fast_atb(&x_dense, &wdx);
+                            d_design = Some(dx);
                         }
                     }
 
@@ -4079,14 +4063,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             ),
                         });
                     }
-                    let mut scaled_x = x_dense.clone();
-                    ndarray::Zip::from(scaled_x.rows_mut())
-                        .and(&dw)
-                        .par_for_each(|mut sr, &dwi| sr.mapv_inplace(|v| v * dwi));
-                    // X'(diag(dW)·X) outer correction term — faer route, same
-                    // rationale as above.
-                    correction_mat += &fast_atb(&x_dense, &scaled_x);
-
+                    let correction_mat = diagonal_block_hessian_drift(
+                        x_dyn,
+                        &dw,
+                        d_design.as_ref().map(|dx| (dx, wwork)),
+                    )?;
                     Ok(Some(DriftDerivResult::Dense(correction_mat)))
                 }
             }
@@ -4127,8 +4108,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
                     format!("missing dynamic design for block {b} diagonal second correction")
                 })?;
-                let x_dense = x_dyn.to_dense();
-                let n = x_dense.nrows();
+                let n = x_dyn.nrows();
 
                 let reject_second_order_geometry =
                     |label: &str,
@@ -4188,11 +4168,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         ),
                     });
                 }
-                let mut scaled_x = x_dense.clone();
-                ndarray::Zip::from(scaled_x.rows_mut())
-                    .and(&d2w)
-                    .par_for_each(|mut sr, &d2wi| sr.mapv_inplace(|value| value * d2wi));
-                Ok(Some(DriftDerivResult::Dense(fast_atb(&x_dense, &scaled_x))))
+                Ok(Some(DriftDerivResult::Dense(diagonal_block_hessian_drift(
+                    x_dyn, &d2w, None,
+                )?)))
             }
         }
     };

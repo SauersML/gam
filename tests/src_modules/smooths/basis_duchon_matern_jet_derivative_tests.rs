@@ -470,7 +470,10 @@ fn test_matern_ratio_half_is_exact_at_small_r_and_refuses_at_collision() {
     let refused =
         matern_input_location_hessian_nd(center.view(), center.view(), ls, MaternNu::Half, None);
     assert!(
-        matches!(refused, Err(BasisError::DegenerateAtCollision { dim: 2, .. })),
+        matches!(
+            refused,
+            Err(BasisError::DegenerateAtCollision { dim: 2, .. })
+        ),
         "the nu=1/2 input-location Hessian at a center must refuse with DegenerateAtCollision"
     );
     let off_center = ndarray::array![[0.9_f64, 0.1]];
@@ -1009,7 +1012,11 @@ fn test_knot_cloud_axis_scales_zero_variance() {
     // contrasts where they were, however far from unit scale it goes.
     let tiny = centers.mapv(|v| v * 1.0e-9);
     let tiny_scales = knot_cloud_axis_scales(tiny.view());
-    assert_abs_diff_eq!(tiny_scales[0], scales[0] * 1.0e-9, epsilon = 1e-12 * scales[0] * 1.0e-9);
+    assert_abs_diff_eq!(
+        tiny_scales[0],
+        scales[0] * 1.0e-9,
+        epsilon = 1e-12 * scales[0] * 1.0e-9
+    );
     let tiny_eta = initial_aniso_contrasts(tiny.view());
     assert_abs_diff_eq!(tiny_eta[0], eta[0], epsilon = 1e-12);
 }
@@ -1225,14 +1232,10 @@ use super::closed_form_penalty::bessel_k;
 
 // Hybrid isotropic Duchon evaluation, test-local: the partial-fraction and
 // finite-part Riesz oracle these kernel tests compare production against.
-fn duchon_small_chi_riesz_series_value(
-    d: usize,
-    a: usize,
-    b: usize,
-    kappa: f64,
-    r: f64,
-) -> f64 {
-    super::closed_form_penalty::duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, 0, 0)[0]
+fn duchon_small_chi_riesz_series_value(d: usize, a: usize, b: usize, kappa: f64, r: f64) -> f64 {
+    super::closed_form_penalty::duchon_small_chi_riesz_series_radial_derivatives(
+        d, a, b, kappa, r, 0, 0,
+    )[0]
 }
 
 /// Hybrid isotropic Duchon penalty
@@ -1292,7 +1295,7 @@ fn isotropic_duchon_penalty(q: usize, d: usize, m: usize, s: f64, kappa: f64, r:
     let kappa_sq = kappa * kappa;
 
     // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
-    let mut sum = gam_linalg::utils::KahanSum::default();
+    let mut sum = gam_math::sparse_grid::CompensatedSum::default();
     for j in 1..=a {
         let sign = if (a - j).is_multiple_of(2) { 1.0 } else { -1.0 };
         let binom = gam_math::special::binomial_coefficient_f64(a + b - j - 1, a - j);
@@ -1310,7 +1313,7 @@ fn isotropic_duchon_penalty(q: usize, d: usize, m: usize, s: f64, kappa: f64, r:
         sum.add(term);
     }
 
-    sum.sum()
+    sum.value()
 }
 
 #[test]
@@ -1632,7 +1635,6 @@ fn test_isotropic_hybrid_partial_fraction() {
 
 #[test]
 fn test_schoenberg_isotropic_agrees_with_partial_fraction() {
-
     // `isotropic_duchon_penalty` is the separately q-loaded
     // Riesz-Matérn partial-fraction representative. This test checks that
     // representative directly; the anisotropic radial chain is tested
@@ -1896,7 +1898,6 @@ fn test_riesz_satisfies_laplacian_identity() {
 
 #[test]
 fn test_log_riesz_finite_part_satisfies_laplacian_identity() {
-
     // Even-dimensional log-Riesz branches need the finite-part shift
     // A_n in R_{d/2+n}^d = c_n r^{2n}(log r + A_n). The shift is correct
     // exactly when the distributional recurrence survives away from the
@@ -2104,7 +2105,6 @@ fn test_isotropic_duchon_kappa_to_zero_limit() {
 
 #[test]
 fn test_isotropic_duchon_kappa_to_zero_ir_divergence_is_quotiented_by_finite_part() {
-
     // Same (m,s,q) as the convergent test but d=5. Now a=1,b=4 and
     // d-2a-2b = -5, so the ordinary low-frequency positive-κ Green's
     // function carries a divergent polynomial/nullspace component. The
@@ -2272,7 +2272,6 @@ fn test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partia
 
 #[test]
 fn test_even_log_riesz_small_kappa_uses_full_taylor_series() {
-
     // Even-dimensional log-Riesz case: d/2 <= N = 2m - q + 2s.
     // This used to return only the leading R_N term under cancellation.
     // The expected value below is the finite-part Taylor series itself,
@@ -2308,7 +2307,6 @@ fn test_even_log_riesz_small_kappa_uses_full_taylor_series() {
 
 #[test]
 fn test_even_log_riesz_small_kappa_derivative_bundle_matches_fd() {
-
     // Same even-dimensional log-Riesz cancellation basin as the value
     // Taylor test, but through the production derivative bundle. This
     // pins the important wiring: value, η, κ, ηκ, and κκ must all use
@@ -2541,7 +2539,6 @@ fn det_rand(seed: &mut u64) -> f64 {
 
 #[test]
 fn test_aniso_scale_invariance_via_letter_a_section_9() {
-
     let cases: &[(usize, usize, usize, usize, f64)] = &[
         (0, 3, 1, 1, 0.7),
         (1, 3, 1, 1, 1.3),
@@ -2662,10 +2659,7 @@ fn singular_convergent_derivative_builders_use_analytic_self_pair() {
 
     for i in 0..centers.nrows() {
         for j in 0..centers.nrows() {
-            let denom = value[[i, j]]
-                .abs()
-                .max(psi_value[[i, j]].abs())
-                .max(1e-300);
+            let denom = value[[i, j]].abs().max(psi_value[[i, j]].abs()).max(1e-300);
             assert!(
                 (psi_value[[i, j]] - value[[i, j]]).abs() / denom < 1e-12,
                 "log-kappa derivative builder value must match analytic pair matrix at ({i},{j}): value={:.16e} psi_value={:.16e}",
@@ -2676,9 +2670,7 @@ fn singular_convergent_derivative_builders_use_analytic_self_pair() {
     }
 
     let zero_lag = vec![0.0_f64; d];
-    let diag_bundle = pair_block_radial_with_j_second_derivatives(
-        q, m, s, kappa, &eta, &zero_lag,
-    );
+    let diag_bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &zero_lag);
     assert!(
         (value[[0, 0]] - diag_bundle.value).abs()
             / value[[0, 0]].abs().max(diag_bundle.value.abs()).max(1e-300)
@@ -2689,7 +2681,6 @@ fn singular_convergent_derivative_builders_use_analytic_self_pair() {
 
 #[test]
 fn test_radial_form_matches_q0_laplacian_chain_at_eta_zero_full_sweep() {
-
     let qs = [0_usize, 1, 2];
     let ds = [1_usize, 3, 5, 7, 9, 11];
     let ms = [1_usize, 2, 3];
@@ -2758,7 +2749,6 @@ fn test_radial_form_matches_q0_laplacian_chain_at_eta_zero_full_sweep() {
 
 #[test]
 fn test_radial_form_uniform_eta_uses_exact_isotropic_metric_identity() {
-
     let cases: &[(usize, usize, usize, usize, f64, f64)] = &[
         (0, 3, 1, 2, 0.5, 0.20),
         (1, 7, 1, 2, 0.1, -0.35),
@@ -2783,7 +2773,6 @@ fn test_radial_form_uniform_eta_uses_exact_isotropic_metric_identity() {
 
 #[test]
 fn test_letter_b_taylor_matches_partial_fraction_in_overlap() {
-
     let cases: &[(usize, usize, usize, usize, f64, f64)] = &[
         (3, 1, 2, 1, 0.5, 1.0),
         (3, 2, 1, 1, 0.5, 0.8),
@@ -2907,7 +2896,6 @@ fn test_isotropic_limit_at_b_equals_i_recovers_radial_bilaplacian() {
 
 #[test]
 fn test_pair_block_symmetric_under_pair_swap() {
-
     let mut seed = 0xBADD_F00D_u64;
     let cases: &[(usize, usize, usize, usize, f64)] = &[
         (1, 3, 1, 1, 0.7),
@@ -2937,7 +2925,6 @@ fn test_pair_block_symmetric_under_pair_swap() {
 
 #[test]
 fn test_pair_block_continuous_at_diagonal_via_eps_limit() {
-
     // Pure-Duchon (κ=0), q ∈ {1, 2}, with p = 4(m+s)−d > 2q so
     // the finite-part radial limit is bounded.
     let cases: &[(usize, usize, usize, usize, f64)] = &[
@@ -3225,9 +3212,8 @@ fn assert_pair_block_bundle_fully_fd_gated<F>(
 fn test_pair_block_derivative_branch_matrix_is_fully_fd_gated_2315() {
     use super::closed_form_penalty::{
         AnisoMetricPowers, analytic_self_pair_bundle, aniso_invariants_with_powers,
-        hybrid_self_pair_bundle_odd_d,
-        schoenberg_self_pair_bundle,
-        schwinger_radial_is_convergent, use_duchon_small_chi_riesz_series,
+        hybrid_self_pair_bundle_odd_d, schoenberg_self_pair_bundle, schwinger_radial_is_convergent,
+        use_duchon_small_chi_riesz_series,
     };
 
     // The axis-rescaled lag length R and anisotropy traces the radial form reads,
@@ -3379,7 +3365,6 @@ fn test_pair_block_derivative_branch_matrix_is_fully_fd_gated_2315() {
 
 #[test]
 fn test_pair_block_pure_riesz_kappa_independence_is_exactly_gated_2315() {
-
     // `s == 0` is a separate production match arm: the hybrid factor is absent,
     // so the value and every eta derivative are exactly independent of kappa,
     // while all kappa and eta-kappa derivatives are exactly zero. Exercise both
@@ -3463,8 +3448,8 @@ fn test_pair_block_pure_riesz_kappa_independence_is_exactly_gated_2315() {
 #[test]
 fn test_even_d_duchon_collision_derivative_matches_finite_difference_2315() {
     use super::duchon_kernel_math::{
-        duchon_matern_kernel_general_from_distance, duchon_partial_fraction_coeffs,
-        DUCHON_COLLISION_TAYLOR_REL,
+        DUCHON_COLLISION_TAYLOR_REL, duchon_matern_kernel_general_from_distance,
+        duchon_partial_fraction_coeffs,
     };
     use super::duchon_psi_derivatives::{
         duchon_phi_even_derivative_collision, duchon_polyharmonic_block_taylor_r2j,
@@ -3565,8 +3550,7 @@ fn test_even_d_duchon_collision_derivative_matches_finite_difference_2315() {
             1 => (2.0 * phi(h) - 2.0 * phi0) / (h * h),
             2 => {
                 let fourth_difference = |step: f64| {
-                    (2.0 * phi(2.0 * step) - 8.0 * phi(step) + 6.0 * phi0)
-                        / step.powi(4)
+                    (2.0 * phi(2.0 * step) - 8.0 * phi(step) + 6.0 * phi0) / step.powi(4)
                 };
                 let coarse = fourth_difference(h);
                 let fine = fourth_difference(0.5 * h);
@@ -3588,7 +3572,6 @@ fn test_even_d_duchon_collision_derivative_matches_finite_difference_2315() {
 
 #[test]
 fn test_eta_derivative_matches_finite_difference() {
-
     let mut seed = 0xABCD_1234_u64;
     let cases: &[(usize, usize, usize, usize, f64)] = &[(1, 3, 1, 1, 0.8), (2, 5, 2, 2, 1.0)];
 
@@ -3748,10 +3731,8 @@ fn wahba_sphere_kernel_simd_matches_scalar_within_documented_tolerance() {
     for &m in &[1_usize, 2, 3, 4] {
         for chunk in xs.chunks(4) {
             let seps: Vec<HalfAngleSeparation> = chunk.iter().map(|&x| sep_from_cos(x)).collect();
-            let u_lane =
-                wide::f64x4::from([seps[0].u, seps[1].u, seps[2].u, seps[3].u]);
-            let v_lane =
-                wide::f64x4::from([seps[0].v, seps[1].v, seps[2].v, seps[3].v]);
+            let u_lane = wide::f64x4::from([seps[0].u, seps[1].u, seps[2].u, seps[3].u]);
+            let v_lane = wide::f64x4::from([seps[0].v, seps[1].v, seps[2].v, seps[3].v]);
             let simd = wahba_sphere_kernel_simd_kind(u_lane, v_lane, m, SphereWahbaKernel::Sobolev);
             let simd_arr: [f64; 4] = simd.into();
             for (i, &x) in chunk.iter().enumerate() {
@@ -3831,8 +3812,8 @@ fn auto_streaming_engages_for_large_synthetic_basis() {
     // dense buffer fits materializes, one more row streams, and the streamed
     // chunk is the library's one row-chunk rule.
     let cols = 200usize;
-    let ceiling = gam_runtime::resource::ResourcePolicy::default_library()
-        .max_single_materialization_bytes;
+    let ceiling =
+        gam_runtime::resource::ResourcePolicy::default_library().max_single_materialization_bytes;
     let fitting_rows = ceiling / (cols * std::mem::size_of::<f64>());
     assert!(
         fitting_rows > 0,
@@ -3903,19 +3884,25 @@ fn schwinger_kappa_partials_are_the_derivatives_of_the_values_chart_2735() {
     for &kappa in &[0.607_f64, 1.0, 1.65] {
         for &chi in &[0.3_f64, 0.6, 1.0, 2.0] {
             let r = chi / kappa;
-            let value = |k: f64| radial_derivatives_of_isotropic_duchon(d, m, s as f64, k, r, max_order);
-            let partial =
-                |k: f64| radial_derivatives_of_isotropic_duchon_kappa_partial(d, m, s, k, r, max_order);
+            let value =
+                |k: f64| radial_derivatives_of_isotropic_duchon(d, m, s as f64, k, r, max_order);
+            let partial = |k: f64| {
+                radial_derivatives_of_isotropic_duchon_kappa_partial(d, m, s, k, r, max_order)
+            };
             let first = partial(kappa);
             let second =
                 radial_derivatives_of_isotropic_duchon_kappa_partial2(d, m, s, kappa, r, max_order);
             let f0 = value(kappa);
             let h = 3.0e-4 * kappa;
             let steps = [h, 2.0 * h, 4.0 * h];
-            let values: Vec<(Vec<f64>, Vec<f64>)> =
-                steps.iter().map(|&step| (value(kappa + step), value(kappa - step))).collect();
-            let partials: Vec<(Vec<f64>, Vec<f64>)> =
-                steps.iter().map(|&step| (partial(kappa + step), partial(kappa - step))).collect();
+            let values: Vec<(Vec<f64>, Vec<f64>)> = steps
+                .iter()
+                .map(|&step| (value(kappa + step), value(kappa - step)))
+                .collect();
+            let partials: Vec<(Vec<f64>, Vec<f64>)> = steps
+                .iter()
+                .map(|&step| (partial(kappa + step), partial(kappa - step)))
+                .collect();
             for order in 0..=asserted_orders {
                 // Richardson extrapolation of the central differences at levels
                 // `fine` and `fine + 1`: (h, 2h) is the reference, (2h, 4h) the bar.
@@ -3927,7 +3914,12 @@ fn schwinger_kappa_partials_are_the_derivatives_of_the_values_chart_2735() {
                 };
                 let checks = [
                     ("∂_κ", first[order], &values[..], f0[order].abs() / kappa),
-                    ("∂²_κ", second[order], &partials[..], f0[order].abs() / (kappa * kappa)),
+                    (
+                        "∂²_κ",
+                        second[order],
+                        &partials[..],
+                        f0[order].abs() / (kappa * kappa),
+                    ),
                 ];
                 for (label, analytic, samples, value_scale) in checks {
                     let reference = richardson(samples, 0);

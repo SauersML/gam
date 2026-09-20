@@ -2912,6 +2912,7 @@ impl BernoulliMarginalSlopeFamily {
         let mut tail = 0.0;
         let mut density = 0.0;
         let summands = cells.len() * exact_kernel::TERMINAL_GL_ORDER;
+        let mut tail_rounding = 0.0;
         for partition_cell in cells {
             let cell = partition_cell.cell;
             let state = self.evaluate_cell_moments_lru(
@@ -2923,6 +2924,7 @@ impl BernoulliMarginalSlopeFamily {
                 4,
             )?;
             tail += state.value;
+            tail_rounding += state.value_rounding;
             let (dc_da_raw, _) = exact_kernel::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
@@ -2937,6 +2939,7 @@ impl BernoulliMarginalSlopeFamily {
             density,
             density_slope: None,
             summands,
+            tail_rounding,
         })
     }
 
@@ -3008,6 +3011,7 @@ impl BernoulliMarginalSlopeFamily {
             density,
             density_slope: Some(density_slope),
             summands: grid.nodes.len(),
+            tail_rounding: 0.0,
         })
     }
 
@@ -3448,7 +3452,7 @@ impl BernoulliInterceptSolveStats {
             self.seed_residual_le_1e10.fetch_add(1, Ordering::Relaxed);
         } else if abs <= SEED_RESIDUAL_BIN_EDGES[2] {
             self.seed_residual_le_1e8.fetch_add(1, Ordering::Relaxed);
-        } else if abs <= resolution {
+        } else if abs.is_finite() && abs <= resolution {
             self.seed_residual_le_resolution
                 .fetch_add(1, Ordering::Relaxed);
         } else {
@@ -5323,6 +5327,7 @@ mod empirical_flex_jet_oracle_tests {
                     density,
                     density_slope: Some(density_slope),
                     summands: fx.grid.nodes.len(),
+                    tail_rounding: 0.0,
                 }
             };
             let bits = |t: CalibrationTail| {
@@ -5465,6 +5470,72 @@ mod empirical_flex_jet_oracle_tests {
                 order_two_bits(&reference),
                 "kind={is_score_warp}: order-two row jet"
             );
+        }
+    }
+
+    /// gam#3216 (a), from PR #3374: the de-nested calibration tail charges its
+    /// cell integrators' own error bounds (the bivariate-normal bound of an
+    /// affine cell, Wilkinson's γ over the terminal rule for a curved one),
+    /// and a finite law, whose terms are each a positive probability to its own
+    /// relative accuracy, charges none. The kernel's bounds are pinned on one
+    /// affine and one curved cell.
+    #[test]
+    fn denested_tail_charges_its_cell_integrators_bounds_3216() {
+        use crate::cubic_cell_kernel::{
+            DenestedCubicCell, NON_AFFINE_VALUE_TERM_OPERATIONS, TERMINAL_GL_ORDER,
+            evaluate_cell_moments,
+        };
+        use gam_math::bivariate_normal::bivariate_normal_interval_probability;
+        use gam_math::roundoff::accumulation_growth;
+
+        let affine = DenestedCubicCell { left: -0.9, right: 0.8, c0: -6.5, c1: -0.35, c2: 0.0, c3: 0.0 };
+        let state = evaluate_cell_moments(affine, 2).expect("affine cell");
+        let s = affine.c1.hypot(1.0);
+        let expected = bivariate_normal_interval_probability(affine.c0 / s, affine.left, affine.right, -affine.c1 / s)
+            .expect("bivariate-normal interval");
+        assert_eq!(state.value.to_bits(), expected.value.to_bits());
+        assert!(state.value_rounding > 0.0 && state.value_rounding == expected.rounding);
+
+        let curved = DenestedCubicCell { left: -0.9, right: 0.8, c0: -2.5, c1: -0.35, c2: 0.2, c3: -0.05 };
+        let state = evaluate_cell_moments(curved, 2).expect("curved cell");
+        assert!(state.value > 0.0);
+        assert_eq!(
+            state.value_rounding,
+            accumulation_growth(TERMINAL_GL_ORDER + NON_AFFINE_VALUE_TERM_OPERATIONS) * state.value
+        );
+
+        for is_score_warp in [true, false] {
+            let fx = make_fixture(is_score_warp);
+            let dev_range = if is_score_warp {
+                fx.primary.h.clone().unwrap()
+            } else {
+                fx.primary.w.clone().unwrap()
+            };
+            let beta: Array1<f64> = Array1::from_iter(dev_range.enumerate().map(|(k, _)| fx.beta_dev[k]));
+            let (beta_h, beta_w) = if is_score_warp {
+                (Some(&beta), None)
+            } else {
+                (None, Some(&beta))
+            };
+            for a in [-1.3, 0.0, 0.8] {
+                for side in [true, false] {
+                    let cells = fx
+                        .family
+                        .evaluate_denested_calibration_tail(a, 0.35, beta_h, beta_w, side)
+                        .expect("denested calibration tail");
+                    assert!(
+                        cells.tail > 0.0 && cells.tail_rounding > 0.0 && cells.tail_rounding < cells.tail,
+                        "kind={is_score_warp} a={a} side={side}: tail {:e}, charged bound {:e}",
+                        cells.tail,
+                        cells.tail_rounding
+                    );
+                    let grid = fx
+                        .family
+                        .evaluate_empirical_grid_calibration_tail(a, 0.35, beta_h, beta_w, &fx.grid, side)
+                        .expect("grid calibration tail");
+                    assert_eq!(grid.tail_rounding, 0.0);
+                }
+            }
         }
     }
 

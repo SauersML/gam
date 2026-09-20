@@ -2796,8 +2796,8 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
             (_, "chunk_size") => &["64"],
             // Flags and selectors.
             // Both polarities: the default is not the same on every arm
-            // (`sz` defaults the null-space penalty OFF, `fs`/`s()` ON), and
-            // a single polarity would probe the default on half of them.
+            // (`mjs` defaults the null-space penalty OFF, `s()`/`fs`/`sz`
+            // ON), and a single polarity would probe the default on some.
             (_, "double_penalty") => &["false", "true"],
             (_, "identifiability") => &["none"],
             (_, "include_intercept") => &["true"],
@@ -3329,7 +3329,10 @@ fn sz_penalty_metadata_is_emitted_in_matrix_order_2289() {
     .expect("build multi-penalty sz smooth");
     let n_levels = spec.group_frozen_levels.as_ref().map(Vec::len).unwrap_or(4);
 
-    assert!(built.active_penalties.len() >= 2 * n_levels);
+    // `L` per-level curvature blocks followed by the pooled null ridges (one
+    // per marginal null component). The marginal's own null ridge is NOT also
+    // replicated per level (#3969).
+    assert!(built.active_penalties.len() > n_levels);
     for (idx, penalty) in built.active_penalties.iter().enumerate() {
         let analysis = crate::basis::analyze_penalty_block(&penalty.matrix).expect("PSD penalty");
         assert_eq!(penalty.info.original_index, idx);
@@ -3342,10 +3345,70 @@ fn sz_penalty_metadata_is_emitted_in_matrix_order_2289() {
             .all(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
     );
     assert!(
-        built.active_penalties[n_levels..2 * n_levels]
+        built.active_penalties[n_levels..]
             .iter()
             .all(|penalty| matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace))
     );
+}
+
+/// #3969: `double_penalty=` is the single switch for the sz deviation
+/// null-space penalty. `false` must leave exactly the `L` per-level curvature
+/// blocks; `true` (the default) must add exactly one pooled zero-sum ridge per
+/// marginal null component and nothing else. Before the fix `false` was
+/// ignored (the pooled ridges were always added) and `true` additionally
+/// replicated the marginal's own null ridge into `L` per-level blocks, so the
+/// null space carried `L + nn` smoothing parameters for a penalty spanned by
+/// `nn` of them (`Σ_{k,j} (μ_k + ν_j) E_k ⊗ R_j` has a one-dimensional kernel
+/// in the smoothing parameters).
+#[test]
+fn sz_double_penalty_flag_is_the_single_null_space_switch_3969() {
+    let ds = continuous_x_factor_dataset(180, 4);
+    let mut workspace = crate::basis::BasisWorkspace::new();
+    let mut build = |formula: &str| {
+        let spec = factor_smooth_spec_for(formula, &ds);
+        let n_levels = spec.group_frozen_levels.as_ref().map(Vec::len).unwrap_or(4);
+        let built = crate::smooth::build_factor_smooth(
+            ds.values.view(),
+            &spec,
+            "sz_null_switch",
+            &mut workspace,
+        )
+        .expect("build sz factor smooth");
+        (n_levels, built)
+    };
+    let (n_levels, off) = build("y ~ s(x, g, bs=sz, k=8, double_penalty=false)");
+    assert_eq!(
+        off.active_penalties.len(),
+        n_levels,
+        "double_penalty=false must leave only the L per-level curvature blocks"
+    );
+    assert!(
+        off.active_penalties
+            .iter()
+            .all(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+    );
+
+    let (_, on) = build("y ~ s(x, g, bs=sz, k=8, double_penalty=true)");
+    let (_, default) = build("y ~ s(x, g, bs=sz, k=8)");
+    assert_eq!(
+        default.active_penalties.len(),
+        on.active_penalties.len(),
+        "the sz default must penalize the deviation null space (#1605)"
+    );
+    let null_ridges: Vec<_> = on
+        .active_penalties
+        .iter()
+        .filter(|penalty| matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace))
+        .collect();
+    // Each marginal null component (the constant, the centred linear, ...)
+    // is pooled exactly once.
+    assert!(!null_ridges.is_empty());
+    assert_eq!(on.active_penalties.len(), n_levels + null_ridges.len());
+    let l_minus_one = n_levels - 1;
+    for ridge in null_ridges {
+        // `(I + 11ᵀ) ⊗ R_k` with rank-1 `R_k` has rank `L - 1`.
+        assert_eq!(ridge.info.effective_rank, l_minus_one);
+    }
 }
 
 /// #1457: `y ~ s(x, by=g) + g` with a BARE categorical `g` must NOT lower to
@@ -5452,6 +5515,76 @@ fn domain_fixes_the_bspline_interval_independently_of_the_sample() {
     // its end knots to the domain.
     let cr = build_formula("y ~ s(x, bs=cr, k=6, domain=[-1, 2])", &wide);
     assert_eq!(knot_span(bspline_spec(&cr, 0)), (-1.0, 2.0));
+}
+
+/// `knots=[...]` on a cubic regression spline gives its interior value knots:
+/// the basis is indexed by exactly those positions plus the two boundary knots
+/// (the data range, or `domain=` when given). The list used to be dropped and
+/// the default quantile-knot basis fitted instead. A list fixes the basis size,
+/// so it conflicts with `k=`. A periodic B-spline is a uniform cyclic grid that
+/// cannot take arbitrary positions, so it refuses the list rather than
+/// ignoring it. `knot_placement=` is a rule for generating knots; where no
+/// knots are generated from it (cr quantile knots, a periodic grid, or an
+/// explicit list) it is refused instead of being accepted and never read. The
+/// cr builder reads neither `degree=` nor `penalty_order=`, so values other
+/// than the cr's own cubic / second-derivative pair are refused too.
+#[test]
+fn explicit_knots_and_placement_are_honoured_or_refused() {
+    let wide = smooth_option_subrange(0.0, 1.0);
+    let value_knots = |formula: &str| -> Vec<f64> {
+        let spec = build_formula(formula, &wide);
+        match &bspline_spec(&spec, 0).knotspec {
+            BSplineKnotSpec::NaturalCubicRegression { knots } => knots.to_vec(),
+            other => panic!("`{formula}` must build cr value knots, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        value_knots("y ~ s(x, bs=cr, knots=[0.3, 0.6])"),
+        vec![0.0, 0.3, 0.6, 1.0]
+    );
+    assert_eq!(
+        value_knots("y ~ s(x, bs=cr, knots=[0.6, 0.3])"),
+        vec![0.0, 0.3, 0.6, 1.0]
+    );
+    assert_eq!(
+        value_knots("y ~ s(x, bs=cr, knots=[0.3, 0.6], domain=[-1, 2])"),
+        vec![-1.0, 0.3, 0.6, 2.0]
+    );
+    let cr = build_formula("y ~ s(x, bs=cr, knots=[0.25, 0.5, 0.75])", &wide);
+    let design = crate::smooth::build_term_collection_design(wide.values.view(), &cr)
+        .expect("an explicit cr value-knot list builds a design");
+    assert_eq!(design.design.nrows(), wide.values.nrows());
+
+    let conflict = formula_error("y ~ s(x, bs=cr, k=8, knots=[0.3])", &wide);
+    assert!(conflict.contains("not both"), "{conflict}");
+    let duplicate = formula_error("y ~ s(x, bs=cr, knots=[0.3, 0.3])", &wide);
+    assert!(duplicate.contains("duplicate"), "{duplicate}");
+    let outside = formula_error("y ~ s(x, bs=cr, knots=[0.3, 1.5])", &wide);
+    assert!(outside.contains("strictly inside"), "{outside}");
+
+    let periodic = formula_error("y ~ s(x, periodic=true, period=1, knots=[0.2, 0.5])", &wide);
+    assert!(periodic.contains("uniform cyclic grid"), "{periodic}");
+
+    let cr_placement = formula_error("y ~ s(x, bs=cr, knot_placement=uniform)", &wide);
+    assert!(cr_placement.contains("does not apply to bs=cr"), "{cr_placement}");
+    // A cr basis is cubic with a second-derivative penalty by construction;
+    // its own values are accepted, any other value is refused.
+    build_formula("y ~ s(x, bs=cr, degree=3, penalty_order=2)", &wide);
+    let cr_degree = formula_error("y ~ s(x, bs=cr, degree=2)", &wide);
+    assert!(cr_degree.contains("degree=2 does not apply to bs=cr"), "{cr_degree}");
+    let cr_order = formula_error("y ~ s(x, bs=cr, penalty_order=1)", &wide);
+    assert!(cr_order.contains("penalty_order=1 does not apply to bs=cr"), "{cr_order}");
+    let periodic_placement = formula_error(
+        "y ~ s(x, periodic=true, period=1, knot_placement=quantile)",
+        &wide,
+    );
+    assert!(
+        periodic_placement.contains("knot_placement= does not apply on a periodic axis"),
+        "{periodic_placement}"
+    );
+    let list_placement =
+        formula_error("y ~ s(x, knots=[0.3, 0.6], knot_placement=quantile)", &wide);
+    assert!(list_placement.contains("cannot be combined"), "{list_placement}");
 }
 
 /// A tensor smooth takes one domain interval per margin, `none` keeping a

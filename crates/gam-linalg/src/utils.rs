@@ -59,7 +59,8 @@ pub const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
 /// (largest-admissible, hence smoothest) value gives `τ₀ = floor/ln2 ≈ 1.443e-8`,
 /// so the absolute perturbation is `P·floor` — exactly the deflation floor
 /// relative to the operator's own curvature scale.
-pub(crate) const SMOOTH_PSD_CLAMP_TEMPERATURE: f64 = SPECTRAL_DEFLATION_REL_FLOOR / std::f64::consts::LN_2;
+pub(crate) const SMOOTH_PSD_CLAMP_TEMPERATURE: f64 =
+    SPECTRAL_DEFLATION_REL_FLOOR / std::f64::consts::LN_2;
 
 /// Homogeneity-preserving smooth replacement for `prefactor · max(x, 0)` on a
 /// dimensionless `x` (`prefactor ≥ 0`), at the temperature
@@ -177,41 +178,6 @@ pub fn trace_of_product(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> f64 {
         }
     }
     value
-}
-
-/// Numerically stable softplus `log(1 + exp(x))`.
-///
-/// Uses the identity `softplus(x) = max(x, 0) + log1p(exp(-|x|))`, which
-/// avoids both `exp` overflow for large positive `x` and `log(1)` cancellation
-/// for large negative `x`. Previously duplicated as `stable_softplus` in
-/// `terms/smooth.rs` and `families/gamlss.rs`.
-#[inline]
-pub fn stable_softplus(x: f64) -> f64 {
-    if x > 0.0 {
-        x + (-x).exp().ln_1p()
-    } else {
-        x.exp().ln_1p()
-    }
-}
-
-/// Numerically stable logistic `σ(x) = 1 / (1 + exp(-x))`.
-///
-/// Splits on the sign of `x` to keep both `exp` arguments non-positive and
-/// avoid overflow:
-///   σ(x) = 1 / (1 + exp(-x))   for x ≥ 0,
-///   σ(x) = exp(x) / (1 + exp(x))   for x < 0.
-///
-/// Canonical home for the routine previously duplicated as `logistic` in
-/// `terms/analytic_penalties.rs`, `sigmoid_stable` in `inference/hmc.rs`, and
-/// `sigmoid_scalar` in `terms/sae/manifold/mod.rs` — all three were bit-identical.
-#[inline]
-pub fn stable_logistic(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let ex = x.exp();
-        ex / (1.0 + ex)
-    }
 }
 
 /// Generic finiteness check for any `f64` ndarray view (1-D, 2-D, etc.).
@@ -809,27 +775,6 @@ pub fn certified_spd_inverse(
     certified_spd_factorize(matrix, label)?.inverse()
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct KahanSum {
-    sum: f64,
-    c: f64,
-}
-
-impl KahanSum {
-    #[inline]
-    pub fn add(&mut self, value: f64) {
-        let y = value - self.c;
-        let t = self.sum + y;
-        self.c = (t - self.sum) - y;
-        self.sum = t;
-    }
-
-    #[inline]
-    pub fn sum(self) -> f64 {
-        self.sum
-    }
-}
-
 pub struct StableSolver;
 
 impl StableSolver {
@@ -1415,7 +1360,6 @@ impl RankCertifiedPsdPseudoinverse {
     pub fn into_pseudoinverse(self) -> Array2<f64> {
         self.pseudoinverse
     }
-
 }
 
 /// Compute a declared rank-truncated PSD pseudoinverse from one strict,
@@ -1720,7 +1664,10 @@ mod certified_inverse_tests {
         let pseudoinverse = geometry.into_pseudoinverse();
         let expected = array![[1.0, 0.0], [0.0, 0.0]];
         for (got, want) in pseudoinverse.iter().zip(expected.iter()) {
-            assert!((got - want).abs() <= 4.0 * f64::EPSILON, "{pseudoinverse:?}");
+            assert!(
+                (got - want).abs() <= 4.0 * f64::EPSILON,
+                "{pseudoinverse:?}"
+            );
         }
         // With no declared cutoff only the rounding band is unresolved.
         let error = rank_certified_psd_pseudoinverse(&matrix, 0.0).unwrap_err();
@@ -1945,82 +1892,7 @@ mod tests {
 
 #[cfg(test)]
 mod pure_fn_tests {
-    use super::{inf_norm, predict_gam_dimension_mismatch_message, row_mismatch_message, stable_logistic, stable_softplus};
-
-    // -----------------------------------------------------------------------
-    // stable_softplus: log(1 + exp(x))
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn softplus_at_zero() {
-        let got = stable_softplus(0.0);
-        let expected = (1.0_f64 + 1.0_f64).ln();
-        assert!((got - expected).abs() < 1e-14, "got={got}");
-    }
-
-    #[test]
-    fn softplus_positive_large_approximates_x() {
-        let x = 100.0_f64;
-        let got = stable_softplus(x);
-        assert!(
-            (got - x).abs() < 1e-10,
-            "softplus({x}) = {got}, expected ~{x}"
-        );
-    }
-
-    #[test]
-    fn softplus_negative_large_approximates_zero() {
-        let x = -50.0_f64;
-        let got = stable_softplus(x);
-        assert!(got >= 0.0, "softplus must be non-negative, got {got}");
-        assert!(got < 1e-10, "softplus({x}) = {got}, expected ~0");
-    }
-
-    #[test]
-    fn softplus_matches_naive_formula_at_moderate_x() {
-        for x in [-5.0_f64, -1.0, 0.5, 1.0, 5.0] {
-            let got = stable_softplus(x);
-            let expected = (1.0 + x.exp()).ln();
-            assert!(
-                (got - expected).abs() < 1e-12,
-                "x={x}: got={got} expected={expected}"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // stable_logistic: 1 / (1 + exp(-x))
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn logistic_at_zero_is_half() {
-        let got = stable_logistic(0.0);
-        assert!((got - 0.5).abs() < 1e-15, "got={got}");
-    }
-
-    #[test]
-    fn logistic_large_positive_approaches_one() {
-        let got = stable_logistic(100.0);
-        assert!((got - 1.0).abs() < 1e-10, "got={got}");
-    }
-
-    #[test]
-    fn logistic_large_negative_approaches_zero() {
-        let got = stable_logistic(-100.0);
-        assert!(got >= 0.0 && got < 1e-10, "got={got}");
-    }
-
-    #[test]
-    fn logistic_symmetry_around_zero() {
-        for x in [0.5_f64, 1.0, 2.0, 5.0] {
-            let pos = stable_logistic(x);
-            let neg = stable_logistic(-x);
-            assert!(
-                (pos + neg - 1.0).abs() < 1e-15,
-                "x={x}: pos={pos} neg={neg}"
-            );
-        }
-    }
+    use super::{inf_norm, predict_gam_dimension_mismatch_message, row_mismatch_message};
 
     // -----------------------------------------------------------------------
     // inf_norm
@@ -2110,7 +1982,9 @@ mod certified_log_det_tests {
         let largest = values.iter().copied().fold(0.0_f64, f64::max);
         let dim = matrix.nrows();
         (dim * dim) as f64 * accumulation_growth(3 * dim + 1) * largest / smallest
-            + accumulation_growth(2 * dim) * dim as f64 * smallest.ln().abs().max(largest.ln().abs())
+            + accumulation_growth(2 * dim)
+                * dim as f64
+                * smallest.ln().abs().max(largest.ln().abs())
     }
 
     #[test]

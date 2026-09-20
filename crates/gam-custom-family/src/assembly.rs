@@ -1858,8 +1858,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                                     )
                                 })?;
                         let wwork = certify_finite_working_weights(working_weights)?;
-                        let x_dense = x_dyn.to_dense();
-                        let n = x_dense.nrows();
+                        let n = x_dyn.nrows();
 
                         let mut d_eta = x_dyn.matrixvectormultiply(direction);
                         let geom = family.block_geometry_directional_derivative(
@@ -1868,25 +1867,12 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                             spec,
                             direction,
                         )?;
-                        let mut correction_mat = Array2::<f64>::zeros((p, p));
-
+                        let mut d_design = None;
                         if let Some(geom_dir) = geom {
                             d_eta += &geom_dir.d_offset;
                             if let Some(dx) = geom_dir.d_design {
                                 d_eta += &fast_av(&dx, &beta_flat);
-                                let mut wx = x_dense.clone();
-                                let mut wdx = dx.clone();
-                                ndarray::Zip::from(wx.rows_mut())
-                                    .and(wdx.rows_mut())
-                                    .and(wwork.view())
-                                    .par_for_each(|mut wxr, mut wdxr, &wi| {
-                                        if wi != 1.0 {
-                                            wxr.mapv_inplace(|v| v * wi);
-                                            wdxr.mapv_inplace(|v| v * wi);
-                                        }
-                                    });
-                                correction_mat += &fast_atb(&dx, &wx);
-                                correction_mat += &fast_atb(&x_dense, &wdx);
+                                d_design = Some(dx);
                             }
                         }
 
@@ -1908,12 +1894,11 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                                 n
                             ) });
                         }
-                        let mut scaled_x = x_dense.clone();
-                        ndarray::Zip::from(scaled_x.rows_mut())
-                            .and(&dw)
-                            .par_for_each(|mut sr, &dwi| sr.mapv_inplace(|v| v * dwi));
-                        correction_mat += &fast_atb(&x_dense, &scaled_x);
-
+                        let correction_mat = diagonal_block_hessian_drift(
+                            x_dyn,
+                            &dw,
+                            d_design.as_ref().map(|dx| (dx, wwork)),
+                        )?;
                         Ok(Some(DriftDerivResult::Dense(correction_mat)))
                     }
                 }
@@ -1959,8 +1944,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                                 "missing dynamic design for block {block_idx} diagonal fixed-point second correction"
                             )
                         })?;
-                        let x_dense = x_dyn.to_dense();
-                        let n = x_dense.nrows();
+                        let n = x_dyn.nrows();
                         let reject_second_order_geometry =
                             |label: &str,
                              geom: Option<BlockGeometryDirectionalDerivative>|
@@ -2015,11 +1999,9 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                                 n
                             ) });
                         }
-                        let mut scaled_x = x_dense.clone();
-                        ndarray::Zip::from(scaled_x.rows_mut())
-                            .and(&d2w)
-                            .par_for_each(|mut sr, &d2wi| sr.mapv_inplace(|value| value * d2wi));
-                        Ok(Some(DriftDerivResult::Dense(fast_atb(&x_dense, &scaled_x))))
+                        Ok(Some(DriftDerivResult::Dense(diagonal_block_hessian_drift(
+                            x_dyn, &d2w, None,
+                        )?)))
                     }
                 }
             };

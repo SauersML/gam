@@ -19,7 +19,6 @@ pub enum CgroupMemoryProbeFailureKind {
     InvalidLimit,
     InvalidCounter,
     MissingCounter,
-    InconsistentCounters,
 }
 
 impl fmt::Display for CgroupMemoryProbeFailureKind {
@@ -32,7 +31,6 @@ impl fmt::Display for CgroupMemoryProbeFailureKind {
             Self::InvalidLimit => "invalid-limit",
             Self::InvalidCounter => "invalid-counter",
             Self::MissingCounter => "missing-counter",
-            Self::InconsistentCounters => "inconsistent-counters",
         };
         formatter.write_str(name)
     }
@@ -70,8 +68,10 @@ impl fmt::Display for CgroupMemoryProbeFailure {
 ///
 /// `working_set_bytes = memory.current - inactive_file`. Only inactive file
 /// cache is credited as reclaimable; active file cache and reclaimable slab are
-/// deliberately left in the working set. The governor's separate 1/4 headroom
-/// remains available for reclaim latency, allocator slack, and untracked work.
+/// deliberately left in the working set. An `inactive_file` figure above the
+/// charge counter earns no credit at all, so the working set is then the whole
+/// charge. The governor's separate 1/4 headroom remains available for reclaim
+/// latency, allocator slack, and untracked work.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CgroupMemoryAvailability {
     binding_path: Box<str>,
@@ -84,24 +84,36 @@ pub struct CgroupMemoryAvailability {
 }
 
 impl CgroupMemoryAvailability {
-    /// Assemble one observation from counters that were read together.
+    /// Assemble one observation from the charge counter and the inactive file
+    /// cache read beside it.
     ///
-    /// `None` when `inactive_file > current`, which is a torn read of the two
-    /// counters rather than a legal state: the working set would be negative.
-    /// This is the single construction site — the live probe, the replay used
-    /// by [`crate::test_support::simulated_cgroup_memory_environment`], and the
+    /// The charge counter (`memory.current`, v1 `memory.usage_in_bytes`) is the
+    /// figure the kernel enforces the limit against, and `inactive_file` is only
+    /// reclaim credit on top of it. The two are not one snapshot: `memory.stat`
+    /// is aggregated apart from the page counter (v2 flushes per-CPU stat deltas
+    /// lazily, v1 sums the hierarchy separately), so `inactive_file` can exceed
+    /// the charge it would reclaim. Such a credit has no consistent reading, and
+    /// the level is admitted at its headroom `limit - current` with no credit.
+    /// Refusing the level instead admitted zero bytes and refused every governed
+    /// allocation under that ceiling.
+    ///
+    /// This is the single construction site — the live v1 and v2 probes, the
+    /// replay used by
+    /// [`crate::test_support::simulated_cgroup_memory_environment`], and the
     /// unit fixtures all funnel through it, so the derived `working_set` and
     /// `available` can never disagree between a measured and a replayed
     /// environment.
-    pub(crate) fn from_consistent_counters(
+    pub(crate) fn from_counters(
         binding_path: impl Into<Box<str>>,
         limit_bytes: u64,
         current_bytes: u64,
         inactive_file_bytes: u64,
         inspected_levels: usize,
-    ) -> Option<Self> {
-        let working_set_bytes = current_bytes.checked_sub(inactive_file_bytes)?;
-        Some(Self {
+    ) -> Self {
+        let working_set_bytes = current_bytes
+            .checked_sub(inactive_file_bytes)
+            .unwrap_or(current_bytes);
+        Self {
             binding_path: binding_path.into(),
             limit_bytes,
             current_bytes,
@@ -109,7 +121,7 @@ impl CgroupMemoryAvailability {
             working_set_bytes,
             available_bytes: limit_bytes.saturating_sub(working_set_bytes),
             inspected_levels,
-        })
+        }
     }
 
     pub const fn limit_bytes(&self) -> u64 {
@@ -533,29 +545,13 @@ mod linux {
                                 })?;
                             let current_after = parse_counter(&current_after_raw, &current_path)?;
                             let current_bytes = current_before.max(current_after);
-                            if inactive_file_bytes > current_bytes {
-                                return Err(failure(
-                                    CgroupMemoryProbeFailureKind::InconsistentCounters,
-                                    &stat_path,
-                                    format!(
-                                        "inactive_file={inactive_file_bytes} exceeds memory.current={current_bytes}"
-                                    ),
-                                ));
-                            }
-                            let candidate = CgroupMemoryAvailability::from_consistent_counters(
+                            let candidate = CgroupMemoryAvailability::from_counters(
                                 directory.display().to_string().into_boxed_str(),
                                 limit_bytes,
                                 current_bytes,
                                 inactive_file_bytes,
                                 0,
-                            )
-                            .ok_or_else(|| {
-                                failure(
-                                    CgroupMemoryProbeFailureKind::InconsistentCounters,
-                                    &stat_path,
-                                    "memory counters became inconsistent during construction",
-                                )
-                            })?;
+                            );
                             if binding.as_ref().map_or(true, |current| {
                                 candidate.available_bytes() < current.available_bytes()
                             }) {
@@ -656,35 +652,18 @@ mod linux {
             let inactive_file_bytes = parse_stat_counter(&stat_raw, inactive_key, &stat_path)?;
             let usage_after = parse_counter(&read_required(&usage_path)?, &usage_path)?;
             let current_bytes = usage_before.max(usage_after);
-            // v1 enforces `memory.limit_in_bytes` against the charge counter
-            // `memory.usage_in_bytes`, so `limit − usage` is the headroom before the
-            // kernel reclaims, and inactive file cache is only reclaim credit on top of
-            // it. `memory.stat` is summed apart from that counter and can exceed it: an
-            // MSI slurm task cgroup read total_inactive_file=2398375936 against
-            // memory.usage_in_bytes=1192067072. A credit larger than the charge it would
-            // reclaim has no consistent reading, so the level is admitted at its headroom
-            // with no credit. Refusing the level admitted zero bytes and refused every
-            // governed allocation on that node.
-            let reclaim_credit_bytes = if inactive_file_bytes > current_bytes {
-                0
-            } else {
-                inactive_file_bytes
-            };
+            // `memory.stat` is summed apart from the charge counter and can exceed
+            // it: an MSI slurm task cgroup read total_inactive_file=2398375936
+            // against memory.usage_in_bytes=1192067072. The constructor admits such
+            // a level at its headroom with no reclaim credit.
             inspected_levels = inspected_levels.saturating_add(1);
-            let candidate = CgroupMemoryAvailability::from_consistent_counters(
+            let candidate = CgroupMemoryAvailability::from_counters(
                 directory.display().to_string().into_boxed_str(),
                 limit_bytes,
                 current_bytes,
-                reclaim_credit_bytes,
+                inactive_file_bytes,
                 0,
-            )
-            .ok_or_else(|| {
-                failure(
-                    CgroupMemoryProbeFailureKind::InconsistentCounters,
-                    &stat_path,
-                    "memory counters became inconsistent during construction",
-                )
-            })?;
+            );
             if binding
                 .as_ref()
                 .is_none_or(|current| candidate.available_bytes() < current.available_bytes())
@@ -922,16 +901,18 @@ mod linux {
         }
 
         #[test]
-        fn inconsistent_cache_counter_fails_closed() {
+        fn v2_reclaim_credit_above_the_charge_counter_admits_the_headroom_without_credit() {
             let fixture = Fixture::new("/tenant/leaf");
             fixture.level("tenant/leaf", "1000", 100, 101);
-            let CgroupMemoryObservation::ProbeFailed(failure) = fixture.observe() else {
-                panic!("inconsistent controller counters must fail closed");
+            let CgroupMemoryObservation::V2Limited(observation) = fixture.observe() else {
+                panic!("a v2 inactive-file figure above memory.current must still bound admission");
             };
+            // The working set is limit - available: no reclaim credit was taken.
             assert_eq!(
-                failure.kind(),
-                CgroupMemoryProbeFailureKind::InconsistentCounters
+                observation.limit_bytes() - observation.available_bytes(),
+                100
             );
+            assert_eq!(observation.available_bytes(), 900);
         }
 
         #[test]
@@ -991,10 +972,15 @@ mod linux {
             )
             .expect("hybrid mountinfo");
             let CgroupMemoryObservation::V1Limited(observation) = fixture.observe() else {
-                panic!("a v1 inactive-file figure above the charge counter must still bound admission");
+                panic!(
+                    "a v1 inactive-file figure above the charge counter must still bound admission"
+                );
             };
             // The working set is limit - available: no reclaim credit was taken.
-            assert_eq!(observation.limit_bytes() - observation.available_bytes(), 1024);
+            assert_eq!(
+                observation.limit_bytes() - observation.available_bytes(),
+                1024
+            );
             assert_eq!(observation.available_bytes(), 1024);
         }
     }
@@ -1012,5 +998,34 @@ mod non_linux_tests {
     #[test]
     fn non_linux_platform_has_no_cgroup_controller() {
         assert_eq!(detect_cgroup_memory(), CgroupMemoryObservation::NotPresent);
+    }
+}
+
+
+#[cfg(test)]
+mod counter_arithmetic_tests {
+    use super::CgroupMemoryAvailability;
+
+    #[test]
+    fn counter_extremes_preserve_raw_observation_and_conservative_headroom() {
+        let counters = [0, 1, 100, 101, u64::MAX - 1, u64::MAX];
+        for limit in counters {
+            for current in counters {
+                for inactive in counters {
+                    let observation = CgroupMemoryAvailability::from_counters(
+                        "/fixture", limit, current, inactive, 3);
+                    // Independently compute in a wider signed domain. A cache
+                    // credit above the charge cannot establish reclaimable bytes.
+                    let credit = if inactive <= current { inactive as i128 } else { 0 };
+                    let working = current as i128 - credit;
+                    let available = (limit as i128 - working).max(0) as u64;
+                    assert_eq!(observation.working_set_bytes, working as u64);
+                    assert_eq!(observation.available_bytes, available);
+                    assert_eq!(observation.current_bytes, current);
+                    assert_eq!(observation.inactive_file_bytes, inactive);
+                    assert_eq!(observation.inspected_levels, 3);
+                }
+            }
+        }
     }
 }

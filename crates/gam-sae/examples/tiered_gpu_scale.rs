@@ -220,13 +220,12 @@ fn run() -> Result<(), String> {
         .count();
     println!(
         "[tiered gpu scale] DONE wall={wall:.2}s tier1_ev={:.6} composed_ev={:.6} epochs_run={} \
-         dead_blocks={}/{} pc_reseed_events={} births={} refusals={}",
+         dead_blocks={}/{} births={} refusals={}",
         report.tier1.explained_variance,
         report.explained_variance,
         report.tier1.epochs,
         n_dead,
         args.n_blocks,
-        report.ledger.pc_reseed_events,
         report.ledger.n_births,
         report.ledger.n_refusals,
     );

@@ -420,21 +420,7 @@ fn preload_cuda_userspace_libraries() -> Result<(), String> {
             }
             let mut loaded = Vec::new();
             for path in paths {
-                // SAFETY: these candidates are CUDA userspace libraries found
-                // in canonical toolkit directories or pip's nvidia-*-cu12
-                // wheel layout. RTLD_GLOBAL is required so transitive deps
-                // such as libcusolver -> libnvJitLink resolve without an
-                // LD_LIBRARY_PATH mutation.
-                match unsafe { UnixLibrary::open(Some(&path), RTLD_NOW | RTLD_GLOBAL) } {
-                    Ok(library) => loaded.push(library),
-                    Err(err) => {
-                        return Err(format!(
-                            "could not preload CUDA userspace library {}: {}",
-                            path.display(),
-                            library_load_error_detail(&err)
-                        ));
-                    }
-                }
+                loaded.push(preload_cuda_library(&path)?);
             }
             Ok(loaded)
         })
@@ -445,6 +431,43 @@ fn preload_cuda_userspace_libraries() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn preload_cuda_library(path: &Path) -> Result<UnixLibrary, String> {
+    // SAFETY: production callers pass CUDA userspace candidates from the selected
+    // toolkit or wheel stack. RTLD_GLOBAL lets their transitive dependencies
+    // resolve without changing the process environment.
+    unsafe { UnixLibrary::open(Some(path), RTLD_NOW | RTLD_GLOBAL) }.map_err(|err| {
+        format!(
+            "could not preload CUDA userspace library {}: {}",
+            path.display(),
+            library_load_error_detail(&err)
+        )
+    })
+}
+
+#[derive(Default)]
+struct ComputeLibraryCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, Result<Library, GpuError>>>,
+}
+
+impl ComputeLibraryCache {
+    fn require(
+        &self,
+        stem: &str,
+        load: impl FnOnce() -> Result<Library, GpuError>,
+    ) -> Result<(), GpuError> {
+        // Insert only a complete verdict. If a loader panics, existing entries
+        // still own their handles and the missing entry can be retried.
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(stem.to_owned())
+            .or_insert_with(load)
+            .as_ref()
+            .map(|_| ())
+            .map_err(Clone::clone)
+    }
+}
 /// Require that the platform loader can open the named CUDA compute library
 /// (`cublas`, `cusolver`, `cusparse`) from the one selected userspace stack.
 ///
@@ -475,25 +498,15 @@ pub fn require_cuda_compute_library(stem: &str) -> Result<(), GpuError> {
     // one without the other. A poisoned map is recovered, not bypassed: its
     // entries are complete verdicts, and bypassing it would re-run the probe and
     // drop the handle it opens.
-    static PROBED: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, Result<Library, GpuError>>>,
-    > = OnceLock::new();
-    let mut probed = PROBED
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(outcome) = probed.get(stem) {
-        return outcome.as_ref().map(|_| ()).map_err(Clone::clone);
-    }
-    #[cfg(target_os = "linux")]
-    preload_cuda_userspace_libraries()
-        .map_err(|reason| GpuError::RuntimeDependencyUnavailable { reason })?;
-    probed
-        .entry(stem.to_string())
-        .or_insert_with(|| load_library_names(&cuda_compute_library_candidate_names(stem)))
-        .as_ref()
-        .map(|_| ())
-        .map_err(Clone::clone)
+    static PROBED: OnceLock<ComputeLibraryCache> = OnceLock::new();
+    PROBED
+        .get_or_init(ComputeLibraryCache::default)
+        .require(stem, || {
+            #[cfg(target_os = "linux")]
+            preload_cuda_userspace_libraries()
+                .map_err(|reason| GpuError::RuntimeDependencyUnavailable { reason })?;
+            load_library_names(&cuda_compute_library_candidate_names(stem))
+        })
 }
 
 #[cfg(target_os = "linux")]
@@ -1363,5 +1376,91 @@ mod tests {
             let canonical = path.canonicalize().expect("canonical fake library");
             selected.contains(&canonical)
         }));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod compute_library_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn successful_handle_and_failed_verdict_survive_poison() {
+        let cache = ComputeLibraryCache::default();
+        let loads = AtomicUsize::new(0);
+        cache
+            .require("present", || {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok(UnixLibrary::this().into())
+            })
+            .unwrap();
+        let refusal = || GpuError::DriverLibraryLoadFailed {
+            reason: "libcusolver: missing transitive symbol independent_oracle".into(),
+        };
+        let first = cache
+            .require("broken", || {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Err(refusal())
+            })
+            .unwrap_err();
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _guard = cache.entries.lock().unwrap();
+                panic!("injected cache owner panic");
+            })
+            .is_err()
+        );
+        cache
+            .require("present", || panic!("successful library reloaded"))
+            .unwrap();
+        let again = cache
+            .require("broken", || panic!("failed library reloaded"))
+            .unwrap_err();
+        assert_eq!(first.to_string(), again.to_string());
+        assert!(again.to_string().contains("independent_oracle"));
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        let entries = cache
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(matches!(entries.get("present"), Some(Ok(_))));
+        assert!(matches!(entries.get("broken"), Some(Err(_))));
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn loader_panic_does_not_publish_an_incomplete_verdict() {
+        let cache = ComputeLibraryCache::default();
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _ = cache.require("panicked", || panic!("injected loader panic"));
+            })
+            .is_err()
+        );
+        let mut calls = 0;
+        cache
+            .require("panicked", || {
+                calls += 1;
+                Ok(UnixLibrary::this().into())
+            })
+            .unwrap();
+        cache
+            .require("panicked", || panic!("completed verdict reloaded"))
+            .unwrap();
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn preload_reports_actual_platform_loader_diagnostic() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("libcuda_invalid_fixture.so");
+        std::fs::write(&path, b"not an ELF object").unwrap();
+        let error = preload_cuda_library(&path).unwrap_err();
+        assert!(error.contains(path.to_str().unwrap()), "{error}");
+        assert!(
+            error.contains("file too short") || error.contains("invalid ELF header"),
+            "{error}"
+        );
+        assert!(!error.ends_with("dlopen failed"), "{error}");
     }
 }
