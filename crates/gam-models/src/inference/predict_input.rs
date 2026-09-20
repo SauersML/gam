@@ -6,7 +6,6 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use crate::inference::predict_io::{FittedLatentScoreMap, LatentConditioningSpan, PredictInput};
 use gam_linalg::matrix::DesignMatrix;
 use gam_linalg::utils::inf_norm;
-use gam_math::probability::standard_normal_quantile;
 use gam_model_kernels::scale_design::{
     build_scale_deviation_operator, scale_transform_from_payload,
 };
@@ -20,7 +19,7 @@ use crate::survival::predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
 };
 use crate::transformation_normal::{
-    CTN_LOCATION_COLUMNS, CtnRowBases, CtnRowFloors, CtnTransformTable,
+    CTN_LOCATION_COLUMNS, CtnPredictiveQuadrature, CtnRowBases, CtnRowFloors, CtnTransformTable,
     TRANSFORMATION_MONOTONICITY_EPS, ctn_endpoint_bases, ctn_laplace_quantile_correction,
     ctn_response_bases_at, ctn_response_second_derivative_basis_at, ctn_row_geometry,
     transformation_normal_pit_score,
@@ -259,10 +258,6 @@ pub fn build_marginal_slope_local_auxiliary_matrix(
 /// Number of nodes in the shared fine response grid used to tabulate (and then
 /// invert) the CTM conditional transform `h(y|x)`.
 const TRANSFORMATION_NORMAL_INVERSION_GRID: usize = 257;
-
-/// Number of standard-normal quadrature nodes (midpoint rule in probability
-/// space) used to average `h⁻¹(Z|x)` into the response-scale mean `E[Y|x]`.
-const TRANSFORMATION_NORMAL_MEAN_QUADRATURE: usize = 48;
 
 /// The chart a saved CTN model was written in, together with everything needed
 /// to replay its transform: the frozen response knots / degree / coefficient
@@ -752,20 +747,6 @@ pub(crate) fn transformation_normal_band_z_nodes() -> Array1<f64> {
     })
 }
 
-/// The standard-normal midpoint quadrature nodes `z_k = Φ⁻¹((k + ½)/QUAD)` that
-/// the CTM mean averages the inverse transform over. The plug-in mean and its
-/// posterior-mean correction read the same nodes.
-fn transformation_normal_mean_z_nodes() -> Result<Vec<f64>, PredictInputError> {
-    const QUAD: usize = TRANSFORMATION_NORMAL_MEAN_QUADRATURE;
-    (0..QUAD)
-        .map(|k| {
-            let p = ((k as f64) + 0.5) / (QUAD as f64);
-            standard_normal_quantile(p)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| PredictInputError::InvalidInput { reason: e })
-}
-
 /// The Laplace-order posterior-mean correction to the plug-in CTM mean `E[Y|x]`
 /// (SPEC rule 3: the default prediction is the posterior mean, never the plug-in).
 ///
@@ -775,7 +756,12 @@ fn transformation_normal_mean_z_nodes() -> Result<Vec<f64>, PredictInputError> {
 /// `Σ_α[k, l] = ψᵀ V[(k, ·), (l, ·)] ψ`. The response-scale posterior mean is
 /// `E_Z E_α[h⁻¹(Z|x; α)]`. To the order of the Laplace approximation itself each
 /// quantile moves by `½tr(Σ_α∇²y)` (see [`ctn_laplace_quantile_correction`]),
-/// averaged over the same Z nodes as the plug-in mean.
+/// and `E_Z[c(h⁻¹(Z))] = ∫ c dF`, so the correction `c(y)` is integrated against
+/// the same predictive measure as the plug-in mean: the quadrature's interior
+/// nodes, plus the two affine tails in closed form. On a tail `h″ = 0` and the
+/// value basis continues linearly, `a(y) = a_b + (y − y_b)·a′_b`, so
+/// `c(y) = a′_bᵀΣ_α a(y)/γ_b²` is affine in `y − y_b` with level `a′_bᵀΣ_α a_b/γ_b²`
+/// and slope `a′_bᵀΣ_α a′_b/γ_b²`, `γ_b` the tail slope.
 ///
 /// The exact expectation under that Gaussian does not exist. Its predictive CDF
 /// has the closed form `F(t|x) = Φ(ĥ(t)/√(1 + s²(t)))`, `s²(t) = a(t)ᵀΣ_α a(t)`,
@@ -795,8 +781,9 @@ fn transformation_normal_posterior_mean_correction(
     design: &gam_terms::smooth::TermCollectionPredictionDesign,
     n: usize,
     offset: &Array1<f64>,
-    table: &CtnTransformTable,
+    quadrature: &CtnPredictiveQuadrature<'_>,
 ) -> Result<Array1<f64>, PredictInputError> {
+    let table = quadrature.table();
     if table.nrows() != n {
         return Err(PredictInputError::DimensionMismatch {
             reason: format!(
@@ -822,46 +809,73 @@ fn transformation_normal_posterior_mean_correction(
         .map_err(|error| PredictInputError::InvalidInput {
             reason: error.to_string(),
         })?;
-    let z_nodes = transformation_normal_mean_z_nodes()?;
-    let saved_ref = &saved;
-    let coefficients_ref = &coefficients;
-    let cov_mat_ref = &cov_mat;
-    let offset_ref = &offset;
-    let z_nodes_ref = &z_nodes;
+    // Every row shares the quadrature's nodes, so the bases are evaluated once.
+    let nodes = quadrature.nodes().to_owned();
+    let (value, derivative) = saved.bases_at(&nodes)?;
+    let second = saved.second_derivative_basis_at(&nodes)?;
+    let grid_y = table.grid_y();
+    let ends = Array1::from_vec(vec![grid_y[0], grid_y[grid_y.len() - 1]]);
+    let (end_value, end_derivative) = saved.bases_at(&ends)?;
+    let flat = Array1::<f64>::zeros(p_resp);
     let rows: Vec<Result<f64, String>> = (0..n)
         .into_par_iter()
         .map(|i| {
-            let cov_row = cov_mat_ref.row(i);
-            let alpha = saved_ref.alpha_row(coefficients_ref, cov_row);
+            let cov_row = cov_mat.row(i);
+            let alpha = saved.alpha_row(&coefficients, cov_row);
             let alpha_covariance = ctn_alpha_covariance(covariance, cov_row, p_resp);
-            let quantiles = Array1::from_iter(z_nodes_ref.iter().map(|&z| table.invert(i, z)));
-            let (value, derivative) = saved_ref.bases_at(&quantiles).map_err(String::from)?;
-            let second = saved_ref
-                .second_derivative_basis_at(&quantiles)
-                .map_err(String::from)?;
-            let mut acc = 0.0_f64;
-            for (k, &y) in quantiles.iter().enumerate() {
-                let geometry = ctn_row_geometry(
-                    saved_ref.chart,
+            let slope_at = |value: ndarray::ArrayView1<'_, f64>,
+                            derivative: ndarray::ArrayView1<'_, f64>,
+                            y: f64| {
+                ctn_row_geometry(
+                    saved.chart,
                     alpha.view(),
                     CtnRowBases {
-                        value: value.row(k),
-                        derivative: derivative.row(k),
-                        lower: saved_ref.lower_basis.view(),
-                        upper: saved_ref.upper_basis.view(),
+                        value,
+                        derivative,
+                        lower: saved.lower_basis.view(),
+                        upper: saved.upper_basis.view(),
                     },
-                    saved_ref.floors(y, offset_ref[i]),
-                );
-                acc += ctn_laplace_quantile_correction(
-                    value.row(k),
-                    derivative.row(k),
-                    second.row(k),
+                    saved.floors(y, offset[i]),
+                )
+                .h_prime
+            };
+            let measure = quadrature.row_measure(i);
+            let mut correction = 0.0_f64;
+            for (j, (&weight, &y)) in measure.interior.iter().zip(nodes.iter()).enumerate() {
+                if weight == 0.0 {
+                    continue;
+                }
+                correction += weight
+                    * ctn_laplace_quantile_correction(
+                        value.row(j),
+                        derivative.row(j),
+                        second.row(j),
+                        alpha.view(),
+                        alpha_covariance.view(),
+                        slope_at(value.row(j), derivative.row(j), y),
+                    );
+            }
+            for (b, tail) in [(0, &measure.lower), (1, &measure.upper)] {
+                let (a, a_prime) = (end_value.row(b), end_derivative.row(b));
+                let gamma = slope_at(a, a_prime, ends[b]);
+                let level = ctn_laplace_quantile_correction(
+                    a,
+                    a_prime,
+                    flat.view(),
                     alpha.view(),
                     alpha_covariance.view(),
-                    geometry.h_prime,
+                    gamma,
                 );
+                let slope = ctn_laplace_quantile_correction(
+                    a_prime,
+                    a_prime,
+                    flat.view(),
+                    alpha.view(),
+                    alpha_covariance.view(),
+                    gamma,
+                );
+                correction += tail.expectation(level, slope);
             }
-            let correction = acc / (z_nodes_ref.len() as f64);
             if correction.is_finite() {
                 Ok(correction)
             } else {
@@ -1180,31 +1194,21 @@ fn transformation_normal_predictive_ladder(
     Ok(quantile_ladder)
 }
 
-/// The plug-in response-scale conditional mean `E[Y|x] = E_{Z~N(0,1)}[h⁻¹(Z|x)]`
-/// at the table's coefficients, for each row of a CTM transform table, by
-/// averaging the inverse over a standard-normal midpoint quadrature in probability
-/// space (see the predict branch for the derivation). The generate sampler's
+/// The plug-in response-scale conditional mean `E[Y|x] = ∫ y dΦ(h(y|x))` at the
+/// table's coefficients, for each row of a CTM transform table: the quadrature's
+/// certified Gauss–Legendre rule on every tabulated cell plus the two affine tails
+/// in closed form (see [`CtnPredictiveQuadrature`]). The generate sampler's
 /// reference mean (#1613) and each posterior draw's mean read this directly;
 /// `predict` adds [`transformation_normal_posterior_mean_correction`] to it.
 ///
-/// The outermost quadrature nodes routinely fall past the tabulated latent
-/// range — `Φ(h(y_lo|x))` is around `1/(n+1)` for a well-calibrated fit, and the
-/// extreme midpoint node sits at `1/(2·QUAD)` — so this average is only an
-/// average of the model's own quantile function because
-/// [`CtnTransformTable::invert`] continues through the affine tails instead of
-/// returning the support endpoint (gam#2600).
+/// It replaces an average of `h⁻¹` over 48 midpoint levels `Φ⁻¹((k + ½)/48)`:
+/// `E[Y] = ∫₀¹ h⁻¹(Φ⁻¹(p)) dp` is unbounded at both ends of `p`, and that rule
+/// dropped 1.9 % of a lognormal's mean (gam#3520).
 fn transformation_normal_conditional_mean(
-    table: &CtnTransformTable,
+    quadrature: &CtnPredictiveQuadrature<'_>,
 ) -> Result<Array1<f64>, PredictInputError> {
-    let n = table.nrows();
-    let z_nodes = transformation_normal_mean_z_nodes()?;
-    let mean = Array1::<f64>::from_shape_fn(n, |i| {
-        let mut acc = 0.0_f64;
-        for &z in &z_nodes {
-            acc += table.invert(i, z);
-        }
-        acc / (z_nodes.len() as f64)
-    });
+    let n = quadrature.table().nrows();
+    let mean = Array1::from_vec((0..n).into_par_iter().map(|i| quadrature.mean(i)).collect());
     if mean.iter().any(|value| !value.is_finite()) {
         return Err(PredictInputError::InvalidInput {
             reason: "transformation-normal conditional mean E[Y|x] produced non-finite values"
@@ -1267,7 +1271,9 @@ pub fn build_transformation_normal_quantile_grid(
     }
     let table =
         transformation_normal_quantile_grid(model, &design, n, offset).map_err(String::from)?;
-    let conditional_mean = transformation_normal_conditional_mean(&table).map_err(String::from)?;
+    let quadrature = table.predictive_quadrature()?;
+    let conditional_mean =
+        transformation_normal_conditional_mean(&quadrature).map_err(String::from)?;
     Ok(TransformationNormalQuantileGrid {
         table,
         conditional_mean,
@@ -1542,20 +1548,26 @@ fn build_predict_input_for_model_inner(
             // supplied response). We tabulate the monotone transform once via
             // `transformation_normal_quantile_grid` — the SAME curve the
             // `gam generate` inverse-transform sampler inverts (#1613) — and
-            // average its inverse over a standard-normal quadrature: writing
-            // `E[Y|x] = ∫₀¹ h⁻¹(Φ⁻¹(p)|x) dp`, apply the midpoint rule on `m`
-            // evenly spaced probability levels `p_k = (k + ½)/m`, `z_k = Φ⁻¹(p_k)`.
-            // Probability space keeps every node inside the finite I-spline
-            // support (no normal-tail truncation) and needs no Gauss–Hermite
-            // weights.
+            // integrate in `y`: `E[Y|x] = ∫ y·φ(h(y|x))·h'(y|x) dy`, by a
+            // certified Gauss–Legendre rule on every tabulated cell and in
+            // closed form on the two affine tails (gam#3520).
             let table = transformation_normal_quantile_grid(model, &design, n, offset)?;
-            let conditional_mean = transformation_normal_conditional_mean(&table)?;
+            let quadrature = table
+                .predictive_quadrature()
+                .map_err(|reason| PredictInputError::InvalidInput { reason })?;
+            let conditional_mean = transformation_normal_conditional_mean(&quadrature)?;
             // SPEC rule 3: the default prediction is the posterior mean, so the
             // plug-in mean above is carried together with its Laplace-order
             // posterior-mean correction (see the function's doc for why this, and
             // not the Gaussian predictive integral, is the posterior mean).
             let posterior_mean_correction =
-                transformation_normal_posterior_mean_correction(model, &design, n, offset, &table)?;
+                transformation_normal_posterior_mean_correction(
+                    model,
+                    &design,
+                    n,
+                    offset,
+                    &quadrature,
+                )?;
             // Response-scale posterior-predictive quantile ladder (SPEC rule 3):
             // under the coefficient posterior the p-quantile of `Y|x` is
             // `g⁻¹(Φ⁻¹(p)|x)` with `g = ĥ/√(1 + s²)`, tabulated on the fixed z
