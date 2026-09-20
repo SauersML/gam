@@ -2828,5 +2828,17 @@
     ],
     "reason": "The conditioning-gate value, gradient and Hessian each defined a private inner copy of the cubic smoothstep ramp (ramp_down, ramp_down_value_and_deriv, ramp_down_value_d1_d2) duplicating conditioning_ramp_down_derivatives, which the third and fourth partials already read. All orders now read both sub-weights through conditioning_sub_weight_derivatives over that one ramp, so the value and every partial select the active max-branch from the same numbers.",
     "evidence": "Each removed inner fn was local to one function body (spectral_gate_weight, spectral_gate_weight_grad, spectral_gate_weight_hess) and called only there; the ramp arithmetic 1 - t^2(3 - 2t), -6t(1-t)/span, -6(1-2t)/span^2 is identical in conditioning_ramp_down_derivatives, so every gate value and partial is bit-identical. The other ramp_down occurrences the guard counts are the call sites inside these bodies and the explicit mixed trace weights stratum closure, which now also reads conditioning_sub_weight_derivatives."
+  },
+  {
+    "base": "08628afb310729629275eb487e7714732662d59e",
+    "items": [
+      "crates/gam-math/src/categorical.rs:fn:positive_log_sum_exp",
+      "crates/gam-models/src/latent_law_compression.rs:fn:log_sum_exp",
+      "crates/gam-sae/src/sparse_dict/split_lr_fdr.rs:fn:logsumexp",
+      "crates/gam-solve/src/evidence.rs:fn:log_sum_exp",
+      "crates/gam-solve/src/reml/block_correction_hessian.rs:fn:log_sum_exp"
+    ],
+    "reason": "Single source of truth for log-sum-exp: five private copies (categorical positive_log_sum_exp, latent_law_compression log_sum_exp, split_lr_fdr logsumexp, evidence log_sum_exp, block_correction_hessian log_sum_exp) plus three inline copies duplicated gam_math::probability::signed_log_sum_exp with all signs +1. They are replaced by one pub gam_math::probability::positive_log_sum_exp that shares signed_log_sum_exp's body. The evidence.rs copy returned -inf for a +inf term; the canonical routine silently dropped NaN terms, which consolidation would have turned into a NaN-swallowing regression, so it now propagates an undefined term as NaN.",
+    "evidence": "gam-math probability tests slse_undefined_term_makes_the_sum_undefined and positive_log_sum_exp_edge_cases pin NaN propagation, +inf, -inf, empty input and the 1000+ln2 overflow case; at the head git grep -w finds no definition of the five removed names in the edited files, and every former caller now calls positive_log_sum_exp."
   }
 ]
