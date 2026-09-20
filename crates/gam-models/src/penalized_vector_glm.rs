@@ -61,7 +61,8 @@
 //! only consume the per-output diagonal (a non-zero cross term cannot be
 //! represented by the separable columns). That family-specific precondition is
 //! enforced by the adapter before it constructs the override view; the engine
-//! consumes whatever block it is given.
+//! consumes the symmetric part of whatever block it is given, the only part the
+//! block's quadratic form reads.
 
 use crate::model_types::EstimationError;
 use crate::vector_response::VectorLikelihood;
@@ -74,7 +75,7 @@ use gam_problem::{
     FixedLambdaStationarityEvidence,
 };
 use gam_solve::pirls::dense_block_xtwx;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 use opt::{BacktrackConfig, backtracking_line_search};
 
 /// Backtracking budget for the damped-Newton line search: full step first, then
@@ -758,6 +759,17 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
             );
         }
     }
+    // A curvature block enters the Newton model only through its quadratic form
+    // ½·ΔηᵀWΔη, which reads (W + Wᵀ)/2 and nothing else. Assembling XᵀWX from
+    // that part keeps the Hessian symmetric, so its factorization does not
+    // depend on which triangle it reads. A symmetric block is unchanged, since
+    // (a + a)·½ = a.
+    let symmetric_override = fisher_w_override.map(|fw| {
+        Array3::from_shape_fn(fw.dim(), |(row, a, b)| {
+            0.5 * (fw[[row, a, b]] + fw[[row, b, a]])
+        })
+    });
+    let fisher_w_override = symmetric_override.as_ref().map(Array3::view);
     for ((i, j), &v) in design.indexed_iter() {
         if !v.is_finite() {
             crate::bail_invalid_estim!("{context}: design[{i},{j}] must be finite (got {v})");

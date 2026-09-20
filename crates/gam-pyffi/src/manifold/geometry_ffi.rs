@@ -2073,23 +2073,6 @@ fn validate_aux_conditional_prior_lambda(
             "AuxConditionalPriorPenalty.lambda_per_row must be finite",
         ));
     }
-
-    let mut max_asym = 0.0_f64;
-    for obs in 0..n_obs {
-        for row in 0..rows {
-            for col in 0..cols {
-                let asym = (view[IxDyn(&[obs, row, col])] - view[IxDyn(&[obs, col, row])]).abs();
-                if asym > max_asym {
-                    max_asym = asym;
-                }
-            }
-        }
-    }
-    if max_asym >= 1.0e-10 {
-        return Err(PyValueError::new_err(format!(
-            "AuxConditionalPriorPenalty.lambda_per_row matrices must be symmetric within 1e-10; max asymmetry is {max_asym:.3e}"
-        )));
-    }
     Ok(())
 }
 
