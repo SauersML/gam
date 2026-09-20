@@ -122,6 +122,18 @@ def test_paired_accuracy_verdicts() -> None:
     g = [_rec("gamfit", s, coverage=0.80) for s in range(3)]
     c = [_rec("pygam", s, coverage=0.94 + 0.001 * s) for s in range(3)]
     assert paired_verdict(g, c, "coverage").loss
+    # ... of the mean coverage over seeds, in either direction. A calibrated
+    # interval's per-seed coverage scatters around 0.95 (mean exactly 0.95
+    # here); an interval that covers every true mean on every seed is
+    # conservative, and loses to it, although its per-seed distance (0.05) is
+    # below the calibrated one's mean per-seed distance (0.06).
+    calibrated = (0.80, 1.0, 1.0, 1.0, 0.95)
+    g = [_rec("gamfit", s, coverage=1.0) for s in range(5)]
+    c = [_rec("pygam", s, coverage=v) for s, v in enumerate(calibrated)]
+    assert paired_verdict(g, c, "coverage").loss
+    g = [_rec("gamfit", s, coverage=v) for s, v in enumerate(calibrated)]
+    c = [_rec("pygam", s, coverage=1.0) for s in range(5)]
+    assert paired_verdict(g, c, "coverage").win
     # A metric gamfit fails to report where pyGAM does is a loss, not a gap.
     g = [_rec("gamfit", 0)]
     c = [_rec("pygam", 0, logscore=1.0)]
