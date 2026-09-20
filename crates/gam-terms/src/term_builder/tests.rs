@@ -3103,7 +3103,10 @@ fn sz_penalty_metadata_is_emitted_in_matrix_order_2289() {
     .expect("build multi-penalty sz smooth");
     let n_levels = spec.group_frozen_levels.as_ref().map(Vec::len).unwrap_or(4);
 
-    assert!(built.active_penalties.len() >= 2 * n_levels);
+    // `L` per-level curvature blocks followed by the pooled null ridges (one
+    // per marginal null component). The marginal's own null ridge is NOT also
+    // replicated per level (#3969).
+    assert!(built.active_penalties.len() > n_levels);
     for (idx, penalty) in built.active_penalties.iter().enumerate() {
         let analysis = crate::basis::analyze_penalty_block(&penalty.matrix).expect("PSD penalty");
         assert_eq!(penalty.info.original_index, idx);
@@ -3116,10 +3119,70 @@ fn sz_penalty_metadata_is_emitted_in_matrix_order_2289() {
             .all(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
     );
     assert!(
-        built.active_penalties[n_levels..2 * n_levels]
+        built.active_penalties[n_levels..]
             .iter()
             .all(|penalty| matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace))
     );
+}
+
+/// #3969: `double_penalty=` is the single switch for the sz deviation
+/// null-space penalty. `false` must leave exactly the `L` per-level curvature
+/// blocks; `true` (the default) must add exactly one pooled zero-sum ridge per
+/// marginal null component and nothing else. Before the fix `false` was
+/// ignored (the pooled ridges were always added) and `true` additionally
+/// replicated the marginal's own null ridge into `L` per-level blocks, so the
+/// null space carried `L + nn` smoothing parameters for a penalty spanned by
+/// `nn` of them (`Σ_{k,j} (μ_k + ν_j) E_k ⊗ R_j` has a one-dimensional kernel
+/// in the smoothing parameters).
+#[test]
+fn sz_double_penalty_flag_is_the_single_null_space_switch_3969() {
+    let ds = continuous_x_factor_dataset(180, 4);
+    let mut workspace = crate::basis::BasisWorkspace::new();
+    let mut build = |formula: &str| {
+        let spec = factor_smooth_spec_for(formula, &ds);
+        let n_levels = spec.group_frozen_levels.as_ref().map(Vec::len).unwrap_or(4);
+        let built = crate::smooth::build_factor_smooth(
+            ds.values.view(),
+            &spec,
+            "sz_null_switch",
+            &mut workspace,
+        )
+        .expect("build sz factor smooth");
+        (n_levels, built)
+    };
+    let (n_levels, off) = build("y ~ s(x, g, bs=sz, k=8, double_penalty=false)");
+    assert_eq!(
+        off.active_penalties.len(),
+        n_levels,
+        "double_penalty=false must leave only the L per-level curvature blocks"
+    );
+    assert!(
+        off.active_penalties
+            .iter()
+            .all(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+    );
+
+    let (_, on) = build("y ~ s(x, g, bs=sz, k=8, double_penalty=true)");
+    let (_, default) = build("y ~ s(x, g, bs=sz, k=8)");
+    assert_eq!(
+        default.active_penalties.len(),
+        on.active_penalties.len(),
+        "the sz default must penalize the deviation null space (#1605)"
+    );
+    let null_ridges: Vec<_> = on
+        .active_penalties
+        .iter()
+        .filter(|penalty| matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace))
+        .collect();
+    // Each marginal null component (the constant, the centred linear, ...)
+    // is pooled exactly once.
+    assert!(!null_ridges.is_empty());
+    assert_eq!(on.active_penalties.len(), n_levels + null_ridges.len());
+    let l_minus_one = n_levels - 1;
+    for ridge in null_ridges {
+        // `(I + 11ᵀ) ⊗ R_k` with rank-1 `R_k` has rank `L - 1`.
+        assert_eq!(ridge.info.effective_rank, l_minus_one);
+    }
 }
 
 /// #1457: `y ~ s(x, by=g) + g` with a BARE categorical `g` must NOT lower to
