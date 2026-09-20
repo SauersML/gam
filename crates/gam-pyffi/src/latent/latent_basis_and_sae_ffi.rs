@@ -508,6 +508,9 @@ fn fit_penalized_multinomial_pyfunc<'py>(
     // the solve converged.
     out.set_item("status", "ok")?;
     out.set_item("iterations", outputs.iterations)?;
+    // The objective the fit maximized, chosen from the data before fitting
+    // (#4173): `penalized_neg_log_likelihood` is the negative of this objective.
+    out.set_item("objective", outputs.objective.name())?;
     out.set_item(
         "coefficients_active",
         outputs.coefficients_active.into_pyarray(py),

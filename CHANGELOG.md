@@ -1,5 +1,25 @@
 ## Unreleased
 
+- **Fixed-λ multinomial separation is decided before the fit** (#4173). The fixed-λ
+  softmax driver used to run plain penalized Newton, and when it stalled with `|η| ≥ 25`
+  it refit with Firth and returned that fit without saying so. It now checks the data
+  before fitting. A cone projection over the penalty nullspace decides whether the
+  penalized likelihood has a finite maximizer. If it does not, the Firth-penalized
+  objective is fitted to convergence. `MultinomialFitOutputs::objective` records which
+  objective was optimized, along with the separation witness and `log det I` in the
+  Firth case. `penalized_neg_log_likelihood` is the negative of that objective. The Python
+  fixed-λ result dict gains an `objective` key. The `|η| ≥ 25` trigger and
+  `VectorGlmStall::eta` are deleted.
+
+- **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
+  (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
+  point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is
+  deleted, and so is `cholesky_logdet_from_col_major`. `GpuMixedPrecisionPolicy` is deleted,
+  since only its `Refinement` variant was ever reachable. `GpuDispatchPolicy` loses seven
+  fields that no dispatch decision read: `xtwx_n_min`, `xtwx_use_fused_below_p`,
+  `syevd_min_p`, `sparse_min_nnz`, `keep_design_resident_min_bytes`,
+  `prefer_gpu_factorization_min_p` and `mixed_precision`.
+
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
   `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and

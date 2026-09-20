@@ -255,19 +255,17 @@ pub struct PenalizedVectorGlmOutputs {
 
 /// Checkpoint evidence for a Newton solve that stopped without certification.
 ///
-/// This is NOT a fit: it exists so family adapters can inspect the abandoned
-/// iterate (e.g. the multinomial separation fingerprint `|η| ≥ 25` that routes
-/// to the Firth/Jeffreys proper-prior refit) and so the typed non-convergence
-/// error can carry honest evidence — the iteration count and the penalized
-/// objective at the last iterate. It carries no covariance and no fitted
+/// This is NOT a fit: it exists so the typed non-convergence error can carry
+/// honest evidence — the iteration count, the penalized objective and a
+/// resumable coefficient checkpoint at the last iterate. Which objective a
+/// family fits is decided before the solve, never from a stalled iterate
+/// (#4173). It carries no covariance and no fitted
 /// probabilities on purpose: nothing downstream may dress it up as a result.
 pub struct VectorGlmStall {
     /// Why the convergence certificate was not reached.
     pub reason: VectorGlmStallReason,
     /// Coefficient checkpoint at the last accepted iterate, shape `(P, M)`.
     pub coefficients: Array2<f64>,
-    /// Linear predictor `η = X β` at the abandoned iterate, shape `(N, M)`.
-    pub eta: Array2<f64>,
     /// Newton iterations executed before the stall was diagnosed.
     pub iterations: usize,
     /// Unpenalized log-likelihood at the abandoned iterate.
@@ -345,8 +343,8 @@ pub enum VectorGlmStallReason {
 /// Two-outcome result of the fixed-λ vector-GLM Newton solve. Hard input /
 /// linear-algebra failures remain `Err`; any terminal state without a
 /// stationarity certificate is a first-class `Stalled` outcome so adapters must
-/// decide explicitly (typed error, or the multinomial separation → Firth
-/// escalation) instead of ever forwarding a non-converged iterate as a fit.
+/// turn it into a typed error instead of ever forwarding a non-converged
+/// iterate as a fit.
 pub enum VectorGlmSolve {
     /// Certified stationary point (step-norm AND first-order optimality gates
     /// passed), with the Laplace covariance computed at the mode.
@@ -1179,12 +1177,10 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         }
         // Budget exhausted (or the post-step score failed certification). Hand
         // back checkpoint evidence — never a covariance or fitted probabilities.
-        // The adapter decides between a typed non-convergence error and the
-        // multinomial separation → Firth/Jeffreys escalation.
+        // The adapter reports it as a typed non-convergence error.
         return Ok(VectorGlmSolve::Stalled(VectorGlmStall {
             reason: stall_reason,
             coefficients: beta,
-            eta,
             iterations,
             log_likelihood,
             penalty_term,

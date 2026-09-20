@@ -14,6 +14,7 @@ use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
 use gam_problem::OrderedRhoBounds;
+use gam_terms::inference::smooth_score_test::WorkingResidual;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -4195,6 +4196,19 @@ where
                 ))
             })?;
     }
+    // The working residual in its Pearson form: at the accepted step the score
+    // is `u = W_F(z − η)` with `W_F` the score-side Fisher weight, and the norm
+    // is `Σ u²/W_F`, each row of null mean `φ` (not `Σ u²/W_H` in the observed
+    // curvature `finalweights`, which is biased for a non-canonical link;
+    // gam#3832). The identity-link weighted RSS is that sum, formed from the
+    // response directly and snapped with the dispersion it sets.
+    let working_residual = if cfg.likelihood.spec.is_gaussian_identity() {
+        Some(WorkingResidual { weighted_norm: weighted_rss, rows: n as usize })
+    } else {
+        let scores = &pirls_res.solveweights
+            * &(&pirls_res.solveworking_response - &pirls_res.final_eta);
+        WorkingResidual::of(pirls_res.solveweights.view(), scores.view())
+    };
     let inference = opts.compute_inference.then(|| FitInference {
         edf_by_block,
         penalty_block_trace,
@@ -4214,6 +4228,7 @@ where
         coefficient_influence,
         weighted_gram,
         identified_subspace,
+        working_residual,
     });
 
     let pirls_status = pirls_res.status;

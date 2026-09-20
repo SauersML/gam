@@ -30,7 +30,12 @@
 //!
 //! * **Fixed-λ inner solve** — [`fit_penalized_multinomial`] is the canonical
 //!   coefficient-space Newton solver at *given* smoothing parameters `λ`,
-//!   built on the shared [`crate::penalized_vector_glm`] engine.
+//!   built on the shared [`crate::penalized_vector_glm`] engine. Before any
+//!   iteration it decides from the data alone, via
+//!   `certify_multinomial_separation`, whether the penalized likelihood has a
+//!   finite maximizer; if not, it fits the Firth-penalized objective instead.
+//!   The objective it optimized is recorded in
+//!   [`MultinomialFitOutputs::objective`].
 //!
 //! * **REML / LAML smoothing-parameter selection** — [`fit_penalized_multinomial_formula`]
 //!   routes through [`crate::custom_family::fit_custom_family_with_rho_prior`]
@@ -77,7 +82,9 @@ use crate::multinomial_reml::MultinomialFamily;
 use crate::penalized_vector_glm::{
     PenalizedVectorGlmInputs, VectorGlmResume, VectorGlmSolve, fit_penalized_vector_glm,
 };
-use crate::vector_response::{MultinomialLogitLikelihood, validate_multinomial_simplex};
+use crate::vector_response::{
+    MultinomialLogitLikelihood, VectorLikelihood, validate_multinomial_simplex,
+};
 use gam_data::ColumnKindTag;
 use gam_data::EncodedDataset;
 use gam_problem::{
@@ -96,7 +103,6 @@ use gam_terms::term_builder::resolve_role_col;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 use opt::{BacktrackConfig, backtracking_line_search};
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
 use std::sync::Arc;
 
 /// Inner joint-Newton KKT tolerance for the multinomial formula path.
@@ -173,15 +179,6 @@ fn multinomial_formula_use_outer_hessian(total_rho_dim: usize) -> bool {
     total_rho_dim <= MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM
 }
 
-/// Logit magnitude beyond which fitted probabilities are saturated at ordinary
-/// double precision diagnostic scale. The bare fixed-λ driver has no outer REML
-/// state and still uses this threshold to reject a non-converged saturated
-/// iterate as a separation artifact. The formula REML path does not use this as
-/// a Firth trigger: with smoothing parameters selected, a finite saturated
-/// surface can be the valid near-separated optimum that should be scored
-/// directly.
-const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
-
 /// Calibrated convergence tolerance for the OUTER REML/LAML smoothing-parameter
 /// search on the formula multinomial path. Matches the primary GLM REML outer
 /// (`solver::fit_orchestration::materialize` uses `tol = 1e-7`, mirrored by the
@@ -194,27 +191,14 @@ const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
 /// KKT target unchanged.
 const MULTINOMIAL_OUTER_REML_TOL: f64 = 1e-7;
 
-fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
-    let mut best = (0.0_f64, 0usize, 0usize);
-    for ((row, active_class), &value) in eta.indexed_iter() {
-        let abs = value.abs();
-        if abs > best.0 {
-            best = (abs, row, active_class);
-        }
-    }
-    best
-}
-
 /// Separation gate for the REML/LAML **formula** path.
 ///
-/// Unlike the bare fixed-λ driver [`fit_penalized_multinomial`] (which has no
-/// outer REML state and so must reject a saturated, non-converged iterate as a
-/// separation artifact at the [`MULTINOMIAL_SEPARATION_ETA_THRESHOLD`] logit
-/// magnitude), the formula path can return a finite saturated mode after the
-/// coupled outer optimizer has selected smoothing parameters. A `|η| >= 25`
-/// gate is therefore wrong here: the penguins arm can legitimately have large
-/// fitted logits while still producing finite probabilities and a usable REML
-/// mode.
+/// The formula path can return a finite saturated mode after the coupled outer
+/// optimizer has selected smoothing parameters, so a logit-magnitude gate would
+/// be wrong here: the penguins arm can legitimately have large fitted logits
+/// while still producing finite probabilities and a usable REML mode. (The
+/// fixed-λ driver [`fit_penalized_multinomial`] does not read logit magnitudes
+/// either: it decides separation from the data before it fits, #4173.)
 ///
 /// Only a genuinely NON-FINITE `η` (a NaN/Inf blow-up in the inner linear
 /// algebra) is a real formula-path failure. A finite, even saturated, `η` is
@@ -683,11 +667,10 @@ impl std::fmt::Display for MultinomialSeparationCertificate {
 
 /// Inputs to [`fit_penalized_multinomial`].
 ///
-/// The penalty matrix `S` is shared across classes; per-class smoothing
-/// parameters `lambdas` (length `K - 1`) scale `S` independently for each
-/// active class. The full block-replicated penalty is `diag_a(λ_a) ⊗ S`,
-/// which a matrix-free Kronecker penalty operator can apply without
-/// materialising it once this driver is lifted into the arrow-Schur loop.
+/// The penalty matrix `S` is shared across classes. The `K` per-class
+/// smoothing parameters enter through the permutation-equivariant class metric
+/// `A(λ)` (#2344), so the penalty on the stacked active-class coefficients is
+/// `A(λ) ⊗ S`.
 #[derive(Debug, Clone)]
 pub struct MultinomialFitInputs<'a> {
     /// Design matrix `X ∈ ℝ^{N×P}` (one row per observation).
@@ -701,29 +684,83 @@ pub struct MultinomialFitInputs<'a> {
     pub y_one_hot: ArrayView2<'a, f64>,
     /// Shared smoothing penalty `S ∈ ℝ^{P×P}` (symmetric, PSD).
     pub penalty: ArrayView2<'a, f64>,
-    /// Per-active-class smoothing parameter `λ_a` (length `K - 1`).
+    /// Per-class smoothing parameter `λ_c` (length `K`, reference class
+    /// included).
     pub lambdas: ArrayView1<'a, f64>,
     /// Optional per-row weights (length `N`); `None` ⇒ uniform 1.0.
     pub row_weights: Option<ArrayView1<'a, f64>>,
     /// Optional per-row Fisher-block override, shape `(N, K-1, K-1)` in the
     /// active-class gauge (the reference class `K-1` is dropped). When `Some`,
-    /// each Newton step uses this block as the curvature `W` in place of the
-    /// analytic softmax Fisher `w_n (δ_ab p_a − p_a p_b)`; the gradient/residual
-    /// path stays analytic, so this is a curvature-only override (the
-    /// research escape-hatch for latent multinomial fits, issue #349). Each
-    /// per-row block must be symmetric, PSD, and finite — preconditions the
-    /// FFI boundary discharges before constructing this view.
+    /// each Newton step on the penalized likelihood uses this block as the
+    /// curvature `W` in place of the analytic softmax Fisher
+    /// `w_n (δ_ab p_a − p_a p_b)`; the gradient/residual path stays analytic, so
+    /// this is a curvature-only override (the research escape-hatch for latent
+    /// multinomial fits, issue #349). Each per-row block must be symmetric, PSD,
+    /// and finite — preconditions the FFI boundary discharges before
+    /// constructing this view. The Firth-penalized objective ignores it: its
+    /// Jeffreys term is defined by the model's own information `I(β)`.
     pub fisher_w_override: Option<ArrayView3<'a, f64>>,
     /// Maximum Newton iterations; recommend 50.
     pub max_iter: usize,
     /// Relative-step convergence tolerance; recommend 1e-7.
     pub tol: f64,
     /// Optional checkpoint emitted by a prior fixed-λ multinomial stall on
-    /// the same design, response, weights, offsets, penalty, and lambdas. A
-    /// `MultinomialNewton` checkpoint resumes the ordinary softmax objective;
-    /// a `MultinomialFirth` checkpoint resumes the Jeffreys/Firth separation
-    /// objective directly. Any other stage or coefficient shape is rejected.
+    /// the same design, response, weights, penalty, and lambdas. Its stage
+    /// must be the one the separation check selects for these data:
+    /// `MultinomialNewton` for the penalized likelihood, `MultinomialFirth`
+    /// for the Firth-penalized objective. Any other stage or coefficient shape
+    /// is rejected.
     pub resume_from: Option<&'a FixedLambdaCheckpoint>,
+}
+
+/// The objective a fixed-λ multinomial fit maximized (#4173).
+///
+/// [`fit_penalized_multinomial`] decides which objective to fit from the data
+/// before it iterates, fits that objective to convergence, and records it
+/// here. The fit's `penalized_neg_log_likelihood` and
+/// `coefficient_covariance` belong to this objective.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MultinomialFixedLambdaObjective {
+    /// `ℓ(β) − ½ θᵀ(A(λ)⊗S)θ`. The data admit a finite maximizer.
+    PenalizedLikelihood,
+    /// `ℓ(β) − ½ θᵀ(A(λ)⊗S)θ + ½ log det I(β)`. The data are (quasi-)separated
+    /// in the null space of the penalty, so the penalized likelihood has no
+    /// finite maximizer.
+    FirthPenalizedLikelihood {
+        /// The separating direction that selected this objective.
+        separation: MultinomialSeparationWitness,
+        /// `log det I(β̂)` of the softmax Fisher information at the returned
+        /// mode.
+        log_det_information: f64,
+    },
+}
+
+impl MultinomialFixedLambdaObjective {
+    /// Stable name of the objective, as reported to Python.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::PenalizedLikelihood => "penalized_likelihood",
+            Self::FirthPenalizedLikelihood { .. } => "firth_penalized_likelihood",
+        }
+    }
+}
+
+/// A penalty-free coefficient direction along which the multinomial likelihood
+/// never decreases and strictly increases on some rows (#4173). See
+/// [`certify_multinomial_separation`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultinomialSeparationWitness {
+    /// Dimension `q` of the null space of `A(λ) ⊗ S`, where the search ran.
+    pub unpenalized_dimension: usize,
+    /// The direction as a `(P, K−1)` coefficient block (column `a` moves
+    /// `β_a`), with unit Frobenius norm and zero penalty.
+    pub direction: Array2<f64>,
+    /// Class-pair margins `x_nᵀ(d_c − d_k)` (observed class `c`, competing
+    /// class `k`) resolved strictly positive.
+    pub strict_margins: usize,
+    /// Margins that are zero within their rounding band: the quasi-separated
+    /// part of the data.
+    pub tied_margins: usize,
 }
 
 /// Outputs of [`fit_penalized_multinomial`].
@@ -735,32 +772,33 @@ pub struct MultinomialFitOutputs {
     pub coefficients_active: Array2<f64>,
     /// Fitted probabilities, shape `(N, K)`.
     pub fitted_probabilities: Array2<f64>,
-    /// Number of Newton iterations executed (including the final step that
-    /// satisfied the tolerance). Non-convergence (outside the separation lane,
-    /// which escalates to the Firth refit) is surfaced as the typed
+    /// Newton iterations executed on [`Self::objective`], including those of a
+    /// resumed checkpoint. Non-convergence is the typed
     /// [`EstimationError::FixedLambdaNewtonDidNotConverge`] rather than an `Ok`
     /// with a flag, so every constructed value of this struct is a certified
     /// converged fit (SPEC: a fit only ever comes from a converged
     /// optimization).
     pub iterations: usize,
-    /// Penalized negative log-likelihood at the returned `β̂`:
-    /// `−log L(β̂) + ½ Σ_a λ_a · β̂_a^T S β̂_a`.
+    /// The objective the fit maximized, decided from the data before fitting.
+    pub objective: MultinomialFixedLambdaObjective,
+    /// Negative of the maximized objective at the returned `β̂`:
+    /// `−ℓ(β̂) + ½ θ̂ᵀ(A(λ)⊗S)θ̂` for the penalized likelihood, and that minus
+    /// `½ log det I(β̂)` for the Firth-penalized objective.
     pub penalized_neg_log_likelihood: f64,
-    /// Unpenalized deviance `−2 log L(β̂)` for diagnostic reporting.
+    /// Unpenalized deviance `−2 ℓ(β̂)` for diagnostic reporting.
     pub deviance: f64,
-    /// Joint Laplace posterior coefficient covariance `H⁻¹` at the converged
-    /// `β̂`, shape `(P·(K−1))×(P·(K−1))` (#1101). Block-ordered to match the
-    /// stacked active-class coefficient vector `β = [β_0; …; β_{K-2}]`: active
-    /// class `a`'s `P` coefficients occupy rows/cols `a·P .. (a+1)·P`, indexed
-    /// `θ[a·P + i] = β̂[i, a]`. This is the Laplace covariance from the factored
-    /// penalized Hessian `XᵀWX + diag_a(λ_a)⊗S`, the covariance the
-    /// logistic-normal moment integrator
+    /// Coefficient covariance at the converged `β̂`, shape
+    /// `(P·(K−1))×(P·(K−1))` (#1101). Block-ordered to match the stacked
+    /// active-class coefficient vector `β = [β_0; …; β_{K-2}]`: active class
+    /// `a`'s `P` coefficients occupy rows/cols `a·P .. (a+1)·P`, indexed
+    /// `θ[a·P + i] = β̂[i, a]`. For the penalized likelihood it is the Laplace
+    /// covariance `(XᵀWX + A(λ)⊗S)⁻¹`. For the Firth-penalized objective it is
+    /// `(I(β̂) + A(λ)⊗S)⁻¹`, the inverse of the scoring matrix that objective's
+    /// Newton iteration uses; it leaves out the curvature of the Jeffreys term.
+    /// The logistic-normal moment integrator
     /// (`crate::multinomial_posterior::integrate_multinomial_design_moments`)
-    /// contracts on the fixed-λ inner-solve path.
+    /// contracts it on the fixed-λ inner-solve path.
     pub coefficient_covariance: Array2<f64>,
-}
-
-impl MultinomialFitOutputs {
 }
 
 #[derive(Clone, Copy)]
@@ -782,7 +820,8 @@ fn fixed_lambda_checkpoint_coefficients(
     })?;
     if checkpoint.stage() != expected_stage {
         crate::bail_invalid_estim!(
-            "multinomial fixed-λ resume checkpoint stage is {}, expected {}",
+            "multinomial fixed-λ resume checkpoint stage is {}, but the separation check \
+             selects the {} stage for these data",
             checkpoint.stage(),
             expected_stage,
         );
@@ -801,11 +840,274 @@ fn fixed_lambda_checkpoint_coefficients(
     })
 }
 
+/// Decide, from the data alone, whether the fixed-λ penalized multinomial
+/// likelihood has a finite maximizer (#4173).
+///
+/// # Existence
+///
+/// Write `θ ∈ ℝ^{P·M}` for the stacked active-class coefficients
+/// (`θ[a·P+i] = β[i,a]`, `M = K−1`, reference logit `η_{K−1} ≡ 0`) and
+/// `P_λ = A(λ) ⊗ S` for the penalty. The objective
+/// `f(θ) = −ℓ(θ) + ½ θᵀP_λθ` is convex, and its recession function is
+///
+/// ```text
+///   f∞(d) = Σ_n w_n Σ_c y_{nc} (max_k δ_{nk} − δ_{nc})   if P_λ d = 0,
+///   f∞(d) = +∞                                          otherwise,
+/// ```
+///
+/// where `δ_{nk} = x_nᵀ d_k` is the change of row `n`'s class-`k` logit along
+/// `d`, with `δ_{n,K−1} = 0`. Let the columns of `N` be an orthonormal basis of
+/// `ker P_λ` and put `d = N z`. Then `f∞(d) = 0` exactly when `G z ≥ 0`, where
+/// `G` has one row
+///
+/// ```text
+///   g_{nck} = (N_c − N_k)ᵀ x_n     for w_n > 0, y_{nc} > 0, k ≠ c,
+/// ```
+///
+/// and `N_a` is the `P × q` block of `N` for class `a` (`N_{K−1} = 0`). Along
+/// `d`, a row whose margins are all zero keeps its likelihood, and a row with a
+/// positive margin gains likelihood forever. So:
+///
+/// * `G z = 0` is a direction along which `f` is constant (the design does not
+///   identify it);
+/// * `G z ≥ 0` with `G z ≠ 0` is a direction along which `f` decreases
+///   strictly from every point, so `f` has no minimizer;
+/// * if no direction of the second kind exists, every recession direction of
+///   `f` is a direction of constancy, and `f` attains its minimum (Rockafellar,
+///   *Convex Analysis*, Thm 27.1).
+///
+/// By Stiemke's lemma, no direction of the second kind exists exactly when some
+/// `μ > 0` has `Gᵀμ = 0`. The binomial separation check (#3129) is the `K = 2`
+/// case.
+///
+/// # The certificate
+///
+/// Project `t = −Gᵀ𝟙` onto the cone generated by the rows of `G` with the
+/// Lawson–Hanson routine
+/// [`gam_solve::active_set::nonnegative_cone_projection_by_rows`]. Its residual
+/// `r = t − Gᵀλ` lies in the polar cone, so `z = −r` has `G z ≥ 0`. The
+/// residual is also orthogonal to the projection, which gives
+/// `‖z‖² = 𝟙ᵀG z`. So a nonzero `z` separates the data, and `z = 0` gives the
+/// strictly positive combination `Gᵀ(𝟙 + λ) = 0`, so a minimizer exists.
+///
+/// # Resolution
+///
+/// The projection resolves correlations with a unit generator above
+/// `ρ = γ_q‖r‖ + ‖band‖`, the band its own polarity check uses. Each margin
+/// `g·z` is evaluated as the difference of two logit changes
+/// `δ = X·reshape(N z)`, which adds the accumulation band of `|X|·|N|·|z|`. A
+/// margin above `ρ‖g‖` plus that band is strict, one within it is tied, and one
+/// below it fails the certificate. The data are separated when at least one
+/// margin is strict.
+///
+/// `Ok(None)` means that no separation was certified: the penalty null space is
+/// trivial, every margin is tied, or the projection could not be certified. The
+/// caller then fits the penalized likelihood. That fit's own convergence
+/// certificate is the evidence that a maximizer exists, and a stall there is a
+/// typed non-convergence error.
+pub(crate) fn certify_multinomial_separation(
+    design: ArrayView2<'_, f64>,
+    y_one_hot: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    lambdas: ArrayView1<'_, f64>,
+    row_weights: Option<ArrayView1<'_, f64>>,
+) -> Result<Option<MultinomialSeparationWitness>, EstimationError> {
+    use gam_linalg::roundoff::{accumulation_band, accumulation_growth};
+
+    let (n_obs, p) = design.dim();
+    let k = y_one_hot.ncols();
+    let m = k - 1;
+    let d = p * m;
+
+    // The assembled penalty A(λ) ⊗ S, block-ordered θ[a·P+i] = β[i,a].
+    let class_metric = crate::penalized_vector_glm::equivariant_class_metric(lambdas, m);
+    let mut assembled = Array2::<f64>::zeros((d, d));
+    for a in 0..m {
+        for b in 0..m {
+            let coefficient = class_metric[[a, b]];
+            if coefficient != 0.0 {
+                assembled
+                    .slice_mut(ndarray::s![a * p..(a + 1) * p, b * p..(b + 1) * p])
+                    .scaled_add(coefficient, &penalty);
+            }
+        }
+    }
+    let kernel = crate::multinomial_reml::measured_penalty_nullspace(&assembled).map_err(
+        |reason| {
+            EstimationError::InvalidInput(format!(
+                "multinomial separation check: the null space of the penalty could not be \
+                 measured: {reason}"
+            ))
+        },
+    )?;
+    let q = kernel.ncols();
+    if q == 0 {
+        return Ok(None);
+    }
+    if kernel.nrows() != d {
+        crate::bail_invalid_estim!(
+            "multinomial separation check: penalty null-space basis has {} rows, expected {d}",
+            kernel.nrows()
+        );
+    }
+
+    // One generator per weighted row, observed class and competing class.
+    let weight = |row: usize| row_weights.as_ref().map_or(1.0, |w| w[row]);
+    let mut generators: Vec<(usize, usize, usize)> = Vec::new();
+    for row in 0..n_obs {
+        if !(weight(row) > 0.0) {
+            continue;
+        }
+        for observed in 0..k {
+            if !(y_one_hot[[row, observed]] > 0.0) {
+                continue;
+            }
+            for other in (0..k).filter(|&other| other != observed) {
+                generators.push((row, observed, other));
+            }
+        }
+    }
+    if generators.is_empty() {
+        return Ok(None);
+    }
+
+    // g_{nck} = (N_c − N_k)ᵀ x_n in the q kernel coordinates.
+    let generator = |index: usize| -> Array1<f64> {
+        let (row, observed, other) = generators[index];
+        let x = design.row(row);
+        let mut g = Array1::<f64>::zeros(q);
+        if observed < m {
+            g += &kernel
+                .slice(ndarray::s![observed * p..(observed + 1) * p, ..])
+                .t()
+                .dot(&x);
+        }
+        if other < m {
+            g -= &kernel
+                .slice(ndarray::s![other * p..(other + 1) * p, ..])
+                .t()
+                .dot(&x);
+        }
+        g
+    };
+    let mut row_norms = Vec::with_capacity(generators.len());
+    let mut target = Array1::<f64>::zeros(q);
+    for index in 0..generators.len() {
+        let g = generator(index);
+        row_norms.push(g.dot(&g).sqrt());
+        target -= &g;
+    }
+
+    // Every margin G z at once, through the logit changes δ = X·reshape(N z),
+    // and the coefficient-space direction N z as a (P, M) block.
+    let reshape = |flat: &Array1<f64>| -> Array2<f64> {
+        let mut block = Array2::<f64>::zeros((p, m));
+        for a in 0..m {
+            for i in 0..p {
+                block[[i, a]] = flat[a * p + i];
+            }
+        }
+        block
+    };
+    let margins_of = |z: &Array1<f64>| -> (Array1<f64>, Array2<f64>) {
+        let direction = reshape(&kernel.dot(z));
+        let logit_change = design.dot(&direction);
+        let class_change =
+            |row: usize, class: usize| if class < m { logit_change[[row, class]] } else { 0.0 };
+        let margins = Array1::from_iter(
+            generators
+                .iter()
+                .map(|&(row, observed, other)| {
+                    class_change(row, observed) - class_change(row, other)
+                }),
+        );
+        (margins, direction)
+    };
+    let row_values = |r: &Array1<f64>| Some(margins_of(r).0);
+    let gather_rows = |ids: &[usize]| -> Option<Array2<f64>> {
+        let mut rows = Array2::<f64>::zeros((ids.len(), q));
+        for (position, &index) in ids.iter().enumerate() {
+            if index >= generators.len() {
+                return None;
+            }
+            rows.row_mut(position).assign(&generator(index));
+        }
+        Some(rows)
+    };
+
+    let Some((multipliers, residual)) = gam_solve::active_set::nonnegative_cone_projection_by_rows(
+        &row_norms,
+        &target,
+        &row_values,
+        &gather_rows,
+    ) else {
+        return Ok(None);
+    };
+
+    // The resolution ρ of the projection, from the multipliers it returned.
+    let passive: Vec<usize> = multipliers.iter().map(|&(index, _)| index).collect();
+    let Some(passive_rows) = gather_rows(&passive) else {
+        return Ok(None);
+    };
+    let mut absolute_sum = target.mapv(f64::abs);
+    for (position, &(_, multiplier)) in multipliers.iter().enumerate() {
+        absolute_sum.scaled_add(multiplier, &passive_rows.row(position).mapv(f64::abs));
+    }
+    let residual_band = absolute_sum
+        .iter()
+        .map(|&sum| accumulation_band(multipliers.len() + 1, sum).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let resolution = accumulation_growth(q) * residual.dot(&residual).sqrt() + residual_band;
+
+    // Classify every margin against its band.
+    let z = residual.mapv(|value| -value);
+    let (margins, direction) = margins_of(&z);
+    let absolute_direction = reshape(&kernel.mapv(f64::abs).dot(&z.mapv(f64::abs)));
+    let absolute_logit_change = design.mapv(f64::abs).dot(&absolute_direction);
+    let evaluation_growth = accumulation_growth(q + p + 2);
+    let mut strict_margins = 0usize;
+    let mut tied_margins = 0usize;
+    for (index, &(row, observed, other)) in generators.iter().enumerate() {
+        let absolute =
+            |class: usize| if class < m { absolute_logit_change[[row, class]] } else { 0.0 };
+        let band = resolution * row_norms[index]
+            + evaluation_growth * (absolute(observed) + absolute(other));
+        let margin = margins[index];
+        if margin > band {
+            strict_margins += 1;
+        } else if margin >= -band {
+            tied_margins += 1;
+        } else {
+            return Ok(None);
+        }
+    }
+    if strict_margins == 0 {
+        return Ok(None);
+    }
+    let norm = direction.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if !(norm.is_finite() && norm > 0.0) {
+        return Ok(None);
+    }
+    Ok(Some(MultinomialSeparationWitness {
+        unpenalized_dimension: q,
+        direction: direction / norm,
+        strict_margins,
+        tied_margins,
+    }))
+}
+
 /// Fit a penalized multinomial-logit GAM at fixed `λ`.
 ///
-/// See the module docs for the optimization problem and conventions. This
-/// function is the canonical inner solve: the outer REML/LAML loop, when
-/// added, calls this at each `ρ = log λ` trial.
+/// See the module docs for the optimization problem and conventions. Before it
+/// iterates, the driver decides from the data whether the penalized likelihood
+/// has a finite maximizer ([`certify_multinomial_separation`]). If it does, the
+/// driver fits the penalized likelihood. If the data are (quasi-)separated in
+/// the null space of the penalty, it fits the Firth-penalized objective
+/// instead. Either objective is fitted to convergence, and the fit records
+/// which one it maximized in [`MultinomialFitOutputs::objective`]. This
+/// function is the canonical inner solve: the outer REML/LAML loop, when added,
+/// calls this at each `ρ = log λ` trial.
 pub fn fit_penalized_multinomial(
     inputs: MultinomialFitInputs<'_>,
 ) -> Result<MultinomialFitOutputs, EstimationError> {
@@ -821,15 +1123,36 @@ pub fn fit_penalized_multinomial(
         resume_from,
     } = inputs;
 
-    // ──────────────────────── family-specific validation ───────────────────
-    // The shared engine re-validates the geometry common to every vector-GLM
-    // (nonempty design, penalty shape, λ finiteness/non-negativity, override
-    // `(N, M, M)` shape, finite design). The multinomial family owns the
-    // class-count contract (`K ≥ 2`, λ length `K`), the per-row simplex
-    // precondition under which the softmax residual/Fisher are the exact
-    // derivatives of `Σ_c y_c log p_c`, and the row-weight check the likelihood
-    // adapter consumes.
-    let n_obs = design.nrows();
+    // ─────────────────────────────── validation ────────────────────────────
+    // The separation check reads the design, penalty and lambdas before either
+    // solver does, so the geometry every solver relies on is validated here.
+    // The multinomial family also owns the class-count contract (`K ≥ 2`, λ
+    // length `K`), the per-row simplex precondition under which the softmax
+    // residual/Fisher are the exact derivatives of `Σ_c y_c log p_c`, and the
+    // row-weight check the likelihood adapter consumes.
+    let (n_obs, p) = design.dim();
+    if n_obs == 0 || p == 0 {
+        crate::bail_invalid_estim!(
+            "fit_penalized_multinomial: design must be nonempty (got {n_obs}x{p})"
+        );
+    }
+    if design.iter().any(|value| !value.is_finite()) {
+        crate::bail_invalid_estim!("fit_penalized_multinomial: design contains non-finite values");
+    }
+    if penalty.dim() != (p, p) {
+        crate::bail_invalid_estim!(
+            "fit_penalized_multinomial: penalty shape {:?} ≠ (P, P) = ({p}, {p})",
+            penalty.dim()
+        );
+    }
+    if penalty.iter().any(|value| !value.is_finite()) {
+        crate::bail_invalid_estim!("fit_penalized_multinomial: penalty contains non-finite values");
+    }
+    if !(tol.is_finite() && tol > 0.0) {
+        crate::bail_invalid_estim!(
+            "fit_penalized_multinomial: tol must be finite and positive, got {tol}"
+        );
+    }
     let (y_rows, k) = y_one_hot.dim();
     if y_rows != n_obs {
         crate::bail_invalid_estim!(
@@ -854,6 +1177,13 @@ pub fn fit_penalized_multinomial(
              reference class included — the permutation-equivariant per-class contract, #2344)",
             lambdas.len()
         );
+    }
+    for (index, &lambda) in lambdas.iter().enumerate() {
+        if !(lambda.is_finite() && lambda >= 0.0) {
+            crate::bail_invalid_estim!(
+                "fit_penalized_multinomial: lambdas[{index}] must be finite and ≥ 0 (got {lambda})"
+            );
+        }
     }
     if let Some(fw) = fisher_w_override.as_ref() {
         if fw.dim() != (n_obs, m, m) {
@@ -880,45 +1210,39 @@ pub fn fit_penalized_multinomial(
     }
     validate_multinomial_simplex(y_one_hot, "fit_penalized_multinomial")?;
 
-    let p = design.ncols();
-    let resumed_newton_coefficients = match resume_from {
-        Some(checkpoint) if checkpoint.stage() == FixedLambdaSolverStage::MultinomialFirth => {
-            let coefficients = fixed_lambda_checkpoint_coefficients(
-                checkpoint,
-                FixedLambdaSolverStage::MultinomialFirth,
-                p,
-                m,
-            )?;
-            return fit_penalized_multinomial_firth_fallback(
-                design,
-                y_one_hot,
-                penalty,
-                lambdas,
-                row_weights,
-                max_iter,
-                tol,
-                Some(FirthResume {
-                    coefficients: coefficients.view(),
-                    completed_iterations: checkpoint.completed_iterations(),
-                }),
-            );
-        }
-        Some(checkpoint) => Some(fixed_lambda_checkpoint_coefficients(
-            checkpoint,
-            FixedLambdaSolverStage::MultinomialNewton,
-            p,
-            m,
-        )?),
-        None => None,
+    // ───────────────────────── choose the objective ────────────────────────
+    let separation =
+        certify_multinomial_separation(design, y_one_hot, penalty, lambdas, row_weights)?;
+    let stage = if separation.is_some() {
+        FixedLambdaSolverStage::MultinomialFirth
+    } else {
+        FixedLambdaSolverStage::MultinomialNewton
     };
-    let vector_resume = resumed_newton_coefficients
-        .as_ref()
-        .map(|coefficients| VectorGlmResume {
-            coefficients: coefficients.view(),
-            completed_iterations: resume_from
-                .map(FixedLambdaCheckpoint::completed_iterations)
-                .unwrap_or(0),
-        });
+    let resumed_coefficients = resume_from
+        .map(|checkpoint| fixed_lambda_checkpoint_coefficients(checkpoint, stage, p, m))
+        .transpose()?;
+    let completed_iterations = resume_from
+        .map(FixedLambdaCheckpoint::completed_iterations)
+        .unwrap_or(0);
+
+    if let Some(separation) = separation {
+        return fit_penalized_multinomial_firth(
+            design,
+            y_one_hot,
+            penalty,
+            lambdas,
+            row_weights,
+            max_iter,
+            tol,
+            separation,
+            resumed_coefficients
+                .as_ref()
+                .map(|coefficients| FirthResume {
+                    coefficients: coefficients.view(),
+                    completed_iterations,
+                }),
+        );
+    }
 
     // ────────────────────────── likelihood construction ───────────────────
     let mut likelihood = MultinomialLogitLikelihood::with_classes(k)?;
@@ -946,25 +1270,27 @@ pub fn fit_penalized_multinomial(
             // construction, collapsing to the shared Centered metric at equal λ.
             class_penalty_metric:
                 crate::penalized_vector_glm::ClassPenaltyMetric::EquivariantPerClass,
-            resume_from: vector_resume,
+            resume_from: resumed_coefficients
+                .as_ref()
+                .map(|coefficients| VectorGlmResume {
+                    coefficients: coefficients.view(),
+                    completed_iterations,
+                }),
         },
         &likelihood,
         "fit_penalized_multinomial",
     )?;
 
+    // SPEC: a fit object must only ever come from a converged optimization. The
+    // data admit a finite maximizer as far as the separation check can resolve,
+    // so a stall here is a typed error carrying its evidence and checkpoint.
     let fit = match solve {
         VectorGlmSolve::Converged(fit) => fit,
         VectorGlmSolve::Stalled(stall) => {
-            return handle_multinomial_fixed_lambda_stall(
-                stall,
-                design,
-                y_one_hot,
-                penalty,
-                lambdas,
-                row_weights,
-                max_iter,
-                tol,
-            );
+            return Err(stall.into_nonconvergence_error(
+                FixedLambdaSolverStage::MultinomialNewton,
+                "fit_penalized_multinomial (fixed-λ softmax damped Newton)",
+            )?);
         }
     };
 
@@ -974,146 +1300,48 @@ pub fn fit_penalized_multinomial(
         coefficients_active: fit.coefficients,
         fitted_probabilities,
         iterations: fit.iterations,
+        objective: MultinomialFixedLambdaObjective::PenalizedLikelihood,
         penalized_neg_log_likelihood: -fit.log_likelihood + fit.penalty_term,
         deviance: -2.0 * fit.log_likelihood,
         coefficient_covariance: fit.coefficient_covariance,
     })
 }
 
-/// Resolve a budget-exhausted fixed-λ softmax Newton solve: either the
-/// separation lane (escalate to the Firth/Jeffreys proper-prior refit) or the
-/// typed non-convergence error. Never mints a fit from the stalled iterate.
-fn handle_multinomial_fixed_lambda_stall(
-    stall: crate::penalized_vector_glm::VectorGlmStall,
-    design: ArrayView2<'_, f64>,
-    y_one_hot: ArrayView2<'_, f64>,
-    penalty: ArrayView2<'_, f64>,
-    lambdas: ArrayView1<'_, f64>,
-    row_weights: Option<ArrayView1<'_, f64>>,
-    max_iter: usize,
-    tol: f64,
-) -> Result<MultinomialFitOutputs, EstimationError> {
-    let (max_abs_eta, row_index, active_class_index) = max_abs_eta_location(stall.eta.view());
-    if max_abs_eta >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD {
-        // Perfect / quasi-perfect separation (#1854): the UNBIASED softmax MLE is
-        // not finite along `active_class_index`'s saturated logit direction, so
-        // the fixed-λ Newton above ran away (`|η| ≥ 25`, no convergence). A
-        // penalty-null direction `v` (`S v = 0`, e.g. an unpenalized intercept /
-        // linear-covariate column) under softmax saturation has
-        // `(XᵀWX + λS) v → 0` for EVERY λ, so no smoothing parameter can bound it
-        // — only a proper prior on that quotient-null subspace can. Rather than
-        // hard-erroring, engage the Firth/Jeffreys proper prior automatically
-        // (magic-by-default): the full-span `½ log|I(β)|` correction supplies the
-        // `O(1)` curvature that keeps the estimate finite on exactly those
-        // separated directions while leaving well-identified fits untouched. This
-        // reuses the same coupled joint-Newton Jeffreys machinery the formula
-        // REML path arms on separation evidence (see
-        // `fit_penalized_multinomial_formula`), only here at the caller's fixed λ.
-        // Start the Firth refit from the well-conditioned origin (β = 0), NOT
-        // from the stalled Newton iterate. That stalled iterate is the runaway
-        // separated point (`|η| ≥ 25`), where the softmax Fisher information
-        // `I(β)` is numerically singular (every fitted probability is pinned to
-        // the {0,1} simplex boundary, so `I → 0`). Warm-starting the Firth
-        // Newton there is catastrophic: the first step `(I + λS)⁻¹ U*` is
-        // unbounded and every backtracked candidate stays on the boundary, so
-        // the line search exhausts without an accepted step and the refit stalls
-        // at iteration 1 — it can never climb back to the interior Firth mode.
-        // The Firth objective's interior mode is start-independent (the
-        // `firth_solver_rejects_a_truncated_iterate` resume contract asserts the
-        // same mode is reached from any interior start), and from `β = 0` the
-        // information is well-conditioned, so a plain from-zero refit converges
-        // reliably on exactly the separated data that defeated the fixed-λ
-        // Newton above.
-        let firth = fit_penalized_multinomial_firth_fallback(
-            design,
-            y_one_hot,
-            penalty,
-            lambdas,
-            row_weights,
-            max_iter,
-            tol,
-            None,
-        );
-        match firth {
-            // SPEC: a fit object must only ever come from a converged
-            // optimization — the Firth fallback itself surfaces a
-            // budget-exhausted refit as the typed
-            // `FixedLambdaNewtonDidNotConverge`, which is forwarded verbatim so
-            // the caller sees which lane stalled and its evidence.
-            Ok(out) => return Ok(out),
-            Err(err @ EstimationError::FixedLambdaNewtonDidNotConverge { .. }) => {
-                return Err(err);
-            }
-            // Firth refit errored: report the explicit hard separation
-            // diagnostic.
-            Err(_) => {
-                return Err(EstimationError::MultinomialSeparationDetected {
-                    iteration: stall.iterations,
-                    max_abs_eta,
-                    active_class_index,
-                    row_index,
-                });
-            }
-        }
-    }
-
-    // SPEC: a fit object must only ever come from a converged optimization.
-    // A stall WITHOUT the separation fingerprint (|η| below the threshold —
-    // e.g. ill-conditioned data exhausting `max_iter`) is a typed error
-    // carrying its evidence, never an Ok(outputs) with a flag.
-    Err(stall.into_nonconvergence_error(
-        FixedLambdaSolverStage::MultinomialNewton,
-        "fit_penalized_multinomial (fixed-λ softmax damped Newton)",
-    )?)
-}
-
-/// Firth/Jeffreys-penalized multinomial refit engaged automatically when the
-/// unbiased softmax MLE separates (#1854).
+/// Fixed-λ Firth-penalized multinomial solve, for data that
+/// [`certify_multinomial_separation`] found (quasi-)separated (#1854, #4173).
 ///
-/// The unbiased fixed-λ solve ([`fit_penalized_multinomial`]) runs away on
-/// (quasi-)separated data because the softmax likelihood has no finite mode along
-/// the saturated logit direction and the smoothing penalty `S` cannot bound a
-/// penalty-null direction (`S v = 0` ⇒ `(XᵀWX + λS) v → 0` for every λ). This
-/// refit arms the full-span Jeffreys/Firth proper prior `½ log|I(β)|` on the
-/// coupled joint softmax information, which supplies the `O(1)` curvature that
-/// bounds exactly those directions and keeps the estimate finite.
+/// On such data the penalized likelihood has no finite maximizer: along the
+/// separating direction the likelihood increases forever and the penalty is
+/// zero, so no smoothing `λ` can bound it. The Jeffreys/Firth term
+/// `½ log det I(β)` on the coupled softmax information supplies the curvature
+/// that bounds exactly those directions.
 ///
 /// # The estimator
 ///
-/// It maximizes the penalized Firth objective at the caller's *fixed* `λ`
+/// It maximizes the Firth-penalized objective at the caller's *fixed* `λ`
 ///
 /// ```text
 ///   ℓ*(β) = Σ_n w_n Σ_c y_{nc} log p_{nc}
-///           − ½ Σ_a λ_a βₐᵀ S βₐ
+///           − ½ θᵀ (A(λ) ⊗ S) θ
 ///           + ½ log det I(β)
 /// ```
 ///
-/// where `I(β)` is the coupled `(P·M)×(P·M)` softmax Fisher information (block
-/// `(a,b)` is `Σ_n w_n (δ_{ab} p_{na} − p_{na} p_{nb}) x_n x_nᵀ`, block-ordered so
+/// where `A(λ)` is the permutation-equivariant class metric (#2344), `I(β)` is
+/// the coupled `(P·M)×(P·M)` softmax Fisher information (block `(a,b)` is
+/// `Σ_n w_n (δ_{ab} p_{na} − p_{na} p_{nb}) x_n x_nᵀ`, block-ordered so
 /// `θ[a·P+i] = β[i,a]`) and `M = K−1` active classes carry the reference-coded
-/// logits (`η_{ref} ≡ 0`). The Jeffreys term `½ log det I(β)` is the standard
-/// Firth penalty: it diverges to `−∞` as any fitted probability approaches the
-/// simplex boundary (`I → 0`), so its maximizer is interior and finite on exactly
-/// the separated directions that defeat every smoothing `λ`.
-///
-/// # Why this fixed-λ solver rather than the outer-REML formula path
-///
-/// The direct entry ([`fit_penalized_multinomial`]) is a fixed-λ inner solve — it
-/// carries no outer smoothing selection — so the natural Firth engagement is a
-/// fixed-λ Firth Newton, not the formula path's outer-REML joint-Newton machinery
-/// (which is armed instead by [`fit_penalized_multinomial_formula`] on separation
-/// evidence). Solving the Firth objective directly here keeps the separation
-/// contract self-contained and independent of the shared trust-region/KKT
-/// certificate machinery.
+/// logits (`η_{ref} ≡ 0`). The Jeffreys term diverges to `−∞` as any fitted
+/// probability approaches the simplex boundary (`I → 0`), so the maximizer is
+/// interior and finite on the separated directions.
 ///
 /// # The iteration
 ///
 /// A Fisher-scoring Newton on `ℓ*`: the ascent direction is
-/// `Δ = (I + Λ⊗S)⁻¹ U*`, where `U*` is the Firth-adjusted penalized score
+/// `Δ = (I + A(λ)⊗S)⁻¹ U*`, where `U*` is the Firth-adjusted penalized score
 ///
 /// ```text
 ///   U*[(c,s)] = Σ_n w_n x_{ns} (y_{nc} − p_{nc})       (data score)
-///             − λ_c (S β_c)_s                           (smoothing penalty)
+///             − Σ_b A_{cb} (S β_b)_s                    (smoothing penalty)
 ///             + ½ Σ_n w_n x_{ns} h^c_n                  (Firth adjustment)
 /// ```
 ///
@@ -1125,7 +1353,15 @@ fn handle_multinomial_fixed_lambda_stall(
 /// verified). Each step is globalized by backtracking on `ℓ*`, so a step that
 /// would push a probability to the boundary (making `I` non-PD) is rejected and
 /// the fit stays interior. Convergence is the Newton decrement `½ U*ᵀΔ`.
-fn fit_penalized_multinomial_firth_fallback(
+///
+/// # What the fit reports
+///
+/// `penalized_neg_log_likelihood` is `−ℓ*(β̂)`, the deviance stays the
+/// likelihood's `−2 ℓ(β̂)`, and the covariance is `(I(β̂) + A(λ)⊗S)⁻¹`, which
+/// leaves out the curvature of the Jeffreys term. A curvature override does not
+/// apply here, because the Jeffreys term is defined by the model's own `I(β)`
+/// and its derivatives.
+fn fit_penalized_multinomial_firth(
     design: ArrayView2<'_, f64>,
     y_one_hot: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
@@ -1133,6 +1369,7 @@ fn fit_penalized_multinomial_firth_fallback(
     row_weights: Option<ArrayView1<'_, f64>>,
     max_iter: usize,
     tol: f64,
+    separation: MultinomialSeparationWitness,
     resume_from: Option<FirthResume<'_>>,
 ) -> Result<MultinomialFitOutputs, EstimationError> {
     use faer::Side;
@@ -1154,16 +1391,6 @@ fn fit_penalized_multinomial_firth_fallback(
         likelihood = likelihood.with_row_weights(w.to_owned())?;
     }
     let weight = |row: usize| -> f64 { row_weights.as_ref().map_or(1.0, |w| w[row]) };
-
-    // The decrement and step certificates below compare against `tol`. A
-    // non-finite or non-positive contract certifies nothing, so it is refused
-    // rather than silently replaced.
-    if !(tol.is_finite() && tol > 0.0) {
-        crate::bail_invalid_estim!(
-            "multinomial Firth solve: tol must be finite and positive, got {tol}"
-        );
-    }
-    let tol_eff = tol;
 
     // Probabilities (N, K), active classes 0..M then the pinned reference at M.
     let probs_at = |beta: &Array2<f64>| -> Array2<f64> {
@@ -1239,7 +1466,7 @@ fn fit_penalized_multinomial_firth_fallback(
         }
         let max_diag = (0..d).fold(0.0_f64, |acc, i| acc.max(mat[[i, i]].abs()));
         Err(EstimationError::InvalidInput(format!(
-            "multinomial Firth fallback: {context} not invertible (max_diag={max_diag:.3e})"
+            "multinomial Firth solve: {context} not invertible (max_diag={max_diag:.3e})"
         )))
     };
 
@@ -1253,38 +1480,31 @@ fn fit_penalized_multinomial_firth_fallback(
             .filter(|ld| ld.is_finite())
     };
 
-    // Penalized Firth objective ℓ* (MAXIMIZED), given probabilities, β, and the
-    // precomputed log det I(β).
-    let objective = |probs: &Array2<f64>, beta: &Array2<f64>, logdet_info: f64| -> f64 {
-        let mut ll = 0.0_f64;
-        for row in 0..n_obs {
-            let w = weight(row);
-            if w == 0.0 {
-                continue;
-            }
-            for c in 0..k {
-                let ycn = y_one_hot[[row, c]];
-                if ycn != 0.0 {
-                    ll += w * ycn * probs[[row, c]].max(f64::MIN_POSITIVE).ln();
-                }
-            }
-        }
-        // #2344: equivariant per-class penalty ½·Σ_{a,b} A[a,b]·β_aᵀSβ_b —
-        // the same metric the shared vector-GLM engine applies, so the Firth
-        // arm optimizes the identical reference-free objective.
-        let a_mat = crate::penalized_vector_glm::equivariant_class_metric(lambdas, m);
+    // #2344: equivariant per-class penalty ½·Σ_{a,b} A[a,b]·β_aᵀSβ_b, the same
+    // metric the shared vector-GLM engine applies, so both objectives carry the
+    // identical reference-free penalty.
+    let class_metric = crate::penalized_vector_glm::equivariant_class_metric(lambdas, m);
+    let penalty_of = |beta: &Array2<f64>| -> f64 {
         let mut pen = 0.0_f64;
         for a in 0..m {
             let bcol = beta.column(a);
             for b in 0..m {
-                let coef = a_mat[[a, b]];
+                let coef = class_metric[[a, b]];
                 if coef != 0.0 {
                     let sbeta = penalty.dot(&beta.column(b));
                     pen += 0.5 * coef * bcol.dot(&sbeta);
                 }
             }
         }
-        ll - pen + 0.5 * logdet_info
+        pen
+    };
+
+    // Penalized Firth objective ℓ*(β) = ℓ(β) − ½ βᵀ(A⊗S)β + ½ log det I(β)
+    // (MAXIMIZED), given β and the precomputed log det I(β). The likelihood is
+    // the softmax's own weighted log-likelihood, evaluated in log-sum-exp form.
+    let objective = |beta: &Array2<f64>, logdet_info: f64| -> Result<f64, EstimationError> {
+        let ll = likelihood.log_lik(design.dot(beta).view(), y_one_hot)?;
+        Ok(ll - penalty_of(beta) + 0.5 * logdet_info)
     };
 
     // Firth-adjusted penalized score U* (length d, block-ordered).
@@ -1355,11 +1575,10 @@ fn fit_penalized_multinomial_firth_fallback(
             }
             // Smoothing penalty gradient (#2344 equivariant metric):
             // U[(a,i)] −= Σ_b A[a,b]·(S β_b)_i.
-            let a_mat = crate::penalized_vector_glm::equivariant_class_metric(lambdas, m);
             for b in 0..m {
                 let sbeta = penalty.dot(&beta.column(b));
                 for a in 0..m {
-                    let coef = a_mat[[a, b]];
+                    let coef = class_metric[[a, b]];
                     if coef == 0.0 {
                         continue;
                     }
@@ -1376,10 +1595,9 @@ fn fit_penalized_multinomial_firth_fallback(
     // of rank-1 class projections, so H stays positive definite).
     let penalized_hessian = |info: &Array2<f64>| -> Array2<f64> {
         let mut h = info.clone();
-        let a_mat = crate::penalized_vector_glm::equivariant_class_metric(lambdas, m);
         for a in 0..m {
             for b in 0..m {
-                let coef = a_mat[[a, b]];
+                let coef = class_metric[[a, b]];
                 if coef == 0.0 {
                     continue;
                 }
@@ -1413,7 +1631,7 @@ fn fit_penalized_multinomial_firth_fallback(
             }
         }
         Err(EstimationError::InvalidInput(
-            "multinomial Firth fallback: penalized Hessian solve failed".to_string(),
+            "multinomial Firth solve: penalized Hessian solve failed".to_string(),
         ))
     };
 
@@ -1448,7 +1666,7 @@ fn fit_penalized_multinomial_firth_fallback(
 
         // Newton decrement ½ U*ᵀ H⁻¹ U* = ½ U*ᵀ Δ (≥ 0, scale-aware stop).
         let decrement = u.dot(&step_vec);
-        if 0.5 * decrement.abs() < tol_eff {
+        if 0.5 * decrement.abs() < tol {
             break;
         }
 
@@ -1465,23 +1683,21 @@ fn fit_penalized_multinomial_firth_fallback(
         // primitive: t₀ = 1, halving up to 60 trials. A candidate whose expected
         // information `I` is not SPD (boundary) is an INVALID trial (`Ok(None)`),
         // so the search contracts without consulting the acceptance test, keeping
-        // the iterate interior. The ascent predicate `o1 ≥ o0 − 1e-12` is inlined
-        // verbatim, so the accepted step is bit-for-bit the hand-rolled loop's.
-        let o0 = objective(&probs, &beta, logdet_info);
-        let accepted_step = match backtracking_line_search::<_, Infallible>(
+        // the iterate interior. A likelihood evaluation that refuses its input is
+        // forwarded as the solve's error.
+        let o0 = objective(&beta, logdet_info)?;
+        let accepted_step = backtracking_line_search::<_, EstimationError>(
             BacktrackConfig::default(),
             |step| {
                 let cand = &beta + &(&delta * step);
-                let cand_probs = probs_at(&cand);
-                let cand_info = assemble_info(&cand_probs);
-                Ok(spd_logdet(&cand_info)
-                    .map(|cand_logdet| (objective(&cand_probs, &cand, cand_logdet), cand)))
+                let cand_info = assemble_info(&probs_at(&cand));
+                match spd_logdet(&cand_info) {
+                    Some(cand_logdet) => Ok(Some((objective(&cand, cand_logdet)?, cand))),
+                    None => Ok(None),
+                }
             },
             |_, o1| o1 >= o0 - 1e-12,
-        ) {
-            Ok(result) => result,
-            Err(never) => match never {},
-        };
+        )?;
         let Some(accepted_step) = accepted_step else {
             // Backtracking exhausted 60 halvings without an admissible ascent
             // step. This is convergence ONLY if the iterate is already first-order
@@ -1491,7 +1707,7 @@ fn fit_penalized_multinomial_firth_fallback(
             // iterate as success).
             //
             // The verdict is the loop's OWN stationarity test — the Newton
-            // decrement `½·Uᵀ H⁻¹ U` against `tol_eff`, the same criterion the top
+            // decrement `½·Uᵀ H⁻¹ U` against `tol`, the same criterion the top
             // of the loop uses to break as converged. A true interior mode never
             // reaches this branch: an infinitesimal step (`step → 0`) leaves the
             // iterate SPD with `o1 ≈ o0`, so it is accepted; a numerically flat
@@ -1507,7 +1723,7 @@ fn fit_penalized_multinomial_firth_fallback(
         beta = accepted_step.payload;
         let max_step = step * delta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         let scale = 1.0 + beta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        if max_step < tol_eff * scale {
+        if max_step < tol * scale {
             small_step_reached = true;
             break;
         }
@@ -1517,38 +1733,15 @@ fn fit_penalized_multinomial_firth_fallback(
     for (idx, &v) in beta.iter().enumerate() {
         if !v.is_finite() {
             crate::bail_invalid_estim!(
-                "multinomial Firth fallback: non-finite coefficient at flat index {idx} = {v}"
+                "multinomial Firth solve: non-finite coefficient at flat index {idx} = {v}"
             );
         }
     }
     let coefficients_active = beta;
 
-    let mut log_likelihood = 0.0_f64;
     let probs = probs_at(&coefficients_active);
-    for row in 0..n_obs {
-        let w = weight(row);
-        for c in 0..k {
-            let ycn = y_one_hot[[row, c]];
-            if ycn != 0.0 {
-                log_likelihood += w * ycn * probs[[row, c]].max(f64::MIN_POSITIVE).ln();
-            }
-        }
-    }
-
-    // #2344 equivariant metric: the reported penalty term matches the
-    // objective the solve optimized.
-    let a_mat = crate::penalized_vector_glm::equivariant_class_metric(lambdas, m);
-    let mut penalty_term = 0.0_f64;
-    for a in 0..m {
-        let beta_col = coefficients_active.column(a);
-        for b in 0..m {
-            let coef = a_mat[[a, b]];
-            if coef != 0.0 {
-                let sbeta = penalty.dot(&coefficients_active.column(b));
-                penalty_term += 0.5 * coef * beta_col.dot(&sbeta);
-            }
-        }
-    }
+    let log_likelihood = likelihood.log_lik(design.dot(&coefficients_active).view(), y_one_hot)?;
+    let penalty_term = penalty_of(&coefficients_active);
 
     // Recompute the Firth score and Newton decrement AT the final accepted
     // iterate. A tiny backtracked coefficient step is not itself stationarity:
@@ -1560,7 +1753,7 @@ fn fit_penalized_multinomial_firth_fallback(
     let hmat = penalized_hessian(&info);
     let final_step = solve_spd(&hmat, &final_score)?;
     let final_decrement = 0.5 * final_score.dot(&final_step).abs();
-    if !(final_decrement.is_finite() && final_decrement < tol_eff) {
+    if !(final_decrement.is_finite() && final_decrement < tol) {
         if small_step_reached {
             stall_reason = FixedLambdaStallReason::StationarityCertificateFailed;
         }
@@ -1577,17 +1770,17 @@ fn fit_penalized_multinomial_firth_fallback(
         )
         .map_err(|reason| {
             EstimationError::InvalidInput(format!(
-                "multinomial Firth fallback produced an invalid internal checkpoint: {reason}"
+                "multinomial Firth solve produced an invalid internal checkpoint: {reason}"
             ))
         })?;
         return Err(EstimationError::FixedLambdaNewtonDidNotConverge {
-            context: "fit_penalized_multinomial (Firth/Jeffreys separation refit)".to_string(),
+            context: "fit_penalized_multinomial (Firth-penalized objective)".to_string(),
             reason: stall_reason,
-            objective_value: -objective(&probs, &coefficients_active, final_logdet_info),
+            objective_value: -objective(&coefficients_active, final_logdet_info)?,
             stationarity: FixedLambdaStationarityEvidence {
                 kind: FixedLambdaResidualKind::NewtonDecrement,
                 residual: final_decrement,
-                bound: tol_eff,
+                bound: tol,
             },
             checkpoint,
         });
@@ -1602,9 +1795,14 @@ fn fit_penalized_multinomial_firth_fallback(
         coefficients_active,
         fitted_probabilities: probs,
         iterations,
-        penalized_neg_log_likelihood: -log_likelihood + penalty_term,
+        // The objective the solve maximized, ℓ*(β̂), negated.
+        penalized_neg_log_likelihood: -(log_likelihood - penalty_term + 0.5 * final_logdet_info),
         deviance: -2.0 * log_likelihood,
         coefficient_covariance,
+        objective: MultinomialFixedLambdaObjective::FirthPenalizedLikelihood {
+            separation,
+            log_det_information: final_logdet_info,
+        },
     })
 }
 
@@ -5057,13 +5255,12 @@ mod fisher_override_tests {
 
     #[test]
     fn fixed_lambda_multinomial_firth_keeps_complete_separation_finite() {
-        // #1854: complete softmax separation used to be a HARD diagnostic
-        // (`MultinomialSeparationDetected`). It now automatically engages the
-        // Firth/Jeffreys proper prior (`½ log|I(β)|`, magic-by-default) so the fit
-        // stays finite instead of running away — the same guarantee the formula
-        // REML path already provided. The class regions are cleanly separated by
-        // `x`, so the unbiased MLE is at infinity; the Firth-penalized fit must
-        // still converge to a finite mode and recover the region structure.
+        // #1854 / #4173: complete softmax separation is decided from the data
+        // before any Newton step, and the fit then maximizes the Firth-penalized
+        // objective (`½ log|I(β)|` added to the likelihood) so it stays finite.
+        // The class regions are cleanly separated by `x`, so the unpenalized MLE
+        // is at infinity; the Firth fit must converge to a finite mode, say that
+        // it is a Firth fit, and recover the region structure.
         let n = 90;
         let design = Array2::<f64>::from_shape_fn((n, 2), |(row, col)| match col {
             0 => 1.0,
@@ -5096,6 +5293,14 @@ mod fisher_override_tests {
             resume_from: None,
         })
         .expect("Firth/Jeffreys prior keeps the separated multinomial fit finite (#1854)");
+        assert!(
+            matches!(
+                out.objective,
+                MultinomialFixedLambdaObjective::FirthPenalizedLikelihood { .. }
+            ),
+            "separated data must be fit under the Firth objective, got {:?}",
+            out.objective
+        );
         // Every coefficient is finite — the whole point of the Firth prior on the
         // separated (unpenalized) logit directions.
         for &b in out.coefficients_active.iter() {
@@ -5633,11 +5838,123 @@ mod fisher_override_tests {
 
 #[cfg(test)]
 mod separation_firth_tests {
-    //! Regression for #1854: on (quasi-)perfect separation the fixed-λ direct
-    //! multinomial solve must engage the Firth/Jeffreys penalty and return a
-    //! finite, converged, well-behaved fit instead of hard-erroring with
-    //! `MultinomialSeparationDetected`.
+    //! Regressions for #1854 and #4173: the fixed-λ multinomial driver decides
+    //! from the data, before it iterates, whether the penalized likelihood has a
+    //! finite maximizer. On (quasi-)separated data it fits the Firth-penalized
+    //! objective to convergence and says so; on overlapping data it never does.
     use super::*;
+
+    /// Unweighted multinomial log-likelihood `Σ_n Σ_c y_nc log p_nc` and the
+    /// coupled softmax Fisher information (block-ordered `θ[a·P+i] = β[i,a]`) of
+    /// a coefficient block, computed from scratch in log-sum-exp form.
+    fn log_likelihood_and_information(
+        design: &Array2<f64>,
+        y: &Array2<f64>,
+        beta: &Array2<f64>,
+    ) -> (f64, Array2<f64>) {
+        let (n, p) = design.dim();
+        let k = y.ncols();
+        let m = k - 1;
+        let mut log_likelihood = 0.0_f64;
+        let mut information = Array2::<f64>::zeros((p * m, p * m));
+        for row in 0..n {
+            let mut eta = vec![0.0_f64; k];
+            for a in 0..m {
+                for i in 0..p {
+                    eta[a] += design[[row, i]] * beta[[i, a]];
+                }
+            }
+            let top = eta.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let log_normalizer = top + eta.iter().map(|e| (e - top).exp()).sum::<f64>().ln();
+            let probs: Vec<f64> = eta.iter().map(|e| (e - log_normalizer).exp()).collect();
+            for c in 0..k {
+                if y[[row, c]] != 0.0 {
+                    log_likelihood += y[[row, c]] * (eta[c] - log_normalizer);
+                }
+            }
+            for a in 0..m {
+                for b in 0..m {
+                    let w = if a == b {
+                        probs[a] - probs[a] * probs[b]
+                    } else {
+                        -probs[a] * probs[b]
+                    };
+                    for i in 0..p {
+                        for j in 0..p {
+                            information[[a * p + i, b * p + j]] +=
+                                w * design[[row, i]] * design[[row, j]];
+                        }
+                    }
+                }
+            }
+        }
+        (log_likelihood, information)
+    }
+
+    /// `log det` of a positive-definite matrix by a plain Cholesky factorization.
+    fn cholesky_log_det(mat: &Array2<f64>) -> f64 {
+        let d = mat.nrows();
+        let mut lower = Array2::<f64>::zeros((d, d));
+        let mut log_det = 0.0_f64;
+        for j in 0..d {
+            let mut diag = mat[[j, j]];
+            for t in 0..j {
+                diag -= lower[[j, t]] * lower[[j, t]];
+            }
+            assert!(diag > 0.0, "information must be positive definite, pivot {diag}");
+            lower[[j, j]] = diag.sqrt();
+            log_det += 2.0 * lower[[j, j]].ln();
+            for i in (j + 1)..d {
+                let mut value = mat[[i, j]];
+                for t in 0..j {
+                    value -= lower[[i, t]] * lower[[j, t]];
+                }
+                lower[[i, j]] = value / lower[[j, j]];
+            }
+        }
+        log_det
+    }
+
+    fn assert_close(actual: f64, expected: f64, what: &str) {
+        assert!(
+            (actual - expected).abs() <= 1e-9 * (1.0 + expected.abs()),
+            "{what}: got {actual}, expected {expected}"
+        );
+    }
+
+    /// One-hot response from a class list.
+    fn one_hot(classes: &[usize], k: usize) -> Array2<f64> {
+        let mut y = Array2::<f64>::zeros((classes.len(), k));
+        for (row, &class) in classes.iter().enumerate() {
+            y[[row, class]] = 1.0;
+        }
+        y
+    }
+
+    /// Intercept-plus-slope design on the given covariate values.
+    fn line_design(xs: &[f64]) -> Array2<f64> {
+        Array2::from_shape_fn((xs.len(), 2), |(row, col)| if col == 0 { 1.0 } else { xs[row] })
+    }
+
+    fn fit_at_fixed_lambda(
+        design: &Array2<f64>,
+        y: &Array2<f64>,
+        penalty: &Array2<f64>,
+        lambdas: &Array1<f64>,
+    ) -> MultinomialFitOutputs {
+        fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 300,
+            tol: 1e-10,
+            resume_from: None,
+        })
+        .expect("fixed-λ multinomial fit must converge")
+    }
 
     /// A perfectly linearly separable 3-class problem with an UNPENALIZED design
     /// (`S = 0`), so no smoothing `λ` can bound the saturated logits — only the
@@ -5685,6 +6002,7 @@ mod separation_firth_tests {
         })
         .expect("separated multinomial must engage Firth and return a fit, not error");
 
+        assert_eq!(out.objective.name(), "firth_penalized_likelihood");
         assert!(
             out.coefficients_active.iter().all(|v| v.is_finite()),
             "all coefficients must be finite under the Firth prior"
@@ -5772,8 +6090,17 @@ mod separation_firth_tests {
         // iteration budget so it provably cannot reach the interior Firth mode.
         // The honest outcome is a typed error, not an inspectable fit.
         let (design, y, penalty, lambdas) = separated_three_class();
+        let witness = certify_multinomial_separation(
+            design.view(),
+            y.view(),
+            penalty.view(),
+            lambdas.view(),
+            None,
+        )
+        .expect("separation check")
+        .expect("separated data");
 
-        let truncated = fit_penalized_multinomial_firth_fallback(
+        let truncated = fit_penalized_multinomial_firth(
             design.view(),
             y.view(),
             penalty.view(),
@@ -5781,6 +6108,7 @@ mod separation_firth_tests {
             None,
             1, // one Newton iteration — far from the separated mode
             1e-12,
+            witness.clone(),
             None,
         )
         .expect_err("a one-iteration Firth solve must not mint a fit");
@@ -5815,7 +6143,7 @@ mod separation_firth_tests {
 
         // Contrast: with a full budget the same problem does reach stationarity
         // and returns the convergence-only result type.
-        let uninterrupted = fit_penalized_multinomial_firth_fallback(
+        let uninterrupted = fit_penalized_multinomial_firth(
             design.view(),
             y.view(),
             penalty.view(),
@@ -5823,10 +6151,12 @@ mod separation_firth_tests {
             None,
             300,
             1e-10,
+            witness,
             None,
         )
-        .expect("Firth fallback must converge under a full budget");
+        .expect("multinomial Firth solve must converge under a full budget");
         assert_eq!(resumed.iterations, uninterrupted.iterations);
+        assert_eq!(resumed.objective, uninterrupted.objective);
         assert_eq!(
             resumed.coefficients_active,
             uninterrupted.coefficients_active
@@ -5838,6 +6168,212 @@ mod separation_firth_tests {
         assert_eq!(
             resumed.coefficient_covariance,
             uninterrupted.coefficient_covariance,
+        );
+    }
+    #[test]
+    fn separable_data_select_firth_before_fitting_and_report_its_objective() {
+        // #4173: the objective is chosen from the data before any Newton step,
+        // and the fit reports the objective it maximized.
+        let (design, y, penalty, lambdas) = separated_three_class();
+        let (n, p) = design.dim();
+        let k = y.ncols();
+        let m = k - 1;
+        let witness = certify_multinomial_separation(
+            design.view(),
+            y.view(),
+            penalty.view(),
+            lambdas.view(),
+            None,
+        )
+        .expect("separation check")
+        .expect("classes ordered along x are separated");
+        // S = 0, so the whole coefficient space is penalty-free.
+        assert_eq!(witness.unpenalized_dimension, p * m);
+        assert!(witness.strict_margins > 0);
+
+        // The witness separates: along it no observed class loses to another
+        // class on any row, and some row's observed class gains.
+        let logit_change = design.dot(&witness.direction);
+        let change = |row: usize, class: usize| {
+            if class < m { logit_change[[row, class]] } else { 0.0 }
+        };
+        let mut largest_margin = 0.0_f64;
+        for row in 0..n {
+            let observed = (0..k).find(|&c| y[[row, c]] == 1.0).expect("one-hot row");
+            for other in (0..k).filter(|&c| c != observed) {
+                let margin = change(row, observed) - change(row, other);
+                assert!(margin >= -1e-12, "row {row}: witness margin {margin} < 0");
+                largest_margin = largest_margin.max(margin);
+            }
+        }
+        assert!(largest_margin > 0.1, "witness must separate, largest margin {largest_margin}");
+
+        let out = fit_at_fixed_lambda(&design, &y, &penalty, &lambdas);
+        assert_eq!(out.objective.name(), "firth_penalized_likelihood");
+        let MultinomialFixedLambdaObjective::FirthPenalizedLikelihood {
+            separation,
+            log_det_information,
+        } = &out.objective
+        else {
+            panic!("separated data must be fit under the Firth objective, got {:?}", out.objective);
+        };
+        assert_eq!(separation, &witness, "the fit records the witness that selected it");
+
+        // The reported quantities are the Firth objective at the returned mode,
+        // recomputed from scratch. S = 0, so ℓ*(β) = ℓ(β) + ½ log det I(β).
+        let firth_objective = |beta: &Array2<f64>| -> f64 {
+            let (log_likelihood, information) = log_likelihood_and_information(&design, &y, beta);
+            log_likelihood + 0.5 * cholesky_log_det(&information)
+        };
+        let (log_likelihood, information) =
+            log_likelihood_and_information(&design, &y, &out.coefficients_active);
+        let log_det = cholesky_log_det(&information);
+        assert_close(*log_det_information, log_det, "log det I(β̂)");
+        assert_close(
+            out.penalized_neg_log_likelihood,
+            -(log_likelihood + 0.5 * log_det),
+            "penalized_neg_log_likelihood = −ℓ*(β̂)",
+        );
+        assert_close(out.deviance, -2.0 * log_likelihood, "deviance = −2ℓ(β̂)");
+
+        // β̂ maximizes the reported objective: every coordinate perturbation
+        // lowers ℓ*. The plain likelihood, in contrast, still rises along the
+        // separating direction, so it is not the objective this fit maximized.
+        let at_mode = firth_objective(&out.coefficients_active);
+        let step = 1e-3;
+        for i in 0..p {
+            for a in 0..m {
+                for sign in [-1.0, 1.0] {
+                    let mut moved = out.coefficients_active.clone();
+                    moved[[i, a]] += sign * step;
+                    let value = firth_objective(&moved);
+                    assert!(
+                        value < at_mode,
+                        "ℓ* must fall off its mode along ({i},{a},{sign}): {value} ≥ {at_mode}"
+                    );
+                }
+            }
+        }
+        let pushed = &out.coefficients_active + &witness.direction;
+        let (pushed_log_likelihood, _) = log_likelihood_and_information(&design, &y, &pushed);
+        assert!(
+            pushed_log_likelihood > log_likelihood,
+            "the likelihood must keep rising along the separating direction"
+        );
+    }
+
+    #[test]
+    fn non_separable_data_never_select_firth() {
+        // Every covariate value carries every class, so any direction that
+        // favors a row's observed class disfavors another row's observed class
+        // at the same logits. The penalized likelihood has a finite maximizer and
+        // the driver must fit it, never the Firth objective.
+        let xs = [
+            -1.0, -1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0,
+        ];
+        let classes: [usize; 15] = [0, 0, 1, 2, 0, 1, 2, 1, 1, 0, 2, 2, 2, 0, 1];
+        let design = line_design(&xs);
+        let y = one_hot(&classes, 3);
+        let penalty = Array2::<f64>::zeros((2, 2));
+        let lambdas = Array1::<f64>::from_elem(3, 1.0);
+
+        let witness = certify_multinomial_separation(
+            design.view(),
+            y.view(),
+            penalty.view(),
+            lambdas.view(),
+            None,
+        )
+        .expect("separation check");
+        assert!(witness.is_none(), "overlapping data must not be separated: {witness:?}");
+
+        let out = fit_at_fixed_lambda(&design, &y, &penalty, &lambdas);
+        assert_eq!(out.objective, MultinomialFixedLambdaObjective::PenalizedLikelihood);
+        assert_eq!(out.objective.name(), "penalized_likelihood");
+
+        // S = 0, so the reported objective is −ℓ(β̂), recomputed from scratch,
+        // and β̂ maximizes ℓ.
+        let log_likelihood_at =
+            |beta: &Array2<f64>| log_likelihood_and_information(&design, &y, beta).0;
+        let log_likelihood = log_likelihood_at(&out.coefficients_active);
+        assert_close(
+            out.penalized_neg_log_likelihood,
+            -log_likelihood,
+            "penalized_neg_log_likelihood = −ℓ(β̂)",
+        );
+        assert_close(out.deviance, -2.0 * log_likelihood, "deviance = −2ℓ(β̂)");
+        let step = 1e-3;
+        for i in 0..2 {
+            for a in 0..2 {
+                for sign in [-1.0, 1.0] {
+                    let mut moved = out.coefficients_active.clone();
+                    moved[[i, a]] += sign * step;
+                    assert!(
+                        log_likelihood_at(&moved) < log_likelihood,
+                        "ℓ must fall off its maximizer along ({i},{a},{sign})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quasi_separated_data_select_firth_with_tied_margins() {
+        // Class 0 fills x < 0 and class 1 fills x > 0, while x = 0 carries all
+        // three classes. Every separating direction leaves the logits at x = 0
+        // equal, so the three x = 0 rows contribute six tied margins, and the
+        // data are quasi-separated rather than completely separated.
+        let xs = [-3.0, -2.0, -1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0];
+        let classes: [usize; 9] = [0, 0, 0, 0, 1, 2, 1, 1, 1];
+        let design = line_design(&xs);
+        let y = one_hot(&classes, 3);
+        let penalty = Array2::<f64>::zeros((2, 2));
+        let lambdas = Array1::<f64>::from_elem(3, 1.0);
+
+        let witness = certify_multinomial_separation(
+            design.view(),
+            y.view(),
+            penalty.view(),
+            lambdas.view(),
+            None,
+        )
+        .expect("separation check")
+        .expect("quasi-separated data must be certified separated");
+        assert!(witness.strict_margins > 0);
+        assert!(
+            witness.tied_margins >= 6,
+            "the x = 0 rows must tie, got {} tied margins",
+            witness.tied_margins
+        );
+        // The logits at x = 0 do not move along the witness.
+        for a in 0..2 {
+            assert!(
+                witness.direction[[0, a]].abs() < 1e-10,
+                "intercept of class {a} moves along the witness: {}",
+                witness.direction[[0, a]]
+            );
+        }
+
+        let out = fit_at_fixed_lambda(&design, &y, &penalty, &lambdas);
+        let MultinomialFixedLambdaObjective::FirthPenalizedLikelihood {
+            log_det_information,
+            ..
+        } = out.objective
+        else {
+            panic!("quasi-separated data must be fit under the Firth objective");
+        };
+        assert!(out.coefficients_active.iter().all(|v| v.is_finite()));
+        for v in out.fitted_probabilities.iter() {
+            assert!(*v > 0.0 && *v < 1.0, "Firth fit must stay interior, got p={v}");
+        }
+        let (log_likelihood, information) =
+            log_likelihood_and_information(&design, &y, &out.coefficients_active);
+        let log_det = cholesky_log_det(&information);
+        assert_close(log_det_information, log_det, "log det I(β̂)");
+        assert_close(
+            out.penalized_neg_log_likelihood,
+            -(log_likelihood + 0.5 * log_det),
+            "penalized_neg_log_likelihood = −ℓ*(β̂)",
         );
     }
 }

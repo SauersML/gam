@@ -4753,6 +4753,17 @@ pub(crate) struct FirthDirection {
     pub(crate) b_uvec: Array1<f64>,
 }
 
+/// Shared contractions of `D H_φ[u]` against one symmetric `Π`, built by
+/// `FirthDenseOperator::hphi_direction_trace_kernel`.
+pub(crate) struct FirthHphiTraceKernel {
+    /// `ℓ = diag(X Π Xᵀ)`.
+    pub(crate) leverage: Array1<f64>,
+    /// `v = ((M⊙M)⊙(X Π Xᵀ)) w'`.
+    pub(crate) hadamard_w1: Array1<f64>,
+    /// `R = Zᵀ diag(w') (M⊙X Π Xᵀ) diag(w') Z` in reduced coordinates.
+    pub(crate) reduced: Array2<f64>,
+}
+
 #[derive(Clone)]
 pub(crate) struct FirthTauPartialKernel {
     pub(super) deta_partial: Array1<f64>,
