@@ -178,7 +178,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 /// `O(ε‖A‖)`; anything below `√ε·‖A‖` cannot be distinguished from an exact
 /// zero by that spectrum, and everything above it is a genuine direction. This
 /// is the same `√ε` split the outer certificate's PSD verdict uses.
-fn subspace_split_threshold(spectrum_norm: f64) -> f64 {
+pub(super) fn subspace_split_threshold(spectrum_norm: f64) -> f64 {
     f64::EPSILON.sqrt() * spectrum_norm
 }
 
@@ -1092,17 +1092,17 @@ fn certify_overlapping_face(
 }
 
 /// Self-adjoint eigendecomposition of an exactly-symmetrized copy.
-fn symmetric_eigh(matrix: &Array2<f64>) -> Option<(Array1<f64>, Array2<f64>)> {
+pub(super) fn symmetric_eigh(matrix: &Array2<f64>) -> Option<(Array1<f64>, Array2<f64>)> {
     symmetrized(matrix).eigh(Side::Lower).ok()
 }
 
 /// [`subspace_split_threshold`] applied to an already-computed spectrum.
-fn range_null_split(values: &Array1<f64>) -> f64 {
+pub(super) fn range_null_split(values: &Array1<f64>) -> f64 {
     subspace_split_threshold(values.iter().fold(0.0_f64, |acc, v| acc.max(v.abs())))
 }
 
 /// Gather selected eigenvectors into a `p×m` orthonormal basis.
-fn basis_columns(vectors: &Array2<f64>, cols: &[usize]) -> Array2<f64> {
+pub(super) fn basis_columns(vectors: &Array2<f64>, cols: &[usize]) -> Array2<f64> {
     let rows = vectors.nrows();
     let mut basis = Array2::<f64>::zeros((rows, cols.len()));
     for (out, &src) in cols.iter().enumerate() {

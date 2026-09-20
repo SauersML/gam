@@ -201,6 +201,82 @@ fn measure_jet_reml_selects_the_representer_range_by_default_2761() {
     );
 }
 
+/// #3764: thin-plate, curvature and measure-jet specs store "auto" as the
+/// numeric marker `0.0`, so an explicit `length_scale=0` / `s=0` accepted by
+/// the formula path became indistinguishable from an omitted option and was
+/// silently swapped for the data-derived seed. For `curv` it was worse: the
+/// explicit value set `length_scale_fixed`, pinning ℓ at the auto seed. The
+/// descriptor path (`smooth_overrides`) already refuses these values; the
+/// formula path must too, while an omitted option still selects auto.
+#[test]
+fn explicit_zero_kernel_range_or_order_is_rejected_not_read_as_auto_3764() {
+    let ds = continuous_dataset(
+        &["y", "x1", "x2"],
+        (0..40)
+            .map(|i| {
+                let t = i as f64 / 39.0;
+                vec![(6.0 * t).sin(), t, 0.5 + 0.5 * (6.0 * t).cos()]
+            })
+            .collect(),
+    );
+    let col_map = ds.column_map();
+    let build = |body: &str| {
+        let parsed = parse_formula(&format!("y ~ {body}")).expect("parse formula");
+        build_termspec(&parsed.terms, &ds, &col_map, &mut Vec::new())
+    };
+
+    for body in [
+        "thinplate(x1, x2, length_scale=0)",
+        "thinplate(x1, x2, length_scale=-1)",
+        "curv(x1, x2, centers=8, length_scale=0)",
+        "curv(x1, x2, centers=8, length_scale=-0.5)",
+        "mjs(x1, x2, centers=8, length_scale=0)",
+        "mjs(x1, x2, centers=8, s=0)",
+        "mjs(x1, x2, centers=8, s=2)",
+    ] {
+        let err = match build(body) {
+            Ok(_) => panic!("'{body}' must be rejected, not read as the auto marker"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("omitted for auto"),
+            "'{body}' must name the auto spelling (omit the option), got: {err}"
+        );
+    }
+
+    // Omitted options keep the auto marker and its provenance.
+    let terms = build("curv(x1, x2, centers=8)").expect("auto-range curvature smooth");
+    let SmoothBasisSpec::ConstantCurvature { spec, .. } = &terms.smooth_terms[0].basis else {
+        panic!("expected a constant-curvature smooth");
+    };
+    assert_eq!(spec.length_scale, 0.0);
+    assert!(
+        !spec.length_scale_fixed,
+        "an omitted length_scale must stay free"
+    );
+
+    let terms = build("mjs(x1, x2, centers=8)").expect("auto measure-jet smooth");
+    let SmoothBasisSpec::MeasureJet { spec, .. } = &terms.smooth_terms[0].basis else {
+        panic!("expected a measure-jet smooth");
+    };
+    assert_eq!((spec.order_s, spec.length_scale), (0.0, 0.0));
+    assert!(spec.learn_length_scale);
+
+    let terms = build("thinplate(x1, x2)").expect("auto-range thin-plate smooth");
+    let SmoothBasisSpec::ThinPlate { spec, .. } = &terms.smooth_terms[0].basis else {
+        panic!("expected a thin-plate smooth");
+    };
+    assert_eq!(spec.length_scale, 0.0);
+
+    // A typed positive value is honoured verbatim.
+    let terms = build("curv(x1, x2, centers=8, length_scale=0.4)").expect("fixed-range curv");
+    let SmoothBasisSpec::ConstantCurvature { spec, .. } = &terms.smooth_terms[0].basis else {
+        panic!("expected a constant-curvature smooth");
+    };
+    assert_eq!(spec.length_scale, 0.4);
+    assert!(spec.length_scale_fixed);
+}
+
 fn continuous_dataset(headers: &[&str], rows: Vec<Vec<f64>>) -> Dataset {
     let nrows = rows.len();
     let ncols = headers.len();
@@ -2943,6 +3019,81 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
              ratchet still holds:\n  {}",
         inert.join("\n  ")
     );
+}
+
+/// #3632: a Matérn `include_intercept=true` term realizes `[K·Z | 1]`, and
+/// its metadata chart `Z` acts on the kernel columns `K` alone. A collection
+/// transform acts on all realized columns, so it cannot compose with `Z`. When
+/// the transform drops exactly one column, its shape matches `Z`'s, and it used
+/// to be taken for `Z` silently. That gave a penalty one column wider than the
+/// design, which panicked in the penalty placement. The combination is now
+/// refused whenever a transform arrives: at every center count when the term
+/// is centered, and for the uncentered default here, whose joint penalty has a
+/// null space that the joint-null rotation takes. An uncentered term whose
+/// penalties jointly have full rank gets no transform. It is realized as
+/// `[K·Z | 1]`, with every penalty exactly on the term's own columns. The same
+/// term without the appended constant builds with every penalty inside the
+/// design.
+#[test]
+fn matern_include_intercept_is_refused_whenever_the_collection_transforms_it() {
+    let ds = continuous_dataset(
+        &["y", "x", "zbig"],
+        (0..240)
+            .map(|i| {
+                let x = ((i % 24) as f64 / 23.0).powi(2);
+                let z = (i / 24) as f64 / 9.0;
+                vec![(i as f64 * 0.13).sin() + x + z, x, 500.0 * z + 3.0]
+            })
+            .collect(),
+    );
+    let col_map = ds.column_map();
+    let build = |formula: &str| {
+        let parsed = parse_formula(formula).expect("formula parses");
+        let mut notes = Vec::new();
+        let spec = build_termspec(&parsed.terms, &ds, &col_map, &mut notes).expect("termspec");
+        crate::smooth::build_term_collection_design(ds.values.view(), &spec)
+    };
+    let refused = |formula: &str| {
+        let err = match build(formula) {
+            Ok(_) => panic!("`{formula}` must be refused, not built"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("include_intercept"), "`{formula}`: {err}");
+    };
+    for centers in ["", ", centers=6", ", centers=9", ", centers=16", ", centers=30"] {
+        refused(&format!("y ~ matern(x, zbig, include_intercept=true{centers})"));
+    }
+    refused("y ~ matern(x, zbig, include_intercept=true, identifiability=none)");
+    for centers in [6usize, 9, 16, 30] {
+        let formula =
+            format!("y ~ matern(x, zbig, include_intercept=true, centers={centers}, identifiability=none)");
+        let design = build(&formula).unwrap_or_else(|err| panic!("`{formula}` builds: {err}"));
+        assert_eq!(design.smooth.terms.len(), 1, "`{formula}`");
+        // The smooth block follows the intercept; there are no linear terms.
+        let local = design.smooth.terms[0].coeff_range.clone();
+        let start = design.intercept_range.end;
+        let columns = start + local.start..start + local.end;
+        assert_eq!(columns.len(), centers + 1, "`{formula}` realizes [K·Z | 1]");
+        assert_eq!(columns.end, design.design.to_dense().ncols(), "`{formula}`");
+        assert!(!design.penalties.is_empty(), "`{formula}`");
+        let mut joint = Array2::<f64>::zeros((columns.len(), columns.len()));
+        for penalty in &design.penalties {
+            assert_eq!(penalty.col_range, columns, "`{formula}`: penalty off the term's columns");
+            assert_eq!(penalty.local.nrows(), columns.len(), "`{formula}`");
+            joint += &penalty.local;
+        }
+        let constant = columns.len() - 1;
+        assert!(joint[[constant, constant]] > 0.0, "`{formula}`: the appended constant is shrunk");
+    }
+    let design = build("y ~ matern(x, zbig)")
+        .expect("a Matérn without the appended constant builds");
+    let width = design.design.to_dense().ncols();
+    assert!(!design.penalties.is_empty());
+    for penalty in &design.penalties {
+        let range = &penalty.col_range;
+        assert!(range.end <= width, "penalty {range:?} outside the {width}-column design");
+        assert_eq!(penalty.local.nrows(), range.len(), "penalty block vs its column range");
+    }
 }
 
 #[test]
