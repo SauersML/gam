@@ -2012,14 +2012,22 @@ pub fn inverse_link_complement_for_inverse_link(
             beta_logistic_link_complement(eta, state.log_delta, state.epsilon, mu)
         }
         InverseLink::Mixture(state) => mixture_link_complement(state, eta, mu),
-        // The latent-cloglog mean is a lognormal-Laplace quadrature
-        // (`latent_cloglog_jet5`), whose kernel reports `mean` and its
-        // derivatives but not the complementary `E[exp(-Z e^eta)]` the exact
-        // complement would need. Until that kernel exposes the survival output,
-        // the naive complement leaves this link's saturation behaviour exactly as
-        // it was, so it retains the `V = mu(1-mu) -> 0` limitation the sibling
-        // links no longer have.
-        InverseLink::LatentCLogLog(_) => 1.0 - mu,
+        // The latent-cloglog mean is `1 − S(eta, σ_L)` with the lognormal-Laplace
+        // survival `S(m, σ) = E[exp(−exp η)]`, `η ~ N(m, σ²)`
+        // (`latent_cloglog_jet5` forms it as `−expm1(ln S)`). Its complement is
+        // `S` itself, read from the same log-space survival surface, so it keeps
+        // its digits where the mean rounds to one.
+        InverseLink::LatentCLogLog(state) => {
+            if eta.is_nan() {
+                f64::NAN
+            } else {
+                crate::quadrature::survival_posterior_mean(
+                    latent_cloglog_quadctx(),
+                    eta,
+                    state.latent_sd,
+                )
+            }
+        }
     };
     if raw.is_nan() {
         raw
@@ -5867,6 +5875,43 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "#3203:\n  {}", failures.join("\n  "));
+    }
+
+    /// The latent-cloglog complement is the survival `S(eta, σ_L)`, not
+    /// `1 − mu`: at `(eta, σ_L) = (8, 0.5)` the mean rounds to one while
+    /// `ln S = −70.97988851759840` (the #2714 high-precision reference row, which
+    /// `ln S` meets to `1e-13` relative).
+    #[test]
+    fn latent_cloglog_complement_keeps_the_survival_tail() {
+        let link = InverseLink::LatentCLogLog(
+            gam_problem::types::LatentCLogLogState::new(0.5).expect("valid latent SD"),
+        );
+        let (mu, _) = inverse_link_mu_d1_for_inverse_link(&link, 8.0).expect("latent jet");
+        assert_eq!(mu, 1.0, "the mean saturates, so 1 - mu carries nothing");
+        let complement = inverse_link_complement_for_inverse_link(&link, 8.0, mu);
+        assert!(
+            complement > 0.0,
+            "the complement must keep the representable survival tail, got {complement:e}"
+        );
+        let reference_log_survival = -7.097_988_851_759_84e1;
+        let relative =
+            (complement.ln() - reference_log_survival).abs() / reference_log_survival.abs();
+        assert!(
+            relative <= 1.0e-12,
+            "ln complement = {:.17e}, reference {reference_log_survival:.17e} \
+             (relative {relative:.3e})",
+            complement.ln()
+        );
+
+        // Where the mean does not saturate, the complement and the mean share
+        // one `ln S`, so they add to one up to the rounding of each.
+        let (mu, _) = inverse_link_mu_d1_for_inverse_link(&link, 0.35).expect("latent jet");
+        let complement = inverse_link_complement_for_inverse_link(&link, 0.35, mu);
+        assert!(
+            (mu + complement - 1.0).abs() <= 4.0 * f64::EPSILON,
+            "mu {mu:.17e} + complement {complement:.17e} must be one"
+        );
+        assert!(inverse_link_complement_for_inverse_link(&link, f64::NAN, f64::NAN).is_nan());
     }
 
     #[test]
