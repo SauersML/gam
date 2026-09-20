@@ -724,11 +724,45 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
                 "latents['{key}'] specifies both aux_prior and aux_outcome; the auxiliary signal is either a prior (gauge-pin covariate) or a modeled outcome (behavioral head), not both"
             ));
         }
-        let explicit_none_mode = obj
+        if aux_outcome.is_some()
+            && dim_selection
+                .as_ref()
+                .is_some_and(|dim| dim.init_log_precision.is_some())
+        {
+            // The behavioral head always composes its own ARD block, seeded by
+            // `aux_outcome.init_log_precision`; a `dim_selection` seed would be
+            // dropped without a word.
+            return Err(format!(
+                "latents['{key}'] sets dim_selection.init_log_precision with aux_outcome; the aux_outcome head always carries ARD, seed it with aux_outcome.init_log_precision"
+            ));
+        }
+        // `none` is the only identification mode named explicitly; every
+        // other mode is implied by the gauge fields present. Any other value,
+        // or `none` next to a gauge field, would otherwise be ignored.
+        let explicit_none_mode = match obj
             .get("id_mode")
             .or_else(|| obj.get("mode"))
-            .and_then(JsonValue::as_str)
-            .is_some_and(|s| s.eq_ignore_ascii_case("none"));
+            .filter(|value| !value.is_null())
+        {
+            None => false,
+            Some(value)
+                if value
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("none")) =>
+            {
+                if aux_prior.is_some() || dim_selection.is_some() || aux_outcome.is_some() {
+                    return Err(format!(
+                        "latents['{key}'] sets id_mode='none' together with aux_prior, aux_outcome or dim_selection; drop id_mode or the gauge fields"
+                    ));
+                }
+                true
+            }
+            Some(other) => {
+                return Err(format!(
+                    "latents['{key}'].id_mode must be 'none' (other modes follow from aux_prior, aux_outcome and dim_selection); got {other}"
+                ));
+            }
+        };
         if aux_prior.is_none()
             && dim_selection.is_none()
             && aux_outcome.is_none()
@@ -752,6 +786,61 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
         });
     }
     Ok(specs)
+}
+
+#[cfg(test)]
+mod latent_gauge_field_tests {
+    use super::*;
+
+    fn parse(latent: JsonValue) -> Result<Vec<LatentSpec>, String> {
+        parse_latent_specs(Some(&serde_json::json!({ "t": latent })))
+    }
+
+    /// Gauge fields that the id-mode resolution would drop are refused by name
+    /// instead of being ignored.
+    #[test]
+    fn dropped_gauge_fields_are_refused() {
+        let u = serde_json::json!([[0.0], [1.0], [2.0]]);
+        let outcome = serde_json::json!({"family": "binomial", "y": [0.0, 1.0, 0.0]});
+
+        let seeded_ard_with_head = parse(serde_json::json!({
+            "n": 3, "d": 1, "aux_outcome": outcome,
+            "dim_selection": {"init_log_precision": [0.5]}
+        }));
+        assert!(
+            seeded_ard_with_head
+                .as_ref()
+                .is_err_and(|error| error.contains("aux_outcome.init_log_precision")),
+            "{:?}",
+            seeded_ard_with_head.err()
+        );
+
+        let none_with_prior = parse(serde_json::json!({
+            "n": 3, "d": 1, "aux_prior": {"u": u}, "id_mode": "none"
+        }));
+        assert!(none_with_prior.is_err_and(|error| error.contains("id_mode='none'")));
+
+        let unknown_mode = parse(serde_json::json!({
+            "n": 3, "d": 1, "aux_prior": {"u": u}, "id_mode": "isometry"
+        }));
+        assert!(unknown_mode.is_err_and(|error| error.contains("id_mode must be 'none'")));
+    }
+
+    /// The accepted spellings still parse: `none` alone, ARD switched on next to
+    /// the head (which carries ARD anyway), and the head's own seed.
+    #[test]
+    fn consistent_gauge_fields_still_parse() {
+        let outcome = serde_json::json!({
+            "family": "binomial", "y": [0.0, 1.0, 0.0], "init_log_precision": [0.5]
+        });
+        let none = parse(serde_json::json!({"n": 3, "d": 1, "id_mode": "none"}))
+            .expect("id_mode='none' alone parses");
+        assert!(none[0].explicit_none_mode);
+        parse(serde_json::json!({
+            "n": 3, "d": 1, "aux_outcome": outcome, "dim_selection": true
+        }))
+        .expect("dim_selection=true beside aux_outcome parses");
+    }
 }
 
 fn deterministic_unit(seed: &mut u64) -> f64 {
