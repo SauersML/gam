@@ -4465,10 +4465,27 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         frozen_warp_basis.as_ref().clone(),
     ));
     let wiggle_offset = Array1::<f64>::zeros(frozen_warp_basis.nrows());
-    // The frozen warp keeps the selected basis's coefficient coordinate, and
-    // its penalties are that basis's full-width matrices, so their declared
-    // nullities carry unchanged (#3023).
-    let wiggle_nullspace_dims = wiggle_block.nullspace_dims.clone();
+    // The frozen warp keeps the selected basis's coefficient coordinate and
+    // widens each penalty to a full-width dense matrix below, so a block-local
+    // declaration `m` becomes `m + (p − w)`: the axes outside its columns are
+    // exactly null (#3023).
+    let wiggle_nullspace_dims: Vec<usize> =
+        if wiggle_block.nullspace_dims.len() == wiggle_block.penalties.len() {
+            wiggle_block
+                .penalties
+                .iter()
+                .zip(&wiggle_block.nullspace_dims)
+                .map(|(penalty, &declared)| match penalty {
+                    crate::model_types::PenaltySpec::Block { col_range, .. } => {
+                        declared + frozen_warp_basis.ncols().saturating_sub(col_range.len())
+                    }
+                    crate::model_types::PenaltySpec::Dense(_)
+                    | crate::model_types::PenaltySpec::DenseWithMean { .. } => declared,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
     let wiggle_penalties: Vec<crate::model_types::PenaltySpec> = wiggle_block
         .penalties
         .iter()
