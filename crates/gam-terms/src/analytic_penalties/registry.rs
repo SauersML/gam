@@ -433,7 +433,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
-            AnalyticPenaltyKind::ScadMcp(p) => p.diag_target(self.target.view(), self.rho.view()),
+            AnalyticPenaltyKind::ScadMcp(p) => {
+                p.psd_majorizer_target(self.target.view(), self.rho.view())
+            }
             AnalyticPenaltyKind::OrderedBetaBernoulli(p) => p
                 .psd_majorizer_diag(self.target.view(), self.rho.view())
                 .expect("ordered Beta--Bernoulli assignment diag"),
