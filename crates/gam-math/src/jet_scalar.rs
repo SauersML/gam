@@ -1426,6 +1426,20 @@ pub struct DynamicOrder2<'arena> {
     pub g: &'arena [f64],
     /// Row-major Hessian channel.
     pub h: &'arena [f64],
+    /// Structural certificate that `h` is identically zero: the jet is an
+    /// affine function of the primaries (a constant, a primary variable, or a
+    /// scaled/linear combination of those).
+    ///
+    /// Exact products of an affine factor with another jet have no term in
+    /// the factor's Hessian, so the order-two kernels skip the dense `n²` pass
+    /// over such a factor's Hessian. A BMS flex row reads each of its `p` score
+    /// and link coefficients as a primary variable multiplying a scalar
+    /// function of the index (gam#3290), so without this certificate those
+    /// kernels spend `O(p·n²)` per node adding zero Hessians; with it they
+    /// spend `O(p·n + n²)`. The flag is set only where `h ≡ 0` holds by
+    /// construction and is cleared by every operation that can curve, so it
+    /// is never a numerical test on the channel values.
+    affine: bool,
 }
 
 impl DynamicOrder2<'_> {
@@ -1461,6 +1475,7 @@ impl DynamicOrder2<'_> {
             v: value,
             g,
             h,
+            affine: false,
         }
     }
 
@@ -1620,7 +1635,13 @@ impl<'arena> DynamicOrder2<'arena> {
             }
             total
         });
-        Self { arena, v, g, h }
+        Self {
+            arena,
+            v,
+            g,
+            h,
+            affine: false,
+        }
     }
 
     /// `a·b + c·d + e` in one pass over the result.
@@ -1652,6 +1673,7 @@ impl<'arena> DynamicOrder2<'arena> {
             v: a.v * b.v + c.v * d.v + e.v,
             g,
             h,
+            affine: false,
         }
     }
 }
@@ -1666,6 +1688,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: c,
             g: arena.zeros(dimension),
             h: arena.zeros(dimension * dimension),
+            affine: true,
         }
     }
 
@@ -1682,6 +1705,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: x,
             g,
             h: arena.zeros(dimension * dimension),
+            affine: true,
         }
     }
 
@@ -1693,6 +1717,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: c,
             g: self.arena.zeros(dimension),
             h: self.arena.zeros(dimension * dimension),
+            affine: true,
         }
     }
 
@@ -1703,6 +1728,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: value,
             g: self.g,
             h: self.h,
+            affine: self.affine,
         }
     }
 
@@ -1765,6 +1791,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: value,
             g: gradient,
             h: hessian,
+            affine: false,
         }
     }
 
@@ -1794,6 +1821,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: derivative_stack[0],
             g: gradient,
             h: hessian,
+            affine: false,
         }
     }
 
@@ -1838,6 +1866,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: value,
             g: gradient,
             h: hessian,
+            affine: false,
         }
     }
 
@@ -1934,6 +1963,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: value,
             g: gradient,
             h: hessian,
+            affine: false,
         }
     }
 
@@ -1981,6 +2011,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: self.v * right.v + addend.v,
             g: gradient,
             h: hessian,
+            affine: false,
         }
     }
 
@@ -2018,6 +2049,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: value,
             g: gradient,
             h: hessian,
+            affine: false,
         }
     }
 
@@ -2041,14 +2073,20 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         }
         // Same per-entry term order as a loop over the inputs inside each
         // entry, one vectorizable pass per input (gam#2892).
+        // An affine input's Hessian is identically zero, so its `n²` pass is
+        // skipped and a combination of affine inputs is itself affine.
         let gradient = arena.zeros(dimension);
         let hessian = arena.zeros(dimension * dimension);
+        let mut affine = true;
         for (input, &weight) in inputs.iter().zip(weights) {
             for (total, &channel) in gradient.iter_mut().zip(input.g) {
                 *total += channel * weight;
             }
-            for (total, &channel) in hessian.iter_mut().zip(input.h) {
-                *total += channel * weight;
+            if !input.affine {
+                affine = false;
+                for (total, &channel) in hessian.iter_mut().zip(input.h) {
+                    *total += channel * weight;
+                }
             }
         }
         Self {
@@ -2056,6 +2094,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: value,
             g: gradient,
             h: hessian,
+            affine,
         }
     }
 
@@ -2075,14 +2114,17 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         let dimension = self.dimension();
         let g = arena_vector(self.arena, dimension, |i| self.g[i] + o.g[i]);
         let h = self.arena.copy(self.h);
-        for (entry, &other) in h.iter_mut().zip(o.h) {
-            *entry += other;
+        if !o.affine {
+            for (entry, &other) in h.iter_mut().zip(o.h) {
+                *entry += other;
+            }
         }
         Self {
             arena: self.arena,
             v: self.v + o.v,
             g,
             h,
+            affine: self.affine && o.affine,
         }
     }
 
@@ -2092,14 +2134,17 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         let dimension = self.dimension();
         let g = arena_vector(self.arena, dimension, |i| self.g[i] - o.g[i]);
         let h = self.arena.copy(self.h);
-        for (entry, &other) in h.iter_mut().zip(o.h) {
-            *entry -= other;
+        if !o.affine {
+            for (entry, &other) in h.iter_mut().zip(o.h) {
+                *entry -= other;
+            }
         }
         Self {
             arena: self.arena,
             v: self.v - o.v,
             g,
             h,
+            affine: self.affine && o.affine,
         }
     }
 
@@ -2134,6 +2179,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: self.v * o.v,
             g,
             h,
+            affine: false,
         }
     }
 
@@ -2147,14 +2193,17 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         let dimension = self.dimension();
         let g = arena_vector(self.arena, dimension, |i| self.g[i] * s);
         let h = self.arena.copy(self.h);
-        for entry in h.iter_mut() {
-            *entry *= s;
+        if !self.affine {
+            for entry in h.iter_mut() {
+                *entry *= s;
+            }
         }
         Self {
             arena: self.arena,
             v: self.v * s,
             g,
             h,
+            affine: self.affine,
         }
     }
 
@@ -2178,6 +2227,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: d[0],
             g,
             h,
+            affine: false,
         }
     }
 
@@ -2248,7 +2298,14 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
                 + left_first[a] * right.g[b]
                 + right.g[a] * left_first[b]
         });
+        // `s0_i·L_i.h` vanishes for an affine left, so only curved lefts pay
+        // an `n²` pass: a flex row's `p` link coefficients enter as primary
+        // variables, which leaves this block `O(p·n + n²)` instead of
+        // `O(p·n²)` (gam#3290).
         for (left, stack) in lefts.iter().zip(derivative_stacks) {
+            if left.affine {
+                continue;
+            }
             for (channel, &left_h) in h.iter_mut().zip(left.h) {
                 *channel += stack[0] * left_h;
             }
@@ -2258,6 +2315,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             v: value,
             g,
             h,
+            affine: false,
         }
     }
 }
@@ -7885,5 +7943,333 @@ mod two_seed_fused_932_tests {
             &TwoSeed::weighted_compose_sum(&[], &right, &[], &addend),
             &addend,
         );
+    }
+}
+
+#[cfg(test)]
+mod affine_certificate_3290_tests {
+    //! The `h ≡ 0` certificate on [`DynamicOrder2`] (gam#3290).
+    //!
+    //! The certificate only lets a kernel skip adding a Hessian that is zero
+    //! by construction, so a certified evaluation must EQUAL the same
+    //! evaluation with every certificate withdrawn, channel by channel. The
+    //! fixtures mix certified coordinate seeds (the BMS flex row's link and
+    //! score coefficients) with genuinely curved jets whose Hessians are dense,
+    //! so both branches of every kernel run and a kernel that skipped a curved
+    //! input's Hessian would disagree on live channels.
+    use super::{
+        DynamicJetArena, DynamicJetBatchWorkspace, DynamicOneSeedBatch, DynamicOrder2,
+        RuntimeJetScalar,
+    };
+    use crate::paired_timing::{SpeedGate, batched, paired_interleaved};
+
+    const DIMENSION: usize = 12;
+    const LINK: usize = 8;
+
+    /// The same jet with its certificate withdrawn, so every kernel takes the
+    /// dense path over its Hessian.
+    fn dense<'a>(x: &DynamicOrder2<'a>) -> DynamicOrder2<'a> {
+        DynamicOrder2 {
+            affine: false,
+            ..*x
+        }
+    }
+
+    fn dense_batch<'a>(
+        x: &DynamicOneSeedBatch<'a>,
+        workspace: &'a DynamicJetBatchWorkspace,
+    ) -> DynamicOneSeedBatch<'a> {
+        DynamicOneSeedBatch {
+            base: dense(&x.base),
+            eps: workspace
+                .arena
+                .alloc_slice_fill_with(x.eps.len(), |lane| dense(&x.eps[lane])),
+        }
+    }
+
+    fn assert_identical(label: &str, got: &DynamicOrder2<'_>, want: &DynamicOrder2<'_>) {
+        assert!(
+            got.v == want.v,
+            "{label}: value {:+.17e} vs dense {:+.17e}",
+            got.v,
+            want.v
+        );
+        for (index, (&got, &want)) in got.g.iter().zip(want.g).enumerate() {
+            assert!(
+                got == want,
+                "{label}: gradient {index} {got:+.17e} vs dense {want:+.17e}"
+            );
+        }
+        for (index, (&got, &want)) in got.h.iter().zip(want.h).enumerate() {
+            assert!(
+                got == want,
+                "{label}: Hessian {index} {got:+.17e} vs dense {want:+.17e}"
+            );
+        }
+    }
+
+    fn assert_live_hessian(label: &str, x: &DynamicOrder2<'_>) {
+        let live = x.h.iter().filter(|channel| channel.abs() > 1.0e-9).count();
+        assert!(
+            live > x.h.len() / 2,
+            "{label}: the comparison must run on live Hessian channels ({live} of {})",
+            x.h.len()
+        );
+    }
+
+    fn stack(term: usize) -> [f64; 5] {
+        let t = term as f64;
+        [
+            0.31 - 0.07 * t,
+            0.62 + 0.05 * t,
+            -0.24 + 0.03 * t,
+            0.11 - 0.02 * t,
+            -0.05,
+        ]
+    }
+
+    /// `f(m)·m` for a dense mixture `m` of every primary: a jet whose Hessian
+    /// has every channel live.
+    fn curved<'a, S: RuntimeJetScalar<'a>>(
+        seeds: &[S],
+        dimension: usize,
+        workspace: &'a S::Workspace,
+        salt: usize,
+    ) -> S {
+        let weights: Vec<f64> = (0..seeds.len())
+            .map(|axis| 0.3 + 0.11 * ((axis + salt) % 5) as f64 - 0.02 * salt as f64)
+            .collect();
+        let mix = S::linear_combination(seeds, &weights, dimension, workspace);
+        mix.compose_unary([0.9 - 0.1 * salt as f64, -0.5, 0.27, -0.14, 0.06])
+            .mul(&mix)
+    }
+
+    fn primaries(arena: &DynamicJetArena) -> Vec<DynamicOrder2<'_>> {
+        (0..DIMENSION)
+            .map(|axis| DynamicOrder2::variable(0.35 - 0.05 * axis as f64, axis, DIMENSION, arena))
+            .collect()
+    }
+
+    #[test]
+    fn affine_certificate_follows_construction_3290() {
+        let arena = DynamicJetArena::new();
+        let seeds = primaries(&arena);
+        let (x, y) = (seeds[1], seeds[3]);
+        let c = DynamicOrder2::constant(2.0, DIMENSION, &arena);
+        let bent = curved(&seeds, DIMENSION, &arena, 0);
+        let combination =
+            DynamicOrder2::linear_combination(&[x, y, c], &[0.5, -1.25, 3.0], DIMENSION, &arena);
+        let certified = [
+            x,
+            c,
+            x.constant_like(1.5),
+            x.with_value(3.0),
+            x.add(&y),
+            x.sub(&c),
+            x.scale(-1.7),
+            x.neg(),
+            combination,
+        ];
+        for (index, jet) in certified.iter().enumerate() {
+            assert!(jet.affine, "jet {index} must carry the affine certificate");
+            assert!(
+                jet.h.iter().all(|&channel| channel == 0.0),
+                "certified jet {index} must have an identically zero Hessian"
+            );
+        }
+        assert_live_hessian("curved fixture", &bent);
+        let uncertified = [
+            bent,
+            bent.with_value(3.0),
+            x.add(&bent),
+            bent.sub(&x),
+            bent.scale(0.5),
+            x.mul(&y),
+            DynamicOrder2::linear_combination(&[x, bent], &[1.0, 1.0], DIMENSION, &arena),
+            DynamicOrder2::weighted_compose_sum(&[x], &y, &[stack(0)], &c),
+        ];
+        for (index, jet) in uncertified.iter().enumerate() {
+            assert!(
+                !jet.affine,
+                "curved jet {index} must not carry the affine certificate"
+            );
+        }
+    }
+
+    #[test]
+    fn affine_certificate_kernels_equal_the_dense_path_3290() {
+        let arena = DynamicJetArena::new();
+        let seeds = primaries(&arena);
+        let bent: Vec<_> = (0..4)
+            .map(|salt| curved(&seeds, DIMENSION, &arena, salt))
+            .collect();
+        // The link coefficients are coordinate seeds; two curved lefts are
+        // interleaved so the skip and the dense pass both run in one call.
+        let mut lefts: Vec<_> = seeds[DIMENSION - LINK..].to_vec();
+        lefts.insert(2, bent[1]);
+        lefts.insert(5, bent[2]);
+        let stacks: Vec<[f64; 5]> = (0..lefts.len()).map(stack).collect();
+        let dense_lefts: Vec<_> = lefts.iter().map(dense).collect();
+        let (right, addend) = (bent[0], bent[3]);
+
+        let certified = DynamicOrder2::weighted_compose_sum(&lefts, &right, &stacks, &addend);
+        assert_live_hessian("weighted_compose_sum", &certified);
+        assert_identical(
+            "weighted_compose_sum",
+            &certified,
+            &DynamicOrder2::weighted_compose_sum(
+                &dense_lefts,
+                &dense(&right),
+                &stacks,
+                &dense(&addend),
+            ),
+        );
+        // All-certified lefts: the BMS link block itself.
+        let links = &lefts[..2];
+        assert_identical(
+            "weighted_compose_sum links",
+            &DynamicOrder2::weighted_compose_sum(links, &right, &stacks[..2], &addend),
+            &DynamicOrder2::weighted_compose_sum(&dense_lefts[..2], &right, &stacks[..2], &addend),
+        );
+
+        let weights: Vec<f64> = (0..lefts.len())
+            .map(|term| 0.7 - 0.13 * term as f64)
+            .collect();
+        let combination = DynamicOrder2::linear_combination(&lefts, &weights, DIMENSION, &arena);
+        assert_live_hessian("linear_combination", &combination);
+        assert_identical(
+            "linear_combination",
+            &combination,
+            &DynamicOrder2::linear_combination(&dense_lefts, &weights, DIMENSION, &arena),
+        );
+
+        let (x, y) = (seeds[0], seeds[5]);
+        for (label, got, want) in [
+            (
+                "add certified+curved",
+                x.add(&right),
+                dense(&x).add(&dense(&right)),
+            ),
+            (
+                "add curved+certified",
+                right.add(&x),
+                dense(&right).add(&dense(&x)),
+            ),
+            (
+                "sub certified-curved",
+                x.sub(&right),
+                dense(&x).sub(&dense(&right)),
+            ),
+            (
+                "sub curved-certified",
+                right.sub(&x),
+                dense(&right).sub(&dense(&x)),
+            ),
+            ("add certified", x.add(&y), dense(&x).add(&dense(&y))),
+            ("scale certified", x.scale(-1.7), dense(&x).scale(-1.7)),
+            ("scale curved", right.scale(-1.7), dense(&right).scale(-1.7)),
+        ] {
+            assert_identical(label, &got, &want);
+        }
+    }
+
+    /// The one-seed batch lowers its link block to the order-two kernels on
+    /// its base and on every lane; every lane must equal the dense path.
+    #[test]
+    fn affine_certificate_one_seed_batch_equals_the_dense_path_3290() {
+        const LANES: usize = 3;
+        let workspace = DynamicJetBatchWorkspace::new(LANES);
+        let seeds: Vec<_> = (0..DIMENSION)
+            .map(|axis| {
+                DynamicOneSeedBatch::seed_directions(
+                    0.35 - 0.05 * axis as f64,
+                    axis,
+                    DIMENSION,
+                    &workspace,
+                    |lane| 0.2 + 0.07 * ((axis + 2 * lane) % 7) as f64 - 0.1 * lane as f64,
+                )
+            })
+            .collect();
+        let right = curved(&seeds, DIMENSION, &workspace, 0);
+        let addend = curved(&seeds, DIMENSION, &workspace, 1);
+        let mut lefts: Vec<_> = seeds[DIMENSION - LINK..].to_vec();
+        lefts.insert(3, curved(&seeds, DIMENSION, &workspace, 2));
+        let stacks: Vec<[f64; 5]> = (0..lefts.len()).map(stack).collect();
+        let dense_lefts: Vec<_> = lefts
+            .iter()
+            .map(|left| dense_batch(left, &workspace))
+            .collect();
+        let certified = DynamicOneSeedBatch::weighted_compose_sum(&lefts, &right, &stacks, &addend);
+        let reference = DynamicOneSeedBatch::weighted_compose_sum(
+            &dense_lefts,
+            &dense_batch(&right, &workspace),
+            &stacks,
+            &dense_batch(&addend, &workspace),
+        );
+        assert_live_hessian("one-seed base", &certified.base);
+        assert_identical("one-seed base", &certified.base, &reference.base);
+        for lane in 0..LANES {
+            assert_live_hessian("one-seed lane", &certified.eps[lane]);
+            assert_identical("one-seed lane", &certified.eps[lane], &reference.eps[lane]);
+        }
+    }
+
+    /// Release-profile speed contract: at the BMS flex row's default width
+    /// (two index primaries plus score and link coefficients, r = 22) the
+    /// certified link block must beat the same block with its certificates
+    /// withdrawn. Both arms build the same operands from a warm-reset arena
+    /// and return the same channels; the only difference is whether the link
+    /// seeds' zero Hessians are streamed.
+    #[test]
+    fn affine_certificate_link_block_is_faster_than_dense_3290() {
+        const WIDTH: usize = 22;
+        const LINK_WIDTH: usize = 18;
+        if cfg!(debug_assertions) {
+            return;
+        }
+        fn link_block(arena: &DynamicJetArena, nudge: f64, certified: bool) -> f64 {
+            let seeds: Vec<_> = (0..WIDTH)
+                .map(|axis| {
+                    DynamicOrder2::variable(0.35 - 0.01 * axis as f64 + nudge, axis, WIDTH, arena)
+                })
+                .collect();
+            let right = curved(&seeds[..2], WIDTH, arena, 0);
+            let right = DynamicOrder2::linear_combination(
+                &[right, seeds[0], seeds[1]],
+                &[1.0, 0.5, -0.25],
+                WIDTH,
+                arena,
+            );
+            let lefts: Vec<_> = seeds[WIDTH - LINK_WIDTH..]
+                .iter()
+                .map(|seed| if certified { *seed } else { dense(seed) })
+                .collect();
+            let stacks: Vec<[f64; 5]> = (0..LINK_WIDTH).map(stack).collect();
+            let result = DynamicOrder2::weighted_compose_sum(&lefts, &right, &stacks, &right);
+            result.v + result.g[WIDTH - 1] + result.h[WIDTH * WIDTH - 1]
+        }
+        let mut gate = SpeedGate::open("AFFINE-CERTIFICATE-3290");
+        let mut certified_arena = DynamicJetArena::new();
+        let mut dense_arena = DynamicJetArena::new();
+        let timing = paired_interleaved(
+            15,
+            1_000,
+            0x3290_AFF1,
+            batched(16, |nudge| {
+                certified_arena.reset();
+                link_block(&certified_arena, nudge, true)
+            }),
+            batched(16, |nudge| {
+                dense_arena.reset();
+                link_block(&dense_arena, nudge, false)
+            }),
+        );
+        gate.faster(
+            &format!("width={WIDTH} link={LINK_WIDTH}"),
+            &timing,
+            "certified",
+            "dense",
+        );
+        gate.finish();
     }
 }
