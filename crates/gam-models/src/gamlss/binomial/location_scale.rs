@@ -28,24 +28,12 @@ impl BinomialLocationScaleFamily {
         self.threshold_design.is_some() && self.log_sigma_design.is_some()
     }
 
-    pub(crate) fn dense_block_designs(
-        &self,
-    ) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
-        dense_locscale_block_designs_cached(
-            self.threshold_design.as_ref(),
-            self.log_sigma_design.as_ref(),
-            "BinomialLocationScaleFamily",
-            "BinomialLocationScale",
-            "threshold",
-            &self.policy.material_policy(),
-        )
-    }
-
-    pub(crate) fn dense_block_designs_fromspecs<'a>(
-        &self,
-        specs: &'a [ParameterBlockSpec],
-    ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
-        dense_locscale_block_designs_fromspecs(
+    pub(crate) fn exact_joint_dense_block_designs<'a>(
+        &'a self,
+        specs: Option<&'a [ParameterBlockSpec]>,
+    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
+        exact_joint_locscale_block_designs(
+            (self.threshold_design.as_ref(), self.log_sigma_design.as_ref()),
             specs,
             2,
             "BinomialLocationScaleFamily",
@@ -57,44 +45,13 @@ impl BinomialLocationScaleFamily {
         )
     }
 
-    pub(crate) fn exact_joint_dense_block_designs<'a>(
-        &'a self,
-        specs: Option<&'a [ParameterBlockSpec]>,
-    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
-        // The non-wiggle family is structurally capable of exact joint outer
-        // rho-derivatives whenever the realized threshold and log-sigma
-        // designs are available somewhere. Prefer cached family designs when
-        // present, but allow the outer hyper code to recover the exact same
-        // joint path from the realized `specs`.
-        //
-        // This is not a convenience fallback. The coupled profiled derivative
-        // is defined in terms of the joint mode system
-        //
-        //   H u_k = -A_k beta,
-        //
-        // so if the block specs already determine the realized joint
-        // curvature, forcing the code back onto a blockwise surrogate just
-        // because the family did not cache duplicate dense designs would be
-        // mathematically wrong.
-        if self.threshold_design.is_some() && self.log_sigma_design.is_some() {
-            return self.dense_block_designs().map(Some);
-        }
-        if let Some(specs) = specs {
-            return self.dense_block_designs_fromspecs(specs).map(Some);
-        }
-        Ok(None)
-    }
-
     pub(crate) fn exact_joint_block_designs_owned(
         &self,
         specs: Option<&[ParameterBlockSpec]>,
     ) -> Result<Option<(DesignMatrix, DesignMatrix)>, String> {
-        let designs = if let (Some(x_t), Some(x_ls)) = (
-            self.threshold_design.as_ref(),
-            self.log_sigma_design.as_ref(),
-        ) {
-            Some((x_t.clone(), x_ls.clone()))
-        } else if let Some(specs) = specs {
+        // The specs are authoritative whenever given, as in
+        // `exact_joint_locscale_block_designs` (#3015).
+        let designs = if let Some(specs) = specs {
             if specs.len() != 2 {
                 return Err(GamlssError::DimensionMismatch { reason: format!(
                     "BinomialLocationScaleFamily spec-aware operator path expects 2 specs, got {}",
@@ -105,6 +62,11 @@ impl BinomialLocationScaleFamily {
                 specs[Self::BLOCK_T].design.clone(),
                 specs[Self::BLOCK_LOG_SIGMA].design.clone(),
             ))
+        } else if let (Some(x_t), Some(x_ls)) = (
+            self.threshold_design.as_ref(),
+            self.log_sigma_design.as_ref(),
+        ) {
+            Some((x_t.clone(), x_ls.clone()))
         } else {
             None
         };
@@ -767,22 +729,6 @@ impl BinomialLocationScaleFamily {
             Array1::from_vec(coeff_tl),
             Array1::from_vec(coeff_ll),
         ))
-    }
-
-    /// Exact diagonal-block-only Hessians (h_tt, h_ll) used by `evaluate()`
-    /// to populate per-block working sets without ever materializing the
-    /// dense p×p joint matrix.
-    pub(crate) fn exact_newton_block_diagonal_hessians_from_design_matrices(
-        &self,
-        block_states: &[ParameterBlockState],
-        x_t: &DesignMatrix,
-        x_ls: &DesignMatrix,
-    ) -> Result<(Array2<f64>, Array2<f64>), String> {
-        let (coeff_tt, _coeff_tl, coeff_ll) =
-            self.exact_newton_joint_hessian_row_coefficients(block_states)?;
-        let h_tt = xt_diag_x_design(x_t, &coeff_tt)?;
-        let h_ll = xt_diag_x_design(x_ls, &coeff_ll)?;
-        Ok((h_tt, h_ll))
     }
 
     pub(crate) fn exact_newton_joint_hessian_from_designs(
@@ -2201,19 +2147,6 @@ impl CustomFamily for BinomialLocationScaleFamily {
             None,
             &self.link_kind,
         )?;
-        if !self.exact_joint_supported() {
-            return Err(
-                "BinomialLocationScaleFamily requires exact curvature designs; diagonal fallback has been removed"
-                    .to_string(),
-            );
-        }
-        let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
-        })?;
-        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleFamily exact path is missing log-sigma design".to_string()
-        })?;
-
         // Per-block gradients from the eta-space score.
         //
         //   score_q = -m1   (m1 = dF/dq, F = -ℓ)
@@ -2248,28 +2181,24 @@ impl CustomFamily for BinomialLocationScaleFamily {
         }
         let grad_eta_t = Array1::from_vec(grad_eta_t_v);
         let grad_eta_ls = Array1::from_vec(grad_eta_ls_v);
-        let grad_t = threshold_design.transpose_vector_multiply(&grad_eta_t);
-        let grad_ls = log_sigma_design.transpose_vector_multiply(&grad_eta_ls);
 
-        // Per-block Hessians without ever materializing the full p×p joint
-        // matrix — the off-diagonal cross block is unused for IRLS-style block
-        // working sets and would cost O(p_t * p_ls * n) to form. The diagonal
-        // blocks are computed from the same row coefficients as the joint.
-        let (h_tt, h_ll) = self.exact_newton_block_diagonal_hessians_from_design_matrices(
-            block_states,
-            threshold_design,
-            log_sigma_design,
-        )?;
+        // Each block's exact curvature within itself is `X_bᵀ diag(c_bb) X_b`, with
+        // `c_bb` the diagonal of the joint rowwise curvature. The block working sets carry
+        // the row score and that curvature, and the caller contracts them with the designs
+        // it solves on. So they hold at any identifiability reduction of those designs,
+        // and read no design copy of the family's own (#3015).
+        let (coeff_tt, _coeff_tl, coeff_ll) =
+            self.exact_newton_joint_hessian_row_coefficients(block_states)?;
         Ok(FamilyEvaluation {
             log_likelihood: core.log_likelihood,
             blockworking_sets: vec![
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_t,
-                    hessian: SymmetricMatrix::Dense(h_tt),
+                BlockWorkingSet::NaturalDiagonal {
+                    score: grad_eta_t,
+                    observed_curvature: coeff_tt,
                 },
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_ls,
-                    hessian: SymmetricMatrix::Dense(h_ll),
+                BlockWorkingSet::NaturalDiagonal {
+                    score: grad_eta_ls,
+                    observed_curvature: coeff_ll,
                 },
             ],
         })

@@ -7,30 +7,36 @@
 use super::*;
 use gam_terms::basis::initializewiggle_knots_from_seed;
 
+/// The binomial location-scale family's block working sets carry each row's score and
+/// within-block curvature, which the solver contracts with the designs it runs on (#3015).
+/// Contracted with the family's own designs, each block's curvature is the matching
+/// principal block of the family's exact joint Hessian.
 #[test]
-pub(crate) fn nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_are_present() {
+pub(crate) fn nonwiggle_family_evaluate_block_curvature_is_the_joint_hessians_principal_block() {
     let n = 6usize;
     let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
     let weights = Array1::from_vec(vec![1.0; n]);
+    let threshold_dense = Array2::from_shape_fn((n, 2), |(i, j)| {
+        let t = i as f64 / (n as f64 - 1.0);
+        match j {
+            0 => 1.0,
+            1 => t - 0.5,
+            _ => unreachable!(),
+        }
+    });
+    let log_sigma_dense = Array2::from_shape_fn((n, 2), |(i, j)| {
+        let t = i as f64 / (n as f64 - 1.0);
+        match j {
+            0 => 1.0,
+            1 => (2.0 * std::f64::consts::PI * t).cos(),
+            _ => unreachable!(),
+        }
+    });
     let threshold_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-        Array2::from_shape_fn((n, 2), |(i, j)| {
-            let t = i as f64 / (n as f64 - 1.0);
-            match j {
-                0 => 1.0,
-                1 => t - 0.5,
-                _ => unreachable!(),
-            }
-        }),
+        threshold_dense.clone(),
     ));
     let log_sigma_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-        Array2::from_shape_fn((n, 2), |(i, j)| {
-            let t = i as f64 / (n as f64 - 1.0);
-            match j {
-                0 => 1.0,
-                1 => (2.0 * std::f64::consts::PI * t).cos(),
-                _ => unreachable!(),
-            }
-        }),
+        log_sigma_dense.clone(),
     ));
     let family = BinomialLocationScaleFamily {
         y: y.clone(),
@@ -64,11 +70,19 @@ pub(crate) fn nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_
     let pt = beta_t.len();
     let pls = beta_ls.len();
 
+    let designs = [&threshold_dense, &log_sigma_dense];
     for (block_idx, (start, end)) in [(0usize, pt), (pt, pt + pls)].into_iter().enumerate() {
         let blockhessian = match &eval.blockworking_sets[block_idx] {
-            BlockWorkingSet::ExactNewton { hessian, .. } => hessian.to_dense(),
-            BlockWorkingSet::Diagonal { .. } | BlockWorkingSet::NaturalDiagonal { .. } => {
-                panic!("expected exact newton block")
+            BlockWorkingSet::NaturalDiagonal {
+                observed_curvature,
+                ..
+            } => {
+                let x = designs[block_idx];
+                x.t()
+                    .dot(&(x * &observed_curvature.view().insert_axis(ndarray::Axis(1))))
+            }
+            BlockWorkingSet::ExactNewton { .. } | BlockWorkingSet::Diagonal { .. } => {
+                panic!("expected a natural-diagonal block, which reads no design of the family's own")
             }
         };
         let joint_block = joint.slice(s![start..end, start..end]).to_owned();
@@ -78,6 +92,162 @@ pub(crate) fn nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_
             1e-10,
             &format!("nonwiggle block {block_idx} principal block"),
         );
+    }
+}
+
+/// The identifiability audit can hand the family specs narrower than the designs it was
+/// built with, and the solve then runs in the specs' coordinates (#3015). Every quantity
+/// the solve reads must be the one a family built on the specs' designs computes: the
+/// exact joint gradient and Hessian, and the block working sets once contracted with the
+/// specs' designs.
+#[test]
+pub(crate) fn the_binomial_location_scale_family_computes_on_the_specs_it_is_handed_3015() {
+    let n = 9usize;
+    let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0]);
+    let weights = Array1::from_vec(vec![1.0; n]);
+    let grid = |i: usize| i as f64 / (n as f64 - 1.0);
+    let threshold_dense = Array2::from_shape_fn((n, 2), |(i, j)| match j {
+        0 => 1.0,
+        _ => grid(i) - 0.5,
+    });
+    // The audit drops the log-σ block's last column, so the specs carry the first two.
+    let full_log_sigma_dense = Array2::from_shape_fn((n, 3), |(i, j)| match j {
+        0 => 1.0,
+        1 => (std::f64::consts::TAU * grid(i)).cos(),
+        _ => (std::f64::consts::TAU * grid(i)).sin(),
+    });
+    let reduced_log_sigma_dense = full_log_sigma_dense.slice(s![.., 0..2]).to_owned();
+    let dense = |x: &Array2<f64>| {
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x.clone()))
+    };
+    let family_on = |log_sigma: &Array2<f64>| BinomialLocationScaleFamily {
+        y: y.clone(),
+        weights: weights.clone(),
+        link_kind: InverseLink::Standard(StandardLink::Probit),
+        threshold_design: Some(dense(&threshold_dense)),
+        log_sigma_design: Some(dense(log_sigma)),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
+        jeffreys_armed: false,
+    };
+    let built_wide = family_on(&full_log_sigma_dense);
+    let built_on_specs = family_on(&reduced_log_sigma_dense);
+    let spec = |name: &str, x: &Array2<f64>, output: usize| {
+        build_location_scale_block(
+            name,
+            dense(x),
+            Array1::zeros(n),
+            Vec::new(),
+            Vec::new(),
+            Array1::zeros(0),
+            None,
+            output,
+            LOCATION_SCALE_N_OUTPUTS,
+            "#3015 contract pin",
+        )
+        .expect("block spec")
+    };
+    let specs = vec![
+        spec("threshold", &threshold_dense, 0),
+        spec("log_sigma", &reduced_log_sigma_dense, 1),
+    ];
+
+    let beta_t = array![0.2, -0.4];
+    let beta_ls = array![-0.1, 0.3];
+    let states = vec![
+        ParameterBlockState {
+            eta: threshold_dense.dot(&beta_t),
+            beta: beta_t,
+        },
+        ParameterBlockState {
+            eta: reduced_log_sigma_dense.dot(&beta_ls),
+            beta: beta_ls,
+        },
+    ];
+    let width = 4usize;
+
+    let hessian = built_wide
+        .exact_newton_joint_hessian_with_specs(&states, &specs)
+        .expect("joint hessian on the specs")
+        .expect("the family carries an exact joint hessian");
+    let reference_hessian = built_on_specs
+        .exact_newton_joint_hessian(&states)
+        .expect("reference joint hessian")
+        .expect("the reference family carries an exact joint hessian");
+    assert_eq!(hessian.dim(), (width, width), "#3015: the joint hessian takes the specs' width");
+    gam_test_support::assert_matrix_derivativefd(
+        &reference_hessian,
+        &hessian,
+        1e-12,
+        "#3015: joint hessian on the specs",
+    );
+
+    let gradient = built_wide
+        .exact_newton_joint_gradient_evaluation(&states, &specs)
+        .expect("joint gradient on the specs")
+        .expect("the family carries an exact joint gradient")
+        .gradient;
+    let reference_gradient = built_on_specs
+        .exact_newton_joint_gradient_from_designs(
+            &states,
+            &dense(&threshold_dense),
+            &dense(&reduced_log_sigma_dense),
+        )
+        .expect("reference joint gradient")
+        .gradient;
+    assert_eq!(gradient.len(), width, "#3015: the joint gradient takes the specs' width");
+    for (index, (value, reference)) in gradient.iter().zip(reference_gradient.iter()).enumerate() {
+        assert!(
+            (value - reference).abs() <= 1e-12 * (1.0 + reference.abs()),
+            "#3015: joint gradient entry {index}: {value} on the specs against {reference}"
+        );
+    }
+
+    // The block working sets, contracted with the specs' designs, carry the same gradient
+    // and the joint hessian's principal blocks.
+    let evaluation = built_wide.evaluate(&states).expect("evaluate");
+    let designs = [&threshold_dense, &reduced_log_sigma_dense];
+    let mut offset = 0usize;
+    for (block_idx, working_set) in evaluation.blockworking_sets.iter().enumerate() {
+        let x = designs[block_idx];
+        let p = x.ncols();
+        let (block_gradient, block_hessian) = match working_set {
+            BlockWorkingSet::NaturalDiagonal {
+                score,
+                observed_curvature,
+            } => (
+                x.t().dot(score),
+                x.t()
+                    .dot(&(x * &observed_curvature.view().insert_axis(ndarray::Axis(1)))),
+            ),
+            BlockWorkingSet::ExactNewton { gradient, hessian } => {
+                (gradient.clone(), hessian.to_dense())
+            }
+            BlockWorkingSet::Diagonal { .. } => {
+                panic!("#3015: the binomial location-scale family carries exact curvature")
+            }
+        };
+        assert_eq!(
+            (block_gradient.len(), block_hessian.dim()),
+            (p, (p, p)),
+            "#3015: block {block_idx}'s working set must take the specs' width"
+        );
+        for local in 0..p {
+            let reference = reference_gradient[offset + local];
+            assert!(
+                (block_gradient[local] - reference).abs() <= 1e-12 * (1.0 + reference.abs()),
+                "#3015: block {block_idx} gradient entry {local}: {} against {reference}",
+                block_gradient[local]
+            );
+        }
+        gam_test_support::assert_matrix_derivativefd(
+            &reference_hessian
+                .slice(s![offset..offset + p, offset..offset + p])
+                .to_owned(),
+            &block_hessian,
+            1e-12,
+            &format!("#3015: block {block_idx} principal block on the specs"),
+        );
+        offset += p;
     }
 }
 

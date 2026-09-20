@@ -194,3 +194,6 @@ pub use fit_config::*;
 pub use materialize::*;
 pub use request::*;
 pub use warm_start_from::*;
+
+#[cfg(test)]
+mod binomial_location_scale_noise_term_in_threshold_span_3015_tests;

@@ -4712,5 +4712,19 @@
     },
     "reason": "#3253: one route for Φ₂. bivariate_normal_cdf_with_complement now evaluates the apex tree and returns its BoundedProbability, so the separate bounded entry is the same function under a second name and is deleted. Its callers (gaussian_activation, the bivariate normal tests, positive_form_tests) call bivariate_normal_cdf_with_complement.",
     "evidence": "Gate dy5 w2slb-bvn-g1 at 94e6a59c5b (direct-dy5-w2slb-bvn-g1.log): the census lists exactly this removal, 13652 -> 13651 public function declarations. In the landing tree the name occurs 0 times (git grep -w -c). Final gate dy5 w2slb-bvn-g5 at 96a81f3bca (tree 0a497192f7): census 0 with this entry."
+  },
+  {
+    "base": "11e49efecf7669ee10f880fa2801d312aa4acfe0",
+    "removed": {
+      "crates/gam-models/src/gamlss/binomial/location_scale.rs::dense_block_designs": 1,
+      "crates/gam-models/src/gamlss/binomial/location_scale.rs::dense_block_designs_fromspecs": 1,
+      "crates/gam-models/src/gamlss/binomial/location_scale.rs::exact_newton_block_diagonal_hessians_from_design_matrices": 1,
+      "crates/gam-models/src/gamlss/binomial/wiggle.rs::assemble_block_diagonals": 1,
+      "crates/gam-models/src/gamlss/binomial/wiggle.rs::dense_block_designs_fromspecs": 1,
+      "crates/gam-models/src/gamlss/gaussian/wiggle.rs::dense_block_designs_fromspecs": 1,
+      "crates/gam-models/src/gamlss/tests_wiggle_ls.rs::nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_are_present": 1
+    },
+    "reason": "#3015: every location-scale family resolves the designs of its exact joint calculus through one rule, exact_joint_locscale_block_designs, which makes the specs it is handed authoritative: the identifiability audit can drop columns and the solve then runs in the specs' coordinates. The binomial location-scale family's dense_block_designs/dense_block_designs_fromspecs and the dense_block_designs_fromspecs of the binomial and Gaussian location-scale wiggle families were that rule's two halves in each family, with the stored pre-audit design read first; the shared rule replaces them. The binomial families' evaluate() returns NaturalDiagonal working sets (row score and within-block curvature, contracted by the caller with the designs it solves on), so exact_newton_block_diagonal_hessians_from_design_matrices and the wiggle family's assemble_block_diagonals, which built those blocks from the stored designs, have no caller. The test nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_are_present asserted the retired representation; it is restated as nonwiggle_family_evaluate_block_curvature_is_the_joint_hessians_principal_block, and the_binomial_location_scale_family_computes_on_the_specs_it_is_handed_3015 pins the reduced-width contract.",
+    "evidence": "Lane gate ls-surv (acn112 60-63). Lane commit c93dda4199 on 700c8e6300: source_removal_guard.py and public_api_census.py name exactly these removals without this entry; cargo check --workspace --all-targets (root ban scanner, 0 rows) and cargo check -p gam-pyffi --all-targets exit 0. Each of three mutants (surv-ls-lead's i3015-mut-all, i3015-mut-owned and i3015-mut-eval patches: the stored designs first in exact_joint_locscale_block_designs, the stored designs first in exact_joint_block_designs_owned, and evaluate() building ExactNewton blocks from the stored designs) fails the_binomial_location_scale_family_computes_on_the_specs_it_is_handed_3015. Re-run at base 990d8e0b93c55f834d5b27a7aa69487c3e2096ae: the guards pass with this entry, and git grep -w finds no caller of a removed item; the remaining same-name hits are the Gaussian and binomial wiggle families' own dense_block_designs (a different item, kept for their spec-less per-block hook) and error-message strings in gamlss/errors.rs."
   }
 ]
