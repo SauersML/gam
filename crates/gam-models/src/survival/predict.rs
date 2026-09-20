@@ -2239,7 +2239,9 @@ pub struct HazardPathScores {
 /// differently-repaired matrix would make the two metrics disagree about which
 /// prediction they scored.
 ///
-/// `grid` must be strictly increasing with at least two points, `observed[i]`
+/// `grid` must be finite, strictly increasing with at least two points, and
+/// start at the time origin `grid[0] = 0` (the only time the first-column pin
+/// `S = 1` is true, and the start of every hazard integral), `observed[i]`
 /// is `δ_i`, and every `event_times[i]` must be finite and positive — callers
 /// validate that, since what to do about a malformed input is theirs to decide.
 pub fn monotone_survival_and_hazard_scores(
@@ -2451,10 +2453,13 @@ pub struct SurvivalPredictionScores {
 /// scored on the same fold gets the same IPCW weights, and integration stops at
 /// the largest observed time, before the tail where those weights blow up.
 ///
-/// Every field is `None` when the shapes disagree, the grid is not strictly
-/// increasing with at least two points, or an event time is not finite and
-/// positive. What a malformed input means is decided here, once, for every front
-/// door.
+/// Every field is `None` when the shapes disagree, the grid is not a finite,
+/// strictly increasing sequence of at least two points starting at the time
+/// origin `0`, or an event time is not finite and positive. The hazard-path
+/// scores integrate from `t = 0`, where every survival path is `1`: a grid that
+/// starts later would have its first predicted column overwritten with `1` and
+/// an event before `grid[0]` scored with a negative cumulative hazard. What a
+/// malformed input means is decided here, once, for every front door.
 pub fn survival_prediction_scores(
     event_times: &[f64],
     events: &[f64],
@@ -2469,6 +2474,8 @@ pub fn survival_prediction_scores(
         || survival.nrows() != event_times.len()
         || survival.ncols() != grid.len()
         || grid.len() < 2
+        || grid[0] != 0.0
+        || grid.iter().any(|time| !time.is_finite())
         || grid.windows(2).any(|pair| pair[1] <= pair[0])
         || event_times.iter().any(|time| !time.is_finite() || *time <= 0.0)
     {
@@ -2579,31 +2586,23 @@ impl KaplanMeier {
         Self::fit(time, &flipped)
     }
 
-    /// [`Self::at`] evaluated across a whole grid. `steps` is sorted by
-    /// construction, so each lookup is a binary search rather than the linear
-    /// scan `at` does — the difference matters when a caller evaluates a dense
-    /// grid against a step function with one step per event time.
+    /// [`Self::at`] evaluated across a whole grid.
     pub fn on_grid(&self, grid: &[f64]) -> Vec<f64> {
-        grid.iter()
-            .map(|&t| {
-                let idx = self.steps.partition_point(|&(time, _)| time <= t);
-                if idx == 0 { 1.0 } else { self.steps[idx - 1].1 }
-            })
-            .collect()
+        grid.iter().map(|&t| self.at(t)).collect()
     }
 
     /// Right-continuous step lookup: `Ŝ(t)` = survival at the last event time
-    /// `≤ t` (and `1.0` before the first event).
+    /// `≤ t` (and `1.0` before the first event, or at a NaN `t`).
+    ///
+    /// `steps` is strictly increasing in time by construction, so this is a
+    /// binary search. The IPCW scorers call it once per subject per grid point
+    /// against a censoring curve with one step per censoring time, so a linear
+    /// scan here would make held-out scoring quadratic in the sample size.
     pub fn at(&self, t: f64) -> f64 {
-        let mut s = 1.0_f64;
-        for &(time, surv) in &self.steps {
-            if time <= t {
-                s = surv;
-            } else {
-                break;
-            }
+        match self.steps.partition_point(|&(time, _)| time <= t) {
+            0 => 1.0,
+            idx => self.steps[idx - 1].1,
         }
-        s
     }
 }
 
@@ -7458,6 +7457,42 @@ mod tests {
         );
     }
 
+    /// The hazard-path scores integrate from the time origin (#3609). A grid
+    /// that starts after 0 would have the model's `Ŝ(grid[0]) < 1` overwritten
+    /// with `1` and an event before `grid[0]` scored with a negative cumulative
+    /// hazard, so it is refused like any other malformed grid; so is a grid
+    /// with a non-finite point.
+    #[test]
+    fn survival_prediction_scores_refuse_a_grid_not_anchored_at_the_origin() {
+        let time = [2.0, 8.0, 10.0, 3.0, 6.0, 1.5];
+        let event = [1.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        let model = Array2::from_shape_fn((6, 6), |(row, col)| {
+            0.95 - col as f64 * (0.05 + 0.02 * row as f64)
+        });
+        let anchored = [0.0, 1.0, 2.0, 3.0, 5.0, 7.0];
+        assert!(
+            survival_prediction_scores(&time, &event, &anchored, model.view(), None)
+                .logloss
+                .is_some()
+        );
+        // The subject at t = 1.5 falls before a grid starting at 2.
+        let shifted = [2.0, 3.0, 4.0, 5.0, 7.0, 9.0];
+        assert_eq!(
+            survival_prediction_scores(&time, &event, &shifted, model.view(), None),
+            SurvivalPredictionScores::default()
+        );
+        let unbounded = [0.0, 1.0, 2.0, 3.0, 5.0, f64::INFINITY];
+        assert_eq!(
+            survival_prediction_scores(&time, &event, &unbounded, model.view(), None),
+            SurvivalPredictionScores::default()
+        );
+        let not_a_number = [0.0, 1.0, f64::NAN, 3.0, 5.0, 7.0];
+        assert_eq!(
+            survival_prediction_scores(&time, &event, &not_a_number, model.view(), None),
+            SurvivalPredictionScores::default()
+        );
+    }
+
     // ---- IPCW Brier score (Graf et al. 1999) -------------------------------
 
     #[test]
@@ -7477,6 +7512,41 @@ mod tests {
         assert!((g.at(6.0) - 2.0 / 3.0).abs() <= 1e-12);
         // At t=8 the last (sole) at-risk subject is censored: G collapses to 0.
         assert!(g.at(8.0).abs() <= 1e-15);
+    }
+
+    /// `at` is a binary search over the steps (#3608); it must return exactly
+    /// the right-continuous step value a front-to-back scan defines, on the
+    /// step times themselves, between them, outside them and at NaN, and
+    /// `on_grid` must be `at` mapped over the grid.
+    #[test]
+    fn kaplan_meier_lookup_equals_the_right_continuous_scan() {
+        let time = [0.5, 1.0, 1.0, 2.0, 2.0, 2.0, 3.5, 4.0, 4.0, 6.0, 7.5, 9.0];
+        let event = [1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        let km = KaplanMeier::fit(&time, &event);
+        assert!(!km.steps.is_empty());
+        let scan = |t: f64| {
+            let mut s = 1.0_f64;
+            for &(step_time, surv) in &km.steps {
+                if step_time <= t {
+                    s = surv;
+                } else {
+                    break;
+                }
+            }
+            s
+        };
+        let mut probes: Vec<f64> = vec![f64::NEG_INFINITY, -1.0, 0.0, f64::INFINITY, f64::NAN];
+        for &(step_time, _) in &km.steps {
+            probes.extend([step_time, step_time - 1e-9, step_time + 1e-9]);
+        }
+        probes.extend((0..=40).map(|k| 0.25 * k as f64));
+        for &t in &probes {
+            assert_eq!(km.at(t).to_bits(), scan(t).to_bits(), "t = {t}");
+        }
+        let on_grid = km.on_grid(&probes);
+        for (&t, &value) in probes.iter().zip(&on_grid) {
+            assert_eq!(value.to_bits(), km.at(t).to_bits(), "t = {t}");
+        }
     }
 
     #[test]
