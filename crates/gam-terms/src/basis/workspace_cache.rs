@@ -309,8 +309,7 @@ pub(crate) fn thin_plate_kernel_constraint_nullspace(
             centers.nrows()
         );
     }
-    let (z, rank) =
-        rrqr_nullspace_basis(&p_k, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    let (z, rank) = rrqr_nullspace_basis(&p_k).map_err(BasisError::LinalgError)?;
     if rank != p_k.ncols() {
         crate::bail_invalid_basis!(
             "thin-plate spline polynomial block is rank deficient at the selected centers: expected rank {}, got {}; choose geometrically independent centers for dimension {}",
@@ -903,8 +902,7 @@ pub(crate) fn weighted_coefficient_sum_to_zero_transform(
     }
     let c = Array2::from_shape_vec((k, 1), weights.iter().map(|w| *w / norm).collect())
         .map_err(|e| BasisError::InvalidInput(format!("invalid sphere constraint weights: {e}")))?;
-    let (z, rank) =
-        rrqr_nullspace_basis(&c, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    let (z, rank) = rrqr_nullspace_basis(&c).map_err(BasisError::LinalgError)?;
     if rank >= k {
         return Err(BasisError::ConstraintNullspaceCollapsed {
             site: "weighted_coefficient_sum_to_zero_transform",

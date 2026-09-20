@@ -3,8 +3,8 @@ use crate::exact_jet_objective::certified_newton_minimum;
 use crate::rho_optimizer::{FallbackPolicy, OuterProblem};
 use faer::Side;
 use gam_linalg::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha, fast_ab, fast_atb,
-    fast_xt_diag_x, fast_xt_diag_y, rrqr_with_permutation,
+    FaerArrayView, FaerCholesky, FaerEigh, FaerSvd, fast_ab, fast_atb, fast_xt_diag_x,
+    fast_xt_diag_y, rrqr_with_permutation,
 };
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval, StationarityStandard};
@@ -137,11 +137,9 @@ impl GaussianRemlBlocksDomain {
                 }
             }
             if penalty.nullity > 0 {
-                let (null_basis, rank) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(
-                    &penalty.root.t().to_owned(),
-                    default_rrqr_rank_alpha(),
-                )
-                .map_err(EstimationError::LinearSystemSolveFailed)?;
+                let (null_basis, rank) =
+                    gam_linalg::faer_ndarray::rrqr_nullspace_basis(&penalty.root.t().to_owned())
+                        .map_err(EstimationError::LinearSystemSolveFailed)?;
                 if rank != penalty.rank() {
                     crate::bail_invalid_estim!(
                         "canonical block penalty root has inconsistent rank"
@@ -306,7 +304,7 @@ impl GaussianRemlBlocksDomain {
             augmented_row += penalty.rank();
         }
 
-        let rank = rrqr_with_permutation(&augmented, default_rrqr_rank_alpha())
+        let rank = rrqr_with_permutation(&augmented)
             .map_err(|error| {
                 EstimationError::InvalidInput(format!(
                     "block Gaussian REML augmented-rank certificate failed: {error}"
@@ -3644,9 +3642,10 @@ fn sign_normalized_design_qr(
 /// [`rotated_weighted_response`]).
 ///
 /// The rank is read off the Householder `R` of `A` itself (`A = Q·R`, so
-/// `null(A) = null(R)`), by the column-pivoted QR of `Rᵀ` at the repository's
-/// QR rank convention [`default_rrqr_rank_alpha`]: a pivot inside Householder
-/// backward error of the largest one is indistinguishable from a zero column.
+/// `null(A) = null(R)`), by the column-pivoted QR of `Rᵀ` at its own derived
+/// band ([`gam_linalg::roundoff::householder_qr_backward_band`]): a trailing
+/// block inside the factorization's backward error is indistinguishable from
+/// zero columns.
 struct WeightedDesignRange {
     /// `Z₀`, `p × (p − r)`.
     null_basis: Array2<f64>,
@@ -3670,11 +3669,8 @@ fn weighted_design_range(
     if upper.iter().any(|value| !value.is_finite()) {
         return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
     }
-    let (null_basis, rank) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(
-        &upper.t().to_owned(),
-        default_rrqr_rank_alpha(),
-    )
-    .map_err(EstimationError::LinearSystemSolveFailed)?;
+    let (null_basis, rank) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(&upper.t().to_owned())
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
     if rank == 0 {
         return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
     }
@@ -3685,9 +3681,8 @@ fn weighted_design_range(
             factor: sign_normalized_design_qr(qr)?,
         });
     }
-    let (range_basis, null_rank) =
-        gam_linalg::faer_ndarray::rrqr_nullspace_basis(&null_basis, default_rrqr_rank_alpha())
-            .map_err(EstimationError::LinearSystemSolveFailed)?;
+    let (range_basis, null_rank) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(&null_basis)
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
     if null_basis.dim() != (p, p - rank) || null_rank != p - rank || range_basis.dim() != (p, rank)
     {
         return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });

@@ -5575,16 +5575,13 @@ fn tensor_margin_separable_factors(
 }
 
 fn numerical_rank(matrix: &Array2<f64>) -> Result<usize, BasisError> {
-    use gam_linalg::faer_ndarray::{FaerSvd, default_rrqr_rank_alpha};
+    use gam_linalg::faer_ndarray::FaerSvd;
     if matrix.nrows() == 0 || matrix.ncols() == 0 {
         return Ok(0);
     }
     let (_, singular, _) = matrix.svd(false, false).map_err(BasisError::LinalgError)?;
     let sigma_max = singular.iter().copied().fold(0.0_f64, f64::max);
-    let tol = default_rrqr_rank_alpha()
-        * f64::EPSILON
-        * matrix.nrows().max(matrix.ncols()) as f64
-        * sigma_max;
+    let tol = gam_linalg::roundoff::factor_singular_band(matrix.nrows(), matrix.ncols(), sigma_max);
     Ok(singular.iter().filter(|&&sigma| sigma > tol).count())
 }
 
@@ -7023,12 +7020,8 @@ fn pca_function_mass_penalty(
     // Use the same design-rank convention as the global identifiability audit.
     // `rrqr_from_gram_with_permutation` recovers the column-pivoted QR verdict
     // from Z^T Z while retaining the tall design's row-count-aware tolerance.
-    let rrqr = gam_linalg::faer_ndarray::rrqr_from_gram_with_permutation(
-        &raw_score_gram,
-        n_rows,
-        gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
-    )
-    .map_err(BasisError::LinalgError)?;
+    let rrqr = gam_linalg::faer_ndarray::rrqr_from_gram_with_permutation(&raw_score_gram, n_rows)
+        .map_err(BasisError::LinalgError)?;
     if rrqr.rank != k {
         let redundant_columns = &rrqr.column_permutation[rrqr.rank..];
         crate::bail_invalid_basis!(

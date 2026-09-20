@@ -30,7 +30,7 @@
 //!   8. Predictions (η = X_marginal β_marginal) on training rows are finite.
 
 use csv::StringRecord;
-use gam::linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
+use gam::linalg::faer_ndarray::rrqr_with_permutation;
 use gam::matrix::LinearOperator;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
@@ -322,7 +322,7 @@ fn large_scale_survival_marginal_slope_canonical_gauge_fix() {
         joint.slice_mut(s![.., ..p_marg]).assign(&raw_marginal);
         joint.slice_mut(s![.., p_marg..]).assign(&raw_slope);
 
-        let rrqr = rrqr_with_permutation(&joint, default_rrqr_rank_alpha())
+        let rrqr = rrqr_with_permutation(&joint)
             .expect("RRQR on joint [marginal | slope] design must not fail");
 
         // Allow at most 1 residual rank deficiency: at n=5000 with centers=10

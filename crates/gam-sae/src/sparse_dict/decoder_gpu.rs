@@ -982,7 +982,7 @@ mod tests {
         SymmetricLowRankPreconditioner::from_scaled_subspace(
             diag.iter().map(|d| d.recip()).collect(),
             candidate,
-            |basis, image| {
+            |basis, image, _exact_doubling| {
                 image.assign(basis);
                 image.mapv_inplace(|value| 2.0 * value);
             },

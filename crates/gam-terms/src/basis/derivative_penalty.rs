@@ -762,18 +762,14 @@ mod tests {
             }
         }
         let (eigenvalues, _) = s.eigh(Side::Lower).expect("symmetric eigendecomposition");
-        let spectral_scale = eigenvalues
-            .iter()
-            .fold(0.0_f64, |scale, value| scale.max(value.abs()))
-            .max(1.0);
-        let psd_tolerance =
-            default_rrqr_rank_alpha() * f64::EPSILON * s.nrows().max(1) as f64 * spectral_scale;
+        let psd_tolerance = gam_linalg::roundoff::symmetric_spectrum_rounding_band(
+            eigenvalues.as_slice().expect("contiguous eigenvalues"),
+        );
         assert!(
             eigenvalues.iter().all(|&value| value >= -psd_tolerance),
             "penalty must be PSD; eigenvalues={eigenvalues:?}, tolerance={psd_tolerance}"
         );
-        let (_, rank) =
-            rrqr_nullspace_basis(s, default_rrqr_rank_alpha()).expect("penalty RRQR rank");
+        let (_, rank) = rrqr_nullspace_basis(s).expect("penalty RRQR rank");
         assert_eq!(
             rank,
             s.nrows() - expected_nullity,
@@ -950,17 +946,10 @@ mod tests {
                     // knots even though the represented polynomial is in its
                     // exact null space. Use the same source-quadratic backward-
                     // error envelope as generalized null classification.
-                    let penalty_scale = built
-                        .roughness
-                        .rows()
-                        .into_iter()
-                        .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
-                        .fold(0.0_f64, f64::max);
-                    let backward_error = default_rrqr_rank_alpha()
-                        * f64::EPSILON
-                        * built.roughness.nrows().max(1) as f64
-                        * penalty_scale
-                        * alpha.dot(&alpha);
+                    let backward_error = gam_linalg::roundoff::null_quadratic_band(
+                        built.roughness.view(),
+                        alpha.view(),
+                    );
                     assert!(
                         observed.abs() <= backward_error,
                         "I-spline degree={value_degree}, order={order}, polynomial degree={polynomial_degree}: expected exact zero, observed {observed}, backward-error envelope {backward_error}"

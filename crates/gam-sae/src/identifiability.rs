@@ -88,7 +88,7 @@ pub use frame_curvature::{
 
 use crate::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use faer::Side;
-use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha};
+use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, FaerSvd};
 use gam_problem::{MetricProvenance, RowMetric};
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};
 
@@ -2370,15 +2370,14 @@ enum CurvatureReduction {
 
 /// The pinning-rank tolerance, in singular values of `R`.
 ///
-/// The same shape as [`gam_linalg::faer_ndarray::rrqr_with_permutation`]'s own
-/// threshold (`α · ε · max(rows, cols) · max(scale, 1)`), so every reduction
-/// decides rank at the RRQR's own tolerance shape. Written once here so no
-/// reduction can drift into a tolerance of its own.
+/// A backward-stable SVD of the `root_rows × param_dim` root returns the
+/// exact singular values of `R + E` with `‖E‖₂ ≤ max(rows, cols)·ε·σ_max`, so by
+/// Weyl a singular value at or below that band is not resolved from zero
+/// ([`gam_linalg::roundoff::factor_singular_band`]). Relative to `σ_max`, with
+/// no absolute floor: a curvature measured in small units keeps its rank.
+/// Written once here so no reduction can drift into a tolerance of its own.
 fn curvature_rank_tolerance(sigma_max: f64, root_rows: usize, param_dim: usize) -> f64 {
-    default_rrqr_rank_alpha()
-        * f64::EPSILON
-        * (root_rows.max(param_dim).max(1) as f64)
-        * sigma_max.max(1.0)
+    gam_linalg::roundoff::factor_singular_band(root_rows, param_dim, sigma_max)
 }
 
 /// The rank decision taken where it belongs — on singular values of `R`.

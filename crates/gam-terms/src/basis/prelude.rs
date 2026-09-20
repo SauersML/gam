@@ -1,6 +1,6 @@
 use gam_linalg::faer_ndarray::{
-    default_rrqr_rank_alpha, fast_ab, fast_abt, fast_ata, fast_atb, rrqr_nullspace_basis,
-    rrqr_nullspace_basis_with_cutoff, rrqr_with_permutation,
+    fast_ab, fast_abt, fast_ata, fast_atb, rrqr_nullspace_basis, rrqr_nullspace_basis_with_cutoff,
+    rrqr_with_permutation,
 };
 pub(crate) use gam_linalg::faer_ndarray::FaerEigh;
 

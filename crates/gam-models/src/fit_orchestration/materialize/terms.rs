@@ -147,8 +147,14 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
     }
     basis.push(intercept.mapv(|v| v / intercept_norm));
 
-    let rank_alpha = gam_linalg::faer_ndarray::default_rrqr_rank_alpha();
-    let mut scale = intercept_norm.max(1.0);
+    // Squared Frobenius norm of the columns factored so far (the intercept and
+    // every kept term). `residualize_against_orthonormal_basis` is modified
+    // Gram–Schmidt, which is numerically Householder QR on `[0; A]`
+    // (Björck & Paige 1992), so a column in the span of the earlier ones
+    // leaves a computed residual no larger than the QR backward band of
+    // `[A, column]` with `rows = n + columns`
+    // ([`gam_linalg::roundoff::householder_qr_backward_band`], #4045).
+    let mut factored_frobenius_sq = intercept_norm * intercept_norm;
     let mut kept = Vec::<LinearTermSpec>::with_capacity(spec.linear_terms.len());
     let mut dropped = Vec::<UnidentifiedScalarTerm>::new();
 
@@ -160,10 +166,14 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
                 reason: format!("{label}: linear term '{}' has non-finite norm", term.name),
             });
         }
-        scale = scale.max(norm.max(1.0));
         let residual = residualize_against_orthonormal_basis(&column, &basis);
         let residual_norm = l2_norm(&residual);
-        let tol = rank_alpha * f64::EPSILON * ((n + basis.len() + 1).max(1) as f64) * scale;
+        let columns = basis.len() + 1;
+        let tol = gam_linalg::roundoff::householder_qr_backward_band(
+            n + columns,
+            columns,
+            (factored_frobenius_sq + norm * norm).sqrt(),
+        );
         let is_data_redundant = residual_norm <= tol;
         let has_constraints = term.coefficient_min.is_some() || term.coefficient_max.is_some();
         if is_data_redundant {
@@ -190,6 +200,7 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
         }
         if residual_norm > tol {
             basis.push(residual.mapv(|v| v / residual_norm));
+            factored_frobenius_sq += norm * norm;
         }
         kept.push(term.clone());
     }

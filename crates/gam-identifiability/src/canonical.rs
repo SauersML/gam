@@ -53,9 +53,7 @@ use crate::audit::{
 use crate::families::compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
 };
-use gam_linalg::faer_ndarray::{
-    default_rrqr_rank_alpha, fast_ata, fast_atb, rrqr_with_permutation,
-};
+use gam_linalg::faer_ndarray::{fast_ata, fast_atb, rrqr_with_permutation};
 use gam_linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use gam_problem::Gauge;
 use gam_problem::{
@@ -648,7 +646,7 @@ pub fn channel_aware_audit_at_operating_scalars(
 ///     null modes a softmax channel shares once the cross-class σ²-coupling thins
 ///     their data signal (multinomial `s(x) + s(x, by=g)`: 28 vs p_red 30).
 ///   • TOLERANCE MATCH. `count_rank` keeps a singular value `σ=√λ` down to
-///     `rank_alpha·ε·n·σ_max`; the old eigenvalue cutoff `λ > scale·64·n·ε` was
+///     its SVD rounding band `max(n,p)·ε·σ_max`; the old eigenvalue cutoff `λ > scale·64·n·ε` was
 ///     ~ε larger and demoted penalty-covered modes whose `λ` sits between
 ///     `ε²λ_max` and `ε·λ_max` (Gaussian survival location-scale: 16 vs p_red 18).
 /// The bare data Gram is recovered when no block is penalised (or the block
@@ -692,7 +690,7 @@ fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize, blocks: &[FlatRankBlo
     // tall-design row count exactly as the audit's
     // `rank_of_gram(.., n_design_rows + n_penalty_rows)` does. The earlier
     // eigenvalue cutoff `λ > scale·64·n·ε` was ~ε larger than `count_rank`'s
-    // σ-space `rank_alpha·ε·n·σ_max` floor and demoted penalty-covered modes whose
+    // σ-space `max(n,p)·ε·σ_max` rounding band and demoted penalty-covered modes whose
     // `λ` sits between `ε²λ_max` and `ε·λ_max` (Gaussian survival location-scale:
     // 16 vs p_red 18). On eigendecomposition failure fall back to the structural
     // column count (no demotion), so a numerical hiccup never becomes a spurious
@@ -748,7 +746,7 @@ fn flat_audit_convention_rank(j: &Array2<f64>, blocks: &[FlatRankBlock]) -> usiz
     // is inconsistent, fall back to the bare RRQR rank (no spurious demotion).
     let declared: usize = blocks.iter().map(|b| b.width).sum();
     if declared != p {
-        return match rrqr_with_permutation(j, default_rrqr_rank_alpha()) {
+        return match rrqr_with_permutation(j) {
             Ok(rrqr) => rrqr.rank,
             Err(_) => p,
         };
@@ -783,8 +781,7 @@ fn flat_audit_convention_rank(j: &Array2<f64>, blocks: &[FlatRankBlock]) -> usiz
     }
 
     let m_rows = j.nrows() + n_penalty_rows;
-    let tiered =
-        priority_tiered_rank_from_gram(&gram, &col_priority, m_rows, default_rrqr_rank_alpha());
+    let tiered = priority_tiered_rank_from_gram(&gram, &col_priority, m_rows);
     tiered.rank
 }
 

@@ -75,8 +75,9 @@
 // 2. Stack horizontally into `X_joint ∈ ℝ^{n×p_total}`. Sort columns by
 //    descending `gauge_priority` before RRQR so higher-priority blocks own
 //    shared directions (canonical-gauge ownership contract).
-// 3. Column-pivoted RRQR (`rrqr_with_permutation`, tolerance
-//    `RRQR_RANK_ALPHA · ε · max(m,n) · leading`) identifies demoted columns.
+// 3. Column-pivoted RRQR (`rrqr_with_permutation`, whose rank counts the
+//    trailing blocks above the Householder QR backward-error band) identifies
+//    demoted columns.
 // 4. Each demoted joint column is attributed back to its `(block_idx,
 //    local_col)` origin via `col_offsets`. `effective_dim` per block is
 //    updated.
@@ -89,9 +90,7 @@ use faer::Side;
 use ndarray::{Array1, Array2};
 
 use crate::families::compiler::RANK_DECISION_GAP;
-use gam_linalg::faer_ndarray::{
-    FaerEigh, default_rrqr_rank_alpha, fast_atb, rrqr_with_permutation, with_nested_parallel,
-};
+use gam_linalg::faer_ndarray::{FaerEigh, fast_atb, rrqr_with_permutation, with_nested_parallel};
 use gam_problem::{
     EstimationError, FamilyLinearizationState, JointRankCertificate, ParameterBlockSpec,
 };
@@ -186,7 +185,8 @@ fn compute_leverage_s2(col: &ndarray::ArrayView1<f64>) -> f64 {
 /// drops straight into the existing attribution path: `column_permutation`
 /// lists every original joint-column index, ACCEPTED (kept) columns first in
 /// the order they were pivoted, then DEMOTED columns; `rank` is the count of
-/// accepted columns; `rank_tol` is the absolute pivot tolerance.
+/// accepted columns; `rank_tol` is the backward-error band that the demoted
+/// columns' joint residual stays within.
 pub(crate) struct PriorityTieredRank {
     pub(crate) rank: usize,
     pub(crate) column_permutation: Vec<usize>,
@@ -226,15 +226,28 @@ pub(crate) struct PriorityTieredRank {
 /// numerical robustness inside a block matches col-piv QR.
 ///
 /// `d[j]` tracks the current squared residual norm of column `j` (Schur
-/// complement diagonal); `g[i][j]` is the running Schur-complemented Gram. The
-/// tolerance matches the tall/`gram` RRQR paths exactly:
-/// `rank_alpha · ε · max(m_rows, p) · max(√d_max⁰, 1)` where `√d_max⁰` is the
-/// largest initial residual norm (= leading pivot magnitude `|R[0,0]|`).
+/// complement diagonal); `g[i][j]` is the running Schur-complemented Gram.
+///
+/// # Rank rule (#4045)
+///
+/// The unconstrained RRQR keeps a column while the trailing block it would
+/// leave behind is above the Householder QR backward-error band `β`
+/// ([`gam_linalg::roundoff::householder_qr_backward_band`] of the `m_rows × p`
+/// design this Gram stands for, at `‖A‖_F = √trace G`): a trailing block of
+/// Frobenius norm at most `β` is a perturbation inside the factorization's own
+/// backward error that makes it exactly dependent. Here the trailing block is
+/// the set of demoted columns, whose residuals are frozen when they are
+/// demoted, so the same statement reads as a budget: the demoted columns'
+/// squared residuals may sum to at most `β²`. Within a tier, while the demoted
+/// residual so far plus the tier's undecided residuals exceeds `β²`, the
+/// largest-residual column is accepted; otherwise the rest of the tier is
+/// demoted and its residual charged to the budget. Subtracting every demoted
+/// residual is then one perturbation of Frobenius norm at most `β` that puts
+/// each demoted column in the span of the accepted ones.
 pub(crate) fn priority_tiered_rank_from_gram(
     gram: &Array2<f64>,
     col_priority: &[u8],
     m_rows: usize,
-    rank_alpha: f64,
 ) -> PriorityTieredRank {
     let p = gram.ncols();
     if p == 0 {
@@ -274,11 +287,12 @@ pub(crate) fn priority_tiered_rank_from_gram(
     }
     // Working Schur-complement Gram (equilibrated) and its diagonal residuals.
     let mut d: Vec<f64> = (0..p).map(|j| g[[j, j]].max(0.0)).collect();
-    // Leading pivot magnitude of the equilibrated Gram (≈ 1 for any column with a
-    // non-zero norm), so the tolerance is now scale-free.
-    let leading_diag = d.iter().cloned().fold(0.0_f64, f64::max).sqrt();
-    let tol = rank_alpha * f64::EPSILON * (m_rows.max(p).max(1) as f64) * leading_diag.max(1.0);
-    let tol_sq = tol * tol;
+    // ‖A D^{-1/2}‖_F = √trace(g): the equilibrated design's Frobenius norm, the
+    // `‖R‖_F` of the tall QR this factorization stands in for.
+    let band =
+        gam_linalg::roundoff::householder_qr_backward_band(m_rows, p, d.iter().sum::<f64>().sqrt());
+    let budget = band * band;
+    let mut demoted_residual = 0.0_f64;
 
     // Distinct priority tiers in DESCENDING order (highest first). A column is
     // only eligible to pivot once every higher tier is exhausted.
@@ -292,27 +306,15 @@ pub(crate) fn priority_tiered_rank_from_gram(
 
     for &tier in &tiers {
         loop {
-            // Largest-residual undecided column WITHIN this tier.
-            let mut pivot: Option<usize> = None;
-            let mut best = tol_sq;
-            for j in 0..p {
-                if decided[j] || col_priority[j] != tier {
-                    continue;
-                }
-                if d[j] > best {
-                    best = d[j];
-                    pivot = Some(j);
-                }
-            }
-            let Some(k) = pivot else { break };
+            let Some(k) = tier_pivot(&d, &decided, col_priority, tier, demoted_residual, budget)
+            else {
+                break;
+            };
             // Accept column k and eliminate it (one pivoted-Cholesky step):
             // Schur-complement the remaining columns against k.
             decided[k] = true;
             accepted.push(k);
             let pivot_val = d[k];
-            if pivot_val <= 0.0 {
-                continue;
-            }
             // Row k of the current Schur Gram gives the coupling g[k][j].
             // Update g[i][j] -= g[i][k]*g[k][j]/pivot_val for undecided i,j,
             // and refresh residual diagonals d[j].
@@ -339,15 +341,11 @@ pub(crate) fn priority_tiered_rank_from_gram(
                 }
             }
         }
-        // Every remaining undecided column in this tier has residual ≤ tol:
-        // it lies in the span of the already-accepted (higher-or-equal-priority)
-        // columns, so it is demoted here — never displacing a higher-priority one.
-        for j in 0..p {
-            if !decided[j] && col_priority[j] == tier {
-                decided[j] = true;
-                demoted.push(j);
-            }
-        }
+        // The remaining undecided columns of this tier fit in the budget: they
+        // lie within the backward error of the span of the already-accepted
+        // (higher-or-equal-priority) columns, so they are demoted here — never
+        // displacing a higher-priority one.
+        demoted_residual += demote_tier(&d, &mut decided, col_priority, tier, &mut demoted);
     }
 
     let rank = accepted.len();
@@ -356,8 +354,58 @@ pub(crate) fn priority_tiered_rank_from_gram(
     PriorityTieredRank {
         rank,
         column_permutation,
-        rank_tol: tol,
+        rank_tol: band,
     }
+}
+
+/// The largest-residual undecided column of `tier`, or `None` when demoting all
+/// of the tier's undecided columns keeps the demoted residual within `budget`
+/// (the rank rule of [`priority_tiered_rank_from_gram`]).
+///
+/// When it returns `Some(k)`, `d[k] > 0`: the demoted residual never exceeds
+/// the budget, so a tier residual that overflows it is positive.
+fn tier_pivot(
+    d: &[f64],
+    decided: &[bool],
+    col_priority: &[u8],
+    tier: u8,
+    demoted_residual: f64,
+    budget: f64,
+) -> Option<usize> {
+    let mut tier_residual = 0.0_f64;
+    let mut pivot: Option<usize> = None;
+    for j in 0..d.len() {
+        if decided[j] || col_priority[j] != tier {
+            continue;
+        }
+        tier_residual += d[j];
+        if pivot.is_none_or(|best| d[j] > d[best]) {
+            pivot = Some(j);
+        }
+    }
+    (demoted_residual + tier_residual > budget)
+        .then_some(pivot)
+        .flatten()
+}
+
+/// Demote every undecided column of `tier`, returning their summed squared
+/// residual.
+fn demote_tier(
+    d: &[f64],
+    decided: &mut [bool],
+    col_priority: &[u8],
+    tier: u8,
+    demoted: &mut Vec<usize>,
+) -> f64 {
+    let mut residual = 0.0_f64;
+    for j in 0..d.len() {
+        if !decided[j] && col_priority[j] == tier {
+            decided[j] = true;
+            demoted.push(j);
+            residual += d[j];
+        }
+    }
+    residual
 }
 
 /// Priority-respecting modified Gram-Schmidt rank factorization on the actual
@@ -371,10 +419,14 @@ pub(crate) fn priority_tiered_rank_from_gram(
 /// priority-tier pivot policy to the unsquared columns, so exact cross-block
 /// aliases are demoted at the tall-matrix RRQR scale while still honoring the
 /// canonical gauge order.
+///
+/// The rank rule is [`priority_tiered_rank_from_gram`]'s budget. Modified
+/// Gram–Schmidt on `m × p` is numerically Householder QR on `[0_p; A]`
+/// (Björck & Paige 1992), so the band is the QR backward-error band with
+/// `rows = m + p` at `‖A‖_F` (#4045).
 pub(crate) fn priority_tiered_rank_from_design(
     design: &Array2<f64>,
     col_priority: &[u8],
-    rank_alpha: f64,
 ) -> PriorityTieredRank {
     let m_rows = design.nrows();
     let p = design.ncols();
@@ -391,9 +443,13 @@ pub(crate) fn priority_tiered_rank_from_design(
         .iter()
         .map(|col| col.iter().map(|v| v * v).sum::<f64>().max(0.0))
         .collect();
-    let leading_diag = d.iter().copied().fold(0.0_f64, f64::max).sqrt();
-    let tol = rank_alpha * f64::EPSILON * (m_rows.max(p).max(1) as f64) * leading_diag.max(1.0);
-    let tol_sq = tol * tol;
+    let band = gam_linalg::roundoff::householder_qr_backward_band(
+        m_rows + p,
+        p,
+        d.iter().sum::<f64>().sqrt(),
+    );
+    let budget = band * band;
+    let mut demoted_residual = 0.0_f64;
 
     let mut tiers: Vec<u8> = col_priority.to_vec();
     tiers.sort_unstable_by(|a, b| b.cmp(a));
@@ -406,25 +462,14 @@ pub(crate) fn priority_tiered_rank_from_design(
 
     for &tier in &tiers {
         loop {
-            let mut pivot: Option<usize> = None;
-            let mut best = tol_sq;
-            for j in 0..p {
-                if decided[j] || col_priority[j] != tier {
-                    continue;
-                }
-                if d[j] > best {
-                    best = d[j];
-                    pivot = Some(j);
-                }
-            }
-            let Some(k) = pivot else { break };
+            let Some(k) = tier_pivot(&d, &decided, col_priority, tier, demoted_residual, budget)
+            else {
+                break;
+            };
             decided[k] = true;
             accepted.push(k);
 
             let pivot_norm = d[k].sqrt();
-            if pivot_norm <= 0.0 {
-                continue;
-            }
             let q = residuals[k].mapv(|v| v / pivot_norm);
             q_basis.push(q);
             for j in 0..p {
@@ -445,12 +490,7 @@ pub(crate) fn priority_tiered_rank_from_design(
                 d[j] = residuals[j].iter().map(|v| v * v).sum::<f64>().max(0.0);
             }
         }
-        for j in 0..p {
-            if !decided[j] && col_priority[j] == tier {
-                decided[j] = true;
-                demoted.push(j);
-            }
-        }
+        demoted_residual += demote_tier(&d, &mut decided, col_priority, tier, &mut demoted);
     }
 
     let rank = accepted.len();
@@ -459,7 +499,7 @@ pub(crate) fn priority_tiered_rank_from_design(
     PriorityTieredRank {
         rank,
         column_permutation,
-        rank_tol: tol,
+        rank_tol: band,
     }
 }
 
@@ -1036,7 +1076,6 @@ fn audit_identifiability_impl(
     // the lower-priority block always absorbs the alias drop — the canonical-
     // gauge contract this audit is built on. It returns the demoted columns in
     // ORIGINAL joint-column indices, so no priority<->original remap is needed.
-    let alpha = default_rrqr_rank_alpha();
     let rrqr_started = std::time::Instant::now();
     let block_priority_summary: Vec<String> = specs
         .iter()
@@ -1049,7 +1088,7 @@ fn audit_identifiability_impl(
         p_total,
         block_priority_summary.join(", "),
     );
-    let ordinary_rrqr = rrqr_with_permutation(joint_rank_input_for_fallback.as_ref(), alpha)
+    let ordinary_rrqr = rrqr_with_permutation(joint_rank_input_for_fallback.as_ref())
         .map_err(|e| EstimationError::LayoutError(format!("identifiability audit: {e}")))?;
     let mut tiered = if ordinary_rrqr.rank == p_total {
         PriorityTieredRank {
@@ -1058,17 +1097,14 @@ fn audit_identifiability_impl(
             rank_tol: ordinary_rrqr.rank_tol,
         }
     } else {
-        priority_tiered_rank_from_gram(&joint_gram_aug, &col_priority, joint_rank_m_rows, alpha)
+        priority_tiered_rank_from_gram(&joint_gram_aug, &col_priority, joint_rank_m_rows)
     };
     if ordinary_rrqr.rank < p_total
         && tiered.rank == p_total
         && col_priority.iter().all(|&prio| prio == col_priority[0])
     {
-        tiered = priority_tiered_rank_from_design(
-            joint_rank_input_for_fallback.as_ref(),
-            &col_priority,
-            alpha,
-        );
+        tiered =
+            priority_tiered_rank_from_design(joint_rank_input_for_fallback.as_ref(), &col_priority);
     }
     log::debug!(
         "[STAGE] identifiability audit: joint priority-tiered RRQR end rank={}/{} elapsed={:.3}s",
@@ -2197,12 +2233,7 @@ pub fn audit_identifiability_channel_aware(
         // handled by the joint `fatal`/gauge-resolution logic below, not by which
         // physical column a block sheds).
         let uniform_priority = vec![0u8; p_block];
-        let pivot = priority_tiered_rank_from_gram(
-            &pivot_gram,
-            &uniform_priority,
-            n * k,
-            default_rrqr_rank_alpha(),
-        );
+        let pivot = priority_tiered_rank_from_gram(&pivot_gram, &uniform_priority, n * k);
         let kept = p_block - n_drop;
         // The last `n_drop` columns in accept-then-demote order are the
         // lowest-residual (most redundant) ones. Falls back to trailing columns
@@ -2711,7 +2742,8 @@ fn channel_aware_penalty_aware_joint_rank(
     // unidentified directions `ker(J_eff) ∩ ker(S)` we DO refuse on — is untouched.
     //
     // WHY the COUNTING is scale-robust after it: `count_rank`'s tolerance is
-    // `τ = α·ε·max(n,p)·σ_max`, relative to the LARGEST singular value. On the raw
+    // the SVD rounding band `τ = max(n,p)·ε·σ_max` (`count_rank_band`),
+    // relative to the LARGEST singular value. On the raw
     // `G` a stiff direction (the marginal-slope chain weight `c_i`, whose spectrum
     // reached ~8.66e7 here) sets `σ_max` huge, so a small-but-nonzero penalty-
     // covered σ on a weakly-distinguished direction (the pilot-effective shared-
@@ -2744,12 +2776,11 @@ fn channel_aware_penalty_aware_joint_rank(
     // reports honestly that there is no margin to carry.
     let spectrum = descending_singular_values_of_gram(&equilibrated)?;
     let sigma_max = spectrum.first().copied().unwrap_or(0.0);
-    let tol = default_rrqr_rank_alpha()
-        * f64::EPSILON
-        * ((n_design_rows + n_penalty_rows)
-            .max(equilibrated.ncols())
-            .max(1) as f64)
-        * sigma_max.max(1.0);
+    let tol = count_rank_band(
+        sigma_max,
+        n_design_rows + n_penalty_rows,
+        equilibrated.ncols(),
+    );
     Ok((
         rank,
         JointRankCertificate {
@@ -3316,22 +3347,26 @@ fn block_penalty_aware_rank(
     if target.ncols() == 0 {
         return Ok(0);
     }
-    rrqr_with_permutation(target, default_rrqr_rank_alpha())
-        .map(|r| r.rank)
-        .map_err(|e| {
-            EstimationError::LayoutError(format!(
-                "identifiability audit per-block RRQR failed: {e:?}"
-            ))
-        })
+    rrqr_with_permutation(target).map(|r| r.rank).map_err(|e| {
+        EstimationError::LayoutError(format!(
+            "identifiability audit per-block RRQR failed: {e:?}"
+        ))
+    })
 }
 
+/// The singular-value band [`count_rank`] decides against: a backward-stable
+/// SVD of the `n × p` design resolves its singular values only to
+/// `max(n, p)·ε·σ_max` ([`gam_linalg::roundoff::factor_singular_band`]), so a
+/// singular value at or below it is not separated from zero (#4045).
+fn count_rank_band(sigma_max: f64, n: usize, p: usize) -> f64 {
+    gam_linalg::roundoff::factor_singular_band(n, p, sigma_max)
+}
+
+/// Number of the descending `singular_values` of an `n × p` design above
+/// [`count_rank_band`].
 pub(crate) fn count_rank(singular_values: &[f64], n: usize, p: usize) -> usize {
-    if singular_values.is_empty() {
-        return 0;
-    }
     let leading = singular_values.first().copied().unwrap_or(0.0);
-    let rank_alpha = default_rrqr_rank_alpha();
-    let tol = rank_alpha * f64::EPSILON * (n.max(p).max(1) as f64) * leading.max(1.0);
+    let tol = count_rank_band(leading, n, p);
     singular_values.iter().filter(|&&v| v > tol).count()
 }
 
@@ -3386,7 +3421,8 @@ pub use gam_problem::MapUniquenessError;
 /// # Returns
 ///
 /// `Ok(())` when the condition holds for every null direction (i.e. every
-/// null direction of `J^T W J` carries `n^T S n > null_tol`).
+/// eigen-direction of `J^T W J` inside its rounding band carries a penalty
+/// quadratic form `n^T S n` above that form's own rounding band).
 ///
 /// `Err(MapUniquenessError)` for the first null direction (sorted by
 /// ascending `n^T S n`) that violates the condition.
@@ -3483,12 +3519,20 @@ pub fn check_map_uniqueness(
         }
     };
 
-    // Determine the null-space tolerance.
-    // Use the same RRQR_RANK_ALPHA · ε · p · λ_max convention as the
-    // rank counters elsewhere in this module.
-    let lambda_max = evals.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-    let rank_alpha = default_rrqr_rank_alpha();
-    let null_tol = rank_alpha * f64::EPSILON * (p as f64) * lambda_max;
+    // Null-space band (#4045): an eigenvalue of the equilibrated `Ĝ` is resolved
+    // from zero only above the eigensolver's `p·ε·‖Ĝ‖₂` plus the rounding the
+    // Gram's assembly left in it. Each entry is an `n`-row accumulation of
+    // products `w_k·J_ki·J_kj` (two roundings), and equilibration adds four
+    // more (`√`, reciprocal, two scalings), so
+    // `|ΔĜ| ≤ γ_{n+5}·D|J|ᵀ|W||J|D`. That majorant is PSD with trace
+    // `trace(Ĝ)` for nonnegative weights, which bounds its spectral norm
+    // ([`gam_linalg::roundoff::weighted_gram_assembly_band`]).
+    let equilibrated_trace: f64 = (0..p).map(|i| g[[i, i]].abs()).sum();
+    let assembly_band = gam_linalg::roundoff::weighted_gram_assembly_band(n, 6, equilibrated_trace);
+    let null_tol = gam_linalg::roundoff::resolved_eigenvalue_band(
+        evals.as_slice().expect("eigenvalues are contiguous"),
+        assembly_band,
+    );
 
     // Collect null directions: eigenvectors whose eigenvalue is below null_tol.
     // Sort by ascending eigenvalue so the most-null direction comes first.
@@ -3504,11 +3548,6 @@ pub fn check_map_uniqueness(
         return Ok(());
     }
 
-    // Penalty tolerance for n^T S n: use a relative threshold proportional
-    // to the Frobenius norm of S.
-    let s_frob_sq: f64 = s_joint.iter().map(|v| v * v).sum();
-    let pen_tol = null_tol * s_frob_sq.sqrt().max(1.0);
-
     for (dir_idx, (lam, evec_col)) in null_dirs.iter().enumerate() {
         // Back to the design's own units: `J·D·u = 0` means `J·(D·u) = 0`, and
         // the penalty is in those units, so it is tested on unit `n = D·u`.
@@ -3517,11 +3556,14 @@ pub fn check_map_uniqueness(
         if n_norm > 0.0 {
             n_vec /= n_norm;
         }
-        // Compute n^T S n
+        // Compute n^T S n, and the band below which it does not separate `n`
+        // from `S`'s null space: `S`'s own resolution `p·ε·‖S‖₂‖n‖²` plus the
+        // evaluation's rounding (#4045).
         let sn: Array1<f64> = s_joint.dot(&n_vec);
         let ntsn: f64 = n_vec.iter().zip(sn.iter()).map(|(ni, si)| ni * si).sum();
+        let pen_tol = gam_linalg::roundoff::null_quadratic_band(s_joint.view(), n_vec.view());
 
-        if ntsn < pen_tol {
+        if ntsn <= pen_tol {
             // Find the dominant block: the block whose columns have the
             // largest cumulative squared component in n_vec.
             let dominant_block = dominant_block_for_direction(&n_vec, specs, col_offsets);
@@ -3529,7 +3571,7 @@ pub fn check_map_uniqueness(
             let message = format!(
                 "MAP estimate is non-unique: null direction {} of J^T W J (equilibrated \
                  eigenvalue {lam:.3e}) \
-                 has n^T S n = {ntsn:.3e} < tolerance {pen_tol:.3e}; \
+                 has n^T S n = {ntsn:.3e} within its rounding band {pen_tol:.3e}; \
                  the MAP is flat along this direction (no likelihood curvature, no penalty \
                  curvature); dominant block: '{}'. \
                  Fix: add a non-degenerate smoothness penalty to block '{}' that covers this \
@@ -3600,7 +3642,7 @@ mod tests {
         let t = linspace(n);
         let unpenalized = Array2::<f64>::zeros((3, 3));
         let col_offsets = [0usize, 3];
-        for scale in [1.0, 1e6, 1e-6] {
+        for scale in [1.0, 1e8, 1e-6] {
             let mut design = Array2::<f64>::zeros((n, 3));
             for i in 0..n {
                 design[[i, 0]] = scale * t[i];
@@ -3608,21 +3650,27 @@ mod tests {
                 design[[i, 2]] = if i % 2 == 0 { 1.05 } else { 0.95 };
             }
             // J has known rank 3 by the module's own RRQR convention.
-            let known_rank = rrqr_with_permutation(&design, default_rrqr_rank_alpha())
-                .unwrap()
-                .rank;
-            assert_eq!(known_rank, 3, "scale {scale:e}: fixture design must be full rank");
-            if scale == 1e6 {
+            let known_rank = rrqr_with_permutation(&design).unwrap().rank;
+            assert_eq!(
+                known_rank, 3,
+                "scale {scale:e}: fixture design must be full rank"
+            );
+            if scale == 1e8 {
                 // The regime this pins: the weak direction's Gram eigenvalue sits
                 // BETWEEN the singular-value cutoff squared (so J is full rank)
-                // and the raw eigen floor `α·ε·p·λ_max` (so the unequilibrated
-                // check called it null).
+                // and the raw eigen floor — the eigensolver's `p·ε·λ_max` plus
+                // the Gram's `γ_n·trace(G)` assembly band — so an unequilibrated
+                // check calls it null.
                 let (raw_evals, _) = design.t().dot(&design).eigh(Side::Lower).unwrap();
                 let raw_max = raw_evals.iter().copied().fold(0.0_f64, f64::max);
                 let raw_min = raw_evals.iter().copied().fold(f64::INFINITY, f64::min);
-                let alpha_eps = default_rrqr_rank_alpha() * f64::EPSILON;
-                let squared_floor = alpha_eps * 3.0 * raw_max;
-                let singular_cutoff = alpha_eps * (n as f64) * raw_max.sqrt();
+                let raw_trace: f64 = raw_evals.iter().copied().map(f64::abs).sum();
+                let squared_floor = gam_linalg::roundoff::resolved_eigenvalue_band(
+                    raw_evals.as_slice().unwrap(),
+                    gam_linalg::roundoff::weighted_gram_assembly_band(n, 2, raw_trace),
+                );
+                let singular_cutoff =
+                    gam_linalg::roundoff::factor_singular_band(n, 3, raw_max.sqrt());
                 assert!(
                     singular_cutoff * singular_cutoff < raw_min && raw_min < squared_floor,
                     "fixture no longer exercises the swallowed-curvature regime: min eigenvalue \
@@ -3641,10 +3689,11 @@ mod tests {
 
             let mut aliased = design.clone();
             aliased.column_mut(2).fill(1.0);
-            let aliased_rank = rrqr_with_permutation(&aliased, default_rrqr_rank_alpha())
-                .unwrap()
-                .rank;
-            assert_eq!(aliased_rank, 2, "scale {scale:e}: aliased design must lose one rank");
+            let aliased_rank = rrqr_with_permutation(&aliased).unwrap().rank;
+            assert_eq!(
+                aliased_rank, 2,
+                "scale {scale:e}: aliased design must lose one rank"
+            );
             let aliased_specs = [spec_from_dense("time_transform", aliased.clone())];
             let error =
                 check_map_uniqueness(&aliased, &[], &unpenalized, &aliased_specs, &col_offsets)

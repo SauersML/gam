@@ -586,17 +586,33 @@ impl SymmetricLowRankPreconditioner {
     /// `E = Uᵀ S U` SPD. Thus callers never supply the private `C,Q` factors and
     /// cannot construct a nonsymmetric or indefinite `H`; dependent candidates
     /// cannot smuggle an arbitrary QR completion into the represented subspace.
+    ///
+    /// `apply_scaled(U, image, image_error)` writes the computed `Ŷ = fl(S U)`
+    /// into `image` and a componentwise bound `|Ŷ − S U| ≤ image_error` of its
+    /// own rounding into `image_error` (zero for an exact application). The
+    /// operator's symmetry is then checked against a derived band rather than a
+    /// constant: with `G = fl(UᵀŶ)` and `S = Sᵀ` exactly,
+    /// `u_aᵀ S u_b = u_bᵀ S u_a`, so
+    ///
+    /// ```text
+    /// |G_ab − G_ba| ≤ M_ab + M_ba,   M = |U|ᵀ (γ_rows |Ŷ| + image_error),
+    /// ```
+    ///
+    /// the first term the `rows`-term inner products forming `G`
+    /// (Higham, *ASNA* §3.1), the second the application's own error seen
+    /// through `u_a`. A skew beyond that band is an operator that is not
+    /// symmetric, not roundoff.
     pub fn from_scaled_subspace<F>(
         inverse_diagonal: Vec<f64>,
         scaled_candidates: ndarray::Array2<f64>,
         apply_scaled: F,
     ) -> Result<Self, String>
     where
-        F: FnOnce(&ndarray::Array2<f64>, &mut ndarray::Array2<f64>),
+        F: FnOnce(&ndarray::Array2<f64>, &mut ndarray::Array2<f64>, &mut ndarray::Array2<f64>),
     {
         use crate::faer_ndarray::{
-            FaerCholesky, FaerQr, default_rrqr_rank_alpha, fast_ab_into, fast_atb_with_parallelism,
-            matmul_parallelism, rrqr_with_permutation,
+            FaerCholesky, FaerQr, fast_ab_into, fast_atb_with_parallelism, matmul_parallelism,
+            rrqr_with_permutation,
         };
         use faer::Side;
 
@@ -617,7 +633,7 @@ impl SymmetricLowRankPreconditioner {
             return Err("PCG scaled-subspace candidates must be finite".to_string());
         }
 
-        let rrqr = rrqr_with_permutation(&scaled_candidates, default_rrqr_rank_alpha())
+        let rrqr = rrqr_with_permutation(&scaled_candidates)
             .map_err(|err| format!("PCG scaled-subspace RRQR failed: {err}"))?;
         let rank = rrqr.rank;
         if rank == 0 {
@@ -641,28 +657,50 @@ impl SymmetricLowRankPreconditioner {
         }
 
         let mut image = ndarray::Array2::<f64>::zeros((rows, rank));
-        apply_scaled(&scaled_basis, &mut image);
+        let mut image_error = ndarray::Array2::<f64>::zeros((rows, rank));
+        apply_scaled(&scaled_basis, &mut image, &mut image_error);
         if !image.iter().all(|value| value.is_finite()) {
             return Err("PCG scaled operator produced a non-finite coarse image".to_string());
         }
+        if !image_error
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+        {
+            return Err(
+                "PCG scaled operator reported a non-finite or negative application error bound"
+                    .to_string(),
+            );
+        }
 
-        let mut galerkin =
-            fast_atb_with_parallelism(&scaled_basis, &image, matmul_parallelism(rank, rank, rows));
+        let parallelism = matmul_parallelism(rank, rank, rows);
+        let mut galerkin = fast_atb_with_parallelism(&scaled_basis, &image, parallelism);
+        // W = γ_rows|Ŷ| + image_error, M = |U|ᵀW: the symmetry band of the
+        // documented derivation. M is a nonnegative `rows`-term accumulation, so
+        // its computed value is at least (1 − γ_{rows+1}) of the exact one
+        // (the `+1` for the final M_ab + M_ba), and the computed skew is at most
+        // (1 + u) of the exact one; scaling by (1 + u)/(1 − γ_{rows+1}) keeps
+        // the evaluated comparison implied by the exact one.
+        let formation_growth = crate::roundoff::accumulation_growth(rows);
+        image_error.zip_mut_with(&image, |error, value| {
+            *error += formation_growth * value.abs();
+        });
         drop(image);
+        let skew_band =
+            fast_atb_with_parallelism(&scaled_basis.mapv(f64::abs), &image_error, parallelism);
+        drop(image_error);
         if !galerkin.iter().all(|value| value.is_finite()) {
             return Err("PCG Galerkin operator is non-finite".to_string());
         }
-        let symmetry_factor =
-            default_rrqr_rank_alpha() * f64::EPSILON * rows.max(rank).max(1) as f64;
+        let band_evaluation = (1.0 + crate::roundoff::UNIT_ROUNDOFF)
+            / (1.0 - crate::roundoff::accumulation_growth(rows + 1));
         for a in 0..rank {
             for b in 0..a {
                 let skew = (galerkin[[a, b]] - galerkin[[b, a]]).abs();
-                let scale = galerkin[[a, b]].abs().max(galerkin[[b, a]].abs()).max(1.0);
-                if skew > symmetry_factor * scale {
+                let band = (skew_band[[a, b]] + skew_band[[b, a]]) * band_evaluation;
+                if !(skew <= band) {
                     return Err(format!(
                         "PCG Galerkin operator is not symmetric at ({a},{b}): \
-                         skew {skew:.3e} exceeds {:.3e}",
-                        symmetry_factor * scale
+                         skew {skew:.3e} exceeds its rounding band {band:.3e}"
                     ));
                 }
                 let value = 0.5 * (galerkin[[a, b]] + galerkin[[b, a]]);
@@ -1635,14 +1673,23 @@ mod tests {
         let preconditioner = SymmetricLowRankPreconditioner::from_scaled_subspace(
             vec![1.0; m],
             candidate,
-            |basis, image| {
+            |basis, image, image_error| {
+                // Each entry is an m-term inner product followed by the rank-one
+                // update (λ − 1)·qᵢ·(qᵀx) + xᵢ: at most m + 4 roundings on the
+                // path, so |error| ≤ γ_{m+4}(|xᵢ| + |λ − 1||qᵢ| Σ|q_k||x_k|).
+                let growth = crate::roundoff::accumulation_growth(m + 4);
                 for c in 0..basis.ncols() {
                     let mut qt_x = 0.0f64;
+                    let mut qt_x_abs = 0.0f64;
                     for i in 0..m {
                         qt_x += q[i] * basis[[i, c]];
+                        qt_x_abs += (q[i] * basis[[i, c]]).abs();
                     }
                     for i in 0..m {
                         image[[i, c]] = basis[[i, c]] + (eigenvalue - 1.0) * q[i] * qt_x;
+                        image_error[[i, c]] = growth
+                            * (basis[[i, c]].abs()
+                                + (eigenvalue - 1.0).abs() * q[i].abs() * qt_x_abs);
                     }
                 }
             },
@@ -1692,7 +1739,7 @@ mod tests {
         let err = SymmetricLowRankPreconditioner::from_scaled_subspace(
             vec![1.0; 8],
             candidate,
-            |basis, image| {
+            |basis, image, _exact_negation| {
                 image.assign(basis);
                 image.mapv_inplace(|value| -value);
             },

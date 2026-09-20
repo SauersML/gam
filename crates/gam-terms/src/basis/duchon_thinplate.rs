@@ -1805,8 +1805,7 @@ pub(crate) fn kernel_constraint_nullspace_from_matrix(
     }
     // Constraint system Q^T alpha = 0. The trailing columns of the orthogonal
     // factor in a column-pivoted QR of Q span null(Q^T).
-    let (z, _) = rrqr_nullspace_basis(&constraint_matrix, default_rrqr_rank_alpha())
-        .map_err(BasisError::LinalgError)?;
+    let (z, _) = rrqr_nullspace_basis(&constraint_matrix).map_err(BasisError::LinalgError)?;
     Ok(z)
 }
 
@@ -2278,7 +2277,7 @@ pub(crate) fn thin_plate_canonical_infeasible_at_centers(centers: ArrayView2<'_,
     // Duchon rather than hard-erroring in canonical TPS.
     let poly_block = thin_plate_polynomial_block(centers);
     let poly_cols = poly_block.ncols();
-    match rrqr_nullspace_basis(&poly_block, default_rrqr_rank_alpha()) {
+    match rrqr_nullspace_basis(&poly_block) {
         Ok((_, rank)) => rank < poly_cols,
         // If the rank probe itself fails, defer to the canonical path, which
         // surfaces a precise error rather than silently promoting.
@@ -2946,11 +2945,8 @@ pub fn build_thin_plate_penalty_psi_derivativeswithworkspace(
                 );
             }
             let kernel_coordinate_map = transform.slice(s![0..kernel_cols, ..]).to_owned();
-            let (frame, _) = rrqr_nullspace_basis(
-                &kernel_coordinate_map.t().to_owned(),
-                default_rrqr_rank_alpha(),
-            )
-            .map_err(BasisError::LinalgError)?;
+            let (frame, _) = rrqr_nullspace_basis(&kernel_coordinate_map.t().to_owned())
+                .map_err(BasisError::LinalgError)?;
             (
                 fast_ab(&center_design, transform),
                 fast_ab(&center_design_psi, transform),
@@ -3166,8 +3162,7 @@ pub fn apply_sum_to_zero_constraint(
     // constraint matrix.
     let mut c_mat = Array2::<f64>::zeros((k, 1));
     c_mat.column_mut(0).assign(&c);
-    let (z, rank) =
-        rrqr_nullspace_basis(&c_mat, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    let (z, rank) = rrqr_nullspace_basis(&c_mat).map_err(BasisError::LinalgError)?;
     if rank >= k {
         return Err(BasisError::ConstraintNullspaceCollapsed {
             site: "apply_sum_to_zero_constraint",
@@ -3249,8 +3244,7 @@ pub(crate) fn apply_sum_to_zero_constraint_sparse(
     // that ZZᵀ is the canonical orthogonal projector onto null(cᵀ).
     let mut c_mat = Array2::<f64>::zeros((k, 1));
     c_mat.column_mut(0).assign(&c);
-    let (z, rank) =
-        rrqr_nullspace_basis(&c_mat, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    let (z, rank) = rrqr_nullspace_basis(&c_mat).map_err(BasisError::LinalgError)?;
     if rank >= k {
         return Err(BasisError::ConstraintNullspaceCollapsed {
             site: "apply_sum_to_zero_constraint_sparse",
@@ -3489,8 +3483,7 @@ pub(crate) fn compute_geometric_constraint_transform(
     }
 
     // 4. Column-pivoted QR on C_geom^T; the trailing Q columns span null(C_geom).
-    let (z, rank) = rrqr_nullspace_basis(&c_geom.t(), default_rrqr_rank_alpha())
-        .map_err(BasisError::LinalgError)?;
+    let (z, rank) = rrqr_nullspace_basis(&c_geom.t()).map_err(BasisError::LinalgError)?;
     if rank >= k {
         return Err(BasisError::ConstraintNullspaceCollapsed {
             site: "compute_geometric_constraint_transform",

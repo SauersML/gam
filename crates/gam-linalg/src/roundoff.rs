@@ -153,6 +153,45 @@ pub fn factor_singular_band(rows: usize, cols: usize, sigma_max: f64) -> f64 {
     rows.max(cols) as f64 * f64::EPSILON * sigma_max
 }
 
+/// Band below which a computed quadratic `fl(vᵀSv)` of a symmetric `p × p`
+/// matrix does not separate `v` from `S`'s null space (#4045).
+///
+/// It has two parts, both read off the operands:
+///
+/// - **Resolution of `S`.** A symmetric matrix is resolved only to
+///   `‖ΔS‖₂ ≤ p·ε·‖S‖₂`, the same resolution
+///   [`symmetric_spectrum_rounding_band`] assigns to its spectrum. If `v`
+///   lies in the null space of some `S + ΔS` in that ball, then
+///   `|vᵀSv| = |vᵀΔSv| ≤ p·ε·‖S‖₂·‖v‖²`. Here `‖S‖₂` is bounded by
+///   `‖S‖_∞`, the maximum absolute row sum, which majorizes the spectral
+///   radius of a symmetric matrix.
+/// - **Evaluation.** Forming `Sv` and then `vᵀ(Sv)` is a length-`2p`
+///   accumulation path over `|v|ᵀ|S||v|` ([`accumulation_band`]).
+///
+/// An error in `v` of size `δ` enters only at second order,
+/// `(v+δ)ᵀS(v+δ) = δᵀSδ` for `Sv = 0`, so `v`'s own rounding does not appear.
+pub fn null_quadratic_band(
+    matrix: ndarray::ArrayView2<'_, f64>,
+    vector: ndarray::ArrayView1<'_, f64>,
+) -> f64 {
+    let p = matrix.nrows();
+    let mut operator_scale = 0.0_f64;
+    let mut absolute_quadratic = 0.0_f64;
+    for (row, &vi) in matrix.rows().into_iter().zip(vector.iter()) {
+        let mut row_sum = 0.0_f64;
+        let mut row_quadratic = 0.0_f64;
+        for (&entry, &vj) in row.iter().zip(vector.iter()) {
+            row_sum += entry.abs();
+            row_quadratic += entry.abs() * vj.abs();
+        }
+        operator_scale = operator_scale.max(row_sum);
+        absolute_quadratic += vi.abs() * row_quadratic;
+    }
+    let norm_squared = vector.dot(&vector);
+    p as f64 * f64::EPSILON * operator_scale * norm_squared
+        + accumulation_band(2 * p, absolute_quadratic)
+}
+
 /// Rounded operations one Householder reflector commits on a length-`rows`
 /// column, as the `c` of `γ_c` in `fl(P̂b) = (P + ΔP)b`, `‖ΔP‖_F ≤ γ_c`, with `P`
 /// the exact reflector of the exact column (Higham, *ASNA* 2nd ed., Lemmas

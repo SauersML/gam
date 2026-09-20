@@ -1411,12 +1411,9 @@ fn exact_gaussian_coefficients(
                 },
             ))
         };
-        let rank = gam_linalg::faer_ndarray::rrqr_with_permutation(
-            &*positive_weight_reduced_x,
-            gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
-        )
-        .ok()?
-        .rank;
+        let rank = gam_linalg::faer_ndarray::rrqr_with_permutation(&*positive_weight_reduced_x)
+            .ok()?
+            .rank;
         if rank != reduced_p {
             return None;
         }

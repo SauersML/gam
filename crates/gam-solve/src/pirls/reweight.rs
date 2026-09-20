@@ -452,11 +452,8 @@ pub(crate) fn active_face_newton_direction(
     }
     // `rrqr_nullspace_basis(B)` returns an orthonormal basis of `null(Bᵀ)`;
     // with `B = A_activeᵀ` that is `null(A_active)`.
-    let (null_basis, _rank) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(
-        &a_active.t().to_owned(),
-        gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
-    )
-    .ok()?;
+    let (null_basis, _rank) =
+        gam_linalg::faer_ndarray::rrqr_nullspace_basis(&a_active.t().to_owned()).ok()?;
     if null_basis.ncols() == 0 {
         return Some(Array1::<f64>::zeros(p));
     }

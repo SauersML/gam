@@ -2767,19 +2767,15 @@ pub(crate) fn positive_spectral_frame_from_gram(
     let (eigenvalues, eigenvectors) = gram.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
     let n = gram.nrows();
     let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
-    // Scale-invariant rank tolerance: the cutoff must track the Gram's own
-    // spectrum (`α·ε·n·max_eval`), not an absolute floor. An earlier `max_eval
-    // .max(1.0)` clamped the reference scale to 1.0, which is only harmless when
-    // `max_eval ≥ 1`; for a genuinely well-conditioned but small-magnitude Gram
-    // (e.g. a Duchon hybrid whose evaluated kernel sits far below unit scale in
-    // moderate-to-high d) it inflated the tolerance to an absolute `α·ε·n` floor
-    // that swallows the entire — perfectly valid — spectrum, spuriously reporting
-    // `keep == 0`. Using the true `max_eval` makes `keep` invariant to a uniform
-    // rescaling of the Gram (which scales every eigenvalue and the cutoff
-    // identically). The residual `.max(f64::EPSILON)` only guards the degenerate
-    // all-zero Gram so that numerical-zero roundoff directions are still dropped.
-    let tol =
-        (default_rrqr_rank_alpha() * f64::EPSILON * (n.max(1) as f64) * max_eval).max(f64::EPSILON);
+    // Scale-invariant rank tolerance: the cutoff is the eigensolver's own
+    // backward-error band `n·ε·max|λ|` (Weyl), so `keep` is invariant to a
+    // uniform rescaling of the Gram. An absolute floor would swallow the whole
+    // spectrum of a well-conditioned but small-magnitude Gram (e.g. a Duchon
+    // hybrid whose kernel sits far below unit scale in high d). An all-zero Gram
+    // has a zero band and an exactly zero spectrum, so it keeps nothing (#4045).
+    let tol = gam_linalg::roundoff::symmetric_spectrum_rounding_band(
+        eigenvalues.as_slice().expect("contiguous eigenvalues"),
+    );
     let keep = eigenvalues.iter().filter(|&&ev| ev > tol).count();
     if keep == 0 {
         let min_ev = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
@@ -2828,8 +2824,8 @@ pub(crate) fn orthogonality_transform_from_cross_and_gram(
     if k == 0 {
         return Err(BasisError::InsufficientColumnsForConstraint { found: 0 });
     }
-    let (transform_raw, rank) = rrqr_nullspace_basis(constraint_cross, default_rrqr_rank_alpha())
-        .map_err(BasisError::LinalgError)?;
+    let (transform_raw, rank) =
+        rrqr_nullspace_basis(constraint_cross).map_err(BasisError::LinalgError)?;
     if rank >= k || transform_raw.ncols() == 0 {
         return Err(BasisError::ConstraintNullspaceCollapsed {
             site: "orthogonality_transform_from_cross_and_gram",
