@@ -32,10 +32,11 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CholeskyGuard {
     /// Read the matrix as-is: no up-front scan of the input entries, and a pivot
-    /// is rejected only when the accumulated diagonal value is `<= 0.0`. A
-    /// non-finite (`NaN`/`+inf`) diagonal accumulator is *not* rejected here
-    /// (`NaN <= 0.0` and `inf <= 0.0` are both `false`), matching the GPU host
-    /// reference path.
+    /// is rejected unless the accumulated diagonal value is `> 0.0`. That is the
+    /// device kernel's own test (`!(diag > 0.0)` in `arrow_schur_nvrtc`), so a
+    /// `NaN` accumulator is refused here exactly as it is on the device. Every
+    /// non-finite lower-triangle entry reaches some pivot as `NaN` or `-inf`, so
+    /// none of them can yield a factor; only a `+inf` diagonal is admitted.
     NonnegativePivot,
     /// Reject any non-finite entry in the input up front, and reject a pivot
     /// unless the accumulated diagonal value is finite and strictly positive.
@@ -69,13 +70,11 @@ pub fn cholesky_factor_in_place(
                 sum -= l[[i, k]] * l[[j, k]];
             }
             if i == j {
-                // Each arm mirrors the original rejection *expression* (not its
-                // negation) so the `NaN` diagonal case is preserved bit-for-bit:
-                // `NaN <= 0.0` is `false`, so the nonnegative-pivot path lets a
-                // `NaN` accumulator through to `sqrt` exactly as the GPU host
-                // reference did.
+                // Both arms are written as the negation of acceptance, so a `NaN`
+                // accumulator (for which every comparison is false) is rejected
+                // rather than passed to `sqrt` and returned as a factor.
                 let pivot_rejected = match guard {
-                    CholeskyGuard::NonnegativePivot => sum <= 0.0,
+                    CholeskyGuard::NonnegativePivot => !(sum > 0.0),
                     CholeskyGuard::FiniteStrict => !(sum.is_finite() && sum > 0.0),
                 };
                 if pivot_rejected {
@@ -379,6 +378,27 @@ mod tests {
         let x = cholesky_solve_vector(&l, &b);
         // A = 4, so x = 6/4 = 1.5.
         assert!((x[0] - 1.5).abs() < 1e-15);
+    }
+
+    /// Both guards factor the fixture exactly, and both refuse a `NaN` that
+    /// reaches a pivot, whether it sits on the diagonal or below it (#3915).
+    /// Under `NonnegativePivot` a `NaN` accumulator used to pass `sum <= 0.0` and
+    /// come back as `Some` factor with `NaN` on its diagonal.
+    #[test]
+    fn a_nan_pivot_is_refused_under_both_guards() {
+        let l = fixture_factor();
+        let a = reconstruct_spd(&l);
+        for guard in [CholeskyGuard::NonnegativePivot, CholeskyGuard::FiniteStrict] {
+            assert_eq!(cholesky_factor_in_place(a.view(), guard), Some(l.clone()));
+
+            let mut nan_diagonal = a.clone();
+            nan_diagonal[[1, 1]] = f64::NAN;
+            assert!(cholesky_factor_in_place(nan_diagonal.view(), guard).is_none());
+
+            let mut nan_below = a.clone();
+            nan_below[[2, 0]] = f64::NAN;
+            assert!(cholesky_factor_in_place(nan_below.view(), guard).is_none());
+        }
     }
 
     #[test]

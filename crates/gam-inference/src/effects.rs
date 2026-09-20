@@ -2,27 +2,62 @@
 //!
 //! This module owns the statistical kernel shared by difference-smooth,
 //! partial-dependence, and other linear-contrast reports.  Callers supply a
-//! coefficient vector, its covariance, and a contrast design.  Presentation
+//! coefficient vector, its covariance, a contrast design, and the fit's
+//! [`IntervalReference`] (the law of the standardized pivot).  Presentation
 //! layers only marshal the resulting typed report.
 
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_linalg::matrix::symmetrize_in_place;
-use gam_math::probability::standard_normal_quantile;
+use crate::interval_reference::IntervalReference;
 use gam_math::quantile::quantile_from_sorted;
 use gam_solve::estimate::UnifiedFitResult;
 use gam_solve::model_types::InferenceCovarianceMode;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
+use statrs::function::gamma::gamma_lr;
 use std::error::Error;
 use std::fmt;
 
 /// Default confidence level for effect bands.
 pub(crate) const DEFAULT_BAND_LEVEL: f64 = 0.95;
-/// Default Monte Carlo draw count for simultaneous bands.
-pub(crate) const DEFAULT_SIMULATIONS: usize = 10_000;
 /// Default deterministic random seed for simultaneous bands.
-pub(crate) const DEFAULT_SIMULATION_SEED: u64 = 12_345;
+pub const DEFAULT_SIMULATION_SEED: u64 = 12_345;
+
+/// Target Monte Carlo error of a simultaneous band's attained miss rate,
+/// relative to the nominal miss rate `alpha = 1 - level`.
+///
+/// A simulated band's critical value is the `ceil(level * N)`-th order statistic
+/// of `N` simulated suprema, so its attained coverage `F(c_hat)` is exactly
+/// `Beta(k, N + 1 - k)` for the supremum's continuous CDF `F`, whatever the grid
+/// or covariance: mean `level` and standard deviation `sqrt(level * alpha / N)`
+/// to first order. Asking that standard deviation to be this fraction of
+/// `alpha` fixes `N` (see [`simultaneous_band_simulations`]); at 5%, two Monte
+/// Carlo standard deviations keep the attained miss rate within a tenth of
+/// nominal.
+pub const SIMULTANEOUS_BAND_RELATIVE_MC_ERROR: f64 = 0.05;
+
+/// Monte Carlo draw count whose attained-coverage standard deviation is
+/// [`SIMULTANEOUS_BAND_RELATIVE_MC_ERROR`] times the nominal miss rate:
+/// `N = ceil(level / (alpha * delta^2))`, which is 7,600 draws at 95% and
+/// 39,600 at 99%.
+pub fn simultaneous_band_simulations(level: f64) -> Result<usize, EffectError> {
+    validate_level(level)?;
+    let miss_rate = 1.0 - level;
+    let delta = SIMULTANEOUS_BAND_RELATIVE_MC_ERROR;
+    let draws = (level / (miss_rate * delta * delta)).ceil();
+    if !draws.is_finite() || draws > usize::MAX as f64 {
+        return Err(EffectError::InvalidLevel { level });
+    }
+    Ok(draws as usize)
+}
+
+fn validate_level(level: f64) -> Result<(), EffectError> {
+    if !level.is_finite() || !(0.0..1.0).contains(&level) || level == 0.0 {
+        return Err(EffectError::InvalidLevel { level });
+    }
+    Ok(())
+}
 
 /// The coefficient covariance definition used by an effect report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,7 +129,7 @@ fn covariance_by_source(fit: &UnifiedFitResult, source: CovarianceSource) -> Opt
     }
 }
 
-/// Configuration for a pointwise normal-theory confidence band.
+/// Configuration for a pointwise confidence band.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PointwiseBandOptions {
     pub level: f64,
@@ -116,23 +151,26 @@ pub(crate) struct SimultaneousBandOptions {
     pub seed: u64,
 }
 
-impl Default for SimultaneousBandOptions {
-    fn default() -> Self {
-        Self {
-            level: DEFAULT_BAND_LEVEL,
-            simulations: DEFAULT_SIMULATIONS,
+impl SimultaneousBandOptions {
+    /// A band at `level` with the Monte Carlo size its target error implies.
+    pub fn at_level(level: f64) -> Result<Self, EffectError> {
+        Ok(Self {
+            level,
+            simulations: simultaneous_band_simulations(level)?,
             seed: DEFAULT_SIMULATION_SEED,
-        }
+        })
     }
 }
 
 /// Confidence-band procedure for a linear effect curve.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum BandOptions {
-    /// Independent marginal normal intervals at each contrast row.
+    /// Independent marginal intervals at each contrast row, priced off the
+    /// fit's [`IntervalReference`].
     Pointwise(PointwiseBandOptions),
     /// A common critical value calibrated from the supremum of the standardized
-    /// Gaussian effect curve.
+    /// effect curve: Gaussian for a known scale, multivariate-t for an
+    /// estimated one.
     Simultaneous(SimultaneousBandOptions),
 }
 
@@ -164,6 +202,9 @@ pub enum EffectError {
         level: f64,
     },
     InvalidSimulationCount,
+    InvalidDegreesOfFreedom {
+        degrees_of_freedom: f64,
+    },
     CovarianceShape {
         rows: usize,
         columns: usize,
@@ -191,7 +232,7 @@ pub enum EffectError {
         matrix: &'static str,
         detail: String,
     },
-    NormalQuantile {
+    ReferenceQuantile {
         detail: String,
     },
 }
@@ -217,6 +258,10 @@ impl fmt::Display for EffectError {
             Self::InvalidSimulationCount => {
                 formatter.write_str("simultaneous-band simulation count must be positive")
             }
+            Self::InvalidDegreesOfFreedom { degrees_of_freedom } => write!(
+                formatter,
+                "Student-t band reference needs finite positive degrees of freedom, got {degrees_of_freedom}"
+            ),
             Self::CovarianceShape {
                 rows,
                 columns,
@@ -252,11 +297,8 @@ impl fmt::Display for EffectError {
             Self::Eigendecomposition { matrix, detail } => {
                 write!(formatter, "{matrix} eigendecomposition failed: {detail}")
             }
-            Self::NormalQuantile { detail } => {
-                write!(
-                    formatter,
-                    "normal critical-value calculation failed: {detail}"
-                )
+            Self::ReferenceQuantile { detail } => {
+                write!(formatter, "band critical-value calculation failed: {detail}")
             }
         }
     }
@@ -271,25 +313,36 @@ impl Error for EffectError {}
 /// For `m x p` contrast design `C`, coefficient vector `beta`, and covariance
 /// `V`, the report center is `C beta` and its covariance is `C V C'`.
 /// Pointwise bands compute only the diagonal of that covariance, with O(p)
-/// working memory. Simultaneous bands calibrate `max_i |Z_i|` for the
-/// standardized Gaussian curve and factor whichever covariance space is
-/// smaller: coefficient space when `p <= m`, projected curve space otherwise.
+/// working memory. Simultaneous bands calibrate `max_i |T_i|` for the
+/// standardized curve and factor whichever covariance space is smaller:
+/// coefficient space when `p <= m`, projected curve space otherwise.
 /// Positive-semidefinite singular matrices are supported without a ridge.
+///
+/// `reference` is the law of the standardized pivot, owned by the fit
+/// ([`IntervalReference::of_fit`]). When `V` carries a dispersion `φ̂`
+/// estimated from the same data, every standardized row is `Z_i / S` with one
+/// shared `S = √(φ̂/φ)`, `ν S² ~ χ²_ν`: the pointwise pivot is Student-t on
+/// `ν` and the curve is a multivariate-t process. A Gaussian critical value
+/// there ignores the sampling variability of `φ̂` and under-covers.
 pub(crate) fn effect_report(
     beta: ArrayView1<'_, f64>,
     covariance: ArrayView2<'_, f64>,
     contrast_design: ArrayView2<'_, f64>,
     options: BandOptions,
+    reference: IntervalReference,
 ) -> Result<EffectReport, EffectError> {
-    validate_inputs(beta, covariance, contrast_design, options)?;
+    validate_inputs(beta, covariance, contrast_design, options, reference)?;
 
     let covariance = validated_symmetric_matrix(covariance)?;
     let center = contrast_design.dot(&beta);
     let (se, critical) = match options {
         BandOptions::Pointwise(pointwise) => {
             let se = pointwise_standard_errors(contrast_design, covariance.view())?;
-            let critical = standard_normal_quantile(0.5 * (1.0 + pointwise.level))
-                .map_err(|detail| EffectError::NormalQuantile { detail })?;
+            let critical = reference.central_multiplier(pointwise.level).map_err(|error| {
+                EffectError::ReferenceQuantile {
+                    detail: error.to_string(),
+                }
+            })?;
             (se, critical)
         }
         BandOptions::Simultaneous(simultaneous) => {
@@ -301,6 +354,7 @@ pub(crate) fn effect_report(
                 simultaneous.level,
                 simultaneous.simulations,
                 simultaneous.seed,
+                reference,
             );
             (se, critical)
         }
@@ -315,6 +369,91 @@ pub(crate) fn effect_report(
         lower,
         upper,
         critical,
+    })
+}
+
+/// Pointwise and simultaneous bands for one linear effect curve at one level.
+///
+/// Both bands share the center `C beta` and the standard errors of `C V C'`;
+/// they differ only in the critical value, and both read it off the fit's
+/// [`IntervalReference`]. The pointwise one is that reference's two-sided
+/// quantile (normal, or Student-t on `n − edf` for an estimated dispersion).
+/// The simultaneous one is the `level` quantile of the supremum of the
+/// standardized curve — `max_i |Z_i|` for a known scale, the multivariate-t
+/// `max_i |Z_i| / S` for an estimated one — calibrated from
+/// [`simultaneous_band_simulations`] Gaussian draws, so the band covers the
+/// whole curve over the rows of `C` jointly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectBands {
+    pub fit: Array1<f64>,
+    pub se: Array1<f64>,
+    pub lower: Array1<f64>,
+    pub upper: Array1<f64>,
+    pub simultaneous_lower: Array1<f64>,
+    pub simultaneous_upper: Array1<f64>,
+    pub level: f64,
+    pub pointwise_critical: f64,
+    pub simultaneous_critical: f64,
+    /// The Monte Carlo draws behind `simultaneous_critical`.
+    pub simulations: usize,
+    /// The random seed behind `simultaneous_critical`.
+    pub seed: u64,
+}
+
+/// Compute [`EffectBands`] for contrast design `C`, coefficients `beta`, and
+/// covariance `V` at `level`, with `reference` the law of the standardized
+/// pivot owned by the fit ([`IntervalReference::of_fit`]).
+pub fn effect_bands(
+    beta: ArrayView1<'_, f64>,
+    covariance: ArrayView2<'_, f64>,
+    contrast_design: ArrayView2<'_, f64>,
+    level: f64,
+    reference: IntervalReference,
+) -> Result<EffectBands, EffectError> {
+    let options = SimultaneousBandOptions::at_level(level)?;
+    validate_inputs(
+        beta,
+        covariance,
+        contrast_design,
+        BandOptions::Simultaneous(options),
+        reference,
+    )?;
+    let covariance = validated_symmetric_matrix(covariance)?;
+    let fit = contrast_design.dot(&beta);
+    let curve_factor = simultaneous_curve_factor(contrast_design, covariance.view())?;
+    let se = factor_standard_errors(&curve_factor);
+    let pointwise_critical =
+        reference
+            .central_multiplier(level)
+            .map_err(|error| EffectError::ReferenceQuantile {
+                detail: error.to_string(),
+            })?;
+    let simultaneous_critical = simultaneous_critical(
+        &curve_factor,
+        se.view(),
+        level,
+        options.simulations,
+        options.seed,
+        reference,
+    );
+    let band = |critical: f64| {
+        let half_width = se.mapv(|value| critical * value);
+        (&fit - &half_width, &fit + &half_width)
+    };
+    let (lower, upper) = band(pointwise_critical);
+    let (simultaneous_lower, simultaneous_upper) = band(simultaneous_critical);
+    Ok(EffectBands {
+        fit,
+        se,
+        lower,
+        upper,
+        simultaneous_lower,
+        simultaneous_upper,
+        level,
+        pointwise_critical,
+        simultaneous_critical,
+        simulations: options.simulations,
+        seed: options.seed,
     })
 }
 
@@ -388,6 +527,7 @@ fn validate_inputs(
     covariance: ArrayView2<'_, f64>,
     contrast_design: ArrayView2<'_, f64>,
     options: BandOptions,
+    reference: IntervalReference,
 ) -> Result<(), EffectError> {
     if beta.is_empty() {
         return Err(EffectError::EmptyCoefficients);
@@ -429,11 +569,14 @@ fn validate_inputs(
             (simultaneous.level, Some(simultaneous.simulations))
         }
     };
-    if !level.is_finite() || !(0.0..1.0).contains(&level) || level == 0.0 {
-        return Err(EffectError::InvalidLevel { level });
-    }
+    validate_level(level)?;
     if simulations == Some(0) {
         return Err(EffectError::InvalidSimulationCount);
+    }
+    if let IntervalReference::StudentT { degrees_of_freedom } = reference
+        && !(degrees_of_freedom.is_finite() && degrees_of_freedom > 0.0)
+    {
+        return Err(EffectError::InvalidDegreesOfFreedom { degrees_of_freedom });
     }
     Ok(())
 }
@@ -538,6 +681,7 @@ fn simultaneous_critical(
     level: f64,
     simulations: usize,
     seed: u64,
+    reference: IntervalReference,
 ) -> f64 {
     if curve_factor.ncols() == 0 {
         return 0.0;
@@ -554,26 +698,107 @@ fn simultaneous_critical(
         }
     }
 
+    // Draws are generated one at a time, so the stream (and hence the result)
+    // does not depend on the block size; each block of draws is pushed through
+    // the factor as one matrix product.
+    let rank = curve_factor.ncols();
+    let block = gam_runtime::resource::byte_balanced_row_chunk(
+        standardized_factor.nrows(),
+        simulations,
+    );
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut normal_coordinates = vec![0.0; curve_factor.ncols()];
+    let mut draws = Array2::<f64>::zeros((block, rank));
     let mut maxima = Vec::with_capacity(simulations);
-    for _ in 0..simulations {
-        fill_standard_normals(&mut rng, &mut normal_coordinates);
-        let maximum = standardized_factor
-            .rows()
-            .into_iter()
-            .map(|row| {
-                row.iter()
-                    .zip(&normal_coordinates)
-                    .map(|(&loading, &coordinate)| loading * coordinate)
-                    .sum::<f64>()
-                    .abs()
-            })
-            .fold(0.0_f64, f64::max);
-        maxima.push(maximum);
+    while maxima.len() < simulations {
+        let rows = block.min(simulations - maxima.len());
+        for mut draw in draws.rows_mut().into_iter().take(rows) {
+            let coordinates = draw
+                .as_slice_mut()
+                .expect("a row of a standard-layout array is contiguous");
+            fill_standard_normals(&mut rng, coordinates);
+        }
+        let curves = draws
+            .slice(ndarray::s![..rows, ..])
+            .dot(&standardized_factor.t());
+        maxima.extend(
+            curves
+                .rows()
+                .into_iter()
+                .map(|curve| curve.iter().fold(0.0_f64, |maximum, value| maximum.max(value.abs()))),
+        );
     }
     maxima.sort_by(f64::total_cmp);
-    quantile_from_sorted(&maxima, level)
+    match reference {
+        IntervalReference::Normal => quantile_from_sorted(&maxima, level),
+        IntervalReference::StudentT { degrees_of_freedom } => {
+            studentized_sup_critical(&maxima, level, degrees_of_freedom)
+        }
+    }
+}
+
+/// The `level` quantile of `sup_i |Z_i| / S` from sorted Gaussian sup draws
+/// `M_j = sup_i |Z_i|`, where `ν S² ~ χ²_ν` is independent of `Z`.
+///
+/// Conditioning on each draw gives the exceedance exactly in `S`:
+/// `P(M/S > c | M) = P(χ²_ν < ν M²/c²) = P(ν/2, ν M²/(2c²))` (regularized lower
+/// incomplete gamma), so the multivariate-t sup exceedance is the average
+/// `E(c) = (1/N) Σ_j P(ν/2, ν M_j²/(2c²))` over the same Gaussian draws, with no
+/// second random stream. `E` is continuous and strictly decreasing from the
+/// fraction of positive draws (one, almost surely) at `c → 0` to zero at
+/// `c → ∞`, so `E(c) = 1 − level` has one root. It is bracketed by halving /
+/// doubling from the Gaussian critical value (which the root exceeds in
+/// expectation, the t sup having the heavier tail) and bisected until the
+/// bracket is two adjacent floats.
+fn studentized_sup_critical(sorted_maxima: &[f64], level: f64, degrees_of_freedom: f64) -> f64 {
+    let target = 1.0 - level;
+    // `E(c → 0⁺)` is the fraction of strictly positive draws; when that does
+    // not exceed `1 − level` the `level` quantile of `M/S` is zero, exactly as
+    // the Gaussian order statistic reads it.
+    let positive = sorted_maxima.iter().filter(|&&maximum| maximum > 0.0).count();
+    if positive as f64 <= target * sorted_maxima.len() as f64 {
+        return 0.0;
+    }
+    let largest = sorted_maxima[sorted_maxima.len() - 1];
+    let half_df = 0.5 * degrees_of_freedom;
+    let exceedance = |critical: f64| -> f64 {
+        let argument_scale = half_df / (critical * critical);
+        let total = sorted_maxima
+            .iter()
+            .map(|&maximum| {
+                let argument = argument_scale * maximum * maximum;
+                if argument == 0.0 {
+                    0.0
+                } else if argument == f64::INFINITY {
+                    1.0
+                } else {
+                    gamma_lr(half_df, argument)
+                }
+            })
+            .sum::<f64>();
+        total / sorted_maxima.len() as f64
+    };
+
+    let gaussian = quantile_from_sorted(sorted_maxima, level);
+    let start = if gaussian > 0.0 { gaussian } else { largest };
+    let mut lower = start;
+    while exceedance(lower) < target {
+        lower *= 0.5;
+    }
+    let mut upper = start;
+    while exceedance(upper) > target {
+        upper *= 2.0;
+    }
+    loop {
+        let midpoint = 0.5 * (lower + upper);
+        if midpoint <= lower || midpoint >= upper {
+            return upper;
+        }
+        if exceedance(midpoint) > target {
+            lower = midpoint;
+        } else {
+            upper = midpoint;
+        }
+    }
 }
 
 fn fill_standard_normals(rng: &mut StdRng, output: &mut [f64]) {
@@ -607,6 +832,7 @@ mod tests {
             covariance.view(),
             contrast.view(),
             BandOptions::default(),
+            IntervalReference::Normal,
         )
         .unwrap();
 
@@ -623,13 +849,25 @@ mod tests {
         let contrast = array![[1.0, 0.0], [0.0, 1.0], [1.0, -1.0]];
         let options = BandOptions::Simultaneous(SimultaneousBandOptions {
             simulations: 2_000,
-            ..SimultaneousBandOptions::default()
+            ..SimultaneousBandOptions::at_level(DEFAULT_BAND_LEVEL).unwrap()
         });
 
-        let first =
-            effect_report(beta.view(), covariance.view(), contrast.view(), options).unwrap();
-        let second =
-            effect_report(beta.view(), covariance.view(), contrast.view(), options).unwrap();
+        let first = effect_report(
+            beta.view(),
+            covariance.view(),
+            contrast.view(),
+            options,
+            IntervalReference::Normal,
+        )
+        .unwrap();
+        let second = effect_report(
+            beta.view(),
+            covariance.view(),
+            contrast.view(),
+            options,
+            IntervalReference::Normal,
+        )
+        .unwrap();
 
         assert_eq!(first, second);
         assert_abs_diff_eq!(first.se[0], 1.0, epsilon = 1e-14);
@@ -645,6 +883,7 @@ mod tests {
             array![[1.0, 0.0], [0.0, -0.1]].view(),
             array![[0.0, 1.0]].view(),
             BandOptions::default(),
+            IntervalReference::Normal,
         )
         .unwrap_err();
 
@@ -664,6 +903,7 @@ mod tests {
             array![[1.0]].view(),
             array![[1.0]].view(),
             BandOptions::default(),
+            IntervalReference::Normal,
         )
         .unwrap();
 
@@ -682,13 +922,14 @@ mod tests {
         let contrast = array![[1.0, 0.5], [-0.25, 1.0]];
         let options = BandOptions::Simultaneous(SimultaneousBandOptions {
             simulations: 1_000,
-            ..SimultaneousBandOptions::default()
+            ..SimultaneousBandOptions::at_level(DEFAULT_BAND_LEVEL).unwrap()
         });
         let first = effect_report(
             array![1.0, -2.0].view(),
             covariance.view(),
             contrast.view(),
             options,
+            IntervalReference::Normal,
         )
         .unwrap();
         let shifted = effect_report(
@@ -696,6 +937,7 @@ mod tests {
             covariance.view(),
             contrast.view(),
             options,
+            IntervalReference::Normal,
         )
         .unwrap();
         let signed = effect_report(
@@ -703,6 +945,7 @@ mod tests {
             covariance.view(),
             (-&contrast).view(),
             options,
+            IntervalReference::Normal,
         )
         .unwrap();
 
@@ -725,8 +968,9 @@ mod tests {
             array![[1.0], [1e-9]].view(),
             BandOptions::Simultaneous(SimultaneousBandOptions {
                 simulations: 64,
-                ..SimultaneousBandOptions::default()
+                ..SimultaneousBandOptions::at_level(DEFAULT_BAND_LEVEL).unwrap()
             }),
+            IntervalReference::Normal,
         )
         .expect("scaled contrasts of the same Gaussian coefficient");
         assert_eq!(report.se[0], 1.0);
@@ -783,14 +1027,13 @@ mod tests {
         let (contrast, covariance) = correlated_curve_fixture();
         let beta = Array1::zeros(covariance.nrows());
         let level = 0.95;
+        let options = SimultaneousBandOptions::at_level(level).unwrap();
         let simultaneous = effect_report(
             beta.view(),
             covariance.view(),
             contrast.view(),
-            BandOptions::Simultaneous(SimultaneousBandOptions {
-                level,
-                ..SimultaneousBandOptions::default()
-            }),
+            BandOptions::Simultaneous(options),
+            IntervalReference::Normal,
         )
         .unwrap();
         let pointwise = effect_report(
@@ -798,6 +1041,7 @@ mod tests {
             covariance.view(),
             contrast.view(),
             BandOptions::Pointwise(PointwiseBandOptions { level }),
+            IntervalReference::Normal,
         )
         .unwrap();
         for (&factor_se, &quadratic_se) in simultaneous.se.iter().zip(&pointwise.se) {
@@ -817,9 +1061,9 @@ mod tests {
                 / replicates as f64
         };
         // Coverage error from the replicate count and from the calibration's
-        // own quantile estimate at the default simulation count.
+        // own quantile estimate at the level's derived simulation count.
         let mcse = (level * (1.0 - level) / replicates as f64
-            + level * (1.0 - level) / DEFAULT_SIMULATIONS as f64)
+            + level * (1.0 - level) / options.simulations as f64)
             .sqrt();
         let whole_curve = coverage(simultaneous.critical);
         assert!(
@@ -835,6 +1079,224 @@ mod tests {
             "pointwise whole-curve coverage {pointwise_curve} should fall well short of {level}"
         );
         assert!(simultaneous.critical > pointwise.critical);
+    }
+
+    #[test]
+    fn pointwise_band_with_estimated_scale_uses_student_t_critical_value() {
+        let report = effect_report(
+            array![0.0].view(),
+            array![[1.0]].view(),
+            array![[1.0]].view(),
+            BandOptions::default(),
+            IntervalReference::StudentT {
+                degrees_of_freedom: 10.0,
+            },
+        )
+        .unwrap();
+        // t_{0.975, 10} = 2.228138851986274 (not z_{0.975} = 1.959963984540054).
+        assert_abs_diff_eq!(report.critical, 2.228_138_851_986_274, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn student_t_reference_without_positive_degrees_of_freedom_is_rejected() {
+        for degrees_of_freedom in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let error = effect_report(
+                array![0.0].view(),
+                array![[1.0]].view(),
+                array![[1.0]].view(),
+                BandOptions::Simultaneous(
+                    SimultaneousBandOptions::at_level(DEFAULT_BAND_LEVEL).unwrap(),
+                ),
+                IntervalReference::StudentT { degrees_of_freedom },
+            )
+            .unwrap_err();
+            assert!(matches!(error, EffectError::InvalidDegreesOfFreedom { .. }));
+        }
+    }
+
+    #[test]
+    fn simulation_count_meets_the_relative_mc_error_target() {
+        assert_eq!(simultaneous_band_simulations(0.95).unwrap(), 7_600);
+        assert_eq!(simultaneous_band_simulations(0.99).unwrap(), 39_600);
+        for level in [0.8, 0.9, 0.95, 0.99, 0.999] {
+            let n = simultaneous_band_simulations(level).unwrap() as f64;
+            // Attained coverage is Beta(k, N + 1 - k) with k ~ level * N, so
+            // its standard deviation relative to the miss rate is at most the target.
+            let relative = (level * (1.0 - level) / n).sqrt() / (1.0 - level);
+            assert!(relative <= SIMULTANEOUS_BAND_RELATIVE_MC_ERROR + 1e-12);
+        }
+        for level in [0.0, 1.0, -0.5, f64::NAN] {
+            assert!(simultaneous_band_simulations(level).is_err());
+        }
+    }
+
+    #[test]
+    fn estimated_scale_simultaneous_band_covers_the_multivariate_t_curve() {
+        // With an estimated dispersion the standardized curve is `Z / S`, one
+        // `S` shared by every row with `ν S² ~ χ²_ν`: the band must cover the
+        // multivariate-t sup at the nominal rate, which the Gaussian critical
+        // value does not.
+        let (contrast, covariance) = correlated_curve_fixture();
+        let beta = Array1::zeros(covariance.nrows());
+        let level = 0.95;
+        let degrees_of_freedom = 6_usize;
+        let simultaneous = SimultaneousBandOptions::at_level(level).unwrap();
+        let options = BandOptions::Simultaneous(simultaneous);
+        let studentized = effect_report(
+            beta.view(),
+            covariance.view(),
+            contrast.view(),
+            options,
+            IntervalReference::StudentT {
+                degrees_of_freedom: degrees_of_freedom as f64,
+            },
+        )
+        .unwrap();
+        let gaussian = effect_report(
+            beta.view(),
+            covariance.view(),
+            contrast.view(),
+            options,
+            IntervalReference::Normal,
+        )
+        .unwrap();
+        assert_eq!(studentized.se, gaussian.se);
+        assert!(studentized.critical > gaussian.critical);
+
+        let replicates = 20_000;
+        let maxima = independent_standardized_maxima(
+            &contrast,
+            &covariance,
+            &studentized.se,
+            replicates,
+            20_260_920,
+        );
+        let mut rng = StdRng::seed_from_u64(20_260_921);
+        let mut normals = vec![0.0; degrees_of_freedom];
+        let studentized_maxima: Vec<f64> = maxima
+            .iter()
+            .map(|&maximum| {
+                fill_standard_normals(&mut rng, &mut normals);
+                let chi_square = normals.iter().map(|value| value * value).sum::<f64>();
+                maximum / (chi_square / degrees_of_freedom as f64).sqrt()
+            })
+            .collect();
+        let coverage = |critical: f64| {
+            studentized_maxima
+                .iter()
+                .filter(|&&maximum| maximum <= critical)
+                .count() as f64
+                / replicates as f64
+        };
+        // Coverage error from the replicate count and from the calibration's
+        // own estimate at the level's derived simulation count; three standard
+        // errors bound a two-sided normal deviation with probability 0.997.
+        let mcse = (level * (1.0 - level) / replicates as f64
+            + level * (1.0 - level) / simultaneous.simulations as f64)
+            .sqrt();
+        let whole_curve = coverage(studentized.critical);
+        assert!(
+            (whole_curve - level).abs() <= 3.0 * mcse,
+            "multivariate-t whole-curve coverage {whole_curve} vs {level} (3 MCSE = {})",
+            3.0 * mcse
+        );
+        let gaussian_curve = coverage(gaussian.critical);
+        assert!(
+            gaussian_curve < level - 10.0 * mcse,
+            "Gaussian critical value coverage {gaussian_curve} should fall well short of {level} \
+             under an estimated scale"
+        );
+    }
+
+    #[test]
+    fn simultaneous_band_attains_its_exact_coverage_on_independent_rows() {
+        // For m independent standard normal rows, P(max |Z_i| <= c) = (2 Phi(c) - 1)^m
+        // exactly, so the attained coverage of the simulated critical value is
+        // checkable against the level within the Monte Carlo error the draw count targets.
+        let m = 12;
+        let level = 0.95;
+        let bands = effect_bands(
+            Array1::zeros(m).view(),
+            Array2::eye(m).view(),
+            Array2::eye(m).view(),
+            level,
+            IntervalReference::Normal,
+        )
+        .unwrap();
+        let attained =
+            (2.0 * gam_math::probability::normal_cdf(bands.simultaneous_critical) - 1.0)
+                .powi(m as i32);
+        let mc_sd = (level * (1.0 - level) / bands.simulations as f64).sqrt();
+        assert!(
+            (attained - level).abs() <= 4.0 * mc_sd,
+            "attained {attained} at critical {}",
+            bands.simultaneous_critical
+        );
+        assert_eq!(bands.simulations, simultaneous_band_simulations(level).unwrap());
+        assert_abs_diff_eq!(bands.pointwise_critical, 1.959_963_984_540_054, epsilon = 1e-9);
+        assert!(bands.simultaneous_critical > bands.pointwise_critical);
+        for row in 0..m {
+            assert!(bands.simultaneous_lower[row] < bands.lower[row]);
+            assert!(bands.simultaneous_upper[row] > bands.upper[row]);
+        }
+    }
+
+    #[test]
+    fn a_perfectly_correlated_curve_needs_only_the_pointwise_critical_value() {
+        // Every row is a positive multiple of one coefficient, so the maximum
+        // of the standardized curve is a single |Z| and the simultaneous and
+        // pointwise critical values agree up to Monte Carlo error.
+        let level = 0.95;
+        let bands = effect_bands(
+            array![0.3].view(),
+            array![[2.0]].view(),
+            array![[1.0], [2.0], [0.5]].view(),
+            level,
+            IntervalReference::Normal,
+        )
+        .unwrap();
+        let attained = 2.0 * gam_math::probability::normal_cdf(bands.simultaneous_critical) - 1.0;
+        let mc_sd = (level * (1.0 - level) / bands.simulations as f64).sqrt();
+        assert!((attained - level).abs() <= 4.0 * mc_sd);
+        let again = effect_bands(
+            array![0.3].view(),
+            array![[2.0]].view(),
+            array![[1.0], [2.0], [0.5]].view(),
+            level,
+            IntervalReference::Normal,
+        )
+        .unwrap();
+        assert_eq!(bands, again);
+    }
+
+    #[test]
+    fn estimated_scale_bands_read_the_student_t_reference() {
+        // A perfectly correlated curve has sup |T_i| = |T| for one Student-t
+        // pivot, so both critical values target t_{nu, (1 + level) / 2}: the
+        // pointwise one exactly, the simultaneous one up to Monte Carlo error.
+        let level = 0.95;
+        let degrees_of_freedom = 10.0;
+        let bands = effect_bands(
+            array![0.3].view(),
+            array![[2.0]].view(),
+            array![[1.0], [2.0], [0.5]].view(),
+            level,
+            IntervalReference::StudentT { degrees_of_freedom },
+        )
+        .unwrap();
+        // t_{0.975, 10} = 2.228138851986274 (not z_{0.975} = 1.959963984540054).
+        assert_abs_diff_eq!(bands.pointwise_critical, 2.228_138_851_986_274, epsilon = 1e-9);
+        let attained = 1.0
+            - gam_math::probability::student_t_two_sided_probability(
+                bands.simultaneous_critical,
+                degrees_of_freedom,
+            );
+        let mc_sd = (level * (1.0 - level) / bands.simulations as f64).sqrt();
+        assert!(
+            (attained - level).abs() <= 4.0 * mc_sd,
+            "attained {attained} at critical {}",
+            bands.simultaneous_critical
+        );
     }
 
     #[test]

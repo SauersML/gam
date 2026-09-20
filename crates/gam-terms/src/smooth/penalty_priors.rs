@@ -65,21 +65,42 @@ pub(crate) struct PenaltyBlockGammaPriorMetadata {
     global_index: usize,
 }
 
-fn penalty_block_label_candidates(info: &PenaltyBlockInfo) -> Vec<String> {
-    let mut labels = Vec::<String>::new();
-    labels.push(format!("penalty:{}", info.global_index));
-    labels.push(info.global_index.to_string());
+/// Every label a penalty block answers to, grouped by specificity, most
+/// specific tier first:
+///
+/// 0. the block itself: `penalty:{global}`, `{global}`, `{term}:{local}`;
+/// 1. the whole term: `{term}`;
+/// 2. the penalty's source label, which may be shared across terms.
+///
+/// A label appears only in the most specific tier that produces it.
+fn penalty_block_label_tiers(info: &PenaltyBlockInfo) -> [Vec<String>; 3] {
+    let mut block = vec![
+        format!("penalty:{}", info.global_index),
+        info.global_index.to_string(),
+    ];
+    let mut term = Vec::<String>::new();
     if let Some(termname) = info.termname.as_ref() {
-        labels.push(termname.clone());
-        labels.push(format!("{termname}:{}", info.penalty.original_index));
+        block.push(format!("{termname}:{}", info.penalty.original_index));
+        term.push(termname.clone());
     }
+    let mut source = Vec::<String>::new();
     if let crate::basis::PenaltySource::Other(label) = &info.penalty.source {
-        labels.push(label.clone());
+        source.push(label.clone());
     }
-    labels.push(format!("{:?}", info.penalty.source));
-    labels.sort();
-    labels.dedup();
-    labels
+    source.push(format!("{:?}", info.penalty.source));
+    let mut seen = BTreeSet::<String>::new();
+    [block, term, source].map(|tier| {
+        tier.into_iter()
+            .filter(|label| seen.insert(label.clone()))
+            .collect::<Vec<String>>()
+    })
+}
+
+fn penalty_block_label_candidates(info: &PenaltyBlockInfo) -> Vec<String> {
+    penalty_block_label_tiers(info)
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn penalty_block_metadata(info: &PenaltyBlockInfo) -> PenaltyBlockGammaPriorMetadata {
@@ -154,47 +175,65 @@ pub fn realize_keyed_penalty_block_gamma_priors(
 ) -> Result<gam_spec::RhoPrior, BasisError> {
     let mut keyed = BTreeMap::<String, (f64, f64)>::new();
     for (label, shape, rate) in priors {
+        validate_gamma_precision_prior(label, *shape, *rate)?;
         if keyed.insert(label.clone(), (*shape, *rate)).is_some() {
             crate::bail_invalid_basis!(
                 "duplicate Gamma precision hyperprior for penalty block label '{label}'"
             );
         }
     }
-    let mut consumed = BTreeSet::<String>::new();
-    let prior = realize_penalty_block_gamma_priors(design, |metadata| {
-        let info = design
-            .penaltyinfo
-            .iter()
-            .find(|info| info.global_index == metadata.global_index)
-            .expect("metadata global index should match penaltyinfo");
-        for label in penalty_block_label_candidates(info) {
-            if let Some(value) = keyed.get(&label) {
-                consumed.insert(label);
-                return Some(*value);
-            }
-        }
-        None
-    })?;
+    let available = design
+        .penaltyinfo
+        .iter()
+        .flat_map(penalty_block_label_candidates)
+        .collect::<BTreeSet<_>>();
+    // A key is unknown only when no block answers to it. A key every one of
+    // whose blocks is overridden by a more specific key is known and shadowed.
     let unknown: Vec<String> = keyed
         .keys()
-        .filter(|label| !consumed.contains(*label))
+        .filter(|label| !available.contains(*label))
         .cloned()
         .collect();
     if !unknown.is_empty() {
-        let available = design
-            .penaltyinfo
-            .iter()
-            .flat_map(penalty_block_label_candidates)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join(", ");
         crate::bail_invalid_basis!(
-            "unknown Gamma precision hyperprior penalty block label(s): {}; available labels: {available}",
-            unknown.join(", ")
+            "unknown Gamma precision hyperprior penalty block label(s): {}; available labels: {}",
+            unknown.join(", "),
+            available.into_iter().collect::<Vec<_>>().join(", ")
         );
     }
-    Ok(prior)
+    // Each block takes its prior from the most specific tier that has a key.
+    // Two keys in that tier name the block equally specifically, so there is
+    // no principled winner between them.
+    let mut resolved = BTreeMap::<usize, (f64, f64)>::new();
+    for info in &design.penaltyinfo {
+        for tier in penalty_block_label_tiers(info) {
+            let matches: Vec<&String> = tier
+                .iter()
+                .filter(|label| keyed.contains_key(*label))
+                .collect();
+            match matches.as_slice() {
+                [] => continue,
+                [label] => {
+                    resolved.insert(info.global_index, keyed[*label]);
+                }
+                several => {
+                    crate::bail_invalid_basis!(
+                        "ambiguous Gamma precision hyperprior for penalty block {}: labels {} all name it at the same specificity",
+                        info.global_index,
+                        several
+                            .iter()
+                            .map(|label| format!("'{label}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
+            break;
+        }
+    }
+    realize_penalty_block_gamma_priors(design, |metadata| {
+        resolved.get(&metadata.global_index).copied()
+    })
 }
 
 fn validate_rho_prior_coordinate(

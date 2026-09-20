@@ -38,7 +38,9 @@ use crate::survival::location_scale::{
 };
 use crate::survival::latent::fixed_latent_hazard_frailty;
 use crate::survival::lognormal_kernel::FrailtySpec;
-use crate::survival::{CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints};
+use crate::survival::{
+    CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints_with_rounding,
+};
 use crate::wiggle::monotone_wiggle_basis_with_derivative_order;
 use gam_linalg::matrix::DesignMatrix;
 use gam_math::probability::normal_pdf;
@@ -236,6 +238,7 @@ impl SurvivalPredictionCovarianceMode {
 }
 
 /// Inputs to the unified survival predict pipeline.
+#[derive(Clone, Copy)]
 pub struct SurvivalPredictRequest<'a> {
     pub model: &'a SavedModel,
     pub data: ArrayView2<'a, f64>,
@@ -1192,20 +1195,69 @@ impl SurvivalPosteriorIntegration {
 /// [`SurvivalPosteriorIntegration::ExactAnchor`] and
 /// [`SurvivalPosteriorIntegration::TruncatedLaw`] are refused for a model they do
 /// not cover.
+///
+/// The published point is always the conditional-posterior mean
+/// `E[S | D, ρ̂]`, exactly as on the competing-risks and standard-family paths:
+/// `covariance_mode` governs only the reported uncertainty, so requesting an
+/// interval (or a covariance definition for it) never moves the point
+/// (gam#398, gam#3421). A smoothing-corrected band integrates its second
+/// moments under the corrected law in a separate pass over the same rule.
 pub fn predict_survival_posterior_mean_with(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
     integration: SurvivalPosteriorIntegration,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    predict_survival_posterior_mean_integrated(req, covariance_mode, integration, integration)
+}
+
+/// [`predict_survival_posterior_mean_with`] with the point's conditional law
+/// integrated by `point_integration` and a smoothing-corrected band's law by
+/// `band_integration`.
+fn predict_survival_posterior_mean_integrated(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+    point_integration: SurvivalPosteriorIntegration,
+    band_integration: SurvivalPosteriorIntegration,
+) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    let point_request = SurvivalPredictRequest {
+        with_uncertainty: false,
+        ..req
+    };
+    let (mut result, point) = survival_posterior_moments(
+        point_request,
+        SurvivalPredictionCovarianceMode::Conditional,
+        point_integration,
+    )?;
+    let band = match (req.with_uncertainty, covariance_mode) {
+        (false, _) => None,
+        (true, SurvivalPredictionCovarianceMode::Conditional) => None,
+        (true, SurvivalPredictionCovarianceMode::SmoothingCorrected) => Some(
+            survival_posterior_moments(point_request, covariance_mode, band_integration)?.1,
+        ),
+    };
+    let uncertainty = req
+        .with_uncertainty
+        .then(|| (band.as_ref().unwrap_or(&point), covariance_mode));
+    publish_survival_posterior_moments(&mut result, &point, uncertainty)?;
+    Ok(result)
+}
+
+/// The plug-in prediction beside the posterior moments of every cell under
+/// the `covariance_mode` coefficient law, integrated by `integration`.
+fn survival_posterior_moments(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+    integration: SurvivalPosteriorIntegration,
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     match integration {
         SurvivalPosteriorIntegration::SigmaPoint => {
-            predict_survival_sigma_point_posterior_mean(req, covariance_mode)
+            survival_sigma_point_posterior_moments(req, covariance_mode)
         }
         SurvivalPosteriorIntegration::ExactAnchor => {
-            predict_survival_exact_anchor_posterior_mean(req, covariance_mode)
+            survival_exact_anchor_posterior_moments(req, covariance_mode)
         }
         SurvivalPosteriorIntegration::TruncatedLaw => {
-            predict_survival_truncated_law_posterior_mean(req, covariance_mode)
+            survival_truncated_law_posterior_moments(req, covariance_mode)
         }
     }
 }
@@ -1214,8 +1266,21 @@ fn predict_survival_posterior_mean(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let integration = SurvivalPosteriorIntegration::default_for(req.model, covariance_mode)?;
-    predict_survival_posterior_mean_with(req, covariance_mode, integration)
+    // Each law takes the integration that covers it: the cone truncates only
+    // the conditional posterior (gam#3038), so a truncated location-scale
+    // point integrates the truncated law while its smoothing-corrected band
+    // integrates the corrected normal.
+    let point_integration = SurvivalPosteriorIntegration::default_for(
+        req.model,
+        SurvivalPredictionCovarianceMode::Conditional,
+    )?;
+    let band_integration = SurvivalPosteriorIntegration::default_for(req.model, covariance_mode)?;
+    predict_survival_posterior_mean_integrated(
+        req,
+        covariance_mode,
+        point_integration,
+        band_integration,
+    )
 }
 
 /// First and second posterior moments of a single-event survival prediction,
@@ -1249,30 +1314,32 @@ impl SurvivalPosteriorMoments {
 /// predictive law's own hazard; the posterior mean of the hazard, `E_θ[f/S]`,
 /// is a different quantity wherever `S` varies across the posterior and is
 /// never published (`hazard_mean` only tells a zero hazard from an infinite
-/// one where `S̄ = 0`). Posterior standard deviations are added when uncertainty
-/// was requested, and the plug-in survival is kept by name in `survival_plugin`.
+/// one where `S̄ = 0`). When `uncertainty` names the band's moments and their
+/// covariance definition, the posterior standard deviations under that law are
+/// added; the plug-in survival is kept by name in `survival_plugin`.
 fn publish_survival_posterior_moments(
     result: &mut SurvivalPredictResult,
     moments: &SurvivalPosteriorMoments,
-    with_uncertainty: bool,
-    covariance_mode: SurvivalPredictionCovarianceMode,
+    uncertainty: Option<(&SurvivalPosteriorMoments, SurvivalPredictionCovarianceMode)>,
 ) -> Result<(), SurvivalPredictError> {
     let (n_rows, n_times) = result.survival.dim();
-    if moments.survival_mean.dim() != (n_rows, n_times) || moments.eta_mean.len() != n_rows {
-        return Err(SurvivalPredictError::IncompatibleSchema {
-            reason: format!(
-                "posterior survival moments have shape {:?}, but the prediction is {n_rows}x{n_times}",
-                moments.survival_mean.dim()
-            ),
-        });
+    for published in std::iter::once(moments).chain(uncertainty.map(|(band, _)| band)) {
+        if published.survival_mean.dim() != (n_rows, n_times)
+            || published.eta_mean.len() != n_rows
+        {
+            return Err(SurvivalPredictError::IncompatibleSchema {
+                reason: format!(
+                    "posterior survival moments have shape {:?}, but the prediction is {n_rows}x{n_times}",
+                    published.survival_mean.dim()
+                ),
+            });
+        }
     }
     let SurvivalPosteriorMoments {
         survival_mean,
-        survival_second,
         density_mean,
         hazard_mean,
-        eta_mean,
-        eta_second,
+        ..
     } = moments;
     // `result` is the plug-in prediction and the loop below overwrites its
     // surfaces with the posterior means, so the plug-in survival is taken
@@ -1305,21 +1372,21 @@ fn publish_survival_posterior_moments(
             };
         }
     }
-    result.survival_se = with_uncertainty.then(|| {
+    result.survival_se = uncertainty.map(|(band, _)| {
         Array2::from_shape_fn((n_rows, n_times), |(row, time)| {
-            (survival_second[[row, time]] - survival_mean[[row, time]] * survival_mean[[row, time]])
+            let mean = band.survival_mean[[row, time]];
+            (band.survival_second[[row, time]] - mean * mean)
                 .max(0.0)
                 .sqrt()
         })
     });
-    result.eta_se = with_uncertainty.then(|| {
+    result.eta_se = uncertainty.map(|(band, _)| {
         Array1::from_shape_fn(n_rows, |row| {
-            (eta_second[row] - eta_mean[row] * eta_mean[row])
-                .max(0.0)
-                .sqrt()
+            let mean = band.eta_mean[row];
+            (band.eta_second[row] - mean * mean).max(0.0).sqrt()
         })
     });
-    result.covariance_source = with_uncertainty.then_some(covariance_mode);
+    result.covariance_source = uncertainty.map(|(_, covariance_mode)| covariance_mode);
     result.survival_plugin = Some(survival_plugin);
     Ok(())
 }
@@ -1540,17 +1607,16 @@ impl ExactAnchorPosterior {
     }
 }
 
-fn predict_survival_exact_anchor_posterior_mean(
+fn survival_exact_anchor_posterior_moments(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let with_uncertainty = req.with_uncertainty;
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let (_, active_covariance, _) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
     let posterior = ExactAnchorPosterior {
         covariance: active_covariance,
     };
-    let (mut result, moments) = predict_survival_surfaces(
+    let (result, moments) = predict_survival_surfaces(
         SurvivalPredictRequest {
             with_uncertainty: false,
             estimand: SurvivalPredictEstimand::Plugin,
@@ -1566,8 +1632,7 @@ fn predict_survival_exact_anchor_posterior_mean(
     // (`survival_plugin`), so its curve is held to the same domain as when it
     // is published alone.
     refuse_decreasing_survival(&result)?;
-    publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
-    Ok(result)
+    Ok((result, moments))
 }
 
 /// The cone-truncated coefficient posterior of a location-scale fit under
@@ -1591,11 +1656,10 @@ fn truncated_survival_posterior_draws(
         .map_err(|reason| SurvivalPredictError::PosteriorCovariance { reason })
 }
 
-fn predict_survival_truncated_law_posterior_mean(
+fn survival_truncated_law_posterior_moments(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let with_uncertainty = req.with_uncertainty;
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let draws = truncated_survival_posterior_draws(req.model, covariance_mode)?.ok_or_else(|| {
         SurvivalPredictError::UnsupportedConfiguration {
             reason: format!(
@@ -1605,7 +1669,7 @@ fn predict_survival_truncated_law_posterior_mean(
             ),
         }
     })?;
-    let (mut result, moments) = predict_survival_surfaces(
+    let (result, moments) = predict_survival_surfaces(
         SurvivalPredictRequest {
             with_uncertainty: false,
             estimand: SurvivalPredictEstimand::Plugin,
@@ -1618,17 +1682,16 @@ fn predict_survival_truncated_law_posterior_mean(
         "internal error: the truncated-law survival pass returned no posterior moments".to_string()
     })?;
     refuse_decreasing_survival(&result)?;
-    publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
-    Ok(result)
+    Ok((result, moments))
 }
 
-fn predict_survival_sigma_point_posterior_mean(
+fn survival_sigma_point_posterior_moments(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let (posterior_mean, active_covariance, cone_coords) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
-    let mut result = predict_survival(
+    let result = predict_survival(
         SurvivalPredictRequest {
             model: req.model,
             data: req.data,
@@ -1702,8 +1765,7 @@ fn predict_survival_sigma_point_posterior_mean(
         Ok(())
     })?;
 
-    publish_survival_posterior_moments(&mut result, &moments, req.with_uncertainty, covariance_mode)?;
-    Ok(result)
+    Ok((result, moments))
 }
 
 fn predict_competing_risks_with_posterior(
@@ -1711,16 +1773,20 @@ fn predict_competing_risks_with_posterior(
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<CompetingRisksPredictResult, SurvivalPredictError> {
     let posterior_mean_estimand = req.estimand == SurvivalPredictEstimand::PosteriorMean;
+    // The public posterior-mean point is always the conditional-posterior
+    // estimand. `covariance_mode` governs only the reported uncertainty,
+    // exactly as on the single-event and standard-family paths, so a request
+    // without uncertainty integrates the conditional law whatever mode it
+    // names, and a smoothing-corrected interval computes the conditional point
+    // once and the corrected second moments separately (gam#3421).
+    let covariance_mode = if req.with_uncertainty {
+        covariance_mode
+    } else {
+        SurvivalPredictionCovarianceMode::Conditional
+    };
     let (posterior_mean, active_covariance, cone_coords) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
-    // The public posterior-mean point is always the conditional-posterior
-    // estimand. A smoothing-corrected interval changes only its reported
-    // uncertainty, exactly as on the standard-family path. If corrected
-    // covariance becomes available for this model class, compute the
-    // conditional point once and the corrected second moments separately;
-    // never silently change the point estimand with the interval mode.
     let separate_conditional_point = posterior_mean_estimand
-        && req.with_uncertainty
         && covariance_mode == SurvivalPredictionCovarianceMode::SmoothingCorrected;
     let mut result = if separate_conditional_point {
         predict_competing_risks_with_posterior(
@@ -3589,6 +3655,11 @@ pub fn predict_competing_risks_survival(
     let mut cumulative_hazard_refined = (0..cause_count)
         .map(|_| Array2::<f64>::zeros((n, refined_cols)))
         .collect::<Vec<_>>();
+    // Rounding band of each refined cumulative hazard, so the AJ assembly
+    // clamps only decreases that are rounding of these evaluations (#3529).
+    let mut cumulative_hazard_refined_band = (0..cause_count)
+        .map(|_| Array2::<f64>::zeros((n, refined_cols)))
+        .collect::<Vec<_>>();
     let mut linear_predictor = (0..cause_count)
         .map(|_| Array1::<f64>::zeros(n))
         .collect::<Vec<_>>();
@@ -3602,6 +3673,8 @@ pub fn predict_competing_risks_survival(
         /// Cumulative hazard on the refined AJ grid (gam#1385); empty on the
         /// per-row-eval path.
         cumulative_refined: Vec<f64>,
+        /// Rounding band of each `cumulative_refined` entry (#3529).
+        cumulative_refined_band: Vec<f64>,
         eta_exit: f64,
     }
 
@@ -3612,7 +3685,7 @@ pub fn predict_competing_risks_survival(
             let i = flat % n;
             let block = &fit.blocks[cause];
             let timewiggle = saved_timewiggle_by_cause[cause].as_ref();
-            let evaluate_at = |t_query: f64| -> Result<(f64, f64, f64), SurvivalPredictError> {
+            let evaluate_at = |t_query: f64| -> Result<RpRowEvaluation, SurvivalPredictError> {
                 let t_entry = age_entry[i].min(t_query);
                 let single_entry = Array1::from_elem(1, t_entry);
                 let single_exit = Array1::from_elem(1, t_query);
@@ -3655,10 +3728,11 @@ pub fn predict_competing_risks_survival(
                 survival: vec![0.0; t_cols],
                 cumulative: vec![0.0; t_cols],
                 cumulative_refined: vec![0.0; refined_cols],
+                cumulative_refined_band: vec![0.0; refined_cols],
                 eta_exit: 0.0,
             };
             if per_row_eval {
-                let (eta_t, cum_t, haz_t) = evaluate_at(age_exit[i])?;
+                let (eta_t, cum_t, haz_t, cum_band_t) = evaluate_at(age_exit[i])?;
                 out.eta_exit = eta_t;
                 out.hazard[0] = haz_t;
                 out.cumulative[0] = cum_t;
@@ -3672,16 +3746,19 @@ pub fn predict_competing_risks_survival(
                 for s in 1..=CIF_REFINE_SUBINTERVALS {
                     let frac = (s as f64) / (CIF_REFINE_SUBINTERVALS as f64);
                     let t_query = age_exit[i] * frac;
-                    out.cumulative_refined[s - 1] = if t_query <= 0.0 {
-                        0.0
+                    let (cum, cum_band) = if t_query <= 0.0 {
+                        (0.0, 0.0)
                     } else if s == CIF_REFINE_SUBINTERVALS {
                         // frac == 1 exactly: reuse the exit evaluation so the
                         // assembled CIF and the reported cumulative hazard
                         // agree to the bit.
-                        cum_t
+                        (cum_t, cum_band_t)
                     } else {
-                        evaluate_at(t_query)?.1
+                        let (_, cum, _, cum_band) = evaluate_at(t_query)?;
+                        (cum, cum_band)
                     };
+                    out.cumulative_refined[s - 1] = cum;
+                    out.cumulative_refined_band[s - 1] = cum_band;
                 }
             } else {
                 for (j, &t_query) in eval_times.iter().enumerate() {
@@ -3696,7 +3773,7 @@ pub fn predict_competing_risks_survival(
                         out.cumulative[j] = 0.0;
                         out.survival[j] = 1.0;
                     } else {
-                        let (_eta_t, cum_t, haz_t) = evaluate_at(t_query)?;
+                        let (_eta_t, cum_t, haz_t, _) = evaluate_at(t_query)?;
                         out.hazard[j] = haz_t;
                         out.cumulative[j] = cum_t;
                         out.survival[j] = (-cum_t).exp().clamp(0.0, 1.0);
@@ -3708,13 +3785,16 @@ pub fn predict_competing_risks_survival(
                 // per-cause cumulative_hazard and the assembly agree at the user
                 // times to the bit.
                 for (jr, &t_query) in refined_times.iter().enumerate() {
-                    out.cumulative_refined[jr] = if t_query <= 0.0 {
-                        0.0
+                    let (cum, cum_band) = if t_query <= 0.0 {
+                        (0.0, 0.0)
                     } else {
-                        evaluate_at(t_query)?.1
+                        let (_, cum, _, cum_band) = evaluate_at(t_query)?;
+                        (cum, cum_band)
                     };
+                    out.cumulative_refined[jr] = cum;
+                    out.cumulative_refined_band[jr] = cum_band;
                 }
-                let (eta_t, _, _) = evaluate_at(age_exit[i])?;
+                let (eta_t, _, _, _) = evaluate_at(age_exit[i])?;
                 out.eta_exit = eta_t;
             }
             Ok(out)
@@ -3730,6 +3810,8 @@ pub fn predict_competing_risks_survival(
         }
         for jr in 0..refined_cols {
             cumulative_hazard_refined[row.cause][[row.row, jr]] = row.cumulative_refined[jr];
+            cumulative_hazard_refined_band[row.cause][[row.row, jr]] =
+                row.cumulative_refined_band[jr];
         }
     }
 
@@ -3746,9 +3828,10 @@ pub fn predict_competing_risks_survival(
         let assembly_times = Array1::from_shape_fn(CIF_REFINE_SUBINTERVALS, |s| {
             ((s + 1) as f64) / (CIF_REFINE_SUBINTERVALS as f64)
         });
-        let refined_assembled = assemble_competing_risks_cif_from_endpoints(
+        let refined_assembled = assemble_competing_risks_cif_from_endpoints_with_rounding(
             assembly_times.view(),
             &cumulative_hazard_refined,
+            &cumulative_hazard_refined_band,
         )
         .map_err(|err| err.to_string())?;
         let last = CIF_REFINE_SUBINTERVALS - 1;
@@ -3770,9 +3853,10 @@ pub fn predict_competing_risks_survival(
         }
     } else {
         let assembly_times = Array1::from_vec(refined_times.clone());
-        let refined_assembled = assemble_competing_risks_cif_from_endpoints(
+        let refined_assembled = assemble_competing_risks_cif_from_endpoints_with_rounding(
             assembly_times.view(),
             &cumulative_hazard_refined,
+            &cumulative_hazard_refined_band,
         )
         .map_err(|err| err.to_string())?;
         // Project refined CIF / overall-survival columns onto the user grid.
@@ -4657,8 +4741,23 @@ fn evaluate_rp_row(
         derivative_time_offset_row,
         primary_offset_row,
     )
+    .map(|(eta, cumulative_hazard, hazard, _)| (eta, cumulative_hazard, hazard))
 }
 
+/// `(eta, H, h, band_H)` of one Royston-Parmar row; see [`evaluate_rp_row_with_beta`].
+type RpRowEvaluation = (f64, f64, f64, f64);
+
+/// Evaluate one Royston-Parmar row: `(eta, H, h, band_H)`.
+///
+/// `band_H` bounds the rounding of `H = exp(eta)` as evaluated here, for the
+/// design row as built. `eta = Σ_j x_j β_j + (eta_time_offset + primary_offset)`
+/// is a sum of `p + 2` terms, so its forward error is at most
+/// `δ = γ_{p+2} · (Σ_j |x_j β_j| + |eta_time_offset| + |primary_offset|)`
+/// (Higham, Lemma 3.1 / inner-product bound). `exp` is faithfully rounded, a
+/// relative error below `ε`, so
+/// `|Ĥ − H| ≤ Ĥ · (expm1(δ) + ε) / (1 − ε)`.
+/// The competing-risks Aalen-Johansen assembly uses it to tell a rounding-level
+/// decrease of `H` between two evaluations from a real one (#3529).
 fn evaluate_rp_row_with_beta(
     beta: &Array1<f64>,
     saved_timewiggle: Option<&SavedBaselineTimeWiggleRuntime>,
@@ -4667,7 +4766,7 @@ fn evaluate_rp_row_with_beta(
     eta_time_offset_row: f64,
     derivative_time_offset_row: f64,
     primary_offset_row: f64,
-) -> Result<(f64, f64, f64), SurvivalPredictError> {
+) -> Result<RpRowEvaluation, SurvivalPredictError> {
     let p_time = row_time.x_exit_time.ncols();
     let p_timewiggle = saved_timewiggle.map_or(0, |runtime| runtime.beta.len());
     let p_cov = cov_row.len();
@@ -4764,7 +4863,17 @@ fn evaluate_rp_row_with_beta(
     let eta =
         predict_royston_parmar_eta(x_exit.view(), beta.view(), offset_view.view(), &likelihood)?[0];
     let (cum, haz) = royston_parmar_survival_hazard_components(eta, eta_derivative)?;
-    Ok((eta, cum, haz))
+    let eta_magnitude = x_exit
+        .row(0)
+        .iter()
+        .zip(beta.iter())
+        .map(|(x, b)| (x * b).abs())
+        .sum::<f64>()
+        + eta_time_offset_row.abs()
+        + primary_offset_row.abs();
+    let eta_band = gam_linalg::roundoff::accumulation_growth(p + 2) * eta_magnitude;
+    let cum_band = cum * (eta_band.exp_m1() + f64::EPSILON) / (1.0 - f64::EPSILON);
+    Ok((eta, cum, haz, cum_band))
 }
 
 fn predict_royston_parmar_eta<X>(
