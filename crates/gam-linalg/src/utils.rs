@@ -59,7 +59,8 @@ pub const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
 /// (largest-admissible, hence smoothest) value gives `τ₀ = floor/ln2 ≈ 1.443e-8`,
 /// so the absolute perturbation is `P·floor` — exactly the deflation floor
 /// relative to the operator's own curvature scale.
-pub(crate) const SMOOTH_PSD_CLAMP_TEMPERATURE: f64 = SPECTRAL_DEFLATION_REL_FLOOR / std::f64::consts::LN_2;
+pub(crate) const SMOOTH_PSD_CLAMP_TEMPERATURE: f64 =
+    SPECTRAL_DEFLATION_REL_FLOOR / std::f64::consts::LN_2;
 
 /// Homogeneity-preserving smooth replacement for `prefactor · max(x, 0)` on a
 /// dimensionless `x` (`prefactor ≥ 0`), at the temperature
@@ -774,27 +775,6 @@ pub fn certified_spd_inverse(
     certified_spd_factorize(matrix, label)?.inverse()
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct KahanSum {
-    sum: f64,
-    c: f64,
-}
-
-impl KahanSum {
-    #[inline]
-    pub fn add(&mut self, value: f64) {
-        let y = value - self.c;
-        let t = self.sum + y;
-        self.c = (t - self.sum) - y;
-        self.sum = t;
-    }
-
-    #[inline]
-    pub fn sum(self) -> f64 {
-        self.sum
-    }
-}
-
 pub struct StableSolver;
 
 impl StableSolver {
@@ -1380,7 +1360,6 @@ impl RankCertifiedPsdPseudoinverse {
     pub fn into_pseudoinverse(self) -> Array2<f64> {
         self.pseudoinverse
     }
-
 }
 
 /// Compute a declared rank-truncated PSD pseudoinverse from one strict,
@@ -1685,7 +1664,10 @@ mod certified_inverse_tests {
         let pseudoinverse = geometry.into_pseudoinverse();
         let expected = array![[1.0, 0.0], [0.0, 0.0]];
         for (got, want) in pseudoinverse.iter().zip(expected.iter()) {
-            assert!((got - want).abs() <= 4.0 * f64::EPSILON, "{pseudoinverse:?}");
+            assert!(
+                (got - want).abs() <= 4.0 * f64::EPSILON,
+                "{pseudoinverse:?}"
+            );
         }
         // With no declared cutoff only the rounding band is unresolved.
         let error = rank_certified_psd_pseudoinverse(&matrix, 0.0).unwrap_err();
@@ -2000,7 +1982,9 @@ mod certified_log_det_tests {
         let largest = values.iter().copied().fold(0.0_f64, f64::max);
         let dim = matrix.nrows();
         (dim * dim) as f64 * accumulation_growth(3 * dim + 1) * largest / smallest
-            + accumulation_growth(2 * dim) * dim as f64 * smallest.ln().abs().max(largest.ln().abs())
+            + accumulation_growth(2 * dim)
+                * dim as f64
+                * smallest.ln().abs().max(largest.ln().abs())
     }
 
     #[test]

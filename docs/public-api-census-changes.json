@@ -4947,5 +4947,14 @@
     },
     "reason": "#4466: the saved-model payload carried write-only mirrors (sas_param_covariance, mixture_link_param_covariance, beta_noise, slope_formulas, baseline_slopes, latent_score_contract). Predict reads the link covariance from fit_result.fitted_link, the noise coefficients from the fit's Scale block and the marginal-slope contract from slope_formula/baseline_slope/z_columns, so the mirrors could be edited or drift with no effect on any reloaded prediction. They are deleted with SavedLatentScoreContract, the struct only latent_score_contract held, and the FitResult::working_response/working_geometry accessors, which had no caller outside each other.",
     "evidence": "At 00b33efd50, git grep finds no reader of the six payload keys (beta_noise only behind a dead fallback after the fit's Scale block) outside their writers in model_payload_builders.rs, the new()/validate_numeric_finiteness boilerplate in model.rs and tests; SavedLatentScoreContract is named only in model.rs; '.working_response()' has no call site and '.working_geometry()' is called only by working_response, both in result_types.rs. stateful_saved_model_sync now asserts the SAS covariance round-trips through fit_result.fitted_link and pins 96 payload keys (the pin had also missed gaussian_sigma_floor and informational_notes)."
+  },
+  {
+    "base": "d4a58ec52168803d9123f73231e2c562953ac9cc",
+    "removed": {
+      "crates/gam-linalg/src/utils.rs::add": 1,
+      "crates/gam-linalg/src/utils.rs::sum": 1
+    },
+    "reason": "#4306: remove the KahanSum type and migrate all live consumers directly to gam_math::sparse_grid::CompensatedSum. The shared Neumaier algorithm preserves low-order bits under a larger addend and folds final compensation into the result; no compatibility wrapper or alias remains.",
+    "evidence": "Four exact cancellation/copy/reset/quadrature regressions execute against rebuilt gam-math; complete changed consumer crates and their transitive dependency metadata compile with warnings denied on MSI. Source census enumerates all direct consumers and removed declarations."
   }
 ]
