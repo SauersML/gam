@@ -310,6 +310,24 @@ impl ScadMcpPenalty {
         out
     }
 
+    /// PSD-majorizer diagonal `B(target; ρ)` (see [`Self::psd_majorizer_one`]):
+    /// the operator the frozen curvature op applies, so its diagonal and
+    /// log-determinant are read from here, never from the exact (negative in
+    /// the taper region) [`Self::diag_target`].
+    pub(crate) fn psd_majorizer_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let weight = self.resolved_weight(rho);
+        let mut out = Array1::<f64>::zeros(target.len());
+        for (i, &t) in target.iter().enumerate() {
+            out[i] = self.psd_majorizer_one(t, weight);
+        }
+        out
+    }
+
+    /// `log det(B + λI) = Σ_i log(B_ii + λ)` of the diagonal PSD majorizer `B`.
     pub fn log_det_plus_lambda_i(
         &self,
         target: ArrayView1<'_, f64>,
@@ -321,7 +339,7 @@ impl ScadMcpPenalty {
                 "ScadMcpPenalty::log_det_plus_lambda_i requires finite λ > 0; got {lambda}"
             ));
         }
-        let diag = self.diag_target(target, rho);
+        let diag = self.psd_majorizer_target(target, rho);
         let mut sum = 0.0;
         for &entry in diag.iter() {
             let shifted = lambda + entry;
@@ -378,12 +396,7 @@ impl AnalyticPenalty for ScadMcpPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        let weight = self.resolved_weight(rho);
-        let mut out = Array1::<f64>::zeros(target.len());
-        for (i, &t) in target.iter().enumerate() {
-            out[i] = self.psd_majorizer_one(t, weight);
-        }
-        Some(out)
+        Some(self.psd_majorizer_target(target, rho))
     }
 
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {

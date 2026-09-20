@@ -2098,33 +2098,50 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
+    /// The structural monotonicity rows of the score-warp or link-deviation
+    /// block; no other block is constrained. The rows come from the block's
+    /// deviation runtime, so they constrain the block only if `spec` describes
+    /// the block the solver carries and the rows have that block's width.
     fn block_linear_constraints(
         &self,
         block_states: &[ParameterBlockState],
         block_idx: usize,
         spec: &ParameterBlockSpec,
     ) -> Result<Option<ConstraintSet>, String> {
-        if block_states.len() == usize::MAX
-            || block_idx == usize::MAX
-            || spec.design.ncols() == usize::MAX
-        {
-            return Err("unreachable bernoulli marginal-slope constraint state".to_string());
+        let state = block_states.get(block_idx).ok_or_else(|| {
+            format!(
+                "bernoulli marginal-slope block constraints: block {block_idx} is out of range \
+                 for {} blocks",
+                block_states.len()
+            )
+        })?;
+        let width = spec.design.ncols();
+        if state.beta.len() != width {
+            return Err(format!(
+                "bernoulli marginal-slope block constraints: block {block_idx} carries {} \
+                 coefficients but its design has {width} columns",
+                state.beta.len()
+            ));
         }
-        if self.score_block_index().is_some_and(|idx| block_idx == idx) {
-            return Ok(self
-                .score_warp
-                .as_ref()
-                .map(DeviationRuntime::structural_monotonicity_constraints)
-                .map(ConstraintSet::Dense));
+        let runtime = if self.score_block_index() == Some(block_idx) {
+            self.score_warp.as_ref()
+        } else if self.link_block_index() == Some(block_idx) {
+            self.link_dev.as_ref()
+        } else {
+            None
+        };
+        let Some(runtime) = runtime else {
+            return Ok(None);
+        };
+        let constraints = runtime.structural_monotonicity_constraints();
+        if constraints.a.ncols() != width {
+            return Err(format!(
+                "bernoulli marginal-slope block constraints: block {block_idx}'s monotonicity \
+                 rows have {} columns but its design has {width}",
+                constraints.a.ncols()
+            ));
         }
-        if self.link_block_index().is_some_and(|idx| block_idx == idx) {
-            return Ok(self
-                .link_dev
-                .as_ref()
-                .map(DeviationRuntime::structural_monotonicity_constraints)
-                .map(ConstraintSet::Dense));
-        }
-        Ok(None)
+        Ok(Some(ConstraintSet::Dense(constraints)))
     }
 
     fn post_update_block_beta(
@@ -3008,6 +3025,38 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(out)
                 })
                 .collect();
+        }
+        // The contraction is linear in its direction. Past the row's `r` axes,
+        // contract those once and read every direction off them, `T3[d] =
+        // Σ_a d_a·T3[e_a]`, the way the rigid path reads its directions off
+        // `rigid_third_full` (gam#2922).
+        if row_dirs.len() > r {
+            let axes = (0..r)
+                .map(|axis| {
+                    let mut unit = Array1::<f64>::zeros(r);
+                    unit[axis] = 1.0;
+                    unit
+                })
+                .collect::<Vec<_>>();
+            let axis_thirds = self.row_primary_third_contracted_many_with_moments(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &axes,
+            )?;
+            return Ok(row_dirs
+                .iter()
+                .map(|dir| {
+                    let mut out = Array2::<f64>::zeros((r, r));
+                    for (&weight, third) in dir.iter().zip(&axis_thirds) {
+                        if weight != 0.0 {
+                            out.scaled_add(weight, third);
+                        }
+                    }
+                    out
+                })
+                .collect());
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
             return Err(

@@ -207,6 +207,86 @@ pub(crate) fn harmonic_degree_for_wahba_basis_width(
     Ok(degree.max(8))
 }
 
+/// Refuse a harmonic truncation degree the dense harmonic engine cannot build.
+fn validate_spherical_harmonic_degree(l_max: usize) -> Result<(), BasisError> {
+    if l_max < 1 {
+        crate::bail_invalid_basis!("spherical-harmonic max_degree must be >= 1");
+    }
+    if l_max > SPHERICAL_HARMONIC_MAX_DEGREE {
+        crate::bail_invalid_basis!(
+            "spherical-harmonic max_degree {l_max} too large; cap is {SPHERICAL_HARMONIC_MAX_DEGREE}"
+        );
+    }
+    Ok(())
+}
+
+/// Column count of the basis [`build_spherical_spline_basis`] builds from `spec`
+/// on `n_rows` rows, read without evaluating it: the one width rule, so a caller
+/// that needs a static shape (the Python `Sphere.basis_size`) asks for it
+/// instead of restating it. The harmonic engine, which the pseudo Wahba kernel
+/// routes through, spans the `L(L+2)` harmonics of degrees `1..=L`; a Wahba
+/// center basis keeps one column per center (the section `[K Z - H C | H]`
+/// splits the centers between the kernel null-space block and the low-degree
+/// harmonics). Its center count is known before selection only for
+/// caller-supplied centers and for the farthest-point selector, which returns
+/// exactly its budget (completing from a lattice when the data hold fewer
+/// distinct directions); any other strategy is refused rather than guessed. A
+/// degree or center count the builder refuses is refused here with the same
+/// error. A frozen identifiability transform returns its active column count
+/// after validating its rows against that raw basis width.
+pub fn spherical_spline_basis_width(
+    spec: &SphericalSplineBasisSpec,
+    n_rows: usize,
+) -> Result<usize, BasisError> {
+    let degree = if matches!(spec.method, SphereMethod::Harmonic) {
+        spec.max_degree.unwrap_or_else(|| {
+            default_spherical_harmonic_degree(n_rows, spec.penalty_order)
+        })
+    } else if matches!(spec.wahba_kernel, SphereWahbaKernel::Pseudo) {
+        match spec.max_degree {
+            Some(degree) => degree,
+            None => harmonic_degree_for_wahba_basis_width(spec, n_rows)?,
+        }
+    } else {
+        let centers = match realized_center_strategy(&spec.center_strategy) {
+            CenterStrategy::FarthestPoint { num_centers } => *num_centers,
+            CenterStrategy::UserProvided(centers) => centers.nrows(),
+            _ => {
+                crate::bail_invalid_basis!(
+                    "a Wahba sphere basis under this center strategy has its width fixed only \
+                     by center selection; use farthest-point or explicit centers for a static \
+                     width"
+                );
+            }
+        };
+        if centers < 2 {
+            return Err(BasisError::InsufficientColumnsForConstraint { found: centers });
+        }
+        return sphere_width_after_identifiability(spec, centers);
+    };
+    validate_spherical_harmonic_degree(degree)?;
+    sphere_width_after_identifiability(spec, degree * (degree + 2))
+}
+
+/// A frozen identifiability chart changes the builder's output column count.
+fn sphere_width_after_identifiability(
+    spec: &SphericalSplineBasisSpec,
+    raw_width: usize,
+) -> Result<usize, BasisError> {
+    match &spec.identifiability {
+        SphericalSplineIdentifiability::CenterSumToZero => Ok(raw_width),
+        SphericalSplineIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != raw_width {
+                crate::bail_dim_basis!(
+                    "frozen spherical identifiability transform mismatch: {raw_width} raw basis columns but transform has {} rows",
+                    transform.nrows()
+                );
+            }
+            Ok(transform.ncols())
+        }
+    }
+}
+
 fn real_spherical_harmonic_design_up_to_degree(
     data: ArrayView2<'_, f64>,
     max_degree: usize,
@@ -679,14 +759,7 @@ pub(crate) fn build_spherical_harmonic_basis(
     let l_max = spec
         .max_degree
         .unwrap_or_else(|| default_spherical_harmonic_degree(n, spec.penalty_order));
-    if l_max < 1 {
-        crate::bail_invalid_basis!("spherical-harmonic max_degree must be >= 1");
-    }
-    if l_max > SPHERICAL_HARMONIC_MAX_DEGREE {
-        crate::bail_invalid_basis!(
-            "spherical-harmonic max_degree {l_max} too large; cap is {SPHERICAL_HARMONIC_MAX_DEGREE}"
-        );
-    }
+    validate_spherical_harmonic_degree(l_max)?;
     if !(1..=4).contains(&spec.penalty_order) {
         crate::bail_invalid_basis!(
             "spherical-harmonic penalty_order must be one of 1, 2, 3, 4; got {}",
@@ -3433,7 +3506,6 @@ pub(crate) fn build_matern_basis_log_kappa_derivativeswithworkspace(
             )?,
         )
     } else {
-        // The helper already gates and selects the forward active operators.
         build_matern_operator_penalty_psi_derivatives(
             centers.view(),
             length_scale,
@@ -4371,6 +4443,58 @@ mod harmonic_penalty_invariants_tests {
 
 #[cfg(test)]
 mod sphere_harmonic_default_degree_tests;
+
+#[cfg(test)]
+mod width_rule_tests {
+    use super::*;
+
+    #[test]
+    fn static_sphere_width_matches_raw_and_frozen_builders() {
+        let data = Array2::from_shape_fn((40, 2), |(i,j)| {
+            if j == 0 { 70.0*(i as f64*0.73).sin() } else { 170.0*(i as f64*0.41).cos() }
+        });
+        for (method,kernel,degree) in [
+            (SphereMethod::Wahba,SphereWahbaKernel::Sobolev,None),
+            (SphereMethod::Wahba,SphereWahbaKernel::Pseudo,None),
+            (SphereMethod::Harmonic,SphereWahbaKernel::Sobolev,Some(3)),
+        ] {
+            let mut spec=SphericalSplineBasisSpec {
+                center_strategy:CenterStrategy::FarthestPoint {num_centers:20},
+                penalty_order:2,double_penalty:false,radians:false,method,
+                max_degree:degree,wahba_kernel:kernel,
+                identifiability:SphericalSplineIdentifiability::CenterSumToZero,
+                adaptive_degree:false,
+            };
+            let raw_width=spherical_spline_basis_width(&spec,data.nrows()).unwrap();
+            assert_eq!(raw_width,build_spherical_spline_basis(data.view(),&spec).unwrap().design.ncols());
+            let transform=Array2::from_shape_fn((raw_width,5),|(i,j)| if i==j {1.0}else{0.0});
+            spec.identifiability=SphericalSplineIdentifiability::FrozenTransform {transform};
+            assert_eq!(spherical_spline_basis_width(&spec,data.nrows()).unwrap(),5);
+            assert_eq!(build_spherical_spline_basis(data.view(),&spec).unwrap().design.ncols(),5);
+            spec.identifiability=SphericalSplineIdentifiability::FrozenTransform {transform:Array2::zeros((raw_width+1,5))};
+            assert!(spherical_spline_basis_width(&spec,data.nrows()).is_err());
+            assert!(build_spherical_spline_basis(data.view(),&spec).is_err());
+        }
+    }
+
+    #[test]
+    fn static_sphere_width_refuses_unsupported_degrees_and_center_counts() {
+        let mut spec=SphericalSplineBasisSpec::default();
+        spec.method=SphereMethod::Harmonic;
+        for degree in [0,33,50] {
+            spec.max_degree=Some(degree);
+            assert!(spherical_spline_basis_width(&spec,40).is_err());
+        }
+        spec.method=SphereMethod::Wahba;
+        spec.wahba_kernel=SphereWahbaKernel::Sobolev;
+        spec.max_degree=None;
+        spec.center_strategy=CenterStrategy::FarthestPoint {num_centers:1};
+        assert!(spherical_spline_basis_width(&spec,40).is_err());
+        spec.wahba_kernel=SphereWahbaKernel::Pseudo;
+        spec.center_strategy=CenterStrategy::FarthestPoint {num_centers:1089};
+        assert!(spherical_spline_basis_width(&spec,40).is_err());
+    }
+}
 
 #[cfg(test)]
 mod matern_rough_kernel_log_kappa_alignment_tests {
