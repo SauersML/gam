@@ -66,6 +66,32 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
+    /// Score pullback of the absorbed-influence block (#461). Unlike the identity
+    /// flex blocks, the absorber's `p₁` coefficients enter through the single
+    /// `o_infl` primary scalar with row design `Z̃_infl[row,:]`, so the block score
+    /// is `primary[infl] · Z̃[row,:]` (the same projection `add_pullback` applies
+    /// to the Hessian and `accumulate_dynamic_q_blockwise_row` to the gradient).
+    pub(crate) fn accumulate_score_influence_block(
+        &self,
+        primary_layout: Option<&FlexPrimarySlices>,
+        row: usize,
+        primary: &Array1<f64>,
+        score_i: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let Some(infl_idx) = primary_layout.and_then(|layout| layout.infl) else {
+            return Ok(());
+        };
+        let z_tilde = self.influence_absorber.as_ref().ok_or_else(|| {
+            "accumulate_score_influence_block: influence primary index present but no Z̃ design"
+                .to_string()
+        })?;
+        let weight = primary[infl_idx];
+        if weight != 0.0 {
+            score_i.scaled_add(weight, &z_tilde.row(row));
+        }
+        Ok(())
+    }
+
     /// Score pullback using actual Jacobians from q-geometry (timewiggle-correct).
     pub(crate) fn accumulate_score_with_q_geometry<Storage>(
         &self,
@@ -191,6 +217,7 @@ impl SurvivalMarginalSlopeFamily {
             Array1<f64>,             // score_g
             Array1<f64>,             // score_h
             Array1<f64>,             // score_w
+            Array1<f64>,             // score_i (absorbed influence)
             BlockHessianAccumulator, // Hessian blocks
         );
         let make_acc = || -> Acc {
@@ -201,6 +228,7 @@ impl SurvivalMarginalSlopeFamily {
                 Array1::zeros(p_g),
                 Array1::zeros(p_h),
                 Array1::zeros(p_w),
+                Array1::zeros(p_i),
                 BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
             )
         };
@@ -209,7 +237,7 @@ impl SurvivalMarginalSlopeFamily {
         let row_weights = outer_row_weights_by_index(options, self.n);
         // Process fixed row chunks in parallel and merge local cross-block
         // accumulators in row-chunk order for deterministic timewiggle assembly.
-        let (objective_psi, score_t, score_m, score_g, score_h, score_w, acc) =
+        let (objective_psi, score_t, score_m, score_g, score_h, score_w, score_i, acc) =
             chunked_row_reduction(
                 row_iter.as_slice(),
                 make_acc,
@@ -271,12 +299,18 @@ impl SurvivalMarginalSlopeFamily {
                         Some(&mut a.4),
                         Some(&mut a.5),
                     );
+                    self.accumulate_score_influence_block(
+                        flex_primary.as_ref(),
+                        row,
+                        &pb,
+                        &mut a.6,
+                    )?;
 
                     for (loading, design_row) in channels.channels() {
                         let right_primary = f_pipi.dot(loading);
-                        a.6.add_rank1_psi_cross(self, row, block_idx, design_row, &right_primary)?;
+                        a.7.add_rank1_psi_cross(self, row, block_idx, design_row, &right_primary)?;
                     }
-                    a.6.add_pullback(self, row, &third)?;
+                    a.7.add_pullback(self, row, &third)?;
 
                     Ok(())
                 },
@@ -287,7 +321,8 @@ impl SurvivalMarginalSlopeFamily {
                     total.3 += &chunk.3;
                     total.4 += &chunk.4;
                     total.5 += &chunk.5;
-                    total.6.add(&chunk.6);
+                    total.6 += &chunk.6;
+                    total.7.add(&chunk.7);
                 },
             )?;
 
@@ -307,6 +342,9 @@ impl SurvivalMarginalSlopeFamily {
         }
         if let Some(range) = slices.link_dev.as_ref() {
             score_psi.slice_mut(s![range.clone()]).assign(&score_w);
+        }
+        if let Some(range) = slices.influence.as_ref() {
+            score_psi.slice_mut(s![range.clone()]).assign(&score_i);
         }
 
         Ok(Some(ExactNewtonJointPsiTerms {
@@ -714,6 +752,7 @@ impl SurvivalMarginalSlopeFamily {
             score_g: Array1<f64>,
             score_h: Array1<f64>,
             score_w: Array1<f64>,
+            score_i: Array1<f64>,
             hessian: BlockHessianAccumulator,
         }
         let make_acc = || -> JointPsiSecondOrderAcc {
@@ -724,6 +763,7 @@ impl SurvivalMarginalSlopeFamily {
                 score_g: Array1::zeros(p_g),
                 score_h: Array1::zeros(p_h),
                 score_w: Array1::zeros(p_w),
+                score_i: Array1::zeros(p_i),
                 hessian: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
             }
         };
@@ -739,6 +779,7 @@ impl SurvivalMarginalSlopeFamily {
             score_g,
             score_h,
             score_w,
+            score_i,
             hessian,
         } = chunked_row_reduction(
             row_iter.as_slice(),
@@ -858,6 +899,12 @@ impl SurvivalMarginalSlopeFamily {
                     Some(&mut a.score_h),
                     Some(&mut a.score_w),
                 );
+                self.accumulate_score_influence_block(
+                    flex_primary.as_ref(),
+                    row,
+                    &pb1,
+                    &mut a.score_i,
+                )?;
                 let pb2 = third_i.dot(&dir_j);
                 self.accumulate_score_blockwise(
                     row,
@@ -872,6 +919,12 @@ impl SurvivalMarginalSlopeFamily {
                     Some(&mut a.score_h),
                     Some(&mut a.score_w),
                 );
+                self.accumulate_score_influence_block(
+                    flex_primary.as_ref(),
+                    row,
+                    &pb2,
+                    &mut a.score_i,
+                )?;
 
                 // Hessian
                 if let Some(channels) = channels_ij.as_ref() {
@@ -924,6 +977,7 @@ impl SurvivalMarginalSlopeFamily {
                 total.score_g += &chunk.score_g;
                 total.score_h += &chunk.score_h;
                 total.score_w += &chunk.score_w;
+                total.score_i += &chunk.score_i;
                 total.hessian.add(&chunk.hessian);
             },
         )?;
@@ -943,6 +997,9 @@ impl SurvivalMarginalSlopeFamily {
         }
         if let Some(range) = slices.link_dev.as_ref() {
             score_psi_psi.slice_mut(s![range.clone()]).assign(&score_w);
+        }
+        if let Some(range) = slices.influence.as_ref() {
+            score_psi_psi.slice_mut(s![range.clone()]).assign(&score_i);
         }
 
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {

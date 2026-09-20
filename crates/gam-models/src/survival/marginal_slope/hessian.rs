@@ -723,6 +723,30 @@ impl BlockHessianAccumulator {
                 }
             }
         }
+        // Block (psi, influence): the absorbed-influence coefficients (#461)
+        // enter through the single `o_infl` primary with row design
+        // `Z̃_infl[row,:]`, exactly as `add_pullback` projects them, so the
+        // cross is `right_primary[infl] · psi_row ⊗ Z̃[row,:]`.
+        if let Some(infl_idx) = primary.infl {
+            let alpha = right_primary[infl_idx];
+            if alpha != 0.0 {
+                let z_tilde = family.influence_absorber.as_ref().ok_or_else(|| {
+                    "add_rank1_psi_cross: influence primary index present but no Z̃ design"
+                        .to_string()
+                })?;
+                let target = match psi_block {
+                    PsiBlock::Marginal => &mut self.h_mi,
+                    PsiBlock::Slope => &mut self.h_gi,
+                };
+                ndarray::linalg::general_mat_mul(
+                    alpha,
+                    &psi_col,
+                    &z_tilde.row(row).insert_axis(Axis(0)),
+                    1.0,
+                    target,
+                );
+            }
+        }
         Ok(())
     }
 
