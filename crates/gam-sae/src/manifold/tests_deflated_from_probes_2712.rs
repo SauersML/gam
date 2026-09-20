@@ -32,6 +32,7 @@ use super::tests::{gamma_fd_tiny_fixture, small_two_atom_periodic_term};
 use super::tests_recovery_split_780::{
     FdAnchorCandidate, FdAnchorRegime, certified_fd_anchor, rho_ladder_family, sparse_lift_ladder,
 };
+use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
 use super::*;
 
 /// The cold, genuinely indefinite two-atom softmax state, where

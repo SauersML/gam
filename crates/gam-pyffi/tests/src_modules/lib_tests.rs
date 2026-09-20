@@ -176,9 +176,8 @@ fn sae_fit_seed_construction_stays_in_gam_sae_2236() {
         "term_from_padded_blocks_with_mode(",
         "build_sae_basis_evaluators(",
         "seed_reconstruction_dispersion(",
-        "SaeManifoldRho::new_shared_ard(",
+        "SaeManifoldRho::new(",
         "base_term.set_fit_config(",
-        "const SAE_SHARED_ARD_K_THRESHOLD",
     ];
     let hits = forbidden_orchestration
         .into_iter()

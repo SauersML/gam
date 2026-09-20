@@ -992,84 +992,6 @@ fn analytic_penalty_objective_contribution(
     Ok(LatentIdObjectiveContribution { cost, gradient })
 }
 
-fn add_analytic_penalty_hessian_to_eval(
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    latent: &gam_terms::latent::LatentCoordValues,
-    registry: &gam_terms::AnalyticPenaltyRegistry,
-    eval: &mut (f64, Array1<f64>, gam_problem::HessianValue),
-) -> Result<(), EstimationError> {
-    let flat_len = latent.len();
-    let t_start = rho_dim;
-    let t_end = t_start + flat_len;
-    let rho_start = t_end;
-    let rho_end = rho_start + registry.total_rho_count();
-    if theta.len() < rho_end {
-        crate::bail_invalid_estim!(
-            "latent-coordinate theta too short for analytic penalty Hessian: got {}, need at least {}",
-            theta.len(),
-            rho_end
-        );
-    }
-    let gam_problem::HessianValue::Dense(hessian) = &mut eval.2 else {
-        if eval.2.is_analytic() {
-            eval.2 = gam_problem::HessianValue::Unavailable;
-        }
-        return Ok(());
-    };
-    if hessian.dim() != (theta.len(), theta.len()) {
-        crate::bail_invalid_estim!(
-            "analytic penalty Hessian target shape mismatch: got {}x{}, expected {}x{}",
-            hessian.nrows(),
-            hessian.ncols(),
-            theta.len(),
-            theta.len()
-        );
-    }
-    let target_t = theta.slice(s![t_start..t_end]);
-    let rho = theta.slice(s![rho_start..rho_end]);
-    registry
-        .validate_rho(rho)
-        .map_err(EstimationError::InvalidInput)?;
-    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
-    {
-        let rho_local = rho.slice(s![rho_slice]);
-        if !matches!(tier, gam_terms::PenaltyTier::Psi) {
-            continue;
-        }
-        if let Some(diag) = penalty.hessian_diag(target_t.view(), rho_local) {
-            if diag.len() != flat_len {
-                crate::bail_invalid_estim!(
-                    "analytic penalty Hessian diagonal length mismatch: got {}, expected {}",
-                    diag.len(),
-                    flat_len
-                );
-            }
-            for i in 0..flat_len {
-                hessian[[t_start + i, t_start + i]] += diag[i];
-            }
-            continue;
-        }
-        let mut probe = Array1::<f64>::zeros(flat_len);
-        for col in 0..flat_len {
-            probe[col] = 1.0;
-            let hv = penalty.hvp(target_t.view(), rho_local, probe.view());
-            if hv.len() != flat_len {
-                crate::bail_invalid_estim!(
-                    "analytic penalty Hessian-vector length mismatch: got {}, expected {}",
-                    hv.len(),
-                    flat_len
-                );
-            }
-            for row in 0..flat_len {
-                hessian[[t_start + row, t_start + col]] += hv[row];
-            }
-            probe[col] = 0.0;
-        }
-    }
-    Ok(())
-}
-
 fn add_analytic_penalty_objective_to_eval(
     theta: &Array1<f64>,
     rho_dim: usize,
@@ -1087,7 +1009,14 @@ fn add_analytic_penalty_objective_to_eval(
         );
     }
     eval.1 += &contribution.gradient;
-    add_analytic_penalty_hessian_to_eval(theta, rho_dim, latent, registry, eval)?;
+    // The penalty's second derivative is not assembled here: `hessian_diag` is
+    // the exact diagonal even for penalties whose Hessian is dense, and the
+    // t-rho / rho-rho blocks of learnable penalty rho have no trait API. The
+    // latent joint problem is declared gradient-only, so an analytic Hessian
+    // from the REML core no longer describes this objective.
+    if eval.2.is_analytic() {
+        eval.2 = gam_problem::HessianValue::Unavailable;
+    }
     Ok(())
 }
 

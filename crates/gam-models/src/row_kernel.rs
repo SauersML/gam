@@ -1767,7 +1767,9 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         if rank == 0 || n_rows == 0 {
             return 0.0;
         }
-        if jf_projection_exceeds_budget::<K>(n_rows, rank) {
+        // A subsample walks only its stored rows, weighted, through the tiled
+        // walk; the whole-projection path is the full-data `RowSet::All` form.
+        if !matches!(self.rows, RowSet::All) || jf_projection_exceeds_budget::<K>(n_rows, rank) {
             return self.trace_projected_factor_tiled(factor);
         }
         let jf = self.compute_jf(factor);
@@ -1793,7 +1795,9 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         if rank == 0 || n_rows == 0 {
             return 0.0;
         }
-        if jf_projection_exceeds_budget::<K>(n_rows, rank) {
+        // A subsample walks only its stored rows, weighted, through the tiled
+        // walk; the whole-projection path is the full-data `RowSet::All` form.
+        if !matches!(self.rows, RowSet::All) || jf_projection_exceeds_budget::<K>(n_rows, rank) {
             return self.trace_projected_factor_tiled(factor);
         }
         let jf = self.cached_jf(factor, cache);
@@ -2077,37 +2081,38 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
         })
     }
 
-    /// Memory-bounded trace for large-scale shapes — the block-tiled form of
-    /// [`Self::trace_projected_factor_with_jf`] computing the identical
-    /// `tr(FᵀBF) = Σ_r Σ_k (Jᵣ·F[:,k])ᵀ Tᵣ (Jᵣ·F[:,k])`. Rather than build and
-    /// cache the whole `n × K·rank` projection, it walks contiguous row-tiles:
-    /// each tile's `J·F` slice is produced by the same structured BLAS-3 GEMM
-    /// ([`RowKernel::jacobian_action_matrix_rows`]), consumed immediately by the
-    /// per-row jet contraction, then dropped — so peak memory is one tile
-    /// (≤ [`JF_TILE_BUDGET_BYTES`]) regardless of `n`, while the GEMM throughput
-    /// and cache-blocking of the fast path are preserved. Tiles are a multiple
-    /// of [`ARROW_ROW_CHUNK`] and summed in order, so the result is
-    /// associatively identical to the whole-projection path.
+    /// Memory-bounded trace over the operator's [`RowSet`] — the block-tiled
+    /// form of `tr(FᵀBF) = Σ_r w_r Σ_k (Jᵣ·F[:,k])ᵀ Tᵣ (Jᵣ·F[:,k])`, summed over
+    /// the walk positions of `self.rows` with each row's Horvitz–Thompson
+    /// weight `w_r` (1 under `RowSet::All`). Rather than build and cache the
+    /// whole `n × K·rank` projection, it walks contiguous position tiles: each
+    /// tile's `J·F` slice is produced by the same structured BLAS-3 GEMM
+    /// ([`row_set_jacobian_tile`]), consumed immediately by the per-row jet
+    /// contraction, then dropped — so peak memory is one tile
+    /// (≤ [`JF_TILE_BUDGET_BYTES`]) regardless of `n`. Tiles are a multiple of
+    /// [`ARROW_ROW_CHUNK`] and summed in order, so under `RowSet::All` the
+    /// result is associatively identical to the whole-projection
+    /// [`Self::trace_projected_factor_with_jf`].
     fn trace_projected_factor_tiled(&self, factor: &Array2<f64>) -> f64 {
         let rank = factor.ncols();
-        let n_rows = self.kern.n_rows();
+        let n_walk = self.rows.walk_len(self.kern.n_rows());
         let direction = self.direction.as_slice();
         let tile = jf_tile_rows::<K>(rank);
 
         let mut total = 0.0_f64;
         let mut tile_start = 0;
-        while tile_start < n_rows {
-            let tile_end = (tile_start + tile).min(n_rows);
-            let jf = self
-                .kern
-                .jacobian_action_matrix_rows(factor.view(), tile_start, tile_end);
+        while tile_start < n_walk {
+            let tile_end = (tile_start + tile).min(n_walk);
             let b = tile_end - tile_start;
+            let jf =
+                row_set_jacobian_tile(&*self.kern, &self.rows, factor.view(), tile_start, tile_end);
+            assert_eq!(jf.dim(), (b, K * rank), "row-kernel J·F tile shape");
             total += deterministic_chunked_sum(b, |chunk_idx| -> f64 {
                 let start = chunk_idx * ARROW_ROW_CHUNK;
                 let end = (start + ARROW_ROW_CHUNK).min(b);
                 let mut chunk_total = 0.0_f64;
                 for local in start..end {
-                    let row = tile_start + local;
+                    let (row, weight) = self.rows.row_at(tile_start + local);
                     let dir_k = self.kern.jacobian_action(row, direction);
                     let third = self.kern.row_third_contracted(row, &dir_k).expect(
                         "row-kernel third contraction should succeed for validated directions",
@@ -2132,7 +2137,7 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
                         }
                         row_total += quad;
                     }
-                    chunk_total += row_total;
+                    chunk_total += weight * row_total;
                 }
                 chunk_total
             });
@@ -2207,7 +2212,9 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         if rank == 0 || n_rows == 0 {
             return 0.0;
         }
-        if jf_projection_exceeds_budget::<K>(n_rows, rank) {
+        // A subsample walks only its stored rows, weighted, through the tiled
+        // walk; the whole-projection path is the full-data `RowSet::All` form.
+        if !matches!(self.rows, RowSet::All) || jf_projection_exceeds_budget::<K>(n_rows, rank) {
             return self.trace_projected_factor_tiled(factor);
         }
         let jf = self.compute_jf(factor);
@@ -2228,7 +2235,9 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         if rank == 0 || n_rows == 0 {
             return 0.0;
         }
-        if jf_projection_exceeds_budget::<K>(n_rows, rank) {
+        // A subsample walks only its stored rows, weighted, through the tiled
+        // walk; the whole-projection path is the full-data `RowSet::All` form.
+        if !matches!(self.rows, RowSet::All) || jf_projection_exceeds_budget::<K>(n_rows, rank) {
             return self.trace_projected_factor_tiled(factor);
         }
         let jf = self.cached_jf(factor, cache);
@@ -2318,35 +2327,38 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
         })
     }
 
-    /// Memory-bounded trace — second-derivative analogue of
+    /// Memory-bounded trace over the operator's [`RowSet`] — second-derivative
+    /// analogue of
     /// [`RowKernelDirectionalDerivativeOperator::trace_projected_factor_tiled`].
-    /// Walks contiguous row-tiles, producing each tile's `J·F` slice by the
-    /// structured BLAS-3 GEMM ([`RowKernel::jacobian_action_matrix_rows`]) and
-    /// consuming it with the per-row `row_fourth_contracted` jet before
-    /// dropping it. Peak memory one tile (≤ [`JF_TILE_BUDGET_BYTES`]); tiles are
-    /// a multiple of [`ARROW_ROW_CHUNK`] and summed in order, so the result is
-    /// associatively identical to the whole-projection path.
+    /// Walks contiguous position tiles of `self.rows`, producing each tile's
+    /// `J·F` slice by the structured BLAS-3 GEMM ([`row_set_jacobian_tile`])
+    /// and consuming it with the per-row `row_fourth_contracted` jet, scaled by
+    /// the row's Horvitz–Thompson weight, before dropping it. Peak memory one
+    /// tile (≤ [`JF_TILE_BUDGET_BYTES`]); tiles are a multiple of
+    /// [`ARROW_ROW_CHUNK`] and summed in order, so under `RowSet::All` the
+    /// result is associatively identical to the whole-projection
+    /// [`Self::trace_projected_factor_with_jf`].
     fn trace_projected_factor_tiled(&self, factor: &Array2<f64>) -> f64 {
         let rank = factor.ncols();
-        let n_rows = self.kern.n_rows();
+        let n_walk = self.rows.walk_len(self.kern.n_rows());
         let direction_u = self.direction_u.as_slice();
         let direction_v = self.direction_v.as_slice();
         let tile = jf_tile_rows::<K>(rank);
 
         let mut total = 0.0_f64;
         let mut tile_start = 0;
-        while tile_start < n_rows {
-            let tile_end = (tile_start + tile).min(n_rows);
-            let jf = self
-                .kern
-                .jacobian_action_matrix_rows(factor.view(), tile_start, tile_end);
+        while tile_start < n_walk {
+            let tile_end = (tile_start + tile).min(n_walk);
             let b = tile_end - tile_start;
+            let jf =
+                row_set_jacobian_tile(&*self.kern, &self.rows, factor.view(), tile_start, tile_end);
+            assert_eq!(jf.dim(), (b, K * rank), "row-kernel J·F tile shape");
             total += deterministic_chunked_sum(b, |chunk_idx| -> f64 {
                 let start = chunk_idx * ARROW_ROW_CHUNK;
                 let end = (start + ARROW_ROW_CHUNK).min(b);
                 let mut chunk_total = 0.0_f64;
                 for local in start..end {
-                    let row = tile_start + local;
+                    let (row, weight) = self.rows.row_at(tile_start + local);
                     let dir_u = self.kern.jacobian_action(row, direction_u);
                     let dir_v = self.kern.jacobian_action(row, direction_v);
                     let fourth = self.kern.row_fourth_contracted(row, &dir_u, &dir_v).expect(
@@ -2372,7 +2384,7 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
                         }
                         row_total += quad;
                     }
-                    chunk_total += row_total;
+                    chunk_total += weight * row_total;
                 }
                 chunk_total
             });
@@ -3042,6 +3054,70 @@ mod gram_inner_contraction_tests {
             rel2_cached < 1e-10,
             "second-derivative cached Gram path drifted: rel={rel2_cached:.3e} got={got2_cached} ref={ref2}",
         );
+    }
+
+    /// Under a Horvitz–Thompson subsample the trace channels must estimate the
+    /// same weighted drift the operator's dense form materializes (#3716):
+    /// `tr(Fᵀ·B·F)` with `B = Σ_{r∈S} w_r J_rᵀ T_r J_r`, not the full-data sum.
+    #[test]
+    fn gram_inner_contraction_walks_weighted_subsample() {
+        let n = 32;
+        let p = 11;
+        let rank = 7;
+        let kern = Arc::new(SyntheticKernel::new(n, p, 0xC0FFEE));
+        let rows = crate::test_support::row_set_overrides::weighted_subsample(n);
+
+        let mut s = 0xFACADE_u64;
+        let mut next = || -> f64 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as f64 / (u32::MAX as f64)) - 0.5
+        };
+        let direction: Vec<f64> = (0..p).map(|_| next()).collect();
+        let direction_u: Vec<f64> = (0..p).map(|_| next()).collect();
+        let direction_v: Vec<f64> = (0..p).map(|_| next()).collect();
+        let factor = Array2::from_shape_fn((p, rank), |_| next());
+        let dense_trace =
+            |dense: Array2<f64>| -> f64 { factor.t().dot(&dense.dot(&factor)).diag().sum() };
+
+        let op1 = RowKernelDirectionalDerivativeOperator {
+            kern: Arc::clone(&kern),
+            direction,
+            p,
+            rows: rows.clone(),
+        };
+        let op2 = RowKernelSecondDirectionalDerivativeOperator {
+            kern: Arc::clone(&kern),
+            direction_u,
+            direction_v,
+            p,
+            rows,
+        };
+        let cases = [
+            (
+                "first",
+                HyperOperator::trace_projected_factor(&op1, &factor),
+                op1.trace_projected_factor_cached(&factor, &ProjectedFactorCache::default()),
+                dense_trace(HyperOperator::to_dense(&op1)),
+            ),
+            (
+                "second",
+                HyperOperator::trace_projected_factor(&op2, &factor),
+                op2.trace_projected_factor_cached(&factor, &ProjectedFactorCache::default()),
+                dense_trace(HyperOperator::to_dense(&op2)),
+            ),
+        ];
+        for (order, uncached, cached, reference) in cases {
+            for (path, got) in [("uncached", uncached), ("cached", cached)] {
+                let rel = (got - reference).abs() / reference.abs().max(1e-12);
+                assert!(
+                    rel < 1e-10,
+                    "{order}-derivative {path} subsample trace drifted from its dense form: \
+                     rel={rel:.3e} got={got} dense={reference}",
+                );
+            }
+        }
     }
 
     // ── #979: all-axes Jeffreys directional derivative is BUILD-ONCE + exact ──

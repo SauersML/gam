@@ -310,6 +310,41 @@ pub(super) fn reject_too_few_rows_for_formula(
     })
 }
 
+/// Refuse precision hyperpriors and coefficient groups on a model class whose
+/// fit request has no place for them.
+///
+/// `FitConfig::penalty_block_gamma_priors` (the frontends' `precision_hyperpriors`)
+/// is realized only by the standard fit and by the survival
+/// transformation/Weibull fit. `FitConfig::coefficient_groups` is realized only
+/// by the standard fit. Every other materializer builds a request without these
+/// fields, so without this check the fit would run with the default flat
+/// smoothing-parameter prior while the caller believes the requested prior was
+/// used.
+pub(super) fn reject_unrealized_precision_priors(
+    config: &FitConfig,
+    model: &str,
+    realizes_penalty_block_priors: bool,
+) -> Result<(), WorkflowError> {
+    if !realizes_penalty_block_priors && !config.penalty_block_gamma_priors.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "precision_hyperpriors is not supported for {model}: only standard and \
+                 survival transformation/weibull fits realize penalty-block Gamma priors, \
+                 so this fit would ignore them"
+            ),
+        });
+    }
+    if !config.coefficient_groups.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "coefficient_groups is not supported for {model}: only standard fits \
+                 realize coefficient groups, so this fit would ignore them"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Detect whether a response column is binary (0/1 only).
 pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     if y.is_empty() {
@@ -317,6 +352,36 @@ pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     }
     // Exact membership: a value near 0 or 1 is not an outcome.
     y.iter().all(|&v| v == 0.0 || v == 1.0)
+}
+
+/// Judge the response column against the family's support and degeneracy
+/// rules over the rows that enter the likelihood (positive prior weight).
+///
+/// Both rules are owned by [`ResponseFamily`] so the formula materializers
+/// and the external-design path share one definition; this adapter only
+/// attaches the column name and routes the violation to
+/// [`WorkflowError::InvalidData`], the data-error class, because the fault is
+/// in the supplied values rather than in the model configuration.
+pub(super) fn validate_response_against_family(
+    family: &LikelihoodSpec,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    response: &str,
+) -> Result<(), WorkflowError> {
+    family
+        .response
+        .validate_response_support(y, weights)
+        .map_err(|violation| WorkflowError::InvalidData {
+            column: response.to_string(),
+            problem: violation.problem(),
+        })?;
+    family
+        .response
+        .validate_response_degeneracy(y, weights)
+        .map_err(|degeneracy| WorkflowError::InvalidData {
+            column: response.to_string(),
+            problem: degeneracy.problem(),
+        })
 }
 
 #[cfg(test)]

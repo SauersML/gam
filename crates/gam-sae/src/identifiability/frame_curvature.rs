@@ -906,8 +906,9 @@ pub struct StreamedLambdaMax {
     /// Rayleigh quotient of an explicit vector, hence a LOWER bound on the true
     /// `λ_max` up to the solve's own rounding.
     pub lambda_max: f64,
-    /// `β_k·|e_kᵀy|` for the returned pair, relative to `max(λ_max, 1)` — the
-    /// sharp Ritz residual the solve certified against.
+    /// `β_k·|e_kᵀy|` for the returned pair, relative to `λ_max` — the sharp Ritz
+    /// residual the solve certified against (#3784: no unit floor, which would
+    /// report an absolute residual for a curvature carried in small units).
     pub relative_residual: f64,
     /// `tr(H)`, the rigorous PSD upper bound `λ_max` was checked against.
     pub trace: f64,
@@ -1060,10 +1061,17 @@ pub fn streamed_lambda_max(
             operator.root_rows(),
         ));
     }
+    // The solve certified `residual / |θ|` against the unclamped Ritz value, so
+    // the reported ratio is read off that same `|θ|`, never off the clamp.
+    let relative_residual = if residual == 0.0 {
+        0.0
+    } else {
+        residual / lambda_max.abs()
+    };
     let lambda_max = lambda_max.clamp(0.0, trace);
     Ok(StreamedLambdaMax {
         lambda_max,
-        relative_residual: residual / lambda_max.max(1.0),
+        relative_residual,
         trace,
         passes: matvecs + 1,
     })

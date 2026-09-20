@@ -48,14 +48,12 @@ pub enum DispersionError {
     NegativeEstimate { phi: f64 },
     #[error("zero estimated dispersion has no finite reciprocal")]
     ZeroHasNoReciprocal,
-    #[error("the reciprocal of dispersion phi={phi} is not representable as a finite f64")]
-    ReciprocalNotRepresentable { phi: f64 },
-    #[error("dispersion multiplier must be finite and strictly positive, got {multiplier}")]
-    InvalidMultiplier { multiplier: f64 },
+    #[error("the reciprocal of {value} is not representable as a finite nonzero f64")]
+    ReciprocalNotRepresentable { value: f64 },
     #[error(
-        "rescaling dispersion phi={phi} by multiplier={multiplier} is not representable as a finite f64"
+        "a dispersion reciprocal (precision/shape) must be finite and strictly positive, got {value}"
     )]
-    RescaleNotRepresentable { phi: f64, multiplier: f64 },
+    InvalidReciprocalSource { value: f64 },
 }
 
 impl Dispersion {
@@ -105,18 +103,17 @@ impl Dispersion {
     /// Construct a dispersion from a finite positive precision/shape.
     ///
     /// This checks the division itself; a positive subnormal denominator whose
-    /// reciprocal overflows is rejected instead of being floored.
+    /// reciprocal overflows is rejected instead of being floored. A non-finite
+    /// or non-positive `value` is reported as a bad precision/shape, never as a
+    /// bad dispersion: `value` is not `phi`.
     #[inline]
     pub fn from_reciprocal(value: f64, estimated: bool) -> Result<Self, DispersionError> {
-        if !value.is_finite() {
-            return Err(DispersionError::NonFinite { phi: value });
-        }
-        if value <= 0.0 {
-            return Err(DispersionError::NonPositiveKnown { phi: value });
+        if !(value.is_finite() && value > 0.0) {
+            return Err(DispersionError::InvalidReciprocalSource { value });
         }
         let phi = 1.0 / value;
         if !phi.is_finite() || phi == 0.0 {
-            return Err(DispersionError::ReciprocalNotRepresentable { phi: value });
+            return Err(DispersionError::ReciprocalNotRepresentable { value });
         }
         if estimated {
             Self::estimated(phi)
@@ -149,7 +146,7 @@ impl Dispersion {
         }
         let reciprocal = 1.0 / self.phi;
         if !reciprocal.is_finite() {
-            return Err(DispersionError::ReciprocalNotRepresentable { phi: self.phi });
+            return Err(DispersionError::ReciprocalNotRepresentable { value: self.phi });
         }
         Ok(reciprocal)
     }
@@ -159,7 +156,6 @@ impl Dispersion {
     pub fn sqrt(self) -> f64 {
         self.phi.sqrt()
     }
-
 }
 
 impl From<Dispersion> for DispersionWire {
@@ -208,6 +204,33 @@ mod tests {
         assert_eq!(
             Dispersion::ZERO_ESTIMATE.reciprocal(),
             Err(DispersionError::ZeroHasNoReciprocal)
+        );
+    }
+
+    #[test]
+    fn from_reciprocal_reports_the_precision_not_a_dispersion() {
+        let estimated = Dispersion::from_reciprocal(4.0, true).unwrap();
+        assert_eq!(estimated.phi(), 0.25);
+        assert!(estimated.is_estimated());
+        assert!(
+            !Dispersion::from_reciprocal(4.0, false)
+                .unwrap()
+                .is_estimated()
+        );
+        for bad in [0.0, -2.0, f64::NAN, f64::INFINITY] {
+            for estimated in [true, false] {
+                let err = Dispersion::from_reciprocal(bad, estimated).unwrap_err();
+                assert!(
+                    matches!(err, DispersionError::InvalidReciprocalSource { .. }),
+                    "value={bad}, estimated={estimated}: {err:?}"
+                );
+                assert!(err.to_string().contains("precision/shape"));
+            }
+        }
+        let tiny = f64::from_bits(1);
+        assert_eq!(
+            Dispersion::from_reciprocal(tiny, true).unwrap_err(),
+            DispersionError::ReciprocalNotRepresentable { value: tiny }
         );
     }
 
