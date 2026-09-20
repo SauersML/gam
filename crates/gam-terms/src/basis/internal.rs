@@ -302,13 +302,15 @@ pub(crate) fn evaluate_spline_local_values(
     knots: ArrayView1<f64>,
     scratch: &mut BsplineScratch,
 ) -> (usize, usize) {
+    let knots = knots
+        .as_slice()
+        .expect("B-spline knot vector is contiguous");
     let num_knots = knots.len();
     let num_basis = num_knots - degree - 1;
 
+    // Every `left`, `right` and `n` entry the recursion reads is written earlier
+    // in the same call, so the scratch needs no clearing between points.
     scratch.ensure_degree(degree);
-    scratch.n.fill(0.0);
-    scratch.left.fill(0.0);
-    scratch.right.fill(0.0);
 
     let x_eval = x.clamp(knots[degree], knots[num_basis]);
 
@@ -323,16 +325,13 @@ pub(crate) fn evaluate_spline_local_values(
             // The loop counts how many of knots[degree+1..=num_basis] are
             // `<= x_eval`, so `partition_point(|&k| k <= x_eval)` on that
             // slice gives the same offset from `degree`.
-            let slice = knots
-                .as_slice()
-                .expect("B-spline knot vector is contiguous");
-            degree + slice[degree + 1..=num_basis].partition_point(|&k| k <= x_eval)
+            degree + knots[degree + 1..=num_basis].partition_point(|&k| k <= x_eval)
         }
     };
 
-    let left = &mut scratch.left;
-    let right = &mut scratch.right;
-    let n = &mut scratch.n;
+    let left = &mut scratch.left[..=degree];
+    let right = &mut scratch.right[..=degree];
+    let n = &mut scratch.n[..=degree];
 
     n[0] = 1.0;
 

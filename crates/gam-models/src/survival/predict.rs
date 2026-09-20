@@ -38,7 +38,7 @@ use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::survival::{CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints};
 use crate::wiggle::monotone_wiggle_basis_with_derivative_order;
 use gam_linalg::matrix::DesignMatrix;
-use gam_math::probability::{normal_cdf, normal_pdf};
+use gam_math::probability::normal_pdf;
 use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam_solve::mixture_link::inverse_link_jet_for_inverse_link;
 use gam_terms::smooth::TermCollectionSpec;
@@ -122,6 +122,12 @@ pub enum SurvivalPredictError {
     /// produced a non-finite or out-of-domain value that downstream code
     /// cannot consume.
     NumericalFailure { reason: String },
+    /// The reported survival curve would increase at a requested cell,
+    /// `dH/dt < 0`, so no non-negative hazard is the derivative of the
+    /// cumulative hazard reported beside it (gam#3026). The fit's likelihood is
+    /// defined only where the survival index increases, so the cell is refused
+    /// rather than published with a hazard that belongs to a different curve.
+    DecreasingSurvival { reason: String },
     /// Saved-model validation failed below this prediction layer; the model
     /// source error keeps its own payload/schema category.
     ModelPayload {
@@ -138,7 +144,8 @@ impl std::fmt::Display for SurvivalPredictError {
             | SurvivalPredictError::IncompatibleSchema { reason }
             | SurvivalPredictError::UnsupportedConfiguration { reason }
             | SurvivalPredictError::PosteriorCovariance { reason }
-            | SurvivalPredictError::NumericalFailure { reason } => f.write_str(reason),
+            | SurvivalPredictError::NumericalFailure { reason }
+            | SurvivalPredictError::DecreasingSurvival { reason } => f.write_str(reason),
             SurvivalPredictError::ModelPayload { context, source } => {
                 write!(f, "{context}: {source}")
             }
@@ -155,7 +162,8 @@ impl std::error::Error for SurvivalPredictError {
             | SurvivalPredictError::IncompatibleSchema { .. }
             | SurvivalPredictError::UnsupportedConfiguration { .. }
             | SurvivalPredictError::PosteriorCovariance { .. }
-            | SurvivalPredictError::NumericalFailure { .. } => None,
+            | SurvivalPredictError::NumericalFailure { .. }
+            | SurvivalPredictError::DecreasingSurvival { .. } => None,
         }
     }
 }
@@ -768,10 +776,12 @@ fn conditional_event_density(
     if survival > 0.0 && hazard.is_finite() {
         return Ok(survival * hazard);
     }
-    if cumulative_hazard.is_finite() && hazard > 0.0 {
-        return Ok((hazard.ln() - cumulative_hazard).exp());
+    // The node's hazard is signed where its law's survival rises
+    // ([`predict_survival_coefficient_law`]); its density `S·h` keeps that sign.
+    if cumulative_hazard.is_finite() && !hazard.is_nan() {
+        return Ok(hazard.signum() * (hazard.abs().ln() - cumulative_hazard).exp());
     }
-    if cumulative_hazard == f64::INFINITY && hazard.is_finite() && hazard >= 0.0 {
+    if cumulative_hazard == f64::INFINITY && hazard.is_finite() {
         return Ok(0.0);
     }
     Err(SurvivalPredictError::NumericalFailure {
@@ -1102,10 +1112,11 @@ pub enum SurvivalPosteriorIntegration {
     /// through the two primaries, both affine in `θ` (the slope's follow-up
     /// margin included), so their joint law is exactly bivariate Gaussian and
     /// the posterior mean is adaptive Gauss–Hermite over it with the anchor
-    /// re-solved at every node. The event density `φ(η)·max(η′, 0)` also reads
-    /// the tangents `(q′(t), b′(t))`: given the primaries they are Gaussian and
-    /// `η′ = η_q·q′ + η_b·b′` is linear in them, so they enter through the
-    /// closed-form mean of the positive part of that conditional normal.
+    /// re-solved at every node. The event density `φ(η)·η′` also reads the
+    /// tangents `(q′(t), b′(t))`: given the primaries they are Gaussian and
+    /// `η′ = η_q·q′ + η_b·b′` is linear in them, so they enter through their
+    /// conditional mean alone ([`exact_anchor_node_moments`]), and the published
+    /// density is exactly `−dE_θ[S]/dt`.
     ///
     /// Survival and density are integrated separately under this one rule and
     /// the published hazard is their ratio `E_θ[f]/E_θ[S]`, the hazard of the
@@ -1226,12 +1237,17 @@ fn publish_survival_posterior_moments(
         for time in 0..n_times {
             let survival = survival_mean[[row, time]].clamp(0.0, 1.0);
             let density = density_mean[[row, time]];
-            if !(density.is_finite() && density >= 0.0) {
+            if !density.is_finite() {
                 return Err(SurvivalPredictError::NumericalFailure {
                     reason: format!(
-                        "posterior survival density is invalid at row {row}, time column {time}: {density}"
+                        "posterior survival density is not finite at row {row}, time column {time}: {density}"
                     ),
                 });
+            }
+            if density < 0.0 {
+                return Err(decreasing_survival_refusal(format!(
+                    "posterior-mean event density {density:.3e} = -dE[S]/dt at row {row}, time column {time}"
+                )));
             }
             result.survival[[row, time]] = survival;
             result.cumulative_hazard[[row, time]] = -survival.ln();
@@ -1265,10 +1281,48 @@ fn publish_survival_posterior_moments(
 
 /// `(E S, E S², E f, E h, E η, E η²)` of one marginal-slope `(row, t)` cell over
 /// the coefficient posterior: survival `S = Φ(−η)`, event density
-/// `f = φ(η)·max(η′, 0)`, hazard `h = f/S`, and the linear predictor. The
-/// published hazard is `E f / E S` ([`publish_survival_posterior_moments`]);
-/// `E h` only decides between a zero and an infinite hazard where `E S = 0`.
-type ExactAnchorCellMoments = (f64, f64, f64, f64, f64, f64);
+/// `f = φ(η)·η′`, hazard `h = f/S`, and the linear predictor. The published
+/// hazard is `E f / E S` ([`publish_survival_posterior_moments`]); `E h` only
+/// decides between a zero and an infinite hazard where `E S = 0`.
+pub(crate) type ExactAnchorCellMoments = (f64, f64, f64, f64, f64, f64);
+
+/// One node of the exact anchored posterior integral at the primaries
+/// `(q, b)`: `(S, S², f, h, η, η²)` with `S = Φ(−η)`, event density
+/// `f = φ(η)·E[η′ | q, b]` and `h = f/S`.
+///
+/// `conditional_tangent` is `(E[q′ | q, b], E[b′ | q, b])`. The index rate
+/// `η′ = η_q·q′ + η_b·b′` is linear in the tangents, so its conditional mean is
+/// `η_q·E[q′ | q, b] + η_b·E[b′ | q, b]` and
+///
+/// ```text
+///   E_θ[φ(η)·η′] = E_{q,b}[φ(η)·E(η′ | q, b)] = −d/dt E_θ[Φ(−η(t))]
+/// ```
+///
+/// by differentiating under the integral (`φ ≤ 1/√(2π)`, `η′` Gaussian given
+/// the primaries). The published hazard `h̄ = E f / E S` is therefore exactly
+/// `dH̄/dt` for the published `H̄ = −log E S`. The density is signed: the mean
+/// of a positive part, `E[max(η′, 0)]`, is the expectation of a clamp, and the
+/// `h̄` it gives is the derivative of no reported curve (gam#3026). A cell whose
+/// integrated density is negative is refused by
+/// [`decreasing_survival_refusal`] where the moments are published.
+pub(crate) fn exact_anchor_node_moments(
+    eta: f64,
+    eta_q: f64,
+    eta_b: f64,
+    conditional_tangent: [f64; 2],
+) -> ExactAnchorCellMoments {
+    let rate = eta_q * conditional_tangent[0] + eta_b * conditional_tangent[1];
+    let (log_survival, mills_ratio) = signed_probit_logcdf_and_mills_ratio(-eta);
+    let survival = log_survival.exp();
+    (
+        survival,
+        survival * survival,
+        normal_pdf(eta) * rate,
+        mills_ratio * rate,
+        eta,
+        eta * eta,
+    )
+}
 
 /// The coefficient posterior [`SurvivalPosteriorIntegration::ExactAnchor`]
 /// pushes onto every cell's primaries: the active covariance over the
@@ -1315,9 +1369,10 @@ impl ExactAnchorPosterior {
     /// `x_q′ = [time′(t) | 0 | 0]` and `x_b′ = [0 | 0 | slope′(t)]`, so they are
     /// jointly Gaussian with covariance `X V Xᵀ`. The primaries are integrated
     /// by the projected bivariate Gauss–Hermite rule; given the primaries `y`
-    /// the tangents are `N(t̂ + B(y − ŷ), C)` with `B = Σ_ty Σ_yy⁻¹` and
-    /// `C = Σ_tt − B Σ_yt`, both taken over the support the rule integrates
-    /// (only the major axis when `Σ_yy` is singular in floating point).
+    /// the tangents have mean `t̂ + B(y − ŷ)` with `B = Σ_ty Σ_yy⁻¹`, taken over
+    /// the support the rule integrates (only the major axis when `Σ_yy` is
+    /// singular in floating point). The density is linear in the tangents, so
+    /// that conditional mean is all it reads ([`exact_anchor_node_moments`]).
     fn cell_moments(
         &self,
         quadctx: &gam_solve::quadrature::QuadratureContext,
@@ -1414,15 +1469,6 @@ impl ExactAnchorPosterior {
             }
             gam_solve::quadrature::BivariateNormalSupport::Point => [[0.0; 2]; 2],
         };
-        let mut conditional = [[0.0_f64; 2]; 2];
-        for k in 0..2 {
-            for l in 0..2 {
-                conditional[k][l] = sigma[[2 + k, 2 + l]]
-                    - regression[k][0] * sigma[[0, 2 + l]]
-                    - regression[k][1] * sigma[[1, 2 + l]];
-            }
-        }
-        let conditional_cross = 0.5 * (conditional[0][1] + conditional[1][0]);
         let tangent_hat = [cell.q_t, cell.b_t];
 
         gam_solve::quadrature::normal_expectation_2d_projected_result(
@@ -1443,38 +1489,9 @@ impl ExactAnchorPosterior {
                 let (dq, db) = (q - q_hat, b - b_hat);
                 let q_t = tangent_hat[0] + regression[0][0] * dq + regression[0][1] * db;
                 let b_t = tangent_hat[1] + regression[1][0] * dq + regression[1][1] * db;
-                let tangent_mean = eta_q * q_t + eta_b * b_t;
-                let tangent_variance = eta_q * eta_q * conditional[0][0]
-                    + 2.0 * eta_q * eta_b * conditional_cross
-                    + eta_b * eta_b * conditional[1][1];
-                // The plug-in kernel clamps `η′` at its physical floor 0
-                // (`clamp_marginal_slope_index_derivative_at_horizon`); this is
-                // that clamp's expectation over the conditional law of `η′`.
-                let positive_tangent = gaussian_positive_part_mean(tangent_mean, tangent_variance);
-                let (log_survival, mills_ratio) = signed_probit_logcdf_and_mills_ratio(-eta);
-                let survival = log_survival.exp();
-                Ok((
-                    survival,
-                    survival * survival,
-                    normal_pdf(eta) * positive_tangent,
-                    mills_ratio * positive_tangent,
-                    eta,
-                    eta * eta,
-                ))
+                Ok(exact_anchor_node_moments(eta, eta_q, eta_b, [q_t, b_t]))
             },
         )
-    }
-}
-
-/// `E[max(L, 0)]` for `L ~ N(mean, variance)`: `m·Φ(m/s) + s·φ(m/s)` with
-/// `s = √variance`, and `max(m, 0)` when the law is a point mass.
-fn gaussian_positive_part_mean(mean: f64, variance: f64) -> f64 {
-    if variance > 0.0 {
-        let sd = variance.sqrt();
-        let ratio = mean / sd;
-        (mean * normal_cdf(ratio) + sd * normal_pdf(ratio)).max(0.0)
-    } else {
-        mean.max(0.0)
     }
 }
 
@@ -1500,6 +1517,10 @@ fn predict_survival_exact_anchor_posterior_mean(
     let moments = moments.ok_or_else(|| {
         "internal error: the exact anchored survival pass returned no posterior moments".to_string()
     })?;
+    // The plug-in survival is published beside the posterior mean
+    // (`survival_plugin`), so its curve is held to the same domain as when it
+    // is published alone.
+    refuse_decreasing_survival(&result)?;
     publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
     Ok(result)
 }
@@ -1537,7 +1558,7 @@ fn predict_survival_sigma_point_posterior_mean(
 
     for_each_survival_posterior_node(&posterior_mean, &active_covariance, &cone_coords, |node, weight| {
         let draw_model = saved_model_with_survival_coefficients(req.model, node)?;
-        let draw = predict_survival(
+        let draw = predict_survival_coefficient_law(
             SurvivalPredictRequest {
                 model: &draw_model,
                 data: req.data,
@@ -2527,7 +2548,8 @@ pub struct CompetingRisksPredictResult {
 ///
 /// Pure library function: no progress bars, no file I/O, no uncertainty
 /// bounds. The CLI wraps this with progress updates + CSV writes; the
-/// FFI wraps it with JSON serialization.
+/// FFI wraps it with JSON serialization. A surface whose survival curve
+/// increases at a requested cell is refused by name (gam#3026).
 pub fn predict_survival(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
@@ -2535,6 +2557,24 @@ pub fn predict_survival(
     if req.estimand == SurvivalPredictEstimand::PosteriorMean {
         return predict_survival_posterior_mean(req, covariance_mode);
     }
+    let result = predict_survival_coefficient_law(req, covariance_mode)?;
+    refuse_decreasing_survival(&result)?;
+    Ok(result)
+}
+
+/// The survival law at the coefficients `req.model` carries, for an integrator
+/// that sums it over coefficient draws or quadrature nodes: the sigma-point
+/// posterior rule's nodes and a Monte Carlo reference both read it. It is the
+/// plug-in pass of [`predict_survival`] without the refusal of a decreasing
+/// survival curve: where the law's survival rises, its hazard is the negative
+/// `dH/dt` it is, so a sum of `S·h` over draws is exactly `−d/dt` of the same
+/// sum of `S`, and the integrator refuses only the curve it publishes
+/// (gam#3026). It is not a survival prediction; publish through
+/// [`predict_survival`].
+pub fn predict_survival_coefficient_law(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+) -> Result<SurvivalPredictResult, SurvivalPredictError> {
     predict_survival_surfaces(req, covariance_mode, None).map(|(result, _)| result)
 }
 
@@ -4047,8 +4087,7 @@ fn evaluate_joint_marginal_slope_row(
         &ctx.law,
         &mut workspace,
     )?;
-    let eta_derivative = clamp_marginal_slope_index_derivative_at_horizon(eta_t);
-    let (cum, haz) = probit_survival_hazard_components(eta, eta_derivative)?;
+    let (cum, haz) = probit_survival_hazard_components(eta, eta_t)?;
     Ok((eta, cum, haz))
 }
 
@@ -4285,52 +4324,78 @@ fn evaluate_marginal_slope_cell(
     // `+derivative_guard` offset are both already folded into `qd_exit_base`),
     // so there is no predict-vs-fit desync in the derivative reconstruction.
     //
-    // Fit enforces the monotonicity floor `q'(t) >= derivative_guard` ONLY at
-    // each training row's own exit time (one `t` per row), via the active-set
-    // guard constraints. A prediction horizon is an arbitrary `t` — typically a
-    // single CIF horizon evaluated for every row — which generally is NOT one of
-    // the constrained training exit times. Where that horizon lands in a region
-    // of sparse/no training exits, the penalized baseline spline can extrapolate
-    // to a locally decreasing survival index, so `q'(t) < 0` is a legitimate
-    // model statement ("no instantaneous hazard accrues here"), not a numerical
-    // bug. The instantaneous hazard rate is physically non-negative, so the
-    // truthful response is to clamp the index time-derivative at its floor 0
-    // (flat hazard, survival locally constant) rather than reject the whole
-    // prediction — clamping keeps the CIF well-posed and monotone. Only a
-    // non-finite derivative (a real numerical failure) is surfaced to the strict
-    // validator below.
-    let eta_derivative = clamp_marginal_slope_index_derivative_at_horizon(eta_t_arr[0]);
-    let (cum, haz) = probit_survival_hazard_components(eta, eta_derivative)?;
+    // The complete rate `η′ = η_q·q′ + η_b·b′` goes to the hazard unchanged: the
+    // hazard reported is the derivative of the cumulative hazard reported beside
+    // it, and a published surface whose index decreases at a cell is refused by
+    // name ([`refuse_decreasing_survival`]).
+    let (cum, haz) = probit_survival_hazard_components(eta, eta_t_arr[0])?;
     Ok((eta, cum, haz))
 }
 
-/// Reconstruct the marginal-slope survival index time-derivative `eta'(t)` at a
-/// prediction horizon and clamp it to its physical floor.
-///
-/// The complete derivative already contains both moving fitted coordinates,
-/// `eta'(t) = eta_q q'(t) + eta_b b'(t)`. The instantaneous hazard rate
-/// `h(t) = mills · eta'(t)` is physically non-negative, so a finite negative
-/// `eta'(t)` — which a
-/// penalized baseline spline can legitimately produce when the prediction
-/// horizon lands outside the training exit times the monotonicity guard
-/// constrains — is clamped to its floor 0 (flat hazard, locally constant
-/// survival), keeping the CIF well-posed. Non-finite values pass through
-/// unchanged so the strict validator rejects them as genuine numerical failures.
-#[inline]
-fn clamp_marginal_slope_index_derivative_at_horizon(eta_derivative: f64) -> f64 {
-    if eta_derivative.is_finite() {
-        eta_derivative.max(0.0)
-    } else {
-        eta_derivative
+/// The named refusal of a published survival surface whose curve increases,
+/// `dH/dt < 0` (gam#3026). Every survival surface that is published, the
+/// plug-in ([`refuse_decreasing_survival`]) and the posterior mean
+/// ([`publish_survival_posterior_moments`]), declines such a cell through this
+/// one route. `detail` names the quantity that went negative and where.
+#[cold]
+#[inline(never)]
+pub(crate) fn decreasing_survival_refusal(detail: String) -> SurvivalPredictError {
+    SurvivalPredictError::DecreasingSurvival {
+        reason: format!(
+            "survival prediction refused: the reported survival curve increases here ({detail}), \
+             so no hazard h >= 0 is the derivative dH/dt of the reported cumulative hazard; the \
+             fitted model is not a survival model at this cell"
+        ),
     }
 }
 
+/// Refuse a plug-in survival surface that reports a negative hazard anywhere.
+/// The hazard of every family is the derivative of the cumulative hazard
+/// reported beside it, sign included, so `h < 0` is a cell where the reported
+/// survival rises: no survival function reports it, and publishing `h = 0`
+/// there instead would pair the curve with the hazard of a different one.
+fn refuse_decreasing_survival(result: &SurvivalPredictResult) -> Result<(), SurvivalPredictError> {
+    match result
+        .hazard
+        .indexed_iter()
+        .find(|(_, hazard)| **hazard < 0.0)
+    {
+        Some(((row, time), hazard)) => Err(decreasing_survival_refusal(format!(
+            "hazard dH/dt={hazard:.6e} < 0 at row {row}, time column {time}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Cumulative hazard and hazard of the probit survival law `S(t) = Φ(−η(t))`
+/// at one cell, from the index and its complete time derivative:
+///
+/// ```text
+///   H = −log Φ(−η),   h = dH/dt = φ(η)/Φ(−η) · η′
+/// ```
+///
+/// `h` is the exact derivative of the `H` returned beside it for every finite
+/// rate, its sign included, so a consumer composing the two (the cumulative
+/// incidence `∫ exp(−Σ ΔH) h`) reads one curve, and an integrator summing
+/// `S·h` over coefficient draws or quadrature nodes obtains `−d/dt` of its sum
+/// of `S`. The survival domain is `η′ ≥ 0`, and it is the fit's own: its
+/// likelihood carries `log η′` at every event and holds
+/// `q′ ≥ derivative_guard ≥ 0` at every row. A time-constant slope has
+/// `η′ = α_q·q′ ≥ α_q·derivative_guard ≥ 0` at every `t` by construction (the
+/// I-spline time block has `M_k ≥ 0` on all of `ℝ` and is coned to `β ≥ 0`, the
+/// baseline offset's rate is `S₀h₀/φ ≥ 0`, and `α_q > 0`), so its fitted law
+/// never leaves the domain; `η′ = 0` is a flat stretch with `h = dH/dt = 0`
+/// exactly. A slope that varies along follow-up carries no such guarantee:
+/// `η′ = α_q·q′ + (α_b + z)·b′` is affine in `z` with an unsigned `b′(t)`
+/// (gam#2767). Where `η′ < 0` this returns the negative `h` it is; it is never
+/// clamped, and the surfaces that publish a hazard refuse it
+/// ([`decreasing_survival_refusal`]).
 #[inline]
-fn probit_survival_hazard_components(
+pub(crate) fn probit_survival_hazard_components(
     eta: f64,
     eta_derivative: f64,
 ) -> Result<(f64, f64), SurvivalPredictError> {
-    if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative >= 0.0) {
+    if !(eta.is_finite() && eta_derivative.is_finite()) {
         return Err(SurvivalPredictError::NumericalFailure {
             reason: format!(
                 "saved survival marginal-slope prediction produced invalid survival index derivative: eta={eta}, eta_t={eta_derivative}"
@@ -4350,12 +4415,13 @@ fn probit_survival_hazard_components(
         mills_ratio * eta_derivative
     };
     // `>= 0.0` rejects NaN (a programming-bug signal) and accepts the full
-    // mathematical range [0, +∞]. Saturated probit fits where the model
-    // genuinely says S(t)→0 produce a +∞ cumulative hazard — that is the
-    // truthful answer, and the consumer's `survival = exp(-cum).clamp(0,1)`
-    // handles it cleanly. Rejecting +∞ would force the predictor to fail on
-    // models that the inner solver has already certified as a valid fit.
-    if !(cumulative_hazard >= 0.0 && hazard >= 0.0) {
+    // mathematical range [0, +∞] of the cumulative hazard. Saturated probit
+    // fits where the model genuinely says S(t)→0 produce a +∞ cumulative
+    // hazard — that is the truthful answer, and the consumer's
+    // `survival = exp(-cum).clamp(0,1)` handles it cleanly. Rejecting +∞ would
+    // force the predictor to fail on models that the inner solver has already
+    // certified as a valid fit.
+    if !(cumulative_hazard >= 0.0 && !hazard.is_nan()) {
         return Err(SurvivalPredictError::NumericalFailure {
             reason: format!(
                 "saved survival marginal-slope prediction produced invalid survival components: eta={eta}, eta_t={eta_derivative}, log_survival={log_survival}, hazard={hazard}"
@@ -4547,9 +4613,8 @@ fn royston_parmar_survival_hazard_components(
     // (`S(t)` locally constant). Any RP model predicted on a grid that extends
     // past its training support hits this regime on the tail nodes. The earlier
     // strict `> 0.0` gate spuriously failed those predictions (#1564). The
-    // probit / marginal-slope sibling guard
-    // (`probit_survival_hazard_components`) already accepts the full `[0, ∞)`
-    // range and maps a zero derivative to a zero hazard; the RP guard must match.
+    // probit / marginal-slope sibling (`probit_survival_hazard_components`)
+    // maps a zero derivative to a zero hazard; the RP guard must match.
     if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative >= 0.0) {
         return Err(SurvivalPredictError::NumericalFailure {
             reason: format!(
@@ -5540,9 +5605,14 @@ fn remap_term_collectionspec_columns(
 pub fn fit_result_from_saved_model_for_prediction(
     model: &SavedModel,
 ) -> Result<UnifiedFitResult, String> {
+    saved_fit_result(model).cloned()
+}
+
+/// Borrow the saved canonical fit result, for readers that need no owned copy.
+pub fn saved_fit_result(model: &SavedModel) -> Result<&UnifiedFitResult, String> {
     model
         .fit_result
-        .clone()
+        .as_ref()
         .ok_or_else(|| "model is missing canonical fit_result payload; refit".to_string())
 }
 
@@ -6388,50 +6458,160 @@ mod tests {
         );
     }
 
+    /// gam#3026: the hazard is the derivative of the cumulative hazard reported
+    /// beside it, on both tails and through the bulk. `η(t) = a + c·log t` with
+    /// `c > 0`, `H(t) = −log Φ(−η(t))`, and `dH/dt` by a Richardson-extrapolated
+    /// central difference in `log t`, whose truncation error is `O(δ⁴)`.
     #[test]
-    fn marginal_slope_index_derivative_clamps_extrapolation_negative_to_flat_hazard() {
-        // The #1040 end-to-end blocker: at a prediction horizon outside the
-        // training exit times, the penalized baseline derivative q'(t) can dip
-        // negative (e.g. the reported eta_t=-0.00135), producing a negative
-        // index time-derivative the strict validator used to reject. The
-        // physical hazard floor is 0, so the clamp must turn it into a flat
-        // hazard the validator accepts — keeping predict/CIF runnable.
-        let eta_t = clamp_marginal_slope_index_derivative_at_horizon(-1.35e-3);
-        assert_eq!(
-            eta_t, 0.0,
-            "negative extrapolation derivative must clamp to 0"
-        );
-        // Downstream validator now accepts it as a flat-hazard point.
-        let (cum, hazard) = probit_survival_hazard_components(-0.563, eta_t)
-            .expect("clamped flat-hazard prediction must validate");
-        assert!(
-            cum >= 0.0,
-            "cumulative hazard must be well-posed, got {cum}"
-        );
-        assert_eq!(
-            hazard, 0.0,
-            "clamped derivative gives zero instantaneous hazard"
-        );
+    fn probit_survival_hazard_is_the_derivative_of_its_cumulative_hazard_3026() {
+        let (a, c) = (-1.15, 0.95);
+        let cumulative = |t: f64| {
+            probit_survival_hazard_components(a + c * t.ln(), c / t)
+                .expect("increasing index")
+                .0
+        };
+        let delta = 1e-3;
+        for t in [1e-4_f64, 1e-2, 0.3, 1.0, 5.0, 40.0, 1e3] {
+            let (_, hazard) =
+                probit_survival_hazard_components(a + c * t.ln(), c / t).expect("increasing index");
+            let at = |m: f64| cumulative(t * (m * delta).exp());
+            let d1 = (at(1.0) - at(-1.0)) / (2.0 * delta);
+            let d2 = (at(2.0) - at(-2.0)) / (4.0 * delta);
+            let derivative = (4.0 * d1 - d2) / 3.0 / t;
+            assert!(
+                (hazard - derivative).abs() <= 1e-8 * derivative.abs(),
+                "at t={t}: hazard {hazard} is not dH/dt {derivative}"
+            );
+        }
     }
 
+    /// gam#3026: where the index decreases the kernel returns the negative
+    /// hazard it is, still `dH/dt`, instead of a flat hazard:
+    /// `η(t) = a − c·log t` with `c > 0`, `dH/dt` by the same Richardson
+    /// difference in `log t`. The rate `−1.35e-3` is the one the deleted
+    /// clamp's test recorded (#1040), where the clamp reported `h = 0` beside
+    /// an `H` whose derivative is negative.
     #[test]
-    fn marginal_slope_index_derivative_preserves_positive_and_nonfinite() {
-        // A genuinely positive derivative passes through unchanged (scaled by
-        // the chain factor), and a non-finite value is left for the strict
-        // validator to reject as a real numerical failure rather than masked.
-        let positive = clamp_marginal_slope_index_derivative_at_horizon(1.0);
+    fn probit_survival_hazard_is_signed_where_the_index_decreases_3026() {
+        let (a, c) = (0.4, 0.3);
+        let cumulative = |t: f64| {
+            probit_survival_hazard_components(a - c * t.ln(), -c / t)
+                .expect("finite index")
+                .0
+        };
+        let delta = 1e-3;
+        for t in [1e-2_f64, 0.3, 1.0, 5.0, 40.0] {
+            let (_, hazard) =
+                probit_survival_hazard_components(a - c * t.ln(), -c / t).expect("finite index");
+            let at = |m: f64| cumulative(t * (m * delta).exp());
+            let d1 = (at(1.0) - at(-1.0)) / (2.0 * delta);
+            let d2 = (at(2.0) - at(-2.0)) / (4.0 * delta);
+            let derivative = (4.0 * d1 - d2) / 3.0 / t;
+            assert!(
+                hazard < 0.0 && (hazard - derivative).abs() <= 1e-8 * derivative.abs(),
+                "at t={t}: hazard {hazard} is not dH/dt {derivative}"
+            );
+        }
+        let (cumulative, hazard) =
+            probit_survival_hazard_components(-0.563, -1.35e-3).expect("finite index");
+        let (log_survival, mills_ratio) = signed_probit_logcdf_and_mills_ratio(0.563);
+        assert_eq!((cumulative, hazard), (-log_survival, mills_ratio * -1.35e-3));
+    }
+
+    /// gam#3026: a plug-in surface that reports a negative hazard at any cell
+    /// is refused by name, naming the cell, and one whose hazards are all
+    /// non-negative (a flat stretch's `0` included) publishes.
+    #[test]
+    fn a_surface_whose_survival_increases_is_refused_by_name_3026() {
+        let surface = |hazard: Array2<f64>| SurvivalPredictResult {
+            times: vec![1.0, 2.0],
+            survival: Array2::from_elem((2, 2), 0.5),
+            cumulative_hazard: Array2::from_elem((2, 2), 2.0_f64.ln()),
+            hazard,
+            linear_predictor: Array1::zeros(2),
+            likelihood_mode: SurvivalLikelihoodMode::MarginalSlope,
+            survival_se: None,
+            eta_se: None,
+            covariance_source: None,
+            survival_plugin: None,
+        };
+        refuse_decreasing_survival(&surface(ndarray::array![[0.3, 0.0], [0.1, 0.2]]))
+            .expect("non-negative hazards publish");
+        match refuse_decreasing_survival(&surface(ndarray::array![[0.3, 0.2], [0.1, -4.0e-3]])) {
+            Err(SurvivalPredictError::DecreasingSurvival { reason }) => assert!(
+                reason.contains("row 1, time column 1"),
+                "the refusal must name the cell: {reason}"
+            ),
+            other => panic!("a negative hazard must be refused by name, got {other:?}"),
+        }
+    }
+
+    /// gam#3026: the exact anchored posterior's density is `−d/dt E[S]`, so the
+    /// published hazard `E f / E S` is `dH̄/dt`. The law makes the rate negative
+    /// with visible probability: `q(t) = u + v·log t` with `(u, v)` bivariate
+    /// normal and `P(v < 0) = Φ(−0.5/0.6) ≈ 0.20`. On the rigid frame with
+    /// `b = 0`, `η = q`, `η_q = 1` and `η_b = 0`. Given `q(t)`, `v` has mean
+    /// `m_v + β(q − m_q)`, and `E[S]` and `E[f]` are integrated by the same
+    /// trapezoid over `q`, which is spectrally accurate for a Gaussian weight.
+    /// The positive-part rule the node replaced is measured too, so the fixture
+    /// can tell the two apart.
+    #[test]
+    fn exact_anchor_node_density_is_the_derivative_of_the_posterior_survival_3026() {
+        let (m_u, m_v) = (-0.4, 0.5);
+        let (s_u, s_v, rho) = (0.7_f64, 0.6_f64, -0.3_f64);
+        // Moments of (q(t), v) at log t = x.
+        let law = |x: f64| {
+            let mean_q = m_u + m_v * x;
+            let var_q = s_u * s_u + 2.0 * rho * s_u * s_v * x + s_v * s_v * x * x;
+            let cov_vq = rho * s_u * s_v + s_v * s_v * x;
+            let var_v_given_q = s_v * s_v - cov_vq * cov_vq / var_q;
+            (mean_q, var_q, cov_vq / var_q, var_v_given_q)
+        };
+        let nodes = 4001;
+        let integrate = |t: f64, signed: bool| -> (f64, f64) {
+            let x = t.ln();
+            let (mean_q, var_q, beta, var_v_given_q) = law(x);
+            let sd_q = var_q.sqrt();
+            let (mut survival, mut density) = (0.0, 0.0);
+            for k in 0..nodes {
+                let w = -12.0 + 24.0 * k as f64 / (nodes - 1) as f64;
+                let q = mean_q + sd_q * w;
+                let weight = normal_pdf(w) * 24.0 / (nodes - 1) as f64;
+                // d q / d t = v / t, so the tangent's conditional mean is E[v | q] / t.
+                let v_mean = m_v + beta * (q - mean_q);
+                let rate = if signed {
+                    v_mean / t
+                } else {
+                    let sd = var_v_given_q.max(0.0).sqrt();
+                    (v_mean * normal_cdf(v_mean / sd) + sd * normal_pdf(v_mean / sd)) / t
+                };
+                let moments = exact_anchor_node_moments(q, 1.0, 0.0, [rate, 0.0]);
+                survival += weight * moments.0;
+                density += weight * moments.2;
+            }
+            (survival, density)
+        };
+        let delta = 1e-3;
+        let mut positive_part_gap = 0.0_f64;
+        for t in [0.2_f64, 1.0, 3.0, 12.0] {
+            let (survival, density) = integrate(t, true);
+            let at = |m: f64| -(integrate(t * (m * delta).exp(), true).0).ln();
+            let d1 = (at(1.0) - at(-1.0)) / (2.0 * delta);
+            let d2 = (at(2.0) - at(-2.0)) / (4.0 * delta);
+            let derivative = (4.0 * d1 - d2) / 3.0 / t;
+            let hazard = density / survival;
+            assert!(
+                (hazard - derivative).abs() <= 1e-7 * derivative.abs(),
+                "at t={t}: posterior hazard E f / E S = {hazard} is not dH̄/dt = {derivative}"
+            );
+            let (_, positive_density) = integrate(t, false);
+            positive_part_gap =
+                positive_part_gap.max((positive_density / survival - derivative).abs() / derivative);
+        }
         assert!(
-            (positive - 1.0).abs() <= 1e-15,
-            "positive derivative scaled by chain factor"
-        );
-        let nonfinite = clamp_marginal_slope_index_derivative_at_horizon(f64::NAN);
-        assert!(
-            nonfinite.is_nan(),
-            "non-finite derivative passes through unclamped"
-        );
-        assert!(
-            probit_survival_hazard_components(0.5, nonfinite).is_err(),
-            "non-finite derivative must still be rejected by the validator"
+            positive_part_gap > 1e-3,
+            "the fixture must separate the signed density from the positive-part rule; the gap \
+             was {positive_part_gap:.3e}"
         );
     }
 
@@ -6464,19 +6644,6 @@ mod tests {
         assert!(
             err_dt
                 .to_string()
-                .contains("invalid survival index derivative")
-        );
-    }
-
-    #[test]
-    fn probit_survival_hazard_rejects_negative_time_derivative() {
-        // The CDF S(t) = Phi(-eta(t)) is monotone in t iff eta'(t) > 0. A
-        // negative slope would give a non-monotone survival curve, which is
-        // not a valid survival function.
-        let err = probit_survival_hazard_components(1.0, -0.5)
-            .expect_err("negative derivative should be invalid");
-        assert!(
-            err.to_string()
                 .contains("invalid survival index derivative")
         );
     }

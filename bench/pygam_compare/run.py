@@ -22,9 +22,9 @@ load hits all of them alike.
 The per-rep timeout and memory cap are a HARNESS SAFETY NET, not a solver
 budget: they only stop a runaway rep from stalling the whole plan. A rep that
 trips either is recorded with that status, the remaining reps of the cell and
-every larger ``n`` of the same (lib, family, design, threads, concurrency)
-are recorded as ``not_run_after_<status>``, and the report counts all of it
-against the library.
+every larger ``n`` of the same (lib, family, design, n_predict, threads,
+concurrency) are recorded as ``not_run_after_<status>``, and the report counts
+all of it against the library.
 
 Workers never inherit the caller's ``PYTHONPATH``; ``--lib-path DIR`` is the
 one way to put a pinned build first on their import path (for example a copy
@@ -243,6 +243,7 @@ def run_rep(
     timeout_s: float,
     memcap_mb: float,
     cwd: str,
+    postfit: bool = False,
     lib_path: str | None = None,
 ) -> dict[str, Any]:
     """Run one worker subprocess, policing the safety net; return its record."""
@@ -255,6 +256,10 @@ def run_rep(
         cell.design,
         str(seed),
     ]
+    if cell.n_predict is not None:
+        cmd.append(str(cell.n_predict))
+    if postfit:
+        cmd.append("--postfit")
     env_extra = None if lib_path is None else {"PYTHONPATH": lib_path}
     rec = run_isolated(
         cmd, cwd, timeout_s, memcap_mb, threads=cell.threads, env_extra=env_extra
@@ -267,6 +272,7 @@ def run_rep(
         threads=cell.threads,
         concurrency=cell.concurrency,
         seed=seed,
+        **({} if cell.n_predict is None else {"n_predict": cell.n_predict}),
     )
     return rec
 
@@ -278,6 +284,7 @@ def run_batch(
     timeout_s: float,
     memcap_mb: float,
     cwd: str,
+    postfit: bool = False,
     lib_path: str | None = None,
 ) -> list[dict[str, Any]]:
     """Run ``cell.concurrency`` identical reps at once; one record per process,
@@ -285,7 +292,17 @@ def run_batch(
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=cell.concurrency) as pool:
         futures = [
-            pool.submit(run_rep, lib, cell, seed, timeout_s, memcap_mb, cwd, lib_path)
+            pool.submit(
+                run_rep,
+                lib,
+                cell,
+                seed,
+                timeout_s,
+                memcap_mb,
+                cwd,
+                postfit=postfit,
+                lib_path=lib_path,
+            )
             for _ in range(cell.concurrency)
         ]
         recs = [f.result() for f in futures]
@@ -343,8 +360,9 @@ def run_plan(
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     records: list[dict[str, Any]] = []
-    # (lib, family, design, threads, concurrency) -> status that stopped it at some n
-    stopped: dict[tuple[str, str, str, int | None, int], str] = {}
+    # (lib, family, design, n_predict, threads, concurrency) -> status that
+    # stopped it at some n
+    stopped: dict[tuple[str, str, str, int | None, int | None, int], str] = {}
     with (
         tempfile.TemporaryDirectory(prefix="pygam_compare_") as cwd,
         records_path.open("w") as fh,
@@ -357,6 +375,7 @@ def run_plan(
                         lib,
                         cell.family,
                         cell.design,
+                        cell.n_predict,
                         cell.threads,
                         cell.concurrency,
                     )
@@ -372,18 +391,37 @@ def run_plan(
                                 seed=rep,
                                 slot=slot,
                                 status=f"not_run_after_{stopped[key]}",
+                                **(
+                                    {}
+                                    if cell.n_predict is None
+                                    else {"n_predict": cell.n_predict}
+                                ),
                             )
                             for slot in range(cell.concurrency)
                         ]
                     elif cell.concurrency == 1:
                         batch = [
                             run_rep(
-                                lib, cell, rep, plan.timeout_s, memcap_mb, cwd, lib_path
+                                lib,
+                                cell,
+                                rep,
+                                plan.timeout_s,
+                                memcap_mb,
+                                cwd,
+                                postfit=plan.postfit,
+                                lib_path=lib_path,
                             )
                         ]
                     else:
                         batch = run_batch(
-                            lib, cell, rep, plan.timeout_s, memcap_mb, cwd, lib_path
+                            lib,
+                            cell,
+                            rep,
+                            plan.timeout_s,
+                            memcap_mb,
+                            cwd,
+                            postfit=plan.postfit,
+                            lib_path=lib_path,
                         )
                     if key not in stopped and _worst_status(batch) != "ok":
                         stopped[key] = _worst_status(batch)

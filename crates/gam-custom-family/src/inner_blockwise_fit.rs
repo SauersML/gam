@@ -44,6 +44,7 @@ struct ExactJointFitContext<'a, F> {
     options: &'a BlockwiseFitOptions,
     states: Vec<ParameterBlockState>,
     s_lambdas: Vec<Array2<f64>>,
+    penalty_roots: BlockPenaltyRoots,
     joint_bundle: Option<&'a gam_problem::JointPenaltyBundle>,
     lastobjective: f64,
     converged: bool,
@@ -3448,13 +3449,8 @@ pub(crate) fn single_block_simplified_newton_corrections<
             ),
         });
     }
-    let p = spec.design.ncols();
-    let lambdas =
-        exact_lambdas_from_log_strengths(block_log_lambda, "Newton-region probe log strength")?;
-    let mut s_lambda = Array2::<f64>::zeros((p, p));
-    for (k, s) in spec.penalties.iter().enumerate() {
-        s.add_scaled_to(lambdas[k], &mut s_lambda);
-    }
+    // The solver's own curvature: the penalty's structural roots (#2954).
+    let s_lambda = crate::blockwise_solve::block_s_lambda(0, spec, block_log_lambda)?;
     let mut states = buildblock_states(family, specs)?;
     if predictor_beta.len() != states[0].beta.len() {
         return Err(CustomFamilyError::DimensionMismatch {
@@ -3850,53 +3846,6 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
     // body now handles that case directly, so the cap stays fixed at the
     // baseline for the lifetime of this outer call.
     let inner_max_cycles = inner_max_cycles_base.max(1);
-    // Each block's assembled penalty matrix depends only on that block's
-    // penalties and smoothing parameters. Build these setup matrices in
-    // parallel, but keep the coordinate-descent and line-search loops below
-    // strictly serial because each accepted block update changes the state seen
-    // by later blocks.
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let s_lambdas_launch_started = std::time::Instant::now();
-    let s_lambdas_par_iter = (0..specs.len()).into_par_iter().map(|b| {
-        let spec = &specs[b];
-        let Some(block_log_lambda) = block_log_lambdas.get(b) else {
-            return Err(CustomFamilyError::UnsupportedConfiguration {
-                reason: format!("missing log-smoothing parameter vector for block {b}"),
-            });
-        };
-        if block_log_lambda.len() != spec.penalties.len() {
-            return Err(CustomFamilyError::DimensionMismatch {
-                reason: format!(
-                    "block {b} log-smoothing parameter length {} does not match penalties {}",
-                    block_log_lambda.len(),
-                    spec.penalties.len()
-                ),
-            });
-        }
-
-        let p = spec.design.ncols();
-        let lambdas = exact_lambdas_from_log_strengths(
-            block_log_lambda,
-            &format!("inner block {b} log strength"),
-        )?;
-        let mut s_lambda = Array2::<f64>::zeros((p, p));
-        for (k, s) in spec.penalties.iter().enumerate() {
-            s.add_scaled_to(lambdas[k], &mut s_lambda);
-        }
-        Ok(s_lambda)
-    });
-    let s_lambdas_collect_started = std::time::Instant::now();
-    let s_lambdas_launch_elapsed = s_lambdas_launch_started.elapsed();
-    let s_lambdas = s_lambdas_par_iter.collect::<Result<Vec<_>, CustomFamilyError>>()?;
-    if prelude_log {
-        log::debug!(
-            "[STAGE] PIRLS/inner step=s_lambdas par_iter launch={:.3}s collect={:.3}s blocks={} (since inner-start={:.3}s)",
-            s_lambdas_launch_elapsed.as_secs_f64(),
-            s_lambdas_collect_started.elapsed().as_secs_f64(),
-            specs.len(),
-            inner_started.elapsed().as_secs_f64(),
-        );
-    }
     let joint_bundle: Option<&gam_problem::JointPenaltyBundle> = options.joint_penalties.as_deref();
     if let Some(bundle) = joint_bundle {
         for (i, spec) in bundle.specs().iter().enumerate() {
@@ -3909,6 +3858,22 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             }
         }
         assert_eq!(bundle.specs().len(), bundle.log_lambdas().len());
+    }
+    // The penalty as one function (#2954): every value, increment and curvature
+    // below reads these roots. Each block's roots depend only on that block's
+    // penalties, so they are formed on rayon workers; the coordinate-descent and
+    // line-search loops below stay strictly serial because each accepted block
+    // update changes the state seen by later blocks.
+    let s_lambdas_started = std::time::Instant::now();
+    let penalty_roots = BlockPenaltyRoots::new(specs, block_log_lambdas, joint_bundle)?;
+    let s_lambdas = penalty_roots.s_lambdas().to_vec();
+    if prelude_log {
+        log::debug!(
+            "[STAGE] PIRLS/inner step=penalty roots elapsed={:.3}s blocks={} (since inner-start={:.3}s)",
+            s_lambdas_started.elapsed().as_secs_f64(),
+            specs.len(),
+            inner_started.elapsed().as_secs_f64(),
+        );
     }
     let objective_state =
         crate::assembly::InnerObjectiveState::new(family, block_log_lambdas, joint_bundle);
@@ -4146,15 +4111,10 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         );
     }
     let penalty_started = std::time::Instant::now();
-    let mut current_penalty = total_quadratic_penalty(
-        &states,
-        &s_lambdas,
-        joint_bundle,
-        Some(specs),
-    );
+    let mut current_penalty = penalty_roots.value_of_states(&states).value;
     if prelude_log {
         log::debug!(
-            "[STAGE] PIRLS/inner step=total_quadratic_penalty elapsed={:.3}s penalty={:.6e} (prelude_total={:.3}s)",
+            "[STAGE] PIRLS/inner step=penalty value elapsed={:.3}s penalty={:.6e} (prelude_total={:.3}s)",
             penalty_started.elapsed().as_secs_f64(),
             current_penalty,
             inner_started.elapsed().as_secs_f64(),
@@ -4205,6 +4165,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             options,
             states,
             s_lambdas,
+            penalty_roots,
             joint_bundle,
             lastobjective,
             converged,
@@ -4396,8 +4357,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             // total: it advances inside the line search whenever a trial
             // is accepted, so we must snapshot it here.
             let obj_before_block = objective_cycle_prev;
-            let old_block_penalty =
-                block_quadratic_penalty(&beta_old, s_lambda);
+            let old_block_penalty = penalty_roots.block_value(b, &beta_old);
             let step_beta_inf = delta.iter().copied().map(f64::abs).fold(0.0, f64::max);
             max_proposed_beta_step = max_proposed_beta_step.max(step_beta_inf);
             log::trace!(
@@ -4456,8 +4416,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 } else {
                     refresh_single_block_eta(family, specs, &mut states, b)?;
                 }
-                let trial_block_penalty =
-                    block_quadratic_penalty(&states[b].beta, s_lambda);
+                let trial_block_penalty = penalty_roots.block_value(b, &states[b].beta);
                 let trial_penalty = current_penalty - old_block_penalty + trial_block_penalty;
                 // The early exit certifies that the accept test below would
                 // refuse the trial, so its slack is the accept test's own
@@ -4584,15 +4543,16 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             // this evaluation can carry (gam#2977 S2). Only this block's
             // penalty moved; the other blocks' penalty values enter through
             // the objective magnitudes.
-            let (_, old_block_penalty_accumulation) =
-                block_quadratic_penalty_with_accumulation(&beta_old, s_lambda);
-            let (_, trial_block_penalty_accumulation) =
-                block_quadratic_penalty_with_accumulation(&states[b].beta, s_lambda);
+            let old_block_penalty_value = penalty_roots.block_penalty_value(b, &beta_old);
+            let trial_block_penalty_value = penalty_roots.block_penalty_value(b, &states[b].beta);
             let block_accumulation = ObjectiveAccumulation::between_endpoints(
                 spec.solver_design().nrows(),
-                s_lambda.len(),
+                old_block_penalty_value.depth,
                 [obj_before_block, objective_cycle_prev],
-                [old_block_penalty_accumulation, trial_block_penalty_accumulation],
+                [
+                    old_block_penalty_value.magnitude,
+                    trial_block_penalty_value.magnitude,
+                ],
                 [0.0, 0.0],
             );
             let trust_update = update_joint_trust_region_radius(
@@ -4667,10 +4627,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                             } else {
                                 refresh_single_block_eta(family, specs, &mut states, b)?;
                             }
-                            let trial_block_penalty = block_quadratic_penalty(
-                                &states[b].beta,
-                                s_lambda,
-                            );
+                            let trial_block_penalty = penalty_roots.block_value(b, &states[b].beta);
                             let trial_penalty =
                                 current_penalty - old_block_penalty + trial_block_penalty;
                             let blockwise_slack = joint_objective_roundoff_slack(
@@ -4737,12 +4694,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             refresh_all_block_etas(family, specs, &mut states)?;
         }
         cached_eval = family.evaluate(&states)?;
-        current_penalty = total_quadratic_penalty(
-            &states,
-            &s_lambdas,
-            joint_bundle,
-            Some(specs),
-        );
+        current_penalty = penalty_roots.value_of_states(&states).value;
         let objective = -cached_eval.log_likelihood + current_penalty;
         let objective_change = (objective - lastobjective).abs();
         lastobjective = objective;
@@ -4922,6 +4874,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             specs,
             options,
             &s_lambdas,
+            &penalty_roots,
             joint_bundle,
             inner_tol,
             &cached_active_sets,
@@ -4939,6 +4892,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         block_log_lambdas,
         options,
         s_lambdas,
+        &penalty_roots,
         joint_bundle,
         cached_active_sets,
         &cached_eval,
@@ -4971,6 +4925,7 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     s_lambdas: &[Array2<f64>],
+    penalty_roots: &BlockPenaltyRoots,
     joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
     inner_tol: f64,
     cached_active_sets: &[Option<Vec<usize>>],
@@ -5186,12 +5141,7 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
                     continue;
                 }
             };
-            let trial_penalty = total_quadratic_penalty(
-                states,
-                s_lambdas,
-                joint_bundle,
-                Some(specs),
-            );
+            let trial_penalty = penalty_roots.value_of_states(states).value;
             let trial_obj = -trial_ll + trial_penalty;
             // Not worse beyond the objective's own rounding, the band every other
             // accept test in the inner solve reads.
@@ -5232,6 +5182,7 @@ fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'stat
     block_log_lambdas: &[Array1<f64>],
     options: &BlockwiseFitOptions,
     s_lambdas: Vec<Array2<f64>>,
+    penalty_roots: &BlockPenaltyRoots,
     joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
     cached_active_sets: Vec<Option<Vec<usize>>>,
     cached_eval: &FamilyEvaluation,
@@ -5296,12 +5247,7 @@ fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'stat
     }
 
     // Reuse cached evaluation from the last cycle's end (or the initial eval if 0 cycles ran).
-    let penalty_value = total_quadratic_penalty(
-        &states,
-        &s_lambdas,
-        joint_bundle,
-        Some(specs),
-    );
+    let penalty_value = penalty_roots.value_of_states(&states).value;
 
     let (block_logdet_h, block_logdet_s) = if converged && product.requires_laplace_artifacts() {
         let (h, s) = blockwise_logdet_terms_with_workspace(
