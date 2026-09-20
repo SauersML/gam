@@ -1629,7 +1629,7 @@ pub(crate) fn outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync +
 pub(crate) struct OneBlockIdentityFamily;
 
 #[test]
-pub(crate) fn large_scale_shape_margslope_flex_prices_the_dense_route_at_25_products() {
+pub(crate) fn large_scale_shape_margslope_flex_cycle0_bounds_cg_by_the_dense_route_cost() {
     // p = 51, n = 320k: the dense route builds n·p² and factors p³/3 while one
     // product streams 2·n·p, so a step takes CG only when its iteration bound
     // costs fewer than 25 products, not the historical 4·p = 204 (gam#3285).
