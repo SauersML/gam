@@ -7,24 +7,6 @@ pub(crate) const ADAPTIVE_KKT_ETA: f64 = 0.1;
 
 pub(crate) const ADAPTIVE_KKT_FLOOR_REML_DIVISOR: f64 = 100.0;
 
-pub(crate) const IFT_QUALITY_HISTORY_CAP: usize = 5;
-
-/// Rolling-quality bands and step-cap adjustment factors for the IFT step-cap
-/// controller (`record_ift_prediction_quality`). `quality` is the relative
-/// prediction residual averaged over the last [`IFT_QUALITY_HISTORY_CAP`]
-/// predictions; below `GROW` the linearization is reliably excellent and the cap
-/// is loosened, above `SHRINK` it is tightened, in between it is held. A rolling
-/// quality at or above `FLAT_FALLBACK` flips the predictor to flat warm-start.
-pub(crate) const IFT_QUALITY_GROW_BAND: f64 = 1e-3;
-
-pub(crate) const IFT_QUALITY_SHRINK_BAND: f64 = 1e-1;
-
-pub(crate) const IFT_QUALITY_FLAT_FALLBACK_BAND: f64 = 0.5;
-
-pub(crate) const IFT_STEP_CAP_GROW_FACTOR: f64 = 1.5;
-
-pub(crate) const IFT_STEP_CAP_SHRINK_FACTOR: f64 = 0.5;
-
 // KKT residual acceptance tolerances for the active-set inner solver.
 // Primal/dual/complementarity are checked at 1e-7 (matches the inner
 // barrier-stopping tolerance used in PIRLS); stationarity uses a looser
@@ -109,11 +91,29 @@ pub(crate) struct PenaltySubspace {
     pub(crate) rank: usize,
 }
 
+/// Trust radii of the two warm-start predictors, each measured from that
+/// predictor's own last error against the flat seed it competes with
+/// (`record_warm_start_prediction_error`). `None` means no measurement yet.
+///
+/// * `ift_radius` is in the predictor's step metric `s = max_k |Δρ_k|`
+///   (`max_k |Δθ_k|` on the joint path). The first-order implicit-function
+///   prediction errs at second order, `E ≈ c₂ s²`, while the flat seed errs
+///   at first order, `F ≈ c₁ s`, so the prediction is the better seed exactly
+///   when `s < c₁ / c₂`; one measured pair `(s, E, F)` gives that radius as
+///   `s · F / E`.
+/// * `tangent_radius` is in `|α + 1|`, where `α` places the new ρ along the
+///   last secant. The secant through `(ρ_prev, β_prev)` and `(ρ_cur, β_cur)`
+///   evaluated at `1 + α` errs by `E ≈ c₂ |α (α + 1)|` and the flat seed by
+///   `F ≈ c₁ |α|`, so the secant wins exactly when `|α + 1| < c₁ / c₂`,
+///   measured as `|α + 1| · F / E`.
+///
+/// `pending` carries the step metric of the prediction handed to the inner
+/// solve, so its error can be attributed when the solve converges.
 #[derive(Default)]
-pub(crate) struct IftQualityRuntimeState {
-    pub(crate) quality_history: Vec<f64>,
-    pub(crate) next_step_cap: Option<f64>,
-    pub(crate) fallback_next_flat: bool,
+pub(crate) struct WarmStartTrustState {
+    pub(crate) ift_radius: Option<f64>,
+    pub(crate) tangent_radius: Option<f64>,
+    pub(crate) pending: Option<(WarmStartPredictionSource, f64)>,
 }
 
 #[derive(Clone)]
