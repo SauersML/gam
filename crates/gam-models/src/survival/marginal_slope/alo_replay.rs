@@ -405,6 +405,7 @@ pub fn replay_saved_survival_marginal_slope_alo(
         time_wiggle_degree: input.time_wiggle_degree,
         time_wiggle_ncols: input.time_wiggle_ncols,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let mut block_states = vec![
         ParameterBlockState {
