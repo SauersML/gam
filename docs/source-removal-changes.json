@@ -2215,5 +2215,14 @@
     ],
     "reason": "#3173: every production outer evaluation of a custom family now goes through evaluate_on_branch, which solves a certified mode from each start (correct_labeled_laplace_mode, or the branch continuation for the incumbent) and prices only the mode the lowest-penalized-objective rule selects (outerobjective_from_coefficient_mode_labeled). The single-seed evaluators outerobjectivegradienthessian_labeled and outerobjectivegradienthessian_internal were the solve-and-price route that evaluation used; they have no production caller left and move verbatim into the cfg(test) test_support module, where tests that price the criterion at a mode they chose still call them.",
     "evidence": "At the gate base 4b87357bf0 source_removal_guard.py and public_api_census.py report exactly these two identities (production_occurrences 0 for both). At the head tree git grep -w finds both names only in crates/gam-custom-family/src/test_support.rs (the moved definitions) and in test modules. cargo check --workspace --all-targets rc 0 and cargo build --workspace --lib rc 0 at the gate; the gam-custom-family lib suite passes except the main red a_double_well_fit_publishes_its_uncertified_trace_2901, identical at base."
+  },
+  {
+    "base": "b3fbbbab2e0eae7c217bc986ddf46c6e36754731",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/arc_curvature_stationary_2817_tests.rs:fn:a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817",
+      "crates/gam-solve/src/rho_optimizer/bridges.rs:const:COST_STALL_WINDOW"
+    ],
+    "reason": "#3176: FixedPointProgress judges each evaluation on its own. It stops the walk iff the evaluation neither improves the incumbent resolvably (resolvably_below at tau each side) nor proposes a step shorter than the previous one, so its 6-evaluation window is deleted. The device BFGS walk, the only other reader of COST_STALL_WINDOW, keeps the count opt's CostStallConfig requires as the private OPT_COST_STALL_WINDOW in gpu/reml_outer.rs until opt's stall rule is window-free (#3018). The limit-cycle pin a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817 asserted a stop at the second window, which no longer exists; it is restated as a_limit_cycling_fixed_point_walk_stops_at_its_first_unprogressing_evaluation_2817.",
+    "evidence": "At base b3fbbbab2e source_removal_guard.py reports exactly these two guarded removals (production_occurrences 0 for both). At the head tree git grep -w finds neither name in crates/. The three restated FixedPointProgress pins pass in cargo test -p gam-solve --lib fixed_point_walk."
   }
 ]
