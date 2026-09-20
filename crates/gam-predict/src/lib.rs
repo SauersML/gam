@@ -2239,24 +2239,43 @@ where
 ///
 /// `prior_weights` are the per-row weights resolved from the PREDICTION frame
 /// (the same weight column / unit-weight default `sample_replicates` resolves,
-/// via `resolve_weight_column`). `None`, a length mismatch, or a
-/// non-finite / non-positive weight falls back to `w_i = 1` for that row, so an
-/// unweighted fit is byte-identical to the pre-#2077 scalar broadcast.
+/// via `resolve_weight_column`). `None` broadcasts the pooled scalar, so an
+/// unweighted fit is byte-identical to the pre-#2077 scalar broadcast. Supplied
+/// weights must cover every row and be finite and strictly positive: a zero weight
+/// has no finite observation variance under the analytic-weight model, and a
+/// weight vector of another length does not describe these rows. Either is
+/// refused, exactly as the generative sibling refuses it, rather than read as
+/// `w_i = 1` — that substitution reported a finite unit-weight band for a row
+/// whose observation variance is unbounded.
 fn gaussian_observation_variance_per_row(
     obsvar: f64,
     n: usize,
     prior_weights: Option<&Array1<f64>>,
-) -> Array1<f64> {
-    match prior_weights {
-        Some(weights) if weights.len() == n => Array1::from_iter(weights.iter().map(|&w| {
-            if w.is_finite() && w > 0.0 {
-                obsvar / w
-            } else {
-                obsvar
-            }
-        })),
-        _ => Array1::from_elem(n, obsvar),
+) -> Result<Array1<f64>, EstimationError> {
+    let Some(weights) = prior_weights else {
+        return Ok(Array1::from_elem(n, obsvar));
+    };
+    if weights.len() != n {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian observation band: prior weights length {} does not match the {n} \
+             prediction rows",
+            weights.len()
+        )));
     }
+    weights
+        .iter()
+        .enumerate()
+        .map(|(row, &w)| {
+            if w.is_finite() && w > 0.0 {
+                Ok(obsvar / w)
+            } else {
+                Err(EstimationError::InvalidInput(format!(
+                    "Gaussian observation band: prior weight at row {row} must be finite and \
+                     > 0 (Var(Y_i) = sigma^2 / w_i), got {w}"
+                )))
+            }
+        })
+        .collect()
 }
 
 /// Total predictive variance `Var(Y)` of a fresh response, per row, by the law of
@@ -2297,7 +2316,7 @@ pub(crate) fn family_predictive_variance<S>(
     mean_variance: &Array1<f64>,
     source: &S,
     prior_weights: Option<&Array1<f64>>,
-) -> Option<Array1<f64>>
+) -> Result<Option<Array1<f64>>, EstimationError>
 where
     S: UncertaintyCovarianceSource + ?Sized,
 {
@@ -2306,10 +2325,19 @@ where
     let rows = |term: &dyn Fn(usize, f64) -> f64| {
         Array1::from_iter(mean.iter().enumerate().map(|(i, &m)| term(i, m)))
     };
-    match response {
+    // The Gaussian per-row noise is the one term that can be refused (invalid
+    // prior weights); every other arm is `None` only for a missing dispersion.
+    let gaussian_noise = match response {
+        ResponseFamily::Gaussian => Some(gaussian_observation_variance_per_row(
+            source.observation_standard_deviation().powi(2),
+            n,
+            prior_weights,
+        )?),
+        _ => None,
+    };
+    let predictive = || match response {
         ResponseFamily::Gaussian => {
-            let obsvar = source.observation_standard_deviation().powi(2);
-            let noise = gaussian_observation_variance_per_row(obsvar, n, prior_weights);
+            let noise = gaussian_noise.as_ref()?;
             Some(rows(&|i, _| noise[i] + v[i]))
         }
         ResponseFamily::Poisson => Some(rows(&|i, m| m + v[i])),
@@ -2360,7 +2388,8 @@ where
         ResponseFamily::StudentT { sigma, nu } => {
             (*nu > 2.0).then(|| rows(&|i, _| sigma * sigma * nu / (nu - 2.0) + v[i]))
         }
-    }
+    };
+    Ok(predictive())
 }
 
 #[inline]
@@ -2472,7 +2501,7 @@ where
             // is centred on the response mean with its posterior variance, so it
             // is on the response scale under any link (identity: μ = η), whose
             // support is the whole line.
-            let Some(total_var) = predictive_variance() else {
+            let Some(total_var) = predictive_variance()? else {
                 return Ok((None, None));
             };
             let obs_se = total_var.mapv(f64::sqrt);
@@ -2500,7 +2529,7 @@ where
             // predictive — NOT a continuous moment-matched surrogate, which has
             // no zero atom and would over-cover the lower tail at low rates.
             let total_var =
-                predictive_variance().expect("Poisson has a closed-form conditional variance");
+                predictive_variance()?.expect("Poisson has a closed-form conditional variance");
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
                 poisson_moment_matched_interval(mean[i], total_var, p_lo, p_hi)
             })
@@ -2526,7 +2555,7 @@ where
             // effective dispersion), NOT a continuous moment-matched surrogate —
             // a Gamma has no zero atom and would grossly over-cover the lower
             // tail at low means.
-            let total_var = predictive_variance().expect("theta availability was checked above");
+            let total_var = predictive_variance()?.expect("theta availability was checked above");
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
                 negative_binomial_moment_matched_interval(mean[i], theta, total_var, p_lo, p_hi)
             })
@@ -2543,7 +2572,7 @@ where
             // zero atom and would over-cover the lower tail like the NB
             // surrogate, #1193). Estimation uncertainty is folded into an
             // effective dispersion that matches the inflated total variance.
-            let total_var = predictive_variance().expect("phi availability was checked above");
+            let total_var = predictive_variance()?.expect("phi availability was checked above");
             let power = *p;
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
                 tweedie_moment_matched_interval(mean[i], phi, power, total_var, p_lo, p_hi)
@@ -2554,7 +2583,7 @@ where
             // strongly right-skewed, so the band is built from equal-tailed
             // Gamma quantiles (moment-matched predictive), not a symmetric
             // `μ ± z·σ` band that mis-covers each tail (#817).
-            let Some(total_var) = predictive_variance() else {
+            let Some(total_var) = predictive_variance()? else {
                 return Ok((None, None));
             };
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
@@ -2565,7 +2594,7 @@ where
             // `Var(Y|μ) = φμ³`: heavier right skew than the Gamma, so the band
             // is built from equal-tailed moment-matched inverse-Gaussian
             // quantiles.
-            let Some(total_var) = predictive_variance() else {
+            let Some(total_var) = predictive_variance()? else {
                 return Ok((None, None));
             };
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
@@ -2595,7 +2624,7 @@ where
                         .to_string(),
                 )
             })?;
-            let total_var = predictive_variance().expect("phi and the complement are present");
+            let total_var = predictive_variance()?.expect("phi and the complement are present");
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
                 beta_moment_matched_interval(mean[i], complement[i], total_var, p_lo, p_hi)
             })
@@ -3351,7 +3380,7 @@ where
         &mean_variance,
         source,
         None,
-    )
+    )?
     .ok_or_else(|| {
         EstimationError::InvalidInput(format!(
             "conformal prediction for {} requires fitted observation-scale dispersion; \
@@ -5407,6 +5436,46 @@ mod tests {
         (mean, variance.sqrt(), complement)
     }
 
+    /// A weighted Gaussian row's observation noise is `σ²/w_i`, so a zero weight has
+    /// no finite band and a weight vector of another length describes other rows.
+    /// Both are refused, as the generative replicate path refuses them, instead of
+    /// being read as a unit weight.
+    #[test]
+    fn gaussian_observation_band_refuses_invalid_prior_weights() {
+        let fit = test_fit_with_covariance(array![0.0], Array2::eye(1));
+        let z = standard_normal_quantile(0.975).unwrap();
+        let z_row = array![z];
+        let band = |weights: Array1<f64>| {
+            family_observation_band(
+                &ResponseFamily::Gaussian,
+                &array![0.0],
+                None,
+                &array![0.0],
+                &z_row,
+                &z_row,
+                IntervalReference::Normal,
+                &fit,
+                Some(&weights),
+            )
+        };
+        let (lower, upper) = band(array![4.0]).expect("a positive weight has a band");
+        let (lower, upper) = (lower.expect("lower edge")[0], upper.expect("upper edge")[0]);
+        assert!(
+            (upper - 0.5 * z).abs() <= 1e-12,
+            "sigma/sqrt(4) band: {upper}"
+        );
+        assert!(
+            (lower + 0.5 * z).abs() <= 1e-12,
+            "sigma/sqrt(4) band: {lower}"
+        );
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let err = band(array![bad]).expect_err("an invalid weight is refused");
+            assert!(err.to_string().contains("prior weight at row 0"), "{err}");
+        }
+        let err = band(array![1.0, 1.0]).expect_err("a mismatched weight vector is refused");
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
     /// #3140: far in the upper tail the posterior mean of a logit-Beta response
     /// rounds to one, so `1 − m` is zero and no Beta has any spread there. The
     /// complement integrated as its own function of η keeps its digits, and the band
@@ -5491,6 +5560,7 @@ mod tests {
             &fit,
             None,
         )
+        .expect("no prior weights to refuse")
         .expect("the Bernoulli predictive variance with its complement");
         assert!(
             predictive[0] > 0.0 && predictive[0] == complement,
