@@ -214,9 +214,27 @@ struct SummaryPredictorBlock<'a> {
     /// The payload field `spec` was read from, for the absence reasons.
     spec_field: &'static str,
     offset: gam_solve::estimate::SummaryBlockOffset,
-    /// The fit block whose coefficient and λ counts the replay must reproduce;
-    /// `None` when `saved_lambdas_index_rebuilt_layout` owns that check.
-    block: Option<&'a gam_solve::estimate::FittedBlock>,
+    /// How the replayed design sits inside the fit block that carries it.
+    placement: SummaryBlockPlacement<'a>,
+}
+
+/// How a presented predictor's replayed design maps onto the fit block that
+/// carries it, and so which coefficient and λ counts the replay must reproduce.
+#[derive(Clone, Copy)]
+enum SummaryBlockPlacement<'a> {
+    /// The design is the fit's leading Mean or Location block, read from global
+    /// index 0; `saved_lambdas_index_rebuilt_layout` owns the λ-count check.
+    Leading,
+    /// The design is this whole fit block.
+    Whole(&'a gam_solve::estimate::FittedBlock),
+    /// The design is the covariate tail of a Royston-Parmar block laid out as
+    /// `[time basis | time wiggle | covariates]` (Weibull and transformation
+    /// survival, #3568): its columns start `time_columns` into the block, and
+    /// its λ are the block's last ones, after the time penalties.
+    CovariateTail {
+        block: &'a gam_solve::estimate::FittedBlock,
+        time_columns: usize,
+    },
 }
 
 impl SummaryPredictorBlock<'_> {
@@ -242,8 +260,19 @@ impl SummaryPredictorBlock<'_> {
 /// link-deviation flex block) own λ and coefficients but no summary rows; they
 /// still advance the offsets of the blocks after them.
 ///
-/// Every other fit presents its single mean (or location) predictor from
-/// `resolved_termspec` at the start of the layout.
+/// Every other fit presents its one covariate predictor from
+/// `resolved_termspec`, placed at the fit block that carries it (#3568): the
+/// first Mean block, else the first Location block, else the Threshold block
+/// of a threshold/log-σ fit (in a location-scale survival fit the
+/// time-transform block leads it). Its offsets count every block before it, and
+/// its λ count is checked against that block alone. A Royston-Parmar survival
+/// fit (Weibull, transformation) has one Mean block holding the time basis and
+/// the covariates together, so the covariate columns start after the time
+/// prologue inside it. Reading every fit's spec at global index 0 put the time
+/// block's coefficients under the covariates' names. A multi-block fit with no
+/// such block (a competing-risks fit, whose covariates live inside every
+/// cause's time block) has no one block the spec builds, and is refused with
+/// its block roles rather than read at 0.
 fn summary_predictor_blocks<'a>(
     model: &'a FittedModel,
     fit: &'a gam_solve::estimate::UnifiedFitResult,
@@ -259,12 +288,53 @@ fn summary_predictor_blocks<'a>(
         Ok::<_, String>(spec)
     };
     if !matches!(payload.family_state, FittedFamily::MarginalSlope { .. }) {
+        let spec = frozen(payload.resolved_termspec.as_ref(), "resolved_termspec")?;
+        let presented = [BlockRole::Mean, BlockRole::Location, BlockRole::Threshold]
+            .into_iter()
+            .find_map(|role| fit.blocks.iter().position(|block| block.role == role));
+        let (offset, placement) = match presented {
+            None if fit.blocks.len() <= 1 => {
+                (SummaryBlockOffset::default(), SummaryBlockPlacement::Leading)
+            }
+            None => {
+                let roles: Vec<&str> = fit.blocks.iter().map(|block| block.role.name()).collect();
+                return Err(format!(
+                    "no block of the saved fit carries the `resolved_termspec` predictor (block \
+                     roles: {roles:?}), so its coefficient and smoothing-parameter offsets are \
+                     unknown"
+                ));
+            }
+            Some(index) => {
+                let block = &fit.blocks[index];
+                let royston_parmar = matches!(payload.family_state, FittedFamily::Survival { .. })
+                    && block.role == BlockRole::Mean
+                    && fit.block_by_role(BlockRole::Time).is_none();
+                let placement = if royston_parmar {
+                    SummaryBlockPlacement::CovariateTail {
+                        block,
+                        time_columns: royston_parmar_time_columns(model)?,
+                    }
+                } else if index == 0 && block.role != BlockRole::Threshold {
+                    SummaryBlockPlacement::Leading
+                } else {
+                    SummaryBlockPlacement::Whole(block)
+                };
+                let offset = SummaryBlockOffset {
+                    coefficients: fit.blocks[..index].iter().map(|b| b.beta.len()).sum(),
+                    penalties: fit.blocks[..index].iter().map(|b| b.lambdas.len()).sum(),
+                };
+                if !matches!(placement, SummaryBlockPlacement::Leading) {
+                    validate_block_totals(fit)?;
+                }
+                (offset, placement)
+            }
+        };
         return Ok(vec![SummaryPredictorBlock {
             predictor: None,
-            spec: frozen(payload.resolved_termspec.as_ref(), "resolved_termspec")?,
+            spec,
             spec_field: "resolved_termspec",
-            offset: SummaryBlockOffset::default(),
-            block: None,
+            offset,
+            placement,
         }]);
     }
     let mut predictors = Vec::new();
@@ -282,22 +352,13 @@ fn summary_predictor_blocks<'a>(
                     .map_err(|reason| format!("{predictor} predictor: {reason}"))?,
                 spec_field,
                 offset,
-                block: Some(block),
+                placement: SummaryBlockPlacement::Whole(block),
             });
         }
         offset.coefficients += block.beta.len();
         offset.penalties += block.lambdas.len();
     }
-    if offset.coefficients != fit.beta.len() || offset.penalties != fit.lambdas.len() {
-        return Err(format!(
-            "the saved fit's blocks hold {} coefficients and {} smoothing parameters but its \
-             flat layout has {} and {}, so no block's offset is known",
-            offset.coefficients,
-            offset.penalties,
-            fit.beta.len(),
-            fit.lambdas.len()
-        ));
-    }
+    validate_block_totals(fit)?;
     for (predictor, role) in [("marginal", BlockRole::Location), ("slope", BlockRole::Scale)] {
         if !predictors.iter().any(|block| block.predictor == Some(predictor)) {
             return Err(format!(
@@ -309,6 +370,42 @@ fn summary_predictor_blocks<'a>(
     Ok(predictors)
 }
 
+/// Refuse a fit whose per-block coefficient and λ counts do not add up to its
+/// flat layout, since no block's global offset is then known.
+fn validate_block_totals(fit: &UnifiedFitResult) -> Result<(), String> {
+    let coefficients: usize = fit.blocks.iter().map(|block| block.beta.len()).sum();
+    let penalties: usize = fit.blocks.iter().map(|block| block.lambdas.len()).sum();
+    if coefficients != fit.beta.len() || penalties != fit.lambdas.len() {
+        return Err(format!(
+            "the saved fit's blocks hold {coefficients} coefficients and {penalties} smoothing \
+             parameters but its flat layout has {} and {}, so no block's offset is known",
+            fit.beta.len(),
+            fit.lambdas.len()
+        ));
+    }
+    Ok(())
+}
+
+/// The width of the time prologue of a Royston-Parmar survival block: the
+/// saved time basis evaluated at the saved anchor (the row the fit and the
+/// saved-model sampler centre the time design with, so it has the fit's time
+/// width), followed by the baseline time-wiggle coefficients.
+fn royston_parmar_time_columns(model: &FittedModel) -> Result<usize, String> {
+    let payload = model.payload();
+    let basis = crate::inference::model::load_survival_time_basis_config_from_model(model)?;
+    let anchor = payload.survival_time_anchor.ok_or_else(|| {
+        "survival model was saved without `survival_time_anchor`, so the time prologue of its \
+         [time | covariates] block has no known width; refit to recover the term tables"
+            .to_string()
+    })?;
+    let time = crate::survival::evaluate_survival_time_basis_row(anchor, &basis)?.len();
+    Ok(time
+        + payload
+            .beta_baseline_timewiggle
+            .as_ref()
+            .map_or(0, Vec::len))
+}
+
 /// One predictor's frozen basis replayed at representative inputs: the design
 /// whose column layout both of its term tables read.
 struct ReplayedPredictor<'a> {
@@ -317,7 +414,7 @@ struct ReplayedPredictor<'a> {
 }
 
 fn replay_predictor<'a>(
-    predictor: SummaryPredictorBlock<'a>,
+    mut predictor: SummaryPredictorBlock<'a>,
     ranges: &'a [(f64, f64)],
 ) -> Result<ReplayedPredictor<'a>, String> {
     // Every categorical column — including a fixed main effect represented by
@@ -330,6 +427,39 @@ fn replay_predictor<'a>(
     let data = representative_data_from_ranges(ranges, &factor_levels);
     let design = gam_terms::smooth::build_term_collection_design(data.view(), predictor.spec)
         .map_err(|err| format!("{}: frozen-basis design replay failed: {err}", predictor.label()))?;
+    // Both term tables index the fit's coefficients through the design's
+    // columns, so a replay whose width does not fill its place in the block is
+    // refused for both, not only for the smooth table.
+    let columns = design.design.ncols();
+    match predictor.placement {
+        SummaryBlockPlacement::Leading => {}
+        SummaryBlockPlacement::Whole(block) => {
+            if columns != block.beta.len() {
+                return Err(format!(
+                    "{}: the rebuilt design has {columns} coefficients but the fit's {} block \
+                     has {}",
+                    predictor.label(),
+                    block.role.name(),
+                    block.beta.len()
+                ));
+            }
+        }
+        SummaryBlockPlacement::CovariateTail {
+            block,
+            time_columns,
+        } => {
+            if time_columns + columns != block.beta.len() {
+                return Err(format!(
+                    "{}: the fit's {} block has {} coefficients, not the {time_columns} of its \
+                     time prologue plus the {columns} of the rebuilt covariate design",
+                    predictor.label(),
+                    block.role.name(),
+                    block.beta.len()
+                ));
+            }
+            predictor.offset.coefficients += time_columns;
+        }
+    }
     Ok(ReplayedPredictor { predictor, design })
 }
 
@@ -367,27 +497,50 @@ fn predictor_block_smooth_terms(
     let label = predictor.label();
     // The walk below reads the fit's per-penalty record by the rebuilt layout's
     // global index, so a rebuild with another block count would misread it.
-    match predictor.block {
-        None => crate::inference::model::saved_lambdas_index_rebuilt_layout(
-            spec,
-            design.penalties.len(),
-            fit,
-            "per-smooth summary",
-        )?,
-        Some(block) => {
-            if design.design.ncols() != block.beta.len()
-                || design.penalties.len() != block.lambdas.len()
-            {
+    let mut offset = predictor.offset;
+    match predictor.placement {
+        SummaryBlockPlacement::Leading => {
+            crate::inference::model::saved_lambdas_index_rebuilt_layout(
+                spec,
+                design.penalties.len(),
+                fit,
+                "per-smooth summary",
+            )?
+        }
+        SummaryBlockPlacement::Whole(block) => {
+            if design.penalties.len() != block.lambdas.len() {
                 return Err(format!(
-                    "{label}: the rebuilt design has {} coefficients and {} penalty blocks but \
-                     the fit's {} block has {} coefficients and {} smoothing parameters",
-                    design.design.ncols(),
+                    "{label}: the rebuilt design has {} penalty blocks but the fit's {} block has \
+                     {} smoothing parameters",
                     design.penalties.len(),
                     block.role.name(),
-                    block.beta.len(),
                     block.lambdas.len()
                 ));
             }
+        }
+        SummaryBlockPlacement::CovariateTail { block, .. } => {
+            // The block's λ are the time penalties followed by the covariate
+            // blocks the fit admitted (`covariate_penalty_blocks`, in design
+            // order), so the design's penalties are the block's last λ exactly
+            // when the fit admitted every one of them.
+            let admitted = crate::survival::covariate_penalty_blocks(
+                &design.penalties,
+                &design.nullspace_dims,
+                design.design.ncols(),
+                0,
+            )
+            .len();
+            if admitted != design.penalties.len() || admitted > block.lambdas.len() {
+                return Err(format!(
+                    "{label}: the fit's {} block has {} smoothing parameters and the rebuilt \
+                     covariate design has {} penalty blocks, of which the survival fit admits \
+                     {admitted}, so the covariate λ are not the block's trailing ones",
+                    block.role.name(),
+                    block.lambdas.len(),
+                    design.penalties.len()
+                ));
+            }
+            offset.penalties += block.lambdas.len() - admitted;
         }
     }
 
@@ -399,7 +552,7 @@ fn predictor_block_smooth_terms(
     // #1277, #1360, #1368 and #1372 each had to be landed twice. Every fitted
     // quantity the test reads comes from `fit`; the frozen-basis replay supplies
     // only the term structure.
-    let rows = gam_solve::estimate::smooth_term_summary_rows(design, fit, predictor.offset);
+    let rows = gam_solve::estimate::smooth_term_summary_rows(design, fit, offset);
     Ok(rows
         .into_iter()
         .map(|row| SummarySmoothTermRow {
