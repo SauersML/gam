@@ -3033,8 +3033,9 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// The anchoring residual `Σ_k w_k Φ(η_k) − μ` at intercept `a` under the
-    /// finite law `grid`, the standard deviation of `Φ(η(U))` under that law, and
-    /// `μ` (gam#2926: the closed-form certificate reads all three).
+    /// finite law `grid`, the standard deviation of `Φ(η(U))` under that law, `μ`,
+    /// and the probabilities `Φ(η_k)` at the law's nodes (gam#2926: the closed-form
+    /// certificate reads all four).
     pub(super) fn evaluate_empirical_grid_anchoring_residual(
         &self,
         a: f64,
@@ -3043,7 +3044,7 @@ impl BernoulliMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
         grid: &EmpiricalZGrid,
-    ) -> Result<(f64, f64, f64), String> {
+    ) -> Result<(f64, f64, f64, Vec<f64>), String> {
         let marginal = self.marginal_link_map(marginal_eta)?;
         let mut probabilities = Vec::with_capacity(grid.nodes.len());
         let mut mean = 0.0;
@@ -3065,7 +3066,7 @@ impl BernoulliMarginalSlopeFamily {
                  at intercept={a}"
             ));
         }
-        Ok((mean - marginal.mu, variance.sqrt(), marginal.mu))
+        Ok((mean - marginal.mu, variance.sqrt(), marginal.mu, probabilities))
     }
 
     pub(super) fn flex_active(&self) -> bool {
