@@ -6,12 +6,12 @@
 //! uniform draws on [0, 2π] usually have range [ε, 2π-ε], so inferring the
 //! period from data max-min would create off-by-ε seam discontinuities.
 //!
-//! A cyclic *basis selector* (`cc`/`cyclic`, i.e. mgcv `bs="cc"`) is the
-//! opposite case: the basis is DEFINED to wrap over its knot range, whose
-//! default is the observed data range, with the two endpoint knots identified
-//! by construction. There is no separate "true period" to approximate, so —
-//! exactly like mgcv's `s(x, bs="cc")` and the tensor `cc` margin — a bare
-//! cyclic smooth must be accepted and wrap on `[min, max]`, not rejected.
+//! A cyclic *basis selector* (`cyclic()`, `bs="cyclic"`) is the opposite
+//! case: the basis is DEFINED to wrap over its knot range, whose default is
+//! the observed data range, with the two endpoint knots identified by
+//! construction. There is no separate "true period" to approximate, so — as
+//! for the tensor `cyclic` margin — a bare cyclic smooth must be accepted and
+//! wrap on `[min, max]`, not rejected.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -82,7 +82,7 @@ fn assert_rejects_missing_period(formula: &str, data: &gam::data::EncodedDataset
     );
 }
 
-/// A cyclic *basis selector* (`cc`/`cyclic`, mgcv `bs="cc"`) needs no explicit
+/// A cyclic *basis selector* (`cyclic()`, `bs="cyclic"`) needs no explicit
 /// period: it wraps over the observed data range. Assert the fit is ACCEPTED
 /// and that the converged curve is genuinely periodic — fitted(min) ==
 /// fitted(max) — the defining structural property of a cyclic basis, which
@@ -127,11 +127,10 @@ fn periodic_without_explicit_period_behavior_consistent() {
     // A `periodic=true` FLAG on an open B-spline still requires an explicit
     // period (the off-by-ε seam concern is real for a forced-periodic basis).
     assert_rejects_missing_period("y ~ s(t, periodic=true)", &data);
-    // A cyclic BASIS selector (mgcv `bs="cc"`) wraps on the observed data
-    // range and must be accepted — matching mgcv, the tensor `cc` margin, and
-    // the #874 / cc-margin regressions.
+    // A cyclic BASIS selector wraps on the observed data range and must be
+    // accepted, like the tensor `cyclic` margin and the #874 / cyclic-margin
+    // regressions.
     assert_accepts_and_wraps("y ~ cyclic(t)", &data, "t");
-    assert_accepts_and_wraps("y ~ cc(t)", &data, "t");
 }
 
 #[test]

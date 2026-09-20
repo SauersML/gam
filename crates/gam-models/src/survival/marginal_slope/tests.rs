@@ -9260,7 +9260,7 @@ fn flex_survival_anchoring_residual_matches_its_calibration_and_the_rigid_form_2
     );
     let law = normal_quantile_law(4001);
     for &(q, slope) in &[(-1.5, 0.4), (0.3, 0.8), (2.0, -0.6)] {
-        let (flex_residual, _, _) = family
+        let (flex_residual, _, _, _) = family
             .flex_survival_anchoring_residual(q, slope, beta_h, None, &law)
             .expect("flex anchoring residual");
         assert!(
@@ -9268,10 +9268,10 @@ fn flex_survival_anchoring_residual_matches_its_calibration_and_the_rigid_form_2
             "under the program's own N(0, 1) the flex residual must vanish: q={q} slope={slope} \
              residual={flex_residual:e}"
         );
-        let (through_flex, sd_through_flex, scale_through_flex) = family
+        let (through_flex, sd_through_flex, scale_through_flex, _) = family
             .flex_survival_anchoring_residual(q, slope, None, None, &law)
             .expect("rigid anchoring residual through the flex program");
-        let (rigid, sd_rigid, scale_rigid) =
+        let (rigid, sd_rigid, scale_rigid, _) =
             crate::bms::estimated_latent_law::closed_form_survival_anchoring_residual(
                 q,
                 family.probit_frailty_scale() * slope,

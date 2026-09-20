@@ -124,13 +124,13 @@ fn gam_gaussian_location_scale_matches_gamboostlss() {
     let x_idx = col["x"];
     let ncols = ds.headers.len();
 
-    // ---- fit with gam: mu ~ s(x, bs='tp'), log-sigma ~ 1 + s(x, bs='tp') ----
+    // ---- fit with gam: mu ~ s(x, bs='tps'), log-sigma ~ 1 + s(x, bs='tps') ----
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("1 + s(x, bs='tp')".to_string()),
+        noise_formula: Some("1 + s(x, bs='tps')".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg).expect("gam location-scale fit");
+    let result = fit_from_formula("y ~ s(x, bs='tps')", &ds, &cfg).expect("gam location-scale fit");
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
         fit,
         response_scale,

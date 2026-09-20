@@ -1797,10 +1797,31 @@ fn selected_gpu_consumers_cannot_retry_on_cpu_932() {
     let dense_source = include_str!("row_primary_hessian.rs");
     let device_source = include_str!("gpu/row.rs");
 
+    // Every selected-GPU consumer, named by the operation it passes: the
+    // HVP/diagonal dispatches (the raced joint-Hessian HVP included: its
+    // device executor's error ends the race, gam#3024) and the joint-gradient
+    // and dense cache-boundary adapters, which forward their caller's label.
+    let mut consumers: Vec<&str> = axis_source
+        .split("require_selected_gpu_result(")
+        .skip(1)
+        .map(|call| call.split(',').next().expect("operation argument").trim())
+        .collect();
+    consumers.sort_unstable();
     assert_eq!(
-        axis_source.matches("require_selected_gpu_result(").count(),
-        9,
-        "seven HVP/diagonal dispatches plus the joint-gradient and dense cache-boundary adapters must share the fail-closed contract"
+        consumers,
+        [
+            "\"batched tiled row-Hessian matvec\"",
+            "\"host-pin row-Hessian diagonal\"",
+            "\"host-pin row-Hessian matvec\"",
+            "\"joint-Hessian HVP\"",
+            "\"joint-Hessian diagonal\"",
+            "\"raced joint-Hessian HVP\"",
+            "\"tiled row-Hessian diagonal\"",
+            "\"tiled row-Hessian matvec\"",
+            "operation",
+            "operation",
+        ],
+        "every HVP/diagonal dispatch and cache-boundary adapter must share the fail-closed contract"
     );
     assert_eq!(
         workspace_source

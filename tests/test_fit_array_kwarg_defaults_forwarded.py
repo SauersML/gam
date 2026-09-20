@@ -33,7 +33,7 @@ def test_fit_array_documented_defaults_reach_likelihood_spec() -> None:
         negbin_theta,
         negbin_theta / (negbin_theta + negbin_mu),
     ).astype(np.float64)
-    negbin = gamfit.fit_array(x, negbin_y, "y ~ x0", family="negbin")
+    negbin = gamfit.fit_array(x, negbin_y, "y ~ x0", family="negative-binomial")
     assert negbin.summary().family_name == "Negative-Binomial Log", (
         "fit_array should forward the Negative-Binomial family into the fitted model"
     )

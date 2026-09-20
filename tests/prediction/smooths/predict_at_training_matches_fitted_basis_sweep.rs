@@ -152,10 +152,10 @@ fn predict_at_training_matches_fitted_across_1d_bases() {
     }
 
     let bases: &[(&str, &str)] = &[
-        ("tp", "y ~ s(x, bs=\"tp\", k=10)"),
+        ("tp", "y ~ s(x, bs=\"tps\", k=10)"),
         ("ps", "y ~ s(x, bs=\"ps\", k=10)"),
         ("cr", "y ~ s(x, bs=\"cr\", k=10)"),
-        ("cc", "y ~ s(x, bs=\"cc\", k=10)"),
+        ("cc", "y ~ s(x, bs=\"cyclic\", k=10)"),
         ("ds", "y ~ s(x, bs=\"ds\", k=10)"),
     ];
 
