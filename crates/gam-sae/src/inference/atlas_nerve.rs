@@ -170,8 +170,10 @@ pub struct AtlasNerveEdge {
     /// When no transfer evidence exists, the rejected aggregate audit row uses
     /// identity zero and can never enter the certified inventory.
     pub overlap: usize,
+    /// Summed min-weight mass of the rows both charts fire on. A pair is
+    /// co-active exactly when this is positive; there is no further mass
+    /// threshold.
     pub coactivation_mass: f64,
-    pub coactivation_threshold: f64,
     pub transfer_valid: bool,
     pub admitted: bool,
     pub filtration: f64,
@@ -326,13 +328,12 @@ fn validate_charts(charts: &[AtlasChart]) -> Result<usize, String> {
     Ok(n)
 }
 
-fn mutual_row_mass(charts: &[AtlasChart], simplex: &[usize]) -> (f64, f64) {
+fn mutual_row_mass(charts: &[AtlasChart], simplex: &[usize]) -> f64 {
     if simplex.is_empty() {
-        return (0.0, f64::INFINITY);
+        return 0.0;
     }
     let mut positions = vec![0usize; simplex.len()];
     let mut total = 0.0_f64;
-    let mut positive_count = 0usize;
 
     loop {
         if simplex
@@ -373,24 +374,17 @@ fn mutual_row_mass(charts: &[AtlasChart], simplex: &[usize]) -> (f64, f64) {
                 .map(|(&chart_idx, &position)| charts[chart_idx].support_weights[position])
                 .fold(f64::INFINITY, f64::min);
             total += row_mass;
-            positive_count += 1;
             for position in &mut positions {
                 *position += 1;
             }
         }
     }
-    let threshold = if positive_count > 0 {
-        total / positive_count as f64
-    } else {
-        f64::INFINITY
-    };
-    (total, threshold)
+    total
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PairOverlap {
     mass: f64,
-    positive_rows: usize,
 }
 
 /// Merge the per-chart sorted support lists by row and accumulate only chart
@@ -427,7 +421,6 @@ fn sparse_pair_overlaps(charts: &[AtlasChart]) -> (BTreeMap<(usize, usize), Pair
                 let (b, wb) = live[right];
                 let pair = overlaps.entry((a, b)).or_default();
                 pair.mass += wa.min(wb);
-                pair.positive_rows += 1;
             }
         }
     }
@@ -785,8 +778,7 @@ pub fn build_atlas_nerve(
     let mut edge_reports = Vec::new();
     let mut max_filtration = 0.0_f64;
     for (&(a, b), overlap) in &overlaps {
-        let threshold = overlap.mass / overlap.positive_rows as f64;
-        let coactive = overlap.mass.is_finite() && overlap.mass >= threshold;
+        let coactive = overlap.mass.is_finite() && overlap.mass > 0.0;
         let filtration = chart_distance(&charts[a], &charts[b], overlap.mass)
             .max(dtm[a])
             .max(dtm[b]);
@@ -802,7 +794,6 @@ pub fn build_atlas_nerve(
                 b,
                 overlap: overlap_id,
                 coactivation_mass: overlap.mass,
-                coactivation_threshold: threshold,
                 transfer_valid,
                 admitted,
                 filtration,
@@ -826,7 +817,7 @@ pub fn build_atlas_nerve(
     let inventory = enumerate_full_nerve(
         n,
         &|simplex: &[usize]| {
-            let (mass, _) = mutual_row_mass(charts, simplex);
+            let mass = mutual_row_mass(charts, simplex);
             mass.is_finite() && mass > 0.0
         },
         &adjacency,
@@ -1063,7 +1054,7 @@ mod tests {
             .iter()
             .find(|edge| edge.a == 1 && edge.b == 2)
             .unwrap();
-        assert!(rejected.coactivation_mass >= rejected.coactivation_threshold);
+        assert!(rejected.coactivation_mass > 0.0);
         assert!(!rejected.transfer_valid);
         assert!(!rejected.admitted);
     }
