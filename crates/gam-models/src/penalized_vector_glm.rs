@@ -355,10 +355,63 @@ pub enum VectorGlmSolve {
     Stalled(VectorGlmStall),
 }
 
+/// Add the class-space penalty curvature `∇²_β pen(β)` for `metric` onto the
+/// penalized Hessian `H = block(XᵀWX)`. Shared by the in-loop and
+/// final-iterate Hessian assemblies so both see the identical algebra (the
+/// gradient counterpart is [`fill_penalized_gradient`]).
+fn add_class_penalty_hessian(
+    hessian: &mut Array2<f64>,
+    penalty: ArrayView2<'_, f64>,
+    lambdas: ArrayView1<'_, f64>,
+    p: usize,
+    m: usize,
+    metric: ClassPenaltyMetric,
+) {
+    match metric {
+        // Diagonal: H_{aa} += λ_a·S.
+        ClassPenaltyMetric::Diagonal => {
+            for a in 0..m {
+                let la = lambdas[a];
+                if la == 0.0 {
+                    continue;
+                }
+                let base = a * p;
+                for i in 0..p {
+                    for j in 0..p {
+                        hessian[[base + i, base + j]] += la * penalty[[i, j]];
+                    }
+                }
+            }
+        }
+        // Centered (#1587): H_{ab} += λ·(δ_ab − 1/K)·S, K = M+1, shared
+        // λ = lambdas[0] — couples every class pair via the −(λ/K)·S
+        // off-diagonals. Reference-invariant softmax penalty.
+        ClassPenaltyMetric::Centered if m > 0 && lambdas[0] != 0.0 => {
+            let lam = lambdas[0];
+            let inv_k = 1.0 / ((m + 1) as f64);
+            for a in 0..m {
+                for b in 0..m {
+                    let coef = lam * (if a == b { 1.0 } else { 0.0 } - inv_k);
+                    let (ba, bb) = (a * p, b * p);
+                    for i in 0..p {
+                        for j in 0..p {
+                            hessian[[ba + i, bb + j]] += coef * penalty[[i, j]];
+                        }
+                    }
+                }
+            }
+        }
+        ClassPenaltyMetric::Centered => {}
+        // EquivariantPerClass (#2344): H += A(λ) ⊗ S, the coupled
+        // heterogeneous per-class blocks.
+        ClassPenaltyMetric::EquivariantPerClass => {
+            add_equivariant_penalty_blocks(hessian, penalty, lambdas, p, m);
+        }
+    }
+}
+
 /// Add `A(λ) ⊗ S` — the equivariant per-class metric's coupled blocks
 /// (#2344, see [`equivariant_class_metric`]) — onto the penalized Hessian.
-/// Shared by the in-loop and final-iterate Hessian assemblies so both see the
-/// identical algebra.
 fn add_equivariant_penalty_blocks(
     hessian: &mut Array2<f64>,
     penalty: ArrayView2<'_, f64>,
@@ -883,46 +936,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
                 hessian.dim()
             );
         }
-        match class_penalty_metric {
-            ClassPenaltyMetric::Diagonal => {
-                for a in 0..m {
-                    let la = lambdas[a];
-                    if la == 0.0 {
-                        continue;
-                    }
-                    let base = a * p;
-                    for i in 0..p {
-                        for j in 0..p {
-                            hessian[[base + i, base + j]] += la * penalty[[i, j]];
-                        }
-                    }
-                }
-            }
-            // Centered (#1587): H_{ab} += λ·(δ_ab − 1/K)·S, K = M+1, shared
-            // λ = lambdas[0] — couples every class pair via the −(λ/K)·S
-            // off-diagonals. Reference-invariant softmax penalty.
-            ClassPenaltyMetric::Centered if m > 0 && lambdas[0] != 0.0 => {
-                let lam = lambdas[0];
-                let inv_k = 1.0 / ((m + 1) as f64);
-                for a in 0..m {
-                    for b in 0..m {
-                        let coef = lam * (if a == b { 1.0 } else { 0.0 } - inv_k);
-                        let (ba, bb) = (a * p, b * p);
-                        for i in 0..p {
-                            for j in 0..p {
-                                hessian[[ba + i, bb + j]] += coef * penalty[[i, j]];
-                            }
-                        }
-                    }
-                }
-            }
-            ClassPenaltyMetric::Centered => {}
-            // EquivariantPerClass (#2344): H += A(λ) ⊗ S, the coupled
-            // heterogeneous per-class blocks.
-            ClassPenaltyMetric::EquivariantPerClass => {
-                add_equivariant_penalty_blocks(&mut hessian, penalty, lambdas, p, m);
-            }
-        }
+        add_class_penalty_hessian(&mut hessian, penalty, lambdas, p, m, class_penalty_metric);
 
         fill_penalized_gradient(
             design,
@@ -1112,43 +1126,14 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
             .view(),
     };
     let mut hessian_final = dense_block_xtwx(design, fisher_blocks_final, None)?;
-    match class_penalty_metric {
-        ClassPenaltyMetric::Diagonal => {
-            for a in 0..m {
-                let la = lambdas[a];
-                if la == 0.0 {
-                    continue;
-                }
-                let base = a * p;
-                for i in 0..p {
-                    for j in 0..p {
-                        hessian_final[[base + i, base + j]] += la * penalty[[i, j]];
-                    }
-                }
-            }
-        }
-        ClassPenaltyMetric::Centered if m > 0 && lambdas[0] != 0.0 => {
-            let lam = lambdas[0];
-            let inv_k = 1.0 / ((m + 1) as f64);
-            for a in 0..m {
-                for b in 0..m {
-                    let coef = lam * (if a == b { 1.0 } else { 0.0 } - inv_k);
-                    let (ba, bb) = (a * p, b * p);
-                    for i in 0..p {
-                        for j in 0..p {
-                            hessian_final[[ba + i, bb + j]] += coef * penalty[[i, j]];
-                        }
-                    }
-                }
-            }
-        }
-        ClassPenaltyMetric::Centered => {}
-        // EquivariantPerClass (#2344): H += A(λ) ⊗ S, the coupled
-        // heterogeneous per-class blocks.
-        ClassPenaltyMetric::EquivariantPerClass => {
-            add_equivariant_penalty_blocks(&mut hessian_final, penalty, lambdas, p, m);
-        }
-    }
+    add_class_penalty_hessian(
+        &mut hessian_final,
+        penalty,
+        lambdas,
+        p,
+        m,
+        class_penalty_metric,
+    );
 
     // Re-evaluate the exact penalized score AT the accepted final iterate. The
     // loop's inexpensive gate uses the pre-step score (valid to first order
