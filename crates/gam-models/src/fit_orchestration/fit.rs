@@ -635,16 +635,14 @@ pub(crate) fn fit_standard_model_on_design(
         }
     };
 
-    let adaptive_spatial_terms = adaptive_spatial_term_mask(&request.spec);
-    let adaptive_spatial_center_counts = adaptive_spatial_center_counts(&request.spec);
+    let adaptive_bases = adaptive_bases(&request.spec);
     let result = StandardFitResult {
         saved_link_state: fitted.fit.fitted_link.clone(),
         fit: fitted.fit,
         design: fitted.design,
         resolvedspec: fitted.resolvedspec,
         basis_adequacy: Vec::new(),
-        adaptive_spatial_terms: adaptive_spatial_terms.clone(),
-        adaptive_spatial_center_counts: adaptive_spatial_center_counts.clone(),
+        adaptive_bases: adaptive_bases.clone(),
         kappa_timing: fitted.kappa_timing,
         wiggle_knots: None,
         wiggle_degree: None,
@@ -765,8 +763,7 @@ pub(crate) fn fit_standard_model_on_design(
         design: solved.design,
         resolvedspec: solved.resolvedspec,
         basis_adequacy: Vec::new(),
-        adaptive_spatial_terms,
-        adaptive_spatial_center_counts,
+        adaptive_bases,
         kappa_timing: result.kappa_timing,
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),

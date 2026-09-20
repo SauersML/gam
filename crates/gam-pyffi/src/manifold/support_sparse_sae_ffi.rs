@@ -286,7 +286,7 @@ impl SupportSparseManifoldSaeCore {
         )?;
         out.set_item("support_values", support_values(term).into_pyarray(py))?;
         out.set_item("coords", coords_rows(py, term)?)?;
-        out.set_item("certificate", json_value_to_py(py, certificate)?)?;
+        out.set_item("certificate", json_value_to_py(py, &certificate)?)?;
         Ok(out.unbind())
     }
 }
@@ -346,7 +346,7 @@ impl SupportSparseManifoldSaeCore {
         )?;
         out.set_item("values", support_values(&term).into_pyarray(py))?;
         out.set_item("coords", coords_rows(py, &term)?)?;
-        out.set_item("certificate", json_value_to_py(py, certificate)?)?;
+        out.set_item("certificate", json_value_to_py(py, &certificate)?)?;
         Ok(out.unbind())
     }
 
@@ -442,11 +442,11 @@ impl SupportSparseManifoldSaeCore {
         out.set_item("criterion_kind", SUPPORT_CRITERION_KIND.tag())?;
         out.set_item(
             "certificates",
-            json_value_to_py(py, self.certificates.clone())?,
+            json_value_to_py(py, &self.certificates)?,
         )?;
         out.set_item(
             "termination",
-            json_value_to_py(py, self.termination.clone())?,
+            json_value_to_py(py, &self.termination)?,
         )?;
         // Without these the payload cannot rebuild the model it came from:
         // `reconstruction_r2` is not recoverable from `fitted` alone (the
@@ -671,11 +671,11 @@ impl SupportSparseManifoldSaeCore {
     }
     #[getter]
     fn certificates(&self, py: Python<'_>) -> PyResult<PyObject> {
-        json_value_to_py(py, self.certificates.clone())
+        json_value_to_py(py, &self.certificates)
     }
     #[getter]
     fn termination(&self, py: Python<'_>) -> PyResult<PyObject> {
-        json_value_to_py(py, self.termination.clone())
+        json_value_to_py(py, &self.termination)
     }
     #[getter]
     fn fitted<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
