@@ -1826,9 +1826,7 @@ pub fn drop_zero_weight_rows<'a>(
         return Ok(Cow::Borrowed(data));
     }
     if keep.is_empty() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: format!("weight column '{name}' is zero on every row; there is nothing to fit"),
-        });
+        return Err(no_positive_weight_error(name, weights.len()));
     }
     data.select_rows(&keep)
         .map(Cow::Owned)
