@@ -212,7 +212,12 @@ fn freeze_smooth_basis_from_metadata(
                         },
                         None => crate::basis::CenterStrategy::UserProvided(centers.clone()),
                     },
-                    length_scale: length_scale.map(crate::OriginalUnits::original_value),
+                    // A thin-plate spec promoted to a hybrid Duchon kernel learns κ
+                    // (`MaternLengthScale::auto_resolved` in the promotion), so the
+                    // replay keeps the realized scale learnable too.
+                    length_scale: length_scale.map(|realized| {
+                        MaternLengthScale::auto_resolved(realized.original_value())
+                    }),
                     power: *power,
                     nullspace_order: *nullspace_order,
                     identifiability,
@@ -387,7 +392,36 @@ fn freeze_smooth_basis_from_metadata(
                 },
                 None => crate::basis::CenterStrategy::UserProvided(centers.clone()),
             };
-            s.length_scale = length_scale.map(crate::OriginalUnits::original_value);
+            // The realized scale replays with its provenance intact (gam#3020):
+            // a pinned `length_scale=<number>` stays pinned, and a learned
+            // `length_scale=auto` replays as the resolved value of a scale that
+            // is still learnable. Hybrid-ness itself is structural, so the
+            // spec and the fitted metadata must agree on it.
+            // The metadata records the spec's own original-units value, so a
+            // pinned scale must come back bit-identical; any other value means
+            // some path moved a scale the caller pinned.
+            match (s.length_scale.as_mut(), length_scale) {
+                (Some(scale), Some(realized))
+                    if scale.is_fixed() && scale.resolved() != Some(realized.original_value()) =>
+                {
+                    crate::bail_invalid_estim!(
+                        "Duchon freeze for '{}': pinned length_scale {:?} but the fitted \
+                         basis realized length_scale {}",
+                        term_name,
+                        scale,
+                        realized.original_value()
+                    )
+                }
+                (Some(scale), Some(realized)) => scale.set_resolved(realized.original_value()),
+                (None, None) => {}
+                (spec_scale, meta_scale) => crate::bail_invalid_estim!(
+                    "Duchon freeze mismatch for '{}': spec length_scale {:?} but fitted \
+                     metadata length_scale {:?}",
+                    term_name,
+                    spec_scale,
+                    meta_scale
+                ),
+            }
             s.power = *power;
             s.nullspace_order = *nullspace_order;
             s.identifiability = match identifiability_transform {

@@ -955,7 +955,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     periodic: None,
-                    length_scale: Some(0.7),
+                    length_scale: Some(crate::basis::MaternLengthScale::fixed(0.7)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::None,
@@ -1588,7 +1588,7 @@ mod tests {
                         center_strategy: centers,
                         periodic: None,
                         length_scale: (family == BasisScaleFamily::HybridDuchon)
-                            .then_some(0.55 * factor),
+                            .then_some(crate::basis::MaternLengthScale::fixed(0.55 * factor)),
                         power: if family == BasisScaleFamily::HybridDuchon {
                             1.0
                         } else {

@@ -1426,7 +1426,7 @@ fn hierarchical_smooth_ownership_is_order_independent_for_bspline_and_duchon() {
                 radial_reparam: None,
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                length_scale: Some(1.0),
+                length_scale: Some(gam_terms::basis::MaternLengthScale::fixed(1.0)),
                 power: 5.0,
                 nullspace_order: DuchonNullspaceOrder::Linear,
                 identifiability: SpatialIdentifiability::default(),
@@ -1546,7 +1546,7 @@ fn freeze_roundtrip_preserves_hierarchical_smooth_transforms() {
                         radial_reparam: None,
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                        length_scale: Some(1.0),
+                        length_scale: Some(gam_terms::basis::MaternLengthScale::fixed(1.0)),
                         power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
@@ -1884,7 +1884,7 @@ fn frozen_spatial_replay_preserves_standardized_length_scale_compensation() {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                    length_scale: Some(1.4),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::fixed(1.4)),
                     power: 5.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
@@ -1961,7 +1961,7 @@ fn term_collection_joint_duchon_carries_frozen_transform_into_metadata() {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::fixed(1.0)),
                     power: 3.0,
                     nullspace_order: DuchonNullspaceOrder::Zero,
                     identifiability: SpatialIdentifiability::default(),
@@ -2016,7 +2016,7 @@ fn frozen_joint_maternspec_rebuild_keeps_adaptive_cache_in_sync() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                    length_scale: gam_terms::basis::MaternLengthScale::fixed(1.0),
+                    length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(1.0),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -2358,7 +2358,7 @@ fn exact_joint_two_block_spatial_length_scale_freezes_matern_centers() {
             spec: MaternBasisSpec {
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                length_scale: gam_terms::basis::MaternLengthScale::fixed(length_scale),
+                length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(length_scale),
                 nu: MaternNu::FiveHalves,
                 include_intercept: false,
                 double_penalty: true,
@@ -2434,7 +2434,7 @@ fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-                    length_scale: gam_terms::basis::MaternLengthScale::fixed(0.85),
+                    length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(0.85),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -2597,7 +2597,7 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(1.0)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
@@ -2778,7 +2778,7 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(1.0)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
@@ -3139,7 +3139,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(1.0)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
@@ -3487,7 +3487,7 @@ fn incremental_frozen_realizer_matches_unified_full_rebuild() {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                        length_scale: gam_terms::basis::MaternLengthScale::fixed(0.8),
+                        length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(0.8),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: true,
@@ -3634,7 +3634,7 @@ fn two_block_exact_joint_design_cache_clears_memo_on_theta_change() {
             spec: MaternBasisSpec {
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
-                length_scale: gam_terms::basis::MaternLengthScale::fixed(length_scale),
+                length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(length_scale),
                 nu: MaternNu::FiveHalves,
                 include_intercept: false,
                 double_penalty: true,
@@ -3778,7 +3778,7 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                    length_scale: Some(0.9),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(0.9)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
@@ -3888,7 +3888,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                    length_scale: gam_terms::basis::MaternLengthScale::fixed(0.85),
+                    length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(0.85),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -4100,7 +4100,7 @@ fn exact_matern_log_kappa_derivative_uses_feature_columns_only() {
                 spec: MaternBasisSpec {
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                    length_scale: gam_terms::basis::MaternLengthScale::fixed(0.4),
+                    length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(0.4),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -4208,7 +4208,7 @@ fn a_trial_the_collection_gauge_cannot_place_refuses_instead_of_failing_2959() {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                    length_scale: Some(0.9),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(0.9)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
@@ -4283,7 +4283,7 @@ fn duchon_terms_participate_in_kappa_optimization() {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                    length_scale: Some(0.9),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(0.9)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
@@ -4440,10 +4440,6 @@ fn thin_plate_terms_anchor_length_scale_and_enroll_no_kappa_axis() {
         spatial_length_scale_term_indices(&spec).is_empty(),
         "penalized thin-plate regression splines must not contribute a redundant isotropic kappa axis"
     );
-    assert!(
-        all_spatial_terms_kappa_fixed(&spec),
-        "with no TPS kappa axis, all spatial terms are effectively fixed-geometry"
-    );
 }
 
 #[test]
@@ -4496,21 +4492,20 @@ fn pure_duchon_from_length_scales_aniso_is_isotropic_single_psi() {
 }
 
 #[test]
-fn explicit_duchon_aniso_length_scale_is_locked_kappa() {
-    // An explicit `length_scale` locks a Duchon term only where the term does
-    // not enroll per-axis ψ. Since gam#2735 (8b5ffc479) a hybrid Duchon's η is a
-    // REML coordinate wherever `duchon_spec_supports_axis_psi` certifies the
-    // per-axis derivative surface: there the requested contrasts are a start,
-    // and κ and η are estimated together. Where the capability declines, here a
-    // fractional spectral power whose ψ derivative is not derived, the term keeps
-    // its fixed geometry and the explicit scale locks it.
-    let duchon_with_power = |power: f64| TermCollectionSpec {
+fn explicit_duchon_aniso_length_scale_is_pinned_kappa() {
+    // gam#3020: an explicit `length_scale=<number>` is a request, not a seed.
+    // It pins the term's whole kernel geometry, whether or not the spec's power
+    // would certify a per-axis ψ surface (gam#2735), so the term enrolls no
+    // outer axis. The same spec with a learned scale (`length_scale=auto`)
+    // enrolls; at an integer power its per-axis ψ is estimated.
+    use gam_terms::basis::MaternLengthScale;
+    let duchon = |power: f64, length_scale: MaternLengthScale| TermCollectionSpec {
         level: Default::default(),
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {
             frozen_parametric_residualization: None,
-            name: "duchon_fixed_geometry".to_string(),
+            name: "duchon_aniso".to_string(),
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1, 2],
                 spec: DuchonBasisSpec {
@@ -4522,7 +4517,7 @@ fn explicit_duchon_aniso_length_scale_is_locked_kappa() {
                         [0.0, 1.0, 0.0],
                         [0.0, 0.0, 1.0],
                     ]),
-                    length_scale: Some(1.0),
+                    length_scale: Some(length_scale),
                     power,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::None,
@@ -4537,33 +4532,31 @@ fn explicit_duchon_aniso_length_scale_is_locked_kappa() {
         }],
     };
 
-    let declined = duchon_with_power(1.5);
+    for power in [1.0, 1.5] {
+        assert!(
+            spatial_length_scale_term_indices(&duchon(power, MaternLengthScale::fixed(1.0)))
+                .is_empty(),
+            "an explicit Duchon length_scale must pin κ and η at power {power}"
+        );
+    }
+
+    let declined = duchon(1.5, MaternLengthScale::auto_resolved(1.0));
     assert!(
         !spatial_term_uses_per_axis_psi(&declined, 0),
         "a fractional spectral power has no per-axis ψ derivative surface"
     );
-    assert!(
-        spatial_term_has_locked_kappa(&declined, 0),
-        "an explicit length_scale locks a Duchon term whose anisotropy is fixed geometry"
-    );
-    assert!(
-        all_spatial_terms_kappa_fixed(&declined),
-        "a Duchon term with explicit length_scale and fixed anisotropy has no REML κ/ψ axis"
+    assert_eq!(
+        spatial_length_scale_term_indices(&declined),
+        vec![0],
+        "a learned Duchon scale enrolls its isotropic κ even when η is fixed geometry"
     );
 
-    let enrolled = duchon_with_power(1.0);
+    let enrolled = duchon(1.0, MaternLengthScale::auto_resolved(1.0));
     assert!(
         spatial_term_uses_per_axis_psi(&enrolled, 0),
         "an integer-power hybrid Duchon enrolls its per-axis ψ (gam#2735)"
     );
-    assert!(
-        !spatial_term_has_locked_kappa(&enrolled, 0),
-        "enrolled per-axis ψ is estimated, so the explicit length_scale is its start, not a lock"
-    );
-    assert!(
-        !all_spatial_terms_kappa_fixed(&enrolled),
-        "an enrolled Duchon term contributes REML κ/ψ axes"
-    );
+    assert_eq!(spatial_length_scale_term_indices(&enrolled), vec![0]);
 }
 
 #[test]
@@ -4584,7 +4577,7 @@ fn from_length_scales_aniso_keeps_nonaniso_spatial_terms_scalar() {
                             [1.0, 0.0],
                             [0.0, 1.0],
                         ]),
-                        length_scale: gam_terms::basis::MaternLengthScale::fixed(0.5),
+                        length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(0.5),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: false,
@@ -4608,7 +4601,7 @@ fn from_length_scales_aniso_keeps_nonaniso_spatial_terms_scalar() {
                             [1.0, 0.0],
                             [0.0, 1.0],
                         ]),
-                        length_scale: gam_terms::basis::MaternLengthScale::fixed(0.25),
+                        length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(0.25),
                         nu: MaternNu::ThreeHalves,
                         include_intercept: false,
                         double_penalty: false,
@@ -4654,7 +4647,7 @@ fn aniso_bounds_clamp_preserves_in_range_global_length_scale_and_eta() {
                         [0.0, 1.0],
                         [1.0, 1.0],
                     ]),
-                    length_scale: gam_terms::basis::MaternLengthScale::fixed(1.0),
+                    length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(1.0),
                     nu: MaternNu::FiveHalves,
                     include_intercept: false,
                     double_penalty: true,
@@ -4862,7 +4855,7 @@ fn incremental_realizer_replays_raw_duchon_spec_in_emitted_chart_2433() {
                     radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                    length_scale: Some(1.0),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(1.0)),
                     power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),

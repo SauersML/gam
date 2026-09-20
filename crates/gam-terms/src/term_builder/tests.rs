@@ -613,9 +613,10 @@ fn default_matern_2d_seeds_resolving_length_scale_not_overscaled_diameter() {
     );
 }
 
-/// gam#979: the BMS entry point asks `all_spatial_terms_kappa_fixed` before
-/// any design build. Omitted Matérn scales must therefore be distinguishable
-/// from explicit scales both before and after Auto seed resolution.
+/// gam#979 / gam#3020: every family enrolls κ through the one pre-design
+/// predicate `spatial_term_supports_hyper_optimization`. Omitted Matérn scales
+/// must therefore be distinguishable from explicit scales both before and
+/// after Auto seed resolution, so an explicit scale is pinned in every family.
 #[test]
 fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
     let ds = continuous_dataset(
@@ -669,8 +670,8 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
         }
     ));
     assert!(
-        !crate::smooth::all_spatial_terms_kappa_fixed(&auto),
-        "BMS pre-design query must enroll omitted Matérn κ"
+        crate::smooth::spatial_term_supports_hyper_optimization(&auto, 0),
+        "pre-design query must enroll omitted Matérn κ"
     );
     crate::smooth::auto_init_length_scale_in_place(ds.values.view(), &mut auto.smooth_terms[0]);
     assert!(matches!(
@@ -686,7 +687,7 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
         } if value.is_finite() && *value > 0.0
     ));
     assert!(
-        !crate::smooth::all_spatial_terms_kappa_fixed(&auto),
+        crate::smooth::spatial_term_supports_hyper_optimization(&auto, 0),
         "resolved Auto Matérn κ must remain optimizer-owned"
     );
 
@@ -703,7 +704,7 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
             } if *value == explicit.parse::<f64>().unwrap()
         ));
         assert!(
-            crate::smooth::all_spatial_terms_kappa_fixed(&fixed),
+            !crate::smooth::spatial_term_supports_hyper_optimization(&fixed, 0),
             "explicit Matérn length_scale={explicit} must lock κ before design build"
         );
     }

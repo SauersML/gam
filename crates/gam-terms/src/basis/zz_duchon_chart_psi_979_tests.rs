@@ -55,7 +55,7 @@ fn frozen_hybrid_fixture(
         center_strategy: CenterStrategy::FarthestPoint {
             num_centers: centers,
         },
-        length_scale: Some(1.0),
+        length_scale: Some(crate::basis::MaternLengthScale::fixed(1.0)),
         power,
         nullspace_order: order,
         identifiability: SpatialIdentifiability::default(),
@@ -95,7 +95,7 @@ fn fixture_centers(spec: &DuchonBasisSpec) -> Array2<f64> {
 /// The frozen spec with the isotropic coordinate moved to `ψ`: `ℓ = e^{−ψ}`.
 fn spec_at_psi(spec: &DuchonBasisSpec, psi: f64) -> DuchonBasisSpec {
     let mut out = spec.clone();
-    out.length_scale = Some((-psi).exp());
+    out.length_scale = Some(crate::basis::MaternLengthScale::fixed((-psi).exp()));
     out
 }
 

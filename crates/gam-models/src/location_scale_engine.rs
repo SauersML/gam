@@ -78,8 +78,10 @@ mod tests {
     use gam_terms::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
     use ndarray::{Array2, array};
 
-    /// Build a single-term spec carrying a 1-D Matérn smooth with an explicit
-    /// `length_scale`. Such a term supports outer hyper-optimization and
+    /// Build a single-term spec carrying a 1-D Matérn smooth whose learned
+    /// (`Auto`) length scale is seeded at `length_scale`. Such a term supports
+    /// outer hyper-optimization (an explicit `Fixed` scale would be pinned,
+    /// gam#3020) and
     /// contributes exactly one log(kappa) coordinate, so a two-block setup over
     /// `[block_a, block_b]` has a fully predictable κ layout: one coordinate per
     /// block, block A before block B.
@@ -95,7 +97,7 @@ mod tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                        length_scale: gam_terms::basis::MaternLengthScale::fixed(length_scale),
+                        length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(length_scale),
                         nu: MaternNu::FiveHalves,
                         include_intercept: false,
                         double_penalty: false,

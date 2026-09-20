@@ -20,7 +20,6 @@ use crate::model_types::UnifiedFitResult;
 use gam_linalg::matrix::LinearOperator;
 use gam_terms::smooth::{
     SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
-    get_spatial_length_scale, spatial_term_uses_per_axis_psi,
 };
 use gam_row_macros::row_program;
 use ndarray::{Array1, Array2, s};
@@ -3390,23 +3389,11 @@ fn validate_dispersion_spatial_hyperparameter_request(
         return Ok(());
     }
 
-    let unfrozen_terms = |spec: &TermCollectionSpec| -> Vec<usize> {
-        spatial_length_scale_term_indices(spec)
-            .into_iter()
-            .filter(|&idx| {
-                // On the incoming (pre-build) spec, `0.0` is the Matérn
-                // auto-initialization sentinel, not a user-locked scale.
-                // A positive scalar scale freezes only an isotropic axis;
-                // per-axis psi coordinates remain an optimization request.
-                let scalar_scale_is_locked = get_spatial_length_scale(spec, idx)
-                    .is_some_and(|scale| scale.is_finite() && scale > 0.0)
-                    && !spatial_term_uses_per_axis_psi(spec, idx);
-                !scalar_scale_is_locked
-            })
-            .collect()
-    };
-    let mean_terms = unfrozen_terms(meanspec);
-    let log_disp_terms = unfrozen_terms(log_dispspec);
+    // The enrollment predicate is the single source of truth for which terms
+    // carry an outer κ/ψ axis (gam#3020): an explicit `length_scale=<number>`
+    // is pinned there, so only the terms whose scale is learned remain.
+    let mean_terms = spatial_length_scale_term_indices(meanspec);
+    let log_disp_terms = spatial_length_scale_term_indices(log_dispspec);
     if mean_terms.is_empty() && log_disp_terms.is_empty() {
         return Ok(());
     }

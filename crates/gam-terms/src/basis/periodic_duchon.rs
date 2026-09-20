@@ -1026,6 +1026,7 @@ pub(crate) fn build_periodic_duchon_basis_1d(
     centers: Array2<f64>,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
+    let hybrid_length_scale = spec.hybrid_length_scale()?;
     if data.ncols() != 1 {
         crate::bail_invalid_basis!(
             "periodic Duchon smooths currently require exactly one covariate"
@@ -1069,7 +1070,7 @@ pub(crate) fn build_periodic_duchon_basis_1d(
     // Validate against the INTEGER `s` the hybrid kernel actually evaluates
     // (`power_as_usize` truncates a fractional `spec.power`), so the
     // well-posedness gate matches the realized kernel rather than the raw power.
-    validate_duchon_kernel_orders(spec.length_scale, p_order, s_order as f64, 1)?;
+    validate_duchon_kernel_orders(hybrid_length_scale, p_order, s_order as f64, 1)?;
     let z = kernel_constraint_nullspace(
         centers.view(),
         effective_nullspace_order,
@@ -1077,14 +1078,13 @@ pub(crate) fn build_periodic_duchon_basis_1d(
     )?;
     let kernel_cols = z.ncols();
     let mut basis = Array2::<f64>::zeros((data.nrows(), kernel_cols + 1));
-    let coeffs = spec
-        .length_scale
+    let coeffs = hybrid_length_scale
         .map(|ls| {
             duchon_inverse_length_scale(ls, "periodic Duchon basis")
                 .map(|kappa| duchon_partial_fraction_coeffs(p_order, s_order, kappa))
         })
         .transpose()?;
-    let pure_poly_coeff = if spec.length_scale.is_none() {
+    let pure_poly_coeff = if hybrid_length_scale.is_none() {
         Some(PolyharmonicBlockCoeff::new(
             (pure_duchon_block_order(p_order, s_order as f64)) as f64,
             1,
@@ -1094,7 +1094,7 @@ pub(crate) fn build_periodic_duchon_basis_1d(
     };
     let kernel_amp = duchon_kernel_amplification(
         centers.view(),
-        spec.length_scale,
+        hybrid_length_scale,
         p_order,
         s_order,
         1,
@@ -1110,7 +1110,7 @@ pub(crate) fn build_periodic_duchon_basis_1d(
     let centers_col0: Vec<f64> = centers.column(0).to_vec();
     let n_data = data.nrows();
     let k_centers = centers_col0.len();
-    let len_scale = spec.length_scale;
+    let len_scale = hybrid_length_scale;
     let mut raw_kernel = Array2::<f64>::zeros((n_data, k_centers));
     let err_flag = std::sync::atomic::AtomicBool::new(false);
     // Hoist the kernel-form choice out of the inner row × center loop. The
@@ -1203,7 +1203,7 @@ pub(crate) fn build_periodic_duchon_basis_1d(
             // Same exact circular periodization the design uses, so
             // ``ω = z' K_centers z`` is the PSD Gram of the periodic smoother.
             let kappa = duchon_inverse_length_scale(
-                spec.length_scale.expect("hybrid branch requires length_scale"),
+                hybrid_length_scale.expect("hybrid branch requires length_scale"),
                 "periodic hybrid Duchon center kernel",
             )?;
             Ok(
@@ -1250,7 +1250,7 @@ pub(crate) fn build_periodic_duchon_basis_1d(
             centers,
             // `input_scale: ONE` below; see the Duchon builder in
             // `duchon_thinplate.rs` for why that makes this original units.
-            length_scale: spec.length_scale.map(crate::OriginalUnits::new),
+            length_scale: hybrid_length_scale.map(crate::OriginalUnits::new),
             periodic: Some(vec![Some(period)]),
             power: spec.power,
             nullspace_order: effective_nullspace_order,
@@ -1632,7 +1632,7 @@ pub fn duchon_function_norm_penalty(
     let spec = DuchonBasisSpec {
         radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
-        length_scale,
+        length_scale: length_scale.map(MaternLengthScale::fixed),
         power,
         nullspace_order,
         identifiability: SpatialIdentifiability::None,

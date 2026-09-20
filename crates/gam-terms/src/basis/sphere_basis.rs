@@ -2035,7 +2035,7 @@ pub(crate) fn build_duchon_operator_penalty_psi_derivatives_in_directions(
     workspace: &mut BasisWorkspace,
     directions: &[DuchonPsiDirection],
 ) -> Result<Vec<(Vec<PenaltySource>, Vec<Array2<f64>>, Vec<Array2<f64>>)>, BasisError> {
-    let length_scale = spec.length_scale.ok_or_else(|| {
+    let length_scale = spec.hybrid_length_scale()?.ok_or_else(|| {
         BasisError::InvalidInput(
             "exact Duchon log-kappa derivatives require hybrid Duchon with length_scale"
                 .to_string(),
@@ -2730,7 +2730,7 @@ pub(crate) fn build_duchon_native_penalty_psi_derivatives_in_directions(
     workspace: &mut BasisWorkspace,
     directions: &[DuchonPsiDirection],
 ) -> Result<Vec<(Vec<PenaltySource>, Vec<Array2<f64>>, Vec<Array2<f64>>)>, BasisError> {
-    let length_scale = spec.length_scale.ok_or_else(|| {
+    let length_scale = spec.hybrid_length_scale()?.ok_or_else(|| {
         BasisError::InvalidInput(
             "exact Duchon native penalty log-kappa derivatives require hybrid Duchon with length_scale"
                 .to_string(),
@@ -2823,7 +2823,7 @@ pub(crate) fn build_duchon_native_penalty_psi_derivatives_in_directions(
     let omega = project_kernel(&kernel);
     let candidates = duchon_native_penalty_candidates(
         centers,
-        spec.length_scale,
+        Some(length_scale),
         spec.power,
         effective_nullspace_order,
         aniso,

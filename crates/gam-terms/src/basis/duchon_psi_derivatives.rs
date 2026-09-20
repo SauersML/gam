@@ -1373,7 +1373,7 @@ pub(crate) fn build_duchon_design_psi_derivativeswithworkspace(
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<ScalarDesignPsiDerivatives, BasisError> {
-    let length_scale = spec.length_scale.ok_or_else(|| {
+    let length_scale = spec.hybrid_length_scale()?.ok_or_else(|| {
         BasisError::InvalidInput(
             "exact Duchon log-kappa derivatives require hybrid Duchon with length_scale"
                 .to_string(),
@@ -1481,7 +1481,9 @@ pub fn build_duchon_basis_log_kappa_aniso_derivativeswith_collocationwithworkspa
             spec.power
         );
     }
-    let length_scale = spec.length_scale.expect("capability check requires a hybrid scale");
+    let length_scale = spec
+        .hybrid_length_scale()?
+        .expect("capability check requires a hybrid scale");
     let eta = spec
         .aniso_log_scales
         .clone()
@@ -2467,7 +2469,7 @@ mod end_to_end_1604_tests {
             let spec = DuchonBasisSpec {
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                 periodic: None,
-                length_scale: Some(0.5),
+                length_scale: Some(crate::basis::MaternLengthScale::fixed(0.5)),
                 power,
                 nullspace_order: DuchonNullspaceOrder::Linear,
                 identifiability: SpatialIdentifiability::None,

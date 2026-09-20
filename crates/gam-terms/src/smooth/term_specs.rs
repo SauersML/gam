@@ -2922,11 +2922,13 @@ impl SpatialLogKappaCoords {
         })
     }
 
-    /// Rewrite any ψ entries whose originating term lacks an explicit
-    /// `length_scale` so they sit at the midpoint of the per-term data-derived
-    /// ψ window. Used so the outer optimizer starts inside the physically
-    /// meaningful region instead of at the constructors' placeholder ψ̄ = 0.
-    /// For terms with an explicit length_scale, the user's choice is respected.
+    /// Rewrite any ψ entries whose originating term has no resolved
+    /// `length_scale` yet so they sit at the midpoint of the per-term
+    /// data-derived ψ window. Used so the outer optimizer starts inside the
+    /// physically meaningful region instead of at the constructors' placeholder
+    /// ψ̄ = 0. A term whose learned (`Auto`) scale already carries a resolved
+    /// seed starts from it. Explicit scales never reach here: they are pinned
+    /// and enroll no ψ slot (gam#3020).
     /// Anisotropy offsets η_a (those stored by `from_length_scales_aniso`) are
     /// preserved: we re-center around the new ψ̄, keeping Ση_a = 0.
     pub fn reseed_from_data(
@@ -3245,10 +3247,20 @@ pub fn set_spatial_length_scale(
             spec.length_scale.set_resolved(length_scale);
             Ok(())
         }
-        SmoothBasisSpec::Duchon { spec, .. } => {
-            spec.length_scale = Some(length_scale);
-            Ok(())
-        }
+        // A pure Duchon (`length_scale = None`) is scale-free: writing a κ into
+        // it would silently turn it into the hybrid Duchon–Matérn kernel, a
+        // different model. A hybrid keeps its owner (Auto stays Auto, Fixed
+        // stays Fixed); only Auto terms are ever enrolled for κ search.
+        SmoothBasisSpec::Duchon { spec, .. } => match spec.length_scale.as_mut() {
+            Some(scale) => {
+                scale.set_resolved(length_scale);
+                Ok(())
+            }
+            None => Err(EstimationError::InvalidInput(format!(
+                "term '{}' is a scale-free (pure) Duchon smooth and has no length scale to set",
+                term.name
+            ))),
+        },
         _ => Err(EstimationError::InvalidInput(format!(
             "term '{}' does not expose a spatial length scale",
             term.name
@@ -3262,7 +3274,7 @@ pub fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> O
         .and_then(|term| match &term.basis {
             SmoothBasisSpec::ThinPlate { spec, .. } => Some(spec.length_scale),
             SmoothBasisSpec::Matern { spec, .. } => spec.length_scale.resolved(),
-            SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale,
+            SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale.and_then(|s| s.resolved()),
             _ => None,
         })
 }
@@ -3309,12 +3321,22 @@ pub fn spatial_term_supports_hyper_optimization(
     // its per-axis kernel-η ARD: the d-dimensional ψ search is the *point* of
     // the anisotropic request ("Matérn keeps its kernel-η ARD").
     //
-    // Either way a Matérn term always enrolls a κ/ψ axis (1 isotropic, or d
+    // Either way an Auto Matérn term enrolls a κ/ψ axis (1 isotropic, or d
     // anisotropic), so `spatial_dims_per_term` reports the correct count.
+    //
+    // gam#3020 — an explicit `length_scale` is a REQUEST, not a seed: a
+    // `MaternLengthScale::Fixed(ℓ)` is pinned in every family, so it enrolls
+    // no outer coordinate at all. This predicate is the single enrollment gate
+    // every family reads (`spatial_length_scale_term_indices`), so declining
+    // here is what makes the standard, survival, BMS, GAMLSS, dispersion and
+    // transformation-normal fits agree that ℓ comes back exactly as supplied.
+    // A pinned κ with learned per-axis contrasts is a different request that
+    // the formula layer rejects (`length_scale=<number>` with `scale_dims`),
+    // so a Fixed term's η is literal geometry too.
     if let Some(term) = spec.smooth_terms.get(term_idx)
-        && let SmoothBasisSpec::Matern { .. } = &term.basis
+        && let SmoothBasisSpec::Matern { spec: matern, .. } = &term.basis
     {
-        return true;
+        return !matern.length_scale.is_fixed();
     }
 
     // Measure-jet geometry dials are outer ψ coordinates; enrollment is
@@ -3338,7 +3360,17 @@ pub fn spatial_term_supports_hyper_optimization(
         return true;
     }
 
-    get_spatial_length_scale(spec, term_idx).is_some()
+    // Duchon: a pure Duchon (`None`) is scale-free and has no κ; a hybrid with
+    // an explicit `Fixed(ℓ)` is pinned (gam#3020); only a hybrid whose κ is
+    // `Auto` (seeded from the data, then learned) enrolls.
+    spec.smooth_terms
+        .get(term_idx)
+        .is_some_and(|term| match &term.basis {
+            SmoothBasisSpec::Duchon { spec, .. } => {
+                matches!(spec.length_scale, Some(MaternLengthScale::Auto { .. }))
+            }
+            _ => false,
+        })
 }
 
 /// The constant-curvature smooth's spec, when `term_idx` is one. Single
@@ -3546,47 +3578,6 @@ pub fn set_single_term_constant_curvature_kappa(
     } else {
         Ok(false)
     }
-}
-
-/// Returns `true` when a spatial term has NO outer optimization axes — i.e.
-/// the user provided an explicit `length_scale` and the term does not enroll
-/// REML-side per-axis ψ contrasts, so both the scalar κ and any fixed geometry
-/// anisotropy are anchored.
-///
-/// This is the per-term predicate that distinguishes "fixed kernel scale"
-/// from "optimize the kernel scale" within the family entry points that
-/// want to honor an explicit user-supplied scale (e.g. Bernoulli
-/// marginal-slope, where the joint-spatial outer solver otherwise spends
-/// ~80 iters stalled on the user's chosen ρ at high gradient).
-pub fn spatial_term_has_locked_kappa(spec: &TermCollectionSpec, term_idx: usize) -> bool {
-    let explicitly_fixed = spec
-        .smooth_terms
-        .get(term_idx)
-        .is_some_and(|term| match &term.basis {
-            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale.is_fixed(),
-            SmoothBasisSpec::ThinPlate { .. } => true,
-            SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale.is_some(),
-            _ => false,
-        });
-    explicitly_fixed && !spatial_term_uses_per_axis_psi(spec, term_idx)
-}
-
-/// Returns `true` when every spatial term in `spec` has a locked kernel scale
-/// (explicit `length_scale=X` without anisotropy) and therefore contributes no
-/// outer ψ/κ optimization axis. Empty term collections also return `true` —
-/// there are no kappas to optimize.
-///
-/// Used by family entry points that want to honor a user-supplied scalar length
-/// scale exactly: when all spatial terms are locked the n-block joint-spatial
-/// outer solver has nothing to optimize, and routing through it merely spends
-/// ~80 outer iters chasing a stalled ARC at the user's chosen ρ. Skipping
-/// straight to the rho-only path avoids that waste and respects the user's
-/// explicit kernel-scale input.
-pub fn all_spatial_terms_kappa_fixed(spec: &TermCollectionSpec) -> bool {
-    spec.smooth_terms.iter().enumerate().all(|(idx, _)| {
-        !spatial_term_supports_hyper_optimization(spec, idx)
-            || spatial_term_has_locked_kappa(spec, idx)
-    })
 }
 
 pub(crate) fn spatial_identifiability_policy(
@@ -3825,8 +3816,8 @@ pub(crate) fn spatial_term_psi_search_box(
 }
 
 
-/// Data-derived ψ seed for a spatial term when the user has not set an
-/// explicit length_scale on its basis spec: the midpoint of the ψ window, i.e.
+/// Data-derived ψ seed for an enrolled spatial term whose learned scale has no
+/// resolved value yet: the midpoint of the ψ window, i.e.
 /// `ℓ = √(r_min·r_max)` in the standardized frame, the geometric mean of the
 /// cloud's extreme pair distances.
 pub(crate) fn spatial_term_psi_seed(
@@ -3835,7 +3826,7 @@ pub(crate) fn spatial_term_psi_seed(
     term_idx: usize,
 ) -> Result<Option<f64>, BasisError> {
     if get_spatial_length_scale(spec, term_idx).is_some() {
-        return Ok(None); // user/spec-provided length_scale wins
+        return Ok(None); // an already-resolved seed wins
     }
     let (psi_lo, psi_hi) = spatial_term_psi_bounds(data, spec, term_idx)?;
     Ok(Some(0.5 * (psi_lo + psi_hi)))
@@ -4019,7 +4010,7 @@ pub fn log_spatial_aniso_scales(spec: &TermCollectionSpec) {
                 (spec.aniso_log_scales.as_ref(), spec.length_scale.resolved())
             }
             SmoothBasisSpec::Duchon { spec, .. } => {
-                (spec.aniso_log_scales.as_ref(), spec.length_scale)
+                (spec.aniso_log_scales.as_ref(), spec.length_scale.and_then(|s| s.resolved()))
             }
             _ => (None, None),
         };
@@ -4897,6 +4888,25 @@ pub(crate) fn auto_init_length_scale_in_basis(data: ArrayView2<'_, f64>, basis: 
                 spec.length_scale.resolve_auto_once(resolved);
             }
         }
+        // gam#3020 — a hybrid Duchon–Matérn term written `length_scale=auto`
+        // owns a learned κ with no user value; seed it exactly like the Matérn
+        // Auto scale (the same rotation-invariant, density-adaptive fill
+        // distance), so the κ search starts from a frame-independent point.
+        // A pure Duchon (`None`) is scale-free and a `Fixed` scale is the
+        // user's, so neither is touched.
+        SmoothBasisSpec::Duchon {
+            feature_cols, spec, ..
+        } => {
+            if let Some(scale) = spec.length_scale.as_mut()
+                && scale.resolved().is_none()
+            {
+                let resolved = match center_strategy_requested_count(&spec.center_strategy) {
+                    Some(k) => auto_initial_length_scale_for_centers(data, feature_cols, k),
+                    None => auto_initial_length_scale(data, feature_cols),
+                };
+                scale.resolve_auto_once(resolved);
+            }
+        }
         SmoothBasisSpec::ThinPlate {
             feature_cols, spec, ..
         } => {
@@ -4920,14 +4930,13 @@ pub(crate) fn auto_init_length_scale_in_basis(data: ArrayView2<'_, f64>, basis: 
         // whether it carries an auto-seeded length scale. None of these do:
         // B-spline marginals (`FactorSmooth`, `TensorBSpline`) and `Pca` are
         // knot/column constructions with no kernel bandwidth, and the
-        // `Sphere` / `ConstantCurvature` / `MeasureJet` / `Duchon` specs carry
-        // no `length_scale` field to resolve.
+        // `Sphere` / `ConstantCurvature` / `MeasureJet` specs carry no
+        // typed-Auto `length_scale` to resolve.
         SmoothBasisSpec::BSpline1D { .. }
         | SmoothBasisSpec::FactorSmooth { .. }
         | SmoothBasisSpec::Sphere { .. }
         | SmoothBasisSpec::ConstantCurvature { .. }
         | SmoothBasisSpec::MeasureJet { .. }
-        | SmoothBasisSpec::Duchon { .. }
         | SmoothBasisSpec::Pca { .. }
         | SmoothBasisSpec::TensorBSpline { .. } => {}
     }
@@ -8689,17 +8698,22 @@ pub(crate) fn build_single_local_smooth_term_for(
                 }
             }
             let mut spec_local = spec.clone();
+            let original_length_scale = spec.hybrid_length_scale()?;
             let frame = term.basis.scale_contract().normalize_euclidean_frame(
                 select_columns(data, feature_cols)?,
                 *input_scale,
-                spec.length_scale,
+                original_length_scale,
                 &mut spec_local.center_strategy,
             )?;
             let x = frame.coordinates;
             let realized_input_scale = frame.input_scale;
-            let length_scale_eff = frame.length_scale;
-            spec_local.length_scale =
-                length_scale_eff.map(crate::StandardizedUnits::standardized_value);
+            // The standardized-frame value replaces the numeric scale only; its
+            // owner (Auto / Fixed) travels with it unchanged.
+            if let (Some(scale), Some(standardized)) =
+                (spec_local.length_scale.as_mut(), frame.length_scale)
+            {
+                scale.set_resolved(standardized.standardized_value());
+            }
             // The Duchon input axis is standardized in place above (`x → x/σ`,
             // scale-only, no centering). A 1-D cyclic boundary `[start, end)`
             // declared in ORIGINAL covariate units must move into that same
@@ -8755,7 +8769,7 @@ pub(crate) fn build_single_local_smooth_term_for(
             } = &mut result.metadata
             {
                 *metadata_scale = realized_input_scale;
-                *length_scale = spec.length_scale.map(crate::OriginalUnits::new);
+                *length_scale = original_length_scale.map(crate::OriginalUnits::new);
                 // Same convention as `length_scale`: metadata (and hence the
                 // frozen replay spec design_freezing copies it into) always
                 // stores the period in ORIGINAL covariate units, and the

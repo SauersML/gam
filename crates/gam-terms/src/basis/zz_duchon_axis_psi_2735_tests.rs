@@ -46,7 +46,7 @@ fn frozen_aniso_fixture() -> (Array2<f64>, DuchonBasisSpec) {
         radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 9 },
-        length_scale: Some(0.8),
+        length_scale: Some(crate::basis::MaternLengthScale::fixed(0.8)),
         power: 2.0,
         nullspace_order: DuchonNullspaceOrder::Linear,
         identifiability: SpatialIdentifiability::default(),
@@ -100,7 +100,7 @@ fn shift_raw_psi(spec: &DuchonBasisSpec, axis: usize, h: f64) -> DuchonBasisSpec
         .expect("fixture is anisotropic");
     let dim = eta.len();
     let inv_d = 1.0 / dim as f64;
-    let psi_bar = -spec.length_scale.expect("hybrid fixture").ln();
+    let psi_bar = -spec.length_scale.and_then(|scale| scale.resolved()).expect("hybrid fixture").ln();
     let mut out = spec.clone();
     out.length_scale = Some((-(psi_bar + h * inv_d)).exp());
     out.aniso_log_scales = Some(

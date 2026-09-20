@@ -246,6 +246,7 @@ pub fn build_duchon_basis_spec_chart(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
+    let hybrid_length_scale = spec.hybrid_length_scale()?;
     // An explicitly frozen chart already makes the basis spec-determined, and
     // the periodic/cyclic builders never reach the data-metric branch at all,
     // so in both cases the ordinary path is already frame-independent.
@@ -271,7 +272,7 @@ pub fn build_duchon_basis_spec_chart(
     }
     let omega_constrained = duchon_constrained_bending_penalty(
         centers.view(),
-        spec.length_scale,
+        hybrid_length_scale,
         spec.power,
         effective_nullspace_order,
         aniso.as_deref(),
@@ -439,6 +440,7 @@ fn build_duchon_basis_uncached(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
+    let hybrid_length_scale = spec.hybrid_length_scale()?;
     if let Some((_start, _end, period)) = spec.boundary.period() {
         // A 1-D cyclic boundary is the formula-DSL spelling of periodicity.
         // Normalize it onto `spec.periodic` so ALL periodic 1-D Duchon terms
@@ -533,12 +535,12 @@ fn build_duchon_basis_uncached(
     // eigendecomposition (gh#750). Gate on the truncated integer for hybrid so
     // that case is rejected here with a clear message while every valid hybrid
     // config (e.g. 1D, where `2(2+0)=4>1` stays finite) still builds.
-    let validation_power = if spec.length_scale.is_some() {
+    let validation_power = if hybrid_length_scale.is_some() {
         spec.power_as_usize() as f64
     } else {
         spec.power
     };
-    validate_duchon_kernel_orders(spec.length_scale, p_order, validation_power, data.ncols())?;
+    validate_duchon_kernel_orders(hybrid_length_scale, p_order, validation_power, data.ncols())?;
     let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
     let spectral_basis = center_strategy_spectral_basis(&spec.center_strategy);
     if let Some(spectral) = spectral_basis {
@@ -556,7 +558,7 @@ fn build_duchon_basis_uncached(
                  are mutually exclusive"
             );
         }
-        if spec.length_scale.is_some() {
+        if hybrid_length_scale.is_some() {
             crate::bail_invalid_basis!(
                 "Duchon spectral reduction currently requires the scale-free kernel; \
                  a moving hybrid range would change the retained eigenspace"
@@ -594,7 +596,7 @@ fn build_duchon_basis_uncached(
             }
             (None, None) => duchon_spectral_kernel_chart(
                 centers.view(),
-                spec.length_scale,
+                hybrid_length_scale,
                 spec.power,
                 effective_nullspace_order,
                 aniso.as_deref(),
@@ -652,7 +654,7 @@ fn build_duchon_basis_uncached(
         let shared_data = shared_owned_data_matrix(data, &workspace.cache);
         let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
         let s_order: f64 = spec.power;
-        let length_scale = spec.length_scale;
+        let length_scale = hybrid_length_scale;
         let s_order_int = length_scale.map(|_| duchon_power_to_usize(s_order));
         let coeffs = length_scale
             .map(|ls| {
@@ -767,7 +769,7 @@ fn build_duchon_basis_uncached(
                 symmetrize_penalty(&raw_gram.slice(s![..kernel_cols, ..kernel_cols]).to_owned());
             let omega_constrained = duchon_constrained_bending_penalty(
                 centers.view(),
-                spec.length_scale,
+                hybrid_length_scale,
                 spec.power,
                 effective_nullspace_order,
                 aniso.as_deref(),
@@ -867,7 +869,7 @@ fn build_duchon_basis_uncached(
             build_duchon_basis_designwithworkspace(
                 data,
                 centers.view(),
-                spec.length_scale,
+                hybrid_length_scale,
                 spec.power,
                 effective_nullspace_order,
                 aniso.as_deref(),
@@ -923,7 +925,7 @@ fn build_duchon_basis_uncached(
     };
     let mut candidates = duchon_native_penalty_candidates_with_curvature(
         centers.view(),
-        spec.length_scale,
+        hybrid_length_scale,
         spec.power,
         effective_nullspace_order,
         aniso.as_deref(),
@@ -936,7 +938,7 @@ fn build_duchon_basis_uncached(
             points.view(),
             centers.view(),
             &spec.operator_penalties,
-            spec.length_scale,
+            hybrid_length_scale,
             spec.power,
             effective_nullspace_order,
             aniso.is_some(),
@@ -959,7 +961,7 @@ fn build_duchon_basis_uncached(
             // metadata's original-units range.  The term-collection wrapper
             // that DID standardize replaces the scale and the range together
             // (`term_specs.rs`), keeping the tag honest on both sides.
-            length_scale: spec.length_scale.map(crate::OriginalUnits::new),
+            length_scale: hybrid_length_scale.map(crate::OriginalUnits::new),
             periodic: spec.periodic.clone(),
             power: spec.power,
             nullspace_order: effective_nullspace_order,
@@ -1704,13 +1706,14 @@ pub(crate) fn duchon_resolve_radial_chart(
     kernel_transform: &Array2<f64>,
     workspace: &mut BasisWorkspace,
 ) -> Result<DuchonResolvedRadialChart, BasisError> {
+    let hybrid_length_scale = spec.hybrid_length_scale()?;
     // Build the un-rotated constrained kernel design once, take its realized
     // Gram `G_c = (K·Z)ᵀ(K·Z)`, and solve `Ω_c v = μ G_c v` with
     // `Ω_c = α²·ZᵀK_CC Z`.
     let raw = build_duchon_basis_designwithworkspace(
         data,
         centers,
-        spec.length_scale,
+        hybrid_length_scale,
         spec.power,
         effective_nullspace_order,
         aniso,
@@ -1731,7 +1734,7 @@ pub(crate) fn duchon_resolve_radial_chart(
     let design_gram = data_metric_design_gram(kernel_block);
     let omega_constrained = duchon_constrained_bending_penalty(
         centers,
-        spec.length_scale,
+        hybrid_length_scale,
         spec.power,
         effective_nullspace_order,
         aniso,

@@ -2942,29 +2942,6 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mean_penalty_count = builder.mean_penalty_count(&mean_boot_design);
     let noise_penalty_count = builder.noise_penalty_count(&noise_boot_design);
 
-    // Honor an explicit user-supplied `length_scale=X` on every spatial term
-    // in both the mean and noise blocks: when every term is κ-locked (no
-    // anisotropy, no per-axis ψ contrasts), the joint-spatial outer optimizer
-    // has nothing to optimize. Routing through it anyway wraps the full
-    // two-block coefficient solve inside an unnecessary outer loop where
-    // each evaluation runs the inner Newton from scratch. This is the same
-    // short-circuit the Bernoulli marginal-slope entry point performs at
-    // bernoulli_marginal_slope.rs:16432-16442; mirroring it here makes the
-    // GAMLSS path skip straight to the `(!enabled || log_kappa_dim == 0)`
-    // fast path in `optimize_spatial_length_scale_exact_joint_typed`.
-    let mut effective_kappa_options = kappa_options.clone();
-    if effective_kappa_options.enabled
-        && gam_terms::smooth::all_spatial_terms_kappa_fixed(&mean_bootspec)
-        && gam_terms::smooth::all_spatial_terms_kappa_fixed(&noise_bootspec)
-    {
-        log::debug!(
-            "[GAMLSS spatial] disabling κ/ψ optimization: every spatial term in \
-             both blocks has an explicit length_scale and no anisotropy; \
-             user-supplied kernel scale is fixed"
-        );
-        effective_kappa_options.enabled = false;
-    }
-    let kappa_options: &SpatialLengthScaleOptimizationOptions = &effective_kappa_options;
 
     // Macro to invoke the exact-joint spatial optimizer with shared closures.
     // The exact path evaluates the full profiled/Laplace objective over

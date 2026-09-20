@@ -588,7 +588,7 @@ mod tests {
                     spec: MaternBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
-                        length_scale: gam_terms::basis::MaternLengthScale::fixed(0.45),
+                        length_scale: gam_terms::basis::MaternLengthScale::auto_resolved(0.45),
                         nu: MaternNu::ThreeHalves,
                         include_intercept: false,
                         double_penalty: false,

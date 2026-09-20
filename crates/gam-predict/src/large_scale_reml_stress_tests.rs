@@ -281,7 +281,7 @@ fn duchon_aniso_pc_spec(name: &str, pc_dim: usize, k_centers: usize) -> TermColl
                         num_centers: k_centers,
                     },
                     // Hybrid Duchon — required for aniso_log_scales.
-                    length_scale: Some(HYBRID_LENGTH_SCALE),
+                    length_scale: Some(gam_terms::basis::MaternLengthScale::auto_resolved(HYBRID_LENGTH_SCALE)),
                     power: power as f64,
                     nullspace_order,
                     identifiability: gam_terms::basis::SpatialIdentifiability::default(),

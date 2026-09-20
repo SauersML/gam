@@ -587,7 +587,7 @@ Radial basis with Matérn covariance kernel.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `centers` (`k`) | auto | Number of centres. |
-| `length_scale` | `1.0` | Global length-scale init. |
+| `length_scale` | learned | Omitted: derived from the data and learned by REML. A number pins the kernel scale exactly, in every family (never re-learned); it cannot be combined with `scale_dims=true`. |
 | `nu` | `5/2` | Smoothness, one of `1/2`, `3/2`, `5/2`, `7/2`, `9/2`. |
 | `include_intercept` | `false` | Append a constant column. |
 | `double_penalty` | `true` | Ridge + main penalty. |
@@ -622,7 +622,7 @@ zero (recover the null by default; opt into overfitting). Scale-free unless
 | `order` (alias `nullspace_order`) | `1` (Linear, affine null space) | Polynomial nullspace order `p`. Polynomial block has `C(d + p, d)` columns (`p=0` → constant only, `p=1` (Linear) → `d+1` columns, `p=2` → `(d+1)(d+2)/2`). Honoured whether or not `power` is also given. |
 | `power` (alias `p`) | cubic default `s = (d−1)/2` | Riesz fractional smoothness `s`. The default gives `φ(r)=r³` in every dimension; an explicit value (e.g. `power=0` → `r²·log r` thin-plate in even `d`) is honored verbatim. |
 | `centers` (`k`) | auto | Number of centres. |
-| `length_scale` | none (scale-free) | Optional global scale. Without it, the kernel is pure polyharmonic; with it, the kernel is the hybrid Duchon-Matérn (κ = 1/length_scale). |
+| `length_scale` | none (scale-free) | Omitted: the pure polyharmonic kernel (no scale). `length_scale=auto`: the hybrid Duchon-Matérn kernel (κ = 1/length_scale) with κ derived from the data and learned by REML. `length_scale=<number>`: the hybrid kernel with κ pinned exactly as given, in every family (standard, survival, location-scale/GAMLSS, marginal-slope); a pinned number cannot be combined with `scale_dims=true`. |
 | `scale_dims` | `false` | Per-axis **relevance** (ARD by shrinkage): one gradient penalty `Σ(∂f/∂x_a)²` per input axis, each its own REML `λ_a`. REML flattens the surface along axes that don't earn their keep — automatic variable relevance via plain penalties. The kernel metric is held fixed at its knot-geometry init (not separately optimized). |
 | `periodic`, `period`, `period_start`, `period_end` | — | 1-D cyclic Duchon (see below). |
 
@@ -855,7 +855,9 @@ There are two distinct mechanisms, matched to the kernel:
   knot-geometry init — well-conditioned and analytic (the per-axis penalty's
   derivative is just `λ_a S_a`), and it scales: the penalty blocks are
   centers-space (`O(k)`, `n`-free) and add nothing to the GPU data Hessian.
-  A hybrid Duchon (with `length_scale`) still learns its single global scale.
+  A hybrid Duchon with `length_scale=auto` still learns its single global scale;
+  an explicit numeric `length_scale` is pinned and is rejected together with
+  `scale_dims=true`.
 - **Matérn**: kernel-metric ARD — learns per-axis log-scales (length scales) in
   the covariance kernel itself. This is the natural, well-conditioned ARD for a
   length-scale kernel, so Matérn keeps it.

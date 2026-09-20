@@ -3187,7 +3187,11 @@ fn duchon_basis<'py>(
         any_periodic,
     )?;
     let (spec_length_scale, spec_nullspace, spec_power) =
-        (cfg.length_scale, cfg.nullspace_order, cfg.power);
+        (
+            cfg.length_scale.map(MaternLengthScale::fixed),
+            cfg.nullspace_order,
+            cfg.power,
+        );
     let basis_only_operator_penalties = DuchonOperatorPenaltySpec {
         mass: OperatorPenaltySpec::Disabled,
         tension: OperatorPenaltySpec::Disabled,

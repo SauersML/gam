@@ -41,7 +41,7 @@ fn assert_raw_axis_design_derivatives(length_scale: f64, contrast: f64) {
         radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-        length_scale: Some(length_scale),
+        length_scale: Some(gam_terms::basis::MaternLengthScale::fixed(length_scale)),
         power: 1.0,
         nullspace_order: DuchonNullspaceOrder::Linear,
         identifiability: SpatialIdentifiability::default(),
