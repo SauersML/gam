@@ -6336,8 +6336,8 @@ mod run_plan_saddle_escape_tests;
 #[path = "stratum_boundary_2939_tests.rs"]
 mod stratum_boundary_2939_tests;
 
-// #2953: an outer result's gradient is a measurement at a point, and the
-// reproducibility floor reads it only at the point being certified.
+// #2953: an outer result's gradient is a measurement at a point; #3531: a
+// second same-ρ measurement never widens the stationarity bound.
 #[path = "run_plan_measurement_point_2953_tests.rs"]
 mod run_plan_measurement_point_2953_tests;
 

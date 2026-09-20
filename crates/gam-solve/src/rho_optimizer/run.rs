@@ -1517,12 +1517,6 @@ pub struct OuterResult {
     /// Final value and gradient when the solver is gradient-based, with the ρ
     /// they were measured at.
     pub final_measurement: Option<OuterFirstOrderMeasurement>,
-    /// The measurement a certificate pass displaced from `final_measurement`
-    /// when it re-measured this ρ. A later pass at the same ρ re-measures from
-    /// the same reset state and replays the earlier pass bit for bit, so without
-    /// this record it would hold two copies of one measurement and never the
-    /// independent one the solver took.
-    pub displaced_measurement: Option<OuterFirstOrderMeasurement>,
     /// Final Hessian when the solver tracks one.
     pub final_hessian: Option<Array2<f64>>,
     /// Single authoritative termination lifecycle. Private so downstream
@@ -1698,7 +1692,6 @@ impl OuterResult {
             iterations,
             final_grad_norm: None,
             final_measurement: None,
-            displaced_measurement: None,
             final_hessian: None,
             termination: OuterTermination::from_solver_claim(solver_claimed_convergence),
             plan_used,
@@ -3047,9 +3040,6 @@ pub(crate) enum StationarityBoundSource {
     /// `|Pg|·√(τ/Δpred)` = `√(2·h·τ)` (#2253/#2249/#2015/#2091) -- the only rung
     /// with a derivation from the criterion's own resolution.
     CurvatureResolvability,
-    /// Twice the same-ρ spread between the run-recorded and certificate-time
-    /// gradients (#2299): the measuring instrument's demonstrated noise.
-    GradientReproducibility,
     /// `config.tolerance` judged against the EFS/fixed-point route's
     /// normalized residual `‖(θ⁺−θ)/scale‖_∞` -- not against a gradient norm
     /// at all. The route has no ladder: it exposes no analytic gradient, so
@@ -3103,7 +3093,6 @@ impl StationarityBoundSource {
             Self::CoordinateBand => "coordinate-band",
             Self::ArithmeticLimited => "arithmetic-limited",
             Self::CurvatureResolvability => "curvature-resolvability",
-            Self::GradientReproducibility => "gradient-reproducibility",
             Self::FixedPointResidual => "fixed-point-residual",
             Self::CallerRequirement => "caller-requirement",
             Self::NewtonDecrement => "newton-decrement",
@@ -3607,7 +3596,6 @@ fn certify_fixed_point_optimality(
     result.final_value = evaluation.cost;
     result.final_grad_norm = None;
     result.final_measurement = None;
-    result.displaced_measurement = None;
     result.final_hessian = None;
 
     let certificate = OuterCriterionCertificate {
@@ -4134,32 +4122,12 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         ),
     )?;
 
-    // The optimizer's own recorded best-iterate evidence, captured before the
-    // fresh certificate-time measurement overwrites it below. When it was taken
-    // at this ρ, it and `evaluation` are TWO independent measurements of the
-    // objective at one point — the raw material for the gradient-reproducibility
-    // floor further down, at zero additional objective evaluations.
-    let run_recorded = result.final_measurement.take();
-    // A previous certificate pass at this ρ (screening, before this mint)
-    // replaced the solver's measurement with its own reset re-measurement, which
-    // this pass's evaluation replays bit for bit. The measurement it displaced is
-    // the independent one.
-    let displaced = result
-        .displaced_measurement
-        .take()
-        .filter(|measurement| measurement.is_at(&result.rho));
-
     // Install measured first-order evidence before any fallible curvature
     // processing. If curvature is malformed, the retained resume checkpoint
     // still carries the exact value/gradient that caused certification to stop.
     result.final_value = evaluation.cost;
     result.final_grad_norm = Some(projected_grad_norm);
     result.record_measurement_at_rho(evaluation.cost, evaluation.gradient);
-    result.displaced_measurement = displaced.clone().or_else(|| {
-        run_recorded
-            .clone()
-            .filter(|measurement| measurement.is_at(&result.rho))
-    });
 
     // #2596 — a pass that spends LESS evidence must not produce a STRONGER
     // refusal than the pass that mints.
@@ -4480,97 +4448,6 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             bound_source,
         };
         return super::newton_polish::polish_the_mint(obj, config, context, result, inputs);
-    }
-
-    // Gradient-reproducibility floor (#2299 fully-saturated smooth). A
-    // stationarity certificate cannot resolve below the reproducibility of its
-    // own measuring instrument: at a rail-adjacent optimum (λ ~ 1e12, the term
-    // collapsed onto its penalty null space, edf saturated) the analytic
-    // gradient is a difference of enormous canceling log-det terms whose
-    // evaluation drifts run to run, so |Pg| measures round-off, not slope —
-    // observed as the SAME ρ returning |g| ∈ {2.5e-3 … 4.5e-2} across
-    // consecutive evaluations while the objective stays flat to 1e-7.
-    //
-    // The certifier may already hold TWO independent measurements at this ρ:
-    // the optimizer's recorded best-iterate measurement (`run_recorded`) and
-    // the fresh certificate-time `evaluation` — so the instrument's
-    // demonstrated noise costs ZERO additional objective evaluations (scripted
-    // test objectives keep their exact call counts). A REAL residual gradient
-    // reproduces (spread ≈ 0, no widening — genuine descent can never be
-    // masked, and a deterministic objective yields bit-identical pairs), while
-    // cancellation noise decorrelates (spread ~ |Pg|). The widening is gated
-    // on the recorded measurement having been taken at exactly this ρ, and on
-    // the two measurements' objective VALUES agreeing to the same relative
-    // floor the cost-stall guard uses; the PSD gate below is unchanged.
-    //
-    // #2953: the point gate is what makes the spread a measure of noise. The
-    // gradients of two DIFFERENT points differ by the slope between them, and
-    // on a deterministic objective that is the only way the spread can be
-    // nonzero, so without the gate the floor widened exactly where the
-    // criterion was not flat.
-    //
-    // A decrement verdict is not widened here (#2954): measured gradient noise can
-    // only make its decrement unresolvable, never make a resolvable decrease
-    // stationary.
-    if decrement_decided.is_none()
-        && projected_grad_norm > stationarity_bound
-        && let Some(prior) = run_recorded.as_ref()
-        && !prior.is_at(&result.rho)
-    {
-        log::debug!(
-            "[CERTIFICATE] {context}: gradient-reproducibility floor not applied: the \
-             run-recorded measurement was taken at rho={:?}, not at the certified rho={:?} \
-             (#2953)",
-            prior.rho().to_vec(),
-            result.rho.to_vec(),
-        );
-    }
-    //
-    // A mint that follows a screening pass at this ρ holds the screening's reset
-    // re-measurement as `run_recorded`, a bit-for-bit replay of its own
-    // evaluation, so the solver's measurement that screening displaced is
-    // weighed too. Otherwise the mint refuses on a spread of exactly zero a
-    // point the screening certified on the solver's evidence at the same ρ.
-    for prior in run_recorded.iter().chain(displaced.iter()) {
-        if decrement_decided.is_some()
-            || projected_grad_norm <= stationarity_bound
-            || !prior.is_at(&result.rho)
-            || layout
-                .validate_gradient_len(prior.gradient(), "outer run-recorded gradient")
-                .is_err()
-            || !prior.gradient().iter().all(|value| value.is_finite())
-            || !prior.value().is_finite()
-        {
-            continue;
-        }
-        const GRADIENT_REPRODUCIBILITY_WIDENING: f64 = 2.0;
-        let objective_tol = outer_criterion_resolution(config);
-        let cost_drift = (prior.value() - evaluation.cost).abs();
-        let prior_projected = project_gradient_vector(
-            &result.rho,
-            prior.gradient(),
-            Some(&rail_projection_bounds),
-        );
-        let spread = (&prior_projected - &projected_gradient)
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
-        let repro_bound = GRADIENT_REPRODUCIBILITY_WIDENING * spread;
-        if cost_drift <= objective_tol
-            && repro_bound.is_finite()
-            && repro_bound > stationarity_bound
-            && projected_grad_norm <= repro_bound
-        {
-            log::debug!(
-                "[CERTIFICATE] {context}: gradient-reproducibility floor widened the \
-                 stationarity bound to {repro_bound:.3e} (|Pg|={projected_grad_norm:.3e}, \
-                 same-ρ spread between the run-recorded and certificate-time gradients \
-                 {spread:.3e}, cost drift {cost_drift:.3e} ≤ tol {objective_tol:.3e})"
-            );
-            stationarity_bound = repro_bound;
-            bound_source = StationarityBoundSource::GradientReproducibility;
-        }
     }
 
     // #2568 -- the caller's requirement caps the ladder's TOP, after every
