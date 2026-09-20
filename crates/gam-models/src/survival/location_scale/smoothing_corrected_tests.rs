@@ -62,7 +62,7 @@ fn second_difference_penalty(p_basis: usize) -> Array2<f64> {
 }
 
 /// A survival location-scale spec whose LOCATION block carries a real penalized
-/// smooth (the bench's `s(x, type=ps)` shape), so the fit is NOT the reduced
+/// smooth (the bench's `s(x, bs=ps)` shape), so the fit is NOT the reduced
 /// unpenalized parametric-AFT regime and must route through the coupled
 /// custom-family path that computes the smoothing correction.
 fn penalized_location_spec(x: &Array1<f64>, age_exit: &Array1<f64>) -> SurvivalLocationScaleSpec {

@@ -2441,7 +2441,15 @@
     "evidence": "git grep -n -w set_degenerate_gaussian_reml_items at 391a766e10 finds its declaration in crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs and exactly two calls, the ModelIsIllConditioned arms of gaussian_reml_fit and gaussian_reml_fit_positions in crates/gam-pyffi/src/model/model_ffi.rs, which 8fae1cc34e removes. scripts/source_removal_guard.py --base 391a766e10 --head e8568910a9 names exactly this item (production_occurrences 3). The removal was measured independently by the direct gate run dy5 w2saeb-3310-g1 (direct-dy5-w2saeb-3310-g1.log), whose source-removal guard named the same item for an equivalent change."
   },
   {
-    "base": "8195d75d0aebc3f4c886b20efd5ef0201ac719c7",
+    "base": "801ff9f60defaf03e13a5e950f4e6e45b2d106c7",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/arc_curvature_stationary_2817_tests.rs:fn:a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817"
+    ],
+    "reason": "#3176: FixedPointProgress judges each evaluation on its own (a resolved improvement of the incumbent, charged each value's own rounding gamma_1*|V|, or a contraction of the step) instead of filling COST_STALL_WINDOW-evaluation windows, so a limit-cycling walk stops at its first unprogressing evaluation, not its second window. The pin restating the second-window stop is replaced by a_limit_cycling_fixed_point_walk_stops_at_its_first_unprogressing_evaluation_2817.",
+    "evidence": "At base 801ff9f60d source_removal_guard.py reports exactly this one guarded removal. The replacement pin and the restated contraction, improvement and below-tau-above-rounding pins pass in cargo test -p gam-solve --lib fixed_point_walk."
+  },
+  {
+    "base": "19964754761e66a86a1424011a2105795a7e4130",
     "items": [
       "crates/gam-cli/src/main.rs:const:CLI_WORKER_STACK_SIZE",
       "crates/gam-linalg/src/parallel.rs:fn:run_on_single_worker_pool",

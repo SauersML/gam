@@ -381,7 +381,7 @@ fn tps_k18_basis_must_span_smooth_bivariate_function_ridge_stabilized() {
 /// `num_centers = 3` yields a **3-column** basis (2 polynomial + 1 wiggle), not
 /// a 5-column one. A single wiggle mode cannot span a full period of sin(2πx):
 /// across 50 seeds an unpenalized dim-3 fit tops out at R² ≈ 0.59 (and mgcv's
-/// own `bs="tp", k=3` truncation lands at the same ceiling), so an R² ≥ 0.70
+/// own `bs="tps", k=3` truncation lands at the same ceiling), so an R² ≥ 0.70
 /// bar at `num_centers = 3` asserts the mathematically impossible for ANY
 /// correct TPS construction — it was calibrated against the phantom dim-5 count.
 ///
@@ -431,7 +431,7 @@ fn tps_k5_basis_must_span_smooth_univariate_function() {
 /// The seed-118 fuzz failure is not a single 2D TPS; it is two independent
 /// one-dimensional TPS smooths with k=18 on skewed covariates:
 ///
-///   y ~ s(x0, type=tps, centers=18) + s(x1, type=tps, centers=18)
+///   y ~ s(x0, bs=tps, centers=18) + s(x1, bs=tps, centers=18)
 ///
 /// This test builds exactly that term-collection design and fits it by near-OLS
 /// on the training rows of a deterministic additive sawtooth-plus-polynomial
