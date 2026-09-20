@@ -206,7 +206,11 @@ pub(crate) fn smooth_floor_dp(dp: f64, scale: f64) -> (f64, f64, f64) {
 ///   contractions of high-order derivatives).
 /// - Those infinite-series corrections are not expanded in this routine.
 pub(crate) struct SmoothingCorrectionComputation {
-    pub correction: Option<Array2<f64>>,
+    /// The correction's square-root factor `B` in the original coefficient
+    /// frame, `C = J·V_ρ·Jᵀ = B·Bᵀ` ([`smoothing_correction_factor`]). A route
+    /// that publishes a dense covariance forms `C` from it with
+    /// [`smoothing_correction_gram`]; the factorized route keeps `B` (#3283).
+    pub factor: Option<Array2<f64>>,
     /// Regularized inverse outer Hessian `Cov(rho_hat)` in the same rho ordering
     /// as the fitted smoothing-parameter vector. This exposes the #740 quantity
     /// to LR Bartlett inference without changing the production algebra that
@@ -355,7 +359,7 @@ pub enum EigenClassification {
     Railed,
 }
 
-/// Assemble `Q J Vρ Jᵀ Qᵀ` through a rectangular square-root factor.
+/// The rectangular square-root factor of `Q J Vρ Jᵀ Qᵀ`.
 ///
 /// `invert_identified_rho_hessian` has already classified every retained
 /// eigendirection as strictly positive and resolved. Therefore
@@ -373,8 +377,12 @@ pub enum EigenClassification {
 /// two generic matrix products. When a true correction diagonal was zero or
 /// much smaller than the matrix's signed off-diagonal scale, that route could
 /// emit a negative diagonal of order ε; a small conditional covariance need
-/// not dominate that error when the corrected covariance is assembled.
-fn smoothing_correction_gram(
+/// not dominate that error when the corrected covariance is assembled
+/// ([`smoothing_correction_gram`]).
+///
+/// `B` is `p × r`, `r` the number of active directions, so a route that cannot
+/// hold a `p × p` matrix carries the correction as `B` itself (#3283).
+fn smoothing_correction_factor(
     jacobian_trans: &Array2<f64>,
     qs: &Array2<f64>,
     eigenvalues: &Array1<f64>,
@@ -409,13 +417,18 @@ fn smoothing_correction_gram(
             .assign(&direction.mapv(|value| value * scale));
     }
 
-    let factor_orig = qs.dot(&factor_trans);
-    let mut correction = factor_orig.dot(&factor_orig.t());
+    qs.dot(&factor_trans)
+}
+
+/// `C = B Bᵀ` from the factor [`smoothing_correction_factor`] returns, with
+/// every diagonal entry accumulated as the sum of squares `‖b_i‖²`.
+pub(crate) fn smoothing_correction_gram(factor: &Array2<f64>) -> Array2<f64> {
+    let mut correction = factor.dot(&factor.t());
     gam_linalg::matrix::symmetrize_in_place(&mut correction);
     // Make the Gram diagonal's non-negativity explicit rather than relying on
     // a backend-specific GEMM diagonal accumulation path.
-    for index in 0..factor_orig.nrows() {
-        let row = factor_orig.row(index);
+    for index in 0..factor.nrows() {
+        let row = factor.row(index);
         correction[[index, index]] = row.dot(&row);
     }
     correction
@@ -1153,8 +1166,10 @@ fn dump_indefinite_rho_hessian_diagnostic(
     inverted: Option<&InvertedRhoHessian>,
     outer_gradient: &Array1<f64>,
 ) {
+    // Everything below exists only to be logged at debug level: an
+    // eigendecomposition and `O(K² block²)` pair traces nobody reads otherwise.
     let k = hessian_rho.nrows();
-    if k == 0 {
+    if k == 0 || !log::log_enabled!(log::Level::Debug) {
         return;
     }
 
@@ -1524,7 +1539,7 @@ pub(crate) fn compute_smoothing_correction(
     let n_rho = final_rho.len();
     if n_rho == 0 {
         return SmoothingCorrectionComputation {
-            correction: None,
+            factor: None,
             rho_covariance: None,
             active_rank: None,
             status: SmoothingCorrectionStatus::NotApplicableNoSmoothingParameters,
@@ -1540,7 +1555,7 @@ pub(crate) fn compute_smoothing_correction(
         Ok(penalties) => penalties,
         Err(error) => {
             return SmoothingCorrectionComputation {
-                correction: None,
+                factor: None,
                 rho_covariance: None,
                 active_rank: None,
                 status: SmoothingCorrectionStatus::Unavailable(
@@ -1554,7 +1569,7 @@ pub(crate) fn compute_smoothing_correction(
     let ct = &applied_penalties;
     if lambdas.len() != n_rho || ct.len() != n_rho {
         return SmoothingCorrectionComputation {
-            correction: None,
+            factor: None,
             rho_covariance: None,
             active_rank: None,
             status: SmoothingCorrectionStatus::Unavailable(
@@ -1572,15 +1587,55 @@ pub(crate) fn compute_smoothing_correction(
     // many directions must be null?" and never "is THIS direction one of
     // them?". Nothing else about the count changes: with zero prior means the
     // augmented Gram is bit-identical to the `tr(S_i S_j)` one this replaces.
+    //
+    // The invariance is read in the ORIGINAL frame, from the block-local
+    // `S̃_k = Π S_k Π` the criterion applies there. `null(w ↦ Σ w_k A_k)` and the
+    // Gram `⟨A_i, A_j⟩` are invariant under the orthogonal congruence by `Qs`
+    // (`S_k ↦ QsᵀS_kQs`, `μ_k ↦ Qsᵀμ_k`), so this is the same subspace; but the
+    // rotated penalties are dense, and their double-double Gram costs
+    // `O(K² p²)` against `O(Σ_overlapping block²)`. On forty coordinates at
+    // `p = 221` that was two thirds of the post-fit correction.
+    let original_applied = match crate::estimate::reml::applied_canonical_penalties_for(
+        &final_fit.reparam_result,
+        &reml_state.canonical_penalties,
+    ) {
+        Ok(penalties) => penalties,
+        Err(error) => {
+            return SmoothingCorrectionComputation {
+                factor: None,
+                rho_covariance: None,
+                active_rank: None,
+                status: SmoothingCorrectionStatus::Unavailable(
+                    SmoothingCorrectionUnavailable::PenaltyStructure {
+                        error: error.to_string(),
+                    },
+                ),
+            };
+        }
+    };
+    if original_applied.len() != n_rho {
+        return SmoothingCorrectionComputation {
+            factor: None,
+            rho_covariance: None,
+            active_rank: None,
+            status: SmoothingCorrectionStatus::Unavailable(
+                SmoothingCorrectionUnavailable::PenaltyDimension {
+                    rho: n_rho,
+                    lambdas: lambdas.len(),
+                    canonical_penalties: original_applied.len(),
+                },
+            ),
+        };
+    }
     let invariance =
         match crate::penalty_invariance::PenaltyMapInvariance::from_canonical_penalties(
-            ct,
-            n_coeffs_trans,
+            &original_applied,
+            reml_state.p,
         ) {
             Ok(invariance) => invariance,
             Err(error) => {
                 return SmoothingCorrectionComputation {
-                    correction: None,
+                    factor: None,
                     rho_covariance: None,
                     active_rank: None,
                     status: SmoothingCorrectionStatus::Unavailable(
@@ -1614,7 +1669,7 @@ pub(crate) fn compute_smoothing_correction(
         Ok(hessian) => hessian,
         Err(error) => {
             return SmoothingCorrectionComputation {
-                correction: None,
+                factor: None,
                 rho_covariance: None,
                 active_rank: None,
                 status: SmoothingCorrectionStatus::Unavailable(
@@ -1639,7 +1694,7 @@ pub(crate) fn compute_smoothing_correction(
             n_coeffs_trans
         );
         return SmoothingCorrectionComputation {
-            correction: None,
+            factor: None,
             rho_covariance: None,
             active_rank: None,
             status: SmoothingCorrectionStatus::Unavailable(
@@ -1679,7 +1734,7 @@ pub(crate) fn compute_smoothing_correction(
                          skipping."
                     );
                     return SmoothingCorrectionComputation {
-                        correction: None,
+                        factor: None,
                         rho_covariance: None,
                         active_rank: None,
                         status: SmoothingCorrectionStatus::Unavailable(
@@ -1735,7 +1790,7 @@ pub(crate) fn compute_smoothing_correction(
                     "IFT beta-rho sensitivity solve failed for smoothing correction; skipping."
                 );
                 return SmoothingCorrectionComputation {
-                    correction: None,
+                    factor: None,
                     rho_covariance: None,
                     active_rank: None,
                     status: SmoothingCorrectionStatus::Unavailable(
@@ -1773,7 +1828,7 @@ pub(crate) fn compute_smoothing_correction(
                 }
             };
             return SmoothingCorrectionComputation {
-                correction: None,
+                factor: None,
                 rho_covariance: None,
                 active_rank: None,
                 status: SmoothingCorrectionStatus::Unavailable(reason),
@@ -1927,7 +1982,7 @@ pub(crate) fn compute_smoothing_correction(
                 outer_gradient,
             );
             return SmoothingCorrectionComputation {
-                correction: None,
+                factor: None,
                 rho_covariance: None,
                 active_rank: None,
                 status: SmoothingCorrectionStatus::Unavailable(
@@ -1960,7 +2015,7 @@ pub(crate) fn compute_smoothing_correction(
         // identity the custom-family lane mints when every outer coordinate is railed (#2677).
         let p_original = final_fit.reparam_result.qs.nrows();
         return SmoothingCorrectionComputation {
-            correction: Some(Array2::<f64>::zeros((p_original, p_original))),
+            factor: Some(Array2::<f64>::zeros((p_original, 0))),
             rho_covariance: Some(inverted.inverse),
             active_rank: Some(0),
             status: SmoothingCorrectionStatus::ZeroNoIdentifiedOuterDirections,
@@ -2004,7 +2059,7 @@ pub(crate) fn compute_smoothing_correction(
     //   J = dβ̂/dρ,  J[:,k] = -H^{-1}(A_k β̂),
     //   V_ρ = (∇²_{ρρ}V)^{-1} evaluated at the final ρ.
     let qs = &final_fit.reparam_result.qs;
-    let v_corr_orig = smoothing_correction_gram(
+    let factor_orig = smoothing_correction_factor(
         &jacobian_trans,
         qs,
         &inverted.eigenvalues,
@@ -2013,11 +2068,12 @@ pub(crate) fn compute_smoothing_correction(
     );
     let rho_covariance = inverted.inverse;
 
-    // Validate the result
-    if !v_corr_orig.iter().all(|v| v.is_finite()) {
+    // Validate the result: every diagonal entry `‖b_i‖²` of `C = B Bᵀ` finite,
+    // which bounds every off-diagonal entry `|b_iᵀ b_j| ≤ ‖b_i‖‖b_j‖` as well.
+    if !factor_orig.rows().into_iter().all(|row| row.dot(&row).is_finite()) {
         log::debug!("Non-finite values in smoothing correction matrix; skipping.");
         return SmoothingCorrectionComputation {
-            correction: None,
+            factor: None,
             rho_covariance: Some(rho_covariance),
             active_rank: Some(active_rank_used),
             status: SmoothingCorrectionStatus::Unavailable(
@@ -2026,7 +2082,7 @@ pub(crate) fn compute_smoothing_correction(
         };
     }
     SmoothingCorrectionComputation {
-        correction: Some(v_corr_orig),
+        factor: Some(factor_orig),
         rho_covariance: Some(rho_covariance),
         active_rank: Some(active_rank_used),
         status: SmoothingCorrectionStatus::Computed,
@@ -2053,13 +2109,13 @@ mod smoothing_correction_gram_tests {
             EigenClassification::Active,
         ];
 
-        let correction = smoothing_correction_gram(
+        let correction = smoothing_correction_gram(&smoothing_correction_factor(
             &jacobian,
             &qs,
             &eigenvalues,
             &eigenvectors,
             &classifications,
-        );
+        ));
 
         assert!(
             correction.iter().all(|&value| value == 0.0),
@@ -2094,13 +2150,13 @@ mod smoothing_correction_gram_tests {
             EigenClassification::Active,
         ];
 
-        let correction = smoothing_correction_gram(
+        let correction = smoothing_correction_gram(&smoothing_correction_factor(
             &jacobian,
             &qs,
             &eigenvalues,
             &eigenvectors,
             &classifications,
-        );
+        ));
         let inverse = eigenvectors
             .dot(&Array2::from_diag(&eigenvalues.mapv(f64::recip)))
             .dot(&eigenvectors.t());

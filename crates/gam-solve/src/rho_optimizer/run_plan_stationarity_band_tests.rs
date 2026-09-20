@@ -132,15 +132,15 @@ fn zz_measure_2613_gradient_only_stiff_ridge_trajectory() {
 // ─── #2613 the cost-stall guard counts ACCEPTED steps, not evaluations ────────
 
 /// `‖Pg‖` at every point in the #2613 window tests: below the guard's `1e-3`
-/// stationarity threshold, so a filled window certifies as `Converged` rather
-/// than routing through the `StuckKeepDescending` escape budget. The escape
-/// ladder is a different mechanism with its own tests; keeping it out of these
-/// makes the halt index a clean function of the window alone.
+/// stationarity threshold, so a stall certifies as `Converged` rather than routing
+/// through the `StuckKeepDescending` escape. The escape ladder is a different
+/// mechanism with its own tests; keeping it out of these makes the halt index a
+/// clean function of the accepted steps alone.
 const STATIONARY_GRAD_2613: f64 = 5.0e-4;
 
 /// The plateau every #2613 window test sits on: a Strong-Wolfe zoom's trials
 /// converging geometrically to one point, so consecutive costs differ by ~1e-9
-/// against a `1e-7 · (1 + 4996.7) ≈ 5e-4` improvement floor while the ITERATE
+/// against each value's resolution `1e-7 · (1 + 4996.7) ≈ 5e-4` while the ITERATE
 /// has not moved once.
 fn zoom_plateau_schedule_2613(len: usize) -> Vec<(f64, f64, f64)> {
     (0..len)
@@ -196,8 +196,16 @@ fn drive_first_order_bridge_2613(
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-7, COST_STALL_WINDOW, &claim_band_config(1.0e-3), exit.clone());
-    guard.observe_seed(&seed_rho, seed_cost, seed_grad);
+    let config = claim_band_config(1.0e-3);
+    let mut guard = CostStallGuard::new(outer_criterion_resolution(&config), &config, exit.clone());
+    // The scripted objective publishes no evidence, so the seed value carries the
+    // resolution the certificate asserts, as every later sample does (#3018).
+    guard.observe_seed(
+        &seed_rho,
+        seed_cost,
+        outer_criterion_resolution(&config),
+        seed_grad,
+    );
     let mut bridge = OuterFirstOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),
@@ -212,7 +220,11 @@ fn drive_first_order_bridge_2613(
         consecutive_probe_refusals: 0,
         accepted_steps: ledger,
         pending_first_order: Vec::new(),
-        incumbent: Some((seed_rho, seed_cost)),
+        incumbent: Some(OuterIncumbent {
+            rho: seed_rho,
+            cost: seed_cost,
+            gradient: array![seed_grad],
+        }),
         stratum_rank: None,
         stratum_probe: None,
     };
@@ -245,7 +257,7 @@ fn drive_first_order_bridge_2613(
 /// else, which is the whole content of the fix.
 #[test]
 fn line_search_probes_never_advance_the_cost_stall_window_2613() {
-    let schedule = zoom_plateau_schedule_2613(COST_STALL_WINDOW * 4);
+    let schedule = zoom_plateau_schedule_2613(24);
     let offered: Arc<Mutex<Vec<(usize, f64)>>> = Arc::new(Mutex::new(Vec::new()));
     let (outcomes, published) = drive_first_order_bridge_2613(
         schedule.clone(),
@@ -300,12 +312,12 @@ fn line_search_probes_never_advance_the_cost_stall_window_2613() {
 }
 
 /// #2613 — the guard's own job is untouched: a genuine run of accepted outer
-/// steps with no improvement still halts, on exactly the
-/// `COST_STALL_WINDOW`-th accepted step, and still certifies a stationary
-/// plateau as converged.
+/// steps with no resolvable improvement still halts, on exactly the first
+/// accepted step that stalls (#3018), and still certifies a stationary plateau
+/// as converged.
 #[test]
 fn accepted_steps_still_trip_the_cost_stall_window_2613() {
-    let schedule = zoom_plateau_schedule_2613(COST_STALL_WINDOW * 4);
+    let schedule = zoom_plateau_schedule_2613(24);
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let incumbent = Arc::new(Mutex::new(-4996.7_f64));
     let (outcomes, published) = {
@@ -321,6 +333,7 @@ fn accepted_steps_still_trip_the_cost_stall_window_2613() {
                     iter: idx,
                     step_norm: 1.0e-6,
                     actual_decrease: *prev - cost,
+                    predicted_decrease: *prev - cost,
                 });
                 *prev = cost;
             },
@@ -336,12 +349,13 @@ fn accepted_steps_still_trip_the_cost_stall_window_2613() {
         "the halt must use the shared cost-stall sentinel",
     );
     // The accept for evaluation `i` is published after it and drained at the
-    // top of evaluation `i+1`, so the window closes on evaluation
-    // `COST_STALL_WINDOW`. One evaluation of latency is inherent:
+    // top of evaluation `i+1`, so the first accepted step, a stall (its
+    // decrease is ~1e-9 against resolutions of ~5e-4, and it sits inside the
+    // band), is judged on evaluation 1. One evaluation of latency is inherent:
     // `on_step_accepted` fires after the line search that produced the step.
     assert_eq!(
-        halted, COST_STALL_WINDOW,
-        "the window must close on the {COST_STALL_WINDOW}th accepted step: {outcomes:?}",
+        halted, 1,
+        "the halt must come at the first accepted step that stalls: {outcomes:?}",
     );
     let published = published.expect("a stalled run must publish its best iterate");
     assert!(
@@ -360,14 +374,14 @@ fn accepted_steps_still_trip_the_cost_stall_window_2613() {
 #[test]
 fn accepted_step_resolves_by_cost_not_by_recency_2613() {
     // Evaluation 0 is the accepted trial; 1 and 2 are rescue pokes that lose.
-    // Then a plateau at the accepted cost, long enough to close the window.
+    // Then a plateau at the accepted cost, long enough for a stall to be judged.
     let mut schedule = vec![
         (-100.0, 11.0, STATIONARY_GRAD_2613),
         (-99.0, 11.5, STATIONARY_GRAD_2613),
         (-98.5, 10.5, STATIONARY_GRAD_2613),
     ];
     schedule.extend(
-        (0..(COST_STALL_WINDOW + 3)).map(|_| (-100.0, 11.0, STATIONARY_GRAD_2613)),
+        (0..4).map(|_| (-100.0, 11.0, STATIONARY_GRAD_2613)),
     );
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let (outcomes, published) = {
@@ -389,13 +403,14 @@ fn accepted_step_resolves_by_cost_not_by_recency_2613() {
                     // repeats the accepted cost, so every later step decreases
                     // by nothing.
                     actual_decrease: if idx == 2 { 90.0 } else { -100.0 - cost },
+                    predicted_decrease: if idx == 2 { 90.0 } else { -100.0 - cost },
                 });
             },
         )
     };
     assert!(
         outcomes.iter().position(Result::is_err).is_some(),
-        "the plateau must eventually close the window: {outcomes:?}",
+        "the plateau must stall and halt: {outcomes:?}",
     );
     let published = published.expect("the closed window must publish an incumbent");
     assert_eq!(
