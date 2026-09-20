@@ -4,6 +4,9 @@
 /// basis, so value, first and second derivative agree on both sides of a
 /// breakpoint and only the span-local third derivative depends on this choice.
 /// Values outside the band select the nearest end span.
+///
+/// The caller must supply finite, strictly increasing breakpoints. Runtime
+/// construction validates that invariant once; lookup remains logarithmic.
 pub fn span_index_for_breakpoints(
     breakpoints: &[f64],
     value: f64,
@@ -106,5 +109,29 @@ mod tests {
             err.contains("my_var"),
             "error should mention label, got: {err}"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod boundary_oracle_tests {
+    use super::span_index_for_breakpoints;
+
+    #[test]
+    fn binary_span_search_agrees_with_interval_membership_at_adjacent_floats() {
+        let breakpoints = [-f64::MAX, -1.0, -f64::MIN_POSITIVE, 0.0,
+            f64::MIN_POSITIVE, 1.0, f64::MAX];
+        for point in breakpoints {
+            for value in [point.next_down(), point, point.next_up()] {
+                if !value.is_finite() { continue; }
+                let expected = breakpoints.windows(2).enumerate()
+                    .find(|(index, endpoints)| value <= endpoints[1] &&
+                        (*index == 0 || value > endpoints[0]))
+                    .map(|(index, _)| index).expect("finite value inside endpoint extremes");
+                assert_eq!(span_index_for_breakpoints(&breakpoints, value, "oracle").unwrap(), expected,
+                    "point={point:e}, value={value:e}");
+            }
+        }
+        assert_eq!(span_index_for_breakpoints(&breakpoints, -0.0, "signed zero").unwrap(), 2);
     }
 }

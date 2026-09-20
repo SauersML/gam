@@ -204,14 +204,14 @@ fn drive_trials_3017(trials: &[f64], report_accepted: bool) -> Vec<Result<f64, S
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     // The guard exactly as the dense ARC route builds and seeds it. The scripted
-    // criterion publishes no evidence, so its values carry the criterion's
-    // resolution (#3018).
-    let resolution = outer_criterion_resolution(&config);
-    let mut guard = CostStallGuard::new(resolution, &config, exit);
+    // criterion publishes no evidence, so its values carry only their own
+    // rounding (#3018, #3287).
+    let mut guard = CostStallGuard::new(&config, exit);
+    let seed_resolution = guard.value_resolution(value_3017(SEED_3017), &Default::default());
     guard.observe_second_order_seed(
         &array![SEED_3017],
         value_3017(SEED_3017),
-        resolution,
+        seed_resolution,
         gradient_3017(SEED_3017).abs(),
         Some(true),
     );
@@ -227,7 +227,7 @@ fn drive_trials_3017(trials: &[f64], report_accepted: bool) -> Vec<Result<f64, S
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-30.0], array![30.0])),
-        curvature_stationary_resolution: Some(resolution),
+        curvature_stationary_resolution: Some(outer_criterion_resolution(&config)),
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: Some(&config),
     };

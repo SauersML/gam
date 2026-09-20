@@ -438,12 +438,6 @@ pub(crate) fn fit_standard_model_on_design(
     mut request: StandardFitRequest<'_>,
     realized_design: Option<TermCollectionDesign>,
 ) -> Result<StandardFitResult, FitFailure> {
-    if request.estimate_tweedie_p {
-        return Err(FitFailure::raised(
-            gam_problem::FailureCategory::Input,
-            "automatic Tweedie power profiling is derivative-free hyperparameter search and is forbidden by SPEC.md; supply an explicit p strictly between 1 and 2",
-        ));
-    }
     // #2750: resolve every AUTO measure-jet representer range against the
     // response, once, before anything reads the spec.
     //

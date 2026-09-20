@@ -332,12 +332,6 @@ impl PredictableModel for TransformationNormalPredictor {
         Ok(result)
     }
 
-    fn n_blocks(&self) -> usize {
-        1
-    }
-    fn block_roles(&self) -> Vec<BlockRole> {
-        vec![BlockRole::Mean]
-    }
 }
 
 #[cfg(test)]

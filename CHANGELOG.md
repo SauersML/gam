@@ -1,11 +1,18 @@
 ## Unreleased
 
-- **`gam_runtime::span::span_index_for_breakpoints` assigns an interior breakpoint to the span on its
-  left** (#4376). Both anchored deviation runtimes already wanted that span and each corrected the
-  helper's right-hand answer with its own copy of the same adjustment. The adjustments are gone and
-  the helper states the one convention. `DeviationRuntime::span_index_for`, which had no caller outside
-  that adjustment, is removed.
-
+- **Warm-start lookup cache rows belong to one store root and see sibling writes** (#3882, #3885).
+  The process-global lookup cache was keyed by fingerprint alone, so a second
+  `WarmStartStore` on a different root returned, touched and could TTL-expire the
+  first root's entry. Rows are now keyed by the key directory. The fast path also
+  checked only the chosen meta file's mtime, so it never saw a better entry that a
+  sibling process wrote into the same key dir, and its own access-stamp rewrite
+  invalidated the row on every hit. A hit now requires both the meta and the key-dir
+  mtimes to match, and the row is re-recorded after the touch. `touch_lookup_hit` is
+  removed.
+- **`process_monitor` reads every `/proc/self` field through one parser** (#4073).
+  `parse_status_kb`, `parse_status_count` and `parse_io_bytes` were three copies of
+  "the integer after the key"; they are replaced by `parse_proc_value`, which takes the
+  first whitespace-separated token after the key for `status` and `io` lines alike.
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
   point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is

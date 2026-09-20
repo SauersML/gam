@@ -387,8 +387,12 @@ pub trait CustomFamily {
     /// and dimensions, but they deliberately do not know the family response
     /// vector or likelihood-side data stored on `Self`. Reusing β across
     /// different responses is mathematically unsafe, so persistent block-level
-    /// warm-starts are enabled only for families that provide a fingerprint of
-    /// the data that defines their likelihood. Outer ρ cache remains available
+    /// warm-starts are honoured only for families that provide a fingerprint of
+    /// the data that defines their likelihood. Returning `None` (the default)
+    /// means the family cannot key a record: a fit given a configured
+    /// `BlockwiseFitOptions::persistent_warm_start_store` then REFUSES it with
+    /// `CustomFamilyError::UnsupportedConfiguration` naming the family
+    /// (gam#3002), never a silent cold fit. Outer ρ cache remains available
     /// independently through `BlockwiseFitOptions::cache_session`.
     fn persistent_warm_start_fingerprint(
         &self,

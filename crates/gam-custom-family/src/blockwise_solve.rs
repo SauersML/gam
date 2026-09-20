@@ -492,6 +492,58 @@ pub(crate) fn weighted_normal_equations(
     Ok((xtwx, xtwy))
 }
 
+/// Directional derivative of a diagonal working-set block's data Hessian
+/// `H = Xᵀ W X`:
+///
+/// `D_β H[d] = Xᵀ diag(dw) X + (dXᵀ W X + Xᵀ W dX)`,
+///
+/// where the bracket appears only when the block geometry moves the design,
+/// i.e. `geometry = Some((dX, w))`. `X` is used as an operator throughout. The
+/// signed Gram streams through `xt_diag_x_signed_op`, and `M = Xᵀ W dX` is
+/// accumulated over bounded row chunks of `X`, with the bracket equal to
+/// `M + Mᵀ`. No n×p copy of the design is ever formed.
+pub(crate) fn diagonal_block_hessian_drift(
+    x: &DesignMatrix,
+    dw: &Array1<f64>,
+    geometry: Option<(&Array2<f64>, &Array1<f64>)>,
+) -> Result<Array2<f64>, CustomFamilyError> {
+    let (mut drift, _) = weighted_normal_equations(x, dw, None)?;
+    let Some((dx, w)) = geometry else {
+        return Ok(drift);
+    };
+    let (n, p) = (x.nrows(), x.ncols());
+    if dx.nrows() != n || dx.ncols() != p || w.len() != n {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "diagonal dH geometry shape mismatch: dX is {}x{}, weights {}, design {n}x{p}",
+                dx.nrows(),
+                dx.ncols(),
+                w.len()
+            ),
+        });
+    }
+    let chunk = gam_linalg::utils::row_chunk_for_byte_budget(n, p);
+    let mut x_rows = Array2::<f64>::zeros((chunk, p));
+    let mut wdx_rows = Array2::<f64>::zeros((chunk, p));
+    let mut xt_w_dx = Array2::<f64>::zeros((p, p));
+    for start in (0..n).step_by(chunk) {
+        let end = (start + chunk).min(n);
+        let len = end - start;
+        let mut x_view = x_rows.slice_mut(s![..len, ..]);
+        gam_linalg::matrix::DenseDesignOperator::row_chunk_into(x, start..end, x_view.view_mut())
+            .map_err(|error| error.to_string())?;
+        let mut wdx_view = wdx_rows.slice_mut(s![..len, ..]);
+        wdx_view.assign(&dx.slice(s![start..end, ..]));
+        for (mut row, &wi) in wdx_view.rows_mut().into_iter().zip(w.slice(s![start..end])) {
+            row *= wi;
+        }
+        xt_w_dx += &fast_atb(&x_view, &wdx_view);
+    }
+    drift += &xt_w_dx;
+    drift += &xt_w_dx.t();
+    Ok(drift)
+}
+
 /// Smallest diagonal shift that makes the penalized joint Hessian
 /// Cholesky-factorable (i.e. positive definite at the solver floor), or `None`
 /// when no shift is needed (the matrix is already PD) or none can help (a

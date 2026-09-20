@@ -1432,21 +1432,6 @@ mod tests {
     }
 
     #[test]
-    fn log1pexp_is_finite_for_extreme_eta() {
-        assert!(gam_linalg::utils::stable_softplus(1000.0).is_finite());
-        assert!(gam_linalg::utils::stable_softplus(-1000.0).is_finite());
-        assert!((gam_linalg::utils::stable_softplus(-1000.0) - 0.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn sigmoid_stable_behaves_at_extremes() {
-        let hi = gam_linalg::utils::stable_logistic(1000.0);
-        let lo = gam_linalg::utils::stable_logistic(-1000.0);
-        assert!((1.0 - 1e-12..=1.0).contains(&hi));
-        assert!((0.0..=1e-12).contains(&lo));
-    }
-
-    #[test]
     fn exact_hmc_family_tails_are_finite_when_the_surface_is_representable() {
         let tail_cases = [
             (
@@ -2011,7 +1996,7 @@ mod tests {
         let posterior_nll: f64 = eta
             .iter()
             .zip(y.iter())
-            .map(|(&eta_i, &y_i)| gam_linalg::utils::stable_softplus(eta_i) - y_i * eta_i)
+            .map(|(&eta_i, &y_i)| gam_math::special::softplus(eta_i) - y_i * eta_i)
             .sum();
         let zero_nll = x.nrows() as f64 * std::f64::consts::LN_2;
         assert!(
@@ -2069,7 +2054,7 @@ mod tests {
                 let (mut loglik, mut i00, mut i01, mut i11) = (0.0, 0.0, 0.0, 0.0);
                 for (xi, yi) in xs.iter().zip(y.iter()) {
                     let eta = b0 + b1 * xi;
-                    loglik += yi * eta - gam_linalg::utils::stable_softplus(eta);
+                    loglik += yi * eta - gam_math::special::softplus(eta);
                     let mu = 1.0 / (1.0 + (-eta).exp());
                     let wi = mu * (1.0 - mu);
                     i00 += wi;
