@@ -583,6 +583,10 @@ impl OuterProblem {
         self.max_iter = n;
         self
     }
+    /// The outer iteration budget this problem declares.
+    pub fn max_iter(&self) -> usize {
+        self.max_iter
+    }
     pub fn with_bounds(mut self, lo: Array1<f64>, hi: Array1<f64>) -> Self {
         self.bounds = Some((lo, hi));
         self
@@ -7355,11 +7359,7 @@ pub(crate) fn is_per_atom_efs_frontier(cap: &OuterCapability) -> bool {
 /// Builds the same bounded seed and tolerance/budget the standard plan path
 /// uses, takes the same single derived start (initial-ρ if supplied, else the
 /// commensurate-curvature start — the per-atom fixed point is a contraction
-/// near the optimum), then drives the per-atom EFS loop. The shared-border
-/// topology defaults to disjoint (every atom owns a private penalty block — the
-/// common ARD-per-atom case); callers with a known arrow-border overlap can run
-/// the module's `run_per_atom_efs` directly with a populated
-/// `SharedBorderTopology`.
+/// near the optimum), then drives the per-atom EFS loop.
 ///
 /// Additive: this function neither mutates nor bypasses the dense path; it is
 /// the pre-dispatch shortcut [`run_outer`] calls before the dense ladder.
@@ -7401,12 +7401,10 @@ pub(crate) fn run_per_atom_efs_if_frontier(
         lower,
         upper,
     );
-    let topology = crate::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
 
     obj.reset();
     install_matching_initial_inner_seed(obj, config, &seed, context)?;
-    let result =
-        crate::estimate::reml::per_atom_efs::run_per_atom_efs(obj, &seed, &pa_cfg, &topology)?;
+    let result = crate::estimate::reml::per_atom_efs::run_per_atom_efs(obj, &seed, &pa_cfg)?;
     Ok(Some(result.into_outer_result(the_plan)))
 }
 
