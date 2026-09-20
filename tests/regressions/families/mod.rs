@@ -38,3 +38,4 @@ mod small_n_gaussian_double_penalty_terminates;
 mod solver_links_and_topology;
 mod tweedie_dispersion_frozen_at_one;
 mod tweedie_dispersion_observation_interval;
+mod tweedie_phi_gate;

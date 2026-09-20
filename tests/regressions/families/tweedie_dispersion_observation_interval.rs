@@ -18,8 +18,8 @@
 //! Three independent things are asserted, each of which the frozen-`φ` bug
 //! breaks and none of which the η-SE test covers:
 //!   1. ABSOLUTE `φ̂` RECOVERY — the fitted dispersion tracks the data's true
-//!      `φ` (≈ 0.4 and ≈ 6.0), not the frozen 1.0. (The η-SE test only checks
-//!      the *ratio* of two fits, which is invariant to a shared bias.)
+//!      `φ` (0.4 and 6.0), not the frozen 1.0, within the Pearson estimator's
+//!      own sampling band (`tweedie_phi_gate`, #4131).
 //!   2. OBSERVATION-INTERVAL WIDTH scales as √φ across the two fits.
 //!   3. EMPIRICAL COVERAGE — the fitted-`φ` 95% observation interval brackets
 //!      the held-out responses far better than the counterfactual `φ=1` band a
@@ -40,6 +40,8 @@ use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Gamma, Poisson, Uniform};
+
+use super::tweedie_phi_gate::TweedieLogFixture;
 
 const B0: f64 = 0.6;
 const BX: f64 = 0.7;
@@ -66,6 +68,8 @@ fn tweedie_sample(rng: &mut StdRng, mu: f64, phi: f64) -> f64 {
 struct TweedieFit {
     /// Fitted dispersion the covariance / predictive band were scaled by.
     phi_hat: f64,
+    /// Coefficient count of the fit (the Pearson divisor bias).
+    n_coefficients: usize,
     /// Per-row fitted response mean μ̂ on the supplied grid.
     mean: Vec<f64>,
     /// Per-row posterior SE of the mean (the `SE(μ̂)` term of the band).
@@ -154,6 +158,7 @@ fn fit_tweedie(x: &[f64], y: &[f64], eval: &[f64]) -> TweedieFit {
 
     TweedieFit {
         phi_hat,
+        n_coefficients: fit.fit.beta.len(),
         mean: pred.mean.to_vec(),
         mean_se: pred.mean_standard_error.to_vec(),
         obs_halfwidth,
@@ -201,25 +206,16 @@ fn tweedie_observation_interval_reflects_estimated_dispersion() {
     let fit_hi = fit_tweedie(&x, &y_hi, &x);
 
     // ── 1. Absolute φ̂ recovery (the ratio test cannot see a shared bias) ────
-    let rel_err_lo = (fit_lo.phi_hat - phi_lo).abs() / phi_lo;
-    let rel_err_hi = (fit_hi.phi_hat - phi_hi).abs() / phi_hi;
-    eprintln!(
-        "[tweedie-obs] true φ: lo={phi_lo} hi={phi_hi}; fitted φ̂: lo={:.4} hi={:.4} \
-         (rel err lo={rel_err_lo:.3} hi={rel_err_hi:.3})",
-        fit_lo.phi_hat, fit_hi.phi_hat
-    );
-    assert!(
-        rel_err_lo < 0.20,
-        "Tweedie φ̂ does not recover the low dispersion: φ̂={:.4} vs true {phi_lo} \
-         (rel err {rel_err_lo:.3}); frozen-φ bug pins it at 1.0",
-        fit_lo.phi_hat
-    );
-    assert!(
-        rel_err_hi < 0.20,
-        "Tweedie φ̂ does not recover the high dispersion: φ̂={:.4} vs true {phi_hi} \
-         (rel err {rel_err_hi:.3}); frozen-φ bug pins it at 1.0",
-        fit_hi.phi_hat
-    );
+    // The Pearson φ̂ has SD ≈ 2.4% (φ = 0.4) and 3.7% (φ = 6) of φ at n = 4000,
+    // so the band is derived from that SD, not set as a relative error (#4131).
+    let fixture = TweedieLogFixture {
+        x: &x,
+        b0: B0,
+        bx: BX,
+        p: TWEEDIE_P,
+    };
+    fixture.assert_phi_hat_recovers("lo", fit_lo.phi_hat, phi_lo, fit_lo.n_coefficients);
+    fixture.assert_phi_hat_recovers("hi", fit_hi.phi_hat, phi_hi, fit_hi.n_coefficients);
 
     // ── 2. Observation-interval width scales as √φ ──────────────────────────
     let mean_hw_lo: f64 =
