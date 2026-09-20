@@ -13,87 +13,16 @@ pub(crate) fn build_time_blockspec(
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
 ) -> ParameterBlockSpec {
-    // Diagnostic (fires once per fit): the identifiability audit has reported the
-    // `time_surface` design as intra-block rank-deficient on degenerate fixtures.
-    // Dump the per-column span (max−min over exit rows) and mean so a rank
-    // collapse is traceable to constant/collinear columns vs a genuine full-rank
-    // design. Cheap (n×p pass, once), never on a hot path.
-    if let Ok(dense) = design_exit.try_to_dense_arc("build_time_blockspec::diag") {
-        let d = dense.as_ref();
-        let (n_rows, p_cols) = d.dim();
-        let mut spans: Vec<f64> = Vec::with_capacity(p_cols);
-        let mut norms: Vec<f64> = Vec::with_capacity(p_cols);
-        let mut degenerate_cols = 0usize;
-        for j in 0..p_cols {
-            let col = d.column(j);
-            let lo = col.iter().copied().fold(f64::INFINITY, f64::min);
-            let hi = col.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let span = hi - lo;
-            if span == 0.0 {
-                degenerate_cols += 1;
-            }
-            spans.push(span);
-            norms.push(col.dot(&col).sqrt());
-        }
-        // Collinearity probe: pick the highest-norm column as the reference and
-        // report |cos angle| of every other column against it (after mean-
-        // centering, so a shared constant offset doesn't inflate the cosine).
-        // Near-1 across the board ⇒ all columns collinear ⇒ the rank-1 collapse
-        // is genuine near-collinearity, not just constant columns.
-        let ref_col = norms
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(j, _)| j)
-            .unwrap_or(0);
-        let centered = |j: usize| -> Array1<f64> {
-            let col = d.column(j).to_owned();
-            let mean = col.sum() / (n_rows.max(1) as f64);
-            col.mapv(|v| v - mean)
-        };
-        let r = centered(ref_col);
-        let rn = r.dot(&r).sqrt();
-        let cosines: Vec<String> = (0..p_cols)
-            .map(|j| {
-                let c = centered(j);
-                let cn = c.dot(&c).sqrt();
-                // A centered column with no mass is constant; a cosine against
-                // it (or against a constant reference) is not a number.
-                if cn == 0.0 || rn == 0.0 {
-                    "const".to_string()
-                } else {
-                    format!("{:.4}", (c.dot(&r) / (cn * rn)).abs())
-                }
-            })
-            .collect();
-        log::debug!(
-            "[marginal-slope/time_surface-diag] design_exit {n_rows}x{p_cols}; constant cols={degenerate_cols}/{p_cols}; ref_col={ref_col}; per-col span={:?}; |cos vs ref (mean-centered)|={:?}",
-            spans.iter().map(|s| format!("{s:.3e}")).collect::<Vec<_>>(),
-            cosines,
-        );
-    }
-    // Share the three dense design matrices with the multi-output Jacobian
-    // via `Arc` — `try_to_dense_arc` is zero-copy for materialized designs,
-    // so the callback retains no duplicate `n × p` storage. Falls back to no
-    // callback if densification fails.
-    let jac_cb: Option<Arc<dyn crate::custom_family::BlockEffectiveJacobian>> = (|| {
-        let d_entry = time_block
-            .design_entry
-            .try_to_dense_arc("build_time_blockspec::entry")
-            .ok()?;
-        let d_exit = design_exit
-            .try_to_dense_arc("build_time_blockspec::exit")
-            .ok()?;
-        let d_deriv = time_block
-            .design_derivative_exit
-            .try_to_dense_arc("build_time_blockspec::deriv")
-            .ok()?;
-        if d_entry.dim() != d_exit.dim() || d_entry.dim() != d_deriv.dim() {
-            return None;
-        }
-        Some(Arc::new(TimeBlockJacobian::new(d_entry, d_exit, d_deriv))
-            as Arc<dyn crate::custom_family::BlockEffectiveJacobian>)
-    })();
+    // The callback shares the three designs in the storage they already have
+    // and reads them one row chunk at a time, so a streamed design keeps its
+    // callback. The identifiability audit and the canonical gauge read this
+    // block's geometry from the callback alone.
+    let jac_cb: Arc<dyn crate::custom_family::BlockEffectiveJacobian> =
+        Arc::new(TimeBlockJacobian::new(
+            &time_block.design_entry,
+            design_exit,
+            &time_block.design_derivative_exit,
+        ));
 
     ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -109,7 +38,7 @@ pub(crate) fn build_time_blockspec(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 200,
-        jacobian_callback: jac_cb,
+        jacobian_callback: Some(jac_cb),
         stacked_design: None,
         stacked_offset: None,
     }
@@ -150,14 +79,8 @@ pub(crate) fn build_marginal_blockspec(
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
 ) -> ParameterBlockSpec {
-    let jac_cb: Option<Arc<dyn crate::custom_family::BlockEffectiveJacobian>> = design
-        .design
-        .try_to_dense_arc("build_marginal_blockspec")
-        .ok()
-        .map(|d| {
-            Arc::new(MarginalBlockJacobian::new(d))
-                as Arc<dyn crate::custom_family::BlockEffectiveJacobian>
-        });
+    let jac_cb: Arc<dyn crate::custom_family::BlockEffectiveJacobian> =
+        Arc::new(MarginalBlockJacobian::new(&design.design));
 
     ParameterBlockSpec {
         name: "marginal_surface".to_string(),
@@ -168,7 +91,7 @@ pub(crate) fn build_marginal_blockspec(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 150,
-        jacobian_callback: jac_cb,
+        jacobian_callback: Some(jac_cb),
         stacked_design: None,
         stacked_offset: None,
     }
