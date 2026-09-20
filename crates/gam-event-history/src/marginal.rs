@@ -56,6 +56,7 @@ use super::chain::{
 use super::cohort::{EventHistoryError, SubjectNodes};
 use super::scalar::{add_real, div, exp, ln, recip, sqrt, square};
 use gam_math::nested_dual::JetField;
+use gam_math::roundoff::accumulation_growth;
 use ndarray::ArrayView2;
 use std::collections::HashMap;
 
@@ -1951,6 +1952,9 @@ pub(crate) struct Spell {
     pub node: usize,
     /// `ln P(no event across the spell | the history before it)`.
     pub log_survival: f64,
+    /// The roundoff bound of [`Self::log_survival`] as it was formed, which
+    /// scales with the log integrals or normalisers it is assembled from.
+    pub log_survival_roundoff: f64,
     /// `E[λ_d(t) | the history before t]` for every mark when an event closes
     /// the spell at `t`; `None` for the open tail.
     pub intensities: Option<Vec<f64>>,
@@ -1983,11 +1987,17 @@ pub(crate) fn spells(
     }
     let pass = forward_filter(inputs, None, compensated)?;
     let mut spells = Vec::new();
-    let mut log_survival = 0.0_f64;
+    // A node's normaliser `ln c + shift` sums `size` positive terms (relative
+    // error `γ_{size+2}` with the weight and exponential), and the logarithm,
+    // the shift and the running sum each add `ε` of their magnitudes.
+    let (mut log_survival, mut log_survival_roundoff) = (0.0_f64, 0.0_f64);
     let mut open = false;
     for n in 0..n_nodes {
         if !nodes.is_event(n) {
-            log_survival += pass.log_normalisers[n];
+            let log_normaliser = pass.log_normalisers[n];
+            log_survival += log_normaliser;
+            log_survival_roundoff += accumulation_growth(pass.grids[n].size() + 2)
+                + f64::EPSILON * (2.0 * log_normaliser.abs() + log_survival.abs());
             open = true;
             continue;
         }
@@ -2005,15 +2015,17 @@ pub(crate) fn spells(
         spells.push(Spell {
             node: n,
             log_survival,
+            log_survival_roundoff,
             intensities: Some(intensities),
         });
-        log_survival = 0.0;
+        (log_survival, log_survival_roundoff) = (0.0, 0.0);
         open = false;
     }
     if open {
         spells.push(Spell {
             node: n_nodes - 1,
             log_survival,
+            log_survival_roundoff,
             intensities: None,
         });
     }
