@@ -173,8 +173,9 @@ impl<'a> RemlState<'a> {
             return false;
         }
         // A latched #784 block correction splices `Δ_b` with its exact
-        // gradient but no ρ-Hessian, so the criterion it defines has none.
-        !self.block_correction_latched()
+        // gradient and ρ-Hessian, unless `Δ_b` has no closed-form Hessian on
+        // this fit, when the criterion it defines has none.
+        self.block_correction_hessian_refusal().is_none()
     }
 
     /// Whether the exact analytic outer Hessian of the Tierney-Kadane
@@ -3710,7 +3711,7 @@ impl<'a> RemlState<'a> {
         if reml_is_gaussian_identity(&self.config.likelihood) {
             return Ok(self.weights.to_owned());
         }
-        let pilot = self.execute_pirls_if_needed(rho)?;
+        let (pilot, _) = self.execute_pirls_if_needed(rho, BundleRows::Observed)?;
         if pilot.solveweights.len() != self.weights.len() {
             return Err(EstimationError::InvalidInput(format!(
                 "P-IRLS returned {} working weights for {} rows",
@@ -4211,7 +4212,7 @@ impl<'a> RemlState<'a> {
     /// Creates a sanitized cache key from rho values.
     /// Returns None if any component is NaN, in which case caching is skipped.
     /// Maps -0.0 to 0.0 to ensure consistency in caching.
-    pub(super) fn rhokey_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
+    pub(crate) fn rhokey_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
         // A capped inner solve is a different mathematical state from an
         // uncapped solve at the same rho.  Keep both cap identities in every
         // eval, bundle, and PIRLS key so terminal cap=0 evidence can never
@@ -4224,14 +4225,18 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
     ) -> Result<EvalShared, EstimationError> {
-        self.prepare_eval_bundlewithkey_and_row_policy(rho, key, false)
+        self.prepare_eval_bundlewithkey_and_row_policy(rho, key, BundleRows::Observed)
     }
 
+    /// Build the bundle at `rho`. `rows` is the row policy the caller admits:
+    /// `SufficientStatistics` takes the coefficient-space Gaussian solve when
+    /// the surface is eligible, and the returned bundle's `rows` records what
+    /// the solve actually produced.
     fn prepare_eval_bundlewithkey_and_row_policy(
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
-        value_only_rows: bool,
+        rows: BundleRows,
     ) -> Result<EvalShared, EstimationError> {
         // #1575 observability: count every genuine (cache-missing) full-n inner
         // P-IRLS solve. Callers funnel cache hits through `obtain_eval_bundle*`,
@@ -4268,7 +4273,7 @@ impl<'a> RemlState<'a> {
                 match self.prepare_sparse_eval_bundlewithkey(
                     rho,
                     key.clone(),
-                    value_only_rows,
+                    rows,
                     decision.clone(),
                 ) {
                     Ok(bundle) => Ok(bundle),
@@ -4291,42 +4296,48 @@ impl<'a> RemlState<'a> {
                             reason: "sparse_exact_spd_assembly_failed",
                             ..decision
                         };
-                        self.prepare_dense_eval_bundlewithkey(
-                            rho,
-                            key,
-                            value_only_rows,
-                            fallback,
-                        )
+                        self.prepare_dense_eval_bundlewithkey(rho, key, rows, fallback)
                     }
                 }
             }
             RemlGeometry::DenseSpectral => {
-                self.prepare_dense_eval_bundlewithkey(rho, key, value_only_rows, decision)
+                self.prepare_dense_eval_bundlewithkey(rho, key, rows, decision)
             }
         }
     }
 
+    /// The bundle at `rho` with fitted observation rows, for consumers that
+    /// read them (post-fit inference, ext-coordinate builders, EFS).
     pub(crate) fn obtain_eval_bundle(
         &self,
         rho: &Array1<f64>,
     ) -> Result<EvalShared, EstimationError> {
         let key = self.rhokey_sanitized(rho);
-        if let Some(existing) = self.cache_manager.cached_eval_bundle(&key) {
-            return Ok(existing.clone());
+        if let Some(existing) = self
+            .cache_manager
+            .cached_eval_bundle(&key)
+            .filter(|bundle| bundle.rows == BundleRows::Observed)
+        {
+            return Ok(existing);
         }
         let bundle = self.prepare_eval_bundlewithkey(rho, key)?;
         self.cache_manager.store_eval_bundle(bundle.clone());
         Ok(bundle)
     }
 
-    /// Obtain a bundle for a scalar value callback without forcing fixed-design
-    /// Gaussian row materialization.
+    /// The bundle at `rho` for the pure-ρ outer criterion: its value, gradient
+    /// and Hessian.
     ///
-    /// A previously cached full bundle is always reusable. On a cache miss,
-    /// only the eligible Gaussian-identity surface takes the compact row policy,
-    /// and that bundle is not stored in the full-result cache. Other families
-    /// retain the ordinary path and its cache behavior.
-    pub(crate) fn obtain_value_eval_bundle(
+    /// On an eligible fixed-design Gaussian identity surface every one of those
+    /// is a function of `XᵀWX`, `XᵀW(y−offset)`, `(y−offset)ᵀW(y−offset)` and
+    /// the penalties (the dispersion is profiled from the deviance, the
+    /// log-likelihood is `−½·deviance`, and `∂H/∂ρ_k = λ_k S_k` because the
+    /// working weights do not move), so a cache miss solves in coefficient
+    /// space and an outer iteration costs no pass over the `n` rows. Any cached
+    /// bundle at `rho` serves, whichever rows it carries; one built here is
+    /// cached marked `SufficientStatistics`, so `obtain_eval_bundle` still
+    /// realises fitted rows for the consumers that read them.
+    pub(crate) fn obtain_outer_eval_bundle(
         &self,
         rho: &Array1<f64>,
     ) -> Result<EvalShared, EstimationError> {
@@ -4335,9 +4346,15 @@ impl<'a> RemlState<'a> {
         }
         let key = self.rhokey_sanitized(rho);
         if let Some(existing) = self.cache_manager.cached_eval_bundle(&key) {
-            return Ok(existing.clone());
+            return Ok(existing);
         }
-        self.prepare_eval_bundlewithkey_and_row_policy(rho, key, true)
+        let bundle = self.prepare_eval_bundlewithkey_and_row_policy(
+            rho,
+            key,
+            BundleRows::SufficientStatistics,
+        )?;
+        self.cache_manager.store_eval_bundle(bundle.clone());
+        Ok(bundle)
     }
 
     /// Fixes audit answer C for design-moving ext-coords: when the realized
@@ -4350,8 +4367,12 @@ impl<'a> RemlState<'a> {
         theta: &Array1<f64>,
     ) -> Result<EvalShared, EstimationError> {
         let key = self.rhokey_sanitized(theta);
-        if let Some(existing) = self.cache_manager.cached_eval_bundle(&key) {
-            return Ok(existing.clone());
+        if let Some(existing) = self
+            .cache_manager
+            .cached_eval_bundle(&key)
+            .filter(|bundle| bundle.rows == BundleRows::Observed)
+        {
+            return Ok(existing);
         }
         let bundle = self.prepare_eval_bundlewithkey(rho, key)?;
         self.cache_manager.store_eval_bundle(bundle.clone());
@@ -6260,15 +6281,16 @@ impl<'a> RemlState<'a> {
     }
 
     /// Return the shared fixed-design Gaussian row placeholders used only by
-    /// value-only rho probes.
+    /// pure-ρ outer criterion evaluations (value, gradient and Hessian).
     ///
     /// The exact coefficient solve, score, deviance, Hessian, and REML value
-    /// still come from `GaussianFixedCache` sufficient statistics. The row
-    /// carrier exists solely because `PirlsResult` also transports
-    /// observation-scale diagnostics that the value evaluator never reads.
-    /// Building these invariant arrays once keeps distinct rho trials in
-    /// coefficient space without lying to full gradient or final-fit callers
-    /// about their fitted rows (#2435).
+    /// and its ρ-derivatives still come from `GaussianFixedCache` sufficient
+    /// statistics. The row carrier exists solely because `PirlsResult` also
+    /// transports observation-scale diagnostics that the criterion never
+    /// reads. Building these invariant arrays once keeps distinct rho trials in
+    /// coefficient space; bundles built on them are marked
+    /// `BundleRows::SufficientStatistics`, so row consumers and the final fit
+    /// still receive fitted rows (#2435).
     fn gaussian_cost_only_frozen_rows_if_eligible(
         &self,
     ) -> Result<Option<Arc<crate::pirls::GaussianFrozenRows>>, EstimationError> {
@@ -6310,14 +6332,10 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
-        value_only_rows: bool,
+        rows: BundleRows,
         decision: SparseRemlDecision,
     ) -> Result<EvalShared, EstimationError> {
-        let pirls_result = if value_only_rows {
-            self.execute_pirls_for_value_only(rho)?
-        } else {
-            self.execute_pirls_if_needed(rho)?
-        };
+        let (pirls_result, rows) = self.execute_pirls_if_needed(rho, rows)?;
         let mut h_total = self.effectivehessian(pirls_result.as_ref())?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
         if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
@@ -6388,6 +6406,7 @@ impl<'a> RemlState<'a> {
         Ok(EvalShared {
             key,
             pirls_result,
+            rows,
             geometry: decision,
             h_total: Arc::new(h_total),
             sparse_exact: None,
@@ -6398,7 +6417,7 @@ impl<'a> RemlState<'a> {
             criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
             applied_canonical_penalties: std::sync::OnceLock::new(),
             penalty_scores_at_mode: std::sync::OnceLock::new(),
-            block_local_correction: std::sync::OnceLock::new(),
+            block_local_correction: Default::default(),
         })
     }
 
@@ -6406,14 +6425,10 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
-        value_only_rows: bool,
+        rows: BundleRows,
         decision: SparseRemlDecision,
     ) -> Result<EvalShared, EstimationError> {
-        let pirls_result = if value_only_rows {
-            self.execute_pirls_for_value_only(rho)?
-        } else {
-            self.execute_pirls_if_needed(rho)?
-        };
+        let (pirls_result, rows) = self.execute_pirls_if_needed(rho, rows)?;
         if !matches!(
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::OriginalSparseNative
@@ -6520,6 +6535,7 @@ impl<'a> RemlState<'a> {
         Ok(EvalShared {
             key,
             pirls_result,
+            rows,
             geometry: decision,
             h_total: Arc::new(Array2::zeros((0, 0))),
             sparse_exact: Some(Arc::new({
@@ -6561,30 +6577,8 @@ impl<'a> RemlState<'a> {
                 cell
             },
             penalty_scores_at_mode: std::sync::OnceLock::new(),
-            block_local_correction: std::sync::OnceLock::new(),
+            block_local_correction: Default::default(),
         })
-    }
-
-    /// Runs the inner P-IRLS loop, caching the result.
-    pub(super) fn execute_pirls_if_needed(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<Arc<PirlsResult>, EstimationError> {
-        self.execute_pirls_if_needed_with_row_policy(rho, false)
-    }
-
-    /// Gaussian value-only twin of [`Self::execute_pirls_if_needed`].
-    ///
-    /// On an eligible fixed-design Gaussian surface this asks P-IRLS to synthesize
-    /// observation fields from one shared invariant carrier while all numerical
-    /// fit quantities come from exact sufficient statistics. The compact result
-    /// is deliberately not inserted into the ordinary PIRLS cache: a later
-    /// gradient or accepted fit at the same rho must materialize exact rows.
-    fn execute_pirls_for_value_only(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<Arc<PirlsResult>, EstimationError> {
-        self.execute_pirls_if_needed_with_row_policy(rho, true)
     }
 
     /// The inner P-IRLS iteration budget in force for one solve: the configured
@@ -6600,11 +6594,15 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn execute_pirls_if_needed_with_row_policy(
+    /// Runs the inner P-IRLS loop, caching the result. `rows` is the row kind
+    /// the caller can consume; the returned kind is what the result carries
+    /// (`SufficientStatistics` is only honoured when the frozen Gaussian
+    /// carrier exists).
+    fn execute_pirls_if_needed(
         &self,
         rho: &Array1<f64>,
-        value_only_rows: bool,
-    ) -> Result<Arc<PirlsResult>, EstimationError> {
+        rows: BundleRows,
+    ) -> Result<(Arc<PirlsResult>, BundleRows), EstimationError> {
         let use_cache = self
             .cache_manager
             .pirls_cache_enabled
@@ -6637,15 +6635,18 @@ impl<'a> RemlState<'a> {
             if cached.cache_compacted {
                 let mut pirls_config = self.config.as_pirls_config();
                 pirls_config.link_kind = self.runtime_inverse_link();
-                return Ok(Arc::new(cached.rehydrate_after_reml_cache(
-                    self.x(),
-                    self.y,
-                    self.weights,
-                    self.offset.view(),
-                    &pirls_config.link_kind,
-                )?));
+                return Ok((
+                    Arc::new(cached.rehydrate_after_reml_cache(
+                        self.x(),
+                        self.y,
+                        self.weights,
+                        self.offset.view(),
+                        &pirls_config.link_kind,
+                    )?),
+                    BundleRows::Observed,
+                ));
             }
-            return Ok(cached);
+            return Ok((cached, BundleRows::Observed));
         }
 
         // Outer-aware cap: an atomic that only caps the inner Newton iteration
@@ -6671,10 +6672,18 @@ impl<'a> RemlState<'a> {
             .as_ref()
             .map(|(c, _)| c.clone());
         let prediction_source = predicted_warm_start_with_source.as_ref().map(|(_, s)| *s);
-        let cost_only_gaussian_rows = if value_only_rows {
+        let cost_only_gaussian_rows = if rows == BundleRows::SufficientStatistics {
             self.gaussian_cost_only_frozen_rows_if_eligible()?
         } else {
             None
+        };
+        // A request for sufficient-statistic rows is only honoured when the
+        // frozen carrier exists; otherwise the solve realises real rows and
+        // the bundle must say so, or row readers would refuse a valid one.
+        let realised_rows = if cost_only_gaussian_rows.is_some() {
+            BundleRows::SufficientStatistics
+        } else {
+            BundleRows::Observed
         };
         let pirls_result = {
             let warm_start_holder = self
@@ -6946,10 +6955,10 @@ impl<'a> RemlState<'a> {
                 // derivative request needs them by contract, while a
                 // value-only request that has them found no frozen bundle to
                 // synthesize from.
-                let row_source = match (value_only_rows, cost_only_gaussian_rows.is_some()) {
+                let row_source = match (rows, cost_only_gaussian_rows.is_some()) {
                     (_, true) => "frozen",
-                    (true, false) => "full(no-frozen-bundle)",
-                    (false, false) => "full(derivative-request)",
+                    (BundleRows::SufficientStatistics, false) => "full(no-frozen-bundle)",
+                    (BundleRows::Observed, false) => "full(derivative-request)",
                 };
                 log::debug!(
                     "[STAGE] inner pirls solve iters={} status={:?} max_eta={:.1} jeffreys_logdet={} rows={} elapsed={:.3}s",
@@ -7430,7 +7439,7 @@ impl<'a> RemlState<'a> {
                 self.store_persistent_warm_start();
                 // Cache only if key is valid (not NaN).
                 if use_cache
-                    && !value_only_rows
+                    && cost_only_gaussian_rows.is_none()
                     && let Some(key) = key_opt
                 {
                     self.cache_manager
@@ -7439,7 +7448,7 @@ impl<'a> RemlState<'a> {
                         .expect("PIRLS result cache lock poisoned")
                         .insert(key, Arc::new(pirls_result.compact_for_reml_cache()));
                 }
-                Ok(pirls_result)
+                Ok((pirls_result, realised_rows))
             }
             pirls::PirlsStatus::Unstable => {
                 // The fit was unstable. This is where we throw our specific, user-friendly error.
@@ -9272,6 +9281,7 @@ mod firth_hessian_direction_reuse_tests {
 
 #[cfg(test)]
 mod capped_request_cache_tests {
+    use super::BundleRows;
     use super::super::super::RemlConfig;
     use super::super::super::tests::{binomial_logit_glm_spec, build_logit_state};
     use ndarray::{Array1, array};
@@ -9304,16 +9314,18 @@ mod capped_request_cache_tests {
             .compute_outer_eval_with_order(&rho, crate::rho_optimizer::OuterEvalOrder::Value)
             .expect("uncapped value probe should succeed");
         let uncapped = state
-            .execute_pirls_if_needed(&rho)
-            .expect("uncapped mode is cached");
+            .execute_pirls_if_needed(&rho, BundleRows::Observed)
+            .expect("uncapped mode is cached")
+            .0;
 
         // A fresh solve records its iteration count; a cache answer does not.
         let untouched = usize::MAX;
         state.last_inner_iters.store(untouched, Ordering::Relaxed);
         state.outer_inner_cap.store(5, Ordering::Relaxed);
         let capped = state
-            .execute_pirls_if_needed(&rho)
-            .expect("capped request should succeed");
+            .execute_pirls_if_needed(&rho, BundleRows::Observed)
+            .expect("capped request should succeed")
+            .0;
 
         assert_eq!(
             state.last_inner_iters.load(Ordering::Relaxed),
@@ -9326,12 +9338,12 @@ mod capped_request_cache_tests {
         // answers an uncapped request.
         let rho_capped_only = array![0.5];
         state
-            .execute_pirls_if_needed(&rho_capped_only)
+            .execute_pirls_if_needed(&rho_capped_only, BundleRows::Observed)
             .expect("capped solve should succeed");
         state.outer_inner_cap.store(0, Ordering::Relaxed);
         state.last_inner_iters.store(untouched, Ordering::Relaxed);
         state
-            .execute_pirls_if_needed(&rho_capped_only)
+            .execute_pirls_if_needed(&rho_capped_only, BundleRows::Observed)
             .expect("uncapped solve should succeed");
         assert_ne!(state.last_inner_iters.load(Ordering::Relaxed), untouched);
     }

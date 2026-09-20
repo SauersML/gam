@@ -59,7 +59,7 @@ fn unique_count_column_uses_canonical_level_bits() {
 fn radial_1d_default_not_starved_below_univariate_spline_resolution_1867() {
     for n in [30usize, 1_000, 100_000] {
         let col: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
-        let univariate_floor = univariate_spline_basis_dim(col.view());
+        let univariate_floor = univariate_spline_basis_dim(col.view(), col.len());
         assert_eq!(
             univariate_floor,
             DEFAULT_PENALTY_ORDER + penalized_resolution_rank(n, 1, DEFAULT_PENALTY_ORDER),
@@ -4200,6 +4200,116 @@ fn by_level_thin_plate_sizes_default_centers_from_the_smallest_level() {
         tp_centers(&small),
         "by-level default must equal the smallest level's own default"
     );
+}
+
+/// #3179: the 1-D radial floor (#1867) is the basis dimension of the `s(x)`
+/// competing on the same rows. Under a categorical `by=` that spline is sized
+/// from the smallest level, so the floor must be too: sizing it from the
+/// pooled column length handed every by-level `matern(x)`/`duchon(x)` block
+/// the pooled spline's resolution, more columns than its own level supports.
+#[test]
+fn by_level_radial_univariate_floor_sizes_from_the_smallest_level_3179() {
+    let n_a = 30usize;
+    let n_b = 30_000usize;
+    let n = n_a + n_b;
+    let rows: Vec<Vec<f64>> = (0..n)
+        .map(|i| {
+            let in_a = i < n_a;
+            let x = if in_a {
+                i as f64 / (n_a - 1) as f64
+            } else {
+                (i - n_a) as f64 / (n_b - 1) as f64
+            };
+            let g = if in_a { 0.0 } else { 1.0 };
+            vec![x + g, x, g]
+        })
+        .collect();
+    let ds = Dataset {
+        headers: vec!["y".into(), "x".into(), "g".into()],
+        values: Array2::from_shape_vec(
+            (rows.len(), 3),
+            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+        )
+        .expect("rectangular by-level test data"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "g".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["a".into(), "b".into()],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
+        ],
+    };
+    let ds_small = continuous_dataset(
+        &["y", "x"],
+        (0..n_a)
+            .map(|i| {
+                let x = i as f64 / (n_a - 1) as f64;
+                vec![x, x]
+            })
+            .collect(),
+    );
+    let build = |data: &Dataset, bs: &str, with_by: bool| -> usize {
+        let mut options = BTreeMap::new();
+        options.insert("bs".to_string(), bs.to_string());
+        if with_by {
+            options.insert("by".to_string(), "g".to_string());
+            options.insert("__by_col".to_string(), "2".to_string());
+        }
+        let mut notes = Vec::new();
+        let basis = build_smooth_basis(
+            SmoothKind::S,
+            &["x".to_string()],
+            &[1],
+            &options,
+            data,
+            &mut notes,
+        )
+        .unwrap_or_else(|e| panic!("s(x, bs={bs}) builds: {e}"));
+        let inner = match basis {
+            SmoothBasisSpec::BySmooth { smooth, .. } => *smooth,
+            other => other,
+        };
+        match inner {
+            SmoothBasisSpec::Matern { spec, .. } => spec.center_strategy.planned_num_centers(1),
+            SmoothBasisSpec::Duchon { spec, .. } => spec.center_strategy.planned_num_centers(1),
+            other => panic!("expected a radial basis for bs={bs}, got {other:?}"),
+        }
+    };
+    let col = ds.values.column(1);
+    let level_floor = univariate_spline_basis_dim(col, n_a);
+    let pooled_floor = univariate_spline_basis_dim(col, n);
+    // The fixture discriminates: the pooled floor binds where the level's
+    // own plan does not, so pooled sizing would change the by-level count.
+    let matern_plan = default_num_centers(n_a, 1);
+    assert!(
+        default_matern_center_count(n_a, 1, matern_plan, pooled_floor)
+            > default_matern_center_count(n_a, 1, matern_plan, level_floor),
+        "fixture must separate the pooled floor {pooled_floor} from the level floor {level_floor}"
+    );
+    for bs in ["matern", "duchon"] {
+        assert_eq!(
+            build(&ds, bs, true),
+            build(&ds_small, bs, false),
+            "by-level {bs}(x) default must equal the smallest level's own default"
+        );
+    }
 }
 
 /// A continuous `by=` smooth is a varying coefficient `f(x)·z` whose constant
