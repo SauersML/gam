@@ -49,7 +49,7 @@ def test_geodesic_sphere_cost_shape_and_symmetry() -> None:
 def test_k_eq_1_recovers_atom() -> None:
     atom = np.array([0.05, 0.1, 0.2, 0.3, 0.2, 0.1, 0.04, 0.01])
     atoms = atom[None, :]
-    bary = kernels.sinkhorn_barycenter(atoms, eps=0.05, n_iter=60)
+    bary = kernels.sinkhorn_barycenter(atoms, eps=0.05)
     assert bary.shape == (8,)
     assert abs(bary.sum() - 1.0) < 1e-8
     assert np.max(np.abs(bary - atom)) < 5e-3
@@ -65,7 +65,7 @@ def test_k_eq_2_mean_is_between() -> None:
     atoms = np.stack([a, b], axis=0)
     cost = kernels.euclidean_cost(pts)
     bary = kernels.sinkhorn_barycenter(
-        atoms, weights=np.array([0.5, 0.5]), cost=cost, eps=0.005, n_iter=200
+        atoms, weights=np.array([0.5, 0.5]), cost=cost, eps=0.005
     )
     assert bary.shape == (m,)
     assert abs(bary.sum() - 1.0) < 1e-8
@@ -83,7 +83,7 @@ def test_no_nan_at_small_eps() -> None:
          np.exp(-((np.arange(m) - 11.0) ** 2) / 4.0)],
         axis=0,
     )
-    bary = kernels.sinkhorn_barycenter(atoms, eps=1e-3, n_iter=50)
+    bary = kernels.sinkhorn_barycenter(atoms, eps=1e-3)
     assert np.all(np.isfinite(bary))
     assert abs(bary.sum() - 1.0) < 1e-8
 
@@ -94,6 +94,6 @@ def test_rejects_tiny_eps() -> None:
     atoms = np.array([[0.5, 0.5], [0.5, 0.5]])
     for eps in (0.0, -1.0, 2.0**-53):
         with pytest.raises(ValueError):
-            kernels.sinkhorn_barycenter(atoms, eps=eps, n_iter=10)
-    bary = kernels.sinkhorn_barycenter(atoms, eps=2.0**-52, n_iter=10)
+            kernels.sinkhorn_barycenter(atoms, eps=eps)
+    bary = kernels.sinkhorn_barycenter(atoms, eps=2.0**-52)
     assert np.all(np.isfinite(bary))
