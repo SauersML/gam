@@ -7186,6 +7186,13 @@ pub(crate) fn run_outer_uncertified(
     // `OuterResult.iterations` is the total across solver restarts and these are
     // the restarts, so the returned result carries them (#2817).
     let mut spent_iterations: usize = 0;
+    // #2980 — the lowest state an attempt of THIS ladder ended on without converging. The next
+    // plan continues the search from it, as the fixed-point continuations below do (#2822),
+    // instead of re-descending from the derived start: a gradient-only search that stopped in
+    // a flat valley hands the declared-curvature attempt its stationary point, not the start
+    // it left. A checkpoint the caller carried in is judged against (#2953) but is not a start:
+    // the ladder's first attempt searches from the start it was given.
+    let mut ladder_continuation: Option<OuterResult> = None;
 
     'plan_attempts: for (attempt_idx, attempt_cap) in attempts.iter().enumerate() {
         let the_plan = plan(attempt_cap);
@@ -7202,6 +7209,27 @@ pub(crate) fn run_outer_uncertified(
         // would be. Otherwise this attempt could publish the optimum an earlier attempt declined
         // (#2953).
         attempt_config.carried_checkpoint = best_checkpoint.as_ref().map(carried_checkpoint_of);
+        let continues_a_fixed_point =
+            fixed_point_continuation.is_some() || refuted_fixed_point_continuation.is_some();
+        if !continues_a_fixed_point && let Some(checkpoint) = ladder_continuation.as_ref() {
+            attempt_config.initial_rho = Some(checkpoint.rho.clone());
+            // `OuterResult` carries no inner mode; the objective warm-starts its inner solve
+            // at the checkpoint the way it would at any other trial point.
+            attempt_config.initial_inner_seed = None;
+            // A mid-ladder stop, not a terminal certificate imported from a prior fit, so the
+            // zero-iteration resume path must not accept it without searching.
+            attempt_config.initial_rho_is_prior_terminal_certificate = false;
+            // A transferred Hessian is bound to the prior fit's terminal rho, not to this
+            // checkpoint.
+            attempt_config.warm_start_outer_hessian = None;
+            log::debug!(
+                "[OUTER] {context}: continuing {the_plan} from the lowest state the {:?} \
+                 attempt ended on after {} iteration(s): cost={:.6e}",
+                checkpoint.plan_used.solver,
+                checkpoint.iterations,
+                checkpoint.final_value,
+            );
+        }
         if let Some(checkpoint) = fixed_point_continuation.take() {
             if !matches!(the_plan.solver, Solver::Bfgs) {
                 return Err(EstimationError::RemlOptimizationFailed(format!(
@@ -7393,6 +7421,13 @@ pub(crate) fn run_outer_uncertified(
                         !checkpoint.final_value.is_finite()
                             || result.final_value < checkpoint.final_value
                     });
+                let improves_continuation = result.final_value.is_finite()
+                    && ladder_continuation.as_ref().is_none_or(|continuation| {
+                        result.final_value < continuation.final_value
+                    });
+                if improves_continuation {
+                    ladder_continuation = Some(result.clone());
+                }
                 if improves_checkpoint {
                     best_checkpoint = Some(result);
                 }

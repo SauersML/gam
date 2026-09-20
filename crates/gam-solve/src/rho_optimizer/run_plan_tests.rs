@@ -6331,6 +6331,10 @@ mod run_plan_single_start_tests;
 #[path = "run_plan_dominated_plateau_2953_tests.rs"]
 mod run_plan_dominated_plateau_2953_tests;
 
+// #2980: a plan change continues from the lowest state the attempt before it ended on.
+#[path = "run_plan_ladder_continuation_2980_tests.rs"]
+mod run_plan_ladder_continuation_2980_tests;
+
 fn tmp_cache_session(label: &str) -> (tempfile::TempDir, Arc<CacheSession>) {
     let dir = tempfile::tempdir().expect("the test environment provides a writable temp dir");
     let store = gam_runtime::warm_start::WarmStartStore::open(

@@ -19,8 +19,9 @@
 //!   flat top: the flat top is still declined on the checkpoint's stored value. The fit refuses
 //!   with `DominanceUnresolved`, unless a later plan attempt certifies below the checkpoint.
 //! - The well where a search cannot restart from a stored state: a continuation that certifies
-//!   the flat top it was started to replace, or a later plan attempt that certifies it again,
-//!   declines it on the state it started from instead of publishing it.
+//!   the flat top it was started to replace declines it on the state it started from instead of
+//!   publishing it, and a later plan attempt, which continues from that state (#2980), cannot
+//!   publish it either.
 
 use super::*;
 use gam_problem::DominanceRefusalKind;
@@ -735,11 +736,9 @@ fn a_later_attempt_that_certifies_below_the_refused_checkpoint_publishes_2953() 
     let Some(record) = published.dominated_plateau.as_ref() else {
         panic!("a declined optimum must ride on the published result");
     };
-    // Both attempts start on the flat top and certify it there, and both are declined: the
-    // BFGS attempt on the checkpoint it could not re-evaluate, the ARC attempt on the same
-    // checkpoint re-evaluated. The lower of the two declined optima rides on the result, which
-    // is the ARC attempt's, whose first step moved it a little way down the flat top's residual
-    // slope.
+    // The BFGS attempt starts on the flat top, certifies it there, and declines it on the
+    // checkpoint it could not re-evaluate. The ARC attempt continues from that checkpoint
+    // (#2980) and certifies the centre below it, and the declined flat top rides on the result.
     assert!(
         record.plateau_rho[0].abs() < WIDTH
             && record.plateau_value.to_bits() == well_value(record.plateau_rho[0]).to_bits()
@@ -977,7 +976,7 @@ fn a_later_attempt_cannot_publish_the_optimum_an_earlier_attempt_declined_2953()
         .expect("the continuation fixture's calibration certifies the well's centre");
     let error = run.outcome.expect_err(
         "the bowl's minimum that the BFGS attempt declined for a state in the well must not \
-         publish when the ARC attempt certifies it again",
+         publish when the ARC attempt that continues from that state cannot search the well",
     );
     let EstimationError::DominatedCertifiedPlateau {
         plateau_rho,
