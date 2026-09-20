@@ -5440,6 +5440,36 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 rail_test_summary(&result.rho, &certificate_railed, config)
             );
         }
+        // #3321: `|Pg|` alone does not say which coordinate carries it, so a
+        // refusal at a railed point cannot tell a projection defect (the mass sits
+        // on a railed coordinate) from a search defect (it sits on an interior
+        // one). Name the coordinates that carry it, with the raw component beside
+        // the projected one.
+        {
+            let mut carriers: Vec<usize> = (0..projected_gradient.len())
+                .filter(|&k| projected_gradient[k] != 0.0)
+                .collect();
+            carriers.sort_by(|&a, &b| {
+                projected_gradient[b]
+                    .abs()
+                    .total_cmp(&projected_gradient[a].abs())
+            });
+            let carriers = carriers
+                .iter()
+                .take(4)
+                .map(|&k| {
+                    format!(
+                        "#{} theta={:.4e} Pg={:.3e} g={:.3e}",
+                        native_coordinate(config.native_coordinate_order.as_deref(), k),
+                        result.rho[k],
+                        projected_gradient[k],
+                        evaluation.gradient[k]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            summary = format!("{summary}; largest |Pg| carriers: [{carriers}]");
+        }
         // #2465 again, one level up: the `solver provenance` this refusal is
         // about to append reports the terminating `|g|` of the run that produced
         // `result`. When that run executed under an active-set reduction, its
