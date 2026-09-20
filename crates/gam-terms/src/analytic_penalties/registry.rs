@@ -391,11 +391,12 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
     }
 
     fn diag(&self) -> Array1<f64> {
-        // Each diagonal penalty exposes `hessian_diag` directly (ARD,
-        // smoothed-L¹, Log; Hoyer currently exposes its preconditioner
-        // diagonal). Every other penalty returns its exact diagonal at every
-        // dimension: the closed form where the penalty has one, otherwise unit
-        // probes of the PSD majorizer. A Hutchinson estimate used to stand in
+        // Each diagonal penalty exposes its PSD-majorizer diagonal directly
+        // (ARD, smoothed-L¹, Log); Hoyer's rank-2 majorizer is dense, so its
+        // diagonal comes from unit probes. Every other penalty returns its
+        // exact diagonal at every dimension: the closed form where the
+        // penalty has one, otherwise unit probes of the PSD majorizer. A
+        // Hutchinson estimate used to stand in
         // above dimension 1024, so the same operator answered with an estimate on
         // one side of a size window and the exact value on the other (#2900).
         match &self.penalty {
@@ -461,13 +462,19 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             ));
         }
         // For the diagonal-Hessian penalties (ARD, smoothed-L¹ and Log) the
-        // closed form is `Σ_i log(d_i + λ)`. Forward-difference TV uses the
+        // closed form is `Σ_i log(d_i + λ)`. Hoyer's PSD majorizer is dense
+        // (rank 2), so it takes the dense eigensolve instead of the product of
+        // its diagonal, which Hadamard's inequality makes an upper bound
+        // rather than the log-determinant. Forward-difference TV uses the
         // tridiagonal path-graph structure. Every other PSD penalty takes the
         // exact dense eigensolve at every dimension, admitted on the memory
         // governor's ledger. A 16-probe SLQ estimate used to replace it above
         // dimension 1024 (#2900).
         // Orthogonality is excluded because its exact Hessian is indefinite.
         match &self.penalty {
+            AnalyticPenaltyKind::Sparsity(p) if matches!(p.kind, SparsityKind::Hoyer) => {
+                self.governed_dense_log_det_plus_lambda_i(lambda, || self.as_dense())
+            }
             AnalyticPenaltyKind::Ard(_)
             | AnalyticPenaltyKind::TopKActivation(_)
             | AnalyticPenaltyKind::SmoothThreshold(_)
