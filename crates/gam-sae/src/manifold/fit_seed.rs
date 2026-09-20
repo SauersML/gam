@@ -199,7 +199,6 @@ pub struct SaeFitSeedRequest<'a, 'context> {
     pub top_k: Option<usize>,
     pub threshold: f64,
     pub seed_refine_routing: bool,
-    pub seed_refine_random_state: u64,
     pub fit_config: SaeFitConfig,
     pub temperature_schedule: Option<GumbelTemperatureSchedule>,
     pub fisher_metric: Option<SaeFisherRowMetricRequest<'a>>,
@@ -434,7 +433,6 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
             request.alpha,
             request.tau,
             request.threshold,
-            request.seed_refine_random_state,
         )?;
     }
 
@@ -640,7 +638,6 @@ mod tests {
             top_k: None,
             threshold: 0.0,
             seed_refine_routing: false,
-            seed_refine_random_state: 0,
             fit_config: SaeFitConfig::default(),
             temperature_schedule: None,
             fisher_metric: None,
