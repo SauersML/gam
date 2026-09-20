@@ -6670,14 +6670,12 @@ impl<'a> RemlState<'a> {
             h_total: Arc::new(Array2::zeros((0, 0))),
             sparse_exact: Some(Arc::new({
                 let factor = Arc::new(sparse_system.factor);
-                // Compute Takahashi selected inverse from simplicial factorization.
-                // This precomputes H^{-1} entries on the filled pattern of L, enabling
-                // O(nnz) trace computations instead of O(p) column solves.
-                let sfactor =
-                    gam_linalg::sparse_exact::factorize_simplicial(&sparse_system.h_sparse)?;
-                let takahashi = Some(Arc::new(
-                    gam_linalg::sparse_exact::TakahashiInverse::compute(&sfactor)?,
-                ));
+                // Takahashi selected inverse on the filled pattern of the factor
+                // already computed for log|H| (#3634): H^{-1} entries there make
+                // trace computations O(nnz) instead of O(p) column solves, and
+                // refactoring the same H to get them would double the dominant
+                // per-evaluation cost.
+                let takahashi = Some(Arc::new(factor.selected_inverse()?));
                 SparseExactEvalData {
                     factor,
                     takahashi,
