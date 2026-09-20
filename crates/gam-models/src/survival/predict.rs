@@ -8129,6 +8129,256 @@ mod tests {
              {largest_truncation_effect:.2e}"
         );
     }
+
+    /// gam#3575: a Royston-Parmar fit whose monotone I-spline baseline has a
+    /// flat segment pins baseline coefficients on their bound `β_j = 0`. Its
+    /// posterior is `N(β̂ − H⁻¹g, H⁻¹)` restricted to the cone, and the
+    /// posterior-mean surfaces must integrate THAT law: a strictly positive
+    /// survival SE and moments matching a rejection Monte Carlo of the same
+    /// law. The fraction-to-boundary sigma-point rule this replaces collapsed
+    /// every node onto the mode, publishing the plug-in with SE ≈ 0.
+    ///
+    /// The reference is independent of the rule: rejection draws from the
+    /// ambient `N(β_unc, Σ)` kept only inside the cone, every draw replayed
+    /// through the per-coefficient survival law. The published `E[S]` must
+    /// match the Monte Carlo mean within four Monte Carlo standard errors plus
+    /// the rule's certified relative accuracy, and the published variance
+    /// `SE²` the Monte Carlo variance within four standard errors of the
+    /// sample variance (from the fourth central moment) plus the accuracy the
+    /// rule certifies for `E[S²] − E[S]²`.
+    #[test]
+    fn royston_parmar_posterior_mean_integrates_the_cone_truncated_law_3575() {
+        use crate::fit_orchestration::FitConfig;
+        use crate::inference::model::FittedModel;
+        use crate::inference::model_payload_builders::fit_formula_to_payload;
+        use crate::survival::location_scale::factorize_psd_covariance;
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+        // Events in two clusters, early `t ∈ (0.1, 0.3)` and late
+        // `t ∈ (8, 12)`, with subjects censored across the gap between them:
+        // the gap carries exposure but no events, so the maximum-likelihood
+        // baseline hazard is zero there and the monotone baseline presses
+        // against its cone.
+        let n = 300;
+        let mut rng = Lcg3038(0x3575);
+        let mut records = Vec::with_capacity(n);
+        for _ in 0..n {
+            let x = rng.normal();
+            let event_time = if rng.unit() < 0.5 {
+                0.1 + 0.2 * rng.unit()
+            } else {
+                8.0 + 4.0 * rng.unit()
+            };
+            let censor = if rng.unit() < 0.3 {
+                0.3 + 7.7 * rng.unit()
+            } else {
+                15.0
+            };
+            let (time, event) = if event_time <= censor {
+                (event_time, 1)
+            } else {
+                (censor, 0)
+            };
+            records.push(csv::StringRecord::from(vec![
+                format!("{time:.17e}"),
+                event.to_string(),
+                format!("{x:.17e}"),
+            ]));
+        }
+        let headers = ["time", "event", "x"].iter().map(|s| s.to_string()).collect();
+        let data = gam_data::encode_recordswith_inferred_schema(headers, records)
+            .expect("encode the #3575 fixture");
+        let config = FitConfig {
+            survival_likelihood: Some("transformation".to_string()),
+            ..FitConfig::default()
+        };
+        let payload =
+            fit_formula_to_payload("Surv(time, event) ~ x".to_string(), &data, &config)
+                .expect("Royston-Parmar survival fit");
+        let model = FittedModel::from_payload(payload);
+        let mode = SurvivalPredictionCovarianceMode::Conditional;
+
+        let fit = fit_result_from_saved_model_for_prediction(&model).expect("saved fit");
+        let geometry = fit.geometry.as_ref().expect("fit geometry");
+        let constrained = geometry
+            .constrained_posterior
+            .as_ref()
+            .expect("the Royston-Parmar fit publishes its cone-truncated posterior");
+        eprintln!(
+            "[3575] mode {:?}; published posterior mean {:?}",
+            constrained.mode,
+            fit.beta.to_vec()
+        );
+        assert_eq!(
+            SurvivalPosteriorIntegration::default_for(&model, mode).expect("default integration"),
+            SurvivalPosteriorIntegration::TruncatedLaw,
+            "the fixture's posterior must carry an active cone"
+        );
+
+        let frame = ndarray::array![[1.0, 0.0, -1.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0]];
+        let col_map = data.column_map();
+        let zeros = Array1::<f64>::zeros(frame.nrows());
+        let times = [0.15, 0.25, 1.0, 4.0, 9.0, 11.0];
+        let request = |estimand, with_uncertainty| SurvivalPredictRequest {
+            model: &model,
+            data: frame.view(),
+            col_map: &col_map,
+            training_headers: Some(&data.headers),
+            primary_offset: &zeros,
+            noise_offset: &zeros,
+            time_grid: Some(&times),
+            with_uncertainty,
+            estimand,
+        };
+        let published = predict_survival(request(SurvivalPredictEstimand::PosteriorMean, true), mode)
+            .expect("the posterior-mean surfaces integrate the truncated law");
+        let published_se = published
+            .survival_se
+            .as_ref()
+            .expect("an uncertainty request publishes the survival SE");
+        let sigma_point = predict_survival_posterior_mean_with(
+            request(SurvivalPredictEstimand::PosteriorMean, true),
+            mode,
+            SurvivalPosteriorIntegration::SigmaPoint,
+        );
+        match &sigma_point {
+            Ok(result) => eprintln!(
+                "[3575] fraction-to-boundary sigma points: survival SE {:?}",
+                result.survival_se.as_ref().map(|se| se.to_vec())
+            ),
+            Err(error) => eprintln!("[3575] fraction-to-boundary sigma points refused: {error}"),
+        }
+
+        // The ambient law the cone truncates. The Royston-Parmar gauge is the
+        // identity, so the active coordinates are the raw coefficients.
+        let correction = constrained
+            .correction()
+            .expect("available moments")
+            .expect("an active cone");
+        let gauge = &geometry.coefficient_gauge;
+        let unconstrained = constrained.unconstrained_center().expect("ambient centre");
+        let lift = gauge.t_full.dot(&correction.lift);
+        let ambient = fit.beta_covariance().expect("conditional covariance")
+            + &lift
+                .dot(&correction.removed_normal_variance)
+                .dot(&lift.t());
+        let factor = factorize_psd_covariance(&ambient, "#3575 ambient covariance")
+            .expect("ambient factor")
+            .factor;
+        let center = gauge.t_full.dot(unconstrained) + &gauge.affine_shift;
+        let normal = gauge.t_full.t().dot(&gauge.t_full);
+        let normal_inverse = {
+            let eig = factorize_psd_covariance(&normal, "#3575 gauge normal equations")
+                .expect("gauge factor");
+            let scaled = &eig.eigenvectors * &eig.inv_sqrt_eigenvalues;
+            scaled.dot(&scaled.t())
+        };
+
+        let chunks = 16usize;
+        let per_chunk = 250usize;
+        let (n_rows, n_times) = published.survival.dim();
+        let (samples, proposals) = (0..chunks)
+            .into_par_iter()
+            .map(|chunk| {
+                let mut rng = Lcg3038(0x5eed_3575 ^ ((chunk as u64 + 1) << 32));
+                let mut samples = Vec::with_capacity(per_chunk);
+                let mut proposals = 0usize;
+                while samples.len() < per_chunk {
+                    proposals += 1;
+                    let z = Array1::from_shape_fn(factor.ncols(), |_| rng.normal());
+                    let displacement = factor.dot(&z);
+                    let active = unconstrained
+                        + &normal_inverse.dot(&gauge.t_full.t().dot(&displacement));
+                    let slack = constrained.constraints.a.dot(&active) - &constrained.constraints.b;
+                    if slack.iter().any(|&value| value < 0.0) {
+                        continue;
+                    }
+                    let draw_model =
+                        saved_model_with_survival_coefficients(&model, &(&center + &displacement))
+                            .expect("draw model");
+                    let draw = predict_survival_coefficient_law(
+                        SurvivalPredictRequest {
+                            model: &draw_model,
+                            ..request(SurvivalPredictEstimand::Plugin, false)
+                        },
+                        mode,
+                    )
+                    .expect("per-coefficient survival law at a feasible draw");
+                    samples.push(draw.survival);
+                }
+                (samples, proposals)
+            })
+            .reduce(
+                || (Vec::new(), 0usize),
+                |mut a, b| {
+                    a.0.extend(b.0);
+                    (a.0, a.1 + b.1)
+                },
+            );
+        let draws = samples.len() as f64;
+        eprintln!(
+            "[3575] Monte Carlo: {} feasible draws of {proposals} ambient proposals",
+            samples.len()
+        );
+        let plugin = published
+            .survival_plugin
+            .as_ref()
+            .expect("posterior-mean prediction carries the plug-in survival");
+        let mut largest_jensen_gap = 0.0_f64;
+        for row in 0..n_rows {
+            for time in 0..n_times {
+                let cell = [row, time];
+                let mc_mean = samples.iter().map(|s| s[cell]).sum::<f64>() / draws;
+                let central = |power: i32| {
+                    samples
+                        .iter()
+                        .map(|s| (s[cell] - mc_mean).powi(power))
+                        .sum::<f64>()
+                        / draws
+                };
+                let mc_variance = central(2);
+                let mc_mean_se = (mc_variance / draws).sqrt();
+                let mc_variance_se = ((central(4) - mc_variance * mc_variance).max(0.0) / draws).sqrt();
+                let survival = published.survival[cell];
+                let se = published_se[cell];
+                let rule_accuracy = 2.0e-3 * (mc_mean * (1.0 - mc_mean)).sqrt();
+                eprintln!(
+                    "[3575] row {row} t={:.2}: E[S] rule {survival:.6} MC {mc_mean:.6} \
+                     (se {mc_mean_se:.1e}, plug-in {:.6}); SE rule {se:.3e} MC {:.3e}",
+                    times[time],
+                    plugin[cell],
+                    mc_variance.sqrt()
+                );
+                assert!(
+                    se > 0.0,
+                    "row {row}, t={}: the truncated posterior carries mass off the bound, yet the \
+                     published survival SE is {se:e}",
+                    times[time]
+                );
+                assert!(
+                    (survival - mc_mean).abs() <= 4.0 * mc_mean_se + rule_accuracy,
+                    "row {row}, t={}: published E[S] {survival:.6} vs Monte Carlo {mc_mean:.6} \
+                     (se {mc_mean_se:.2e})",
+                    times[time]
+                );
+                // `Var = E[S²] − E[S]²`: an error δ in each certified moment
+                // moves it by at most `δ + 2·E[S]·δ ≤ 3δ`.
+                assert!(
+                    (se * se - mc_variance).abs() <= 4.0 * mc_variance_se + 3.0 * rule_accuracy,
+                    "row {row}, t={}: published Var[S] {:.3e} vs Monte Carlo {mc_variance:.3e} \
+                     (se {mc_variance_se:.2e})",
+                    times[time],
+                    se * se
+                );
+                largest_jensen_gap = largest_jensen_gap.max((survival - plugin[cell]).abs());
+            }
+        }
+        eprintln!("[3575] max |E[S] − S(E[β])| {largest_jensen_gap:.2e}");
+        assert!(
+            largest_jensen_gap > 0.0,
+            "the posterior-mean survival must integrate the law, not re-publish the plug-in"
+        );
+    }
 }
 
 /// Multiplier applied to the Weibull baseline scale when no time-basis knots are
