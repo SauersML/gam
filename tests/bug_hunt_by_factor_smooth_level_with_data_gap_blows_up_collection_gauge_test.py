@@ -10,10 +10,11 @@ penalty in that chart spread over ten decades, and a Poisson fit's outer REML
 solve could not certify (the pyGAM-audit term fuzzer found it as a
 ``DominatedCertifiedPlateau`` on ``fz0072``).
 
-The gauge is now an orthonormal frame of the same span, so it cannot amplify a
-design row. This pins that: both families fit; every design entry on a grid
-through the gap is bounded by the raw basis scale; predictions there are finite
-and stay on the scale of the data.
+The gauge's metric now adds the term's own penalties to that Gram, so a
+direction the fit rows barely see but the penalty charges is not amplified at a
+new row. This pins that: both families fit; every design entry on a grid
+through the gap stays on the raw basis scale; predictions there are finite and
+stay on the scale of the data.
 """
 
 from __future__ import annotations
@@ -73,8 +74,9 @@ def test_gap_level_design_is_well_scaled_and_predicts_finitely(
     )
     design = np.asarray(model.design_matrix(grid).matrix, dtype=float)
     # The raw B-spline rows are a partition of unity (unit l2 bound) and the
-    # indicator columns are 0/1, so an orthonormal chart keeps every entry on
-    # the unit scale; the whitened chart put entries in the hundreds here.
+    # indicator columns are 0/1; a chart that does not amplify gap directions
+    # keeps every entry on that scale, and the whitened chart put entries in
+    # the hundreds here.
     # The check is an order of magnitude, not a tolerance on the unit bound.
     largest = float(np.max(np.abs(design)))
     assert largest < _ORDER_OF_MAGNITUDE * _UNIT_BASIS_SCALE, (
