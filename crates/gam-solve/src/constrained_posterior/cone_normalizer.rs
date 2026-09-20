@@ -337,6 +337,8 @@ impl OrthantLogMass {
         (sigma, mu)
     }
 
+    /// [`Self::cavity_on`] against a freshly formed shift; the sweep keeps its shift instead.
+    #[cfg(test)]
     fn cavity(&self, j: usize) -> (f64, f64) {
         self.cavity_on(j, &(&self.m0 + &self.w.dot(&self.nu)))
     }
