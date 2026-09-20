@@ -3022,16 +3022,18 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
 }
 
 /// #3632: a Matérn `include_intercept=true` term realizes `[K·Z | 1]`, and
-/// its metadata chart `Z` acts on the kernel columns `K` alone. A centered
-/// term's collection transform acts on all realized columns, so it cannot
-/// compose with `Z`. When the transform drops exactly one column, its shape
-/// matches `Z`'s, and it used to be taken for `Z` silently. That gave a
-/// penalty one column wider than the design, which panicked in the penalty
-/// placement. The uncentered form (`identifiability=none`) gets a transform on
-/// all realized columns too: the kernel penalty is zero on the constant, so
-/// the joint-null rotation absorbs it. The combination is now refused at
-/// every center count under both policies. The same term without the
-/// appended constant builds with every penalty inside the design.
+/// its metadata chart `Z` acts on the kernel columns `K` alone. A collection
+/// transform acts on all realized columns, so it cannot compose with `Z`. When
+/// the transform drops exactly one column, its shape matches `Z`'s, and it used
+/// to be taken for `Z` silently. That gave a penalty one column wider than the
+/// design, which panicked in the penalty placement. The combination is now
+/// refused whenever a transform arrives: at every center count when the term
+/// is centered, and for the uncentered default here, whose joint penalty has a
+/// null space that the joint-null rotation takes. An uncentered term whose
+/// penalties jointly have full rank gets no transform. It is realized as
+/// `[K·Z | 1]`, with every penalty exactly on the term's own columns. The same
+/// term without the appended constant builds with every penalty inside the
+/// design.
 #[test]
 fn matern_include_intercept_is_refused_whenever_the_collection_transforms_it() {
     let ds = continuous_dataset(
@@ -3051,21 +3053,40 @@ fn matern_include_intercept_is_refused_whenever_the_collection_transforms_it() {
         let spec = build_termspec(&parsed.terms, &ds, &col_map, &mut notes).expect("termspec");
         crate::smooth::build_term_collection_design(ds.values.view(), &spec)
     };
-    for policy in ["", ", identifiability=none"] {
-        for centers in ["", ", centers=6", ", centers=9", ", centers=16", ", centers=30"] {
-            let formula = format!("y ~ matern(x, zbig, include_intercept=true{centers}{policy})");
-            let err = match build(&formula) {
-                Ok(_) => panic!("`{formula}` must be refused, not built"),
-                Err(err) => err.to_string(),
-            };
-            assert!(err.contains("include_intercept"), "`{formula}`: {err}");
+    let refused = |formula: &str| {
+        let err = match build(formula) {
+            Ok(_) => panic!("`{formula}` must be refused, not built"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("include_intercept"), "`{formula}`: {err}");
+    };
+    for centers in ["", ", centers=6", ", centers=9", ", centers=16", ", centers=30"] {
+        refused(&format!("y ~ matern(x, zbig, include_intercept=true{centers})"));
+    }
+    refused("y ~ matern(x, zbig, include_intercept=true, identifiability=none)");
+    for centers in [6usize, 9, 16, 30] {
+        let formula =
+            format!("y ~ matern(x, zbig, include_intercept=true, centers={centers}, identifiability=none)");
+        let design = build(&formula).unwrap_or_else(|err| panic!("`{formula}` builds: {err}"));
+        assert_eq!(design.smooth.terms.len(), 1, "`{formula}`");
+        let columns = design.smooth.terms[0].coeff_range.clone();
+        assert_eq!(columns.len(), centers + 1, "`{formula}` realizes [K·Z | 1]");
+        assert_eq!(columns.end, design.design.to_dense().ncols(), "`{formula}`");
+        assert!(!design.penalties.is_empty(), "`{formula}`");
+        let mut joint = Array2::<f64>::zeros((columns.len(), columns.len()));
+        for penalty in &design.penalties {
+            assert_eq!(penalty.col_range, columns, "`{formula}`: penalty off the term's columns");
+            assert_eq!(penalty.local.nrows(), columns.len(), "`{formula}`");
+            joint += &penalty.local;
         }
+        let constant = columns.len() - 1;
+        assert!(joint[[constant, constant]] > 0.0, "`{formula}`: the appended constant is shrunk");
     }
     let design = build("y ~ matern(x, zbig)")
         .expect("a Matérn without the appended constant builds");
     let width = design.design.to_dense().ncols();
-    assert!(!design.smooth.penalties.is_empty());
-    for penalty in &design.smooth.penalties {
+    assert!(!design.penalties.is_empty());
+    for penalty in &design.penalties {
         let range = &penalty.col_range;
         assert!(range.end <= width, "penalty {range:?} outside the {width}-column design");
         assert_eq!(penalty.local.nrows(), range.len(), "penalty block vs its column range");

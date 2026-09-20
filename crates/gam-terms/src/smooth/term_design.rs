@@ -3085,19 +3085,19 @@ fn with_identifiability_transform(
             // removes exactly one column, and is silently taken for `Z`. The
             // penalty is then built one column wider than the design (#3632).
             //
-            // A transform always arrives for such a term. The kernel penalty
-            // is zero on the appended constant. So the constant is either
-            // centered away against the model's constant, or, uncentered
-            // (`identifiability=none`), it lies in the joint penalty null
-            // space. The joint-null rotation then acts on all realized
-            // columns and absorbs the constant into the parametric block.
-            // Either way the model's own intercept carries that direction.
+            // A centered term always gets such a transform: it centers the
+            // appended constant away against the model's constant. An
+            // uncentered one (`identifiability=none`) gets one only when its
+            // joint penalty has a null space, and the joint-null rotation then
+            // acts on all realized columns. When the penalties jointly have
+            // full rank (the double penalty shrinks the constant), no
+            // transform arrives and `[K·Z | 1]` is realized as is.
             if *include_intercept && transform.is_some() {
                 crate::bail_invalid_basis!(
-                    "matern include_intercept=true appends an unpenalized constant column after \
-                     the kernel chart, but this term collection transforms the term's realized \
-                     columns: it centers the term against the model's constant, or it absorbs \
-                     the unpenalized constant into the parametric block. The Matérn chart acts \
+                    "matern include_intercept=true appends a constant column after the kernel \
+                     chart, but this term collection transforms the term's realized columns: it \
+                     centers the term against the model's constant, or it rotates the term's \
+                     joint penalty null space into the parametric block. The Matérn chart acts \
                      on the kernel columns alone, so it cannot carry that transform. The \
                      model's intercept already spans the constant; drop include_intercept=true"
                 );
