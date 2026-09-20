@@ -62,9 +62,11 @@ pub fn canonical_standard_fit_options(
         // Formula/CLI fits are the interactive/default path: keep coefficient
         // covariance and the analytic first-order smoothing correction, which
         // the returned fit needs. The rho-posterior adequacy diagnostic (Tier-0
-        // PSIS over dozens of refits, and its Tier-1/Tier-2 escalations) is not
-        // needed to build that fit, so it runs only for lower-level callers that
-        // request it (`skip_rho_posterior_inference: false`).
+        // PSIS over dozens of refits, and its Tier-1/Tier-2 escalations) has no
+        // reader on this path, so the fit publishes
+        // `NotComputed(InferenceNotRequested)` and spends no criterion
+        // evaluation on it (#3010); lower-level callers that read it request it
+        // (`skip_rho_posterior_inference: false`).
         skip_rho_posterior_inference: true,
         // The count for the loops that still take one: the negative-binomial
         // alternation, the expectile LAWS iterations, the bounded-effect
@@ -668,12 +670,22 @@ fn deterministic_gaussian_standard_fit(
             // residual≡0 invariant even though the mathematical mean is
             // unchanged.
             let intercept = request.y[0] - request.offset[0];
-            let mut beta = Array1::<f64>::zeros(p);
-            for col in design.intercept_range.clone() {
-                if col < p {
-                    beta[col] = intercept;
-                }
+            // Dispatch only takes this branch for a spec with a global
+            // intercept; the realized design must agree, or the constant
+            // would land on no column (or on several) and the fit published
+            // as exact would not reproduce `y`.
+            if design.intercept_range.len() != 1 || design.intercept_range.end > p {
+                return Err(raised_fit_failure(
+                    FailureCategory::Invariant,
+                    format!(
+                        "constant-response Gaussian shortcut needs exactly one intercept \
+                         column, got {:?} in a design of width {p}",
+                        design.intercept_range,
+                    ),
+                ));
             }
+            let mut beta = Array1::<f64>::zeros(p);
+            beta[design.intercept_range.start] = intercept;
             (beta, vec![DeterministicPenaltyFace::Infinite; n_penalties])
         }
     };
@@ -946,6 +958,19 @@ fn deterministic_gaussian_standard_fit(
         let z = &infinite_null_basis;
         let u = &infinite_range_basis;
         let free_dim = z.ncols();
+        // A zero face is a REML optimum only because the criterion is
+        // unbounded there: the response lies exactly in a column space of
+        // dimension `free_dim` that the data could have missed. That needs more
+        // supported rows than free directions. With `free_dim >= n+` the free
+        // columns span every supported response, so the exact fit is automatic
+        // interpolation, the profiled criterion stays bounded, and certifying
+        // phi = 0 with zero covariance would be wrong. The square case
+        // `free_dim == n+` has a nonsingular `A` and would pass the
+        // factorization below, so it is declined here.
+        let supported_rows = request.weights.iter().filter(|&&w| w > 0.0).count();
+        if free_dim >= supported_rows {
+            return Ok(GaussianStandardRoute::Iterative(Some(design)));
+        }
         let raw_free_information = z.t().dot(&xtwx.dot(z));
         let free_information =
             (&raw_free_information + &raw_free_information.t().to_owned()) * 0.5;
@@ -1269,6 +1294,14 @@ fn gaussian_response_is_constant(request: &StandardFitRequest<'_>) -> bool {
     if gam_terms::smooth::term_collection_has_nonzero_anchor(&request.spec) {
         return false;
     }
+    // The shortcut carries the constant on the global intercept column. A
+    // design without one (`0 + x`, `0 + factor`, an anchored B-spline gauging
+    // the level) has nowhere to put it: β = 0 would leave η = offset ≠ y and
+    // still be certified exact with φ̂ = 0. Such models go to the exact-boundary
+    // certificate, which proves exactness from the realized design instead.
+    if !gam_terms::smooth::term_collection_has_global_intercept(&request.spec) {
+        return false;
+    }
     // The intercept-only shortcut is exact — residual ≡ 0 — precisely when the
     // OFFSET-ADJUSTED response `y − offset` is constant: then `η = offset +
     // intercept = y` at every row. Testing the raw `y` alone would (a) miss an
@@ -1523,6 +1556,131 @@ mod exact_gaussian_boundary_design_reuse_tests {
         assert_eq!(on_design.fit.log_lambdas, fresh.fit.log_lambdas);
         assert_eq!(on_design.fit.beta, fresh.fit.beta);
         assert_eq!(on_design.design.design.to_dense(), fresh.design.design.to_dense());
+    }
+}
+
+#[cfg(test)]
+mod square_exact_gaussian_design_tests {
+    use super::*;
+    use csv::StringRecord;
+    use gam_data::encode_recordswith_inferred_schema;
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+
+    const N: usize = 8;
+
+    fn noisy_curve() -> Dataset {
+        let mut rng = StdRng::seed_from_u64(4127);
+        let headers: Vec<String> = ["x", "y"].iter().map(|h| h.to_string()).collect();
+        let rows = (0..N)
+            .map(|i| {
+                let x = i as f64 / (N - 1) as f64;
+                let noise: f64 = rng.random::<f64>() - 0.5;
+                let y = (2.0 * std::f64::consts::PI * x).sin() + 0.6 * noise;
+                StringRecord::from(vec![x.to_string(), y.to_string()])
+            })
+            .collect();
+        encode_recordswith_inferred_schema(headers, rows).expect("encode")
+    }
+
+    fn standard_request<'a>(data: &'a Dataset) -> StandardFitRequest<'a> {
+        let config = FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        };
+        match materialize("y ~ s(x, bs='cr', k=8)", data, &config)
+            .expect("materialize")
+            .request
+        {
+            FitRequest::Standard(request) => request,
+            _ => panic!("a Gaussian s() formula materializes a standard request"),
+        }
+    }
+
+    /// With as many coefficients as rows, the design interpolates any
+    /// response, so the exact fit carries no evidence of a zero residual
+    /// variance. The shortcut must decline it instead of reporting phi = 0.
+    #[test]
+    fn square_design_interpolation_is_not_a_deterministic_fit() {
+        let data = noisy_curve();
+        let request = standard_request(&data);
+        assert!(
+            matches!(
+                exact_gaussian_boundary(&request).expect("boundary check"),
+                ExactGaussianVerdict::Boundary(_)
+            ),
+            "precondition: a square full-rank design certifies an exact boundary"
+        );
+        match try_deterministic_gaussian_standard_fit(&request).expect("route") {
+            GaussianStandardRoute::Iterative(Some(design)) => {
+                assert_eq!(design.design.ncols(), N, "the design is square");
+            }
+            GaussianStandardRoute::Iterative(None) => {
+                panic!("the declined route must hand over its realized design")
+            }
+            GaussianStandardRoute::Exact(_) => {
+                panic!("square-design interpolation was certified as an exact fit")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod constant_response_intercept_tests {
+    use super::*;
+    use csv::StringRecord;
+    use gam_data::encode_recordswith_inferred_schema;
+
+    fn constant_response() -> Dataset {
+        let headers: Vec<String> = ["x", "y"].iter().map(|h| h.to_string()).collect();
+        let rows = (0..40)
+            .map(|i| {
+                let x = 0.1 + 0.05 * i as f64;
+                StringRecord::from(vec![x.to_string(), "5".to_string()])
+            })
+            .collect();
+        encode_recordswith_inferred_schema(headers, rows).expect("encode")
+    }
+
+    fn standard_request<'a>(formula: &str, data: &'a Dataset) -> StandardFitRequest<'a> {
+        let config = FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        };
+        match materialize(formula, data, &config)
+            .expect("materialize")
+            .request
+        {
+            FitRequest::Standard(request) => request,
+            _ => panic!("a Gaussian linear formula materializes a standard request"),
+        }
+    }
+
+    /// The constant-response shortcut places `y - offset` on the global
+    /// intercept column. With the intercept removed (`0 + x`) there is no
+    /// such column, so the shortcut would publish β = 0 — fitted η = 0 while
+    /// y = 5 — as an exact fit with φ̂ = 0 and zero covariance. The shortcut
+    /// must decline, and the exact-boundary certificate must refuse a design
+    /// that cannot reproduce the response.
+    #[test]
+    fn no_intercept_constant_response_is_not_an_exact_fit() {
+        let data = constant_response();
+        let with_intercept = standard_request("y ~ x", &data);
+        assert!(
+            gaussian_response_is_constant(&with_intercept),
+            "a constant response under an intercept is the exact intercept-only fit"
+        );
+
+        let request = standard_request("y ~ 0 + x", &data);
+        assert!(
+            !gaussian_response_is_constant(&request),
+            "no intercept column can carry the constant"
+        );
+        let route = try_deterministic_gaussian_standard_fit(&request).expect("route");
+        assert!(
+            matches!(route, GaussianStandardRoute::Iterative(_)),
+            "y = 5 is not in the span of 0 + x, so the fit is not exact"
+        );
     }
 }
 
@@ -3072,7 +3230,6 @@ fn fit_expectile_laws(
         offset,
         spec,
         family: materialized_family,
-        estimate_tweedie_p: _,
         options,
         kappa_options,
         wiggle,
@@ -3139,7 +3296,6 @@ fn fit_expectile_laws(
             family: gaussian_family.clone(),
             // Expectile LAWS fits a Gaussian-identity inner family; no Tweedie
             // power to estimate (#2026).
-            estimate_tweedie_p: false,
             options: options.clone(),
             kappa_options: kappa_options.clone(),
             wiggle: None,
@@ -3405,8 +3561,8 @@ fn publish_expectile_sandwich_covariance(
 /// through to the dense path:
 /// - family is Gaussian + identity link;
 /// - no link wiggle, no latent coordinates, no coefficient groups, no penalty
-///   hyperpriors, no linear/box constraints, no Firth, no adaptive
-///   regularization, no externally injected null-space dims;
+///   hyperpriors, no linear/box constraints, no Firth, no externally
+///   injected null-space dims;
 /// - the term collection is exactly one smooth term — no linear terms, no
 ///   random effects, no by-variables / factor interactions;
 /// - that smooth is a plain 1-D B-spline whose penalty order is compatible
@@ -3422,7 +3578,8 @@ fn publish_expectile_sandwich_covariance(
 ///   through: their knot-value parameterization is a finite-rank regression
 ///   spline, not the scan's full smoothing-spline state-space posterior;
 /// - the offset is identically zero and every weight is finite and positive;
-/// - at least 3 distinct finite abscissae (the scan's diffuse rank plus one).
+/// - at least `order + 1` distinct finite abscissae (the scan's `order`
+///   diffuse innovations plus one proper innovation to profile σ²).
 ///
 /// λ-mapping note: the scan's penalty is exactly `λ∫f″²` (state-space
 /// `q = 1/λ` at unit σ²). The dense 1-D B-spline path penalizes the same
@@ -3435,11 +3592,13 @@ fn publish_expectile_sandwich_covariance(
 /// at this seam (the formula DSL exposes none for this term class), so no
 /// pinned-λ mapping arises.
 ///
-/// Identifiability transforms on the smooth (centering / linear-trend
-/// removal / orthogonality-to-intercept) are accepted as eligible: they only
-/// re-coordinate the unpenalized null space against the implicit intercept
-/// and do not change the fitted posterior of `E[y|x]`, which is what the
-/// scan returns directly.
+/// Only two identifiability policies are eligible: `none` and sum-to-zero
+/// centring. Each removes at most the constant, and the intercept puts it
+/// back, so the model spans the same `{1, x, …} ⊕ wiggle` the scan solves.
+/// Linear-trend removal (`identifiability="linear"`) takes the `x` direction
+/// out of the model. Design-column orthogonality and a frozen transform can
+/// impose any constraint. The scan honours none of these, so they fall through
+/// to the dense path (#3870).
 pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineScanInputs> {
     if !request.family.is_gaussian_identity() {
         return None;
@@ -3509,12 +3668,16 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
     if !(1..=3).contains(&order)
         || bspec.degree != 2 * order - 1
         || bspec.double_penalty
+        || !matches!(
+            bspec.identifiability,
+            gam_terms::basis::BSplineIdentifiability::None
+                | gam_terms::basis::BSplineIdentifiability::WeightedSumToZero { .. }
+        )
         || !bspec.boundary_conditions.is_free()
         || !matches!(bspec.boundary, gam_terms::basis::OneDimensionalBoundary::Open)
         || matches!(
             bspec.knotspec,
             gam_terms::basis::BSplineKnotSpec::PeriodicUniform { .. }
-                | gam_terms::basis::BSplineKnotSpec::NaturalCubicRegression { .. }
         )
         // `bs="cr"` materialises a `NaturalCubicRegression` value-knot
         // spec: a Lancaster–Salkauskas cubic-regression basis whose columns
@@ -3583,6 +3746,18 @@ fn cascade_sobolev_order(requested: f64, d: usize) -> f64 {
     requested.clamp(lo + eps, hi)
 }
 
+/// Whether a radial spec asks for geometry the cascade cannot represent. The
+/// cascade fits in open Euclidean coordinates under one unit per-axis metric,
+/// so a wrapped axis (`period=[…]`) or learned per-axis length scales
+/// (`scale_dims=true`, `FitConfig::scale_dimensions`) would be silently
+/// dropped. Such a term stays on the dense radial path, which honours both.
+fn radial_geometry_leaves_cascade_metric(
+    periodic: Option<&[Option<f64>]>,
+    aniso_log_scales: Option<&[f64]>,
+) -> bool {
+    periodic.is_some_and(|axes| axes.iter().any(Option::is_some)) || aniso_log_scales.is_some()
+}
+
 /// Structural signature of a residual-cascade-eligible request: the scattered
 /// radial smooth's coordinate columns and the Sobolev order it requests
 /// (before the Wendland native-window clamp). Produced by
@@ -3604,7 +3779,9 @@ pub struct ResidualCascadeSignature {
 /// - the model is exactly one smooth term — no linear terms, no random
 ///   effects, no by-variables;
 /// - that smooth is a scattered radial spatial smooth (`Duchon` or `Matern`)
-///   over `d ∈ {2, 3}` coordinates with no shape constraint;
+///   over `d ∈ {2, 3}` coordinates with no shape constraint, no periodic axis
+///   and no per-axis anisotropy (the cascade's open unit metric represents
+///   neither);
 /// - the offset is identically zero, every weight is finite and positive, and
 ///   every coordinate and response value is finite.
 ///
@@ -3657,6 +3834,12 @@ pub fn residual_cascade_structural_signature(
             // Pure-Duchon native order is `p + s` (kernel exponent 2(p+s)−d);
             // the multilevel frame targets the same continuum smoothness. `p`
             // is the polynomial nullspace degree, `s` the spectral power.
+            if radial_geometry_leaves_cascade_metric(
+                spec.periodic.as_deref(),
+                spec.aniso_log_scales.as_deref(),
+            ) {
+                return None;
+            }
             let p = match spec.nullspace_order {
                 gam_terms::basis::DuchonNullspaceOrder::Zero => 0.0,
                 gam_terms::basis::DuchonNullspaceOrder::Linear => 1.0,
@@ -3667,6 +3850,12 @@ pub fn residual_cascade_structural_signature(
         gam_terms::smooth::SmoothBasisSpec::Matern {
             feature_cols, spec, ..
         } => {
+            if radial_geometry_leaves_cascade_metric(
+                spec.periodic.as_deref(),
+                spec.aniso_log_scales.as_deref(),
+            ) {
+                return None;
+            }
             // Matérn smoothness ν sets native Sobolev order ν + d/2; the cascade
             // frame represents up to (d+3)/2, so the fast path's clamp applies
             // the ceiling. (d is known just below from feature_cols.)
@@ -3719,8 +3908,9 @@ pub fn residual_cascade_structural_signature(
 /// path is both exact-posterior and cheap, so there is no reason to change
 /// estimators.
 ///
-/// The returned [`ResidualCascadeInputs`] carry a unit per-axis metric (the
-/// spec's isotropic radial distance); the quasi-uniformity guard inside
+/// The returned [`ResidualCascadeInputs`] carry a unit per-axis metric, which
+/// is the spec's own radial distance because the structural signature refuses
+/// periodic and anisotropic specs; the quasi-uniformity guard inside
 /// [`gam_solve::residual_cascade::fit_residual_cascade`] (issue caveat 2)
 /// is the no-regression gate that refuses the selected route when a
 /// near-degenerate metric would break the BPX iteration bound. That refusal is
@@ -3752,7 +3942,7 @@ pub fn residual_cascade_fast_path(
 }
 
 /// Parse a formula, resolve it against a dataset, and produce a ready-to-fit `FitRequest`.
-fn family_requests_transformation_normal(family: Option<&str>) -> bool {
+pub(crate) fn family_requests_transformation_normal(family: Option<&str>) -> bool {
     family
         .map(|name| name.trim().to_ascii_lowercase().replace('_', "-"))
         .as_deref()
@@ -4445,5 +4635,151 @@ mod unread_firth_and_family_refusal_tests {
         )
         .expect("the standard binomial route reads firth");
         assert!(matches!(firth.request, FitRequest::Standard(_)));
+    }
+}
+
+#[cfg(test)]
+mod residual_cascade_geometry_tests {
+    use super::*;
+
+    /// Deterministic scattered 2-D sample on the unit square.
+    fn scattered_2d(n: usize) -> Dataset {
+        let golden = 0.618_033_988_749_894_9_f64;
+        let root2 = std::f64::consts::SQRT_2.fract();
+        let rows = (0..n)
+            .map(|i| {
+                let a = ((i + 1) as f64 * golden).fract();
+                let b = ((i + 1) as f64 * root2).fract();
+                let u = ((i + 3) as f64 * golden).fract();
+                let y = (std::f64::consts::TAU * a).sin() * (std::f64::consts::TAU * b).cos()
+                    + 0.1 * (u - 0.5);
+                csv::StringRecord::from(vec![a.to_string(), b.to_string(), y.to_string()])
+            })
+            .collect();
+        let headers = ["x1", "x2", "y"].into_iter().map(String::from).collect();
+        gam_data::encode_recordswith_inferred_schema(headers, rows).expect("encode fixture")
+    }
+
+    fn gaussian(scale_dimensions: bool) -> FitConfig {
+        FitConfig {
+            family: Some("gaussian".to_string()),
+            scale_dimensions,
+            ..FitConfig::default()
+        }
+    }
+
+    fn standard_request<'a>(
+        formula: &str,
+        data: &'a Dataset,
+        config: &FitConfig,
+    ) -> StandardFitRequest<'a> {
+        let mat = materialize(formula, data, config).expect("materialize");
+        let FitRequest::Standard(request) = mat.request else {
+            panic!("`{formula}` must materialize as a standard request");
+        };
+        request
+    }
+
+    /// The cascade fits open coordinates under a unit metric. A term that asks
+    /// for learned per-axis length scales must stay on the dense radial path,
+    /// whether it asks per term or through the global flag; the isotropic
+    /// control on the same data stays eligible.
+    #[test]
+    fn anisotropic_radial_smooth_is_not_a_cascade_candidate() {
+        let data = scattered_2d(600);
+        for formula in ["y ~ duchon(x1, x2)", "y ~ matern(x1, x2)"] {
+            let control = standard_request(formula, &data, &gaussian(false));
+            assert!(
+                residual_cascade_structural_signature(&control).is_some(),
+                "`{formula}` (isotropic) is the eligible control"
+            );
+            let global = standard_request(formula, &data, &gaussian(true));
+            assert!(
+                residual_cascade_structural_signature(&global).is_none(),
+                "`{formula}` with scale_dimensions must not take the unit-metric cascade"
+            );
+        }
+        let per_term =
+            standard_request("y ~ duchon(x1, x2, scale_dims=true)", &data, &gaussian(false));
+        assert!(
+            residual_cascade_structural_signature(&per_term).is_none(),
+            "duchon(scale_dims=true) must not take the unit-metric cascade"
+        );
+    }
+
+    /// A wrapped axis has no representation in the cascade's open Euclidean
+    /// frame, so a periodic radial spec must not be structurally eligible.
+    #[test]
+    fn periodic_radial_smooth_is_not_a_cascade_candidate() {
+        let data = scattered_2d(600);
+        for formula in ["y ~ duchon(x1, x2)", "y ~ matern(x1, x2)"] {
+            let mut request = standard_request(formula, &data, &gaussian(false));
+            assert!(residual_cascade_structural_signature(&request).is_some());
+            match &mut request.spec.smooth_terms[0].basis {
+                gam_terms::smooth::SmoothBasisSpec::Duchon { spec, .. } => {
+                    spec.periodic = Some(vec![Some(1.0), None]);
+                }
+                gam_terms::smooth::SmoothBasisSpec::Matern { spec, .. } => {
+                    spec.periodic = Some(vec![Some(1.0), None]);
+                }
+                _ => panic!("`{formula}` must materialize a radial basis"),
+            }
+            assert!(
+                residual_cascade_structural_signature(&request).is_none(),
+                "`{formula}` with a periodic axis must not take the open-domain cascade"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod spline_scan_identifiability_routing_tests {
+    use super::*;
+    use csv::StringRecord;
+    use gam_data::encode_recordswith_inferred_schema;
+
+    fn trend_data() -> Dataset {
+        let headers: Vec<String> = ["x", "y"].iter().map(|h| h.to_string()).collect();
+        let rows = (0..60)
+            .map(|i| {
+                let x = i as f64 / 59.0;
+                let y = 2.0 * x + 0.3 * (7.0 * x).sin() + 0.05 * ((i * 37 % 11) as f64 - 5.0);
+                StringRecord::from(vec![x.to_string(), y.to_string()])
+            })
+            .collect();
+        encode_recordswith_inferred_schema(headers, rows).expect("encode")
+    }
+
+    fn routes_to_scan(identifiability: &str) -> bool {
+        let data = trend_data();
+        let config = FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        };
+        let formula = format!(
+            "y ~ s(x, bs=\"ps\", degree=3, penalty_order=2, double_penalty=False{identifiability})"
+        );
+        match materialize(&formula, &data, &config)
+            .expect("materialize")
+            .request
+        {
+            FitRequest::Standard(request) => spline_scan_fast_path(&request).is_some(),
+            _ => panic!("a Gaussian s(x) formula materializes a standard request"),
+        }
+    }
+
+    /// Sum-to-zero centring spans `{1, x} ⊕ wiggle` with the intercept, which
+    /// is exactly the scan's model.
+    #[test]
+    fn centred_smooths_keep_the_scan() {
+        assert!(routes_to_scan(""));
+        assert!(routes_to_scan(", identifiability=\"sum_tozero\""));
+    }
+
+    /// `identifiability="linear"` removes the `x` direction, which the scan's
+    /// unpenalized null space would fit back in (#3870).
+    #[test]
+    fn linear_trend_removal_falls_through_to_the_dense_path() {
+        assert!(!routes_to_scan(", identifiability=\"linear\""));
     }
 }

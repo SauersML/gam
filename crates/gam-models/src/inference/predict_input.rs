@@ -3,18 +3,12 @@ use std::collections::HashMap;
 use ndarray::{Array1, Array2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-use crate::inference::predict_io::{FittedLatentScoreMap, LatentConditioningSpan, PredictInput};
-use gam_linalg::matrix::DesignMatrix;
-use gam_linalg::utils::inf_norm;
-use gam_math::probability::standard_normal_quantile;
-use gam_model_kernels::scale_design::{
-    build_scale_deviation_operator, scale_transform_from_payload,
-};
 use crate::bms::LatentMeasureKind;
 use crate::inference::model::{
     FittedModel, FittedModelError, PredictModelClass, SavedTransformationNormalGeometry,
     append_deployment_extension_columns,
 };
+use crate::inference::predict_io::{FittedLatentScoreMap, LatentConditioningSpan, PredictInput};
 use crate::survival::predict::SurvivalPredictError;
 use crate::survival::predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
@@ -24,6 +18,12 @@ use crate::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, ctn_endpoint_bases, ctn_laplace_quantile_correction,
     ctn_response_bases_at, ctn_response_second_derivative_basis_at, ctn_row_geometry,
     transformation_normal_pit_score,
+};
+use gam_linalg::matrix::DesignMatrix;
+use gam_linalg::utils::inf_norm;
+use gam_math::probability::standard_normal_quantile;
+use gam_model_kernels::scale_design::{
+    build_scale_deviation_operator, scale_transform_from_payload,
 };
 use gam_problem::BlockRole;
 use gam_terms::smooth::build_term_collection_prediction_design;
@@ -479,8 +479,11 @@ impl SavedCtnChart {
             .ok_or_else(|| PredictInputError::MissingMetadata {
                 reason: "saved transformation-normal model missing unified fit".to_string(),
             })?;
-        fit_saved.require_posterior_mean("transformation-normal prediction")
-            .map_err(|error| PredictInputError::InvalidInput { reason: error.to_string() })?;
+        fit_saved
+            .require_posterior_mean("transformation-normal prediction")
+            .map_err(|error| PredictInputError::InvalidInput {
+                reason: error.to_string(),
+            })?;
         let beta = &fit_saved.blocks[0].beta;
         if beta.len() != self.p_resp * p_cov {
             return Err(PredictInputError::DimensionMismatch {
@@ -1445,10 +1448,12 @@ fn build_predict_input_for_model_inner(
                 col_map,
                 "resolved_termspec_noise",
             )?;
-            let design_noise_raw = build_term_collection_prediction_design(design_input, &spec_noise)
-                .map_err(|e| PredictInputError::InvalidInput {
-                    reason: format!("failed to build noise prediction design: {e}"),
-                })?;
+            let design_noise_raw =
+                build_term_collection_prediction_design(design_input, &spec_noise).map_err(
+                    |e| PredictInputError::InvalidInput {
+                        reason: format!("failed to build noise prediction design: {e}"),
+                    },
+                )?;
             let mean_offset = design
                 .compose_offset(offset.view(), "location-scale mean prediction")
                 .map_err(|error| PredictInputError::InvalidInput {
@@ -1654,9 +1659,9 @@ impl FittedModel {
         col_map: &HashMap<String, usize>,
     ) -> Result<Option<Array1<f64>>, PredictInputError> {
         let runtime = self.saved_prediction_runtime()?;
-        let Some(conditional) = runtime.latent_z_conditional_calibration.as_ref() else {
+        if runtime.latent_z_conditional_calibration.is_none() {
             return Ok(None);
-        };
+        }
         if self.survival_marginal_slope_joint_latent_law.is_some() {
             return Err(PredictInputError::InvalidInput {
                 reason: "latent conditional residual: the model is anchored on the joint latent \
@@ -1664,13 +1669,6 @@ impl FittedModel {
                     .to_string(),
             });
         }
-        let normalization =
-            self.latent_z_normalization
-                .as_ref()
-                .ok_or_else(|| PredictInputError::MissingMetadata {
-                    reason: "latent conditional residual requires the saved latent-z normalization"
-                        .to_string(),
-                })?;
         let z_raw = crate::inference::ctn::latent_scores(self, data, col_map)
             .map_err(|reason| PredictInputError::InvalidInput { reason })?;
         let spec = resolve_termspec_for_prediction(
@@ -1686,14 +1684,34 @@ impl FittedModel {
                 reason: format!("failed to build the conditioning design: {e}"),
             }
         })?;
+        self.fitted_latent_score(&z_raw, &design.design, "latent conditional residual")
+            .map(Some)
+    }
+
+    /// Each row's fitted latent score (gam#3016): `z_raw` through the map this saved
+    /// marginal-slope model applied to its latent score before any kernel read it, the
+    /// saved normalisation and then the rank-INT or the conditional location-scale
+    /// calibration the fit minted, the conditional one reading `a` as the whole of
+    /// `conditioning`. A host that replays the fitted model on rows of its own, as the
+    /// saved-model ALO does, reads the score here instead of composing the maps itself.
+    pub fn fitted_latent_score(
+        &self,
+        z_raw: &Array1<f64>,
+        conditioning: &DesignMatrix,
+        context: &str,
+    ) -> Result<Array1<f64>, PredictInputError> {
+        let normalization = self.latent_z_normalization.as_ref().ok_or_else(|| {
+            PredictInputError::MissingMetadata {
+                reason: format!("{context} requires the saved latent-z normalization"),
+            }
+        })?;
         FittedLatentScoreMap {
             normalization,
-            rank_int: runtime.latent_z_rank_int_calibration.as_ref(),
-            conditional: Some(conditional),
+            rank_int: self.latent_z_rank_int_calibration.as_ref(),
+            conditional: self.latent_z_conditional_calibration.as_ref(),
             span: LatentConditioningSpan::PrimaryDesign,
         }
-        .apply(&z_raw, &design.design, "latent conditional residual")
-        .map(Some)
+        .apply(z_raw, conditioning, context)
         .map_err(|error| PredictInputError::InvalidInput {
             reason: error.to_string(),
         })
@@ -1834,5 +1852,47 @@ mod tests {
         let err = build_marginal_slope_local_auxiliary_matrix(&model, data.view(), &missing)
             .expect_err("a table without the conditioning column is refused");
         assert!(err.to_string().contains("ctx"), "got: {err}");
+    }
+    #[test]
+    fn local_law_column_identity_is_invariant_to_table_permutation() {
+        let model = local_law_model();
+        let original = ndarray::array![[0.5, 4.0], [-0.5, 6.0]];
+        let reordered = ndarray::array![[4.0, 0.5], [6.0, -0.5]];
+        let original_names = [("z".into(), 0), ("ctx".into(), 1)].into_iter().collect();
+        let reordered_names = [("ctx".into(), 0), ("z".into(), 1)].into_iter().collect();
+        let first =
+            build_marginal_slope_local_auxiliary_matrix(&model, original.view(), &original_names)
+                .unwrap();
+        let second =
+            build_marginal_slope_local_auxiliary_matrix(&model, reordered.view(), &reordered_names)
+                .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, Some(ndarray::array![[2.0], [3.0]]));
+    }
+
+    #[test]
+    fn local_law_refuses_missing_metadata_and_invalid_column_indices() {
+        let data = ndarray::array![[0.5, 4.0]];
+        let columns = [("z".into(), 0), ("ctx".into(), 1)].into_iter().collect();
+        let mut model = local_law_model();
+        model.training_headers = None;
+        assert!(matches!(
+            build_marginal_slope_local_auxiliary_matrix(&model, data.view(), &columns),
+            Err(PredictInputError::MissingMetadata { .. })
+        ));
+
+        let mut model = local_law_model();
+        model.training_headers = Some(vec!["z".into()]);
+        assert!(matches!(
+            build_marginal_slope_local_auxiliary_matrix(&model, data.view(), &columns),
+            Err(PredictInputError::DimensionMismatch { .. })
+        ));
+
+        let model = local_law_model();
+        let invalid_columns = [("ctx".into(), 2)].into_iter().collect();
+        assert!(matches!(
+            build_marginal_slope_local_auxiliary_matrix(&model, data.view(), &invalid_columns),
+            Err(PredictInputError::DimensionMismatch { .. })
+        ));
     }
 }
