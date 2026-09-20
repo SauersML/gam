@@ -476,6 +476,58 @@ pub(crate) fn joint_penalty_subspace_trace_matches_projected_logdet_derivative()
 }
 
 #[test]
+pub(crate) fn joint_penalty_subspace_refuses_an_indefinite_laplace_precision_3303() {
+    // #3303: at the survival location-scale link-wiggle modes `M = H + S_λ` had
+    // exactly `rank(S_λ)` positive eigenvalues beside `−4.577` and `−2.217`, and
+    // the penalty floor kept the positive ones and dropped the negative ones
+    // without a word, pricing `log|M₊|` in place of `log|M|`. Here `S_λ` has rank
+    // 3 and `M = diag(4, 3, −4.577, 0)`: two resolved positive eigenvalues, one
+    // material negative one, one structural zero. No Laplace approximation exists
+    // at this saddle, so the criterion refuses the trial point by name.
+    let ranges = vec![(0, 4)];
+    let penalties = vec![array![
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0]
+    ]];
+    let h = array![
+        [3.0, 0.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0, 0.0],
+        [0.0, 0.0, -5.577, 0.0],
+        [0.0, 0.0, 0.0, 0.0]
+    ];
+    let err = joint_penalty_subspace_trace_parts(
+        &JointHessianSource::Dense(h),
+        &ranges,
+        &penalties,
+        4,
+        0.0,
+        None,
+        None,
+        None,
+    )
+    .expect_err("an indefinite Laplace precision has no Laplace criterion");
+    assert!(
+        err.is_trial_point_infeasible(),
+        "a saddle at one trial point is rho-local, got {err}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("indefinite") && message.contains("-4.577"),
+        "the refusal must name the material negative eigenvalue, got {message}"
+    );
+
+    // A negative eigenvalue inside the rounding band `p·ε·‖M‖₂` is not resolved
+    // from zero, so its sign is no measurement and the kept set stands.
+    let band = 4.0 * f64::EPSILON * 4.0;
+    let kept = laplace_precision_kept_eigenpairs(&[4.0, 3.0, 2.0, -0.5 * band], 3)
+        .expect("a within-band negative eigenvalue is roundoff, not a saddle");
+    assert_eq!(kept, vec![0, 1, 2]);
+    assert!(laplace_precision_kept_eigenpairs(&[4.0, 3.0, 2.0, -2.0 * band], 3).is_err());
+}
+
+#[test]
 pub(crate) fn joint_penalty_subspace_logdet_keeps_the_identified_rank_2901() {
     // #2901 V22: the criterion keeps standard REML's identified rank. The stiff
     // curvature `1e17` puts the rounding band `p·ε·‖M‖₂` at `88.8`, so `1e3` is
@@ -504,7 +556,12 @@ pub(crate) fn joint_penalty_subspace_logdet_keeps_the_identified_rank_2901() {
         penalty_rank_at_rounding_band(&penalties[0]).expect("penalty rank"),
         3
     );
-    assert_eq!(laplace_precision_kept_eigenpairs(eigenvalues, 3).len(), 3);
+    assert_eq!(
+        laplace_precision_kept_eigenpairs(eigenvalues, 3)
+            .expect("a positive semidefinite precision has a Laplace kept set")
+            .len(),
+        3
+    );
     let (logdet, kernel) = joint_penalty_subspace_trace_parts(
         &JointHessianSource::Dense(h.clone()),
         &ranges,
