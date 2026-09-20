@@ -315,6 +315,63 @@ mod tests {
     }
 
     #[test]
+    fn lc22_probe_3474() {
+        use gam_solve::rho_optimizer::OuterObjective;
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (target, term, rho, _pin, _provenance) = seeded_external_fixture();
+        let rho_flat = rho.to_flat(&term.assignment).expect("flat");
+        eprintln!("[probe] seed rho = {rho_flat:?}");
+        let registry = AnalyticPenaltyRegistry::new();
+        let mut objective = SaeManifoldOuterObjective::new(
+            term, target.clone(), Some(registry), rho, 40, 1.0, 1.0e-6, 1.0e-6,
+        );
+        let pts: Vec<[f64; 2]> = std::env::var("LC22_PTS")
+            .ok()
+            .map(|s| {
+                s.split(';')
+                    .map(|p| {
+                        let v: Vec<f64> = p.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                        [v[0], v[1]]
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![[rho_flat[0], rho_flat[1]], [4.0, rho_flat[1]], [8.0, -4.0], [12.0, -6.0], [16.867491342553677, -7.261040811383532]]);
+        for p in pts {
+            let r = ndarray::Array1::from(vec![p[0], p[1]]);
+            let e = objective.eval(&r);
+            match e {
+                Ok(ev) => {
+                    let h = 1e-4;
+                    let mut fd = vec![];
+                    for j in 0..2 {
+                        let mut rp = r.clone();
+                        rp[j] += h;
+                        let mut rm = r.clone();
+                        rm[j] -= h;
+                        let fp = objective.eval(&rp).map(|e| e.cost).unwrap_or(f64::NAN);
+                        let fm = objective.eval(&rm).map(|e| e.cost).unwrap_or(f64::NAN);
+                        fd.push((fp - fm) / (2.0 * h));
+                    }
+                    eprintln!(
+                        "[probe] rho={p:?} cost={:.12e} grad={:?} fd={fd:?}",
+                        ev.cost, ev.gradient
+                    );
+                }
+                Err(err) => eprintln!("[probe] rho={p:?} error {err}"),
+            }
+        }
+        if std::env::var("LC22_NORUN").is_err() {
+            let result = OuterProblem::new(rho_flat.len())
+                .with_initial_rho(rho_flat)
+                .run(&mut objective, "#2263 native replay fixture");
+            match result {
+                Ok(r) => eprintln!("[probe] run ok rho={:?} converged={}", r.rho, r.converged()),
+                Err(e) => eprintln!("[probe] run err {e}"),
+            }
+        }
+    }
+
+    #[test]
     fn converged_native_replay_passes_zero_optimization_audit_and_perturbation_fails() {
         let (target, term, rho, pin, provenance) = native_converged_state();
         let mut perturbed = term.clone();
