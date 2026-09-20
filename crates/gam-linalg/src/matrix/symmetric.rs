@@ -79,28 +79,14 @@ impl SymmetricMatrix {
         Ok(dense)
     }
 
-    pub fn factorize(&self) -> Result<Box<dyn FactorizedSystem>, String> {
-        match self {
-            Self::Dense(mat) => {
-                let factor = crate::utils::StableSolver::new()
-                    .factorize(mat)
-                    .map_err(|e| format!("Dense SymmetricMatrix factorization failed: {e:?}"))?;
-                Ok(Box::new(factor))
-            }
-            Self::Sparse(mat) => {
-                let factor = crate::sparse_exact::factorize_sparse_spd(mat)
-                    .map_err(|e| format!("Sparse SymmetricMatrix factorization failed: {e:?}"))?;
-                Ok(Box::new(factor))
-            }
-        }
-    }
-
-    /// Strict factorization for covariance and other SPD-only estimands.
+    /// SPD factorization, with one contract for both storages (gam#3696).
     ///
-    /// No LDLT/LBLT route and no diagonal jitter is admitted: dense matrices
-    /// must pass an unperturbed Cholesky factorization, while sparse matrices
-    /// use the existing exact sparse-SPD factorization.
-    pub fn factorize_spd(&self) -> Result<Box<dyn FactorizedSystem>, String> {
+    /// No LDLT/LBLT route and no diagonal jitter is admitted: the matrix must
+    /// pass an unperturbed Cholesky factorization whose every pivot clears its
+    /// derived roundoff band, whether it is stored dense or sparse. An
+    /// indefinite or numerically singular matrix is an error on either
+    /// storage, never a silently accepted indefinite factor.
+    pub fn factorize(&self) -> Result<Box<dyn FactorizedSystem>, String> {
         match self {
             Self::Dense(matrix) => {
                 crate::utils::validate_finite_symmetric_matrix(
@@ -138,7 +124,7 @@ impl SymmetricMatrix {
                 }
                 Ok(Box::new(factor) as Box<dyn FactorizedSystem>)
             }
-            Self::Sparse(matrix) => crate::sparse_exact::factorize_sparse_spd_strict(matrix)
+            Self::Sparse(matrix) => crate::sparse_exact::factorize_sparse_spd_certified(matrix)
                 .map(|factor| Box::new(factor) as Box<dyn FactorizedSystem>)
                 .map_err(|error| {
                     format!("Sparse SymmetricMatrix strict SPD factorization failed: {error:?}")
@@ -612,9 +598,9 @@ mod tests {
         // against the largest diagonal, gamma_(4)·1e16 exceeds the second pivot
         // 1, so the matrix was refused as numerically singular.
         let badly_scaled = SymmetricMatrix::Dense(array![[1.0e16_f64, 0.0], [0.0, 1.0]]);
-        assert!(badly_scaled.factorize_spd().is_ok());
+        assert!(badly_scaled.factorize().is_ok());
         // Control: `dense2x2` has the exact null vector (2, -1) and stays refused.
-        assert!(dense2x2().factorize_spd().is_err());
+        assert!(dense2x2().factorize().is_err());
     }
 
     // ── variant dispatch ──────────────────────────────────────────────────────

@@ -74,7 +74,7 @@ proptest! {
     fn strict_spd_solve_recovers_x_with_condition_derived_error((matrix, expected) in spd_case()) {
         let n = matrix.nrows();
         let rhs = matrix.dot(&expected);
-        let factor = SymmetricMatrix::Dense(matrix.clone()).factorize_spd().unwrap();
+        let factor = SymmetricMatrix::Dense(matrix.clone()).factorize().unwrap();
         let actual = factor.solve(&rhs).unwrap();
         let error = infinity_norm(&(&actual - &expected));
 
@@ -149,7 +149,7 @@ proptest! {
             matrix[[n - 1, index]] = matrix[[0, index]];
             matrix[[index, n - 1]] = matrix[[index, 0]];
         }
-        prop_assert!(SymmetricMatrix::Dense(matrix.clone()).factorize_spd().is_err());
+        prop_assert!(SymmetricMatrix::Dense(matrix.clone()).factorize().is_err());
         let sparse = dense_to_upper_csc(&matrix);
         prop_assert!(factorize_sparse_spd_strict(&sparse).is_err());
     }
@@ -183,8 +183,8 @@ proptest! {
         let scaled = Array2::from_shape_fn((n, n), |(row, column)| {
             matrix[[row, column]] * 10.0f64.powi(exponents[row] + exponents[column])
         });
-        prop_assert!(SymmetricMatrix::Dense(matrix.clone()).factorize_spd().is_ok());
-        prop_assert!(SymmetricMatrix::Dense(scaled.clone()).factorize_spd().is_ok());
+        prop_assert!(SymmetricMatrix::Dense(matrix.clone()).factorize().is_ok());
+        prop_assert!(SymmetricMatrix::Dense(scaled.clone()).factorize().is_ok());
         let sparse = dense_to_upper_csc(&scaled);
         prop_assert!(factorize_sparse_spd_strict(&sparse).is_ok());
     }
