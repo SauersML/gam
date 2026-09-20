@@ -615,29 +615,14 @@ impl PyEncodedTable {
             .map(|(column, schema)| {
                 let value = self.dataset.values[[row, column]];
                 match schema.kind {
-                    ColumnKindTag::Categorical => {
-                        let code = value as usize;
-                        if value < 0.0 || value.fract() != 0.0 || code >= schema.levels.len() {
-                            return Err(format!(
-                                "categorical column '{}' has invalid encoded value {value} at row {}",
-                                schema.name,
-                                row + 1
-                            ));
-                        }
-                        // Legacy table entry points still infer from strings. Mark
-                        // this one lazily-rendered row so numeric-looking labels
-                        // retain their categorical source intent.
-                        Ok(format!(
-                            "{}{}",
-                            gam::data::CATEGORICAL_CELL_SENTINEL,
-                            schema.levels[code]
-                        ))
-                    }
-                    ColumnKindTag::Binary => Ok(if value == 0.0 {
-                        "0".to_string()
-                    } else {
-                        "1".to_string()
-                    }),
+                    // Legacy table entry points still infer from strings. Mark
+                    // this one lazily-rendered row so numeric-looking labels
+                    // retain their categorical source intent.
+                    ColumnKindTag::Categorical => schema.present_cell_label(value, row).map(
+                        |label| format!("{}{label}", gam::data::CATEGORICAL_CELL_SENTINEL),
+                    ),
+                    // A missing binary cell is refused, not rendered as "1".
+                    ColumnKindTag::Binary => schema.present_cell_label(value, row),
                     ColumnKindTag::Continuous => Ok(format!("{value:?}")),
                 }
             })
@@ -1411,23 +1396,15 @@ fn extract_row_ids(
         rows.dataset.schema.columns.get(index).ok_or_else(|| {
             py_value_error(format!("id_column '{id_column}' has no encoded schema"))
         })?;
-    let mut row_ids = Vec::with_capacity(rows.dataset.values.nrows());
-    for row in 0..rows.dataset.values.nrows() {
-        let value = rows.dataset.values[[row, index]];
-        row_ids.push(match schema.kind {
-            ColumnKindTag::Categorical => {
-                let code = value as usize;
-                schema.levels.get(code).cloned().ok_or_else(|| {
-                    py_value_error(format!(
-                        "id_column '{id_column}' has invalid category code {value} at row {}",
-                        row + 1
-                    ))
-                })?
-            }
-            ColumnKindTag::Binary => if value == 0.0 { "0" } else { "1" }.to_string(),
-            ColumnKindTag::Continuous => format!("{value:?}"),
-        });
-    }
+    // Every prediction row needs its own id: a missing id cell is refused, not
+    // relabelled as the first level (`NaN as usize == 0`) or as binary "1".
+    let row_ids = (0..rows.dataset.values.nrows())
+        .map(|row| {
+            schema
+                .present_cell_label(rows.dataset.values[[row, index]], row)
+                .map_err(|err| py_value_error(format!("id_column '{id_column}': {err}")))
+        })
+        .collect::<PyResult<Vec<String>>>()?;
     Ok(Some(row_ids))
 }
 
