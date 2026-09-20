@@ -1588,7 +1588,7 @@ impl Built {
 /// kernel row for one gap, the carried `P × S` conditional expectations,
 /// the per-node densities of every node and the one forward kernel built at
 /// a time (`G³` Lagrange bases and `2G²` inner coordinates per axis, and the
-/// log ratio and inner weights over the grid), per parallel subject, in the widest scalar the outer solve uses (sixteen channels
+/// root ratio and inner weights over the grid), per parallel subject, in the widest scalar the outer solve uses (sixteen channels
 /// for mixed reference sensitivities nested over two outer directions).
 fn transient_footprint_bytes(
     order: usize,

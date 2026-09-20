@@ -491,16 +491,27 @@ pub(crate) fn log_standard_prior<S: JetField>(grid: &Grid<S>, like: &S) -> Vec<S
 /// is `centre + √(q/τ²) x` at Gauss-Hermite node `x`, with
 /// `centre = φσ(z' − φμ)/(τ²√2)`.
 ///
-/// The ratio enters through its logarithm: `ln r` is carried by the tensor
-/// Lagrange interpolant on the nodes of `from` and exponentiated at the inner
-/// points. Every inner weight is then positive, the predicted density is a
-/// log-sum-exp of them, and the representation cannot lose positivity at any
-/// order. The interpolation is exact whenever `ln α` is a polynomial of
-/// degree below the order, which includes every Gaussian (`ln r` is then
-/// quadratic) whatever its centre and spread relative to the grid. The
-/// polynomial is used as the polynomial it is beyond the hull: the inner
-/// points are finitely many, each a finite value, and a clamp would put a
-/// kink into an otherwise smooth objective.
+/// The ratio enters through its square root: `s = √r` is carried by the
+/// tensor Lagrange interpolant `s̃` on the nodes of `from` and squared at the
+/// inner points. Every inner weight `w_l s̃²` is non-negative at any order and
+/// at any inner point, inside the hull or beyond it, so the predicted density
+/// cannot lose positivity. The prediction is exact whenever `s` agrees with a
+/// polynomial of degree below the order `G` on the nodes: `s̃²` is then a
+/// polynomial of degree `2G − 2` in the inner node, which the `G`-point inner
+/// rule integrates exactly. The densities carried exactly at order `G` are
+/// the envelope times the square of such a polynomial.
+///
+/// The square root is the carrier because it is bounded. A node factor can
+/// be an astronomically steep wall across the hull (a large loading over a
+/// long exposure puts `ln r` at `−3·10⁸` on one node and `3` on another).
+/// `ln r` is then no polynomial of any practical degree, and its interpolant
+/// overshoots between the nodes by amounts that `exp` turns into overflow.
+/// `s` lies in `[0, max s]` there, and its interpolant is bounded by the
+/// Lebesgue constant of the rule times that. The polynomial is used as the polynomial it is
+/// beyond the hull: its square grows polynomially while the target's Gaussian
+/// factor decays, and a clamp would put a kink into an otherwise smooth
+/// objective. `s` is formed relative to its largest node value, so nothing
+/// overflows; the shift is added back to the log predicted density.
 ///
 /// Normalising the inner weights of target point `z'_j` gives `ŵ_{jl}`, the
 /// quadrature rule of the law of `z` given `z'_j` and the data so far. A
@@ -512,8 +523,10 @@ pub(crate) fn log_standard_prior<S: JetField>(grid: &Grid<S>, like: &S) -> Vec<S
 /// used and dropped.
 pub(crate) struct ForwardKernel<S> {
     order: usize,
-    /// `ln r` on the points of `from`.
-    log_ratio: Vec<S>,
+    /// `√r` on the points of `from`, relative to its largest node value.
+    root_ratio: Vec<S>,
+    /// `ln` of the largest node value of `r`, the shift of `root_ratio`.
+    log_ratio_shift: f64,
     /// `bases[k][(j_k G + l) G + i] = L_i(raw_{k, j_k, l})`: the Lagrange
     /// basis of `from` at the inner points of target coordinate `j_k`.
     bases: Vec<Vec<S>>,
@@ -524,8 +537,8 @@ pub(crate) struct ForwardKernel<S> {
     innovations: Vec<Vec<S>>,
     /// The source coordinate `z` of every inner point, `[k][j_k G + l]`.
     coordinates: Vec<Vec<S>>,
-    /// `Σ_k ln(w_{l_k}/√π)` per flat inner point, axis 0 fastest.
-    log_inner_weights: Vec<f64>,
+    /// `Π_k w_{l_k}/√π` per flat inner point, axis 0 fastest.
+    inner_weights: Vec<f64>,
 }
 
 /// One target point of a [`ForwardKernel`]: the log predicted density there
@@ -556,6 +569,14 @@ impl<S: JetField> ForwardKernel<S> {
                     add_real(&acc.add(&log_sigma[k]), x * x + LOG_SQRT_TWO_PI)
                 })
             })
+            .collect();
+        let log_ratio_shift = log_ratio
+            .iter()
+            .map(|t| t.value())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let root_ratio: Vec<S> = log_ratio
+            .iter()
+            .map(|t| exp(&add_real(t, -log_ratio_shift).scale(0.5)))
             .collect();
         let mut bases = Vec::with_capacity(atoms);
         let mut log_gauss = Vec::with_capacity(atoms);
@@ -609,12 +630,12 @@ impl<S: JetField> ForwardKernel<S> {
             innovations.push(axis_innovations);
             coordinates.push(axis_coordinates);
         }
-        let log_inner_weights = (0..from.size())
+        let inner_weights = (0..from.size())
             .map(|l| {
                 let mut rest = l;
-                let mut acc = 0.0;
+                let mut acc = 1.0;
                 for _ in 0..atoms {
-                    acc += gh.normal_weights[rest % g].ln();
+                    acc *= gh.normal_weights[rest % g];
                     rest /= g;
                 }
                 acc
@@ -622,12 +643,13 @@ impl<S: JetField> ForwardKernel<S> {
             .collect();
         Self {
             order: g,
-            log_ratio,
+            root_ratio,
+            log_ratio_shift,
             bases,
             log_gauss,
             innovations,
             coordinates,
-            log_inner_weights,
+            inner_weights,
         }
     }
 
@@ -639,14 +661,18 @@ impl<S: JetField> ForwardKernel<S> {
     /// The log predicted density at target point `j` and its normalised
     /// inner weights.
     pub fn row(&self, j: usize) -> KernelRow<S> {
-        let at_inner = interpolate_at_inner_points(self.order, &self.bases, &self.log_ratio, j);
+        let at_inner = interpolate_at_inner_points(self.order, &self.bases, &self.root_ratio, j);
         let terms: Vec<S> = at_inner
             .iter()
-            .zip(self.log_inner_weights.iter())
-            .map(|(q, &w)| add_real(q, w))
+            .zip(self.inner_weights.iter())
+            .map(|(s, &w)| square(s).scale(w))
             .collect();
-        let log_mass = log_sum_exp(&terms);
-        let weights = terms.iter().map(|t| exp(&t.sub(&log_mass))).collect();
+        let mass = terms
+            .iter()
+            .fold(terms[0].constant_like(0.0), |acc, t| acc.add(t));
+        let inverse_mass = recip(&mass);
+        let weights = terms.iter().map(|t| t.mul(&inverse_mass)).collect();
+        let log_mass = add_real(&ln(&mass), self.log_ratio_shift);
         let log_predicted = self
             .log_gauss
             .iter()

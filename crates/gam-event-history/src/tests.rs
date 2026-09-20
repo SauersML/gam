@@ -178,7 +178,7 @@ fn subject(times: &[f64], exposures: &[f64], counts: &[Vec<f64>]) -> SubjectNode
 }
 
 #[test]
-fn forward_kernel_is_exact_on_a_gaussian() {
+fn forward_kernel_is_exact_on_an_enveloped_squared_polynomial() {
     let gh = GaussHermite::new(15).expect("rule");
     let from = Grid::new(&gh, &[0.1], &[0.9], &0.0);
     let to = Grid::new(&gh, &[0.4], &[0.5], &0.0);
@@ -186,26 +186,39 @@ fn forward_kernel_is_exact_on_a_gaussian() {
     let transition = AtomTransition::new(&kappa);
     let phi = (-kappa).exp();
     let q = 1.0 - phi * phi;
-    // A Gaussian of a centre and width unrelated to either grid: its log
-    // density is quadratic, so the log-domain interpolant of degree 14 carries
-    // it exactly. What remains is the inner rule applied to `exp` of a
-    // quadratic of coefficient ≈ −0.18 in the Hermite variable, whose Taylor
-    // remainder past degree 29 is below 1e−20: the prediction is the Gaussian
-    // convolution to roundoff.
-    let (mu0, sigma0) = (0.3, 0.7);
+    // The envelope of `from` times the square of a quadratic in its
+    // standardised coordinate that stays positive: the square root of the
+    // ratio is that quadratic, which the interpolant of degree 14 carries
+    // exactly, and its square is integrated exactly by the inner rule. The
+    // prediction is the convolution to roundoff, and so is the conditional
+    // mean, a polynomial of degree 5 against the inner Gaussian.
+    let (mu, sigma) = (0.1, 0.9);
+    let density = |z: f64| {
+        let xi = (z - mu) / (std::f64::consts::SQRT_2 * sigma);
+        let root = 1.0 + 0.3 * xi + 0.1 * xi * xi;
+        gaussian(z, mu, sigma * sigma) * root * root
+    };
     let log_alpha: Vec<f64> = (0..from.size())
-        .map(|i| gaussian(*from.coordinate(i, 0), mu0, sigma0 * sigma0).ln())
+        .map(|i| density(*from.coordinate(i, 0)).ln())
         .collect();
     let kernel = ForwardKernel::new(&gh, &from, &log_alpha, &to, &[transition.clone()]);
     let predicted = kernel.log_predicted(to.size());
-    let tau2 = phi * phi * sigma0 * sigma0 + q;
+    // The reference convolution by the trapezoid rule, spectrally accurate
+    // for a smooth integrand that decays like a Gaussian: at a step of 1e−3
+    // over ±12 its error is far below roundoff.
+    let step = 1e-3;
+    let points: Vec<f64> = (0..=24_000).map(|m| -12.0 + step * m as f64).collect();
     for j in 0..to.size() {
-        let z = *to.coordinate(j, 0);
-        let exact = gaussian(z, phi * mu0, tau2).ln();
+        let target = *to.coordinate(j, 0);
+        let (mass, first) = points.iter().fold((0.0, 0.0), |(m, f), &z| {
+            let w = gaussian(target, phi * z, q) * density(z) * step;
+            (m + w, f + w * z)
+        });
         assert!(
-            (predicted[j] - exact).abs() < 1e-8,
-            "node {j}: log predicted {} exact {exact}",
-            predicted[j]
+            (predicted[j] - mass.ln()).abs() < 1e-9,
+            "node {j}: log predicted {} exact {}",
+            predicted[j],
+            mass.ln()
         );
         // The row's conditional expectation of z is the exact posterior mean
         // of the source given the target.
@@ -214,10 +227,10 @@ fn forward_kernel_is_exact_on_a_gaussian() {
         let mean: f64 = (0..from.size())
             .map(|i| transfer[i] * from.coordinate(i, 0))
             .sum();
-        let exact_mean = mu0 + phi * sigma0 * sigma0 * (z - phi * mu0) / tau2;
         assert!(
-            (mean - exact_mean).abs() < 1e-8,
-            "node {j}: conditional mean {mean} exact {exact_mean}"
+            (mean - first / mass).abs() < 1e-9,
+            "node {j}: conditional mean {mean} exact {}",
+            first / mass
         );
     }
     // The backward interpolation reproduces a constant at every inner point

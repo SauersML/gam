@@ -552,15 +552,14 @@ pub(crate) struct FilteredNode<S> {
 /// Where a node's grid goes: at the posterior mean, with the predictive
 /// spread.
 ///
-/// The forward kernel interpolates `ln` of the filtered density divided by
-/// the grid's Gaussian envelope, exactly when that log ratio is a polynomial
-/// of degree below the order. The Poisson node factor is not: after an event
-/// the log ratio is the log-intensity `a z` minus its exposure-weighted
-/// exponential, and on a grid placed at the *predicted* moments the
-/// exponential part, of degree unbounded, is what the interpolant must
-/// resolve across a hull of `±x_max √2 σ`. Re-centring the grid on the
+/// The forward kernel interpolates the square root of the filtered density
+/// divided by the grid's Gaussian envelope, exactly when that root is a
+/// polynomial of degree below the order. On a grid placed at the *predicted*
+/// moments the ratio is the node's likelihood factor itself, after an event
+/// an exponential tilt `exp(a z)` whose root `exp(a z / 2)` is no polynomial
+/// of any degree across a hull of `±x_max √2 σ`. Re-centring the grid on the
 /// posterior mean absorbs the tilt into the envelope (a tilted Gaussian is a
-/// shifted Gaussian) and leaves a log ratio that is flat where the mass is.
+/// shifted Gaussian) and leaves a ratio that is flat where the mass is.
 ///
 /// The spread stays the predictive one. The Poisson node factor is
 /// log-concave with at most linear growth in `z`, so the posterior is
