@@ -127,6 +127,10 @@ pub enum GpuKernel {
     /// The SAE softmax row jet's bilinear residual-curvature HVP, raced over
     /// one prepared state's lifetime: its build and every apply against it.
     SaeRowJetBilinear,
+    /// The BMS per-row Hessian matvec `H_i · v_i` over host-resident rows.
+    RowHessianMatvec,
+    /// The BMS per-row Hessian diagonal over host-resident rows.
+    RowHessianDiagonal,
     RemlTrace,
     FinalInference,
 }
@@ -149,6 +153,8 @@ impl GpuKernel {
             Self::SaeRowJetChannels => "sae-row-jet-channels",
             Self::SaeRowJetLinear => "sae-row-jet-linear",
             Self::SaeRowJetBilinear => "sae-row-jet-bilinear",
+            Self::RowHessianMatvec => "row-hessian-matvec",
+            Self::RowHessianDiagonal => "row-hessian-diagonal",
             Self::RemlTrace => "reml-trace",
             Self::FinalInference => "final-inference",
         }
@@ -508,7 +514,7 @@ pub fn log_backend_inventory_once() {
             "none"
         };
         log::trace!(
-            "[GPU backend] policy={} compiled_backends={} kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,marginal-slope-rows-host-pin,survival-marginal-slope-rows,polya-gamma-draws,sae-row-jet-channels,sae-row-jet-linear,sae-row-jet-bilinear,reml-trace,final-inference",
+            "[GPU backend] policy={} compiled_backends={} kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,marginal-slope-rows-host-pin,survival-marginal-slope-rows,polya-gamma-draws,sae-row-jet-channels,sae-row-jet-linear,sae-row-jet-bilinear,row-hessian-matvec,row-hessian-diagonal,reml-trace,final-inference",
             global_policy().as_str(),
             compiled_backends
         );
