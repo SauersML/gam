@@ -1804,9 +1804,8 @@ fn canonicalize_for_identifiability_inner(
                 &reduced_specs,
                 &red_col_offsets,
             )
-            .map_err(|error| {
-                log::debug!("[CANON] MAP uniqueness check failed: {}", error.message,);
-                CustomFamilyError::MapUniquenessFailure { error }
+            .inspect_err(|error| {
+                log::debug!("[CANON] MAP uniqueness check failed: {error}");
             })?;
 
             log::trace!(

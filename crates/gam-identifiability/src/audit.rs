@@ -93,7 +93,8 @@ use gam_linalg::faer_ndarray::{
     FaerEigh, default_rrqr_rank_alpha, fast_atb, rrqr_with_permutation, with_nested_parallel,
 };
 use gam_problem::{
-    EstimationError, FamilyLinearizationState, JointRankCertificate, ParameterBlockSpec,
+    CustomFamilyError, EstimationError, FamilyLinearizationState, JointRankCertificate,
+    ParameterBlockSpec,
 };
 use gam_runtime::loop_progress::LoopProgress;
 
@@ -3407,17 +3408,75 @@ pub use gam_problem::MapUniquenessError;
 /// `Ok(())` when the condition holds for every null direction (i.e. every
 /// null direction of `J^T W J` carries `n^T S n > null_tol`).
 ///
-/// `Err(MapUniquenessError)` for the first null direction (sorted by
-/// ascending `n^T S n`) that violates the condition.
+/// `MapUniquenessFailure` when the penalty restricted to the likelihood null
+/// space has an unresolved direction; `NumericalFailure` when that space or
+/// its restricted penalty cannot be certified.
 pub fn check_map_uniqueness(
     j_joint: &Array2<f64>,
     w_diag: &[f64],
     s_joint: &Array2<f64>,
     specs: &[ParameterBlockSpec],
     col_offsets: &[usize],
-) -> Result<(), MapUniquenessError> {
+) -> Result<(), CustomFamilyError> {
     let n = j_joint.nrows();
     let p = j_joint.ncols();
+
+    if s_joint.dim() != (p, p)
+        || (!w_diag.is_empty() && w_diag.len() != n)
+        || col_offsets.len() != specs.len() + 1
+        || col_offsets.first() != Some(&0)
+        || col_offsets.last() != Some(&p)
+        || col_offsets.windows(2).any(|pair| pair[0] > pair[1])
+        || specs
+            .iter()
+            .enumerate()
+            .any(|(i, spec)| col_offsets[i + 1] - col_offsets[i] != spec.design.ncols())
+    {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason:
+                "MAP uniqueness check: inconsistent design, weight, penalty or block dimensions"
+                    .into(),
+        });
+    }
+    if j_joint
+        .iter()
+        .chain(s_joint.iter())
+        .any(|value| !value.is_finite())
+        || w_diag
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "MAP uniqueness check: designs and penalties must be finite and weights finite and nonnegative".into(),
+        });
+    }
+    // A quadratic penalty is symmetric. Two p-term contractions in T^T S T
+    // can round its stored triangles differently; differences beyond their
+    // gamma_(2p) envelope do not describe that same symmetric operator.
+    let operation_error = 2.0 * (p as f64) * f64::EPSILON;
+    let gamma = operation_error / (1.0 - operation_error);
+    let penalty_scale = s_joint
+        .iter()
+        .fold(0.0_f64, |scale, &value| scale.max(value.abs()));
+    let symmetry_tol = gamma * penalty_scale;
+    let mut symmetric_penalty = s_joint.clone();
+    for i in 0..p {
+        for j in 0..i {
+            let lower = s_joint[[i, j]];
+            let upper = s_joint[[j, i]];
+            if (lower - upper).abs() > symmetry_tol {
+                return Err(CustomFamilyError::NumericalFailure {
+                    reason:
+                        "MAP uniqueness check: penalty is not symmetric within contraction roundoff"
+                            .into(),
+                });
+            }
+            let value = lower + 0.5 * (upper - lower);
+            symmetric_penalty[[i, j]] = value;
+            symmetric_penalty[[j, i]] = value;
+        }
+    }
+    let s_joint = &symmetric_penalty;
 
     if p == 0 {
         return Ok(());
@@ -3469,6 +3528,12 @@ pub fn check_map_uniqueness(
         g
     };
 
+    if g.iter().any(|value| !value.is_finite()) {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "MAP uniqueness check: non-finite weighted Gram matrix".into(),
+        });
+    }
+
     // Equilibrate before taking the eigen floor. The null space of `JᵀWJ` does
     // not depend on the units of a design column, but the floor below does:
     // `eigh` resolves eigenvalues only to a few `ε·λ_max`, so one column in
@@ -3489,18 +3554,24 @@ pub fn check_map_uniqueness(
     }
 
     // Eigendecompose the equilibrated G = V diag(λ) V^T (symmetric).
-    let (evals, evecs) = match g.eigh(Side::Lower) {
-        Ok(pair) => pair,
-        Err(e) => {
-            // Eigendecomposition failure: skip the check rather than
-            // producing a spurious failure — log and return Ok.
-            log::debug!(
-                "[MAP-UNIQUE] check_map_uniqueness: eigendecomposition of J^T W J failed \
-                 ({e:?}); skipping MAP uniqueness check",
-            );
-            return Ok(());
-        }
-    };
+    let (evals, evecs) = g
+        .eigh(Side::Lower)
+        .map_err(|e| CustomFamilyError::NumericalFailure {
+            reason: format!(
+                "MAP uniqueness check: eigendecomposition of the equilibrated J^T W J \
+                 ({p}x{p}) failed ({e:?}); ker(J^T W J) ∩ ker(S) cannot be certified",
+            ),
+        })?;
+
+    if evals
+        .iter()
+        .chain(evecs.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "MAP uniqueness check: non-finite weighted Gram eigensystem".into(),
+        });
+    }
 
     // Determine the null-space tolerance.
     // Use the same RRQR_RANK_ALPHA · ε · p · λ_max convention as the
@@ -3523,48 +3594,105 @@ pub fn check_map_uniqueness(
         return Ok(());
     }
 
-    // Penalty tolerance for n^T S n: use a relative threshold proportional
-    // to the Frobenius norm of S.
-    let s_frob_sq: f64 = s_joint.iter().map(|v| v * v).sum();
-    let pen_tol = null_tol * s_frob_sq.sqrt().max(1.0);
-
-    for (dir_idx, (lam, evec_col)) in null_dirs.iter().enumerate() {
-        // Back to the design's own units: `J·D·u = 0` means `J·(D·u) = 0`, and
-        // the penalty is in those units, so it is tested on unit `n = D·u`.
-        let mut n_vec: Array1<f64> = &evecs.column(*evec_col) * &col_scale;
-        let n_norm = n_vec.dot(&n_vec).sqrt();
-        if n_norm > 0.0 {
-            n_vec /= n_norm;
+    // The restriction must be positive definite on the WHOLE null space.
+    // Testing only the diagonal n_i^T S n_i misses an unpenalized linear
+    // combination of basis vectors (e.g. S = [[1,1],[1,1]] on R^2).
+    // Map the equilibrated null basis back to coefficient units, then QR it
+    // so the restricted eigenvalues describe unit coefficient directions.
+    let mut null_basis = Array2::<f64>::zeros((p, null_dirs.len()));
+    for (column, (_, eigen_column)) in null_dirs.iter().enumerate() {
+        let mut direction = &evecs.column(*eigen_column) * &col_scale;
+        let norm = direction.iter().fold(0.0_f64, |acc, &x| acc.hypot(x));
+        if !norm.is_finite() || norm == 0.0 {
+            return Err(CustomFamilyError::NumericalFailure {
+                reason: "MAP uniqueness check: invalid coefficient-space null direction".into(),
+            });
         }
-        // Compute n^T S n
-        let sn: Array1<f64> = s_joint.dot(&n_vec);
-        let ntsn: f64 = n_vec.iter().zip(sn.iter()).map(|(ni, si)| ni * si).sum();
-
-        if ntsn < pen_tol {
-            // Find the dominant block: the block whose columns have the
-            // largest cumulative squared component in n_vec.
+        direction /= norm;
+        null_basis.column_mut(column).assign(&direction);
+    }
+    let null_basis = orthonormal_map_null_basis(&null_basis)?;
+    let penalty_on_null = null_basis.t().dot(&s_joint.dot(&null_basis));
+    if penalty_on_null.iter().any(|value| !value.is_finite()) {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "MAP uniqueness check: non-finite restricted penalty".into(),
+        });
+    }
+    let (penalty_values, penalty_vectors) =
+        penalty_on_null
+            .eigh(Side::Lower)
+            .map_err(|error| CustomFamilyError::NumericalFailure {
+                reason: format!(
+                    "MAP uniqueness check: restricted penalty eigendecomposition failed: {error:?}"
+                ),
+            })?;
+    if penalty_values
+        .iter()
+        .chain(penalty_vectors.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "MAP uniqueness check: non-finite restricted penalty eigensystem".into(),
+        });
+    }
+    // Retain the existing relative penalty floor, but compute its Frobenius
+    // norm without squaring large entries into infinity.
+    let penalty_norm = s_joint.iter().fold(0.0_f64, |acc, &x| acc.hypot(x));
+    let pen_tol = null_tol * penalty_norm.max(1.0);
+    if !pen_tol.is_finite() {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "MAP uniqueness check: penalty scale exceeds representable range".into(),
+        });
+    }
+    for (dir_idx, &penalty_value) in penalty_values.iter().enumerate() {
+        if penalty_value <= pen_tol {
+            let n_vec = null_basis.dot(&penalty_vectors.column(dir_idx));
             let dominant_block = dominant_block_for_direction(&n_vec, specs, col_offsets);
-
             let message = format!(
-                "MAP estimate is non-unique: null direction {} of J^T W J (equilibrated \
-                 eigenvalue {lam:.3e}) \
-                 has n^T S n = {ntsn:.3e} < tolerance {pen_tol:.3e}; \
-                 the MAP is flat along this direction (no likelihood curvature, no penalty \
-                 curvature); dominant block: '{}'. \
-                 Fix: add a non-degenerate smoothness penalty to block '{}' that covers this \
-                 direction, or remove the unpenalised null direction from the model.",
-                dir_idx, dominant_block, dominant_block,
+                "MAP estimate is non-unique: direction {dir_idx} in ker(J^T W J) has \
+                 n^T S n = {penalty_value:.3e} <= tolerance {pen_tol:.3e}; \
+                 the MAP has no resolved penalty curvature along this likelihood-null \
+                 direction; dominant block: '{dominant_block}'. \
+                 Fix: add a non-degenerate smoothness penalty covering this direction, \
+                 or remove the unpenalised null direction from the model."
             );
-            return Err(MapUniquenessError {
-                message,
-                dominant_block,
-                null_direction_index: dir_idx,
-                penalty_quadratic_form: ntsn,
+            return Err(CustomFamilyError::MapUniquenessFailure {
+                error: MapUniquenessError {
+                    message,
+                    dominant_block,
+                    null_direction_index: dir_idx,
+                    penalty_quadratic_form: penalty_value,
+                },
             });
         }
     }
 
     Ok(())
+}
+
+fn orthonormal_map_null_basis(basis: &Array2<f64>) -> Result<Array2<f64>, CustomFamilyError> {
+    if basis.iter().any(|value| !value.is_finite()) {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "MAP uniqueness check: non-finite coefficient-space null basis".into(),
+        });
+    }
+    let (q, r) = gam_linalg::faer_ndarray::FaerQr::qr(basis).map_err(|error| {
+        CustomFamilyError::NumericalFailure {
+            reason: format!("MAP uniqueness check: null-space orthogonalization failed: {error:?}"),
+        }
+    })?;
+    let r_scale = r
+        .iter()
+        .fold(0.0_f64, |scale, &value| scale.max(value.abs()));
+    let qr_tol = default_rrqr_rank_alpha() * f64::EPSILON * (basis.nrows() as f64) * r_scale;
+    if q.iter().chain(r.iter()).any(|value| !value.is_finite())
+        || r.diag().iter().any(|value| value.abs() <= qr_tol)
+    {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "MAP uniqueness check: coefficient scaling makes the null basis numerically rank deficient".into(),
+        });
+    }
+    Ok(q)
 }
 
 /// Identify which block's columns contribute most (in L2 norm) to the
@@ -3598,6 +3726,115 @@ mod tests {
     use gam_problem::test_support::{spec_from_dense, spec_from_dense_with_priority};
     use linspace as linspace_minus_one_to_one;
     use ndarray::Array2;
+
+    #[test]
+    fn map_uniqueness_checks_combinations_of_null_directions() {
+        let design = Array2::<f64>::zeros((4, 2));
+        let specs = [spec_from_dense("joint_null", design.clone())];
+        let penalty = ndarray::array![[1.0, 1.0], [1.0, 1.0]];
+        // Each coordinate has positive penalty, but their difference has zero.
+        let error = check_map_uniqueness(&design, &[], &penalty, &specs, &[0, 2]);
+        assert!(
+            matches!(error, Err(CustomFamilyError::MapUniquenessFailure { .. })),
+            "{error:?}"
+        );
+        assert!(check_map_uniqueness(&design, &[], &Array2::eye(2), &specs, &[0, 2]).is_ok());
+    }
+
+    #[test]
+    fn map_uniqueness_restricted_penalty_respects_design_units() {
+        for scale in [1e-6, 1.0, 1e6] {
+            let design = Array2::from_shape_fn((8, 3), |(row, col)| {
+                (row + 1) as f64 * if col == 0 { scale } else { 1.0 }
+            });
+            let specs = [spec_from_dense("rank_one", design.clone())];
+            // The likelihood has rank one. A rank-one penalty cannot cover its
+            // two-dimensional null space, even though its diagonal is positive.
+            let penalty = Array2::from_elem((3, 3), 1.0);
+            let error = check_map_uniqueness(&design, &[], &penalty, &specs, &[0, 3]);
+            assert!(
+                matches!(error, Err(CustomFamilyError::MapUniquenessFailure { .. })),
+                "scale={scale}: {error:?}"
+            );
+            assert!(check_map_uniqueness(&design, &[], &Array2::eye(3), &specs, &[0, 3]).is_ok());
+        }
+    }
+
+    #[test]
+    fn map_uniqueness_refuses_nonfinite_and_invalid_inputs() {
+        let design = Array2::eye(2);
+        let specs = [spec_from_dense("finite", design.clone())];
+        let penalty = Array2::zeros((2, 2));
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut invalid = design.clone();
+            invalid[[0, 0]] = value;
+            assert!(matches!(
+                check_map_uniqueness(&invalid, &[], &penalty, &specs, &[0, 2]),
+                Err(CustomFamilyError::NumericalFailure { .. })
+            ));
+            let mut invalid = penalty.clone();
+            invalid[[0, 0]] = value;
+            assert!(matches!(
+                check_map_uniqueness(&design, &[], &invalid, &specs, &[0, 2]),
+                Err(CustomFamilyError::NumericalFailure { .. })
+            ));
+        }
+        for weights in [[-1.0, 1.0], [f64::NAN, 1.0], [f64::INFINITY, 1.0]] {
+            assert!(matches!(
+                check_map_uniqueness(&design, &weights, &penalty, &specs, &[0, 2]),
+                Err(CustomFamilyError::NumericalFailure { .. })
+            ));
+        }
+        assert!(matches!(
+            check_map_uniqueness(&design, &[1.0], &penalty, &specs, &[0, 2]),
+            Err(CustomFamilyError::DimensionMismatch { .. })
+        ));
+        assert!(matches!(
+            check_map_uniqueness(&design, &[], &penalty, &specs, &[0, 3]),
+            Err(CustomFamilyError::DimensionMismatch { .. })
+        ));
+        let huge = Array2::from_elem((2, 2), f64::MAX);
+        assert!(matches!(
+            check_map_uniqueness(&huge, &[], &penalty, &specs, &[0, 2]),
+            Err(CustomFamilyError::NumericalFailure { .. })
+        ));
+    }
+
+    #[test]
+    fn map_uniqueness_refuses_asymmetric_penalty_but_accepts_roundoff() {
+        let design = Array2::zeros((4, 2));
+        let specs = [spec_from_dense("null", design.clone())];
+        let asymmetric = ndarray::array![[2.0, 0.1], [0.9, 2.0]];
+        assert!(matches!(
+            check_map_uniqueness(&design, &[], &asymmetric, &specs, &[0, 2]),
+            Err(CustomFamilyError::NumericalFailure { .. })
+        ));
+        let rounded = ndarray::array![[2.0, 0.5 + f64::EPSILON], [0.5, 2.0]];
+        assert!(check_map_uniqueness(&design, &[], &rounded, &specs, &[0, 2]).is_ok());
+    }
+
+    #[test]
+    fn map_uniqueness_keeps_resolvable_extreme_units_and_refuses_collapsed_basis() {
+        let units = [1e-150, 1.0, 1e150];
+        let design =
+            Array2::from_shape_fn((8, 3), |(row, column)| (row + 1) as f64 * units[column]);
+        let specs = [spec_from_dense("extreme_units", design.clone())];
+        let result = check_map_uniqueness(&design, &[], &Array2::eye(3), &specs, &[0, 3]);
+        assert!(
+            result.is_ok(),
+            "a resolved null basis with identity penalty is unique: {result:?}"
+        );
+        // Extreme units alone need not collapse the eigensolver's chosen basis.
+        // Exercise actual collapse directly: two normalized columns now differ
+        // only below resolvable precision. QR's arbitrary completion must not
+        // become a certificate for that missing direction.
+        let collapsed = ndarray::array![[1.0, 1.0], [0.0, 1e-100]];
+        assert!(matches!(
+            orthonormal_map_null_basis(&collapsed),
+            Err(CustomFamilyError::NumericalFailure { .. })
+        ));
+        assert!(orthonormal_map_null_basis(&Array2::eye(2)).is_ok());
+    }
 
     fn linspace(n: usize) -> ndarray::Array1<f64> {
         if n <= 1 {
@@ -3658,7 +3895,10 @@ mod tests {
                 verdict.is_ok(),
                 "scale {scale:e}: a direction with resolvable curvature is not a null \
                  direction: {}",
-                verdict.err().map(|error| error.message).unwrap_or_default()
+                verdict
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default()
             );
 
             let mut aliased = design.clone();
@@ -3671,9 +3911,16 @@ mod tests {
                 "scale {scale:e}: aliased design must lose one rank"
             );
             let aliased_specs = [spec_from_dense("time_transform", aliased.clone())];
-            let error =
-                check_map_uniqueness(&aliased, &[], &unpenalized, &aliased_specs, &col_offsets)
-                    .expect_err("an exactly aliased, unpenalized pair must refuse at every scale");
+            let error = match check_map_uniqueness(
+                &aliased,
+                &[],
+                &unpenalized,
+                &aliased_specs,
+                &col_offsets,
+            ) {
+                Err(CustomFamilyError::MapUniquenessFailure { error }) => error,
+                other => panic!("scale {scale:e}: expected MAP-uniqueness failure, got {other:?}"),
+            };
             assert!(
                 error.penalty_quadratic_form.abs() < 1e-8,
                 "scale {scale:e}: the refused direction must carry no penalty, got {:.3e}",
