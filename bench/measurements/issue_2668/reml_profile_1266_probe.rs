@@ -65,7 +65,6 @@ fn reml_profile_1266_probe() {
         let rows = smooth_term_summary_rows(
             &std_fit.design,
             &std_fit.fit,
-            None,
             SummaryBlockOffset::default(),
         );
         let edfs: Vec<(String, f64)> = rows.iter().map(|row| (row.name.clone(), row.edf)).collect();
