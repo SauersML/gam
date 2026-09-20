@@ -91,11 +91,13 @@ impl SaeManifoldTerm {
         // same discipline the streaming fit already trusts
         // (`streaming_gates_frozen`, chunk-size-invariance pinned) and is
         // exactly what value/gradient consistency (#1026/#1625) wants at the
-        // evaluation scope rather than per assembly. A NEW evaluation (new ρ,
-        // or an evidence re-entry) still re-freezes from its own entry state,
-        // so a settled state re-prices identically — the #2253 idempotence
-        // certificate is preserved, and V(ρ) still tracks routing changes
-        // across ρ moves.
+        // evaluation scope rather than per assembly. Freezing at the entry state
+        // is not idempotent: re-freezing at a settled root prices a different
+        // objective from the one that root was converged under (#2933 F05,
+        // ½log|A| moved 8.1e-5 on `recompute_reproduces_joint_shape_band`), so
+        // the pricing criterion leaves its gates declared on success and this
+        // converge-only scope, with no priced value to declare them for, hands
+        // back the gate state it was given.
         let gates_were_frozen = self.freeze_collapse_prevention_gates();
         let out = self.converge_inner_for_undamped_logdet_gate_frozen(
             target,
@@ -852,7 +854,9 @@ impl SaeManifoldTerm {
                              (tol {grad_tolerance:.6e}) ½λ²/scale={predicted_relative_decrease:.6e} \
                              after {total_inner_iter} inner iterations"
                         );
-                        let refined = self.refine_accepted_root(
+                        // #2933 F08 — the majorizer decrement admits; the exact information
+                        // decides. A refusal falls through to the polish and the windows.
+                        if let Some(cache) = self.certified_decrement_acceptance(
                             target,
                             Some(rho),
                             rho_fixed,
@@ -866,9 +870,12 @@ impl SaeManifoldTerm {
                             loss,
                             criterion_fixed_point,
                             &mut total_inner_iter,
-                        )?;
-                        drop(criterion_scope);
-                        return Ok(refined.map_or(limit_factor.cache, |factor| factor.cache));
+                            &sys,
+                            limit_factor.cache,
+                        )? {
+                            drop(criterion_scope);
+                            return Ok(cache);
+                        }
                     }
                     // #2267 — try the superlinear finish before paying for the first
                     // majorized window it would replace. On the shipped example's K=8
@@ -1124,14 +1131,16 @@ impl SaeManifoldTerm {
                                         options,
                                     )
                                     .ok()
+                                    .map(|best_factor| (best_sys, best_factor))
                                 });
-                            if let Some(best_factor) = refactored {
+                            if let Some((best_sys, best_factor)) = refactored {
                                 log::debug!(
                                     "[SAE-ACCEPT] best-seen decrement certificate: ‖g‖ {grad_norm:.6e} \
                                      \u{2192} {best_g:.6e}, ½λ²/scale {excursion_cert:.6e} \
                                      \u{2192} {best_cert:.6e} after {total_inner_iter} iters"
                                 );
-                                let refined = self.refine_accepted_root(
+                                // #2933 F08 — the exact information decides the best-seen state.
+                                if let Some(cache) = self.certified_decrement_acceptance(
                                     target,
                                     Some(rho),
                                     rho_fixed,
@@ -1145,12 +1154,15 @@ impl SaeManifoldTerm {
                                     loss,
                                     criterion_fixed_point,
                                     &mut total_inner_iter,
-                                )?;
-                                drop(criterion_scope);
-                                return Ok(refined.map_or(best_factor.cache, |factor| factor.cache));
+                                    &best_sys,
+                                    best_factor.cache,
+                                )? {
+                                    drop(criterion_scope);
+                                    return Ok(cache);
+                                }
                             }
-                            // Re-factor at best-seen failed: restore the
-                            // excursion so state + final_cache stay consistent,
+                            // Re-factor at best-seen failed, or the exact information refused
+                            // it: restore the excursion so state + final_cache stay consistent,
                             // then fall through to the honest refusal below.
                             self.restore_mutable_state(&excursion)?;
                         } else if Self::inner_decrement_certifies(excursion_cert) {
@@ -1160,7 +1172,9 @@ impl SaeManifoldTerm {
                                  ½λ²/scale={excursion_cert:.6e} after \
                                  {total_inner_iter} inner iterations"
                             );
-                            let refined = self.refine_accepted_root(
+                            // #2933 F08 — the exact information decides; a refusal is refused
+                            // honestly below.
+                            if let Some(cache) = self.certified_decrement_acceptance(
                                 target,
                                 Some(rho),
                                 rho_fixed,
@@ -1174,9 +1188,12 @@ impl SaeManifoldTerm {
                                 loss,
                                 criterion_fixed_point,
                                 &mut total_inner_iter,
-                            )?;
-                            drop(criterion_scope);
-                            return Ok(refined.map_or(final_cache, |factor| factor.cache));
+                                &sys,
+                                final_cache,
+                            )? {
+                                drop(criterion_scope);
+                                return Ok(cache);
+                            }
                         }
                     }
                     // Inner solve did not converge; the returned Err carries
@@ -1383,7 +1400,7 @@ impl SaeManifoldTerm {
                 // spectral deflation `solve_arrow_newton_step_with_options` errors,
                 // the whole `if let Ok(..)` is skipped, and a perfectly good fit is
                 // refused to the non-convergence sentinel (#1095: public
-                // sae_manifold_fit K=1 circle → GamError at every N).
+                // sae_manifold_fit K=1 circle → GamfitError at every N).
                 //
                 // Ensure the stationary EVIDENCE system opts into per-row spectral
                 // discovery (installing an empty-per-row `row_gauge_deflation` is
@@ -1511,7 +1528,9 @@ impl SaeManifoldTerm {
                              ½λ²/scale={predicted_relative_decrease:.6e} tol={grad_tolerance:.6e} \
                              after {total_inner_iter} inner iterations"
                         );
-                        let refined = self.refine_accepted_root(
+                        // #2933 F08 — the majorizer decrement admits; the exact information
+                        // decides. A refusal arms the polish below, as an uncertified plateau.
+                        if let Some(cache) = self.certified_decrement_acceptance(
                             target,
                             None,
                             rho_fixed,
@@ -1525,9 +1544,12 @@ impl SaeManifoldTerm {
                             loss,
                             criterion_fixed_point,
                             &mut total_inner_iter,
-                        )?;
-                        drop(criterion_scope);
-                        return Ok(refined.map_or(stationary_cache, |factor| factor.cache));
+                            &stationary_sys,
+                            stationary_cache,
+                        )? {
+                            drop(criterion_scope);
+                            return Ok(cache);
+                        }
                     }
                     // #2267/#2283 — permitted at every armed plateau. What re-arms
                     // the polish is a materially descending refine round (the stall

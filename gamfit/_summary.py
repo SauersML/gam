@@ -12,9 +12,12 @@ from __future__ import annotations
 import operator
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
-from typing import Any, Iterator, Mapping, overload
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, overload
 
 from ._binding import rust_module
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 #: Columns of :meth:`Summary.smooth_terms_frame`, in the documented order.
@@ -52,8 +55,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "curvature_estimands",
     "basis_checks",
     "covariance_kind",
-    "covariance_n",
-    "covariance_flat",
+    "covariance",
     "coefficient_se_source",
     "group_metadata",
     "deployment_extensions",
@@ -211,8 +213,9 @@ class Summary:
         Estimated dispersion :math:`\\hat\\varphi` of the fitted family:
         Gaussian :math:`\\hat\\sigma^2 = \\mathrm{RSS}_w / (n - \\mathrm{edf})`
         (mgcv's ``gam.scale``), Gamma ``1 / shape``, ``1`` for fixed-scale
-        families (Poisson, binomial). ``None`` only for a custom family that
-        declares no dispersion.
+        families (Poisson, binomial). ``None`` exactly when the family's scale
+        contract has no scalar dispersion: a custom family that declares none,
+        or Royston-Parmar survival.
     edf_total : float or None
         Total effective degrees of freedom across all blocks.
     edf_rank_bound : list of mapping
@@ -251,12 +254,32 @@ class Summary:
     smooth_terms : list of dict
         The mgcv-style per-smooth significance table: one record per
         smooth / random-effect term with keys ``name``, ``edf``, ``ref_df``,
-        and — for penalized smooths — ``chi_sq`` (Wood 2013 rank-truncated
-        Wald statistic) and ``p_value``. Random-effect smooths report ``edf``
-        only. A shape-constrained smooth (``shape=...``) has no ``chi_sq`` or
-        ``p_value``; it carries ``p_value_unavailable = "shape_constrained"``
-        instead, because its null ``f = 0`` is the apex of the constraint cone
-        and no calibrated reference exists for the truncated posterior mean.
+        and — for penalized smooths — ``chi_sq`` and ``p_value`` from the
+        variance-component score test of ``f = 0`` (Lin 1997; Zhang & Lin 2003).
+        The score fits the other terms only and weights the term's directions by
+        its fixed structural penalties, one variance component per penalty on
+        its own null scale, so it never reads the term's own fitted
+        smoothing parameter, and its reference law (a weighted
+        :math:`\chi^2_1` sum, over :math:`\chi^2_\rho/\rho` when the scale is
+        estimated) is the null law at the fitted smoothing parameters of the
+        other terms; ``chi_sq`` is scaled so its null mean is ``ref_df``.
+        Random-effect blocks carry the score test of their variance component
+        against its exact boundary null law, or a ``"random_effect_*"``
+        reason when it could not be scored. A smooth with no valid
+        p-value has no ``chi_sq`` or ``p_value`` and carries a
+        ``p_value_unavailable`` reason instead: ``"shape_constrained"`` (the
+        null is the apex of the constraint cone), ``"unpenalized_direction"``
+        (a direction no penalty shrinks is a fixed effect the variance-component
+        null does not remove), ``"fit_curvature_unavailable"`` (the model kept no
+        exact penalized Hessian and weighted Gram), ``"dispersion_unavailable"``
+        (the coefficient covariance scale cannot be resolved),
+        ``"not_identified"``, ``"indefinite_curvature"`` (a custom family's
+        observed information leaves the term's score no covariance), or
+        ``"residual_df_unavailable"``.
+        A model with more than one linear predictor (the Bernoulli
+        marginal-slope family) tags each record with ``predictor`` —
+        ``"marginal"`` or ``"slope"`` — naming the formula the smooth belongs
+        to; each row is tested against its own predictor's block.
         Empty when the model has no smooth or random-effect terms; every
         other absence is labeled by :attr:`smooth_terms_unavailable`.
     smooth_terms_unavailable : str or None
@@ -266,8 +289,7 @@ class Summary:
         reason, so an absence is never reported without its reason — the same
         contract as :attr:`reml_score_unavailable`.
 
-        This ``p_value`` is the *first-order* Wald reference; computing it needs
-        only the saved model. For the **second-order-accurate**, Bartlett-corrected
+        This ``p_value`` needs only the saved model. For the **second-order-accurate**, Bartlett-corrected
         likelihood-ratio p-value (the exact Lawley factor auto-applied whenever the
         family carries closed-form cumulant jets, #939/#1063) call
         :meth:`Model.smooth_significance(data) <gamfit.Model.smooth_significance>`,
@@ -275,12 +297,11 @@ class Summary:
     covariance_kind : str or None
         ``"smoothing-corrected"`` or ``"conditional"`` depending on which
         posterior covariance variant was returned. The kind, the ``std_error``
-        column, and ``covariance_flat`` always come from the SAME covariance
+        column, and ``covariance`` always come from the SAME covariance
         definition (#2296); see ``coefficient_se_source``.
-    covariance_n : int or None
-        Side length of the coefficient covariance matrix.
-    covariance_flat : list of float or None
-        Row-major flat coefficient covariance matrix.
+    covariance : numpy.ndarray or None
+        The ``(p, p)`` float64 coefficient covariance matrix, in coefficient
+        order.
     group_metadata : dict or None
         Saved group-level metadata for grouped fits.
     deployment_extensions : list of dict
@@ -290,6 +311,8 @@ class Summary:
         record per smooth term with ``name``, ``term_idx``, ``basis_dim`` (the
         realized ``k'``), ``nullspace_dim``, ``edf``, ``enrichment_dim``,
         ``enrichment_rank``, ``statistic``, ``p_value`` and ``provenance``. A
+        field the check did not measure is omitted, so a row whose
+        ``provenance`` is not ``"radial_enrichment"`` carries no ``p_value``. A
         small ``p_value`` says the fit's residuals still carry structure in that
         smooth's covariates which its realized basis cannot represent. See
         :meth:`gamfit.Model.basis_check` for the construction and its limits.
@@ -390,8 +413,7 @@ class Summary:
     #: converged on was rich enough.
     basis_checks: list[dict[str, Any]] = field(default_factory=list)
     covariance_kind: str | None = None
-    covariance_n: int | None = None
-    covariance_flat: list[float] | None = None
+    covariance: np.ndarray | None = None
     #: Exact covariance definition behind the coefficient ``std_error`` column
     #: (#2296): ``"conditional"`` or ``"smoothing-corrected"``, recorded from
     #: the definition-consistent pair the engine summary actually consumed.
@@ -503,7 +525,9 @@ class Summary:
         (``chi_sq`` / ``p_value`` are absent for random-effect smooths and any
         shape-constrained term, matching the engine, which only computes the
         Wood Wald test for ordinary penalized smooths). A shape-constrained row
-        adds a ``p_value_unavailable`` column naming the reason.
+        adds a ``p_value_unavailable`` column naming the reason, and a
+        multi-predictor model adds a ``predictor`` column (``"marginal"`` /
+        ``"slope"``).
         """
         import pandas as pd
 

@@ -34,9 +34,7 @@ def _block_oracle(model, term, grid, level):
     """``X_t beta_t`` and ``sqrt(diag(X_t V_t X_t^T))`` at ``g = level``."""
     summary = model.summary()
     beta = np.asarray([c["estimate"] for c in summary.coefficients], dtype=float)
-    cov = np.asarray(summary.covariance_flat, dtype=float).reshape(
-        summary.covariance_n, summary.covariance_n
-    )
+    cov = summary.covariance
     block = next(b for b in model.term_blocks if b.name == term)
     frame = pd.DataFrame({"x": grid, "g": [level] * grid.size})
     design = np.asarray(model.design_matrix(frame).matrix, dtype=float)

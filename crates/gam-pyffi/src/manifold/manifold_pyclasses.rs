@@ -18,7 +18,7 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use crate::{PyObject, json_value_to_py, py_value_error};
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "EuclideanManifold",
     skip_from_py_object
 )]
@@ -53,12 +53,12 @@ impl EuclideanManifold {
 
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dim = descriptor_dimension("EuclideanManifold.dim", self.dim)?;
-        json_value_to_py(py, ManifoldSpec::Euclidean(dim).descriptor())
+        json_value_to_py(py, &ManifoldSpec::Euclidean(dim).descriptor())
     }
 }
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "CircleManifold",
     skip_from_py_object
 )]
@@ -81,12 +81,12 @@ impl CircleManifold {
     }
 
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
-        json_value_to_py(py, ManifoldSpec::Circle.descriptor())
+        json_value_to_py(py, &ManifoldSpec::Circle.descriptor())
     }
 }
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "SphereManifold",
     skip_from_py_object
 )]
@@ -121,12 +121,12 @@ impl SphereManifold {
 
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
         let intrinsic_dim = descriptor_dimension("SphereManifold.intrinsic_dim", self.intrinsic_dim)?;
-        json_value_to_py(py, ManifoldSpec::Sphere { intrinsic_dim }.descriptor())
+        json_value_to_py(py, &ManifoldSpec::Sphere { intrinsic_dim }.descriptor())
     }
 }
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "TorusManifold",
     skip_from_py_object
 )]
@@ -161,7 +161,7 @@ impl TorusManifold {
 
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dim = descriptor_dimension("TorusManifold.dim", self.dim)?;
-        json_value_to_py(py, ManifoldSpec::Torus { dim }.descriptor())
+        json_value_to_py(py, &ManifoldSpec::Torus { dim }.descriptor())
     }
 }
 
@@ -199,7 +199,7 @@ fn validate_frame_domain(name: &str, k: i64, n: i64) -> PyResult<()> {
 }
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "GrassmannManifold",
     skip_from_py_object
 )]
@@ -248,12 +248,12 @@ impl GrassmannManifold {
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
         let k = descriptor_dimension("GrassmannManifold.k", self.k)?;
         let n = descriptor_dimension("GrassmannManifold.n", self.n)?;
-        json_value_to_py(py, ManifoldSpec::Grassmann { k, n }.descriptor())
+        json_value_to_py(py, &ManifoldSpec::Grassmann { k, n }.descriptor())
     }
 }
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "StiefelManifold",
     skip_from_py_object
 )]
@@ -302,11 +302,11 @@ impl StiefelManifold {
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
         let k = descriptor_dimension("StiefelManifold.k", self.k)?;
         let n = descriptor_dimension("StiefelManifold.n", self.n)?;
-        json_value_to_py(py, ManifoldSpec::Stiefel { k, n }.descriptor())
+        json_value_to_py(py, &ManifoldSpec::Stiefel { k, n }.descriptor())
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "SpdManifold", skip_from_py_object)]
+#[pyclass(module = "gamfit._rust", name = "SpdManifold", skip_from_py_object)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SpdManifold {
     #[pyo3(get, set)]
@@ -330,11 +330,11 @@ impl SpdManifold {
 
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
         let n = descriptor_dimension("SpdManifold.n", self.n)?;
-        json_value_to_py(py, ManifoldSpec::Spd { n }.descriptor())
+        json_value_to_py(py, &ManifoldSpec::Spd { n }.descriptor())
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "ProductManifold")]
+#[pyclass(module = "gamfit._rust", name = "ProductManifold")]
 pub(crate) struct ProductManifold {
     #[pyo3(get, set)]
     parts: Vec<PyObject>,

@@ -92,6 +92,11 @@ A 2-D smooth fit to scattered observations:
 ## Predict
 
 ```python
+import gamfit
+
+train = {"x": list(range(12)), "y": [1.2, 1.9, 3.1, 4.5, 5.0, 5.4, 5.6, 5.5, 5.2, 4.8, 4.4, 4.1]}
+model = gamfit.fit(train, "y ~ s(x)")   # the first model above
+
 preds = model.predict([{"x": 1.5}, {"x": 2.5}])
 ```
 
@@ -102,6 +107,11 @@ response-scale point predictions by default. Ask for a table with
 For pointwise Wald intervals, pass `interval=`:
 
 ```python
+import gamfit
+
+train = {"x": list(range(12)), "y": [1.2, 1.9, 3.1, 4.5, 5.0, 5.4, 5.6, 5.5, 5.2, 4.8, 4.4, 4.1]}
+model = gamfit.fit(train, "y ~ s(x)")
+
 preds = model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95)
 # Columns: linear_predictor_plugin, mean_plugin, posterior_mean,
 #          posterior_mean_standard_error, posterior_mean_lower, posterior_mean_upper
@@ -120,6 +130,12 @@ See [predictions.md](predictions.md) for details on `return_type`,
 ## Inspect
 
 ```python
+import gamfit
+
+train = {"x": list(range(12)), "y": [1.2, 1.9, 3.1, 4.5, 5.0, 5.4, 5.6, 5.5, 5.2, 4.8, 4.4, 4.1]}
+test = {"x": [1.5, 2.5]}
+model = gamfit.fit(train, "y ~ s(x)")
+
 model.summary()                     # Summary object
 model.diagnose(train).metrics       # n_obs, mae, rmse, bias, optional r_squared
 model.check(test).ok                # schema check against training
@@ -141,6 +157,11 @@ See [diagnostics.md](diagnostics.md) for the full list.
 ## Persist
 
 ```python
+import gamfit
+
+train = {"x": list(range(12)), "y": [1.2, 1.9, 3.1, 4.5, 5.0, 5.4, 5.6, 5.5, 5.2, 4.8, 4.4, 4.1]}
+model = gamfit.fit(train, "y ~ s(x)")
+
 model.save("model.gam")
 loaded = gamfit.load("model.gam")
 ```
@@ -155,10 +176,16 @@ Smoothing parameters are point estimates from REML. To draw from the
 posterior of the coefficients conditional on those estimates:
 
 ```python
+import gamfit
+
+train = {"x": list(range(12)), "y": [1.2, 1.9, 3.1, 4.5, 5.0, 5.4, 5.6, 5.5, 5.2, 4.8, 4.4, 4.1]}
+test = {"x": [1.5, 2.5]}
+model = gamfit.fit(train, "y ~ s(x)")
+
 posterior = model.sample(train, seed=42)
 print(posterior)
-# PosteriorSamples(n_draws=..., n_coeffs=8, method='nuts',
-#                  rhat=1.0040, ess=..., converged=True)
+# PosteriorSamples(n_draws=..., n_coeffs=8, method='laplace',
+#                  rhat=1.0000, ess=..., converged=True)
 
 bands = posterior.predict(test, level=0.95)
 ```

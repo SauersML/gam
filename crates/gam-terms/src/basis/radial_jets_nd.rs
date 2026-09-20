@@ -555,6 +555,196 @@ pub fn duchon_sae_atom_basis_with_jet(
     Ok((phi, jet))
 }
 
+/// `sup |r^e·(a + b·ln r)|` over `r ∈ [r_lo, r_hi]`, `0 ≤ r_lo ≤ r_hi`, or `None` where
+/// it is unbounded (#2576). With `r_lo > 0` both `r^e` and `ln r` are monotone on the
+/// interval, so the endpoints bound both factors. With `r_lo = 0` the power must not
+/// blow up: `e > 0` bounds `r^e|ln r|` by its interior maximum `1/(e·E)` at
+/// `r = exp(−1/e)` or its value at `r_hi`, `e = 0` is bounded only without the log, and
+/// `e < 0` is unbounded unless the term vanishes.
+fn radial_log_power_sup(e: f64, a: f64, b: f64, r_lo: f64, r_hi: f64) -> Option<f64> {
+    if a == 0.0 && b == 0.0 {
+        return Some(0.0);
+    }
+    if r_lo > 0.0 {
+        let power = r_lo.powf(e).max(r_hi.powf(e));
+        let log = r_lo.ln().abs().max(r_hi.ln().abs());
+        return Some(power * (a.abs() + b.abs() * log));
+    }
+    if e > 0.0 {
+        let log_power = if b == 0.0 {
+            0.0
+        } else {
+            let peak = (-1.0 / e).exp();
+            let at_end = r_hi.powf(e) * r_hi.ln().abs();
+            if r_hi <= peak {
+                at_end
+            } else {
+                at_end.max(1.0 / (e * std::f64::consts::E))
+            }
+        };
+        Some(a.abs() * r_hi.powf(e) + b.abs() * log_power)
+    } else if e == 0.0 && b == 0.0 {
+        Some(a.abs())
+    } else {
+        None
+    }
+}
+
+/// Per-column upper bounds `[sup|Φ_b|, sup‖∂Φ_b‖, sup‖∂²Φ_b‖, sup‖∂³Φ_b‖]` (jets as the
+/// Frobenius norms of their partials) of the scale-free Duchon SAE atom over the ball
+/// `‖t − center‖₂ ≤ radius`, column-for-column with [`duchon_sae_atom_basis_with_jet`]
+/// (#2576). `None` when the ball reaches a center at which a jet of the kernel is
+/// unbounded.
+///
+/// Kernel column `b` is `α·Σ_j Z_jb ψ_j(t)` with `ψ_j(t) = φ(‖t − c_j‖)` and
+/// `φ(r) = c·r^p·(ln r)^ℓ` the pure polyharmonic kernel (`ℓ = 1` in its log case), so
+/// each of its jet bounds is `α·Σ_j |Z_jb|` times center `j`'s radial bound. With `u`
+/// the unit direction to the center, `∇ψ = φ'u`, `D²ψ = φ''uuᵀ + (φ'/r)(I − uuᵀ)` and
+/// `D³ψ = (φ''' − 3β)u⊗u⊗u + β·sym(δ⊗u)` with `β = (φ'' − φ'/r)/r`, whose Frobenius
+/// norms are at most `|φ'|`, `|φ''| + √(d−1)|φ'/r|` and `|φ''' − 3β| + √(3(d+2))|β|`.
+/// Each of those is a sum of terms `r^e(a + b ln r)`, bounded on the radial interval
+/// the ball spans ([`radial_log_power_sup`]). A polynomial column `t^α` is bounded
+/// with `|t_a| ≤ |center_a| + radius`: a partial meeting axis `a` exactly `j_a` times
+/// is at most `Π_a α_a^{↓j_a}(|center_a| + radius)^{α_a − j_a}`.
+pub fn duchon_sae_atom_jet_ball_bound(
+    center: ArrayView1<'_, f64>,
+    radius: f64,
+    centers: ArrayView2<'_, f64>,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<Option<Vec<[f64; 4]>>, BasisError> {
+    let dim = centers.ncols();
+    if dim == 0 {
+        crate::bail_invalid_basis!(
+            "duchon_sae_atom_jet_ball_bound: centers must have at least one column"
+        );
+    }
+    if center.len() != dim {
+        crate::bail_dim_basis!(
+            "duchon_sae_atom_jet_ball_bound: center has {} coordinates but centers have {dim}",
+            center.len()
+        );
+    }
+    if !(radius.is_finite() && radius >= 0.0) || center.iter().any(|value| !value.is_finite()) {
+        crate::bail_invalid_basis!(
+            "duchon_sae_atom_jet_ball_bound: center and radius must be finite (radius {radius})"
+        );
+    }
+    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    let s_order: f64 = 0.0;
+    let poly_block_centers = polynomial_block_from_order(centers, effective_order);
+    let z = kernel_constraint_nullspace_from_matrix(poly_block_centers.view())?;
+    let pure_poly_coeff =
+        PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, s_order), dim);
+    let kernel_amp = duchon_kernel_amplification(
+        centers,
+        None,
+        p_order,
+        duchon_power_to_usize(s_order),
+        dim,
+        None,
+        None,
+        Some(&pure_poly_coeff),
+    );
+    let (c, p) = (pure_poly_coeff.c, pure_poly_coeff.power);
+    // `(e, a, b)` of each radial term, `r^e (a + b ln r)`, for the kernel `φ`, `φ'`,
+    // `φ''`, `φ'/r`, `β = (φ'' − φ'/r)/r` and `φ''' − 3β`.
+    let terms: [(f64, f64, f64); 6] = if pure_poly_coeff.is_log_case {
+        [
+            (p, 0.0, c),
+            (p - 1.0, c, c * p),
+            (p - 2.0, c * (2.0 * p - 1.0), c * p * (p - 1.0)),
+            (p - 2.0, c, c * p),
+            (p - 3.0, c * (2.0 * p - 2.0), c * p * (p - 2.0)),
+            (
+                p - 3.0,
+                c * (3.0 * p * p - 12.0 * p + 8.0),
+                c * p * (p - 2.0) * (p - 4.0),
+            ),
+        ]
+    } else {
+        [
+            (p, c, 0.0),
+            (p - 1.0, c * p, 0.0),
+            (p - 2.0, c * p * (p - 1.0), 0.0),
+            (p - 2.0, c * p, 0.0),
+            (p - 3.0, c * p * (p - 2.0), 0.0),
+            (p - 3.0, c * p * (p - 2.0) * (p - 4.0), 0.0),
+        ]
+    };
+    let mut center_bounds = Vec::with_capacity(centers.nrows());
+    for j in 0..centers.nrows() {
+        let distance = (0..dim)
+            .map(|axis| (center[axis] - centers[[j, axis]]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let (r_lo, r_hi) = ((distance - radius).max(0.0), distance + radius);
+        let mut sups = [0.0_f64; 6];
+        for (slot, &(e, a, b)) in terms.iter().enumerate() {
+            match radial_log_power_sup(e, a, b, r_lo, r_hi) {
+                Some(value) => sups[slot] = value,
+                None => return Ok(None),
+            }
+        }
+        center_bounds.push([
+            sups[0],
+            sups[1],
+            sups[2] + ((dim - 1) as f64).sqrt() * sups[3],
+            sups[5] + (3.0 * (dim + 2) as f64).sqrt() * sups[4],
+        ]);
+    }
+    let mut columns: Vec<[f64; 4]> = z
+        .columns()
+        .into_iter()
+        .map(|weights| {
+            let mut bound = [0.0_f64; 4];
+            for (weight, center_bound) in weights.iter().zip(&center_bounds) {
+                for (entry, value) in bound.iter_mut().zip(center_bound) {
+                    *entry += kernel_amp.abs() * weight.abs() * value;
+                }
+            }
+            bound
+        })
+        .collect();
+    let degree = match effective_order {
+        DuchonNullspaceOrder::Zero => 0,
+        DuchonNullspaceOrder::Linear => 1,
+        DuchonNullspaceOrder::Degree(k) => k,
+    };
+    let reach: Vec<f64> = center.iter().map(|value| value.abs() + radius).collect();
+    for alpha in monomial_exponents(dim, degree) {
+        let mut bound = [0.0_f64; 4];
+        for (order, entry) in bound.iter_mut().enumerate() {
+            let mut squared = 0.0_f64;
+            for tuple in 0..dim.pow(order as u32) {
+                let mut counts = vec![0usize; dim];
+                let mut code = tuple;
+                for _ in 0..order {
+                    counts[code % dim] += 1;
+                    code /= dim;
+                }
+                if counts.iter().zip(&alpha).any(|(&count, &power)| count > power) {
+                    continue;
+                }
+                let partial = counts
+                    .iter()
+                    .zip(&alpha)
+                    .zip(&reach)
+                    .map(|((&count, &power), &rho)| {
+                        (0..count).map(|j| (power - j) as f64).product::<f64>()
+                            * rho.powi((power - count) as i32)
+                    })
+                    .product::<f64>();
+                squared += partial * partial;
+            }
+            *entry = squared.sqrt();
+        }
+        columns.push(bound);
+    }
+    Ok(Some(columns))
+}
+
+
 /// Reproducing-norm smoothness penalty for the scale-free Duchon SAE atom,
 /// consistent column-for-column with [`duchon_sae_atom_basis_with_jet`].
 ///
@@ -2422,7 +2612,7 @@ fn spherical_design_route(
     if matches!(spec.method, SphereMethod::Harmonic) {
         let max_degree = spec
             .max_degree
-            .unwrap_or_else(|| default_spherical_harmonic_degree(data.nrows()));
+            .unwrap_or_else(|| default_spherical_harmonic_degree(data.nrows(), spec.penalty_order));
         if !(1..=4).contains(&spec.penalty_order) {
             crate::bail_invalid_basis!(
                 "spherical-harmonic {context} penalty_order must be one of 1, 2, 3, 4; got {}",
@@ -2628,6 +2818,7 @@ mod spherical_design_hessian_tests {
             max_degree,
             wahba_kernel,
             identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+            adaptive_degree: false,
         }
     }
 

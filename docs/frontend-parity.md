@@ -27,6 +27,7 @@ APIs such as a matrix kernel.
 | Prediction and posterior-mean uncertainty | `gam::predict` saved-model machinery | `predict`, `--uncertainty`, `--level`, `--covariance-mode`, offsets and IDs | `Model.predict`, `predict_array`; interval, observation interval, covariance mode, IDs | Parity; Python exposes richer typed return objects |
 | Conformal prediction bands | `gam_predict::conformal_routes` | `predict --conformal`, `--training-data`, `--calibration`, `--level` | `Model.predict(interval="conformal", training_data=... or calibration=...)` | Same Rust routes |
 | CTN observed-response score | saved-model prediction machinery | `transformation-score` | `Model.transformation_score` | Parity |
+| Marginal-slope conditional latent residual `(z − m(a))/√v(a)` | `FittedModel::latent_conditional_residual` over `FittedLatentScoreMap` | `latent-residual` | `Model.latent_conditional_residual` | Parity |
 | Diagnostics / ALO | `gam::inference::alo`, saved-model ALO | `diagnose`; report may include diagnostics | `Model.diagnose`, `check`, `basis_check`, `curvature`, `smooth_significance` | Core diagnostics shared; Python methods are programmatic views |
 | Term partial effects with pointwise intervals and simultaneous bands | `gam_predict::partial_effect::partial_effect` | `partial-effect MODEL --term --level --n-points --grid --out` (JSON or CSV) | `Model.partial_dependence` → `PartialEffect`; `Model.plot_terms` draws it | Same Rust function |
 | Posterior coefficient sampling | `gam::inference::sample` / `gam::hmc` | `sample --samples --seed` | `Model.sample` with the same controls | Same Rust sampler |
@@ -48,6 +49,7 @@ The one global flag is `-v/--verbose` (the Python counterpart is the `gamfit` lo
 | `fit` | `DATA`, `FORMULA`; `--request`, `--predict-noise`, `--slope-formula`, `--z-column`, `--weights-column`, `--offset-column`, `--noise-offset-column`, `--frailty-kind`, `--frailty-sd`, `--hazard-loading`, `--transformation-normal`, `--firth`, `--family`, `--negative-binomial-theta`, `--expectile-tau`, `--survival-likelihood`, baseline and time-basis controls, `--scale-dimensions`, `--out` |
 | `predict` | `MODEL NEW_DATA --out`; offset/noise-offset/ID, `--uncertainty`, `--level`, `--covariance-mode`, `--conformal`, `--training-data`, `--calibration` |
 | `transformation-score` | `MODEL LABELLED_DATA --out`; offset and ID columns |
+| `latent-residual` | `MODEL DATA --out`; ID column |
 | `diagnose` | `MODEL DATA` |
 | `partial-effect` | `MODEL --term`; `--level`, `--n-points` or `--grid`, `--out` (`.json` or `.csv`) |
 | `sample` | `MODEL DATA`; `--samples`, `--seed`, `--out` |
@@ -74,7 +76,7 @@ The formula front doors are `fit`, `fit_array`, `validate_formula`, and
 `config`.
 
 The fitted `Model` public workflow methods/properties are `predict`,
-`predict_array`, `transformation_score`, `summary`,
+`predict_array`, `transformation_score`, `latent_conditional_residual`, `summary`,
 `smoothing_parameters`, `check`, `curvature`, `smooth_significance`,
 `basis_check`, `debiased_functional`, `report`, `sample`, `sample_replicates`,
 `iter_replicates`, `design_matrix`, `design_matrix_array`, `difference_smooth`,

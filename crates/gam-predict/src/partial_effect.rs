@@ -21,32 +21,25 @@ use gam_models::inference::model::{
 use gam_models::inference::saved_summary::{
     prediction_model_class_label, scan_introspection, scan_smooth_label,
 };
-use gam_models::survival::predict::{
-    fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
-};
+use gam_models::survival::predict::{resolve_termspec_for_prediction, saved_fit_result};
 use gam_solve::model_types::InferenceCovarianceMode;
-use gam_terms::smooth::build_term_collection_design;
+use gam_terms::smooth::{
+    TermCollectionPredictionDesign, TermCollectionSpec, build_term_collection_prediction_design,
+    build_term_prediction_columns, term_collection_has_nonzero_anchor,
+};
 use ndarray::{Array2, s};
 use serde::Serialize;
-use std::ops::Range;
 
-/// A standard model's mean-block design at some rows, with each term's columns.
-pub struct StandardMeanDesign {
-    pub matrix: Array2<f64>,
-    /// Every non-intercept term's name and global coefficient columns.
-    pub term_ranges: Vec<(String, Range<usize>)>,
-}
+const NONZERO_ANCHOR_DESIGN_ERROR: &str = "design_matrix cannot represent a model with non-zero \
+     smooth anchors as a single coefficient matrix; use Model.predict for the complete affine \
+     predictor";
 
-/// The full mean-block design of a standard GAM at `dataset`'s rows.
-///
-/// This is deliberately distinct from the public affine predictor design. A
-/// link-wiggle's final fitted predictor uses the mean block as its row offset
-/// and a LinkWiggle-frame matrix, so returning this internal matrix from the
-/// public API was the architectural root cause of #2299.
-pub fn standard_mean_design(
+/// The frozen mean-block term specification a term-design diagnostic
+/// evaluates, resolved against the dataset's columns.
+fn standard_mean_termspec(
     model: &FittedModel,
-    dataset: EncodedDataset,
-) -> Result<StandardMeanDesign, String> {
+    dataset: &EncodedDataset,
+) -> Result<TermCollectionSpec, String> {
     // A scan-routed model never materializes a dense B-spline design — the
     // exact O(n) state-space smoother is the whole point — so there is no model
     // matrix to export (#1046).
@@ -74,48 +67,52 @@ pub fn standard_mean_design(
                 .to_string(),
         );
     }
-    let col_map = dataset.column_map();
-    let training_headers = model.training_headers.as_ref();
-    let spec = resolve_termspec_for_prediction(
+    resolve_termspec_for_prediction(
         &model.resolved_termspec,
-        training_headers,
-        &col_map,
+        model.training_headers.as_ref(),
+        &dataset.column_map(),
         "resolved_termspec",
     )
-    .map_err(|err| err.to_string())?;
-    let design = build_term_collection_design(dataset.values.view(), &spec)
-        .map_err(|err| format!("failed to build design matrix: {err}"))?;
-    if design.affine_offset.iter().any(|value| *value != 0.0) {
-        return Err(
-            "design_matrix cannot represent a model with non-zero smooth anchors as a single \
-             coefficient matrix; use Model.predict for the complete affine predictor"
-                .to_string(),
-        );
-    }
-    let term_ranges = design.named_term_ranges();
-    let dense = design
-        .design
-        .try_to_dense_by_chunks("design_matrix prediction design")?;
-    let matrix = append_deployment_extension_columns(
-        model.payload(),
-        dataset.values.view(),
-        &col_map,
-        training_headers,
-        dense,
-    )
-    .map_err(|err| err.to_string())?;
-    Ok(StandardMeanDesign {
-        matrix,
-        term_ranges,
-    })
+    .map_err(|err| err.to_string())
 }
 
-/// [`standard_mean_design`]'s matrix alone.
-pub fn standard_mean_design_dense(
+/// The undensified mean-block design behind [`standard_mean_design`], so a
+/// caller that reads one term's columns never materializes the rest.
+fn standard_mean_prediction_design(
+    model: &FittedModel,
+    dataset: &EncodedDataset,
+) -> Result<TermCollectionPredictionDesign, String> {
+    let spec = standard_mean_termspec(model, dataset)?;
+    let design = build_term_collection_prediction_design(dataset.values.view(), &spec)
+        .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    if design.affine_offset.iter().any(|value| *value != 0.0) {
+        return Err(NONZERO_ANCHOR_DESIGN_ERROR.to_string());
+    }
+    Ok(design)
+}
+
+/// The full mean-block design of a standard GAM at `dataset`'s rows.
+///
+/// This is deliberately distinct from the public affine predictor design. A
+/// link-wiggle's final fitted predictor uses the mean block as its row offset
+/// and a LinkWiggle-frame matrix, so returning this internal matrix from the
+/// public API was the architectural root cause of #2299.
+pub fn standard_mean_design(
     model: &FittedModel,
     dataset: EncodedDataset,
 ) -> Result<Array2<f64>, String> {
-    standard_mean_design(model, dataset).map(|design| design.matrix)
+    let design = standard_mean_prediction_design(model, &dataset)?;
+    let dense = design
+        .design
+        .try_to_dense_by_chunks("design_matrix prediction design")?;
+    append_deployment_extension_columns(
+        model.payload(),
+        dataset.values.view(),
+        &dataset.column_map(),
+        model.training_headers.as_ref(),
+        dense,
+    )
+    .map_err(|err| err.to_string())
 }
 
 /// One term's partial effect on a grid, on the linear-predictor scale.
@@ -145,8 +142,11 @@ pub fn partial_effect(
     level: f64,
 ) -> Result<PartialEffect, String> {
     let table = partial_effect_table(model, term, grid)?;
-    let design = standard_mean_design(model, table.table.clone())?;
-    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let spec = standard_mean_termspec(model, &table.table)?;
+    if term_collection_has_nonzero_anchor(&spec) {
+        return Err(NONZERO_ANCHOR_DESIGN_ERROR.to_string());
+    }
+    let fit = saved_fit_result(model)?;
     let covariance_source = fit.published_covariance_mode();
     let covariance = match covariance_source {
         InferenceCovarianceMode::SmoothingCorrected => fit.beta_covariance_corrected(),
@@ -157,39 +157,45 @@ pub fn partial_effect(
          partial-effect intervals"
             .to_string()
     })?;
-    let p = fit.beta.len();
-    if design.matrix.ncols() != p || covariance.dim() != (p, p) {
-        return Err(format!(
-            "partial effect of {term:?}: the rebuilt design has {} columns and the covariance is \
-             {:?}, but the fit has {p} coefficients",
-            design.matrix.ncols(),
-            covariance.dim()
-        ));
-    }
-    let block = design
-        .term_ranges
-        .iter()
-        .find(|(name, _)| name == term)
-        .map(|(_, range)| range.clone())
-        .ok_or_else(|| {
-            let available: Vec<&str> = design
-                .term_ranges
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .collect();
-            format!(
-                "partial effect: term {term:?} has no coefficient block; available: {available:?}"
-            )
-        })?;
+    // The term's coefficient range is a property of the layout, not of the
+    // rows, so one grid row places it; the grid itself then realizes only the
+    // term's own columns and the blocks they read.
+    let rows = table.table.values.view();
+    let layout =
+        build_term_collection_prediction_design(rows.slice(s![..rows.nrows().min(1), ..]), &spec)
+            .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    let block = layout.term_range(term).ok_or_else(|| {
+        format!(
+            "partial effect: term {term:?} has no coefficient block; available: {:?}",
+            layout.term_names()
+        )
+    })?;
     if block.is_empty() {
         return Err(format!(
             "partial effect: term {term:?} has no coefficients in the fitted model"
         ));
     }
+    let p = fit.beta.len();
+    if block.end > p || covariance.dim() != (p, p) {
+        return Err(format!(
+            "partial effect of {term:?}: columns {block:?} and the {:?} covariance do not fit \
+             the {p} saved coefficients",
+            covariance.dim()
+        ));
+    }
+    let term_design = build_term_prediction_columns(rows, &spec, term)
+        .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    if term_design.ncols() != block.len() {
+        return Err(format!(
+            "partial effect of {term:?}: the term realizes {} columns on the grid but spans \
+             {block:?} in the model layout",
+            term_design.ncols()
+        ));
+    }
     let bands = effect_bands(
         fit.beta.slice(s![block.clone()]),
-        covariance.slice(s![block.clone(), block.clone()]),
-        design.matrix.slice(s![.., block]),
+        covariance.slice(s![block.clone(), block]),
+        term_design.view(),
         level,
     )
     .map_err(|error| format!("partial effect of {term:?}: {error}"))?;

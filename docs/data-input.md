@@ -101,18 +101,34 @@ else the training kind, else `dict`. Override with `return_type=`:
 | --- | --- |
 | `None` | Tabular path only: input kind for pandas/polars/numpy/pyarrow inputs, else training kind, else `dict`. |
 | `"dict"` | `PredictionResult`, a `dict[str, list]` with attribute access to prediction columns. |
-| `"numpy"` | 2-D `numpy.ndarray` with columns in fixed order. |
+| `"numpy"` | Structured `numpy.ndarray` of shape `(n_samples,)` with one named field per prediction column, the same names as the DataFrame result. |
 | `"pandas"` | `pandas.DataFrame`. |
 | `"polars"` | `polars.DataFrame`. |
 | `"pyarrow"` | `pyarrow.Table`. |
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+model = gamfit.fit(pd.DataFrame({"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}), "y ~ s(x)")
+test_df = pd.DataFrame({"x": [1.5, 2.5, 3.5]})
+
 pred = model.predict(test_df, return_type="dict")
 pred["posterior_mean"]
 pred.posterior_mean
-model.predict(test_df, return_type="numpy")
+table = model.predict(test_df, interval=0.95, return_type="numpy")
+table["posterior_mean_lower"]
 model.predict(test_df, return_type="pandas")
 ```
+
+A positional NumPy array passed to `predict` for a model fitted on a named
+table binds to the model's predictor columns in training-table order when its
+width equals their count; any other width raises
+`gamfit.errors.SchemaMismatchError` naming the expected columns. A model fitted
+on an array keeps reading its columns as `x0`, `x1`, ….
 
 ## Array-returning model classes
 
@@ -121,6 +137,15 @@ a 1-D `numpy.ndarray` of shape `(n_samples,)` by default. Passing
 `id_column=` or `return_type=` switches them to tabular output.
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 4, 300)
+train_df = pd.DataFrame({"x": x, "y": np.sin(x) + rng.gamma(2.0, 0.3, 300)})   # right-skewed noise
+test_df = pd.DataFrame({"patient": ["P001", "P002", "P003"], "x": [0.5, 2.0, 3.5]})
+
 model = gamfit.fit(train_df, "y ~ s(x)", transformation_normal=True)
 
 # 1-D numpy by default: the response-scale conditional mean E[Y|x]
@@ -145,6 +170,13 @@ A column that is not part of the model can be carried through to the
 output by naming it with `id_column=`:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+model = gamfit.fit({"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}, "y ~ s(x)")
+
 preds = model.predict(
     [
         {"patient_id": "P001", "x": 1.5},

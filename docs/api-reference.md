@@ -15,11 +15,11 @@ classes (`gamfit.__all__`):
 `JointEventModel`, `CtnStage1`, `__version__`.
 
 Everything else lives in a public submodule, imported on first access
-(`gamfit.errors.GamError`, or `from gamfit.errors import GamError`):
+(`gamfit.errors.GamfitError`, or `from gamfit.errors import GamfitError`):
 
 | Submodule | Contents |
 | --- | --- |
-| `gamfit.errors` | exception hierarchy rooted at `GamError`, plus `GamInferenceWarning` |
+| `gamfit.errors` | exception hierarchy rooted at `GamfitError`, plus `GamInferenceWarning` |
 | `gamfit.results` | prediction, summary, diagnostics, and posterior-sample result types |
 | `gamfit.plot` | matplotlib plotting (optional `gamfit[plot]` extra) |
 | `gamfit.smooth` | formula term specifications (`BSpline`, `Duchon`, `LatentCoord`, ...) |
@@ -688,7 +688,9 @@ Everything else lives in a public submodule, imported on first access
 
 ## Exceptions
 
-::: gamfit.errors.GamError
+See [Exceptions](exceptions.md) for the hierarchy and when each is raised.
+
+::: gamfit.errors.GamfitError
     options:
       show_root_heading: true
       heading_level: 3
@@ -698,12 +700,22 @@ Everything else lives in a public submodule, imported on first access
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.errors.SchemaMismatchError
+::: gamfit.errors.DataError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.errors.PredictionError
+::: gamfit.errors.ConvergenceError
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.errors.NotFittedError
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.errors.InternalError
     options:
       show_root_heading: true
       heading_level: 3
@@ -713,22 +725,7 @@ Everything else lives in a public submodule, imported on first access
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.errors.AloError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.ArrowSchurError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.errors.BasisError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.CacheStoreError
     options:
       show_root_heading: true
       heading_level: 3
@@ -743,27 +740,7 @@ Everything else lives in a public submodule, imported on first access
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.errors.CorrectedCovarianceError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.CubicCellKernelError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.CustomFamilyError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.DataError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.DeviationRuntimeError
+::: gamfit.errors.DictionaryConvergenceError
     options:
       show_root_heading: true
       heading_level: 3
@@ -774,16 +751,6 @@ Everything else lives in a public submodule, imported on first access
       heading_level: 3
 
 ::: gamfit.errors.FitConvergenceError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.InnerModeConvergenceError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.FitError
     options:
       show_root_heading: true
       heading_level: 3
@@ -808,22 +775,7 @@ Everything else lives in a public submodule, imported on first access
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.errors.FittedModelError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.GamlssError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.errors.GeometryError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.GpuError
     options:
       show_root_heading: true
       heading_level: 3
@@ -838,17 +790,12 @@ Everything else lives in a public submodule, imported on first access
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.errors.HmcError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.IdentifiabilityCompilerError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.errors.IllConditionedError
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.errors.InnerModeConvergenceError
     options:
       show_root_heading: true
       heading_level: 3
@@ -873,47 +820,12 @@ Everything else lives in a public submodule, imported on first access
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.errors.JointPenaltyError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.LatentSurvivalError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.errors.LayoutError
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.errors.LinearAlgebraError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.errors.LinearSystemSolveError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.LognormalKernelError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.MapUniquenessError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.MatrixError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.MatrixMaterializationError
     options:
       show_root_heading: true
       heading_level: 3
@@ -929,11 +841,6 @@ Everything else lives in a public submodule, imported on first access
       heading_level: 3
 
 ::: gamfit.errors.MonotoneRootError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.OuterStrategyError
     options:
       show_root_heading: true
       heading_level: 3
@@ -958,7 +865,7 @@ Everything else lives in a public submodule, imported on first access
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.errors.PredictInputError
+::: gamfit.errors.PredictionError
     options:
       show_root_heading: true
       heading_level: 3
@@ -968,52 +875,7 @@ Everything else lives in a public submodule, imported on first access
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.errors.ScaleDesignError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.SmoothError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.SurvivalConstructionError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.SurvivalError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.SurvivalLocationScaleError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.SurvivalMarginalSlopeError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.SurvivalPredictError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.TermBuilderError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.TransformationNormalError
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.errors.UnsupportedLinkError
+::: gamfit.errors.SchemaMismatchError
     options:
       show_root_heading: true
       heading_level: 3

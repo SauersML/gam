@@ -20,8 +20,6 @@ from . import _rust
 
 class RustModule(Protocol):
     ARDPenalty: type[_rust.ARDPenalty]
-    AloError: type[_rust.AloError]
-    ArrowSchurError: type[_rust.ArrowSchurError]
     AtomBirthGate: type[_rust.AtomBirthGate]
     AtomCore: type[_rust.AtomCore]
     AuxConditionalPriorPenalty: type[_rust.AuxConditionalPriorPenalty]
@@ -29,65 +27,49 @@ class RustModule(Protocol):
     BlockOrthogonalityPenalty: type[_rust.BlockOrthogonalityPenalty]
     BlockSparseDictStream: type[_rust.BlockSparseDictStream]
     BlockSparsityPenalty: type[_rust.BlockSparsityPenalty]
-    CacheStoreError: type[_rust.CacheStoreError]
     CalibratorError: type[_rust.CalibratorError]
     CircleManifold: type[_rust.CircleManifold]
     ColumnNotFoundError: type[_rust.ColumnNotFoundError]
-    CorrectedCovarianceError: type[_rust.CorrectedCovarianceError]
-    CubicCellKernelError: type[_rust.CubicCellKernelError]
-    CustomFamilyError: type[_rust.CustomFamilyError]
+    ConvergenceError: type[_rust.ConvergenceError]
     DataError: type[_rust.DataError]
-    DeviationRuntimeError: type[_rust.DeviationRuntimeError]
     DictionaryConvergenceError: type[_rust.DictionaryConvergenceError]
     EigendecompositionError: type[_rust.EigendecompositionError]
     EuclideanManifold: type[_rust.EuclideanManifold]
     FitConvergenceError: type[_rust.FitConvergenceError]
-    FitError: type[_rust.FitError]
     FitInputError: type[_rust.FitInputError]
     FitInvariantError: type[_rust.FitInvariantError]
     FitNumericalError: type[_rust.FitNumericalError]
     FitSeedError: type[_rust.FitSeedError]
-    FittedModelError: type[_rust.FittedModelError]
     FittedTransport: type[_rust.FittedTransport]
     FormulaError: type[_rust.FormulaError]
-    GamError: type[_rust.GamError]
-    GamlssError: type[_rust.GamlssError]
+    GamfitError: type[_rust.GamfitError]
     GeometryError: type[_rust.GeometryError]
-    GpuError: type[_rust.GpuError]
     GradientUnavailableError: type[_rust.GradientUnavailableError]
     GrassmannManifold: type[_rust.GrassmannManifold]
     HessianNotPositiveDefiniteError: type[_rust.HessianNotPositiveDefiniteError]
-    HmcError: type[_rust.HmcError]
-    IdentifiabilityCompilerError: type[_rust.IdentifiabilityCompilerError]
     IllConditionedError: type[_rust.IllConditionedError]
     InnerModeConvergenceError: type[_rust.InnerModeConvergenceError]
     IntegrationError: type[_rust.IntegrationError]
+    InternalError: type[_rust.InternalError]
     InvalidConfigurationError: type[_rust.InvalidConfigurationError]
     InvalidInputError: type[_rust.InvalidInputError]
     InvalidSpecificationError: type[_rust.InvalidSpecificationError]
     IsometryPenalty: type[_rust.IsometryPenalty]
     IvaeRidgeMeanGauge: type[_rust.IvaeRidgeMeanGauge]
-    JointPenaltyError: type[_rust.JointPenaltyError]
-    LatentSurvivalError: type[_rust.LatentSurvivalError]
     LayoutError: type[_rust.LayoutError]
-    LinearAlgebraError: type[_rust.LinearAlgebraError]
     LinearSystemSolveError: type[_rust.LinearSystemSolveError]
-    LognormalKernelError: type[_rust.LognormalKernelError]
     ManifoldBehaviorCore: type[_rust.ManifoldBehaviorCore]
     ManifoldCrosscoderCore: type[_rust.ManifoldCrosscoderCore]
     ManifoldSAE: type[_rust.ManifoldSAE]
     ManifoldSAESupport: type[_rust.ManifoldSAESupport]
-    MapUniquenessError: type[_rust.MapUniquenessError]
-    MatrixError: type[_rust.MatrixError]
-    MatrixMaterializationError: type[_rust.MatrixMaterializationError]
     MechanismSparsityPenalty: type[_rust.MechanismSparsityPenalty]
     MissingDependencyError: type[_rust.MissingDependencyError]
     ModelOverparameterizedError: type[_rust.ModelOverparameterizedError]
     MonotoneRootError: type[_rust.MonotoneRootError]
+    NotFittedError: type[_rust.NotFittedError]
     NuclearNormPenalty: type[_rust.NuclearNormPenalty]
     OrderedBetaBernoulliPenalty: type[_rust.OrderedBetaBernoulliPenalty]
     OrthogonalityPenalty: type[_rust.OrthogonalityPenalty]
-    OuterStrategyError: type[_rust.OuterStrategyError]
     ParameterConstraintError: type[_rust.ParameterConstraintError]
     ParametricAuxConditionalPriorPenalty: type[_rust.ParametricAuxConditionalPriorPenalty]
     PenaltySpectrumError: type[_rust.PenaltySpectrumError]
@@ -99,10 +81,8 @@ class RustModule(Protocol):
     RESPONSE_GEOMETRY_SCHEMA: str
     RemlConvergenceError: type[_rust.RemlConvergenceError]
     ScadMcpPenalty: type[_rust.ScadMcpPenalty]
-    ScaleDesignError: type[_rust.ScaleDesignError]
     SchemaMismatchError: type[_rust.SchemaMismatchError]
     SheafConsistencyPenalty: type[_rust.SheafConsistencyPenalty]
-    SmoothError: type[_rust.SmoothError]
     SmoothThresholdPenalty: type[_rust.SmoothThresholdPenalty]
     SoftmaxAssignmentSparsityPenalty: type[_rust.SoftmaxAssignmentSparsityPenalty]
     SparseDictStream: type[_rust.SparseDictStream]
@@ -110,18 +90,10 @@ class RustModule(Protocol):
     SpdManifold: type[_rust.SpdManifold]
     SphereManifold: type[_rust.SphereManifold]
     StiefelManifold: type[_rust.StiefelManifold]
-    SurvivalConstructionError: type[_rust.SurvivalConstructionError]
-    SurvivalError: type[_rust.SurvivalError]
-    SurvivalLocationScaleError: type[_rust.SurvivalLocationScaleError]
-    SurvivalMarginalSlopeError: type[_rust.SurvivalMarginalSlopeError]
-    SurvivalPredictError: type[_rust.SurvivalPredictError]
-    TermBuilderError: type[_rust.TermBuilderError]
     Tier0SAE: type[_rust.Tier0SAE]
     TopKActivationPenalty: type[_rust.TopKActivationPenalty]
     TorusManifold: type[_rust.TorusManifold]
     TotalVariationPenalty: type[_rust.TotalVariationPenalty]
-    TransformationNormalError: type[_rust.TransformationNormalError]
-    UnsupportedLinkError: type[_rust.UnsupportedLinkError]
     _EncodedTable: type[_rust._EncodedTable]
     _EventHistoryModel: type[_rust._EventHistoryModel]
     _FittedModel: type[_rust._FittedModel]
@@ -415,7 +387,11 @@ class RustModule(Protocol):
     @staticmethod
     def is_multinomial_family_name(family: str) -> bool: ...
     @staticmethod
+    def kl_measurement_floor(logit_format: str, vocab_size: int, logit_max_abs: float, logit_max_abs_change: float, control_nats: float) -> dict[Any, Any]: ...
+    @staticmethod
     def label_shuffle_permutation(n_rows: int, seed: int, draw: int) -> NDArray[np.uint64]: ...
+    @staticmethod
+    def latent_conditional_residual_table(model: _rust._FittedModel, headers: Sequence[str], rows: _rust._EncodedTable) -> NDArray[np.float64] | None: ...
     @staticmethod
     def lawley_bartlett_factor(design: NDArray[np.float64], family: str, eta: NDArray[np.float64], tested_start: int, tested_end: int, ref_df: float, penalty: NDArray[np.float64] | None = ..., dispersion: float = ..., prior_weights: NDArray[np.float64] | None = ..., lr_statistic: float | None = ...) -> dict[Any, Any]: ...
     @staticmethod
@@ -451,7 +427,7 @@ class RustModule(Protocol):
     @staticmethod
     def manifold_metric_tensor(manifold_json: str, point: NDArray[np.float64]) -> NDArray[np.float64]: ...
     @staticmethod
-    def marginal_slope_clip_probabilities(values: Sequence[float]) -> list[float]: ...
+    def marginal_slope_clip_probabilities(values: NDArray[np.float64]) -> NDArray[np.float64]: ...
     @staticmethod
     def matern_basis(points: NDArray[np.float64], centers: NDArray[np.float64], length_scale: float = ..., nu: str = ..., aniso_log_scales: NDArray[np.float64] | None = ...) -> NDArray[np.float64]: ...
     @staticmethod
@@ -488,8 +464,6 @@ class RustModule(Protocol):
     def numerics_inverse_softplus(x: NDArray[np.float64]) -> NDArray[np.float64]: ...
     @staticmethod
     def numerics_sigmoid_stable(x: NDArray[np.float64]) -> NDArray[np.float64]: ...
-    @staticmethod
-    def ordered_prediction_columns(columns_json: str) -> str: ...
     @staticmethod
     def parameter_decomposition_run(request_json: str, tensors: dict[Any, Any]) -> tuple[str, dict[Any, Any]]: ...
     @staticmethod
@@ -549,6 +523,8 @@ class RustModule(Protocol):
     @staticmethod
     def poincare_to_lorentz(y: NDArray[np.float64], curvature: float) -> NDArray[np.float64]: ...
     @staticmethod
+    def positional_prediction_headers(model: _rust._FittedModel, width: int) -> list[str]: ...
+    @staticmethod
     def posterior_coefficient_names_json(request_json: str) -> str: ...
     @staticmethod
     def posterior_credible_interval(samples: NDArray[np.float64], level: float) -> NDArray[np.float64]: ...
@@ -571,11 +547,11 @@ class RustModule(Protocol):
     @staticmethod
     def predict_multinomial_intervals_pyfunc(model_bytes: Sequence[int], headers: Sequence[str], rows: _rust._EncodedTable, level: float = ...) -> dict[Any, Any]: ...
     @staticmethod
-    def predict_table(model: _rust._FittedModel, headers: Sequence[str], rows: _rust._EncodedTable, interval: float | None, covariance_mode: str | None = ..., observation_interval: bool | None = ...) -> str: ...
+    def predict_table(model: _rust._FittedModel, headers: Sequence[str], rows: _rust._EncodedTable, interval: float | None, covariance_mode: str | None = ..., observation_interval: bool | None = ...) -> Any: ...
     @staticmethod
-    def predict_table_conformal(model: _rust._FittedModel, headers: Sequence[str], rows: _rust._EncodedTable, calibration_headers: Sequence[str], calibration_rows: _rust._EncodedTable, conformal_level: float, options_json: str | None = ...) -> str: ...
+    def predict_table_conformal(model: _rust._FittedModel, headers: Sequence[str], rows: _rust._EncodedTable, calibration_headers: Sequence[str], calibration_rows: _rust._EncodedTable, conformal_level: float, options_json: str | None = ...) -> Any: ...
     @staticmethod
-    def predict_table_full_conformal(model: _rust._FittedModel, headers: Sequence[str], rows: _rust._EncodedTable, training_headers: Sequence[str], training_rows: _rust._EncodedTable, conformal_level: float = ...) -> str: ...
+    def predict_table_full_conformal(model: _rust._FittedModel, headers: Sequence[str], rows: _rust._EncodedTable, training_headers: Sequence[str], training_rows: _rust._EncodedTable, conformal_level: float = ...) -> Any: ...
     @staticmethod
     def randomization_p_value(observed: float, null_statistics: NDArray[np.float64]) -> tuple[int, float]: ...
     @staticmethod
@@ -669,7 +645,7 @@ class RustModule(Protocol):
     @staticmethod
     def sae_manifold_payload_roundtrip(payload_json: str) -> str: ...
     @staticmethod
-    def sae_manifold_predict_oos(x_new: NDArray[np.float64], geometry_plans: object, decoder_blocks: Sequence[NDArray[np.float64]], alpha: float, tau: float, assignment_kind: str, max_iter: int = ..., learning_rate: float = ..., ridge_ext_coord: float = ..., initial_logits: NDArray[np.float64] | None = ..., initial_coords: NDArray[np.float64] | None = ..., threshold_gate_threshold: float = ..., top_k: int | None = ..., hybrid_linear_images: Sequence[tuple[int, float, NDArray[np.float64], NDArray[np.float64], NDArray[np.float64] | None]] | None = ..., log_lambda_sparse: float | None = ..., log_lambda_smooth: Sequence[float] | None = ..., log_ard: Sequence[Sequence[float]] | None = ..., learnable_alpha: bool = ...) -> dict[Any, Any]: ...
+    def sae_manifold_predict_oos(x_new: NDArray[np.float64], geometry_plans: object, decoder_blocks: Sequence[NDArray[np.float64]], alpha: float, tau: float, assignment_kind: str, ridge_ext_coord: float = ..., initial_logits: NDArray[np.float64] | None = ..., initial_coords: NDArray[np.float64] | None = ..., threshold_gate_threshold: float = ..., top_k: int | None = ..., hybrid_linear_images: Sequence[tuple[int, float, NDArray[np.float64], NDArray[np.float64], NDArray[np.float64] | None]] | None = ..., log_lambda_sparse: float | None = ..., log_lambda_smooth: Sequence[float] | None = ..., log_ard: Sequence[Sequence[float]] | None = ..., learnable_alpha: bool = ...) -> dict[Any, Any]: ...
     @staticmethod
     def sae_manifold_reconstruct_ffi(geometry_plans: object, decoder_blocks: Sequence[NDArray[np.float64]], coords: Sequence[NDArray[np.float64]], assignments: NDArray[np.float64], p_out: int) -> NDArray[np.float64]: ...
     @staticmethod
@@ -713,7 +689,7 @@ class RustModule(Protocol):
     @staticmethod
     def sinkhorn_geodesic_sphere_cost(directions: NDArray[np.float64]) -> NDArray[np.float64]: ...
     @staticmethod
-    def sklearn_fit_metadata(columns: Sequence[str], formula: str | None, target_column: str | None = ..., has_external_target: bool = ...) -> tuple[str, list[str], str]: ...
+    def sklearn_fit_metadata(columns: Sequence[str], formula: str | None, target_column: str | None = ..., has_external_target: bool = ..., has_sample_weight: bool = ...) -> tuple[str, list[str], str, str | None]: ...
     @staticmethod
     def skovgaard_r_star(contrast: NDArray[np.float64], beta: NDArray[np.float64], penalized_hessian: NDArray[np.float64], row_scores: NDArray[np.float64], lr_statistic: float, fisher_information: NDArray[np.float64] | None = ..., theta_null: float = ...) -> dict[Any, Any]: ...
     @staticmethod
@@ -822,10 +798,6 @@ class RustModule(Protocol):
     def transformation_score_table(model: _rust._FittedModel, headers: Sequence[str], rows: _rust._EncodedTable) -> NDArray[np.float64]: ...
     @staticmethod
     def validate_formula_json(headers: Sequence[str], rows: _rust._EncodedTable, formula: str, config_json: str | None) -> str: ...
-    @staticmethod
-    def vec_to_array1_f64(values: Sequence[float]) -> NDArray[np.float64]: ...
-    @staticmethod
-    def weighted_auc_from_predictions(observed: Sequence[float], predicted_mean: Sequence[float], weights: Sequence[float]) -> float: ...
     @staticmethod
     def weighted_sum_to_zero_transform(basis: NDArray[np.float64], weights: NDArray[np.float64] | None = ...) -> NDArray[np.float64]: ...
     @staticmethod

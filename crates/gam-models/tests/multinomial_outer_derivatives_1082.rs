@@ -160,12 +160,7 @@ fn jeffreys_outer_gradient_and_hessian_match_the_criterion() {
 fn armed_fit_certifies_on_the_exact_jeffreys_outer_hessian_2898() {
     let family = quasi_separated_family(true);
     let specs = family.build_block_specs();
-    let options = BlockwiseFitOptions {
-        // The production formula route pins its seed instead of screening
-        // (`fit_penalized_multinomial_formula`, #715).
-        screen_initial_rho: false,
-        ..laplace_options()
-    };
+    let options = laplace_options();
     let fit = fit_custom_family_with_rho_prior(&family, &specs, &options, RhoPrior::Flat)
         .expect("the armed quasi-separated multinomial fit must certify");
     // Printed before the assertions below, so a refused premise is still readable.

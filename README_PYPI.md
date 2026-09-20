@@ -108,17 +108,29 @@ double-cover parameterization, not a twisted Möbius-strip basis.
 ## API examples
 
 ```python
+import numpy as np
+import pandas as pd
 import gamfit
 from gamfit.sklearn import GAMRegressor, GAMClassifier
 
+rng = np.random.default_rng(0)
+train = pd.DataFrame({"x": rng.uniform(0, 10, 300), "site": rng.choice(["A", "B", "C"], 300)})
+train["y"] = np.sin(train.x) + (train.site == "B") + rng.normal(0, 0.3, 300)
+test = train.drop(columns="y").head(5)
+X, y = train[["x"]], train["y"].to_numpy()
+
 # Validate before you fit
 gamfit.validate_formula(train, "y ~ s(x) + group(site)")
+model = gamfit.fit(train, "y ~ s(x) + group(site)")
 
 # Posterior sampling and mean bands
 posterior = model.sample(train, seed=42)
 bands = posterior.predict(test, level=0.95)
 
 # Survival
+age, bmi = rng.uniform(30, 80, 400), rng.normal(25, 4, 400)
+t = 15 * rng.weibull(1.5, 400) * np.exp(-(age - 55) / 20 - (bmi - 25) / 10)
+df = pd.DataFrame({"entry": 0.0, "exit": np.minimum(t, 25), "event": (t < 25) * 1.0, "age": age, "bmi": bmi})
 gamfit.fit(df,
     "Surv(entry, exit, event) ~ s(age) + bmi + timewiggle(internal_knots=6)",
     survival_likelihood="transformation",

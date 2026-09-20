@@ -9,8 +9,9 @@
 //! `SurvivalPredictEstimand::PosteriorMean` publishes the posterior-predictive
 //! law: `E_θ[S(t; θ)]`, and the hazard of that law, `E_θ[f(t; θ)]/E_θ[S(t; θ)]`.
 //! Both integrations it can run are measured here against Monte Carlo over the
-//! full coefficient posterior, every draw run through the production plug-in
-//! prediction (anchor re-solved per draw): the `2·rank` sigma-point rule, exact
+//! full coefficient posterior, every draw evaluated by the per-coefficient law
+//! both integrations sum (`predict_survival_coefficient_law`, anchor re-solved
+//! per draw): the `2·rank` sigma-point rule, exact
 //! for cubic functionals of `θ` only, and the exact integration over the
 //! bivariate Gaussian law of `(q(t), b(t))` (both affine in `θ`) with the anchor
 //! re-solved at every node, which is what the pass publishes. The event density
@@ -38,7 +39,8 @@ use gam_models::inference::model::FittedModel;
 use gam_models::inference::model_payload_builders::fit_formula_to_payload;
 use gam_models::survival::predict::{
     SurvivalPosteriorIntegration, SurvivalPredictEstimand, SurvivalPredictRequest,
-    SurvivalPredictionCovarianceMode, predict_survival, predict_survival_posterior_mean_with,
+    SurvivalPredictionCovarianceMode, predict_survival, predict_survival_coefficient_law,
+    predict_survival_posterior_mean_with,
 };
 use ndarray::{Array1, Array2};
 use std::collections::HashMap;
@@ -165,6 +167,10 @@ fn survival_prediction_frame() -> (Array2<f64>, HashMap<String, usize>, Vec<f64>
 #[derive(Clone, Copy, Debug)]
 enum Surface {
     PlugIn,
+    /// The per-coefficient law a posterior integration sums
+    /// (`predict_survival_coefficient_law`): where a draw's survival rises its
+    /// hazard is the negative `dH/dt` it is, which the plug-in refuses to publish.
+    CoefficientLaw,
     /// `predict_survival` under its default posterior-mean estimand.
     Published,
     /// The posterior mean under a named integration.
@@ -201,6 +207,7 @@ fn survival_surfaces(
     let mode = SurvivalPredictionCovarianceMode::Conditional;
     let result = match surface {
         Surface::PlugIn => predict_survival(request, mode),
+        Surface::CoefficientLaw => predict_survival_coefficient_law(request, mode),
         Surface::Published => predict_survival(
             SurvivalPredictRequest {
                 estimand: SurvivalPredictEstimand::PosteriorMean,
@@ -257,8 +264,11 @@ struct MonteCarloReference {
     mean_draw_hazard: Array2<f64>,
 }
 
-/// Every draw is run through the production plug-in prediction, anchor
-/// re-solved per draw.
+/// Every draw is evaluated by the per-coefficient law the sigma-point nodes sum,
+/// anchor re-solved per draw. Its density is signed where a draw's survival
+/// rises, so `mean(f)` is exactly `−d/dt mean(S)` (gam#3026). On this fixture
+/// such a draw is not rare: at some requested cell the survival of 0.24% of the
+/// `N(θ̂, V)` draws rises, and of 17% of the `N(θ̂, 9V)` draws (5,000 each).
 fn survival_monte_carlo_reference(
     model: &FittedModel,
     data: &Array2<f64>,
@@ -304,7 +314,8 @@ fn survival_monte_carlo_reference(
                 standard.mapv_inplace(|_| gaussian(&mut state));
                 let theta = &theta_hat + &factor.dot(&standard);
                 assign_survival_coefficients(&mut draw_model, &theta);
-                let draw = survival_surfaces(&draw_model, data, col_map, times, Surface::PlugIn);
+                let draw =
+                    survival_surfaces(&draw_model, data, col_map, times, Surface::CoefficientLaw);
                 sums[0] += &draw.survival;
                 sums[1] += &draw.survival.mapv(|s| s * s);
                 sums[2] += &draw.density;

@@ -213,16 +213,33 @@ def build_info() -> dict[str, Any]:
     """Return build/runtime metadata for the Rust extension.
 
     Reports whether ``gamfit._rust`` was importable and, when available, the
-    build-time information exposed by the extension (version, commit, feature
-    flags). Useful for bug reports and for confirming a development build is
-    being used.
+    build-time information the extension exposes. ``commit``, ``dirty`` and
+    ``model_payload_version`` tell two engines apart. The crate ``version``
+    below is the static release line, which every commit between releases
+    shares. ``gamfit.__version__`` also names the commit when the build was
+    stamped by ``scripts/gamfit_version.py``, as ``./build.sh maturin`` does
+    (gam#3157).
 
     Returns
     -------
     dict
         Always contains ``available`` (bool) and ``module`` (str). When the
-        extension loaded, additional engine-specific keys are merged in;
-        otherwise ``reason`` describes why import failed.
+        extension loaded it also contains:
+
+        - ``version`` (str): the gam-pyffi crate version, the release line in
+          ``pyproject.toml``.
+        - ``commit`` (str or None): the full hash of the gam commit the
+          extension was built from; None when the build had no gam git tree
+          to read, as for a build from an unpacked sdist.
+        - ``dirty`` (bool or None): whether the tracked files differed from
+          ``commit`` at build time, so that the extension is not exactly that
+          commit's engine; None when ``commit`` is None.
+        - ``model_payload_version`` (int): the saved-model format this engine
+          writes. A model saved with a newer payload version is refused by name.
+        - ``capabilities`` and ``supported_model_classes`` (lists of str), and
+          ``cuda_diagnostics`` (dict).
+
+        When the extension did not load, ``reason`` describes why.
 
     Examples
     --------
@@ -839,6 +856,7 @@ def fit(
     expectile_tau:
         Optional expectile level in the open interval ``(0, 1)`` for
         ``family="expectile"``, or a strictly increasing sequence of levels.
+        Passing it with any other family raises.
         A sequence is fitted jointly as one location-scale model whose level
         curves ``mu(x) + c_tau * E[sigma(x)]`` never cross; ``predict`` then
         returns an ``(n, K)`` array with one column per level. This is the
@@ -1078,7 +1096,7 @@ def fit(
         For missing response-geometry fields, invalid penalty targets, invalid
         Fisher-Rao blocks, or formula/data mismatches surfaced before the Rust
         fit.
-    GamError
+    GamfitError
         Rust engine errors are mapped into the typed gamfit exception
         hierarchy.
     """
@@ -1414,7 +1432,7 @@ def loads(model_bytes: bytes) -> LoadedModel:
 
     Raises
     ------
-    GamError
+    GamfitError
         If the payload is malformed or incompatible with the current engine.
 
     Examples
@@ -1598,7 +1616,7 @@ def explain_error(exc: BaseException) -> str:
 
     Inspects the exception type and returns a one-line suggestion tailored to
     the gamfit error hierarchy (:class:`FormulaError`,
-    :class:`SchemaMismatchError`, :class:`PredictionError`, :class:`GamError`,
+    :class:`SchemaMismatchError`, :class:`PredictionError`, :class:`GamfitError`,
     :class:`RustExtensionUnavailableError`). Unrecognized exceptions fall back
     to a generic message.
 
@@ -1616,7 +1634,7 @@ def explain_error(exc: BaseException) -> str:
     --------
     >>> try:
     ...     gamfit.fit(df, "y ~ s(nope)")
-    ... except gamfit.errors.GamError as exc:
+    ... except gamfit.errors.GamfitError as exc:
     ...     print(gamfit.explain_error(exc))
     Check the formula syntax and confirm every referenced column exists.
     """
@@ -1625,7 +1643,7 @@ def explain_error(exc: BaseException) -> str:
     from ._exceptions import (
         ColumnNotFoundError,
         FormulaError,
-        GamError,
+        GamfitError,
         PredictionError,
         SchemaMismatchError,
     )
@@ -1664,7 +1682,7 @@ def explain_error(exc: BaseException) -> str:
         return "Compare the serving data with the training schema using model.check(...)."
     if isinstance(exc, PredictionError):
         return "Prediction failed. Validate the new data and confirm the fitted model is supported by the Python binding."
-    if isinstance(exc, GamError):
+    if isinstance(exc, GamfitError):
         return "The Rust engine returned an error. Inspect the exception message for the underlying failure detail."
     return "Unexpected error. Inspect the full traceback and the original exception message."
 

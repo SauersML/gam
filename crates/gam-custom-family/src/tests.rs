@@ -3,6 +3,7 @@
 //! as `#[cfg(test)] mod tests;`; reaches the FD helper via `super::test_support`.
 
 use super::*;
+use crate::test_support::outerobjectivegradienthessian_labeled;
 
 pub(crate) fn test_design_hyper_layout(
     design_derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
@@ -2566,21 +2567,6 @@ pub(crate) fn logdet_intent_takes_dense_while_inner_solve_takes_operator() {
 }
 
 #[test]
-pub(crate) fn custom_family_default_outer_seed_config_is_tightened_for_expensive_paths() {
-    let family = OneBlockIdentityFamily;
-
-    let small = family.outer_seed_config(4);
-    assert_eq!(small.max_seeds, 6);
-    assert_eq!(small.seed_budget, 1);
-    assert_eq!(small.screen_max_inner_iterations, 2);
-
-    let large = family.outer_seed_config(16);
-    assert_eq!(large.max_seeds, 4);
-    assert_eq!(large.seed_budget, 1);
-    assert_eq!(large.screen_max_inner_iterations, 2);
-}
-
-#[test]
 pub(crate) fn finite_working_weight_certificate_preserves_zero_tiny_and_signed_rows_bit_exactly() {
     let weights = array![0.0, f64::from_bits(1), 1.0e-16, -1.0e-9, 0.25];
     let certified = certify_finite_working_weights(&weights).expect("finite signed weights");
@@ -3967,48 +3953,6 @@ pub(crate) fn nonconverged_inner_refuses_profile_derivatives() {
         msg.contains("inner solve did not converge") && msg.contains("refusing to expose"),
         "unexpected error: {msg}"
     );
-}
-
-#[test]
-pub(crate) fn custom_family_seed_screening_proxy_ranks_partial_fit_without_laplace_terms() {
-    let specs = vec![default_diagonal_exact_hook_spec()];
-    let penalty_counts = validate_blockspecs(&specs).expect("valid test spec");
-    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
-        .expect("valid label layout");
-    let options = BlockwiseFitOptions {
-        use_remlobjective: true,
-        use_outer_hessian: true,
-        compute_covariance: false,
-        inner_max_cycles: 1,
-        ..BlockwiseFitOptions::default()
-    };
-
-    let (score, warm_start, inner_converged) = custom_family_seed_screening_proxy_labeled(
-        &DefaultDiagonalExactHookFamily,
-        &specs,
-        &options,
-        &layout,
-        &array![0.0],
-        None,
-        &gam_problem::RhoPrior::Flat,
-    )
-    .expect("screening proxy should score a finite partial inner solve");
-
-    assert!(score.is_finite());
-    assert!(
-        !inner_converged,
-        "one-cycle screening is expected to be a partial inner fit"
-    );
-    assert_eq!(warm_start.rho, array![0.0]);
-    assert_eq!(warm_start.block_beta.len(), 1);
-    let cached = warm_start
-        .cached_inner
-        .expect("screening warm start owns the partial inner iterate");
-    assert!(!cached.converged);
-    assert!(cached.block_logdet_h.is_none());
-    assert!(cached.block_logdet_s.is_none());
-    let expected = -cached.log_likelihood + cached.penalty_value;
-    assert_eq!(score.to_bits(), expected.to_bits());
 }
 
 #[test]
@@ -6979,12 +6923,7 @@ pub(crate) fn certified_test_outer(
         .with_hessian(gam_problem::DeclaredHessianForm::Dense)
         .with_disable_fixed_point(true)
         .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Disabled)
-        .with_initial_rho(theta)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..gam_problem::SeedConfig::default()
-        });
+        .with_initial_rho(theta);
     let mut outer_objective = problem.build_objective(
         (),
         move |_: &mut (), point: &Array1<f64>| {
@@ -7887,6 +7826,7 @@ mod joint_hessian_drift_fd_979;
 
 mod residual_summand_floor_2976;
 mod walk_endpoint_mode_2627;
+mod warm_start_retention_2996;
 
 /// gam#2360. `audit_converged_identifiability` handed the drift audit a bare
 /// `vec![0.0; n]` as the pilot β. The pilot the PRE-FIT audit linearized at is

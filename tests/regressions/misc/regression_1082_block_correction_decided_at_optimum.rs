@@ -16,17 +16,28 @@
 //! - `y ~ s(x, k=8) + s(z, k=8)` on seed 7: the verdict engages at the start
 //!   `−6` and declines at the optimum (`max|γ| = 0.083` against `τ = 0.173`).
 //!   Before, the start `−6` latched the correction and the start `3` never did,
-//!   so the two fits published different models (`ρ₃` apart by `5.6e-4`).
-//!   After, both decline at the same optimum.
+//!   so the two fits optimized different criteria. After, both decline at the
+//!   optimum.
 //! - `y ~ s(x, k=10)` on seed 1: the verdict engages at the optimum
 //!   (`max|γ| = 0.286` against `τ = 0.200`). Before, both starts latched, but at
 //!   different points of their paths (`−6` itself, and a mid-path point), so the
 //!   latched rules and the published optima differed (`ρ₁` `4.803257` against
-//!   `4.804257`). After, both admit at the same Laplace optimum and publish the
-//!   same corrected optimum.
+//!   `4.804257`). After, both admit at the Laplace optimum and latch the same
+//!   rule and block.
 //!
-//! The fit is a deterministic function of the Laplace optimum, which both starts
-//! reach at the same point, so the published point agrees bit for bit.
+//! What the two starts share, and what they do not (#3280). The admission, the
+//! latched rule and the latched block are properties of the model, so they are
+//! the same from either start. The published `ρ` is not the same float: it is
+//! the point where each start's search met its certificate, and nothing after a
+//! declined decision moves it. The outer certificate resolves the criterion to
+//! its statistical resolution `τ_stat = 1/(2n)` (`OuterProblemSize::
+//! statistical_resolution`), a decrease that changes no reported quantity by
+//! more than the error of the inference built on it, so two starts publish the
+//! same model to that resolution, not to the bit. Measured at 7fff1617da (dy7
+//! run w2thb-probe2): on seed 7 the starts end `4.8e-2` apart in `ρ₂` (a flat
+//! direction, `λ₂ ≈ e^8.6`) with criterion values `6.6e-5` apart, against
+//! `τ_stat = 3.1e-3`; on seed 1 they end `1.7e-10` apart in `ρ`, values `3e-14`
+//! apart.
 
 use csv::StringRecord;
 use gam::estimate::outer_eval_capture::{enable_rho_outer_audit, take_rho_outer_audit};
@@ -109,11 +120,12 @@ fn poisson_fixture(seed: u64, n: usize, base_mean: f64, amp: f64, formula: &str)
     }
 }
 
-/// What a fit published: its smoothing parameters, and whether the #784
-/// correction is part of its criterion, read from the audit of its last outer
-/// evaluation, with the latched rule and block when it is.
+/// What a fit published: its smoothing parameters and criterion value, and
+/// whether the #784 correction is part of its criterion, read from the audit of
+/// its last outer evaluation, with the latched rule and block when it is.
 struct Published {
     log_lambdas: Vec<f64>,
+    criterion: f64,
     engaged: bool,
     axis_orders: Vec<usize>,
     block_cols: Vec<usize>,
@@ -141,14 +153,13 @@ fn fit_from(fixture: &PoissonFixture, start: f64) -> Published {
         .unwrap_or_default();
     Published {
         log_lambdas: fit.log_lambdas.to_vec(),
+        criterion: fit
+            .reml_score
+            .expect("a certified Poisson fit publishes its criterion value"),
         engaged: audit.quadrature_marginal_engaged,
         axis_orders,
         block_cols,
     }
-}
-
-fn bits(values: &[f64]) -> Vec<u64> {
-    values.iter().map(|value| value.to_bits()).collect()
 }
 
 fn listed(values: &[f64]) -> String {
@@ -171,12 +182,19 @@ fn block_correction_admission_does_not_depend_on_the_start_1082() {
         let fixture = poisson_fixture(seed, n, base_mean, amp, formula);
         let low = fit_from(&fixture, -6.0);
         let high = fit_from(&fixture, 3.0);
+        // The criterion's statistical resolution over the `n` rows the route
+        // declares (`OuterProblemSize::statistical_resolution`).
+        let tau_stat = 0.5 / fixture.y.len() as f64;
+        let criterion_gap = (low.criterion - high.criterion).abs();
         eprintln!(
-            "[#1082 pin] seed={seed} `{formula}`: start -6 engaged={} log_lambdas=[{}]; \
-             start 3 engaged={} log_lambdas=[{}]",
+            "[#1082 pin] seed={seed} `{formula}`: start -6 engaged={} criterion={:.15e} \
+             log_lambdas=[{}]; start 3 engaged={} criterion={:.15e} log_lambdas=[{}]; \
+             criterion gap {criterion_gap:.3e} against tau_stat {tau_stat:.3e}",
             low.engaged,
+            low.criterion,
             listed(&low.log_lambdas),
             high.engaged,
+            high.criterion,
             listed(&high.log_lambdas)
         );
         // Each fixture exercises its branch: a decision that does not hold its
@@ -198,12 +216,30 @@ fn block_correction_admission_does_not_depend_on_the_start_1082() {
             (&high.axis_orders, &high.block_cols),
             "#1082: seed {seed} `{formula}`: the two starts latched different rules or blocks"
         );
-        assert_eq!(
-            bits(&low.log_lambdas),
-            bits(&high.log_lambdas),
-            "#1082: seed {seed} `{formula}`: the two starts published different optima \
-             ([{}] against [{}]). Both reach the same Laplace optimum, and the decision and any \
-             corrected continuation are functions of that point alone.",
+        // The two fits certify optima of one criterion, so they must publish
+        // the same model to the resolution their certificates decide at. A
+        // Newton-decrement verdict certifies a point only where the decrease
+        // left to the minimum, rounding included, is within
+        // `max(τ_stat − band_f, band_f) ≤ τ_stat`, where `band_f` is the
+        // criterion value's own rounding band: no verdict is taken where
+        // `band_f > τ_stat` (`outer_decrement_bands`), and `V − V* ≤ λ²` is
+        // the self-concordant bound the verdict rests on. Each published value
+        // is within `band_f ≤ τ_stat` of its exact value, so both lie in
+        // `[V* − τ_stat, V* + 2·τ_stat]` and differ by at most `3·τ_stat`. The
+        // #784-corrected criterion has no analytic ρ-Hessian (#3139), so its
+        // fits certify on the per-coordinate gradient band instead, and there
+        // the same bar is this pin's requirement that both starts publish one
+        // answer to the criterion's resolution. Optima of two criteria, or two
+        // local optima, whose values differ by more than that fail it.
+        assert!(
+            criterion_gap <= 3.0 * tau_stat,
+            "#1082: seed {seed} `{formula}`: the two starts published fits whose criterion \
+             values differ by {criterion_gap:.6e} ({:.15e} against {:.15e}), beyond \
+             3·tau_stat = {:.6e}, the most two certified optima of one criterion can differ \
+             by (log_lambdas [{}] against [{}])",
+            low.criterion,
+            high.criterion,
+            3.0 * tau_stat,
             listed(&low.log_lambdas),
             listed(&high.log_lambdas)
         );

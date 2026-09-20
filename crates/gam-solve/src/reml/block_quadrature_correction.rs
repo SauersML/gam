@@ -187,6 +187,15 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<bool, EstimationError> {
+        // A family the correction never applies to has its decision without an
+        // evaluation: the verdict below would only reach the same decline, after
+        // a reset that discards the certified optimum's inner solve and a fresh
+        // one to replace it.
+        if let Some(reason) = self.block_correction_family_decline() {
+            log::trace!("[#784] block-local correction declined at the optimum: {reason}");
+            *self.block_correction_decision_guard() = BlockCorrectionDecision::DeclinedAtOptimum;
+            return Ok(false);
+        }
         *self.block_correction_decision_guard() = BlockCorrectionDecision::DecidingAtOptimum;
         // Every cached evaluation priced the Laplace criterion, and the decision
         // is taken at the terminal inner mode, not a capped screening one.
@@ -199,6 +208,45 @@ impl<'a> RemlState<'a> {
             *decision = BlockCorrectionDecision::DeclinedAtOptimum;
         }
         Ok(*decision == BlockCorrectionDecision::AdmittedAtOptimum)
+    }
+
+    /// Why the correction never applies to this fit's likelihood, if it never
+    /// does. Each reason reads only the configured family, so it holds at every
+    /// ρ of the fit.
+    fn block_correction_family_decline(&self) -> Option<&'static str> {
+        if reml_is_gaussian_identity(&self.config.likelihood) {
+            return Some("Laplace is exact for the Gaussian-identity model");
+        }
+        // The exact score channel relies on the exponential-family unit-
+        // deviance identity dD/dμ = −2w(y−μ)/V(μ), which does not hold for
+        // the Beta pseudo-family parameterization. Decline rather than splice
+        // a gradient that is not the derivative of the spliced value.
+        if matches!(
+            reml_spec(&self.config.likelihood).response,
+            ResponseFamily::Beta { .. }
+        ) {
+            return Some(
+                "the Beta family has no exponential-family score identity for the exact \
+                 gradient channels",
+            );
+        }
+        // Firth/Jeffreys fits: the integrand `Gam784BlockTarget::excess` is the
+        // remainder of the PLAIN penalized likelihood about its mode, but under
+        // Firth β̂ is the mode of the Jeffreys-penalized objective. The plain
+        // remainder then keeps a linear term (∇Φ(β̂) ≠ 0), omits the Jeffreys
+        // change Φ(β̂+δ)−Φ(β̂), and subtracts only XᵀWX while the draws are
+        // scaled by `h_total`, which carries −H_Φ. On separated data that
+        // mis-targeted Δ_b is orders of magnitude above 1/n_eff and drags the
+        // criterion off the certified Laplace surface, so the outer search it
+        // is spliced into cannot certify. Decline — value and gradient
+        // together — until the Jeffreys term is integrated.
+        if reml_robust_jeffreys_link(&self.config).is_some() {
+            return Some(
+                "Firth/Jeffreys bias reduction is active and the block target integrates \
+                 the plain penalized likelihood, not the Jeffreys-penalized one",
+            );
+        }
+        None
     }
 
     fn block_local_quadrature_correction_compute(
@@ -231,8 +279,8 @@ impl<'a> RemlState<'a> {
             return Ok(zero());
         }
 
-        // Laplace is exact for the Gaussian-identity model: nothing to correct.
-        if reml_is_gaussian_identity(&self.config.likelihood) {
+        if let Some(reason) = self.block_correction_family_decline() {
+            log::trace!("[#784] block-local fallback declined: {reason}");
             return Ok(zero());
         }
         // The mode and trace channels need one λ per canonical penalty.
@@ -264,10 +312,10 @@ impl<'a> RemlState<'a> {
 
         // ── Unconditional declines, BEFORE any evidence is bought ────────────
         //
-        // The two predicates below decline the whole correction, and neither
-        // consults a single number the diagnostic produces: one reads the
-        // hyper-layout, the other the configured response family. Both are
-        // therefore constant across the entire fit.
+        // The predicate below and the family declines above decline the whole
+        // correction, and none consults a single number the diagnostic
+        // produces: this one reads the hyper-layout, the others the configured
+        // response family. All are therefore constant across the entire fit.
         //
         // They used to sit AFTER `directional_cubic_diagnostic` — an `O(p³)`
         // dense factorization plus `O(n·p)` cubic contractions — so every
@@ -276,7 +324,7 @@ impl<'a> RemlState<'a> {
         // as though it had been decided on evidence (gam#2584). Evidence is
         // worth buying only when the verdict can depend on it.
         //
-        // Hoisting them is exactly value-preserving: neither predicate reads
+        // Hoisting them is exactly value-preserving: no predicate reads
         // `sampler`, `max_abs`, `directional` or `verdict`, and every path they
         // guard returns the same `zero()` it returned before.
 
@@ -298,21 +346,6 @@ impl<'a> RemlState<'a> {
             );
             return Ok(zero());
         }
-        // The exact score channel relies on the exponential-family unit-
-        // deviance identity dD/dμ = −2w(y−μ)/V(μ), which does not hold for
-        // the Beta pseudo-family parameterization. Decline rather than splice
-        // a gradient that is not the derivative of the spliced value.
-        if matches!(
-            reml_spec(&self.config.likelihood).response,
-            ResponseFamily::Beta { .. }
-        ) {
-            log::trace!(
-                "[#784] block-local fallback declined before the skewness diagnostic: \
-                 Beta family has no exponential-family score identity for the exact \
-                 gradient channels"
-            );
-            return Ok(zero());
-        }
 
         // Resolve the injected gam-inference corrector. When the inference tier
         // is not linked / registered, decline the correction (zero contribution) —
@@ -322,9 +355,85 @@ impl<'a> RemlState<'a> {
             return Ok(zero());
         };
 
-        // Step 1: per-direction skewness diagnostic γ_r.
+        // The eigensystem every step below reads: the block's directions `v_r`,
+        // their curvatures `λ_r`, and the resolvent the mode and gap terms are
+        // built from. It is the criterion's own spectral operator for this ρ
+        // whenever the criterion priced one on the full frame. An `eigh` of the
+        // assembled `H` resolves each eigenvalue only to `O(ε·‖H‖)`; with one λ
+        // railed, `‖H‖` is many orders above the soft modes this block lives
+        // on, so that error is a visible fraction of `λ_r` and of `v_r`, and it
+        // changes with the last bits of `H` from one inner solve to the next.
+        // `Δ_b` then differs between two evaluations at the same ρ by far more
+        // than the outer line search can resolve, and the BFGS continuation
+        // stalls on noise. The criterion's operator is priced from the root
+        // `B` with `H = BᵀB` when the assembled spectrum cannot resolve
+        // `log|H|` (#2644), which prices each soft mode to its own scale — the
+        // same eigenpairs the Laplace term was priced on.
+        //
+        // The decision is published by the spectral assembly. A value-only
+        // probe on the transformed route prices a Cholesky factor and publishes
+        // none, so the assembly is run once at a derivative order to obtain it,
+        // exactly as `criterion_rank_decision_at` does: `Δ_b` must be one
+        // function of ρ whether the evaluation carries a gradient or not.
+        // Only a sparse-exact backend, or a spectral operator priced on an
+        // active-constraint face's free basis, leaves no full-frame decision;
+        // the criterion priced no spectrum of this frame's `H` there, so the
+        // assembled matrix's own is the only one.
+        if bundle.criterion_rank_decision().is_none()
+            && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd
+        {
+            self.build_auto_assembly(
+                rho,
+                bundle,
+                super::reml_outer_engine::EvalMode::ValueAndGradient,
+                false,
+                false,
+            )?;
+        }
+        let sym_h = (h_total + &h_total.t()) * 0.5;
+        let (evals, evecs) = match bundle.criterion_rank_decision() {
+            Some(decision) => {
+                let evals = Array1::from(decision.operator.raw_eigenvalues.clone());
+                let evecs = match decision.frame {
+                    CriterionFrame::Transformed => decision.operator.eigenvectors.clone(),
+                    // `H_orig = Qs·H·Qsᵀ` with `Qs` orthogonal, so the transformed
+                    // frame's eigenvectors are `Qsᵀ·V_orig` with the same eigenvalues.
+                    CriterionFrame::Original => match pirls_result.coordinate_frame {
+                        pirls::PirlsCoordinateFrame::TransformedQs => pirls_result
+                            .reparam_result
+                            .qs
+                            .t()
+                            .dot(&decision.operator.eigenvectors),
+                        pirls::PirlsCoordinateFrame::OriginalSparseNative => {
+                            decision.operator.eigenvectors.clone()
+                        }
+                    },
+                };
+                log::trace!(
+                    "[#784] block eigensystem from the criterion's {:?} operator ({:?} frame)",
+                    decision.predicate,
+                    decision.frame,
+                );
+                (evals, evecs)
+            }
+            None => sym_h.eigh(Side::Lower).map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "#784 block-local fallback eigendecomposition failed: {e}"
+                ))
+            })?,
+        };
+        if evals.len() != p || evecs.dim() != (p, p) {
+            return Err(EstimationError::InvalidInput(format!(
+                "#784 block eigensystem has {} eigenvalues and {}x{} eigenvectors for p={p}",
+                evals.len(),
+                evecs.nrows(),
+                evecs.ncols()
+            )));
+        }
+
+        // Step 1: per-direction skewness diagnostic γ_r, aligned to those pairs.
         let (max_abs, directional) = corrector
-            .directional_cubic_diagnostic(h_total, x_design, c_weights, false)
+            .directional_cubic_diagnostic(&evals, &evecs, x_design, c_weights, false)
             .map_err(EstimationError::InvalidInput)?;
         if !max_abs.is_finite() || max_abs == 0.0 {
             return Ok(zero());
@@ -366,16 +475,10 @@ impl<'a> RemlState<'a> {
         // extension of the same rule — it agrees with it exactly wherever the
         // flagged set has the latched size, which is every ρ the pre-#2748 fit
         // was already stable on.
-        let sym_h = (h_total + &h_total.t()) * 0.5;
-        let (evals, evecs) = sym_h.eigh(Side::Lower).map_err(|e| {
-            EstimationError::InvalidInput(format!(
-                "#784 block-local fallback eigendecomposition failed: {e}"
-            ))
-        })?;
         let mut admissible: Vec<usize> = (0..evals.len().min(directional.len()))
             .filter(|&r| evals[r] > 0.0 && directional[r].is_finite())
             .collect();
-        let block_cols: Vec<usize> = match latched_block_dim {
+        let mut block_cols: Vec<usize> = match latched_block_dim {
             Some(m) => {
                 // Descending |γ_r|, ties broken by index so the selection is a
                 // deterministic function of (H, γ) and not of sort stability.
@@ -387,7 +490,6 @@ impl<'a> RemlState<'a> {
                         .then(a.cmp(&b))
                 });
                 admissible.truncate(m);
-                admissible.sort_unstable();
                 admissible
             }
             None => verdict
@@ -397,6 +499,7 @@ impl<'a> RemlState<'a> {
                 .filter(|&r| r < evals.len() && evals[r] > 0.0)
                 .collect(),
         };
+        order_block_axes_by_curvature(&mut block_cols, &evals);
         if block_cols.is_empty() {
             return Ok(zero());
         }
@@ -1110,6 +1213,24 @@ fn block_correction_design_admission(
     Ok(())
 }
 
+/// Put the block's eigendirections in ascending-curvature order, ties broken by
+/// index.
+///
+/// The latched Gauss-Hermite orders are bound to axis *positions*, so the
+/// position of each direction must be a property of the direction, not of the
+/// eigensolver that produced it. `eigh` of the assembled `H` returns ascending
+/// eigenvalues; the stacked-root SVD the criterion switches to once the
+/// assembled spectrum cannot resolve `log|H|` (#2644) returns descending ones.
+/// Ordered by index, the block's two axes traded their latched orders at that
+/// switch: on the prostate `s(pc1) + s(pc2)` binomial fit the 16-node rule
+/// moved to the axis certified at 9, `Δ_b` stepped by 1.2e-5 between
+/// `ρ₂ = 18.4366` and `18.4473` where its smooth variation is 1e-7, and the
+/// corrected BFGS continuation failed its line search on the step until
+/// `StepSizeTooSmall`.
+fn order_block_axes_by_curvature(block_cols: &mut [usize], evals: &Array1<f64>) {
+    block_cols.sort_by(|&a, &b| evals[a].total_cmp(&evals[b]).then(a.cmp(&b)));
+}
+
 /// One integrated piece of the block marginal: the whole block under a tensor
 /// rule, or one axis of it under the split, with its gradient channels.
 struct BlockPieceQuadrature {
@@ -1473,5 +1594,33 @@ mod design_admission_tests {
                 ..
             }) if (rows, cols, requested_bytes, cap_bytes) == (n_obs, p, bytes, bytes - 1)
         ));
+    }
+}
+
+#[cfg(test)]
+mod block_axis_order_tests {
+    use super::*;
+
+    /// The same block read from an ascending (`eigh`) and a descending
+    /// (stacked-root SVD) eigensystem must give every axis position the same
+    /// direction, or the latched per-axis orders land on different directions
+    /// when the criterion switches route.
+    #[test]
+    fn axis_positions_do_not_depend_on_the_eigensolver_order() {
+        let ascending = Array1::from(vec![2.092e-1, 1.545, 2.772, 1.160e1, 1.753e1, 1.054e2]);
+        let descending = Array1::from_iter(ascending.iter().rev().copied());
+        let n = ascending.len();
+        let mut from_eigh = vec![4usize, 1];
+        let mut from_root = vec![n - 1 - 4, n - 1 - 1];
+        order_block_axes_by_curvature(&mut from_eigh, &ascending);
+        order_block_axes_by_curvature(&mut from_root, &descending);
+        let curvatures = |cols: &[usize], evals: &Array1<f64>| -> Vec<f64> {
+            cols.iter().map(|&r| evals[r]).collect()
+        };
+        assert_eq!(curvatures(&from_eigh, &ascending), vec![1.545, 1.753e1]);
+        assert_eq!(
+            curvatures(&from_eigh, &ascending),
+            curvatures(&from_root, &descending)
+        );
     }
 }

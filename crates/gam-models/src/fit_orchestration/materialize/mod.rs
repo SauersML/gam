@@ -14,10 +14,12 @@ mod transformation;
 mod validation;
 
 pub use columns::{
-    expand_automatic_fit_formula, fit_required_columns, formula_columns, resolve_offset_column,
+    expand_automatic_fit_formula, fit_required_columns, formula_columns,
+    resolve_fit_weight_column, resolve_offset_column,
     resolve_weight_column,
 };
 pub(crate) use columns::resolve_continuous_column;
+pub(crate) use family::code_two_level_label_response;
 pub use family::{
     FamilyNuisanceOverrides, is_multinomial_family_name, resolve_family, response_column_kind,
     scalar_family_from_name,
@@ -29,7 +31,6 @@ pub(crate) use location_scale::materialize_location_scale;
 pub(crate) use marginal_slope::materialize_bernoulli_marginal_slope;
 pub(crate) use standard::materialize_standard;
 pub(crate) use survival::materialize_survival;
-pub use terms::gate_duchon_operator_penalties_for_family;
 pub(crate) use terms::{
     build_termspec_with_geometry_and_overrides, prune_unidentified_linear_terms_for_marginal_slope,
 };

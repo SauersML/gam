@@ -11,11 +11,6 @@ const MIN_ROWS_PER_TASK: usize = 512;
 /// worth parallelizing at all, these chunk sizes keep enough tasks available.
 const MAX_ROWS_PER_TASK: usize = 16_384;
 
-/// Maximum number of row-reduction tasks per worker. More tasks improve load
-/// balance when row costs are uneven, but beyond this the reducer is dominated
-/// by tiny partial matrices/vectors.
-const MAX_TASKS_PER_WORKER: usize = 4;
-
 /// Return a row chunk size for a parallel row reduction, or `None` when the
 /// caller should stay serial.
 ///
@@ -24,6 +19,14 @@ const MAX_TASKS_PER_WORKER: usize = 4;
 /// from expensive row kernels that solve roots, evaluate special functions, or
 /// assemble high-order jets. `reduction_cells` is the number of f64 cells in one
 /// per-task accumulator, used to avoid creating many large partials.
+///
+/// **The chunking is a function of the shape alone.** A reduction sums its
+/// per-chunk partials, so the chunk boundaries fix the summation order; a
+/// chunking read from the pool width made every such reduction's bits a
+/// function of `RAYON_NUM_THREADS`, and made a one-thread pool take a different
+/// (unchunked) path from every wider one. Sizing a chunk by the work it carries
+/// already leaves every worker tasks to steal once the reduction is large enough
+/// to be worth splitting; a one-thread pool runs the same chunks in order.
 pub fn row_reduction_chunk_rows(
     n_rows: usize,
     row_work_units: usize,
@@ -33,9 +36,8 @@ pub fn row_reduction_chunk_rows(
     if n_rows == 0 || row_work_units == 0 {
         return None;
     }
-    let workers = rayon::current_num_threads();
     let total_work = n_rows.saturating_mul(row_work_units);
-    if workers <= 1 || total_work < min_parallel_work {
+    if total_work < min_parallel_work {
         return None;
     }
 
@@ -43,20 +45,38 @@ pub fn row_reduction_chunk_rows(
         .div_ceil(row_work_units.max(1))
         .clamp(MIN_ROWS_PER_TASK, MAX_ROWS_PER_TASK);
     let tasks_by_rows = n_rows.div_ceil(min_rows_by_work).max(1);
-    if tasks_by_rows <= 1 {
-        return None;
-    }
-
-    let task_cap_by_workers = workers.saturating_mul(MAX_TASKS_PER_WORKER).max(1);
-    let task_cap_by_reduction = reduction_task_cap(reduction_cells);
-    let tasks = tasks_by_rows
-        .min(task_cap_by_workers)
-        .min(task_cap_by_reduction)
-        .max(1);
+    let tasks = tasks_by_rows.min(reduction_task_cap(reduction_cells));
     if tasks <= 1 {
         return None;
     }
     Some(n_rows.div_ceil(tasks).max(1))
+}
+
+/// Rows per block for a product that contracts a long row axis into a small
+/// output (`AᵀB`, `Aᵀ·diag(w)·B`), or `None` when the output is too large for
+/// the row split and the product belongs to faer's output-tiled GEMM.
+///
+/// Each block is one task: a sequential GEMM of its rows into a private
+/// `output_cells` partial, the partials combined over a fixed pairwise tree.
+/// The block is sized so one task carries [`TARGET_WORK_PER_TASK`] of
+/// multiply-adds (`rows · output_cells`), within the same row band every other
+/// row reduction uses. The split applies only while a [`MIN_ROWS_PER_TASK`]
+/// block still fits inside that budget: beyond it the output is wide enough
+/// that faer's own tiling has output tiles for every worker, and partials of
+/// that size would be the reduction traffic this module exists to avoid.
+///
+/// The answer is a function of the shape alone — never of the pool width, the
+/// nesting depth or the caller's degree — so the summation order, and with it
+/// every bit of the product, is the same at every thread count.
+pub fn row_contraction_block_rows(output_cells: usize) -> Option<usize> {
+    if output_cells == 0 || output_cells > TARGET_WORK_PER_TASK / MIN_ROWS_PER_TASK {
+        return None;
+    }
+    Some(
+        TARGET_WORK_PER_TASK
+            .div_ceil(output_cells)
+            .clamp(MIN_ROWS_PER_TASK, MAX_ROWS_PER_TASK),
+    )
 }
 
 /// Number of chunks that [`row_reduction_chunk_rows`] will create for `n_rows`.
@@ -65,6 +85,32 @@ pub fn row_reduction_chunk_count(n_rows: usize, chunk_rows: usize) -> usize {
         0
     } else {
         n_rows.div_ceil(chunk_rows.max(1))
+    }
+}
+
+/// Run `op` on the global pool's worker when that pool has exactly one thread
+/// and the caller is not already one of its workers; otherwise run it here.
+///
+/// A parallel iterator started from a thread outside the pool injects its job
+/// into the pool, wakes a sleeping worker and parks the caller on a latch until
+/// the worker finishes. With one worker nothing ever runs concurrently with
+/// the caller, so that round trip is pure latency: about 13 µs per call against
+/// 0.04 µs for the same call made on the worker, where the job runs in place.
+/// A small-n fit issues thousands of such calls, one per penalty block, pair of
+/// penalties, or reparameterization step. At n = 100 with five smooths, the
+/// driver thread spent 48% of its samples parked on those latches while the
+/// worker was busy for 8% of them. Running the whole driver on the worker
+/// executes exactly the same work in the same order and removes every
+/// handoff.
+///
+/// A wider pool is left alone: there the handoff buys real concurrency, and the
+/// code's `current_thread_index()` guards, which run nested loops sequentially
+/// on a worker, would turn parallel loops serial.
+pub fn run_on_single_worker_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    if rayon::current_thread_index().is_none() && rayon::current_num_threads() == 1 {
+        rayon::scope(|_| op())
+    } else {
+        op()
     }
 }
 
@@ -99,6 +145,19 @@ mod tests {
     fn chunk_rows_below_min_parallel_work_returns_none() {
         // total_work = 10 * 5 = 50 < min_parallel_work = 10_000
         assert_eq!(row_reduction_chunk_rows(10, 5, 1, 10_000), None);
+    }
+
+    #[test]
+    fn row_contraction_blocks_carry_one_task_of_work() {
+        assert_eq!(row_contraction_block_rows(0), None);
+        // A 10×10 Gram: the budget would ask for 160k rows, capped at the band.
+        assert_eq!(row_contraction_block_rows(100), Some(MAX_ROWS_PER_TASK));
+        // A 50×50 Gram: 16e6 / 2500 rows.
+        assert_eq!(row_contraction_block_rows(2500), Some(6400));
+        // The widest output whose smallest block still fits one task.
+        let widest = TARGET_WORK_PER_TASK / MIN_ROWS_PER_TASK;
+        assert_eq!(row_contraction_block_rows(widest), Some(MIN_ROWS_PER_TASK));
+        assert_eq!(row_contraction_block_rows(widest + 1), None);
     }
 
     #[test]

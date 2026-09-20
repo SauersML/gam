@@ -2861,8 +2861,11 @@ extern "C" __global__ void status_first_ladder(
                     // (step_lm_lambda was stripped from the export), so
                     // H_pen·β ≈ Xᵀ·grad_eta at a KKT-feasible solution.
                     let grad = penalized_hessian.dot(&beta);
+                    // One product, no cancellation of operands: the
+                    // gradient's natural scale is its own magnitude.
+                    let grad_scale = grad.dot(&grad).sqrt();
                     Some(crate::active_set::compute_constraint_kkt_diagnostics(
-                        &beta, &grad, lin,
+                        &beta, &grad, grad_scale, lin,
                     ))
                 });
 
@@ -3474,7 +3477,7 @@ pub(crate) fn solve_gaussian_pls_gpu(
 /// drifting away from the GPU formula.
 mod cpu_fallback {
     use super::{PirlsGpuInput, PirlsGpuStep};
-    use crate::estimate::reml::assembly::xt_diag_x_dense_into;
+    use crate::estimate::reml::assembly::xt_diag_x_dense;
     use faer::Side;
     use gam_linalg::faer_ndarray::FaerCholesky;
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -3486,8 +3489,7 @@ mod cpu_fallback {
         validate(x, weights)?;
         let x_owned = x.to_owned();
         let w_owned = weights.to_owned();
-        let mut scratch = Array2::<f64>::zeros(x_owned.dim());
-        Ok(xt_diag_x_dense_into(&x_owned, &w_owned, &mut scratch))
+        Ok(xt_diag_x_dense(&x_owned, &w_owned))
     }
 
     pub(super) fn solve_step_cpu(input: PirlsGpuInput<'_>) -> Result<PirlsGpuStep, String> {

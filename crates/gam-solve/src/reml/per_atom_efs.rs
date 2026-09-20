@@ -22,11 +22,12 @@
 //!    objective's `eval_efs` hook runs one inner P-IRLS solve and returns the
 //!    full per-coordinate step vector. We apply each atom's own multiplicative
 //!    log-λ step, with a whole-vector cost line search (Wood–Fasiolo give
-//!    ascent in the EFS direction but not full-step monotonicity). The per-atom
-//!    arithmetic *after* the shared inner solve is embarrassingly parallel; we
-//!    fan it across the existing rayon pool, honoring the OnceLock+nested-rayon
-//!    rule (any `get_or_init` is warmed at the top level before the
-//!    `into_par_iter`, never inside it).
+//!    ascent in the EFS direction but not full-step monotonicity). The step is
+//!    taken as `eval_efs` produced it, with no per-coordinate box: the line
+//!    search alone sets its length. The per-atom arithmetic *after* the shared
+//!    inner solve is O(K); the only rayon fan-out is the border-block probe,
+//!    which honors the OnceLock+nested-rayon rule (any `get_or_init` is warmed
+//!    at the top level before the `into_par_iter`, never inside it).
 //!
 //! 2. **Shared-border coupled correction** (only the few border axes). Most
 //!    atoms are penalty-block-disjoint: their ρ updates do not interact, so the
@@ -84,19 +85,6 @@ use std::sync::Arc;
 /// the `10^4`–`10^5` ARD-per-atom regime. The threshold is auto-derived from
 /// the coordinate count alone; there is no flag.
 pub(crate) const PER_ATOM_EFS_MIN_RHO_DIM: usize = 64;
-
-/// Maximum absolute step in log-λ for any single per-atom update, mirroring the
-/// `EFS_MAX_STEP` clamp the unified EFS path applies, so one outer iteration
-/// cannot move any `λ_i` by more than `exp(5)` ≈ 148×.
-pub(crate) const PER_ATOM_MAX_STEP: f64 = 5.0;
-
-/// Whole-vector backtracking halvings for the per-atom EFS line search.
-pub(crate) const PER_ATOM_MAX_BACKTRACK: usize = 8;
-
-/// Relative tolerance for the descent condition during backtracking; matches
-/// the unified EFS path so ULP-level cost noise near a fixed point does not
-/// trigger spurious backtracking.
-pub(crate) const PER_ATOM_COST_DESCENT_TOL: f64 = 1e-12;
 
 /// Auto-switch threshold predicate: is this problem in the frontier ρ-scaling
 /// regime where the per-atom decoupled EFS primary should take over from the
@@ -219,16 +207,28 @@ pub struct PerAtomEfsConfig {
     /// Per-coordinate lower/upper bounds on ρ.
     pub lower: Array1<f64>,
     pub upper: Array1<f64>,
+    /// Absolute resolution of the criterion, `τ_stat = 1/(2n)`, or 0 when the
+    /// route declares no size: an improvement no larger than this is not
+    /// progress.
+    pub criterion_resolution: f64,
 }
 
 impl PerAtomEfsConfig {
-    /// Build from the bounds and budget the generic outer config supplies.
-    pub fn new(tolerance: f64, max_iter: usize, lower: Array1<f64>, upper: Array1<f64>) -> Self {
+    /// Build from the bounds, budget and criterion resolution the generic
+    /// outer config supplies.
+    pub fn new(
+        tolerance: f64,
+        max_iter: usize,
+        lower: Array1<f64>,
+        upper: Array1<f64>,
+        criterion_resolution: f64,
+    ) -> Self {
         Self {
             tolerance,
             max_iter,
             lower,
             upper,
+            criterion_resolution,
         }
     }
 }
@@ -246,15 +246,17 @@ pub(crate) fn project_to_bounds(rho: &Array1<f64>, cfg: &PerAtomEfsConfig) -> Ar
     out
 }
 
-/// Clamp a raw multiplicative log-λ step to the per-atom maximum, treating
-/// non-finite raw steps as zero (the coordinate makes no move this iteration).
-#[inline]
-pub(crate) fn sanitize_step(raw: f64) -> f64 {
-    if raw.is_finite() {
-        raw.clamp(-PER_ATOM_MAX_STEP, PER_ATOM_MAX_STEP)
-    } else {
-        0.0
+/// The step vector exactly as its source produced it. Its length is globalised
+/// by the whole-vector cost line search, not by a box on each coordinate (SPEC
+/// 18-22). A non-finite component is refused: it has no direction to search, and
+/// zeroing it would let the ∞-norm test certify a point the step never resolved.
+pub(crate) fn finite_step(raw: &[f64], source: &str) -> Result<Array1<f64>, EstimationError> {
+    if let Some((axis, value)) = raw.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "per-atom EFS: {source} step on axis {axis} is non-finite ({value})"
+        )));
     }
+    Ok(Array1::from_vec(raw.to_vec()))
 }
 
 /// Assemble the restricted `m × m` outer-Hessian sub-block over the
@@ -362,8 +364,9 @@ fn solve_shared_border_block(
         ))
     })?;
 
+    let delta = finite_step(&delta.to_vec(), "shared-border correction")?;
     for (row, &axis) in border.iter().enumerate() {
-        step[axis] = sanitize_step(-delta[row]);
+        step[axis] = -delta[row];
     }
     Ok(step)
 }
@@ -375,7 +378,7 @@ fn solve_shared_border_block(
 ///
 /// Returns a full-length ρ step that is zero off the border. An indefinite or
 /// singular border block is factored by the pivoted symmetric fallback, a
-/// non-finite component is zeroed by `sanitize_step`, and the whole-vector cost
+/// non-finite component is refused by [`finite_step`], and the whole-vector cost
 /// line search decides whether the correction is taken.
 pub(crate) fn shared_border_correction(
     topology: &SharedBorderTopology,
@@ -394,11 +397,16 @@ pub(crate) fn shared_border_correction(
 /// Whole-vector cost line search for the per-atom EFS step.
 ///
 /// Wood–Fasiolo give ascent in the EFS direction but not full-step
-/// monotonicity, so backtrack `α ∈ {1, 1/2, …, 2^-8}` on the *whole* applied
-/// step (per-atom decoupled step plus the shared-border correction), accepting
-/// the first α whose projected cost does not increase beyond the descent
-/// tolerance. Returns the accepted `(rho_new, cost_new, alpha)`, or `None` when
-/// no halving was accepted (the caller then surfaces a stall).
+/// monotonicity, so halve α from 1 on the *whole* applied step (per-atom
+/// decoupled step plus the shared-border correction), accepting the first α
+/// whose projected cost does not resolvably exceed the current cost. Halving
+/// ends where the step stops being resolvable: once `α·‖step‖∞` falls below the
+/// step-norm tolerance, the move is one the convergence test would already call
+/// zero, so the schedule is `{α = 2^-k : α·‖step‖∞ ≥ tolerance}` and carries no
+/// count of its own. Two costs differ resolvably when they are further apart than
+/// the sum of their rounding bands, `γ₁·(|f_cur| + |f_trial|)`. Returns the
+/// accepted `(rho_new, cost_new, alpha)`, or `None` when no resolvable halving
+/// was accepted (the caller then surfaces a stall).
 pub(crate) fn backtrack_cost(
     obj: &mut dyn OuterObjective,
     rho: &Array1<f64>,
@@ -406,14 +414,29 @@ pub(crate) fn backtrack_cost(
     current_cost: f64,
     cfg: &PerAtomEfsConfig,
 ) -> Result<Option<(Array1<f64>, f64, f64)>, EstimationError> {
-    let descent_slack = PER_ATOM_COST_DESCENT_TOL * current_cost.abs().max(1.0);
+    if !(cfg.tolerance > 0.0 && cfg.tolerance.is_finite()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "per-atom EFS: step-norm tolerance {} must be positive and finite",
+            cfg.tolerance
+        )));
+    }
+    let full_step = finite_step(&full_step.to_vec(), "line-search")?;
+    let step_inf = full_step.iter().map(|s| s.abs()).fold(0.0_f64, f64::max);
+    let schedule = BacktrackConfig::default();
+    let mut max_steps = 0usize;
+    let mut alpha = schedule.initial_step;
+    while alpha * step_inf >= cfg.tolerance {
+        max_steps += 1;
+        alpha *= schedule.contraction;
+    }
+    let band = gam_math::roundoff::accumulation_growth(1);
     // Recoverable domain refusals arrive as `Ok(+∞)` and keep halving. A typed
     // error means the objective artifact could not be built and must escape this
     // line search without being reinterpreted as another numerical point.
     let accepted = backtracking_line_search::<_, EstimationError>(
         BacktrackConfig {
-            max_steps: PER_ATOM_MAX_BACKTRACK + 1,
-            ..BacktrackConfig::default()
+            max_steps,
+            ..schedule
         },
         |alpha| {
             let mut trial = rho.clone();
@@ -424,7 +447,9 @@ pub(crate) fn backtrack_cost(
             let cost = obj.eval_cost(&trial)?;
             Ok(Some((cost, trial)))
         },
-        |_, cost| cost.is_finite() && cost <= current_cost + descent_slack,
+        |_, cost| {
+            cost.is_finite() && cost <= current_cost + band * (current_cost.abs() + cost.abs())
+        },
     )?;
     Ok(accepted.map(|step| (step.payload, step.value, step.step)))
 }
@@ -434,8 +459,7 @@ pub(crate) fn backtrack_cost(
 ///
 /// Loop, each iteration:
 /// 1. `eval_efs` at the current ρ — one inner P-IRLS solve — yields the full
-///    per-coordinate decoupled step vector (embarrassingly parallel arithmetic
-///    after the shared solve; we fan the clamp/assembly across rayon).
+///    per-coordinate decoupled step vector.
 /// 2. If the topology has shared-border axes, add the coupled Newton correction
 ///    on just those axes via the matrix-free θ-HVP (`m × m` solve).
 /// 3. Whole-vector cost line search; apply the accepted step.
@@ -484,10 +508,9 @@ pub fn run_per_atom_efs(
     // The progress certificate the dense fixed-point walk carries (#2817): a
     // window that bought no resolved improvement and no smaller step since the
     // previous one ends the walk as a stall, instead of the iteration count.
-    // Floor and window are the ones the outer cost-stall guard derives from the
-    // same outer tolerance.
+    // Resolution and window are the ones the outer cost-stall guard uses.
     let mut progress = crate::rho_optimizer::FixedPointProgress::new(
-        (cfg.tolerance * 1.0e-2).max(crate::rho_optimizer::COST_STALL_REL_TOL_FLOOR),
+        cfg.criterion_resolution,
         crate::rho_optimizer::COST_STALL_WINDOW,
     );
 
@@ -510,18 +533,9 @@ pub fn run_per_atom_efs(
         }
         last_cost = efs.cost;
 
-        // Clamp each atom's own multiplicative step. This is the embarrassingly
-        // parallel per-atom arithmetic: independent across coordinates. Fan it
-        // across rayon; the closure touches only the local step value (no
-        // OnceLock, no shared mutation), so it is deadlock-safe.
-        let mut full_step: Array1<f64> = {
-            let raw = efs.steps.as_slice();
-            let clamped: Vec<f64> = (0..rho_dim)
-                .into_par_iter()
-                .map(|i| sanitize_step(raw[i]))
-                .collect();
-            Array1::from_vec(clamped)
-        };
+        // Each atom's own multiplicative step, unboxed: its length is set by the
+        // whole-vector line search below, and a non-finite component is refused.
+        let mut full_step = finite_step(&efs.steps, "decoupled EFS")?;
 
         // ── Layer 2: shared-border coupled correction (m × m) ──
         //
@@ -604,9 +618,11 @@ pub fn run_per_atom_efs(
                 // fit to a gradient-based primary, exactly as the EFS bridge
                 // does for the dense-K path.
                 log::debug!(
-                    "[PER-ATOM-EFS] step rejected after {} halvings at cost={:.6e} \
+                    "[PER-ATOM-EFS] step rejected at every resolvable halving \
+                     (step_inf={:.3e}, tolerance={:.3e}) at cost={:.6e} \
                      (rho_dim={}, border={}); reporting stall",
-                    PER_ATOM_MAX_BACKTRACK,
+                    step_inf,
+                    cfg.tolerance,
                     efs.cost,
                     rho_dim,
                     topology.border_count(),
@@ -736,6 +752,7 @@ mod tests {
             200,
             Array1::from_elem(dim, -50.0),
             Array1::from_elem(dim, 50.0),
+            0.0,
         )
     }
 
@@ -832,6 +849,172 @@ mod tests {
             );
         }
         assert!(result.final_value < 1e-10);
+    }
+
+    #[test]
+    fn decoupled_step_is_realised_without_a_per_coordinate_box() {
+        // Every coordinate sits 20 log-units from its target, well inside the
+        // ±50 bounds. The decoupled step is the exact Newton step, so the walk
+        // lands in one step and certifies it on the next: two iterations. A
+        // ±5 box on each coordinate needs four boxed steps before the fifth
+        // iteration even sees a step below tolerance.
+        let dim = 96;
+        let a = Array2::from_shape_fn(
+            (dim, dim),
+            |(i, j)| {
+                if i == j { 1.0 + (i % 5) as f64 } else { 0.0 }
+            },
+        );
+        let target = Array1::from_shape_fn(dim, |i| if i % 2 == 0 { 20.0 } else { -20.0 });
+        let mut obj = QuadraticObjective {
+            a,
+            target: target.clone(),
+        };
+        let cfg = wide_bounds(dim);
+        let result = run_per_atom_efs(
+            &mut obj,
+            &Array1::zeros(dim),
+            &cfg,
+            &SharedBorderTopology::disjoint(dim),
+        )
+        .expect("run");
+        assert!(result.converged, "separable quadratic must converge");
+        assert_eq!(
+            result.iterations, 2,
+            "the exact Newton step must be taken whole, not boxed"
+        );
+        for i in 0..dim {
+            assert_eq!(result.rho[i], target[i], "coord {i}");
+        }
+    }
+
+    #[test]
+    fn backtracking_halves_until_the_step_is_unresolvable() {
+        // f(ρ) = ½(ρ − 1)², ρ = 0, step 768: the cost at ρ = 768α does not
+        // exceed f(0) = ½ only for 768α ≤ 2, first reached at α = 2^-9. A
+        // schedule stopped at a fixed count of eight halvings (α = 2^-8,
+        // ρ = 3, f = 2) reports a stall on a step that halving still resolves.
+        let mut obj = QuadraticObjective {
+            a: array![[1.0]],
+            target: array![1.0],
+        };
+        let cfg = PerAtomEfsConfig::new(
+            1e-9,
+            200,
+            Array1::from_elem(1, -1e4),
+            Array1::from_elem(1, 1e4),
+            0.0,
+        );
+        let (rho_new, cost_new, alpha) =
+            backtrack_cost(&mut obj, &array![0.0], &array![768.0], 0.5, &cfg)
+                .expect("line search")
+                .expect("a resolvable halving decreases the cost");
+        assert_eq!(alpha, 2f64.powi(-9));
+        assert_eq!(rho_new[0], 1.5);
+        assert_eq!(cost_new, 0.125);
+
+        // Once α·‖step‖∞ is below the tolerance there is nothing left to try:
+        // a step already under it is refused without evaluating anything.
+        let none =
+            backtrack_cost(&mut obj, &array![0.0], &array![1e-10], 0.5, &cfg).expect("line search");
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn backtracking_refuses_a_resolvable_cost_increase() {
+        // Every trial point costs 5e-13 more than the current 1.0: far below
+        // any fixed relative slack of 1e-12, but more than two thousand times
+        // the rounding band γ₁·(|1| + |1 + 5e-13|) ≈ 2.2e-16 of the two values,
+        // so it is a real increase and no step may be accepted.
+        struct RisingObjective;
+        impl OuterObjective for RisingObjective {
+            fn capability(&self) -> OuterCapability {
+                OuterCapability {
+                    gradient: Derivative::Analytic,
+                    hessian: DeclaredHessianForm::Unavailable,
+                    n_params: 1,
+                    psi_dim: 0,
+                    fixed_point_available: true,
+                    barrier_config: None,
+                    prefer_gradient_only: false,
+                    disable_fixed_point: false,
+                }
+            }
+            fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+                assert_eq!(rho.len(), 1);
+                Ok(1.0 + 5e-13)
+            }
+            fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+                assert_eq!(rho.len(), 1);
+                Err(EstimationError::InvalidInput("unused".to_string()))
+            }
+            fn reset(&mut self) {}
+            fn seed_inner_state(
+                &mut self,
+                beta: &Array1<f64>,
+            ) -> Result<SeedOutcome, EstimationError> {
+                if !beta.is_empty() {
+                    assert_eq!(beta.len(), 1);
+                }
+                Ok(SeedOutcome::NoSlot)
+            }
+        }
+        let accepted = backtrack_cost(
+            &mut RisingObjective,
+            &array![0.0],
+            &array![1.0],
+            1.0,
+            &wide_bounds(1),
+        )
+        .expect("line search");
+        assert!(
+            accepted.is_none(),
+            "a cost increase above rounding must be refused"
+        );
+    }
+
+    #[test]
+    fn non_finite_decoupled_step_is_refused_not_zeroed() {
+        // One coordinate's step is NaN. Zeroing it lets the ∞-norm test call the
+        // walk converged at a point that coordinate never resolved.
+        struct NanStepObjective(QuadraticObjective);
+        impl OuterObjective for NanStepObjective {
+            fn capability(&self) -> OuterCapability {
+                self.0.capability()
+            }
+            fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+                self.0.eval_cost(rho)
+            }
+            fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+                self.0.eval(rho)
+            }
+            fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+                let mut efs = self.0.eval_efs(rho)?;
+                efs.steps[0] = f64::NAN;
+                Ok(efs)
+            }
+            fn reset(&mut self) {}
+            fn seed_inner_state(
+                &mut self,
+                beta: &Array1<f64>,
+            ) -> Result<SeedOutcome, EstimationError> {
+                self.0.seed_inner_state(beta)
+            }
+        }
+        let dim = 2;
+        let mut obj = NanStepObjective(QuadraticObjective {
+            a: Array2::eye(dim),
+            target: array![3.0, 0.0],
+        });
+        let error = run_per_atom_efs(
+            &mut obj,
+            &Array1::zeros(dim),
+            &wide_bounds(dim),
+            &SharedBorderTopology::disjoint(dim),
+        )
+        .err()
+        .expect("a non-finite EFS step must fail the run");
+        assert!(error.to_string().contains("non-finite"), "{error}");
     }
 
     #[test]

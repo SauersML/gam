@@ -166,29 +166,13 @@ impl<'a> RemlState<'a> {
         p: &Array1<f64>,
         synthetic_ext_count: usize,
     ) -> Result<f64, EstimationError> {
-        self.compute_cost_charging(p, synthetic_ext_count, true)
-    }
-
-    /// Evaluate the outer criterion WITHOUT charging the outer-loop
-    /// cost-evaluation counter.
-    ///
-    /// `outer_cost_evals` measures the work the smoothing-parameter SEARCH did,
-    /// and is gated as such (`tests/perf_1689_pspline_thinplate_profile.rs`
-    /// caps it). Post-convergence covariance work — the sigma-node calibration
-    /// in [`super::eval::RemlState::calibrate_sigma_node`], which reads the
-    /// criterion at a handful of fixed ρ to find where one posterior sigma
-    /// actually is — is not part of that search, and charging it there would
-    /// make a work guard read a covariance refinement as an outer-loop
-    /// regression (#2728).
-    pub(crate) fn compute_cost_uncharged(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
-        self.compute_cost_charging(p, 0, false)
+        self.compute_cost_charging(p, synthetic_ext_count)
     }
 
     fn compute_cost_charging(
         &self,
         p: &Array1<f64>,
         synthetic_ext_count: usize,
-        charge: bool,
     ) -> Result<f64, EstimationError> {
         let cost_call_idx = {
             let mut calls = self
@@ -196,9 +180,7 @@ impl<'a> RemlState<'a> {
                 .cost_eval_count
                 .write()
                 .expect("cost-eval counter lock is never held across a panic");
-            if charge {
-                *calls += 1;
-            }
+            *calls += 1;
             *calls
         };
         let t_eval_start = std::time::Instant::now();
@@ -282,7 +264,7 @@ impl<'a> RemlState<'a> {
         // tabulated `backend DenseSpectral` from THIS line on both sides of a
         // 12x per-trial cost change and could conclude only "it is not a
         // backend switch" -- the label is two-valued, so it cannot say which of
-        // the six routes to it was taken, nor whether a density was measured at
+        // the routes to it was taken, nor whether a density was measured at
         // all.
         log::trace!(
             "[REML] eval#{} pirls done | elapsed {:.1}ms | backend {:?} | {}",
@@ -342,8 +324,8 @@ impl<'a> RemlState<'a> {
 
             // Hot diagnostics walk the Hessian eigenspectrum and emit
             // ill-conditioning warnings. They are only meaningful for fully
-            // converged inner modes — partial fits accepted from seed
-            // screening (cap=3) routinely yield indefinite Hessians, and
+            // converged inner modes — partial fits under an outer-imposed
+            // inner cap routinely yield indefinite Hessians, and
             // surfacing those as `Penalized Hessian not PD` warnings would
             // confuse log readers and mask real production-fit issues.
             let want_hot_diag = !pirls_result.status.is_failed_max_iterations()
@@ -402,52 +384,6 @@ impl<'a> RemlState<'a> {
             t_eval_start.elapsed().as_secs_f64() * 1000.0
         );
         Ok(cost)
-    }
-
-    /// Seed-screening ranking proxy.
-    ///
-    /// In screening mode (`screening_max_inner_iterations > 0`), runs the
-    /// inner P-IRLS solve under the active iteration cap and returns the
-    /// minimum penalized deviance (`-2·log L + βᵀSβ`, plus the structural
-    /// ridge contribution carried in `stable_penalty_term`) observed across
-    /// all inner iterations. Penalized deviance descends monotonically along
-    /// any inner descent path P-IRLS takes, so this minimum is a meaningful
-    /// quality signal even when the inner solver was capped before reaching
-    /// the mode — strictly better than ranking by the partial-fit V_LAML
-    /// criterion, whose `0.5·log|H|` term is dominated by noise at a
-    /// poorly-conditioned partial β̂.
-    ///
-    /// Outside of screening mode this delegates to `Self::compute_cost` so
-    /// the optimization objective itself is never changed by this method's
-    /// presence.
-    pub(crate) fn compute_screening_proxy(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
-        let in_screening = self.screening_max_inner_iterations.load(Ordering::Relaxed) > 0;
-        if !in_screening {
-            return self.compute_cost(p);
-        }
-        // Use the same bundle pipeline as `compute_cost`, but read the proxy
-        // directly from `pirls_result.min_penalized_deviance` instead of
-        // assembling the LAML criterion. Bundle assembly already runs
-        // P-IRLS under the screening cap; reusing it keeps the screening
-        // path's behavioural invariants (no warm-start update, no LRU write,
-        // no KKT enforcement at partial fits).
-        let bundle = match self.obtain_eval_bundle(p) {
-            Ok(bundle) => bundle,
-            Err(err) if err.is_inner_solve_retreat() => {
-                self.cache_manager.invalidate_eval_bundle();
-                return Ok(f64::INFINITY);
-            }
-            Err(e) => {
-                self.cache_manager.invalidate_eval_bundle();
-                return Err(e);
-            }
-        };
-        let proxy = bundle.pirls_result.min_penalized_deviance;
-        if proxy.is_finite() {
-            Ok(proxy)
-        } else {
-            Ok(f64::INFINITY)
-        }
     }
 
     ///
@@ -1353,16 +1289,13 @@ impl<'a> RemlState<'a> {
 
         let c_nontrivial = pirls_result.solve_c_nontrivial;
 
-        // Only the penalty-side `log|S|₊` machinery consumes the penalty
-        // subspace now; the Hessian-side kernel is intrinsic to H_pen (#901)
-        // and no longer needs `range(S_+)`. Its rank bounds H's identified rank
+        // The Hessian-side kernel is intrinsic to H_pen (#901) and does not
+        // need `range(S_+)`. The penalty rank bounds H's identified rank
         // below, so it is computed before the Hessian operator.
-        let penalty_subspace = Some(self.compute_penalty_subspace(e_for_logdet.as_ref())?);
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             e_for_logdet.as_ref(),
             &[],
-            penalty_subspace.as_ref(),
             bundle,
             mode,
             free_basis_opt.as_ref(),
@@ -1576,6 +1509,7 @@ impl<'a> RemlState<'a> {
             if let Some(ref taka) = sparse.takahashi {
                 op = op.with_takahashi(taka.clone());
             }
+            op = op.with_hessian(sparse.hessian.clone());
             std::sync::Arc::new(op)
         };
 
@@ -1769,15 +1703,13 @@ impl<'a> RemlState<'a> {
             None
         };
         let e_for_logdet = &pirls_result.reparam_result.e_transformed;
-        // Penalty-side `log|S|₊` machinery only; the Hessian-side kernel is
-        // intrinsic to H_pen (#901) and no longer consumes `range(S_+)`. Its
-        // rank bounds H's identified rank, so it is computed before the operator.
-        let penalty_subspace = Some(self.compute_penalty_subspace(e_for_logdet)?);
+        // The Hessian-side kernel is intrinsic to H_pen (#901) and does not
+        // consume `range(S_+)`. The penalty rank bounds H's identified rank,
+        // so it is computed before the operator.
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             e_for_logdet,
             &[],
-            penalty_subspace.as_ref(),
             bundle,
             mode,
             // Original-basis assembly is only used when there are no active
@@ -1805,6 +1737,7 @@ impl<'a> RemlState<'a> {
             weights: pirls_result.finalweights.view(),
             penalties: root_penalties.as_slice(),
             lambdas: &root_lambdas,
+            data_root: Some(&self.data_root_cache),
         };
         let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = {
             use super::reml_outer_engine::HessianFactorization as _;
@@ -4112,11 +4045,11 @@ mod ift_warm_start_tests {
         }
         let nullity = p - rank;
         CanonicalPenalty {
-            root,
+            root: root.into_shared(),
             col_range: 0..p,
             total_dim: p,
             nullity,
-            local,
+            local: local.into_shared(),
             prior_mean: Array1::zeros(p),
             positive_eigenvalues,
             op: None,

@@ -36,13 +36,20 @@
 //! added to. A row with no posterior spread along its normal (its normal in the kernel of the
 //! pseudo-inverse the criterion prices) removes no mass and is skipped, as [`super`] skips it.
 //! No dependence filter is needed: nothing below forms `W⁻¹`, so rows whose normals are linearly
-//! dependent are admissible.
+//! dependent are admissible. A row repeated exactly is the same half-space, and the intersection
+//! holds it once, so it enters once. EP would give each copy its own site and count its
+//! truncation once per copy. A family whose cone is declared over its data rows repeats a row
+//! for every tied data row: the transformation-normal cone `ψ_iᵀA_k ≥ 0` repeats each response
+//! row once per data row of an intercept-only fit.
 //!
 //! # `ln P` by expectation propagation
 //!
 //! `P(u ≥ 0)` has no closed form beyond two rows. It is estimated by EP on the orthant's
 //! half-line indicators (Cunningham, Hennig and Lacoste-Julien, 2011): deterministic, smooth in
-//! `(m₀, W)`, and exact for one row and for rows whose normals are `M⁻¹`-orthogonal. A sweep
+//! `(m₀, W)`, and exact for one row and for rows whose normals are `M⁻¹`-orthogonal. Each sweep
+//! visits the sites in order, carrying the posterior from one site to the next by the rank-one
+//! update the site's move makes to its precision, `O(q²)` a site, and forms the posterior
+//! exactly again at the sweep's end. A sweep
 //! that moves `ln Z_EP` by no more than its own rounding band ends the iteration. The change need
 //! not fall monotonically on the way: on strongly correlated rows it can grow for one sweep and
 //! then contract geometrically. A sweep that fails to contract halves the step every later site
@@ -246,6 +253,19 @@ pub struct OrthantLogMass {
     /// The share of its full update each site took on the last sweep: 1 unless a sweep failed to
     /// contract.
     fraction: f64,
+    /// The linearized fixed point at these sites, formed on the first derivative that reads it.
+    site_motion_system: std::sync::OnceLock<Result<SiteMotionSystem, ConeNormalizerRefusal>>,
+}
+
+/// What the sites' motion reads at a fixed point that does not depend on the direction of the
+/// motion: the posterior `(Σ, μ)`, each site's update partials in its cavity, and the inverse of
+/// `I − ∂F/∂s`. Every direction of every coordinate pair solves with the same inverse.
+#[derive(Clone, Debug)]
+struct SiteMotionSystem {
+    sigma: Array2<f64>,
+    mu: Array1<f64>,
+    jacobians: Vec<[f64; 4]>,
+    inverse: Array2<f64>,
 }
 
 impl OrthantLogMass {
@@ -264,6 +284,7 @@ impl OrthantLogMass {
             log_mass: 0.0,
             sweeps: 0,
             fraction: 1.0,
+            site_motion_system: std::sync::OnceLock::new(),
         };
         if q == 0 {
             return Ok(state);
@@ -274,8 +295,18 @@ impl OrthantLogMass {
         loop {
             state.sweeps += 1;
             let (mut at_fixed_point, mut moved) = (true, false);
+            // The sweep starts from the posterior of its sites, formed exactly, and carries it
+            // from site to site by the rank-one update a site's move makes to the precision
+            // `W⁻¹ + T`: with `c = Δτ̃/(1 + Δτ̃ Σ_jj)`, `Σ ← Σ − c Σ_{:j}Σ_{j:}` and
+            // `μ ← μ + Σ_{:j}(Δν̃ − Δτ̃ μ_j)/(1 + Δτ̃ Σ_jj)`. Site `j` reads the same cavity it
+            // would from `(E W, E(m₀ + W ν̃))` at the sites before it, in `O(q²)` instead of the
+            // `O(q³)` of forming and inverting `I + WT` again. `1 + Δτ̃ Σ_jj = Σ_jj (τ_c + τ̃_j)` is
+            // positive for an admissible cavity, since the new `τ̃_j` is not negative.
+            let (mut sigma, mut mu) = state.posterior();
             for j in 0..q {
-                let (tau_c, nu_c) = state.cavity(j);
+                let s_jj = sigma[[j, j]];
+                let tau_c = 1.0 / s_jj - state.tau[j];
+                let nu_c = mu[j] / s_jj - state.nu[j];
                 if !(tau_c > 0.0 && tau_c.is_finite()) {
                     return Err(ConeNormalizerRefusal::CavityPrecision {
                         row: j,
@@ -288,10 +319,22 @@ impl OrthantLogMass {
                 let tau = (1.0 - fraction) * state.tau[j] + fraction * update.tau;
                 let nu = (1.0 - fraction) * state.nu[j] + fraction * update.nu;
                 moved |= tau != state.tau[j] || nu != state.nu[j];
+                let (d_tau, d_nu) = (tau - state.tau[j], nu - state.nu[j]);
                 state.tau[j] = tau;
                 state.nu[j] = nu;
-                state.e = inverse_i_plus_wt(&state.w, &state.tau)?;
+                let denominator = 1.0 + d_tau * s_jj;
+                let column = sigma.column(j).to_owned();
+                let mean_step = (d_nu - d_tau * mu[j]) / denominator;
+                mu.scaled_add(mean_step, &column);
+                let shrink = d_tau / denominator;
+                for a in 0..q {
+                    let scaled = shrink * column[a];
+                    for b in 0..q {
+                        sigma[[a, b]] -= scaled * column[b];
+                    }
+                }
             }
+            state.e = inverse_i_plus_wt(&state.w, &state.tau)?;
             let (log_mass, magnitude) = state.evaluate_log_mass()?;
             let change = (log_mass - previous).abs();
             // Every term of ln Z_EP is formed in O(q²) rounded operations. A damped sweep moves
@@ -324,12 +367,6 @@ impl OrthantLogMass {
         let sigma = self.e.dot(&self.w);
         let mu = self.e.dot(&(&self.m0 + &self.w.dot(&self.nu)));
         (sigma, mu)
-    }
-
-    fn cavity(&self, j: usize) -> (f64, f64) {
-        let (sigma, mu) = self.posterior();
-        let s_jj = sigma[[j, j]];
-        (1.0 / s_jj - self.tau[j], mu[j] / s_jj - self.nu[j])
     }
 
     /// `ln Z_EP` and the summed magnitude of its terms,
@@ -457,45 +494,69 @@ impl OrthantLogMass {
     /// Per unit site change the posterior moves by `dΣ/dτ̃_k = −Σ_{:k}Σ_{k:}`,
     /// `dμ/dτ̃_k = −Σ_{:k} μ_k`, `dμ/dν̃_k = Σ_{:k}`; along `(dm₀, dW)` by `dΣ = E dW Eᵀ` and
     /// `dμ = E dm₀ + E dW (ν̃ − Tμ)`. Site `j` reads the cavity
-    /// `(1/Σ_jj − τ̃_j, μ_j/Σ_jj − ν̃_j)`.
+    /// `(1/Σ_jj − τ̃_j, μ_j/Σ_jj − ν̃_j)`. Only the right-hand side depends on the direction; the
+    /// system is the fixed point's own ([`Self::linearized_fixed_point`]).
     fn site_motion(
         &self,
         dm0: &Array1<f64>,
         dw: &Array2<f64>,
     ) -> Result<(Array1<f64>, Array1<f64>), ConeNormalizerRefusal> {
         let q = self.m0.len();
-        let (sigma, mu) = self.posterior();
+        let system = self.linearized_fixed_point()?;
+        let (sigma, mu) = (&system.sigma, &system.mu);
         let d_sigma = self.e.dot(dw).dot(&self.e.t());
-        let shift = &self.nu - &(&self.tau * &mu);
+        let shift = &self.nu - &(&self.tau * mu);
         let d_mu = self.e.dot(dm0) + self.e.dot(&dw.dot(&shift));
-        let mut system = Array2::<f64>::eye(2 * q);
         let mut rhs = Array1::<f64>::zeros(2 * q);
         for j in 0..q {
             let s_jj = sigma[[j, j]];
-            let tau_c = 1.0 / s_jj - self.tau[j];
-            let nu_c = mu[j] / s_jj - self.nu[j];
-            let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = site_update(tau_c, nu_c).jacobian;
+            let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = system.jacobians[j];
             let s2 = s_jj * s_jj;
-            let cavity_rate = |d_sjj: f64, d_muj: f64| -> (f64, f64) {
-                (-d_sjj / s2, d_muj / s_jj - mu[j] * d_sjj / s2)
-            };
-            for k in 0..q {
-                let (dtc, dnc) =
-                    cavity_rate(-sigma[[j, k]] * sigma[[j, k]], -sigma[[j, k]] * mu[k]);
-                let dtc = if k == j { dtc - 1.0 } else { dtc };
-                system[[j, k]] -= dt_dtc * dtc + dt_dnc * dnc;
-                system[[q + j, k]] -= dn_dtc * dtc + dn_dnc * dnc;
-                let (dtc, dnc) = cavity_rate(0.0, sigma[[j, k]]);
-                let dnc = if k == j { dnc - 1.0 } else { dnc };
-                system[[j, q + k]] -= dt_dtc * dtc + dt_dnc * dnc;
-                system[[q + j, q + k]] -= dn_dtc * dtc + dn_dnc * dnc;
-            }
-            let (dtc, dnc) = cavity_rate(d_sigma[[j, j]], d_mu[j]);
+            let (dtc, dnc) = (-d_sigma[[j, j]] / s2, d_mu[j] / s_jj - mu[j] * d_sigma[[j, j]] / s2);
             rhs[j] = dt_dtc * dtc + dt_dnc * dnc;
             rhs[q + j] = dn_dtc * dtc + dn_dnc * dnc;
         }
-        let ds = invert(system, "the linearized EP fixed point")?.dot(&rhs);
+        let ds = system.inverse.dot(&rhs);
         Ok((ds.slice(s![0..q]).to_owned(), ds.slice(s![q..2 * q]).to_owned()))
+    }
+
+    /// The posterior, the site partials and the inverse of the linearized fixed point's
+    /// `2q × 2q` system `I − ∂F/∂s`, formed once for these sites.
+    fn linearized_fixed_point(&self) -> Result<&SiteMotionSystem, ConeNormalizerRefusal> {
+        self.site_motion_system
+            .get_or_init(|| {
+                let q = self.m0.len();
+                let (sigma, mu) = self.posterior();
+                let mut system = Array2::<f64>::eye(2 * q);
+                let mut jacobians = Vec::with_capacity(q);
+                for j in 0..q {
+                    let s_jj = sigma[[j, j]];
+                    let tau_c = 1.0 / s_jj - self.tau[j];
+                    let nu_c = mu[j] / s_jj - self.nu[j];
+                    let jacobian = site_update(tau_c, nu_c).jacobian;
+                    let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = jacobian;
+                    jacobians.push(jacobian);
+                    let s2 = s_jj * s_jj;
+                    let cavity_rate = |d_sjj: f64, d_muj: f64| -> (f64, f64) {
+                        (-d_sjj / s2, d_muj / s_jj - mu[j] * d_sjj / s2)
+                    };
+                    for k in 0..q {
+                        let (dtc, dnc) =
+                            cavity_rate(-sigma[[j, k]] * sigma[[j, k]], -sigma[[j, k]] * mu[k]);
+                        let dtc = if k == j { dtc - 1.0 } else { dtc };
+                        system[[j, k]] -= dt_dtc * dtc + dt_dnc * dnc;
+                        system[[q + j, k]] -= dn_dtc * dtc + dn_dnc * dnc;
+                        let (dtc, dnc) = cavity_rate(0.0, sigma[[j, k]]);
+                        let dnc = if k == j { dnc - 1.0 } else { dnc };
+                        system[[j, q + k]] -= dt_dtc * dtc + dt_dnc * dnc;
+                        system[[q + j, q + k]] -= dn_dtc * dtc + dn_dnc * dnc;
+                    }
+                }
+                let inverse = invert(system, "the linearized EP fixed point")?;
+                Ok(SiteMotionSystem { sigma, mu, jacobians, inverse })
+            })
+            .as_ref()
+            .map_err(|refusal| refusal.clone())
     }
 }
 
@@ -510,12 +571,20 @@ fn slack_horizon() -> Result<f64, ConeNormalizerRefusal> {
 /// `v = dβ̂/dθ`, the KKT gradient's total derivative `ġ`, and the precision's motion `Ṁ` applied to
 /// `y = M⁻¹g` ([`ConeNormalizer::solved_gradient`]) and to each column of `R = M⁻¹Aᵀ`
 /// ([`ConeNormalizer::normal_solves`]).
+///
+/// Where `M⁻¹` is the criterion's kept-spectrum pseudo-inverse `M⁺`, its derivative is not
+/// `−M⁺ṀM⁺` alone: the kept eigenvectors rotate into the dropped ones. That part of `D(M⁺)[Ṁ]`
+/// is applied to `g` and to each retained constraint normal ([`ConeNormalizer::retained_normals`])
+/// in `inverse_rotation_on_gradient` and `inverse_rotation_on_normals`, zero where `M⁻¹` is an
+/// inverse (gam#2952).
 #[derive(Clone, Debug)]
 pub struct ConeCoordinateMotion {
     pub mode_response: Array1<f64>,
     pub gradient_rate: Array1<f64>,
     pub precision_rate_on_y: Array1<f64>,
     pub precision_rate_on_r: Array2<f64>,
+    pub inverse_rotation_on_gradient: Array1<f64>,
+    pub inverse_rotation_on_normals: Array2<f64>,
 }
 
 /// One coordinate pair's second-order motion: `v_kl`, `g̈_kl`, and `M̈_kl` applied to `y` and to
@@ -526,6 +595,12 @@ pub struct ConePairMotion {
     pub gradient_rate: Array1<f64>,
     pub precision_rate_on_y: Array1<f64>,
     pub precision_rate_on_r: Array2<f64>,
+    /// What the inverse identities in [`ConeNormalizer::second_order`] omit where `M⁻¹` is the
+    /// criterion's kept-spectrum pseudo-inverse: `(D²M⁺[Ṁ_k, Ṁ_l] − M⁺Ṁ_kM⁺Ṁ_lM⁺ − M⁺Ṁ_lM⁺Ṁ_kM⁺)`
+    /// plus the rotation of the pair drift `D M⁺[M̈] + M⁺M̈M⁺`, applied to `g` and to each retained
+    /// normal. Zero where `M⁻¹` is an inverse (gam#2952).
+    pub inverse_rotation_on_gradient: Array1<f64>,
+    pub inverse_rotation_on_normals: Array2<f64>,
 }
 
 /// A coordinate's first derivative of `C`, with the rates its pairs reuse.
@@ -577,12 +652,22 @@ impl ConeNormalizer {
         let center = beta - &y;
         let p = beta.len();
         let mut kept: Vec<(Array1<f64>, Array1<f64>, f64)> = Vec::new();
+        let mut half_spaces = std::collections::HashSet::<Vec<u64>>::new();
         for row in 0..rows.nrows() {
             let norm = rows.row(row).dot(&rows.row(row)).sqrt();
             if !(norm > 0.0) {
                 continue;
             }
             let unit = rows.row(row).mapv(|value| value / norm);
+            let bound = bounds[row] / norm;
+            // A row repeated exactly bounds the same half-space, and an intersection holds it
+            // once: `P(u ≥ 0)` is the same with the repeat as without it. EP is not, since it
+            // gives each copy its own site, so a repeat enters once.
+            let half_space: Vec<u64> =
+                unit.iter().chain(std::iter::once(&bound)).map(|value| (value + 0.0).to_bits()).collect();
+            if !half_spaces.insert(half_space) {
+                continue;
+            }
             let solved = solve(&unit);
             let variance = unit.dot(&solved);
             if !variance.is_finite() {
@@ -591,7 +676,7 @@ impl ConeNormalizer {
             if !(variance > 0.0) {
                 continue;
             }
-            let mean = unit.dot(&center) - bounds[row] / norm;
+            let mean = unit.dot(&center) - bound;
             if mean / variance.sqrt() < horizon {
                 kept.push((unit, solved, mean));
             }
@@ -622,6 +707,11 @@ impl ConeNormalizer {
     /// Rows inside the mass horizon.
     pub fn retained_rows(&self) -> usize {
         self.rows.nrows()
+    }
+
+    /// The unit normals of the rows inside the mass horizon, `Aᵀ`, `p × q`.
+    pub fn retained_normals(&self) -> Array2<f64> {
+        self.rows.t().to_owned()
     }
 
     /// EP sweeps at this mode.
@@ -656,9 +746,13 @@ impl ConeNormalizer {
         motion: &ConeCoordinateMotion,
         solve: &dyn Fn(&Array1<f64>) -> Array1<f64>,
     ) -> ConeFirstOrder {
-        let y_rate = solve(&(&motion.gradient_rate - &motion.precision_rate_on_y));
+        let y_rate = solve(&(&motion.gradient_rate - &motion.precision_rate_on_y))
+            + &motion.inverse_rotation_on_gradient;
         let m0_rate = self.rows.dot(&motion.mode_response) - self.rows.dot(&y_rate);
-        let w_rate = symmetrized(&(-self.r.t().dot(&motion.precision_rate_on_r)));
+        let w_rate = symmetrized(
+            &(self.rows.dot(&motion.inverse_rotation_on_normals)
+                - self.r.t().dot(&motion.precision_rate_on_r)),
+        );
         let derivative = -0.5 * (motion.gradient_rate.dot(&self.y) + self.gradient.dot(&y_rate))
             - self.orthant.mean_gradient().dot(&m0_rate)
             - frobenius(&self.orthant.covariance_gradient(), &w_rate);
@@ -688,17 +782,37 @@ impl ConeNormalizer {
             - motion_l.precision_rate_on_y.dot(&first_k.y_rate)
             - motion_k.precision_rate_on_y.dot(&first_l.y_rate)
             - pair.precision_rate_on_y.dot(&self.y);
+        // Where `M⁻¹` is a kept-spectrum pseudo-inverse, `ÿ` and `Ẅ` also carry what the identities
+        // above omit: the pair's second rotation, and each coordinate's first rotation against the
+        // other's rates (`ẏ` already carries the first rotation, which the identities read back
+        // through `Ṁ ẏ`). All of it is zero where `M⁻¹` is an inverse.
+        let (turn_k, turn_l) = (&motion_k.inverse_rotation_on_gradient, &motion_l.inverse_rotation_on_gradient);
+        let y_turned = turn_k.dot(&motion_l.gradient_rate)
+            + turn_l.dot(&motion_k.gradient_rate)
+            + self.gradient.dot(&pair.inverse_rotation_on_gradient)
+            + motion_l.precision_rate_on_y.dot(turn_k)
+            + motion_k.precision_rate_on_y.dot(turn_l);
         let second_gy = pair.gradient_rate.dot(&self.y)
             + motion_k.gradient_rate.dot(&first_l.y_rate)
             + motion_l.gradient_rate.dot(&first_k.y_rate)
-            + y_moved;
+            + y_moved
+            + y_turned;
+        let normal_turned = motion_k.inverse_rotation_on_normals.t().dot(&motion_l.gradient_rate)
+            + motion_l.inverse_rotation_on_normals.t().dot(&motion_k.gradient_rate)
+            + self.rows.dot(&pair.inverse_rotation_on_gradient)
+            + motion_l.precision_rate_on_r.t().dot(turn_k)
+            + motion_k.precision_rate_on_r.t().dot(turn_l);
         let normal_moved = self.r.t().dot(&pair.gradient_rate)
             - motion_l.precision_rate_on_r.t().dot(&first_k.y_rate)
             - motion_k.precision_rate_on_r.t().dot(&first_l.y_rate)
-            - self.r.t().dot(&pair.precision_rate_on_y);
+            - self.r.t().dot(&pair.precision_rate_on_y)
+            + normal_turned;
         let m0_second = self.rows.dot(&pair.mode_response) - normal_moved;
         let cross = motion_k.precision_rate_on_r.t().dot(&first_l.solved_rate_on_r);
-        let w_second = symmetrized(&(&cross + &cross.t() - self.r.t().dot(&pair.precision_rate_on_r)));
+        let w_second = symmetrized(
+            &(&cross + &cross.t() - self.r.t().dot(&pair.precision_rate_on_r)
+                + self.rows.dot(&pair.inverse_rotation_on_normals)),
+        );
         let (d_gamma, d_big_gamma) = self.orthant.gradient_motion(&first_l.m0_rate, &first_l.w_rate)?;
         let second_log_mass = d_gamma.dot(&first_k.m0_rate)
             + frobenius(&d_big_gamma, &first_k.w_rate)
@@ -767,6 +881,20 @@ mod tests {
         move |rhs: &Array1<f64>| inverse.dot(rhs)
     }
 
+    /// One undamped EP sweep read straight off the definitions: each site's cavity from
+    /// `Σ = EW` and `μ = E(m₀ + Wν̃)` re-formed from `E = (I + WT)⁻¹` after every site.
+    fn sequential_site_sweep(state: &mut OrthantLogMass) {
+        for j in 0..state.m0.len() {
+            let (sigma, mu) = state.posterior();
+            let s_jj = sigma[[j, j]];
+            let update = site_update(1.0 / s_jj - state.tau[j], mu[j] / s_jj - state.nu[j]);
+            state.tau[j] = update.tau;
+            state.nu[j] = update.nu;
+            state.e = inverse_i_plus_wt(&state.w, &state.tau).expect("admissible sites");
+        }
+        state.site_motion_system = std::sync::OnceLock::new();
+    }
+
     /// The change of `ln Z_EP` need not fall monotonically. This orthant is where EP was refused on
     /// the #2765 named gate for one growing sweep (seven rows correlated up to 0.98; job 1264873,
     /// change 1.047e-5 after 1.546e-7 at sweep 5). Continued undamped from there, the same
@@ -799,13 +927,7 @@ mod tests {
             .unwrap_or_else(|refusal| panic!("EP settles on the recorded orthant: {refusal}"));
         let mut checked = mass.clone();
         let q = m0.len();
-        for j in 0..q {
-            let (tau_c, nu_c) = checked.cavity(j);
-            let update = site_update(tau_c, nu_c);
-            checked.tau[j] = update.tau;
-            checked.nu[j] = update.nu;
-            checked.e = inverse_i_plus_wt(&checked.w, &checked.tau).expect("admissible sites");
-        }
+        sequential_site_sweep(&mut checked);
         let (after, magnitude) = checked.evaluate_log_mass().expect("a finite EP log mass");
         let band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
         eprintln!(
@@ -1013,6 +1135,234 @@ mod tests {
         );
     }
 
+    /// gam#2952: where the criterion prices the kept-spectrum pseudo-inverse `M⁺` of an
+    /// indefinite precision, the first derivative of `C` is the derivative of `C` priced with
+    /// `M⁺`. `M(t) = R(t) Λ(t) R(t)ᵀ` rotates its eigenvectors, so the kept pair turns into the
+    /// dropped negative direction, which `−M⁺ṀM⁺` alone does not see. The kernel is written down
+    /// exactly at every `t`, the way the criterion's producers build it from one eigendecomposition.
+    #[test]
+    fn the_normalizer_derivative_follows_a_kept_spectrum_pseudo_inverse_2952() {
+        use crate::estimate::reml::reml_outer_engine::PenaltySubspaceTrace;
+        let rows = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.6, 0.8]];
+        let bounds = array![0.0, 0.0, -0.05];
+        let axis = array![0.3_f64, -0.5, 0.8];
+        let axis = &axis / axis.dot(&axis).sqrt();
+        let generator = array![
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0]
+        ];
+        let q0 = array![[0.8, -0.6, 0.0], [0.36, 0.48, -0.8], [0.48, 0.64, 0.6]];
+        // Eigenvalues 2.0 and 0.9 are kept; −0.3 is dropped, like the #2894 wiggle optimum's
+        // −0.12 against a kept 0.45.
+        let spectrum = |t: f64| array![2.0 + 0.4 * t, 0.9 - 0.3 * t, -0.3 + 0.1 * t];
+        let rotation = |t: f64| {
+            let angle = 0.7 * t;
+            Array2::<f64>::eye(3)
+                + &(&generator * angle.sin())
+                + &(generator.dot(&generator) * (1.0 - angle.cos()))
+        };
+        let kernel_at = |t: f64| {
+            let basis = rotation(t).dot(&q0);
+            let values = spectrum(t);
+            PenaltySubspaceTrace {
+                u_s: basis.slice(s![.., 0..2]).to_owned(),
+                h_proj_inverse: Array2::from_diag(&values.slice(s![0..2]).mapv(|value| 1.0 / value)),
+                dropped_basis: basis.slice(s![.., 2..3]).to_owned(),
+                dropped_eigenvalues: values.slice(s![2..3]).to_owned(),
+                logdet_correction: 0.0,
+            }
+        };
+        let precision_at = |t: f64| {
+            let basis = rotation(t).dot(&q0);
+            basis.dot(&Array2::from_diag(&spectrum(t))).dot(&basis.t())
+        };
+        let (b0, b1) = (array![0.01, 0.02, 0.3], array![-0.2, 0.1, 0.05]);
+        let (g0, g1) = (array![0.4, 0.3, 0.0], array![0.1, -0.2, 0.05]);
+        let normalizer_at = |t: f64| {
+            let kernel = kernel_at(t);
+            let solve = |v: &Array1<f64>| kernel.apply_pseudo_inverse(v);
+            ConeNormalizer::evaluate(&rows, &bounds, &(&b0 + &(&b1 * t)), &(&g0 + &(&g1 * t)), &solve)
+                .expect("normalizer")
+        };
+        let kernel = kernel_at(0.0);
+        let solve = |v: &Array1<f64>| kernel.apply_pseudo_inverse(v);
+        let normalizer = normalizer_at(0.0);
+        assert!(normalizer.retained_rows() >= 2, "at least two correlated rows are near their bounds");
+        // `Ṁ(0) = 0.7·(Ω M₀ − M₀ Ω) + Q₀ Λ̇ Q₀ᵀ`, since `Ṙ(0) = 0.7·Ω` and `Ω` is skew.
+        let m0 = precision_at(0.0);
+        let precision_rate = (generator.dot(&m0) - m0.dot(&generator)) * 0.7
+            + q0.dot(&Array2::from_diag(&array![0.4, -0.3, 0.1])).dot(&q0.t());
+        let fd_precision = (precision_at(1.0e-5) - precision_at(-1.0e-5)) / 2.0e-5;
+        let rate_gap = (&precision_rate - &fd_precision).iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(rate_gap <= 1.0e-8, "the path's precision rate: gap {rate_gap:e} to its central difference");
+        let rotation_on_dropped = precision_rate.dot(&kernel.dropped_basis);
+        let turn = kernel
+            .pseudo_inverse_rotation(&rotation_on_dropped)
+            .expect("spectral kernel");
+        let motion_with = |turn_on_gradient: Array1<f64>, turn_on_normals: Array2<f64>| {
+            ConeCoordinateMotion {
+                mode_response: b1.clone(),
+                gradient_rate: g1.clone(),
+                precision_rate_on_y: precision_rate.dot(normalizer.solved_gradient()),
+                precision_rate_on_r: precision_rate.dot(normalizer.normal_solves()),
+                inverse_rotation_on_gradient: turn_on_gradient,
+                inverse_rotation_on_normals: turn_on_normals,
+            }
+        };
+        let exact = motion_with(turn.apply(&g0), turn.apply_columns(&normalizer.retained_normals()));
+        let derivative = normalizer.first_order(&exact, &solve).derivative;
+        let (fd, bar) = richardson(&|t: f64| normalizer_at(t).value(), 1.0e-3);
+        assert!(
+            (derivative - fd).abs() <= bar,
+            "dC {derivative} against central difference {fd} (bar {bar})"
+        );
+        // The rotation is the derivative of the pseudo-inverse itself: along the same path,
+        // `d(M⁺v)/dt = −M⁺ṀM⁺v + rotation(v)` for a fixed `v`.
+        let probe = array![0.7, -0.2, 0.4];
+        let (fd_solve, _) = {
+            let h = 1.0e-5;
+            (
+                (kernel_at(h).apply_pseudo_inverse(&probe) - kernel_at(-h).apply_pseudo_inverse(&probe))
+                    / (2.0 * h),
+                h,
+            )
+        };
+        let analytic_solve = -solve(&precision_rate.dot(&solve(&probe))) + turn.apply(&probe);
+        let solve_gap = (&analytic_solve - &fd_solve).iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(solve_gap <= 1.0e-7, "d(M⁺v) against central difference: gap {solve_gap:e}");
+        // Positive control: without the rotation the derivative is the inverse's, and it misses.
+        let inverse_only = motion_with(
+            Array1::zeros(3),
+            Array2::zeros(normalizer.normal_solves().raw_dim()),
+        );
+        let missed = normalizer.first_order(&inverse_only, &solve).derivative;
+        assert!(
+            (missed - fd).abs() > 1.0e3 * bar,
+            "positive control: −M⁺ṀM⁺ alone gives {missed} against {fd} (bar {bar})"
+        );
+
+        // Second order along the same path. `Ṁ(t) = 0.7·(Ω M − M Ω) + R Ṅ Rᵀ` with
+        // `Ṅ = Q₀ Λ̇ Q₀ᵀ`, so `M̈(0) = 0.7·(Ω Ṁ₀ − Ṁ₀ Ω) + 0.7·(Ω Ṅ − Ṅ Ω)`.
+        let n_rate = q0.dot(&Array2::from_diag(&array![0.4, -0.3, 0.1])).dot(&q0.t());
+        let precision_rate_at = |t: f64| {
+            let m = precision_at(t);
+            let turn = rotation(t);
+            (generator.dot(&m) - m.dot(&generator)) * 0.7 + turn.dot(&n_rate).dot(&turn.t())
+        };
+        let second_precision = (generator.dot(&precision_rate) - precision_rate.dot(&generator)) * 0.7
+            + (generator.dot(&n_rate) - n_rate.dot(&generator)) * 0.7;
+        let fd_second = (precision_rate_at(1.0e-5) - precision_rate_at(-1.0e-5)) / 2.0e-5;
+        let second_gap =
+            (&second_precision - &fd_second).iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(second_gap <= 1.0e-8, "the path's second precision rate: gap {second_gap:e}");
+        let exact_motion_at = |t: f64, normalizer: &ConeNormalizer, kernel: &PenaltySubspaceTrace| {
+            let rate = precision_rate_at(t);
+            let turn = kernel
+                .pseudo_inverse_rotation(&rate.dot(&kernel.dropped_basis))
+                .expect("spectral kernel");
+            ConeCoordinateMotion {
+                mode_response: b1.clone(),
+                gradient_rate: g1.clone(),
+                precision_rate_on_y: rate.dot(normalizer.solved_gradient()),
+                precision_rate_on_r: rate.dot(normalizer.normal_solves()),
+                inverse_rotation_on_gradient: turn.apply(&(&g0 + &(&g1 * t))),
+                inverse_rotation_on_normals: turn.apply_columns(&normalizer.retained_normals()),
+            }
+        };
+        // The second order is graded on one row, where EP is exact (P = Φ), so the check measures
+        // the rotation algebra alone. On correlated rows a difference of the first derivative also
+        // carries EP's fixed-point tolerance, which the 2765 pin grades on its own fixture.
+        let row_one = array![[0.0, 1.0, 0.0]];
+        let bound_one = array![0.0];
+        let normalizer_one_at = |t: f64| {
+            let kernel = kernel_at(t);
+            let solve = |v: &Array1<f64>| kernel.apply_pseudo_inverse(v);
+            ConeNormalizer::evaluate(&row_one, &bound_one, &(&b0 + &(&b1 * t)), &(&g0 + &(&g1 * t)), &solve)
+                .expect("normalizer")
+        };
+        let derivative_at = |t: f64| {
+            let kernel = kernel_at(t);
+            let normalizer = normalizer_one_at(t);
+            let solve = |v: &Array1<f64>| kernel.apply_pseudo_inverse(v);
+            normalizer.first_order(&exact_motion_at(t, &normalizer, &kernel), &solve).derivative
+        };
+        let normalizer_one = normalizer_one_at(0.0);
+        assert_eq!(normalizer_one.retained_rows(), 1, "the one row is inside the mass horizon");
+        let normals = normalizer_one.retained_normals();
+        let mut probes = Array2::<f64>::zeros((3, 1 + normals.ncols()));
+        probes.column_mut(0).assign(&g0);
+        probes.slice_mut(s![.., 1..]).assign(&normals);
+        let apply_rate = |v: &Array1<f64>| precision_rate.dot(v);
+        let second_rotation = |vectors: &Array2<f64>| {
+            kernel
+                .pseudo_inverse_second_rotation(
+                    &apply_rate,
+                    &apply_rate,
+                    &rotation_on_dropped,
+                    &rotation_on_dropped,
+                    &second_precision.dot(&kernel.dropped_basis),
+                    vectors,
+                )
+                .expect("spectral kernel")
+        };
+        // The kernel's second rotation is the second derivative of the pseudo-inverse itself:
+        // `d²(M⁺v)/dt² = 2 M⁺ṀM⁺ṀM⁺v − M⁺M̈M⁺v + (second rotation)(v)` for a fixed `v`, against a
+        // Richardson-extrapolated second difference.
+        let second_difference = |h: f64| {
+            (kernel_at(h).apply_pseudo_inverse(&probe) - kernel.apply_pseudo_inverse(&probe) * 2.0
+                + kernel_at(-h).apply_pseudo_inverse(&probe))
+                / (h * h)
+        };
+        let second_solve = (second_difference(1.0e-3) * 4.0 - second_difference(2.0e-3)) / 3.0;
+        let mut probe_column = Array2::<f64>::zeros((3, 1));
+        probe_column.column_mut(0).assign(&probe);
+        let inverse_part = solve(&precision_rate.dot(&solve(&precision_rate.dot(&solve(&probe))))) * 2.0
+            - solve(&second_precision.dot(&solve(&probe)));
+        let analytic_second = &inverse_part + &second_rotation(&probe_column).column(0);
+        let second_solve_gap =
+            (&analytic_second - &second_solve).iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(
+            second_solve_gap <= 1.0e-8,
+            "d²(M⁺v) against a second difference: gap {second_solve_gap:e}"
+        );
+        let second_turn = second_rotation(&probes);
+        let pair_with = |turn_on_gradient: Array1<f64>, turn_on_normals: Array2<f64>| ConePairMotion {
+            mode_response: Array1::zeros(3),
+            gradient_rate: Array1::zeros(3),
+            precision_rate_on_y: second_precision.dot(normalizer_one.solved_gradient()),
+            precision_rate_on_r: second_precision.dot(normalizer_one.normal_solves()),
+            inverse_rotation_on_gradient: turn_on_gradient,
+            inverse_rotation_on_normals: turn_on_normals,
+        };
+        let exact_one = exact_motion_at(0.0, &normalizer_one, &kernel);
+        let first = normalizer_one.first_order(&exact_one, &solve);
+        let pair = pair_with(second_turn.column(0).to_owned(), second_turn.slice(s![.., 1..]).to_owned());
+        let second = normalizer_one
+            .second_order(&exact_one, &first, &exact_one, &first, &pair)
+            .expect("second order");
+        let (fd2, bar2) = richardson(&derivative_at, 1.0e-3);
+        assert!(
+            (second - fd2).abs() <= bar2,
+            "d²C {second} against central difference of dC {fd2} (bar {bar2})"
+        );
+        // Positive control: the inverse identities alone miss the second derivative.
+        let bare_pair = pair_with(Array1::zeros(3), Array2::zeros(normals.raw_dim()));
+        let bare_first_motion = ConeCoordinateMotion {
+            inverse_rotation_on_gradient: Array1::zeros(3),
+            inverse_rotation_on_normals: Array2::zeros(normals.raw_dim()),
+            ..exact_one.clone()
+        };
+        let bare_first = normalizer_one.first_order(&bare_first_motion, &solve);
+        let bare = normalizer_one
+            .second_order(&bare_first_motion, &bare_first, &bare_first_motion, &bare_first, &bare_pair)
+            .expect("second order");
+        assert!(
+            (bare - fd2).abs() > 1.0e3 * bar2,
+            "positive control: the inverse identities give {bare} against {fd2} (bar {bar2})"
+        );
+    }
+
     #[test]
     fn the_normalizer_derivatives_match_central_differences_2765() {
         let rows = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.6, 0.8]];
@@ -1043,6 +1393,9 @@ mod tests {
                 gradient_rate: &g1 + &(&g2 * (2.0 * t)),
                 precision_rate_on_y: m_rate.dot(normalizer.solved_gradient()),
                 precision_rate_on_r: m_rate.dot(normalizer.normal_solves()),
+                // `dense_solve` is an inverse: nothing rotates.
+                inverse_rotation_on_gradient: Array1::zeros(b1.len()),
+                inverse_rotation_on_normals: Array2::zeros(normalizer.normal_solves().raw_dim()),
             }
         };
         let derivative_at = |t: f64| {
@@ -1070,6 +1423,8 @@ mod tests {
             gradient_rate: &g2 * 2.0,
             precision_rate_on_y: (&m2 * 2.0).dot(normalizer.solved_gradient()),
             precision_rate_on_r: (&m2 * 2.0).dot(normalizer.normal_solves()),
+            inverse_rotation_on_gradient: Array1::zeros(b2.len()),
+            inverse_rotation_on_normals: Array2::zeros(normalizer.normal_solves().raw_dim()),
         };
         let second = normalizer
             .second_order(&motion, &first, &motion, &first, &pair)
@@ -1078,6 +1433,111 @@ mod tests {
         assert!(
             (second - fd2).abs() <= bar2,
             "d²C {second} against central difference of dC {fd2} (bar {bar2})"
+        );
+    }
+
+    /// gam#3135 (the property gam-2959 proposed for #2959 M7): the rank-one sweep stops at a fixed
+    /// point of the definition's sweep. On a correlated three-row orthant, a twelve-row banded one
+    /// and a twelve-row one near rank one, a further sweep that re-forms the posterior after every
+    /// site moves `ln P` by no more than the rounding band EP stops at.
+    #[test]
+    fn the_rank_one_sweep_stops_at_a_fixed_point_of_the_sequential_site_sweep_3135() {
+        let correlated = (
+            array![-1.5, 0.2, 1.0],
+            array![[1.0, 0.5, -0.3], [0.5, 2.0, 0.4], [-0.3, 0.4, 0.8]],
+        );
+        let rows = 12usize;
+        let banded = (
+            Array1::from_shape_fn(rows, |i| 1.5 * (1.3 * i as f64).sin()),
+            Array2::from_shape_fn((rows, rows), |(i, j)| {
+                let scale = (0.5 + 0.1 * i as f64) * (0.5 + 0.1 * j as f64);
+                scale * 0.6_f64.powi((i as i32 - j as i32).abs())
+            }),
+        );
+        let near_rank_one = (
+            Array1::from_shape_fn(rows, |i| 0.3 * (0.7 * i as f64).cos() - 0.2),
+            Array2::from_shape_fn((rows, rows), |(i, j)| {
+                let (a, b) = (1.0 + 0.05 * i as f64, 1.0 + 0.05 * j as f64);
+                0.97 * a * b + if i == j { 0.03 * a * a } else { 0.0 }
+            }),
+        );
+        for (m0, w) in [correlated, banded, near_rank_one] {
+            let q = m0.len();
+            let mass = OrthantLogMass::converge(&m0, &w).expect("the orthant converges");
+            let (_, magnitude) = mass.evaluate_log_mass().expect("a finite EP log mass");
+            let mut checked = mass.clone();
+            sequential_site_sweep(&mut checked);
+            let (after, _) = checked.evaluate_log_mass().expect("a finite EP log mass");
+            let band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
+            eprintln!(
+                "[3135-EP] q = {q}: ln P {:.15e} after {} sweeps; a sequential sweep moves it {:e} (band {band:e})",
+                mass.log_mass(),
+                mass.sweeps(),
+                (after - mass.log_mass()).abs()
+            );
+            assert!(
+                (after - mass.log_mass()).abs() <= band,
+                "q = {q}: a sequential sweep from the rank-one stop moves ln P {:.15e} by {:e}, \
+                 above the band {band:e}",
+                mass.log_mass(),
+                (after - mass.log_mass()).abs()
+            );
+        }
+    }
+
+
+    /// An exactly repeated row is one half-space: `C` is the value of the rows without the repeat,
+    /// bit for bit. Positive control: EP handed the copies counts each one's truncation.
+    #[test]
+    fn a_repeated_row_enters_the_normalizer_once_1082() {
+        let h = array![[2.0, 0.8, 0.3], [0.8, 1.5, -0.4], [0.3, -0.4, 1.2]];
+        let solve = dense_solve(&h);
+        let beta = array![0.0, 0.2, 0.5];
+        let gradient = array![0.3, 0.0, 0.0];
+        let distinct = array![[1.0, 0.0, 0.0], [0.0, 0.6, 0.8]];
+        let distinct_bounds = array![0.0, 0.1];
+        let copies = 38;
+        let repeated = Array2::from_shape_fn((2 * copies, 3), |(i, j)| distinct[[i % 2, j]]);
+        let repeated_bounds = Array1::from_shape_fn(2 * copies, |i| distinct_bounds[i % 2]);
+        let once = ConeNormalizer::evaluate(&distinct, &distinct_bounds, &beta, &gradient, &solve)
+            .expect("normalizer on the distinct rows");
+        let with_copies = ConeNormalizer::evaluate(&repeated, &repeated_bounds, &beta, &gradient, &solve)
+            .expect("normalizer on the repeated rows");
+        assert_eq!(with_copies.retained_rows(), once.retained_rows(), "each half-space enters once");
+        assert_eq!(
+            with_copies.value().to_bits(),
+            once.value().to_bits(),
+            "C with {copies} copies of each row {} against C without them {}",
+            with_copies.value(),
+            once.value()
+        );
+        // The active row alone: one half-space, where EP is exact, against 38 sites on it.
+        let v = solve(&array![1.0, 0.0, 0.0])[0];
+        let m = -0.3 * v;
+        let exact = normal_logcdf(m / v.sqrt());
+        let single = OrthantLogMass::converge(&array![m], &array![[v]]).expect("one site");
+        let copied = OrthantLogMass::converge(
+            &Array1::from_elem(copies, m),
+            &Array2::from_elem((copies, copies), v),
+        )
+        .expect("the copied sites converge");
+        eprintln!(
+            "[1082-EP] one row at z = {:.6}: ln Φ {exact:.15e}; EP on one site {:.15e}; EP on {copies} copies \
+             {:.15e} in {} sweeps",
+            m / v.sqrt(),
+            single.log_mass(),
+            copied.log_mass(),
+            copied.sweeps()
+        );
+        assert!(
+            (single.log_mass() - exact).abs() <= band(64, exact.abs().max(1.0)),
+            "one site is exact: {} against ln Φ {exact}",
+            single.log_mass()
+        );
+        assert!(
+            (copied.log_mass() - exact).abs() > 1.0e3 * band(64, exact.abs().max(1.0)),
+            "positive control: EP on {copies} copies of one row gives {} against ln Φ {exact}",
+            copied.log_mass()
         );
     }
 }

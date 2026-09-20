@@ -34,7 +34,9 @@ from ._survival import (
     term_blocks_for_model,
 )
 from ._tables import (
+    detect_table_kind,
     normalize_table,
+    numpy_table_width,
     restore_output_table,
     table_columns,
 )
@@ -166,12 +168,18 @@ class Model:
             Input rows in any format accepted by :func:`gamfit.fit`
             (``pandas.DataFrame``, ``pyarrow.Table``, ``polars.DataFrame``,
             ``dict`` of columns, ``list`` of record dicts, ...). Columns must
-            cover every predictor referenced by the fitted formula.
+            cover every predictor referenced by the fitted formula. A 2-D
+            NumPy array is positional: a model fitted from an array reads its
+            columns as ``x0, x1, ...``; a model fitted from a named table binds
+            them to its predictor columns in training-table order, and needs
+            exactly that many columns.
         interval : float, "conformal", or None, default None
             Single uncertainty knob. ``None`` returns the point prediction(s)
             only. A float in ``(0, 1)`` (e.g. ``0.95``) requests the full
             uncertainty decomposition at that pointwise coverage; the output
-            gains ``posterior_mean_standard_error``,
+            gains ``linear_predictor_standard_error`` (the posterior SD of η),
+            ``posterior_mean_standard_error`` (the posterior SD of the
+            response, from the same η integral as ``posterior_mean``),
             ``posterior_mean_lower``, and ``posterior_mean_upper`` columns
             alongside ``linear_predictor_plugin`` / ``mean_plugin`` /
             ``posterior_mean``. On survival models it
@@ -184,22 +192,24 @@ class Model:
             band at ``conformal_level`` coverage in ``posterior_mean_lower`` /
             ``posterior_mean_upper`` — the same routes as ``gam predict
             --conformal``. Exactly one of ``training_data`` or ``calibration``
-            is required. With ``training_data`` it is the exact full-conformal
-            set at the fitted (frozen) smoothing parameters (#942 Layer 1):
-            every labeled row is used for both fitting and calibration, the
-            set is exact *given* the frozen penalty, and it costs one Cholesky
-            per test point with zero refits. It needs a Gaussian-identity model
-            fitted without prior weights, offsets, or a link wiggle. The saved
-            model carries only the ``p x p`` frozen penalty, never per-row
-            training data, so the labeled rows are passed again here. Because the
-            smoothing parameters were selected from all training responses, the
-            finite-sample ``conformal_level`` coverage theorem applies only
-            where the per-row ``frozen_rho_certified`` output column is 1.0 (the
-            Layer-3 certificate that freezing the global smoothing parameter
-            matches the honest ρ-re-selecting set, under a grid-checked
-            Lipschitz assumption); rows with 0.0 carry no finite-sample
-            guarantee, and the bounds report the outer envelope of the
-            (possibly multi-interval) set. With ``calibration`` it is the
+            is required. With ``training_data`` it is the full-conformal set of
+            the fit that re-selects the smoothing strength by REML on the
+            training rows plus the candidate test row (#942 Layer 3): every
+            labeled row is used for both fitting and calibration, and the test
+            row is treated exactly like a training row, so the finite-sample
+            ``conformal_level`` coverage theorem holds. It costs one Cholesky
+            per test point plus a cold REML refit at each finite endpoint. It
+            needs a Gaussian-identity model fitted without prior weights,
+            offsets, or a link wiggle. The saved model carries only the
+            ``p x p`` frozen penalty and its smoothing-parameter count, never
+            per-row training data, so the labeled rows are passed again here.
+            The per-row ``conformal_certificate`` output column is 0
+            (exact_frozen: nothing to re-select) or 1 (honest_refit) where the
+            guarantee holds; a negative code is a typed refusal (several
+            smoothing parameters, a payload without the count, a degenerate
+            criterion) where the row carries the frozen-smoothing set with no
+            finite-sample guarantee. The bounds report the outer envelope of
+            the (possibly multi-interval) set. With ``calibration`` it is the
             split-conformal band ``mu_hat(x) +/- q_hat * s(x)`` calibrated on
             that held-out fold, with finite-sample marginal coverage
             ``>= conformal_level`` regardless of model misspecification, for
@@ -248,6 +258,9 @@ class Model:
         return_type : {"dict", "pandas", "numpy", "polars", "pyarrow", "list"}, optional
             Force a specific output container. ``None`` (default) mirrors the
             shape of ``data`` (and the training table where unambiguous).
+            ``"numpy"`` is a structured array with one named field per output
+            column, read by the same names as a DataFrame
+            (``pred["posterior_mean_lower"]``).
         id_column : str or None, default None
             Name of an identifier column in ``data`` to propagate as a row key
             in the output (so predictions can be joined back to the input).
@@ -266,8 +279,10 @@ class Model:
               ``linear_predictor_plugin`` (``X·beta_hat``), ``mean_plugin``
               (its inverse-link image), and ``posterior_mean`` (the default
               response-scale point prediction). When ``interval`` is set it
-              adds ``posterior_mean_standard_error`` plus
-              ``posterior_mean_lower`` / ``posterior_mean_upper``.
+              adds ``linear_predictor_standard_error`` (``SE(η)``),
+              ``posterior_mean_standard_error`` (``√Var[link^{-1}(η)]``) plus
+              ``posterior_mean_lower`` / ``posterior_mean_upper`` (the
+              inverse link of the η credible quantiles).
               When the requested table container is ``"dict"``, the return is
               a ``PredictionResult``: it supports normal mapping access
               (``pred["posterior_mean"]``) and column attributes
@@ -302,12 +317,22 @@ class Model:
         required = rust_module().required_model_columns(self._prediction_model, False)
         if required is not None and id_column is not None:
             required = sorted(set(required) | {id_column})
-        headers, rows, table_kind = normalize_table(data, required_columns=required)
+        positional_headers = None
+        if detect_table_kind(data) == "numpy":
+            try:
+                positional_headers = rust_module().positional_prediction_headers(
+                    self._prediction_model, numpy_table_width(data)
+                )
+            except Exception as exc:
+                raise map_exception(exc) from exc
+        headers, rows, table_kind = normalize_table(
+            data, required_columns=required, positional_headers=positional_headers
+        )
         row_ids = extract_row_ids(headers, rows, id_column)
         # interval='conformal' runs the gam_predict::conformal_routes column
         # builders `gam predict --conformal` uses: the exact full-conformal set
         # without a calibration fold, the split-conformal band with one. The
-        # returned JSON has the model-based predict column schema, so
+        # returned payload has the model-based predict column schema, so
         # shape_predict_response is unchanged.
         if interval == "conformal":
             # allow-list (a): FFI input validation.
@@ -319,7 +344,7 @@ class Model:
             try:
                 if training_data is not None:
                     train_headers, train_rows, _ = normalize_table(training_data)
-                    raw = rust_module().predict_table_full_conformal(
+                    payload = rust_module().predict_table_full_conformal(
                         self._prediction_model,
                         headers,
                         rows,
@@ -337,7 +362,7 @@ class Model:
                         covariance_mode,
                         observation_interval,
                     )
-                    raw = rust_module().predict_table_conformal(
+                    payload = rust_module().predict_table_conformal(
                         self._prediction_model,
                         headers,
                         rows,
@@ -349,7 +374,7 @@ class Model:
             except Exception as exc:
                 raise map_exception(exc) from exc
             return shape_predict_response(
-                raw,
+                payload,
                 table_kind=table_kind,
                 training_table_kind=self._training_table_kind,
                 interval=conformal_level,
@@ -363,7 +388,7 @@ class Model:
         if training_data is not None:
             raise ValueError('training_data= applies only to interval="conformal"')
         try:
-            raw = rust_module().predict_table(
+            payload = rust_module().predict_table(
                 self._prediction_model,
                 headers,
                 rows,
@@ -374,7 +399,7 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
         return shape_predict_response(
-            raw,
+            payload,
             table_kind=table_kind,
             training_table_kind=self._training_table_kind,
             interval=interval,
@@ -419,6 +444,48 @@ class Model:
         if return_type is None and id_column is None:
             return scores
         columns: dict[str, list[Any]] = {"score": scores.tolist()}
+        if id_column is not None:
+            columns = {id_column: list(row_ids or []), **columns}
+        return restore_output_table(
+            columns,
+            requested=return_type,
+            input_kind=table_kind,
+            training_kind=self._training_table_kind,
+        )
+
+    def latent_conditional_residual(
+        self,
+        data: Any,
+        *,
+        return_type: str | None = None,
+        id_column: str | None = None,
+    ) -> Any:
+        """Evaluate the conditional latent residual ``(z - m(a)) / sqrt(v(a))``.
+
+        This method is defined for marginal-slope models fitted with a
+        conditional latent law (``latent_measure="conditional-location-scale"``).
+        It applies the map the fit applied to its own score, so at the
+        training rows it returns the fit's standardized score bit for bit, and
+        on new rows it returns the residual a held-out adequacy check compares
+        with the training residual law. The rows need the score column and the
+        conditioning covariates; a survival model's time columns are not read.
+
+        Returns ``None`` when the fit consumed no conditional latent law. By
+        default the residual is a one-dimensional NumPy array;
+        ``return_type=`` or ``id_column=`` requests a one-column table named
+        ``residual`` (plus the requested identifier).
+        """
+        headers, rows, table_kind = normalize_table(data)
+        row_ids = extract_row_ids(headers, rows, id_column)
+        try:
+            residual = rust_module().latent_conditional_residual_table(
+                self._prediction_model, headers, rows
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        if residual is None or (return_type is None and id_column is None):
+            return residual
+        columns: dict[str, list[Any]] = {"residual": residual.tolist()}
         if id_column is not None:
             columns = {id_column: list(row_ids or []), **columns}
         return restore_output_table(
@@ -525,8 +592,9 @@ class Model:
 
         Gaussian: ``sigma_hat^2 = RSS_w / (n - edf_total)`` (mgcv's
         ``gam.scale``); Gamma: ``1 / shape``; fixed-scale families (Poisson,
-        binomial): ``1``. ``None`` only for a custom family that declares no
-        dispersion.
+        binomial): ``1``. ``None`` exactly when the family's scale contract
+        has no scalar dispersion: a custom family that declares none, or
+        Royston-Parmar survival.
         """
         return self.summary().scale
 
@@ -647,15 +715,16 @@ class Model:
     def smooth_significance(self, data: Any) -> list[dict[str, Any]]:
         """Per-term likelihood-ratio significance for every penalized smooth (#1063).
 
-        :meth:`summary` reports Wood's rank-truncated *Wald* statistic
-        :math:`T = \\hat\\beta'\\hat\\Sigma^- \\hat\\beta`. The exact Lawley /
-        Bartlett factor corrects the *likelihood-ratio* statistic, and under
-        penalization the Wald form is already a weighted :math:`\\chi^2` whose
-        second-order mean is not :math:`d + \\Delta\\varepsilon`, so dividing
-        :math:`T` by the LR factor would correct the wrong statistic. This method
+        :meth:`summary` reports a variance-component *score* statistic. The
+        exact Lawley / Bartlett factor corrects the *likelihood-ratio*
+        statistic, and a score statistic's second-order mean is not
+        :math:`d + \\Delta\\varepsilon`, so dividing it by the LR factor would
+        correct the wrong statistic. This method
         instead computes a genuine per-term LR statistic
         :math:`W = 2(\\ell_{\\text{full}} - \\ell_{\\text{null}})` by a
-        constrained refit dropping the smooth, then Bartlett-corrects *that*:
+        constrained fit that fixes the smooth's coefficients at zero while
+        holding every other smoothing parameter at the full fit's
+        :math:`\\hat\\lambda`, then Bartlett-corrects *that*:
         :math:`W^* = W / c`, :math:`c = 1 + \\Delta\\varepsilon / d`.
 
         The reference :math:`W` is scored against is the statistic's own null
@@ -698,7 +767,24 @@ class Model:
         :math:`\\alpha = 0.05` and up to 1.6x anti-conservative at
         :math:`10^{-4}`), or ``"unit_weight_fallback"``.
 
-        For each penalized (shape-unconstrained) smooth term it returns
+        It returns one row per tested smooth term, always with the same keys.
+        The published p-value is exactly one of:
+
+        * ``p_value`` — the tail of the Bartlett-corrected statistic, resolved
+          to within ``p_value_bound``;
+        * ``p_value_upper_bound`` — the published accuracy does not separate
+          the tail from zero, so it is reported as ``p < p_value_upper_bound``
+          (the top of the certified interval) rather than as a residue such
+          as ``0.0``;
+        * ``unavailable_reason`` — a stable label
+          (``"empty_coefficient_block"``, ``"degenerate_reference"``,
+          ``"full_refit_failed"``, ``"null_fit_not_converged"``,
+          ``"null_fit_unsupported"``,
+          ``"null_log_likelihood_not_finite"``, ``"tail_not_computable"``)
+          with ``unavailable_message`` saying what happened; every inference
+          field of such a row is ``None``.
+
+        For a term with an inference row it also carries
         ``statistic_lr`` (the raw :math:`W`), ``ref_df`` (the null mean
         :math:`d = \\sum_j w_j`, which is what the Bartlett factor is
         denominated in — *not* a chi-square degrees of freedom),
@@ -708,13 +794,15 @@ class Model:
         estimated-scale channel above, ``None`` off the profiled Gaussian),
         ``bartlett_factor``
         :math:`c`, ``statistic_corrected`` :math:`W^*`, ``p_value_uncorrected``,
-        ``p_value_corrected`` (the magic-by-default value), ``material`` (the
+        ``p_value_corrected`` (the raw evaluated tail behind ``p_value`` /
+        ``p_value_upper_bound``), ``material`` (the
         n-too-small-here diagnostic — ``True`` when the correction moves the
         Bartlett factor or the p-value by more than 10%), and
-        ``correction_provenance`` — ``"lawley_lr"`` when the family carries
+        ``correction_provenance`` — ``"lawley_lr_estimated_lambda"`` or
+        ``"lawley_lr_fixed_lambda"`` when the family carries
         closed-form cumulant jets (gaussian / poisson / binomial / gamma) and the
-        null refit converged, else ``"none"`` (the uncorrected reference stands,
-        never weakened).
+        factor is computable at this ``n``, else
+        ``"none"`` (the uncorrected reference stands, never weakened).
 
         A shape-constrained smooth (``shape=...``) gets no LR p-value. Its null
         :math:`f = 0` is the apex of the constraint cone and the fitted
@@ -777,8 +865,9 @@ class Model:
         * ``provenance`` — ``"radial_enrichment"`` when a test ran, else the
           NAME of the evidence that was missing (``"no_continuous_covariates"``,
           ``"enrichment_budget_below_realized_width"``, ``"no_irls_row_state"``,
-          ``"design_gram_unavailable"``, ...). ``p_value`` is present exactly
-          when a test ran, so "adequate" and "not measured" are never
+          ``"design_gram_unavailable"``, ``"null_fit_unavailable"``,
+          ``"conditional_reference_unavailable"``, ...). ``p_value`` is present
+          exactly when a test ran, so "adequate" and "not measured" are never
           confusable.
 
         Method
@@ -788,8 +877,21 @@ class Model:
         in the fit's own IRLS weight metric. The statistic is
         :math:`T = U^{\top} V^{-} U / \hat\varphi` with
         :math:`U = \tilde Z^{\top} s` and :math:`V = \tilde Z^{\top} W \tilde Z`,
-        referred to :math:`\chi^2_r` (known dispersion) or :math:`F(r, \nu)`
-        (estimated).
+        referred to :math:`\chi^2_r` (known dispersion) or, with the scale
+        estimated on :math:`\nu` residual degrees of freedom, as the
+        added-variable :math:`(T/r)(\nu - r)/(\nu - T)` to :math:`F(r, \nu - r)`.
+
+        For a canonical binomial (logit) or Poisson (log) fit that reference is
+        only first order, and at small ``n`` its error is not small (a
+        conservative test is as miscalibrated as an anti-conservative one).
+        There the score is instead evaluated at the unpenalized null MLE on the
+        test's rows and referred to its law CONDITIONAL on the sufficient
+        statistic :math:`X^{\top}(w \circ y)`, which removes the nuisance
+        :math:`\beta` exactly: the score's conditional mean and covariance are
+        corrected to :math:`O(1/n)` and its fourth cumulant matched by a scaled
+        :math:`c\,\chi^2_{r/c}`. Where that expansion leaves its range of
+        validity (high-leverage rows at an extreme fitted mean) the row reports
+        ``"conditional_reference_unavailable"`` rather than a number.
 
         The projection is **orthogonal in the weight metric**, not the fit's
         penalized :math:`H^{-1}`. That is deliberate and it is what the test
@@ -1780,8 +1882,8 @@ class MultinomialModel:
         """Wood rank-truncated Wald smooth-term significance table (#1101).
 
         One row per ``(active class, smooth term)`` with keys ``class``,
-        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value`` — the same
-        kernel the scalar :meth:`Model.summary` smooth-term p-values use. Empty
+        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value`` from the Wood
+        rank-truncated Wald kernel. Empty
         when the model has no smooth terms or no stored covariance.
         """
         try:

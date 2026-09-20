@@ -550,86 +550,6 @@ mod tests {
         );
     }
 
-    /// #2379: the Gaussian profiled-diagonal seed helper honors its (validated)
-    /// ρ-box by CLAMPING into it — never silently swapping or escaping it. The
-    /// helper now takes an `OrderedRhoBounds`, so an inverted box is impossible
-    /// to hand it (refused upstream at construction); this pins that a valid box
-    /// with the upper bound below the natural profiled optimum clamps the emitted
-    /// seed to that upper bound rather than producing an out-of-box value.
-    #[test]
-    fn gaussian_profiled_diagonal_seed_clamps_into_its_validated_box() {
-        // A smooth-ish Gaussian-identity design whose profiled REML optimum for
-        // the summed penalty sits at a moderate, finite ρ.
-        let n = 40usize;
-        let y = Array1::from_iter((0..n).map(|i| {
-            let t = (i as f64 + 0.5) / n as f64;
-            (std::f64::consts::TAU * t).sin() + 0.05 * (i as f64 % 3.0 - 1.0)
-        }));
-        let w = Array1::<f64>::ones(n);
-        let mut x = Array2::<f64>::zeros((n, 3));
-        for i in 0..n {
-            let t = (i as f64 + 0.5) / n as f64;
-            x[[i, 0]] = 1.0;
-            x[[i, 1]] = t;
-            x[[i, 2]] = t * t;
-        }
-        let offset = Array1::<f64>::zeros(n);
-        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-10, false);
-        let p = x.ncols();
-        let canonical = vec![gam_terms::construction::CanonicalPenalty::from_dense_root(
-            array![[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            p,
-        )];
-        let state = RemlState::newwith_offset(
-            y.view(),
-            x,
-            w.view(),
-            offset.view(),
-            canonical,
-            p,
-            &cfg,
-            Some(vec![1]),
-            None,
-            None,
-        )
-        .expect("state");
-
-        // A wide, ordered box: the emitted seed is finite and inside it. Its
-        // value is the natural profiled ρ (nothing binds).
-        let wide = gam_problem::OrderedRhoBounds::new(-12.0, 12.0)
-            .expect("ordered rho bounds: the fixture passes lo < hi");
-        let seed_wide = state
-            .analytic_gaussian_profiled_diagonal_rho(wide)
-            .expect("no error")
-            .expect("gaussian-identity profiled diagonal returns a seed");
-        let natural = seed_wide[0];
-        for &r in seed_wide.iter() {
-            assert!(r.is_finite(), "seed coordinate is finite");
-            assert!(
-                (-12.0..=12.0).contains(&r),
-                "seed {r} stays inside the wide box"
-            );
-        }
-
-        // A box whose UPPER bound is pinned strictly below the natural optimum:
-        // the profiled ρ must be clamped DOWN to that upper bound, proving the box
-        // is honored (a silent swap would instead have solved a different box).
-        // Derive the cap from the measured optimum so the assertion is robust to
-        // the exact fixture geometry; `cap_lo < cap_hi` and both are finite.
-        let cap_hi = natural - 2.0;
-        let cap_lo = natural - 10.0;
-        let capped = gam_problem::OrderedRhoBounds::new(cap_lo, cap_hi)
-            .expect("ordered rho bounds: the fixture passes lo < hi");
-        let seed_capped = state
-            .analytic_gaussian_profiled_diagonal_rho(capped)
-            .expect("no error")
-            .expect("seed present");
-        assert!(
-            seed_capped.iter().all(|&r| (r - cap_hi).abs() < 1e-9),
-            "capped seed {seed_capped:?} clamps to the binding upper bound {cap_hi}"
-        );
-    }
-
     #[test]
     fn canonical_logit_firth_keeps_exact_tk_hessian_beyond_row_pair_scale() {
         // n²·p = 1.12e8: ten times the row-pair budget that used to send this
@@ -1238,6 +1158,101 @@ mod tests {
         assert_eq!(
             cleared_len, 0,
             "reset_outer_seed_state must clear the cross-call PIRLS LRU; got {cleared_len} entries"
+        );
+    }
+
+    fn gaussian_reset_fixture() -> (Array1<f64>, Array1<f64>, Array2<f64>, Array2<f64>) {
+        let y = array![0.3, -0.2, 0.9, 0.4, -0.7, 1.1, 0.2, -0.4];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.5, -0.4],
+            [1.0, 0.0, 0.7],
+            [1.0, 0.4, -0.3],
+            [1.0, 0.9, 0.1],
+            [1.0, 1.3, -0.6],
+            [1.0, -0.8, 0.5],
+            [1.0, 0.6, 0.9],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
+        (y, w, x, s0)
+    }
+
+    #[test]
+    pub(crate) fn gaussian_reset_keeps_the_seed_independent_inner_solve() {
+        // A Gaussian-identity inner mode is one direct solve, so the solve an
+        // outer reset used to discard is the one the next evaluation rebuilt.
+        // The reset keeps it: re-evaluating the same ρ runs no new solve, and
+        // returns exactly what a state that never saw another ρ returns.
+        let (y, w, x, s0) = gaussian_reset_fixture();
+        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-10, false);
+        let order = crate::rho_optimizer::OuterEvalOrder::ValueAndGradient;
+        let (rho_seed, rho) = (array![-1.5], array![0.7]);
+        let solves = |state: &RemlState<'_>| {
+            state
+                .arena
+                .inner_pirls_solve_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        state
+            .compute_outer_eval_with_order(&rho_seed, order)
+            .expect("seed eval");
+        state.compute_outer_eval_with_order(&rho, order).expect("eval");
+        let before_reset = solves(&state);
+        state.reset_outer_seed_state();
+        let reused = state
+            .compute_outer_eval_with_order(&rho, order)
+            .expect("eval after reset");
+        assert_eq!(
+            solves(&state),
+            before_reset,
+            "the reset must keep the Gaussian inner solve at ρ, not rebuild it"
+        );
+
+        let fresh_state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        let fresh = fresh_state
+            .compute_outer_eval_with_order(&rho, order)
+            .expect("fresh eval");
+        assert_eq!(reused.cost.to_bits(), fresh.cost.to_bits());
+        assert_eq!(
+            reused.gradient.mapv(f64::to_bits),
+            fresh.gradient.mapv(f64::to_bits)
+        );
+    }
+
+    #[test]
+    pub(crate) fn gaussian_block_correction_decision_needs_no_evaluation() {
+        // Laplace is exact for the Gaussian-identity model, so the #784
+        // admission deferred to the certified optimum declines there without
+        // an evaluation, and the optimum's inner solve is left in place.
+        let (y, w, x, s0) = gaussian_reset_fixture();
+        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-10, false);
+        let rho = array![0.7];
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        state.defer_block_correction_admission();
+        state.compute_cost_and_gradient(&rho).expect("eval");
+        let solves = || {
+            state
+                .arena
+                .inner_pirls_solve_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = solves();
+        assert!(
+            !state
+                .decide_block_correction_admission(&rho)
+                .expect("decision"),
+            "the correction never applies to a Gaussian-identity fit"
+        );
+        assert_eq!(solves(), before, "the decision must not run an inner solve");
+        assert!(!state.block_correction_admission_deferred());
+        state.compute_cost_and_gradient(&rho).expect("eval");
+        assert_eq!(
+            solves(),
+            before,
+            "the optimum's inner solve must survive the decision"
         );
     }
 
@@ -4506,6 +4521,9 @@ pub(crate) struct SparseRemlDecision {
 pub(crate) struct SparseExactEvalData {
     pub(crate) factor: Arc<SparseExactFactor>,
     pub(crate) takahashi: Option<Arc<gam_linalg::sparse_exact::TakahashiInverse>>,
+    /// The upper-triangular penalized Hessian `factor` factors, so trace
+    /// kernels can read its sparsity pattern.
+    pub(crate) hessian: Arc<faer::sparse::SparseColMat<usize, f64>>,
     pub(crate) logdet_h: f64,
     pub(crate) logdet_s_pos: f64,
     pub(crate) penalty_rank: usize,
@@ -4802,9 +4820,9 @@ pub(crate) struct EvalShared {
     /// hold the bare `RemlGeometry` label, so every consumer that reported
     /// `backend {:?}` reported a two-valued enum and nothing that could
     /// falsify it: `select_reml_geometry` measures a penalized-Hessian
-    /// density against `SPARSE_HESSIAN_MAX_DENSITY` on one of its six routes
-    /// and never measures it on the other five, and the label is identical
-    /// across all six. Storing the decision rather than its outcome makes a
+    /// density against `SPARSE_HESSIAN_MAX_DENSITY` on one of its routes
+    /// and never measures it on the others, and the label is identical
+    /// across all of them. Storing the decision rather than its outcome makes a
     /// bundle unrepresentable without the basis for its own label.
     pub(crate) geometry: SparseRemlDecision,
     /// The exact H_total matrix used for LAML cost computation.
@@ -4933,7 +4951,7 @@ pub(crate) fn applied_canonical_penalties_for(
     let projected = canonical_penalties
         .iter()
         .map(|penalty| {
-            split.project_canonical(penalty, gam_terms::construction::PenaltyFrame::Original)
+            split.projected_canonical(penalty, gam_terms::construction::PenaltyFrame::Original)
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
@@ -4942,18 +4960,19 @@ pub(crate) fn applied_canonical_penalties_for(
                  subspace failed: {error}"
             ))
         })?;
-    // `project_canonical` returns the penalty itself when the projection is
-    // below the root's own noise, so an all-unchanged result IS the identity
-    // and is handed back as the original `Arc` rather than as a copy.
-    if projected
-        .iter()
-        .zip(canonical_penalties.iter())
-        .all(|(a, b)| a.root == b.root && a.col_range == b.col_range)
-    {
-        Ok(Arc::clone(canonical_penalties))
-    } else {
-        Ok(Arc::new(projected))
+    // `projected_canonical` returns `None` when the projection is below the
+    // root's own noise, so an all-`None` result IS the identity and is handed
+    // back as the original `Arc` rather than as a copy.
+    if projected.iter().all(Option::is_none) {
+        return Ok(Arc::clone(canonical_penalties));
     }
+    Ok(Arc::new(
+        projected
+            .into_iter()
+            .zip(canonical_penalties.iter())
+            .map(|(projected, penalty)| projected.unwrap_or_else(|| penalty.clone()))
+            .collect(),
+    ))
 }
 
 impl EvalShared {
@@ -5024,9 +5043,14 @@ impl EvalShared {
         }
     }
 
+    ///
+    /// `spectra` must be the state's [`RemlState::penalty_unit_spectra`]; it
+    /// serves the factorization whenever the applied penalties are the
+    /// canonical list itself, which is the ordinary path.
     pub(crate) fn penalty_pseudologdet_original(
         &self,
         canonical_penalties: &Arc<Vec<gam_terms::construction::CanonicalPenalty>>,
+        spectra: &penalty_logdet::PenaltyUnitSpectra,
         lambdas: &[f64],
         p: usize,
     ) -> Result<Arc<penalty_logdet::PenaltyPseudologdet>, EstimationError> {
@@ -5043,10 +5067,12 @@ impl EvalShared {
         // `log|S|₊` is one half of the LAML ratio `½(log|H| − log|S|₊)`; the
         // other half carries the split-projected penalty, so this one must too.
         let applied = self.applied_canonical_penalties(canonical_penalties)?;
-        let pld = Arc::new(
+        let pld = if spectra.serves(&applied) {
+            penalty_logdet::PenaltyPseudologdet::from_penalty_spectra(spectra, lambdas, p)
+        } else {
             penalty_logdet::PenaltyPseudologdet::from_penalties(&applied, lambdas, p)
-                .map_err(EstimationError::InvalidInput)?,
-        );
+        };
+        let pld = Arc::new(pld.map_err(EstimationError::InvalidInput)?);
         match self.penalty_pseudologdet.set(Arc::clone(&pld)) {
             Ok(()) => Ok(pld),
             // A concurrent caller initialized the cell first; both objects
@@ -5320,12 +5346,12 @@ pub(crate) const OUTER_EVAL_LRU_CAPACITY: usize = 8;
 /// keyed by sanitized rho-bits plus the active inner-solve caps.
 ///
 /// CORRECTNESS: the key starts with `Vec<u64>` of `f64::to_bits` (with ±0
-/// canonicalized) and appends the screening and outer P-IRLS caps. Every
+/// canonicalized) and appends the outer P-IRLS cap. Every
 /// other input to `OuterEval` — design matrix, prior weights, offset, penalty
 /// structure, link/SAS/mixture state, Firth/Jeffreys configuration, and the
 /// rho-prior — is immutable for the lifetime of the state that owns the cache.
-/// Inner fidelity is not immutable: search-time caps deliberately change it.
-/// Including those caps prevents a full-fidelity terminal request from
+/// Inner fidelity is not immutable: the search-time cap deliberately changes it.
+/// Including that cap prevents a full-fidelity terminal request from
 /// replaying a coarse search entry at the same rho. Distinct rho/fidelity
 /// states never alias because lookups compare the full key vector.
 pub(crate) struct OuterEvalLru {
@@ -5393,13 +5419,13 @@ pub(crate) struct EvalCacheManager {
     /// structure, link state, Firth/Jeffreys configuration, and rho-prior — all
     /// of which are immutable for the lifetime of the state that owns this
     /// manager and therefore the lifetime of the cache), the remaining
-    /// result-determining state is `(rho, screening_cap, outer_cap)`. The cap
-    /// suffix is essential because a search-time partial inner mode and the
-    /// terminal uncapped mode can share bit-identical rho.
-    /// The binomial REML fit performs ~20-32 seed-grid pre-solves plus
-    /// line-search revisits; with only the single `current_outer_eval` slot,
-    /// any revisit to an earlier rho re-ran a full n-sized P-IRLS. This LRU
-    /// returns the stored cost/gradient for those revisited rho-points.
+    /// result-determining state is `(rho, outer_cap)`. The cap suffix is
+    /// essential because a search-time partial inner mode and the terminal
+    /// uncapped mode can share bit-identical rho.
+    /// Line searches and certification probes revisit earlier rho-points;
+    /// with only the single `current_outer_eval` slot, any revisit re-ran a
+    /// full n-sized P-IRLS. This LRU returns the stored cost/gradient for
+    /// those revisited rho-points.
     pub(crate) outer_eval_lru: RwLock<OuterEvalLru>,
     pub(crate) pirls_cache_enabled: AtomicBool,
 }
@@ -5500,14 +5526,20 @@ impl EvalCacheManager {
             .write()
             .expect("current eval bundle lock is poisoned: a writer panicked while holding it")
             .take();
-        self.current_outer_eval
-            .write()
-            .expect("current outer eval lock is poisoned: a writer panicked while holding it")
-            .take();
+        self.forget_previous_outer_eval();
         self.outer_eval_lru
             .write()
             .expect("outer-eval LRU lock is poisoned: a writer panicked while holding it")
             .clear();
+    }
+
+    /// Drop the single-slot mirror of the previous outer evaluation, which a
+    /// new trajectory must not inherit, and keep every keyed cache.
+    pub(crate) fn forget_previous_outer_eval(&self) {
+        self.current_outer_eval
+            .write()
+            .expect("current outer eval lock is poisoned: a writer panicked while holding it")
+            .take();
     }
 
     pub(crate) fn clear_eval_and_factor_caches(&self) {
@@ -5602,9 +5634,8 @@ pub(crate) struct RemlState<'a> {
     /// This is the single canonical penalty representation — no full-width
     /// `rank × p` roots are stored separately.
     pub(crate) canonical_penalties: Arc<Vec<gam_terms::construction::CanonicalPenalty>>,
-    pub(crate) balanced_penalty_root: Array2<f64>,
     pub(crate) reparam_invariant: ReparamInvariant,
-    pub(crate) sparse_penalty_block_count: Option<usize>,
+    pub(crate) sparse_penalty_block_count: usize,
     pub(crate) p: usize,
     pub(crate) config: Arc<RemlConfig>,
     pub(crate) runtime_mixture_link_state: Option<gam_problem::MixtureLinkState>,
@@ -5697,25 +5728,20 @@ pub(crate) struct RemlState<'a> {
     pub(crate) ift_joint_mode_response_slot:
         std::sync::Mutex<Option<outer_eval::IftJointModeResponseRuntimeCache>>,
     pub(crate) warm_start_enabled: AtomicBool,
-    pub(crate) screening_max_inner_iterations: Arc<AtomicUsize>,
     /// Outer-aware inner-PIRLS iteration cap for the main descent loop.
     ///
-    /// Distinct from `screening_max_inner_iterations`, which is used during
-    /// seed selection and toggles a side-effect bundle (cache writes,
-    /// warm-start updates, KKT enforcement all suppressed). This atomic is
-    /// purely a cap — when nonzero, the inner Newton loop is capped at
+    /// This atomic is purely a cap — when nonzero, the inner Newton loop is capped at
     /// `min(this, full_max_iterations)`, but cache writes and warm-start
     /// updates remain enabled. Driven by the outer optimizer to coarsen
     /// inner solves at early outer iterations when ρ is far from converged,
     /// and lifted back to full at the final accepted iter (otherwise the
     /// returned β would be biased by the loose cap).
     ///
-    /// Both atomics are honored together as `min(screening_cap, outer_cap)`
-    /// when both are nonzero. Default 0 (no cap from this source).
+    /// Default 0 (no cap).
     pub(crate) outer_inner_cap: Arc<AtomicUsize>,
 
     /// Inner-PIRLS feedback signal driven by `execute_pirls_if_needed` after
-    /// each NON-screening solve. Stores the iteration count at which the
+    /// each inner solve. Stores the iteration count at which the
     /// inner Newton stopped, plus a flag indicating whether it converged
     /// (vs. hit the iteration cap). The outer first-/second-order bridges
     /// read these atomics to drive an adaptive `inner_cap_schedule`: the
@@ -5761,7 +5787,7 @@ pub(crate) struct RemlState<'a> {
 
     /// Negative-Binomial overdispersion `theta` frozen for the smoothing-
     /// parameter (λ) search (#1082), bit-packed `f64` (`f64::to_bits`). `0`
-    /// (the default) signals "not yet frozen". On the first non-screening
+    /// (the default) signals "not yet frozen". On the first
     /// λ-search inner solve of an estimated-θ NB fit, the maximum-likelihood θ
     /// at the solve's converged η is computed once and stored here; every subsequent
     /// λ-search evaluation pins the inner solve to this value via
@@ -5774,7 +5800,7 @@ pub(crate) struct RemlState<'a> {
 
     /// Tweedie exponential-dispersion `phi` frozen for the smoothing-parameter
     /// (λ) search (#1477), bit-packed `f64` (`f64::to_bits`). `0` (the default)
-    /// signals "not yet frozen". On the first non-screening λ-search inner solve
+    /// signals "not yet frozen". On the first λ-search inner solve
     /// of an estimated-φ Tweedie fit, the converged-η Pearson `phî` is captured
     /// once and stored here; every subsequent λ-search evaluation pins the inner
     /// solve to this value via
@@ -5789,7 +5815,7 @@ pub(crate) struct RemlState<'a> {
 
     /// Gamma shape `k = 1/φ` frozen for the smoothing-parameter (λ) search
     /// (#1074), bit-packed `f64` (`f64::to_bits`). `0` (the default) signals
-    /// "not yet frozen". On the first non-screening λ-search inner solve of an
+    /// "not yet frozen". On the first λ-search inner solve of an
     /// estimated-shape Gamma fit, the seed's converged-η MLE `k̂` is captured
     /// once and stored here; every subsequent λ-search evaluation pins the inner
     /// solve to this value via
@@ -5807,7 +5833,7 @@ pub(crate) struct RemlState<'a> {
 
     /// Beta-regression precision `phi` frozen for the smoothing-parameter (λ)
     /// search (#2369), bit-packed `f64` (`f64::to_bits`). `0` (the default)
-    /// signals "not yet frozen". On the first non-screening λ-search inner solve
+    /// signals "not yet frozen". On the first λ-search inner solve
     /// of an estimated-φ Beta fit, the seed's converged-η Pearson `phî` is
     /// captured once and stored here; every subsequent λ-search evaluation pins
     /// the inner solve to this value via
@@ -5832,7 +5858,7 @@ pub(crate) struct RemlState<'a> {
     pub(crate) frozen_dispersion_phi: Arc<AtomicU64>,
 
     /// Last observed IFT-prediction residual (`‖β_converged − β_predicted‖
-    /// / ‖β_converged‖`) from the most recent non-screening solve where
+    /// / ‖β_converged‖`) from the most recent solve where
     /// the predictor was actually consumed. Bit-packed `f64` (low 64
     /// bits via `f64::to_bits`).
     ///
@@ -5856,7 +5882,7 @@ pub(crate) struct RemlState<'a> {
 
     /// Last observed gain ratio of the accepted LM step
     /// (`actual_reduction / predicted_reduction`) from the most recent
-    /// non-screening PIRLS solve. Bit-packed `f64` with the same NaN
+    /// PIRLS solve. Bit-packed `f64` with the same NaN
     /// sentinel discipline as `last_ift_prediction_residual`: NaN bits
     /// (`IFT_RESIDUAL_NO_SIGNAL_BITS`) encode "no signal yet" so a
     /// recorded ratio of exactly 0 (degenerate but possible) doesn't
@@ -6002,4 +6028,12 @@ pub(crate) struct RemlState<'a> {
     pub(crate) gaussian_dp_floor_scale_cache: std::sync::OnceLock<f64>,
     pub(crate) positive_weight_observation_count_cache: std::sync::OnceLock<usize>,
     pub(crate) rho_weight_anchor_cache: std::sync::OnceLock<f64>,
+    /// The data half `R_G` (`R_GᵀR_G = XᵀWX`) of the root-scale Hessian
+    /// operator, kept for the weights it was formed at. Keyed to `x`, so
+    /// `reset_surface` clears it.
+    pub(crate) data_root_cache: laml_logdet::DataRootCache,
+    /// The λ-free half of every evaluation's `log|Sλ|₊` factorization — each
+    /// penalty's unit root and each block's structural rank — for the penalty
+    /// list in `canonical_penalties`. See [`Self::penalty_unit_spectra`].
+    pub(crate) penalty_unit_spectra: RwLock<Option<Arc<penalty_logdet::PenaltyUnitSpectra>>>,
 }

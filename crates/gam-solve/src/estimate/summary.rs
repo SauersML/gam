@@ -27,16 +27,16 @@ pub struct SmoothTermSummary {
     /// published raw, so `edf` may lie outside `[0, dim]` and is not clamped. `None`
     /// when every block of the term is certified, or the fit recorded no bounds.
     pub edf_rank_bound: Option<String>,
-    /// Why `pvalue` is absent, when the absence is a refusal rather than a
-    /// missing input. `None` whenever `pvalue` is present.
+    /// Why `pvalue` is absent, when the term or the fit leaves no valid
+    /// reference law. `None` whenever `pvalue` is present.
     pub pvalue_unavailable: Option<SmoothPValueUnavailable>,
 }
 
 /// Why a smooth term reports no significance p-value.
 ///
-/// A reason, not a status: each variant names the property of the term that
-/// leaves no valid reference distribution, so an absent p-value is never
-/// confusable with a missing input or a term that was never tested.
+/// A reason, not a status: each variant names the property of the term, or the
+/// missing piece of the fit, that leaves no valid reference distribution, so an
+/// absent p-value is never confusable with a term that was never tested.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SmoothPValueUnavailable {
     /// The term is shape-constrained (`shape=` monotone, convex, concave).
@@ -56,6 +56,43 @@ pub enum SmoothPValueUnavailable {
     ///   REML-selected λ shrink every face together, and the mixture weights
     ///   move with them.
     ShapeConstrained,
+    /// The term has coefficient directions that none of its penalties shrink.
+    ///
+    /// The score test treats the smooth as the variance components
+    /// `β_j ~ N(0, Σ_l τ_l·S_l⁺)`, one per penalty, and tests `τ = 0`. A direction outside every
+    /// penalty's range is a fixed effect of the term, which `τ = 0` does not
+    /// remove, so "no effect" is not the variance-component null and the
+    /// score's reference law does not describe it.
+    UnpenalizedDirection,
+    /// The fit carries no exact penalized Hessian `H` and weighted Gram
+    /// `X'WX` in one coefficient layout (its inference block was not kept), or
+    /// they are not one finite fit. The score and its covariance are read off
+    /// exactly those two, and a Gram reconstructed without the fitted weights
+    /// would give a reference law for a different statistic.
+    FitCurvatureUnavailable,
+    /// The fit's coefficient covariance scale (the dispersion `φ` the score
+    /// is standardized by) cannot be resolved from its likelihood metadata.
+    DispersionUnavailable,
+    /// The term is not identified apart from the rest of the model: the other
+    /// coefficients' penalized Hessian is not positive definite, or the term's
+    /// score has no variance left once they are fitted.
+    NotIdentified,
+    /// The fit's likelihood curvature `H − S(λ)` is indefinite on the term's
+    /// score once the other coefficients are fitted. A custom family's
+    /// penalized Hessian is its observed information, which need not be
+    /// positive semidefinite at a penalized mode; the score then has no
+    /// covariance to refer it to.
+    IndefiniteCurvature,
+    /// The scale is estimated, but the fit has no positive residual degrees of
+    /// freedom for the denominator of the reference law.
+    ResidualDfUnavailable,
+    /// A random-effect term whose variance-component score test
+    /// (`gam_terms::inference::random_effect_test`) could not be computed, with
+    /// the test's own reason.
+    RandomEffect(gam_terms::inference::random_effect_test::RandomEffectTestUnavailable),
+    /// A random-effect term the fit carries no test record for: a model saved
+    /// before the test existed, or a fit route that does not compute it.
+    RandomEffectTestNotRecorded,
 }
 
 impl SmoothPValueUnavailable {
@@ -63,6 +100,14 @@ impl SmoothPValueUnavailable {
     pub fn label(self) -> &'static str {
         match self {
             Self::ShapeConstrained => "shape_constrained",
+            Self::UnpenalizedDirection => "unpenalized_direction",
+            Self::FitCurvatureUnavailable => "fit_curvature_unavailable",
+            Self::DispersionUnavailable => "dispersion_unavailable",
+            Self::NotIdentified => "not_identified",
+            Self::IndefiniteCurvature => "indefinite_curvature",
+            Self::ResidualDfUnavailable => "residual_df_unavailable",
+            Self::RandomEffect(reason) => reason.label(),
+            Self::RandomEffectTestNotRecorded => "random_effect_test_not_recorded",
         }
     }
 
@@ -73,6 +118,35 @@ impl SmoothPValueUnavailable {
                 "shape-constrained: the null f = 0 is the apex of the constraint cone, so no \
                  chi-square, spectral or chi-bar-square reference is valid for the truncated \
                  posterior mean; no p-value is reported"
+            }
+            Self::UnpenalizedDirection => {
+                "unpenalized direction: some coefficient direction of the term is shrunk by no \
+                 penalty, so f = 0 is not the variance-component null tau = 0; no p-value is \
+                 reported"
+            }
+            Self::FitCurvatureUnavailable => {
+                "fit curvature unavailable: the fit kept no exact penalized Hessian and weighted \
+                 Gram, which the score test is read off; no p-value is reported"
+            }
+            Self::DispersionUnavailable => {
+                "dispersion unavailable: the fit's coefficient covariance scale cannot be \
+                 resolved from its likelihood metadata; no p-value is reported"
+            }
+            Self::NotIdentified => {
+                "not identified: the term's score has no variance once the other terms are \
+                 fitted; no p-value is reported"
+            }
+            Self::IndefiniteCurvature => {
+                "indefinite curvature: the fit's likelihood curvature leaves the term's score an \
+                 indefinite covariance, so the score has no variance law; no p-value is reported"
+            }
+            Self::ResidualDfUnavailable => {
+                "residual df unavailable: the scale is estimated but the fit has no positive \
+                 residual degrees of freedom; no p-value is reported"
+            }
+            Self::RandomEffect(reason) => reason.explanation(),
+            Self::RandomEffectTestNotRecorded => {
+                "the fit carries no variance-component test for this random effect"
             }
         }
     }

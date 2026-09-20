@@ -817,11 +817,12 @@ impl BinomialLocationScaleWiggleFamily {
         )
     }
 
-    pub(crate) fn dense_block_designs_fromspecs<'a>(
-        &self,
-        specs: &'a [ParameterBlockSpec],
-    ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
-        dense_locscale_block_designs_fromspecs(
+    pub(crate) fn exact_joint_dense_block_designs<'a>(
+        &'a self,
+        specs: Option<&'a [ParameterBlockSpec]>,
+    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
+        exact_joint_locscale_block_designs(
+            (self.threshold_design.as_ref(), self.log_sigma_design.as_ref()),
             specs,
             3,
             "BinomialLocationScaleWiggleFamily",
@@ -831,19 +832,6 @@ impl BinomialLocationScaleWiggleFamily {
             "threshold",
             &self.policy.material_policy(),
         )
-    }
-
-    pub(crate) fn exact_joint_dense_block_designs<'a>(
-        &'a self,
-        specs: Option<&'a [ParameterBlockSpec]>,
-    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
-        if self.threshold_design.is_some() && self.log_sigma_design.is_some() {
-            return self.dense_block_designs().map(Some);
-        }
-        if let Some(specs) = specs {
-            return self.dense_block_designs_fromspecs(specs).map(Some);
-        }
-        Ok(None)
     }
 
     pub(crate) fn shadow_with_exact_joint_designs(
@@ -2846,20 +2834,6 @@ impl BinomialWiggleOrder2Rows {
             .assign(&hww);
         mirror_upper_to_lower(&mut h);
         Ok(h)
-    }
-
-    /// Block-diagonal Hessians (h_tt, h_ll, h_ww) without ever materializing
-    /// the cross blocks. Used by `evaluate()` to populate per-block working
-    /// sets.
-    pub(crate) fn assemble_block_diagonals(
-        &self,
-        x_t: &Array2<f64>,
-        x_ls: &Array2<f64>,
-    ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), String> {
-        let h_tt = xt_diag_x_dense(x_t, &self.coeff_tt)?;
-        let h_ll = xt_diag_x_dense(x_ls, &self.coeff_ll)?;
-        let h_ww = xt_diag_x_dense(&self.b0, &self.coeff_ww)?;
-        Ok((h_tt, h_ll, h_ww))
     }
 }
 

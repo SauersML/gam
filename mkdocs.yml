@@ -148,6 +148,7 @@ nav:
     - Inspecting terms: partial-effects.md
     - Posterior sampling: posterior-sampling.md
     - Diagnostics, summaries, reports: diagnostics.md
+    - p-values and calibration: pvalues.md
     - scikit-learn integration: sklearn.md
     - PyTorch integration: torch.md
     - Save and load: persistence.md
@@ -157,5 +158,6 @@ nav:
     - Cookbook: cookbook.md
     - Benchmarks against pyGAM: benchmarks.md
     - GPU acceleration: gpu_acceleration.md
+    - Threads: threads.md
     - REML scaling: reml_scaling.md
   - Changelog: changelog.md

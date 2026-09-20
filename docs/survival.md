@@ -8,6 +8,17 @@ parameterised.
 ## The `Surv(...)` response
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+age, bmi = rng.uniform(40, 80, n), rng.normal(27, 4, n)
+t = rng.exponential(10 * np.exp(-0.04 * (age - 60) - 0.05 * (bmi - 27)))   # event time
+c = rng.uniform(2, 25, n)                                                    # censoring time
+df = {"entry": np.zeros(n), "exit": np.minimum(t, c), "event": (t <= c).astype(float),
+      "age": age, "bmi": bmi}
+
 gamfit.fit(df, "Surv(entry, exit, event) ~ age + s(bmi)")
 ```
 
@@ -29,6 +40,19 @@ lowered to `Surv(0, time, event)` with a synthetic zero-entry column.
 Interval-censored responses use a distinct spelling:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+age = rng.uniform(40, 80, n)
+t = 10 * rng.weibull(1.5, n) * np.exp(-0.03 * (age - 60))   # true (unobserved) event time
+c = rng.uniform(2, 25, n)
+event = (t <= c).astype(float)                               # 1: T bracketed in (left, right]
+df = {"age": age, "event": event,
+      "left": np.where(event == 1, t * rng.uniform(0.5, 0.95, n), c),
+      "right": np.where(event == 1, t * rng.uniform(1.05, 1.5, n), c)}
+
 gamfit.fit(df, "SurvInterval(left, right, event) ~ s(age)",
            survival_likelihood="latent",
            baseline_target="weibull",
@@ -62,6 +86,17 @@ requests select the identical likelihood regardless of entrance.
 is rejected for every other survival mode.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+age, bmi = rng.uniform(40, 80, n), rng.normal(27, 4, n)
+t = rng.exponential(10 * np.exp(-0.04 * (age - 60) - 0.05 * (bmi - 27)))
+c = rng.uniform(2, 25, n)
+df = {"entry": np.zeros(n), "exit": np.minimum(t, c), "event": (t <= c).astype(float),
+      "age": age, "bmi": bmi}
+
 gamfit.fit(df,
     "Surv(entry, exit, event) ~ s(age) + bmi",
     survival_likelihood="transformation",
@@ -82,6 +117,17 @@ For modes that support a scalar parametric baseline (`"transformation"`,
 | `"gompertz-makeham"` | `baseline_rate` and `baseline_makeham` default to `0.5 / mean_positive_exit`; `baseline_shape` defaults to `0.01` | Gompertz hazard plus a constant additive floor. |
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+bmi = rng.normal(27, 4, n)
+# Gompertz event times: hazard 0.08 * exp(0.1 t) * exp(0.05 (bmi - 27))
+t = np.log1p(rng.exponential(1.0, n) * 0.1 / (0.08 * np.exp(0.05 * (bmi - 27)))) / 0.1
+c = rng.uniform(2, 25, n)
+df = {"entry": np.zeros(n), "exit": np.minimum(t, c), "event": (t <= c).astype(float), "bmi": bmi}
+
 gamfit.fit(df,
     "Surv(entry, exit, event) ~ s(bmi)",
     survival_likelihood="transformation",
@@ -141,6 +187,16 @@ To override it, name the anchor in the data's own time units. It is then
 honored verbatim by every likelihood mode:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+age = rng.uniform(40, 60, n)                                 # age at recruitment = entry age
+t = rng.exponential(15 * np.exp(-0.05 * (age - 50)))         # years from entry to event
+c = rng.uniform(5, 20, n)
+df = {"entry": age, "exit": age + np.minimum(t, c), "event": (t <= c).astype(float), "age": age}
+
 gamfit.fit(df,
     "Surv(entry, exit, event) ~ s(age)",
     survival_likelihood="location-scale",
@@ -164,6 +220,18 @@ model always predicts in the frame it was fitted in. Supplying it without a
 | `"hazard-multiplier"` | Multiplicative log-normal frailty on the hazard. |
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+age, bmi = rng.uniform(40, 80, n), rng.normal(27, 4, n)
+risk = np.exp(0.03 * (age - 60) + 0.05 * (bmi - 27) + rng.normal(0, 0.3, n))   # log-normal frailty
+t = np.log1p(rng.exponential(1.0, n) * 0.1 / (0.08 * risk)) / 0.1                # Gompertz times
+c = rng.uniform(2, 25, n)
+df = {"entry": np.zeros(n), "exit": np.minimum(t, c), "event": (t <= c).astype(float),
+      "age": age, "bmi": bmi}
+
 gamfit.fit(df,
     "Surv(entry, exit, event) ~ s(age) + bmi",
     survival_likelihood="latent",
@@ -192,6 +260,18 @@ For one-cause survival fits, `Model.predict(...)` returns a
 the survival surface on a user-supplied time grid:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+df = pd.DataFrame({"age": rng.uniform(40, 80, n), "bmi": rng.normal(27, 4, n)})
+t = rng.exponential(10 * np.exp(-0.04 * (df["age"] - 60) - 0.05 * (df["bmi"] - 27)))
+c = rng.uniform(2, 25, n)
+df["entry"], df["exit"], df["event"] = 0.0, np.minimum(t, c), (t <= c).astype(float)
+train_df, test_df = df.iloc[:300], df.iloc[300:]
+
 model = gamfit.fit(train_df, "Surv(entry, exit, event) ~ s(age) + bmi")
 pred = model.predict(test_df)
 
@@ -211,6 +291,21 @@ For dense surfaces on large cohorts use the chunked iterators or stream
 to CSV:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+df = pd.DataFrame({"age": rng.uniform(40, 80, n), "bmi": rng.normal(27, 4, n)})
+t = rng.exponential(10 * np.exp(-0.04 * (df["age"] - 60) - 0.05 * (df["bmi"] - 27)))
+c = rng.uniform(2, 25, n)
+df["entry"], df["exit"], df["event"] = 0.0, np.minimum(t, c), (t <= c).astype(float)
+train_df, test_df = df.iloc[:300], df.iloc[300:]
+
+def process(block):                     # stand-in for your own per-chunk work
+    print(block.shape, block.mean(axis=0))
+
 pred = gamfit.fit(train_df, "Surv(entry, exit, event) ~ s(age) + bmi").predict(test_df)
 for row_slice, time_slice, block in pred.survival_at_chunks([1, 5, 10, 20]):
     process(block)
@@ -222,6 +317,20 @@ For separate cause-specific fits, predict each endpoint and assemble CIFs
 on the same grid:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+df = pd.DataFrame({"age": rng.uniform(40, 80, n)})
+t_disease, t_death = rng.exponential(15 * np.exp(-0.04 * (df["age"] - 60))), rng.exponential(25, n)
+t, c = np.minimum(t_disease, t_death), rng.uniform(2, 25, n)
+df["entry"], df["exit"] = 0.0, np.minimum(t, c)
+df["disease"] = ((t <= c) & (t_disease < t_death)).astype(float)
+df["death"] = ((t <= c) & (t_death < t_disease)).astype(float)
+train_df, test_df = df.iloc[:300], df.iloc[300:]
+
 disease_pred = gamfit.fit(train_df, "Surv(entry, exit, disease) ~ s(age)").predict(test_df)
 death_pred = gamfit.fit(train_df, "Surv(entry, exit, death) ~ s(age)").predict(test_df)
 
@@ -246,6 +355,18 @@ For location-scale survival, passing any `interval=...` produces
 delta-method standard errors:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+df = pd.DataFrame({"age": rng.uniform(40, 80, n), "bmi": rng.normal(27, 4, n)})
+t = rng.exponential(10 * np.exp(-0.04 * (df["age"] - 60) - 0.05 * (df["bmi"] - 27)))
+c = rng.uniform(2, 25, n)
+df["entry"], df["exit"], df["event"] = 0.0, np.minimum(t, c), (t <= c).astype(float)
+train_df, test_df = df.iloc[:300], df.iloc[300:]
+
 model = gamfit.fit(
     train_df,
     "Surv(entry, exit, event) ~ s(age) + bmi",
@@ -266,6 +387,19 @@ hazard, survival, cumulative-hazard, and CIF surface, plus overall survival
 and each cause's linear predictor:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+df = pd.DataFrame({"age": rng.uniform(40, 80, n)})
+t1, t2 = rng.exponential(15 * np.exp(-0.04 * (df["age"] - 60))), rng.exponential(25, n)
+t, c = np.minimum(t1, t2), rng.uniform(2, 25, n)
+df["entry"], df["exit"] = 0.0, np.minimum(t, c)
+df["cause"] = np.where(t > c, 0.0, np.where(t1 < t2, 1.0, 2.0))   # 0 censored, 1 or 2 cause
+train_df, test_df = df.iloc[:300], df.iloc[300:]
+
 # event codes 1..K in the event column select the joint competing-risks fit
 model = gamfit.fit(train_df, "Surv(entry, exit, cause) ~ s(age)")
 pred = model.predict(

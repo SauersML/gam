@@ -3577,6 +3577,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gam-build-identity"
+version = "0.3.157"
+
+[[package]]
 name = "gam-cli"
 version = "0.3.157"
 dependencies = [
@@ -3584,6 +3588,7 @@ dependencies = [
  "comfy-table",
  "csv",
  "gam",
+ "gam-build-identity",
  "gam-data",
  "gam-math",
  "gam-predict",
@@ -3642,6 +3647,7 @@ version = "0.3.157"
 dependencies = [
  "arrow",
  "csv",
+ "gam-spec",
  "log",
  "ndarray 0.17.2",
  "parquet",
@@ -3862,7 +3868,6 @@ dependencies = [
  "statrs 0.19.0",
  "tempfile",
  "thiserror 2.0.19",
- "wide 1.5.0",
 ]
 
 [[package]]
@@ -3916,6 +3921,7 @@ dependencies = [
  "csv",
  "faer",
  "gam",
+ "gam-build-identity",
  "gam-math",
  "gam-predict",
  "gam-runtime",
@@ -6421,7 +6427,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "opt"
 version = "0.9.0"
-source = "git+https://github.com/SauersML/opt.git?rev=53ce029cce55fd79dd0be03906a57a916085ebb9#53ce029cce55fd79dd0be03906a57a916085ebb9"
+source = "git+https://github.com/SauersML/opt.git?rev=4053fcb6b7567b05fd1dee199fe8e2e43e6f1315#4053fcb6b7567b05fd1dee199fe8e2e43e6f1315"
 dependencies = [
  "faer",
  "log",

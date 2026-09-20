@@ -67,7 +67,8 @@ use crate::fit_orchestration::drivers::{
     SpatialLengthScaleOptimizationTiming,
     fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
     fit_term_collectionwith_latent_coord_optimization,
-    fit_term_collectionwith_spatial_length_scale_optimization, freeze_term_collection_from_design,
+    fit_term_collectionwith_spatial_length_scale_optimization_on_design,
+    freeze_term_collection_from_design,
 };
 // #1521: relocated DOWN into gam_terms::smooth (was drivers::build_term_collection_design).
 use gam_terms::smooth::build_term_collection_design;
@@ -165,9 +166,13 @@ mod binomial_separation_convergence_1762_tests;
 mod perfect_binomial_separation_2273_tests;
 
 #[cfg(test)]
+mod binomial_separation_jeffreys_tests;
 
 #[cfg(test)]
 mod smooth_significance_ref_df_floor_1766_tests;
+
+#[cfg(test)]
+mod smooth_lr_nested_null_tests;
 
 #[cfg(test)]
 mod gaussian_reml_stall_edf_collapse_1788_tests;
@@ -189,3 +194,6 @@ pub use fit_config::*;
 pub use materialize::*;
 pub use request::*;
 pub use warm_start_from::*;
+
+#[cfg(test)]
+mod binomial_location_scale_noise_term_in_threshold_span_3015_tests;

@@ -92,9 +92,12 @@ struct PyFittedModel {
 
 impl PyFittedModel {
     fn compile(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<Self> {
-        let (model, source) = detach_py_result(py, "compile_model", move || {
-            load_model_impl(&model_bytes).map(|model| (model, model_bytes))
-        })?;
+        let (model, source) = detach_typed_py_result(
+            py,
+            "compile_model",
+            move || load_model_impl(&model_bytes).map(|model| (model, model_bytes)),
+            saved_model_error_to_pyerr,
+        )?;
         Ok(Self {
             model: Arc::new(model),
             source: source.into(),
@@ -471,6 +474,16 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     info.set_item("python_module", "gam._rust")?;
     info.set_item("abi3", "cp310+")?;
     info.set_item("version", env!("CARGO_PKG_VERSION"))?;
+    // The version is shared by every commit between releases, so the commit
+    // and the saved-model payload version are what tell two engines apart
+    // (gam#3007, gam#3157). Both identity keys are None for a build that had no
+    // gam git tree to read.
+    info.set_item("commit", gam_build_identity::COMMIT)?;
+    info.set_item("dirty", gam_build_identity::DIRTY)?;
+    info.set_item(
+        "model_payload_version",
+        gam::inference::model::MODEL_PAYLOAD_VERSION,
+    )?;
     info.set_item(
         "capabilities",
         vec![
@@ -481,6 +494,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "torch_from_fitted",
             "predict",
             "transformation_score",
+            "latent_conditional_residual",
             "predict_array",
             "predict_conformal",
             "build_predict_payload_json",
@@ -592,7 +606,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// Python objects and then reparsing their string representations. This class
 /// owns the canonical `EncodedDataset`. Its sequence protocol renders only a
 /// requested row for the few metadata helpers that still consume text.
-#[pyclass(name = "_EncodedTable", frozen, skip_from_py_object)]
+#[pyclass(module = "gamfit._rust", name = "_EncodedTable", frozen, skip_from_py_object)]
 #[derive(Clone)]
 struct PyEncodedTable {
     dataset: EncodedDataset,
@@ -893,11 +907,17 @@ fn encoded_table_from_arrow(
 /// [`gam::data::project_encoded_to_schema`], the projection `gam predict` applies
 /// to a Parquet file: labels map onto training levels, a random-effect group's
 /// unseen or missing label takes the unknown-level code, and a missing or
-/// non-finite numeric cell is refused naming its column.
+/// non-finite numeric cell is refused naming its column. A numeric-coded fixed
+/// `factor(g)` has no categorical schema, so its unseen levels are refused by
+/// [`FittedModel::unseen_numeric_factor_levels`], the check `gam predict` runs.
+///
+/// A refused cell is [`PredictError::Input`] and a missing column or a column
+/// of the wrong kind is [`PredictError::SchemaMismatch`], so each reaches Python
+/// as its own class.
 fn dataset_with_model_schema_from_encoded(
     model: &FittedModel,
     source: &EncodedDataset,
-) -> Result<EncodedDataset, String> {
+) -> Result<EncodedDataset, PredictError> {
     let required = required_prediction_columns(model)?;
     let present = source.headers.iter().cloned().collect::<BTreeSet<_>>();
     let missing = required
@@ -905,7 +925,7 @@ fn dataset_with_model_schema_from_encoded(
         .map(|name| format!("missing required column '{name}'"))
         .collect::<Vec<_>>();
     if !missing.is_empty() {
-        return Err(missing.join(" "));
+        return Err(PredictError::SchemaMismatch(missing.join(" ")));
     }
     let consumable = prediction_consumable_columns(model)?;
     let keep = source
@@ -942,8 +962,24 @@ fn dataset_with_model_schema_from_encoded(
     let policy = gam::data::UnseenCategoryPolicy::encode_unknown_for_columns(
         model.random_effect_group_columns(),
     );
-    gam::data::project_encoded_to_schema(selected, model.require_data_schema()?, &policy)
-        .map_err(|error| error.to_string())
+    let schema = model
+        .require_data_schema()
+        .map_err(|error| PredictError::Other(error.to_string()))?;
+    let dataset = gam::data::project_encoded_to_schema(selected, schema, &policy).map_err(
+        |error| match error {
+            gam::data::DataError::InvalidCell { .. } => PredictError::Input(error),
+            gam::data::DataError::SchemaMismatch { reason } => PredictError::SchemaMismatch(reason),
+            other => PredictError::Other(other.to_string()),
+        },
+    )?;
+    if let Some(unseen) = model
+        .unseen_numeric_factor_levels(&dataset.headers, dataset.values.view())
+        .into_iter()
+        .next()
+    {
+        return Err(PredictError::Input(unseen));
+    }
+    Ok(dataset)
 }
 
 fn schema_check_encoded(
@@ -982,33 +1018,21 @@ fn schema_check_encoded(
         }
     }
     if issues.is_empty()
-        && let Err(message) = dataset_with_model_schema_from_encoded(model, source)
+        && let Err(error) = dataset_with_model_schema_from_encoded(model, source)
     {
+        let column = match &error {
+            PredictError::Input(gam::data::DataError::InvalidCell { column, .. }) => {
+                Some(column.clone())
+            }
+            PredictError::Input(_) | PredictError::SchemaMismatch(_) | PredictError::Other(_) => {
+                None
+            }
+        };
         issues.push(SchemaIssue {
             kind: "schema_error".to_string(),
-            message,
-            column: None,
+            message: String::from(error),
+            column,
         });
-    }
-    if issues.is_empty() {
-        for (column, vocabulary) in model.numeric_fixed_factor_vocabularies() {
-            let Some(index) = source.headers.iter().position(|header| header == &column) else {
-                continue;
-            };
-            for value in source.values.column(index) {
-                if !vocabulary.contains(&gam::data::canonical_level_bits(*value)) {
-                    issues.push(SchemaIssue {
-                        kind: "schema_error".to_string(),
-                        message: format!(
-                            "unseen level '{value}' in fixed factor column '{column}'; \
-                             the factor's levels were fixed at fit time"
-                        ),
-                        column: Some(column.clone()),
-                    });
-                    break;
-                }
-            }
-        }
     }
     Ok(SchemaCheckPayload {
         ok: issues.is_empty(),
@@ -1073,11 +1097,15 @@ fn numeric_matrix_f64<'py>(
 }
 
 #[pyfunction]
-fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
+fn marginal_slope_clip_probabilities<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Py<PyArray1<f64>>> {
     Ok(values
-        .into_iter()
-        .map(|value| value.clamp(0.0, 1.0))
-        .collect())
+        .as_array()
+        .mapv(|value| value.clamp(0.0, 1.0))
+        .into_pyarray(py)
+        .unbind())
 }
 
 #[pyfunction]
@@ -1123,11 +1151,6 @@ fn flat_to_matrix_f64<'py>(
     let out = Array2::from_shape_vec((n_rows, n_cols), flat)
         .map_err(|err| py_value_error(format!("failed to reshape design matrix: {err}")))?;
     Ok(out.into_pyarray(py).unbind())
-}
-
-#[pyfunction]
-fn vec_to_array1_f64<'py>(py: Python<'py>, values: Vec<f64>) -> PyResult<Py<PyArray1<f64>>> {
-    Ok(Array1::from_vec(values).into_pyarray(py).unbind())
 }
 
 fn survival_prediction_matrix_from_rows(rows: Vec<Vec<f64>>, label: &str) -> PyResult<Array2<f64>> {
@@ -1512,7 +1535,15 @@ fn fit_table(
     // driver and persistence envelope; route it here on the same predicate the
     // CLI uses, so callers read the model kind off the returned bytes
     // (`saved_model_kind`) instead of re-deriving it from the family name.
-    let fit_config = parse_fit_config(config_json.as_deref()).map_err(py_value_error)?;
+    // A refused configuration is an `InvalidConfigurationError` here exactly as
+    // it is once the fit runs (`fit_dataset_impl`), not a bare `GamfitError`.
+    let fit_config = parse_fit_config(config_json.as_deref())
+        .map_err(|reason| {
+            workflow_error_to_pyerr(
+                py,
+                gam::families::fit_orchestration::WorkflowError::InvalidConfig { reason },
+            )
+        })?;
     if fit_config
         .family
         .as_deref()
@@ -1837,7 +1868,7 @@ fn predict_table(
     interval: Option<f64>,
     covariance_mode: Option<String>,
     observation_interval: Option<bool>,
-) -> PyResult<String> {
+) -> PyResult<PyObject> {
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let model = Arc::clone(&model.model);
@@ -1849,7 +1880,8 @@ fn predict_table(
             covariance_mode,
             observation_interval,
         )
-    })
+    })?
+    .into_py(py)
 }
 
 #[pyfunction]
@@ -1861,17 +1893,20 @@ fn ctn_required_fit_columns(formula: String, config_json: String) -> PyResult<Ve
 
 #[pyfunction]
 fn required_model_columns(model: PyRef<'_, PyFittedModel>, observed_score: bool) -> PyResult<Option<Vec<String>>> {
-    let mut model = model.model.as_ref().clone();
+    let model = model.model.as_ref();
     // Outcome models without an embedded CTN retain their existing table
     // ingestion contract, including intercept-only row-count inputs.
     if !observed_score && model.score_transform.is_none() {
         return Ok(None);
     }
-    if observed_score {
-        if let Some(transform) = model.score_transform.as_ref() {
-            model = FittedModel::from_payload((**transform).clone());
+    let transformed;
+    let model = match model.score_transform.as_ref() {
+        Some(transform) if observed_score => {
+            transformed = FittedModel::from_payload((**transform).clone());
+            &transformed
         }
-    }
+        _ => model,
+    };
     let mut columns = model.prediction_required_columns().map_err(py_value_error)?;
     if observed_score {
         let response = response_column_name(&model.formula)
@@ -1879,6 +1914,51 @@ fn required_model_columns(model: PyRef<'_, PyFittedModel>, observed_score: bool)
         columns.insert(response);
     }
     Ok(Some(columns.into_iter().collect()))
+}
+
+/// Column names a positional (NumPy) prediction array of `width` columns
+/// binds to.
+///
+/// A model fitted from a positional array reads the synthetic sequence
+/// `x0..x{width-1}`, so that sequence is used whenever it covers every column
+/// the model reads. A model fitted from a named table binds the array to its
+/// predictor columns in training-table order (the order the sklearn wrapper
+/// reports as `feature_names_in_`), and only when the width equals their
+/// count; any other width is a `SchemaMismatchError` naming the expected
+/// columns, never a guessed binding.
+#[pyfunction]
+fn positional_prediction_headers(
+    model: PyRef<'_, PyFittedModel>,
+    width: usize,
+) -> PyResult<Vec<String>> {
+    let model = model.model.as_ref();
+    let required = model.prediction_required_columns().map_err(py_value_error)?;
+    let synthetic: Vec<String> = (0..width).map(|index| format!("x{index}")).collect();
+    if required.iter().all(|name| synthetic.contains(name)) {
+        return Ok(synthetic);
+    }
+    let predictors: Vec<String> = model
+        .payload()
+        .training_headers
+        .iter()
+        .flatten()
+        .filter(|name| required.contains(name.as_str()))
+        .cloned()
+        .collect();
+    if predictors.len() == required.len() && predictors.len() == width {
+        return Ok(predictors);
+    }
+    Err(SchemaMismatchError::new_err(format!(
+        "a positional array binds to the model's {} predictor column(s) {:?} in \
+         training-table order, but the input has {width} column(s); pass a table \
+         with named columns or an array of matching width",
+        required.len(),
+        if predictors.len() == required.len() {
+            predictors
+        } else {
+            required.into_iter().collect()
+        },
+    )))
 }
 
 fn transformation_score_encoded_table_impl(
@@ -1947,6 +2027,40 @@ fn transformation_score_table<'py>(
     Ok(scores.into_pyarray(py).unbind())
 }
 
+/// The declared conditional latent law's standardized residual
+/// `ζ = (z − m(a))/√v(a)` of a saved marginal-slope model on new rows, through
+/// the map its fit applied (gam#3016). `None` when the fit consumed no
+/// conditional law. The frame needs the score and the conditioning covariates,
+/// not a survival model's time columns.
+#[pyfunction]
+fn latent_conditional_residual_table<'py>(
+    py: Python<'py>,
+    model: PyRef<'_, PyFittedModel>,
+    headers: Vec<String>,
+    rows: PyRef<'_, PyEncodedTable>,
+) -> PyResult<Option<Py<PyArray1<f64>>>> {
+    let model = Arc::clone(&model.model);
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
+    let residual = detach_pyresult(py, "latent_conditional_residual_table", move || {
+        let required = model
+            .latent_conditional_residual_columns()
+            .map_err(py_value_error)?;
+        let present = dataset.headers.iter().cloned().collect::<BTreeSet<_>>();
+        let missing = required
+            .difference(&present)
+            .map(|name| format!("missing required column '{name}'"))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(SchemaMismatchError::new_err(missing.join(" ")));
+        }
+        model
+            .latent_conditional_residual(dataset.values.view(), &dataset.column_map())
+            .map_err(|error| PredictInputError::new_err(error.to_string()))
+    })?;
+    Ok(residual.map(|values| values.into_pyarray(py).unbind()))
+}
+
 /// Per-row residuals of type `kind` (`response`, `working`, `deviance`,
 /// `pearson`) of a saved standard model on labeled rows; the rows must carry
 /// the response (and the weight/offset columns the model was fit with).
@@ -1989,7 +2103,7 @@ fn predict_table_conformal(
     calibration_rows: PyRef<'_, PyEncodedTable>,
     conformal_level: f64,
     options_json: Option<String>,
-) -> PyResult<String> {
+) -> PyResult<PyObject> {
     let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     calibration_rows
@@ -1997,7 +2111,7 @@ fn predict_table_conformal(
         .map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let calibration_dataset = calibration_rows.dataset.clone();
-    detach_py_result(py, "predict_table_conformal", move || {
+    let payload = detach_py_result(py, "predict_table_conformal", move || {
         predict_encoded_table_conformal_impl(
             &model,
             dataset,
@@ -2005,7 +2119,8 @@ fn predict_table_conformal(
             conformal_level,
             options_json.as_deref(),
         )
-    })
+    })?;
+    prediction_payload_into_py(py, payload)
 }
 
 #[pyfunction]
@@ -2051,13 +2166,11 @@ fn competing_risks_cif_impl(
         .iter()
         .map(|hazard| hazard.view())
         .collect::<Vec<_>>();
-    // `ndarray::stack` is a pure shape contract violation — keep it as a
-    // bare `PyValueError` rather than forcing it through a typed engine
-    // enum it does not belong to.
+    // Endpoints whose hazard grids differ in shape cannot be stacked.
     let cumulative_hazard =
         ndarray::stack(Axis(0), &endpoint_views).map_err(shape_error_to_pyerr)?;
     // Typed engine path: `assemble_competing_risks_cif` returns
-    // `Result<_, SurvivalError>`, dispatch to `gamfit.errors.SurvivalError`.
+    // `Result<_, SurvivalError>`, raised as the class of its fit category.
     let result =
         gam::families::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
             .map_err(survival_error_to_pyerr)?;
@@ -2137,8 +2250,8 @@ fn competing_risks_cif_from_predictions_impl(
     times: ArrayView1<'_, f64>,
     cumulative_hazards: &[Array2<f64>],
 ) -> PyResult<(Vec<Array2<f64>>, Array2<f64>)> {
-    // Typed engine path: `SurvivalError` → `gamfit.errors.SurvivalError` (issue
-    // #343), no string flattening.
+    // Typed engine path: `SurvivalError` → the class of its fit category
+    // (issue #343), no string flattening.
     let result = gam::families::survival::assemble_competing_risks_cif_from_endpoints(
         times,
         cumulative_hazards,
@@ -3334,6 +3447,7 @@ fn sphere_basis<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let built = build_spherical_spline_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
     let penalty = built
@@ -3443,6 +3557,7 @@ fn sphere_basis_with_centers<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let built = build_spherical_spline_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
     let penalty = built
@@ -3528,6 +3643,7 @@ fn sphere_basis_jet<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let jet = spherical_spline_design_jet(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(jet.into_pyarray(py).unbind())
@@ -3579,6 +3695,7 @@ fn sphere_basis_jet_with_centers<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let jet = spherical_spline_design_jet(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(jet.into_pyarray(py).unbind())
@@ -3644,6 +3761,7 @@ fn sphere_basis_hessian<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let hessian = spherical_spline_design_hessian(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(hessian.into_pyarray(py).unbind())
@@ -3853,6 +3971,7 @@ const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     "linear_predictor_plugin",
     "mean_plugin",
     "posterior_mean",
+    "linear_predictor_standard_error",
     "posterior_mean_standard_error",
     "posterior_mean_lower",
     "posterior_mean_upper",
@@ -3874,79 +3993,6 @@ const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     "noise_scale",
 ];
 
-struct OrderedPredictionColumnEntries(Vec<(String, serde_json::Value)>);
-
-impl<'de> Deserialize<'de> for OrderedPredictionColumnEntries {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct OrderedPredictionColumnVisitor;
-
-        impl<'de> Visitor<'de> for OrderedPredictionColumnVisitor {
-            type Value = OrderedPredictionColumnEntries;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a JSON object containing prediction columns")
-            }
-
-            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut entries = Vec::with_capacity(access.size_hint().unwrap_or(0));
-                while let Some((key, value)) = access.next_entry::<String, serde_json::Value>()? {
-                    entries.push((key, value));
-                }
-                Ok(OrderedPredictionColumnEntries(entries))
-            }
-        }
-
-        deserializer.deserialize_map(OrderedPredictionColumnVisitor)
-    }
-}
-
-fn ordered_json_object_string(
-    entries: Vec<(String, serde_json::Value)>,
-) -> Result<String, serde_json::Error> {
-    let mut output = String::from("{");
-    for (index, (key, value)) in entries.into_iter().enumerate() {
-        if index > 0 {
-            output.push(',');
-        }
-        output.push_str(&serde_json::to_string(&key)?);
-        output.push(':');
-        output.push_str(&serde_json::to_string(&value)?);
-    }
-    output.push('}');
-    Ok(output)
-}
-
-#[pyfunction]
-fn ordered_prediction_columns(columns_json: &str) -> PyResult<String> {
-    let OrderedPredictionColumnEntries(mut pending): OrderedPredictionColumnEntries =
-        serde_json::from_str(columns_json).map_err(|err| {
-            py_value_error(format!(
-                "ordered_prediction_columns: failed to parse columns JSON: {err}"
-            ))
-        })?;
-    let mut ordered = Vec::with_capacity(pending.len());
-    for preferred in PREFERRED_PREDICTION_COLUMNS {
-        if let Some(index) = pending
-            .iter()
-            .position(|entry| entry.0.as_str() == *preferred)
-        {
-            ordered.push(pending.remove(index));
-        }
-    }
-    ordered.extend(pending);
-    ordered_json_object_string(ordered).map_err(|err| {
-        py_value_error(format!(
-            "ordered_prediction_columns: failed to serialise columns JSON: {err}"
-        ))
-    })
-}
-
 /// Finalize topology candidate lifecycles through the typed Rust selector.
 ///
 /// Python supplies exactly one terminal outcome per declared candidate:
@@ -3960,7 +4006,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     enum ScoreKind {
         Reml,
         Laml,
-        Bic,
         Tk,
     }
     #[derive(Deserialize)]
@@ -4003,7 +4048,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
             name: String,
             raw_reml: LifecycleFloat,
             laml: Option<LifecycleFloat>,
-            deviance: Option<LifecycleFloat>,
             null_dim: Option<LifecycleFloat>,
             null_space_logdet: Option<LifecycleFloat>,
             effective_dim: LifecycleFloat,
@@ -4034,7 +4078,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     let score_kind = match request.score_kind {
         ScoreKind::Reml => gam::solver::TopologySelectionScoreKind::Reml,
         ScoreKind::Laml => gam::solver::TopologySelectionScoreKind::Laml,
-        ScoreKind::Bic => gam::solver::TopologySelectionScoreKind::Bic,
         ScoreKind::Tk => gam::solver::TopologySelectionScoreKind::Tk,
     };
     let score_scale = match request.score_scale {
@@ -4050,7 +4093,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
                 name,
                 raw_reml,
                 laml,
-                deviance,
                 null_dim,
                 null_space_logdet,
                 effective_dim,
@@ -4061,7 +4103,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
                     name,
                     raw_reml: raw_reml.decode()?,
                     laml: laml.map(LifecycleFloat::decode).transpose()?,
-                    deviance: deviance.map(LifecycleFloat::decode).transpose()?,
                     null_dim: null_dim.map(LifecycleFloat::decode).transpose()?,
                     null_space_logdet: null_space_logdet.map(LifecycleFloat::decode).transpose()?,
                     effective_dim: effective_dim.decode()?,
@@ -4343,11 +4384,18 @@ fn compare_models(
             )))
         })
         .collect::<PyResult<Vec<_>>>()?;
+    let models = detach_typed_py_result(
+        py,
+        "compare_models",
+        move || {
+            model_bytes
+                .iter()
+                .map(|bytes| load_model_impl(bytes))
+                .collect::<Result<Vec<_>, _>>()
+        },
+        saved_model_error_to_pyerr,
+    )?;
     let comparison = detach_py_result(py, "compare_models", move || {
-        let models = model_bytes
-            .iter()
-            .map(|bytes| load_model_impl(bytes))
-            .collect::<Result<Vec<_>, String>>()?;
         let named = labels
             .into_iter()
             .zip(models.iter())
@@ -4356,7 +4404,7 @@ fn compare_models(
         serde_json::to_value(comparison)
             .map_err(|err| format!("failed to serialize model comparison: {err}"))
     })?;
-    json_value_to_py(py, comparison)
+    json_value_to_py(py, &comparison)
 }
 
 fn extract_reml_score_raw_impl(fit: &Bound<'_, PyAny>) -> PyResult<f64> {
@@ -4410,7 +4458,8 @@ fn json_lookup_str(payload: &serde_json::Value, keys: &[&str]) -> Option<String>
 
 fn reml_fit_view<'py>(fit: &Bound<'py, PyAny>) -> PyResult<RemlFitView<'py>> {
     if let Ok(model_bytes) = fit.extract::<Vec<u8>>() {
-        let model = load_model_impl(&model_bytes).map_err(PyValueError::new_err)?;
+        let model =
+            load_model_impl(&model_bytes).map_err(|err| saved_model_error_to_pyerr(fit.py(), err))?;
         let summary = summary_payload_value(&model).map_err(PyValueError::new_err)?;
         return Ok(RemlFitView::SavedSummary(summary));
     }

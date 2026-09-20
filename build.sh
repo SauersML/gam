@@ -71,12 +71,27 @@ KEY ENV OVERRIDES
   GAM_FORCE=1              bypass result cache + coalescing, always run, refresh cache
   GAM_NO_CACHE=1           don't read/write the result cache (still single-flight)
   GAM_USE_SCCACHE=1        use sccache (cold trees/CI; trades away incremental)
+  RUSTC_WRAPPER=<path>     an sccache wrapper already in the env is honoured as-is
+                          (no install attempt) — see SESSION BUILD CACHE below
   GAM_REMOTE_RUN=<runner>  route builds off-box when local disk is too low
 
 NOTES
   • Result cache: the same command on unchanged source serves the prior result in ~0s.
   • Transient OOM/timeout are auto-retried (dropping to -j1) and never cached.
   • The maturin lane auto-tunes (-j1, LTO off) when FREE RAM is low, to survive the link.
+
+SESSION BUILD CACHE (cold cloud session → warm deps in one download)
+  .github/workflows/build-cache.yml uploads artifact `session-build-cache` (an
+  sccache dir built at /home/user/gam by this script) on every push to main.
+  1. GitHub MCP: actions_list list_workflow_runs resource_id=build-cache.yml
+     (branch main, status completed) → newest run id; then actions_list
+     list_workflow_run_artifacts resource_id=<run id> → the artifact id.
+  2. actions_get download_workflow_run_artifact resource_id=<artifact id>
+     → signed URL (expires in ~1 min, use it at once).
+  3. scripts/fetch_build_cache.sh '<url>'  then  . ~/.cache/gam-build-cache.env
+     and build with ./build.sh as usual. Registry/git deps come from the cache
+     while workspace crates stay incremental; add GAM_USE_SCCACHE=1 for a
+     one-shot build that also takes the workspace crates from the cache.
 EOF
     exit 0 ;;
 esac
@@ -98,7 +113,15 @@ esac
 # GAM_USE_SCCACHE=1 (which trades incremental away on purpose).
 # ---------------------------------------------------------------------------
 CARGO=(cargo)
-if [[ -n "${GAM_USE_SCCACHE:-}" ]]; then
+# A RUSTC_WRAPPER already in the environment (e.g. the session build cache's
+# ~/.local/bin/sccache-rustc-wrapper from scripts/fetch_build_cache.sh) wins over
+# `--config build.rustc-wrapper` anyway, so honour it: no install attempt, and
+# under GAM_USE_SCCACHE only the incremental switch changes. Without
+# GAM_USE_SCCACHE that wrapper serves the registry/git deps from the cache while
+# the workspace crates keep compiling incrementally (sccache passes them through).
+if [[ -n "${GAM_USE_SCCACHE:-}" && -n "${RUSTC_WRAPPER:-}" ]]; then
+  export CARGO_INCREMENTAL=0   # so the workspace crates are cacheable too
+elif [[ -n "${GAM_USE_SCCACHE:-}" ]]; then
   if ! command -v sccache >/dev/null 2>&1 && [[ ! -f "$S/.sccache_tried" ]]; then
     : >"$S/.sccache_tried"
     echo "[build.sh] sccache requested but not found — installing…" >&2
@@ -116,7 +139,7 @@ fi
 # Compact one-line cache summary, in the same telemetry spirit as history.log.
 # No-ops silently when sccache is inactive or its stats format shifts.
 sccache_summary() {
-  [[ "${CARGO[*]}" == *rustc-wrapper* ]] || return 0
+  [[ "${CARGO[*]}" == *rustc-wrapper* || "${RUSTC_WRAPPER:-}" == *sccache* ]] || return 0
   sccache --show-stats 2>/dev/null \
     | grep -iE 'compile requests[[:space:]]|cache hits[[:space:]]+[0-9]|cache misses[[:space:]]+[0-9]' \
     | sed 's/^[[:space:]]*/[sccache] /' >&2 || true
@@ -680,7 +703,7 @@ if [[ "${1:-}" == "maturin" ]]; then
     # and the =0 override only runs in the cargo-lane sccache block, NOT here — so
     # the maturin lane must zero it itself or `maturin develop` dies with
     # "sccache: incremental compilation is prohibited".
-    export RUSTC_WRAPPER="$(command -v sccache)" CARGO_INCREMENTAL=0
+    export RUSTC_WRAPPER="${RUSTC_WRAPPER:-$(command -v sccache)}" CARGO_INCREMENTAL=0
   fi
   # A release extension build+link is the heaviest compile here. On a box with
   # little FREE RAM (regardless of total installed), the default codegen fan-out +
@@ -696,6 +719,16 @@ if [[ "${1:-}" == "maturin" ]]; then
   REQ="maturin develop --release $*"
   CMD=(maturin develop --release "$@")
   run_under_global_lock
+  # maturin installs gamfit under pyproject.toml's static version, which every commit between releases
+  # shares (gam#3157). Rewrite the installed distribution to the version this tree derives. The stamp
+  # refuses when the installed engine recorded a different commit or dirty state from the tree's, i.e.
+  # the tree moved during the build. It runs in the interpreter maturin installed into (VIRTUAL_ENV,
+  # then CONDA_PREFIX, then .venv).
+  if [[ "$code" == "0" ]]; then
+    _env="${VIRTUAL_ENV:-${CONDA_PREFIX:-$REPO/.venv}}"
+    "$_env/bin/python" "$REPO/scripts/gamfit_version.py" stamp-installed --root "$REPO" >>"$LOG" 2>&1
+    code=$?
+  fi
   record "$REQ" "n/a" "$code" "$DUR"
   finish "$code" "n/a"
 fi

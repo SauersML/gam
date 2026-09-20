@@ -279,25 +279,6 @@ fn fit_term_collection_on_realized_design(
     Ok(fitted)
 }
 
-fn checked_fit_log_lambdas(
-    lambdas: &Array1<f64>,
-    context: &str,
-) -> Result<Array1<f64>, EstimationError> {
-    let values = lambdas
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(coordinate, lambda)| {
-            gam_problem::checked_log_strength(lambda).map_err(|error| {
-                EstimationError::InvalidInput(format!(
-                    "{context} lambda coordinate {coordinate} is outside the canonical physical-strength domain: {error}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Array1::from_vec(values))
-}
-
 fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign) -> FitOptions {
     FitOptions {
         resource_policy: options.resource_policy.clone(),
@@ -332,6 +313,31 @@ struct BoundedLinearTermMeta {
     min: f64,
     max: f64,
     prior: BoundedCoefficientPriorSpec,
+    /// Offset `c` between the fitted latent coordinate `t` and the logit
+    /// coordinate `theta = t + c` of `beta = min + width*sigma(theta)`. It is
+    /// nonzero only under the shrinkage prior, whose latent ridge `lambda*t^2`
+    /// must be centred at the null: `t = 0` maps to `beta = 0` when zero lies
+    /// strictly inside the box, and to the box midpoint (`c = 0`) otherwise.
+    latent_center: f64,
+}
+
+impl BoundedLinearTermMeta {
+    /// Logit coordinate of the interval map at fitted latent coordinate `t`.
+    fn logit(&self, latent: f64) -> f64 {
+        latent + self.latent_center
+    }
+}
+
+/// Logit-coordinate centre of a shrinkage-prior `bounded()` coefficient on the
+/// box `(min, max)`: the `theta` with `min + width*sigma(theta) = 0` when zero
+/// is interior, `ln(-min) - ln(max)`, and the box midpoint `theta = 0` when
+/// zero is not an admissible value.
+fn bounded_shrinkage_latent_center(min: f64, max: f64) -> f64 {
+    if min < 0.0 && max > 0.0 {
+        (-min).ln() - max.ln()
+    } else {
+        0.0
+    }
 }
 
 /// β-dependent effective Jacobian for the bounded-linear fit block.
@@ -402,7 +408,7 @@ impl BlockEffectiveJacobian for BoundedEffectiveJacobian {
             } else {
                 state.beta[term.col_idx]
             };
-            let (_, _, db_dtheta, _, _, _, _) = bounded_latent_derivatives(theta, term.min, term.max);
+            let (_, _, db_dtheta, _, _, _, _) = bounded_latent_derivatives(term.logit(theta), term.min, term.max);
             if !(db_dtheta.is_finite() && db_dtheta > 0.0) {
                 return Err(format!(
                     "BoundedEffectiveJacobian::effective_jacobian_at: bounded column {} has unrepresentable derivative {db_dtheta} at theta={theta}",
@@ -723,6 +729,9 @@ fn bounded_prior_shapes(prior: &BoundedCoefficientPriorSpec) -> Result<Option<(f
     let (a, b) = match prior {
         // `None` means constrained MLE with no extra prior term on the bounded coefficient.
         BoundedCoefficientPriorSpec::None => return Ok(None),
+        // The shrinkage prior is Gaussian on the latent coordinate; the fit
+        // carries it as a REML-weighted penalty block, not as a prior term.
+        BoundedCoefficientPriorSpec::Shrinkage => return Ok(None),
         // Uniform on the normalized user-scale coefficient z in (0, 1). In latent space this is
         // exactly the Jacobian term for the logistic transform, up to an additive width constant.
         BoundedCoefficientPriorSpec::Uniform => (1.0, 1.0),
@@ -1780,7 +1789,7 @@ impl BoundedLinearFamily {
                 ));
             }
             let (beta, _, db_dtheta, d2b_dtheta2, d3b_dtheta3, _, _) =
-                bounded_latent_derivatives(latent_beta[term.col_idx], term.min, term.max);
+                bounded_latent_derivatives(term.logit(latent_beta[term.col_idx]), term.min, term.max);
             if [beta, db_dtheta, d2b_dtheta2, d3b_dtheta3]
                 .iter()
                 .any(|value| !value.is_finite())
@@ -1795,7 +1804,7 @@ impl BoundedLinearFamily {
             second_diag[term.col_idx] = d2b_dtheta2;
             third_diag[term.col_idx] = d3b_dtheta3;
             let (_, _, _, prior_neghess_derivative, _) =
-                bounded_prior_terms(latent_beta[term.col_idx], &term.prior)?;
+                bounded_prior_terms(term.logit(latent_beta[term.col_idx]), &term.prior)?;
             priorthird[term.col_idx] = prior_neghess_derivative;
         }
         Ok((beta_user, jac_diag, second_diag, third_diag, priorthird))
@@ -1817,7 +1826,7 @@ impl BoundedLinearFamily {
         let mut offset = self.offset.clone();
         for term in &self.bounded_terms {
             let (beta, _, _) =
-                bounded_latent_to_user(latent_beta[term.col_idx], term.min, term.max);
+                bounded_latent_to_user(term.logit(latent_beta[term.col_idx]), term.min, term.max);
             offset.scaled_add(beta, &self.design.column(term.col_idx));
         }
         if offset.iter().any(|value| !value.is_finite()) {
@@ -1872,7 +1881,7 @@ impl BoundedLinearFamily {
         let mut prior_loglik = 0.0;
         for term in &self.bounded_terms {
             let (logp, grad, neghess, _, _) =
-                bounded_prior_terms(latent_beta[term.col_idx], &term.prior)?;
+                bounded_prior_terms(term.logit(latent_beta[term.col_idx]), &term.prior)?;
             prior_loglik += logp;
             priorgrad[term.col_idx] += grad;
             prior_neghess[[term.col_idx, term.col_idx]] += neghess;
@@ -1946,10 +1955,10 @@ impl BoundedLinearFamily {
         for term in &self.bounded_terms {
             let col = term.col_idx;
             let (_, _, _, _, _, d4b_dtheta4, d5b_dtheta5) =
-                bounded_latent_derivatives(latent_beta[col], term.min, term.max);
+                bounded_latent_derivatives(term.logit(latent_beta[col]), term.min, term.max);
             fourth_diag[col] = d4b_dtheta4;
             fifth_diag[col] = d5b_dtheta5;
-            prior_fifth[col] = bounded_prior_neghess_third_derivative(latent_beta[col], &term.prior)?;
+            prior_fifth[col] = bounded_prior_neghess_third_derivative(term.logit(latent_beta[col]), &term.prior)?;
         }
         let scaled_bounded_columns = |scale: &dyn Fn(usize) -> f64| {
             let mut out = Array2::<f64>::zeros(x_eff.raw_dim());
@@ -2288,9 +2297,9 @@ impl CustomFamily for BoundedLinearFamily {
             let col = term.col_idx;
             let x_b = self.design.column(col);
             let (_, _, _, _, _, d4b_dtheta4, _) =
-                bounded_latent_derivatives(latent_beta[col], term.min, term.max);
+                bounded_latent_derivatives(term.logit(latent_beta[col]), term.min, term.max);
             let (_, _, _, _, prior_neghess_second_derivative) =
-                bounded_prior_terms(latent_beta[col], &term.prior)?;
+                bounded_prior_terms(term.logit(latent_beta[col]), &term.prior)?;
             let u_b = d_beta_u_flat[col];
             let v_b = d_betav_flat[col];
             d2h[[col, col]] -= x_b.dot(&dd_score_uv) * second_diag[col]
@@ -2444,8 +2453,9 @@ impl CustomFamily for BoundedLinearFamily {
         let limit = bounded_latent_injective_limit();
         let mut clamped = beta;
         for term in &self.bounded_terms {
-            let theta = clamped[term.col_idx];
-            clamped[term.col_idx] = theta.clamp(-limit, limit);
+            // The limit bounds the logit coordinate `t + c`, not `t` itself.
+            let logit = clamped[term.col_idx] + term.latent_center;
+            clamped[term.col_idx] = logit.clamp(-limit, limit) - term.latent_center;
         }
         Ok(clamped)
     }
@@ -2659,6 +2669,33 @@ fn certify_bounded_edf_interval(
     crate::bail_invalid_estim!(
         "{label}={value} lies outside [{lower}, {upper}] by more than the dense-trace backward-error allowance {allowed}"
     )
+}
+
+/// Refit budget for the bounded fit's profiled Gaussian dispersion.
+const BOUNDED_GAUSSIAN_SCALE_MAX_ITER: usize = 50;
+/// Fixed-point tolerance for the profiled dispersion, on `ln phi`, and for the
+/// latent coefficients, relative to `1 + |theta|`.
+const BOUNDED_GAUSSIAN_SCALE_TOL: f64 = 1e-8;
+
+/// `S_lambda = sum_k lambda_k S_k` over the bounded fit's penalties, as a dense
+/// `p x p` matrix.
+fn bounded_penalty_sum(penalties: &[PenaltySpec], lambdas: &Array1<f64>, p: usize) -> Array2<f64> {
+    let mut s_lambda = Array2::<f64>::zeros((p, p));
+    for (penalty, &lambda) in penalties.iter().zip(lambdas.iter()) {
+        match penalty {
+            PenaltySpec::Block {
+                local, col_range, ..
+            } => {
+                s_lambda
+                    .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
+                    .scaled_add(lambda, local);
+            }
+            PenaltySpec::Dense(m) | PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                s_lambda.scaled_add(lambda, m);
+            }
+        }
+    }
+    s_lambda
 }
 
 fn exact_bounded_edf(
@@ -2914,8 +2951,42 @@ fn fit_bounded_term_collection_with_design(
     let conditioning = LinearFitConditioning::from_columns(design, &conditioning_cols);
     let dense_design = design.design.to_dense_cow();
     let fit_design = conditioning.apply_to_design(&dense_design);
-    let fit_penalties = conditioning
-        .transform_blockwise_penalties_to_internal(&design.penalties, design.design.ncols());
+    // A shrinkage-prior bounded coefficient's one-column ridge acts on its
+    // latent logit coordinate, which the conditioning map never touches (it
+    // only rescales the box), so that block passes through untransformed.
+    // Every other penalty is a user-coordinate penalty and is conditioned.
+    let shrinkage_cols: Vec<usize> = spec
+        .linear_terms
+        .iter()
+        .enumerate()
+        .filter_map(|(j, linear)| {
+            matches!(
+                linear.coefficient_geometry,
+                LinearCoefficientGeometry::Bounded {
+                    prior: BoundedCoefficientPriorSpec::Shrinkage,
+                    ..
+                }
+            )
+            .then_some(design.intercept_range.end + j)
+        })
+        .collect();
+    let fit_penalties: Vec<PenaltySpec> = design
+        .penalties
+        .iter()
+        .map(|bp| {
+            let latent_block = bp.col_range.len() == 1 && shrinkage_cols.contains(&bp.col_range.start);
+            if latent_block {
+                PenaltySpec::from_blockwise(bp.clone())
+            } else {
+                conditioning
+                    .transform_blockwise_penalties_to_internal(
+                        std::slice::from_ref(bp),
+                        design.design.ncols(),
+                    )
+                    .remove(0)
+            }
+        })
+        .collect();
     if design.linear_constraints.is_some() {
         crate::bail_invalid_estim!(
             "bounded() terms are not yet compatible with explicit linear constraints"
@@ -2939,11 +3010,20 @@ fn fit_bounded_term_collection_with_design(
         {
             let col_idx = design.intercept_range.end + j;
             let (min_internal, max_internal) = conditioning.internal_bounds_for(col_idx, min, max);
+            let latent_center = match prior {
+                BoundedCoefficientPriorSpec::Shrinkage => {
+                    bounded_shrinkage_latent_center(min_internal, max_internal)
+                }
+                BoundedCoefficientPriorSpec::None
+                | BoundedCoefficientPriorSpec::Uniform
+                | BoundedCoefficientPriorSpec::Beta { .. } => 0.0,
+            };
             bounded_terms.push(BoundedLinearTermMeta {
                 col_idx,
                 min: min_internal,
                 max: max_internal,
                 prior,
+                latent_center,
             });
         }
     }
@@ -3003,9 +3083,11 @@ fn fit_bounded_term_collection_with_design(
         bounded_terms: bounded_terms.clone(),
         jeffreys_armed: true,
     };
-    let blockspec = ParameterBlockSpec {
+    let blockspec = |initial_log_lambdas: Array1<f64>, initial_beta: Array1<f64>| ParameterBlockSpec {
         name: "eta".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(designzeroed)),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            designzeroed.clone(),
+        )),
         offset: offset.to_owned(),
         penalties: fit_penalties
             .iter()
@@ -3038,31 +3120,136 @@ fn fit_bounded_term_collection_with_design(
         stacked_design: None,
         stacked_offset: None,
     };
-    let fit = fit_custom_family_arming_on_evidence(
-        &family_adapter,
-        &[blockspec],
-        &BlockwiseFitOptions {
-            inner_tol: options.tol,
-            outer_max_iter: options.max_iter,
-            outer_tol: options.tol,
-            // The bounded path builds its own user-scale covariance below by
-            // inverting the user-scale penalised Hessian (delta-method through
-            // the bounded transform's Jacobian + the conditioning map), so it
-            // does not consume the inner solver's optional canonical-space
-            // `covariance_conditional`. Inverting the reported precision
-            // directly guarantees `inv(penalized_hessian) == covariance` and
-            // works on every bounded fit — including the common no-smoothing
-            // path where the inner solve surfaces no covariance at all (the
-            // gam#854 "bounded fit emits no user-scale covariance" symptom).
-            // A penalized fit with inference on still requests the latent
-            // conditional covariance: it is the `V_cond` through which
-            // `fit_custom_family` mints the first-order smoothing correction from
-            // the certified outer rho-Hessian, pushed to user scale below (#2903).
-            compute_covariance: options.compute_inference && !fit_penalties.is_empty(),
-            ..BlockwiseFitOptions::default()
-        },
-    )
-    .map_err(EstimationError::CustomFamily)?;
+    let fit_options = BlockwiseFitOptions {
+        inner_tol: options.tol,
+        outer_max_iter: options.max_iter,
+        outer_tol: options.tol,
+        // The bounded path builds its own user-scale covariance below by
+        // inverting the user-scale penalised Hessian (delta-method through
+        // the bounded transform's Jacobian + the conditioning map), so it
+        // does not consume the inner solver's optional canonical-space
+        // `covariance_conditional`. Inverting the reported precision
+        // directly guarantees `inv(penalized_hessian) == covariance` and
+        // works on every bounded fit — including the common no-smoothing
+        // path where the inner solve surfaces no covariance at all (the
+        // gam#854 "bounded fit emits no user-scale covariance" symptom).
+        // A penalized fit with inference on still requests the latent
+        // conditional covariance: it is the `V_cond` through which
+        // `fit_custom_family` mints the first-order smoothing correction from
+        // the certified outer rho-Hessian, pushed to user scale below (#2903).
+        compute_covariance: options.compute_inference && !fit_penalties.is_empty(),
+        ..BlockwiseFitOptions::default()
+    };
+    let run_fit = |adapter: &BoundedLinearFamily,
+                   initial_log_lambdas: Array1<f64>,
+                   initial_beta: Array1<f64>| {
+        fit_custom_family_arming_on_evidence(
+            adapter,
+            &[blockspec(initial_log_lambdas, initial_beta)],
+            &fit_options,
+        )
+        .map_err(EstimationError::CustomFamily)
+    };
+    let mut fit = run_fit(&family_adapter, initial_log_lambdas, initial_beta)?;
+
+    // Profiled Gaussian dispersion. The bounded family's profiled-Gaussian rows
+    // carry unit dispersion, which leaves the fit invariant to sigma only while
+    // nothing but the likelihood shapes the coefficients. Once a smoothing
+    // parameter is selected, or a bounded prior adds a log-density, the
+    // criterion weighs the data against the prior at the dispersion it is
+    // given: at sigma = 1 it chooses lambda as if the residual variance were 1
+    // in the response's units, so the choice changes with the units of y. The
+    // dispersion is therefore profiled jointly with lambda: refit at the fixed
+    // dispersion `phi`, update `phi = RSS / (n - edf)`, the stationarity
+    // condition of the Laplace criterion in `phi`, and repeat to the fixed point.
+    let p_fit = fit_design.ncols();
+    let profiles_gaussian_scale = matches!(
+        resolved_likelihood_scale,
+        gam_spec::ResolvedLikelihoodScale::ProfiledGaussian
+    ) && (!fit_penalties.is_empty()
+        || bounded_terms
+            .iter()
+            .map(|term| bounded_prior_shapes(&term.prior))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(EstimationError::InvalidInput)?
+            .iter()
+            .any(Option::is_some));
+    // `fit_phi` is the dispersion the current fit ran at. Its lambdas weigh the
+    // penalty against a likelihood scaled by `1/phi`, so `phi * lambda` is the
+    // unit-dispersion lambda every quantity below is reported on.
+    let mut fit_phi = 1.0_f64;
+    let mut fit_adapter = family_adapter.clone();
+    if profiles_gaussian_scale {
+        let n_obs = y.len() as f64;
+        let mut profiled = false;
+        for _ in 0..BOUNDED_GAUSSIAN_SCALE_MAX_ITER {
+            let latent = fit.block_states[0].beta.clone();
+            let lambdas_unit = fit.lambdas.mapv(|lambda| lambda * fit_phi);
+            let (unit_state, _, _, _) = family_adapter
+                .evaluation_from_latent(&latent)
+                .map_err(EstimationError::InvalidInput)?;
+            let (_, h_fit, _, _) = fit_adapter
+                .evaluation_from_latent(&latent)
+                .map_err(EstimationError::InvalidInput)?;
+            let mut precision = h_fit * fit_phi;
+            precision += &bounded_penalty_sum(&fit_penalties, &lambdas_unit, p_fit);
+            let cov = certified_bounded_posterior_covariance(
+                &precision,
+                "bounded Gaussian profiled-scale posterior precision",
+            )?;
+            let (_, _, edf) = exact_bounded_edf(&fit_penalties, &lambdas_unit, &cov)?;
+            let rss = -2.0 * unit_state.log_likelihood;
+            let sigma = certified_profiled_gaussian_scale(rss, n_obs - edf, "bounded Gaussian")?;
+            let phi_next = sigma * sigma;
+            // An exact fit leaves no residual variance to profile: the data
+            // outweigh any finite prior and the current fit is the answer.
+            if phi_next == 0.0 || (phi_next.ln() - fit_phi.ln()).abs() <= BOUNDED_GAUSSIAN_SCALE_TOL {
+                profiled = true;
+                break;
+            }
+            let scale = gam_spec::LikelihoodScaleMetadata::FixedDispersion { phi: phi_next };
+            fit_adapter.likelihood = gam_spec::GlmLikelihoodSpec::try_new(
+                glm_likelihood.spec.clone(),
+                scale,
+            )
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            let warm_log_lambdas = fit
+                .log_lambdas
+                .mapv(|rho| rho + fit_phi.ln() - phi_next.ln());
+            let next = run_fit(&fit_adapter, warm_log_lambdas, latent.clone())?;
+            let moved = next.block_states[0]
+                .beta
+                .iter()
+                .zip(latent.iter())
+                .any(|(a, b)| (a - b).abs() > BOUNDED_GAUSSIAN_SCALE_TOL * (1.0 + b.abs()));
+            fit = next;
+            fit_phi = phi_next;
+            // The coefficients no longer respond to the dispersion: the fixed
+            // point is reached even while `phi` itself still falls toward an
+            // exact fit's zero.
+            if !moved {
+                profiled = true;
+                break;
+            }
+        }
+        if !profiled {
+            crate::bail_invalid_estim!(
+                "bounded Gaussian dispersion did not reach its profiled fixed point in \
+                 {BOUNDED_GAUSSIAN_SCALE_MAX_ITER} refits (last phi = {fit_phi})"
+            );
+        }
+    }
+    // The reported strengths are exactly `exp(log_lambdas)`, so the unit-dispersion
+    // shift is taken on the log coordinate.
+    let log_lambdas = fit.log_lambdas.mapv(|rho| rho + fit_phi.ln());
+    let lambdas = Array1::from_vec(
+        gam_problem::checked_exp_log_strengths(log_lambdas.iter().copied()).map_err(|error| {
+            EstimationError::InvalidInput(format!(
+                "bounded unit-dispersion lambda coordinate {} is outside the solver domain: {}",
+                error.coordinate, error.value
+            ))
+        })?,
+    );
 
     let latent_beta = fit.block_states[0].beta.clone();
     let (beta_user_internal, jac_diag) = family_adapter
@@ -3070,26 +3257,18 @@ fn fit_bounded_term_collection_with_design(
         .map_err(EstimationError::InvalidInput)?;
     let beta_user = conditioning.backtransform_beta(&beta_user_internal);
 
-    let (eta_state, h_data, _, _) = family_adapter
+    // `eta_state` is read at unit dispersion (deviance and working weights on
+    // the unscaled contract); the precision is the fitted curvature lifted back
+    // to unit dispersion, so a bounded prior's log-density keeps the weight the
+    // fit gave it.
+    let (eta_state, _, _, _) = family_adapter
         .evaluation_from_latent(&latent_beta)
         .map_err(EstimationError::InvalidInput)?;
-    let p_fit = fit_design.ncols();
-    let mut s_lambda_internal = Array2::<f64>::zeros((p_fit, p_fit));
-    for (k, penalty) in fit_penalties.iter().enumerate() {
-        match penalty {
-            PenaltySpec::Block {
-                local, col_range, ..
-            } => {
-                s_lambda_internal
-                    .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
-                    .scaled_add(fit.lambdas[k], local);
-            }
-            PenaltySpec::Dense(m) | PenaltySpec::DenseWithMean { matrix: m, .. } => {
-                s_lambda_internal.scaled_add(fit.lambdas[k], m);
-            }
-        }
-    }
-    let mut latent_precision = h_data.clone();
+    let (_, h_fit, _, _) = fit_adapter
+        .evaluation_from_latent(&latent_beta)
+        .map_err(EstimationError::InvalidInput)?;
+    let s_lambda_internal = bounded_penalty_sum(&fit_penalties, &lambdas, p_fit);
+    let mut latent_precision = h_fit * fit_phi;
     latent_precision += &s_lambda_internal;
     let user_precision_internal =
         transform_bounded_latent_precision_to_user_internal(&latent_precision, &jac_diag)?;
@@ -3143,17 +3322,14 @@ fn fit_bounded_term_collection_with_design(
     } else {
         None
     };
-    let s_lambda_original = weighted_blockwise_penalty_sum(
-        &design.penalties,
-        fit.lambdas
-            .as_slice()
-            .expect("the fitted lambdas are a contiguous standard-layout array"),
-        design.design.ncols(),
-    );
-    let penalty_term = beta_user.dot(&s_lambda_original.dot(&beta_user));
+    // The penalty the fit minimised, in the coordinates it acts on: user-scale
+    // penalties are conditioned into `s_lambda_internal`, which leaves their
+    // quadratic form unchanged, and a latent shrinkage ridge reads the latent
+    // coordinate it is centred on.
+    let penalty_term = latent_beta.dot(&s_lambda_internal.dot(&latent_beta));
     let deviance = -2.0 * eta_state.log_likelihood;
     let (edf_by_block, penalty_block_trace, edf_total) = if let Some(cov) = latent_cov.as_ref() {
-        exact_bounded_edf(&fit_penalties, &fit.lambdas, cov)?
+        exact_bounded_edf(&fit_penalties, &lambdas, cov)?
     } else {
         (
             vec![0.0; fit_penalties.len()],
@@ -3279,8 +3455,6 @@ fn fit_bounded_term_collection_with_design(
         .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     Ok(FittedTermCollection {
         fit: {
-            let log_lambdas =
-                checked_fit_log_lambdas(&fit.lambdas, "final fitted term collection")?;
             let inf = FitInference {
                 edf_by_block,
                 penalty_block_trace,
@@ -3305,6 +3479,7 @@ fn fit_bounded_term_collection_with_design(
                 reparam_qs: None,
                 dispersion,
                 factorized_standard_errors: None,
+                smoothing_correction_factorized: None,
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
@@ -3320,11 +3495,11 @@ fn fit_bounded_term_collection_with_design(
                     beta: beta_user.clone(),
                     role: gam_problem::BlockRole::Mean,
                     edf: edf_total,
-                    lambdas: fit.lambdas.clone(),
+                    lambdas: lambdas.clone(),
                 }],
                 training_sample_size: y.len(),
                 log_lambdas,
-                lambdas: fit.lambdas,
+                lambdas,
                 likelihood_scale: glm_likelihood.scale,
                 likelihood_family: Some(glm_likelihood.spec),
                 log_likelihood_normalization: gam_spec::LogLikelihoodNormalization::UserProvided,

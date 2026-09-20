@@ -1280,6 +1280,17 @@ impl SaeBasisSecondJet for SnapshotLinearSecondJet2521 {
         }
         Ok(Array4::<f64>::zeros((coords.nrows(), 2, 1, 1)))
     }
+
+    fn jet_ball_bound(
+        &self,
+        center: ndarray::ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<crate::basis::SaeBasisJetBallCapability, String> {
+        Ok(crate::basis::SaeBasisJetBallCapability::Unavailable(format!(
+            "SnapshotLinearSecondJet2521 is a snapshot test basis and declares no bound \
+             on the ball of radius {radius} around {center}"
+        )))
+    }
 }
 
 fn structural_restore_fixture_2521() -> SaeManifoldTerm {
@@ -2188,30 +2199,29 @@ pub(crate) fn collapse_rescue_projection_matches_train_and_oos_and_refuses_targe
 }
 
 /// #1777 GOAL 2 — the PER-FIT [`SaeFitConfig`] is the source of truth for the
-/// ordered Beta--Bernoulli-α and separation-barrier overrides: two terms carrying DIFFERENT configs
-/// produce correspondingly-different α / barrier strength, and the two terms do
-/// not leak into each other.
+/// separation-barrier override and the backend policy: two terms carrying DIFFERENT configs
+/// produce correspondingly-different barrier strengths, and the two terms do not leak into
+/// each other.
 #[test]
-pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha() {
-    let (mut term_a, _t_a, rho_a) = small_two_atom_ordered_beta_bernoulli_term();
-    let (mut term_b, _t_b, rho_b) = small_two_atom_ordered_beta_bernoulli_term();
+pub(crate) fn per_fit_config_isolates_barrier_and_gpu_policy() {
+    let (mut term_a, _t_a, _rho_a) = small_two_atom_ordered_beta_bernoulli_term();
+    let (mut term_b, _t_b, _rho_b) = small_two_atom_ordered_beta_bernoulli_term();
+    let canonical = term_a.separation_barrier_strength();
 
     // Distinct per-fit configs, applied to each term independently.
     term_a.set_fit_config(SaeFitConfig {
         separation_barrier_strength_override: Some(0.1),
-        ordered_beta_bernoulli_alpha_override: Some(0.2),
         gpu_policy: gam_gpu::GpuPolicy::Off,
     });
     term_b.set_fit_config(SaeFitConfig {
         separation_barrier_strength_override: Some(3.0),
-        ordered_beta_bernoulli_alpha_override: Some(5.0),
         gpu_policy: gam_gpu::GpuPolicy::Required,
     });
 
     // Round-trips through the config accessor.
     assert_eq!(
-        term_a.fit_config().ordered_beta_bernoulli_alpha_override,
-        Some(0.2)
+        term_a.fit_config().separation_barrier_strength_override,
+        Some(0.1)
     );
     assert_eq!(
         term_b.fit_config().separation_barrier_strength_override,
@@ -2220,29 +2230,16 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha()
     assert_eq!(term_a.fit_config().gpu_policy, gam_gpu::GpuPolicy::Off);
     assert_eq!(term_b.fit_config().gpu_policy, gam_gpu::GpuPolicy::Required);
 
-    // ordered Beta--Bernoulli-α: the per-fit override is the resolved concentration
-    // (bypassing the mode schedule), and the two terms resolve different values.
-    // α parameterizes the prior used by the fit; it does not rewrite an
-    // already-materialized assignment matrix.
-    let concentration = |term: &SaeManifoldTerm, rho: &SaeManifoldRho| {
-        term.assignment
-            .ordered_beta_bernoulli_prior_parameters(rho)
-            .expect("fixture rho is inside the prior domain")
-            .map(|parameters| parameters.concentration)
-    };
-    assert_eq!(concentration(&term_a, &rho_a), Some(0.2));
-    assert_eq!(concentration(&term_b, &rho_b), Some(5.0));
-
     // Barrier strength (K=2, so the barrier is live): the per-fit override is the
     // source of truth, distinct per term.
     assert_eq!(term_a.separation_barrier_strength(), 0.1);
     assert_eq!(term_b.separation_barrier_strength(), 3.0);
 
-    // Isolation: clearing term_a's config leaves term_b untouched, and term_a
-    // uses the mode's canonical α.
+    // Isolation: clearing term_a's config restores its canonical strength and leaves
+    // term_b untouched.
     term_a.set_fit_config(SaeFitConfig::default());
-    assert_eq!(concentration(&term_a, &rho_a), Some(1.0)); // the mode's compiled α
-    assert_eq!(concentration(&term_b, &rho_b), Some(5.0));
+    assert_eq!(term_a.separation_barrier_strength(), canonical);
+    assert_eq!(term_b.separation_barrier_strength(), 3.0);
 }
 
 /// F5 — the per-fit separation-barrier override (#1777) must isolate two
@@ -2267,7 +2264,6 @@ pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
                     let (mut term, _t, _rho) = small_two_atom_ordered_beta_bernoulli_term();
                     term.set_fit_config(SaeFitConfig {
                         separation_barrier_strength_override: Some(mu),
-                        ordered_beta_bernoulli_alpha_override: None,
                         gpu_policy: gam_gpu::GpuPolicy::Off,
                     });
                     // Hammer the barrier-strength read while the sibling thread
@@ -2291,12 +2287,13 @@ pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
     });
 }
 
-/// #976 Layer-1 guard 2: a single Newton application cannot move a gate
-/// logit by more than the gate-scale cap, however large the solver's raw
-/// delta. Softmax canonicalization shifts whole rows, so the invariant is
+/// A Newton application realises exactly `step_size · Δ` on every gate logit,
+/// however large the raw delta: the step is globalised by the Armijo line
+/// search on the realised objective, not by a hand box on the logit move
+/// (SPEC 18-22). Softmax canonicalization shifts whole rows, so the step is
 /// checked on the within-row logit DIFFERENCE, which the shift preserves.
 #[test]
-pub(crate) fn assignment_logit_step_cap_bounds_single_iteration_gate_motion() {
+pub(crate) fn assignment_logit_newton_step_is_realised_unboxed() {
     let (mut term, _target, _rho) = small_two_atom_periodic_term();
     let n = term.assignment.n_obs();
     let q = term.assignment.row_block_dim();
@@ -2304,17 +2301,19 @@ pub(crate) fn assignment_logit_step_cap_bounds_single_iteration_gate_motion() {
 
     let mut delta = Array1::<f64>::zeros(n * q);
     // Softmax K=2 has one free logit per row at offset 0 of the row block.
-    delta[0] = 1.0e6;
+    let raw = 1.0e3 * term.assignment.mode.temperature();
+    delta[0] = raw;
     let delta_beta = Array1::<f64>::zeros(term.beta_dim());
-    term.apply_newton_step(delta.view(), delta_beta.view(), 1.0)
+    let step_size = 0.5;
+    term.apply_newton_step(delta.view(), delta_beta.view(), step_size)
         .expect("step applies");
 
-    let cap = SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * term.assignment.mode.temperature();
     let diff_after = term.assignment.logits[[0, 0]] - term.assignment.logits[[0, 1]];
+    let realised = diff_after - diff_before;
+    let expected = step_size * raw;
     assert!(
-        ((diff_after - diff_before) - cap).abs() < 1.0e-9,
-        "a 1e6 raw logit delta must realise exactly the {cap}-cap, moved {}",
-        diff_after - diff_before
+        (realised - expected).abs() <= 8.0 * f64::EPSILON * (expected.abs() + diff_before.abs()),
+        "the logit must move by step_size·Δ = {expected}, moved {realised}"
     );
 }
 
