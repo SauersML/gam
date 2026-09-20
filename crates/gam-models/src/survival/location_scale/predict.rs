@@ -393,9 +393,14 @@ pub(crate) fn inverse_link_survival_prob_checked(
 ) -> Result<f64, SurvivalLocationScaleError> {
     let failure = inverse_link_failure_prob_checked(inverse_link, eta)?;
     let survival = match inverse_link {
-        InverseLink::Standard(link) => {
-            standard_link_survival_value(*link, eta).unwrap_or(1.0 - failure)
-        }
+        InverseLink::Standard(link) => standard_link_survival_value(*link, eta).ok_or_else(|| {
+            SurvivalLocationScaleError::InvalidConfiguration {
+                reason: format!(
+                    "prediction does not support the {} link for survival models",
+                    link.name()
+                ),
+            }
+        })?,
         _ => gam_solve::mixture_link::inverse_link_complement_for_inverse_link(
             inverse_link,
             eta,
@@ -552,6 +557,18 @@ mod survival_prob_tail_tests {
             rel_err(loglog, (-40.0_f64).exp()) < 1e-14,
             "loglog S(40) = {loglog:e}"
         );
+    }
+
+    /// A link with no survival closed form is refused, never answered with `1 − F`.
+    #[test]
+    fn a_link_without_a_survival_closed_form_is_refused() {
+        for link in [StandardLink::Log, StandardLink::Sqrt, StandardLink::Inverse] {
+            let refused = inverse_link_survival_prob_checked(&InverseLink::Standard(link), 0.5);
+            assert!(
+                matches!(refused, Err(SurvivalLocationScaleError::InvalidConfiguration { .. })),
+                "{link:?}: {refused:?}"
+            );
+        }
     }
 
     /// The checked prediction value, the fit's unchecked value and the log-space
