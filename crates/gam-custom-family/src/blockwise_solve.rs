@@ -218,41 +218,6 @@ pub(crate) fn labeled_options_for_rho<'a>(
     Ok(std::borrow::Cow::Owned(owned))
 }
 
-pub(crate) fn outerobjectivegradienthessian_labeled<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    layout: &PenaltyLabelLayout,
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: &gam_problem::RhoPrior,
-    eval_mode: EvalMode,
-) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
-    let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
-    let physical_warm_start = physical_warm_start_for_labeled(warm_start, &physical_rho, layout);
-    // gam#1587: build the per-eval joint penalty bundle from the current outer ρ
-    // (each joint spec's λ pulled from its tied outer coordinate) and attach it
-    // to the inner-solve options so BOTH the inner β̂ AND the outer evaluator
-    // (penalty coords / logdet / operator) see the full-width centered penalty.
-    // No joint specs ⇒ `options` is passed through untouched (byte-identical).
-    let labeled_options = labeled_options_for_rho(options, specs, layout, rho)?;
-    let options = labeled_options.as_ref();
-    let base = outerobjectivegradienthessian_internal(
-        family,
-        specs,
-        options,
-        &layout.penalty_counts,
-        &physical_rho,
-        physical_warm_start.as_ref().or(warm_start),
-        gam_problem::RhoPrior::Flat,
-        eval_mode,
-    )?;
-    pullback_labeled_outer_eval(base, rho, layout, rho_prior, eval_mode)
-        .map_err(CustomFamilyError::from)
-}
-
 /// Correct one labeled-rho continuation waypoint to its certified coefficient
 /// mode, without constructing a Laplace scalar that an interior waypoint would
 /// discard.
