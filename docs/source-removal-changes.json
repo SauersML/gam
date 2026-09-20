@@ -2802,5 +2802,13 @@
     ],
     "reason": "#4522: gauss_hermite_probabilists was a line-for-line Numerical Recipes gauher transcription (asymptotic seeds, orthonormal recurrence, 200-step Newton); it is now a split of gam_math::quadrature::standard_normal_gauss_hermite_rule, the workspace's one standard-normal Gauss-Hermite rule. PI_QUARTER_INV (pi^-1/4, the recurrence seed) was a local constant of the deleted transcription.",
     "evidence": "At this base, source_removal_guard.py with the landing commit as head reports exactly this identity. git grep -w PI_QUARTER_INV finds none under crates, src or tests in the head tree."
+  },
+  {
+    "base": "c78ebbfb47498180e00fa0b6721359b1ff02948c",
+    "items": [
+      "crates/gam-math/src/paired_timing.rs:fn:quantile_sorted"
+    ],
+    "reason": "#3877: paired_timing quantiles route through the shared gam_math::quantile::quantile_from_sorted; the private duplicate is deleted.",
+    "evidence": "PR #3887; quantile_from_sorted returns NaN on empty input exactly like the removed helper."
   }
 ]
