@@ -1695,6 +1695,19 @@ fn saved_model_kind(model_bytes: Vec<u8>) -> &'static str {
     "scalar"
 }
 
+/// Write a saved gamfit model's bytes to `path` through the one saved-model
+/// writer every surface shares (gam#3054): atomic, so a failed save leaves the
+/// previous file whole, and durable on Unix before it returns.
+#[pyfunction]
+fn write_saved_model_file(
+    py: Python<'_>,
+    path: std::path::PathBuf,
+    model_bytes: Vec<u8>,
+) -> PyResult<()> {
+    py.detach(move || gam_model_api::saved_model::write_saved_model(&path, &model_bytes))
+        .map_err(crate::ffi::ffi_errors::saved_document_error_to_pyerr)
+}
+
 #[pyfunction]
 fn build_extend_group_payload_json(
     spec_json: &str,

@@ -4620,6 +4620,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_kind, module)?)?;
+    module.add_function(wrap_pyfunction!(write_saved_model_file, module)?)?;
     module.add_function(wrap_pyfunction!(is_multinomial_family_name, module)?)?;
     module.add("RESPONSE_GEOMETRY_SCHEMA", RESPONSE_GEOMETRY_SCHEMA)?;
     module.add_function(wrap_pyfunction!(saved_model_class_traits, module)?)?;
