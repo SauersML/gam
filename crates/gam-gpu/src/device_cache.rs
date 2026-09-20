@@ -21,19 +21,18 @@ mod linux {
     use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
     use std::collections::HashMap;
     use std::path::Path;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
     /// Process-wide NVRTC module cache for a single PTX source string.
     ///
     /// The first call to [`PtxModuleCache::get_or_compile`] compiles the
-    /// source via `cudarc::nvrtc::compile_ptx`, loads the module on the
-    /// supplied context, and stores the resulting `Arc<CudaModule>`.
-    /// Subsequent calls return the cached module without recompiling.
+    /// source with the shared device-keyed NVRTC options (see
+    /// [`compile_ptx_arch`]), loads the module on the supplied context, and
+    /// stores the resulting `Arc<CudaModule>`. Subsequent calls return the
+    /// cached module without recompiling.
     ///
     /// The `label` is woven into the error message so the originating
-    /// backend stays identifiable in logs; the wording matches each
-    /// caller's previous bespoke `format!` so existing log assertions
-    /// continue to hold.
+    /// backend stays identifiable in logs.
     #[derive(Default)]
     pub struct PtxModuleCache {
         module: std::sync::OnceLock<Arc<CudaModule>>,
@@ -58,32 +57,11 @@ mod linux {
             label: &'static str,
             source: &str,
         ) -> Result<&Arc<CudaModule>, GpuError> {
-            self.get_or_load(ctx, label, || {
-                // cudarc's NVRTC loader panics when libnvrtc is missing (#2972).
-                require_cudarc_library(CudarcLibrary::Nvrtc)?;
-                compile_ptx_with_opts(source, nvrtc_compile_options()?)
-                    .gpu_ctx_with(|err| format!("{label} NVRTC compile failed: {err}"))
-            })
-        }
-
-        /// Load the PTX that `compile` produces on `ctx` the first time; return
-        /// the cached `Arc<CudaModule>` on every subsequent call. This is the
-        /// entry for a kernel whose NVRTC options differ from the shared ones
-        /// (a family that must disable FMA contraction, say); everything else
-        /// goes through [`Self::get_or_compile`].
-        pub fn get_or_load<F>(
-            &self,
-            ctx: &Arc<CudaContext>,
-            label: &'static str,
-            compile: F,
-        ) -> Result<&Arc<CudaModule>, GpuError>
-        where
-            F: FnOnce() -> Result<cudarc::nvrtc::Ptx, GpuError>,
-        {
             if let Some(existing) = self.module.get() {
                 return Ok(existing);
             }
-            let ptx = compile()?;
+            let ptx =
+                compile_with_shared_options(source, || format!("{label} NVRTC compile failed"))?;
             let module = ctx
                 .load_module(ptx)
                 .gpu_ctx_with(|err| format!("{label} module load failed: {err}"))?;
@@ -126,22 +104,25 @@ mod linux {
         where
             S: FnOnce(K) -> String,
         {
-            if let Ok(guard) = self.modules.lock() {
-                if let Some(module) = guard.get(&key) {
-                    return Ok(Arc::clone(module));
-                }
+            if let Some(module) = self.lock_modules().get(&key) {
+                return Ok(Arc::clone(module));
             }
-            let ptx = compile_ptx_arch(source(key))
-                .gpu_ctx_with(|err| format!("{label} NVRTC compile failed (key={key}): {err}"))?;
+            let ptx = compile_with_shared_options(&source(key), || {
+                format!("{label} NVRTC compile failed (key={key})")
+            })?;
             let module = ctx
                 .load_module(ptx)
                 .gpu_ctx_with(|err| format!("{label} module load failed (key={key}): {err}"))?;
-            if let Ok(mut guard) = self.modules.lock() {
-                // A concurrent compile of the same key may have won the race;
-                // its module is the one every later caller sees.
-                return Ok(Arc::clone(guard.entry(key).or_insert(module)));
-            }
-            Ok(module)
+            // A concurrent compile of the same key may have won the race;
+            // its module is the one every later caller sees.
+            Ok(Arc::clone(self.lock_modules().entry(key).or_insert(module)))
+        }
+
+        /// The module map. A panic elsewhere while the lock was held cannot
+        /// leave it inconsistent (the guarded sections only read or insert an
+        /// `Arc`), so a poisoned lock is recovered rather than bypassed.
+        fn lock_modules(&self) -> MutexGuard<'_, HashMap<K, Arc<CudaModule>>> {
+            self.modules.lock().unwrap_or_else(PoisonError::into_inner)
         }
     }
 
@@ -159,10 +140,20 @@ mod linux {
     /// this instead when their kernel uses double atomics, or the device path
     /// silently falls back to the CPU.
     pub fn compile_ptx_arch<S: AsRef<str>>(source: S) -> Result<cudarc::nvrtc::Ptx, GpuError> {
+        compile_with_shared_options(source.as_ref(), || "NVRTC compile failed".to_string())
+    }
+
+    /// The one shared-options NVRTC compile behind every entry in this module.
+    /// An absent libnvrtc keeps its typed [`GpuError`]; a compile failure is
+    /// reported as `"{context()}: {err}"`.
+    fn compile_with_shared_options(
+        source: &str,
+        context: impl FnOnce() -> String,
+    ) -> Result<cudarc::nvrtc::Ptx, GpuError> {
         // cudarc's NVRTC loader panics when libnvrtc is missing (#2972).
         require_cudarc_library(CudarcLibrary::Nvrtc)?;
-        compile_ptx_with_opts(source.as_ref(), nvrtc_compile_options()?)
-            .gpu_ctx_with(|err| std::format!("NVRTC compile failed: {err}"))
+        compile_ptx_with_opts(source, nvrtc_compile_options()?)
+            .gpu_ctx_with(|err| format!("{}: {err}", context()))
     }
 
     fn nvrtc_compile_options() -> Result<CompileOptions, GpuError> {

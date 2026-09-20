@@ -16,10 +16,6 @@
 
 #[cfg(target_os = "linux")]
 use crate::survival::marginal_slope::RIGID_FEATURE_PROGRAM_CUDA_VGH;
-#[cfg(target_os = "linux")]
-use cudarc::nvrtc::Ptx;
-#[cfg(target_os = "linux")]
-use gam_gpu::gpu_error::GpuError;
 
 /// Flattened row-major value, gradient, and Hessian channels for `K = 4`.
 #[cfg(target_os = "linux")]
@@ -251,15 +247,9 @@ fn survival_rowjet_source() -> &'static str {
     })
 }
 
-/// Compile the exact CUDA source used by the production survival V/G/H module.
-#[cfg(target_os = "linux")]
-pub(crate) fn compile_survival_rowjet_ptx() -> Result<Ptx, GpuError> {
-    gam_gpu::device_cache::compile_ptx_arch(survival_rowjet_source())
-}
-
 #[cfg(target_os = "linux")]
 mod device {
-    use super::{SurvivalRowInputs, SurvivalRowVghChannels, compile_survival_rowjet_ptx};
+    use super::{SurvivalRowInputs, SurvivalRowVghChannels, survival_rowjet_source};
     use gam_gpu::backend_probe::CachedBackend;
     use gam_gpu::device_cache::PtxModuleCache;
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
@@ -286,16 +276,9 @@ mod device {
     }
 
     fn module(backend: &Backend) -> Result<Arc<CudaModule>, GpuError> {
-        // The family's own compiler pins the real device architecture and
-        // disables FMA contraction for close parity with separately rounded
-        // host ops, so the module is loaded from that PTX rather than the
-        // shared-options compile.
         backend
             .module
-            .get_or_load(&backend.ctx, "survival_rowjet", || {
-                compile_survival_rowjet_ptx()
-                    .gpu_ctx_with(|error| format!("survival_rowjet NVRTC compile: {error}"))
-            })
+            .get_or_compile(&backend.ctx, "survival_rowjet", survival_rowjet_source())
             .map(Arc::clone)
     }
 

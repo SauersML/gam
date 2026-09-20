@@ -1,5 +1,12 @@
 ## Unreleased
 
+- **One NVRTC module-cache entry** (#4097). `PtxModuleCache::get_or_load`, the entry for a
+  kernel with its own NVRTC options, is removed: its only caller (the survival V/G/H
+  row-jet kernel) compiled with the shared options anyway, and now uses `get_or_compile`.
+  Every cache compile goes through one shared-options path, so a missing libnvrtc keeps its
+  typed error and compile failures are labelled once. `KeyedPtxModuleCache` recovers a
+  poisoned lock instead of silently recompiling on every call.
+
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
   `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and

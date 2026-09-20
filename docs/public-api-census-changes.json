@@ -4852,5 +4852,14 @@
     },
     "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
     "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
+  },
+  {
+    "base": "6ff5fb018530b3fcea704c2953e13c357e211eda",
+    "removed": {
+      "crates/gam-gpu/src/device_cache.rs::get_or_load": 1,
+      "crates/gam-models/src/gpu_kernels/survival_rowjet.rs::compile_survival_rowjet_ptx": 1
+    },
+    "reason": "#4097: PtxModuleCache::get_or_load was documented as the entry for a kernel whose NVRTC options differ from the shared ones, but its only caller, gam-models survival_rowjet, passed compile_survival_rowjet_ptx, which was exactly device_cache::compile_ptx_arch(survival_rowjet_source()) with the shared options. get_or_load is folded into get_or_compile, survival_rowjet calls get_or_compile(ctx, \"survival_rowjet\", survival_rowjet_source()), and compile_survival_rowjet_ptx goes with it; the three shared-options compiles (PtxModuleCache, KeyedPtxModuleCache, compile_ptx_arch) now share one private compile_with_shared_options.",
+    "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base 6ff5fb018530b3fcea704c2953e13c357e211eda and head the change's commit list exactly these removals. Read-proof at the head: git grep -w finds 0 occurrences of get_or_load and compile_survival_rowjet_ptx in crates/ tests/ examples/; before the change git grep -n get_or_load on main found only its definition in crates/gam-gpu/src/device_cache.rs and the one call in crates/gam-models/src/gpu_kernels/survival_rowjet.rs."
   }
 ]
