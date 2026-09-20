@@ -11,8 +11,8 @@
 //! `|Pg| = 1.593` against a bound of `3.682e-2`.
 //!
 //! A fit is only minted from a converged optimization, so a returned payload is
-//! itself the certificate. The recovery check reads the fitted linear predictor
-//! on the training rows and compares `exp(η̂)` with the true mean.
+//! itself the certificate. The recovery check reads the terminal inner solve's
+//! fitted mean on the training rows and compares it with the true mean.
 
 use csv::StringRecord;
 use gam_data::{EncodedDataset, encode_recordswith_inferred_schema};
@@ -63,7 +63,7 @@ fn correlation(a: &[f64], b: &[f64]) -> f64 {
 }
 
 /// Fits `formula` under the Gamma family and returns the correlation of the
-/// fitted mean `exp(η̂)` with the true mean on the training rows.
+/// fitted mean with the true mean on the training rows.
 fn certified_recovery(formula: &str) -> f64 {
     let data = dataset();
     let config = FitConfig {
@@ -77,12 +77,13 @@ fn certified_recovery(formula: &str) -> f64 {
         fit.reml_score().is_some_and(f64::is_finite),
         "{formula}: the certified fit has a finite criterion"
     );
-    let eta = &fit
-        .block_states
-        .first()
-        .expect("a single-predictor fit carries its block state")
-        .eta;
-    let fitted_mean: Vec<f64> = eta.iter().map(|value| value.exp()).collect();
+    let fitted_mean: Vec<f64> = fit
+        .artifacts
+        .pirls
+        .as_ref()
+        .expect("a single-predictor GLM fit carries its terminal inner solve")
+        .finalmu
+        .to_vec();
     assert!(
         fitted_mean.iter().all(|value| value.is_finite()),
         "{formula}: the fitted mean is finite"
