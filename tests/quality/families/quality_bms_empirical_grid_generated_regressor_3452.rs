@@ -192,7 +192,10 @@ fn assert_covariance_matches_sampling_variance(law: Law, seed: u64) {
              calibrate it and correct its covariance for that first stage; law consumed: {}",
             fit.latent_law_consumed.label()
         );
-        let on_grid = matches!(fit.latent_measure, LatentMeasureKind::GlobalEmpirical { .. });
+        let on_grid = matches!(
+            fit.latent_measure,
+            LatentMeasureKind::GlobalEmpirical { .. }
+        );
         empirical_fits += usize::from(on_grid);
         if matches!(law, Law::ScaleMixture) {
             assert!(

@@ -1528,8 +1528,8 @@ pub struct LatentZConditionalCalibration {
     /// basis, so the stacked bread is block lower-triangular and the meat has a
     /// cross-block proportional to the residual's third moment. Both vanish
     /// under a Gaussian residual, and neither vanishes on the branch this
-    /// covariance serves (gam#2484). Built by
-    /// `stacked_first_stage_sandwich_cov`; the two retired fields were its
+    /// covariance serves (gam#2484). Built as `ΨᵀΨ` from
+    /// [`stacked_first_stage_row_influence`]; the two retired fields were its
     /// diagonal blocks.
     ///
     /// Fit-time only: predict applies the map from `mean_coeffs`/`var_coeffs`
@@ -1691,8 +1691,8 @@ impl LatentZConditionalCalibration {
     }
 
     /// Joint first-stage covariance `V₁` of `θ₁`, ordered to match
-    /// [`Self::zeta_theta1_jacobian_row`]: the stacked sandwich
-    /// [`stacked_first_stage_sandwich_cov`], which is NOT block-diagonal off a
+    /// [`Self::zeta_theta1_jacobian_row`]: the stacked sandwich `ΨᵀΨ` of
+    /// [`stacked_first_stage_row_influence`], which is NOT block-diagonal off a
     /// Gaussian residual (gam#2484).
     pub fn theta1_covariance(&self) -> Array2<f64> {
         self.theta1_cov.clone()
@@ -2176,48 +2176,6 @@ pub(crate) fn stacked_first_stage_inverse_bread(
     j_inv.slice_mut(s![p.., ..p]).assign(&k);
     j_inv.slice_mut(s![p.., p..]).assign(&n_pinv);
     Ok(j_inv)
-}
-
-/// The joint first-stage covariance `V₁ = J⁻¹ Ω J⁻ᵀ` of `θ₁ = (β_m, β_v)`, the
-/// sandwich of the stacked system [`stacked_first_stage_inverse_bread`]
-/// documents, with the robust (HC0) meat
-///
-/// ```text
-/// Ω = Σ_i w_i² [A_i û_i ; B_i r_i][·]ᵀ = SᵀS,   S_i = [w_i û_i A_iᵀ | w_i r_i B_iᵀ].
-/// ```
-///
-/// Both off-diagonal channels, `M_vm` in the bread and `Ω_mv ∝ E[û³]` in the
-/// meat, vanish for a Gaussian residual and neither vanishes on the branch this
-/// covariance serves (gam#2484). The mean block is the standalone HC0 sandwich
-/// `M⁺ Ω_mm M⁺` exactly, because `J⁻¹` is block lower-triangular. `V₁` is a
-/// congruence of the PSD Gram `Ω`, so it is PSD, and so is the
-/// generated-regressor term built from it. `var_residuals` are the `r_i`.
-///
-/// Formed as `ΨᵀΨ` from the row influence
-/// [`stacked_first_stage_row_influence`], which is `J⁻¹ Ω J⁻ᵀ` exactly. The fit
-/// builds `θ₁`'s covariance from that influence directly
-/// ([`LatentZConditionalCalibration::theta1_row_influence`]); this closed form of
-/// the same number is what the tests pin the formula against.
-#[cfg(test)]
-pub(crate) fn stacked_first_stage_sandwich_cov(
-    mean_basis: ArrayView2<'_, f64>,
-    var_basis: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    mean_residuals: &[f64],
-    var_residuals: &[f64],
-    mean_normal: &Array2<f64>,
-    var_normal: &Array2<f64>,
-) -> Result<Array2<f64>, String> {
-    let psi = stacked_first_stage_row_influence(
-        mean_basis,
-        var_basis,
-        weights,
-        mean_residuals,
-        var_residuals,
-        mean_normal,
-        var_normal,
-    )?;
-    first_stage_covariance_from_row_influence(&psi)
 }
 
 /// `V₁ = ΨᵀΨ` for a first-stage row influence `Ψ`, refused when non-finite.
@@ -3585,8 +3543,52 @@ mod tests {
 
 #[cfg(test)]
 mod stacked_first_stage_sandwich_2484_tests {
-    use super::{preconditioned_normal_pseudoinverse, stacked_first_stage_sandwich_cov};
-    use ndarray::{Array1, Array2, array};
+    use super::{
+        first_stage_covariance_from_row_influence, preconditioned_normal_pseudoinverse,
+        stacked_first_stage_row_influence,
+    };
+    use ndarray::{Array1, Array2, ArrayView1, ArrayView2, array};
+
+    /// The joint first-stage covariance `V₁ = J⁻¹ Ω J⁻ᵀ` of `θ₁ = (β_m, β_v)`, the
+    /// sandwich of the stacked system [`stacked_first_stage_inverse_bread`]
+    /// documents, with the robust (HC0) meat
+    ///
+    /// ```text
+    /// Ω = Σ_i w_i² [A_i û_i ; B_i r_i][·]ᵀ = SᵀS,   S_i = [w_i û_i A_iᵀ | w_i r_i B_iᵀ].
+    /// ```
+    ///
+    /// Both off-diagonal channels, `M_vm` in the bread and `Ω_mv ∝ E[û³]` in the
+    /// meat, vanish for a Gaussian residual and neither vanishes on the branch this
+    /// covariance serves (gam#2484). The mean block is the standalone HC0 sandwich
+    /// `M⁺ Ω_mm M⁺` exactly, because `J⁻¹` is block lower-triangular. `V₁` is a
+    /// congruence of the PSD Gram `Ω`, so it is PSD, and so is the
+    /// generated-regressor term built from it. `var_residuals` are the `r_i`.
+    ///
+    /// Formed as `ΨᵀΨ` from the row influence
+    /// [`stacked_first_stage_row_influence`], which is `J⁻¹ Ω J⁻ᵀ` exactly. The fit
+    /// builds `θ₁`'s covariance from that influence directly
+    /// ([`LatentZConditionalCalibration::theta1_row_influence`]); this closed form of
+    /// the same number is what the tests pin the formula against.
+    fn stacked_first_stage_sandwich_cov(
+        mean_basis: ArrayView2<'_, f64>,
+        var_basis: ArrayView2<'_, f64>,
+        weights: ArrayView1<'_, f64>,
+        mean_residuals: &[f64],
+        var_residuals: &[f64],
+        mean_normal: &Array2<f64>,
+        var_normal: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let psi = stacked_first_stage_row_influence(
+            mean_basis,
+            var_basis,
+            weights,
+            mean_residuals,
+            var_residuals,
+            mean_normal,
+            var_normal,
+        )?;
+        first_stage_covariance_from_row_influence(&psi)
+    }
 
     /// The standalone HC0 sandwich `M⁺ (Σ w² e² A Aᵀ) M⁺` of one weighted-ridge
     /// stage -- the block-diagonal form the joint sandwich replaced.
