@@ -145,5 +145,10 @@ fn a_tied_bulk_has_no_width_to_resolve_and_is_not_refused() {
         })
         .collect();
     let data = Array2::from_shape_vec((n, 1), x).expect("shape");
-    super::build_thin_plate_basis(data.view(), &spec(10)).expect("tied bulk builds");
+    let built = super::build_thin_plate_basis(data.view(), &spec(10)).expect("tied bulk builds");
+    assert_eq!(built.design.nrows(), n, "one design row per observation");
+    assert!(
+        built.design.to_dense().iter().all(|v| v.is_finite()),
+        "the tied-bulk design must be finite"
+    );
 }

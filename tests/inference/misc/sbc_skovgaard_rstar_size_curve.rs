@@ -4,8 +4,9 @@
 //! The #1891 registry routes frequentist test p-values to a TEST-SIZE curve —
 //! under a true null the empirical rejection rate at `α` must match `α` to
 //! within Monte-Carlo error. An oversized test is the #1872/#1873
-//! anti-conservative signature; an undersized one is just as miscalibrated. The `wood_smooth_test_pvalue` surface is gated by
-//! the smooth-significance null-FPR bug-hunt; this file is the DEDICATED size
+//! anti-conservative signature; an undersized one is just as miscalibrated.
+//! The `wood_smooth_test_pvalue` surface is gated by the smooth-significance
+//! null-FPR bug-hunt; this file is the DEDICATED size
 //! curve for the Skovgaard `r*` p-value the registry noted as pending, driving
 //! the exact production assembly `scalar_skovgaard_r_star`.
 //!
