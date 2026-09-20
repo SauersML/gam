@@ -46,9 +46,19 @@ pub struct CurvatureInference {
 /// profiled Gaussian REML evidence and its analytic profile score. Each CI
 /// endpoint solves the Wilks likelihood-ratio equation directly inside the
 /// chart-bound bracket with safeguarded Newton steps; bisection is the
-/// guaranteed-progress fallback. A bound is reported as open only when the
-/// analytic score certifies that the connected likelihood set containing κ̂
-/// remains monotone all the way to that bound.
+/// guaranteed-progress fallback.
+///
+/// The interval is the connected component through κ̂ of the likelihood-ratio
+/// set `C = {κ : r(κ) ≤ 0}`, `r(κ) = V_p(κ) − V_p(κ̂) − ½z²` (the Wilks set
+/// `2(V_p(κ) − V_p(κ̂)) ≤ χ²₁,₁₋α`). Its outward end is the FIRST zero of `r`
+/// past κ̂, and the only points whose outward score matters are the ones
+/// certified INSIDE `C` (`r < 0`): an inside point where `V_p` is already
+/// falling outward sits past an interior maximum of `V_p`, which may have
+/// crossed the level, so continuing outward from it could report a later
+/// crossing — a different component. A point with `r ≥ 0` is outside `C`
+/// whatever its slope: the first crossing lies between the last inside point
+/// and it, which is all a bracket needs. In particular a chart bound above the
+/// level brackets the endpoint, and its score is irrelevant (gam#3509).
 fn curvature_profile_lr_endpoint<F>(
     profile: &mut F,
     kappa_hat: f64,
@@ -82,15 +92,21 @@ where
              (outward score at the bound {outward_score:.6e})"
         ));
     }
-    if outward_score < -score_tolerance {
-        return Err(format!(
-            "curvature profile is not outward-monotone at chart bound {bound}: \
-             outward score {outward_score:.6e} is below tolerance {score_tolerance:.6e} \
-             (kappa_hat={kappa_hat}, V(kappa_hat)={value_hat:.9e}, V(bound)={bound_value:.9e}, \
-             V(bound) - V(kappa_hat) - half_threshold = {bound_residual:.6e})"
-        ));
-    }
     if bound_residual < 0.0 {
+        // The bound is inside `C`, so the interval is open there only if the
+        // component reaches it. A profile still falling outward at the bound
+        // has an interior maximum between κ̂ and the bound that nothing here
+        // has evaluated; the caller's global ceiling is what certifies such a
+        // profile, and without it the component's end is not identified.
+        if outward_score < -score_tolerance {
+            return Err(format!(
+                "curvature profile is not outward-monotone at chart bound {bound}, which lies \
+                 inside the likelihood-ratio set: outward score {outward_score:.6e} is below \
+                 tolerance {score_tolerance:.6e} (kappa_hat={kappa_hat}, \
+                 V(kappa_hat)={value_hat:.9e}, V(bound)={bound_value:.9e}, \
+                 V(bound) - V(kappa_hat) - half_threshold = {bound_residual:.6e})"
+            ));
+        }
         return Ok((bound, true));
     }
     if bound_residual == 0.0 {
@@ -121,20 +137,24 @@ where
             break;
         }
         let (value, score) = profile(probe)?;
-        let outward_score = direction * score;
-        if outward_score < -score_tolerance {
-            return Err(format!(
-                "curvature profile changed direction before its likelihood crossing at \
-                 kappa={probe}: outward score {outward_score:.6e} is below tolerance \
-                 {score_tolerance:.6e}"
-            ));
-        }
         let residual = value - value_hat - half_threshold;
         if residual >= 0.0 {
+            // Outside `C` at any slope: the first crossing is in
+            // (inside_x, probe]. A score pointing back toward κ̂ only sends the
+            // next Newton step out of the central half, i.e. to bisection.
             outside_x = probe;
             outside_residual = residual;
             outside_score = score;
         } else {
+            let outward_score = direction * score;
+            if outward_score < -score_tolerance {
+                return Err(format!(
+                    "curvature profile changed direction inside its likelihood-ratio set at \
+                     kappa={probe}: outward score {outward_score:.6e} is below tolerance \
+                     {score_tolerance:.6e} (V(kappa)={value:.9e}, \
+                     V(kappa) - V(kappa_hat) - half_threshold = {residual:.6e})"
+                ));
+            }
             inside_x = probe;
         }
     }
@@ -159,6 +179,13 @@ where
     Ok((endpoint, false))
 }
 
+/// `value_ceiling` is a κ-free upper bound on the profile over the whole chart,
+/// `V_p(κ) ≤ value_ceiling` for every κ in `[kappa_min, kappa_max]` (for the
+/// constant-curvature smooth, [`ConstantCurvatureProfile::value_ceiling`]; pass
+/// `f64::INFINITY` when none is known). When it sits within the Wilks level of
+/// `V_p(κ̂)`, every κ in the chart satisfies `r(κ) ≤ 0`: the likelihood-ratio
+/// set IS the chart, exactly, and no endpoint search or monotonicity argument
+/// is needed.
 fn curvature_profile_ci_from_analytic_score<F>(
     profile: &mut F,
     kappa_hat: f64,
@@ -166,6 +193,7 @@ fn curvature_profile_ci_from_analytic_score<F>(
     kappa_max: f64,
     level: f64,
     relative_tolerance: f64,
+    value_ceiling: f64,
 ) -> Result<gam_geometry::curvature_estimand::KappaProfileCi, String>
 where
     F: FnMut(f64) -> Result<(f64, f64), String>,
@@ -221,25 +249,43 @@ where
             kappa_hat_support.label()
         ));
     }
+    if value_ceiling.is_nan() || value_hat > value_ceiling + score_tolerance {
+        // The ceiling is a theorem about the profile, so a κ̂ above it means
+        // the ceiling's premise (the smooth switched off leaves only the
+        // intercept) does not hold for this profile, not that κ̂ is fine.
+        return Err(format!(
+            "curvature profile exceeds its kappa-free ceiling: V(kappa_hat={kappa_hat})=\
+             {value_hat:.9e}, ceiling={value_ceiling:.9e}, tolerance={score_tolerance:.6e}"
+        ));
+    }
 
-    let (ci_lo, lo_at_bound) = curvature_profile_lr_endpoint(
-        profile,
-        kappa_hat,
-        value_hat,
-        kappa_min,
-        half_threshold,
-        x_tolerance,
-        score_tolerance,
-    )?;
-    let (ci_hi, hi_at_bound) = curvature_profile_lr_endpoint(
-        profile,
-        kappa_hat,
-        value_hat,
-        kappa_max,
-        half_threshold,
-        x_tolerance,
-        score_tolerance,
-    )?;
+    let ((ci_lo, lo_at_bound), (ci_hi, hi_at_bound)) =
+        if value_ceiling - value_hat <= half_threshold {
+            // sup_κ r(κ) ≤ value_ceiling − V_p(κ̂) − ½z² ≤ 0: the whole chart is
+            // in the likelihood-ratio set, and both ends are the chart's walls.
+            ((kappa_min, true), (kappa_max, true))
+        } else {
+            (
+                curvature_profile_lr_endpoint(
+                    profile,
+                    kappa_hat,
+                    value_hat,
+                    kappa_min,
+                    half_threshold,
+                    x_tolerance,
+                    score_tolerance,
+                )?,
+                curvature_profile_lr_endpoint(
+                    profile,
+                    kappa_hat,
+                    value_hat,
+                    kappa_max,
+                    half_threshold,
+                    x_tolerance,
+                    score_tolerance,
+                )?,
+            )
+        };
     let verdict = if ci_lo > 0.0 {
         gam_geometry::curvature_estimand::CurvatureVerdict::Spherical
     } else if ci_hi < 0.0 {
@@ -307,6 +353,7 @@ pub fn curvature_inference_forspec(
     };
     let x_term = select_columns(data, feature_cols).map_err(EstimationError::from)?;
     let profile = ConstantCurvatureProfile::new(x_term.view(), y, base_spec)?;
+    let value_ceiling = profile.value_ceiling()?;
 
     // CI and flatness revisit κ̂ and κ=0. The shared profile caches each joint
     // value/analytic-score pair so every statistic consumes the same evaluation.
@@ -326,6 +373,7 @@ pub fn curvature_inference_forspec(
         kappa_max,
         level,
         options.tol,
+        value_ceiling,
     )
     .map_err(EstimationError::RemlOptimizationFailed)?;
     let flatness = gam_geometry::curvature_estimand::flatness_lr_test(
@@ -369,6 +417,7 @@ mod curvature_profile_score_tests {
             3.0,
             level,
             1.0e-10,
+            f64::INFINITY,
         )
         .expect("analytic quadratic profile CI");
         let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
@@ -384,7 +433,15 @@ mod curvature_profile_score_tests {
         let mut profile =
             |kappa: f64| -> Result<(f64, f64), String> { Ok((0.5 * kappa * kappa, kappa)) };
         let ci =
-            curvature_profile_ci_from_analytic_score(&mut profile, 0.0, -0.1, 0.1, 0.95, 1.0e-10)
+            curvature_profile_ci_from_analytic_score(
+                &mut profile,
+                0.0,
+                -0.1,
+                0.1,
+                0.95,
+                1.0e-10,
+                f64::INFINITY,
+            )
                 .expect("open bounded profile CI");
         assert_eq!(ci.ci_lo, -0.1);
         assert_eq!(ci.ci_hi, 0.1);
@@ -415,6 +472,7 @@ mod curvature_profile_score_tests {
             kappa_max,
             0.95,
             1.0e-10,
+            f64::INFINITY,
         )
         .expect("a boundary optimum with the score pointing out of the box is stationary");
         assert_eq!(
@@ -432,6 +490,7 @@ mod curvature_profile_score_tests {
             kappa_max,
             0.95,
             1.0e-10,
+            f64::INFINITY,
         )
         .expect("the mirrored boundary optimum");
         assert_eq!(
@@ -449,9 +508,109 @@ mod curvature_profile_score_tests {
                 kappa_max,
                 0.95,
                 1.0e-10,
+                f64::INFINITY,
             )
             .is_err(),
             "a non-stationary INTERIOR point is not an optimum and must still be refused"
+        );
+    }
+
+    /// gam#3509: a chart bound ABOVE the Wilks level brackets the endpoint, so
+    /// the profile's slope there says nothing about the interval. On
+    /// `V = aκ² − bκ⁴` the profile peaks at `κ² = a/2b` and is falling again at
+    /// the bounds `±1`, but `V(±1) = a − b` is still above `½z²`; the interval
+    /// is the first crossing `aκ² − bκ⁴ = ½z²`, found through the falling
+    /// bound, not refused because of it.
+    #[test]
+    fn a_bound_above_the_wilks_level_brackets_the_crossing_whatever_its_slope_3509() {
+        let (a, b) = (8.0_f64, 5.0_f64);
+        let level = 0.95;
+        let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
+            .expect("valid normal quantile");
+        let half_threshold = 0.5 * z * z;
+        assert!(a - b > half_threshold && 2.0 * a - 4.0 * b < 0.0);
+        let mut profile = |kappa: f64| -> Result<(f64, f64), String> {
+            let k2 = kappa * kappa;
+            Ok((a * k2 - b * k2 * k2, 2.0 * a * kappa - 4.0 * b * k2 * kappa))
+        };
+        let ci = curvature_profile_ci_from_analytic_score(
+            &mut profile,
+            0.0,
+            -1.0,
+            1.0,
+            level,
+            1.0e-10,
+            f64::INFINITY,
+        )
+        .expect("a bound above the level is a bracket, not a refusal");
+        let first_crossing =
+            ((a - (a * a - 4.0 * b * half_threshold).sqrt()) / (2.0 * b)).sqrt();
+        assert!((ci.ci_hi - first_crossing).abs() <= 1.0e-8, "{ci:?}");
+        assert!((ci.ci_lo + first_crossing).abs() <= 1.0e-8, "{ci:?}");
+        assert!(!ci.lo_at_bound && !ci.hi_at_bound);
+    }
+
+    /// gam#3509, the other half: a bound INSIDE the likelihood-ratio set on a
+    /// profile that is falling there. `V = aκ² − bκ⁴` with a peak `a²/4b`
+    /// below `½z²` keeps every κ in the set, but the bound's slope alone
+    /// cannot tell that from a peak that crossed the level, so without a
+    /// ceiling the endpoint is refused. The profile's own supremum, passed as
+    /// the κ-free ceiling, certifies the whole chart: the interval is the
+    /// chart, open at both walls, which is exactly the Wilks set.
+    #[test]
+    fn a_ceiling_within_the_wilks_level_certifies_the_whole_chart_3509() {
+        let (a, b) = (0.5_f64, 0.3_f64);
+        let level = 0.95;
+        let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
+            .expect("valid normal quantile");
+        let supremum = a * a / (4.0 * b);
+        assert!(supremum < 0.5 * z * z && 2.0 * a - 4.0 * b < 0.0);
+        let mut profile = |kappa: f64| -> Result<(f64, f64), String> {
+            let k2 = kappa * kappa;
+            Ok((a * k2 - b * k2 * k2, 2.0 * a * kappa - 4.0 * b * k2 * kappa))
+        };
+        assert!(
+            curvature_profile_ci_from_analytic_score(
+                &mut profile,
+                0.0,
+                -1.0,
+                1.0,
+                level,
+                1.0e-10,
+                f64::INFINITY,
+            )
+            .is_err(),
+            "a falling bound inside the set is not certified by its slope alone"
+        );
+        let ci = curvature_profile_ci_from_analytic_score(
+            &mut profile,
+            0.0,
+            -1.0,
+            1.0,
+            level,
+            1.0e-10,
+            supremum,
+        )
+        .expect("the ceiling certifies the whole chart");
+        assert_eq!((ci.ci_lo, ci.ci_hi), (-1.0, 1.0));
+        assert!(ci.lo_at_bound && ci.hi_at_bound);
+        assert_eq!(
+            ci.verdict,
+            gam_geometry::curvature_estimand::CurvatureVerdict::Flat
+        );
+        // A ceiling below V_p(κ̂) contradicts the profile it claims to bound.
+        let mut shifted = |kappa: f64| profile(kappa).map(|(v, s)| (v + 1.0, s));
+        assert!(
+            curvature_profile_ci_from_analytic_score(
+                &mut shifted,
+                0.0,
+                -1.0,
+                1.0,
+                level,
+                1.0e-10,
+                supremum,
+            )
+            .is_err()
         );
     }
 }

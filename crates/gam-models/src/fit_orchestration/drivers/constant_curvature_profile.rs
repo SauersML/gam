@@ -489,6 +489,46 @@ impl<'a> ConstantCurvatureProfile<'a> {
         })
     }
 
+    /// A κ-free ceiling on the profile: `V_p(κ) ≤ value_ceiling()` at EVERY κ
+    /// and η of the chart (gam#3509).
+    ///
+    /// At any `(κ, η)` the closed form is, in the penalty's whitened spectrum
+    /// `δ_j` (`t_j = e^ρ δ_j`, rank `r`, `dp(ρ) = r0 + Σ_j c_j² t_j/(1+t_j)`),
+    ///
+    /// ```text
+    ///   V(ρ) = ½[log|XᵀX| + Σ_j log(1+t_j) − log|S|₊ − rρ] + ½ν·(1 + log(2π·dp/ν)) + const.
+    /// ```
+    ///
+    /// The penalty's null space is exactly the ψ-free intercept column (the
+    /// kernel Gram is strictly positive definite on the sum-to-zero frame), so
+    /// `ν = n − 1` and, as `ρ → ∞`, `log|XᵀX + λS| − log|λS|₊ → log n` and
+    /// `dp → Σ(y − ȳ)²`: `V_∞` is the REML value of the intercept-only model, the
+    /// same number at every ψ. The finite-ρ excess is
+    /// `½Σ_j log(1 + 1/t_j) + ½ν·log(dp(ρ)/dp_∞)`, whose second part is `≤ 0`
+    /// (`dp` rises to `dp_∞`). At the upper face of the resolvability domain,
+    /// `ρ_up = −log √ε − log δ_min`, every `1/t_j ≤ √ε·δ_min/δ_j ≤ √ε`, so
+    /// `V(ρ_up) ≤ V_∞ + ½r·log(1 + √ε)`. The ρ selector evaluates that face and
+    /// returns a value no larger, and the η profile then takes a minimum over
+    /// such values, so the bound holds for `V_p(κ)` itself. `r ≤ p_coefficients − 1`.
+    fn value_ceiling(&self) -> Result<f64, EstimationError> {
+        let n = self.response.len();
+        let intercept = Array2::<f64>::ones((n, 1));
+        let no_penalty = Array2::<f64>::zeros((1, 1));
+        let response_2d = self.response.insert_axis(ndarray::Axis(1));
+        let smooth_absent = gam_solve::gaussian_reml::gaussian_reml_multi_closed_form(
+            intercept.view(),
+            response_2d.view(),
+            no_penalty.view(),
+            None,
+            None,
+        )?;
+        let penalized_modes = self.p_coefficients.saturating_sub(1) as f64;
+        let face_excess_per_mode = gam_solve::estimate::rho_domain::log_gradient_resolution()
+            .exp()
+            .ln_1p();
+        Ok(smooth_absent.reml_score + 0.5 * penalized_modes * face_excess_per_mode)
+    }
+
     /// The profile VALUE at one point of the plane, without derivative blocks.
     ///
     /// Shares the jet cache: a point already evaluated at full order answers
