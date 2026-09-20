@@ -4,7 +4,7 @@ use gam::families::inference::saved_summary::compare_saved_models;
 /// Rank saved models on their smoothing-corrected AIC and print the comparison
 /// as JSON. The ranking is `compare_saved_models`, the same function behind
 /// `gamfit.compare_models`, so the two front ends print one document.
-pub(crate) fn run_compare(args: CompareArgs) -> Result<(), String> {
+pub(crate) fn run_compare(args: CompareArgs) -> CliResult<()> {
     let names = match args.names {
         Some(names) => {
             if names.len() != args.models.len() {
@@ -12,7 +12,8 @@ pub(crate) fn run_compare(args: CompareArgs) -> Result<(), String> {
                     "compare: {} --names given for {} models",
                     names.len(),
                     args.models.len()
-                ));
+                )
+                .into());
             }
             names
         }
@@ -26,10 +27,11 @@ pub(crate) fn run_compare(args: CompareArgs) -> Result<(), String> {
         .models
         .iter()
         .map(|path| {
-            SavedModel::load_from_path(path)
-                .map_err(|err| format!("compare: failed to load {}: {err}", path.display()))
+            SavedModel::load_from_path(path).map_err(|err| {
+                CliError::from(err).context(&format!("compare: failed to load {}", path.display()))
+            })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<CliResult<Vec<_>>>()?;
     let named = names.into_iter().zip(models.iter()).collect::<Vec<_>>();
     let comparison = compare_saved_models(&named)?;
     let json = serde_json::to_string_pretty(&comparison)

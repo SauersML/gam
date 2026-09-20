@@ -8555,7 +8555,9 @@ fn cli_partial_effect_writes_bands_and_labelled_factor_levels() {
     fn run(argv: &[&str]) -> Result<(), String> {
         match Cli::try_parse_from(argv).map_err(|e| e.to_string())?.command {
             Command::Fit(args) => run_fit(args).map_err(|error| error.to_string()),
-            Command::PartialEffect(args) => run_partial_effect(args),
+            Command::PartialEffect(args) => {
+                run_partial_effect(args).map_err(|error| error.to_string())
+            }
             _ => panic!("expected a fit or partial-effect command"),
         }
     }

@@ -80,7 +80,7 @@ fn saved_alo_report_data(
 pub(crate) fn run_sample(args: SampleArgs) -> CliResult<()> {
     validate_positive_optional_usize("--samples", args.samples)?;
     reject_multinomial_model(&args.model, "sample")?;
-    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
+    let model = SavedModel::load_from_path(&args.model)?;
     let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
     require_dataset_rows("sample", &args.data, ds.values.nrows())?;
     let col_map = ds.column_map();
@@ -225,7 +225,7 @@ pub(crate) fn run_sample(args: SampleArgs) -> CliResult<()> {
 
 pub(crate) fn run_generate(args: GenerateArgs) -> CliResult<()> {
     reject_multinomial_model(&args.model, "generate")?;
-    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
+    let model = SavedModel::load_from_path(&args.model)?;
 
     let ds = load_datasetwith_model_schema(&args.data, &model)?;
     require_dataset_rows("generate", &args.data, ds.values.nrows())?;
@@ -362,7 +362,7 @@ pub(crate) fn run_generate_unified(
     .map_err(|error| error.to_string())
 }
 
-pub(crate) fn run_summary(args: SummaryArgs) -> Result<(), String> {
+pub(crate) fn run_summary(args: SummaryArgs) -> CliResult<()> {
     reject_multinomial_model(&args.model, "summary")?;
     let model = SavedModel::load_from_path(&args.model)?;
     let summary = saved_model_summary(&model)?;
@@ -379,12 +379,12 @@ pub(crate) fn run_summary(args: SummaryArgs) -> Result<(), String> {
     use std::io::Write as _;
     std::io::stdout()
         .write_all(text.as_bytes())
-        .map_err(|error| format!("failed to write the summary: {error}"))
+        .map_err(|error| CliError::from(format!("failed to write the summary: {error}")))
 }
 
 pub(crate) fn run_report(args: ReportArgs) -> CliResult<()> {
     reject_multinomial_model(&args.model, "report")?;
-    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
+    let model = SavedModel::load_from_path(&args.model)?;
     // The report card of the saved model has one owner, which gamfit's
     // `Model.report()` renders too. This command adds only what the data it is
     // given can show.

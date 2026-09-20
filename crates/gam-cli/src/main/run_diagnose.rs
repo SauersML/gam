@@ -46,7 +46,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> CliResult<()> {
     // `--alo` flag was a silent no-op.
 
     reject_multinomial_model(&args.model, "diagnose")?;
-    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
+    let model = SavedModel::load_from_path(&args.model)?;
     let parsed = parse_formula(&model.formula)?;
     // A spline-scan model (a Standard fit routed through the exact O(n)
     // smoother) keeps no dense design/Gram, and ALO leverage is defined off
@@ -76,8 +76,10 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> CliResult<()> {
     let col_map = ds.column_map();
     let y_col = resolve_saved_alo_response_col(&model, &parsed, &col_map)?;
     let y = ds.values.column(y_col).to_owned();
-    let weights = resolve_weight_column(&ds, &col_map, model.weight_column.as_deref())
-        .map_err(|error| format!("failed to resolve saved diagnose weights: {error}"))?;
+    let weights =
+        resolve_weight_column(&ds, &col_map, model.weight_column.as_deref()).map_err(|error| {
+            CliError::from(error).context("failed to resolve saved diagnose weights")
+        })?;
     let (offset, noise_offset) = report_offset_for(&model, &ds, &col_map)?;
     let input = build_saved_alo_predict_input(
         &model,
@@ -96,7 +98,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> CliResult<()> {
             prior_weights: &weights,
         },
     )
-    .map_err(|error| format!("saved-model ALO failed: {error}"))?;
+    .map_err(|error| CliError::from(error).context("saved-model ALO failed"))?;
     print_multicoordinate_alo(&alo);
 
     // Model-comparison corroboration channels (#946): exact smoothing-corrected
@@ -126,7 +128,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> CliResult<()> {
             weights.view(),
             Some(eta_loo.view()),
         )
-        .map_err(|err| format!("cannot resolve model-comparison dispersion: {err}"))?;
+        .map_err(|err| CliError::from(err).context("cannot resolve model-comparison dispersion"))?;
         let mut summary = Table::new();
         summary
             .load_preset(UTF8_FULL)

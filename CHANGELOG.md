@@ -1,5 +1,15 @@
 ## Unreleased
 
+- **CLI: a saved model the engine refuses to read exits with the data code on every command** (#4432).
+  Each command that loads a model flattened the typed `FittedModelError` into a bare message, so an
+  unreadable, malformed or stale model file exited with the invocation (formula) code, where
+  `gamfit.load` raises `DataError` for the same file. `predict`, `transformation-score`,
+  `latent-residual`, `diagnose`, `residuals`, `partial-effect`, `summary`, `compare`, `sample`,
+  `generate` and `report` now exit with the data code. `transformation-score` also keeps the data
+  loader's refusal and its `help:` line, and `diagnose` keeps the category and advice of a refused
+  weight column, ALO solve or model-comparison dispersion. The `diagnose` help no longer mentions the
+  removed `--alo` option.
+
 - **CLI: `residuals`, `diagnose`, `sample`, `generate` and `report` keep a data refusal's exit code and `help:` line** (#4312).
   These commands flattened the typed error from the model-schema data loader into a bare message, so a
   non-finite cell or an unseen level exited with the invocation (formula) code and printed no remedy.

@@ -1521,7 +1521,7 @@ pub(crate) fn run_predict(args: PredictArgs) -> CliResult<()> {
         return run_predict_multinomial(&args).map_err(CliError::from);
     }
     let phase_start = std::time::Instant::now();
-    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
+    let model = SavedModel::load_from_path(&args.model)?;
     log::debug!(
         "[PHASE] predict load-model done elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
@@ -1595,22 +1595,23 @@ pub(crate) fn run_predict(args: PredictArgs) -> CliResult<()> {
 /// downstream marginal-slope fit.  This is a distinct command from `predict`:
 /// ordinary CTM prediction is the response-scale conditional mean and does not
 /// consume the observed response.
-pub(crate) fn run_transformation_score(args: TransformationScoreArgs) -> Result<(), String> {
+pub(crate) fn run_transformation_score(args: TransformationScoreArgs) -> CliResult<()> {
     let model = SavedModel::load_from_path(&args.model)?;
     if model.predict_model_class() != PredictModelClass::TransformationNormal {
         return Err(format!(
             "gam transformation-score requires a transformation-normal model; got {}",
             pretty_predict_model_class(model.predict_model_class())
-        ));
+        )
+        .into());
     }
-    let parsed =
-        parse_formula(model.payload().formula.as_str()).map_err(|error| error.to_string())?;
+    let parsed = parse_formula(model.payload().formula.as_str())?;
     let response_column = parsed.response.trim();
     if response_column.is_empty() || response_column.contains('(') {
         return Err(format!(
             "transformation-normal model formula '{}' has no plain observed-response column",
             model.payload().formula
-        ));
+        )
+        .into());
     }
 
     let effective_offset_column = args
@@ -1667,10 +1668,9 @@ pub(crate) fn run_transformation_score(args: TransformationScoreArgs) -> Result<
 /// (gam#3016). gamfit returns the same values from
 /// `Model.latent_conditional_residual`.
 pub(crate) fn run_latent_residual(args: LatentResidualArgs) -> CliResult<()> {
-    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
+    let model = SavedModel::load_from_path(&args.model)?;
     let columns = model
-        .latent_conditional_residual_columns()
-        .map_err(|error| error.to_string())?
+        .latent_conditional_residual_columns()?
         .into_iter()
         .collect::<Vec<_>>();
     let dataset = load_datasetwith_model_schema_columns(&args.data, &model, &columns)?;

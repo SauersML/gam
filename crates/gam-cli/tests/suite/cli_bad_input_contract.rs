@@ -92,6 +92,9 @@ fn cli_fit_bad_inputs_exit_with_their_category_and_name_the_offending_input() {
     );
 }
 
+/// A saved model the engine cannot read is a data refusal
+/// (`FittedModelError::error_category`), the category `gamfit.load` raises for
+/// the same file, on every command that loads one.
 #[test]
 fn every_post_fit_command_rejects_a_bad_model_with_a_named_error() {
     let scratch = tempfile::tempdir().expect("scratch directory");
@@ -106,22 +109,27 @@ fn every_post_fit_command_rejects_a_bad_model_with_a_named_error() {
 
     for args in [
         vec!["predict", model, data, "--out", out],
+        vec!["transformation-score", model, data, "--out", out],
+        vec!["latent-residual", model, data, "--out", out],
         vec!["diagnose", model, data],
+        vec!["residuals", model, data, "--type", "response"],
+        vec!["partial-effect", model, "--term", "s(x)"],
+        vec!["summary", model],
+        vec!["compare", model],
         vec!["sample", model, data, "--out", out],
         vec!["generate", model, data, "--out", out],
         vec!["report", model, data, out],
     ] {
         let output = gam(&args);
+        let error = stderr(&output);
         assert_eq!(
             output.status.code(),
-            exit_code(gam::ErrorCategory::Formula),
-            "args={args:?}: {}",
-            stderr(&output)
+            exit_code(gam::ErrorCategory::Data),
+            "args={args:?}: {error}"
         );
         assert!(
-            stderr(&output).contains("corrupt-model.gam"),
-            "args={args:?}: {}",
-            stderr(&output)
+            error.contains("failed to parse model") && error.contains("corrupt-model.gam"),
+            "args={args:?}: {error}"
         );
     }
 }

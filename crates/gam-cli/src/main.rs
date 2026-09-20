@@ -298,16 +298,14 @@ fn run() -> CliResult<()> {
         Command::Crosscoder(args) => run_crosscoder(args),
         Command::ParameterDecomposition(args) => run_parameter_decomposition_cli(args),
         Command::Report(args) => run_report(args),
-        Command::Summary(args) => run_summary(args).map_err(CliError::from),
+        Command::Summary(args) => run_summary(args),
         Command::Predict(args) => run_predict(args),
-        Command::TransformationScore(args) => {
-            run_transformation_score(args).map_err(CliError::from)
-        }
+        Command::TransformationScore(args) => run_transformation_score(args),
         Command::LatentResidual(args) => run_latent_residual(args),
         Command::Diagnose(args) => run_diagnose(args),
-        Command::PartialEffect(args) => run_partial_effect(args).map_err(CliError::from),
+        Command::PartialEffect(args) => run_partial_effect(args),
         Command::Residuals(args) => run_residuals(args),
-        Command::Compare(args) => run_compare(args).map_err(CliError::from),
+        Command::Compare(args) => run_compare(args),
         Command::Sample(args) => run_sample(args),
         Command::Generate(args) => run_generate(args),
         Command::JointEvents(args) => run_joint_events(args).map_err(CliError::from),

@@ -127,9 +127,7 @@ pub(crate) fn load_datasetwith_model_schema_columns(
     model: &SavedModel,
     columns: &[String],
 ) -> CliResult<Dataset> {
-    let schema = model
-        .require_data_schema()
-        .map_err(|err| CliError::from(err.to_string()))?;
+    let schema = model.require_data_schema()?;
     let policy =
         UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
     // The typed `DataError` keeps its advice through `?`: a NaN cell or an
