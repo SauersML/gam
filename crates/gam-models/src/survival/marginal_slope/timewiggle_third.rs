@@ -1564,6 +1564,225 @@ impl SurvivalMarginalSlopeFamily {
         })
     }
 
+    /// `D_β ∂_θ H[v]` for the baseline-chart coordinate `axis` along the coefficient direction
+    /// `d_beta` under the row measure of `options` (gam#3304). With `w_θ` the chart's z-block
+    /// motion and `Ã` fixed, a row contributes `Ãᵀ∇⁴[w_θ, Ãv]Ã`, the single-direction case of
+    /// [`Self::timewiggle_baseline_psi_hessian_all_beta_axes`].
+    pub(crate) fn timewiggle_baseline_psi_hessian_drift(
+        &self,
+        block_states: &[ParameterBlockState],
+        axis: usize,
+        d_beta: &Array1<f64>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Array2<f64>, String> {
+        let geometry = self.rigid_baseline_geometry()?;
+        let frame = self.timewiggle_zeta_frame(block_states)?;
+        let flex = self.effective_flex_active(block_states)?;
+        let row_weights = self.rigid_third_row_weights(options);
+        let width = frame.layout.width;
+        let p_total = frame.slices.total;
+        if d_beta.len() != p_total {
+            return Err(format!(
+                "time-wiggle baseline Hessian drift needs a direction of length {p_total}, got {}",
+                d_beta.len()
+            ));
+        }
+        let zeros = || Array2::<f64>::zeros((p_total, p_total));
+        let result = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            self.n,
+            |range| -> Result<Array2<f64>, String> {
+                let mut acc = zeros();
+                let mut scratch = Array2::<f64>::zeros((width, p_total));
+                for row in range {
+                    let weight = row_weights[row];
+                    if weight == 0.0 {
+                        continue;
+                    }
+                    let w = Self::baseline_zeta_motion(geometry, row, axis, width)?;
+                    let psi_row = self.timewiggle_zeta_psi_row(&frame, block_states, row, flex)?;
+                    let parts = psi_row.parts(&frame.layout);
+                    let images = &psi_row.zeta_row.images;
+                    let v_zeta = zeta_image_of(images, d_beta, width);
+                    let third = |direction: &Array1<f64>| -> Result<Array2<f64>, String> {
+                        self.zeta_row_third(&psi_row.program, direction)
+                    };
+                    let fourth =
+                        |left: &Array1<f64>, right: &Array1<f64>| -> Result<Array2<f64>, String> {
+                            self.zeta_row_fourth(&psi_row.program, left, right)
+                        };
+                    let inner = parts.order_four(&w, &v_zeta, &third, &fourth)? * weight;
+                    add_zeta_sandwich(&inner, images, images, &mut scratch, &mut acc);
+                }
+                Ok(acc)
+            },
+            |left, right| -> Result<_, String> { Ok(left + right) },
+        )?
+        .unwrap_or_else(zeros);
+        Ok(result)
+    }
+
+    /// `∂²_θθ' ℓ̄`, `∂²_θθ' ∇_β ℓ̄` and `∂²_θθ' H` for a pair of baseline-chart coordinates under
+    /// the row measure of `options` (gam#3304). With `w_θ`, `w_θ'` the chart's z-block motions,
+    /// `w_θθ'` its second motion and `Ã` fixed, a row contributes `∇·w_θθ' + w_θᵀ∇²w_θ'`,
+    /// `Ãᵀ(∇³[w_θ]w_θ' + ∇²w_θθ')` and `Ãᵀ(∇⁴[w_θ, w_θ'] + ∇³[w_θθ'])Ã`.
+    pub(crate) fn timewiggle_baseline_psi_second_order_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        axis: usize,
+        other_axis: usize,
+        options: &BlockwiseFitOptions,
+    ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
+        let geometry = self.rigid_baseline_geometry()?;
+        let frame = self.timewiggle_zeta_frame(block_states)?;
+        let flex = self.effective_flex_active(block_states)?;
+        let row_weights = self.rigid_third_row_weights(options);
+        let width = frame.layout.width;
+        let p_total = frame.slices.total;
+        let zeros = || {
+            (
+                0.0,
+                Array1::<f64>::zeros(p_total),
+                Array2::<f64>::zeros((p_total, p_total)),
+            )
+        };
+        let (objective_psi_psi, score_psi_psi, hessian_psi_psi) =
+            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                self.n,
+                |range| -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+                    let (mut objective, mut score, mut hessian) = zeros();
+                    let mut scratch = Array2::<f64>::zeros((width, p_total));
+                    for row in range {
+                        let weight = row_weights[row];
+                        if weight == 0.0 {
+                            continue;
+                        }
+                        let w_i = Self::baseline_zeta_motion(geometry, row, axis, width)?;
+                        let w_j = Self::baseline_zeta_motion(geometry, row, other_axis, width)?;
+                        let w_ij =
+                            Self::baseline_zeta_second_motion(geometry, row, axis, other_axis, width)?;
+                        let psi_row = self.timewiggle_zeta_psi_row(&frame, block_states, row, flex)?;
+                        let parts = psi_row.parts(&frame.layout);
+                        let images = &psi_row.zeta_row.images;
+                        let third = |direction: &Array1<f64>| -> Result<Array2<f64>, String> {
+                            self.zeta_row_third(&psi_row.program, direction)
+                        };
+                        let fourth = |left: &Array1<f64>,
+                                      right: &Array1<f64>|
+                         -> Result<Array2<f64>, String> {
+                            self.zeta_row_fourth(&psi_row.program, left, right)
+                        };
+                        let second = parts.order_two();
+                        objective += weight * (parts.order_one().dot(&w_ij) + w_i.dot(&second.dot(&w_j)));
+                        let score_zeta = parts.order_three(&w_i, &third)?.dot(&w_j) + second.dot(&w_ij);
+                        add_pulled_back(images, &score_zeta, weight, &mut score);
+                        let inner = (parts.order_four(&w_i, &w_j, &third, &fourth)?
+                            + parts.order_three(&w_ij, &third)?)
+                            * weight;
+                        add_zeta_sandwich(&inner, images, images, &mut scratch, &mut hessian);
+                    }
+                    Ok((objective, score, hessian))
+                },
+                |left, right| -> Result<_, String> {
+                    Ok((left.0 + right.0, left.1 + right.1, left.2 + right.2))
+                },
+            )?
+            .unwrap_or_else(zeros);
+        Ok(ExactNewtonJointPsiSecondOrderTerms {
+            objective_psi_psi,
+            score_psi_psi,
+            hessian_psi_psi,
+            hessian_psi_psi_operator: None,
+        })
+    }
+
+    /// `∂²_θψ ℓ̄`, `∂²_θψ ∇_β ℓ̄` and `∂²_θψ H` for the baseline-chart coordinate `baseline_axis`
+    /// and the design ψ `design_psi_index` under the row measure of `options` (gam#3304). The
+    /// chart moves ζ by `w_θ` and leaves `Ã` fixed; the design ψ moves `Ã` by `Ã_ψ` and ζ by
+    /// `w_ψ = Ã_ψβ`. A row contributes `w_θᵀ∇²w_ψ`, `Ã_ψᵀ∇²w_θ + Ãᵀ∇³[w_θ]w_ψ` and
+    /// `Ãᵀ∇⁴[w_θ, w_ψ]Ã + Ã_ψᵀ∇³[w_θ]Ã + Ãᵀ∇³[w_θ]Ã_ψ`. Returns `None` where the family has no
+    /// ψ block for the design axis.
+    pub(crate) fn timewiggle_baseline_design_psi_second_order_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        baseline_axis: usize,
+        design_psi_index: usize,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        let Some((block_idx, psi_map)) =
+            self.timewiggle_design_psi_map(derivative_blocks, design_psi_index)?
+        else {
+            return Ok(None);
+        };
+        let geometry = self.rigid_baseline_geometry()?;
+        let frame = self.timewiggle_zeta_frame(block_states)?;
+        let flex = self.effective_flex_active(block_states)?;
+        let row_weights = self.rigid_third_row_weights(options);
+        let width = frame.layout.width;
+        let p_total = frame.slices.total;
+        let beta = flat_beta(block_states)?;
+        let zeros = || {
+            (
+                0.0,
+                Array1::<f64>::zeros(p_total),
+                Array2::<f64>::zeros((p_total, p_total)),
+            )
+        };
+        let (objective_psi_psi, score_psi_psi, hessian_psi_psi) =
+            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                self.n,
+                |range| -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+                    let (mut objective, mut score, mut hessian) = zeros();
+                    let mut scratch = Array2::<f64>::zeros((width, p_total));
+                    for row in range {
+                        let weight = row_weights[row];
+                        if weight == 0.0 {
+                            continue;
+                        }
+                        let w_theta = Self::baseline_zeta_motion(geometry, row, baseline_axis, width)?;
+                        let psi_row = self.timewiggle_zeta_psi_row(&frame, block_states, row, flex)?;
+                        let parts = psi_row.parts(&frame.layout);
+                        let images = &psi_row.zeta_row.images;
+                        let x_psi = psi_map.row_vector(row).map_err(|error| {
+                            format!("time-wiggle baseline-by-design ψ pair row: {error}")
+                        })?;
+                        let psi_images = psi_zeta_images(self, &frame, row, block_idx, &x_psi)?;
+                        let w_psi = zeta_image_of(&psi_images, &beta, width);
+                        let third = |direction: &Array1<f64>| -> Result<Array2<f64>, String> {
+                            self.zeta_row_third(&psi_row.program, direction)
+                        };
+                        let fourth = |left: &Array1<f64>,
+                                      right: &Array1<f64>|
+                         -> Result<Array2<f64>, String> {
+                            self.zeta_row_fourth(&psi_row.program, left, right)
+                        };
+                        let second_w_theta = parts.order_two().dot(&w_theta);
+                        let third_theta = parts.order_three(&w_theta, &third)?;
+                        objective += weight * second_w_theta.dot(&w_psi);
+                        add_pulled_back(&psi_images, &second_w_theta, weight, &mut score);
+                        add_pulled_back(images, &third_theta.dot(&w_psi), weight, &mut score);
+                        let fourth_theta_psi =
+                            parts.order_four(&w_theta, &w_psi, &third, &fourth)? * weight;
+                        add_zeta_sandwich(&fourth_theta_psi, images, images, &mut scratch, &mut hessian);
+                        let third_theta = third_theta * weight;
+                        add_zeta_sandwich(&third_theta, &psi_images, images, &mut scratch, &mut hessian);
+                        add_zeta_sandwich(&third_theta, images, &psi_images, &mut scratch, &mut hessian);
+                    }
+                    Ok((objective, score, hessian))
+                },
+                |left, right| -> Result<_, String> {
+                    Ok((left.0 + right.0, left.1 + right.1, left.2 + right.2))
+                },
+            )?
+            .unwrap_or_else(zeros);
+        Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
+            objective_psi_psi,
+            score_psi_psi,
+            hessian_psi_psi,
+            hessian_psi_psi_operator: None,
+        }))
+    }
+
     /// `{D_β_a ∂_θ H}` along every coefficient axis `a` for the baseline-chart coordinate
     /// `axis`, under the row measure `row_weights` (gam#3061). The chart moves the index offsets
     /// and leaves `Ã` fixed, so with `w_θ` the z-block motion of the entry index, the exit index
