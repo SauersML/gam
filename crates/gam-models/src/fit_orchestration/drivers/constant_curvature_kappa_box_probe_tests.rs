@@ -461,13 +461,65 @@ mod constant_curvature_kappa_range_identification_tests {
         }
     }
 
+    /// The η-profile read off a jet taken AWAY from η's minimizer is the
+    /// profile, not the κ slice beside it (gam#3426).
+    ///
+    /// The inner solve certifies η̂ by its Newton decrement against `1/(2n)`, so
+    /// the jet `evaluate` reduces carries a residual `V_η ≠ 0`, and the plain
+    /// envelope `V_p′ = V_κ` is then short by `V_κη·V_η/V_ηη` — measured at
+    /// `1.5e-2` on the FD fixture below. On a quadratic `V` the Newton minimizer
+    /// of the jet's quadratic in η IS the minimizer, so the reduction must return
+    /// the closed-form profile exactly, at every η the jet is taken at.
+    #[test]
+    fn the_eta_profile_of_an_off_minimum_jet_is_the_profile() {
+        // V(κ, η) = ½(a κ² + 2b κη + c η²) + g κ + f η, c > 0.
+        let (a, b, c, g, f) = (3.0_f64, 1.7, 2.5, -0.4, 0.9);
+        let v = |kappa: f64, eta: f64| {
+            0.5 * (a * kappa * kappa + 2.0 * b * kappa * eta + c * eta * eta) + g * kappa + f * eta
+        };
+        // η*(κ) = −(bκ + f)/c, so V_p(κ) = V(κ, η*(κ)) with
+        // V_p′ = (a − b²/c)κ + g − b f/c and V_p″ = a − b²/c.
+        for kappa in [-0.7_f64, 0.0, 1.3] {
+            let eta_star = -(b * kappa + f) / c;
+            let exact = (
+                v(kappa, eta_star),
+                (a - b * b / c) * kappa + g - b * f / c,
+                a - b * b / c,
+            );
+            for offset in [-0.3_f64, 0.0, 0.05, 0.8] {
+                let eta = eta_star + offset;
+                let jet = ProfiledRemlPsiJet {
+                    value: v(kappa, eta),
+                    rho_at_bound: false,
+                    gradient: [a * kappa + b * eta + g, b * kappa + c * eta + f],
+                    hessian: [[a, b], [b, c]],
+                };
+                let (value, first, second) =
+                    jet.eta_profiled_kappa_jet().expect("V_ηη > 0 identifies η");
+                let scale = 1.0 + exact.0.abs().max(exact.1.abs()).max(exact.2.abs());
+                for (name, got, want) in [
+                    ("V_p", value, exact.0),
+                    ("V_p′", first, exact.1),
+                    ("V_p″", second, exact.2),
+                ] {
+                    assert!(
+                        (got - want).abs() <= 16.0 * f64::EPSILON * scale,
+                        "κ={kappa}, η−η*={offset}: {name}={got:.17e} against the closed-form \
+                         profile {want:.17e}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The PROFILED derivatives must be the derivatives of the PROFILED value.
     ///
     /// `constant_curvature_kappa_jet_fd_tests` differences `V(κ, η)` at fixed
     /// `η`. Nothing differences `V_p(κ) = min_η V(κ, η)`, and the reduction from
     /// one to the other is where the range coordinate's whole cost lands:
-    /// `V_p′ = V_κ` by the envelope theorem, and `V_p″ = V_κκ − V_κη²/V_ηη` by
-    /// one more differentiation. The Schur term is NON-POSITIVE, so a profile
+    /// `V_p′ = V_κ` by the envelope theorem (with the certified residual `V_η`
+    /// carried, gam#3426), and `V_p″ = V_κκ − V_κη²/V_ηη` by one more
+    /// differentiation. The Schur term is NON-POSITIVE, so a profile
     /// that fails to apply it does not produce a wrong fit — it produces an
     /// OVERSTATED curvature, which is what the outer solve's terminal
     /// stationarity certificate is denominated in (#2458). Exactly the class of

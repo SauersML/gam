@@ -2258,6 +2258,189 @@ struct ClosedFormFallback {
     hints: ThetaHints,
 }
 
+/// A finite latent law in the score's standard units `(m, s)` (gam#3231).
+///
+/// On a finite law `{u_k, w_k}` the anchor `Σ_k w_k Φ(a + b·u_k) = Φ(q)` with
+/// `η = a + b·z` is unchanged under `z → (z − m)/s`, `u_k → (u_k − m)/s`,
+/// `b → b·s`, `a → a + b·m`, so the score's units are a coordinate choice there,
+/// and the fit solves in the coordinates where the score has weighted mean 0 and
+/// SD 1, whatever units it was recorded in. Returns the law on that axis and the
+/// `(m, s)` of the map. The standard-normal law states that the score is
+/// `N(0, 1)` as given, and a calibrated law reads the scale-free `ζ` axis, so
+/// both keep the score's own axis, `(0, 1)`.
+fn finite_law_in_standard_units(
+    kind: LatentMeasureKind,
+    calibration: &LatentMeasureCalibration,
+    (mean, sd): (f64, f64),
+) -> Result<(LatentMeasureKind, (f64, f64)), String> {
+    if !matches!(calibration, LatentMeasureCalibration::None) {
+        return Ok((kind, (0.0, 1.0)));
+    }
+    let standardize = |grid: &EmpiricalZGrid| {
+        EmpiricalZGrid::new(
+            grid.nodes.iter().map(|&u| (u - mean) / sd).collect(),
+            grid.weights.clone(),
+            "bernoulli marginal-slope finite latent law in standard units",
+        )
+    };
+    let kind = match kind {
+        LatentMeasureKind::StandardNormal => return Ok((kind, (0.0, 1.0))),
+        LatentMeasureKind::GlobalEmpirical { grid } => LatentMeasureKind::GlobalEmpirical {
+            grid: standardize(&grid)?,
+        },
+        LatentMeasureKind::LocalEmpirical {
+            feature_cols,
+            input_scales,
+            centers,
+            grids,
+            top_k,
+            bandwidth,
+            mixture,
+            train_row_mixtures,
+        } => LatentMeasureKind::LocalEmpirical {
+            feature_cols,
+            input_scales,
+            centers,
+            grids: grids.iter().map(standardize).collect::<Result<_, _>>()?,
+            top_k,
+            bandwidth,
+            mixture,
+            train_row_mixtures,
+        },
+    };
+    Ok((kind, (mean, sd)))
+}
+
+/// The converged coefficients a re-solve starts from when it reads the score on
+/// the axis `to` and the converged fit read it on `from`, each `(m, s)` with the
+/// score `(z − m)/s`, or `None` for the row-varying calibrated `ζ` axis. The
+/// marginal and residual blocks read no score axis and always carry over. The
+/// slope is `s` times the slope on the score as given, so it carries over scaled
+/// by `s_to/s_from` between two fixed axes (a shift is absorbed by the row
+/// intercept) and not at all to or from `ζ`. The flex deviations are functions on
+/// the axis itself and carry over only onto the same axis.
+fn hints_across_score_axes(
+    from: Option<(f64, f64)>,
+    to: Option<(f64, f64)>,
+    block_states: &[ParameterBlockState],
+    residual: bool,
+    beta_h: Option<&Array1<f64>>,
+    beta_w: Option<&Array1<f64>>,
+) -> ThetaHints {
+    let same_axis = from == to;
+    let slope_beta = match (from, to) {
+        _ if same_axis => Some(block_states[1].beta.clone()),
+        (Some((_, sd_from)), Some((_, sd_to))) => {
+            Some(block_states[1].beta.mapv(|beta| beta * (sd_to / sd_from)))
+        }
+        _ => None,
+    };
+    ThetaHints {
+        marginal_beta: Some(block_states[0].beta.clone()),
+        slope_beta,
+        residual_beta: residual.then(|| block_states[2].beta.clone()),
+        score_warp_beta: if same_axis { beta_h.cloned() } else { None },
+        link_dev_beta: if same_axis { beta_w.cloned() } else { None },
+    }
+}
+
+#[cfg(test)]
+mod score_units_tests {
+    use super::*;
+    use gam_math::probability::normal_cdf;
+
+    /// The law moves onto the score's standard units node by node, keeping its
+    /// masses, and the anchor on it is the raw-unit anchor under
+    /// `b → b·s`, `a → a + b·m` (gam#3231).
+    #[test]
+    fn a_global_finite_law_moves_onto_the_standard_units_and_keeps_its_anchor() {
+        let raw = EmpiricalZGrid::new(vec![1.0, 2.0, 4.0], vec![0.2, 0.5, 0.3], "test law")
+            .expect("a valid law");
+        let (mean, sd) = (2.0, 0.5);
+        let (kind, units) = finite_law_in_standard_units(
+            LatentMeasureKind::GlobalEmpirical { grid: raw.clone() },
+            &LatentMeasureCalibration::None,
+            (mean, sd),
+        )
+        .expect("the law in standard units");
+        assert_eq!(units, (mean, sd));
+        let LatentMeasureKind::GlobalEmpirical { grid } = kind else {
+            panic!("a global law stays global");
+        };
+        assert_eq!(grid.nodes, vec![-2.0, 0.0, 4.0]);
+        assert_eq!(grid.weights, raw.weights);
+
+        let (a, b) = (-0.3, 0.7);
+        let anchor = |a: f64, b: f64, law: &EmpiricalZGrid| {
+            law.pairs().map(|(u, w)| w * normal_cdf(a + b * u)).sum::<f64>()
+        };
+        let raw_anchor = anchor(a, b, &raw);
+        let standard_anchor = anchor(a + b * mean, b * sd, &grid);
+        // Each argument is a few roundings of `|a| + |b|·max|u|` apart, passed
+        // through `φ ≤ 1`, plus the rounding of the three-term sum.
+        let band = f64::EPSILON * (3.0 + 4.0 * (a.abs() + b.abs() * 4.0));
+        assert!(
+            (raw_anchor - standard_anchor).abs() <= band,
+            "the anchor must not depend on the units: {raw_anchor} vs {standard_anchor}"
+        );
+    }
+
+    #[test]
+    fn the_standard_normal_law_keeps_the_score_as_given() {
+        let (kind, units) = finite_law_in_standard_units(
+            LatentMeasureKind::StandardNormal,
+            &LatentMeasureCalibration::None,
+            (2.0, 0.5),
+        )
+        .expect("the standard-normal law");
+        assert_eq!(kind, LatentMeasureKind::StandardNormal);
+        assert_eq!(units, (0.0, 1.0));
+    }
+
+    /// Between two fixed axes the slope carries over as `s` times the slope on
+    /// the score as given; the flex deviations are functions on the axis and
+    /// carry over only onto the same one, and nothing on the axis crosses to ζ.
+    #[test]
+    fn hints_carry_the_slope_across_score_axes() {
+        let state = |beta: Vec<f64>| ParameterBlockState {
+            beta: Array1::from(beta),
+            eta: Array1::zeros(1),
+        };
+        let blocks = [state(vec![0.1, 0.2]), state(vec![3.0])];
+        let flex = Array1::from(vec![0.4]);
+        let rescaled = hints_across_score_axes(
+            Some((0.0, 1.0)),
+            Some((5.0, 0.25)),
+            &blocks,
+            false,
+            Some(&flex),
+            Some(&flex),
+        );
+        assert_eq!(rescaled.marginal_beta, Some(blocks[0].beta.clone()));
+        assert_eq!(rescaled.slope_beta, Some(Array1::from(vec![0.75])));
+        assert_eq!(rescaled.score_warp_beta, None);
+        assert_eq!(rescaled.link_dev_beta, None);
+        assert_eq!(rescaled.residual_beta, None);
+
+        let same = hints_across_score_axes(
+            Some((5.0, 0.25)),
+            Some((5.0, 0.25)),
+            &blocks,
+            false,
+            Some(&flex),
+            Some(&flex),
+        );
+        assert_eq!(same.slope_beta, Some(blocks[1].beta.clone()));
+        assert_eq!(same.score_warp_beta, Some(flex.clone()));
+        assert_eq!(same.link_dev_beta, Some(flex.clone()));
+
+        let to_zeta =
+            hints_across_score_axes(Some((5.0, 0.25)), None, &blocks, false, None, None);
+        assert_eq!(to_zeta.slope_beta, None);
+        assert_eq!(to_zeta.marginal_beta, Some(blocks[0].beta.clone()));
+    }
+}
+
 /// One fit's outcome under its latent-law certificate.
 enum CertifiedFit {
     Fitted(Box<BernoulliMarginalSlopeFitResult>),
@@ -2432,6 +2615,13 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // The raw score is kept for the training score below, which is computed from
     // it through the map prediction applies (gam#3016).
     let z_raw = std::mem::replace(&mut spec.z, z_standardized);
+    // gam#3231: the score's standard units, the axis a fit on an uncalibrated
+    // finite law solves in.
+    let standard_units = {
+        let units = weighted_location_scale(&spec.z, &spec.weights, "bernoulli marginal-slope")
+            .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+        (units.mean, units.sd)
+    };
     // #2750/#2754/#2761: resolve every AUTO measure-jet representer range
     // against the response before any design is built here.
     //
@@ -2631,8 +2821,20 @@ fn fit_bernoulli_marginal_slope_terms_under(
         empirical_build: latent_measure_build,
         certificate_law: latent_certificate_law,
         consumed: mut latent_law_consumed,
-        moving_law: latent_moving_law,
+        moving_law: mut latent_moving_law,
     } = decision;
+    if let Some(candidates) = latent_moving_law.as_mut() {
+        candidates.set_standard_units(standard_units.0, standard_units.1);
+    }
+    let (latent_measure, fit_units) =
+        finite_law_in_standard_units(latent_measure, &latent_z_calibration, standard_units)
+            .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
+    // The fit's score is `(z − m)/s` in the policy's units, so the saved map
+    // composes the policy's normalisation with it.
+    let z_normalization = LatentZNormalization {
+        mean: z_normalization.mean + z_normalization.sd * fit_units.0,
+        sd: z_normalization.sd * fit_units.1,
+    };
 
     let y = Arc::new(spec.y.clone());
     let weights = Arc::new(spec.weights.clone());
@@ -2662,6 +2864,10 @@ fn fit_bernoulli_marginal_slope_terms_under(
         mean: z_normalization.mean,
         sd: z_normalization.sd,
     };
+    // The slope offset is a slope on the score as given; on the fit's score
+    // `(z − mean)/sd` the same slope is `sd` times it (prediction applies the
+    // identical factor).
+    spec.slope_offset *= saved_normalization.sd;
     let z = Arc::new(
         FittedLatentScoreMap {
             normalization: &saved_normalization,
@@ -3811,13 +4017,16 @@ fn fit_bernoulli_marginal_slope_terms_under(
                         },
                         moving_law: None,
                     },
-                    hints: ThetaHints {
-                        marginal_beta: Some(block_states[0].beta.clone()),
-                        slope_beta: Some(block_states[1].beta.clone()),
-                        residual_beta: residual_runtime.as_ref().map(|_| block_states[2].beta.clone()),
-                        score_warp_beta: beta_h.cloned(),
-                        link_dev_beta: beta_w.cloned(),
-                    },
+                    // The closed form reads the score as given; the finite law
+                    // is solved in its standard units.
+                    hints: hints_across_score_axes(
+                        Some((0.0, 1.0)),
+                        Some(standard_units),
+                        block_states,
+                        residual_runtime.is_some(),
+                        beta_h,
+                        beta_w,
+                    ),
                 }));
             }
         }
@@ -3925,25 +4134,18 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 certificate.chosen.label(),
                 certificate.summary()
             );
-            // The slope and the flex deviations live on the latent axis: they carry
-            // over only when the chosen arm reads the same axis as the fitted one.
-            let calibrated_axis = |arm: MovingLawArm| {
-                matches!(
-                    arm,
-                    MovingLawArm::LocationScaleGaussian | MovingLawArm::LocationScaleEmpirical
-                )
-            };
-            let same_axis = calibrated_axis(certificate.chosen) == calibrated_axis(certificate.fitted);
+            let hints = hints_across_score_axes(
+                candidates.score_axis(certificate.fitted),
+                candidates.score_axis(certificate.chosen),
+                block_states,
+                residual_runtime.is_some(),
+                beta_h,
+                beta_w,
+            );
             let chosen = certificate.chosen;
             return Ok(CertifiedFit::ReSolve(ClosedFormFallback {
                 decision: candidates.decision_for(chosen, Some(certificate))?,
-                hints: ThetaHints {
-                    marginal_beta: Some(block_states[0].beta.clone()),
-                    slope_beta: same_axis.then(|| block_states[1].beta.clone()),
-                    residual_beta: residual_runtime.as_ref().map(|_| block_states[2].beta.clone()),
-                    score_warp_beta: if same_axis { beta_h.cloned() } else { None },
-                    link_dev_beta: if same_axis { beta_w.cloned() } else { None },
-                },
+                hints,
             }));
         }
     }
