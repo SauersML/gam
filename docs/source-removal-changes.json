@@ -2215,5 +2215,35 @@
     ],
     "reason": "#3173: every production outer evaluation of a custom family now goes through evaluate_on_branch, which solves a certified mode from each start (correct_labeled_laplace_mode, or the branch continuation for the incumbent) and prices only the mode the lowest-penalized-objective rule selects (outerobjective_from_coefficient_mode_labeled). The single-seed evaluators outerobjectivegradienthessian_labeled and outerobjectivegradienthessian_internal were the solve-and-price route that evaluation used; they have no production caller left and move verbatim into the cfg(test) test_support module, where tests that price the criterion at a mode they chose still call them.",
     "evidence": "At the gate base 4b87357bf0 source_removal_guard.py and public_api_census.py report exactly these two identities (production_occurrences 0 for both). At the head tree git grep -w finds both names only in crates/gam-custom-family/src/test_support.rs (the moved definitions) and in test modules. cargo check --workspace --all-targets rc 0 and cargo build --workspace --lib rc 0 at the gate; the gam-custom-family lib suite passes except the main red a_double_well_fit_publishes_its_uncertified_trace_2901, identical at base."
+  },
+  {
+    "base": "119fd0951aadbf36aa148bf44e2bc3d673794d67",
+    "items": [
+      "crates/gam-sae/src/certificate_impls.rs:fn:claim",
+      "crates/gam-sae/src/certificate_impls.rs:fn:evidence",
+      "crates/gam-sae/src/certificate_impls.rs:fn:verdict",
+      "crates/gam-sae/src/manifold/certificate.rs:const:SAE_CERT_CURVATURE_CONSTANT",
+      "crates/gam-sae/src/manifold/certificate.rs:const:SAE_CERT_INCOHERENCE_BUDGET",
+      "crates/gam-sae/src/manifold/certificate.rs:enum:GlobalOptimalityVerdict",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:curved_dictionary_global_optimality_verdict",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:healthy_regime_certifies_with_positive_margin",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:is_certified",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:margin",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:negative_snr_proxy_never_certifies",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:overflowing_certificate_budget_has_no_margin",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:snr_at_or_below_one_does_not_certify",
+      "crates/gam-sae/src/manifold/certificate.rs:struct:CertificateInputs",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:const:A_FLOOR",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:const:K_ATOMS",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:fn:benign_corner_certifies_and_hard_corner_does_not",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:fn:certified_region_is_monotone_no_interior_hole",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:fn:certified_set_is_strict_subset_of_loose_recovery_boundary",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:fn:grid",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:fn:no_certified_cell_violates_a_precondition",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:fn:verdict",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:struct:Cell"
+    ],
+    "reason": "#2946 census T1/C1: GlobalOptimalityVerdict::CertifiedGlobal published Verdict::Certified under the claim 'unique global optimum' from the sufficient condition mu_hat <= c0*a^2*(1-1/SNR)*(1-C_kappa*kappa)/K, whose inequality has no derivation and whose constants SAE_CERT_CURVATURE_CONSTANT=1.0 and SAE_CERT_INCOHERENCE_BUDGET=0.125 are chosen. SPEC: 'Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible in production code.' and 'Unnecessary choices and options should be deleted, not included.' The verdict, its margin/is_certified helpers, both constants, the curved_dictionary_global_optimality_verdict decision rule, the Certificate impl (claim/evidence/verdict) that recorded it in the certificate ledger, its four unit tests and the sae_incoherence_phase_diagram integration test (which only mapped where the underived verdict flipped) are deleted. The measurements survive unchanged as DictionaryIncoherenceReport (renamed from CertificateInputs): mu_hat, per-atom kappa_hat, peak activity floor and SNR proxy.",
+    "evidence": "At base 119fd0951a source_removal_guard.py reports exactly these 23 identities. At head, git grep -w finds no occurrence of GlobalOptimalityVerdict, CertificateInputs, SAE_CERT_CURVATURE_CONSTANT, SAE_CERT_INCOHERENCE_BUDGET, curved_dictionary_global_optimality_verdict or global_optimality outside CHANGELOG.md and this ledger; no Python code read the removed global_optimality* dict keys (experiments and tests/fixtures/manifold_sae/generate_golden.py read only mu_hat/activity_floor). The removed claim/evidence/verdict are the one `impl Certificate for CertificateInputs` block; the other Certificate impls in the file are untouched. cargo check --workspace --tests rc 0; cargo test -p gam-sae --lib certificate passes."
   }
 ]
