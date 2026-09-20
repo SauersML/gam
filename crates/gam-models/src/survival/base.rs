@@ -5475,4 +5475,90 @@ mod tests {
         }
     }
 
+    /// gam#3451: at an interior optimum of an unpenalised survival fit the score
+    /// cancels to rounding, so a scale built from that score reads the certificate
+    /// as about 1 on a fully converged fit. The scale is the norm of the operands
+    /// the score is a difference of; the event operand's intercept entry alone is
+    /// the weighted event count, so the scale can never fall below it.
+    #[test]
+    fn unpenalised_survival_optimum_certifies_on_the_score_operands_3451() {
+        let age_entry = Array1::<f64>::zeros(10);
+        let age_exit = array![0.3_f64, 0.5, 0.7, 0.9, 1.1, 1.3, 1.6, 1.9, 2.2, 2.5];
+        let event_target = array![1u8, 1, 0, 1, 0, 1, 1, 0, 1, 1];
+        let event_competing = Array1::<u8>::zeros(10);
+        let sampleweight = Array1::<f64>::ones(10);
+        let rows = age_exit.len();
+        let mut x_entry = Array2::<f64>::zeros((rows, 2));
+        let mut x_exit = Array2::<f64>::zeros((rows, 2));
+        let mut x_derivative = Array2::<f64>::zeros((rows, 2));
+        for i in 0..rows {
+            x_exit[[i, 0]] = 1.0;
+            x_exit[[i, 1]] = age_exit[i].ln();
+            x_derivative[[i, 1]] = 1.0 / age_exit[i];
+        }
+        // No delayed entry: the entry rows are left at zero.
+        x_entry.fill(0.0);
+        let model = survival_model_with_offsets(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
+            None,
+            PenaltyBlocks::new(Vec::new()),
+            SurvivalMonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect("model build");
+
+        // Damped Newton on the (unpenalised) Weibull likelihood to its optimum.
+        let mut beta = array![0.0_f64, 1.0];
+        for _ in 0..100 {
+            let state = model.update_state(&beta).expect("state");
+            let h = state.hessian.to_dense();
+            let g = &state.gradient;
+            let det = h[[0, 0]] * h[[1, 1]] - h[[0, 1]] * h[[1, 0]];
+            let step = array![
+                (h[[1, 1]] * g[0] - h[[0, 1]] * g[1]) / det,
+                (h[[0, 0]] * g[1] - h[[1, 0]] * g[0]) / det,
+            ];
+            let mut t = 1.0_f64;
+            loop {
+                let trial = &beta - &(t * &step);
+                match model.update_state(&trial) {
+                    Ok(next) if next.deviance <= state.deviance => {
+                        beta = trial;
+                        break;
+                    }
+                    _ if t < f64::EPSILON => break,
+                    _ => t *= 0.5,
+                }
+            }
+        }
+
+        let state = model.update_state(&beta).expect("state at the optimum");
+        let g_norm = state.gradient.dot(&state.gradient).sqrt();
+        let weighted_events: f64 = event_target
+            .iter()
+            .zip(sampleweight.iter())
+            .map(|(&d, &w)| f64::from(d) * w)
+            .sum();
+        assert!(
+            state.gradient_natural_scale >= weighted_events,
+            "the stationarity scale {:.3e} fell below the weighted event count {weighted_events}: \
+             it is built from the cancelled score, not from its operands",
+            state.gradient_natural_scale
+        );
+        assert!(
+            state.certifies_kkt(g_norm, 1e-12),
+            "a converged unpenalised survival fit must certify: |g|={g_norm:.3e}, \
+             scale={:.3e}",
+            state.gradient_natural_scale
+        );
+    }
 }

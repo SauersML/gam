@@ -2361,4 +2361,80 @@ mod tests {
         );
         assert!(penalty.with_labeled_rows(x.slice(ndarray::s![.., ..2]).to_owned(), y).is_err());
     }
+
+    /// gam#3451: an unpenalised Poisson fit whose test row sits at its own fitted
+    /// mean, `z = μ̂_*`, is the augmented optimum with the training optimum's β̂:
+    /// the test row's residual is zero and the training score cancels to rounding.
+    /// A stationarity scale built from that score and residual is itself rounding,
+    /// so the certificate refused the exact solution. The scale is the operands'
+    /// norms; `‖Xᵀy‖` alone is at least `Σy` through the intercept column.
+    #[test]
+    fn unpenalised_optimum_at_its_own_fitted_test_mean_certifies_3451() {
+        use std::f64::consts::PI;
+        let n = 16usize;
+        let p = 2usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = (PI * t).cos();
+            y[i] = (1.0 + (2.0 * PI * t).sin()).exp().round();
+        }
+        let s = Array2::<f64>::zeros((p, p));
+        let weights = Array1::<f64>::ones(n);
+        let no_test_row = Array1::<f64>::zeros(p);
+        let training = GlmHomotopyFullConformal::new(
+            CanonicalGlmFamily::PoissonLog,
+            &x,
+            &y,
+            &weights,
+            &s,
+            &no_test_row,
+        )
+        .expect("training engine");
+        // Newton on the convex training likelihood; a zero test row adds nothing.
+        let mut beta = Array1::<f64>::zeros(p);
+        for _ in 0..50 {
+            let g = training.penalized_score(&beta, 0.0);
+            let step = training
+                .penalized_hessian(&beta)
+                .cholesky(Side::Lower)
+                .expect("training Hessian SPD")
+                .solvevec(&g);
+            beta -= &step;
+        }
+
+        let x_star = cosine_row(p, 0.37);
+        let eng = GlmHomotopyFullConformal::new(
+            CanonicalGlmFamily::PoissonLog,
+            &x,
+            &y,
+            &weights,
+            &s,
+            &x_star,
+        )
+        .expect("augmented engine");
+        let z = CanonicalGlmFamily::PoissonLog.mean(x_star.dot(&beta));
+        let y_total: f64 = y.sum();
+        let scale = eng.gradient_natural_scale(&beta, z);
+        assert!(
+            scale >= y_total,
+            "the stationarity scale {scale:.3e} fell below Σy = {y_total}: it is built from \
+             the cancelled score, not from its operands"
+        );
+        assert!(
+            eng.kkt_converged(&beta, z, GLM_CONVERGENCE_RTOL),
+            "the exact augmented optimum must certify: |g|={:.3e}, scale={scale:.3e}",
+            vec_norm(&eng.penalized_score(&beta, z))
+        );
+        let (refit, _) = eng
+            .cold_fit(z, Array1::<f64>::zeros(p))
+            .expect("the cold refit at z = μ̂_* must certify");
+        let gap = vec_norm(&(&refit - &beta));
+        assert!(
+            gap <= 1e-9 * (1.0 + vec_norm(&beta)),
+            "the cold refit at z = μ̂_* must return the training optimum (gap {gap:.3e})"
+        );
+    }
 }
