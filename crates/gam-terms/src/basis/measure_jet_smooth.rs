@@ -2317,9 +2317,21 @@ pub(crate) fn realize_measure_jet_geometry(
 /// directions of the local data covariance. This is the standard local-PCA
 /// noise floor: for each center's nearest-assignment cell with enough points to
 /// span a tangent (`≥ d + 1`, the linear-algebra rank requirement — not a tuned
-/// knob), the smallest eigenvalue of the cell-local covariance estimates the
-/// perpendicular variance `σ_coord²`; averaging over cells (weighted by the
-/// cell count) pools the estimate. No response values, no smoothing dial, and
+/// knob), the smallest eigenvalue of the cell-local scatter `S_i = Σ (x−x̄)(x−x̄)ᵀ`
+/// carries the perpendicular variance `σ_coord²`, and the cells are pooled over
+/// their residual degrees of freedom:
+///
+///   σ̂² = Σ_i λ_min(S_i) / Σ_i (n_i − d).
+///
+/// Along the true normal `n`, `nᵀS_i n ~ σ²χ²_{n_i−1}` (the cell mean costs one
+/// degree of freedom). The PCA minimum then rotates `n` toward each of the
+/// `d − 1` tangent directions `t` and removes `(tᵀS_i n)²/(tᵀS_i t − nᵀS_i n) ~ σ²χ²₁`
+/// per direction to first order in σ over the tangent spread, so
+/// `E[λ_min(S_i)] = σ²(n_i − d)` on a codimension-1 stratum. Pooling over `n_i`
+/// instead would shrink σ̂² by `Σ(n_i − d)/Σn_i`, which is `1/(d+1)` for the
+/// smallest admitted cell (#3741). On a stratum of codimension `c > 1`, the
+/// minimum over the `c` noise eigenvalues is an extreme order statistic and
+/// stays biased low. No response values, no smoothing dial, and
 /// no magic constant enter — it is a pure function of the ambient point cloud
 /// and the frozen centers, in the centers' (standardized) coordinate frame.
 ///
@@ -2359,8 +2371,9 @@ pub(crate) fn measure_jet_input_noise_scale(
         }
         members[best].push(j);
     }
-    let mut weighted_sum = 0.0_f64;
-    let mut weight = 0.0_f64;
+    // Σ_i λ_min(S_i) and its residual degrees of freedom Σ_i (n_i − d).
+    let mut scatter_minimum_sum = 0.0_f64;
+    let mut residual_dof = 0.0_f64;
     for cell in &members {
         let n_i = cell.len();
         // A cell needs at least d + 1 points to define a full-rank local
@@ -2399,14 +2412,15 @@ pub(crate) fn measure_jet_input_noise_scale(
             .fold(f64::INFINITY, |acc, v| acc.min(v))
             .max(0.0);
         if smallest.is_finite() {
-            weighted_sum += n_i as f64 * smallest;
-            weight += n_i as f64;
+            // `smallest` is λ_min(S_i / n_i); `n_i ≥ d + 1` keeps the dof positive.
+            scatter_minimum_sum += n_i as f64 * smallest;
+            residual_dof += (n_i - d) as f64;
         }
     }
-    if weight <= 0.0 {
+    if residual_dof <= 0.0 {
         return Ok(None);
     }
-    let sigma2 = weighted_sum / weight;
+    let sigma2 = scatter_minimum_sum / residual_dof;
     if !(sigma2.is_finite() && sigma2 > 0.0) {
         return Ok(None);
     }
@@ -3117,6 +3131,48 @@ mod tests {
             measure_jet_input_noise_scale(data.view(), centers.view())
                 .expect("estimate ok")
                 .is_none()
+        );
+    }
+
+    /// Small cells: the pooled local-PCA minimum must be charged its residual
+    /// degrees of freedom `n_i − d`, not `n_i` (#3741). This test puts a line in 2-D
+    /// with 200 centers over 800 points, so about 4 points fall in each cell.
+    /// Pooling over `n_i` returns about `σ·√(400/800) ≈ 0.71σ`. Pooling over `n_i − d`
+    /// has an unbiased σ̂², and its sampling spread is χ²₄₀₀/400, a relative sd of
+    /// `√(2/400) ≈ 7%` on σ̂² and about 3.5% on σ̂. The 12% band is about 3.4 sd and
+    /// still excludes the n_i-pooled value.
+    #[test]
+    pub(crate) fn input_noise_scale_is_unbiased_on_small_cells() {
+        let tang = [1.0 / 5f64.sqrt(), 2.0 / 5f64.sqrt()];
+        let perp = [2.0 / 5f64.sqrt(), -1.0 / 5f64.sqrt()];
+        // Noise far below the within-cell tangent spread (~4e-3), so the
+        // first-order dof count is the operative one.
+        let sigma = 1.0e-4_f64;
+        let n = 800usize;
+        let mut state = 0x0fed_cba9_8765_4321u64;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for j in 0..n {
+            let t = 3.0 * (j as f64) / (n as f64 - 1.0);
+            let noise = sigma * lcg_normal(&mut state);
+            for a in 0..2 {
+                data[(j, a)] = t * tang[a] + noise * perp[a];
+            }
+        }
+        let n_centers = 200usize;
+        let mut centers = Array2::<f64>::zeros((n_centers, 2));
+        for i in 0..n_centers {
+            let t = 3.0 * (i as f64 + 0.5) / (n_centers as f64);
+            for a in 0..2 {
+                centers[(i, a)] = t * tang[a];
+            }
+        }
+        let est = measure_jet_input_noise_scale(data.view(), centers.view())
+            .expect("estimate ok")
+            .expect("noise scale present");
+        assert!(
+            (est / sigma - 1.0).abs() <= 0.12,
+            "small-cell σ_coord {est} is not unbiased for {sigma} (ratio {:.3}; n_i pooling gives ≈ 0.71)",
+            est / sigma
         );
     }
 

@@ -1237,6 +1237,39 @@ fn compensated_matmul_into(
     Ok(())
 }
 
+/// The finished `diag(X M Xᵀ)` of a [`DenseDesignOperator::quadratic_form_diag`]:
+/// every entry is refused unless finite, then negative rounding drift is set to
+/// zero.
+///
+/// The diagonal is a variance when `M` is a PSD covariance or precision, so a
+/// negative entry can only be the rounding of the two products. A non-finite
+/// entry can be neither: it means the design, `M` or a product overflowed. It
+/// used to be clamped with `f64::max`, which returns its non-`NaN` operand, so a
+/// `NaN` or `−∞` came back as an exact zero variance with no error (#4113). The
+/// finiteness test runs first because the drift clamp would otherwise also map
+/// `−∞` to zero. For finite entries the result is bit-for-bit the old clamp.
+fn certified_quadratic_form_diag(
+    operator: &str,
+    mut diagonal: Array1<f64>,
+) -> Result<Array1<f64>, String> {
+    if let Some((row, value)) = diagonal
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "{operator}::quadratic_form_diag: diag(X M Xᵀ) is {value} at row {row}; a \
+             non-finite design, middle matrix or product has no variance"
+        ));
+    }
+    for value in diagonal.iter_mut() {
+        if *value < 0.0 {
+            *value = 0.0;
+        }
+    }
+    Ok(diagonal)
+}
+
 /// Trait for dense-backed design operators that avoid eager materialization.
 ///
 /// Implement this trait for structured designs (multi-channel, rowwise-Kronecker,
@@ -1297,12 +1330,10 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
             ndarray::Zip::from(&mut chunk_out)
                 .and(x_chunk.rows())
                 .and(xm_chunk.rows())
-                // clamp tiny-negative fp drift on diag(X M Xᵀ) when M is a
-                // PSD covariance/precision matrix; not a weight clip.
-                .par_for_each(|o, xr, xmr| *o = xr.dot(&xmr).max(0.0));
+                .par_for_each(|o, xr, xmr| *o = xr.dot(&xmr));
             start = end;
         }
-        Ok(out)
+        certified_quadratic_form_diag("DenseDesignOperator", out)
     }
 
     /// Fill a dense row chunk without materializing the full matrix.
@@ -1973,7 +2004,7 @@ impl DenseDesignOperator for DenseDesignMatrix {
                     && let (Some(m_all), Some(xc_all), Some(out_slice)) =
                         (matrix.as_slice(), xc.as_slice(), out.as_slice_mut())
                 {
-                    // Parallel per-row clamped quadratic-form diagonal with
+                    // Parallel per-row quadratic-form diagonal with
                     // stride-1 reads from both row-major operands. Avoids the
                     // per-row `Array1::dot` call's overhead at large-scale shapes
                     // (n ≈ 2e5, p ≈ 33).
@@ -1990,18 +2021,14 @@ impl DenseDesignOperator for DenseDesignMatrix {
                             for j in 0..p {
                                 acc += m_row[j] * xc_row[j];
                             }
-                            // clamp tiny-negative fp drift on diag(X M Xᵀ)
-                            // when M is a PSD covariance/precision matrix.
-                            slot[0] = acc.max(0.0);
+                            slot[0] = acc;
                         });
                 } else {
                     for i in 0..n {
-                        // clamp tiny-negative fp drift on diag(X M Xᵀ)
-                        // when M is a PSD covariance/precision matrix.
-                        out[i] = matrix.row(i).dot(&xc.row(i)).max(0.0);
+                        out[i] = matrix.row(i).dot(&xc.row(i));
                     }
                 }
-                Ok(out)
+                certified_quadratic_form_diag("DenseDesignMatrix", out)
             }
             Self::Lazy(op) => op.quadratic_form_diag(middle),
         }
@@ -2555,9 +2582,9 @@ impl DenseDesignOperator for RandomEffectOperator {
         let out: Vec<f64> = self
             .group_ids
             .par_iter()
-            .map(|g| g.map(|g| middle[[g, g]].max(0.0)).unwrap_or(0.0))
+            .map(|g| g.map(|g| middle[[g, g]]).unwrap_or(0.0))
             .collect();
-        Ok(Array1::from(out))
+        certified_quadratic_form_diag("RandomEffectOperator", Array1::from(out))
     }
 }
 
@@ -3232,11 +3259,7 @@ impl DenseDesignOperator for BlockDesignOperator {
             }
         }
 
-        // Clamp to non-negative (variance-like quantity).
-        for v in out.iter_mut() {
-            *v = v.max(0.0);
-        }
-        Ok(out)
+        certified_quadratic_form_diag("BlockDesignOperator", out)
     }
 
     fn apply_columns(&self, cols: &[usize]) -> Array2<f64> {
@@ -3878,9 +3901,9 @@ impl DenseDesignOperator for ConditionedDesign {
         let mut result = self.inner.quadratic_form_diag(&ama)?;
         let x_amd = self.inner.apply(&amd);
         for i in 0..result.len() {
-            result[i] = (result[i] - 2.0 * x_amd[i] + dtmd).max(0.0);
+            result[i] = result[i] - 2.0 * x_amd[i] + dtmd;
         }
-        Ok(result)
+        certified_quadratic_form_diag("ConditionedDesign", result)
     }
 
     fn row_chunk_into(
@@ -4633,9 +4656,9 @@ impl DenseDesignOperator for DesignMatrix {
                             acc += xij * middle[[j, k]] * xik;
                         }
                     }
-                    out[i] = acc.max(0.0);
+                    out[i] = acc;
                 }
-                Ok(out)
+                certified_quadratic_form_diag("SparseDesignMatrix", out)
             }
         }
     }
@@ -6204,7 +6227,7 @@ mod tests {
         );
     }
 
-    use super::{BlockDesignOperator, CoefficientTransformOperator, ConditionedDesign, DenseDesignMatrix, DenseDesignOperator, DesignBlock, DesignMatrix, EmbeddedColumnBlock, FiniteSignedWeightsView, MultiChannelOperator, PsdWeightsView, RandomEffectOperator, ReparamOperator, RowwiseKroneckerOperator, SparseDesignMatrix, dense_operator_to_dense_by_chunks, dense_transpose_weighted_response, fast_atv, fast_av, streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view};
+    use super::{BlockDesignOperator, CoefficientTransformOperator, ConditionedDesign, DenseDesignMatrix, DenseDesignOperator, DesignBlock, DesignMatrix, EmbeddedColumnBlock, FiniteSignedWeightsView, MultiChannelOperator, PsdWeightsView, RandomEffectOperator, ReparamOperator, RowwiseKroneckerOperator, SparseDesignMatrix, certified_quadratic_form_diag, dense_operator_to_dense_by_chunks, dense_transpose_weighted_response, fast_atv, fast_av, streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view};
     use crate::matrix::LinearOperator;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
     use gam_runtime::resource::{MaterializationPolicy, MatrixMaterializationError, ResourcePolicy};
@@ -7938,5 +7961,94 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #4113: the finished diagonal keeps every finite entry, sets rounding
+    /// drift below zero to zero, and refuses `NaN`, `+∞` and `−∞`. The old
+    /// `f64::max(0.0)` returned `0.0` for `NaN` and `−∞`.
+    #[test]
+    fn certified_quadratic_form_diag_refuses_non_finite_and_clamps_drift() {
+        let kept = certified_quadratic_form_diag("Test", array![1.5, -1e-18, 0.0, 7.25])
+            .expect("a finite diagonal is certified");
+        assert_eq!(kept, array![1.5, 0.0, 0.0, 7.25]);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = certified_quadratic_form_diag("Test", array![1.0, 2.0, bad])
+                .expect_err("a non-finite diagonal entry has no variance");
+            assert!(
+                error.contains("Test::quadratic_form_diag") && error.contains("at row 2"),
+                "error names the operator and the row: {error}"
+            );
+        }
+    }
+
+    /// #4113: a `NaN` in the middle matrix reaches `diag(X M Xᵀ)` on the dense,
+    /// sparse and one-hot random-effect paths, and each now returns an error
+    /// where it used to return a zero variance.
+    #[test]
+    fn quadratic_form_diag_refuses_non_finite_middle_on_dense_sparse_and_random_effect() {
+        let x = array![[1.0, 2.0], [3.0, -1.0], [0.5, 4.0]];
+        let mut middle = array![[2.0, 0.5], [0.5, 1.0]];
+        middle[[1, 1]] = f64::NAN;
+
+        let dense = DesignMatrix::Dense(DenseDesignMatrix::from(x.clone()));
+        let error = DenseDesignOperator::quadratic_form_diag(&dense, &middle)
+            .expect_err("dense diag(X M Xᵀ) with a NaN middle");
+        assert!(error.contains("DenseDesignMatrix"), "{error}");
+
+        let triplets: Vec<Triplet<usize, usize, f64>> = x
+            .indexed_iter()
+            .map(|((row, col), &value)| Triplet::new(row, col, value))
+            .collect();
+        let sparse = DesignMatrix::from(
+            SparseColMat::try_new_from_triplets(3, 2, &triplets).expect("sparse fixture"),
+        );
+        let error = DenseDesignOperator::quadratic_form_diag(&sparse, &middle)
+            .expect_err("sparse diag(X M Xᵀ) with a NaN middle");
+        assert!(error.contains("SparseDesignMatrix"), "{error}");
+
+        let random_effect = RandomEffectOperator::new(vec![Some(0), None, Some(1)], 2);
+        let error = random_effect
+            .quadratic_form_diag(&middle)
+            .expect_err("random-effect diag(X M Xᵀ) with a NaN variance");
+        assert!(error.contains("RandomEffectOperator"), "{error}");
+        let mut negative_infinite = array![[2.0, 0.5], [0.5, 1.0]];
+        negative_infinite[[0, 0]] = f64::NEG_INFINITY;
+        let error = random_effect
+            .quadratic_form_diag(&negative_infinite)
+            .expect_err("random-effect diag(X M Xᵀ) with a −∞ variance");
+        assert!(error.contains("-inf at row 0"), "{error}");
+    }
+
+    /// #4113: with a finite middle matrix the certified diagonal is exactly
+    /// `diag(X M Xᵀ)`. The fixture is dyadic, so every path is exact in `f64`.
+    #[test]
+    fn quadratic_form_diag_is_exact_for_finite_middle() {
+        let x = array![[1.0, 2.0], [3.0, -1.0], [0.5, 4.0]];
+        let middle = array![[2.0, 0.5], [0.5, 1.0]];
+        let expected = array![8.0, 16.0, 18.5];
+
+        let dense = DesignMatrix::Dense(DenseDesignMatrix::from(x.clone()));
+        assert_eq!(
+            DenseDesignOperator::quadratic_form_diag(&dense, &middle).expect("dense"),
+            expected
+        );
+
+        let triplets: Vec<Triplet<usize, usize, f64>> = x
+            .indexed_iter()
+            .map(|((row, col), &value)| Triplet::new(row, col, value))
+            .collect();
+        let sparse = DesignMatrix::from(
+            SparseColMat::try_new_from_triplets(3, 2, &triplets).expect("sparse fixture"),
+        );
+        assert_eq!(
+            DenseDesignOperator::quadratic_form_diag(&sparse, &middle).expect("sparse"),
+            expected
+        );
+
+        let random_effect = RandomEffectOperator::new(vec![Some(0), None, Some(1)], 2);
+        assert_eq!(
+            random_effect.quadratic_form_diag(&middle).expect("random effect"),
+            array![2.0, 0.0, 1.0]
+        );
     }
 }
