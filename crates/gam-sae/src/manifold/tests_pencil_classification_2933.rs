@@ -950,7 +950,7 @@ fn the_metric_derivative_differentiates_the_conditioned_evidence_factor_2933() {
         ((i + j + 1) as f64 * 0.23).cos() / (1.0 + (i as f64 - j as f64).abs())
     });
     let (trace, _) = term
-        .evidence_metric_derivative_channels(&rho, target.view(), &cache, &weight)
+        .evidence_metric_derivative_channels(&rho, target.view(), &cache, &weight, None)
         .expect("metric derivative channels");
 
     let mut coordinates: Vec<(usize, Box<dyn Fn(&mut SaeManifoldRho, f64)>)> = Vec::new();
@@ -1042,7 +1042,7 @@ fn the_metric_derivative_differentiates_the_evidence_factor_along_the_state_2933
             ((i + 2 * j + 1) as f64 * 0.19).sin() + ((2 * i + j + 1) as f64 * 0.19).sin()
         });
         let (_, gamma) = term
-            .evidence_metric_derivative_channels(&rho, target.view(), &cache, &weight)
+            .evidence_metric_derivative_channels(&rho, target.view(), &cache, &weight, None)
             .expect("metric derivative channels");
         let dt = Array1::from_shape_fn(total_t, |i| ((i + 1) as f64 * 0.61).sin());
         let db = Array1::from_shape_fn(k, |j| ((j + 2) as f64 * 0.43).cos());
