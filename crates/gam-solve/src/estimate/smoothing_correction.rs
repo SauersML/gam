@@ -486,6 +486,64 @@ pub(crate) fn eigenpair_residual_bounds(
     Ok(bounds)
 }
 
+/// The η band of the structural pseudo-inverse `Σ_{a ∈ active} v_a v_aᵀ/σ_a`
+/// of `matrix`, certified against its projector (#4038):
+/// [`gam_linalg::roundoff::psd_pseudo_inverse_backward_band`] at the active
+/// eigenvectors' own measured orthonormality defect and eigen-residual.
+///
+/// The residual is taken against `Σ̃ = diag(1/s_a)`, `s_a = fl(1/σ_a)`, the
+/// eigenvalues the accumulated inverse actually carries. Per pair,
+/// [`eigenpair_residual_bounds`] bounds `‖H v_a − σ_a v_a‖₂`; with
+/// `|σ_a − 1/s_a| ≤ γ_1·σ_a` and rows of `V_a` of norm at most `√(1 + ω)`,
+/// `‖H V_a − V_a Σ̃‖₂ ≤ √(Σ_a b_a²) + √(1 + ω)·γ_1·max σ_a`.
+fn structural_pseudo_inverse_band(
+    matrix: &Array2<f64>,
+    matrix_max_abs: f64,
+    eigenvalues: &Array1<f64>,
+    eigenvectors: &Array2<f64>,
+    active_columns: &[usize],
+) -> Result<f64, String> {
+    let dimension = matrix.nrows();
+    let rank = active_columns.len();
+    if rank == 0 {
+        return Ok(gam_linalg::roundoff::psd_pseudo_inverse_backward_band(
+            dimension,
+            0,
+            matrix_max_abs,
+            0.0,
+            0.0,
+        ));
+    }
+    let pair_bounds = eigenpair_residual_bounds(matrix, eigenvalues, eigenvectors)?;
+    let mut active = Array2::<f64>::zeros((dimension, rank));
+    let mut squared_residual = 0.0_f64;
+    let mut max_eigenvalue = 0.0_f64;
+    for (slot, &column) in active_columns.iter().enumerate() {
+        active.column_mut(slot).assign(&eigenvectors.column(column));
+        squared_residual += pair_bounds[column] * pair_bounds[column];
+        max_eigenvalue = max_eigenvalue.max(eigenvalues[column]);
+    }
+    let mut gram_defect = active.t().dot(&active);
+    for index in 0..rank {
+        gram_defect[[index, index]] -= 1.0;
+    }
+    let gram_defect_frobenius = gram_defect.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let orthonormality_defect =
+        gam_linalg::roundoff::orthonormality_defect_bound(gram_defect_frobenius, dimension, rank);
+    let reciprocal_shift = (1.0 + orthonormality_defect).sqrt()
+        * gam_linalg::roundoff::accumulation_growth(1)
+        * max_eigenvalue;
+    let eigen_residual = gam_math::roundoff::inflated(squared_residual.sqrt(), rank)
+        + gam_math::roundoff::inflated(reciprocal_shift, 2);
+    Ok(gam_linalg::roundoff::psd_pseudo_inverse_backward_band(
+        dimension,
+        rank,
+        matrix_max_abs,
+        eigen_residual,
+        orthonormality_defect,
+    ))
+}
+
 /// Invert the ρ-Hessian on the subspace where its curvature is actually
 /// resolvable, judged by the SAME standard the outer certificate used to accept
 /// this ρ̂ (#2428).
@@ -876,8 +934,12 @@ pub fn invert_identified_rho_hessian_off_railed(
         }
     }
 
-    let mut inverse = Array2::<f64>::zeros((n, n));
-    let mut projector = Array2::<f64>::zeros((n, n));
+    // The pseudo-inverse and its projector are accumulated in the coordinates
+    // the spectrum was taken in (`work`), where they are certified below, and
+    // lifted to ρ afterwards.
+    let mut work_inverse = Array2::<f64>::zeros((judged_dimension, judged_dimension));
+    let mut work_projector = Array2::<f64>::zeros((judged_dimension, judged_dimension));
+    let mut active_columns = Vec::with_capacity(judged_dimension);
     let mut classifications = Vec::with_capacity(n);
     let mut active_rank = 0usize;
     let mut structural_zero = 0usize;
@@ -923,11 +985,14 @@ pub fn invert_identified_rho_hessian_off_railed(
                         "positive rho curvature {sigma:.3e} has an unrepresentable reciprocal"
                     ));
                 }
-                let v = eigenvectors.column(i);
-                for row in 0..n {
-                    for col in 0..n {
-                        inverse[[row, col]] += inv_lambda * v[row] * v[col];
-                        projector[[row, col]] += v[row] * v[col];
+                // Active implies judged: `i ≥ unjudged_dimension`.
+                let judged_column = i - unjudged_dimension;
+                active_columns.push(judged_column);
+                let v = judged_eigenvectors.column(judged_column);
+                for row in 0..judged_dimension {
+                    for col in 0..judged_dimension {
+                        work_inverse[[row, col]] += inv_lambda * v[row] * v[col];
+                        work_projector[[row, col]] += v[row] * v[col];
                     }
                 }
             }
@@ -984,12 +1049,11 @@ pub fn invert_identified_rho_hessian_off_railed(
         });
     }
 
-    gam_linalg::matrix::symmetrize_in_place(&mut inverse);
     // Nothing was judged, so nothing was inverted: `V_ρ = 0` exactly and there
     // is no product to certify.
     if judged_dimension == 0 {
         return Ok(InvertedRhoHessian {
-            inverse,
+            inverse: Array2::<f64>::zeros((n, n)),
             active_rank,
             structural_zero,
             below_gradient_floor,
@@ -1010,29 +1074,37 @@ pub fn invert_identified_rho_hessian_off_railed(
     // term again, since `Q'·diag(λ)H_λ = (diag(λ)Q)'H_λ = 0` on the certified
     // null. Certifying the ρ-space product would therefore be re-testing the
     // gradient, at the one site whose whole purpose is to stop doing that.
-    let (certify_matrix, certify_inverse, certify_projector) = match judged.as_ref() {
-        Some(basis) => (
-            compressed.clone().expect("a judged basis implies a compression"),
-            basis.t().dot(&inverse).dot(basis),
-            basis.t().dot(&projector).dot(basis),
-        ),
-        None => (hessian_rho.clone(), inverse.clone(), projector.clone()),
-    };
     let matrix_max_abs = gam_linalg::utils::validate_finite_symmetric_matrix(
-        &certify_matrix,
+        work,
         "structurally singular rho Hessian",
     )
     .map_err(|error| error.to_string())?;
-    let residual = certify_matrix.dot(&certify_inverse) - &certify_projector;
-    gam_linalg::utils::certify_linear_system_residual(
-        certify_matrix.nrows(),
+    let certificate_band = structural_pseudo_inverse_band(
+        work,
         matrix_max_abs,
-        &certify_projector,
-        &certify_inverse,
+        &judged_eigenvalues,
+        &judged_eigenvectors,
+        &active_columns,
+    )?;
+    let residual = work.dot(&work_inverse) - &work_projector;
+    gam_linalg::utils::certify_linear_system_residual(
+        judged_dimension,
+        matrix_max_abs,
+        &work_projector,
+        &work_inverse,
         &residual,
+        certificate_band,
         "rho-Hessian structural pseudoinverse",
     )
     .map_err(|error| error.to_string())?;
+    // Certified first, then lifted and projected onto the symmetric matrices:
+    // the pseudo-inverse is symmetric, so the projected error `(E + Eᵀ)/2` is
+    // no larger than `E`.
+    let mut inverse = match judged.as_ref() {
+        Some(basis) => basis.dot(&work_inverse).dot(&basis.t()),
+        None => work_inverse,
+    };
+    gam_linalg::matrix::symmetrize_in_place(&mut inverse);
 
     Ok(InvertedRhoHessian {
         inverse,

@@ -293,6 +293,9 @@ pub struct CertifiedSpdFactor<'a> {
     matrix: &'a Array2<f64>,
     matrix_max_abs: f64,
     factor: FaerCholeskyFactor,
+    /// The η band of this factor's solves against `matrix`: the Cholesky band
+    /// plus the symmetric-part defect of `matrix` (#4038).
+    solve_band: f64,
     label: String,
 }
 
@@ -317,6 +320,7 @@ impl CertifiedSpdFactor<'_> {
             self.matrix_max_abs,
             &rhs_matrix,
             &solution,
+            self.solve_band,
             &self.label,
         )?;
         Ok(CertifiedSymmetricSolution {
@@ -344,6 +348,7 @@ impl CertifiedSpdFactor<'_> {
             self.matrix_max_abs,
             rhs,
             &solution,
+            self.solve_band,
             &self.label,
         )?;
         Ok((solution, certificate))
@@ -353,16 +358,24 @@ impl CertifiedSpdFactor<'_> {
     pub fn inverse(&self) -> Result<CertifiedSpdInverse, CertifiedSymmetricSolveError> {
         let rhs = Array2::<f64>::eye(self.matrix.nrows());
         let mut inverse = self.factor.solve_mat(&rhs);
-        // Independent identity columns can differ by a few solve-roundoff bits;
-        // project those bits back to the analytic symmetry, then recertify.
-        symmetrize_in_place(&mut inverse);
+        // The band bounds the solve the factor performed, so the certificate
+        // reads those columns as solved.
         let certificate = certify_symmetric_matrix_solution(
             self.matrix,
             self.matrix_max_abs,
             &rhs,
             &inverse,
+            self.solve_band,
             &self.label,
         )?;
+        // Independent identity columns differ by solve-roundoff bits; project
+        // them onto the analytic symmetry. The projection `X ↦ (X + Xᵀ)/2` fixes
+        // the symmetric `A⁻¹`, so the projected error `(E + Eᵀ)/2` of
+        // `E = X̂ − A⁻¹` is no larger than `E` entrywise-max or in Frobenius
+        // norm: the returned inverse is at least as accurate as the certified
+        // columns. Their residual is NOT a bound on the projection's (`A·Eᵀ`
+        // carries `κ(A)`), which is why the certificate is taken first.
+        symmetrize_in_place(&mut inverse);
         Ok(CertifiedSpdInverse {
             inverse,
             certificate,
@@ -381,6 +394,8 @@ impl CertifiedSpdInverse {
         &self.inverse
     }
 
+    /// The certificate of the solved identity columns, taken before their
+    /// symmetrization (see [`CertifiedSpdFactor::inverse`]).
     #[inline]
     pub fn certificate(&self) -> SymmetricSolveCertificate {
         self.certificate
@@ -464,10 +479,14 @@ pub enum CertifiedSymmetricSolveError {
         allowed: f64,
         residual_max_abs: f64,
     },
+    #[error(
+        "{label}: the solve's derived backward-error band {allowed:?} is not a finite \
+         bound, so no residual certifies it"
+    )]
+    NoBackwardErrorBound { label: String, allowed: f64 },
 }
 
 const SYMMETRY_ULP_ALLOWANCE: f64 = 32.0;
-const SOLVE_ROUNDOFF_OPS_PER_DIMENSION: f64 = 256.0;
 
 #[inline]
 fn positive_ulp(value: f64) -> f64 {
@@ -602,10 +621,31 @@ fn max_norm_backward_error(
     (residual_max_abs.ln() - denominator_log).exp()
 }
 
-#[inline]
-fn solve_backward_error_allowance(dimension: usize) -> f64 {
-    let roundoff = SOLVE_ROUNDOFF_OPS_PER_DIMENSION * dimension as f64 * f64::EPSILON;
-    roundoff / (1.0 - roundoff)
+/// The η share of solving the symmetric matrix a factorization READ instead of
+/// the stored `matrix` the residual is formed with (#4038).
+///
+/// A dense symmetric factorization reads one triangle, so it solves the exact
+/// symmetric `A_L` mirrored from it, while the certificate forms `A·X̂ − B` with
+/// the stored `A`. `A·x̂ − b = (A_L·x̂ − b) + (A − A_L)·x̂`, and each row of the
+/// second term is at most `n·δ·‖x̂‖_max` for the largest mirrored-pair defect
+/// `δ = max |a_ij − a_ji|`, i.e. `δ/‖A‖_max` against the certificate's
+/// denominator. `A_L`'s entries are entries of `A`, so every band stated at
+/// `‖A‖_max` also holds for `A_L`. The measured defect is inflated for its
+/// subtraction and the division.
+pub fn symmetric_part_defect_band(matrix: &Array2<f64>, matrix_max_abs: f64) -> f64 {
+    let mut defect = 0.0_f64;
+    for row in 0..matrix.nrows() {
+        for col in 0..row {
+            defect = defect.max((matrix[[row, col]] - matrix[[col, row]]).abs());
+        }
+    }
+    if defect == 0.0 {
+        return 0.0;
+    }
+    if !(matrix_max_abs > 0.0) {
+        return f64::INFINITY;
+    }
+    gam_math::roundoff::inflated(defect / matrix_max_abs, 1)
 }
 
 fn certify_symmetric_matrix_solution(
@@ -613,6 +653,7 @@ fn certify_symmetric_matrix_solution(
     matrix_max_abs: f64,
     rhs: &Array2<f64>,
     solution: &Array2<f64>,
+    allowed_backward_error: f64,
     label: &str,
 ) -> Result<SymmetricSolveCertificate, CertifiedSymmetricSolveError> {
     let residual = matrix.dot(solution) - rhs;
@@ -622,12 +663,20 @@ fn certify_symmetric_matrix_solution(
         rhs,
         solution,
         &residual,
+        allowed_backward_error,
         label,
     )
 }
 
 /// Certify a solve performed by an exact dense or sparse factorization from
 /// its residual `A X - B` and the exact matrix max-entry norm.
+///
+/// `allowed_backward_error` is the band of the algorithm that produced `X`:
+/// an upper bound on the η it can reach in binary64, derived from that
+/// algorithm's backward-error analysis and measured on its own factor (the
+/// `*_backward_band` functions of [`crate::roundoff`]). The certificate is
+/// therefore a proof that the residual is rounding and not a failed solve; a
+/// band that is not finite proves nothing and is refused (#4038).
 ///
 /// This is the shared certification boundary for operator-backed systems that
 /// cannot materialize `A` merely to call [`certified_symmetric_solve`].  It does
@@ -639,6 +688,7 @@ pub fn certify_linear_system_residual(
     rhs: &Array2<f64>,
     solution: &Array2<f64>,
     residual: &Array2<f64>,
+    allowed_backward_error: f64,
     label: &str,
 ) -> Result<SymmetricSolveCertificate, CertifiedSymmetricSolveError> {
     if dimension == 0
@@ -698,7 +748,12 @@ pub fn certify_linear_system_residual(
         rhs_max_abs,
         residual_max_abs,
     );
-    let allowed_backward_error = solve_backward_error_allowance(dimension);
+    if !(allowed_backward_error.is_finite() && allowed_backward_error >= 0.0) {
+        return Err(CertifiedSymmetricSolveError::NoBackwardErrorBound {
+            label: label.to_string(),
+            allowed: allowed_backward_error,
+        });
+    }
     if !max_norm_backward_error.is_finite() || max_norm_backward_error > allowed_backward_error {
         return Err(CertifiedSymmetricSolveError::BackwardErrorTooLarge {
             label: label.to_string(),
@@ -750,8 +805,16 @@ fn certified_symmetric_matrix_solve(
     let mut solution = rhs.clone();
     let mut solution_view = array2_to_matmut(&mut solution);
     factor.solve_in_place(solution_view.as_mut());
-    let certificate =
-        certify_symmetric_matrix_solution(matrix, matrix_max_abs, rhs, &solution, label)?;
+    let allowed_backward_error = factor.solve_backward_band(matrix_max_abs)
+        + symmetric_part_defect_band(matrix, matrix_max_abs);
+    let certificate = certify_symmetric_matrix_solution(
+        matrix,
+        matrix_max_abs,
+        rhs,
+        &solution,
+        allowed_backward_error,
+        label,
+    )?;
     Ok((solution, certificate))
 }
 
@@ -786,10 +849,13 @@ pub fn certified_spd_factorize<'a>(
             reason: error.to_string(),
         }
     })?;
+    let solve_band = crate::roundoff::cholesky_solve_backward_band(matrix.nrows())
+        + symmetric_part_defect_band(matrix, matrix_max_abs);
     Ok(CertifiedSpdFactor {
         matrix,
         matrix_max_abs,
         factor,
+        solve_band,
         label: label.to_string(),
     })
 }
@@ -1688,6 +1754,62 @@ mod certified_inverse_tests {
         );
         let residual = matrix.dot(solved.solution()) - &rhs;
         assert!(residual.iter().all(|value| value.is_finite()));
+    }
+
+    /// The Cholesky band has no growth or condition term, so an ill-conditioned
+    /// SPD matrix (Hilbert, `κ₂ ≈ 1.5e10` at `n = 8`) certifies at it: the
+    /// residual of a backward-stable solve is small regardless of `κ` (#4038).
+    #[test]
+    fn ill_conditioned_spd_solve_certifies_at_the_cholesky_band_4038() {
+        let dimension = 8;
+        let hilbert =
+            Array2::from_shape_fn((dimension, dimension), |(i, j)| 1.0 / (i + j + 1) as f64);
+        let certified = certified_spd_inverse(&hilbert, "Hilbert inverse").unwrap();
+        let certificate = certified.certificate();
+        assert_eq!(
+            certificate.allowed_backward_error,
+            crate::roundoff::cholesky_solve_backward_band(dimension)
+        );
+        assert!(certificate.max_norm_backward_error <= certificate.allowed_backward_error);
+        assert!(certificate.allowed_backward_error < 256.0 * dimension as f64 * f64::EPSILON);
+    }
+
+    /// An indefinite system that needs 2×2 pivots certifies at the band priced
+    /// by its own factor's growth, and that band is what the certificate reports.
+    #[test]
+    fn indefinite_solve_certifies_at_its_factor_growth_band_4038() {
+        let dimension = 12;
+        let matrix = Array2::from_shape_fn((dimension, dimension), |(i, j)| {
+            if i == j {
+                if i % 2 == 0 { 1.0e-3 } else { -2.0e-3 }
+            } else {
+                ((i * 7 + j * 7) % 11) as f64 / 11.0 - 0.5
+            }
+        });
+        let rhs = Array1::from_shape_fn(dimension, |i| (i as f64 + 1.0).sin());
+        let solved = certified_symmetric_solve(&matrix, &rhs, "indefinite growth").unwrap();
+        let certificate = solved.certificate();
+        assert!(certificate.allowed_backward_error.is_finite());
+        assert!(certificate.max_norm_backward_error <= certificate.allowed_backward_error);
+        assert!(
+            certificate.allowed_backward_error
+                >= crate::roundoff::cholesky_solve_backward_band(dimension)
+        );
+    }
+
+    /// A band that is not a finite bound certifies nothing, even at an exact
+    /// residual.
+    #[test]
+    fn a_non_finite_band_refuses_even_an_exact_residual_4038() {
+        let rhs = array![[1.0], [2.0]];
+        let solution = array![[1.0], [2.0]];
+        let residual = array![[0.0], [0.0]];
+        for band in [f64::INFINITY, f64::NAN, -1.0] {
+            assert!(matches!(
+                certify_linear_system_residual(2, 1.0, &rhs, &solution, &residual, band, "no band"),
+                Err(CertifiedSymmetricSolveError::NoBackwardErrorBound { .. })
+            ));
+        }
     }
 
     #[test]
