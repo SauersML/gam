@@ -131,38 +131,55 @@ pub(crate) fn apply_linear_extension_from_first_derivative(
         crate::bail_dim_basis!("basis row count must match z length");
     }
 
-    let mut needs_ext = false;
-    for i in 0..z_raw.len() {
-        if z_raw[i] != z_clamped[i] {
-            needs_ext = true;
-            break;
-        }
-    }
-    if !needs_ext {
+    let Some((exterior, b_prime)) =
+        exterior_boundary_slopes(z_raw, z_clamped, knot_vector, degree)?
+    else {
         return Ok(());
+    };
+    if b_prime.ncols() != basisvalues.ncols() {
+        crate::bail_dim_basis!("basis derivative shape mismatch");
     }
 
+    for (slope_row, &i) in exterior.iter().enumerate() {
+        let dz = z_raw[i] - z_clamped[i];
+        for j in 0..basisvalues.ncols() {
+            basisvalues[[i, j]] += dz * b_prime[[slope_row, j]];
+        }
+    }
+    Ok(())
+}
+
+/// Returns the rows whose point was clamped, together with the first-derivative
+/// basis evaluated at those rows' clamped points (one derivative row per
+/// exterior row, in the same order), or `None` when every point is interior.
+///
+/// Each basis row depends on its own point only, so these rows equal the
+/// matching rows of a full-length derivative basis. Evaluating only the
+/// exterior rows keeps a design with a few out-of-range points from paying for
+/// a second complete basis evaluation.
+pub(crate) fn exterior_boundary_slopes(
+    z_raw: ArrayView1<f64>,
+    z_clamped: ArrayView1<f64>,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+) -> Result<Option<(Vec<usize>, Arc<Array2<f64>>)>, BasisError> {
+    let exterior: Vec<usize> = (0..z_raw.len())
+        .filter(|&i| z_raw[i] != z_clamped[i])
+        .collect();
+    if exterior.is_empty() {
+        return Ok(None);
+    }
+    let exterior_clamped: Array1<f64> = exterior.iter().map(|&i| z_clamped[i]).collect();
     let (b_prime_arc, _) = create_basis::<Dense>(
-        z_clamped,
+        exterior_clamped.view(),
         KnotSource::Provided(knot_vector),
         degree,
         BasisOptions::first_derivative(),
     )?;
-    let b_prime = b_prime_arc.as_ref();
-    if b_prime.nrows() != basisvalues.nrows() || b_prime.ncols() != basisvalues.ncols() {
+    if b_prime_arc.nrows() != exterior.len() {
         crate::bail_dim_basis!("basis derivative shape mismatch");
     }
-
-    for i in 0..z_raw.len() {
-        let dz = z_raw[i] - z_clamped[i];
-        if dz == 0.0 {
-            continue;
-        }
-        for j in 0..basisvalues.ncols() {
-            basisvalues[[i, j]] += dz * b_prime[[i, j]];
-        }
-    }
-    Ok(())
+    Ok(Some((exterior, b_prime_arc)))
 }
 
 /// Storage layout discriminant for [`BasisOutputFormat`] impls. Encoded as an

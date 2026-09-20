@@ -67,7 +67,7 @@ use ndarray::{Array1, Array2};
 pub use gam_problem::rho_posterior::{
     ESCALATE_K_HAT, PLUG_IN_ADEQUATE_K_HAT, RhoMixtureNode, RhoPosteriorAdequacy,
     RhoPosteriorEscalation, RhoPosteriorMixture, RhoPosteriorNotComputed, RhoPosteriorOutcome,
-    RhoPosteriorRefusal, RhoPosteriorSamples, RhoProposalAdequacy,
+    RhoPosteriorRefusal, RhoPosteriorSamples, RhoProposalAdequacy, WeightTailShape,
 };
 
 /// Monolith (gam-inference-tier) implementor of the contract-downed
@@ -587,14 +587,27 @@ where
             }
             rho_m[i] += acc;
         }
-        let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
-        // log w_m = −criterion(ρ_m) + criterion(ρ̂) + ½‖z_m‖².
+        // The proposal's −log density at the draw it actually made,
+        // ½(ρ_m − ρ̂)ᵀ H_ρ (ρ_m − ρ̂). It equals ½‖z_m‖² in exact arithmetic,
+        // but ρ_m is rounded, and the weight is target over proposal at ONE
+        // point: valuing the proposal at the unrounded draw puts rounding noise
+        // in every weight of an exact proposal, which then has a spurious
+        // tail instead of the flat one it has (#3202).
+        let mut quad = 0.0;
+        for i in 0..k {
+            let di = rho_m[i] - rho_hat[i];
+            for j in 0..k {
+                quad += di * outer_hessian[[i, j]] * (rho_m[j] - rho_hat[j]);
+            }
+        }
+        let half_quad = 0.5 * quad;
+        // log w_m = −criterion(ρ_m) + criterion(ρ̂) + ½(ρ_m − ρ̂)ᵀ H_ρ (ρ_m − ρ̂).
         let cost = criterion(&rho_m)
             .map_err(|detail| RhoPosteriorRefusal::CriterionUnavailableAtDraw { draw, detail })?;
         if !cost.is_finite() {
             return Err(RhoPosteriorRefusal::CriterionNotFiniteAtDraw { draw });
         }
-        raw_weights.push(-cost + cost_hat + half_norm_sq);
+        raw_weights.push(-cost + cost_hat + half_quad);
     }
 
     // Stabilize and exponentiate: subtract the max log-weight (cancels in the
@@ -603,8 +616,9 @@ where
     let weights: Vec<f64> = raw_weights.iter().map(|&lw| (lw - max_lw).exp()).collect();
 
     let psis = pareto_smooth_weights(&weights).ok_or(RhoPosteriorRefusal::TailFitUnavailable)?;
-    let k_hat = psis.k_hat;
-    if !k_hat.is_finite() {
+    if let WeightTailShape::Pareto(k_hat) = psis.shape
+        && !k_hat.is_finite()
+    {
         return Err(RhoPosteriorRefusal::TailShapeNotFinite);
     }
 
@@ -624,25 +638,31 @@ where
         .sum();
 
     Ok(Some(RhoPosteriorAdequacy {
-        k_hat,
-        adequacy: RhoProposalAdequacy::from_k_hat(k_hat),
+        tail_shape: psis.shape,
+        adequacy: RhoProposalAdequacy::from_tail_shape(psis.shape),
         n_samples: m,
         effective_sample_size: 1.0 / sum_sq,
     }))
 }
 
-/// Standard error of `adequacy.k_hat`, the resolution of its grade (#2946 T2).
+/// Standard error of the fitted `k̂` in `adequacy.tail_shape`, the resolution
+/// of its grade (#2946 T2).
 ///
 /// It is [`gam_solve::psis::shape_standard_error`] at the tail sample
 /// [`gam_solve::psis::tail_count`]`(n_samples)` that the Pareto fit used,
 /// evaluated at the reported shape as a plug-in for the true one. A grade whose
-/// `k_hat` lies within a few of these of [`PLUG_IN_ADEQUATE_K_HAT`] or
+/// `k̂` lies within a few of these of [`PLUG_IN_ADEQUATE_K_HAT`] or
 /// [`ESCALATE_K_HAT`] does not say which side of that cutoff the truth is on.
-pub fn k_hat_standard_error(adequacy: &RhoPosteriorAdequacy) -> f64 {
-    gam_solve::psis::shape_standard_error(
-        gam_solve::psis::tail_count(adequacy.n_samples),
-        adequacy.k_hat,
-    )
+/// A flat tail fitted no shape, so it has none (`None`): its grade is read off
+/// the weights exactly.
+pub fn k_hat_standard_error(adequacy: &RhoPosteriorAdequacy) -> Option<f64> {
+    match adequacy.tail_shape {
+        WeightTailShape::Pareto(k_hat) => Some(gam_solve::psis::shape_standard_error(
+            gam_solve::psis::tail_count(adequacy.n_samples),
+            k_hat,
+        )),
+        WeightTailShape::Flat => None,
+    }
 }
 
 #[cfg(test)]
@@ -653,7 +673,8 @@ mod tests {
     /// CLOSED-FORM FIXTURE: when the criterion IS exactly the Gaussian
     /// `−log π(ρ|y) = ½(ρ−ρ̂)ᵀ H_ρ (ρ−ρ̂)` that the Laplace proposal assumes,
     /// the importance weights are all identically 1 — the proposal is the
-    /// target. PSIS must then report a tiny `k̂` and grade the plug-in adequate.
+    /// target. The weights then have no tail at all, so PSIS reports the flat
+    /// shape, ESS is `M` exactly, and the plug-in grades adequate (#3202).
     #[test]
     fn exact_gaussian_target_grades_plug_in_adequate() {
         let rho_hat = array![0.3, -0.7];
@@ -673,18 +694,34 @@ mod tests {
         let graded = rho_posterior_adequacy(&rho_hat, &h, crit, Some(256))
             .expect("diagnostic formed")
             .expect("diagnostic present");
-        // All weights equal ⇒ ESS == M and k̂ small ⇒ plug-in adequate.
-        assert!(
-            (graded.effective_sample_size - graded.n_samples as f64).abs() < 1e-6,
-            "uniform weights must give ESS == M: ess={} M={}",
-            graded.effective_sample_size,
-            graded.n_samples
-        );
-        assert!(
-            graded.k_hat < 0.5,
-            "exact-Gaussian target must yield small k̂, got {}",
-            graded.k_hat
-        );
+        // The criterion and the proposal value each draw by the same
+        // arithmetic, so every log-weight is exactly 0 and every weight 1:
+        // M = 256 sums, normalizes and squares without rounding.
+        assert_eq!(graded.tail_shape, WeightTailShape::Flat);
+        assert_eq!(graded.effective_sample_size, graded.n_samples as f64);
+        assert_eq!(graded.adequacy, RhoProposalAdequacy::PlugInAdequate);
+        assert_eq!(k_hat_standard_error(&graded), None);
+    }
+
+    /// #3202 repro: 1-D, `ρ̂ = 1`, `H = [[1]]`, `c(ρ) = ½(ρ − 1)²`, `M = 64`.
+    /// The proposal is exact. Valued at the unrounded draw `z` rather than at
+    /// `ρ_m = ρ̂ + z`, the log-weights were rounding noise with only a few
+    /// distinct values in the tail, too few positive excesses to fit, and the
+    /// best possible proposal was refused as `TailFitUnavailable`.
+    #[test]
+    fn exact_one_dimensional_proposal_is_flat_not_refused_3202() {
+        let rho_hat = array![1.0];
+        let h = array![[1.0]];
+        let crit = |rho: &Array1<f64>| {
+            let d = rho[0] - 1.0;
+            Ok(0.5 * d * d)
+        };
+        let graded = rho_posterior_adequacy(&rho_hat, &h, crit, Some(64))
+            .expect("an exact proposal is graded, not refused")
+            .expect("diagnostic present");
+        assert_eq!(graded.tail_shape, WeightTailShape::Flat);
+        assert_eq!(graded.n_samples, 64);
+        assert_eq!(graded.effective_sample_size, 64.0);
         assert_eq!(graded.adequacy, RhoProposalAdequacy::PlugInAdequate);
     }
 
@@ -705,11 +742,10 @@ mod tests {
         let graded = rho_posterior_adequacy(&rho_hat, &h, crit, Some(512))
             .expect("diagnostic formed")
             .expect("diagnostic present");
-        assert!(
-            graded.k_hat > 0.5,
-            "heavy-tailed target must raise k̂ above 0.5, got {}",
-            graded.k_hat
-        );
+        let WeightTailShape::Pareto(k_hat) = graded.tail_shape else {
+            panic!("a heavy-tailed target has a tail to fit, got {:?}", graded.tail_shape);
+        };
+        assert!(k_hat > 0.5, "heavy-tailed target must raise k̂ above 0.5, got {k_hat}");
         // This used to be `assert_ne!(.., PlugInAdequate)`, which is ENTAILED
         // by the `k̂ > 0.5` assertion five lines up: `PlugInAdequate` is
         // DEFINED as `k̂ < 0.5`. It could not distinguish `ImportanceCorrect`
@@ -720,13 +756,12 @@ mod tests {
         // tiers, and unlike a hard-coded expected tier it cannot go stale if
         // the fixture's k̂ drifts within a band -- while still failing loudly if
         // the thresholds are ever rewired.
-        let expected = RhoProposalAdequacy::from_k_hat(graded.k_hat);
+        let expected = RhoProposalAdequacy::from_k_hat(k_hat);
         assert_eq!(
             graded.adequacy, expected,
-            "the adequacy grade must follow from k̂ = {} by the documented \
+            "the adequacy grade must follow from k̂ = {k_hat} by the documented \
              thresholds (k̂ < 0.5 PlugInAdequate, ≤ 0.7 ImportanceCorrect, \
-             else Escalate)",
-            graded.k_hat
+             else Escalate)"
         );
         assert!(
             matches!(
@@ -742,9 +777,11 @@ mod tests {
     fn effective_sample_size_is_bounded_and_deterministic() {
         let rho_hat = array![1.0];
         let h = array![[1.0]];
+        // A quartic excess over the proposal quadratic, so the weights carry a
+        // genuine tail and the determinism check covers a fitted `k̂`.
         let crit = |rho: &Array1<f64>| {
             let d = rho[0] - 1.0;
-            Ok(0.5 * d * d)
+            Ok(0.5 * d * d + d * d * d * d / 24.0)
         };
         let a = rho_posterior_adequacy(&rho_hat, &h, crit, Some(64))
             .expect("a formed")
@@ -763,7 +800,12 @@ mod tests {
             "ESS must lie in [1, M = {m}], got {ess}"
         );
         // Deterministic: identical k̂ across runs (fixed-seed stream).
-        assert_eq!(a.k_hat.to_bits(), b.k_hat.to_bits());
+        let (WeightTailShape::Pareto(k_a), WeightTailShape::Pareto(k_b)) =
+            (a.tail_shape, b.tail_shape)
+        else {
+            panic!("a quartic target has a tail to fit: {:?}, {:?}", a.tail_shape, b.tail_shape);
+        };
+        assert_eq!(k_a.to_bits(), k_b.to_bits());
     }
 
     /// #2946 T2: a fit's `k̂` resolution is the Pareto shape error at the tail
@@ -773,19 +815,19 @@ mod tests {
     #[test]
     fn k_hat_standard_error_reads_the_fits_own_tail_2946() {
         let at_cutoff = RhoPosteriorAdequacy {
-            k_hat: ESCALATE_K_HAT,
+            tail_shape: WeightTailShape::Pareto(ESCALATE_K_HAT),
             adequacy: RhoProposalAdequacy::from_k_hat(ESCALATE_K_HAT),
             n_samples: DEFAULT_M,
             effective_sample_size: 10.0,
         };
-        let se = k_hat_standard_error(&at_cutoff);
+        let se = k_hat_standard_error(&at_cutoff).expect("a fitted shape has a resolution");
         assert_eq!(
             se.to_bits(),
             gam_solve::psis::shape_standard_error(8, ESCALATE_K_HAT).to_bits()
         );
         assert!((se - 0.27).abs() < 0.005, "{se}");
         let larger = RhoPosteriorAdequacy { n_samples: 512, ..at_cutoff.clone() };
-        assert!(k_hat_standard_error(&larger) < se);
+        assert!(k_hat_standard_error(&larger).expect("a fitted shape has a resolution") < se);
     }
 
     #[test]

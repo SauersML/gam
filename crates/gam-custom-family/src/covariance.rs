@@ -1189,23 +1189,8 @@ pub(crate) fn penalized_hessian_from_owned_mode(
     let mut h = unpenalized_hessian.clone();
     for (b, spec) in specs.iter().enumerate() {
         let (start, end) = ranges[b];
-        let lambdas = exact_lambdas_from_log_strengths(
-            &per_block_log_lambdas[b],
-            &format!("owned returned-beta block {b} log strength"),
-        )?;
-        if lambdas.len() != spec.penalties.len() {
-            return Err(CustomFamilyError::DimensionMismatch {
-                reason: format!(
-                    "owned returned-beta block {b} has {} smoothing strengths, expected {}",
-                    lambdas.len(),
-                    spec.penalties.len(),
-                ),
-            });
-        }
-        let mut s_lambda = Array2::<f64>::zeros((end - start, end - start));
-        for (k, s) in spec.penalties.iter().enumerate() {
-            s.add_scaled_to(lambdas[k], &mut s_lambda);
-        }
+        // The block curvature every other consumer reads, on the roots (#2954).
+        let s_lambda = crate::blockwise_solve::block_s_lambda(b, spec, &per_block_log_lambdas[b])?;
         h.slice_mut(ndarray::s![start..end, start..end])
             .scaled_add(1.0, &s_lambda);
     }
@@ -2234,7 +2219,9 @@ pub(crate) fn joint_penalty_subspace_trace_parts(
     let m_slice = m_evals
         .as_slice()
         .expect("eigh returns an owned standard-layout eigenvalue vector");
-    let kept = laplace_precision_kept_eigenpairs(m_slice, penalty_rank);
+    let kept = laplace_precision_kept_eigenpairs(m_slice, penalty_rank).map_err(|reason| {
+        CustomFamilyError::trial_point(format!("joint penalty subspace: {reason}"))
+    })?;
     let logdet: f64 = kept.iter().map(|&eig_idx| m_evals[eig_idx].ln()).sum();
     // Full Moore–Penrose pseudo-inverse `M⁺` (drop ker(H+Sλ)) in spectral
     // form: kept eigenvectors as the kernel basis, diag(1/σ) as the reduced

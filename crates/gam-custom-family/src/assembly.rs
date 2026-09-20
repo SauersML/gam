@@ -46,31 +46,46 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
     CustomFamilyError,
 > {
     use gam_problem::PenaltyCoordinate;
-    use gam_solve::estimate::reml::assembly::{
-        InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
-    };
+    use gam_solve::estimate::reml::assembly::InnerAssembly;
 
-    // Collect dense penalty matrices so references stay valid for the assembler.
-    let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = {
+    // The penalty's structural roots (#2954): the criterion's value (the inner
+    // result's `penalty_value`), its ρ-gradient coordinates and its `log|S|₊`
+    // below all read these, so they describe one function. Each block's roots
+    // depend only on that block's penalties.
+    let per_block_roots = {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         (0..specs.len())
             .into_par_iter()
-            .map(|b| specs[b].penalties.iter().map(|p| p.to_dense()).collect())
-            .collect()
+            .map(|b| crate::blockwise_solve::block_penalty_roots(b, &specs[b], &per_block[b]))
+            .collect::<Result<Vec<_>, CustomFamilyError>>()?
     };
-    let block_descs: Vec<PenaltyBlockDesc> = (0..specs.len())
-        .flat_map(|b| {
-            let (start, end) = ranges[b];
-            per_block_penalties_dense[b]
+    // Each penalty as `RᵀR`, the matrix its root defines, for the pseudo-logdet.
+    let per_block_penalties_dense: Vec<Vec<Array2<f64>>> = per_block_roots
+        .iter()
+        .enumerate()
+        .map(|(b, (_, terms))| {
+            let width = ranges[b].1 - ranges[b].0;
+            terms
                 .iter()
-                .map(move |dense| PenaltyBlockDesc {
-                    matrix: dense,
-                    range_start: start,
-                    range_end: end,
-                })
+                .map(|term| term.embedded_penalty(width))
+                .collect()
         })
         .collect();
-    let mut penalty_coords = penalty_coords_from_blocks(&block_descs, total)?;
+    let mut penalty_coords: Vec<PenaltyCoordinate> = per_block_roots
+        .iter()
+        .enumerate()
+        .flat_map(|(b, (_, terms))| {
+            let start = ranges[b].0;
+            terms.iter().map(move |term| {
+                PenaltyCoordinate::from_block_root(
+                    term.root.as_ref().clone(),
+                    start + term.columns.start,
+                    start + term.columns.end,
+                    total,
+                )
+            })
+        })
+        .collect();
 
     // Compute penalty logdet derivatives.
     let mut per_block_penalties: Vec<&[Array2<f64>]> = per_block_penalties_dense
@@ -1875,38 +1890,6 @@ fn criterion_face_tangent(
         ActiveConstraintTangentGeometry::Tangent(z) => Some(z),
         ActiveConstraintTangentGeometry::FullyPinned => None,
     })
-}
-
-/// Evaluate the rho-only custom-family outer objective through the unified
-/// joint hyperpath with no external ψ coordinates attached.
-pub(crate) fn outerobjectivegradienthessian_internal<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    penalty_counts: &[usize],
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: gam_problem::RhoPrior,
-    eval_mode: EvalMode,
-) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
-    let hyper_layout = CustomFamilyHyperLayout::new(
-        vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()],
-        Vec::new(),
-        Array1::zeros(0),
-    )?;
-    evaluate_custom_family_hyper_internal(
-        family,
-        specs,
-        options,
-        penalty_counts,
-        rho,
-        &hyper_layout,
-        warm_start,
-        rho_prior,
-        eval_mode,
-    )
 }
 
 pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(

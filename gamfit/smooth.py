@@ -1064,9 +1064,9 @@ class Categorical(Smooth):
     """Sum-to-zero contrast for a categorical predictor.
 
     A "smooth" only in the gamfit-as-engine sense — really a random
-    effect with a ridge penalty on the level contrasts. Included here so
-    additive fits can mix continuous smooths and categorical factors in
-    one call.
+    effect whose ridge prices its sum-to-zero level effects, every level
+    alike. It carries no constant. Included here so additive fits can mix
+    continuous smooths and categorical factors in one call.
     """
 
     levels: Any = None                   # (N,) integer level codes

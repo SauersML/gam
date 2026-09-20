@@ -1402,6 +1402,7 @@ mod sphere_gpu_tests {
             max_degree: None,
             wahba_kernel: SphereWahbaKernel::SobolevTruncated { lmax },
             identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+            adaptive_degree: false,
         };
 
         // The decision above is about a shape; this is the production entry

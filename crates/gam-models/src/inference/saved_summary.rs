@@ -114,149 +114,6 @@ fn representative_data_from_ranges(
     data
 }
 
-/// Dense, space-filling reconstruction of the training inputs for the Wald
-/// design-whitening Gram (#2142). Denser than `representative_data_from_ranges`
-/// so a high-basis univariate smooth gets a full-rank Gram, and with each
-/// continuous column swept in an independent coprime order so multivariate
-/// (tensor) margins are not collinear on the diagonal — the shared-ramp
-/// representative grid samples only the diagonal line and would make every
-/// tensor Gram rank-deficient. `rows` is forced to a power of two so every odd
-/// per-column stride is coprime to it and therefore traverses the full
-/// evenly-spaced grid. Categorical columns keep cycling their frozen levels.
-fn whitening_data_from_ranges(
-    ranges: &[(f64, f64)],
-    factor_levels: &std::collections::BTreeMap<usize, Vec<u64>>,
-    rows: usize,
-) -> Array2<f64> {
-    let rows = rows.max(2);
-    let n_cols = ranges.len();
-    let mut data = Array2::<f64>::zeros((rows, n_cols));
-    for (col, &(lo, hi)) in ranges.iter().enumerate() {
-        if let Some(lv) = factor_levels.get(&col) {
-            if !lv.is_empty() {
-                for row in 0..rows {
-                    data[[row, col]] = f64::from_bits(lv[row % lv.len()]);
-                }
-                continue;
-            }
-        }
-        let (lo, hi) = if lo.is_finite() && hi.is_finite() && hi >= lo {
-            (lo, hi)
-        } else {
-            (0.0, 1.0)
-        };
-        // Odd stride is coprime to the power-of-two `rows`, so `(row*stride) %
-        // rows` is a full-period permutation of the evenly-spaced grid — a
-        // different one per column, breaking the diagonal collinearity.
-        let stride = 2 * col + 1;
-        for row in 0..rows {
-            let idx = row.wrapping_mul(stride) % rows;
-            let frac = idx as f64 / (rows - 1) as f64;
-            data[[row, col]] = lo + frac * (hi - lo);
-        }
-    }
-    data
-}
-
-/// Reconstruct the design-whitening Gram `X'X` for the summary Wald smooth test
-/// from the frozen basis (#2142). The persisted summary path drops the fit's
-/// inference block, so the exact weighted Gram `X'WX` is gone; mgcv itself
-/// whitens the Wood (2013) statistic with the *unweighted* prediction-matrix
-/// Gram, so `X'X` at representative inputs is the intended object (and it
-/// reduces to `X'WX` for the Gaussian identity case). Returns the full `p×p`
-/// Gram in the trained coefficient layout, or `None` when the rebuilt design's
-/// column count does not match the trained coefficient count — a stale/mismatched
-/// spec, in which case the test falls back to the un-whitened raw covariance.
-fn summary_whitening_gram(
-    spec: &gam_terms::smooth::TermCollectionSpec,
-    ranges: &[(f64, f64)],
-    factor_levels: &std::collections::BTreeMap<usize, Vec<u64>>,
-    expected_ncols: usize,
-) -> Option<Array2<f64>> {
-    if expected_ncols == 0 {
-        return None;
-    }
-    let rows = (4 * expected_ncols).max(64).next_power_of_two();
-    let data = whitening_data_from_ranges(ranges, factor_levels, rows);
-    let design = gam_terms::smooth::build_term_collection_design(data.view(), spec).ok()?;
-    let x = design.design.to_dense();
-    if x.ncols() != expected_ncols {
-        return None;
-    }
-    // Lower triangle of `X'X` is the true Gram; the whitening eigendecomposition
-    // reads only that side, so no explicit symmetrization is needed.
-    Some(x.t().dot(&x))
-}
-
-#[cfg(test)]
-mod whitening_gram_tests {
-    //! Direct tests of the #2142 design-whitening-Gram reconstruction grid used
-    //! when a summary is built from an inference-stripped (compact) model. The
-    //! whitening math itself is covered by `gam-terms` `smooth_test` tests; here
-    //! we only verify the reconstruction *inputs* are non-degenerate.
-    use super::whitening_data_from_ranges;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn dense_grid_spans_range_and_breaks_diagonal_collinearity() {
-        let ranges = [(0.0_f64, 1.0_f64), (-2.0, 4.0)];
-        let levels = BTreeMap::new();
-        let data = whitening_data_from_ranges(&ranges, &levels, 64);
-        assert_eq!(data.nrows(), 64);
-        assert_eq!(data.ncols(), 2);
-        // Each continuous column sweeps its full [lo, hi] range.
-        for (c, &(lo, hi)) in ranges.iter().enumerate() {
-            let col = data.column(c);
-            let cmin = col.iter().cloned().fold(f64::INFINITY, f64::min);
-            let cmax = col.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            assert!((cmin - lo).abs() < 1e-9, "col {c} min {cmin} != {lo}");
-            assert!((cmax - hi).abs() < 1e-9, "col {c} max {cmax} != {hi}");
-        }
-        // The shared-ramp representative grid puts both columns on the same
-        // diagonal (Pearson r == 1), collapsing every tensor Gram. The
-        // independent coprime sweeps must break that: |r| strictly below 1.
-        let c0 = data.column(0);
-        let c1 = data.column(1);
-        let m0 = c0.mean().unwrap();
-        let m1 = c1.mean().unwrap();
-        let (mut cov, mut v0, mut v1) = (0.0, 0.0, 0.0);
-        for i in 0..64 {
-            let (a, b) = (c0[i] - m0, c1[i] - m1);
-            cov += a * b;
-            v0 += a * a;
-            v1 += b * b;
-        }
-        let r = cov / (v0.sqrt() * v1.sqrt());
-        assert!(
-            r.abs() < 0.9,
-            "columns must not be collinear (diagonal grid), got r={r}"
-        );
-    }
-
-    #[test]
-    fn categorical_columns_cycle_every_frozen_level() {
-        let ranges = [(0.0_f64, 1.0_f64), (0.0, 0.0)];
-        let mut levels = BTreeMap::new();
-        let lv = vec![1.0_f64.to_bits(), 2.0_f64.to_bits(), 3.0_f64.to_bits()];
-        levels.insert(1usize, lv.clone());
-        let data = whitening_data_from_ranges(&ranges, &levels, 64);
-        let allowed: Vec<f64> = lv.iter().map(|&b| f64::from_bits(b)).collect();
-        for i in 0..64 {
-            let v = data[[i, 1]];
-            assert!(
-                allowed.iter().any(|&a| a == v),
-                "row {i} value {v} is not a frozen level"
-            );
-        }
-        for &a in &allowed {
-            assert!(
-                (0..64).any(|i| data[[i, 1]] == a),
-                "frozen level {a} never appears"
-            );
-        }
-    }
-}
-
 /// Build the mgcv-style per-smooth significance table for the FFI summary.
 ///
 /// This is marshalling, not a second summary: the table comes from
@@ -264,8 +121,9 @@ mod whitening_gram_tests {
 /// fit's penalty layout that the in-process CLI summary also uses (#2470).
 /// Random-effect blocks get the variance-component score test the fit recorded
 /// (`FitArtifacts::random_effect_tests`, scored against its exact boundary null
-/// law, not a Wald χ²), and penalized smooth terms get the Wood (2013)
-/// rank-truncated Wald statistic and p-value.
+/// law, not a Wald χ²), and penalized smooth terms get the variance-component
+/// score test read off the fit's exact curvature, or the typed reason it cannot
+/// be computed.
 ///
 /// The "Mirrors `main.rs::build_model_summary`'s smooth-term loop" this
 /// sentence used to open with was accurate and was the problem: a comment
@@ -460,41 +318,15 @@ fn predictor_block_smooth_terms(
         }
     }
 
-    // Wood (2013) design-whitening metric for the Wald smooth test (#2142).
-    // Prefer the fit's exact weighted Gram `X'WX` when the inference block
-    // survived; on the persisted summary path (inference dropped) reconstruct
-    // the unweighted `X'X` of this predictor's frozen basis and place it at the
-    // block's coefficients — the test reads only a term's own block of the Gram
-    // and the intercept column it residualizes on, both inside this block.
-    // `None` → un-whitened fallback.
-    let reconstructed_gram = if fit.weighted_gram().is_none() {
-        summary_whitening_gram(spec, ranges, &factor_levels, design.design.ncols()).map(|gram| {
-            embed_block_gram(gram, predictor.offset.coefficients, fit.beta.len())
-        })
-    } else {
-        None
-    };
-    let whitening_gram_full: Option<&Array2<f64>> =
-        fit.weighted_gram().or(reconstructed_gram.as_ref());
     // The walk over the fit's flat penalty layout — the `LinearTermRidge`
     // prologue, the random-effect blocks that own no entry, the block-local →
-    // global coefficient shift, the per-term influence trace, and the Wood test
-    // with its reference distribution — is ONE accounting, shared with the
+    // global coefficient shift, the per-term influence trace, and the smooth
+    // test with its reference distribution — is ONE accounting, shared with the
     // in-process CLI summary (#2470). Both surfaces spelled it out, so #1219,
-    // #1277, #1360, #1368 and #1372 each had to be landed twice; the comment
-    // this replaces recorded its own copy of #1368 as "fixed on the in-process
-    // path but never propagated here". What genuinely differs on this persisted
-    // path is the EVIDENCE — a frozen-basis replay instead of the training
-    // design, so the whitening Gram is reconstructed rather than exact — and
-    // that is the only thing handed over. Both reference-distribution inputs
-    // (`wald_residual_degrees_of_freedom`, `wald_scale_is_estimated`) are read
-    // off the fit inside that walk, which is where `fd998d957` put them.
-    let rows = gam_solve::estimate::smooth_term_summary_rows(
-        &design,
-        fit,
-        whitening_gram_full,
-        predictor.offset,
-    );
+    // #1277, #1360, #1368 and #1372 each had to be landed twice. Every fitted
+    // quantity the test reads comes from `fit`; the frozen-basis replay supplies
+    // only the term structure.
+    let rows = gam_solve::estimate::smooth_term_summary_rows(&design, fit, predictor.offset);
     Ok(rows
         .into_iter()
         .map(|row| SummarySmoothTermRow {
@@ -507,18 +339,6 @@ fn predictor_block_smooth_terms(
             p_value_unavailable: row.pvalue_unavailable.map(|reason| reason.label()),
         })
         .collect())
-}
-
-/// A block's `k×k` Gram placed at coefficient `offset` of a `p×p` zero matrix.
-fn embed_block_gram(block: Array2<f64>, offset: usize, p: usize) -> Array2<f64> {
-    if offset == 0 && block.nrows() == p {
-        return block;
-    }
-    let k = block.nrows();
-    let mut full = Array2::<f64>::zeros((p, p));
-    full.slice_mut(ndarray::s![offset..offset + k, offset..offset + k])
-        .assign(&block);
-    full
 }
 
 /// Read the fitted κ̂ off every `curv(...)` constant-curvature smooth in the
@@ -932,15 +752,12 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
     let reml_score = fit
         .comparable_reml_score()
         .map_err(|err| format!("failed to compute comparable REML score: {err}"))?;
-    // A custom family has no scalar response distribution, hence no single
-    // dispersion to report; every built-in family resolves one.
-    let scale = match fit.likelihood_family {
-        None => None,
-        Some(_) => Some(
-            fit.dispersion_phi()
-                .map_err(|err| format!("failed to resolve the fitted dispersion: {err}"))?,
-        ),
-    };
+    // A custom family, and a family whose scale contract has no scalar
+    // response dispersion (Royston-Parmar), report no scale; every other
+    // family resolves one or the summary refuses.
+    let scale = fit
+        .scalar_dispersion_phi()
+        .map_err(|err| format!("failed to resolve the fitted dispersion: {err}"))?;
     let information_criteria = summary_information_criteria(&fit)?;
     Ok(SummaryPayload {
         formula: model.payload().formula.clone(),
@@ -1054,10 +871,10 @@ pub struct SummaryCoefficientRow {
 /// boundary null is not a Wald χ²; see
 /// `gam_terms::inference::random_effect_test`), with `ref_df` its effective
 /// d.f.; penalized smooth terms carry the
-/// Wood (2013) rank-truncated Wald `chi_sq` / `p_value`. The shape mirrors the
+/// variance-component score test's `chi_sq` / `p_value`. The shape mirrors the
 /// CLI's `SmoothTermSummary`.
 ///
-/// This `p_value` is the *first-order* Wald reference. The summary table is
+/// This `p_value` is the score test at the fitted smoothing parameters. The summary table is
 /// built from a saved model without the training rows, so it cannot run the
 /// per-term constrained refits the second-order test needs. The
 /// **second-order-accurate, Bartlett-corrected likelihood-ratio** p-value is
@@ -1079,8 +896,9 @@ pub struct SummarySmoothTermRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_value: Option<f64>,
     /// Why `p_value` is absent when the term has no valid reference law
-    /// (`"shape_constrained"`), or why a random-effect block's variance-component
-    /// test could not be scored (`"random_effect_*"`); see
+    /// (`"shape_constrained"`, `"unpenalized_direction"`, ...), or why a
+    /// random-effect block's variance-component test could not be scored
+    /// (`"random_effect_*"`); see
     /// [`gam_solve::estimate::SmoothPValueUnavailable`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_value_unavailable: Option<&'static str>,
@@ -1175,8 +993,8 @@ pub struct SummaryPayload {
     /// a Gaussian REML fit reports the residual-d.f. estimator
     /// `φ̂ = Σ wᵢ(yᵢ − μ̂ᵢ)² / (n − edf)`, with `n` the positive-weight rows and
     /// `edf = p − Σ_k tr(λ_k H⁻¹ S_k)` (the `edf_total` field); a spline-scan fit reports the smoother's
-    /// REML-profiled `σ̂²`. `None` only for a custom-family fit, which has no
-    /// scalar response distribution.
+    /// REML-profiled `σ̂²`. `None` exactly when the scale contract has no scalar
+    /// response dispersion: a custom-family fit, or Royston-Parmar survival.
     pub scale: Option<f64>,
     /// Reported log-likelihood at the converged mode. Carried so
     /// `compare_models` can form the Occam-penalised conditional AIC it ranks on

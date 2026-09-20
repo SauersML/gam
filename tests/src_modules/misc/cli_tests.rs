@@ -1460,22 +1460,16 @@ fn cli_firth_preflight_accepts_redundant_survival_marginal_slope_flag() {
 }
 
 #[test]
-fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
-    // #2116: the `gam` CLI and the `gamfit` Python API are two front-ends of ONE
-    // shared engine (#1191/#1196). The Python/materialize standard path drops the
-    // Duchon *operator* penalties (the mass/tension collocation-Gram blocks) for a
-    // non-Gaussian-identity family via `gate_duchon_operator_penalties_for_family`
-    // (materialize/standard.rs), but the CLI's hand-built `StandardFitRequest`
-    // never applied that gate — so a Duchon smooth under e.g. Poisson fit a
-    // DIFFERENT penalty structure through the CLI than through Python, a genuine
-    // single-engine-contract violation. `run_fit` now applies the SAME gate. This
-    // test drives the real CLI fit end-to-end and pins that the persisted (frozen)
-    // Duchon term carries ALL operator penalties DISABLED under Poisson — matching
-    // the materialize path. Before the fix the frozen term kept the default
-    // (mass + tension Active), so the assertion failed; after the fix it passes.
+fn cli_scale_dimensions_fit_keeps_one_duchon_penalty_structure_for_every_family() {
+    // `scale_dimensions` promotes a multi-D thin-plate smooth to an anisotropic
+    // Duchon whose per-axis relevance is carried ONLY by the tension-ARD
+    // penalties. The materialize path used to switch the Duchon operator
+    // penalties off for every non-Gaussian-identity family, which silently
+    // turned `scale_dimensions` into a no-op for a GLM. The penalty structure is
+    // a property of the smooth, not of the likelihood: a Poisson fit must
+    // persist the same mass + tension operator penalties a Gaussian fit does.
     let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
     let train_path = td.path().join("duchon_poisson.csv");
-    let model_path = td.path().join("model.json");
 
     // Deterministic 7x7 spatial grid with a smooth log-linear Poisson mean; every
     // count is a non-negative integer so the Poisson support check passes.
@@ -1491,75 +1485,72 @@ fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
     }
     fs::write(&train_path, csv).unwrap_or_else(|e| panic!("{} failed: {:?}", "write csv", e));
 
-    run_fit(FitArgs {
-        expectile_tau: None,
-        data: train_path,
-        request: None,
-        formula_positional: Some("y ~ s(pc1, pc2, type=duchon, centers=6)".to_string()),
-        predict_noise: None,
-        slope_formula: None,
-        z_column: None,
-        residual_columns: Vec::new(),
-        weights_column: None,
-        offset_column: None,
-        noise_offset_column: None,
-        frailty_kind: None,
-        frailty_sd: None,
-        hazard_loading: None,
-        transformation_normal: false,
-        firth: false,
-        family: FamilyArg::PoissonLog,
-        negative_binomial_theta: None,
-        // `survival_likelihood` is read exclusively by the survival fit path.
-        // On a Poisson response nothing consumes it, so the requested survival
-        // model would silently degrade to an ordinary GAM -- the fit now refuses
-        // it rather than ignoring it. This test gates Duchon operator penalties
-        // and never needed the option.
-        survival_likelihood: None,
-        baseline_target: "linear".to_string(),
-        baseline_scale: None,
-        baseline_shape: None,
-        baseline_rate: None,
-        baseline_makeham: None,
-        time_basis: "ispline".to_string(),
-        threshold_time_k: None,
-        sigma_time_k: None,
-        slope_time_k: None,
-        scale_dimensions: false,
-        out: Some(model_path.clone()),
-    })
-    .unwrap_or_else(|e| {
-        panic!(
-            "{} failed: {:?}",
-            "CLI Poisson Duchon fit should succeed", e
-        )
-    });
-
-    let saved = SavedModel::load_from_path(&model_path)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
-    let spec = saved
-        .resolved_termspec
-        .as_ref()
-        .expect("standard fit must persist a resolved termspec");
-    let duchon = spec
-        .smooth_terms
-        .iter()
-        .find_map(|term| match &term.basis {
-            SmoothBasisSpec::Duchon { spec, .. } => Some(spec),
-            _ => None,
+    for family in [FamilyArg::Gaussian, FamilyArg::PoissonLog] {
+        let model_path = td.path().join(format!("model_{family:?}.json"));
+        run_fit(FitArgs {
+            expectile_tau: None,
+            data: train_path.clone(),
+            request: None,
+            formula_positional: Some("y ~ s(pc1, pc2)".to_string()),
+            predict_noise: None,
+            slope_formula: None,
+            z_column: None,
+            residual_columns: Vec::new(),
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
+            transformation_normal: false,
+            firth: false,
+            family,
+            negative_binomial_theta: None,
+            survival_likelihood: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            threshold_time_k: None,
+            sigma_time_k: None,
+            slope_time_k: None,
+            scale_dimensions: true,
+            out: Some(model_path.clone()),
         })
-        .expect("resolved termspec must contain the Duchon smooth");
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "CLI scale_dimensions fit should succeed", e
+            )
+        });
 
-    use gam::basis::OperatorPenaltySpec::Disabled;
-    assert!(
-        matches!(duchon.operator_penalties.mass, Disabled)
-            && matches!(duchon.operator_penalties.tension, Disabled)
-            && matches!(duchon.operator_penalties.stiffness, Disabled),
-        "CLI standard fit under Poisson must gate the Duchon operator penalties \
-         (mass/tension collocation-Gram blocks) off, matching the Python/materialize \
-         path (#2116); got {:?}",
-        duchon.operator_penalties
-    );
+        let saved = SavedModel::load_from_path(&model_path)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+        let spec = saved
+            .resolved_termspec
+            .as_ref()
+            .expect("standard fit must persist a resolved termspec");
+        let duchon = spec
+            .smooth_terms
+            .iter()
+            .find_map(|term| match &term.basis {
+                SmoothBasisSpec::Duchon { spec, .. } => Some(spec),
+                _ => None,
+            })
+            .expect("resolved termspec must contain the Duchon smooth");
+
+        use gam::basis::OperatorPenaltySpec::{Active, Disabled};
+        assert!(
+            matches!(duchon.operator_penalties.mass, Active { .. })
+                && matches!(duchon.operator_penalties.tension, Active { .. })
+                && matches!(duchon.operator_penalties.stiffness, Disabled),
+            "{family:?} scale_dimensions fit must keep the Duchon mass + tension \
+             operator penalties that carry the per-axis relevance; got {:?}",
+            duchon.operator_penalties
+        );
+    }
 }
 
 /// #2631: the CLI and the engine must resolve the SAME baseline time anchor for
@@ -3815,6 +3806,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
             dispersion: gam::estimate::Dispersion::known(1.0)
                 .expect("unit known dispersion is valid"),
             factorized_standard_errors: None,
+            smoothing_correction_factorized: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
@@ -3955,7 +3947,7 @@ fn core_saved_fit_result_json_roundtripswith_finite_summary() {
 }
 
 #[test]
-fn parse_bounded_linear_term_defaults_to_no_prior() {
+fn parse_bounded_linear_term_defaults_to_shrinkage_prior() {
     let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1) + z")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     assert_eq!(parsed.terms.len(), 2);
@@ -3970,7 +3962,7 @@ fn parse_bounded_linear_term_defaults_to_no_prior() {
             assert_eq!(name, "mu_hat");
             assert_eq!((*min, *max), (0.0, 1.0));
             match prior {
-                BoundedCoefficientPriorSpec::None => {}
+                BoundedCoefficientPriorSpec::Shrinkage => {}
                 other => panic!("unexpected prior: {other:?}"),
             }
             assert!(!*double_penalty);
@@ -5980,7 +5972,7 @@ fn saved_survival_flex_exit_helper_matches_rigid_when_deviations_absent() {
     for i in 0..q_exit.len() {
         let c = (1.0 + slope[i] * slope[i]).sqrt();
         let expected_eta = q_exit[i] * c + slope[i] * z[i];
-        let expected_mean = super::normal_cdf(expected_eta);
+        let expected_mean = normal_cdf(expected_eta);
         assert!(
             (eta[i] - expected_eta).abs() <= 1e-10,
             "row {i}: eta mismatch: got {}, expected {}",
@@ -6067,7 +6059,7 @@ fn saved_survival_flex_exit_helper_with_zero_scorewarp_matches_rigid() {
     for i in 0..q_exit.len() {
         let c = (1.0 + slope[i] * slope[i]).sqrt();
         let expected_eta = q_exit[i] * c + slope[i] * z[i];
-        let expected_mean = super::normal_cdf(expected_eta);
+        let expected_mean = normal_cdf(expected_eta);
         assert!((eta[i] - expected_eta).abs() <= 1e-10);
         assert!((mean[i] - expected_mean).abs() <= 1e-10);
     }
@@ -6098,7 +6090,7 @@ fn saved_survival_flex_exit_helper_matches_gaussian_frailty_rigid_formula() {
         let sb = scale * slope[i];
         let c = (1.0 + sb * sb).sqrt();
         let expected_eta = q_exit[i] * c + sb * z[i];
-        let expected_mean = super::normal_cdf(expected_eta);
+        let expected_mean = normal_cdf(expected_eta);
         assert!((eta[i] - expected_eta).abs() <= 1e-10);
         assert!((mean[i] - expected_mean).abs() <= 1e-10);
     }
@@ -6269,7 +6261,7 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
     let primary_offset = array![0.2, -0.15];
     let noise_offset = array![0.04, -0.01];
 
-    let (predictor, pred_input, _) = super::build_saved_survival_marginal_slope_predictor(
+    let (predictor, pred_input, _) = gam::families::survival::predict::build_saved_survival_marginal_slope_predictor(
         &model,
         &fit_saved,
         "z",
@@ -6488,7 +6480,7 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
     let primary_offset = array![0.0];
     let noise_offset = array![0.0];
 
-    let (predictor, pred_input, _) = super::build_saved_survival_marginal_slope_predictor(
+    let (predictor, pred_input, _) = gam::families::survival::predict::build_saved_survival_marginal_slope_predictor(
         &model,
         &fit_saved,
         "z",
@@ -6533,6 +6525,152 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved survival helper should evaluate", e));
     assert!((prediction.eta[0] - expected_eta[0]).abs() <= 1e-12);
     assert!((prediction.mean[0] - expected_mean[0]).abs() <= 1e-12);
+}
+
+/// gam#3316: `gam predict` on a survival marginal-slope model publishes the
+/// library's `predict_survival` posterior mean, not a probit-normal integral of
+/// a delta-method Gaussian for eta. The CLI columns must be the library's
+/// surfaces at each row's own exit time, band included.
+#[test]
+fn cli_survival_marginal_slope_predict_publishes_library_posterior_mean_3316() {
+    use gam::families::survival::predict::{
+        SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
+        predict_survival,
+    };
+    let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
+    let train_path = td.path().join("train.csv");
+    let model_path = td.path().join("model.json");
+    let pred_path = td.path().join("pred.csv");
+    let n = 80usize;
+    let mut csv = String::from("t0,t1,event,x,z\n");
+    let mut state: u64 = 0x3316;
+    let mut uniform = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    for i in 0..n {
+        let x = -1.0 + 2.0 * (i as f64 + 0.5) / n as f64;
+        let z = gam::probability::standard_normal_quantile(uniform())
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e));
+        // Probit survival S(t) = Phi(-(log t - 0.4 x - 0.5 z)): draw t from it.
+        let e = gam::probability::standard_normal_quantile(uniform())
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e));
+        let t = (0.4 * x + 0.5 * z + e).exp();
+        let censor = (1.5 * uniform()).exp();
+        let (time, event) = if t <= censor { (t, 1) } else { (censor, 0) };
+        csv.push_str(&format!("0,{time},{event},{x},{z}\n"));
+    }
+    fs::write(&train_path, csv)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival marginal-slope csv", e));
+
+    let mut args = location_scale_fit_args(
+        train_path.clone(),
+        model_path.clone(),
+        "Surv(t0, t1, event) ~ x",
+        "unused",
+    );
+    args.predict_noise = None;
+    args.slope_formula = Some("1".to_string());
+    args.z_column = Some("z".to_string());
+    args.survival_likelihood = Some("marginal-slope".to_string());
+    run_fit(args).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "survival marginal-slope fit should succeed", e
+        )
+    });
+
+    run_predict(PredictArgs {
+        model: model_path.clone(),
+        new_data: train_path.clone(),
+        out: pred_path.clone(),
+        offset_column: None,
+        noise_offset_column: None,
+        id_column: None,
+        uncertainty: true,
+        level: 0.9,
+        covariance_mode: Some(InferenceCovarianceMode::Conditional),
+        conformal: false,
+        calibration: None,
+        training_data: None,
+    })
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "survival marginal-slope predict should succeed", e
+        )
+    });
+
+    let model = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+    let dataset = load_dataset_projected(
+        &train_path,
+        &[
+            "t0".to_string(),
+            "t1".to_string(),
+            "event".to_string(),
+            "x".to_string(),
+            "z".to_string(),
+        ],
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "load survival dataset", e));
+    let col_map = dataset.column_map();
+    let zeros = Array1::<f64>::zeros(n);
+    let library = predict_survival(
+        SurvivalPredictRequest {
+            model: &model,
+            data: dataset.values.view(),
+            col_map: &col_map,
+            training_headers: model.payload().training_headers.as_ref(),
+            primary_offset: &zeros,
+            noise_offset: &zeros,
+            time_grid: None,
+            with_uncertainty: true,
+            estimand: SurvivalPredictEstimand::PosteriorMean,
+        },
+        SurvivalPredictionCovarianceMode::Conditional,
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "library survival predict", e));
+    let plugin = library
+        .survival_plugin
+        .as_ref()
+        .expect("the posterior-mean prediction keeps its plug-in by name");
+    let survival_se = library
+        .survival_se
+        .as_ref()
+        .expect("uncertainty was requested");
+    let eta_se = library.eta_se.as_ref().expect("uncertainty was requested");
+    let z = gam::probability::standard_normal_quantile(0.95)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e));
+    // The CSV writes every value with `{:.12}` fixed decimals, so a published
+    // cell differs from the library value by at most half a unit in the 12th
+    // decimal plus the parse's own rounding (one ulp of the value).
+    let assert_published = |column: &str, row: usize, expected: f64| {
+        let published = csv_value_at(&pred_path, row, column);
+        let bound = 0.5e-12 + f64::EPSILON * expected.abs().max(1.0);
+        assert!(
+            (published - expected).abs() <= bound,
+            "row {row} `{column}`: CSV published {published}, library {expected}"
+        );
+    };
+    let mut max_gap_to_delta = 0.0f64;
+    for i in 0..n {
+        let mean = library.survival[[i, 0]];
+        let sd = survival_se[[i, 0]];
+        assert_published("survival_prob", i, mean);
+        assert_published("survival_prob_plugin", i, plugin[[i, 0]]);
+        assert_published("eta", i, library.linear_predictor[i]);
+        assert_published("std_error", i, eta_se[i]);
+        assert_published("mean_lower", i, (mean - z * sd).clamp(0.0, 1.0));
+        assert_published("mean_upper", i, (mean + z * sd).clamp(0.0, 1.0));
+        let delta = normal_cdf(-library.linear_predictor[i] / (1.0 + eta_se[i] * eta_se[i]).sqrt());
+        max_gap_to_delta = max_gap_to_delta.max((mean - delta).abs());
+    }
+    eprintln!(
+        "[gam#3316] max |library posterior mean - delta-method Phi(-eta/sqrt(1+se^2))| = {max_gap_to_delta:.3e}"
+    );
 }
 
 #[test]

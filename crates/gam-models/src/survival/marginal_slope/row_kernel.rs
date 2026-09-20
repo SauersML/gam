@@ -1038,6 +1038,74 @@ impl<const P: usize, G: SlopeRowGeometry<P>> gam_math::jet_tower::RowProgram<P>
     }
 }
 
+impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G> {
+    /// Every row's `(nll, grad, hess)` through the A100 NVRTC survival row jet
+    /// (#932-GPU): gather every row's primaries and scalar inputs, then run the
+    /// device dispatcher ([`crate::gpu_kernels::survival_rowjet`]), which
+    /// evaluates the same order-2 `rigid_row_nll` lowering for all `n` rows in
+    /// parallel. The host gather applies the canonical derivative and
+    /// signed-margin domain checks before launch, because the device kernel
+    /// consumes already-admitted primaries.
+    #[cfg(target_os = "linux")]
+    pub(super) fn rigid_row_jet_on_device(
+        &self,
+    ) -> Result<(Vec<f64>, Vec<[f64; P]>, Vec<[[f64; P]; P]>), String> {
+        use crate::gpu_kernels::survival_rowjet::{SurvivalRowInputs, survival_rigid_row_vgh};
+        let n = self.family.n;
+        let probit_scale = self.family.probit_frailty_scale();
+        // Gather per-row inputs in parallel (the pure-f64 score summary + primary
+        // projections — the same quantities the per-row path computes).
+        let gather: Result<Vec<SurvivalRowInputs>, String> = (0..n)
+            .into_par_iter()
+            .map(|row| {
+                let p = rigid_row_kernel_primaries::<P, G>(&self.family, &self.block_states, row)?;
+                let inputs = rigid_row_inputs(
+                    &self.family,
+                    &self.block_states,
+                    row,
+                    "survival marginal-slope rigid row kernel (batched)",
+                )?;
+                let [neg_eta0, neg_eta1, adjusted_derivative] =
+                    rigid_row_admission_witnesses::<P, G>(&p, &inputs);
+                validate_rigid_row_admission::<P, G>(
+                    p[PRIMARY_QD1],
+                    &inputs,
+                    neg_eta0,
+                    neg_eta1,
+                    adjusted_derivative,
+                )?;
+                Ok(SurvivalRowInputs {
+                    // `G::FOLLOW_UP_VARYING` is false on this branch, so
+                    // `P == STATIC_SLOPE_PRIMARIES` and this is a copy, not
+                    // a truncation.
+                    primaries: std::array::from_fn(|axis| p[axis]),
+                    wi: inputs.wi,
+                    wi_entry: inputs.wi_entry,
+                    di: inputs.di,
+                    z_sum: inputs.z_sum,
+                    cov_ones: inputs.covariance_ones,
+                })
+            })
+            .collect();
+        let rows = gather?;
+        let ch = survival_rigid_row_vgh(&rows, probit_scale)?;
+        let mut grads = vec![[0.0_f64; P]; n];
+        let mut hesss = vec![[[0.0_f64; P]; P]; n];
+        for row in 0..n {
+            for a in 0..STATIC_SLOPE_PRIMARIES {
+                grads[row][a] = ch.grad[row * STATIC_SLOPE_PRIMARIES + a];
+                for b in 0..STATIC_SLOPE_PRIMARIES {
+                    hesss[row][a][b] =
+                        ch.hess[row * STATIC_SLOPE_PRIMARIES * STATIC_SLOPE_PRIMARIES
+                            + a * STATIC_SLOPE_PRIMARIES
+                            + b];
+                }
+            }
+        }
+        Ok((ch.value, grads, hesss))
+    }
+}
+
 impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
     for SurvivalMarginalSlopeRowKernel<P, G>
 {
@@ -1060,17 +1128,15 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
         rigid_row_order2::<P, G>(&p, &inputs)
     }
 
-    /// Batched all-rows `(nll, grad, hess)` via the A100 NVRTC survival row-jet
-    /// (#932-GPU). Gathers every row's primaries + scalar inputs, then calls the
-    /// device dispatcher ([`crate::gpu_kernels::survival_rowjet`]) which runs the
-    /// same order-2 `rigid_row_nll` lowering for all `n` rows in parallel. Linux
-    /// batches below device admission return `None` and use the ordinary per-row
-    /// cache path. Once admitted, probe/compile/launch/transfer failures are
-    /// returned and never hidden by a CPU retry.
-    ///
-    /// The host gather applies the canonical derivative and signed-margin domain
-    /// checks before launch because the device kernel consumes already-admitted
-    /// primaries.
+    /// Batched all-rows `(nll, grad, hess)` through the device row jet
+    /// ([`Self::rigid_row_jet_on_device`]), under the one row-kernel decision.
+    /// A frame outside the row jet's declaration, `off`, a host without a
+    /// device, and a shape whose CPU executor timed faster return `None` and
+    /// take the ordinary per-row cache path. Under `auto` a shape this process
+    /// has not timed races the per-row loop against the device pass once and
+    /// returns the per-row result (gam#3024). Once the device is selected,
+    /// probe/compile/launch/transfer failures are returned and never hidden by
+    /// a CPU retry.
     fn batched_value_grad_hess_all(
         &self,
     ) -> Option<Result<(Vec<f64>, Vec<[f64; P]>, Vec<[[f64; P]; P]>), String>> {
@@ -1079,81 +1145,28 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
         // a declared latent law, takes the ordinary per-row CPU path under
         // `auto` rather than a silently different lowering, and is refused
         // under `required`.
-        let n = self.family.n;
-        match rigid_row_jet_decision::<P, G>(n) {
-            Ok(decision) if decision.use_gpu => {}
-            Ok(_) => return None,
-            Err(error) => return Some(Err(error)),
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            use crate::gpu_kernels::survival_rowjet::{SurvivalRowInputs, survival_rigid_row_vgh};
-            let probit_scale = self.family.probit_frailty_scale();
-            // Gather per-row inputs in parallel (the pure-f64 score summary + primary
-            // projections — the same quantities the per-row path computes).
-            let gather: Result<Vec<SurvivalRowInputs>, String> = (0..n)
-                .into_par_iter()
-                .map(|row| {
-                    let p =
-                        rigid_row_kernel_primaries::<P, G>(&self.family, &self.block_states, row)?;
-                    let inputs = rigid_row_inputs(
-                        &self.family,
-                        &self.block_states,
-                        row,
-                        "survival marginal-slope rigid row kernel (batched)",
-                    )?;
-                    let [neg_eta0, neg_eta1, adjusted_derivative] =
-                        rigid_row_admission_witnesses::<P, G>(&p, &inputs);
-                    validate_rigid_row_admission::<P, G>(
-                        p[PRIMARY_QD1],
-                        &inputs,
-                        neg_eta0,
-                        neg_eta1,
-                        adjusted_derivative,
-                    )?;
-                    Ok(SurvivalRowInputs {
-                        // `G::FOLLOW_UP_VARYING` is false on this branch, so
-                        // `P == STATIC_SLOPE_PRIMARIES` and this is a copy, not
-                        // a truncation.
-                        primaries: std::array::from_fn(|axis| p[axis]),
-                        wi: inputs.wi,
-                        wi_entry: inputs.wi_entry,
-                        di: inputs.di,
-                        z_sum: inputs.z_sum,
-                        cov_ones: inputs.covariance_ones,
-                    })
-                })
-                .collect();
-            let rows = match gather {
-                Ok(rows) => rows,
-                Err(error) => return Some(Err(error)),
-            };
-            let ch = match survival_rigid_row_vgh(&rows, probit_scale) {
-                Ok(channels) => channels,
-                Err(error) => return Some(Err(error)),
-            };
-            let mut grads = vec![[0.0_f64; P]; n];
-            let mut hesss = vec![[[0.0_f64; P]; P]; n];
-            for row in 0..n {
-                for a in 0..STATIC_SLOPE_PRIMARIES {
-                    grads[row][a] = ch.grad[row * STATIC_SLOPE_PRIMARIES + a];
-                    for b in 0..STATIC_SLOPE_PRIMARIES {
-                        hesss[row][a][b] = ch.hess
-                            [row * STATIC_SLOPE_PRIMARIES * STATIC_SLOPE_PRIMARIES
-                                + a * STATIC_SLOPE_PRIMARIES
-                                + b];
-                    }
+        match rigid_row_jet_decision::<P, G>(self.family.n) {
+            Err(error) => Some(Err(error)),
+            #[cfg(target_os = "linux")]
+            Ok(decision) => {
+                if let Some(shape) = decision.race {
+                    Some(gam_gpu::race_row_kernel(
+                        shape,
+                        || crate::row_kernel::evaluate_every_row(self),
+                        || self.rigid_row_jet_on_device().map(|_| ()),
+                    ))
+                } else if decision.use_gpu {
+                    Some(self.rigid_row_jet_on_device())
+                } else {
+                    None
                 }
             }
-            Some(Ok((ch.value, grads, hesss)))
+            // The row jet is compiled only on Linux, so off it no decision
+            // selects the device or races it, and the per-row path handles
+            // every row.
+            #[cfg(not(target_os = "linux"))]
+            Ok(_) => None,
         }
-
-        // Non-Linux hosts can never pass device admission (the selector is
-        // `cfg!(target_os = "linux") && …`), so the early `None` above is the
-        // only exit and the per-row cache path handles every row.
-        #[cfg(not(target_os = "linux"))]
-        None
     }
 
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; P] {
@@ -2030,11 +2043,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
             .map(|chunk_idx| {
                 let start = chunk_idx * chunk;
                 let end = (start + chunk).min(n);
-                let mut acc = Array2::<f64>::zeros((p, p));
-                for row in start..end {
-                    per_row(row, &mut acc)?;
-                }
-                Ok(acc)
+                Self::pullback_chunk(p, start..end, &per_row)
             })
             .collect();
         let mut total = Array2::<f64>::zeros((p, p));
@@ -2042,6 +2051,26 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
             total += &acc?;
         }
         Ok(total)
+    }
+
+    /// One chunk of [`Self::chunked_pullback_reduce`]: its rows' pullbacks folded in index
+    /// order into a fresh `p×p` accumulator. Out of line on purpose (gam#2967): the chunk is
+    /// mapped inside Rayon's split frame, which stays live across every join below it and is
+    /// stacked once per nested steal, so `per_row`'s row program must not be inlined there.
+    #[inline(never)]
+    fn pullback_chunk<F>(
+        p: usize,
+        rows: core::ops::Range<usize>,
+        per_row: &F,
+    ) -> Result<Array2<f64>, String>
+    where
+        F: Fn(usize, &mut Array2<f64>) -> Result<(), String>,
+    {
+        let mut acc = Array2::<f64>::zeros((p, p));
+        for row in rows {
+            per_row(row, &mut acc)?;
+        }
+        Ok(acc)
     }
 
     /// gam#979 build-once all-axes FIRST directional derivative — see the trait

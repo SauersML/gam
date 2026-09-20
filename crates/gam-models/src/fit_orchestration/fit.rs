@@ -129,10 +129,15 @@ fn resolved_wiggle_inverse_link(
 /// Jeffreys penalty enabled without duplicating the dispatch.
 type StandardBaseFit = crate::fit_orchestration::drivers::FittedTermCollectionWithSpec;
 
+///
+/// `realized_design` is the design already realized from `request.spec`,
+/// `request.data` and `options.resource_policy`, when a caller holds one. Only
+/// the spatial dispatch below can fit on it; the others realize their own.
 fn fit_standard_base(
     request: &StandardFitRequest<'_>,
     family: &LikelihoodSpec,
     options: &FitOptions,
+    realized_design: Option<TermCollectionDesign>,
 ) -> Result<StandardBaseFit, gam_solve::estimate::EstimationError> {
     if let Some(latent_coord) = request.latent_coord.as_ref() {
         if !request.coefficient_groups.is_empty() || !request.penalty_block_gamma_priors.is_empty()
@@ -180,7 +185,7 @@ fn fit_standard_base(
             },
         )
     } else {
-        fit_term_collectionwith_spatial_length_scale_optimization(
+        fit_term_collectionwith_spatial_length_scale_optimization_on_design(
             request.data.view(),
             request.y.as_ref().clone(),
             request.weights.as_ref().clone(),
@@ -189,6 +194,7 @@ fn fit_standard_base(
             family.clone(),
             options,
             &request.kappa_options,
+            realized_design,
         )
     }
 }
@@ -488,7 +494,17 @@ mod standard_convergence_gate_tests {
 }
 
 pub(crate) fn fit_standard_model(
+    request: StandardFitRequest<'_>,
+) -> Result<StandardFitResult, FitFailure> {
+    fit_standard_model_on_design(request, None)
+}
+
+/// [`fit_standard_model`] handed the design an earlier stage realized from
+/// this request's `spec`, `data` and `options.resource_policy` (the exact
+/// Gaussian boundary certificate realizes it before refusing the request).
+pub(crate) fn fit_standard_model_on_design(
     mut request: StandardFitRequest<'_>,
+    realized_design: Option<TermCollectionDesign>,
 ) -> Result<StandardFitResult, FitFailure> {
     if request.estimate_tweedie_p {
         return Err(FitFailure::raised(
@@ -529,6 +545,9 @@ pub(crate) fn fit_standard_model(
              the response before the standard-fit dispatch"
         );
     }
+    // A screened range is a different spec from the one the handed design was
+    // realized from.
+    let realized_design = realized_design.filter(|_| seeded == 0);
 
     // #1762/#2273: a separated binomial design has no finite maximum
     // likelihood, on every binomial link. The Jeffreys prior |I(β)|^½ bounds
@@ -549,7 +568,7 @@ pub(crate) fn fit_standard_model(
     // declined before solving because the Firth outer derivative does not
     // define their appended link coordinates (#2654).
     let is_firth_capable_binomial = request.family.supports_firth();
-    let base = fit_standard_base(&request, &request.family, &request.options);
+    let base = fit_standard_base(&request, &request.family, &request.options, realized_design);
     let fitted = match base {
         Ok(fitted) => fitted,
         Err(original_error) => {
@@ -565,7 +584,7 @@ pub(crate) fn fit_standard_model(
             let original_report = original_error.to_string();
             let mut firth_options = request.options.clone();
             firth_options.firth_bias_reduction = true;
-            let firth = fit_standard_base(&request, &request.family, &firth_options);
+            let firth = fit_standard_base(&request, &request.family, &firth_options, None);
             let firth_failure = firth.as_ref().err().map(ToString::to_string);
             match certified_retry_or_original(original_error, firth) {
                 Ok(mut firth_fitted) => {
@@ -616,16 +635,14 @@ pub(crate) fn fit_standard_model(
         }
     };
 
-    let adaptive_spatial_terms = adaptive_spatial_term_mask(&request.spec);
-    let adaptive_spatial_center_counts = adaptive_spatial_center_counts(&request.spec);
+    let adaptive_bases = adaptive_bases(&request.spec);
     let result = StandardFitResult {
         saved_link_state: fitted.fit.fitted_link.clone(),
         fit: fitted.fit,
         design: fitted.design,
         resolvedspec: fitted.resolvedspec,
         basis_adequacy: Vec::new(),
-        adaptive_spatial_terms: adaptive_spatial_terms.clone(),
-        adaptive_spatial_center_counts: adaptive_spatial_center_counts.clone(),
+        adaptive_bases: adaptive_bases.clone(),
         kappa_timing: fitted.kappa_timing,
         wiggle_knots: None,
         wiggle_degree: None,
@@ -746,8 +763,7 @@ pub(crate) fn fit_standard_model(
         design: solved.design,
         resolvedspec: solved.resolvedspec,
         basis_adequacy: Vec::new(),
-        adaptive_spatial_terms,
-        adaptive_spatial_center_counts,
+        adaptive_bases,
         kappa_timing: result.kappa_timing,
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),
@@ -1246,6 +1262,7 @@ pub(crate) fn gaussian_response_sample_std(v: ArrayView1<'_, f64>) -> f64 {
 pub(crate) fn rescale_gaussian_location_scale_to_raw(
     result: &mut GaussianLocationScaleFitResult,
     response_scale: f64,
+    raw_offsets: &GaussianLocationScaleRawOffsets,
 ) -> Result<(), String> {
     let units = if result
         .fit
@@ -1258,7 +1275,25 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw(
     } else {
         ActiveFrameUnits::ComposeIntoGauge
     };
-    rescale_gaussian_location_scale_to_raw_with_units(result, response_scale, units)
+    rescale_gaussian_location_scale_to_raw_with_units(result, response_scale, units, raw_offsets)
+}
+
+/// The offsets of a Gaussian location-scale request in the response's own units,
+/// read before the fit standardizes them. The raw remap publishes the fitted linear
+/// predictors with them, since the saved model adds exactly these offsets when it
+/// predicts the training rows (#3001).
+pub(crate) struct GaussianLocationScaleRawOffsets {
+    pub(crate) mean: Array1<f64>,
+    pub(crate) log_sigma: Array1<f64>,
+}
+
+impl GaussianLocationScaleRawOffsets {
+    pub(crate) fn of(spec: &GaussianLocationScaleTermSpec) -> Self {
+        Self {
+            mean: spec.mean_offset.clone(),
+            log_sigma: spec.log_sigma_offset.clone(),
+        }
+    }
 }
 
 /// How the raw remap carries the change of units on the precision side of a
@@ -1280,6 +1315,7 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
     result: &mut GaussianLocationScaleFitResult,
     response_scale: f64,
     units: ActiveFrameUnits,
+    raw_offsets: &GaussianLocationScaleRawOffsets,
 ) -> Result<(), String> {
     use gam_problem::BlockRole;
 
@@ -1319,7 +1355,6 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
                 }
                 if let Some(state) = result.fit.fit.block_states.get_mut(block_idx) {
                     state.beta.mapv_inplace(|v| v * s);
-                    state.eta.mapv_inplace(|v| v * s);
                 }
             }
             BlockRole::Scale => {
@@ -1336,9 +1371,6 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
                     {
                         state.beta[col] += ln_s;
                     }
-                }
-                if let Some(state) = result.fit.fit.block_states.get_mut(block_idx) {
-                    state.eta.mapv_inplace(|v| v + ln_s);
                 }
             }
             BlockRole::Time | BlockRole::Threshold => {
@@ -1446,6 +1478,17 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
                 *value *= factor;
             }
         }
+        // The factorized branch's correction `C = B·Bᵀ` takes `D·C·D`, so its
+        // factor's rows scale like the coefficients, as do its corrected
+        // standard errors (#3283).
+        if let Some(factorized) = inference.smoothing_correction_factorized.as_mut() {
+            for (mut row, &factor) in factorized.factor.rows_mut().into_iter().zip(row_factors.iter()) {
+                row *= factor;
+            }
+            for (value, &factor) in factorized.standard_errors.iter_mut().zip(row_factors.iter()) {
+                *value *= factor;
+            }
+        }
         // X'WX is a precision-side quadratic form exactly like H, and the influence
         // map acts on the same coordinates, so both change with the units only
         // where H does.
@@ -1510,6 +1553,82 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
     }
 
     result.response_scale = s;
+    publish_raw_gaussian_location_scale_predictors(result, raw_offsets)
+}
+
+/// Publish each block's fitted linear predictor from the raw saved coefficients,
+/// through the saved model's own evaluation (#3001).
+///
+/// The fit ran on the standardized response. Rescaling its internal predictors
+/// (`s·η` for the mean and the wiggle, `η + ln s` for log σ) reaches the raw ones
+/// only to rounding, and the wiggle block's state was the engine's own
+/// contraction of its design. The saved model predicts `X_μ·β_μ + o_μ`, adds the
+/// link wiggle's share
+/// [`crate::inference::model::SavedLinkWiggleRuntime::contribution`] at that
+/// index, and predicts `X_σ·β_σ + o_σ`. The states are published here with the
+/// same designs, offsets and functions, so on the training rows a saved model
+/// predicts exactly the mean and scale its fit reports.
+fn publish_raw_gaussian_location_scale_predictors(
+    result: &mut GaussianLocationScaleFitResult,
+    raw_offsets: &GaussianLocationScaleRawOffsets,
+) -> Result<(), String> {
+    use crate::inference::model::SavedLinkWiggleRuntime;
+    use gam_problem::BlockRole;
+
+    let blocks = &result.fit.fit.blocks;
+    let position = |role: BlockRole| blocks.iter().position(|block| block.role == role);
+    let location = position(BlockRole::Location)
+        .or_else(|| position(BlockRole::Mean))
+        .ok_or_else(|| "gaussian location-scale raw remap: the fit has no location block".to_string())?;
+    let scale = position(BlockRole::Scale)
+        .ok_or_else(|| "gaussian location-scale raw remap: the fit has no scale block".to_string())?;
+    let wiggle = position(BlockRole::LinkWiggle);
+    if result.fit.fit.block_states.len() != blocks.len() {
+        return Err(format!(
+            "gaussian location-scale raw remap: {} block states for {} fitted blocks",
+            result.fit.fit.block_states.len(),
+            blocks.len()
+        ));
+    }
+
+    let eta_location =
+        result.fit.mean_design.design.dot(&blocks[location].beta) + &raw_offsets.mean;
+    let mut eta_scale = result.fit.noise_design.design.dot(&blocks[scale].beta);
+    eta_scale += &raw_offsets.log_sigma;
+    let wiggle_share = match wiggle {
+        None => None,
+        Some(index) => {
+            let (Some(knots), Some(degree), Some(beta)) = (
+                result.wiggle_knots.as_ref(),
+                result.wiggle_degree,
+                result.beta_link_wiggle.as_ref(),
+            ) else {
+                return Err(
+                    "gaussian location-scale raw remap: a link-wiggle block without its knots, \
+                     degree and coefficients"
+                        .to_string(),
+                );
+            };
+            let runtime = SavedLinkWiggleRuntime {
+                knots: knots.to_vec(),
+                degree,
+                penalty_metadata: None,
+                beta: beta.clone(),
+                index_shift: None,
+            };
+            let share = runtime
+                .contribution(&eta_location)
+                .map_err(|error| format!("gaussian location-scale raw remap: {error}"))?;
+            Some((index, share))
+        }
+    };
+
+    let states = &mut result.fit.fit.block_states;
+    states[location].eta = eta_location;
+    states[scale].eta = eta_scale;
+    if let Some((index, share)) = wiggle_share {
+        states[index].eta = share;
+    }
     Ok(())
 }
 
@@ -1533,6 +1652,7 @@ pub(crate) fn fit_gaussian_location_scale_model(
             ),
         ));
     }
+    let raw_offsets = GaussianLocationScaleRawOffsets::of(&request.spec);
     if response_scale != 1.0 {
         request.spec.y.mapv_inplace(|v| v / response_scale);
         // The mean (identity-link) offset rides in the same units as y; the
@@ -1549,7 +1669,7 @@ pub(crate) fn fit_gaussian_location_scale_model(
 
     // The raw-unit remap rewrites a fitted result the engine assembled, so its
     // refusals are shape disagreements inside that result (#2937).
-    rescale_gaussian_location_scale_to_raw(&mut result, response_scale)
+    rescale_gaussian_location_scale_to_raw(&mut result, response_scale, &raw_offsets)
         .map_err(crate::gamlss::assembly_failure)?;
     Ok(result)
 }
@@ -2536,6 +2656,7 @@ fn survival_unified_fit_result(
         reparam_qs: None,
         dispersion: gam_solve::estimate::Dispersion::UNIT,
         factorized_standard_errors: None,
+        smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence: None,
         weighted_gram: None,

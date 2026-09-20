@@ -181,16 +181,24 @@ impl SurvivalMarginalSlopeFamily {
         let slopes = self.row_slope_channels(row, block_states).map_err(program)?;
         let beta_h = self.flex_score_beta(block_states).map_err(program)?;
         let beta_w = self.flex_link_beta(block_states).map_err(program)?;
+        // Every arm is scored at the anchor the fit used: the intercept the fitted
+        // family solves on its own law, the closed form on the Gaussian law and the
+        // anchored root on a finite one (as the flex program's own solve does).
+        let fitted_law = self.flex_law_grid(Some(row)).map_err(program)?;
         let anchor = |q: f64, slope: f64| -> Result<(f64, f64), MovingLawError> {
             if beta_h.is_some() || beta_w.is_some() {
-                self.flex_survival_anchor_log_probabilities(q, slope, beta_h, beta_w, law)
-            } else {
-                Ok(crate::bms::estimated_latent_law::closed_form_survival_anchor_log_probabilities(
-                    q,
-                    self.probit_frailty_scale() * slope,
-                    law,
-                )?)
+                return self.flex_survival_anchor_log_probabilities(q, slope, beta_h, beta_w, law);
             }
+            let observed_slope = self.probit_frailty_scale() * slope;
+            let alpha = match fitted_law {
+                Some(grid) => solve_anchor(q, observed_slope, grid).map_err(program)?,
+                None => q * (1.0 + observed_slope * observed_slope).sqrt(),
+            };
+            Ok(crate::bms::estimated_latent_law::survival_anchor_log_probabilities(
+                alpha,
+                observed_slope,
+                law,
+            )?)
         };
         Ok([anchor(q1, slopes.exit)?, anchor(q0, slopes.entry)?])
     }

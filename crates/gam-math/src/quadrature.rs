@@ -306,9 +306,236 @@ pub fn max_representable_standard_normal_gauss_hermite_order() -> usize {
     })
 }
 
+/// The standard normal restricted to `(lower, upper)`, `lower < 0 < upper`, and the
+/// map that transports a standard-normal rule onto it.
+///
+/// With `Z = Φ(upper) − Φ(lower)`, the map `u ↦ ψ(u)` solves
+/// `Φ(ψ) = Φ(lower) + Z·Φ(u)`. It pushes `N(0,1)` forward onto the normal truncated to
+/// the interval, so for any `f`
+///
+/// ```text
+/// ∫_lower^upper φ(x) f(x) dx = Z · E_{u∼N(0,1)}[ f(ψ(u)) ],
+/// ```
+///
+/// and a Gauss–Hermite rule on the right is a rule for the left. `ψ` is analytic on
+/// the whole line and reaches the ends only as `u → ±∞`, so an integrand with a root
+/// or a jump at an end of the interval becomes smooth in `u`, where Gauss–Hermite
+/// converges geometrically in its order instead of algebraically.
+///
+/// A node with `u ≤ 0` is inverted through the lower tail `Φ(lower) + Z·Φ(u)` and a
+/// node with `u > 0` through the upper tail `(1 − Φ(upper)) + Z·(1 − Φ(u))`, each in
+/// log space. Both probabilities are below `3/4`, so neither inversion reads a
+/// probability that has rounded toward one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TruncatedNormalTransport {
+    lower: f64,
+    upper: f64,
+    log_mass: f64,
+    log_cdf_lower: f64,
+    log_sf_upper: f64,
+}
+
+impl TruncatedNormalTransport {
+    /// The transport onto `(lower, upper)`. Either end may be infinite; the interval
+    /// must contain zero in its interior.
+    pub fn new(lower: f64, upper: f64) -> Result<Self, String> {
+        if !(lower < 0.0 && upper > 0.0) {
+            return Err(format!(
+                "a truncated-normal transport needs lower < 0 < upper, got ({lower}, {upper})"
+            ));
+        }
+        // Z = ½(erf(upper/√2) + erf(−lower/√2)): both terms are positive, so the
+        // mass is formed without cancellation however close either end is to zero.
+        let mass = 0.5
+            * (libm::erf(upper / std::f64::consts::SQRT_2)
+                + libm::erf(-lower / std::f64::consts::SQRT_2));
+        Ok(Self {
+            lower,
+            upper,
+            log_mass: mass.ln(),
+            log_cdf_lower: crate::probability::normal_logcdf(lower),
+            log_sf_upper: crate::probability::normal_logsf(upper),
+        })
+    }
+
+    pub fn lower(&self) -> f64 {
+        self.lower
+    }
+
+    pub fn upper(&self) -> f64 {
+        self.upper
+    }
+
+    /// `ln Z`, the log of the standard-normal mass of the interval.
+    pub fn log_mass(&self) -> f64 {
+        self.log_mass
+    }
+
+    /// `ψ(u)`, the image of the standard-normal point `u` in the interval.
+    pub fn transport(&self, u: f64) -> Result<f64, String> {
+        use crate::probability::{
+            normal_logcdf, normal_logsf, standard_normal_quantile_from_log_cdf,
+        };
+        use crate::special::logaddexp;
+        if u <= 0.0 {
+            let log_cdf = logaddexp(self.log_cdf_lower, self.log_mass + normal_logcdf(u));
+            standard_normal_quantile_from_log_cdf(log_cdf)
+        } else {
+            let log_sf = logaddexp(self.log_sf_upper, self.log_mass + normal_logsf(u));
+            standard_normal_quantile_from_log_cdf(log_sf).map(|x| -x)
+        }
+    }
+
+    /// `(∂ψ/∂lower, ∂ψ/∂upper)` at the node `u` with image `psi = ψ(u)`, from
+    /// differentiating `Φ(ψ) = Φ(lower) + Z·Φ(u)`:
+    ///
+    /// ```text
+    /// ∂ψ/∂lower = φ(lower)·(1 − Φ(u)) / φ(ψ),   ∂ψ/∂upper = φ(upper)·Φ(u) / φ(ψ).
+    /// ```
+    ///
+    /// An infinite end does not move, and its sensitivity is zero.
+    pub fn endpoint_sensitivities(&self, u: f64, psi: f64) -> (f64, f64) {
+        use crate::probability::{normal_logcdf, normal_logsf};
+        let half_psi_sq = 0.5 * psi * psi;
+        let lower = if self.lower.is_finite() {
+            (half_psi_sq - 0.5 * self.lower * self.lower + normal_logsf(u)).exp()
+        } else {
+            0.0
+        };
+        let upper = if self.upper.is_finite() {
+            (half_psi_sq - 0.5 * self.upper * self.upper + normal_logcdf(u)).exp()
+        } else {
+            0.0
+        };
+        (lower, upper)
+    }
+
+    /// `(∂ ln Z/∂lower, ∂ ln Z/∂upper) = (−φ(lower)/Z, φ(upper)/Z)`.
+    pub fn log_mass_endpoint_gradient(&self) -> (f64, f64) {
+        let density_over_mass = |end: f64| {
+            if end.is_finite() {
+                (crate::probability::normal_pdf(end).ln() - self.log_mass).exp()
+            } else {
+                0.0
+            }
+        };
+        (
+            -density_over_mass(self.lower),
+            density_over_mass(self.upper),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `E[f | lower < X < upper]·Z` by a transported order-`order` rule.
+    fn transported_integral(
+        transport: &TruncatedNormalTransport,
+        order: usize,
+        f: impl Fn(f64) -> f64,
+    ) -> f64 {
+        let rule = standard_normal_gauss_hermite_rule(order).expect("standard-normal rule");
+        let mean: f64 = rule
+            .iter()
+            .map(|&(u, w)| w * f(transport.transport(u).expect("transported node")))
+            .sum();
+        mean * transport.log_mass().exp()
+    }
+
+    #[test]
+    fn transported_rule_integrates_a_root_at_the_cut_geometrically() {
+        // ∫_a^∞ φ(x)·√(x − a) dx has a square-root kink at the cut. Over the whole
+        // line with the indicator the rule converges algebraically; transported onto
+        // (a, ∞) the integrand is analytic in u. Reference: the transported rule at
+        // twice the order, which the geometric rate makes exact to roundoff.
+        let a = -0.7;
+        let transport = TruncatedNormalTransport::new(a, f64::INFINITY).expect("transport");
+        let f = |x: f64| (x - a).sqrt();
+        let reference = transported_integral(&transport, 160, f);
+        let transported = transported_integral(&transport, 40, f);
+        assert!(
+            (transported - reference).abs() <= 1e-9,
+            "order-40 transported rule {transported} vs reference {reference}"
+        );
+        let rule = standard_normal_gauss_hermite_rule(160).expect("rule");
+        let indicator: f64 = rule
+            .iter()
+            .filter(|&&(u, _)| u > a)
+            .map(|&(u, w)| w * f(u))
+            .sum();
+        assert!(
+            (indicator - reference).abs() > 1e-5,
+            "the untransported order-160 rule {indicator} should still miss {reference}"
+        );
+    }
+
+    #[test]
+    fn transported_rule_recovers_truncated_normal_moments() {
+        // E[X·1(a<X<b)] = φ(a) − φ(b) and the mass Φ(b) − Φ(a).
+        let (a, b) = (-1.3, 0.4);
+        let transport = TruncatedNormalTransport::new(a, b).expect("transport");
+        let pdf = crate::probability::normal_pdf;
+        let cdf = crate::probability::normal_cdf;
+        // Both ends cut: the image of the Gaussian tails flattens onto the ends, so
+        // the rate is geometric but slower than one-sided (≈1e-9 at order 30,
+        // ≈1e-12 at 60, roundoff by 120).
+        let mass = transported_integral(&transport, 120, |_| 1.0);
+        assert!((mass - (cdf(b) - cdf(a))).abs() <= 1e-15);
+        let first = transported_integral(&transport, 120, |x| x);
+        assert!(
+            (first - (pdf(a) - pdf(b))).abs() <= 1e-13,
+            "first moment {first} vs {}",
+            pdf(a) - pdf(b)
+        );
+        // The map is monotone and stays inside the interval. The outermost nodes of a
+        // high order rule sit within roundoff of an end, so their images may tie or
+        // land an ulp past it; the block integrand gives such a node zero weight,
+        // which is its value at the end.
+        let rule = standard_normal_gauss_hermite_rule(60).expect("rule");
+        let images: Vec<f64> = rule
+            .iter()
+            .map(|&(u, _)| transport.transport(u).expect("node"))
+            .collect();
+        assert!(images.windows(2).all(|pair| pair[0] <= pair[1]));
+        let ulp = |end: f64| 2.0 * f64::EPSILON * end.abs();
+        assert!(
+            images
+                .iter()
+                .all(|&x| a - ulp(a) <= x && x <= b + ulp(b)),
+            "images {:?}",
+            (images[0] - a, images[images.len() - 1] - b)
+        );
+    }
+
+    #[test]
+    fn endpoint_sensitivities_match_the_moved_map() {
+        let (a, b) = (-0.9, 1.6);
+        let transport = TruncatedNormalTransport::new(a, b).expect("transport");
+        let h = 1e-6;
+        let moved_lower = TruncatedNormalTransport::new(a + h, b).expect("moved lower");
+        let moved_lower_back = TruncatedNormalTransport::new(a - h, b).expect("moved lower");
+        let moved_upper = TruncatedNormalTransport::new(a, b + h).expect("moved upper");
+        let moved_upper_back = TruncatedNormalTransport::new(a, b - h).expect("moved upper");
+        for u in [-4.0, -1.2, -0.1, 0.0, 0.3, 2.5, 5.0] {
+            let psi = transport.transport(u).expect("node");
+            let (d_lower, d_upper) = transport.endpoint_sensitivities(u, psi);
+            let fd_lower = (moved_lower.transport(u).unwrap()
+                - moved_lower_back.transport(u).unwrap())
+                / (2.0 * h);
+            let fd_upper = (moved_upper.transport(u).unwrap()
+                - moved_upper_back.transport(u).unwrap())
+                / (2.0 * h);
+            assert!((d_lower - fd_lower).abs() <= 1e-7, "u={u}: {d_lower} vs {fd_lower}");
+            assert!((d_upper - fd_upper).abs() <= 1e-7, "u={u}: {d_upper} vs {fd_upper}");
+        }
+        let (g_lower, g_upper) = transport.log_mass_endpoint_gradient();
+        let fd_lower = (moved_lower.log_mass() - moved_lower_back.log_mass()) / (2.0 * h);
+        let fd_upper = (moved_upper.log_mass() - moved_upper_back.log_mass()) / (2.0 * h);
+        assert!((g_lower - fd_lower).abs() <= 1e-8);
+        assert!((g_upper - fd_upper).abs() <= 1e-8);
+    }
 
     #[test]
     fn standard_normal_rule_integrates_normal_moments_through_degree_nine_784() {

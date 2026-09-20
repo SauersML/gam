@@ -117,10 +117,56 @@ fn arc_reaches_the_optimum_through_a_run_of_rejected_trials_3017() {
         .iter()
         .filter(|&&trial| value_3017(trial) > value_3017(SEED_3017))
         .count();
+    // Two stalls at one incumbent that bought nothing stop a run (#3018), so the
+    // defect needs two trials above the seed.
     assert!(
-        rejected > ARC_COST_STALL_WINDOW,
-        "the fixture must spend more trials above the seed than one stall window, or \
-         it does not exercise the defect: {rejected} over {seed_trajectory:?}",
+        rejected >= 2,
+        "the fixture must spend at least two trials above the seed, or it does not \
+         exercise the defect: {rejected} over {seed_trajectory:?}",
+    );
+}
+
+/// The same criterion and seed with no declared problem size, so no criterion
+/// resolution and a solver band of `1e-3` (#3286). ARC reaches `ρ*` to within
+/// `3.9e-7`, where `|g| = 3.9e-2` and `H = 1e5` still leave `½g²/H = 7.6e-9` of
+/// decrease, about 50× the criterion's rounding. Its Newton step there is
+/// `3.9e-7`, but the point `fl(ρ + s)` it lands on is off the step by up to
+/// `ulp(6.9)/2 = 4.4e-16`. The model gradient at the represented step is then
+/// `H·r ≈ 4.4e-11`, while opt's termination test asked for `θ‖s‖² ≈ 1.5e-13`,
+/// so every trial was refused before evaluation, σ climbed to its ceiling and
+/// the run ended on `trust_region_reject_floor` at `|g| = 3.9e-2`.
+#[test]
+fn arc_takes_the_newton_step_whose_represented_point_rounds_3286() {
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .with_tolerance(1.0e-3)
+        .with_initial_rho(array![SEED_3017]);
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(value_3017(theta[0])),
+        |_: &mut (), theta: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: value_3017(theta[0]),
+                gradient: array![gradient_3017(theta[0])],
+                hessian: HessianValue::Dense(array![[hessian_3017(theta[0])]]),
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let cap = obj.capability();
+    assert_eq!(plan(&cap).solver, Solver::Arc, "the fixture must run the dense ARC route");
+    let result = problem
+        .run(&mut obj, "#3286 represented step")
+        .unwrap_or_else(|error| panic!("ARC must certify ρ* = {:.6}: {error}", optimum_3017()));
+    assert!(result.converged(), "the run must certify its optimum");
+    let gradient = gradient_3017(result.rho[0]).abs();
+    assert!(
+        gradient <= 1.0e-3,
+        "the certified point must meet the solver band: |g| = {gradient:.3e} at ρ = {:.12}",
+        result.rho[0]
     );
 }
 
@@ -157,12 +203,15 @@ fn drive_trials_3017(trials: &[f64], report_accepted: bool) -> Vec<Result<f64, S
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    // The guard exactly as the dense ARC route builds and seeds it.
+    // The guard exactly as the dense ARC route builds and seeds it. The scripted
+    // criterion publishes no evidence, so its values carry the criterion's
+    // resolution (#3018).
     let resolution = outer_criterion_resolution(&config);
-    let mut guard = CostStallGuard::new(resolution, ARC_COST_STALL_WINDOW, &config, exit);
+    let mut guard = CostStallGuard::new(resolution, &config, exit);
     guard.observe_second_order_seed(
         &array![SEED_3017],
         value_3017(SEED_3017),
+        resolution,
         gradient_3017(SEED_3017).abs(),
         Some(true),
     );
@@ -200,16 +249,16 @@ fn drive_trials_3017(trials: &[f64], report_accepted: bool) -> Vec<Result<f64, S
     outcomes
 }
 
-/// The guard counts ARC's iterates, not its trials. Two stall windows of
-/// rejected trials at one iterate are σ growing toward the curvature's scale,
-/// not steps that bought nothing, so they never stop the run. The control arm
+/// The guard counts ARC's iterates, not its trials. Eight rejected trials at one
+/// iterate are σ growing toward the curvature's scale, not steps that bought
+/// nothing, so they never stop the run. The control arm
 /// feeds the same trials as accepted steps, which is what the bridge did with
 /// every trial before the repair, and the guard does stop there.
 #[test]
 fn arc_bridge_rejected_trials_never_fill_the_stall_window_3017() {
     // The issue's rejected trials, shrinking from the Newton overshoot at 8.78;
     // each stays above the seed's criterion.
-    let trials: Vec<f64> = (0..2 * ARC_COST_STALL_WINDOW + 2)
+    let trials: Vec<f64> = (0..8)
         .map(|k| SEED_3017 + 3.3443 - 0.05 * k as f64)
         .collect();
     assert!(
@@ -230,8 +279,8 @@ fn arc_bridge_rejected_trials_never_fill_the_stall_window_3017() {
     assert_eq!(
         accepted.last(),
         Some(&Err(ARC_UNPROGRESSING_STALL_SENTINEL.to_string())),
-        "the same trials as accepted non-improving iterates fill two windows and \
-         stop the run: {accepted:?}"
+        "the same trials as accepted non-improving iterates stall twice and stop \
+         the run: {accepted:?}"
     );
 }
 
@@ -268,8 +317,9 @@ const BETA_TR_3017: f64 = 1.0e12;
 /// boundary: `s = r`, predicted decrease `k·r`, actual `k·(r − β·r⁴/4)`. The
 /// ratio `1 − β·r³/4` stays below `η = 0.1` while `r > (3.6/β)^(1/3) = 1.53e-4`.
 /// From opt's initial radius 1, quartered per rejection, the seven trials
-/// `r = 4^(−j)`, `j = 0..=6`, are rejected: two full stall windows of
-/// `ARC_COST_STALL_WINDOW = 3` and one more. `r = 6.1e-5` is then accepted
+/// `r = 4^(−j)`, `j = 0..=6`, are rejected: two full three-trial stall windows
+/// and one more, before #3018 deleted the window; a rejected trial reaches no
+/// verdict. `r = 6.1e-5` is then accepted
 /// (ratio 0.943), and the run must go on to `ρ* = 1e-4`.
 #[test]
 fn rejected_trust_region_trials_do_not_fill_the_stall_window_3017() {

@@ -1921,6 +1921,319 @@
     "evidence": "At base bdd00e20fd46860b917ff233fc268f9a8f293f9d, source_removal_guard.py and public_api_census.py (run against this base) report exactly these identities, and git grep -w finds both names only in the opt re-export and their callers at the head tree. At the head tree: cargo check --workspace --all-targets RC 0 with 0 warnings, cargo build --workspace --lib RC 0, and gam-solve rho_optimizer:: plus the _3036 pins all pass (acn112, toolchain 1.97.1)."
   },
   {
+    "base": "c14c88d3ab59a78e5741d37a295c4132826cab29",
+    "items": [
+      "crates/gam-models/src/survival/location_scale/time_block.rs:fn:append_linear_constraints"
+    ],
+    "reason": "gam#3037: the flexible survival location-scale time block declared its coordinate cone and, appended to it by append_linear_constraints, one derivative-guard row per training row. The cone implies every one of those rows (the I-spline derivative design is non-negative entrywise, every column carrying it is bounded at zero, and the offsets encode the guard), so the block now declares the cone alone. The flexible path was its only caller, so the concatenation helper is deleted with it.",
+    "evidence": "At the base, git grep finds append_linear_constraints only in crates/gam-models/src/survival/location_scale/time_block.rs: its declaration and its one call in prepare_identified_time_block's flexible path, which this commit replaces with the cone. No bench, script, example or Python file names it. source_removal_guard.py, run without this acknowledgement, refused exactly this one identity (public, 0 production occurrences)."
+  },
+  {
+    "base": "89bea032636428fd8e2ca7e7d5b1762854ff886a",
+    "items": [
+      "crates/gam-models/src/bms/estimated_latent_law.rs:fn:closed_form_survival_anchor_log_probabilities"
+    ],
+    "reason": "gam#2926 (moving-law certificate at the fitted law's anchor): the certificate scores a rigid survival row at the intercept the fit solved on its own law. closed_form_survival_anchor_log_probabilities(q, b, law) computed the closed-form intercept q·sqrt(1 + b²) itself, which is the fit's anchor only when the fitted law is Gaussian. It becomes survival_anchor_log_probabilities(alpha, b, law), which takes the intercept: calibration.rs's rigid arm passes solve_anchor(q, s·b, fitted law), the root the fit solved (#2983), or the closed form on the Gaussian law, where the two coincide.",
+    "evidence": "source_removal_guard.py and public_api_census.py each reported exactly this one identity at base de9b43848b (gateDr4 on acl42), and both passed with this entry at base 136b8383a5 (gateD5). git grep -w closed_form_survival_anchor_log_probabilities finds no occurrence under crates, src or tests at the head tree; survival_anchor_log_probabilities is declared at crates/gam-models/src/bms/estimated_latent_law.rs:253 and called at moving_law_rule.rs:1580, survival/marginal_slope/calibration.rs:197 and timepoint_exact/law_node_tests.rs:490, whose the_moving_law_certificate_scores_a_rigid_row_at_its_fitted_laws_anchor_2926 pins the intercept it takes."
+  },
+  {
+    "base": "94e6a59c5b31edf06a4d4b4b52885099ff721b22",
+    "items": [
+      "crates/gam-custom-family/src/blockwise_solve.rs:const:TOTAL_QUADRATIC_PENALTY_PAR_MIN_BLOCKS",
+      "crates/gam-custom-family/src/blockwise_solve.rs:const:TOTAL_QUADRATIC_PENALTY_PAR_MIN_DENSE_WORK",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:block_quadratic_penalty",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:block_quadratic_penalty_accumulation_matches_the_blas_value_2959",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:block_quadratic_penalty_with_accumulation",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:total_quadratic_penalty",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:total_quadratic_penalty_parallel_worthwhile",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:total_quadratic_penalty_with_accumulation",
+      "crates/gam-problem/src/joint_penalty.rs:fn:quadratic_form_with_accumulation",
+      "crates/gam-problem/src/joint_penalty.rs:fn:quadratic_form_with_accumulation_matches_the_mat_vec_value_2959",
+      "crates/gam-problem/src/joint_penalty.rs:fn:quadratic_with_accumulation",
+      "crates/gam-solve/src/reml/assembly.rs:fn:penalty_coords_from_blocks",
+      "crates/gam-solve/src/reml/assembly.rs:struct:PenaltyBlockDesc"
+    ],
+    "reason": "#2954 stage 1b, ruling (C): the custom-family penalty is evaluated on its structural roots by one function, gam_custom_family::BlockPenaltyRoots (value, penalty_increment, s_lambdas, block_value, terms), which replaces block_quadratic_penalty, block_quadratic_penalty_with_accumulation, total_quadratic_penalty_with_accumulation, total_quadratic_penalty, total_quadratic_penalty_parallel_worthwhile and its two TOTAL_QUADRATIC_PENALTY_PAR_* thresholds in place. The dense 1/2 b'S_lambda b carried lambda times the stored matrix's null eigenvalue (representation error, measured lambda*2.14e-16 on 2923's time block). The joint bundle's quadratic_with_accumulation and JointPenaltySpec::quadratic_form_with_accumulation go the same way: the bundle's quadratic now reads its validated roots, and BlockPenaltyRoots carries the accumulation for per-block and joint terms alike. gam-solve's penalty_coords_from_blocks and PenaltyBlockDesc built the criterion's coordinates from the dense matrices with their own rank threshold; their one caller, the custom-family assembly, now builds them from the same roots, so they had no caller left. The two #2959 pins are superseded by the_root_form_value_is_within_its_band_of_a_double_double_reference_2954 and the_bundle_quadratic_is_the_root_form_at_any_strength_2954, which pin the same property on the root form.",
+    "evidence": "source_removal_guard.py and public_api_census.py, run against this base, report exactly these identities, and git grep -w finds none of the 13 names under crates, src or tests at the head tree. The landing gate at this base ran every lib and integration test target of gam-problem, gam-custom-family, gam-solve and gam-models, and every test that fails at the head fails at the base. The two #2959 pins are superseded by the_root_form_value_is_within_its_band_of_a_double_double_reference_2954 and the_bundle_quadratic_is_the_root_form_at_any_strength_2954, which pass in gam-custom-family and gam-problem."
+  },
+  {
+    "base": "890f20cb3e96f1fa3856ec167bebd9cc6734845f",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/materialize/terms.rs:fn:disable_duchon_operator_penalties_in_basis",
+      "crates/gam-models/src/fit_orchestration/materialize/terms.rs:fn:gate_duchon_operator_penalties_for_family",
+      "tests/src_modules/misc/cli_tests.rs:fn:issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson"
+    ],
+    "reason": "Duchon operator penalties: one penalty structure for every family. gate_duchon_operator_penalties_for_family (with its helper disable_duchon_operator_penalties_in_basis) stripped the Duchon mass and tension operator penalties from every standard fit that was not Gaussian-identity (#1074), on the claim that fixed-dispersion LAML mis-rewards those blocks. Both LAML arms keep log|H| and log|S|+ (the Fixed arm sets include_logdet_h and include_logdet_s exactly as ProfiledGaussian does), so the claim has no criterion basis. What the gate did in practice was make scale_dimensions a no-op for GLMs: the promoted anisotropic s=0 Duchon carries per-axis relevance only through the tension-ARD penalties it removed. The gate and its call in materialize/standard.rs are deleted; every family now fits the resolved Duchon operator penalties as specified. The CLI test that pinned the gate (issue_2116_..._for_poisson) asserted the stripped structure; it is replaced by cli_scale_dimensions_fit_keeps_one_duchon_penalty_structure_for_every_family in the same file, which asserts mass Active, tension Active, stiffness Disabled for Gaussian and Poisson alike.",
+    "evidence": "In the landing tree neither function name occurs (git grep -c 0). The only production caller was materialize/standard.rs, whose call is deleted in the same change, and materialize/mod.rs's re-export is removed. tests/regressions/smooths/glm_duchon_operator_penalties_recover_truth.rs fails with the gate (the formula-path Poisson scale_dimensions fit resolves all-disabled operator penalties) and passes without it; on the same basis the fit with the operator penalties converges and has held-out RMSE(eta) no worse than the gated structure for Poisson and binomial."
+  },
+  {
+    "base": "7b249280deb52c24f0f413208659dc4328c68fb3",
+    "items": [
+      "crates/gam-models/src/inference/full_conformal.rs:fn:eval",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:gaussian_reml_reselection_is_stationary_on_the_augmented_criterion",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:new",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:penalized_rss",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:residual_sum_of_squares",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:select_rho",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:select_rho_domain_is_the_resolvability_interval_of_its_gram_2902",
+      "crates/gam-models/src/inference/full_conformal.rs:struct:GaussianRemlRhoResponse",
+      "crates/gam-models/src/inference/full_conformal.rs:struct:RemlEval"
+    ],
+    "reason": "#3275: GaussianRemlRhoResponse::select_rho, the full-conformal rho-hat(z) Newton polish with the contraction-ratio stop, had no production caller. Since #3213 (63d0074714) the Layer-3 map re-selects rho-hat(z) in full_conformal/honest.rs (branch and bound, then refit_at through OuterProblem, which takes the engine's certified result with no polish), and 1d6a22a6b0 moved the coverage study's training strength off select_rho(None) to the oracle's brute_force_rho because the ratio stop refused it. select_rho was a second, unused route to rho-hat(z), so it is deleted with its polish, not re-tuned. The deny-warnings cascade goes with it: the oracle's gradient, gradient band and Hessian (read only by select_rho), and the rounding scale of residual_sum_of_squares that fed that band. The rest of GaussianRemlRhoResponse (new, eval, penalized_rss, the rho domains) is the independent REML oracle that only the honest tests and the #2280/#2902 pins use, so it moves unchanged in arithmetic into a private #[cfg(test)] mod test_support (full_conformal/test_support.rs), with RemlEval and residual_sum_of_squares. select_rho_domain_is_the_resolvability_interval_of_its_gram_2902 is renamed oracle_rho_domain_is_the_resolvability_interval_of_its_gram_2902 (same body), and gaussian_reml_reselection_is_stationary_on_the_augmented_criterion, which tested only select_rho, is deleted.",
+    "evidence": "git grep -w select_rho at base 7fff1617da finds only the definition and that one unit test; git grep GaussianRemlRhoResponse finds uses only in full_conformal.rs tests and full_conformal/honest/tests.rs. At the head tree git grep -w select_rho -- crates src tests finds nothing, and under crates GaussianRemlRhoResponse, RemlEval and residual_sum_of_squares occur only in full_conformal/test_support.rs and the two test modules. Gate direct-dy5-w2oc-3275-g1.log, TIPCHECK at tip 94e6a59c5b (tree d165e56dc0): cargo check --workspace --all-targets RC 0 with SCANNER_ERRORS=0, gam-pyffi check RC 0, source_removal_guard and public_api_census RC 0, and 16 of 17 gam-models full_conformal:: tests pass, including oracle_rho_domain_is_the_resolvability_interval_of_its_gram_2902, the #2280 penalized-RSS pin and honest_set_matches_brute_force_reml_refits. The 17th, full_conformal_coverage_holds_for_every_row_class, hit nextest's 600 s per-test cap after 5 of its 9 (scenario, n) cells. It executes no code this change touches except the oracle's eval, which now does strictly less work (no A^-1 S solve, traces or Hessian), so the cap is not this change's (read, not measured at main)."
+  },
+  {
+    "base": "12d4f8d71d84c11f6f7e4c6937efdf0d54688d7b",
+    "items": [
+      "crates/gam-sae/src/assignment.rs:const:OVERRIDE_ALPHA",
+      "crates/gam-sae/src/assignment.rs:fn:set_ordered_beta_bernoulli_alpha_override",
+      "crates/gam-sae/src/manifold/tests.rs:fn:per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha",
+      "crates/gam-sae/src/manifold/tests_alpha_override_persistence_2933.rs:const:OVERRIDE_ALPHA",
+      "crates/gam-sae/src/manifold/tests_alpha_override_persistence_2933.rs:fn:a_layout_contradicting_the_effective_concentration_is_refused_2933",
+      "crates/gam-sae/src/manifold/tests_alpha_override_persistence_2933.rs:fn:overridden_fixed_alpha_finalizes_without_changing_the_objective_2933",
+      "crates/gam-sae/src/manifold/tests_alpha_override_persistence_2933.rs:fn:overridden_learnable_alpha_finalizes_at_the_override_concentration_2933",
+      "crates/gam-sae/src/manifold/tests_alpha_override_persistence_2933.rs:fn:overridden_learnable_alpha_reactive_box_matches_the_fixed_twin_2933"
+    ],
+    "reason": "#2933 F06 / #1777: the ordered-beta-Bernoulli alpha override is deleted. SaeFitConfig and SaeAssignment carried ordered_beta_bernoulli_alpha_override, a second path to a state that AssignmentMode::ordered_beta_bernoulli(tau, alpha, learnable) already declares; set_ordered_beta_bernoulli_alpha_override was its setter. A fixed concentration is now declared only through the mode (learnable_alpha: false), so the override-specific tests (the overridden_* finalization and reactive-box twins, the OVERRIDE_ALPHA fixtures, and the per_fit_config barrier-and-alpha isolation test) go with it; the surviving fixed/learnable finalization, layout-refusal and zero-trace tests move to tests_alpha_persistence_2933.rs and cover the single remaining path.",
+    "evidence": "source_removal_guard.py and public_api_census.py against this base report exactly these identities. At the head tree git grep -w alpha_override finds no occurrence under crates, src or tests. cargo check -p gam-sae --tests and cargo check -p gam-pyffi pass; tests_alpha_persistence_2933 keeps fixed_alpha_finalizes_without_changing_the_objective_2933, learnable_alpha_finalizes_and_reloads_its_fitted_concentration_2933, a_layout_contradicting_the_concentration_is_refused_2933 and fixed_alpha_reactive_box_has_no_sparse_face_2933."
+  },
+  {
+    "base": "3bfcf8d74e7664ad5cea9e15e342f10e1b39581e",
+    "items": [
+      "crates/gam-models/src/survival/predict.rs:fn:clamp_marginal_slope_index_derivative_at_horizon",
+      "crates/gam-models/src/survival/predict.rs:fn:gaussian_positive_part_mean",
+      "crates/gam-models/src/survival/predict.rs:fn:marginal_slope_index_derivative_clamps_extrapolation_negative_to_flat_hazard",
+      "crates/gam-models/src/survival/predict.rs:fn:marginal_slope_index_derivative_preserves_positive_and_nonfinite",
+      "crates/gam-models/src/survival/predict.rs:fn:probit_survival_hazard_rejects_negative_time_derivative"
+    ],
+    "reason": "#3026: survival marginal-slope prediction publishes one law, H = -log Phi(-eta) and h = dH/dt = phi(eta)/Phi(-eta) * eta_t, instead of clamping eta_t < 0 to 0 in h alone. clamp_marginal_slope_index_derivative_at_horizon was that clamp (h = 0 beside an H whose derivative is negative), and gaussian_positive_part_mean was its expectation inside the exact anchored posterior, E[max(eta_t, 0)], whose ratio to E[S] is the derivative of no reported curve; the exact rule now integrates the signed E[phi(eta) E(eta_t | q, b)] = -dE[S]/dt. The two clamp tests pinned the deleted clamp. probit_survival_hazard_rejects_negative_time_derivative pinned the kernel refusing a negative rate: the kernel is now the signed per-coefficient law that both posterior rules and the Monte Carlo reference sum, so the refusal of a decreasing survival curve moved to the surfaces that publish one (refuse_decreasing_survival for the plug-in, publish_survival_posterior_moments for the posterior mean), pinned by a_surface_whose_survival_increases_is_refused_by_name_3026 and probit_survival_hazard_is_signed_where_the_index_decreases_3026.",
+    "evidence": "At base 3bfcf8d74e each name occurs only in crates/gam-models/src/survival/predict.rs (git grep -w: clamp_marginal_slope_index_derivative_at_horizon 7 lines: its declaration, its two call sites, one comment and three test uses; gaussian_positive_part_mean 2; each of the three tests 1, its own declaration). At the head tree git grep -w finds none of them. On MSI, the full gate at 08c76b9289 and the narrow re-gate at 3299727c42 are both green: build --workspace --lib and check --workspace --all-targets are green, the survival::predict unit tests pass 42/42 including the replacements a_surface_whose_survival_increases_is_refused_by_name_3026 and probit_survival_hazard_is_signed_where_the_index_decreases_3026, and gam-predict survival_marginal_slope_posterior_mean_against_monte_carlo passes, with the exact rule within 2.0 Monte Carlo standard errors in all four configurations. source_removal_guard reports exactly these 5 guarded removals."
+  },
+  {
+    "base": "9ad6cad14d20a214a2c5f6fe35c5b808dc94c17f",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/arc_curvature_stationary_2817_tests.rs:fn:assert_stops_at_the_second_window_2817",
+      "crates/gam-solve/src/rho_optimizer/arc_curvature_stationary_2817_tests.rs:fn:drive_two_flat_windows_2817",
+      "crates/gam-solve/src/rho_optimizer/bridges.rs:const:ARC_COST_STALL_WINDOW",
+      "crates/gam-solve/src/rho_optimizer/bridges.rs:fn:objective_band",
+      "crates/gam-solve/src/rho_optimizer/bridges.rs:fn:observe_second_order",
+      "crates/gam-solve/src/rho_optimizer/bridges.rs:fn:observe_with_curvature",
+      "crates/gam-solve/src/rho_optimizer/bridges.rs:fn:record_recent",
+      "crates/gam-solve/src/rho_optimizer/bridges.rs:fn:resolution_against_incumbent",
+      "crates/gam-solve/src/rho_optimizer/bridges.rs:fn:resolution_between",
+      "crates/gam-solve/src/rho_optimizer/bridges.rs:fn:stage_objective_band"
+    ],
+    "reason": "gam#3018: the cost-stall guard's stall rule is derived from resolvable decrease. One stalled step (neither its measured nor its model's predicted decrease above R_b + R_j) reaches the verdict, so ARC_COST_STALL_WINDOW and the guard's window are deleted. #3186's objective_band, stage_objective_band, resolution_between and resolution_against_incumbent become each sample's resolution in StallSample, formed by sample_resolution (CostStallGuard::value_resolution) over the same outer_objective_band, so a missing band costs only that value its tau. observe_second_order and the private observe_with_curvature fold into observe(StallSample, predicted_decrease), which carries the curvature verdict and the step's model decrease. record_recent's fixed window+1 cap becomes restart_recent at each resolved progress. The test helpers drive_two_flat_windows_2817 and assert_stops_at_the_second_window_2817 drove two windows, which no longer exist, and the tests that used them are restated for one stalled step.",
+    "evidence": "source_removal_guard.py with this entry verified 511 -> 549 Rust items and exactly these 10 guarded removals at base 94e6a59c5b; the tip check reruns it at this base. In the landing tree git grep -w finds 0 occurrences of nine of the names. The 23 remaining objective_band word matches are unrelated locals and fields in decrement_bands.rs, run.rs, newton_decrement_certificate_2954_tests.rs and two gam-models files; bridges.rs has none. Gate on the landing tree (gate5, acn112, base 94e6a59c5b): workspace lib (ban scanner) and workspace check green; gam-solve 2101 of 2104 distinct tests pass, and the 3 reds also fail at base; the gam-models separation, multinomial and stall receipts pass 63 of 67, and the 4 reds also fail at base with the same messages."
+  },
+  {
+    "base": "96a81f3bca96c060ec79f9c0d52158e9e2389ed5",
+    "items": [
+      "crates/gam-sae/src/assignment.rs:const:SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS",
+      "crates/gam-sae/src/manifold/tests.rs:fn:assignment_logit_step_cap_bounds_single_iteration_gate_motion"
+    ],
+    "reason": "#2902: SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS clamped each accepted Newton step on the assignment logits to +-4 tau, a hand box on the step (SPEC 18-22). The Armijo line search on the realised objective already globalises the step, and the active-mass guard still observes collapse after each accepted iteration, so the cap is deleted and apply_newton_step realises step_size * delta on every logit. The test that pinned the cap is replaced by assignment_logit_newton_step_is_realised_unboxed, which asserts the unboxed step.",
+    "evidence": "git grep finds no remaining use of SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS or logit_step_cap. On main the old test clamps a 1e6 raw logit delta to exactly 4 tau; the new test's 500 tau expected move is realised only as 4 tau on main (fails before) and exactly on the branch (passes after). Full gam-sae lib run, 2059 tests one process each with a 240s timeout: 41 non-zero results on the branch, all 41 identical (same return code) on main f4db2a2b, no new failures."
+  },
+  {
+    "base": "f9f0a6e6ecd0b6c3306926064d7d48ecc86219fa",
+    "items": [
+      "crates/gam-solve/src/reml/per_atom_efs.rs:const:PER_ATOM_COST_DESCENT_TOL",
+      "crates/gam-solve/src/reml/per_atom_efs.rs:const:PER_ATOM_MAX_BACKTRACK",
+      "crates/gam-solve/src/reml/per_atom_efs.rs:const:PER_ATOM_MAX_STEP",
+      "crates/gam-solve/src/reml/per_atom_efs.rs:fn:sanitize_step"
+    ],
+    "reason": "#2902: the per-atom EFS primary boxed each coordinate's log-lambda step to +-5 (PER_ATOM_MAX_STEP), stopped halving after a fixed 8 (PER_ATOM_MAX_BACKTRACK), accepted cost increases up to 1e-12 relative (PER_ATOM_COST_DESCENT_TOL), and zeroed non-finite step components (sanitize_step) so the infinity-norm test could certify an unresolved coordinate (SPEC 18-22). The step is now taken as eval_efs produced it; halving runs while 2^-k*|step|_inf >= tolerance; acceptance uses the two costs' rounding bands gamma_1*(|f|+|f'|); finite_step refuses a non-finite component.",
+    "evidence": "git grep finds no remaining use of the three constants or sanitize_step. New tests in crates/gam-solve/src/reml/per_atom_efs.rs: decoupled_step_is_realised_without_a_per_coordinate_box (2 iterations; main 5), backtracking_halves_until_the_step_is_unresolvable (alpha 2^-9; main stalls), backtracking_refuses_a_resolvable_cost_increase (main accepts +5e-13), non_finite_decoupled_step_is_refused_not_zeroed (main reports converged) -- all four fail on main and pass on the branch. cargo test -p gam-solve --lib -- rho_optimizer reml: 968 passed, 0 failed."
+  },
+  {
+    "base": "990d8e0b93c55f834d5b27a7aa69487c3e2096ae",
+    "items": [
+      "tests/regressions/misc/regression_1082_block_correction_decided_at_optimum.rs:fn:bits"
+    ],
+    "reason": "#3280: block_correction_admission_does_not_depend_on_the_start_1082 no longer asserts bitwise-equal published rho from the two starts, a property nothing guarantees (each start publishes the point where its search met the outer certificate). It asserts the decision, the latched rule and block, and published criterion values within 3*tau_stat instead. bits, the helper that mapped rho to its bit patterns for that assertion, had no other caller and is deleted with it.",
+    "evidence": "At the head tree git grep -w bits finds no occurrence in tests/regressions/misc/regression_1082_block_correction_decided_at_optimum.rs, and the helper was private to that file. Gate direct-dy7-w2thb-g5.log, TIPCHECK at tip 990d8e0b93 (tree aecdde9112): cargo check --workspace --all-targets RC 0 with SCANNER_ERRORS=0, gam-pyffi RC 0, and block_correction_admission_does_not_depend_on_the_start_1082 PASS. Before this entry, the guard's only finding on this change was this removal (direct-dy7-w2thb-g2.log)."
+  },
+  {
+    "base": "38bfcabf183e3eaae913674a739c42ea2351021e",
+    "items": [
+      "crates/gam-solve/src/quadrature.rs:fn:sigmoid",
+      "crates/gam-solve/src/quadrature.rs:fn:test_logit_exact_clamped_degenerate_branch_is_locally_flat"
+    ],
+    "reason": "#2902: the private sigmoid helper clamped its argument to +-QUADRATURE_EXP_LOG_MAX (700); its only caller, stable_sigmoidwith_derivative, now computes the logistic and its slope from z = e^{-|x|}, which never overflows. The deleted test pinned the clamp's defect (a zero slope at mu = -710, where the slope is e^-710).",
+    "evidence": "test_logit_exact_point_mass_keeps_its_tails_past_the_exp_log_limit fails on main (mu=-710: (9.86e-305, 0.0) vs (4.48e-309, 4.48e-309)) and passes here; cargo test -p gam-solve --lib -- quadrature: 84 passed."
+  },
+  {
+    "base": "da88d1a69574d571d8439ccc1c978bf483b0b225",
+    "items": [
+      "crates/gam-solve/src/inference/residual_factor.rs:const:ALTERNATION_MAX_SWEEPS",
+      "crates/gam-solve/src/inference/residual_factor.rs:const:DIAGONAL_REL_FLOOR",
+      "crates/gam-solve/src/inference/residual_factor.rs:const:SCALE_REL_FLOOR",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:bic_penalized_log_likelihood",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:column_variances",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:evidence_ladder_prefers_planted_rank_one",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:factor_coordinates",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:fit_fixed_rank",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:gaussian_bic_log_likelihood",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:gaussian_bic_log_likelihood_with_band",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:hoisted_gram_matches_naive_per_row_rebuild",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:is_finite",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:moving_average_3",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:naive_factor_coordinates",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:naive_gaussian_bic_log_likelihood",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:occupancy_scale_improves_second_moment_reconstruction",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:scaled_second_moment",
+      "crates/gam-solve/src/inference/residual_factor.rs:fn:scaled_second_moment_chunk"
+    ],
+    "reason": "#2901/#2902 (lane bic-removal, SPEC R11/R18/R23): the structured residual model's BIC rank ladder is replaced by the Laplace marginal likelihood of every identifiable rank (residual_factor/evidence.rs). The ladder's alternating fixed-rank fit (fit_fixed_rank with its ALTERNATION_MAX_SWEEPS cap and the DIAGONAL_REL_FLOOR / SCALE_REL_FLOOR clamps), its BIC scorer (gaussian_bic_log_likelihood[_with_band], bic_penalized_log_likelihood) and its moment helpers (column_variances, scaled_second_moment[_chunk], factor_coordinates, moving_average_3, is_finite) have no remaining caller. The tests of the removed internals (hoisted_gram_matches_naive_per_row_rebuild with its naive_* oracles, occupancy_scale_improves_second_moment_reconstruction) go with them; evidence_ladder_prefers_planted_rank_one is superseded by evidence_prefers_planted_rank_one on the same planted DGP.",
+    "evidence": "Replacement: evidence::fit_rank and StructuredResidualModel::log_evidence in crates/gam-solve/src/inference/residual_factor*. The only external reader of bic_penalized_log_likelihood (gam-sae fit_entry.rs StructuredResidualPassDiagnostic and its pyffi dict key) now reads log_evidence. cargo test -p gam-solve --lib residual_factor: 9/9 pass, including the null (rank 0 on three seeds, p = 6) and the planted rank-1 and rank-2 recoveries."
+  },
+  {
+    "base": "fd03e8ce9d4971a33c568de620d551a50ed505f5",
+    "items": [
+      "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs:fn:with_flex_third_jet_arena",
+      "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs:fn:with_flex_timepoint_jet_arena",
+      "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs:static:FLEX_THIRD_JET_ARENA",
+      "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs:static:FLEX_TIMEPOINT_JET_ARENA"
+    ],
+    "reason": "#3266: the survival FLEX jet arenas move out of two per-worker thread-locals into one fit-owned GovernedScratchPool<DynamicJetArena>, the SurvivalMarginalSlopeFamily field flex_jet_arenas made by new_flex_jet_arena_pool on the process MemoryGovernor. This is the survival twin of the BMS scratch fix a6d77058e6 (#2989). Each thread-local kept its worker's largest arena for the life of the process, where no ledger saw it. The two helpers become one method, SurvivalMarginalSlopeFamily::with_flex_jet_arena, which checks an arena out of the family's pool, resets it and checks it back in. An idle arena stays only while the governor admits its retained bytes, and the pool drops with the fit's families. Every caller now calls the method: the four in contracted.rs, the two timepoint builders in flex_jet.rs and three flex_jet tests. The statics FLEX_THIRD_JET_ARENA and FLEX_TIMEPOINT_JET_ARENA are deleted with the helpers.",
+    "evidence": "At this base, source_removal_guard.py with the landing commit as head reports exactly these identities. git grep -w finds none of the four names under crates, src or tests in the head tree. Gate direct-dy6-w2smb-3266-g4.log (acl42): cargo check --workspace --all-targets and gam-pyffi, plus the gam-models tests flex_jet_arenas_are_charged_and_end_with_the_family_3266, flex_third_arena_reuses_warmed_tape_932, flex_timepoint_arena_carriers_are_the_vec_jets_bitwise_2971 and the flex third/fourth/fifth contraction witnesses."
+  },
+  {
+    "base": "a924471b61fe2b7ab2d27d1d4c9c63d7bfc936b0",
+    "items": [
+      "crates/gam-math/src/bivariate_normal.rs:const:BIVARIATE_NORMAL_CDF_ERROR_BOUND",
+      "crates/gam-math/src/bivariate_normal.rs:const:CORE_DENSITY_MAXIMUM",
+      "crates/gam-math/src/bivariate_normal.rs:const:CORE_EVALUATION_ERROR",
+      "crates/gam-math/src/bivariate_normal.rs:const:CORE_MAX_ANGLE",
+      "crates/gam-math/src/bivariate_normal.rs:const:CORE_RULE_NODE_ERROR",
+      "crates/gam-math/src/bivariate_normal.rs:const:CORE_RULE_WEIGHT_ERROR",
+      "crates/gam-math/src/bivariate_normal.rs:const:NODE_VALUE_ERROR",
+      "crates/gam-math/src/bivariate_normal.rs:fn:bivariate_normal_cdf_with_complement_bounded",
+      "crates/gam-math/src/bivariate_normal.rs:fn:cdf_error_bound_covers_the_complementary_orthant_identity",
+      "crates/gam-math/src/bivariate_normal.rs:fn:cdf_on_rule",
+      "crates/gam-math/src/bivariate_normal.rs:fn:core_bernstein_radius_squared",
+      "crates/gam-math/src/bivariate_normal.rs:fn:core_cdf",
+      "crates/gam-math/src/bivariate_normal.rs:fn:core_order",
+      "crates/gam-math/src/bivariate_normal.rs:fn:core_order_is_the_smallest_meeting_the_bernstein_bound",
+      "crates/gam-math/src/bivariate_normal.rs:fn:core_rule_meets_its_truncation_bound_against_doubled_order",
+      "crates/gam-math/src/bivariate_normal.rs:fn:core_rule_meets_the_gauss_legendre_contract_at_the_core_order",
+      "crates/gam-math/src/bivariate_normal.rs:fn:exact_branch",
+      "crates/gam-math/src/bivariate_normal.rs:fn:legendre_double_double",
+      "crates/gam-math/src/bivariate_normal.rs:fn:normal_interval_probability",
+      "crates/gam-math/src/bivariate_normal.rs:fn:reductions_agree_with_the_core_at_the_fixed_point",
+      "crates/gam-math/src/bivariate_normal.rs:fn:with_order",
+      "crates/gam-math/src/bivariate_normal.rs:static:CORE_RULE",
+      "crates/gam-math/src/bivariate_normal.rs:struct:CoreRule",
+      "crates/gam-math/src/bivariate_normal/apex_form.rs:fn:every_branch_meets_the_core_within_both_bounds",
+      "crates/gam-math/src/bivariate_normal/positive_form_tests.rs:fn:outside_the_certified_region_the_oracle_declines_and_the_apex_tree_meets_the_core",
+      "crates/gam-math/src/gaussian_activation.rs:const:BIVARIATE_NORMAL_CONTRACT",
+      "crates/gam-math/src/gaussian_activation.rs:enum:OrthantEntry",
+      "crates/gam-math/src/gaussian_activation.rs:fn:certifies_a_digit",
+      "crates/gam-math/src/gaussian_activation.rs:fn:with_orthant_fallback",
+      "crates/gam-math/tests/gaussian_activation_oracle.rs:const:BIVARIATE_NORMAL_CONTRACT",
+      "crates/gam-sae/src/response/subspace.rs:struct:PassEnergy",
+      "crates/gam-sae/src/response/subspace_tests.rs:fn:a_pass_counts_the_pair_kernels_that_fell_back_to_the_certified_orthant_route"
+    ],
+    "reason": "#3253/#3226, one route for the bivariate normal distribution function. Every Φ₂ value now comes from the apex tree (bivariate_normal/apex_form.rs), so the second route is deleted: the Drezner-Wesolowsky core (core_cdf, cdf_on_rule, exact_branch, normal_interval_probability, CoreRule with with_order, the CORE_RULE static, core_order, core_bernstein_radius_squared) and its error constants (CORE_MAX_ANGLE, CORE_DENSITY_MAXIMUM, CORE_RULE_NODE_ERROR, CORE_RULE_WEIGHT_ERROR, NODE_VALUE_ERROR, CORE_EVALUATION_ERROR and the public BIVARIATE_NORMAL_CDF_ERROR_BOUND). That core cancelled in the ρ < 0 lower tail: at main the plain entries miss #3158's truths by up to 7.84e2 relative, and return 0 for 6.2e-218. bivariate_normal_cdf_with_complement_bounded is folded into bivariate_normal_cdf_with_complement, which now returns the BoundedProbability. In gaussian_activation the plain-then-certified fallback (OrthantEntry, certifies_a_digit, with_orthant_fallback) goes with the plain route, and so does gam-sae's cost receipt for it (the PassEnergy wrapper; pair_pass returns its BandedEnergy). Tests of the deleted route go with it: core_order_is_the_smallest_meeting_the_bernstein_bound, core_rule_meets_its_truncation_bound_against_doubled_order, core_rule_meets_the_gauss_legendre_contract_at_the_core_order (with its only helper legendre_double_double; the node generator keeps its owner's pins in special.rs), reductions_agree_with_the_core_at_the_fixed_point and a_pass_counts_the_pair_kernels_that_fell_back_to_the_certified_orthant_route. The rest are restated against the per-call bound. cdf_error_bound_covers_the_complementary_orthant_identity becomes bounds_cover_the_complementary_orthant_identity (both signs of ρ, both correlation routes, the control drops the second correlation's sign). every_branch_meets_the_core_within_both_bounds becomes every_branch_bound_scales_with_the_value, with #3226's minuend clause removed, and the_issue_law_keeps_its_relative_bound_where_the_difference_did_not; the value check moves to cdf_matches_an_independent_conditional_reference_for_every_correlation. outside_the_certified_region_the_oracle_declines_and_the_apex_tree_meets_the_core becomes ..._keeps_the_complementary_identity. The two test constants BIVARIATE_NORMAL_CONTRACT become Φ₂'s per-call bound at each law (biased_orthant_contract, StandardizedPair::orthant_rounding).",
+    "evidence": "Gate dy5 w2slb-bvn-g1 at 94e6a59c5b (tree 1d69cd17fe, direct-dy5-w2slb-bvn-g1.log.guard): the guard lists exactly these 32 items. In the landing tree each name occurs 0 times under crates/, bench/, tests/, scripts/, gamfit/ and docs/ (git grep -w -c). The failing-before measurement for the plain entries is dy6 w2slb-probe3253 at 94e6a59c5b (direct-dy6-w2slb-probe3253.log.test). Final gate dy5 w2slb-bvn-g5 at 96a81f3bca (tree 0a497192f7): guard 0 with this entry."
+  },
+  {
+    "base": "11e49efecf7669ee10f880fa2801d312aa4acfe0",
+    "items": [
+      "crates/gam-models/src/gamlss/binomial/location_scale.rs:fn:dense_block_designs",
+      "crates/gam-models/src/gamlss/binomial/location_scale.rs:fn:dense_block_designs_fromspecs",
+      "crates/gam-models/src/gamlss/binomial/location_scale.rs:fn:exact_newton_block_diagonal_hessians_from_design_matrices",
+      "crates/gam-models/src/gamlss/binomial/wiggle.rs:fn:assemble_block_diagonals",
+      "crates/gam-models/src/gamlss/binomial/wiggle.rs:fn:dense_block_designs_fromspecs",
+      "crates/gam-models/src/gamlss/gaussian/wiggle.rs:fn:dense_block_designs_fromspecs",
+      "crates/gam-models/src/gamlss/tests_wiggle_ls.rs:fn:nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_are_present"
+    ],
+    "reason": "#3015: every location-scale family resolves the designs of its exact joint calculus through one rule, exact_joint_locscale_block_designs, which makes the specs it is handed authoritative: the identifiability audit can drop columns and the solve then runs in the specs' coordinates. The binomial location-scale family's dense_block_designs/dense_block_designs_fromspecs and the dense_block_designs_fromspecs of the binomial and Gaussian location-scale wiggle families were that rule's two halves in each family, with the stored pre-audit design read first; the shared rule replaces them. The binomial families' evaluate() returns NaturalDiagonal working sets (row score and within-block curvature, contracted by the caller with the designs it solves on), so exact_newton_block_diagonal_hessians_from_design_matrices and the wiggle family's assemble_block_diagonals, which built those blocks from the stored designs, have no caller. The test nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_are_present asserted the retired representation; it is restated as nonwiggle_family_evaluate_block_curvature_is_the_joint_hessians_principal_block, and the_binomial_location_scale_family_computes_on_the_specs_it_is_handed_3015 pins the reduced-width contract.",
+    "evidence": "Lane gate ls-surv (acn112 60-63). Lane commit c93dda4199 on 700c8e6300: source_removal_guard.py and public_api_census.py name exactly these removals without this entry; cargo check --workspace --all-targets (root ban scanner, 0 rows) and cargo check -p gam-pyffi --all-targets exit 0. Each of three mutants (surv-ls-lead's i3015-mut-all, i3015-mut-owned and i3015-mut-eval patches: the stored designs first in exact_joint_locscale_block_designs, the stored designs first in exact_joint_block_designs_owned, and evaluate() building ExactNewton blocks from the stored designs) fails the_binomial_location_scale_family_computes_on_the_specs_it_is_handed_3015. Re-run at base 990d8e0b93c55f834d5b27a7aa69487c3e2096ae: the guards pass with this entry, and git grep -w finds no caller of a removed item; the remaining same-name hits are the Gaussian and binomial wiggle families' own dense_block_designs (a different item, kept for their spec-less per-block hook) and error-message strings in gamlss/errors.rs."
+  },
+  {
+    "base": "135c578e1613f68909f5d8a2504044bcfadec474",
+    "items": [
+      "crates/gam-model-kernels/src/scale_design.rs:const:SCALE_PROJECTION_REPLAY_RCOND_FLOOR",
+      "crates/gam-model-kernels/src/scale_design.rs:fn:build_scale_deviation_transform",
+      "crates/gam-model-kernels/src/scale_design.rs:fn:build_scale_deviation_transform_design",
+      "crates/gam-model-kernels/src/scale_design.rs:fn:build_scale_deviation_transform_impl",
+      "crates/gam-model-kernels/src/scale_design.rs:fn:build_weighted_primary_design",
+      "crates/gam-model-kernels/src/scale_design.rs:fn:choose_scale_projection_ridge_alpha",
+      "crates/gam-model-kernels/src/scale_design.rs:fn:choose_scale_projection_ridge_alpha_scales_with_sigma_max",
+      "crates/gam-model-kernels/src/scale_design.rs:fn:rescale_is_invariant_to_the_noise_columns_units",
+      "crates/gam-model-kernels/src/scale_design.rs:fn:ridge_replay_continuous_under_input_sweep",
+      "crates/gam-model-kernels/src/scale_design.rs:fn:scale_transform_payload_round_trips_alpha",
+      "crates/gam-model-kernels/src/scale_design.rs:fn:solve_scale_projection",
+      "crates/gam-models/src/gamlss/builders.rs:fn:identified_binomial_log_sigma_design",
+      "crates/gam-models/src/gamlss/builders.rs:fn:prepared_gaussian_log_sigma_design"
+    ],
+    "reason": "#3015: no location-scale family residualizes its log-sigma design. location_scale_log_sigma_design (the raw noise design, row-checked) replaces prepared_gaussian_log_sigma_design for Gaussian and identified_binomial_log_sigma_design for binomial: the binomial likelihood sees the blocks only through q = -eta_t*exp(-eta_sigma), whose tangent null space is {d eta_t = eta_t * d eta_sigma}, so a log-sigma column the threshold spans is identified wherever the threshold varies, and residualizing it erased that scale effect before the audit dropped the zeroed column. The saved-model builder no longer derives a transform (LocationScaleResponse::Binomial carries only its link), so the transform-fitting route in gam-model-kernels scale_design.rs (build_scale_deviation_transform, build_scale_deviation_transform_design, build_scale_deviation_transform_impl, solve_scale_projection, build_weighted_primary_design, choose_scale_projection_ridge_alpha, SCALE_PROJECTION_REPLAY_RCOND_FLOOR) has no caller and is deleted; saved models that carry a transform still replay it through scale_transform_from_payload and build_scale_deviation_operator. The three tests of the deleted fitting code go with it; scale_transform_payload_round_trips_alpha is restated on a hand-built transform as scale_transform_payload_round_trips_every_field.",
+    "evidence": "Lane gate ls-surv (acn112 60-63). Lane commit c14fde8317 on c93dda4199: the guards name exactly these removals without this entry; cargo check --workspace --all-targets (root ban scanner, 0 rows) and the gam-pyffi check exit 0. Lane probe on gamfit's #3015 truth (log-sigma slope 0.3 on x3, which the threshold's duchon(x2, x3) spans): the fitted slope is 0.257 +- 0.059 at n = 2000 and 0.277 +- 0.029 at n = 20000; the residualized design zeroed and dropped that column (log-likelihood -11782.10 against -11738.08 at n = 20000). a_saved_scale_transform_replays_its_noise_design_bit_for_bit pins the replay of a saved transform. Re-run at base ac93f7247f402591f76e040bd2bf94342ee753e4: the guards pass with this entry and git grep -w finds none of the removed names under crates/."
+  },
+  {
+    "base": "fc7e17b7b3644b88ef26d2de092a186b5d5a3087",
+    "items": [
+      "crates/gam-predict/src/interval_policy.rs:fn:response_support",
+      "crates/gam-predict/src/lib.rs:fn:family_response_variance",
+      "crates/gam-spec/src/lib.rs:fn:response_support_bounds",
+      "crates/gam-spec/src/lib.rs:fn:response_support_bounds_binomial_unit_interval",
+      "crates/gam-spec/src/lib.rs:fn:response_support_bounds_gamma_nonneg_to_inf",
+      "crates/gam-spec/src/lib.rs:fn:response_support_bounds_gaussian_none"
+    ],
+    "reason": "#3140: the observation bands are built from one posterior law of the response mean with the complement 1 - mu carried, and each edge is a quantile of a law on the response's support, so nothing floors a variance or clamps an edge. family_response_variance returned E[Var(Y|mu)] and formed the Beta and Bernoulli arms as m(1-m) - v under a .max(0.0) floor; family_predictive_variance replaces it with the total E[Var(Y|mu)] + Var(mu) as a sum of non-negative terms, and every caller reads the total. ResponseBounds::response_support and ResponseFamily::response_support_bounds existed only to clamp the observation band to the response support; with that clamp deleted from both band drivers they have no reader, so they go with their three unit tests.",
+    "evidence": "git grep at 4d529db085e4eb5925afb3057c584afeab57b2dd: family_response_variance is defined at crates/gam-predict/src/lib.rs:2209 and called only by the six skew arms of family_observation_band (lib.rs:2429-2535) and predictive_standard_error's conformal scale (lib.rs:3275); ResponseBounds::response_support (crates/gam-predict/src/interval_policy.rs:70) is called only at lib.rs:2328 and :2651, the two band clamps this landing deletes; ResponseFamily::response_support_bounds (crates/gam-spec/src/lib.rs:863) is called only by response_support and by its three unit tests (lib.rs:4395-4412). The landing tree names none of the six items."
+  },
+  {
+    "base": "04346780239dc8e32810c476bb12d0eef4033440",
+    "items": [
+      "crates/gam-gpu/src/calibration.rs:const:_",
+      "crates/gam-gpu/src/device_runtime.rs:fn:resolve_if_fused_batch_exceeds_floor",
+      "crates/gam-gpu/src/policy.rs:const:MIN_CALIBRATABLE_FUSED_KERNEL_N",
+      "crates/gam-gpu/src/policy.rs:fn:polya_gamma_admits_large_batch_and_refuses_small",
+      "crates/gam-gpu/src/policy.rs:fn:polya_gamma_batch_target_is_gpu",
+      "crates/gam-inference/src/gpu_polya_gamma.rs:fn:sub_crossover_batch_routes_to_cpu_bitwise_on_every_host"
+    ],
+    "reason": "#3024 slice A: the survival row jet and the Polya-Gamma batch are admitted under gpu=auto on their own two executors measured on their own workload (gam_gpu::row_kernel_race), not at fused_kernel_min_n, which calibration set to twice the xtwx Gram's crossover. GpuDispatchPolicy::fused_kernel_min_n is deleted with every reader: its pre-probe floor MIN_CALIBRATABLE_FUSED_KERNEL_N and the compile-time assert (const _) that pinned that floor to 2 * XTWX_DIMS[0]; GpuRuntime::resolve_if_fused_batch_exceeds_floor, the size-gated resolve built on the floor; and GpuDispatchPolicy::polya_gamma_batch_target_is_gpu, the PG predicate on it, with its pin polya_gamma_admits_large_batch_and_refuses_small. The PG seam test sub_crossover_batch_routes_to_cpu_bitwise_on_every_host is renamed an_untimed_batch_returns_the_cpu_draws_bitwise_on_every_host_3024: there is no crossover left to be under, and the same bitwise-CPU property now holds for any batch size the process has not timed.",
+    "evidence": "In the landing tree git grep -w finds none of fused_kernel_min_n, MIN_CALIBRATABLE_FUSED_KERNEL_N, resolve_if_fused_batch_exceeds_floor or polya_gamma_batch_target_is_gpu under crates, src or tests. an_untimed_batch_returns_the_cpu_draws_bitwise_on_every_host_3024 and rigid_row_jet_device_admission_and_parity_2900 pass. The race logic is pinned by a_measured_law_decides_every_row_count_3024, an_unfixed_law_is_raced_3024, a_race_returns_the_cpu_value_and_records_the_shape_3024 and a_measured_row_kernel_races_an_untimed_shape_and_then_reads_its_timing_3024."
+  },
+  {
+    "base": "ce53546019d9a566866ae8b17b123bda7cef298e",
+    "items": [
+      "crates/gam-solve/src/pirls/newton_solve.rs:const:ACTIVE_BOUND_ABS_TOL",
+      "crates/gam-solve/src/pirls/newton_solve.rs:const:ACTIVE_BOUND_REL_TOL"
+    ],
+    "reason": "#3180: the P-IRLS box path's second activity rule for lower bounds (1e-6 relative + 1e-10 absolute) is deleted with the duplicate path it guarded. A lower bound is the unit row beta_i >= lb_i of the inequality system, whose one activity rule is active_set::row_is_active (scaled slack <= PRIMAL_FEASIBILITY_TOL), already applied to the same rows by active_face for the exact face decrement and the geometric KKT channels. projected_gradient_norm and the bound QP's warm-start seed now read it through newton_solve.rs lower_bound_binds.",
+    "evidence": "In the landing tree ACTIVE_BOUND_REL_TOL and ACTIVE_BOUND_ABS_TOL occur 0 times (git grep -c); both were pub(crate) and read only at newton_solve.rs projected_gradient_norm and solve_newton_directionwith_lower_bounds. gam-solve all targets at the candidate: the new pins projected_gradient_reports_an_interior_point_short_of_its_bound_3180 and box_bounds_bind_exactly_where_the_active_face_is_active_3180 pass, and the only reds are the four also red at base."
+  },
+  {
+    "base": "b7f57a0fd4754157b2068201f65d69b8ea35b192",
+    "items": [
+      "crates/gam-custom-family/src/assembly.rs:fn:outerobjectivegradienthessian_internal",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:outerobjectivegradienthessian_labeled"
+    ],
+    "reason": "#3173: every production outer evaluation of a custom family now goes through evaluate_on_branch, which solves a certified mode from each start (correct_labeled_laplace_mode, or the branch continuation for the incumbent) and prices only the mode the lowest-penalized-objective rule selects (outerobjective_from_coefficient_mode_labeled). The single-seed evaluators outerobjectivegradienthessian_labeled and outerobjectivegradienthessian_internal were the solve-and-price route that evaluation used; they have no production caller left and move verbatim into the cfg(test) test_support module, where tests that price the criterion at a mode they chose still call them.",
+    "evidence": "At the gate base 4b87357bf0 source_removal_guard.py and public_api_census.py report exactly these two identities (production_occurrences 0 for both). At the head tree git grep -w finds both names only in crates/gam-custom-family/src/test_support.rs (the moved definitions) and in test modules. cargo check --workspace --all-targets rc 0 and cargo build --workspace --lib rc 0 at the gate; the gam-custom-family lib suite passes except the main red a_double_well_fit_publishes_its_uncertified_trace_2901, identical at base."
+  },
+  {
+    "base": "b3fbbbab2e0eae7c217bc986ddf46c6e36754731",
+    "items": [
+      "crates/gam-models/src/gamlss/dispersion_family.rs:fn:outer_hyper_hessian_dense_available"
+    ],
+    "reason": "DispersionGlmLocationScaleFamily's override of CustomFamily::outer_hyper_hessian_dense_available returned `specs.len() < 2`. It declined the dense outer Hessian on every two-block fit because the family had no joint second directional derivative D2_beta H_L[u, v], and the trait default for that hook is block-diagonal, which drops the mean/precision cross curvature. The family now implements exact_newton_joint_hessian_second_directional_derivative_with_specs from its contracted fourth row surfaces, so the override is deleted and the trait default (dense outer Hessian available) applies. The trait method and every other family's implementation are unchanged.",
+    "evidence": "Direct gate dy7 run w2tha-g1-predict (direct-dy7-w2tha-g1-predict.log) at 96a81f3bca on this change gave RC_CHECK 0, SCANNER_ERRORS 0 and RC_PYFFI 0. The gam-predict gamma, negbin and tweedie dispersion_location_scale_assembles_covariance_and_is_predictable tests passed 3 of 3; gamma had been red at 64f2129d00 (dy3 w2o-3140-basectl) and at 96a81f3bca (dy6 w2tha-pr1b). The guard's only hit is this override. The name's other occurrences are the trait declaration, its callers and other families' own overrides, none of which change."
+  },
+  {
+    "base": "45d1a4328ec82034e602ca762a1232a27a3934bc",
+    "items": [
+      "crates/gam-custom-family/src/inner_blockwise_fit.rs:const:POLISH_MAX_ITER",
+      "crates/gam-custom-family/src/inner_blockwise_fit.rs:fn:polish_joint_newton_step"
+    ],
+    "reason": "#2973 (comment 5745385706): polish_joint_newton_step was unreachable. Its only call sat under `if use_joint_newton && !converged` after the blockwise loop of inner_blockwise_fit_for_product, and use_joint_newton is an immutable let that, when true, has already returned through fit_exact_joint. The guard was always false, so the function, its POLISH_MAX_ITER iteration bound and its call block are deleted instead of flooring its stationarity test like the two live copies (718f9b6bc2).",
+    "evidence": "At the base both names occur only in inner_blockwise_fit.rs (the call, the fn, and the const inside it); at the head git grep -w finds neither under crates, src or tests. inner_blockwise_fit.rs at this base is byte-identical to the polishdel gate parent 148435843c (blob 210f50eece), where gam-custom-family check --all-targets, the lib suite (365/366, the one red is the main red a_refusal_with_evidence_refits_armed_once_and_publishes_it_2995), laml_inner_accuracy_2668, cargo check --workspace --all-targets and cargo build --workspace --lib all passed. Every helper the deleted body called keeps another caller."
+  },
+  {
     "base": "fb8743205e07b99be01514dd7ae14e4fbddafc85",
     "items": [
       "crates/gam-terms/src/basis/center_selection.rs:const:LOWER_MASK",

@@ -15,15 +15,16 @@
 //! with the inner solver. A sub-step is kept only when [`newton_region_contraction`] shows the
 //! predictor inside the Newton region of the root the corrector returns; a failed sub-step is
 //! halved. Halving has no count: it ends on a certified sub-step or where a sub-step no longer
-//! moves `ρ(t)` in floating point. There the branch ends, at a fold, and the evaluation is
-//! refused as [`BranchContinuationRefusal::FoldReached`], which the outer search takes as a
-//! rejected trial.
+//! moves `ρ(t)` in floating point. There the branch ends, at a fold
+//! ([`BranchContinuationRefusal::FoldReached`]), and its mode drops out of the evaluation's
+//! candidates: [`evaluate_on_branch`] publishes the certified rival with the lowest penalized
+//! objective, and refuses the trial only when no start certified a mode (gam#3173).
 //!
 //! Each sub-step costs one inner solve and no pricing. The tangent is formed from the exact-Newton
 //! curvature the certified mode's own solve ended on ([`single_block_ift_predictor`]), so a mode
 //! needs no derivative-bearing evaluation to be continued from. The corrector solves to the
-//! criterion's own accuracy ([`criterion_inner_solve_options`]), and only the endpoint is priced,
-//! in the caller's evaluation mode, from the corrected mode as it is. Taking the tangent from the
+//! criterion's own accuracy ([`criterion_inner_solve_options`]), and only the published mode is
+//! priced, in the caller's evaluation mode, as it is. Taking the tangent from the
 //! evaluator's mode responses instead cost two derivative-bearing pricings per value probe on the
 //! tilted double well: one to re-derive a seed's tangent (a value-only seed files none) and one
 //! per interior sub-step.
@@ -51,24 +52,46 @@ use super::*;
 /// a-posteriori contraction test, not a rigorous certificate.
 pub(crate) const NEWTON_REGION_CONTRACTION_BOUND: f64 = 0.25;
 
-/// The Newton correction and the simplified correction at a predictor.
+/// The Newton correction and the simplified correction at a predictor, each beside its arithmetic
+/// resolution.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct NewtonRegionContraction {
     /// `‖Δ⁰‖`, the Newton correction at the predictor.
     pub(crate) first_correction: f64,
     /// `‖Δ̄¹‖`, the simplified correction, with the curvature frozen at the predictor.
     pub(crate) second_correction: f64,
+    /// The largest `‖Δ⁰‖` the rounding of its right-hand side and of the iterate it lands on can
+    /// produce ([`ExactNewtonBlockUpdater::update_step_with_resolution`]).
+    pub(crate) first_resolution: f64,
+    /// The same for `‖Δ̄¹‖`.
+    pub(crate) second_resolution: f64,
 }
 
 impl NewtonRegionContraction {
-    /// The measured contraction `Θ = ‖Δ̄¹‖ / ‖Δ⁰‖`. A predictor that is already stationary
-    /// (`Δ⁰ = Δ̄¹ = 0`) has `Θ = 0`; a non-finite correction measures nothing.
+    /// The measured contraction `Θ = ‖Δ̄¹‖ / ‖Δ⁰‖`, read only where both corrections are resolved.
+    ///
+    /// A correction at or below its resolution is zero on this arithmetic: the iterate it starts
+    /// from is at its root, so Newton has converged there and `Θ = 0`. Above it, `Θ` compares two
+    /// resolved corrections. Below it, `Θ` is a ratio of rounding errors: on the event-history
+    /// slope surface at `λ = 1.09e9` (gam#2973 comment 5744888545), corrections of `9.2e-11` and
+    /// `8.2e-11` against a resolution of `7.1e-9` read `Θ = 0.90`, and the certified mode's own
+    /// continuation was refused as a fold. A non-finite correction or resolution measures nothing.
     pub(crate) fn contraction_factor(&self) -> Option<f64> {
-        if !(self.first_correction.is_finite() && self.second_correction.is_finite()) {
+        if ![
+            self.first_correction,
+            self.second_correction,
+            self.first_resolution,
+            self.second_resolution,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+        {
             return None;
         }
-        if self.first_correction == 0.0 {
-            return (self.second_correction == 0.0).then_some(0.0);
+        if self.first_correction <= self.first_resolution
+            || self.second_correction <= self.second_resolution
+        {
+            return Some(0.0);
         }
         Some(self.second_correction / self.first_correction)
     }
@@ -79,20 +102,23 @@ impl NewtonRegionContraction {
             .is_some_and(|theta| theta <= NEWTON_REGION_CONTRACTION_BOUND)
     }
 
-    /// The Kantorovich radius around the predictor inside which the root the test names lies:
-    /// `‖Δ⁰‖ (1 − √(1 − 2[h₀])) / [h₀]` with `[h₀] = 2Θ`, which is `‖Δ⁰‖` at `Θ = 0` and `2‖Δ⁰‖`
-    /// at `Θ = ¼`. `None` outside the Newton region.
+    /// The radius around the predictor inside which the root the test names lies: the
+    /// Kantorovich radius `‖Δ⁰‖ (1 − √(1 − 2[h₀])) / [h₀]` with `[h₀] = 2Θ`, which is `‖Δ⁰‖` at
+    /// `Θ = 0` and `2‖Δ⁰‖` at `Θ = ¼`, widened by the two corrections' resolutions, since the
+    /// corrections it is measured from are known only to within them. `None` outside the Newton
+    /// region.
     pub(crate) fn root_radius(&self) -> Option<f64> {
         if !self.in_newton_region() {
             return None;
         }
         let theta = self.contraction_factor()?;
         let h = 2.0 * theta;
-        if h == 0.0 {
-            Some(self.first_correction)
+        let kantorovich = if h == 0.0 {
+            self.first_correction
         } else {
-            Some(self.first_correction * (1.0 - (1.0 - 2.0 * h).sqrt()) / h)
-        }
+            self.first_correction * (1.0 - (1.0 - 2.0 * h).sqrt()) / h
+        };
+        Some(kantorovich + self.first_resolution + self.second_resolution)
     }
 }
 
@@ -130,6 +156,8 @@ pub(crate) fn newton_region_contraction<F: CustomFamily + Clone + Send + Sync + 
         contraction: NewtonRegionContraction {
             first_correction: corrections.first_correction,
             second_correction: corrections.second_correction,
+            first_resolution: corrections.first_resolution,
+            second_resolution: corrections.second_resolution,
         },
         state: ConstrainedWarmStart {
             rho: rho.clone(),
@@ -235,9 +263,11 @@ impl BranchContinuationRefusal {
     }
 }
 
-/// A continued evaluation, with the sub-steps that reached it.
+/// A continued mode, with the sub-steps that reached it. The mode is solved to the criterion's
+/// own accuracy and not priced: the evaluation prices the mode it publishes ([`evaluate_on_branch`]).
 pub(crate) struct BranchContinuation {
-    pub(crate) eval: OuterObjectiveEvalResult,
+    /// The endpoint corrector's solve.
+    pub(crate) inner: BlockwiseInnerResult,
     /// Sub-steps attempted, certified or not.
     pub(crate) attempts: usize,
     /// The measured contraction of every certified sub-step, in path order.
@@ -337,11 +367,13 @@ fn correct_sub_step<F: CustomFamily + Clone + Send + Sync + 'static>(
         test.contraction.root_radius(),
     ) else {
         return SubStep::Failed(format!(
-            "outside the Newton region at rho=[{}]: Newton correction {:.3e}, simplified correction \
-             {:.3e}, contraction {}",
+            "outside the Newton region at rho=[{}]: Newton correction {:.3e} (resolution {:.3e}), \
+             simplified correction {:.3e} (resolution {:.3e}), contraction {}",
             join_rho(rho_trial),
             test.contraction.first_correction,
+            test.contraction.first_resolution,
             test.contraction.second_correction,
+            test.contraction.second_resolution,
             test.contraction
                 .contraction_factor()
                 .map_or_else(|| "unmeasured".to_string(), |theta| format!("{theta:.3e}")),
@@ -378,17 +410,15 @@ fn correct_sub_step<F: CustomFamily + Clone + Send + Sync + 'static>(
     }
 }
 
-/// Continue the certified mode `start` along its branch to the labeled `rho_target`, then
-/// evaluate there in `eval_mode` from the continued mode (gam#2973, gam#2366).
+/// Continue the certified mode `start` along its branch to the labeled `rho_target`, to the
+/// criterion's own accuracy (gam#2973, gam#2366).
 pub(crate) fn continue_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     layout: &PenaltyLabelLayout,
-    rho_prior: &gam_problem::RhoPrior,
     start: &ConstrainedWarmStart,
     rho_target: &Array1<f64>,
-    eval_mode: EvalMode,
 ) -> Result<BranchContinuation, BranchContinuationRefusal> {
     if start.rho.len() != rho_target.len() {
         return Err(BranchContinuationRefusal::TangentUnavailable {
@@ -400,27 +430,25 @@ pub(crate) fn continue_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
             ),
         });
     }
+    let criterion_options = criterion_inner_solve_options(family, options, 0);
+    let corrector_options = criterion_options.as_ref().unwrap_or(options);
     if same_point(&start.rho, rho_target) {
-        let eval = outerobjectivegradienthessian_labeled(
+        let (inner, _) = correct_labeled_laplace_mode(
             family,
             specs,
-            options,
+            corrector_options,
             layout,
             rho_target,
             Some(start),
-            rho_prior,
-            eval_mode,
         )
         .map_err(BranchContinuationRefusal::Evaluation)?;
         return Ok(BranchContinuation {
-            eval,
+            inner,
             attempts: 0,
             contractions: Vec::new(),
         });
     }
     let rho_start = start.rho.clone();
-    let criterion_options = criterion_inner_solve_options(family, options, 0);
-    let corrector_options = criterion_options.as_ref().unwrap_or(options);
     let mut certified = start.clone();
     let mut t_certified = 0.0_f64;
     let mut sub_step = 1.0_f64;
@@ -462,13 +490,8 @@ pub(crate) fn continue_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
             } => {
                 contractions.push(contraction);
                 if endpoint {
-                    // The corrected mode is priced as it is, in the caller's evaluation mode.
-                    let eval = outerobjective_from_coefficient_mode_labeled(
-                        family, specs, options, layout, &rho_trial, rho_prior, inner, eval_mode,
-                    )
-                    .map_err(BranchContinuationRefusal::Evaluation)?;
                     return Ok(BranchContinuation {
-                        eval,
+                        inner,
                         attempts,
                         contractions,
                     });
@@ -499,8 +522,7 @@ fn continuation_covers<F: CustomFamily + Clone + Send + Sync + 'static>(
     options: &BlockwiseFitOptions,
     layout: &PenaltyLabelLayout,
 ) -> bool {
-    family.exact_newton_joint_hessian_beta_dependent()
-        && !family.inner_coefficient_objective_is_globally_convex()
+    inner_objective_may_have_several_modes(family)
         && single_block_newton_region_probe_applies(family, specs, options)
         && layout.joint_specs.is_empty()
 }
@@ -532,51 +554,185 @@ fn continues_its_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
         && !same_point(&seed.rho, rho)
 }
 
-/// One outer evaluation at the labeled `rho` from `seed` under gam#2366's selection rule
-/// (gam#2973). A seed that is a certified mode at another θ is continued along its branch
-/// ([`continue_branch`]). Any other seed is evaluated as the seed rules chose it: no seed, the
-/// same θ (a same-ρ reuse), a seed that is no certified mode, a family whose inner objective
-/// declares one mode, or a solve the Newton-region test does not cover yet (the joint Newton
-/// path). A branch that ends before `rho` refuses the trial point.
+/// The starts one outer evaluation solves its candidate modes from (gam#3173). `None` is the
+/// caller's own starting coefficients.
+#[derive(Clone, Copy)]
+pub(crate) struct ModeStarts<'a> {
+    /// The accepted incumbent's mode.
+    pub(crate) incumbent: Option<&'a ConstrainedWarmStart>,
+    /// The fit's fixed starts, the same at every evaluation of one fit.
+    pub(crate) fixed: &'a [Option<ConstrainedWarmStart>],
+}
+
+/// A solved mode certified at the labeled `rho` ([`certify_inner_mode`]). `labeled_options` carry
+/// the evaluation's joint penalties.
+fn certified_mode<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    labeled_options: &BlockwiseFitOptions,
+    layout: &PenaltyLabelLayout,
+    mut inner: BlockwiseInnerResult,
+) -> Result<BlockwiseInnerResult, CustomFamilyError> {
+    let rho_dim = layout.penalty_counts.iter().sum::<usize>();
+    certify_inner_mode(family, specs, labeled_options, &mut inner, rho_dim, 0)?;
+    Ok(inner)
+}
+
+/// One outer evaluation at the labeled `rho` under the published-mode rule (gam#3173, gam#2973):
+/// a certified mode from each start, and the one the rule selects priced in `eval_mode`
+/// ([`select_lowest_penalized`]).
+///
+/// The incumbent is continued along its branch where the continuation covers the solve
+/// ([`continue_branch`]). A branch that ends at its fold before `rho` drops out of the set, and
+/// the lowest rival is published: the branch hands over at its fold. Every other start, and an
+/// incumbent the continuation does not cover, is solved directly at `rho`, as the seed rules chose
+/// it, and a start whose solve is refused at this trial point drops out too. A fixed start whose
+/// seed is the incumbent's is the same computation and is not repeated, and one start is its own
+/// selection. The evaluation refuses only when no start certified a mode, and then with the
+/// incumbent's refusal. Any other error is a failure of the evaluation, not of a start, and is
+/// returned as it is.
 pub(crate) fn evaluate_on_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     layout: &PenaltyLabelLayout,
     rho: &Array1<f64>,
-    seed: Option<&ConstrainedWarmStart>,
+    starts: ModeStarts<'_>,
     rho_prior: &gam_problem::RhoPrior,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
-    let Some(start) =
-        seed.filter(|seed| continues_its_branch(family, specs, options, layout, seed, rho))
-    else {
-        return outerobjectivegradienthessian_labeled(
-            family, specs, options, layout, rho, seed, rho_prior, eval_mode,
-        );
+    let criterion_options = criterion_inner_solve_options(family, options, 0);
+    let solve_options = criterion_options.as_ref().unwrap_or(options);
+    let labeled_options = labeled_options_for_rho(options, specs, layout, rho)?;
+    let direct = |seed: Option<&ConstrainedWarmStart>| {
+        correct_labeled_laplace_mode(family, specs, solve_options, layout, rho, seed)
+            .and_then(|(inner, _)| {
+                certified_mode(family, specs, labeled_options.as_ref(), layout, inner)
+            })
     };
-    match continue_branch(
-        family, specs, options, layout, rho_prior, start, rho, eval_mode,
-    ) {
-        Ok(continuation) => {
-            log::debug!(
-                "[branch continuation] rho=[{}] from rho=[{}]: {} sub-step attempt(s), certified \
-                 contractions [{}]",
-                join_rho(rho),
-                join_rho(&start.rho),
-                continuation.attempts,
-                continuation
-                    .contractions
-                    .iter()
-                    .map(|theta| format!("{theta:.3e}"))
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-            Ok(continuation.eval)
+    // A start that certifies no mode at this trial point drops out of the set; any other error
+    // is the evaluation's.
+    let dropped_or_failed = |refusal: CustomFamilyError| {
+        if refusal.is_trial_point_infeasible() {
+            Ok(refusal)
+        } else {
+            Err(refusal)
         }
-        Err(refusal) => {
-            log::debug!("[branch continuation] refused: {refusal}");
-            Err(refusal.into_trial_point())
+    };
+    let incumbent_seed = SeedIdentity::of(starts.incumbent);
+    let rivals: Vec<(usize, Option<&ConstrainedWarmStart>)> = starts
+        .fixed
+        .iter()
+        .enumerate()
+        .filter(|(_, seed)| SeedIdentity::of(seed.as_ref()) != incumbent_seed)
+        .map(|(index, seed)| (index, seed.as_ref()))
+        .collect();
+    let incumbent = match starts
+        .incumbent
+        .filter(|seed| continues_its_branch(family, specs, options, layout, seed, rho))
+    {
+        Some(start) => match continue_branch(family, specs, options, layout, start, rho) {
+            Ok(continuation) => {
+                log::debug!(
+                    "[branch continuation] rho=[{}] from rho=[{}]: {} sub-step attempt(s), \
+                     certified contractions [{}]",
+                    join_rho(rho),
+                    join_rho(&start.rho),
+                    continuation.attempts,
+                    continuation
+                        .contractions
+                        .iter()
+                        .map(|theta| format!("{theta:.3e}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                certified_mode(
+                    family,
+                    specs,
+                    labeled_options.as_ref(),
+                    layout,
+                    continuation.inner,
+                )
+                .map_err(dropped_or_failed)
+            }
+            Err(refusal @ BranchContinuationRefusal::FoldReached { .. }) => {
+                log::debug!("[branch continuation] ended: {refusal}");
+                Err(Ok(refusal.into_trial_point()))
+            }
+            Err(refusal) => return Err(refusal.into_trial_point()),
+        },
+        None => direct(starts.incumbent).map_err(dropped_or_failed),
+    };
+    let published = if rivals.is_empty() {
+        match incumbent {
+            Ok(inner) => inner,
+            Err(Ok(refusal) | Err(refusal)) => return Err(refusal),
         }
-    }
+    } else {
+        // The penalty roots at this θ, the same the solves evaluated `½βᵀS_λβ` on (#2954).
+        let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
+        let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
+        let roots = BlockPenaltyRoots::new(
+            specs,
+            &per_block,
+            labeled_options.joint_penalties.as_deref(),
+        )?;
+        let candidate = |start: ModeStart, inner: BlockwiseInnerResult| {
+            penalized_objective_at_mode(family, specs, &roots, &inner).map(|penalized_objective| {
+                ModeCandidate {
+                    start,
+                    inner,
+                    penalized_objective,
+                }
+            })
+        };
+        let mut candidates = Vec::new();
+        let incumbent_refusal = match incumbent {
+            Ok(inner) => {
+                candidates.push(candidate(ModeStart::Incumbent, inner)?);
+                None
+            }
+            Err(Ok(refusal)) => Some(refusal),
+            Err(Err(error)) => return Err(error),
+        };
+        for &(index, seed) in &rivals {
+            match direct(seed) {
+                Ok(inner) => candidates.push(candidate(ModeStart::FixedSeed(index), inner)?),
+                Err(refusal) if refusal.is_trial_point_infeasible() => log::debug!(
+                    "[mode selection #3173] rho=[{}]: fixed seed {index} certified no mode: \
+                     {refusal}",
+                    join_rho(rho)
+                ),
+                Err(error) => return Err(error),
+            }
+        }
+        let Some(selection) = select_lowest_penalized(candidates) else {
+            return Err(incumbent_refusal.unwrap_or_else(|| {
+                CustomFamilyError::trial_point(format!(
+                    "no start certified an inner mode at rho=[{}]",
+                    join_rho(rho)
+                ))
+            }));
+        };
+        log::debug!(
+            "[mode selection #3173] rho=[{}]: {} of {} start(s) certified a mode; published the \
+             {} mode, f={:.9e}; runner-up gap {}; incumbent {}",
+            join_rho(rho),
+            selection.certified,
+            rivals.len() + 1,
+            selection.winner.start,
+            selection.winner.penalized_objective.value,
+            selection
+                .runner_up_gap
+                .map_or_else(|| "none".to_string(), |gap| format!("{gap:.3e}")),
+            incumbent_refusal.as_ref().map_or_else(
+                || "certified".to_string(),
+                |refusal| format!("dropped: {refusal}")
+            ),
+        );
+        selection.winner.inner
+    };
+    outerobjective_from_coefficient_mode_labeled(
+        family, specs, options, layout, rho, rho_prior, published, eval_mode,
+    )
 }
