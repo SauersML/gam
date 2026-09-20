@@ -152,6 +152,8 @@ mod student_t_laml_tests;
 #[cfg(test)]
 mod gaussian_high_edf_scale_tests;
 #[cfg(test)]
+mod score_test_working_residual_3832_tests;
+#[cfg(test)]
 mod gaussian_observation_interval_calibration_tests;
 #[cfg(test)]
 mod invert_regularized_rho_hessian_tests;

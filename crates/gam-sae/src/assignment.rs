@@ -1898,21 +1898,15 @@ fn simplex_gate_frame(assignment: &SaeAssignment) -> Option<(Vec<usize>, f64)> {
     (!free.is_empty()).then_some((free, temperature))
 }
 
-/// `ln Σ_{atom ∈ atoms} e^{ℓ_atom/τ}`, shifted by its largest term so no exponent overflows or
-/// underflows to an infinite logarithm.
+/// `ln Σ_{atom ∈ atoms} e^{ℓ_atom/τ}`, through gam-math's max-shifted compensated log-sum-exp so no
+/// exponent overflows or underflows to an infinite logarithm.
 fn log_sum_exp_scaled(
     logits: ArrayView1<'_, f64>,
-    atoms: impl Iterator<Item = usize> + Clone,
+    atoms: impl Iterator<Item = usize>,
     inv_tau: f64,
 ) -> f64 {
-    let top = atoms
-        .clone()
-        .map(|atom| logits[atom] * inv_tau)
-        .fold(f64::NEG_INFINITY, f64::max);
-    top + atoms
-        .map(|atom| (logits[atom] * inv_tau - top).exp())
-        .sum::<f64>()
-        .ln()
+    let scaled: Vec<f64> = atoms.map(|atom| logits[atom] * inv_tau).collect();
+    gam_math::probability::positive_log_sum_exp(&scaled)
 }
 
 /// One softmax row's `J = −Σ_{i∈F} ln z_i − ln R + |F|·ln τ` (see [`simplex_gate_frame`]), from

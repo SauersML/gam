@@ -775,7 +775,6 @@ impl<'a> RemlState<'a> {
     pub(crate) fn build_sparse_derivative_context(
         &self,
         pirls_result: &PirlsResult,
-        bundle: &EvalShared,
     ) -> Result<DerivativeContext, EstimationError> {
         use super::reml_outer_engine::{
             DispersionHandling, FirthAwareGlmDerivatives, GaussianDerivatives,
@@ -787,24 +786,20 @@ impl<'a> RemlState<'a> {
         // Sparse exact still uses the same dense Jeffreys operator; only the
         // H^{-1} applications move to the sparse Cholesky operator.
         let firth_op = if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
-            if let Some(cached) = bundle.firth_dense_operator_original.clone() {
-                Some(cached)
-            } else {
-                let x_dense = self
-                    .x()
-                    .try_to_dense_arc(
-                        "sparse exact REML runtime requires dense design for Firth operator",
-                    )
-                    .map_err(EstimationError::InvalidInput)?;
-                Some(std::sync::Arc::new(
-                    Self::build_firth_dense_operator_for_link(
-                        &jeffreys_link,
-                        x_dense.as_ref(),
-                        &pirls_result.final_eta.to_owned(),
-                        self.weights,
-                    )?,
-                ))
-            }
+            let x_dense = self
+                .x()
+                .try_to_dense_arc(
+                    "sparse exact REML runtime requires dense design for Firth operator",
+                )
+                .map_err(EstimationError::InvalidInput)?;
+            Some(std::sync::Arc::new(
+                Self::build_firth_dense_operator_for_link(
+                    &jeffreys_link,
+                    x_dense.as_ref(),
+                    &pirls_result.final_eta.to_owned(),
+                    self.weights,
+                )?,
+            ))
         } else {
             None
         };
@@ -1020,7 +1015,14 @@ impl<'a> RemlState<'a> {
         // onto the same subspace so each `coord.dim()` matches the reduced
         // `beta.len()` that `InnerSolutionBuilder::build` asserts. The Hessian
         // operator and `e_for_logdet` are already projected by the caller; this
-        // moves the penalty roots in lockstep (`R_k → R_k z`).
+        // moves the penalty roots in lockstep (`R_k → R_k z`). The face is
+        // affine — every point on it is `z β_f + (I − z zᵀ) β̂`, and the
+        // off-face part is non-zero whenever an active constraint has a
+        // non-zero right-hand side — so each restricted coordinate also carries
+        // the root-space offset `R_k(μ_k − (I − z zᵀ) β̂)`, read at the converged
+        // face point `β̂_transformed`. Without it the reduced shifted score is
+        // `zᵀS_k z (β_f − zᵀμ_k)` instead of `zᵀS_k(β̂ − μ_k)` and the outer
+        // ρ-gradient disagrees with the value (gam#4170).
         //
         // Frame consistency (#509 second face): the free basis `z`, the
         // projected Hessian `ZᵀHZ`, the projected design `XZ`, and the reduced
@@ -1056,6 +1058,7 @@ impl<'a> RemlState<'a> {
         let null_split = pirls_result.reparam_result.null_split();
         let penalty_coords = match free_basis {
             Some(z) => {
+                let face_point = pirls_result.beta_transformed.as_ref().view();
                 let original_coords = self.build_penalty_coords();
                 if pirls_result.reparam_result.canonical_transformed.len() == original_coords.len() {
                     pirls_result
@@ -1068,7 +1071,10 @@ impl<'a> RemlState<'a> {
                             ))
                         })?
                         .iter()
-                        .map(|cp| cp.to_penalty_coordinate().project_into_subspace(z))
+                        .map(|cp| {
+                            cp.to_penalty_coordinate()
+                                .project_into_subspace(z, face_point)
+                        })
                         .collect()
                 } else {
                     original_coords
@@ -1076,7 +1082,7 @@ impl<'a> RemlState<'a> {
                         .map(|coord| {
                             null_split
                                 .project_coordinate(coord, PenaltyFrame::Original)
-                                .project_into_subspace(z)
+                                .project_into_subspace(z, face_point)
                         })
                         .collect()
                 }
@@ -1535,7 +1541,7 @@ impl<'a> RemlState<'a> {
             second: det2,
         };
 
-        let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
+        let ctx = self.build_sparse_derivative_context(pirls_result)?;
         // Sparse-exact `log|H|` is the ordinary Cholesky log determinant of
         //
         //     H(ρ) = X'W(ρ)X + S_λ(ρ),
@@ -1558,8 +1564,7 @@ impl<'a> RemlState<'a> {
         let inner_kkt_residual = if presented {
             self.inner_kkt_residual_original_basis(
                 pirls_result,
-                bundle.firth_dense_operator.is_some()
-                    || bundle.firth_dense_operator_original.is_some(),
+                bundle.firth_dense_operator.is_some(),
             )
         } else {
             None
@@ -1689,13 +1694,7 @@ impl<'a> RemlState<'a> {
 
         // Match the transformed assembly's structural-rank Firth operator.
         // A strong penalty changes curvature, never coefficient identifiability.
-        let structural_rank = if let Some(firth) = bundle.firth_dense_operator_original.as_ref() {
-            let root_original = pirls_result
-                .reparam_result
-                .e_transformed
-                .dot(&pirls_result.reparam_result.qs.t());
-            Some(firth_penalized_structural_rank(&firth.q_basis, &root_original)?)
-        } else if let Some(firth) = bundle.firth_dense_operator.as_ref() {
+        let structural_rank = if let Some(firth) = bundle.firth_dense_operator.as_ref() {
             let qs = &pirls_result.reparam_result.qs;
             let root_original = pirls_result.reparam_result.e_transformed.dot(&qs.t());
             Some(firth_penalized_structural_rank(&qs.dot(&firth.q_basis), &root_original)?)
@@ -1931,7 +1930,7 @@ impl<'a> RemlState<'a> {
             );
         }
 
-        let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
+        let ctx = self.build_sparse_derivative_context(pirls_result)?;
         // Original-basis envelope residual: `β` and `H` here are rotated into
         // the original basis, and `build_dense_original_assembly` is only ever
         // reached on the unconstrained QS frame, so the transformed residual
@@ -1941,8 +1940,7 @@ impl<'a> RemlState<'a> {
         let inner_kkt_residual = if presented {
             self.inner_kkt_residual_original_basis(
                 pirls_result,
-                bundle.firth_dense_operator.is_some()
-                    || bundle.firth_dense_operator_original.is_some(),
+                bundle.firth_dense_operator.is_some(),
             )
         } else {
             None
@@ -2540,6 +2538,17 @@ impl<'a> RemlState<'a> {
         } else {
             (Vec::new(), None, None, None)
         };
+        // gam#2987: θ carries one ψ coordinate per direction, so a builder that
+        // returned a different number would give the outer plan a gradient of
+        // the wrong length.
+        if ext_coords.len() != hyper_dirs.len() {
+            return Err(EstimationError::LayoutError(format!(
+                "the τ-coordinate builder returned {} coordinates for {} ψ directions \
+                 ({mode:?} evaluation)",
+                ext_coords.len(),
+                hyper_dirs.len()
+            )));
+        }
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let t2 = std::time::Instant::now();
         // #1376: when this evaluation carries a design-moving ψ coordinate

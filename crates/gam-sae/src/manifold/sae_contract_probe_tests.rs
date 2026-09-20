@@ -10,6 +10,7 @@ use super::tests::{
     warmstart_test_objective_with_evaluator,
 };
 use super::*;
+use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
 use crate::assignment::{AssignmentMode, SaeAssignment};
 use approx::assert_abs_diff_eq;
 use gam_terms::latent::LatentManifold;

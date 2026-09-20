@@ -14,7 +14,7 @@
 use super::SurvivalLocationScaleError;
 use ndarray::Array1;
 
-// Canonical stable softplus lives in `gam-linalg`; its sign-split identity
+// Canonical stable softplus lives in `gam-math`; its sign-split identity
 // already reproduces the explicit NaN/±inf guard arms this module used to
 // carry (NaN → NaN, +inf → +inf, −inf → 0), so the alias is value-identical.
 pub(super) use gam_math::special::softplus;

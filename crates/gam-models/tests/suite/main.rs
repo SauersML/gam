@@ -14,6 +14,7 @@ mod bspline_nonzero_anchor_affine_2297;
 mod default_basis_by_route_3149;
 mod duchon_grid_fit_and_rotation_2319;
 mod exact_gaussian_boundary_2663;
+mod fit_data_boundary;
 mod multinomial_contracted_jeffreys_2612;
 mod multinomial_covariance_mode_2612;
 mod multinomial_dominated_face_2627;

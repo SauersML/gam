@@ -1388,9 +1388,13 @@ impl RankCertifiedPsdPseudoinverse {
 ///
 /// Eigenvalues `lambda > relative_cutoff * lambda_max` define the certified
 /// range. Values at or below that explicit cutoff define the discarded null
-/// space. A negative eigenvalue is admitted only within the dimension-scaled
-/// eigensolver roundoff bound; material indefiniteness is an error. No absolute
-/// floor, repaired eigendecomposition, or fallback rank is hidden here.
+/// space. A negative eigenvalue is admitted only when it is unresolved from
+/// zero: within the decomposition's own rounding band
+/// ([`crate::roundoff::symmetric_spectrum_rounding_band`]) or within the
+/// caller's declared null-space cutoff, whose sign carries no information by the
+/// same resolution that discards it. Material indefiniteness beyond both is an
+/// error. No absolute floor, repaired eigendecomposition, or fallback rank is
+/// hidden here.
 pub fn rank_certified_psd_pseudoinverse(
     penalty: &Array2<f64>,
     relative_cutoff: f64,
@@ -1402,23 +1406,21 @@ pub fn rank_certified_psd_pseudoinverse(
     }
     let (eigs, vecs) = strict_symmetric_eigh(penalty, Side::Lower)
         .map_err(|error| LinalgError::InvalidInput(error.to_string()))?;
-    let max_abs = eigs
-        .iter()
-        .fold(0.0_f64, |maximum, &value| maximum.max(value.abs()));
     let max_eigenvalue = eigs
         .iter()
         .fold(0.0_f64, |maximum, &value| maximum.max(value));
-    let psd_roundoff = 128.0 * penalty.nrows() as f64 * f64::EPSILON * max_abs;
+    let absolute_cutoff = relative_cutoff * max_eigenvalue;
+    let unresolved_band =
+        crate::roundoff::symmetric_spectrum_rounding_band(&eigs.to_vec()).max(absolute_cutoff);
     if let Some((index, &value)) = eigs
         .iter()
         .enumerate()
-        .find(|(_, value)| **value < -psd_roundoff)
+        .find(|(_, value)| **value < -unresolved_band)
     {
         return Err(LinalgError::InvalidInput(format!(
-            "PSD pseudoinverse input is indefinite at eigenvalue {index}: {value:.3e} < -{psd_roundoff:.3e}"
+            "PSD pseudoinverse input is indefinite at eigenvalue {index}: {value:.3e} < -{unresolved_band:.3e}"
         )));
     }
-    let absolute_cutoff = relative_cutoff * max_eigenvalue;
     let mut rank = 0_usize;
     let mut scaled = Array2::<f64>::zeros(vecs.dim());
     for col in 0..eigs.len() {
@@ -1668,6 +1670,25 @@ mod certified_inverse_tests {
     fn psd_pseudoinverse_rejects_material_indefiniteness_instead_of_repairing_it() {
         let matrix = array![[1.0, 0.0], [0.0, -1.0e-4]];
         let error = rank_certified_psd_pseudoinverse(&matrix, 1.0e-10).unwrap_err();
+        assert!(error.to_string().contains("indefinite"));
+    }
+
+    #[test]
+    fn psd_pseudoinverse_admits_a_negative_eigenvalue_inside_its_declared_null_cutoff() {
+        // `-1e-12` is below the decomposition's rounding band `2·ε ≈ 4.4e-16`,
+        // but inside the declared null cutoff `1e-10·λ_max`: the resolution that
+        // discards a `+1e-12` eigenvalue as null cannot read the sign of a
+        // `-1e-12` one, so both are the same discarded direction.
+        let matrix = array![[1.0, 0.0], [0.0, -1.0e-12]];
+        let geometry = rank_certified_psd_pseudoinverse(&matrix, 1.0e-10).unwrap();
+        assert_eq!(geometry.rank(), 1);
+        let pseudoinverse = geometry.into_pseudoinverse();
+        let expected = array![[1.0, 0.0], [0.0, 0.0]];
+        for (got, want) in pseudoinverse.iter().zip(expected.iter()) {
+            assert!((got - want).abs() <= 4.0 * f64::EPSILON, "{pseudoinverse:?}");
+        }
+        // With no declared cutoff only the rounding band is unresolved.
+        let error = rank_certified_psd_pseudoinverse(&matrix, 0.0).unwrap_err();
         assert!(error.to_string().contains("indefinite"));
     }
 }

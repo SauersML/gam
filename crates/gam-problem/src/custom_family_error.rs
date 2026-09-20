@@ -379,12 +379,19 @@ impl std::fmt::Display for ConstrainedFixedPointCondition {
 ///
 /// The loop certifies with
 /// `max_accepted_step <= step_tol && objective_change <= objective_tol`, and then
-/// `joint_stationarity_ok || max_proposed_step <= step_tol`. Reporting only the
-/// cycle count cannot say which of those four conjuncts failed, and they have
-/// different causes: steps still large means the solve needs more cycles, steps
-/// tiny with `joint_stationarity_ok == false` means the exact joint gate is the
-/// blocker rather than the budget, and an `objective_change` above tolerance
-/// means the iterate is still moving. This is deliberately NOT a KKT residual:
+/// `joint_stationarity_ok || max_proposed_step <= step_tol`. Here
+/// `joint_stationarity_ok` is `true` only for a joint residual that was
+/// MEASURED and passed (a family without exact joint curvature measures none,
+/// so it is `false` there), and `max_proposed_step` is the block updates'
+/// step BEFORE trust-region truncation, which vanishes exactly at a fixed
+/// point of the block map. The truncated step is not reported: a collapsed
+/// trust radius drives it to zero at a non-stationary iterate. Reporting only
+/// the cycle count cannot say which of those four conjuncts failed, and they
+/// have different causes: steps still large means the solve needs more cycles,
+/// accepted steps tiny while the proposed step is large means the line search
+/// or trust region stalled short of a stationary point, and an
+/// `objective_change` above tolerance means the iterate is still moving.
+/// This is deliberately NOT a KKT residual:
 /// `BlockwiseInnerResult::kkt_residual` is `None` off a converged iterate on
 /// purpose, because no caller may trust an IFT correction there, so the honest
 /// diagnostic is the decision variables themselves rather than a residual

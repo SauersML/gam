@@ -6,6 +6,7 @@ use gam_linalg::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha, fast_ab, fast_atb,
     fast_xt_diag_x, fast_xt_diag_y, rrqr_with_permutation,
 };
+use gam_linalg::matrix::array2_bits_fingerprint;
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval, StationarityStandard};
 use gam_terms::construction::CanonicalPenalty;
@@ -669,10 +670,15 @@ pub fn gaussian_reml_fit_blocks_exact(
             offsets[block]..offsets[block + 1],
             penalties[block].clone(),
         ));
-        canonical_keys.push(fnv1a_mix(
-            matrix_fingerprint(designs[block].view()),
-            matrix_fingerprint(penalties[block].view()),
-        ));
+        let mut key = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(
+            &(
+                array2_bits_fingerprint(&designs[block]),
+                array2_bits_fingerprint(&penalties[block]),
+            ),
+            &mut key,
+        );
+        canonical_keys.push(std::hash::Hasher::finish(&key));
     }
     let domain = GaussianRemlBlocksDomain::from_blockwise_penalties(p_total, &blockwise_penalties)?;
     let unit_lambdas = Array1::<f64>::ones(f_blocks);
@@ -779,7 +785,6 @@ pub fn gaussian_reml_fit_blocks_exact(
         .with_prefer_gradient_only(false)
         .with_disable_fixed_point(true)
         .with_tolerance(1.0e-10)
-        .with_required_projected_gradient_norm(Some(1.0e-8))
         .with_bounds(rho_lower.clone(), rho_upper.clone())
         .with_rho_canonical_keys(Some(canonical_keys))
         .with_fallback_policy(FallbackPolicy::Disabled)
@@ -1620,7 +1625,7 @@ fn prepare_block_orthogonal(
             lower,
             penalty.view(),
             None,
-            matrix_fingerprint(dense_xt_diag_x(design.view(), weight).view()),
+            array2_bits_fingerprint(&dense_xt_diag_x(design.view(), weight)),
         )?;
         projected_rhs.push(dense_atb(
             cache.eigenvectors.view(),
@@ -2834,13 +2839,13 @@ fn validate_gaussian_reml_forward_fit(
             "Gaussian REML backward requires a finite forward state with positive profiled scales"
         );
     }
-    let penalty_fingerprint = matrix_fingerprint(penalty);
+    let penalty_fingerprint = array2_bits_fingerprint(&penalty);
     if fit.cache.penalty_fingerprint != penalty_fingerprint {
         crate::bail_invalid_estim!("Gaussian REML backward forward-state penalty mismatch");
     }
     let weight = gaussian_reml_weights(n, weights)?;
     let xtwx = dense_xt_diag_x(x, weight.view());
-    if fit.cache.xtwx_fingerprint != matrix_fingerprint(xtwx.view()) {
+    if fit.cache.xtwx_fingerprint != array2_bits_fingerprint(&xtwx) {
         crate::bail_invalid_estim!("Gaussian REML backward forward-state X'WX mismatch");
     }
     Ok(())
@@ -3473,20 +3478,6 @@ fn dense_xt_diag_y(
     fast_xt_diag_y(&x, &w, &y)
 }
 
-fn matrix_fingerprint(matrix: ArrayView2<'_, f64>) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
-    hash = fnv1a_mix(hash, matrix.nrows() as u64);
-    hash = fnv1a_mix(hash, matrix.ncols() as u64);
-    for &value in matrix {
-        hash = fnv1a_mix(hash, value.to_bits());
-    }
-    hash
-}
-
-fn fnv1a_mix(hash: u64, value: u64) -> u64 {
-    (hash ^ value).wrapping_mul(0x100000001b3)
-}
-
 /// Build eigen caches for K problems that share the same penalty matrix in a
 /// single phased pipeline. X'WX construction is batched by the caller; each
 /// cache then uses the same Cholesky/eigendecomposition implementation as the
@@ -3502,10 +3493,7 @@ pub fn build_gaussian_reml_eigen_cache_batched(
     if k == 0 {
         return Vec::new();
     }
-    let fingerprints: Vec<u64> = xtwx_matrices
-        .iter()
-        .map(|m| matrix_fingerprint(m.view()))
-        .collect();
+    let fingerprints: Vec<u64> = xtwx_matrices.iter().map(array2_bits_fingerprint).collect();
 
     let p = xtwx_matrices[0].nrows();
     let uniform_square = p > 0 && xtwx_matrices.iter().all(|matrix| matrix.dim() == (p, p));
@@ -3583,7 +3571,7 @@ pub(crate) fn build_gaussian_reml_eigen_cache_with_nullspace_dim(
     // The Gram matrix remains the cache identity, never the factorization input.
     let range = weighted_design_range(x, weight.view())?;
     gaussian_reml_eigen_cache_from_design_range(
-        &range, penalty, nullspace_dim, matrix_fingerprint(xtwx.view()),
+        &range, penalty, nullspace_dim, array2_bits_fingerprint(&xtwx),
     )
 }
 
@@ -3791,7 +3779,7 @@ fn gaussian_reml_eigen_cache_from_design_range(
         - null_eigenvalues.iter().map(|value| value.ln()).sum::<f64>();
     cache.coefficient_basis = dense_ab(transform.view(), cache.coefficient_basis.view());
     cache.data_null_basis = data_null_basis;
-    cache.penalty_fingerprint = matrix_fingerprint(penalty);
+    cache.penalty_fingerprint = array2_bits_fingerprint(&penalty);
     Ok(cache)
 }
 
@@ -3906,7 +3894,7 @@ fn gaussian_reml_eigen_cache_from_xtwx(
     penalty: ArrayView2<'_, f64>,
     nullspace_dim: Option<usize>,
 ) -> Result<GaussianRemlEigenCache, EstimationError> {
-    let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
+    let xtwx_fingerprint = array2_bits_fingerprint(&xtwx);
     let lower = gaussian_reml_cholesky_lower(xtwx)?;
     gaussian_reml_eigen_cache_from_lower(lower, penalty, nullspace_dim, xtwx_fingerprint)
 }
@@ -3943,7 +3931,7 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
     if lower.ncols() != p {
         crate::bail_invalid_estim!("Gaussian REML Cholesky factor must be square");
     }
-    let penalty_fingerprint = matrix_fingerprint(penalty);
+    let penalty_fingerprint = array2_bits_fingerprint(&penalty);
     let logdet_xtwx = 2.0 * lower.diag().iter().map(|v| v.ln()).sum::<f64>();
     // Congruence preserves rank. Determine it in the supplied penalty's frame:
     // data whitening can give even S=I a 1e12 spectral spread (#2833).
@@ -4166,11 +4154,11 @@ fn prepare_gaussian_reml(
                     cache.coefficient_basis.ncols()
                 );
             }
-            let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
+            let xtwx_fingerprint = array2_bits_fingerprint(&xtwx);
             if cache.xtwx_fingerprint != xtwx_fingerprint {
                 crate::bail_invalid_estim!("Gaussian REML eigen cache X'WX mismatch");
             }
-            let penalty_fingerprint = matrix_fingerprint(penalty);
+            let penalty_fingerprint = array2_bits_fingerprint(&penalty);
             if cache.penalty_fingerprint != penalty_fingerprint {
                 crate::bail_invalid_estim!("Gaussian REML eigen cache penalty mismatch");
             }
@@ -4185,7 +4173,7 @@ fn prepare_gaussian_reml(
             cache.clone()
         }
         None => gaussian_reml_eigen_cache_from_design_range(
-            &range, penalty, nullspace_dim, matrix_fingerprint(xtwx.view()),
+            &range, penalty, nullspace_dim, array2_bits_fingerprint(&xtwx),
         )?,
     };
     let factor = range.factor;
@@ -5494,6 +5482,67 @@ mod tests {
     use ndarray::array;
 
     #[test]
+    fn eigen_cache_refuses_the_design_with_a_negated_column() {
+        // Negating column j of X maps XᵀWX to D·XᵀWX·D bit-exactly (D = diag
+        // with -1 at j): every off-diagonal entry of row and column j flips its
+        // sign bit, an even count. The fit reads coefficients through the
+        // cache's basis, so a cache built for X must be refused for X·D; the
+        // identity guarding that must separate the two Grams.
+        let x = array![
+            [1.0, 0.3, -0.2],
+            [1.0, 1.1, 0.5],
+            [1.0, -0.7, 1.3],
+            [1.0, 2.0, -0.4],
+            [1.0, 0.4, 0.9],
+            [1.0, -1.5, -1.1],
+        ];
+        let y = array![[0.2], [1.4], [-0.3], [2.2], [0.9], [-1.0]];
+        let penalty = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.3], [0.0, 0.3, 1.0]];
+        let cache = build_gaussian_reml_eigen_cache_with_nullspace_dim(
+            x.view(),
+            penalty.view(),
+            None,
+            None,
+        )
+        .expect("the design is full rank");
+        gaussian_reml_multi_closed_form_with_cache(
+            x.view(),
+            y.view(),
+            penalty.view(),
+            None,
+            None,
+            Some(&cache),
+        )
+        .expect("the cache's own design is accepted");
+
+        let mut negated = x.clone();
+        negated.column_mut(1).mapv_inplace(|value| -value);
+        let xtwx = negated.t().dot(&negated);
+        let mut conjugate = x.t().dot(&x);
+        conjugate.row_mut(1).mapv_inplace(|value| -value);
+        conjugate.column_mut(1).mapv_inplace(|value| -value);
+        assert_eq!(
+            xtwx.mapv(f64::to_bits),
+            conjugate.mapv(f64::to_bits),
+            "the negated design's Gram is the sign conjugate"
+        );
+        assert_ne!(
+            array2_bits_fingerprint(&xtwx),
+            array2_bits_fingerprint(&x.t().dot(&x))
+        );
+        let error = gaussian_reml_multi_closed_form_with_cache(
+            negated.view(),
+            y.view(),
+            penalty.view(),
+            None,
+            None,
+            Some(&cache),
+        )
+        .expect_err("a cache built for X must not serve X·D");
+        assert!(error.to_string().contains("X'WX mismatch"), "{error}");
+    }
+
+    #[test]
     fn block_profile_large_penalties_preserve_the_data_nullspace_fit() {
         let n = 24;
         let design = Array2::from_shape_fn((n, 4), |(row, column)| {
@@ -6575,7 +6624,7 @@ mod tests {
             lower,
             penalty.view(),
             None,
-            matrix_fingerprint(gram.view()),
+            array2_bits_fingerprint(gram),
         )
         .unwrap();
         let projected = dense_atb(cache.eigenvectors.view(), head.view());

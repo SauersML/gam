@@ -228,28 +228,68 @@ pub(crate) fn binomial_location_scale_log_likelihood(
     }
 }
 
+/// Expected Fisher information of one binomial row in the latent coordinate
+/// `q`, `f = w·μ′²/(μ(1−μ))`, with its first two `q`-derivatives `(f, f′, f″)`.
+///
+/// For the Bernoulli standard links, the weight jet comes from the single
+/// stable source `gam_solve::mixture_link::fisher_weight_jet5`. That source
+/// pairs the density with the small-tail complement (`Φ(−q)`, `σ(−q)`, …).
+/// Forming `μ(1−μ)` from the reported `μ` loses the survival probability to
+/// cancellation once `μ` nears 1. It then drops to exactly 0 once `μ` rounds
+/// to 1: probit q ≳ 8.3, logit q ≳ 36.7, cloglog q ≳ 3.6. The mirror lower
+/// tail keeps full precision. The expected information must respect the
+/// label swap `(y, q) → (1 − y, −q)` of the symmetric links, and that form
+/// broke it. Links without a closed-form complement (the mixture/SAS/
+/// beta-logistic families and the non-Bernoulli standard links) keep the
+/// `μ`-jet form, which is what `fisher_weight_jet5_for_inverse_link` does
+/// for them too.
 #[inline]
 pub(crate) fn binomial_expected_q_information_derivatives(
     weight: f64,
+    q: f64,
+    link_kind: &InverseLink,
     mu: f64,
     d1: f64,
     d2: f64,
     d3: f64,
-) -> (f64, f64, f64) {
-    if weight == 0.0
-        || !mu.is_finite()
+) -> Result<(f64, f64, f64), String> {
+    if weight == 0.0 {
+        return Ok((0.0, 0.0, 0.0));
+    }
+    if !weight.is_finite() || weight < 0.0 || !q.is_finite() {
+        return Err(format!("binomial expected information requires finite q and nonnegative finite weight: q={q}, weight={weight}"));
+    }
+    let certify = |f: f64, f1: f64, f2: f64| {
+        if f.is_finite() && f >= 0.0 && f1.is_finite() && f2.is_finite() {
+            Ok((f, f1, f2))
+        } else {
+            Err(format!("binomial expected information is not representable at q={q}: information={f}, first={f1}, second={f2}"))
+        }
+    };
+    if let InverseLink::Standard(
+        link @ (StandardLink::Logit
+        | StandardLink::Probit
+        | StandardLink::CLogLog
+        | StandardLink::LogLog
+        | StandardLink::Cauchit),
+    ) = link_kind
+    {
+        let (w0, w1, w2, _, _) = gam_solve::mixture_link::fisher_weight_jet5(*link, q);
+        let (f, f1, f2) = (weight * w0, weight * w1, weight * w2);
+        return certify(f, f1, f2);
+    }
+    if !mu.is_finite()
         || !d1.is_finite()
         || !d2.is_finite()
         || !d3.is_finite()
         || mu <= 0.0
         || mu >= 1.0
-        || d1 == 0.0
     {
-        return (0.0, 0.0, 0.0);
+        return Err(format!("binomial expected information requires a finite inverse-link jet with interior mean at q={q}: mu={mu}, d1={d1}, d2={d2}, d3={d3}"));
     }
     let var = mu * (1.0 - mu);
     if !var.is_finite() || var <= 0.0 {
-        return (0.0, 0.0, 0.0);
+        return Err(format!("binomial expected information requires a finite inverse-link jet with interior mean at q={q}: mu={mu}, d1={d1}, d2={d2}, d3={d3}"));
     }
     let var1 = d1 * (1.0 - 2.0 * mu);
     let var2 = d2 * (1.0 - 2.0 * mu) - 2.0 * d1 * d1;
@@ -259,11 +299,7 @@ pub(crate) fn binomial_expected_q_information_derivatives(
     let f1 = weight * num1 / (var * var);
     let num1_prime = 2.0 * (d2 * d2 + d1 * d3) * var - d1 * d1 * var2;
     let f2 = weight * (num1_prime / (var * var) - 2.0 * num1 * var1 / (var * var * var));
-    if f.is_finite() && f1.is_finite() && f2.is_finite() {
-        (f, f1, f2)
-    } else {
-        (0.0, 0.0, 0.0)
-    }
+    certify(f, f1, f2)
 }
 
 pub(crate) fn binomial_expected_location_scale_second_coefficients(
@@ -1203,6 +1239,97 @@ mod row_program_oracle_tests {
 }
 
 #[cfg(test)]
+mod expected_information_tail_tests {
+    use super::*;
+    use gam_problem::{InverseLink, StandardLink};
+
+    fn expected_information(link: StandardLink, q: f64) -> (f64, f64, f64) {
+        let link = InverseLink::Standard(link);
+        let jet = inverse_link_jet_for_inverse_link(&link, q).expect("inverse-link jet");
+        binomial_expected_q_information_derivatives(1.0, q, &link, jet.mu, jet.d1, jet.d2, jet.d3).expect("finite expected information")
+    }
+
+    fn close(a: f64, b: f64, rel: f64) -> bool {
+        (a - b).abs() <= rel * a.abs().max(b.abs())
+    }
+
+    /// The Bernoulli model is invariant under `(y, q) → (1 − y, −q)` for a
+    /// link with `μ(−q) = 1 − μ(q)`, so the expected information is even in
+    /// `q`, with an odd first derivative and an even second derivative.
+    /// Forming `μ(1 − μ)` from the reported `μ` broke this in the upper tail:
+    /// at probit q = 8 it was 7% off, and from q ≈ 8.3 (logit q ≈ 36.7) it
+    /// was exactly 0, while the mirror row stayed exact.
+    #[test]
+    fn expected_information_is_even_under_the_label_swap_in_both_tails() {
+        let cases: [(StandardLink, &[f64]); 3] = [
+            (StandardLink::Probit, &[0.5, 5.0, 7.5, 8.0, 8.3, 9.0, 12.0]),
+            (StandardLink::Logit, &[0.5, 20.0, 30.0, 35.0, 36.5, 37.0]),
+            (StandardLink::Cauchit, &[0.5, 10.0, 1.0e4, 1.0e8]),
+        ];
+        for (link, qs) in cases {
+            for &q in qs {
+                let (f_hi, f1_hi, f2_hi) = expected_information(link, q);
+                let (f_lo, f1_lo, f2_lo) = expected_information(link, -q);
+                assert!(
+                    f_hi > 0.0 && f_lo > 0.0,
+                    "{link:?} q=±{q}: f=({f_hi}, {f_lo})"
+                );
+                // Both sides are evaluated in log scale from the same
+                // small-tail complement, so they agree to a few ulps of the
+                // O(q²) log-weight; 1e-12 leaves two orders of headroom.
+                assert!(
+                    close(f_hi, f_lo, 1e-12),
+                    "{link:?} q=±{q}: f {f_hi} vs {f_lo}"
+                );
+                assert!(
+                    close(f1_hi, -f1_lo, 1e-12),
+                    "{link:?} q=±{q}: f' {f1_hi} vs {f1_lo}"
+                );
+                assert!(
+                    close(f2_hi, f2_lo, 1e-12),
+                    "{link:?} q=±{q}: f'' {f2_hi} vs {f2_lo}"
+                );
+            }
+        }
+    }
+
+    /// 60-digit references for `W = μ′²/(μ(1−μ))` and its first two
+    /// q-derivatives, at upper-tail points where `μ` has rounded to 1.
+    #[test]
+    fn expected_information_matches_high_precision_references_past_mu_rounding_to_one() {
+        let references = [
+            (
+                StandardLink::Probit,
+                9.0,
+                [
+                    9.3633555091744174425e-18,
+                    -8.3254059169468431652e-17,
+                    7.3078037093236435736e-16,
+                ],
+            ),
+            (
+                StandardLink::Logit,
+                37.0,
+                [
+                    8.533047625744064338e-17,
+                    -8.5330476257440628818e-17,
+                    8.5330476257440599692e-17,
+                ],
+            ),
+        ];
+        for (link, q, expected) in references {
+            let (f, f1, f2) = expected_information(link, q);
+            for (got, want) in [f, f1, f2].into_iter().zip(expected) {
+                assert!(
+                    close(got, want, 1e-12),
+                    "{link:?} q={q}: got {got}, want {want}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod cloglog_saturation_tests {
     use super::*;
     use gam_problem::{InverseLink, StandardLink};
@@ -1236,5 +1363,21 @@ mod cloglog_saturation_tests {
         let ll_fail = binomial_location_scale_log_likelihood(0.0, weight, -800.0, &cloglog, 0.0)
             .expect("an underflowed failure row has log-survival 0");
         assert_eq!(ll_fail, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod expected_information_refusal_tests {
+    use super::*;
+    #[test]
+    fn invalid_or_unrepresentable_information_is_refused() {
+        let logit = InverseLink::Standard(StandardLink::Logit);
+        for (weight, q) in [(f64::INFINITY, 0.0), (-1.0, 0.0), (1.0, f64::NAN)] {
+            assert!(binomial_expected_q_information_derivatives(weight, q, &logit, 0.5, 0.25, 0.0, -0.125).is_err());
+        }
+        let identity = InverseLink::Standard(StandardLink::Identity);
+        assert!(binomial_expected_q_information_derivatives(1.0, 0.0, &identity, 0.0, 1.0, 0.0, 0.0).is_err());
+        assert!(binomial_expected_q_information_derivatives(f64::MAX, 0.0, &identity, 0.5, 1.0, 0.0, 0.0).is_err());
+        assert_eq!(binomial_expected_q_information_derivatives(0.0, 0.0, &logit, 0.5, 0.25, 0.0, -0.125).unwrap(), (0.0, 0.0, 0.0));
     }
 }
