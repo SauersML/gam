@@ -1155,6 +1155,11 @@ pub(crate) struct Gam784BlockTarget<'t> {
     pub(crate) x_transformed: &'t Array2<f64>,
     /// Block eigenvectors `V_b` (columns), shape `p × m`.
     pub(crate) block_vecs: Array2<f64>,
+    /// `A = X_t·V_b`, shape `n × m`, formed once per target. A node `t` moves
+    /// the rows by `s = X_t V_b t = A t`, so every node reads this product
+    /// (`n·m` per node) instead of re-forming `X_t·(V_b t)` (`n·p` per node),
+    /// and so do the moment channels and the axis truncation.
+    pub(crate) row_block_design: Array2<f64>,
     /// Block curvatures `λ_r` (the `H_total` eigenvalues), length `m`.
     pub(crate) block_lambdas: Array1<f64>,
     /// Mode linear predictor η̂ = X_t β̂.
@@ -1201,12 +1206,39 @@ pub(crate) struct Gam784BlockTarget<'t> {
 }
 
 impl Gam784BlockTarget<'_> {
-    /// Map a whitened block displacement `t` to the coefficient displacement
-    /// `δ = V_b t` and the per-row score `s = X_t δ`.
-    pub(crate) fn displacement(&self, t: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
-        let delta = self.block_vecs.dot(t);
-        let s = gam_linalg::faer_ndarray::fast_av(self.x_transformed, &delta);
-        (delta, s)
+    /// The per-row displacement `s = X_t V_b t = A t` of a whitened block
+    /// displacement `t`.
+    pub(crate) fn displacement(&self, t: &Array1<f64>) -> Array1<f64> {
+        let mut s = Array1::<f64>::zeros(self.row_block_design.nrows());
+        self.displacement_into(
+            t.view(),
+            s.as_slice_mut()
+                .expect("a freshly allocated displacement is contiguous"),
+        );
+        s
+    }
+
+    /// [`Self::displacement`] into `s`: one sequential sum over the `m` block
+    /// axes per row. Every path (one node, the node batch, the rounding band)
+    /// forms `s` here, so the same `t` gives the bit-identical `s` on each.
+    fn displacement_into(&self, t: ndarray::ArrayView1<'_, f64>, s: &mut [f64]) {
+        assert_eq!(
+            t.len(),
+            self.row_block_design.ncols(),
+            "#784 block displacement length must match the block dimension"
+        );
+        assert_eq!(
+            s.len(),
+            self.row_block_design.nrows(),
+            "#784 row displacement length must match the row count"
+        );
+        for (row, out) in self.row_block_design.rows().into_iter().zip(s.iter_mut()) {
+            let mut sum = 0.0_f64;
+            for (&a, &t_r) in row.iter().zip(t.iter()) {
+                sum += a * t_r;
+            }
+            *out = sum;
+        }
     }
 
     /// Evaluate `D(eta)/(2 phi)` and its full per-row eta gradient atomically.
@@ -1255,8 +1287,8 @@ impl Gam784BlockTarget<'_> {
         self.likelihood_surface_at(eta).map(|(_, score)| score)
     }
 
-    /// The excess at one node of the batched sweeps, from its column `s` of
-    /// `S = X_t·V_b·T`, with the displaced η-score
+    /// The excess at one node of the batched sweeps, from its row displacement
+    /// `s = A t` ([`Self::displacement_into`]), with the displaced η-score
     /// written into `score` when one is given. `half` is the calling worker's
     /// half-deviance scratch.
     ///
@@ -1318,13 +1350,11 @@ impl Gam784BlockTarget<'_> {
             "posterior displacement draw rows must match smoothing block count"
         );
 
-        // δ-columns: Δ = V_b · T  (p × n_draws). Cheap (O(p·m·n_draws)) and kept
-        // identical to the serial `block_vecs.dot(t)` per column.
-        let delta_all = gam_linalg::faer_ndarray::fast_ab(&self.block_vecs, draws);
-        // s-columns: S = X_t · Δ  (n × n_draws). THE batched matvec — one GEMM
-        // replacing `n_draws` separate `fast_av(x_transformed, δ_s)` calls.
-        let s_all = gam_linalg::faer_ndarray::fast_ab(self.x_transformed, &delta_all);
-
+        // Each node's rows move by `s = A t` with `A = X_t·V_b` formed once per
+        // target: `n·m` per node, into the worker's own `n`-row scratch. No
+        // `n × n_draws` displacement matrix is held, so a node's working set
+        // is its scratch rows and its kept score, whatever the chunk.
+        //
         // Parallelise over nodes, which is where the independent work is, and
         // sweep each node's rows serially (`node_excess`): a row sweep is
         // arithmetic, and splitting it costs the same order as doing it.
@@ -1337,15 +1367,18 @@ impl Gam784BlockTarget<'_> {
         //
         // Order is preserved: this is an indexed map into a `Vec`, so node `s`
         // still lands at position `s` and the result is bit-identical to the
-        // serial loop. Each worker holds one half-deviance scratch of `n` rows.
+        // serial loop. Each worker holds one half-deviance scratch and one
+        // row-displacement scratch of `n` rows.
         (0..n_draws)
             .into_par_iter()
             .map_init(
-                || vec![0.0_f64; n],
-                |half, sidx| {
+                || (vec![0.0_f64; n], vec![0.0_f64; n]),
+                |scratch, sidx| {
+                    let (half, rows) = scratch;
+                    self.displacement_into(draws.column(sidx), rows);
                     let mut score = keep_score.then(|| Array1::<f64>::zeros(n));
                     let excess = match self.node_excess(
-                        s_all.column(sidx),
+                        ndarray::ArrayView1::from(rows.as_slice()),
                         half,
                         score.as_mut().map(|score| {
                             score
@@ -1496,7 +1529,7 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     }
 
     fn excess(&self, t: &Array1<f64>) -> f64 {
-        let (_delta, s) = self.displacement(t);
+        let s = self.displacement(t);
         let eta_disp = &self.eta_hat + &s;
         let Ok((scaled_half_deviance, _score)) = self.likelihood_surface_at(&eta_disp) else {
             return f64::INFINITY;
@@ -1511,14 +1544,17 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     ///   carries at most `accumulation_band(n, Σ|row|)`.
     /// - the linear Taylor term `ψ'(η̂)·s`, an inner product over `n` terms.
     /// - the observed quadratic `Σ_i W_i s_i²`, a compensated sum over `n` terms.
-    /// - the design product `s = X_t V_b t`, whose entries round within
-    ///   `γ_{p(m+1)}·Σ_j |x_ij|·‖δ‖∞`. That moves the displaced surface by at most
+    /// - the design product `s = A t` with `A = fl(X_t V_b)`. Each `a_ir` is a
+    ///   `p`-term inner product, within `γ_p·Σ_j |x_ij||v_jr|`, and `s_i` sums `m`
+    ///   products `a_ir t_r`, within `γ_m·Σ_r |a_ir||t_r|`; together
+    ///   `|ŝ_i − s_i| ≤ (γ_p + γ_m(1 + γ_p))·(|X_t||V_b||t|)_i ≤ γ_{p+m}·(|X_t||V_b||t|)_i`
+    ///   (Higham, Lemma 3.3). That moves the displaced surface by at most
     ///   `|ψ'(η̂_i + s_i)|` times it, the linear term by `|ψ'(η̂_i)|` times it and
     ///   the quadratic by `|W_i|·|s_i|` times it.
     ///
     /// A row surface that does not evaluate returns `+∞`, which no bar passes.
     fn excess_rounding_band(&self, t: &Array1<f64>) -> f64 {
-        let (delta, s) = self.displacement(t);
+        let s = self.displacement(t);
         let eta_disp = &self.eta_hat + &s;
         let Ok(rows) = crate::pirls::deviance_eta_rows_with_log_measure_scale(
             self.y.view(),
@@ -1534,7 +1570,7 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         let displaced_absolute: f64 = rows.iter().map(|row| row.half_deviance.abs()).sum();
         let deviance_band = gam_linalg::roundoff::accumulation_band(n, displaced_absolute)
             + gam_linalg::roundoff::accumulation_band(n, self.base_absolute_half_deviance);
-        let p = delta.len();
+        let p = self.block_vecs.nrows();
         let linear_absolute: f64 = self
             .base_neg_score_at_mode
             .iter()
@@ -1549,9 +1585,10 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
             .map(|(weight, value)| weight.abs() * value * value)
             .sum();
         let curvature_band = gam_linalg::roundoff::accumulation_band(n, curvature_absolute);
-        let delta_max = delta.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        // `|V_b||t|`, the coefficient-side magnitude each design row contracts.
+        let coefficient_magnitude = self.block_vecs.mapv(f64::abs).dot(&t.mapv(f64::abs));
         let design_growth =
-            gam_linalg::roundoff::accumulation_growth(p * (self.block_lambdas.len() + 1));
+            gam_linalg::roundoff::accumulation_growth(p + self.block_lambdas.len());
         let mut design_band = 0.0_f64;
         for ((((design_row, row), base_score), weight), value) in self
             .x_transformed
@@ -1562,8 +1599,12 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
             .zip(self.weights_obs.iter())
             .zip(s.iter())
         {
-            let row_absolute: f64 = design_row.iter().map(|entry| entry.abs()).sum();
-            let entry_band = design_growth * row_absolute * delta_max;
+            let row_magnitude: f64 = design_row
+                .iter()
+                .zip(coefficient_magnitude.iter())
+                .map(|(entry, magnitude)| entry.abs() * magnitude)
+                .sum();
+            let entry_band = design_growth * row_magnitude;
             design_band += (row.eta_score.abs() + base_score.abs() + weight.abs() * value.abs())
                 * entry_band;
         }
@@ -1583,7 +1624,7 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     }
 
     fn displaced_neg_score(&self, t: &Array1<f64>) -> Result<Array1<f64>, String> {
-        let (_delta, s) = self.displacement(t);
+        let s = self.displacement(t);
         self.neg_score_at(&(&self.eta_hat + &s))
             .map_err(|error| error.to_string())
     }
@@ -1593,27 +1634,24 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     }
 
     /// One node of [`Self::excess_with_displaced_neg_score_batch`] (and of
-    /// [`Self::excess_batch`], which runs it) holds its columns of `Δ = V_b·T` (p) and
-    /// `S = X_t·Δ` (n), each at most twice because `fast_ab`'s small-shape route forms
-    /// the product before assigning it; its result entry, displaced score (n) and
-    /// excess-only result; and a half-deviance scratch of `n` rows. The scratch is one per
-    /// worker, not per node, but a node is charged a whole one so the bound holds for
-    /// any split of the batch.
+    /// [`Self::excess_batch`], which runs it) holds its result entry, displaced score
+    /// (n) and excess-only result, plus a row-displacement scratch and a half-deviance
+    /// scratch of `n` rows each. The scratches are one per worker, not per node, but a
+    /// node is charged whole ones so the bound holds for any split of the batch. The
+    /// product `A = X_t·V_b` the nodes read is the target's, formed once, not a node's.
     fn node_working_bytes(&self) -> Option<usize> {
         let n = self.eta_hat.len();
-        let p = self.block_vecs.nrows();
-        p.checked_mul(2)?
-            .checked_add(n.checked_mul(4)?)?
+        n.checked_mul(3)?
             .checked_add(1)?
             .checked_mul(std::mem::size_of::<f64>())?
             .checked_add(std::mem::size_of::<(f64, Option<Array1<f64>>)>())
     }
 
-    /// Fused excess + displaced score sharing one design matvec `s = X_t δ`
+    /// Fused excess + displaced score sharing one row displacement `s = A t`
     /// and one atomic row-oracle sweep at `η̂ + s`. Each row's value and score
     /// are evaluated together on the same unprojected surface (#784, #1082).
     fn excess_with_displaced_neg_score(&self, t: &Array1<f64>) -> (f64, Option<Array1<f64>>) {
-        let (_delta, s) = self.displacement(t);
+        let s = self.displacement(t);
         let eta_disp = &self.eta_hat + &s;
         let Ok((scaled_half_deviance, ngs)) = self.likelihood_surface_at(&eta_disp) else {
             return (f64::INFINITY, None);
@@ -1629,25 +1667,13 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     }
 
     /// Batched excess + displaced score over all importance draws (#784/#1082
-    /// hot path). The per-draw cost of [`Self::excess_with_displaced_neg_score`]
-    /// is dominated by the design matvec `s = X_t · δ` (O(n·p)), repeated
-    /// `n_draws` times (up to 4096). Those matvecs share the SAME design `X_t`
-    /// and the SAME block frame `V_b`, so they batch into two dense matrix–matrix
-    /// products (BLAS-3) instead of `n_draws` matrix–vector products (BLAS-2):
-    ///
-    /// ```text
-    ///   Δ = V_b · T            (p × n_draws)   T = draws (m × n_draws)
-    ///   S = X_t · Δ            (n × n_draws)   one big GEMM, the win
-    /// ```
-    ///
-    /// Column `s` of `S` is exactly `fast_av(X_t, V_b · t_s)` — the same vector
-    /// the serial path forms — and everything downstream (the row oracle,
-    /// deviance, linear Taylor and curvature terms) is then computed per-column
-    /// with byte-for-byte the same arithmetic as the serial
-    /// `excess_with_displaced_neg_score`. Only the matvec→GEMM reassociation can
-    /// perturb `S` (faer reduces the inner `p`-sum the same way per output
-    /// element regardless of the RHS column count, so this is at the level of
-    /// floating-point reassociation, not a different estimator).
+    /// hot path). A node's row displacement is `s = A t` with `A = X_t·V_b`
+    /// formed once per target, so a node costs `n·m` for its displacement where
+    /// re-forming `X_t·(V_b t)` cost `n·p`, and no `n × n_draws` displacement
+    /// matrix is held. Each node's `s` comes from [`Self::displacement_into`],
+    /// the same arithmetic as the one-node
+    /// [`Self::excess_with_displaced_neg_score`], so both see the bit-identical
+    /// `s`; the nodes run in parallel, each with its own serial row sweep.
     fn excess_with_displaced_neg_score_batch(
         &self,
         draws: &Array2<f64>,
@@ -1665,7 +1691,7 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
 
     /// A one-axis block of a reciprocal-power link: the row surface is defined
     /// only on `η > 0` ([`crate::pirls::linear_predictor_positive_domain`]), and
-    /// along the axis `η_i(t) = η̂_i + xv_i·t` with `xv = X_t·v`, so each row with
+    /// along the axis `η_i(t) = η̂_i + xv_i·t` with `xv = A = X_t·v`, so each row with
     /// likelihood mass and `xv_i ≠ 0` ends the domain at `t_i = −η̂_i/xv_i`. The
     /// feasible interval is the intersection of those half-lines, which contains
     /// `t = 0` because the mode is feasible.
@@ -1678,10 +1704,9 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         {
             return None;
         }
-        let xv = gam_linalg::faer_ndarray::fast_av(
-            self.x_transformed,
-            &self.block_vecs.column(0).to_owned(),
-        );
+        // The same `A` column the nodes displace the rows by, so each cut is
+        // where the evaluated surface `η̂ + A t` itself leaves the domain.
+        let xv = self.row_block_design.column(0).to_owned();
         let mut lower: Option<BlockAxisCut> = None;
         let mut upper: Option<BlockAxisCut> = None;
         let mut curvature = 0.0_f64;
@@ -1787,6 +1812,7 @@ mod exact_deviance_state_cache_tests {
         Gam784BlockTarget {
             x_transformed: x,
             block_lambdas: Array1::ones(block_vecs.ncols()),
+            row_block_design: gam_linalg::faer_ndarray::fast_ab(x, &block_vecs),
             block_vecs,
             weights_obs,
             weights_obs_log_abs,
@@ -1975,6 +2001,7 @@ mod exact_deviance_state_cache_tests {
         let target = Gam784BlockTarget {
             x_transformed: &x,
             block_vecs: Array2::eye(2),
+            row_block_design: x.clone(),
             block_lambdas: array![1.0, 1.0],
             eta_hat: eta_hat.clone(),
             weights_obs,
