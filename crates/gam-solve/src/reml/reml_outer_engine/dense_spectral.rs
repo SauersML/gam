@@ -54,6 +54,11 @@ pub struct DenseSpectralOperator {
     /// were taken at. `None` for a penalty the root carries no rows for; empty for
     /// an operator from an eigendecomposition (#2959 D2).
     pub(crate) root_penalty_leverage: Vec<Option<(Array2<f64>, f64)>>,
+    /// `log|H|` and its componentwise forward-error bound from an LLT of the
+    /// same matrix, installed by [`Self::with_cholesky_logdet`] only when that
+    /// bound is tighter than the eigensolver's Weyl bound (#1561). `None` for
+    /// every other operator.
+    pub(crate) factored_logdet: Option<(f64, f64)>,
 }
 
 impl DenseSpectralOperator {
@@ -379,7 +384,48 @@ impl DenseSpectralOperator {
             raw_eigenvalues: eigenvalues.to_vec(),
             epsilon,
             root_penalty_leverage: Vec::new(),
+            factored_logdet: None,
         })
+    }
+
+    /// This operator with `log|H|` priced by an LLT of `h`, the matrix it
+    /// decomposes, wherever the LLT's forward-error bound is the tighter one
+    /// (#1561).
+    ///
+    /// A backward-stable eigensolver perturbs `H` normwise, `‖E‖₂ ≤ p·ε·‖H‖₂`, so
+    /// on a graded Hessian (a smoothing strength of `10¹⁰` beside unit data
+    /// curvature) every small eigenvalue carries an absolute error of order
+    /// `ε·‖H‖₂` and `Σ ln σ_i` moves by `p·ε·‖H‖₂·Σ 1/σ_i`: measured at `1.3·10⁻⁷`
+    /// on the survival Weibull AFT curved arm, where the LLT of the same matrix
+    /// reproduces warm- and cold-started modes to `5·10⁻¹³`. The LLT's error is
+    /// componentwise, `|δH| ≤ γ_(p+1)·|L||Lᵀ|` (Higham, Thm 10.3), so diagonal
+    /// grading costs it nothing ([`DenseCholeskyOperator`]'s bound).
+    ///
+    /// Only the value changes. Traces, solves and the logdet derivatives stay on
+    /// the eigenpairs, whose cancellation-free rail forms need them; both price
+    /// the one exact `log|H|`. Admitted only for an exact, fully active spectrum
+    /// (`PositiveDefinite`, no mask), where `log|H|` is the LLT's scalar; any
+    /// other operator is returned unchanged, as is one whose LLT fails or whose
+    /// bound is not the tighter.
+    pub fn with_cholesky_logdet(mut self, h: &Array2<f64>) -> Self {
+        if self.epsilon != 0.0
+            || !self.active_mask.iter().all(|&active| active)
+            || h.nrows() != self.n_dim
+        {
+            return self;
+        }
+        let Ok(factor) = DenseCholeskyOperator::from_positive_definite(h) else {
+            return self;
+        };
+        let (Some(cholesky_error), Some(spectral_error)) =
+            (factor.logdet_forward_error(), self.logdet_forward_error())
+        else {
+            return self;
+        };
+        if cholesky_error < spectral_error && factor.cached_logdet.is_finite() {
+            self.factored_logdet = Some((factor.cached_logdet, cholesky_error));
+        }
+        self
     }
 
     /// This operator with each penalty's left-singular rows attached; see
@@ -1011,7 +1057,10 @@ impl DenseSpectralOperator {
 
 impl HessianFactorization for DenseSpectralOperator {
     fn logdet(&self) -> f64 {
-        self.cached_logdet
+        match self.factored_logdet {
+            Some((value, _)) => value,
+            None => self.cached_logdet,
+        }
     }
 
     fn as_exact_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
@@ -1290,8 +1339,13 @@ impl HessianFactorization for DenseSpectralOperator {
     /// ([`gam_linalg::roundoff::symmetric_spectrum_rounding_band`]), so each
     /// eigenvalue moves by at most that much and `log|H|₊ = Σ_active ln σ_i` by at
     /// most `p·ε·‖H‖₂·Σ_active 1/σ_i` to first order. The error is normwise, so
-    /// no diagonal equilibration tightens it.
+    /// no diagonal equilibration tightens it; where an LLT's componentwise bound
+    /// is tighter, [`DenseSpectralOperator::with_cholesky_logdet`] prices the
+    /// value and this reports that bound.
     fn logdet_forward_error(&self) -> Option<f64> {
+        if let Some((_, bound)) = self.factored_logdet {
+            return Some(bound);
+        }
         let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(&self.raw_eigenvalues);
         let inverse_sum: f64 = self
             .reg_eigenvalues
