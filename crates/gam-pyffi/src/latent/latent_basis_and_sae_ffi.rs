@@ -2129,8 +2129,8 @@ fn sae_residual_gauge_dict<'py>(
 
 /// Build the per-atom SAE curvature report (#1099, rescoped under #1115). Each
 /// `kappa_hat` is the fitted empirical second-fundamental-form sup-norm bound
-/// already computed for the curved-dictionary certificate
-/// (`CertificateInputs::per_atom_kappa_hat`). It is a descriptive plug-in geometry summary, not an
+/// already computed for the curved-dictionary incoherence report
+/// (`DictionaryIncoherenceReport::per_atom_kappa_hat`). It is a descriptive plug-in geometry summary, not an
 /// estimand with a profiled criterion: a sup-norm curvature BOUND has no
 /// confidence interval, and the delta-method SE that #1099 first shipped was
 /// conditioned on the generated latent coordinates as if known (omitting the
@@ -2138,7 +2138,7 @@ fn sae_residual_gauge_dict<'py>(
 /// schema therefore carries the point bound only — no SE/CI/flatness fields.
 fn sae_curvature_report_dict<'py>(
     py: Python<'py>,
-    report: &gam::terms::sae::manifold::CertificateInputs,
+    report: &gam::terms::sae::manifold::DictionaryIncoherenceReport,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item(
@@ -2288,11 +2288,11 @@ fn sae_decoder_embeddedness_dict<'py>(
 }
 
 /// Build the result-dict entry for the curved-dictionary incoherence/curvature
-/// certificate inputs (#1008). This is a measurement payload only; it deliberately
-/// does not include a certified/uncertified verdict.
+/// measurements (#1008). This is a measurement payload only; no verdict is
+/// derived from it.
 fn sae_incoherence_report_dict<'py>(
     py: Python<'py>,
-    report: &gam::terms::sae::manifold::CertificateInputs,
+    report: &gam::terms::sae::manifold::DictionaryIncoherenceReport,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("mu_hat", report.mu_hat)?;
@@ -2313,23 +2313,6 @@ fn sae_incoherence_report_dict<'py>(
     d.set_item("peak_activity_floor", report.peak_activity_floor)?;
     d.set_item("snr_proxy", report.snr_proxy)?;
     d.set_item("dispersion", report.dispersion)?;
-    // The #1008 global-optimality verdict: a string label plus the signed margin
-    // when its sufficient inequality is defined. A failed precondition makes
-    // the margin null rather than smuggling an infinity through the JSON report.
-    let (verdict_label, margin) = match report.global_optimality {
-        gam::terms::sae::manifold::GlobalOptimalityVerdict::CertifiedGlobal { margin } => {
-            ("certified_global", Some(margin))
-        }
-        gam::terms::sae::manifold::GlobalOptimalityVerdict::Uncertified { margin } => {
-            ("uncertified", margin)
-        }
-    };
-    d.set_item("global_optimality", verdict_label)?;
-    d.set_item(
-        "global_optimality_certified",
-        report.global_optimality.is_certified(),
-    )?;
-    d.set_item("global_optimality_margin", margin)?;
     d.set_item("note", report.note.clone())?;
     Ok(d)
 }
