@@ -806,6 +806,116 @@ fn parametric_row_precision_is_the_stated_precision_with_nothing_added() {
     );
 }
 
+/// The parametric row-precision prior learns its whole conditional precision map:
+/// `λ_k(u_n) = e^{log α_k} + softplus(raw β_k) ‖u_n − μ_k‖²`, plus a learnable
+/// weight, for `2d + d·du + 1` outer coordinates in all. Before this test the only
+/// check of `grad_rho` was the single log-α entry at `t = 0`, and nothing tied
+/// `grad_target` or `hessian_diag` to the value. This pins value -> `grad_target`,
+/// `grad_target` -> `hessian_diag` (the full FD Jacobian of the gradient, so the
+/// Hessian is also checked to be exactly diagonal) and value -> every `grad_rho`
+/// coordinate, all against central differences. It also checks the `as_dense`,
+/// `log det(S + λI)` and frozen-operator channels against that diagonal.
+///
+/// Tolerances. The stencil error is `h²/6 |f'''| + ε_mach |f| / h` with `h = 1e-5`.
+/// - The value is quadratic in `t`, so value -> grad has no truncation error.
+///   Every summand is `O(1)`, which leaves a roundoff of about `1e-10`.
+/// - The gradient is linear in `t`, so grad -> Hessian is also pure roundoff,
+///   about `ε_mach · 3 / h ≈ 1e-10`.
+/// - Along each ρ coordinate, `|f'''| ≲ 2` on this fixture (softplus, `e^ρ` and
+///   the quadratic in μ are all `O(1)` here), so the truncation error is at most
+///   about `3e-11`. The roundoff is `ε_mach · Σ|terms| / h ≈ 2e-10`.
+/// A `1e-8` tolerance leaves at least 40× margin. The dense and log-det channels
+/// re-evaluate the same `w·λ_k(u_n)`, so they agree to rounding: `1e-12` relative
+/// on the entries, and one `ln` per entry for the eight-term log-det sum.
+#[test]
+fn parametric_row_precision_derivatives_match_central_differences() {
+    let (n_eff, d) = (4usize, 2usize);
+    let n = n_eff * d;
+    let penalty = ParametricRowPrecisionPriorPenalty::new(
+        PsiSlice::full(n, Some(d)),
+        array![[-0.6_f64], [0.1], [0.45], [1.2]],
+        array![-0.3_f64, 0.2],
+        array![0.4_f64, -0.7],
+        array![[0.2_f64], [-0.1]],
+        0.8,
+        n_eff,
+        true,
+    )
+    .expect("parametric row-precision penalty");
+    assert_eq!(penalty.rho_count(), 7);
+    let rho = array![0.1_f64, -0.2, 0.3, 0.15, -0.25, 0.05, 0.2];
+    penalty.validate_rho(rho.view()).expect("interior rho");
+    let t = Array1::from_shape_fn(n, |i| 0.5 * (1.1 * i as f64 + 0.3).sin() + 0.1);
+    let h = 1e-5;
+    let tol = 1e-8;
+
+    let g = penalty.grad_target(t.view(), rho.view());
+    let diag = penalty
+        .hessian_diag(t.view(), rho.view())
+        .expect("row-precision Hessian is diagonal");
+    for i in 0..n {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let fd = (penalty.value(tp.view(), rho.view()) - penalty.value(tm.view(), rho.view()))
+            / (2.0 * h);
+        assert_abs_diff_eq!(g[i], fd, epsilon = tol);
+        let gp = penalty.grad_target(tp.view(), rho.view());
+        let gm = penalty.grad_target(tm.view(), rho.view());
+        for j in 0..n {
+            let expected = if i == j { diag[i] } else { 0.0 };
+            assert_abs_diff_eq!((gp[j] - gm[j]) / (2.0 * h), expected, epsilon = tol);
+        }
+    }
+
+    let gr = penalty.grad_rho(t.view(), rho.view());
+    assert_eq!(gr.len(), 7);
+    for c in 0..7 {
+        let mut rp = rho.clone();
+        let mut rm = rho.clone();
+        rp[c] += h;
+        rm[c] -= h;
+        let fd =
+            (penalty.value(t.view(), rp.view()) - penalty.value(t.view(), rm.view())) / (2.0 * h);
+        assert_abs_diff_eq!(gr[c], fd, epsilon = tol);
+    }
+
+    let scale = diag.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    assert!(
+        diag.iter().all(|&x| x > 0.0),
+        "the conditional precision is positive"
+    );
+    let dense = penalty.as_dense(t.view(), rho.view());
+    for i in 0..n {
+        for j in 0..n {
+            let expected = if i == j { diag[i] } else { 0.0 };
+            assert_abs_diff_eq!(dense[[i, j]], expected, epsilon = 1e-12 * scale);
+        }
+    }
+    let lambda = 0.3;
+    let expected_log_det: f64 = diag.iter().map(|&x| (x + lambda).ln()).sum();
+    let log_det = penalty
+        .log_det_plus_lambda_i(rho.view(), lambda)
+        .expect("row-precision log det");
+    assert_abs_diff_eq!(log_det, expected_log_det, epsilon = 1e-12 * n as f64);
+
+    let op = FrozenAnalyticPenaltyOp::new(
+        AnalyticPenaltyKind::ParametricRowPrecisionPrior(Arc::new(penalty)),
+        t.clone(),
+        rho.clone(),
+    )
+    .expect("frozen row-precision operator");
+    let frozen_diag = op.diag();
+    for i in 0..n {
+        assert_abs_diff_eq!(frozen_diag[i], diag[i], epsilon = 1e-12 * scale);
+    }
+    let frozen_log_det = op
+        .log_det_plus_lambda_i(lambda)
+        .expect("frozen row-precision log det");
+    assert_abs_diff_eq!(frozen_log_det, expected_log_det, epsilon = 1e-12 * n as f64);
+}
+
 #[test]
 fn sparsity_learnable_smoothing_has_one_structural_coordinate() {
     assert!(
