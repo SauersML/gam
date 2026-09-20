@@ -4852,5 +4852,14 @@
     },
     "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
     "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
+  },
+  {
+    "base": "f4a293a63f27849835d1fcb67c3eefcef5a495ab",
+    "removed": {
+      "crates/gam-terms/src/smooth/term_specs.rs::apply_response_aware_anisotropy_seed": 1,
+      "crates/gam-terms/src/smooth/term_specs.rs::response_aware_axis_contrasts": 1
+    },
+    "reason": "Delete the response-aware anisotropy seed nudge (#2902 row `clamp(+-MAX_NUDGE)`): a per-axis seed shift clamped to a hand-picked ln 2 box, added in #1376 to steer the kappa/anisotropy optimizer away from a symmetric start that the then-mis-centered psi gradient could not leave. The exact centered psi gradient (#1376 root fix) makes the seed a plain starting point of a gradient optimizer, so the bounded response heuristic is an unnecessary knob; SPEC: 'Hand-supplied search boxes or bounds are never allowed.' and 'In general, do not paper over solver issues.'",
+    "evidence": "git grep -n 'response_aware\\|MAX_NUDGE' at f4a293a63f finds only the two definitions and their doc in term_specs.rs, the single call in fit_orchestration/drivers/spatial_optimization.rs (removed here) and the spec_ban_ledger row (removed here). Anisotropy recovery tests aniso_matern_full_outer_loop_recovers_planted_signal_r2, aniso_matern_recovery_ablation_eta_direction_robust_across_penalty, aniso_matern_recovers_signal_axis run on this branch via focused-rust-proof."
   }
 ]

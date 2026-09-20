@@ -6983,14 +6983,6 @@ fn spatial_kappa_incumbent(
     if kappa_options.max_outer_iter == 0 {
         crate::bail_invalid_estim!("spatial kappa optimization requires max_outer_iter >= 1");
     }
-    // #1376: the geometry-only anisotropy seed (`initial_aniso_contrasts`, from
-    // per-axis knot-coordinate spread) is blind to the response, so a signal
-    // axis and a nuisance axis with equal coordinate spread both seed to ~0 and
-    // the κ optimizer can stall at the symmetric point (it found a weak/flat
-    // antisymmetric gradient, amplified by double-penalty nullspace shrinkage).
-    // Add a bounded, response-aware per-axis nudge so the optimizer starts in
-    // the correct basin.
-    apply_response_aware_anisotropy_seed(data, y.view(), &mut resolvedspec, &spatial_terms);
 
     // Select every free constant-curvature coordinate once from its continuous,
     // analytically differentiated likelihood profile before fitting the baseline.
