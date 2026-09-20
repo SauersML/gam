@@ -204,11 +204,6 @@ pub use solver::estimate::reml::atoms::{
     ThetaDirection,
 };
 pub use solver::estimate::reml::reml_outer_engine::PenaltySubspaceTrace;
-// #986 frontier ρ-scaling: the per-atom decoupled EFS outer engine. `run_outer`
-// auto-routes to it at frontier rho dimension; callers with a known
-// arrow-border overlap drive `run_per_atom_efs` directly with an explicit
-// `SharedBorderTopology` (`new` for a named border set, `disjoint` /
-// `fully_coupled` for the two extremes).
 pub use gam_problem::{
     DeclaredHessianForm, Derivative, EfsEval, ErrorCategory, FailureCategory,
     HessianMaterialization,
@@ -235,9 +230,9 @@ pub use gam_runtime::resource;
 pub use gam_runtime::warm_start;
 pub use gam_spec::{InverseLink, StandardLink};
 pub use gam_problem::outer_subsample::{OuterScoreSubsample, RowSet, WeightedOuterRow};
-pub use solver::estimate::reml::per_atom_efs::{
-    PerAtomEfsConfig, SharedBorderTopology, run_per_atom_efs,
-};
+// #986 frontier ρ-scaling: the per-atom decoupled EFS outer engine. `run_outer`
+// auto-routes to it at frontier rho dimension.
+pub use solver::estimate::reml::per_atom_efs::{PerAtomEfsConfig, run_per_atom_efs};
 pub use solver::{
     estimate, gaussian_reml, mixture_link, pirls, progress_log, seeding, topology_selector,
 };
