@@ -80,9 +80,10 @@ impl<'a> RemlState<'a> {
     /// So the admission is now a property of the MODEL, latched on first
     /// admission and held for the fit
     /// ([`RemlState::block_correction_admission`]), and the block is the
-    /// `m` largest-`|γ_r|` positive-curvature directions at each ρ rather than
-    /// a set defined by a threshold crossing. The spliced objective is a
-    /// function of ρ again, and the spliced gradient stays exact: the four
+    /// directions at the spectral positions the admission integrated
+    /// ([`BlockQuadratureLatch::block_positions`]) at each ρ rather than a set
+    /// re-selected by a threshold crossing or a `|γ_r|` ranking. The spliced
+    /// objective is a function of ρ again, and the spliced gradient stays exact: the four
     /// channels differentiate `Δ_b` at a fixed block, and a ρ-dependent
     /// admission would contribute a term they do not carry — the same
     /// objective↔gradient desync this site already declines the splice over for
@@ -96,51 +97,55 @@ impl<'a> RemlState<'a> {
     /// Per-bundle-cached wrapper around [`Self::block_local_quadrature_correction_compute`].
     ///
     /// The block-local correction is a deterministic function of this bundle's
-    /// converged inner state and ρ alone (mode-invariant, Hessian-free), but the
-    /// outer loop evaluates the objective at one ρ up to three times (value,
-    /// value+gradient, value+gradient+Hessian) sharing the SAME `bundle`. The
-    /// expensive engaged path (dense O(p³) eigendecomposition plus the
-    /// fixed-seed O(draws·n·m) importance sampler) therefore reran 2–3× per
-    /// outer iteration. Hoist it onto `bundle.block_local_correction` so it is
-    /// computed exactly once per inner solution and every consumer at that ρ
-    /// reads the identical value+gradient (exact hoist — #784, #1082). Keyed on
-    /// `n_ext`, which is fixed for a fit, so one cell suffices.
+    /// converged inner state and ρ alone, but the outer loop evaluates the
+    /// objective at one ρ up to three times (value, value+gradient,
+    /// value+gradient+Hessian) sharing the SAME `bundle`. Hoist it onto
+    /// `bundle.block_local_correction` so the eigendecomposition and the
+    /// quadrature run once per inner solution and every consumer at that ρ
+    /// reads the identical value+gradient (exact hoist — #784, #1082).
+    ///
+    /// `want_hessian` says whether the evaluation asks for the ρ-Hessian. Its
+    /// second-order pass over the nodes is paid only then: a value or
+    /// value+gradient evaluation (a line search, the ρ-posterior sampler's
+    /// leapfrog steps) never reads it.
     pub(crate) fn block_local_quadrature_correction(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         n_ext: usize,
+        want_hessian: bool,
     ) -> Result<TkCorrectionTerms, EstimationError> {
         // A deferred search prices the Laplace criterion, which is not this
         // bundle's correction once the admission is decided, so it is not cached.
         if self.block_correction_admission_deferred() {
-            return self.block_local_quadrature_correction_compute(rho, bundle, n_ext);
+            return self.block_local_quadrature_correction_compute(
+                rho,
+                bundle,
+                n_ext,
+                want_hessian,
+            );
         }
-        if let Some((cached_ext, terms, audit)) = bundle.block_local_correction.get()
-            && *cached_ext == n_ext
-        {
+        if let Some(entry) = bundle.block_local_correction.get(n_ext, want_hessian) {
             // Re-publish the audit record the computing call wrote: the window
             // was cleared at the start of THIS assemble call, so without this a
             // ρ whose splice engaged reads back as declined on every assemble
             // after the first (#2623).
-            if let Some(record) = audit.as_ref() {
-                crate::estimate::outer_eval_capture::record_quadrature_marginal(record.clone());
+            if let Some(record) = entry.audit {
+                crate::estimate::outer_eval_capture::record_quadrature_marginal(record);
             }
-            return Ok((**terms).clone());
+            return Ok((*entry.terms).clone());
         }
-        let terms = self.block_local_quadrature_correction_compute(rho, bundle, n_ext)?;
-        let audit = crate::estimate::outer_eval_capture::last_quadrature_marginal_record();
-        // First writer wins; a racing writer built from identical inputs, so
-        // either stored object is correct. A `set` that loses the race (cell
-        // already filled) is fine — both terms are equal — so the `Err` is
-        // discarded by returning the freshly computed `terms` either way.
-        match bundle
+        let terms =
+            self.block_local_quadrature_correction_compute(rho, bundle, n_ext, want_hessian)?;
+        bundle
             .block_local_correction
-            .set((n_ext, std::sync::Arc::new(terms.clone()), audit))
-        {
-            Ok(()) => Ok(terms),
-            Err(_) => Ok(terms),
-        }
+            .store(super::BlockLocalCorrectionCache {
+                n_ext,
+                terms: std::sync::Arc::new(terms.clone()),
+                carries_hessian: want_hessian,
+                audit: crate::estimate::outer_eval_capture::last_quadrature_marginal_record(),
+            });
+        Ok(terms)
     }
 
     fn block_correction_decision_guard(
@@ -158,15 +163,24 @@ impl<'a> RemlState<'a> {
         *self.block_correction_decision_guard() = BlockCorrectionDecision::DeferredToOptimum;
     }
 
-    /// Whether the #784 correction is latched into this fit's criterion. Its
-    /// value and exact ρ-gradient are spliced, but `Δ_b` has no analytic
-    /// ρ-Hessian, so a latched criterion declares none: the search continues on
-    /// BFGS curvature and the smoothing correction is typed-unavailable, as for
-    /// a non-canonical Firth link.
-    pub(crate) fn block_correction_latched(&self) -> bool {
-        self.block_correction_admission
+    /// Why the latched #784 correction has no closed-form ρ-Hessian on this
+    /// fit, or `None` when it is not latched or carries its exact ρ-Hessian
+    /// (`block_correction_hessian`). A criterion with a refused Hessian declares
+    /// none: its search runs on BFGS curvature and its smoothing-corrected
+    /// covariance refuses with this reason.
+    pub(crate) fn block_correction_hessian_refusal(&self) -> Option<String> {
+        if self
+            .block_correction_admission
             .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
+            == 0
+        {
+            return None;
+        }
+        self.block_correction_axis_orders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|latch| latch.hessian_refusal.clone())
     }
 
     pub(crate) fn block_correction_admission_deferred(&self) -> bool {
@@ -187,6 +201,15 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<bool, EstimationError> {
+        // A family the correction never applies to has its decision without an
+        // evaluation: the verdict below would only reach the same decline, after
+        // a reset that discards the certified optimum's inner solve and a fresh
+        // one to replace it.
+        if let Some(reason) = self.block_correction_family_decline() {
+            log::trace!("[#784] block-local correction declined at the optimum: {reason}");
+            *self.block_correction_decision_guard() = BlockCorrectionDecision::DeclinedAtOptimum;
+            return Ok(false);
+        }
         *self.block_correction_decision_guard() = BlockCorrectionDecision::DecidingAtOptimum;
         // Every cached evaluation priced the Laplace criterion, and the decision
         // is taken at the terminal inner mode, not a capped screening one.
@@ -201,11 +224,51 @@ impl<'a> RemlState<'a> {
         Ok(*decision == BlockCorrectionDecision::AdmittedAtOptimum)
     }
 
+    /// Why the correction never applies to this fit's likelihood, if it never
+    /// does. Each reason reads only the configured family, so it holds at every
+    /// ρ of the fit.
+    fn block_correction_family_decline(&self) -> Option<&'static str> {
+        if reml_is_gaussian_identity(&self.config.likelihood) {
+            return Some("Laplace is exact for the Gaussian-identity model");
+        }
+        // The exact score channel relies on the exponential-family unit-
+        // deviance identity dD/dμ = −2w(y−μ)/V(μ), which does not hold for
+        // the Beta pseudo-family parameterization. Decline rather than splice
+        // a gradient that is not the derivative of the spliced value.
+        if matches!(
+            reml_spec(&self.config.likelihood).response,
+            ResponseFamily::Beta { .. }
+        ) {
+            return Some(
+                "the Beta family has no exponential-family score identity for the exact \
+                 gradient channels",
+            );
+        }
+        // Firth/Jeffreys fits: the integrand `Gam784BlockTarget::excess` is the
+        // remainder of the PLAIN penalized likelihood about its mode, but under
+        // Firth β̂ is the mode of the Jeffreys-penalized objective. The plain
+        // remainder then keeps a linear term (∇Φ(β̂) ≠ 0), omits the Jeffreys
+        // change Φ(β̂+δ)−Φ(β̂), and subtracts only XᵀWX while the draws are
+        // scaled by `h_total`, which carries −H_Φ. On separated data that
+        // mis-targeted Δ_b is orders of magnitude above 1/n_eff and drags the
+        // criterion off the certified Laplace surface, so the outer search it
+        // is spliced into cannot certify. Decline — value and gradient
+        // together — until the Jeffreys term is integrated.
+        if reml_robust_jeffreys_link(&self.config).is_some() {
+            return Some(
+                "Firth/Jeffreys bias reduction is active and the block target integrates \
+                 the plain penalized likelihood, not the Jeffreys-penalized one",
+            );
+        }
+        None
+    }
+
     fn block_local_quadrature_correction_compute(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         n_ext: usize,
+        want_hessian: bool,
     ) -> Result<TkCorrectionTerms, EstimationError> {
         // #1521 trait-inversion: the #784 importance-sampling correction and its
         // eigen-diagnostic live UP in the gam-inference `hmc_io` tier; gam-solve
@@ -231,8 +294,8 @@ impl<'a> RemlState<'a> {
             return Ok(zero());
         }
 
-        // Laplace is exact for the Gaussian-identity model: nothing to correct.
-        if reml_is_gaussian_identity(&self.config.likelihood) {
+        if let Some(reason) = self.block_correction_family_decline() {
+            log::trace!("[#784] block-local fallback declined: {reason}");
             return Ok(zero());
         }
         // The mode and trace channels need one λ per canonical penalty.
@@ -264,10 +327,10 @@ impl<'a> RemlState<'a> {
 
         // ── Unconditional declines, BEFORE any evidence is bought ────────────
         //
-        // The two predicates below decline the whole correction, and neither
-        // consults a single number the diagnostic produces: one reads the
-        // hyper-layout, the other the configured response family. Both are
-        // therefore constant across the entire fit.
+        // The predicate below and the family declines above decline the whole
+        // correction, and none consults a single number the diagnostic
+        // produces: this one reads the hyper-layout, the others the configured
+        // response family. All are therefore constant across the entire fit.
         //
         // They used to sit AFTER `directional_cubic_diagnostic` — an `O(p³)`
         // dense factorization plus `O(n·p)` cubic contractions — so every
@@ -276,7 +339,7 @@ impl<'a> RemlState<'a> {
         // as though it had been decided on evidence (gam#2584). Evidence is
         // worth buying only when the verdict can depend on it.
         //
-        // Hoisting them is exactly value-preserving: neither predicate reads
+        // Hoisting them is exactly value-preserving: no predicate reads
         // `sampler`, `max_abs`, `directional` or `verdict`, and every path they
         // guard returns the same `zero()` it returned before.
 
@@ -295,39 +358,6 @@ impl<'a> RemlState<'a> {
                  {n_ext} external (ψ) coordinate(s) present and the ψ-exact gradient \
                  channels are not implemented; splicing a ψ-truncated gradient would \
                  desync objective and gradient (#901)"
-            );
-            return Ok(zero());
-        }
-        // The exact score channel relies on the exponential-family unit-
-        // deviance identity dD/dμ = −2w(y−μ)/V(μ), which does not hold for
-        // the Beta pseudo-family parameterization. Decline rather than splice
-        // a gradient that is not the derivative of the spliced value.
-        if matches!(
-            reml_spec(&self.config.likelihood).response,
-            ResponseFamily::Beta { .. }
-        ) {
-            log::trace!(
-                "[#784] block-local fallback declined before the skewness diagnostic: \
-                 Beta family has no exponential-family score identity for the exact \
-                 gradient channels"
-            );
-            return Ok(zero());
-        }
-        // Firth/Jeffreys fits: the integrand `Gam784BlockTarget::excess` is the
-        // remainder of the PLAIN penalized likelihood about its mode, but under
-        // Firth β̂ is the mode of the Jeffreys-penalized objective. The plain
-        // remainder then keeps a linear term (∇Φ(β̂) ≠ 0), omits the Jeffreys
-        // change Φ(β̂+δ)−Φ(β̂), and subtracts only XᵀWX while the draws are
-        // scaled by `h_total`, which carries −H_Φ. On separated data that
-        // mis-targeted Δ_b is orders of magnitude above 1/n_eff and drags the
-        // criterion off the certified Laplace surface, so the outer search it
-        // is spliced into cannot certify. Decline — value and gradient
-        // together — until the Jeffreys term is integrated.
-        if reml_robust_jeffreys_link(&self.config).is_some() {
-            log::debug!(
-                "[#784] block-local fallback declined before the skewness diagnostic: \
-                 Firth/Jeffreys bias reduction is active and the block target \
-                 integrates the plain penalized likelihood, not the Jeffreys-penalized one"
             );
             return Ok(zero());
         }
@@ -452,39 +482,79 @@ impl<'a> RemlState<'a> {
             return Ok(zero());
         }
 
-        // Build the block subspace V_b. Under a latched admission the block is
-        // the `m` largest-|γ_r| positive-curvature directions, NOT the set that
-        // happens to clear `τ` at this ρ: a set defined by a threshold crossing
-        // changes cardinality as ρ moves, and every change is a jump of a whole
-        // direction's contribution to `Δ_b`. Ranking is the continuous
-        // extension of the same rule — it agrees with it exactly wherever the
-        // flagged set has the latched size, which is every ρ the pre-#2748 fit
-        // was already stable on.
-        let mut admissible: Vec<usize> = (0..evals.len().min(directional.len()))
-            .filter(|&r| evals[r] > 0.0 && directional[r].is_finite())
-            .collect();
-        let block_cols: Vec<usize> = match latched_block_dim {
-            Some(m) => {
-                // Descending |γ_r|, ties broken by index so the selection is a
-                // deterministic function of (H, γ) and not of sort stability.
-                admissible.sort_by(|&a, &b| {
-                    directional[b]
-                        .abs()
-                        .partial_cmp(&directional[a].abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(a.cmp(&b))
-                });
-                admissible.truncate(m);
-                admissible.sort_unstable();
-                admissible
+        // Build the block subspace V_b. At admission the block is the flagged
+        // set, the positive-curvature directions whose |γ_r| clears `τ`. Under
+        // a latched admission it is the directions at the SPECTRAL POSITIONS
+        // the admission integrated, NOT a set re-selected at this ρ.
+        //
+        // A set defined by a threshold crossing changes cardinality as ρ moves,
+        // and every change is a jump of a whole direction's contribution to
+        // `Δ_b` (#2748). Re-ranking by |γ_r| at every ρ keeps the cardinality
+        // but still jumps: the set changes wherever two directions' |γ| cross,
+        // a codimension-one surface in ρ, and each change swaps one axis's
+        // whole contribution for another's, with the latched orders silently
+        // reassigned to directions they were never certified on. Measured on
+        // the convergence fuzzer's `case0/binomial/n1000` (m = 5, axis split):
+        // `Δ_b` took exactly two values, 4.660e-2 and 5.797e-2, across the
+        // BFGS polish's trial points at |g| = 1.4e-4, so the line search could
+        // not pass sufficient decrease and the fit ended `line_search_failed`.
+        // The eigenvector at a fixed position is a continuous function of ρ
+        // away from an eigenvalue coincidence with a neighbouring position, so
+        // the latched block is too, and the frame-rotation channel (c) below
+        // differentiates exactly that motion. It is not uniformly smooth:
+        // near an avoided crossing the eigenvector rotates over a ρ-width
+        // about the size of the relative gap, and `Δ_b` moves as steeply
+        // there (gaps down to 7e-4 on the fuzzer's `case45/binomial/n1000`).
+        //
+        // A position is a rank in ASCENDING eigenvalue order, not an index into
+        // `evals`: the criterion's operator above is an `eigh` of the assembled
+        // `H` (ascending) where that resolves `log|H|` and the root SVD
+        // (descending) where it does not (#2644), and the route can change
+        // between two ρ of one search.
+        let mut ascending: Vec<usize> = (0..evals.len()).collect();
+        ascending.sort_by(|&a, &b| evals[a].total_cmp(&evals[b]).then(a.cmp(&b)));
+        let latched_quadrature = self
+            .block_correction_axis_orders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .filter(|latch| Some(latch.block_positions.len()) == latched_block_dim);
+        let mut block_cols: Vec<usize> = match (&latched_quadrature, latched_block_dim) {
+            (Some(latch), _) => {
+                if let Some(&k) = latch
+                    .block_positions
+                    .iter()
+                    .find(|&&k| k >= ascending.len() || evals[ascending[k]] <= 0.0)
+                {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "#784 latched block direction at spectral position {k} has no positive \
+                         curvature at this rho (eigenvalue {:?}); the block the admission \
+                         integrated does not exist here",
+                        ascending.get(k).map(|&r| evals[r])
+                    )));
+                }
+                latch
+                    .block_positions
+                    .iter()
+                    .map(|&k| ascending[k])
+                    .collect()
             }
-            None => verdict
+            // The admission and its block are latched together below, so an
+            // admission without its block is a broken latch, not a model.
+            (None, Some(m)) => {
+                return Err(EstimationError::InvalidInput(format!(
+                    "#784 block correction latched with block dimension {m} but without the \
+                     block it integrated"
+                )));
+            }
+            (None, None) => verdict
                 .untrustworthy_directions
                 .iter()
                 .copied()
                 .filter(|&r| r < evals.len() && evals[r] > 0.0)
                 .collect(),
         };
+        order_block_axes_by_curvature(&mut block_cols, &evals);
         if block_cols.is_empty() {
             return Ok(zero());
         }
@@ -613,12 +683,6 @@ impl<'a> RemlState<'a> {
             f64::INFINITY
         };
         let next_order_remainder = laplace_floor * laplace_floor;
-        let latched_quadrature = self
-            .block_correction_axis_orders
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .filter(|latch| latch.axis_orders.len() == m);
 
         // ── Axis by axis, or one tensor rule ─────────────────────────────
         //
@@ -678,6 +742,16 @@ impl<'a> RemlState<'a> {
                 },
             });
         }
+        // Whether `Δ_b` has a closed-form ρ-Hessian on this fit, and how its row
+        // curvature is read off the mode. It reads only the family, the link,
+        // the inner solve's curvature contract and the latched block shape, so
+        // it is one answer for the whole fit.
+        let hessian_support = super::block_correction_hessian::block_correction_row_curvature(
+            pirls_result,
+            &target.inverse_link,
+            axis_split,
+            m,
+        );
 
         // Integrate each piece and contract its moments into the gradient
         // channels at once, so one axis target (and its moments) is alive at a
@@ -685,6 +759,7 @@ impl<'a> RemlState<'a> {
         let piece_count = if axis_split { m } else { 1 };
         let mut pieces: Vec<BlockPieceQuadrature> = Vec::with_capacity(piece_count);
         let mut axis_orders: Vec<usize> = Vec::with_capacity(m);
+        let mut truncated_pieces: Vec<bool> = Vec::new();
         for k in 0..piece_count {
             let (first_axis, width) = if axis_split { (k, 1) } else { (0, m) };
             let axis_target;
@@ -721,6 +796,11 @@ impl<'a> RemlState<'a> {
                 },
             };
             axis_orders.extend_from_slice(&quadrature.axis_orders);
+            if crate::estimate::outer_eval_capture::rho_outer_audit_enabled() {
+                truncated_pieces.push(piece_target.axis_truncation().is_some_and(|truncation| {
+                    truncation.lower().is_some() || truncation.upper().is_some()
+                }));
+            }
             let Some(moments) = quadrature.moments.take() else {
                 // The corrector's contract reserves absent moments for the empty
                 // block, and every piece has at least one axis.
@@ -741,17 +821,22 @@ impl<'a> RemlState<'a> {
         let x = x_dense.as_ref();
         // Φ and its derivatives in the whitened block coordinates
         // a_i = Λ^{-1/2} V_bᵀ x_i.
-        let mixed = if axis_split {
-            let (c_obs, d_obs, e_obs) = self.hessian_cde_arrays(pirls_result)?;
-            let mut whitened = x.dot(&target.block_vecs);
-            for r in 0..m {
-                let scale = target.block_lambdas[r].sqrt().recip();
-                whitened.column_mut(r).mapv_inplace(|v| v * scale);
-            }
-            let term = mixed_axis_laplace_term(whitened.view(), &c_obs, &d_obs, &e_obs);
-            Some((term, whitened))
+        let curvature_derivatives = if axis_split || (want_hessian && hessian_support.is_ok()) {
+            Some(self.hessian_cde_arrays(pirls_result)?)
         } else {
             None
+        };
+        let mixed = match (axis_split, curvature_derivatives.as_ref()) {
+            (true, Some((c_obs, d_obs, e_obs))) => {
+                let mut whitened = x.dot(&target.block_vecs);
+                for r in 0..m {
+                    let scale = target.block_lambdas[r].sqrt().recip();
+                    whitened.column_mut(r).mapv_inplace(|v| v * scale);
+                }
+                let term = mixed_axis_laplace_term(whitened.view(), c_obs, d_obs, e_obs);
+                Some((term, whitened))
+            }
+            _ => None,
         };
 
         let delta_b = pieces.iter().map(|piece| piece.quadrature.value).sum::<f64>()
@@ -823,17 +908,27 @@ impl<'a> RemlState<'a> {
 
         // Latch the admission on the first evaluation that reaches here with
         // every gate cleared. Everything below this point splices, so this is
-        // the exact boundary of "the correction is part of this model".
+        // the exact boundary of "the correction is part of this model". The
+        // block, its quadrature and its Hessian support latch together, so the
+        // criterion's Hessian declaration reads this fit's own answer; an
+        // admission without its block is refused where the block is chosen.
         if latched_block_dim.is_none() {
+            let mut rank_of = vec![0; ascending.len()];
+            for (k, &r) in ascending.iter().enumerate() {
+                rank_of[r] = k;
+            }
+            let block_positions: Vec<usize> = block_cols.iter().map(|&r| rank_of[r]).collect();
             self.block_correction_admission
                 .store(m + 1, std::sync::atomic::Ordering::Relaxed);
             *self
                 .block_correction_axis_orders
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(BlockQuadratureLatch {
+                block_positions: block_positions.clone(),
                 axis_orders: axis_orders.clone(),
                 axis_quadrature_errors: axis_quadrature_errors.clone(),
                 axis_split,
+                hessian_refusal: hessian_support.as_ref().err().cloned(),
             });
             let mut decision = self.block_correction_decision_guard();
             if *decision == BlockCorrectionDecision::DecidingAtOptimum {
@@ -842,9 +937,9 @@ impl<'a> RemlState<'a> {
             drop(decision);
             log::debug!(
                 "[#784] block-local correction ADMITTED for this fit: block dimension m={m}, \
-                 axis split={axis_split} and axis orders {:?} are now the model's, and the \
-                 tau={:.3} activation no longer switches the criterion on and off along the \
-                 outer search (#2748, #2623)",
+                 spectral positions {block_positions:?}, axis split={axis_split} and axis orders \
+                 {:?} are now the model's, and the tau={:.3} activation no longer switches \
+                 the criterion on and off along the outer search (#2748, #2623)",
                 axis_orders,
                 verdict.threshold,
             );
@@ -1027,6 +1122,55 @@ impl<'a> RemlState<'a> {
                 g_mat[(q, jr)] = r_tilde[(q, jr)] / gap;
             }
         }
+
+        // The exact ρ-Hessian of `−Δ_b` on the same eigensystem, nodes and
+        // mode: every pair is resolved above, so the eigenframe is twice
+        // differentiable here. A fit whose `Δ_b` has no closed-form Hessian
+        // declares none (`BlockQuadratureLatch::hessian_refusal`), and its
+        // smoothing-corrected covariance refuses with that reason. An
+        // evaluation that does not ask for the Hessian does not pay for it.
+        let cost_hessian = match (&hessian_support, curvature_derivatives.as_ref()) {
+            (Ok(curvature), Some((c_obs, d_obs, e_obs))) if want_hessian => {
+                let fourth = if axis_split {
+                    Some(
+                        super::block_correction_hessian::curvature_fourth_derivative(
+                            pirls_result,
+                            &target.inverse_link,
+                            &target.prior_weights,
+                            c_obs,
+                            e_obs,
+                        )?,
+                    )
+                } else {
+                    None
+                };
+                let second_order = super::block_correction_hessian::block_correction_cost_hessian(
+                    &target,
+                    &super::block_correction_hessian::BlockCorrectionHessianInputs {
+                        curvature: *curvature,
+                        axis_split,
+                        axis_orders: &axis_orders,
+                        evals: &evals,
+                        evecs: &evecs,
+                        block_cols: &block_cols,
+                        c: c_obs,
+                        d: d_obs,
+                        e_f: fourth.as_ref().map(|f| (e_obs, f)),
+                    },
+                )?;
+                log::trace!(
+                    "[#784] ρ-Hessian pieces V={:?} (quadrature {:?}), Φ={:?}",
+                    second_order.piece_values,
+                    pieces
+                        .iter()
+                        .map(|piece| piece.quadrature.value)
+                        .collect::<Vec<_>>(),
+                    second_order.mixed_value,
+                );
+                Some(second_order)
+            }
+            _ => None,
+        };
         let q_c_raw = evecs.dot(&g_mat).dot(&target.block_vecs.t()); // p × p
         let mut q_mat = 0.5 * (&q_c_raw + &q_c_raw.t());
         for jr in 0..m {
@@ -1058,64 +1202,11 @@ impl<'a> RemlState<'a> {
         let mut audit_mode: Vec<f64> = Vec::new();
         let mut audit_spliced: Vec<f64> = Vec::new();
 
-        // WARNING (#2623) -- READ THIS BEFORE CHANGING THE SIGN IN THIS LOOP.
-        //
-        // The convention of the four channels is NOT settled by the contract
-        // comment above, which is self-inconsistent. The authoritative
-        // statement is on the type, in gam-problem laplace_sampler_contract:
-        //
-        //     value:        Delta_b            added to the block marginal
-        //                                      log-likelihood, SUBTRACTED
-        //                                      from the REML/LAML cost
-        //     rho_gradient: d(Delta_b)/d(rho)  explicit channel (a) ONLY
-        //
-        // So channel (a) is PLUS quadrature.rho_gradient, not its negation, and a
-        // sum of four Delta_b-side channels is d(Delta_b)/d(rho), not
-        // d(cost)/d(rho). The formula above labels its left side d(cost)/d(rho)
-        // while listing (a) in Delta_b-side form, and separately calls the
-        // NEGATION of quadrature.rho_gradient channel (a). A Delta_b-side term
-        // cannot appear unnegated in a cost-side total, so the label, the terms
-        // and the type contract cannot all three be right.
-        //
-        // What is settled: value is PLUS Delta_b, confirmed independently by
-        // block_quadrature_marginal_recovers_analytic_quartic_correction, which
-        // checks it against a 20001-point trapezoid reference and asserts it is
-        // negative for an added quartic penalty. So the value: -delta_b
-        // below is correct.
-        //
-        // What is OPEN: whether trace_j and mode_j below are Delta_b-side or
-        // cost-side. The two readings differ by exactly 2*(trace_j + mode_j),
-        // which #2623 measures at about 9.65 on a fold where the true slope is
-        // a three-way near-cancellation and each channel is 25-30x the sum. So
-        // the wrong reading does not perturb the search, it INVERTS it: an
-        // outer gradient of +9.4547 AT the cost minimum, Wolfe failure, and 178
-        // evaluations at one theta.
-        //
-        // DO NOT resolve this by reading, in either direction. It is decided by
-        // giving the typed rho-block audit (enable_rho_outer_audit, #2454) a row
-        // whose fixture ASSERTS the #784 splice engaged, then comparing each
-        // channel against finite differences separately. The existing FD guard
-        // cannot see it: both of its rows are deliberately well-behaved, so the
-        // splice declines and trace_j and mode_j are never exercised at all.
-        //
-        // MEASURED (#2623), and the answer is NEITHER SIGN. The channel record
-        // published below drove the #2623 probe, which finite-differenced Delta_b
-        // itself on fixtures where the splice
-        // engages. On two well-conditioned cells whose importance sampler is
-        // essentially exact (ESS 507.9/512 and 500.1/512) the FD reference is
-        // stable to six digits over h from 3e-4 to 3e-3, and the envelope
-        // channels agree with it to 1e-7 relative -- so the stencil is sound.
-        // Against that reference the three channels below match at no sign
-        // assignment. The four measured ratios of the shipped line to the truth
-        // are 0.84, -1.40, -1.43 and -17.4; for the proposed flip they are -12.1,
-        // 4.36, 8.88 and 27.8. Decisively, WHICH sign is closer changes between
-        // the two rho coordinates of a SINGLE evaluation, and no global sign
-        // convention can do that. So this is a wrong contraction, not a wrong
-        // sign, and flipping it exchanges one wrong gradient for another -- which
-        // is also what the flip measured end-to-end. The residual total gradient
-        // error is 1e-4 to 1.3e-1 relative in these mild regimes and INVERTS the
-        // search on the #2623 fold, where the true slope is a three-way
-        // near-cancellation.
+        // Every channel is on the cost side: `gradient[j]` is ∂(−Δ_b)/∂ρ_j, the
+        // derivative of the `value: −Δ_b` this function returns. The engaged
+        // finite-difference rows in `regression_block_correction_outer_hessian_fd`
+        // pin the total against cost differences on single- and multi-axis blocks
+        // (#2623).
         let mut gradient = Array1::<f64>::zeros(n_rho + n_ext);
         for j in 0..n_rho {
             let lam_j = target.lambdas[j];
@@ -1123,15 +1214,12 @@ impl<'a> RemlState<'a> {
             // v_j = H⁻¹ a_j through the same eigendecomposition as Q.
             let uta = evecs.t().dot(&a_j);
             let v_j = evecs.dot(&(&uta / &evals));
-            // tr(A_j Q) = λ_j Σ_c (S_j Q[:,c])_c.
-            let mut tr_sq = 0.0_f64;
-            for c in 0..p {
-                let s_col = transformed_penalty_matvec(
-                    &target.penalties[j],
-                    &q_mat.column(c).to_owned(),
-                );
-                tr_sq += s_col[c];
-            }
+            // tr(A_j Q) = λ_j tr(S_j Q), over the penalty's own block. `S_j` acts
+            // on a direction here, so the prior mean the score is centred on
+            // does not enter.
+            let penalty = &target.penalties[j];
+            let range = penalty.col_range.clone();
+            let tr_sq = (&penalty.local * &q_mat.slice(ndarray::s![range.clone(), range])).sum();
             // tr(C[v_j] Q) = Σ_i c_i (X v_j)_i rowq_i.
             let xv_j = gam_linalg::faer_ndarray::fast_av(x, &v_j);
             let mut tr_cq = 0.0_f64;
@@ -1159,6 +1247,7 @@ impl<'a> RemlState<'a> {
                     max_abs_skewness: verdict.max_abs_skewness,
                     skewness_threshold: verdict.threshold,
                     block_cols: block_cols.clone(),
+                    truncated_pieces,
                     explicit_a: audit_a,
                     trace_bc: audit_trace,
                     mode_d: audit_mode,
@@ -1166,10 +1255,17 @@ impl<'a> RemlState<'a> {
                 },
             );
         }
+        if let Some(second_order) = cost_hessian.as_ref() {
+            log::trace!(
+                "[#784] ρ-gradient spliced {:?} against the Hessian's own {:?}",
+                gradient,
+                second_order.implied_gradient,
+            );
+        }
         Ok(TkCorrectionTerms {
             value: -delta_b,
             gradient: Some(gradient),
-            hessian: None,
+            hessian: cost_hessian.map(|second_order| second_order.hessian),
         })
     }
 }
@@ -1196,6 +1292,29 @@ fn block_correction_design_admission(
         });
     }
     Ok(())
+}
+
+/// Put the block's eigendirections in ascending-curvature order, ties broken by
+/// index.
+///
+/// The latched Gauss-Hermite orders are bound to axis *positions*, so the
+/// position of each direction must be a property of the direction, not of the
+/// eigensolver that produced it. `eigh` of the assembled `H` returns ascending
+/// eigenvalues; the stacked-root SVD the criterion switches to once the
+/// assembled spectrum cannot resolve `log|H|` (#2644) returns descending ones.
+/// Ordered by index, the block's two axes traded their latched orders at that
+/// switch: on the prostate `s(pc1) + s(pc2)` binomial fit the 16-node rule
+/// moved to the axis certified at 9, `Δ_b` stepped by 1.2e-5 between
+/// `ρ₂ = 18.4366` and `18.4473` where its smooth variation is 1e-7, and the
+/// corrected BFGS continuation failed its line search on the step until
+/// `StepSizeTooSmall`.
+///
+/// This is the same comparator as the ascending spectral order the latch
+/// records its block positions in, so the admission's block is sorted before
+/// its ranks are taken and a latched block, read back in ascending position
+/// order, is already in this order.
+fn order_block_axes_by_curvature(block_cols: &mut [usize], evals: &Array1<f64>) {
+    block_cols.sort_by(|&a, &b| evals[a].total_cmp(&evals[b]).then(a.cmp(&b)));
 }
 
 /// One integrated piece of the block marginal: the whole block under a tensor
@@ -1279,7 +1398,7 @@ fn block_target_channel_moments(
 
 /// The block target restricted to its axis `r`: the same excess `ΔF`, with the
 /// displacement confined to the block eigenvector `u_r` and its curvature `λ_r`.
-fn block_axis_target<'t>(target: &Gam784BlockTarget<'t>, r: usize) -> Gam784BlockTarget<'t> {
+pub(super) fn block_axis_target<'t>(target: &Gam784BlockTarget<'t>, r: usize) -> Gam784BlockTarget<'t> {
     Gam784BlockTarget {
         x_transformed: target.x_transformed,
         block_vecs: target
@@ -1307,12 +1426,12 @@ fn block_axis_target<'t>(target: &Gam784BlockTarget<'t>, r: usize) -> Gam784Bloc
 }
 
 /// The mixed-axis second-order Laplace term `Φ` and its derivatives.
-struct MixedAxisLaplaceTerm {
-    value: f64,
+pub(super) struct MixedAxisLaplaceTerm {
+    pub(super) value: f64,
     /// `∂Φ/∂a_i`, row `i` (n × m).
-    a_gradient: Array2<f64>,
+    pub(super) a_gradient: Array2<f64>,
     /// `∂Φ/∂η_i` at fixed `a_i`, through `(c_i, d_i)(η_i)` (n).
-    eta_gradient: Array1<f64>,
+    pub(super) eta_gradient: Array1<f64>,
 }
 
 /// The part of the second-order Laplace expansion of a block marginal that no
@@ -1340,7 +1459,7 @@ struct MixedAxisLaplaceTerm {
 ///             + (1/6) d_i T(a_i, a_i, a_i) − (5/12) d_i Σ_r T_rrr a_ir³.
 ///
 /// The cost is O(n·m³).
-fn mixed_axis_laplace_term(
+pub(super) fn mixed_axis_laplace_term(
     a: ndarray::ArrayView2<'_, f64>,
     c: &Array1<f64>,
     d: &Array1<f64>,
@@ -1561,5 +1680,33 @@ mod design_admission_tests {
                 ..
             }) if (rows, cols, requested_bytes, cap_bytes) == (n_obs, p, bytes, bytes - 1)
         ));
+    }
+}
+
+#[cfg(test)]
+mod block_axis_order_tests {
+    use super::*;
+
+    /// The same block read from an ascending (`eigh`) and a descending
+    /// (stacked-root SVD) eigensystem must give every axis position the same
+    /// direction, or the latched per-axis orders land on different directions
+    /// when the criterion switches route.
+    #[test]
+    fn axis_positions_do_not_depend_on_the_eigensolver_order() {
+        let ascending = Array1::from(vec![2.092e-1, 1.545, 2.772, 1.160e1, 1.753e1, 1.054e2]);
+        let descending = Array1::from_iter(ascending.iter().rev().copied());
+        let n = ascending.len();
+        let mut from_eigh = vec![4usize, 1];
+        let mut from_root = vec![n - 1 - 4, n - 1 - 1];
+        order_block_axes_by_curvature(&mut from_eigh, &ascending);
+        order_block_axes_by_curvature(&mut from_root, &descending);
+        let curvatures = |cols: &[usize], evals: &Array1<f64>| -> Vec<f64> {
+            cols.iter().map(|&r| evals[r]).collect()
+        };
+        assert_eq!(curvatures(&from_eigh, &ascending), vec![1.545, 1.753e1]);
+        assert_eq!(
+            curvatures(&from_eigh, &ascending),
+            curvatures(&from_root, &descending)
+        );
     }
 }

@@ -20,9 +20,7 @@ import gamfit
 def _beta_and_cov(model):
     summary = model.summary()
     beta = np.asarray([c["estimate"] for c in summary.coefficients], dtype=float)
-    cov = np.asarray(summary.covariance_flat, dtype=float).reshape(
-        summary.covariance_n, summary.covariance_n
-    )
+    cov = summary.covariance
     return beta, cov
 
 
@@ -46,11 +44,11 @@ def test_other_columns_never_reach_a_terms_design_block():
     model = gamfit.fit(frame, "y ~ s(x) + s(z) + g")
 
     result = model.partial_dependence("s(x)", n_points=17)
-    assert result["axes"] == ["x"]
-    assert result["held"] == {}
-    assert result["scale"] == "linear_predictor"
-    assert result["quantity"] == "term_contribution"
-    grid = np.asarray(result["grid"], dtype=float)
+    assert result.axes == ("x",)
+    assert result.held == {}
+    assert result.scale == "linear_predictor"
+    assert result.quantity == "term_contribution"
+    grid = result.x
 
     one = pd.DataFrame({"x": grid, "z": np.full(grid.size, -0.9), "g": ["g0"] * grid.size})
     two = pd.DataFrame(
@@ -63,10 +61,10 @@ def test_other_columns_never_reach_a_terms_design_block():
     beta, cov = _beta_and_cov(model)
     sub = cov[block.start : block.end, block.start : block.end]
     np.testing.assert_allclose(
-        result["predicted"], columns_one @ beta[block.start : block.end], atol=1e-12
+        result.fit, columns_one @ beta[block.start : block.end], atol=1e-12
     )
     np.testing.assert_allclose(
-        result["standard_error"],
+        result.se,
         np.sqrt(np.einsum("ij,jk,ik->i", columns_one, sub, columns_one)),
         atol=1e-12,
     )
@@ -80,14 +78,14 @@ def test_a_linear_term_sweeps_its_own_column():
     model = gamfit.fit(frame, "y ~ x + s(z)")
 
     result = model.partial_dependence("x", n_points=5)
-    assert result["axes"] == ["x"]
-    grid = np.asarray(result["grid"], dtype=float)
+    assert result.axes == ("x",)
+    grid = result.x
     block, columns = _block_columns(
         model, "x", pd.DataFrame({"x": grid, "z": np.full(grid.size, 0.5)})
     )
     beta, _ = _beta_and_cov(model)
     np.testing.assert_allclose(
-        result["predicted"], columns @ beta[block.start : block.end], atol=1e-12
+        result.fit, columns @ beta[block.start : block.end], atol=1e-12
     )
 
 
@@ -105,21 +103,21 @@ def test_a_numeric_by_smooth_reports_its_coefficient_function():
     term = "s(x, by=z, k=8)"
     model = gamfit.fit(_numeric_by_frame(reverse=False), f"y ~ {term}")
     result = model.partial_dependence(term, n_points=21)
-    assert result["quantity"] == "coefficient_function"
-    assert result["contribution"] == "z * f(x)"
-    assert result["held"] == {"z": 1.0}
-    grid = np.asarray(result["grid"], dtype=float)
+    assert result.quantity == "coefficient_function"
+    assert result.contribution == "z * f(x)"
+    assert result.held == {"z": 1.0}
+    grid = result.x
 
     block, columns = _block_columns(
         model, term, pd.DataFrame({"x": grid, "z": np.ones(grid.size)})
     )
     beta, _ = _beta_and_cov(model)
     np.testing.assert_allclose(
-        result["predicted"], columns @ beta[block.start : block.end], atol=1e-12
+        result.fit, columns @ beta[block.start : block.end], atol=1e-12
     )
-    assert np.max(np.abs(result["predicted"])) > 0.5
+    assert np.max(np.abs(result.fit)) > 0.5
 
     reordered = gamfit.fit(_numeric_by_frame(reverse=True), f"y ~ {term}")
     again = reordered.partial_dependence(term, n_points=21)
-    np.testing.assert_array_equal(np.asarray(again["grid"]), grid)
-    np.testing.assert_allclose(again["predicted"], result["predicted"], rtol=0.0, atol=1e-8)
+    np.testing.assert_array_equal(again.x, grid)
+    np.testing.assert_allclose(again.fit, result.fit, rtol=0.0, atol=1e-8)

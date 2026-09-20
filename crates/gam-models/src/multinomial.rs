@@ -1009,14 +1009,6 @@ fn handle_multinomial_fixed_lambda_stall(
         // reuses the same coupled joint-Newton Jeffreys machinery the formula
         // REML path arms on separation evidence (see
         // `fit_penalized_multinomial_formula`), only here at the caller's fixed λ.
-        // Engage the fallback, but never let an internal consistency panic in
-        // the coupled joint-Newton assembly (e.g. the #1395 logdet-collapse
-        // guard) escape as a process abort: convert any panic into the
-        // documented hard separation diagnostic, exactly as if the refit had
-        // returned Err. This mirrors the catch_unwind panic-to-typed-error
-        // boundary already used around the faer / cudarc entry points, and keeps
-        // the separation path no worse than the pre-#1854 clean error while the
-        // Firth refit is still being hardened.
         // Start the Firth refit from the well-conditioned origin (β = 0), NOT
         // from the stalled Newton iterate. That stalled iterate is the runaway
         // separated point (`|η| ≥ 25`), where the softmax Fisher information
@@ -1032,31 +1024,29 @@ fn handle_multinomial_fixed_lambda_stall(
         // information is well-conditioned, so a plain from-zero refit converges
         // reliably on exactly the separated data that defeated the fixed-λ
         // Newton above.
-        let firth = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            fit_penalized_multinomial_firth_fallback(
-                design,
-                y_one_hot,
-                penalty,
-                lambdas,
-                row_weights,
-                max_iter,
-                tol,
-                None,
-            )
-        }));
+        let firth = fit_penalized_multinomial_firth_fallback(
+            design,
+            y_one_hot,
+            penalty,
+            lambdas,
+            row_weights,
+            max_iter,
+            tol,
+            None,
+        );
         match firth {
             // SPEC: a fit object must only ever come from a converged
             // optimization — the Firth fallback itself surfaces a
             // budget-exhausted refit as the typed
             // `FixedLambdaNewtonDidNotConverge`, which is forwarded verbatim so
             // the caller sees which lane stalled and its evidence.
-            Ok(Ok(out)) => return Ok(out),
-            Ok(Err(err @ EstimationError::FixedLambdaNewtonDidNotConverge { .. })) => {
+            Ok(out) => return Ok(out),
+            Err(err @ EstimationError::FixedLambdaNewtonDidNotConverge { .. }) => {
                 return Err(err);
             }
-            // Firth refit errored, or an internal consistency guard panicked:
-            // fall back to the explicit hard separation diagnostic.
-            Ok(Err(_)) | Err(_) => {
+            // Firth refit errored: report the explicit hard separation
+            // diagnostic.
+            Err(_) => {
                 return Err(EstimationError::MultinomialSeparationDetected {
                     iteration: stall.iterations,
                     max_abs_eta,
@@ -3514,32 +3504,6 @@ pub(crate) fn penalized_multinomial_formula_parts(
         // sample-count floor changes the statistical fit and is not a prior.
         rho_lower_bound: None,
         use_outer_hessian,
-        // #715 real-data arm ("canonical-gauge null direction rejects all REML
-        // seeds"): skip the multi-seed outer screening cascade and let the
-        // pinned `init_lambda` ρ flow straight to the outer optimizer.
-        //
-        // The multinomial family declares `levenberg_on_ill_conditioning() ->
-        // true`: near the simplex boundary (the near-separable penguins regime)
-        // the softmax Fisher weight `W = diag(p) − p pᵀ → 0`, so the joint
-        // information `H = JᵀWJ + S_λ` can become full-rank but
-        // ILL-CONDITIONED. The self-vanishing LM damping that keeps the inner
-        // joint-Newton from oscillating on those near-singular modes converges
-        // only GEOMETRICALLY. The default screening policy ranks candidate seeds
-        // with a 2-cycle inner cap (`outer_seed_config`); under geometric
-        // LM-damped descent two cycles never reach a finite, meaningful proxy
-        // objective, so EVERY capped seed can collapse to non-finite cost and
-        // the cascade escalates to ×4, ×16, then an UNCAPPED full inner solve
-        // PER SEED on the near-singular Hessian. That is the adapter-level face
-        // of "all REML startup seeds rejected" and the multi-minute timeout.
-        //
-        // The pinned seed is already principled here: `init_lambda` gives every
-        // (class, term) ρ a sensible moderate warm start, and the per-term
-        // effective-df-floor upper bounds (`effective_df_floor_rho_upper_bounds`,
-        // #715 arm (a)) keep any λ from collapsing the smooth onto its polynomial
-        // null space. So the outer ARC/BFGS optimizer performs the real REML ρ
-        // search from this seed; screening only adds the cascade cost and, on the
-        // near-separable arm, the rejection stall.
-        screen_initial_rho: false,
         // #1101: compute the joint Laplace posterior covariance `H⁻¹` (and the
         // influence matrix `F = H⁻¹ X'WX`) at the converged mode so the saved
         // model can surface delta-method per-class probability standard errors
@@ -4992,6 +4956,58 @@ mod fisher_override_tests {
         })
         .expect_err("wrong active-block shape must error");
         assert!(format!("{err}").contains("fisher_w_override shape"));
+    }
+
+    /// A curvature override enters the Newton model only through its quadratic
+    /// form, so an asymmetric block fits exactly as its symmetric part does, and
+    /// the fit does not depend on which triangle the Hessian factorization reads
+    /// (#2469). Negative control: a different symmetric part moves the fit.
+    #[test]
+    fn fisher_override_is_consumed_through_its_symmetric_part_2469() {
+        let (design, y, penalty, lambdas) = toy();
+        let n = design.nrows();
+        let fit = |over: &Array3<f64>| {
+            fit_penalized_multinomial(MultinomialFitInputs {
+                design: design.view(),
+                y_one_hot: y.view(),
+                penalty: penalty.view(),
+                lambdas: lambdas.view(),
+                row_weights: None,
+                fisher_w_override: Some(over.view()),
+                max_iter: 50,
+                tol: 1.0e-9,
+                resume_from: None,
+            })
+            .expect("override fit must converge")
+        };
+        // Dyadic entries, so (W + Wᵀ)/2 of the skewed block rounds to the
+        // symmetric block exactly and the two fits must agree bit for bit.
+        let symmetric = Array3::from_shape_fn((n, 2, 2), |(_, a, b)| {
+            if a == b { 0.25 } else { -0.125 }
+        });
+        let skew = Array3::from_shape_fn((n, 2, 2), |(row, a, b)| match (a, b) {
+            (0, 1) => 0.0625 * (row as f64 + 1.0),
+            (1, 0) => -0.0625 * (row as f64 + 1.0),
+            _ => 0.0,
+        });
+        let asymmetric = &symmetric + &skew;
+        let from_symmetric = fit(&symmetric);
+        let from_asymmetric = fit(&asymmetric);
+        assert_eq!(
+            from_asymmetric.coefficients_active,
+            from_symmetric.coefficients_active
+        );
+        assert_eq!(from_asymmetric.iterations, from_symmetric.iterations);
+        assert_eq!(
+            from_asymmetric.coefficient_covariance,
+            from_symmetric.coefficient_covariance
+        );
+
+        let other_symmetric = symmetric.mapv(|value| 2.0 * value);
+        assert_ne!(
+            fit(&other_symmetric).coefficient_covariance,
+            from_symmetric.coefficient_covariance
+        );
     }
 
     #[test]

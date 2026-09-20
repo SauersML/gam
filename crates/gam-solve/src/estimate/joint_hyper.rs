@@ -324,13 +324,14 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let x_fit = conditioning.apply_to_design(x);
         let fit_linear_constraints =
             conditioning.transform_linear_constraints_to_internal(opts.linear_constraints.clone());
-        let (config, _) = resolved_external_config(opts)?;
+        let (mut config, _) = resolved_external_config(opts)?;
         // Every entry that builds a REML state certifies binomial separation up
         // front, as the scalar-rho route does: a separated unpenalized design has
-        // no finite mode, and the post-solve heuristic that used to guess it is
-        // gone (#2469).
-        crate::estimate::prefit::reject_prefit_binomial_separation(
-            &config, y, w, &x_fit, &canonical,
+        // no finite flat-prior mode (#2469), so the certificate arms the Jeffreys
+        // prior before the first solve (#3129). The evaluator is built once, at
+        // the baseline design, so the whole joint search prices one objective.
+        crate::estimate::prefit::arm_jeffreys_on_prefit_binomial_separation(
+            &mut config, opts, y, w, &x_fit, &canonical,
         )?;
         let config = Arc::new(config);
 
@@ -430,10 +431,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .resolved_scale()
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
         let k = self.reml_state.canonical_penalties.len();
-        let seed_config = super::optimizer::external_reml_seed_config(
-            k,
-            self.reml_state.config.likelihood.spec.is_gaussian_identity(),
-        );
 
         self.reml_state.without_persistent_warm_start_store(|| {
             super::optimizer::freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
@@ -441,7 +438,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 &resolved_likelihood_scale,
                 k,
                 None,
-                &seed_config,
                 external_hyper_count,
             )
         })

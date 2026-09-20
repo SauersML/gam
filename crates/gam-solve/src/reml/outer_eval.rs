@@ -21,7 +21,6 @@
 pub(crate) use super::*;
 
 pub(crate) use super::sparse_penalty_block_count_from_canonical;
-use crate::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 pub(crate) use crate::persistent_warm_start::{
     PersistentWarmStartRecord, load_record, store_record,
 };
@@ -42,6 +41,8 @@ pub(crate) use ndarray::{Array1, Array2, ArrayView1, s};
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 pub(crate) use std::sync::Arc;
 
+#[path = "block_correction_hessian.rs"]
+mod block_correction_hessian;
 #[path = "block_quadrature_correction.rs"]
 mod block_quadrature_correction;
 #[path = "gradient_hessian.rs"]

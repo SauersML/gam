@@ -5,7 +5,7 @@ DEFAULTS -- and ``diagnose`` has no switch to ask for anything else.
     m = gamfit.fit(d, "y ~ s(x, shape='monotone-increasing')")
     m.summary().covariance_kind          # 'smoothing-corrected'
     m.predict(grid, interval=0.95)
-    # GamError: prediction failed: Invalid input: inequality-truncated credible
+    # GamfitError: prediction failed: Invalid input: inequality-truncated credible
     #   intervals require the persisted conditional posterior; smoothing-corrected
     #   covariance does not define a truncated law
 

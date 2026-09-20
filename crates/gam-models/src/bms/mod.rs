@@ -14,6 +14,7 @@ use crate::fit_orchestration::drivers::{
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint_typed,
     spatial_length_scale_term_indices,
 };
+use crate::inference::predict_io::FittedLatentScoreMap;
 use crate::marginal_slope_shared::{
     CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_optional_matrix,
     add_optional_vector, add_two_surface_psi_outer,
@@ -55,7 +56,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, s};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -195,6 +195,12 @@ pub struct BernoulliMarginalSlopeFitResult {
     /// prediction rebuilds `a(C)` from the (reproducible) marginal design and
     /// applies the identical map.
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
+    /// The latent score of each training row as the kernel consumed it: the raw
+    /// score through the fitted score map (the saved normalisation, then the
+    /// conditional calibration when one was minted). Under the conditional law
+    /// a saved model returns these same values at these rows through
+    /// `FittedModel::latent_conditional_residual` (gam#3016).
+    pub latent_score: Array1<f64>,
     /// The fitted residual repair geometry (gam#2924) when a residual block was
     /// supplied: column names, the pooled joint `(z, r)` covariance, the
     /// conditional model when the pairwise gate escalated, and the centring
@@ -363,12 +369,21 @@ impl ConditionalLawEvidence {
 /// D̂ = Σ_i w_i (r_i² − 2·se_i²) / (π_i(1−π_i))
 /// ```
 ///
-/// The closed form is kept when `D̂ ≤ 0`, and the fit is re-solved on the estimated
-/// law otherwise. Nothing is tuned: as `n` grows the closed form survives only on
-/// Gaussian scores, and at small `n` it wins exactly when the estimated law is too
-/// noisy to beat it. On an exactly Gaussian score the anchors' noise is close to one
-/// shared mode, so about `P(Z² > 2) ≈ 16%` of fits re-solve: slower, and no less
-/// accurate in expectation.
+/// `D̂` is recorded, but the decision is not its sign. On an exactly Gaussian score
+/// `bias = 0`, so the residuals are `Ĝ`'s sampling error alone, `r ~ N(0, Σ)`, and
+/// `T = Σ_i c_i r_i²` (`c_i = w_i/(π_i(1−π_i))`, `T` the residual energy) is the
+/// weighted chi-square `Σ_k λ_k χ²_1` over the eigenvalues `λ_k` of `C^{1/2} Σ C^{1/2}`.
+/// Anchors that share `Ĝ` share its error, and on one law of `M` atoms
+/// `Σ_ij = Σ_m w_m (p_im − p̄_i)(p_jm − p̄_j)/n_eff`, so the `λ_k` are those of the
+/// `M × M` Gram `Σ_i c_i a_i a_iᵀ`, `a_im = √(w_m/n_eff)·(p_im − p̄_i)`
+/// ([`AnchorNoiseGram`]). Their sum is the noise energy. One mode carries most of
+/// it, so the sign of `D̂ = T − 2 Σ_k λ_k` fired on about `P(χ²_1 > 2) ≈ 16%` of exact
+/// Gaussian fits. The closed form is now kept unless `T` exceeds the null law's
+/// upper [`CLOSED_FORM_CERTIFICATE_ALPHA`] quantile, read from the null tail and its
+/// derived error bound ([`crate::probability::signed_weighted_chi_square_sf`]), that
+/// is unless its anchoring error is resolved above the estimated law's own sampling
+/// error at this `n`. The design false-fire rate is that level at every `n`, and the
+/// fire is where the data show the closed form's error.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClosedFormAnchorResidual {
     /// `D̂`.
@@ -383,16 +398,150 @@ pub struct ClosedFormAnchorResidual {
     pub anchors: usize,
     /// Nodes of the estimated law.
     pub nodes: usize,
-    /// The decision, `excess_kl ≤ 0`: the closed form was kept.
+    /// `P(Σ_k λ_k χ²_1 > residual_energy)`: the residual energy's upper tail under
+    /// an exactly Gaussian score, `0` below the subnormal range. `None` in a payload
+    /// written before it was recorded, whose decision was the sign of `excess_kl`.
+    #[serde(default)]
+    pub null_p_value: Option<f64>,
+    /// The relative error bound on `null_p_value`
+    /// ([`crate::probability::TailProbability::relative_error`]); `1` or more where
+    /// the tail is not resolved, as below the subnormal range.
+    #[serde(default)]
+    pub null_p_value_relative_error: Option<f64>,
+    /// `(Σλ)²/Σλ²`, the null law's effective number of modes.
+    #[serde(default)]
+    pub null_modes: Option<f64>,
+    /// The decision, [`closed_form_kept_by_null_tail`]: the closed form was kept.
     pub closed_form_chosen: bool,
 }
 
+/// The closed-form certificate's design false-fire rate (gam#2926): the probability
+/// that the certificate prefers the estimated law on an exactly Gaussian score. A
+/// stated policy, not a tuning knob, at the adequacy screen's level
+/// [`AUTO_Z_NORMAL_SCREEN_ALPHA`].
+pub const CLOSED_FORM_CERTIFICATE_ALPHA: f64 = AUTO_Z_NORMAL_SCREEN_ALPHA;
+
+/// Whether the closed-form certificate keeps the closed form (gam#2926), from the
+/// null tail `tail = P(Q > statistic)` of `Q = Σ_k λ_k χ²_1`, whose mean is
+/// `mean = Σλ` and variance `variance = 2Σλ²`, or `None` where no bound decides it.
+///
+/// A resolved tail (`relative_error = ε < 1`) puts `P` in `[p/(1 + ε), p/(1 − ε)]`.
+/// The closed form is kept when all of it is at least
+/// [`CLOSED_FORM_CERTIFICATE_ALPHA`], and the certificate fires when all of it is
+/// below. An unresolved tail says only `0 ≤ P ≤ 1`. That happens below the
+/// subnormal range, far beyond the rate, and there Cantelli's inequality
+/// `P(Q − μ ≥ s) ≤ σ²/(σ² + s²)` decides it when its bound is below the rate.
+/// Everything else, a bound that straddles the rate or a tail that is not a number,
+/// is undecided.
+pub(crate) fn closed_form_kept_by_null_tail(
+    tail: crate::probability::TailProbability,
+    statistic: f64,
+    mean: f64,
+    variance: f64,
+) -> Option<bool> {
+    let alpha = CLOSED_FORM_CERTIFICATE_ALPHA;
+    if tail.probability.is_nan() || tail.relative_error.is_nan() {
+        return None;
+    }
+    if tail.relative_error < 1.0 {
+        if tail.probability / (1.0 + tail.relative_error) >= alpha {
+            return Some(true);
+        }
+        return (tail.probability / (1.0 - tail.relative_error) < alpha).then_some(false);
+    }
+    let excess = statistic - mean;
+    (excess > 0.0 && variance / (variance + excess * excess) < alpha).then_some(false)
+}
+
+/// The Gram `Σ_i c_i a_i a_iᵀ` of the closed-form certificate's anchors on the `M`
+/// atoms of one estimated law (gam#2926): `c_i = w_i/(π_i(1−π_i))` and
+/// `a_im = √(w_m/n_eff)·(p_im − Σ_k w_k p_ik)`, where `p_im` is the anchor's
+/// probability at atom `m`. Its eigenvalues are the weights of the certificate's
+/// null law ([`ClosedFormAnchorResidual`]). Only the lower triangle is accumulated.
+#[derive(Clone, Debug)]
+pub(crate) struct AnchorNoiseGram {
+    gram: Array2<f64>,
+}
+
+impl AnchorNoiseGram {
+    pub(crate) fn new(atoms: usize) -> Self {
+        Self {
+            gram: Array2::zeros((atoms, atoms)),
+        }
+    }
+
+    /// Add the anchor with certificate coefficient `c = w/(π(1−π))` whose
+    /// probabilities at the law's atoms are `probabilities`.
+    pub(crate) fn add_anchor(
+        &mut self,
+        coefficient: f64,
+        law_weights: &[f64],
+        probabilities: &[f64],
+        effective_n: f64,
+    ) -> Result<(), String> {
+        let atoms = self.gram.nrows();
+        if law_weights.len() != atoms || probabilities.len() != atoms {
+            return Err(format!(
+                "closed-form certificate noise Gram of {atoms} atoms read an anchor over {} \
+                 weights and {} probabilities",
+                law_weights.len(),
+                probabilities.len()
+            ));
+        }
+        let mean: f64 = law_weights
+            .iter()
+            .zip(probabilities)
+            .map(|(w, p)| w * p)
+            .sum();
+        let centered: Vec<f64> = law_weights
+            .iter()
+            .zip(probabilities)
+            .map(|(w, p)| (w / effective_n).sqrt() * (p - mean))
+            .collect();
+        for i in 0..atoms {
+            let scaled = coefficient * centered[i];
+            for j in 0..=i {
+                self.gram[[i, j]] += scaled * centered[j];
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn merge(&mut self, other: &Self) {
+        self.gram += &other.gram;
+    }
+
+    /// The null law's weights: the Gram's eigenvalues, the round-off below zero of
+    /// a positive semidefinite Gram dropped.
+    fn null_weights(&self) -> Result<Vec<f64>, String> {
+        let atoms = self.gram.nrows();
+        let mut full = self.gram.clone();
+        for i in 0..atoms {
+            for j in 0..i {
+                full[[j, i]] = full[[i, j]];
+            }
+        }
+        let (eigenvalues, _) = gam_linalg::faer_ndarray::FaerEigh::eigh(&full, faer::Side::Lower)
+            .map_err(|error| {
+                format!("closed-form certificate noise Gram eigendecomposition failed: {error:?}")
+            })?;
+        if let Some(eigenvalue) = eigenvalues.iter().find(|l| !l.is_finite()) {
+            return Err(format!(
+                "closed-form certificate noise Gram has a non-finite eigenvalue {eigenvalue}"
+            ));
+        }
+        Ok(eigenvalues.iter().copied().filter(|&l| l > 0.0).collect())
+    }
+}
+
 impl ClosedFormAnchorResidual {
-    /// Aggregate per-anchor `(residual, standard error, π(1−π), prior weight)`.
-    /// Anchors whose `π(1−π)` is zero carry no probability to anchor and are not
-    /// measured.
+    /// Aggregate per-anchor `(residual, standard error, π(1−π), prior weight)`
+    /// beside the anchors' noise Gram on the law's atoms. Anchors whose `π(1−π)` is
+    /// zero carry no probability to anchor and are not measured, and the caller adds
+    /// none of them to `noise`.
     pub(crate) fn from_rows(
         rows: &[(f64, f64, f64, f64)],
+        noise: &AnchorNoiseGram,
         nodes: usize,
         effective_n: f64,
     ) -> Result<Self, String> {
@@ -420,6 +569,38 @@ impl ClosedFormAnchorResidual {
             );
         }
         let excess_kl = residual_energy - 2.0 * noise_energy;
+        let weights = noise.null_weights()?;
+        let (sum, sum_sq) = weights
+            .iter()
+            .fold((0.0, 0.0), |(s, q), &l| (s + l, q + l * l));
+        let terms: Vec<crate::probability::WeightedChiSquareTerm> = weights
+            .iter()
+            .map(|&weight| crate::probability::WeightedChiSquareTerm {
+                weight,
+                degrees_of_freedom: 1.0,
+            })
+            .collect();
+        // No positive weight means no anchor's probability varies over the law's
+        // atoms, so every anchor is the same under any law of the score and there is
+        // nothing to prefer.
+        let (null_p_value, relative_error, closed_form_chosen) = if terms.is_empty() {
+            (1.0, 0.0, true)
+        } else {
+            let tail = crate::probability::signed_weighted_chi_square_sf(&terms, residual_energy);
+            let decided = closed_form_kept_by_null_tail(tail, residual_energy, sum, 2.0 * sum_sq);
+            let kept = decided.ok_or_else(|| {
+                format!(
+                    "closed-form certificate null tail does not decide against the design rate \
+                     {CLOSED_FORM_CERTIFICATE_ALPHA}: P = {} with relative error bound {}, \
+                     residual energy = {residual_energy}, {} null weights summing to {sum} \
+                     (squares {sum_sq})",
+                    tail.probability,
+                    tail.relative_error,
+                    weights.len()
+                )
+            })?;
+            (tail.probability, tail.relative_error, kept)
+        };
         Ok(Self {
             excess_kl,
             residual_energy,
@@ -427,20 +608,32 @@ impl ClosedFormAnchorResidual {
             effective_n,
             anchors,
             nodes,
-            closed_form_chosen: excess_kl <= 0.0,
+            null_p_value: Some(null_p_value),
+            null_p_value_relative_error: Some(relative_error),
+            null_modes: Some(if sum_sq > 0.0 { sum * sum / sum_sq } else { 0.0 }),
+            closed_form_chosen,
         })
     }
 
     pub(crate) fn summary(&self) -> String {
         format!(
             "D̂ = Σ w (r² − 2·se²)/π(1−π) = {:.4e} (Σ w r²/π(1−π) = {:.4e}, Σ w se²/π(1−π) = \
-             {:.4e}) over {} anchors, n_eff = {:.1}, estimated law of {} nodes: {}",
+             {:.4e}) over {} anchors, n_eff = {:.1}, estimated law of {} nodes; P(Σ w r²/π(1−π) \
+             beyond an exactly Gaussian score's) = {} (relative error {}) over {} null modes, \
+             against {}: {}",
             self.excess_kl,
             self.residual_energy,
             self.noise_energy,
             self.anchors,
             self.effective_n,
             self.nodes,
+            self.null_p_value
+                .map_or_else(|| "not recorded".to_string(), |p| format!("{p:.3e}")),
+            self.null_p_value_relative_error
+                .map_or_else(|| "not recorded".to_string(), |e| format!("{e:.1e}")),
+            self.null_modes
+                .map_or_else(|| "unrecorded".to_string(), |m| format!("{m:.2}")),
+            CLOSED_FORM_CERTIFICATE_ALPHA,
             if self.closed_form_chosen {
                 "the closed form is kept"
             } else {
@@ -448,6 +641,56 @@ impl ClosedFormAnchorResidual {
             }
         )
     }
+}
+
+/// Rows per chunk of the closed-form certificate's pass. A fixed size, so the
+/// order the noise Gram sums in, and with it every recorded bit, is the same at
+/// any thread count.
+const CERTIFICATE_ROW_CHUNK: usize = 256;
+
+/// The closed-form certificate's pass over `rows` training rows (gam#2926):
+/// `measure(workspace, row)` gives the row's `K` anchors as `(residual, law sd,
+/// π(1−π), probabilities at the law's atoms)`. Each becomes a
+/// [`ClosedFormAnchorResidual::from_rows`] row `(residual, law sd/√n_eff, π(1−π),
+/// weight)`, and each measured one (positive weight and `π(1−π)`) a term of the
+/// anchors' [`AnchorNoiseGram`]. `init` builds one workspace per chunk.
+pub(crate) fn closed_form_certificate_pass<const K: usize, W>(
+    rows: usize,
+    row_weights: &[f64],
+    law_weights: &[f64],
+    effective_n: f64,
+    init: impl Fn() -> Result<W, String> + Sync,
+    measure: impl Fn(&mut W, usize) -> Result<[(f64, f64, f64, Vec<f64>); K], String> + Sync,
+) -> Result<(Vec<(f64, f64, f64, f64)>, AnchorNoiseGram), String> {
+    let root_n = effective_n.sqrt();
+    let atoms = law_weights.len();
+    let partials = (0..rows.div_ceil(CERTIFICATE_ROW_CHUNK))
+        .into_par_iter()
+        .map(|chunk| -> Result<(Vec<(f64, f64, f64, f64)>, AnchorNoiseGram), String> {
+            let mut workspace = init()?;
+            let mut noise = AnchorNoiseGram::new(atoms);
+            let start = chunk * CERTIFICATE_ROW_CHUNK;
+            let end = (start + CERTIFICATE_ROW_CHUNK).min(rows);
+            let mut measured = Vec::with_capacity((end - start) * K);
+            for row in start..end {
+                let weight = row_weights[row];
+                for (residual, law_sd, scale, probabilities) in measure(&mut workspace, row)? {
+                    if weight > 0.0 && scale > 0.0 {
+                        noise.add_anchor(weight / scale, law_weights, &probabilities, effective_n)?;
+                    }
+                    measured.push((residual, law_sd / root_n, scale, weight));
+                }
+            }
+            Ok((measured, noise))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut measured = Vec::with_capacity(rows * K);
+    let mut noise = AnchorNoiseGram::new(atoms);
+    for (chunk, gram) in partials {
+        measured.extend(chunk);
+        noise.merge(&gram);
+    }
+    Ok((measured, noise))
 }
 
 /// The law of the latent score a marginal-slope fit consumed, and how it came
@@ -2149,7 +2392,8 @@ pub(crate) fn weighted_mean(
 /// names: `s = Σ_i w_i u_i ã(C_i)`, `Ω̂ = Σ_i w_i² u_i² ã(C_i)ã(C_i)ᵀ`,
 /// `D = sᵀ Ω̂⁺ s ⟶ χ²_{rank Ω̂}`. Both the conditional-mean test
 /// (`u_i = z_i − z̄`) and the conditional-variance / Breusch-Pagan test
-/// (`u_i = (z_i − z̄)² − σ̂²`) are this statistic with the same centered basis.
+/// (`u_i = û_i² − σ̂²_û` on the conditional-mean residual `û = z − m̂(C)`)
+/// are this statistic with the same centered basis.
 ///
 /// Returns `None` when the test is degenerate (no usable basis directions),
 /// otherwise the asymptotic p-value.
@@ -2171,15 +2415,12 @@ pub(crate) fn robust_conditional_score_pvalue(
         ));
     }
     // Build the per-row scaled basis `B` with `B_i = (w_i u_i) ã_i` once, then
-    // recover both the score and the HC0 robust meat from it with two BLAS-3
-    // GEMMs over chunked row-blocks instead of an `O(n · r²)` per-row scatter:
+    // recover both the score and the HC0 robust meat from it:
     //   • score  `s   = ãᵀ (w ∘ u) = Bᵀ 1`     (column sums of `B`),
     //   • meat   `Ω̂  = Σ_i w_i² u_i² ã_i ã_iᵀ = BᵀB` since `(w_i u_i)² = w_i² u_i²`.
     // A non-positive weight zeroes that row of `B` (its score and meat
     // contributions both vanish), reproducing the `wi <= 0.0` skip EXACTLY.
-    // `fast_ata` is the same parallel Gramian the second-stage sandwich uses, so
-    // the statistic is numerically identical to the row-accumulated form up to
-    // the deterministic GEMM reduction order.
+    // `b_ij = (w_i·u_i)·ã_ij` takes three roundings.
     let mut b = a_centered.to_owned();
     for i in 0..n {
         let wi = weights[i];
@@ -2190,22 +2431,41 @@ pub(crate) fn robust_conditional_score_pvalue(
         }
         b.row_mut(i).iter_mut().for_each(|value| *value *= scale);
     }
-    let s = b.sum_axis(ndarray::Axis(0));
-    let omega = gam_linalg::faer_ndarray::fast_ata(&b);
+    robust_score_contributions_pvalue(&b, 3)
+}
+
+/// The robust score test from its per-row contributions `ψ_i` (the rows of
+/// `contributions`): `s = Σ_i ψ_i`, `Ω̂ = Σ_i ψ_i ψ_iᵀ`, `D = sᵀ Ω̂⁺ s ⟶
+/// χ²_{rank Ω̂}`. A contribution that carries an estimated nuisance's
+/// first-order effect makes `Ω̂` the variance of the score as it is actually
+/// computed, not as if the nuisance were known. `row_roundings` bounds the
+/// roundings that formed each `ψ_ij`, for the rank cutoff.
+pub(crate) fn robust_score_contributions_pvalue(
+    contributions: &Array2<f64>,
+    row_roundings: usize,
+) -> Result<Option<f64>, String> {
+    let n = contributions.nrows();
+    let r = contributions.ncols();
+    if r == 0 || n == 0 {
+        return Ok(None);
+    }
+    let s = contributions.sum_axis(ndarray::Axis(0));
+    let omega = gam_linalg::faer_ndarray::fast_ata(contributions);
     if !s.iter().all(|v| v.is_finite()) || !omega.iter().all(|v| v.is_finite()) {
         return Ok(None);
     }
     // Rank cutoff: `Ω̂`'s formation band against `λ_max(Ω̂)`. Each entry sums `n`
-    // products `b_ij·b_ik` with `b_ij = (w_i·u_i)·ã_ij`, three roundings each, so
-    // `|E_jk| ≤ γ_{n+3}·√(Ω̂_jj·Ω̂_kk)` and `‖E‖₂ ≤ γ_{n+3}·tr Ω̂`, against
-    // `λ_max(Ω̂) ≥ max_j Ω̂_jj`. The `r·ε` term is the eigensolver's backward
-    // error. A PSD Gram with a zero largest diagonal is the zero matrix, which
-    // has no usable direction.
+    // products `ψ_ij·ψ_ik`, each factor formed with `row_roundings` roundings,
+    // so `|E_jk| ≤ γ_{n+row_roundings}·√(Ω̂_jj·Ω̂_kk)` and
+    // `‖E‖₂ ≤ γ_{n+row_roundings}·tr Ω̂`, against `λ_max(Ω̂) ≥ max_j Ω̂_jj`. The
+    // `r·ε` term is the eigensolver's backward error. A PSD Gram with a zero
+    // largest diagonal is the zero matrix, which has no usable direction.
     let omega_max_diagonal = omega.diag().iter().copied().fold(0.0_f64, f64::max);
     if omega_max_diagonal == 0.0 {
         return Ok(None);
     }
-    let relative_cutoff = gam_linalg::roundoff::accumulation_growth(n + 3) * omega.diag().sum()
+    let relative_cutoff = gam_linalg::roundoff::accumulation_growth(n + row_roundings)
+        * omega.diag().sum()
         / omega_max_diagonal
         + r as f64 * f64::EPSILON;
     let omega_geometry = gam_linalg::utils::rank_certified_psd_pseudoinverse(&omega, relative_cutoff)
@@ -2261,51 +2521,93 @@ pub(crate) fn fit_conditional_latent_calibration_if_needed(
         return Ok(None);
     }
 
-    let z_mean = z
-        .iter()
-        .zip(weights.iter())
-        .map(|(&zi, &wi)| wi * zi)
-        .sum::<f64>()
-        / total_weight;
-    let global_var = z
-        .iter()
-        .zip(weights.iter())
-        .map(|(&zi, &wi)| wi * (zi - z_mean) * (zi - z_mean))
-        .sum::<f64>()
-        / total_weight;
-    if !(global_var.is_finite() && global_var > 0.0) {
-        return Ok(None);
-    }
-
-    // Center each basis column by its weighted mean so the score test is about
-    // conditional structure *beyond* the global level (the intercept nuisance).
-    // A constant marginal-design column collapses to ~0 and is dropped by the
-    // pseudo-inverse rank, so an intercept already present in a(C) is harmless.
-    let mut a_centered = a_block.to_owned();
-    for j in 0..p {
-        let col = a_block.column(j);
-        let col_mean = col
-            .iter()
-            .zip(weights.iter())
-            .map(|(&v, &w)| w * v)
-            .sum::<f64>()
-            / total_weight;
-        a_centered.column_mut(j).mapv_inplace(|v| v - col_mean);
-    }
-
-    // Conditional-mean Rao test: u = z − z̄.
-    let u_mean: Vec<f64> = z.iter().map(|&zi| zi - z_mean).collect();
-    let p_mean = robust_conditional_score_pvalue(a_centered.view(), &u_mean, weights.view())?;
-    // Conditional-variance (Breusch-Pagan) Rao test: u = (z − z̄)² − σ̂².
-    let u_var: Vec<f64> = u_mean.iter().map(|&e| e * e - global_var).collect();
-    let p_var = robust_conditional_score_pvalue(a_centered.view(), &u_var, weights.view())?;
-
-    let mean_fires = p_mean.is_some_and(|p| p < AUTO_Z_CONDITIONAL_RAO_ALPHA);
-    let var_fires = p_var.is_some_and(|p| p < AUTO_Z_CONDITIONAL_RAO_ALPHA);
+    // The conditional mean is tested on `z − z̄`, and the conditional variance
+    // on the residual of the conditional mean, `û² − Σwû²/Σw` with
+    // `û = z − m̂(C)`, as a Breusch-Pagan test is on OLS residuals. Testing
+    // `(z − z̄)²` instead has score expectation `Cov(a, (m(a) − m̄)²) +
+    // Cov(a, Var(z|a))`: a moving mean masks or fakes heteroskedasticity
+    // (gam#3335). The estimated mean's first-order effect on that score is
+    // propagated into its meat, so the χ² law holds under a curved mean too.
+    let evidence = estimated_latent_law::conditional_law_evidence(z, weights, Some(a_block))?;
+    let mean_fires = ConditionalLawEvidence::fires(evidence.mean_p_value, evidence.alpha);
+    let var_fires = ConditionalLawEvidence::fires(evidence.variance_p_value, evidence.alpha);
     if !mean_fires && !var_fires {
         return Ok(None);
     }
     fit_conditional_latent_calibration(z, weights, a_block, var_fires).map(Some)
+}
+
+/// The conditional-mean stage `m(C)` of the location-scale calibration.
+pub(crate) struct ConditionalMeanStage {
+    /// `[1 | a(C)]`.
+    pub(crate) basis: Array2<f64>,
+    /// Per-column relative Tikhonov penalty `R` (diagonal).
+    pub(crate) penalty: Array2<f64>,
+    /// `M = AᵀWA + λR`, the normal matrix the ridge factorizes.
+    pub(crate) normal: Array2<f64>,
+    pub(crate) coeffs: Vec<f64>,
+    /// `û = z − m̂(C)`.
+    pub(crate) residuals: Vec<f64>,
+}
+
+/// Fit the conditional mean over the full basis `[1 | a(C)]` via a weighted
+/// ridge (the ridge stabilizes a rank-deficient marginal-index span; it does
+/// not meaningfully shrink the few directions that trigger the gate). Shared
+/// by the Rao gates, whose variance tests run on this residual, and the fit.
+pub(crate) fn fit_conditional_mean_stage(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    a_block: ArrayView2<'_, f64>,
+) -> Result<ConditionalMeanStage, String> {
+    let basis = build_intercept_basis(a_block);
+    // Per-column Tikhonov penalty scaled by the weighted Gram diagonal, so the
+    // ridge is *relative* to each column's scale (a 1e-8 absolute ridge would
+    // be negligible against an O(n) Gram and would not stabilize a
+    // rank-deficient penalized-spline marginal index). `diag_jj = Σ_i w_i a_ij²`;
+    // floored positive so the all-zero (already-dropped) directions still
+    // receive a finite ridge and the factorization cannot fail.
+    let mut penalty = Array2::<f64>::zeros((basis.ncols(), basis.ncols()));
+    for j in 0..basis.ncols() {
+        let diag_jj = basis
+            .column(j)
+            .iter()
+            .zip(weights.iter())
+            .map(|(&x, &w)| w * x * x)
+            .sum::<f64>()
+            .max(f64::MIN_POSITIVE);
+        penalty[[j, j]] = diag_jj;
+    }
+    let z_col = z.view().insert_axis(ndarray::Axis(1));
+    let (coeffs_mat, fitted) = gam_linalg::utils::gaussian_weighted_ridge(
+        basis.view(),
+        z_col,
+        penalty.view(),
+        weights.view(),
+        AUTO_Z_CONDITIONAL_RIDGE_REL,
+    )?;
+    let residuals = z
+        .iter()
+        .zip(fitted.column(0).iter())
+        .map(|(&zi, &mi)| zi - mi)
+        .collect();
+    // The same system rebuilt as a dense `(p+1)²` form, so its inverse can
+    // propagate the mean stage into the Rao gates and the Murphy–Topel `V₁`.
+    let normal = {
+        let mut wa = basis.to_owned();
+        for (mut row, &wi) in wa.rows_mut().into_iter().zip(weights.iter()) {
+            row.iter_mut().for_each(|value| *value *= wi);
+        }
+        let mut m = basis.t().dot(&wa);
+        m += &(penalty.to_owned() * AUTO_Z_CONDITIONAL_RIDGE_REL);
+        m
+    };
+    Ok(ConditionalMeanStage {
+        basis,
+        penalty,
+        normal,
+        coeffs: coeffs_mat.column(0).to_vec(),
+        residuals,
+    })
 }
 
 /// Fit the conditional location-scale calibration at a given structure, with no
@@ -2359,60 +2661,16 @@ pub(crate) fn fit_conditional_latent_calibration(
         ));
     }
 
-    // Escalation fires. Fit the conditional mean over the full basis
-    // [1 | a(C)] via a weighted ridge (the ridge stabilizes a rank-deficient
-    // marginal-index span; it does not meaningfully shrink the few directions
-    // that triggered the gate). The conditional-mean correction is applied
-    // whenever the gate fires (a pure-variance trigger leaves the C-slopes of
-    // m(C) ≈ 0, so it reduces to harmless global centering).
-    let basis = build_intercept_basis(a_block);
-    // Per-column Tikhonov penalty scaled by the weighted Gram diagonal, so the
-    // ridge is *relative* to each column's scale (a 1e-8 absolute ridge would
-    // be negligible against an O(n) Gram and would not stabilize a
-    // rank-deficient penalized-spline marginal index). `diag_jj = Σ_i w_i a_ij²`;
-    // floored positive so the all-zero (already-dropped) directions still
-    // receive a finite ridge and the factorization cannot fail.
-    let mut penalty = Array2::<f64>::zeros((basis.ncols(), basis.ncols()));
-    for j in 0..basis.ncols() {
-        let diag_jj = basis
-            .column(j)
-            .iter()
-            .zip(weights.iter())
-            .map(|(&x, &w)| w * x * x)
-            .sum::<f64>()
-            .max(f64::MIN_POSITIVE);
-        penalty[[j, j]] = diag_jj;
-    }
-    let z_col = z.view().insert_axis(ndarray::Axis(1));
-    let (mean_coeffs_mat, mean_fitted) = gam_linalg::utils::gaussian_weighted_ridge(
-        basis.view(),
-        z_col,
-        penalty.view(),
-        weights.view(),
-        AUTO_Z_CONDITIONAL_RIDGE_REL,
-    )?;
-    let mean_coeffs: Vec<f64> = mean_coeffs_mat.column(0).to_vec();
-
-    // First-stage (generated-regressor) normal matrix `M = AᵀWA + λR`, the same
-    // weighted-ridge system `gaussian_weighted_ridge` factorizes internally;
-    // rebuilt here so its inverse can form the closed-form coefficient sandwich
-    // `V₁` that the second-stage Murphy–Topel correction consumes. `p` is the
-    // marginal-index width (small), so this is a cheap dense `(p+1)²` form.
-    let normal_matrix = {
-        let mut wa = basis.to_owned();
-        for i in 0..wa.nrows() {
-            let wi = weights[i];
-            wa.row_mut(i).iter_mut().for_each(|value| *value *= wi);
-        }
-        let mut m = basis.t().dot(&wa);
-        m += &(penalty.to_owned() * AUTO_Z_CONDITIONAL_RIDGE_REL);
-        m
-    };
-    let mean_residuals: Vec<f64> = z
-        .iter()
-        .zip(mean_fitted.column(0).iter())
-        .map(|(&zi, &mi)| zi - mi)
-        .collect();
+    // Escalation fires. The conditional-mean correction is applied whenever
+    // the gate fires (a pure-variance trigger leaves the C-slopes of m(C) ≈ 0,
+    // so it reduces to harmless global centering).
+    let ConditionalMeanStage {
+        basis,
+        penalty,
+        normal: normal_matrix,
+        coeffs: mean_coeffs,
+        residuals: mean_residuals,
+    } = fit_conditional_mean_stage(z, weights, a_block)?;
     let mean_cov = weighted_ridge_sandwich_cov(
         basis.view(),
         &mean_residuals,
@@ -2497,12 +2755,14 @@ pub(crate) fn fit_conditional_latent_calibration(
         theta1_cov,
     };
 
-    // Sanity-check post-correction moments on the training sample.
-    let calibrated = calibration.apply(z.view(), a_block)?;
+    // Sanity-check post-correction moments on the training sample, whose
+    // calibrated score is the fitted score map's (gam#3016).
+    let calibrated = FittedLatentScoreMap::conditional_only(&calibration)
+        .calibrate(z.view(), Some(a_block))?;
     let post_mean = weighted_mean(
         calibrated
             .as_slice()
-            .expect("calibration.apply returns an owned standard-layout 1-D array"),
+            .expect("the fitted score map returns an owned standard-layout 1-D array"),
         weights.view(),
         total_weight,
     );
@@ -2746,8 +3006,10 @@ pub(crate) fn build_latent_measure_decision(
                 .to_string()
             })?;
             // The law moves, so it is chosen among nested arms by the moving-law
-            // certificate at the converged fit. The fit starts on the simplest arm
-            // that follows a moving mean and variance.
+            // certificate at the converged fit. The fit starts on the simplest
+            // admissible arm that follows a moving mean and variance: the
+            // location-scale Gaussian law only if its residual passes the adequacy
+            // screen.
             let a_block = conditioning.ok_or_else(|| {
                 format!(
                     "{context}: the conditional-law evidence moved without a marginal-index span \
@@ -2760,6 +3022,7 @@ pub(crate) fn build_latent_measure_decision(
                 a_block,
                 local,
                 grid_size,
+                policy,
                 evidence.clone(),
                 context,
             )
@@ -2877,7 +3140,8 @@ pub(crate) fn build_latent_measure_decision(
                     // closed form: a two-point residual survives location-scale
                     // correction unchanged in shape, and only a declaration may
                     // make it Gaussian.
-                    let zeta = cal.apply(z.view(), a_block)?;
+                    let zeta = FittedLatentScoreMap::conditional_only(&cal)
+                        .calibrate(z.view(), Some(a_block))?;
                     let (kind, build) =
                         build_global_empirical_latent_measure(&zeta, weights, grid_size)?;
                     log::debug!(
@@ -3321,7 +3585,6 @@ pub(crate) fn weighted_tail_mass(
 // Cross-module constants — declared here so all submodules can reach them
 // via `use super::*` without promoting implementation details to pub(crate).
 // ---------------------------------------------------------------------------
-pub(super) const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
 /// Upper bound (and large-`n` default) for rows-per-chunk in the parallel
 /// row-accumulation phases.
 ///
@@ -3603,6 +3866,8 @@ mod stacked_first_stage_sandwich_2484_tests {
 pub(crate) mod axis_direction_search;
 pub(crate) mod cell_moment_assembly;
 #[cfg(test)]
+mod conditional_law_gate_tests;
+#[cfg(test)]
 mod empirical_intercept_solve_tests;
 #[cfg(test)]
 mod empirical_measure_2484_tests;
@@ -3610,6 +3875,8 @@ mod empirical_measure_2484_tests;
 mod anchor_law_2926_tests;
 #[cfg(test)]
 mod normal_screen_2926_tests;
+#[cfg(test)]
+mod closed_form_certificate_2926_tests;
 mod standard_normal_flex_fifth;
 pub(crate) mod empirical_measure_sensitivity;
 // #932 BMS flex single-source jet substrate (runtime-dimension `Jet2` + IFT
@@ -3635,6 +3902,8 @@ mod flex_verify_932_tests;
 // timing is eprintln-only per the SPEC ban on wall-clock correctness budgets.
 #[cfg(test)]
 mod flex_measure_932_tests;
+#[cfg(test)]
+mod third_trace_2998_tests;
 // gam#2768 unit gates on the shared latent-measure decision and the conditional
 // location-scale calibration it escalates to. Bare `#[cfg(test)] mod` with the
 // allowed `*_tests` name so the build.rs ban-scanner exempts it.
@@ -3648,6 +3917,10 @@ mod psi_axis_contractions_979_tests;
 // `#[cfg(test)] mod` with the allowed `*_tests` name.
 #[cfg(test)]
 mod multistart_member_2359_tests;
+// gam#3022: the rigid row kernel's per-row tensor tables. Bare
+// `#[cfg(test)] mod` with the allowed `*_tests` name.
+#[cfg(test)]
+mod rigid_row_tensors_3022_tests;
 pub(crate) mod row_primary_hessian;
 mod second_correction_traces;
 
@@ -3678,8 +3951,7 @@ pub(crate) use family::{
 pub(crate) use gradient_paths::MarginalSlopeCovarianceRef;
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub(crate) use gradient_paths::{
-    empirical_intercept_from_marginal, empirical_intercept_from_marginal_within,
-    empirical_intercept_tail_tolerance, signed_probit_neglog_derivatives_up_to_fourth,
+    empirical_intercept, signed_probit_neglog_derivatives_up_to_fourth,
     unary_derivatives_inverse_sqrt, unary_derivatives_log, unary_derivatives_log_normal_pdf,
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };

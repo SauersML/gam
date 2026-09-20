@@ -53,6 +53,12 @@ use num_dual::{
     DualNum, second_derivative, second_partial_derivative, third_partial_derivative_vec,
 };
 
+/// σ floor for fixtures that build a Gaussian location-scale family or its row
+/// kernels directly. Production fits derive the floor from the response's
+/// recording grid (`gaussian_resolution_sigma_floor`); the kernels are exact
+/// for any positive floor, so these fixtures pin one representative value.
+const TEST_SIGMA_FLOOR: f64 = 0.01;
+
 fn test_design_hyper_layout(
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
 ) -> CustomFamilyHyperLayout {
@@ -117,10 +123,10 @@ pub(crate) fn monotone_wiggle_post_update_validator_rejects_hidden_projection() 
 #[test]
 pub(crate) fn logb_dlog_sigma_deta_preserves_negative_tail_precision() {
     let eta = -703.4873664863218;
-    let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(eta);
+    let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(TEST_SIGMA_FLOOR, eta);
 
     assert_eq!(
-        1.0 - LOGB_SIGMA_FLOOR / sigma,
+        1.0 - TEST_SIGMA_FLOOR / sigma,
         0.0,
         "the algebraically equivalent complement form must cancel at this eta"
     );
@@ -399,11 +405,11 @@ pub(crate) fn gaussian_negloglik_log_sigma_psi_numdual<D: DualNum<f64> + Copy>(
             + psi * D::from(x_ls_psi[i])
             + half * psi * psi * D::from(x_ls_psi_psi[i]);
         let eta_ls = x_ls * beta_ls;
-        // Mirror the production logb noise link σ = LOGB_SIGMA_FLOOR + exp(η_ls)
+        // Mirror the production logb noise link σ = TEST_SIGMA_FLOOR + exp(η_ls)
         // (see `GaussianLocationScaleFamily::loglik`); using the bare-exp link
         // here would diverge from the family's σ at the same η and break the
         // psi-derivative identities that this reference negloglik certifies.
-        let sigma = D::from(LOGB_SIGMA_FLOOR) + eta_ls.exp();
+        let sigma = D::from(TEST_SIGMA_FLOOR) + eta_ls.exp();
         let resid = D::from(y[i]) - eta_mu;
         out += D::from(weights[i]) * (half * (resid / sigma).powi(2) + sigma.ln());
     }
@@ -528,10 +534,10 @@ pub(crate) fn gaussian_joint_psi_firstweights_score_ls_carries_logb_chain_rule_f
     let eta_ls = array![-0.2];
     let weights = array![2.5];
     let rows =
-        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
+        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights, TEST_SIGMA_FLOOR).expect("gaussian row scalars");
     let firstweights = gaussian_joint_psi_firstweights(&rows, &array![0.0], &array![1.0]);
-    let sigma = crate::sigma_link::logb_sigma_from_eta_scalar(eta_ls[0]);
-    let kappa = 1.0 - crate::sigma_link::LOGB_SIGMA_FLOOR / sigma;
+    let sigma = crate::sigma_link::logb_sigma_from_eta_scalar(TEST_SIGMA_FLOOR, eta_ls[0]);
+    let kappa = 1.0 - TEST_SIGMA_FLOOR / sigma;
     let standardized_residual = (y[0] - etamu[0]) / sigma;
     let expected = kappa * (weights[0] - weights[0] * standardized_residual.powi(2));
 
@@ -713,7 +719,7 @@ pub(crate) fn gaussian_joint_psisecondweights_eta_ab_term_carries_logb_chain_rul
     let eta_ls = array![-0.2];
     let weights = array![2.5];
     let rows =
-        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
+        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights, TEST_SIGMA_FLOOR).expect("gaussian row scalars");
     let secondweights = gaussian_joint_psisecondweights(
         &rows,
         &array![0.0],
@@ -723,8 +729,8 @@ pub(crate) fn gaussian_joint_psisecondweights_eta_ab_term_carries_logb_chain_rul
         &array![0.0],
         &array![1.0],
     );
-    let sigma = crate::sigma_link::logb_sigma_from_eta_scalar(eta_ls[0]);
-    let kappa = 1.0 - crate::sigma_link::LOGB_SIGMA_FLOOR / sigma;
+    let sigma = crate::sigma_link::logb_sigma_from_eta_scalar(TEST_SIGMA_FLOOR, eta_ls[0]);
+    let kappa = 1.0 - TEST_SIGMA_FLOOR / sigma;
     let standardized_residual = (y[0] - etamu[0]) / sigma;
     let expected = kappa * (weights[0] - weights[0] * standardized_residual.powi(2));
 
@@ -746,6 +752,7 @@ pub(crate) fn large_n_gaussian_location_scale_keeps_exact_outer_hessian_plan() {
         weights: Array1::from_elem(n, 1.0),
         mu_design: None,
         log_sigma_design: None,
+        sigma_floor: TEST_SIGMA_FLOOR,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
@@ -846,6 +853,7 @@ pub(crate) fn gls_workspace_fixture() -> (
         weights,
         mu_design: Some(mu_design.clone()),
         log_sigma_design: Some(log_sigma_design.clone()),
+        sigma_floor: TEST_SIGMA_FLOOR,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
@@ -1736,6 +1744,7 @@ pub(crate) fn zeroweightrows_stay_inactive_in_builtin_diagonal_families() {
         weights: weights.clone(),
         mu_design: None,
         log_sigma_design: None,
+        sigma_floor: TEST_SIGMA_FLOOR,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
@@ -1786,6 +1795,7 @@ pub(crate) fn gaussian_log_sigmaweight_directional_derivative_iszero_on_active_f
         weights: Array1::from_vec(vec![1.0]),
         mu_design: None,
         log_sigma_design: None,
+        sigma_floor: TEST_SIGMA_FLOOR,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
@@ -1819,6 +1829,7 @@ pub(crate) fn gaussian_log_sigmaweight_directional_derivative_matches_finite_dif
         weights: Array1::from_vec(vec![1.0]),
         mu_design: None,
         log_sigma_design: None,
+        sigma_floor: TEST_SIGMA_FLOOR,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
@@ -1922,6 +1933,7 @@ pub(crate) fn gaussian_diagonal_log_sigma_block_uses_fisher_score_step_in_far_ta
         weights: array![1.0],
         mu_design: None,
         log_sigma_design: None,
+        sigma_floor: TEST_SIGMA_FLOOR,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
@@ -1950,9 +1962,9 @@ pub(crate) fn gaussian_diagonal_log_sigma_block_uses_fisher_score_step_in_far_ta
             // (σ ≈ e^η ~ 1e304), so dlogσ/dη = 1 − b/σ → 1 to within
             // f64 precision and the IRLS step matches the pure-exp Fisher
             // step. Compute the expectation explicitly from the new link.
-            let sigma = logb_sigma_from_eta_scalar(eta_ls0);
+            let sigma = logb_sigma_from_eta_scalar(TEST_SIGMA_FLOOR, eta_ls0);
             let inv_s2 = sigma.recip() * sigma.recip();
-            let dlog = logb_dlog_sigma_deta(sigma, logb_sigma_jet1_scalar(eta_ls0).d1);
+            let dlog = logb_dlog_sigma_deta(sigma, logb_sigma_jet1_scalar(TEST_SIGMA_FLOOR, eta_ls0).d1);
             let residual = family.y[0] - eta_mu[0];
             let expected_score = family.weights[0] * (residual * residual * inv_s2 - 1.0) * dlog;
             let expected_info = 2.0 * family.weights[0] * dlog * dlog;
@@ -1998,6 +2010,7 @@ pub(crate) fn gaussian_exact_joint_path_refuses_unrepresentable_scale_atomically
         weights: array![1.0],
         mu_design: Some(mu_design.clone()),
         log_sigma_design: Some(log_sigma_design.clone()),
+        sigma_floor: TEST_SIGMA_FLOOR,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
@@ -2030,6 +2043,7 @@ pub(crate) fn gaussian_diagonal_geometry_preserves_representable_tiny_fisher_wei
         weights: array![1.0, 1.0],
         mu_design: None,
         log_sigma_design: None,
+        sigma_floor: TEST_SIGMA_FLOOR,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
@@ -2060,10 +2074,10 @@ pub(crate) fn gaussian_diagonal_geometry_preserves_representable_tiny_fisher_wei
     };
     assert!(location[0] > 0.0 && location[0] < 1.0e-12);
     assert!(scale[1] > 0.0 && scale[1] < 1.0e-12);
-    let sigma0 = logb_sigma_from_eta_scalar(200.0);
+    let sigma0 = logb_sigma_from_eta_scalar(TEST_SIGMA_FLOOR, 200.0);
     let expected_location = sigma0.recip() * sigma0.recip();
     assert!((location[0] / expected_location - 1.0).abs() <= 4.0 * f64::EPSILON);
-    let jet1 = logb_sigma_jet1_scalar(-20.0);
+    let jet1 = logb_sigma_jet1_scalar(TEST_SIGMA_FLOOR, -20.0);
     let kappa1 = jet1.d1 / jet1.sigma;
     let expected_scale = 2.0 * kappa1 * kappa1;
     assert!((scale[1] / expected_scale - 1.0).abs() <= 4.0 * f64::EPSILON);
@@ -2076,6 +2090,7 @@ pub(crate) fn gaussian_batch_certification_reports_smallest_unrepresentable_row(
         weights: Array1::ones(3),
         mu_design: None,
         log_sigma_design: None,
+        sigma_floor: TEST_SIGMA_FLOOR,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
@@ -2116,7 +2131,7 @@ pub(crate) fn gaussian_location_scale_hotloop_optimized_matches_legacy_and_is_fa
         for i in 0..n {
             let w = weights[i];
             let eta = eta_ls[i];
-            let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(eta);
+            let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(TEST_SIGMA_FLOOR, eta);
             let inv_s2 = (sigma * sigma).recip();
             let r = y[i] - mu[i];
             ll += w * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma.ln()));
@@ -2149,7 +2164,7 @@ pub(crate) fn gaussian_location_scale_hotloop_optimized_matches_legacy_and_is_fa
         let mut wls = Array1::<f64>::zeros(n);
         for i in 0..n {
             let eta = eta_ls[i];
-            let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(eta);
+            let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(TEST_SIGMA_FLOOR, eta);
             let inv_s2 = (sigma * sigma).recip();
             let w = weights[i];
             let r = y[i] - mu[i];
@@ -2240,7 +2255,6 @@ pub(crate) fn spatial_fit_smoke_options() -> BlockwiseFitOptions {
         // convergence criterion to be reached deterministically.
         inner_max_cycles: 48,
         inner_tol: 1e-4,
-        outer_max_iter: 3,
         outer_tol: 1e-4,
         ..BlockwiseFitOptions::default()
     }
@@ -2519,6 +2533,7 @@ pub(crate) fn gaussian_location_scale_exact_newton_spatial_joint_hyper_returns_f
         noisespec: noisespec.clone(),
         mean_offset: Array1::zeros(n),
         noise_offset: Array1::zeros(n),
+        sigma_floor: TEST_SIGMA_FLOOR,
     };
     let mean_design =
         build_term_collection_design(data.view(), &meanspec).expect("build mean design");
@@ -2680,6 +2695,7 @@ pub(crate) fn gaussian_location_scale_family_exposes_joint_psi_hook_surface() {
         noisespec: noisespec.clone(),
         mean_offset: Array1::zeros(n),
         noise_offset: Array1::zeros(n),
+        sigma_floor: TEST_SIGMA_FLOOR,
     };
     let mean_design =
         build_term_collection_design(data.view(), &meanspec).expect("build mean design");
@@ -2993,11 +3009,11 @@ pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean()
     let dataset =
         encode_recordswith_inferred_schema(headers, rows).expect("encode homoscedastic fixture");
     let result = fit_from_formula(
-        "y ~ s(x, bs='tp')",
+        "y ~ s(x, bs='tps')",
         &dataset,
         &FitConfig {
             family: Some("gaussian".to_string()),
-            noise_formula: Some("1 + s(x, bs='tp')".to_string()),
+            noise_formula: Some("1 + s(x, bs='tps')".to_string()),
             ..FitConfig::default()
         },
     )
@@ -3076,6 +3092,7 @@ pub(crate) fn gaussian_log_sigma_psi_terms_match_autodiff_scalar_objective() {
     let family = GaussianLocationScaleFamily {
         y: y.clone(),
         weights: weights.clone(),
+        sigma_floor: TEST_SIGMA_FLOOR,
         mu_design: Some(DesignMatrix::Dense(
             gam_linalg::matrix::DenseDesignMatrix::from(x_mu0_mat.clone()),
         )),
@@ -3291,6 +3308,7 @@ pub(crate) fn gaussian_log_sigma_psi_second_order_terms_match_autodiff_scalar_ob
     let family = GaussianLocationScaleFamily {
         y: y.clone(),
         weights: weights.clone(),
+        sigma_floor: TEST_SIGMA_FLOOR,
         mu_design: Some(DesignMatrix::Dense(
             gam_linalg::matrix::DenseDesignMatrix::from(x_mu0_mat.clone()),
         )),
@@ -3441,7 +3459,7 @@ pub(crate) fn gaussian_negloglik_log_sigma_psi_full_numdual<D: DualNum<f64> + Co
             + psi * D::from(x_ls_psi[i])
             + half * psi * psi * D::from(x_ls_psi_psi[i]);
         let eta_ls = x_ls * beta_ls;
-        let sigma = D::from(LOGB_SIGMA_FLOOR) + eta_ls.exp();
+        let sigma = D::from(TEST_SIGMA_FLOOR) + eta_ls.exp();
         let resid = D::from(y[i]) - eta_mu;
         out += D::from(weights[i]) * (half * (resid / sigma).powi(2) + sigma.ln());
     }
@@ -3470,7 +3488,7 @@ pub(crate) fn gaussian_negloglik_logb_dense_numdual<D: DualNum<f64> + Copy>(
         for k in 0..beta_ls.len() {
             eta_ls += D::from(x_ls[[i, k]]) * beta_ls[k];
         }
-        let sigma = D::from(LOGB_SIGMA_FLOOR) + eta_ls.exp();
+        let sigma = D::from(TEST_SIGMA_FLOOR) + eta_ls.exp();
         let resid = D::from(y[i]) - eta_mu;
         out += D::from(weights[i]) * (half * (resid / sigma).powi(2) + sigma.ln());
     }
@@ -3505,7 +3523,7 @@ pub(crate) fn gaussian_joint_static_hessian_matches_autodiff() {
     let eta_ls = x_ls.dot(&beta_ls);
 
     let rows =
-        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
+        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights, TEST_SIGMA_FLOOR).expect("gaussian row scalars");
     let weights0 =
         gaussian_joint_psi_firstweights(&rows, &Array1::zeros(y.len()), &Array1::zeros(y.len()));
     let xmu_dense = DenseOrOperator::Borrowed(&xmu);
@@ -3636,7 +3654,7 @@ pub(crate) fn gaussian_joint_first_directional_hessian_matches_autodiff() {
     let xi_ls = x_ls.dot(&v_ls);
 
     let rows =
-        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
+        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights, TEST_SIGMA_FLOOR).expect("gaussian row scalars");
     let (dhmumu, dhmu_ls, dh_ls_ls) = gaussian_joint_first_directionalweights(&rows, &ximu, &xi_ls);
     let xmu_dense = DenseOrOperator::Borrowed(&xmu);
     let xls_dense = DenseOrOperator::Borrowed(&x_ls);
@@ -3720,6 +3738,7 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
     let family = GaussianLocationScaleFamily {
         y: y.clone(),
         weights: weights.clone(),
+        sigma_floor: TEST_SIGMA_FLOOR,
         mu_design: Some(DesignMatrix::Dense(
             gam_linalg::matrix::DenseDesignMatrix::from(xmu.clone()),
         )),
@@ -3745,7 +3764,7 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
     // Independent (un-cached) reference scalars computed straight from the free
     // function: a cache HIT must return bit-identical contents.
     let reference =
-        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("reference row scalars");
+        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights, TEST_SIGMA_FLOOR).expect("reference row scalars");
 
     // Drive all four exact-joint paths under the SAME (η_μ, η_logσ). The first
     // populates the cache; the rest must hit it.
@@ -3836,7 +3855,7 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
         !std::sync::Arc::ptr_eq(&primed, &collide),
         "η differing only at an interior index must MISS, not collide on a 3-point fingerprint"
     );
-    let recomputed_collide = gaussian_jointrow_scalars(&y, &etamu, &eta_ls_interior, &weights)
+    let recomputed_collide = gaussian_jointrow_scalars(&y, &etamu, &eta_ls_interior, &weights, TEST_SIGMA_FLOOR)
         .expect("collide reference");
     for (a, b) in collide
         .standardized_residual
@@ -3890,7 +3909,7 @@ pub(crate) fn gaussian_joint_second_directional_hessian_matches_autodiff() {
     let xi_lsv = x_ls.dot(&v_ls);
 
     let rows =
-        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
+        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights, TEST_SIGMA_FLOOR).expect("gaussian row scalars");
     let (d2hmumu, d2hmu_ls, d2h_ls_ls) =
         gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximuv, &xi_lsv);
     let xmu_dense = DenseOrOperator::Borrowed(&xmu);
@@ -4017,7 +4036,7 @@ pub(crate) fn gaussian_joint_psi_second_order_terms_match_autodiff() {
     let z_ls_psi_psi = &x_ls_psi_psi * beta_ls0;
 
     let rows =
-        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("gaussian row scalars");
+        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights, TEST_SIGMA_FLOOR).expect("gaussian row scalars");
     let secondweights = gaussian_joint_psisecondweights(
         &rows,
         &zmu_psi,
@@ -4188,7 +4207,6 @@ impl Zz2155Problem {
         wiggle_degree: degree,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         frozen_warp_design: None,
-        continuation: false,
     };
     let mut frozen_eta = eta0.clone();
     let mut beta_eta = beta_eta0.clone();
@@ -4321,6 +4339,7 @@ pub(crate) fn gls_wiggle_workspace_fixture() -> (
         weights,
         mu_design: Some(mu_design.clone()),
         log_sigma_design: Some(log_sigma_design.clone()),
+        sigma_floor: TEST_SIGMA_FLOOR,
         wiggle_knots: knots,
         wiggle_degree: 2,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),

@@ -75,6 +75,35 @@
 //!    The probed pencil constant is a *measurement of this number*, and the
 //!    two can be compared.
 //!
+//! # `C ≻ 0` is sufficient, not necessary: the KKT test
+//!
+//! What the face needs is `f(t) = ½tr((Σ_j A_j/t_j)⁻¹C) > 0` on the closed
+//! orthant `t_j = e^{−ρ_j} ≥ 0` (`A_j = QᵀS_jQ`), not positivity of `C` in
+//! every direction of `span(Q)`: a smoothing parameter moves its whole range
+//! at once, so an eigen-direction of `C` that no weighting of the face can
+//! isolate is not a way off the face. When the released ranges are linearly
+//! independent (`Σ_j rank A_j = q`), a congruence `R = [R_1 … R_m]` puts
+//! every `A_j = R_j M_j R_jᵀ` in block form together, and
+//!
+//! ```text
+//!     (Σ_j A_j/t_j)⁻¹ = R⁻ᵀ·diag(t_j M_j⁻¹)·R⁻¹   ⟹   f(t) = Σ_j c_j t_j
+//! ```
+//!
+//! exactly — `f` is LINEAR, and the face is a strict minimizer iff every
+//! identified `c_j > 0`. A single-penalty face is always of this kind, which
+//! is why the positive-definiteness gate over-refused it: with one `λ` the
+//! first-order change is `c·e^{−ρ}` whatever the sign pattern of `C`; a
+//! measured negative `c_j` refutes a face of any kind.
+//!
+//! When the ranges OVERLAP `f` is genuinely nonlinear, and the axis laws `c_j`
+//! are only its values at the simplex vertices: with `A_1 = diag(1,1,0)`,
+//! `A_2 = diag(0,1,1)` and `C = diag(1,−5,1)`, `f = ½(t_1 + t_2 − 5t_1t_2/(t_1+t_2))`
+//! has both vertex values `½` yet `f(½,½) = −⅛` — a per-axis test is unsound.
+//! The weighted parallel sum `M(t) = (Σ_j A_j/t_j)⁻¹` is matrix-concave on the
+//! orthant, so with the spectral split `C = C₊ − C₋` (both PSD) the expansion
+//! `f = ½tr(MC₊) − ½tr(MC₋)` is a difference of concave functions and a
+//! simplicial branch-and-bound decides it (`certify_overlapping_face`).
+//!
 //! A face coordinate whose own penalty releases nothing once the others are at
 //! `λ = ∞` (its released subspace is empty) is **unidentified there**: `V` does
 //! not depend on `λ_j` at all, exactly, not merely to first order. Such a
@@ -129,7 +158,7 @@
 //! `(n−M_p)/2·log D_p` and its first variation is `ΔD_p/(2φ̂)`.) The two
 //! penalty logdets have no `β̂`-dependence, so their Schur content is
 //! unchanged, and everything downstream — the `C ≻ 0` proof, per-coordinate
-//! `c_j`, the `Unidentified` typing, the value-domain falsification — is
+//! `c_j`, the `Unidentified` typing — is
 //! family-blind because none of it depends on how `C` was built. Gaussian
 //! identity is the `c ≡ 0` member: the rank-2 term vanishes identically and
 //! the form reduces to the REML one, which is the built-in exactness check.
@@ -139,6 +168,8 @@
 
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
+use gam_linalg::roundoff::accumulation_growth;
+use crate::model_types::FacePositivityRoute;
 use gam_terms::construction::CanonicalPenalty;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 
@@ -183,11 +214,16 @@ pub struct RailFaceLimit {
     pub released_penalties: Vec<Array2<f64>>,
     /// `Qᵀg_c`: the limit score in the released directions.
     pub released_score: Array1<f64>,
-    /// Condition number of the `Z`-block solve that formed the Schur
-    /// complements. It is the error-amplifying step in building `C`, so the
-    /// certificate's curvature margin is scaled by it rather than by a bare
-    /// `ε‖C‖`.
-    pub form_conditioning: f64,
+    /// Rigorous bound on `‖ΔC‖₂`, the floating-point error of the assembled
+    /// form. With `γ_p = p·u/(1 − p·u)` (`u = ε/2`, `p` the coefficient
+    /// dimension), every product and Schur solve that built `C` contributes
+    /// at most `γ_p` relative error on its operands' scale, the pinned solve
+    /// amplified by its conditioning:
+    /// `γ_p·[(‖K‖ + ‖S_R‖)(1 + cond) + ‖g_Q‖²/φ̂ + 2‖g_Q‖‖d̃_Q‖]`. It is
+    /// measured on the operands `C` was built FROM, not on `C` itself — the
+    /// Schur differences cancel, and an error bound read off the cancelled
+    /// result would understate the rounding it carries.
+    pub form_error_bound: f64,
     /// The λ=∞ fit itself: coefficients of the null-space-restricted model, in
     /// the model's own coefficient basis. This is the limit the certificate is
     /// about — the fit a face-certified optimum reports — and the same object a
@@ -206,15 +242,23 @@ pub struct RailFaceLimit {
 /// A proven rail face: the analytic first-order data behind the mint.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RailFaceProof {
-    /// Smallest eigenvalue of `C`; the proof is `min_curvature > curvature_margin`.
+    /// Which exact positivity test decided the face.
+    pub route: FacePositivityRoute,
+    /// The route's decisive statistic — `λ_min(C)` on the positive-form
+    /// route, the binding coordinate's `c_j` on the independent-ranges route.
+    /// The proof is `statistic > band`.
+    pub statistic: f64,
+    /// The rounding band `statistic` had to clear.
+    pub band: f64,
+    /// `λ_min(C)`, reported on either route.
     pub min_curvature: f64,
-    /// The numerical-error floor `min_curvature` had to clear:
-    /// `q·ε·‖C‖·(1 + cond)`.
-    pub curvature_margin: f64,
     /// `‖C‖₂`.
     pub form_norm: f64,
     /// Analytic pencil constants `c_j` in `face` order: `∂V/∂ρ_j → −c_j e^{−ρ_j}`.
     pub tail_constants: Vec<f64>,
+    /// The rounding band `τ_j` of each `c_j`, in `face` order (`0` for an
+    /// unidentified coordinate, which carries no constant to resolve).
+    pub tail_bands: Vec<f64>,
     /// Per-coordinate identifiability at the face, in `face` order.
     pub coordinate_kinds: Vec<FaceCoordinateKind>,
     /// The joint pencil constant along the ray that releases the whole face
@@ -230,8 +274,9 @@ pub(crate) struct RailFaceProof {
 /// Verdict of the analytic face certificate.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RailFaceVerdict {
-    /// `C ≻ 0`: the criterion strictly increases for every finite smoothing
-    /// parameter on the face and on every sub-face.
+    /// The first-order expansion `½tr((Σ_j A_j/t_j)⁻¹C)` is strictly positive
+    /// for every way of coming off the face: the criterion strictly increases
+    /// for every finite smoothing parameter on the face and on every sub-face.
     Certified(RailFaceProof),
     /// The analytic data does not prove the face. Carries the measured
     /// evidence, never a bare flag.
@@ -326,9 +371,25 @@ fn half_trace_inverse_product(a: &Array2<f64>, c: &Array2<f64>) -> Result<f64, S
 
 /// Prove (or refuse) a rail face from its analytic λ→∞ limit data.
 ///
-/// The proof is a single positive-definiteness test on the first-order form
-/// `C`; see the module derivation. Refusals carry the measured margin so a
-/// declined face explains itself.
+/// The first-order expansion off the face is `f(t) = ½tr((Σ_j A_j/t_j)⁻¹C)`,
+/// `t_j = e^{−ρ_j}`, and the face is proven when `f > 0` on the whole closed
+/// simplex of release directions. Three exact tests decide that:
+///
+/// * `C ≻ 0` ([`FacePositivityRoute::PositiveForm`]) is sufficient for any
+///   face geometry;
+/// * when the released ranges are linearly independent, `f = Σ_j c_j t_j` is
+///   exactly linear and every identified `c_j > 0` is necessary AND
+///   sufficient ([`FacePositivityRoute::IndependentRanges`]) — the KKT test,
+///   which certifies faces whose `C` is indefinite along directions no
+///   weighting of the face can isolate;
+/// * when they overlap, a simplicial branch-and-bound on the concave split of
+///   `f` ([`FacePositivityRoute::SimplexBound`]) proves `f > 0` cell by cell or
+///   exhibits a release direction that descends.
+///
+/// A coordinate with a measured negative slope refutes the face on every
+/// route. Every sign decision clears its own rounding band, derived from the
+/// limit's [`RailFaceLimit::form_error_bound`]; refusals carry the measured
+/// statistic and band so a declined face explains itself.
 pub(crate) fn certify_rail_face(limit: &RailFaceLimit) -> RailFaceVerdict {
     let refuse = |reason: String| RailFaceVerdict::Refused { reason };
     let q = limit.first_order_form.nrows();
@@ -355,40 +416,45 @@ pub(crate) fn certify_rail_face(limit: &RailFaceLimit) -> RailFaceVerdict {
             .released_penalties
             .iter()
             .any(|a| a.iter().any(|v| !v.is_finite()))
-        || !limit.form_conditioning.is_finite()
-        || limit.form_conditioning < 1.0
     {
         return refuse("face limit data is not finite".to_string());
     }
 
+    if !limit.form_error_bound.is_finite() || limit.form_error_bound < 0.0 {
+        return refuse(format!(
+            "face limit form error bound {:.3e} is not a finite non-negative number",
+            limit.form_error_bound
+        ));
+    }
+
     let form = symmetrized(&limit.first_order_form);
-    let (values, _) = match form.eigh(Side::Lower) {
+    let (values, form_vectors) = match form.eigh(Side::Lower) {
         Ok(pair) => pair,
         Err(err) => return refuse(format!("first-order form eigendecomposition failed: {err}")),
     };
     let min_curvature = values.iter().fold(f64::INFINITY, |acc, v| acc.min(*v));
     let form_norm = values.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
-    // The eigenvalue backward error is O(q·ε‖C‖); forming C ran the released
-    // directions through the Z-block solve, which amplifies by its condition
-    // number. Below this the sign of `min_curvature` is not a measured fact.
-    let curvature_margin =
-        (q as f64) * f64::EPSILON * form_norm * (1.0 + limit.form_conditioning);
-    if !(min_curvature > curvature_margin) {
-        return refuse(format!(
-            "face first-order form is not positive definite: λ_min(C)={min_curvature:.6e} \
-             ≤ margin {curvature_margin:.3e} (‖C‖={form_norm:.3e}, cond={:.3e}) — releasing \
-             the face would not raise the criterion, so λ=∞ is not proven optimal",
-            limit.form_conditioning
-        ));
-    }
+    // `λ_min(C)` is a measured fact only outside the error of forming `C`
+    // (bounded on its operands, `form_error_bound`) plus the symmetric
+    // eigensolver's own backward error `γ_q‖C‖` — Weyl moves every eigenvalue
+    // by at most the norm of the perturbation.
+    let gamma_q = accumulation_growth(q);
+    let curvature_band = limit.form_error_bound + gamma_q * form_norm;
+    let positive_form = min_curvature > curvature_band;
 
     // Per-coordinate law: hold the rest of the face at λ=∞ and release only j.
     // The directions it frees are the range of its own penalty inside the null
     // space of the others; on that subspace the ordinary one-coordinate tail
     // law holds with `c_j = ½tr((Q_jᵀS_jQ_j)⁻¹ Q_jᵀCQ_j)`.
     let mut tail_constants = Vec::with_capacity(limit.face.len());
+    let mut tail_bands = Vec::with_capacity(limit.face.len());
     let mut coordinate_kinds = Vec::with_capacity(limit.face.len());
+    let mut released_ranks = Vec::with_capacity(limit.face.len());
     for idx in 0..limit.face.len() {
+        match released_rank(&limit.released_penalties[idx]) {
+            Ok(rank) => released_ranks.push(rank),
+            Err(err) => return refuse(err),
+        }
         let mut rest = Array2::<f64>::zeros((q, q));
         for (other, penalty) in limit.released_penalties.iter().enumerate() {
             if other != idx {
@@ -401,6 +467,7 @@ pub(crate) fn certify_rail_face(limit: &RailFaceLimit) -> RailFaceVerdict {
         };
         if free.ncols() == 0 {
             tail_constants.push(0.0);
+            tail_bands.push(0.0);
             coordinate_kinds.push(FaceCoordinateKind::Unidentified);
             continue;
         }
@@ -411,6 +478,7 @@ pub(crate) fn certify_rail_face(limit: &RailFaceLimit) -> RailFaceVerdict {
         };
         if own_values.is_empty() {
             tail_constants.push(0.0);
+            tail_bands.push(0.0);
             coordinate_kinds.push(FaceCoordinateKind::Unidentified);
             continue;
         }
@@ -421,19 +489,120 @@ pub(crate) fn certify_rail_face(limit: &RailFaceLimit) -> RailFaceVerdict {
             c_j += compressed[[a, a]] / sigma;
         }
         c_j *= 0.5;
-        if !(c_j > 0.0) {
-            // `C ≻ 0` makes every compression positive definite, so this can
-            // only be reached by a non-finite or numerically collapsed
-            // released block — evidence the geometry is not resolvable here.
+        // `|Δc_j| ≤ ½Σ_a |u_aᵀΔC u_a|/σ_a ≤ ½tr(own⁻¹)·‖ΔC‖₂`, where `ΔC`
+        // carries both the forming error and the compression's own rounding —
+        // together the `curvature_band` — plus the own block's eigen-rounding,
+        // relative `γ_q·κ(own)` on `c_j` itself.
+        let inverse_trace: f64 = own_values.iter().map(|sigma| 1.0 / sigma).sum();
+        let own_conditioning = own_values.iter().fold(0.0_f64, |acc, v| acc.max(*v))
+            / own_values.iter().fold(f64::INFINITY, |acc, v| acc.min(*v));
+        let tau_j =
+            0.5 * inverse_trace * curvature_band + c_j.abs() * gamma_q * own_conditioning;
+        if !c_j.is_finite() || !tau_j.is_finite() {
             return refuse(format!(
-                "face coordinate {} has a non-positive analytic pencil constant {c_j:.6e} \
-                 against a positive-definite face form — released geometry is degenerate",
+                "face coordinate {} has a non-finite analytic pencil constant {c_j:.3e} \
+                 (band {tau_j:.3e})",
                 limit.face[idx]
             ));
         }
+        if c_j < -tau_j {
+            // A measured NEGATIVE slope: `f(t) = c_j t_j` along this
+            // coordinate's own release, so pulling it back from λ=∞ lowers
+            // the criterion. This refutes the face on every route.
+            return refuse(format!(
+                "releasing face coordinate {} alone lowers the criterion at first order: \
+                 c={c_j:.6e} < −τ={:.3e} — λ=∞ is not a minimizer on this face",
+                limit.face[idx], tau_j
+            ));
+        }
         tail_constants.push(c_j);
+        tail_bands.push(tau_j);
         coordinate_kinds.push(FaceCoordinateKind::StrictOutward);
     }
+
+    // Decide positivity of `f(t) = ½tr((Σ_j A_j/t_j)⁻¹C)` on the simplex.
+    let released_rank_total: usize = released_ranks.iter().sum();
+    let (route, statistic, band) = if positive_form {
+        // `C ≻ 0` makes every compression positive definite, so a
+        // non-positive `c_j` here can only be a numerically collapsed
+        // released block — evidence the geometry is not resolvable.
+        if let Some(idx) = (0..limit.face.len()).find(|&idx| {
+            coordinate_kinds[idx] == FaceCoordinateKind::StrictOutward
+                && !(tail_constants[idx] > 0.0)
+        }) {
+            return refuse(format!(
+                "face coordinate {} has a non-positive analytic pencil constant {:.6e} \
+                 against a positive-definite face form — released geometry is degenerate",
+                limit.face[idx], tail_constants[idx]
+            ));
+        }
+        (FacePositivityRoute::PositiveForm, min_curvature, curvature_band)
+    } else if released_rank_total == q {
+        // Independent released ranges: `f` is exactly linear, `Σ_j c_j t_j`,
+        // so it is positive on the simplex iff every identified slope is — the
+        // KKT test at the face, necessary and sufficient. `C` itself may be
+        // indefinite: a single penalty cannot move its range's directions
+        // independently, so a negative eigen-direction of `C` that no
+        // weighting of the face can isolate is not a descent direction.
+        let mut binding: Option<(f64, f64)> = None;
+        for idx in 0..limit.face.len() {
+            if coordinate_kinds[idx] != FaceCoordinateKind::StrictOutward {
+                continue;
+            }
+            let (c_j, tau_j) = (tail_constants[idx], tail_bands[idx]);
+            if !(c_j > tau_j) {
+                return refuse(format!(
+                    "face coordinate {} has an unresolved first-order slope: |c|={:.3e} ≤ \
+                     τ={tau_j:.3e}, so its sign is not a measured fact; the face's first-order \
+                     form is indefinite (λ_min(C)={min_curvature:.6e} ≤ band \
+                     {curvature_band:.3e}) and cannot decide it either",
+                    limit.face[idx],
+                    c_j.abs()
+                ));
+            }
+            if binding.is_none_or(|(bc, bt)| c_j - tau_j < bc - bt) {
+                binding = Some((c_j, tau_j));
+            }
+        }
+        let Some((c_bind, tau_bind)) = binding else {
+            return refuse("no face coordinate carries an identified first-order slope".to_string());
+        };
+        (FacePositivityRoute::IndependentRanges, c_bind, tau_bind)
+    } else if released_rank_total < q {
+        // The ranks sum below `q`, so their union cannot span the released
+        // subspace: some released direction is penalized by no face member.
+        return refuse(format!(
+            "the face's released ranges do not span the released subspace (Σ rank A_j = \
+             {released_rank_total} < q = {q})"
+        ));
+    } else {
+        // Overlapping released ranges: `f` is nonlinear in `t`, and the axis
+        // laws `c_j` are only its vertex values — a joint release can descend
+        // with every one of them positive. Decide the whole simplex. A
+        // coordinate whose penalty releases nothing leaves `M(t)` independent
+        // of its `t_j`, so the simplex runs over the positive-rank members.
+        let active: Vec<usize> =
+            (0..limit.face.len()).filter(|&idx| released_ranks[idx] > 0).collect();
+        let overlap = OverlapFace {
+            penalties: active.iter().map(|&idx| &limit.released_penalties[idx]).collect(),
+            labels: active.iter().map(|&idx| limit.face[idx]).collect(),
+            form_pairs: (0..q)
+                .map(|a| (values[a], form_vectors.column(a).to_owned()))
+                .collect(),
+            q,
+        };
+        match certify_overlapping_face(&overlap, curvature_band) {
+            Ok((lower, cell_band)) => (FacePositivityRoute::SimplexBound, lower, cell_band),
+            Err(reason) => {
+                return refuse(format!(
+                    "face first-order form is indefinite (λ_min(C)={min_curvature:.6e} ≤ band \
+                     {curvature_band:.3e}, ‖C‖={form_norm:.3e}) and the face's released ranges \
+                     overlap (Σ rank A_j = {released_rank_total} > q = {q}); on the release \
+                     simplex: {reason}"
+                ));
+            }
+        }
+    };
 
     // The joint law: release the whole face together with unit weights.
     let mut unit_face = Array2::<f64>::zeros((q, q));
@@ -491,10 +660,13 @@ pub(crate) fn certify_rail_face(limit: &RailFaceLimit) -> RailFaceVerdict {
     }
 
     RailFaceVerdict::Certified(RailFaceProof {
+        route,
+        statistic,
+        band,
         min_curvature,
-        curvature_margin,
         form_norm,
         tail_constants,
+        tail_bands,
         coordinate_kinds,
         joint_tail_constant,
         value_gap,
@@ -502,6 +674,422 @@ pub(crate) fn certify_rail_face(limit: &RailFaceLimit) -> RailFaceVerdict {
     })
 }
 
+/// The overlapping-range face expansion, evaluated on the computed spectral
+/// split of the first-order form.
+///
+/// With `C̃ = Σ_a λ_a u_a u_aᵀ` the computed eigen-reconstruction of `C`,
+/// `C̃₊ = Σ_{λ_a>0} λ_a u_a u_aᵀ` and `C̃₋ = Σ_{λ_a<0} |λ_a| u_a u_aᵀ` are
+/// exactly PSD, and `f̃ = P − N` with `P = ½tr(M C̃₊)`, `N = ½tr(M C̃₋)`. The
+/// weighted parallel sum `M(t) = (Σ_j A_j/t_j)⁻¹` is matrix-concave on the
+/// orthant (it is the parallel sum of the `t_j A_j⁻¹`, each linear in `t`),
+/// so `P`, `N` and `tr M` are concave: `f̃` is a difference of concave
+/// functions, and on a simplex cell `P` is bounded below by its vertex values
+/// while `N` and `tr M` are bounded above by their tangent planes at any
+/// interior point. `C̃ − C` is inside `curvature_band` (the forming error plus
+/// the eigensolver's backward error), so `|f − f̃| ≤ ½tr M·curvature_band`.
+struct OverlapFace<'a> {
+    /// `A_j` for the positive-rank face coordinates, in simplex order.
+    penalties: Vec<&'a Array2<f64>>,
+    /// The face's ρ-coordinate for each simplex coordinate, for messages.
+    labels: Vec<usize>,
+    /// Eigenpairs `(λ_a, u_a)` of the symmetrized first-order form.
+    form_pairs: Vec<(f64, Array1<f64>)>,
+    q: usize,
+}
+
+/// `P`, `N`, `tr M` at one point of the release simplex, with rigorous
+/// bounds on each one's floating-point error.
+struct OverlapPoint {
+    positive: f64,
+    negative: f64,
+    trace: f64,
+    positive_error: f64,
+    negative_error: f64,
+    trace_error: f64,
+    /// Interior points only: `∂_j N`, `∂_j tr M` and their error bounds.
+    gradients: Option<OverlapGradients>,
+}
+
+struct OverlapGradients {
+    negative: Vec<f64>,
+    negative_error: Vec<f64>,
+    trace: Vec<f64>,
+    trace_error: Vec<f64>,
+}
+
+impl OverlapPoint {
+    fn value(&self) -> f64 {
+        self.positive - self.negative
+    }
+
+    /// `|f(t) − computed f̃(t)|`: the evaluation's own rounding plus the
+    /// form's `½tr M·curvature_band`.
+    fn band(&self, curvature_band: f64) -> f64 {
+        self.positive_error
+            + self.negative_error
+            + 0.5 * (self.trace + self.trace_error) * curvature_band
+    }
+}
+
+fn format_simplex_point(labels: &[usize], t: &[f64]) -> String {
+    let parts: Vec<String> = labels
+        .iter()
+        .zip(t)
+        .map(|(label, value)| format!("t{label}={value:.4}"))
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
+impl OverlapFace<'_> {
+    /// Evaluate the expansion at a point of the closed simplex. A zero
+    /// coordinate is an exact λ=∞ pin: `M = Q(Qᵀ(Σ_{t_j>0}A_j/t_j)Q)⁻¹Qᵀ` on
+    /// the null space `Q` of the pinned penalties.
+    fn evaluate(&self, t: &[f64], with_gradients: bool) -> Result<OverlapPoint, String> {
+        let q = self.q;
+        let m = self.penalties.len();
+        let gamma_q = accumulation_growth(q);
+        let mut pinned = Array2::<f64>::zeros((q, q));
+        let mut weighted = Array2::<f64>::zeros((q, q));
+        let mut any_pinned = false;
+        for (penalty, &tj) in self.penalties.iter().zip(t) {
+            if tj == 0.0 {
+                pinned += *penalty;
+                any_pinned = true;
+            } else {
+                weighted.scaled_add(1.0 / tj, *penalty);
+            }
+        }
+        // The pinned null space `Q` and its Davis–Kahan leakage: a computed
+        // basis leans into the pinned range by at most `‖ΔS_Z‖/gap`, the
+        // sum's formation and eigensolve error over its smallest range
+        // eigenvalue.
+        let (basis, leak) = if any_pinned {
+            let (_, range_values) = range_eigenpairs(&pinned)?;
+            let null = null_space_basis(&pinned)?;
+            if null.ncols() == 0 {
+                return Err(format!(
+                    "the face penalties pinned at {} leave no direction free — the released \
+                     coordinate is unidentified at the face — so ½tr(M(t)C) vanishes there and \
+                     no cell touching it bounds the law away from zero",
+                    format_simplex_point(&self.labels, t)
+                ));
+            }
+            let top = range_values.iter().fold(0.0_f64, |acc, v| acc.max(*v));
+            let gap = range_values.iter().fold(f64::INFINITY, |acc, v| acc.min(*v));
+            let perturbation = (gamma_q + (m as f64) * accumulation_growth(m + 1)) * top;
+            (null, perturbation / gap)
+        } else {
+            (Array2::<f64>::eye(q), 0.0)
+        };
+        let reduced = symmetrized(&basis.t().dot(&weighted).dot(&basis));
+        let (values, vectors) = reduced
+            .eigh(Side::Lower)
+            .map_err(|err| format!("face weighting eigendecomposition failed: {err}"))?;
+        let sigma_min = values.iter().fold(f64::INFINITY, |acc, v| acc.min(*v));
+        let sigma_max = values.iter().fold(0.0_f64, |acc, v| acc.max(*v));
+        if !(sigma_min > 0.0) || !sigma_max.is_finite() {
+            return Err(format!(
+                "the released face weighting is singular at {} (λ_min={sigma_min:.3e})",
+                format_simplex_point(&self.labels, t)
+            ));
+        }
+        // Every arithmetic stage — the eigensolve's backward error, the
+        // weighted sum forming `A(t)`, the explicit product forming `M` and
+        // each trace against it — contributes its `γ` relative to ‖A‖ or ‖M‖;
+        // `κ(A)` converts that norm-wise error into a Loewner-relative one,
+        // `M/(1+η) ≼ M̃ ≼ M/(1−η)`, so `|P̃ − P| ≤ ρP` with `ρ = η/(1−η)`.
+        let conditioning = sigma_max / sigma_min;
+        let arithmetic = gamma_q
+            + (m as f64) * accumulation_growth(m + 1)
+            + (q as f64 + 1.0) * accumulation_growth(q * q + q);
+        let eta = arithmetic * conditioning;
+        // The leaked basis perturbs `M` by at most `2θ(1 + ‖A_free‖/σ_min)‖M‖`:
+        // once through the outer `Q`, once through the reduced solve.
+        let weighted_norm = weighted.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let leak_relative = 2.0 * leak * (1.0 + weighted_norm / sigma_min);
+        if !(eta < 0.5) || !(leak_relative < 0.5) {
+            return Err(format!(
+                "½tr(M(t)C) is not resolvable at {}: the face weighting's conditioning {:.3e} \
+                 leaves relative error η={eta:.3e}, basis leakage {leak_relative:.3e}",
+                format_simplex_point(&self.labels, t),
+                conditioning
+            ));
+        }
+        let rho = eta / (1.0 - eta);
+        let leak_absolute = leak_relative / sigma_min;
+        let lifted = basis.dot(&vectors);
+        let mut scaled = lifted.clone();
+        for (col, &sigma) in values.iter().enumerate() {
+            scaled.column_mut(col).mapv_inplace(|v| v / sigma);
+        }
+        let weighting_inverse = scaled.dot(&lifted.t());
+
+        let mut positive = 0.0_f64;
+        let mut negative = 0.0_f64;
+        let mut positive_mass = 0.0_f64;
+        let mut negative_mass = 0.0_f64;
+        let mut negative_images: Vec<(f64, Array1<f64>)> = Vec::new();
+        for (lambda, u) in self.form_pairs.iter() {
+            let image = weighting_inverse.dot(u);
+            let quadratic = u.dot(&image);
+            if *lambda > 0.0 {
+                positive += lambda * quadratic;
+                positive_mass += lambda;
+            } else if *lambda < 0.0 {
+                negative += -lambda * quadratic;
+                negative_mass += -lambda;
+                negative_images.push((-lambda, image));
+            }
+        }
+        positive *= 0.5;
+        negative *= 0.5;
+        let trace: f64 = (0..q).map(|i| weighting_inverse[[i, i]]).sum();
+        let positive_error = rho * positive + leak_absolute * 0.5 * positive_mass;
+        let negative_error = rho * negative + leak_absolute * 0.5 * negative_mass;
+        let trace_error = rho * trace + leak_absolute * (q as f64);
+
+        let gradients = if with_gradients && !any_pinned {
+            // `∂M/∂t_j = t_j⁻² M A_j M`. With `K = M^{½}A_jM^{½} ≼ t_j I` (as
+            // `A_j/t_j ≼ A(t)`), `0 ≤ ∂_jN ≤ N/t_j`, and a Loewner-relative
+            // `ρ` on `M` moves `∂_jN` by at most `(2ρ+ρ²)·N/t_j`; the same
+            // holds for `tr M`.
+            let square = weighting_inverse.dot(&weighting_inverse);
+            let spread = (2.0 * rho + rho * rho) * (1.0 + rho);
+            let mut grad_negative = Vec::with_capacity(m);
+            let mut grad_negative_error = Vec::with_capacity(m);
+            let mut grad_trace = Vec::with_capacity(m);
+            let mut grad_trace_error = Vec::with_capacity(m);
+            for (penalty, &tj) in self.penalties.iter().zip(t) {
+                let inv_sq = 1.0 / (tj * tj);
+                let mut value = 0.0_f64;
+                for (weight, image) in negative_images.iter() {
+                    value += weight * image.dot(&penalty.dot(image));
+                }
+                grad_negative.push(0.5 * inv_sq * value);
+                grad_negative_error.push(spread * negative / tj);
+                let trace_value: f64 = (0..q)
+                    .map(|row| penalty.row(row).dot(&square.column(row)))
+                    .sum();
+                grad_trace.push(inv_sq * trace_value);
+                grad_trace_error.push(spread * trace / tj);
+            }
+            Some(OverlapGradients {
+                negative: grad_negative,
+                negative_error: grad_negative_error,
+                trace: grad_trace,
+                trace_error: grad_trace_error,
+            })
+        } else {
+            None
+        };
+        Ok(OverlapPoint {
+            positive,
+            negative,
+            trace,
+            positive_error,
+            negative_error,
+            trace_error,
+            gradients,
+        })
+    }
+}
+
+/// `a + b` is exact in `f64` iff its TwoSum error term vanishes.
+fn exact_sum(a: f64, b: f64) -> bool {
+    let s = a + b;
+    let bb = s - a;
+    (a - (s - bb)) + (b - bb) == 0.0
+}
+
+/// Prove `f(t) = ½tr(M(t)C) > 0` on the release simplex of an overlapping
+/// face by simplicial branch-and-bound on the concave split `f̃ = P − N`.
+///
+/// On a cell with vertices `v_i` and centroid `z`, `P − (N(z) + ∇N(z)·(x−z))`
+/// is concave and bounds `f̃` below, so `min_i ℓ_i`,
+/// `ℓ_i = P(v_i) − N(z) − ∇N(z)·(v_i − z)`, bounds it on the cell; the cell is
+/// proven when that clears the evaluation errors plus `½·sup_cell tr M` times
+/// the form band (`tr M` is bounded by its own tangent plane at `z`). A cell
+/// whose centroid measures `f < −band` refutes the face; one whose centroid or
+/// bound sits inside its band is unresolved, since no refinement can decide
+/// a sign the arithmetic does not resolve. Otherwise the cell is split along
+/// its longest edge, whose midpoint is exact in `f64` (dyadic vertices); a
+/// midpoint that is not exact means the simplex cannot be refined further,
+/// which refuses. `f` is analytic on the closed simplex and the lower bound's
+/// gap is `O(diam²)`, so a face that is positive with margin is proven after
+/// finitely many splits.
+///
+/// Returns the binding cell's `(min_i ℓ_i, band)` or the refusal reason.
+fn certify_overlapping_face(
+    overlap: &OverlapFace<'_>,
+    curvature_band: f64,
+) -> Result<(f64, f64), String> {
+    let m = overlap.penalties.len();
+    let gamma_m = accumulation_growth(m + 1);
+    let mut vertices: Vec<Vec<f64>> = Vec::new();
+    let mut vertex_values: Vec<OverlapPoint> = Vec::new();
+    let mut vertex_index: std::collections::HashMap<Vec<u64>, usize> =
+        std::collections::HashMap::new();
+    let refute = |t: &[f64], point: &OverlapPoint| {
+        format!(
+            "releasing the face along {} lowers the criterion at first order: \
+             ½tr(M(t)C)={:.6e} < −band {:.3e} — λ=∞ is not a minimizer on this face",
+            format_simplex_point(&overlap.labels, t),
+            point.value(),
+            point.band(curvature_band)
+        )
+    };
+    // The simplex centre first: a face refuted in its interior (the axis
+    // laws flat or positive, the joint release negative) says so even when a
+    // vertex is structurally degenerate.
+    let centre = vec![1.0 / (m as f64); m];
+    let at_centre = overlap.evaluate(&centre, false)?;
+    if at_centre.value() < -at_centre.band(curvature_band) {
+        return Err(refute(&centre, &at_centre));
+    }
+    for j in 0..m {
+        let mut e = vec![0.0_f64; m];
+        e[j] = 1.0;
+        let point = overlap.evaluate(&e, false)?;
+        // `f(e_j)` is the coordinate's own axis law `c_j`. Every cell touching
+        // a vertex where `f` is not resolved positive keeps a lower bound at or
+        // below that vertex's value, so no refinement could prove the face.
+        let vertex_band = point.band(curvature_band);
+        if point.value() < -vertex_band {
+            return Err(refute(&e, &point));
+        }
+        if !(point.value() > vertex_band) {
+            return Err(format!(
+                "the face's first-order law is unresolved at the vertex {}: \
+                 |½tr(M(t)C)|={:.3e} ≤ band {vertex_band:.3e}",
+                format_simplex_point(&overlap.labels, &e),
+                point.value().abs()
+            ));
+        }
+        vertex_index.insert(e.iter().map(|v| v.to_bits()).collect(), vertices.len());
+        vertices.push(e);
+        vertex_values.push(point);
+    }
+    let mut stack: Vec<Vec<usize>> = vec![(0..m).collect()];
+    let mut binding: Option<(f64, f64)> = None;
+    while let Some(cell) = stack.pop() {
+        let mut centroid = vec![0.0_f64; m];
+        for &v in cell.iter() {
+            for (acc, value) in centroid.iter_mut().zip(vertices[v].iter()) {
+                *acc += value;
+            }
+        }
+        let scale = 1.0 / (cell.len() as f64);
+        centroid.iter_mut().for_each(|v| *v *= scale);
+        let at_centroid = overlap.evaluate(&centroid, true)?;
+        let value = at_centroid.value();
+        let point_band = at_centroid.band(curvature_band);
+        if value < -point_band {
+            return Err(refute(&centroid, &at_centroid));
+        }
+        if !(value > point_band) {
+            return Err(format!(
+                "the face's first-order law is unresolved at {}: |½tr(M(t)C)|={:.3e} ≤ band \
+                 {point_band:.3e}, so its sign on the release simplex is not a measured fact",
+                format_simplex_point(&overlap.labels, &centroid),
+                value.abs()
+            ));
+        }
+        let Some(gradients) = at_centroid.gradients.as_ref() else {
+            return Err("interior simplex point carried no gradient".to_string());
+        };
+        let mut lower = f64::INFINITY;
+        let mut worst_error = 0.0_f64;
+        let mut trace_rise = f64::NEG_INFINITY;
+        for &v in cell.iter() {
+            let vertex = &vertices[v];
+            let at_vertex = &vertex_values[v];
+            let mut linear = 0.0_f64;
+            let mut linear_error = 0.0_f64;
+            let mut trace_linear = 0.0_f64;
+            for j in 0..m {
+                let step = vertex[j] - centroid[j];
+                linear += gradients.negative[j] * step;
+                linear_error +=
+                    (gradients.negative_error[j] + gamma_m * gradients.negative[j].abs()) * step.abs();
+                trace_linear += gradients.trace[j] * step
+                    + (gradients.trace_error[j] + gamma_m * gradients.trace[j].abs()) * step.abs();
+            }
+            let bound = at_vertex.positive - at_centroid.negative - linear;
+            let error = at_vertex.positive_error
+                + at_centroid.negative_error
+                + linear_error
+                + accumulation_growth(3)
+                    * (at_vertex.positive + at_centroid.negative + linear.abs());
+            lower = lower.min(bound);
+            worst_error = worst_error.max(error);
+            trace_rise = trace_rise.max(trace_linear);
+        }
+        let sup_trace = at_centroid.trace + at_centroid.trace_error + trace_rise;
+        let band = worst_error + 0.5 * sup_trace * curvature_band;
+        if lower > band {
+            if binding.is_none_or(|(bl, bb)| lower - band < bl - bb) {
+                binding = Some((lower, band));
+            }
+            continue;
+        }
+        if value - lower <= band + point_band {
+            return Err(format!(
+                "the face's first-order law is unresolved near {}: the cell's lower bound \
+                 {lower:.6e} is already within its band of ½tr(M(t)C)={value:.6e} yet does not \
+                 clear the band {band:.3e}",
+                format_simplex_point(&overlap.labels, &centroid)
+            ));
+        }
+        // Longest-edge bisection.
+        let mut edge = (0usize, 1usize);
+        let mut longest = f64::NEG_INFINITY;
+        for a in 0..cell.len() {
+            for b in (a + 1)..cell.len() {
+                let length: f64 = vertices[cell[a]]
+                    .iter()
+                    .zip(vertices[cell[b]].iter())
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum();
+                if length > longest {
+                    longest = length;
+                    edge = (a, b);
+                }
+            }
+        }
+        let (va, vb) = (cell[edge.0], cell[edge.1]);
+        let mut midpoint = Vec::with_capacity(m);
+        for (x, y) in vertices[va].iter().zip(vertices[vb].iter()) {
+            if !exact_sum(*x, *y) {
+                return Err(format!(
+                    "the release simplex cannot be refined exactly past {}: the face's \
+                     first-order law ½tr(M(t)C)={value:.6e} is not resolved against band \
+                     {band:.3e} at f64 resolution",
+                    format_simplex_point(&overlap.labels, &centroid)
+                ));
+            }
+            midpoint.push(0.5 * (x + y));
+        }
+        let key: Vec<u64> = midpoint.iter().map(|v| v.to_bits()).collect();
+        let mid = match vertex_index.get(&key) {
+            Some(&existing) => existing,
+            None => {
+                let point = overlap.evaluate(&midpoint, false)?;
+                let id = vertices.len();
+                vertex_index.insert(key, id);
+                vertices.push(midpoint);
+                vertex_values.push(point);
+                id
+            }
+        };
+        let mut first = cell.clone();
+        first[edge.0] = mid;
+        let mut second = cell;
+        second[edge.1] = mid;
+        stack.push(first);
+        stack.push(second);
+    }
+    binding.ok_or_else(|| "the release simplex produced no certified cell".to_string())
+}
 
 /// Self-adjoint eigendecomposition of an exactly-symmetrized copy.
 fn symmetric_eigh(matrix: &Array2<f64>) -> Option<(Array1<f64>, Array2<f64>)> {
@@ -921,13 +1509,31 @@ fn assemble_face_limit(input: FaceLimitAssembly<'_>) -> RailFaceLimitOutcome {
         .collect();
     let face_rho: Vec<f64> = face_sorted.iter().map(|&j| rho[j]).collect();
 
+    // ── the rounding error of the assembled form ────────────────────────
+    // Frobenius norms bound the spectral ones, so the bound stays rigorous.
+    let form_conditioning = conditioning.max(survivor_conditioning).max(1.0);
+    let frobenius = |m: &Array2<f64>| m.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let score_norm = released_score.dot(&released_score).sqrt();
+    let drift_norm = released_curvature_drift
+        .as_ref()
+        .map_or(0.0, |drift_q| drift_q.dot(drift_q).sqrt());
+    let form_error_bound = accumulation_growth(k_matrix.nrows())
+        * ((frobenius(&k_matrix) + frobenius(&s_rest)) * (1.0 + form_conditioning)
+            + score_norm * score_norm / dispersion
+            + 2.0 * score_norm * drift_norm);
+    if !form_error_bound.is_finite() {
+        return RailFaceLimitOutcome::FaceUnavailable {
+            reason: "the assembled first-order form's rounding bound is not finite".to_string(),
+        };
+    }
+
     RailFaceLimitOutcome::Available(Box::new(RailFaceLimit {
         face: face_sorted,
         face_rho,
         first_order_form,
         released_penalties,
         released_score,
-        form_conditioning: conditioning.max(survivor_conditioning).max(1.0),
+        form_error_bound,
         limit_beta,
         limit_dispersion: dispersion,
         released_curvature_drift,
@@ -1025,15 +1631,25 @@ pub(crate) fn gaussian_rail_face_limit(
     let penalty_energy = limit_beta.dot(&split.s_rest.dot(&limit_beta));
     let penalized_deviance = weighted_rss + penalty_energy;
     // The profiled scale's denominator must be the CRITERION's own
-    // degrees-of-freedom bookkeeping, which counts the SUM of the
-    // per-penalty ranks — not the rank of the summed penalty. The two agree
-    // when the penalties have disjoint ranges and differ exactly when they
-    // OVERLAP, which is the all-on Hilbert-scale case this certificate is
-    // for. Reproducing the criterion means reproducing its bookkeeping.
-    let criterion_penalty_rank: usize = penalties
-        .iter()
-        .map(|penalty| penalty.positive_eigenvalues.len())
-        .sum();
+    // degrees-of-freedom bookkeeping: `M_p = p − rank(Σ_k S_k)`, the JOINT
+    // structural rank the criterion's penalty pseudo-logdet reports
+    // (`structural_rank_from_canonical_penalties`, every λ_k > 0 on the
+    // face). The sum of the per-penalty ranks agrees only when the ranges
+    // are disjoint; when they OVERLAP it over-counts the rank, under-counts
+    // `M_p`, and mis-states the profiled scale the certificate reproduces.
+    let criterion_penalty_rank = match gam_terms::construction::balanced_penalty_structural_rank(
+        penalties
+            .iter()
+            .map(|penalty| (penalty.local_ref().view(), penalty.col_range.clone())),
+        p,
+    ) {
+        Ok(rank) => rank,
+        Err(error) => {
+            return RailFaceLimitOutcome::FaceUnavailable {
+                reason: format!("the criterion's joint penalty rank is unavailable: {error}"),
+            };
+        }
+    };
     let null_dim = p.saturating_sub(criterion_penalty_rank);
     if n <= null_dim {
         return RailFaceLimitOutcome::FaceUnavailable {
@@ -1271,7 +1887,7 @@ mod rail_face_tests {
             first_order_form: form,
             released_penalties: penalties,
             released_score: score,
-            form_conditioning: 1.0,
+            form_error_bound: 0.0,
             limit_beta: Array1::zeros(0),
             limit_dispersion: 1.0,
             released_curvature_drift: None,
@@ -1336,49 +1952,343 @@ mod rail_face_tests {
         }
     }
 
-    /// The proof is a strict positive-definiteness test. A form with a negative
-    /// direction means releasing the face LOWERS the criterion there — the rail
-    /// is not the optimum — and must refuse, with the measured eigenvalue.
+    /// A single-penalty face moves its whole released range at once, so the
+    /// first-order change off it is `f(t) = t·½tr(A⁻¹C)` EXACTLY, whatever the
+    /// sign pattern of `C`: a negative eigen-direction of `C` that the one
+    /// smoothing parameter cannot isolate is not a way off the face. The
+    /// positive-definiteness gate refused this face; the KKT test certifies it
+    /// on the independent-ranges route with the measured slope as its
+    /// statistic, and the priced value gap is still the tail law `c·e^{−ρ}`.
     #[test]
-    fn indefinite_first_order_form_refuses_with_its_margin() {
+    fn single_penalty_face_with_indefinite_form_certifies_by_its_slope() {
+        let rho = 25.0_f64;
         let lim = limit(
             vec![0],
-            vec![25.0],
+            vec![rho],
             diag(&[4.0, -1.0e-3]),
             vec![diag(&[1.0, 1.0])],
             Array1::from(vec![0.0, 0.0]),
         );
-        match certify_rail_face(&lim) {
-            RailFaceVerdict::Refused { reason } => {
-                assert!(
-                    reason.contains("not positive definite"),
-                    "refusal should name the failed gate: {reason}"
-                );
-                assert!(
-                    reason.contains("λ_min(C)") && reason.contains("margin"),
-                    "refusal should carry the measured λ_min against its margin: {reason}"
-                );
-            }
-            other => panic!("an indefinite face form must not certify, got {other:?}"),
-        }
+        let proof = match certify_rail_face(&lim) {
+            RailFaceVerdict::Certified(proof) => proof,
+            other => panic!("a positive slope proves a one-penalty face, got {other:?}"),
+        };
+        assert_eq!(proof.route, FacePositivityRoute::IndependentRanges);
+        assert!(proof.min_curvature < 0.0, "the fixture's form is indefinite");
+        let expected = 0.5 * (4.0 - 1.0e-3);
+        assert!(
+            (proof.tail_constants[0] - expected).abs() <= 1.0e-12 * expected,
+            "c={} should be ½tr(A⁻¹C) = {expected}",
+            proof.tail_constants[0]
+        );
+        assert_eq!(proof.statistic, proof.tail_constants[0]);
+        assert!(proof.statistic > proof.band && proof.band >= 0.0);
+        let expected_gap = expected * (-rho).exp();
+        assert!(
+            (proof.value_gap - expected_gap).abs() <= 1.0e-12 * expected_gap,
+            "value gap {} should be c·e^(−ρ) = {expected_gap}",
+            proof.value_gap
+        );
     }
 
-    /// A flat direction is not a proof. `λ_min(C) = 0` leaves the criterion
-    /// unchanged to first order along that release, so the face is undetermined
-    /// and the certificate refuses rather than minting a maybe-optimum.
+    /// A measured NEGATIVE slope means releasing the coordinate lowers the
+    /// criterion: λ=∞ is not the optimum and the face must refuse, naming it.
     #[test]
-    fn semidefinite_form_is_not_a_proof() {
+    fn negative_slope_refutes_the_face() {
         let lim = limit(
             vec![0],
             vec![25.0],
-            diag(&[4.0, 0.0]),
+            diag(&[-1.0, 0.5]),
             vec![diag(&[1.0, 1.0])],
             Array1::from(vec![0.0, 0.0]),
         );
-        assert!(
-            matches!(certify_rail_face(&lim), RailFaceVerdict::Refused { .. }),
-            "a face with an exactly flat released direction must refuse"
+        match certify_rail_face(&lim) {
+            RailFaceVerdict::Refused { reason } => assert!(
+                reason.contains("lowers the criterion") && reason.contains("c="),
+                "refusal should name the descending coordinate and its slope: {reason}"
+            ),
+            other => panic!("a negative slope must not certify, got {other:?}"),
+        }
+    }
+
+    /// A slope inside its rounding band is not a proof: `c = 0` leaves the
+    /// criterion unchanged to first order, so the sign is not a measured fact
+    /// and the certificate refuses rather than minting a maybe-optimum.
+    #[test]
+    fn flat_slope_is_not_a_proof() {
+        let lim = limit(
+            vec![0],
+            vec![25.0],
+            diag(&[1.0, -1.0]),
+            vec![diag(&[1.0, 1.0])],
+            Array1::from(vec![0.0, 0.0]),
         );
+        match certify_rail_face(&lim) {
+            RailFaceVerdict::Refused { reason } => assert!(
+                reason.contains("unresolved first-order slope"),
+                "refusal should say the slope's sign is unresolved: {reason}"
+            ),
+            other => panic!("a flat slope must not certify, got {other:?}"),
+        }
+    }
+
+    /// Two penalties with linearly independent but NON-orthogonal released
+    /// ranges and an indefinite `C`. The congruence argument makes
+    /// `½tr((A_0/t_0 + A_1/t_1)⁻¹C) = c_0 t_0 + c_1 t_1` exactly, so the
+    /// per-coordinate slopes decide the face — checked here against the
+    /// directly evaluated expansion at lopsided weightings.
+    #[test]
+    fn independent_ranges_face_is_linear_in_t_and_certifies_on_its_slopes() {
+        let mut a0 = Array2::<f64>::zeros((3, 3));
+        a0[[0, 0]] = 2.0;
+        a0[[0, 1]] = 0.5;
+        a0[[1, 0]] = 0.5;
+        a0[[1, 1]] = 1.0;
+        let v = [0.3, 0.0, 1.0];
+        let mut a1 = Array2::<f64>::zeros((3, 3));
+        for i in 0..3 {
+            for j in 0..3 {
+                a1[[i, j]] = 3.0 * v[i] * v[j];
+            }
+        }
+        let mut form = diag(&[4.0, -1.0, 2.0]);
+        form[[0, 1]] = 1.0;
+        form[[1, 0]] = 1.0;
+        form[[1, 2]] = 0.5;
+        form[[2, 1]] = 0.5;
+        let lim = limit(
+            vec![0, 1],
+            vec![20.0, 22.0],
+            form.clone(),
+            vec![a0.clone(), a1.clone()],
+            Array1::from(vec![0.1, -0.2, 0.3]),
+        );
+        let proof = match certify_rail_face(&lim) {
+            RailFaceVerdict::Certified(proof) => proof,
+            other => panic!("positive slopes on independent ranges must certify, got {other:?}"),
+        };
+        assert_eq!(proof.route, FacePositivityRoute::IndependentRanges);
+        assert!(proof.min_curvature < 0.0, "the fixture's form is indefinite");
+        // Releasing coordinate 1 alone frees `null(A_0) = e_3`: c_1 = ½·C₃₃/3.
+        assert!((proof.tail_constants[1] - 1.0 / 3.0).abs() <= 1.0e-12);
+        for (t0, t1) in [(1.0, 1.0e-3), (1.0e-3, 1.0), (0.3, 0.7), (2.0, 5.0)] {
+            let mut mixed = Array2::<f64>::zeros((3, 3));
+            mixed.scaled_add(1.0 / t0, &a0);
+            mixed.scaled_add(1.0 / t1, &a1);
+            let direct = half_trace_inverse_product(&mixed, &form)
+                .expect("a positive weighting of independent ranges is invertible");
+            let linear = proof.tail_constants[0] * t0 + proof.tail_constants[1] * t1;
+            assert!(
+                (direct - linear).abs() <= 1.0e-10 * linear.abs(),
+                "the expansion at t=({t0},{t1}) is {direct}, the linear law {linear}"
+            );
+            assert!(direct > 0.0);
+        }
+    }
+
+    /// With OVERLAPPING released ranges and an indefinite `C`, a coordinate
+    /// that is unidentified at the face (`A_0 = I` already pins everything
+    /// coordinate 1 penalizes) makes `f` vanish at its simplex vertex: no cell
+    /// touching it bounds the law away from zero, and the simplex bound says
+    /// so — after checking the centre, where `f = 0.65` does not refute.
+    #[test]
+    fn overlapping_face_with_an_unidentified_vertex_refuses_by_name() {
+        let lim = limit(
+            vec![0, 1],
+            vec![25.0, 25.0],
+            diag(&[4.0, -0.1]),
+            vec![diag(&[1.0, 1.0]), Array2::from_elem((2, 2), 1.0)],
+            Array1::from(vec![0.0, 0.0]),
+        );
+        match certify_rail_face(&lim) {
+            RailFaceVerdict::Refused { reason } => assert!(
+                reason.contains("ranges overlap") && reason.contains("unidentified at the face"),
+                "refusal should name the overlap and the vanishing vertex: {reason}"
+            ),
+            other => panic!("an unidentified overlapping vertex cannot certify, got {other:?}"),
+        }
+    }
+
+    /// `A_1 = diag(1,1,0)`, `A_2 = diag(0,1,1)`, `C = diag(1, c, 1)`: the
+    /// ranges share `e_2`, and `M(t) = diag(t_1, t_1t_2/(t_1+t_2), t_2)`, so
+    /// `f = ½(t_1 + t_2 + c·t_1t_2/(t_1+t_2))` in closed form. Both axis laws
+    /// are `c_j = ½` whatever `c`.
+    fn shared_direction_face(c: f64) -> RailFaceLimit {
+        limit(
+            vec![3, 5],
+            vec![22.0, 24.0],
+            diag(&[1.0, c, 1.0]),
+            vec![diag(&[1.0, 1.0, 0.0]), diag(&[0.0, 1.0, 1.0])],
+            Array1::from(vec![0.0, 0.0, 0.0]),
+        )
+    }
+
+    /// `c = −3`: `C` is indefinite and the ranges overlap — the gate this
+    /// replaces refused it — yet `f = ½(1 − 3t_1t_2) ≥ ⅛` on the simplex. The
+    /// root cell's bound is exactly that minimum (`P ≡ ½`, and by Euler the
+    /// tangent of the homogeneous `N` at the centre is `∇N·v = ⅜`).
+    #[test]
+    fn overlapping_face_positive_on_the_simplex_certifies_by_its_bound() {
+        let proof = match certify_rail_face(&shared_direction_face(-3.0)) {
+            RailFaceVerdict::Certified(proof) => proof,
+            other => panic!("f ≥ ⅛ on the simplex must certify, got {other:?}"),
+        };
+        assert_eq!(proof.route, FacePositivityRoute::SimplexBound);
+        assert!(proof.min_curvature < 0.0, "the fixture's form is indefinite");
+        assert!(
+            (proof.statistic - 0.125).abs() <= 1.0e-12,
+            "the root cell's lower bound is min f = ⅛, got {}",
+            proof.statistic
+        );
+        assert!(proof.statistic > proof.band && proof.band >= 0.0);
+        for &c_j in proof.tail_constants.iter() {
+            assert!((c_j - 0.5).abs() <= 1.0e-12, "axis law c_j={c_j} should be ½");
+        }
+    }
+
+    /// `c = −5`: both axis laws are still `+½`, so a per-axis KKT test would
+    /// certify — but `f(½,½) = ½(1 − 5/4) = −⅛`. Releasing the two penalties
+    /// together lowers the criterion; the face is refuted at that point.
+    #[test]
+    fn overlapping_face_descending_jointly_is_refuted_despite_positive_axis_laws() {
+        match certify_rail_face(&shared_direction_face(-5.0)) {
+            RailFaceVerdict::Refused { reason } => {
+                assert!(
+                    reason.contains("lowers the criterion")
+                        && reason.contains("t3=0.5000")
+                        && reason.contains("t5=0.5000"),
+                    "refusal should name the descending joint release: {reason}"
+                );
+                assert!(
+                    reason.contains("-1.250000e-1"),
+                    "refusal should carry the measured f(½,½) = −⅛: {reason}"
+                );
+            }
+            other => panic!("a jointly descending face must not certify, got {other:?}"),
+        }
+    }
+
+    /// Two copies of the same penalty (`A_1 = A_2 = I`): each coordinate is
+    /// unidentified alone, but together `M(t) = t_1t_2/(t_1+t_2)·I`, so the
+    /// face's law is `f = ½·t_1t_2/(t_1+t_2)·tr C`. With `tr C < 0` the joint
+    /// release descends — refuted at the centre before the degenerate vertices
+    /// are ever consulted; with `tr C > 0` it vanishes at both vertices and
+    /// refuses as unresolved there.
+    #[test]
+    fn duplicated_penalty_face_is_decided_by_the_trace_of_its_form() {
+        let duplicated = |form: Array2<f64>| {
+            limit(
+                vec![0, 1],
+                vec![25.0, 25.0],
+                form,
+                vec![diag(&[1.0, 1.0]), diag(&[1.0, 1.0])],
+                Array1::from(vec![0.0, 0.0]),
+            )
+        };
+        match certify_rail_face(&duplicated(diag(&[1.0, -2.0]))) {
+            RailFaceVerdict::Refused { reason } => assert!(
+                reason.contains("lowers the criterion") && reason.contains("-1.250000e-1"),
+                "tr C < 0 must refute at the centre with f = ½·¼·(−1): {reason}"
+            ),
+            other => panic!("tr C < 0 descends jointly, got {other:?}"),
+        }
+        match certify_rail_face(&duplicated(diag(&[2.0, -1.0]))) {
+            RailFaceVerdict::Refused { reason } => assert!(
+                reason.contains("unidentified at the face"),
+                "tr C > 0 vanishes at the vertices and must refuse there: {reason}"
+            ),
+            other => panic!("a law vanishing at both vertices cannot certify, got {other:?}"),
+        }
+    }
+
+    /// An asymmetric overlap the root cell cannot decide, so the bound has to
+    /// REFINE: `A_2 = diag(0,4,1)` gives `f = ½(t_1 + t_2 − 8t_1t_2/(t_2+4t_1))`,
+    /// minimized on the simplex at `t_1 = ⅓` with `f = 1/18`, while the root
+    /// bound at vertex `e_2` is `½ − 0.64 < 0`. The certified statistic must be
+    /// a genuine lower bound: `statistic − band ≤ min f`.
+    #[test]
+    fn overlapping_face_certifies_after_refinement_with_a_sound_lower_bound() {
+        let lim = limit(
+            vec![0, 1],
+            vec![22.0, 24.0],
+            diag(&[1.0, -8.0, 1.0]),
+            vec![diag(&[1.0, 1.0, 0.0]), diag(&[0.0, 4.0, 1.0])],
+            Array1::from(vec![0.0, 0.0, 0.0]),
+        );
+        let proof = match certify_rail_face(&lim) {
+            RailFaceVerdict::Certified(proof) => proof,
+            other => panic!("min f = 1/18 > 0 must certify after refinement, got {other:?}"),
+        };
+        assert_eq!(proof.route, FacePositivityRoute::SimplexBound);
+        assert!(proof.statistic > proof.band);
+        let true_min = 1.0 / 18.0;
+        assert!(
+            proof.statistic - proof.band <= true_min + 1.0e-12,
+            "the certified bound {} − {} exceeds the true minimum {true_min}",
+            proof.statistic,
+            proof.band
+        );
+    }
+
+    /// The decision is basis-free: rotating every `A_j` and `C` by the same
+    /// orthogonal `R` leaves `f` unchanged, so the rotated shared-direction face
+    /// certifies with the same bound — exercising the non-diagonal arithmetic
+    /// (the spectral split of `C`, the parallel sum, the pinned null spaces).
+    /// Three penalties sharing one direction, each with a private one, make the
+    /// simplex two-dimensional and its edge midpoints pin a coordinate exactly.
+    #[test]
+    fn rotated_three_penalty_overlap_certifies_and_refutes_as_its_closed_form() {
+        // `A_j = e_j e_jᵀ + e_4e_4ᵀ`, `C = diag(1,1,1,c)`:
+        // `f = ½(t_1 + t_2 + t_3 + c/Σ_j t_j⁻¹)`, minimized at the centre with
+        // `f = ½(1 + c/9)`; every axis law is `½`.
+        let (s, k) = (0.6_f64, 0.8_f64);
+        let mut r = Array2::<f64>::zeros((4, 4));
+        // A product of two plane rotations, (0,3) and (1,2).
+        r[[0, 0]] = k;
+        r[[0, 3]] = -s;
+        r[[3, 0]] = s;
+        r[[3, 3]] = k;
+        r[[1, 1]] = s;
+        r[[1, 2]] = -k;
+        r[[2, 1]] = k;
+        r[[2, 2]] = s;
+        let rotate = |m: &Array2<f64>| r.dot(m).dot(&r.t());
+        let penalties = |r: &dyn Fn(&Array2<f64>) -> Array2<f64>| {
+            (0..3)
+                .map(|j| {
+                    let mut a = Array2::<f64>::zeros((4, 4));
+                    a[[j, j]] = 1.0;
+                    a[[3, 3]] = 1.0;
+                    r(&a)
+                })
+                .collect::<Vec<_>>()
+        };
+        let face = |c: f64| {
+            limit(
+                vec![1, 2, 4],
+                vec![20.0, 21.0, 22.0],
+                rotate(&diag(&[1.0, 1.0, 1.0, c])),
+                penalties(&rotate),
+                Array1::from(vec![0.0, 0.0, 0.0, 0.0]),
+            )
+        };
+        let proof = match certify_rail_face(&face(-6.0)) {
+            RailFaceVerdict::Certified(proof) => proof,
+            other => panic!("f ≥ ½(1 − 6/9) = ⅙ must certify, got {other:?}"),
+        };
+        assert_eq!(proof.route, FacePositivityRoute::SimplexBound);
+        assert!(
+            (proof.statistic - 1.0 / 6.0).abs() <= 1.0e-10,
+            "the bound should reproduce the closed-form minimum ⅙, got {}",
+            proof.statistic
+        );
+        match certify_rail_face(&face(-12.0)) {
+            RailFaceVerdict::Refused { reason } => assert!(
+                reason.contains("lowers the criterion"),
+                "f(centre) = ½(1 − 12/9) < 0 must refute: {reason}"
+            ),
+            other => panic!("a jointly descending three-penalty face must not certify, got {other:?}"),
+        }
     }
 
     /// Multi-coordinate face with OVERLAPPING penalties. Coordinate 0 penalizes

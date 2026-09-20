@@ -4,18 +4,19 @@ F17. pyGAM's LogisticGAM example ``y ~ factor(student) + s(balance) + s(income)`
 on the ``default`` data (n = 2000, about 3% positives, raw covariates) certified
 an outer minimum and then refused the smoothing-corrected covariance because
 the rho Hessian had negative curvature. That Hessian omitted the second
-derivative of the #784 block-local correction; a latched correction now
-declares no analytic outer Hessian and the search continues as BFGS. The
-continuation then stalled, because the correction took its eigenpairs from an
-``eigh`` of the assembled Hessian: with a smooth penalised onto its rail
-(``lambda ~ 1e13``) that eigensolve resolves the soft modes the correction
-lives on only to ``eps * ||H||``, and the correction's value changed with the
-last bits of ``H`` between two solves at the same rho. The correction now reads
-the criterion's own root-scale (#2644) eigensystem.
+derivative of the #784 block-local correction. The correction now carries its
+exact analytic rho-Hessian, so the search steps on the criterion's own
+curvature and the smoothing-corrected covariance inverts it. The correction
+also used to take its eigenpairs from an ``eigh`` of the assembled Hessian:
+with a smooth penalised onto its rail (``lambda ~ 1e13``) that eigensolve
+resolves the soft modes the correction lives on only to ``eps * ||H||``, and
+the correction's value changed with the last bits of ``H`` between two solves
+at the same rho. It now reads the criterion's own root-scale (#2644)
+eigensystem.
 
 F15. The chicago Poisson model ``y ~ s(time) + s(tmpd) + te(pm10, o3)`` at
-n = 1000-1500 raised "smoothing cubature has no positive-width proposal". It
-now fits and the smoothing correction is integrated by the cubature itself.
+n = 1000-1500 raised "smoothing cubature has no positive-width proposal". The
+cubature is gone; the fit publishes the first-order smoothing correction.
 
 Both fixtures are synthetic analogues with the covariate scales of the data.
 """
@@ -74,8 +75,8 @@ def _assert_intervals(prediction: dict, n: int) -> None:
 
 
 # Seeds on which the binomial search stalled before the correction read the
-# criterion's eigensystem.
-@pytest.mark.parametrize("seed", [7, 8, 10])
+# criterion's eigensystem, or certified without the correction's rho-Hessian.
+@pytest.mark.parametrize("seed", [7, 8, 9, 10])
 @pytest.mark.parametrize(
     "formula",
     ["y ~ factor(student) + s(balance) + s(income)", "y ~ s(balance) + s(income)"],
@@ -85,7 +86,8 @@ def test_rare_event_binomial_on_raw_covariates_returns_intervals(seed, formula):
     assert 0.01 < data["y"].mean() < 0.06
     model = gamfit.fit(data, formula, family="binomial")
     assert model.summary().convergence.get("certified") is True
-    prediction = model.predict(data, interval=0.95)
+    prediction = model.predict(data, interval=0.95, covariance_mode="smoothing")
+    assert prediction["covariance_source"] == "smoothing-corrected"
     _assert_intervals(prediction, len(data["y"]))
 
 

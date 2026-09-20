@@ -412,7 +412,6 @@ fn production_circle_coords_at_seed(
         top_k: None,
         threshold: 0.0,
         seed_refine_routing: refine_routing,
-        seed_refine_random_state: random_state,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
         fisher_metric: None,

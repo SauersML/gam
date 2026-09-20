@@ -1548,7 +1548,7 @@ fn double_penalty_suppressed_on_non_free_boundary_is_single_penalty() {
 }
 
 /// #1476/#1477/#874: in the CENTERED cyclic chart — the one every `cyclic(...)`
-/// / `bs="cc"` term the formula DSL builds actually ships — the harmonic cyclic
+/// / `bs="cyclic"` term the formula DSL builds actually ships — the harmonic cyclic
 /// roughness leaves the constant and the fundamental harmonic unpenalized. The
 /// centering removes the constant and the fundamental survives, so with
 /// `double_penalty: true` the rebuild ships the primary roughness plus a rank-2
@@ -1697,7 +1697,7 @@ fn test_build_bspline_basis_1d_automatic_uniform_uses_data_range() {
         degree: 2,
         penalty_order: 2,
         knotspec: BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(3),
+            num_internal_knots: 3,
             placement: BSplineKnotPlacement::Uniform,
             adaptive: false,
         },
@@ -1724,7 +1724,7 @@ fn test_build_bspline_basis_1d_automatic_quantile_is_not_uniform_for_skewed_data
         degree: 2,
         penalty_order: 2,
         knotspec: BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(3),
+            num_internal_knots: 3,
             placement: BSplineKnotPlacement::Quantile,
             adaptive: false,
         },
@@ -1824,7 +1824,7 @@ fn test_build_bspline_basis_1d_quantile_uses_exact_derivative_gram() {
         degree: 2,
         penalty_order: 2,
         knotspec: BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(3),
+            num_internal_knots: 3,
             placement: BSplineKnotPlacement::Quantile,
             adaptive: false,
         },
@@ -1875,7 +1875,7 @@ fn test_build_bspline_basis_1d_none_identifiability_prefers_sparse_design() {
         degree: 3,
         penalty_order: 2,
         knotspec: BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(6),
+            num_internal_knots: 6,
             placement: BSplineKnotPlacement::Quantile,
             adaptive: false,
         },
@@ -1905,7 +1905,7 @@ fn test_build_bspline_basis_1d_default_identifiability_densifies_via_orthonormal
         degree: 3,
         penalty_order: 2,
         knotspec: BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(6),
+            num_internal_knots: 6,
             placement: BSplineKnotPlacement::Quantile,
             adaptive: false,
         },
@@ -1927,7 +1927,7 @@ fn test_build_bspline_basis_1d_quantile_rejects_missing_interior_support() {
         degree: 2,
         penalty_order: 2,
         knotspec: BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(3),
+            num_internal_knots: 3,
             placement: BSplineKnotPlacement::Quantile,
             adaptive: false,
         },

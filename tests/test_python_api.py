@@ -4,6 +4,7 @@ import json
 import typing
 
 import pathlib
+import re
 import time
 
 pytest = typing.cast(typing.Any, importlib.import_module("pytest"))
@@ -31,7 +32,7 @@ class _ModelTermDiagnostics(typing.Protocol):
         term: str,
         *,
         n_points: int,
-    ) -> dict[str, typing.Any]: ...
+    ) -> gamfit.results.PartialEffect: ...
 
     def variance_share(
         self,
@@ -103,6 +104,13 @@ def test_build_info_reports_real_extension() -> None:
     assert info["module"] == "gamfit._rust"
     assert "fit" in info["capabilities"]
     assert "validate_formula" in info["capabilities"]
+    # gam#3007: the build names its commit, so engines that share a version
+    # string can be told apart. The tests run from a gam checkout.
+    commit = info["commit"]
+    assert isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit), info
+    assert isinstance(info["dirty"], bool), info
+    assert isinstance(info["model_payload_version"], int), info
+    assert info["model_payload_version"] >= 29, info
     assert info["supported_model_classes"] == [
         "standard",
         "transformation-normal",
@@ -206,6 +214,7 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
         "linear_predictor_plugin",
         "mean_plugin",
         "posterior_mean",
+        "linear_predictor_standard_error",
         "posterior_mean_standard_error",
         "posterior_mean_lower",
         "posterior_mean_upper",
@@ -423,13 +432,13 @@ def test_sklearn_regressor_accepts_rhs_only_formula_with_separate_target() -> No
 
 def test_sklearn_classifier_roundtrip() -> None:
     # `y ~ x` is an unpenalized parametric term, so its logistic MLE diverges
-    # under perfect separation and the engine's pre-fit separation guard
-    # (PrefitPerfectSeparationDetected) rejects such a design by design. The two
-    # observations at x=2.0 with opposite labels break separation (the MLE is
-    # finite) while preserving the monotone-increasing P(y=1 | x) trend this
-    # roundtrip asserts; the test targets the sklearn wrapper mechanics
-    # (predict_proba shape, class ordering, argmax hard labels, weighted score),
-    # not the degenerate infinite-slope fit.
+    # under perfect separation, and the engine's pre-fit separation certificate
+    # then fits the Jeffreys-prior estimator instead. The two observations at
+    # x=2.0 with opposite labels break separation (the MLE is finite) while
+    # preserving the monotone-increasing P(y=1 | x) trend this roundtrip
+    # asserts; the test targets the sklearn wrapper mechanics (predict_proba
+    # shape, class ordering, argmax hard labels, weighted score), not the
+    # separated-design estimator.
     train = pd.DataFrame(
         [
             {"y": 0.0, "x": 0.0},
@@ -1922,23 +1931,14 @@ def test_partial_dependence_and_variance_share() -> None:
 
     diagnostics = typing.cast(_ModelTermDiagnostics, model)
     pd_out = diagnostics.partial_dependence("s(x1)", n_points=40)
-    assert set(pd_out.keys()) == {
-        "grid",
-        "axes",
-        "predicted",
-        "standard_error",
-        "covariance_source",
-        "scale",
-        "quantity",
-        "contribution",
-        "held",
-    }
-    assert pd_out["covariance_source"] == "smoothing-corrected"
-    assert pd_out["grid"].shape == (40,)
-    assert pd_out["predicted"].shape == (40,)
-    assert pd_out["standard_error"].shape == (40,)
-    assert np.all(np.isfinite(pd_out["predicted"]))
-    assert np.all(pd_out["standard_error"] >= 0.0)
+    assert isinstance(pd_out, gamfit.results.PartialEffect)
+    assert pd_out.covariance_source == "smoothing-corrected"
+    assert pd_out.axes == ("x1",)
+    assert pd_out.x.shape == (40,)
+    for series in (pd_out.fit, pd_out.se, pd_out.lower, pd_out.upper):
+        assert series.shape == (40,)
+    assert np.all(np.isfinite(pd_out.fit))
+    assert np.all(pd_out.se >= 0.0)
 
     shares = diagnostics.variance_share(frame)
     assert isinstance(shares, dict)
@@ -2361,7 +2361,7 @@ def test_model_term_blocks_sorted_and_typed() -> None:
 
 
 def test_model_partial_dependence_1d_shapes_and_finiteness() -> None:
-    """1D partial_dependence returns grid/predicted/standard_error of length n_points."""
+    """1D partial_dependence returns a grid, curve, SE and both bands of length n_points."""
     rng = np.random.default_rng(2026052202)
     n = 120
     x1 = rng.uniform(0.0, 1.0, n)
@@ -2370,23 +2370,20 @@ def test_model_partial_dependence_1d_shapes_and_finiteness() -> None:
     model = gamfit.fit(frame, "y ~ s(x1)")
     diagnostics = typing.cast(_ModelTermDiagnostics, model)
     pd_out = diagnostics.partial_dependence("s(x1)", n_points=25)
-    assert set(pd_out.keys()) == {
-        "grid",
-        "axes",
-        "predicted",
-        "standard_error",
-        "covariance_source",
-        "scale",
-        "quantity",
-        "contribution",
-        "held",
-    }
-    assert pd_out["covariance_source"] == "smoothing-corrected"
-    assert np.asarray(pd_out["grid"]).shape == (25,)
-    assert np.asarray(pd_out["predicted"]).shape == (25,)
-    assert np.asarray(pd_out["standard_error"]).shape == (25,)
-    assert np.all(np.isfinite(np.asarray(pd_out["predicted"], dtype=float)))
-    assert np.all(np.asarray(pd_out["standard_error"], dtype=float) >= 0.0)
+    assert pd_out.covariance_source == "smoothing-corrected"
+    assert pd_out.grid.shape == (25, 1)
+    assert pd_out.x.shape == (25,)
+    for series in (
+        pd_out.fit,
+        pd_out.se,
+        pd_out.lower,
+        pd_out.upper,
+        pd_out.simultaneous_lower,
+        pd_out.simultaneous_upper,
+    ):
+        assert series.shape == (25,)
+        assert np.all(np.isfinite(series))
+    assert np.all(pd_out.se >= 0.0)
 
 
 def test_model_variance_share_is_a_decomposition_summing_to_one() -> None:

@@ -26,8 +26,8 @@
 //!| `duchon`/framed | 0.01× (was 3.63×) | 5.0e-7 | below (verdict unchanged by frame) |
 //!| `poincare`/unframed | 0.00× (was REFUSED 40 & 400) | 9.6e-4 | **below — first-ever measurement** |
 //!| `poincare`/framed | 0.00× (was REFUSED 40) | 9.6e-4 | below (first-ever framed measurement) |
-//!| `linear`/unframed | 4.21× (was 0.13×) | 3.4e-9 | **above — the exemption INVERTED** |
-//!| `linear`/framed | 4.21× (was 0.13×) | 3.4e-9 | above (verdict unchanged by frame) |
+//!| `linear`/unframed | 0.00× (was 4.21×, and 0.13× before that) | 3.1e-9 | **below — the fix met the criterion** |
+//!| `linear`/framed | 0.00× (was 4.21×) | 3.1e-9 | below (verdict unchanged by frame) |
 //!
 //! What changed between the two tables is the landed #2720/#2762 resolution:
 //! `descend_gauge_orbit` (062277d/69ae5a1, 2026-08-15) gives the inner solve a
@@ -46,8 +46,12 @@
 //!   0.00×, all below the solver's own tolerance. The fix lane's fixed-point
 //!   test (`at_an_inner_fixed_point_...`, periodic-only, all-zeros rho) is
 //!   corroborated at the ARD-saddle penalty state and across geometries.
-//! * **The linear exemption INVERTED**: the one kind that was below tolerance
-//!   pre-fix (0.13×) is now the only one above it (4.21×). Pre-fix, linear's
+//! * **Linear now meets the criterion too (#2822 census, 2026-09-19).** On the
+//!   branch that settled #2822's collapse channels, linear exits at ‖g‖ = 6.1e-15 with
+//!   max |gᵀv|/tol = 0.00× at both frames, so the pin below holds linear to the same
+//!   `< 1` bar as the curved kinds. The history it replaces: the linear exemption
+//!   INVERTED at `5603dec`, where the one kind that was below tolerance
+//!   pre-fix (0.13×) became the only one above it (4.21×). Pre-fix, linear's
 //!   exit state genuinely carried little orbit slope; post-fix, the changed
 //!   trajectory (orbit-mover consults, once-per-plateau arming) exits at a
 //!   state whose dilation direction still carries live slope — recall the
@@ -200,7 +204,6 @@ fn seeded_term_of_kind(
         top_k: None,
         threshold: 0.0,
         seed_refine_routing: minimal.refine_routing,
-        seed_refine_random_state: 45,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
         fisher_metric: None,
@@ -605,10 +608,8 @@ fn chart_gauge_orbit_violation_across_geometries_2720() {
     //   2. poincare no longer refuses — the #2762 orbit mover unblocked the
     //      stall (bisection: refusal dies at `69ae5a1`), so the cell must now
     //      MEASURE, and its measurement must sit below tolerance;
-    //   3. linear is now the ONE kind above tolerance (was 0.13× below): the
-    //      exemption inverted. Pinned in its own band so the finding cannot
-    //      silently drift; the reading is "linear exits above orbit tolerance
-    //      at ARD-saddle rho", not "linear is broken";
+    //   3. linear meets the criterion as well (0.00×; it sat at 4.21× above
+    //      tolerance at `5603dec`), so it is held to the same bar;
     //   4. framing changes no verdict (framed == unframed max-ratio bands).
     let measured = |label: &str| {
         summary
@@ -616,13 +617,13 @@ fn chart_gauge_orbit_violation_across_geometries_2720() {
             .find(|(l, _)| l == label)
             .unwrap_or_else(|| panic!("[2720-geom] cell {label} missing from summary"))
     };
-    for kind in ["periodic", "duchon", "poincare"] {
+    for kind in ["periodic", "duchon", "poincare", "linear"] {
         for frame in ["unframed", "framed"] {
             let (label, cell) = measured(&format!("{kind}/{frame}"));
             let m = match cell {
                 CellOutcome::Measured(m) => *m,
                 CellOutcome::Refused { .. } => panic!(
-                    "[2720-geom] {label} refused — the three curved kinds measured at both \
+                    "[2720-geom] {label} refused — every kind measured at both \
                      frames post-fix (the pre-fix poincare refusal was killed by #2762's \
                      descend_gauge_orbit); a refusal now is an instrument or solver change"
                 ),
@@ -631,28 +632,10 @@ fn chart_gauge_orbit_violation_across_geometries_2720() {
                 m.max_ratio < 1.0,
                 "[2720-geom] {label}: max|gᵀv|/tol = {:.2}× is above tolerance — the \
                  post-fix finding is that the landed #2720/#2762 resolution meets the \
-                 issue's acceptance criterion on every curved kind (measured 0.19× / \
-                 0.01× / 0.00×); if this rose, the orbit mover lost the curved kinds",
+                 issue's acceptance criterion on every kind (measured 0.19× / \
+                 0.01× / 0.00× / 0.00×); if this rose, the orbit mover lost that kind",
                 m.max_ratio
             );
         }
-    }
-    for frame in ["unframed", "framed"] {
-        let (label, cell) = measured(&format!("linear/{frame}"));
-        let m = match cell {
-            CellOutcome::Measured(m) => *m,
-            CellOutcome::Refused { .. } => panic!(
-                "[2720-geom] {label} refused — linear measured at both frames when this \
-                 pin was re-taken; a refusal now is an instrument or solver change"
-            ),
-        };
-        assert!(
-            m.max_ratio > 1.0 && m.max_ratio < 20.0,
-            "[2720-geom] {label}: max|gᵀv|/tol = {:.2}× left the post-fix band (1, 20) \
-             — the linear exemption INVERTED in the post-fix world (pre-fix 0.13× below, \
-             post-fix 4.21× above); if this band fails the linear exit story changed; \
-             re-measure before updating",
-            m.max_ratio
-        );
     }
 }

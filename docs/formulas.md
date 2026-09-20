@@ -30,7 +30,7 @@ hyphen, a leading digit, or non-ASCII letters — is written in backticks,
 anywhere a column name is accepted, the response included:
 
 ```
-`body mass` ~ s(`flipper.length`) + `2nd dose` + C(`site id`)
+`body mass` ~ s(`flipper.length`) + `2nd dose` + factor(`site id`)
 ```
 
 Everything between the backticks is the column name, verbatim. Plain
@@ -112,10 +112,10 @@ y ~ bounded(x, min=0, max=1)         # exact interval transform on x
 ```
 
 `linear(x, min=..., max=...)` keeps a penalized linear term and
-projects the coefficient into `[min, max]`. Accepted aliases for the
-same function: `linear`, `constrain`, `constraint`, `box`. Each accepts
-`min`/`lower` and `max`/`upper`. `constrain()`/`constraint()`/`box()`
-requires at least one of those four to be set.
+projects the coefficient into `[min, max]`. Each bound is optional.
+Other names for the function (`constrain()`, `constraint()`, `box()`)
+and for the bounds (`lower=`, `upper=`) are refused with an error that
+names `linear()`, `min=` or `max=`.
 
 `bounded(x, min, max)` applies an exact interval transform to `x`. It
 is a distinct term type from `linear`, not a constrained linear.
@@ -124,9 +124,10 @@ Required options: `min` and `max` (finite, `min < max`).
 ### bounded() priors
 
 `bounded()` accepts one of `prior=`, `target=`+`strength=`, or no
-prior:
+prior option:
 
 ```
+bounded(x, min=-1, max=1)                  # default: prior=shrinkage
 bounded(x, min=0, max=1, prior=uniform)
 bounded(x, min=0, max=1, prior=center)
 bounded(x, min=0, max=1, target=0.5, strength=3)
@@ -134,9 +135,18 @@ bounded(x, min=0, max=1, target=0.5, strength=3)
 
 `prior=` values:
 
-- `none` — flat on the transformed scale, no penalty.
-- `uniform` (aliases `log-jacobian`, `log_jacobian`, `jacobian`) — flat
-  on the original scale, applied as a log-Jacobian correction.
+- `shrinkage` (the default when no prior option is given) — a Gaussian
+  prior on the latent logit coordinate of the interval transform,
+  centred at the null, with its precision estimated by REML like any
+  other smoothing parameter. A coefficient the data do not support is
+  shrunk back to the null. The null is `0` when `min < 0 < max`. When
+  zero lies outside the box it is not an admissible value, and the
+  prior centres at the box midpoint `(min + max) / 2`, the point of the
+  interval map that favours neither bound.
+- `none` — flat on the transformed scale, no penalty: the constrained
+  maximum-likelihood fit.
+- `uniform` — flat on the original scale, applied as a log-Jacobian
+  correction.
 - `center` — `Beta(2, 2)` toward the midpoint.
 
 `target` plus `strength` is shorthand for a Beta prior:
@@ -144,8 +154,8 @@ bounded(x, min=0, max=1, target=0.5, strength=3)
 `z = (target - min) / (max - min)`. `target` must lie strictly between
 `min` and `max`; `strength` must be positive.
 
-`prior=`, `target`/`strength`, and the (legacy) `pull=` shorthand are
-mutually exclusive.
+`prior=` and `target`/`strength` are mutually exclusive. `pull=` is
+refused; use `prior=`.
 
 ## Removing the intercept {#removing-the-intercept}
 
@@ -167,7 +177,7 @@ Removing the intercept therefore removes the constant only when no term
 could represent it. A term that spans the constant keeps the intercept, and
 the model is exactly the one written with it:
 
-- **A fixed factor** — `+ g`, `factor(g)`, `C(g)`, or the main effect of a
+- **A fixed factor** — `+ g`, `factor(g)`, or the main effect of a
   factor `by=` smooth. `0 + g` is `g`: every level keeps its column and its
   REML-estimated ridge. Beside the free intercept that ridge shrinks only the
   contrasts between levels, so the overall level is free and the level
@@ -184,7 +194,7 @@ The column space is the one the formula wrote; the coefficients are
 parametrized as the intercept plus centred effects, and the fit reports an
 inference note naming the term that kept the intercept.
 
-A random effect (`group(g)`, `re(g)`, `s(g, bs="re")`) never spans the
+A random effect (`group(g)`, `s(g, bs="re")`) never spans the
 constant: its levels are mean-zero deviations. When no term spans it, the
 model has no constant at all and every effect passes through the origin,
 exactly as a parametric no-intercept fit does. `y ~ 0 + linear(x,
@@ -199,9 +209,7 @@ support shrinkage.
 
 ```
 y ~ x + group(site)                      # random intercept per level
-y ~ x + re(site)                         # random-intercept alias of group()
 y ~ x + factor(site)                     # same penalized block as bare `+ site`; forces categorical encoding
-y ~ x + C(site)                          # alias of factor(), as in patsy/formulaic
 y ~ s(time, by=treatment) + treatment    # separate smooth per factor level
 y ~ s(time, by=dose)                     # numeric varying-coefficient smooth: f(time)·dose, f keeps its constant
 y ~ s(time, subject, bs="fs")           # partial-pooling random smooths
@@ -211,14 +219,14 @@ y ~ sz(subject, time)                    # alias for bs="sz"
 y ~ group(subject) + s(subject, time, bs="re")  # random intercept + slope
 ```
 
-`group(g)`/`re(g)`/`s(g, bs="re")` add a random intercept per level of the
+`group(g)` and `s(g, bs="re")` add a random intercept per level of the
 grouping column. The column may be string- or integer-valued. Random slopes are
 supported with `s(x, group, bs="re")`, usually paired with `group(group)` for
 random intercepts.
 
 ### How categorical terms are estimated {#factor-terms}
 
-A bare string column (`+ site`), `factor(site)` (alias `C(site)`) and `group(site)` all build
+A bare string column (`+ site`), `factor(site)` and `group(site)` all build
 the same term: one coefficient per level, with a ridge penalty on those
 coefficients whose strength REML estimates along with every other smoothing
 parameter. On the same data the three spellings choose the same smoothing
@@ -230,22 +238,24 @@ They differ in two ways only:
 
 | Spelling | Numeric column | Level unseen in training |
 | --- | --- | --- |
-| `+ site` | used as a numeric slope | `predict` raises `gamfit.errors.GamError`; `check()` reports it |
-| `factor(site)` | forced to categorical levels | `predict` raises `gamfit.errors.GamError`; `check()` reports it |
-| `group(site)`, `re(site)` | forced to categorical levels | predicted at the population level (the level effect is 0) |
+| `+ site` | used as a numeric slope | `predict` raises `gamfit.errors.PredictionError` (a `DataError`); `check()` reports it |
+| `factor(site)` | forced to categorical levels | `predict` raises `gamfit.errors.PredictionError` (a `DataError`); `check()` reports it |
+| `group(site)` | forced to categorical levels | predicted at the population level (the level effect is 0) |
 
 So `factor(year)` treats `year` as levels rather than as a slope, and a
 held-out level is a schema mismatch for `+ site` and `factor(site)` but an
 expected new group for `group(site)`.
 
-`factor()`, `C()`, `group()` and `re()` take no options: the penalty
+`factor()` and `group()` take no options: the penalty
 strength is always estimated, so `factor(site, k=3)` is rejected as an
-unknown option instead of being ignored. A categorical column is also
+unknown option instead of being ignored. `factor(site)` is the only
+spelling of the level effect: `C(site)` is rejected with an error that
+points to `factor(site)`. A categorical column is also
 refused inside a term that treats its inputs as numeric axes (`linear()`,
 `s()`, `te()`, `thinplate()`, `matern()`, cyclic smooths and the other
 non-factor bases): the error points to `factor(site)` or `group(site)` for
-the level effect, or `s(x, site, bs="fs")` for a per-level smooth of a
-numeric `x`.
+the level effect, or `s(x, by=site)` / `fs(x, site)` for a per-level
+smooth of a numeric `x`.
 
 Why estimate the penalty rather than leave the levels unpenalized? The
 penalized estimate is the random-effect (partial-pooling) estimate, and
@@ -265,7 +275,7 @@ y ~ smooth(x)               # alias of s()
 y ~ s(x, k=15)              # basis dimension 15
 y ~ s(x, knots=10)          # 10 interior knots
 y ~ s(x, degree=3, penalty_order=2)
-y ~ s(x, type=ps)           # explicit P-spline
+y ~ s(x, bs=ps)           # explicit P-spline
 y ~ s(x, double_penalty=true)
 y ~ s(x, bc_left=anchored, anchor_left=0)  # known start value and zero start slope
 y ~ s(x, bc=clamped)        # zero slope at both endpoints
@@ -278,17 +288,17 @@ form from the basis. This is a Sobolev penalty on the represented *function*,
 not the classical Eilers–Marx P-spline coefficient-difference penalty
 `‖Δ²β‖²`: the two share a null space (polynomials of degree below
 `penalty_order`) but are different matrices — most visibly on non-uniform
-knots and at the boundary — so `type=ps` names this basis family, not a
+knots and at the boundary — so `bs=ps` names this basis family, not a
 difference-penalty model, and fits are not expected to coincide with a
 difference-penalized P-spline of the same dimension.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `k` (`basis_dim`) | from data | Total basis dimension. |
+| `k` | from data | Total basis dimension. |
 | `knots` | from data | Number of interior knots. Cannot combine with `k`. |
 | `degree` | 3 | Polynomial degree of the B-spline. |
 | `penalty_order` | 2 | Derivative order penalised (1 = slope, 2 = curvature). |
-| `type` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`, `sphere`. |
+| `bs` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`, `sphere`. |
 | `double_penalty` | `true` | Add a null-space ridge penalty alongside the roughness penalty. |
 | `bc` | `none` | Boundary condition for both endpoints: `none`, `clamped` (zero first derivative), or `anchored` (fixed value and zero first derivative). Combine with `side=left`/`right` for half-open smooths. |
 | `bc_left`, `bc_right` | inherit from `bc` | Per-endpoint overrides, with aliases `start_bc`/`end_bc`. |
@@ -314,7 +324,7 @@ and maximum of the fitted column, so the basis — and therefore the fit —
 depends on which rows happened to be sampled. `domain=[lower, upper]`
 declares the interval instead: the clamped boundary knots are placed at
 `lower` and `upper`, generated interior knots are spread over it, and a
-`bs=cr`/`cs` basis puts its end value-knots there. Quantile knot placement
+`bs=cr` basis puts its end value-knots there. Quantile knot placement
 keeps its interior knots at data quantiles and moves only the boundary knots
 to the domain. Explicit interior `knots=[...]` must lie inside it. Two
 samples of different extent inside the same domain therefore build exactly
@@ -355,7 +365,7 @@ token it does not know. `te()`/`ti()` take `none`, `sum_tozero` and
 `duchon()` and the other radial smooths take `none` and
 `orthogonal_to_parametric`.
 
-`cyclic(x, ...)` (aliases `cc`, `cp`) is shorthand for a periodic 1-D
+`cyclic(x, ...)` is shorthand for a periodic 1-D
 B-spline. It accepts the same period declaration two equivalent ways: a
 period length via `period=` (with an optional `origin=` for the domain
 start), or an explicit domain via `period_start=`/`period_end=`. All of
@@ -560,7 +570,7 @@ Radial-basis surface smooth with thin-plate kernel.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `centers` (`k`, `basis_dim`) | auto | Number of radial centres. |
+| `centers` (`k`) | auto | Number of radial centres. |
 | `length_scale` | `1.0` | Global length-scale init. |
 | `double_penalty` | `true` | Ridge + main penalty. |
 | `by`, `identifiability` | — | `identifiability` takes `none` or `orthogonal_to_parametric`; see [univariate smooths](#univariate-smooths). |
@@ -576,7 +586,7 @@ Radial basis with Matérn covariance kernel.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `centers` (`k`, `basis_dim`) | auto | Number of centres. |
+| `centers` (`k`) | auto | Number of centres. |
 | `length_scale` | `1.0` | Global length-scale init. |
 | `nu` | `5/2` | Smoothness, one of `1/2`, `3/2`, `5/2`, `7/2`, `9/2`. |
 | `include_intercept` | `false` | Append a constant column. |
@@ -611,7 +621,7 @@ zero (recover the null by default; opt into overfitting). Scale-free unless
 | --- | --- | --- |
 | `order` (alias `nullspace_order`) | `1` (Linear, affine null space) | Polynomial nullspace order `p`. Polynomial block has `C(d + p, d)` columns (`p=0` → constant only, `p=1` (Linear) → `d+1` columns, `p=2` → `(d+1)(d+2)/2`). Honoured whether or not `power` is also given. |
 | `power` (alias `p`) | cubic default `s = (d−1)/2` | Riesz fractional smoothness `s`. The default gives `φ(r)=r³` in every dimension; an explicit value (e.g. `power=0` → `r²·log r` thin-plate in even `d`) is honored verbatim. |
-| `centers` (`k`, `basis_dim`) | auto | Number of centres. |
+| `centers` (`k`) | auto | Number of centres. |
 | `length_scale` | none (scale-free) | Optional global scale. Without it, the kernel is pure polyharmonic; with it, the kernel is the hybrid Duchon-Matérn (κ = 1/length_scale). |
 | `scale_dims` | `false` | Per-axis **relevance** (ARD by shrinkage): one gradient penalty `Σ(∂f/∂x_a)²` per input axis, each its own REML `λ_a`. REML flattens the surface along axes that don't earn their keep — automatic variable relevance via plain penalties. The kernel metric is held fixed at its knot-geometry init (not separately optimized). |
 | `periodic`, `period`, `period_start`, `period_end` | — | 1-D cyclic Duchon (see below). |
@@ -632,7 +642,7 @@ parameter, and REML deselects unhelpful ones.
 
 Intrinsic S² smooth for latitude/longitude data on a sphere. The default
 implementation uses Wahba/Sobolev spherical spline kernels with radial centers.
-Set `method=harmonic` (or `kernel=harmonic`) for the real spherical-harmonic
+Set `method=harmonic` for the real spherical-harmonic
 engine, which uses harmonics through degree `L`, drops the global constant so
 the ordinary model intercept remains identifiable, and applies a diagonal
 curvature penalty proportional to `[l(l+1)]²` by harmonic degree. Both methods
@@ -641,10 +651,10 @@ the poles.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `kernel` / `method` | `sobolev` | `sobolev`/`wahba`, `pseudo`/`mgcv`/`sos`, or `harmonic`/`spherical_harmonic`/`spherical-harmonic`. |
-| `centers` / `k` / `basis_dim` | auto | Number of Wahba radial centers. For `method=harmonic`, `k` is instead resolved to the smallest `L` with `L(L+2) >= k`. |
+| `method` | `sobolev` | `sobolev`, `pseudo`, or `harmonic`. |
+| `centers` / `k` | auto | Number of Wahba radial centers. For `method=harmonic`, `k` is instead resolved to the smallest `L` with `L(L+2) >= k`. |
 | `degree` / `max_degree` | auto | Harmonic-only maximum spherical harmonic degree `L`; basis width is `L(L+2)`. |
-| `penalty_order` / `m` | `2` | Wahba penalty order. |
+| `penalty_order` | `2` | Wahba penalty order. |
 | `radians` | `false` | Treat latitude/longitude as radians instead of degrees. |
 | `units` | `degrees` | Set `units=radians` as an alias for `radians=true`. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the curvature penalty. |
@@ -652,9 +662,9 @@ the poles.
 ### Specialized smooths (`mjs`, `curv`, `pca`)
 
 Three further radial/geometry smooths share the `s(...)` materialization
-path through a distinct `type=`:
+path through a distinct `bs=`:
 
-- `mjs(...)` (aliases `measurejet`, `measure_jet`, `web`) — measure-jet
+- `mjs(...)` — measure-jet
   spline for a response varying along an unknown low-dimensional set
   inside a higher-dimensional ambient space.
   Its design is a Gaussian representer basis `K(data, centers; ℓ)`, so the
@@ -674,7 +684,7 @@ path through a distinct `type=`:
   against the response and the slope surface's against the conditional
   covariance of the response with the latent driver, which is the function that
   surface actually carries.
-- `curv(...)` (aliases `curvature`, `constant_curvature`, `mkappa`) —
+- `curv(...)` —
   constant-curvature `M_κ` geodesic-kernel smooth, the κ-generic sibling
   of `sphere()` that interpolates `Sᵈ → ℝᵈ → Hᵈ` via `kappa=` (default
   `0`, flat). See [response-geometry.md](response-geometry.md).
@@ -704,16 +714,16 @@ Each requires at least one variable and accepts radial-smooth options
 (`centers`/`k`, `length_scale`, plus their own keys such as `kappa=` for
 `curv`).
 
-### Tensor product (`te`, `tensor`, `interaction`, `ti`) {#periodic-cyclic-smooths}
+### Tensor product (`te`, `ti`) {#periodic-cyclic-smooths}
 
-`te(...)`, `tensor(...)`, and `interaction(...)` build penalized
+`te(...)` builds penalized
 tensor-product B-splines for covariates whose axes have different units
 or scales. Each margin is a 1-D B-spline; REML selects one smoothing
 parameter per margin. The fit and predict paths freeze the margin knots,
 periodicity, and tensor identifiability transform in the saved model, so
 fresh prediction grids use the same tensor basis as training.
 
-`ti(...)` is the tensor-*interaction* form (mgcv `ti`): structurally the
+`ti(...)` is the tensor-*interaction* form: structurally the
 same tensor-product smooth, but the marginal main effects are excluded so
 only the pure interaction is modeled (per-margin sum-to-zero
 identifiability). Use it to add `s(x1) + s(x2) + ti(x1, x2)` as a
@@ -722,15 +732,15 @@ takes the same options as `te(...)`.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `k` (`basis_dim`) | auto, per margin | Basis dim per margin. Scalar `k=20` applies to every margin; list/tuple forms `k=[k1, k2]`, `k=(k1, k2)`, and `k=c(k1, k2)` set per-margin sizes. Per-margin aliases such as `k_x=12, k_time=8` are also accepted. |
+| `k` | auto, per margin | Basis dim per margin. Scalar `k=20` applies to every margin; list/tuple forms `k=[k1, k2]`, `k=(k1, k2)`, and `k=c(k1, k2)` set per-margin sizes. Per-margin aliases such as `k_x=12, k_time=8` are also accepted. |
 | `knots` | auto, per margin | Interior knots per margin. List form accepted. |
 | `degree` | 3 | Polynomial degree. Scalar applies to every margin; list form `degree=[1, 3]` sets them per margin. |
 | `penalty_order` | 2 | Difference-penalty order, same scalar/list forms. |
 | `knot_placement` | cr quantile value-knots | `uniform` or `quantile` knot placement for the margins. |
 | `double_penalty` | `true` | Ridge alongside per-margin penalties. |
-| `bc` | none | Per-margin margin kind. A `periodic` / `cyclic` / `cc` token makes that margin wrap; `clamped` / `open` / `natural` / `free` / `none` all mark an ordinary non-periodic margin (`clamped` here is the *clamped knot vector* of an open spline, not a zero-derivative endpoint pin — for that, use a 1-D `s(x, bc=clamped)` term). `anchored` is rejected. A single token applies to every margin; any other length is an error. |
+| `bc` | none | Per-margin margin kind. A `periodic` token makes that margin wrap; `clamped` / `open` / `natural` / `free` / `none` all mark an ordinary non-periodic margin (`clamped` here is the *clamped knot vector* of an open spline, not a zero-derivative endpoint pin — for that, use a 1-D `s(x, bc=clamped)` term). `anchored` is rejected. A single token applies to every margin; any other length is an error. |
 | `periodic`, `period`, `periods`, `origin`, `origins` | — | Per-margin periodicity (see below). |
-| `bs` (`type`) | `cr` per margin | Margin basis: `tp`/`tps`, `ps`, `bs`, `cr`, `cs`, `cc`. A scalar `bs=ps` applies to every margin; `bs=c('cc', 'ps')` sets them per margin. `te()` is always a tensor product — `bs=` never turns it into a different smooth. |
+| `bs` | `cr` per margin | Margin basis: `tps`, `ps`, `bs`, `cr`, `cyclic`. A scalar `bs=ps` applies to every margin; `bs=c('cyclic', 'ps')` sets them per margin. `te()` is always a tensor product — `bs=` never turns it into a different smooth. |
 | `domain` | data range, per margin | One `[lower, upper]` interval (or `none`) per margin: `domain=[[0, 1], none]`. See [Fixing the spline's interval](#spline-domain). |
 | `by` | — | See [univariate smooths](#univariate-smooths). |
 | `identifiability` | `sum_tozero` (`te`), `marginal_sum_tozero` (`ti`) | `none`, `sum_tozero`, or `marginal_sum_tozero`. |

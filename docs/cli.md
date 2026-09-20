@@ -15,6 +15,7 @@ gam --help
 | `gam fit DATA FORMULA --out MODEL` | Fit and save a model. |
 | `gam predict MODEL NEW_DATA --out PREDICTIONS.csv` | Predict from a saved model. |
 | `gam diagnose MODEL DATA` | Compute approximate leave-one-out diagnostics. |
+| `gam partial-effect MODEL --term TERM [--out effect.csv]` | One term's partial effect with pointwise and simultaneous bands; see [partial-effects.md](partial-effects.md#cli). |
 | `gam sample MODEL DATA [--out posterior.csv]` | Draw posterior coefficients. |
 | `gam generate MODEL DATA [--out generated.csv]` | Draw synthetic responses from a fitted model. |
 | `gam summary MODEL` | Print the model's text summary (the same text as `print(model.summary())`). |
@@ -92,7 +93,7 @@ gam predict model.gam new.csv --out predictions.csv --conformal --calibration he
 | `--uncertainty` | Include uncertainty columns where the model supports them. |
 | `--level VALUE` | Coverage for uncertainty or conformal intervals; default `0.95`. |
 | `--conformal` | Standard models: replace the posterior band with a distribution-free conformal band. Needs exactly one of `--training-data` or `--calibration`. |
-| `--training-data FILE` | With `--conformal`: the exact full-conformal set of a Gaussian-identity fit at its frozen smoothing parameters, over these labeled rows (normally the training table; must include the response column). The saved model keeps only the `p x p` frozen penalty, never per-row training data. Adds a per-row `frozen_rho_certified` column; the finite-sample coverage theorem holds where that column is 1. |
+| `--training-data FILE` | With `--conformal`: the full-conformal set of a Gaussian-identity fit that re-selects its smoothing strength by REML on these labeled rows plus the candidate test row (normally the training table; must include the response column). The saved model keeps only the `p x p` frozen penalty and its smoothing-parameter count, never per-row training data. Adds a per-row `conformal_certificate` column: the finite-sample coverage theorem holds where it is `0` (exact_frozen) or `1` (honest_refit); a negative code is a typed refusal carrying the frozen-smoothing set. |
 | `--calibration FILE` | With `--conformal`: the split-conformal band calibrated on this held-out labeled table, which must include the response column; any standard family. |
 | `--covariance-mode conditional|corrected` | Conditional covariance or smoothing-corrected covariance. Absent, the definition the saved fit publishes (the one `gam summary` prices its standard errors from) is used and labeled; naming one is a requirement that refuses when the fit cannot supply it. |
 | `--id-column COLUMN` | Carry an identifier column into the prediction CSV. |
@@ -104,8 +105,9 @@ no mode that swaps one for the other. Standard and location-scale mean models
 write `linear_predictor_plugin`, `mean_plugin`, and `posterior_mean`;
 location-scale models that expose a fitted response-side scale add
 `noise_scale`. With `--uncertainty`, the posterior columns are
-`posterior_mean_standard_error`, `posterior_mean_lower`, and
-`posterior_mean_upper`. Survival predictions write `eta`,
+`linear_predictor_standard_error` (posterior SD of η),
+`posterior_mean_standard_error` (posterior SD of the response),
+`posterior_mean_lower`, and `posterior_mean_upper`. Survival predictions write `eta`,
 `survival_prob_plugin` (the plug-in `S(η̂)`), `survival_prob` (the posterior
 mean `E[S(η)]`), `failure_prob`, and `risk_score`, plus `std_error`,
 `mean_lower`, and `mean_upper` with `--uncertainty`. Transformation-normal and

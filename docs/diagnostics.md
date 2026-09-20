@@ -190,6 +190,28 @@ a penalized fit is biased, and its shrinkage bias lives entirely inside the span
 of the fitted design, so projecting it out makes the test blind to "λ is large"
 and sensitive only to structure the design *cannot represent at all*.
 
+For a Gaussian response the score is exactly normal and the `χ²`/`F` reference
+is exact. For a canonical binomial (logit) or Poisson (log) fit it is only first
+order, and at small `n` it is visibly off (on `n = 200` binomial rows it was
+conservative: size `0.032` at `0.05`, which is as much a miscalibration as an
+anti-conservative test). There the score is evaluated at the unpenalized null
+MLE and referred to its law **conditional on the sufficient statistic**
+`Xᵀ(w∘y)`, which does not depend on the nuisance coefficients at all; its mean,
+covariance and fourth cumulant are corrected to `O(1/n)`. Where that expansion
+leaves its range of validity — high-leverage rows at an extreme fitted mean —
+the row reports `provenance = "conditional_reference_unavailable"` and no
+`p_value` (about 7% of null replicates of a default `s(x)` binomial fit at
+`n = 200`; none at `n = 2000`). `"null_fit_unavailable"` means the null MLE
+itself could not be certified. The refused share grows as events get rarer:
+15–19% of `n = 200` rows at Poisson means or success probabilities around
+`0.1–1`, and two-thirds with 28–34 expected events in 200 rows. In that
+last regime the p-values that are reported are **not calibrated** (Poisson:
+size `0.030` at `0.05`, KS `p = 2e-4` against uniformity); treat them as
+unmeasured. The conditional law reads prior weights as frequency weights (as
+the likelihood does), and its calibration was measured on designs of about 10
+columns; much wider designs are tested on a row sample capped by the
+reference's cost, a regime that has not been measured.
+
 Asking whether a direction the basis HAS is being over-smoothed is a
 smoothing-parameter question, and this report declines to answer it. It is also
 conditional on the fitted `λ̂` and on the alternative, exactly as the `summary()`
@@ -323,16 +345,15 @@ train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
 model = gamfit.fit(train_df, "y ~ s(x)")
 
 fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-model.plot(train_df, x="x", kind="prediction",            ax=axes[0])
-model.plot(train_df, x="x", kind="residuals",             ax=axes[1])
-model.plot(train_df, x="x", kind="observed_vs_predicted", ax=axes[2])
+model.plot(train_df, kind="prediction",            ax=axes[0])
+model.plot(train_df, kind="residuals",             ax=axes[1])
+model.plot(train_df, kind="observed_vs_predicted", ax=axes[2])
 plt.tight_layout()
 ```
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `data` | required | Held-out data, with the response column present (same requirements as `diagnose`). |
-| `x` | inferred | Feature column to put on the x-axis for `"prediction"`. Inferred when there is exactly one non-response column. |
 | `y` | `None` | Response column override. |
 | `interval` | `0.95` | Wald-band coverage for `"prediction"`. Ignored for the other kinds. |
 | `kind` | `"prediction"` | One of `"prediction"`, `"residuals"`, `"observed_vs_predicted"`. |
@@ -340,12 +361,15 @@ plt.tight_layout()
 
 | `kind` | Contents |
 | --- | --- |
-| `"prediction"` | Sorted mean curve over `x`, shaded Wald band when `interval` is set, observed scatter overlay. |
+| `"prediction"` | For a model with one feature column: the mean curve over it, shaded Wald band when `interval` is set, observed scatter overlay. |
 | `"residuals"` | Residuals vs predicted mean with a horizontal zero line. |
 | `"observed_vs_predicted"` | Observed vs predicted with a `y = x` reference line. |
 
 Returns the `matplotlib.axes.Axes` drawn on. Raises `ValueError` for
-unknown `kind`, ambiguous `x`, or a missing `x` column. Requires
+unknown `kind`, or for `"prediction"` on data with more than one feature
+column: the full model's prediction sorted by one column zigzags through the
+others' values. Per-term curves are partial effects; draw them with
+`model.plot_terms()` (see [partial-effects.md](partial-effects.md)). Requires
 matplotlib (install `gamfit[plot]`).
 
 ## report()

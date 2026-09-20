@@ -131,7 +131,6 @@ fn build_production_seed(z: &Array2<f64>) -> (SaeManifoldTerm, SaeManifoldRho) {
         top_k: None,
         threshold: 0.0,
         seed_refine_routing: minimal.refine_routing,
-        seed_refine_random_state: 0,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
         fisher_metric: None,

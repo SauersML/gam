@@ -34,9 +34,7 @@ def _block_oracle(model, term, grid, level):
     """``X_t beta_t`` and ``sqrt(diag(X_t V_t X_t^T))`` at ``g = level``."""
     summary = model.summary()
     beta = np.asarray([c["estimate"] for c in summary.coefficients], dtype=float)
-    cov = np.asarray(summary.covariance_flat, dtype=float).reshape(
-        summary.covariance_n, summary.covariance_n
-    )
+    cov = summary.covariance
     block = next(b for b in model.term_blocks if b.name == term)
     frame = pd.DataFrame({"x": grid, "g": [level] * grid.size})
     design = np.asarray(model.design_matrix(frame).matrix, dtype=float)
@@ -54,14 +52,14 @@ def _assert_block_curve(levels):
     assert term in names, f"expected block {term!r}; available: {names}"
 
     result = model.partial_dependence(term, n_points=25)
-    assert result["held"] == {"g": levels[0]}
-    assert result["quantity"] == "term_contribution"
-    assert result["scale"] == "linear_predictor"
+    assert result.held == {"g": levels[0]}
+    assert result.quantity == "term_contribution"
+    assert result.scale == "linear_predictor"
 
-    predicted = np.asarray(result["predicted"], dtype=float)
-    se = np.asarray(result["standard_error"], dtype=float)
+    predicted = result.fit
+    se = result.se
     expected, expected_se = _block_oracle(
-        model, term, np.asarray(result["grid"], dtype=float), levels[0]
+        model, term, result.x, levels[0]
     )
     np.testing.assert_allclose(predicted, expected, atol=1e-10)
     np.testing.assert_allclose(se, expected_se, atol=1e-10)

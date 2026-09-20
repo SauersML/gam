@@ -83,11 +83,11 @@ def test_the_latent_coordinate_fit_refuses_an_isometry_penalty_by_name() -> None
     y = np.sin(2.0 * t0[:, 0]) + 0.1 * rng.normal(size=n)
 
     with pytest.raises(
-        gamfit.errors.GamError, match="supplies no decoder jets for an isometry penalty"
+        gamfit.errors.GamfitError, match="supplies no decoder jets for an isometry penalty"
     ):
         gamfit.fit(
             pd.DataFrame({"y": y}),
-            "y ~ s(t, type='duchon', centers=12)",
+            "y ~ s(t, bs='duchon', centers=12)",
             family="gaussian",
             latents={
                 "t": gamfit.smooth.LatentCoord(

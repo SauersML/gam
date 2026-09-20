@@ -17,7 +17,7 @@ use gam_report::{
     CriterionStationarityRow, EdfBlockRow, MeasureJetSpectrumRow, ReportInput,
     SmoothingForensicsRow,
 };
-use gam_solve::estimate::UnifiedFitResult;
+use gam_solve::estimate::{SmoothPValueUnavailable, UnifiedFitResult};
 use gam_terms::smooth::TermCollectionSpec;
 use ndarray::Array2;
 use serde::Serialize;
@@ -114,149 +114,6 @@ fn representative_data_from_ranges(
     data
 }
 
-/// Dense, space-filling reconstruction of the training inputs for the Wald
-/// design-whitening Gram (#2142). Denser than `representative_data_from_ranges`
-/// so a high-basis univariate smooth gets a full-rank Gram, and with each
-/// continuous column swept in an independent coprime order so multivariate
-/// (tensor) margins are not collinear on the diagonal — the shared-ramp
-/// representative grid samples only the diagonal line and would make every
-/// tensor Gram rank-deficient. `rows` is forced to a power of two so every odd
-/// per-column stride is coprime to it and therefore traverses the full
-/// evenly-spaced grid. Categorical columns keep cycling their frozen levels.
-fn whitening_data_from_ranges(
-    ranges: &[(f64, f64)],
-    factor_levels: &std::collections::BTreeMap<usize, Vec<u64>>,
-    rows: usize,
-) -> Array2<f64> {
-    let rows = rows.max(2);
-    let n_cols = ranges.len();
-    let mut data = Array2::<f64>::zeros((rows, n_cols));
-    for (col, &(lo, hi)) in ranges.iter().enumerate() {
-        if let Some(lv) = factor_levels.get(&col) {
-            if !lv.is_empty() {
-                for row in 0..rows {
-                    data[[row, col]] = f64::from_bits(lv[row % lv.len()]);
-                }
-                continue;
-            }
-        }
-        let (lo, hi) = if lo.is_finite() && hi.is_finite() && hi >= lo {
-            (lo, hi)
-        } else {
-            (0.0, 1.0)
-        };
-        // Odd stride is coprime to the power-of-two `rows`, so `(row*stride) %
-        // rows` is a full-period permutation of the evenly-spaced grid — a
-        // different one per column, breaking the diagonal collinearity.
-        let stride = 2 * col + 1;
-        for row in 0..rows {
-            let idx = row.wrapping_mul(stride) % rows;
-            let frac = idx as f64 / (rows - 1) as f64;
-            data[[row, col]] = lo + frac * (hi - lo);
-        }
-    }
-    data
-}
-
-/// Reconstruct the design-whitening Gram `X'X` for the summary Wald smooth test
-/// from the frozen basis (#2142). The persisted summary path drops the fit's
-/// inference block, so the exact weighted Gram `X'WX` is gone; mgcv itself
-/// whitens the Wood (2013) statistic with the *unweighted* prediction-matrix
-/// Gram, so `X'X` at representative inputs is the intended object (and it
-/// reduces to `X'WX` for the Gaussian identity case). Returns the full `p×p`
-/// Gram in the trained coefficient layout, or `None` when the rebuilt design's
-/// column count does not match the trained coefficient count — a stale/mismatched
-/// spec, in which case the test falls back to the un-whitened raw covariance.
-fn summary_whitening_gram(
-    spec: &gam_terms::smooth::TermCollectionSpec,
-    ranges: &[(f64, f64)],
-    factor_levels: &std::collections::BTreeMap<usize, Vec<u64>>,
-    expected_ncols: usize,
-) -> Option<Array2<f64>> {
-    if expected_ncols == 0 {
-        return None;
-    }
-    let rows = (4 * expected_ncols).max(64).next_power_of_two();
-    let data = whitening_data_from_ranges(ranges, factor_levels, rows);
-    let design = gam_terms::smooth::build_term_collection_design(data.view(), spec).ok()?;
-    let x = design.design.to_dense();
-    if x.ncols() != expected_ncols {
-        return None;
-    }
-    // Lower triangle of `X'X` is the true Gram; the whitening eigendecomposition
-    // reads only that side, so no explicit symmetrization is needed.
-    Some(x.t().dot(&x))
-}
-
-#[cfg(test)]
-mod whitening_gram_tests {
-    //! Direct tests of the #2142 design-whitening-Gram reconstruction grid used
-    //! when a summary is built from an inference-stripped (compact) model. The
-    //! whitening math itself is covered by `gam-terms` `smooth_test` tests; here
-    //! we only verify the reconstruction *inputs* are non-degenerate.
-    use super::whitening_data_from_ranges;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn dense_grid_spans_range_and_breaks_diagonal_collinearity() {
-        let ranges = [(0.0_f64, 1.0_f64), (-2.0, 4.0)];
-        let levels = BTreeMap::new();
-        let data = whitening_data_from_ranges(&ranges, &levels, 64);
-        assert_eq!(data.nrows(), 64);
-        assert_eq!(data.ncols(), 2);
-        // Each continuous column sweeps its full [lo, hi] range.
-        for (c, &(lo, hi)) in ranges.iter().enumerate() {
-            let col = data.column(c);
-            let cmin = col.iter().cloned().fold(f64::INFINITY, f64::min);
-            let cmax = col.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            assert!((cmin - lo).abs() < 1e-9, "col {c} min {cmin} != {lo}");
-            assert!((cmax - hi).abs() < 1e-9, "col {c} max {cmax} != {hi}");
-        }
-        // The shared-ramp representative grid puts both columns on the same
-        // diagonal (Pearson r == 1), collapsing every tensor Gram. The
-        // independent coprime sweeps must break that: |r| strictly below 1.
-        let c0 = data.column(0);
-        let c1 = data.column(1);
-        let m0 = c0.mean().unwrap();
-        let m1 = c1.mean().unwrap();
-        let (mut cov, mut v0, mut v1) = (0.0, 0.0, 0.0);
-        for i in 0..64 {
-            let (a, b) = (c0[i] - m0, c1[i] - m1);
-            cov += a * b;
-            v0 += a * a;
-            v1 += b * b;
-        }
-        let r = cov / (v0.sqrt() * v1.sqrt());
-        assert!(
-            r.abs() < 0.9,
-            "columns must not be collinear (diagonal grid), got r={r}"
-        );
-    }
-
-    #[test]
-    fn categorical_columns_cycle_every_frozen_level() {
-        let ranges = [(0.0_f64, 1.0_f64), (0.0, 0.0)];
-        let mut levels = BTreeMap::new();
-        let lv = vec![1.0_f64.to_bits(), 2.0_f64.to_bits(), 3.0_f64.to_bits()];
-        levels.insert(1usize, lv.clone());
-        let data = whitening_data_from_ranges(&ranges, &levels, 64);
-        let allowed: Vec<f64> = lv.iter().map(|&b| f64::from_bits(b)).collect();
-        for i in 0..64 {
-            let v = data[[i, 1]];
-            assert!(
-                allowed.iter().any(|&a| a == v),
-                "row {i} value {v} is not a frozen level"
-            );
-        }
-        for &a in &allowed {
-            assert!(
-                (0..64).any(|i| data[[i, 1]] == a),
-                "frozen level {a} never appears"
-            );
-        }
-    }
-}
-
 /// Build the mgcv-style per-smooth significance table for the FFI summary.
 ///
 /// This is marshalling, not a second summary: the table comes from
@@ -264,8 +121,9 @@ mod whitening_gram_tests {
 /// fit's penalty layout that the in-process CLI summary also uses (#2470).
 /// Random-effect blocks get the variance-component score test the fit recorded
 /// (`FitArtifacts::random_effect_tests`, scored against its exact boundary null
-/// law, not a Wald χ²), and penalized smooth terms get the Wood (2013)
-/// rank-truncated Wald statistic and p-value.
+/// law, not a Wald χ²), and penalized smooth terms get the variance-component
+/// score test read off the fit's exact curvature, or the typed reason it cannot
+/// be computed.
 ///
 /// The "Mirrors `main.rs::build_model_summary`'s smooth-term loop" this
 /// sentence used to open with was accurate and was the problem: a comment
@@ -282,18 +140,50 @@ mod whitening_gram_tests {
 /// The replay failure in particular used to be swallowed to an empty vector,
 /// which is how a categorical main effect erased every co-fitted `s(x)` row
 /// (#2787): the table looked exactly like "no smooth terms".
-fn summary_smooth_terms(
+///
+/// The parametric rows come from the same replayed designs, through
+/// `gam_solve::estimate::parametric_term_summary_rows`, which the CLI summary
+/// also calls. They need each design's intercept and linear-term column ranges
+/// but not the per-penalty record, so a smoothing-parameter layout mismatch
+/// voids only the smooth table.
+fn summary_term_tables(
     model: &FittedModel,
     fit: &gam_solve::estimate::UnifiedFitResult,
-) -> Result<Vec<SummarySmoothTermRow>, String> {
+) -> SummaryTermTables {
+    let replayed = summary_training_ranges(model).and_then(|ranges| {
+        summary_predictor_blocks(model, fit)?
+            .into_iter()
+            .map(|predictor| replay_predictor(predictor, ranges))
+            .collect::<Result<Vec<_>, String>>()
+    });
+    match replayed {
+        Ok(predictors) => SummaryTermTables {
+            parametric: Ok(predictors
+                .iter()
+                .flat_map(|predictor| parametric_rows(predictor, fit))
+                .collect()),
+            smooth: predictors
+                .iter()
+                .map(|predictor| predictor_block_smooth_terms(predictor, fit))
+                .collect::<Result<Vec<_>, String>>()
+                .map(|tables| tables.into_iter().flatten().collect()),
+        },
+        Err(reason) => SummaryTermTables {
+            parametric: Err(reason.clone()),
+            smooth: Err(reason),
+        },
+    }
+}
+
+/// The two term tables of a summary, each with the reason it is absent.
+struct SummaryTermTables {
+    parametric: Result<Vec<SummaryParametricTermRow>, String>,
+    smooth: Result<Vec<SummarySmoothTermRow>, String>,
+}
+
+/// The saved training feature ranges every predictor's replay reads.
+fn summary_training_ranges(model: &FittedModel) -> Result<&[(f64, f64)], String> {
     let payload = model.payload();
-    let Some(spec) = payload.resolved_termspec.as_ref() else {
-        return Err("model was saved without `resolved_termspec`; refit to recover the \
-                    per-smooth table"
-            .to_string());
-    };
-    spec.validate_frozen("resolved_termspec")
-        .map_err(|err| format!("saved `resolved_termspec` failed validation: {err}"))?;
     let Some(ranges) = payload.training_feature_ranges.as_ref() else {
         return Err("model was saved without training feature ranges; refit to recover the \
                     per-smooth table"
@@ -311,60 +201,217 @@ fn summary_smooth_terms(
             headers.len()
         ));
     }
+    Ok(ranges.as_slice())
+}
+
+/// One predictor the per-smooth table presents: its frozen spec, and where its
+/// block sits in the fit's flat coefficient and penalty layouts.
+struct SummaryPredictorBlock<'a> {
+    /// The predictor's name on each of its rows, `None` for a single-predictor
+    /// fit, whose rows need no qualifier.
+    predictor: Option<&'static str>,
+    spec: &'a TermCollectionSpec,
+    /// The payload field `spec` was read from, for the absence reasons.
+    spec_field: &'static str,
+    offset: gam_solve::estimate::SummaryBlockOffset,
+    /// The fit block whose coefficient and λ counts the replay must reproduce;
+    /// `None` when `saved_lambdas_index_rebuilt_layout` owns that check.
+    block: Option<&'a gam_solve::estimate::FittedBlock>,
+}
+
+impl SummaryPredictorBlock<'_> {
+    /// How an absence reason names this predictor.
+    fn label(&self) -> String {
+        match self.predictor {
+            Some(predictor) => format!("{predictor} predictor (`{}`)", self.spec_field),
+            None => format!("`{}`", self.spec_field),
+        }
+    }
+}
+
+/// The predictors a saved fit's per-smooth table walks, in the fit's block
+/// order.
+///
+/// A Bernoulli marginal-slope fit has two formulas, and each owns one block of
+/// the fit: the marginal surface (the Location block, built from
+/// `resolved_termspec`) and the slope surface (the Scale block, built from
+/// `resolved_slopespec`). Each is replayed from its own spec and read against
+/// its own λ slice and coefficient offset (#2997). Replaying the marginal spec
+/// alone against every block's λ is what refused the table for every such
+/// model as a stale save. Blocks with no formula of their own (a score-warp or
+/// link-deviation flex block) own λ and coefficients but no summary rows; they
+/// still advance the offsets of the blocks after them.
+///
+/// Every other fit presents its single mean (or location) predictor from
+/// `resolved_termspec` at the start of the layout.
+fn summary_predictor_blocks<'a>(
+    model: &'a FittedModel,
+    fit: &'a gam_solve::estimate::UnifiedFitResult,
+) -> Result<Vec<SummaryPredictorBlock<'a>>, String> {
+    use gam_solve::estimate::{BlockRole, SummaryBlockOffset};
+    let payload = model.payload();
+    let frozen = |spec: Option<&'a TermCollectionSpec>, field: &'static str| {
+        let spec = spec.ok_or_else(|| {
+            format!("model was saved without `{field}`; refit to recover the per-smooth table")
+        })?;
+        spec.validate_frozen(field)
+            .map_err(|err| format!("saved `{field}` failed validation: {err}"))?;
+        Ok::<_, String>(spec)
+    };
+    if !matches!(payload.family_state, FittedFamily::MarginalSlope { .. }) {
+        return Ok(vec![SummaryPredictorBlock {
+            predictor: None,
+            spec: frozen(payload.resolved_termspec.as_ref(), "resolved_termspec")?,
+            spec_field: "resolved_termspec",
+            offset: SummaryBlockOffset::default(),
+            block: None,
+        }]);
+    }
+    let mut predictors = Vec::new();
+    let mut offset = SummaryBlockOffset::default();
+    for block in &fit.blocks {
+        let formula = match block.role {
+            BlockRole::Location => Some(("marginal", payload.resolved_termspec.as_ref(), "resolved_termspec")),
+            BlockRole::Scale => Some(("slope", payload.resolved_slopespec.as_ref(), "resolved_slopespec")),
+            _ => None,
+        };
+        if let Some((predictor, spec, spec_field)) = formula {
+            predictors.push(SummaryPredictorBlock {
+                predictor: Some(predictor),
+                spec: frozen(spec, spec_field)
+                    .map_err(|reason| format!("{predictor} predictor: {reason}"))?,
+                spec_field,
+                offset,
+                block: Some(block),
+            });
+        }
+        offset.coefficients += block.beta.len();
+        offset.penalties += block.lambdas.len();
+    }
+    if offset.coefficients != fit.beta.len() || offset.penalties != fit.lambdas.len() {
+        return Err(format!(
+            "the saved fit's blocks hold {} coefficients and {} smoothing parameters but its \
+             flat layout has {} and {}, so no block's offset is known",
+            offset.coefficients,
+            offset.penalties,
+            fit.beta.len(),
+            fit.lambdas.len()
+        ));
+    }
+    for (predictor, role) in [("marginal", BlockRole::Location), ("slope", BlockRole::Scale)] {
+        if !predictors.iter().any(|block| block.predictor == Some(predictor)) {
+            return Err(format!(
+                "{predictor} predictor: the saved marginal-slope fit has no {} block",
+                role.name()
+            ));
+        }
+    }
+    Ok(predictors)
+}
+
+/// One predictor's frozen basis replayed at representative inputs: the design
+/// whose column layout both of its term tables read.
+struct ReplayedPredictor<'a> {
+    predictor: SummaryPredictorBlock<'a>,
+    design: gam_terms::smooth::TermCollectionDesign,
+}
+
+fn replay_predictor<'a>(
+    predictor: SummaryPredictorBlock<'a>,
+    ranges: &'a [(f64, f64)],
+) -> Result<ReplayedPredictor<'a>, String> {
     // Every categorical column — including a fixed main effect represented by
     // a frozen random-effect block — must carry a valid saved level or the
     // design rebuild fails. That failure was swallowed to an EMPTY table for
     // the whole model, erasing co-fitted `s(x)` rows too (#1370/#2787).
     // Synthesize representative data from the term collection's authoritative
     // factor vocabulary so every categorical carrier replays coherently.
-    let factor_levels = spec.frozen_factor_levels_by_col();
+    let factor_levels = predictor.spec.frozen_factor_levels_by_col();
     let data = representative_data_from_ranges(ranges, &factor_levels);
-    let design = gam_terms::smooth::build_term_collection_design(data.view(), spec)
-        .map_err(|err| format!("frozen-basis design replay failed: {err}"))?;
+    let design = gam_terms::smooth::build_term_collection_design(data.view(), predictor.spec)
+        .map_err(|err| format!("{}: frozen-basis design replay failed: {err}", predictor.label()))?;
+    Ok(ReplayedPredictor { predictor, design })
+}
+
+fn parametric_rows(
+    replayed: &ReplayedPredictor<'_>,
+    fit: &UnifiedFitResult,
+) -> Vec<SummaryParametricTermRow> {
+    let predictor = &replayed.predictor;
+    gam_solve::estimate::parametric_term_summary_rows(
+        &replayed.design,
+        predictor.spec,
+        fit,
+        predictor.offset,
+    )
+    .into_iter()
+    .map(|row| SummaryParametricTermRow {
+        name: row.name,
+        predictor: predictor.predictor,
+        estimate: row.estimate,
+        std_error: row.std_error,
+        statistic: row.statistic,
+        p_value: row.pvalue,
+    })
+    .collect()
+}
+
+/// The per-smooth rows of one predictor, read off its replayed design.
+fn predictor_block_smooth_terms(
+    replayed: &ReplayedPredictor<'_>,
+    fit: &UnifiedFitResult,
+) -> Result<Vec<SummarySmoothTermRow>, String> {
+    let predictor = &replayed.predictor;
+    let spec = predictor.spec;
+    let design = &replayed.design;
+    let label = predictor.label();
     // The walk below reads the fit's per-penalty record by the rebuilt layout's
     // global index, so a rebuild with another block count would misread it.
-    crate::inference::model::saved_lambdas_index_rebuilt_layout(
-        spec,
-        design.penalties.len(),
-        fit,
-        "per-smooth summary",
-    )?;
+    match predictor.block {
+        None => crate::inference::model::saved_lambdas_index_rebuilt_layout(
+            spec,
+            design.penalties.len(),
+            fit,
+            "per-smooth summary",
+        )?,
+        Some(block) => {
+            if design.design.ncols() != block.beta.len()
+                || design.penalties.len() != block.lambdas.len()
+            {
+                return Err(format!(
+                    "{label}: the rebuilt design has {} coefficients and {} penalty blocks but \
+                     the fit's {} block has {} coefficients and {} smoothing parameters",
+                    design.design.ncols(),
+                    design.penalties.len(),
+                    block.role.name(),
+                    block.beta.len(),
+                    block.lambdas.len()
+                ));
+            }
+        }
+    }
 
-    // Wood (2013) design-whitening metric for the Wald smooth test (#2142).
-    // Prefer the fit's exact weighted Gram `X'WX` when the inference block
-    // survived; on the persisted summary path (inference dropped) reconstruct
-    // the unweighted `X'X` from the frozen basis. `None` → un-whitened fallback.
-    let reconstructed_gram = if fit.weighted_gram().is_none() {
-        summary_whitening_gram(spec, ranges, &factor_levels, design.design.ncols())
-    } else {
-        None
-    };
-    let whitening_gram_full: Option<&Array2<f64>> =
-        fit.weighted_gram().or(reconstructed_gram.as_ref());
     // The walk over the fit's flat penalty layout — the `LinearTermRidge`
     // prologue, the random-effect blocks that own no entry, the block-local →
-    // global coefficient shift, the per-term influence trace, and the Wood test
-    // with its reference distribution — is ONE accounting, shared with the
+    // global coefficient shift, the per-term influence trace, and the smooth
+    // test with its reference distribution — is ONE accounting, shared with the
     // in-process CLI summary (#2470). Both surfaces spelled it out, so #1219,
-    // #1277, #1360, #1368 and #1372 each had to be landed twice; the comment
-    // this replaces recorded its own copy of #1368 as "fixed on the in-process
-    // path but never propagated here". What genuinely differs on this persisted
-    // path is the EVIDENCE — a frozen-basis replay instead of the training
-    // design, so the whitening Gram is reconstructed rather than exact — and
-    // that is the only thing handed over. Both reference-distribution inputs
-    // (`wald_residual_degrees_of_freedom`, `wald_scale_is_estimated`) are read
-    // off the fit inside that walk, which is where `fd998d957` put them.
-    let rows =
-        gam_solve::estimate::smooth_term_summary_rows(&design, spec, fit, whitening_gram_full);
+    // #1277, #1360, #1368 and #1372 each had to be landed twice. Every fitted
+    // quantity the test reads comes from `fit`; the frozen-basis replay supplies
+    // only the term structure.
+    let rows = gam_solve::estimate::smooth_term_summary_rows(design, fit, predictor.offset);
     Ok(rows
         .into_iter()
         .map(|row| SummarySmoothTermRow {
             name: row.name,
+            predictor: predictor.predictor,
             edf: row.edf,
             ref_df: row.ref_df,
             chi_sq: row.chi_sq,
             p_value: row.pvalue,
-            p_value_unavailable: row.pvalue_unavailable.map(|reason| reason.label()),
+            lambdas: row.lambdas,
+            edf_rank_bound: row.edf_rank_bound,
+            p_value_unavailable: row.pvalue_unavailable,
         })
         .collect())
 }
@@ -390,12 +437,13 @@ fn summary_curvature_estimands(model: &FittedModel) -> Vec<SummaryCurvatureRow> 
         if !cc.kappa.is_finite() {
             continue;
         }
-        // Sign-of-κ̂ point tag. The flatness band is a fixed, small absolute
-        // window on the curvature scale — a screening label only; the
-        // statistically-honest "flat vs curved" call is the κ = 0 LR test.
-        let geometry = if cc.kappa > 1e-6 {
+        // Sign-of-κ̂ point tag, read off the exact sign. κ carries units of
+        // inverse squared length, so any fixed band around zero would move
+        // with the latent scale; the "flat vs curved" call belongs to the
+        // κ = 0 LR test, not to this label.
+        let geometry = if cc.kappa > 0.0 {
             "spherical"
-        } else if cc.kappa < -1e-6 {
+        } else if cc.kappa < 0.0 {
             "hyperbolic"
         } else {
             "flat"
@@ -486,6 +534,10 @@ pub fn scan_smooth_label(scan: &ScanIntrospection) -> String {
     format!("s({})", scan.feature_column)
 }
 
+/// A scan fit keeps no response vector, so its intercept-only deviance is gone.
+const SCAN_RECORDS_NO_NULL_DEVIANCE: &str =
+    "the O(n) spline-scan route records no intercept-only deviance";
+
 /// Build the canonical FFI summary payload for a scan-routed model (#1046):
 /// scalar fitted quantities plus a one-row smooth table keyed on EDF. The
 /// parametric coefficient block is empty (the smoother absorbs the polynomial
@@ -497,6 +549,7 @@ fn scan_summary_payload(
 ) -> Result<SummaryPayload, String> {
     let smooth_terms = vec![SummarySmoothTermRow {
         name: scan_smooth_label(scan),
+        predictor: None,
         edf: scan.edf,
         ref_df: scan.edf,
         // The rank-truncated Wald smooth test needs the joint coefficient
@@ -504,11 +557,14 @@ fn scan_summary_payload(
         // as `summary.gam` does for terms whose Wald test is unavailable.
         chi_sq: None,
         p_value: None,
+        lambdas: vec![scan.lambda],
+        edf_rank_bound: None,
         p_value_unavailable: None,
     }];
     Ok(SummaryPayload {
         formula: model.payload().formula.clone(),
         family_name: model.display_family_name(),
+        link: model.likelihood().link.name().to_string(),
         model_class: prediction_model_class_label(model),
         group_metadata: model.payload().group_metadata.clone(),
         deployment_extensions: model.payload().deployment_extensions.clone(),
@@ -520,6 +576,10 @@ fn scan_summary_payload(
         // row.
         basis_checks: summary_basis_checks(model),
         deviance: scan.deviance,
+        null_deviance: None,
+        deviance_explained: None,
+        deviance_explained_unavailable: Some(SCAN_RECORDS_NO_NULL_DEVIANCE),
+        adjusted_r_squared: None,
         scale: Some(scan.sigma2),
         log_likelihood: Some(scan.log_likelihood),
         n_obs: Some(scan.training_sample_size),
@@ -539,6 +599,9 @@ fn scan_summary_payload(
         information_criteria: scan_information_criteria(scan)?,
         lambdas: vec![scan.lambda],
         coefficients: Vec::new(),
+        parametric_statistic: None,
+        parametric_terms: Vec::new(),
+        parametric_terms_unavailable: None,
         smooth_terms,
         smooth_terms_unavailable: None,
         covariance_kind: None,
@@ -632,6 +695,12 @@ pub const NO_AIC_AT_EXACT_FIT: &str =
     "the fit interpolates the response exactly (zero dispersion), so it has no \
      normalized log-likelihood and no AIC";
 
+/// Why a fit that retained no inference record reports no AIC: both criteria
+/// charge the conditional EDF `tr(F)`, which only that record carries.
+pub const NO_AIC_WITHOUT_A_RETAINED_EDF: &str =
+    "the fit retained no inference record, so it has no conditional EDF for the AIC \
+     to charge";
+
 /// The information criteria a model summary publishes (#946, slop G2).
 ///
 /// Both AICs are formed by the single owner
@@ -708,6 +777,9 @@ fn summary_information_criteria(
     let Some(log_likelihood) = fit.reported_log_likelihood() else {
         return Ok(SummaryInformationCriteria::unavailable(NO_AIC_AT_EXACT_FIT));
     };
+    if fit.edf_total().is_none() {
+        return Ok(SummaryInformationCriteria::unavailable(NO_AIC_WITHOUT_A_RETAINED_EDF));
+    }
     let criteria = gam_solve::inference::information_criteria::information_criteria(
         fit,
         log_likelihood,
@@ -745,10 +817,18 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         return scan_summary_payload(model, &scan);
     }
     let fit = fit_result_from_saved_model_for_prediction(model)?;
-    let (smooth_terms, smooth_terms_unavailable) = match summary_smooth_terms(model, &fit) {
+    let tables = summary_term_tables(model, &fit);
+    let (parametric_terms, parametric_terms_unavailable) = match tables.parametric {
         Ok(rows) => (rows, None),
         Err(reason) => (Vec::new(), Some(reason)),
     };
+    let (smooth_terms, smooth_terms_unavailable) = match tables.smooth {
+        Ok(rows) => (rows, None),
+        Err(reason) => (Vec::new(), Some(reason)),
+    };
+    let scale_is_estimated = fit.likelihood_scale.wald_scale_is_estimated();
+    let log_likelihood = fit.reported_log_likelihood();
+    let fit_to_null = deviance_explained(&fit, model);
     // Definition-consistent coefficient uncertainty (#2296): the SE column,
     // the exported covariance matrix, and their labels all come from ONE
     // covariance definition. Independently selected `corrected.or(conditional)`
@@ -779,29 +859,31 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
     let reml_score = fit
         .comparable_reml_score()
         .map_err(|err| format!("failed to compute comparable REML score: {err}"))?;
-    // A custom family has no scalar response distribution, hence no single
-    // dispersion to report; every built-in family resolves one.
-    let scale = match fit.likelihood_family {
-        None => None,
-        Some(_) => Some(
-            fit.dispersion_phi()
-                .map_err(|err| format!("failed to resolve the fitted dispersion: {err}"))?,
-        ),
-    };
+    // A custom family, and a family whose scale contract has no scalar
+    // response dispersion (Royston-Parmar), report no scale; every other
+    // family resolves one or the summary refuses.
+    let scale = fit
+        .scalar_dispersion_phi()
+        .map_err(|err| format!("failed to resolve the fitted dispersion: {err}"))?;
     let information_criteria = summary_information_criteria(&fit)?;
     Ok(SummaryPayload {
         formula: model.payload().formula.clone(),
         family_name: model.display_family_name(),
+        link: model.likelihood().link.name().to_string(),
         model_class: prediction_model_class_label(model),
         group_metadata: model.payload().group_metadata.clone(),
         deployment_extensions: model.payload().deployment_extensions.clone(),
         deviance: fit.deviance,
+        null_deviance: fit.artifacts.null_deviance,
+        deviance_explained: fit_to_null.as_ref().ok().map(|fit| fit.deviance_explained),
+        adjusted_r_squared: fit_to_null.as_ref().ok().and_then(|fit| fit.adjusted_r_squared),
+        deviance_explained_unavailable: fit_to_null.err(),
         scale,
         // Declined at the same boundary and for the same reason as the
         // criterion: with `φ̂ = 0` there is no normalized density, and the
         // stored `0.0` is the `UserProvided` tag saying so. Emitting it as a
         // number lets `compare_models` rank an exact fit on `−2·0 + 2·edf`.
-        log_likelihood: fit.reported_log_likelihood(),
+        log_likelihood,
         n_obs: Some(fit.training_sample_size()),
         reml_score,
         raw_reml_score,
@@ -817,6 +899,9 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         information_criteria,
         lambdas: fit.lambdas.to_vec(),
         coefficients,
+        parametric_statistic: Some(if scale_is_estimated { "t" } else { "z" }),
+        parametric_terms,
+        parametric_terms_unavailable,
         smooth_terms,
         smooth_terms_unavailable,
         curvature_estimands: summary_curvature_estimands(model),
@@ -828,6 +913,56 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         convergence: Some(summary_convergence(&fit)),
         notes: summary_notes(model),
     })
+}
+
+/// How much of the intercept-only deviance the fit explains.
+struct FitToNull {
+    deviance_explained: f64,
+    adjusted_r_squared: Option<f64>,
+}
+
+/// `1 − D/D₀`, the proportion of the intercept-only deviance `D₀` the fit
+/// removes, and for a Gaussian response the adjusted `R²`
+/// `1 − (D/(n − edf)) / (D₀/(n − 1))`.
+///
+/// Neither is clamped: a penalized fit can sit above the intercept-only
+/// deviance, and a negative proportion is the true statement that it does.
+fn deviance_explained(fit: &UnifiedFitResult, model: &FittedModel) -> Result<FitToNull, &'static str> {
+    let null_deviance = fit.artifacts.null_deviance.ok_or(
+        "the fit recorded no intercept-only deviance: it has no single intercept, carries an \
+         offset, or was saved before the null deviance was recorded",
+    )?;
+    if !(null_deviance > 0.0) {
+        return Err("the intercept-only deviance is zero: the response is constant");
+    }
+    let adjusted_r_squared = (model.likelihood().response == gam_spec::ResponseFamily::Gaussian)
+        .then(|| {
+            let n = fit.training_sample_size() as f64;
+            fit.wald_residual_degrees_of_freedom()
+                .filter(|_| n > 1.0)
+                .map(|residual_df| 1.0 - (fit.deviance / residual_df) / (null_deviance / (n - 1.0)))
+        })
+        .flatten();
+    Ok(FitToNull {
+        deviance_explained: 1.0 - fit.deviance / null_deviance,
+        adjusted_r_squared,
+    })
+}
+
+/// One row of the parametric-coefficient table: an intercept or linear-term
+/// coefficient with its Wald statistic, referred to the distribution
+/// `SummaryPayload::parametric_statistic` names.
+#[derive(Serialize)]
+pub struct SummaryParametricTermRow {
+    pub name: String,
+    /// The predictor the coefficient belongs to on a multi-formula fit, as on
+    /// [`SummarySmoothTermRow::predictor`]; absent on a single-predictor fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predictor: Option<&'static str>,
+    pub estimate: f64,
+    pub std_error: Option<f64>,
+    pub statistic: Option<f64>,
+    pub p_value: Option<f64>,
 }
 
 /// The comparison candidate a saved model's summary defines, or the summary's
@@ -901,10 +1036,10 @@ pub struct SummaryCoefficientRow {
 /// boundary null is not a Wald χ²; see
 /// `gam_terms::inference::random_effect_test`), with `ref_df` its effective
 /// d.f.; penalized smooth terms carry the
-/// Wood (2013) rank-truncated Wald `chi_sq` / `p_value`. The shape mirrors the
+/// variance-component score test's `chi_sq` / `p_value`. The shape mirrors the
 /// CLI's `SmoothTermSummary`.
 ///
-/// This `p_value` is the *first-order* Wald reference. The summary table is
+/// This `p_value` is the score test at the fitted smoothing parameters. The summary table is
 /// built from a saved model without the training rows, so it cannot run the
 /// per-term constrained refits the second-order test needs. The
 /// **second-order-accurate, Bartlett-corrected likelihood-ratio** p-value is
@@ -914,18 +1049,43 @@ pub struct SummaryCoefficientRow {
 #[derive(Serialize)]
 pub struct SummarySmoothTermRow {
     pub name: String,
+    /// The predictor the smooth belongs to on a multi-formula fit: `"marginal"`
+    /// or `"slope"` for a Bernoulli marginal-slope model, whose two formulas can
+    /// name the same smooth (#2997). Absent on a single-predictor fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predictor: Option<&'static str>,
     pub edf: f64,
     pub ref_df: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chi_sq: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_value: Option<f64>,
-    /// Why `p_value` is absent when the term has no valid reference law
-    /// (`"shape_constrained"`), or why a random-effect block's variance-component
-    /// test could not be scored (`"random_effect_*"`); see
-    /// [`gam_solve::estimate::SmoothPValueUnavailable`].
+    /// The fitted smoothing parameters of the penalty blocks this term owns.
+    pub lambdas: Vec<f64>,
+    /// Why this term's `edf` is published unclamped: a penalty block it spends
+    /// is not rank-bound certified (#2901).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub p_value_unavailable: Option<&'static str>,
+    pub edf_rank_bound: Option<String>,
+    /// Why `p_value` is absent when the term has no valid reference law
+    /// (`"shape_constrained"`, `"unpenalized_direction"`, ...), or why a
+    /// random-effect block's variance-component test could not be scored
+    /// (`"random_effect_*"`), serialized as its label; see
+    /// [`gam_solve::estimate::SmoothPValueUnavailable`].
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_smooth_pvalue_unavailable"
+    )]
+    pub p_value_unavailable: Option<SmoothPValueUnavailable>,
+}
+
+fn serialize_smooth_pvalue_unavailable<S: serde::Serializer>(
+    reason: &Option<SmoothPValueUnavailable>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match reason {
+        Some(reason) => serializer.serialize_str(reason.label()),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// The fitted curvature estimate for one `curv(...)` constant-curvature smooth
@@ -943,7 +1103,7 @@ pub struct SummaryCurvatureRow {
     pub term_idx: usize,
     /// Fitted signed sectional curvature κ̂.
     pub kappa_hat: f64,
-    /// Sign-of-κ̂ geometry tag: `"spherical"` (κ̂>0), `"flat"` (κ̂≈0), or
+    /// Sign-of-κ̂ geometry tag: `"spherical"` (κ̂>0), `"flat"` (κ̂=0), or
     /// `"hyperbolic"` (κ̂<0). A point estimate only — the level-α verdict comes
     /// from the profile-CI endpoints via `curvature_inference_json`.
     pub geometry: &'static str,
@@ -1005,20 +1165,34 @@ pub struct SummaryBasisCheckRow {
 pub struct SummaryPayload {
     pub formula: String,
     pub family_name: String,
+    /// The link function's name, e.g. `"identity"`, `"logit"`.
+    pub link: String,
     pub model_class: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_metadata: Option<GroupMetadata>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deployment_extensions: Vec<SavedDeploymentExtension>,
     pub deviance: f64,
+    /// Deviance of the intercept-only model on the training data, recorded at
+    /// fit time. `None` for a fit with no single intercept, with an offset, or
+    /// saved before it was recorded.
+    pub null_deviance: Option<f64>,
+    /// `1 − deviance/null_deviance`, unclamped.
+    pub deviance_explained: Option<f64>,
+    /// `1 − (D/(n − edf)) / (D₀/(n − 1))` for a Gaussian response; `None` for
+    /// every other family.
+    pub adjusted_r_squared: Option<f64>,
+    /// Why `deviance_explained` is `None`. Present iff it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deviance_explained_unavailable: Option<&'static str>,
     /// Estimated scale (dispersion) `φ̂` of the response distribution, the
     /// same value the log-likelihood and every standard error are evaluated
     /// at. Families with a known scale report it (`1` for Poisson, binomial);
     /// a Gaussian REML fit reports the residual-d.f. estimator
     /// `φ̂ = Σ wᵢ(yᵢ − μ̂ᵢ)² / (n − edf)`, with `n` the positive-weight rows and
     /// `edf = p − Σ_k tr(λ_k H⁻¹ S_k)` (the `edf_total` field); a spline-scan fit reports the smoother's
-    /// REML-profiled `σ̂²`. `None` only for a custom-family fit, which has no
-    /// scalar response distribution.
+    /// REML-profiled `σ̂²`. `None` exactly when the scale contract has no scalar
+    /// response dispersion: a custom-family fit, or Royston-Parmar survival.
     pub scale: Option<f64>,
     /// Reported log-likelihood at the converged mode. Carried so
     /// `compare_models` can form the Occam-penalised conditional AIC it ranks on
@@ -1072,6 +1246,16 @@ pub struct SummaryPayload {
     pub information_criteria: SummaryInformationCriteria,
     pub lambdas: Vec<f64>,
     pub coefficients: Vec<SummaryCoefficientRow>,
+    /// The Wald reference of `parametric_terms`: `"t"` (Student-t on the
+    /// residual degrees of freedom) when the scale is estimated, `"z"` when it
+    /// is known.
+    pub parametric_statistic: Option<&'static str>,
+    /// Intercept and linear-term coefficients with their Wald tests.
+    pub parametric_terms: Vec<SummaryParametricTermRow>,
+    /// Why `parametric_terms` could not be built; the same causes as
+    /// `smooth_terms_unavailable` short of the smoothing-parameter layout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parametric_terms_unavailable: Option<String>,
     /// Per-smooth significance table (mgcv-style). Empty when the model has no
     /// smooth/random-effect terms — and ONLY then without a reason: every other
     /// absence names itself in `smooth_terms_unavailable`.
@@ -1483,7 +1667,6 @@ fn smoothing_forensics_rows(
                         None
                     }
                 }),
-                seed_screening: Vec::new(),
             }
         })
         .collect()

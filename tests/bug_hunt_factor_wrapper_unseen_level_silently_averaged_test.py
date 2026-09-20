@@ -2,18 +2,18 @@
 
 The #2102 fix wired the unseen-fixed-factor-level schema guard into the *bare*
 categorical path (``y ~ g``) but not the explicit ``factor(g)`` wrapper. Because
-``factor(g)`` shared the ``group()``/``re()`` parse arm in the formula DSL, it was
+``factor(g)`` shared the ``group()`` parse arm in the formula DSL, it was
 lowered as a *lenient* random effect: an out-of-vocabulary level at ``predict``
 silently returned a fabricated value equal to the factor's sum-to-zero centering
 point (the *unweighted* across-level average), and ``Model.check`` reported
 ``ok=True`` — the exact defect #2102 documented, on a sibling construction its fix
 never reached.
 
-Root cause: ``factor(g)`` is a FIXED categorical factor (R ``factor()`` / patsy
-``C()`` convention), not a random-effect alias. On seen levels it fits identically
+Root cause: ``factor(g)`` names the categorical level effect of a column seen in
+training, not a held-out-group random effect. On seen levels it fits identically
 to the bare ``+ g`` factor (both are penalized categorical blocks); only the
 unseen-level policy differed. The fix carries that policy on
-``ParsedTerm::RandomEffect`` — ``factor()`` => strict, ``group()``/``re()``/
+``ParsedTerm::RandomEffect`` — ``factor()`` => strict, ``group()``/
 ``s(g, bs="re")`` => lenient — so the single whitelist that ``predict`` and
 ``check`` share (``random_effect_group_columns``) excludes fixed factors.
 
@@ -24,7 +24,7 @@ Angles covered here:
 * parity — ``factor(g)`` fits identically to bare ``+ g`` on *seen* levels, and
   the unseen deviation, when it (wrongly) returned, was the unweighted mean —
   proving it was a centering artefact, not an estimate;
-* non-regression — genuine random effects (``group``/``re``/``s(bs="re")``) stay
+* non-regression — genuine random effects (``group``/``s(bs="re")``) stay
   lenient, so the fix did not over-strictify them;
 * ``factor()`` still forces categorical encoding, so ``factor(year)`` on a
   numeric column treats it as levels and rejects an unseen numeric code.
@@ -96,12 +96,12 @@ def test_factor_wrapper_matches_bare_factor_on_seen_levels():
 
 
 def test_random_effects_stay_lenient_on_unseen_level():
-    """Non-regression: genuine random effects (``group``/``re``/``s(bs="re")``)
+    """Non-regression: genuine random effects (``group``/``s(bs="re")``)
     must remain lenient — a held-out group is shrunk to the population mean, so
     ``predict`` returns and ``check`` stays ``ok=True``. The #2137 fix tightens
     ONLY ``factor()``, not the random-effect wrappers."""
     df = _unbalanced_group_frame()
-    for formula in ("y ~ group(g)", "y ~ re(g)", 'y ~ s(g, bs="re")'):
+    for formula in ("y ~ group(g)", 'y ~ s(g, bs="re")'):
         m = gamfit.fit(df, formula, family="gaussian")
         assert m.check(pd.DataFrame({"g": ["TYPO"]})).ok is True, formula
         # Tolerated: returns a finite prediction (population-level), never raises.

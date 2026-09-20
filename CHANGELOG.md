@@ -1,5 +1,58 @@
 ## Unreleased
 
+- **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
+  `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
+  `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and
+  `C_κ = 0.125` and no derivation behind the inequality, and it published that as
+  `Verdict::Certified`. The verdict, both constants and its phase-diagram test are
+  deleted. The measurements stay, renamed `CertificateInputs` →
+  `DictionaryIncoherenceReport`: `μ̂`, per-atom `κ̂`, the activity floor and the SNR
+  proxy. The Python `incoherence_report` dict loses the `global_optimality`,
+  `global_optimality_certified` and `global_optimality_margin` keys, and the report
+  is no longer recorded in the certificate ledger.
+
+- **A learned Gaussian-shift frailty in survival marginal-slope is refused as not identified.**
+  The likelihood reads σ only through the observed slope `s(σ)·g`, `s = 1/√(1+σ²)`, so with
+  the default slope (an intercept in every slope surface and a constant or no offset) any σ
+  fits the data exactly as well as any other once the slope is rescaled. Such a fit is now
+  refused by that reason at fit entry, before any solve, instead of by a missing derivative
+  or a per-score rule. A slope offset outside the slope design's span does identify σ, and
+  those fits keep their previous behaviour. A fixed `frailty_sd` is unaffected (gam#2938).
+
+- **The arrow-Schur "certified mixed precision" solve is removed** (#2946 census T10).
+  The streaming/residency path turned it on by default. It factored the reduced
+  Schur complement and the per-row blocks in f64, copied those factors to f32,
+  solved in f32, and refined with f64 residuals until a backward-error certificate
+  closed. The gates were chosen constants: at most 6 refinements, a 1e-11
+  certificate, a κ·u_f32 margin of 0.5 with a ceiling of 1.0, and a 64·ε floor.
+  Because the f64 factors already existed, the f32 solves and refinement matvecs
+  were extra work on top of an f64 triangular solve that the same factor answers
+  directly. Every dense reduced solve now runs that one f64 solve.
+  `ArrowSolvePrecisionPolicy`, `ArrowSolveOptions::solve_precision`,
+  `MixedPrecisionStatus` and `ArrowPcgDiagnostics::mixed_precision_status` are
+  deleted. The GPU PIRLS mixed-precision policy (`GpuMixedPrecisionPolicy`) is a
+  separate path and is unchanged.
+- **One exception hierarchy, chosen by the engine's error category.** Every engine
+  error now reports one Rust `ErrorCategory` (formula, data, convergence, not fitted,
+  internal). Python raises a class under that category's base, and the CLI exits
+  with that category's code (2, 3, 4, 5, 70), so the two classify a failure the same
+  way without reading its message. The bases are `GamfitError(Exception)`,
+  `FormulaError(GamfitError, ValueError)`, `DataError(GamfitError, ValueError)`,
+  `ConvergenceError(GamfitError, RuntimeError)`, `NotFittedError` (the bases of
+  scikit-learn's `NotFittedError`) and `InternalError(GamfitError, RuntimeError)`.
+  Every other class sits under exactly one of them, and all live in `gamfit.errors`.
+  Classes that no engine path raised are removed. `gamfit.sklearn` estimators raise
+  `gamfit.errors.NotFittedError` before `fit`, a subclass that is also scikit-learn's
+  `NotFittedError`. **Migration:** `GamError` is now
+  `GamfitError` and no longer a `ValueError`. Code that caught `ValueError` for a
+  solver failure should catch `ConvergenceError`, and code that caught `FitError`
+  should catch `ConvergenceError` or the category it means.
+- **`s()` / `te()` / `linear()` on a string or categorical column is a formula error.**
+  These fits used to succeed silently on the column's level codes, and a stray string in
+  a numeric column raised pyarrow's `ArrowInvalid`. Formula resolution in Rust now refuses it,
+  for the CLI and Python alike. The message names the column and its first
+  non-numeric value and row, and lists the terms that accept the column:
+  `factor(g)` / `group(g)`, `s(x, by=g)`, `fs(x, g)` and `s(g, bs="re")`.
 - **The default `s(x)` sizes its basis from the data** (slop.md G1). The formula-default
   open B-spline was capped at `clamp(unique/4, 4..8)` internal knots (12 cubic
   coefficients), so `y ~ s(x)` stopped improving with `n`: on `sin(8πx) + N(0, 0.3²)`
@@ -22,8 +75,24 @@
   adequate basis it rejected 2.3% of the time at 0.05 and 0.1% at 0.01 (1000 seeded
   replicates). It now refers `(T/r)·(ν − r)/(ν − T)` to `F(r, ν − r)`, the classical test of
   the enrichment columns added to the fit, and reports no p-value when `ν ≤ r` or `T ≥ ν`.
-  Estimated-scale `basis_checks` p-values are smaller than before. Known-scale families
-  (binomial, Poisson) are unchanged. Calibration is in `bench/pvalue_calibration/pv-model-comparison/`.
+  Estimated-scale `basis_checks` p-values are smaller than before. Calibration is in
+  `bench/pvalue_calibration/pv-model-comparison/`.
+- **`basis_check` on a canonical binomial or Poisson fit uses the score's conditional law**
+  (pyGAM audit, lane pv-model-comparison). The χ²_r reference for the score at the
+  penalized fit is only first order, and at small n it was miscalibrated in both
+  directions: at n = 200 with a default `s(x)` it was conservative (binomial size 0.032 at
+  0.05; with success probabilities 0.05–0.27 size 0.024 at 0.05, KS p = 1e-9), and with
+  Poisson means 0.14–1.0 its p-values failed a KS test against U(0, 1) (p = 3e-5). The score
+  is now taken at the unpenalized null MLE and referred to its law conditional on the
+  sufficient statistic `Xᵀ(w∘y)`, with its mean, covariance and fourth cumulant corrected
+  to O(1/n) (`c·χ²_{r/c}`, `c = 1 + K₄/(2r)`). Binomial and Poisson `basis_checks` p-values
+  change. Where the expansion leaves its range of validity (Σ not positive definite, or
+  `c ≤ 0`) the row reports provenance `conditional_reference_unavailable` and no p-value;
+  `null_fit_unavailable` means the null MLE could not be certified. A row that is not
+  measured omits the `p_value` key. **Open limit:** with rare events (28–34 expected
+  events in 200 rows) two-thirds of rows are refused and the Poisson p-values that are
+  reported are conservative (size 0.030 at 0.05, KS p = 2e-4); that regime needs the next
+  order of the expansion.
 - **The top-level `gamfit` namespace is 19 names** (PKG-06). `import gamfit` exposed about
   340 names: the core API next to every research helper, basis primitive, result class and
   error type, several under two names. The top level now holds the fit and load entry
@@ -38,7 +107,7 @@
   `topology`, `torch` (and `kernels_jax` / `kernels_torch`). Every other module is private.
   `import gamfit` no longer loads the SAE, topology-selection or plotting code.
   **Migration:** `gamfit.X` becomes `gamfit.<submodule>.X`, for example
-  `gamfit.GamError` → `gamfit.errors.GamError`, `gamfit.Diagnostics` →
+  `gamfit.FormulaError` → `gamfit.errors.FormulaError`, `gamfit.Diagnostics` →
   `gamfit.results.Diagnostics`, `gamfit.bspline_basis` → `gamfit.basis.bspline_basis`,
   `gamfit.sae_manifold_fit` → `gamfit.sae.sae_manifold_fit`,
   `gamfit.select_topology` → `gamfit.topology.select_topology`. Duplicates were removed
@@ -217,9 +286,10 @@
   (#2926). Both families test the score's conditional law on the
   marginal-index span. Where that law does not move and the score passes the
   standard-normal adequacy screen, the fit uses the closed form, kept at the
-  converged fit only when the rows' anchoring residuals under the estimated
-  law say it is expected to be at least as accurate as that law's own anchor
-  (`D̂ = Σ w (r² − 2·se²)/(π(1−π)) ≤ 0`), and records it as
+  converged fit unless the rows' anchoring residuals under the estimated law
+  are beyond what that law's own sampling error gives an exactly Gaussian
+  score (the upper 5% of their exact weighted-chi-square null law; `D̂ =
+  Σ w (r² − 2·se²)/(π(1−π))` is recorded beside it), and records it as
   `estimated-gaussian-adequate`; otherwise the fit is re-solved on the
   estimated law (`estimated-global-by-residual`). Otherwise it anchors the index on
   one estimated finite law, or on local laws by context where the law moves,
@@ -243,6 +313,14 @@
   `declared_latent_law` now serves the Bernoulli family too.
 - Saved models record which law the fit consumed in `latent_law_consumed`.
   Models saved earlier replay their old calibration unchanged.
+- Where the score's law moves, an arm that anchors on a Gaussian residual is a
+  candidate of the moving-law rule only if that residual passes the adequacy
+  screen, and the fit is solved on the simplest candidate first; each arm's
+  screen is recorded in the certificate (`MovingLawArmScore::adequacy`,
+  payload 32).
+- A survival fit that re-solves on the law its certificate chose starts from
+  the converged coefficients it hands over. Before, both cold-start pilots
+  overwrote them, and the rigid pilot cost 19.6 s at 10 000 rows.
 - Fits that anchor on an estimated law are slower than the closed form until
   the anchor kernel follow-up lands: a 100 000-row Bernoulli fit on a skewed
   score took 199 s where the closed form took 4.6 s, and on a moving law
@@ -259,8 +337,8 @@
   from the standard normal. Where a score's law moves, every score keeps the
   closed form as `gaussian-uncertified`, naming that score (#2949). A closed
   form the screen chose for several scores is certified by `D̂` on their joint
-  law, and where `D̂ > 0` re-solved on it, or recorded `gaussian-uncertified`
-  with `D̂` where nothing can re-solve on it.
+  law, and where the certificate fires re-solved on it, or recorded
+  `gaussian-uncertified` with the certificate where nothing can re-solve on it.
 - **`AtomCore.evidence` is removed** (#2946). It copied the fit's `penalized_loss_score`
   into every atom under a label that claimed a per-atom marginal likelihood. It was
   neither a marginal likelihood nor per atom. **Migration:** read the model's top-level

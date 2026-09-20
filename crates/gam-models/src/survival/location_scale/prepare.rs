@@ -102,11 +102,6 @@ pub(crate) fn survival_blockwise_fit_options(
         cache_session: spec.cache_session.clone(),
         persistent_warm_start_store: spec.persistent_warm_start_store.clone(),
         cache_mirror_sessions: spec.cache_mirror_sessions.clone(),
-        // Constant-scale (parametric-AFT) fits pin the time-warp ρ seed at the
-        // identified affine-baseline limit; re-screening that already-correct
-        // seed across the flat unidentified time ridge only stalls. Genuinely
-        // flexible scale/spatial fits keep the default `true` and full screening.
-        screen_initial_rho: !survival_constant_scale(spec),
         ..BlockwiseFitOptions::default()
     }
 }
@@ -118,7 +113,10 @@ pub(crate) fn validate_survival_location_scale_spec(
     let monotone_time_wiggle_ncols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
     match &spec.inverse_link {
         InverseLink::Standard(
-            link @ (StandardLink::Log | StandardLink::Inverse | StandardLink::InverseSquared),
+            link @ (StandardLink::Log
+                | StandardLink::Sqrt
+                | StandardLink::Inverse
+                | StandardLink::InverseSquared),
         ) => {
             return Err(SurvivalLocationScaleError::InvalidConfiguration {
                 reason: format!(
@@ -1138,14 +1136,6 @@ pub(crate) fn validate_time_block(
     let p = b.design_exit.ncols();
     if b.design_entry.ncols() != p || b.design_derivative_exit.ncols() != p {
         bail_dim_sls!("time_block design column mismatch across entry/exit/derivative");
-    }
-    if !b.time_monotonicity.is_coordinate_cone() {
-        return Err(SurvivalLocationScaleError::InvalidConfiguration {
-            reason: format!(
-                "time_block requires a coordinate-cone monotonicity strategy by construction; got {:?}",
-                b.time_monotonicity
-            ),
-        });
     }
     structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
         &b.design_entry,

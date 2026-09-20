@@ -676,3 +676,117 @@ fn a_three_term_redundancy_no_pair_can_see_is_certified_2676() {
         );
     }
 }
+
+/// The invariance is a property of the penalty MAP, not of the coefficient
+/// frame: the orthogonal congruence `S_k ↦ QᵀS_kQ`, `μ_k ↦ Qᵀμ_k` preserves
+/// every augmented inner product. The smoothing correction reads it from the
+/// block-local original-frame penalties rather than the dense rotated ones
+/// the reparameterization carries, which is only sound because of this. Built
+/// with overlapping supports (so the general Gram path runs in both frames), a
+/// redundancy `S_2 = c S_0` with a shared nonzero prior mean (so the border
+/// term is exercised and rotated too), and a dense two-reflector rotation.
+#[test]
+fn the_invariance_is_the_same_in_the_block_local_and_rotated_frames() {
+    let p = 6usize;
+    let s0 = array![[2.0_f64, 0.5, 0.1], [0.5, 1.0, 0.0], [0.1, 0.0, 0.0]];
+    let s1 = array![
+        [1.0_f64, 0.2, 0.0, 0.0],
+        [0.2, 3.0, 1.0, 0.0],
+        [0.0, 1.0, 2.0, 0.3],
+        [0.0, 0.0, 0.3, 0.0]
+    ];
+    let scale = 0.75_f64;
+    let s2 = s0.mapv(|value| scale * value);
+    let s3 = array![[1.5_f64, -0.4, 0.0], [-0.4, 0.8, 0.2], [0.0, 0.2, 1.1]];
+    let mean = Array1::from(vec![0.4_f64, -0.3, 0.2]);
+    let mut block_local = vec![
+        penalty(s0, p),
+        penalty(s1, p),
+        penalty(s2, p),
+        penalty(s3, p),
+    ];
+    block_local[1].col_range = 2..6;
+    block_local[3].col_range = 3..6;
+    block_local[0].prior_mean = mean.clone();
+    block_local[2].prior_mean = mean;
+
+    // Q = (I - 2uuᵀ/uᵀu)(I - 2vvᵀ/vᵀv): orthogonal and dense.
+    let reflector = |direction: Array1<f64>| {
+        let norm2 = direction.dot(&direction);
+        let mut h = Array2::<f64>::eye(p);
+        for i in 0..p {
+            for j in 0..p {
+                h[[i, j]] -= 2.0 * direction[i] * direction[j] / norm2;
+            }
+        }
+        h
+    };
+    let q = reflector(Array1::from(vec![1.0_f64, -2.0, 0.5, 1.5, -0.7, 0.3]))
+        .dot(&reflector(Array1::from(vec![0.2_f64, 0.9, -1.1, 0.4, 1.3, -0.6])));
+    let rotated: Vec<CanonicalPenalty> = block_local
+        .iter()
+        .map(|penalty_k| {
+            let mut embedded = Array2::<f64>::zeros((p, p));
+            embedded
+                .slice_mut(ndarray::s![
+                    penalty_k.col_range.clone(),
+                    penalty_k.col_range.clone()
+                ])
+                .assign(&penalty_k.local);
+            let mut embedded_mean = Array1::<f64>::zeros(p);
+            embedded_mean
+                .slice_mut(ndarray::s![penalty_k.col_range.clone()])
+                .assign(&penalty_k.prior_mean);
+            let mut dense = q.t().dot(&embedded).dot(&q);
+            // Symmetrize the rounding so the helper's eigh sees a symmetric matrix.
+            dense = (&dense + &dense.t()) * 0.5;
+            let mut rotated_k = penalty(dense, p);
+            rotated_k.prior_mean = q.t().dot(&embedded_mean);
+            rotated_k
+        })
+        .collect();
+
+    let local_invariance =
+        PenaltyMapInvariance::from_canonical_penalties(&block_local, p).expect("gram decomposes");
+    let rotated_invariance =
+        PenaltyMapInvariance::from_canonical_penalties(&rotated, p).expect("gram decomposes");
+    assert_eq!(local_invariance.dimension(), 1, "S_2 = c S_0 with a shared mean");
+    assert_eq!(rotated_invariance.dimension(), local_invariance.dimension());
+
+    let lambdas = Array1::from(vec![0.5_f64, 3.0, 8.0, 1.25]);
+    let local_t = local_invariance
+        .theta_directions(&lambdas, 4, 0)
+        .expect("lift exists")
+        .column(0)
+        .to_owned();
+    let rotated_t = rotated_invariance
+        .theta_directions(&lambdas, 4, 0)
+        .expect("lift exists")
+        .column(0)
+        .to_owned();
+    let cosine = local_t.dot(&rotated_t).abs()
+        / (local_t.dot(&local_t).sqrt() * rotated_t.dot(&rotated_t).sqrt());
+    assert!(
+        (1.0 - cosine).abs() < 1e-12,
+        "the two frames must certify the same direction (|cos| = {cosine:.15})"
+    );
+
+    // And a mean that breaks the redundancy breaks it in both frames.
+    let mut broken_local = block_local.clone();
+    broken_local[2].prior_mean = Array1::from(vec![0.1_f64, 0.0, -0.2]);
+    let mut broken_rotated = rotated.clone();
+    let mut embedded_mean = Array1::<f64>::zeros(p);
+    embedded_mean
+        .slice_mut(ndarray::s![0..3])
+        .assign(&broken_local[2].prior_mean);
+    broken_rotated[2].prior_mean = q.t().dot(&embedded_mean);
+    for (frame, bundle) in [("block-local", &broken_local), ("rotated", &broken_rotated)] {
+        assert_eq!(
+            PenaltyMapInvariance::from_canonical_penalties(bundle, p)
+                .expect("gram decomposes")
+                .dimension(),
+            0,
+            "{frame}: a differing prior mean removes the invariance"
+        );
+    }
+}

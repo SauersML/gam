@@ -108,7 +108,8 @@ use gam_solve::{
 use gam_terms::inference::structure_evidence::{ClaimKind, StructureLedger};
 use gam_terms::latent::{LatentIdMode, LatentManifold};
 use gam_terms::structure::anova_atom::{
-    CarveReport, FissionDecision, carve, carve_input_from_fitted_atom, fission_decision,
+    BindingTestUnavailable, CarveReport, FissionDecision, carve, carve_input_from_fitted_atom,
+    fission_decision,
 };
 use opt::{BracketedRootConfig, FirstOrderSample, ObjectiveEvalError, find_root_bracketed};
 
@@ -665,7 +666,7 @@ pub fn harvest_move_proposals(
     // for a bound atom. A carve that does NOT prove binding rides as a fission
     // proposal whose trigger is the carve's interaction fraction (ascending —
     // the most-separable atom sorts first), and whose binding evidence is the
-    // carve's `edge_p_value`, recorded for the ledger.
+    // carve's edge test, recorded for the ledger.
     //
     // A candidate that is NOT a recoverable product atom (single-axis, sphere
     // chart, monomial patch — `factor_basis_sizes() == None`), or whose carve
@@ -684,8 +685,8 @@ pub fn harvest_move_proposals(
             Some(Ok(report)) => {
                 fission_carve_ran_count += 1;
                 let decision = fission_decision(&report, None);
-                let edge_p = report.edge_p_value;
                 let interaction = report.interaction_fraction;
+                let edge_p = report.edge_p_value();
                 carve_results.push(FissionCarveResult {
                     atom,
                     edge_p_value: edge_p,
@@ -746,11 +747,12 @@ pub fn harvest_move_proposals(
     let mut birth_skipped_reason: Option<String> = None;
     if params.max_births > 0 && n > 0 && residuals.ncols() > 0 {
         let p = residuals.ncols();
-        let max_rank = params.max_births.min(p.saturating_sub(1));
+        // The evidence ranks every identifiable factor count; `max_births` is a
+        // per-round admission budget applied to the scored proposals below, not
+        // a cap on the model comparison.
         match StructuredResidualModel::fit(ResidualFactorInput {
             residuals,
             activity: activity.view(),
-            max_factor_rank: max_rank,
         }) {
             Ok(model) => {
                 let factor = model.factor();
@@ -923,9 +925,12 @@ pub fn harvest_move_proposals(
 pub struct FissionCarveResult {
     /// The audited product atom.
     pub atom: usize,
-    /// Edge-level representational binding p-value (the carve's joint Wald over
-    /// the gauge-projected interaction block). `None` when the test degenerated.
-    pub edge_p_value: Option<f64>,
+    /// Edge-level representational binding p-value: the carve's exact
+    /// sample-space test of the atom's interaction directions against its
+    /// additive fit, joint over the decoder outputs. `Err` names why the
+    /// sample could not carry the test (for instance, a re-fit that
+    /// reproduces the decoder exactly leaves no residual variation).
+    pub edge_p_value: Result<f64, BindingTestUnavailable>,
     /// Fraction of centered surface energy carried by the interaction
     /// (0 = perfectly additive / separable, 1 = pure interaction).
     pub interaction_fraction: f64,
@@ -7331,8 +7336,8 @@ pub fn run_structure_search_rounds(
         // p ≈ 1 (additive) absorbs evidence AGAINST it. This makes the binding
         // verdict not merely observable on the `HarvestReport` but BANKED in
         // the persisted ledger, so the dictionary certificate covers it and the
-        // evidence resumes across corpus shards. A `None` p-value (the Wald
-        // test degenerated) is skipped — no fabricated evidence.
+        // evidence resumes across corpus shards. An unavailable test (`Err`,
+        // naming why) is skipped — no fabricated evidence.
 
         // Pre-build the birth-SEED list ONCE per round: the residual-factor
         // births first (indices `0..r`), then — when curl is enabled — the
@@ -7587,18 +7592,16 @@ fn build_residual_factor_births(
     }
     let assignments = term.assignment.assignments();
     let activity: Array1<f64> = (0..n).map(|r| assignments.row(r).sum()).collect();
-    let max_rank = params.max_births.min(p.saturating_sub(1));
     // Propagate a genuine fit failure instead of degrading to "no births".
-    // The evidence ladder already includes the rank-0 rung, so a true "no
-    // structure to harvest" outcome returns `Ok` (an empty/zero-rank factor);
-    // an `Err` here signals a numerical/degenerate failure (non-finite inputs,
-    // an empty ladder, a broken alternation), and swallowing it into
+    // The rank search always scores rank 0, so a true "no structure to
+    // harvest" outcome returns `Ok` (an empty/zero-rank factor); an `Err` here
+    // signals a numerical/degenerate failure (non-finite inputs, a rank whose
+    // posterior mode could not be certified), and swallowing it into
     // `Ok(Vec::new())` would silently paper over that non-convergence
     // (the #2069/#2070 accept-on-failure genus). Surface it.
     let model = StructuredResidualModel::fit(ResidualFactorInput {
         residuals,
         activity: activity.view(),
-        max_factor_rank: max_rank,
     })
     .map_err(|e| format!("build_residual_factor_births: structured-residual fit failed: {e}"))?;
     let factor = model.factor();

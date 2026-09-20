@@ -25,7 +25,7 @@ use crate::formula_dsl::{LinkWiggleFormulaSpec, parse_formula};
 use crate::model::{
     FittedModel as SavedModel, PredictModelClass, load_survival_time_basis_config_from_model,
 };
-use gam_linalg::faer_ndarray::FaerCholesky;
+use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use gam_models::survival::construction::{
     SurvivalLikelihoodMode, add_survival_time_derivative_guard_offset, build_survival_time_basis,
@@ -1079,7 +1079,125 @@ fn sample_standard(
     )
     .map_err(|e| format!("NUTS sampling failed: {e}"));
     drop(sampler_design_copy_reservation);
-    result
+    let mut result = result?;
+    recolor_to_smoothing_corrected_covariance(
+        &mut result,
+        fit.beta_covariance(),
+        fit.beta_covariance_corrected(),
+    )?;
+    Ok(result)
+}
+
+/// Carry the smoothing-parameter uncertainty into exact-likelihood draws
+/// conditional on `ρ̂`, so `sample()` describes the same smoothing-corrected
+/// posterior `summary()` and `predict(se=True)` publish for every family.
+///
+/// NUTS / Pólya-Gamma Gibbs target `π(β | ρ̂, y)`, whose Laplace covariance is
+/// the published conditional `Vb`. The published corrected `V_c` integrates
+/// over `ρ` — first-order `Vb + J V_ρ Jᵀ`, or the sigma-point cubature
+/// `E_ρ[φH⁻¹] + Cov_ρ[β̂(ρ)]`, which can sit below `Vb` in directions where
+/// the curvature grows with `λ`. Every draw is mapped through the linear
+/// optimal-transport map between the two Gaussians,
+///
+/// ```text
+///     β ↦ β̄ + T (β − β̄),   T = Vb^{-1/2} (Vb^{1/2} V_c Vb^{1/2})^{1/2} Vb^{-1/2},
+/// ```
+///
+/// the unique symmetric positive semi-definite `T` with `T Vb T = V_c`, about
+/// the draws' own mean `β̄`. Draws with covariance `Vb` therefore leave with
+/// covariance `V_c` in either direction of change, while the exact conditional
+/// shape (skew, saturation) is carried through the linear map.
+///
+/// A fit that publishes no corrected covariance (a typed absence recorded at
+/// fit time) keeps its conditional draws and provenance; a fit with no
+/// smoothing coordinate publishes `V_c = Vb`, so its draws are already the
+/// corrected posterior.
+fn recolor_to_smoothing_corrected_covariance(
+    result: &mut NutsResult,
+    conditional: Option<&Array2<f64>>,
+    corrected: Option<&Array2<f64>>,
+) -> Result<(), String> {
+    const CONTEXT: &str = "standard posterior smoothing-parameter correction";
+    let Some(corrected) = corrected else {
+        return Ok(());
+    };
+    let conditional = conditional.ok_or_else(|| {
+        format!("{CONTEXT}: the fit publishes a corrected covariance but no conditional one")
+    })?;
+    let p = result.samples.ncols();
+    for (name, matrix) in [("conditional", conditional), ("corrected", corrected)] {
+        if matrix.nrows() != p || matrix.ncols() != p {
+            return Err(format!(
+                "{CONTEXT}: {name} covariance is {}x{}, expected {p}x{p}",
+                matrix.nrows(),
+                matrix.ncols(),
+            ));
+        }
+    }
+    if !std::ptr::eq(conditional, corrected) {
+        let (conditional_values, conditional_vectors) =
+            symmetric_eigh(conditional, CONTEXT, "conditional")?;
+        if let Some(value) = conditional_values.iter().find(|value| **value <= 0.0) {
+            return Err(format!(
+                "{CONTEXT}: conditional covariance has eigenvalue {value:e}; it is not positive \
+                 definite"
+            ));
+        }
+        let root = symmetric_function(&conditional_values, &conditional_vectors, f64::sqrt);
+        let inverse_root =
+            symmetric_function(&conditional_values, &conditional_vectors, |v| v.sqrt().recip());
+        let (inner_values, inner_vectors) =
+            symmetric_eigh(&root.dot(corrected).dot(&root), CONTEXT, "whitened corrected")?;
+        // `V_c` may be rank-deficient in principle; eigenvalues inside the
+        // eigensolver's round-off band `p·ε·μ_max` are that null space, while a
+        // negative eigenvalue beyond it means `V_c` is not a covariance.
+        let largest = inner_values.iter().fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+        let round_off = p as f64 * f64::EPSILON * largest;
+        if let Some(value) = inner_values.iter().find(|value| **value < -round_off) {
+            return Err(format!(
+                "{CONTEXT}: corrected covariance has eigenvalue {value:e} below the round-off \
+                 band -{round_off:e}; it is not a covariance"
+            ));
+        }
+        let inner_root = symmetric_function(&inner_values, &inner_vectors, |v| v.max(0.0).sqrt());
+        let transport = inverse_root.dot(&inner_root).dot(&inverse_root);
+
+        let centre = result
+            .samples
+            .mean_axis(ndarray::Axis(0))
+            .ok_or_else(|| format!("{CONTEXT}: sampler returned no draws"))?;
+        let centred = &result.samples - &centre;
+        // `T` is symmetric, so `(T (β − β̄))ᵀ` for every row is `(β − β̄)ᵀ T`.
+        result.samples = centred.dot(&transport) + &centre;
+        result.posterior_mean = result
+            .samples
+            .mean_axis(ndarray::Axis(0))
+            .ok_or_else(|| format!("{CONTEXT}: sampler returned no draws"))?;
+        result.posterior_std = result.samples.std_axis(ndarray::Axis(0), 1.0);
+    }
+    result.covariance = InferenceCovarianceMode::SmoothingCorrected;
+    Ok(())
+}
+
+fn symmetric_eigh(
+    matrix: &Array2<f64>,
+    context: &str,
+    name: &str,
+) -> Result<(Array1<f64>, Array2<f64>), String> {
+    let symmetric = (matrix + &matrix.t()) * 0.5;
+    symmetric
+        .eigh(Side::Lower)
+        .map_err(|err| format!("{context}: eigendecomposition of the {name} covariance failed: {err}"))
+}
+
+/// `U f(Λ) Uᵀ` for a symmetric matrix with eigendecomposition `U Λ Uᵀ`.
+fn symmetric_function(
+    eigenvalues: &Array1<f64>,
+    eigenvectors: &Array2<f64>,
+    function: impl Fn(f64) -> f64,
+) -> Array2<f64> {
+    let scaled = eigenvectors * &eigenvalues.mapv(function);
+    scaled.dot(&eigenvectors.t())
 }
 
 /// Exact posterior draws for a standard GLM with `bounded()` coefficients.
@@ -1151,7 +1269,7 @@ fn sample_standard_bounded(
 
 /// Exact posterior draws for a standard GLM whose coefficients carry linear
 /// *inequality* constraints `A β ≥ b` — `nonnegative()` / `linear(min,max)` /
-/// `constrain()` box bounds on a parametric term (#1507) and the
+/// `linear(min=, max=)` box bounds on a parametric term (#1507) and the
 /// monotone/convex/concave shape cone `γ_j ≥ 0` on a spline (#1509).
 ///
 /// The posterior is the Laplace Gaussian `N(mode, φ·H⁻¹)` *truncated* to the
@@ -1207,33 +1325,25 @@ fn sample_standard_truncated(
     let sqrt_cov_scale =
         sampling_sqrt_covariance_scale(&fit, "standard constrained-coefficient posterior")?;
 
-    let active_samples = crate::truncated_gaussian::sample_truncated_gaussian_posterior(
+    let draws = crate::truncated_gaussian::sample_truncated_gaussian_posterior(
         &center,
         &mode,
         &penalized_hessian,
         sqrt_cov_scale,
         &constrained.constraints,
         cfg.n_samples,
-        NUTS_CHAINS,
         chain_stream_seed(cfg.seed, 0, 0x7290_C047_5D6E_B14Du64),
     )?;
     // Reflective HMC draws are iid only while no wall is hit; an active
     // constraint at the mode makes every trajectory reflect, correlating
-    // consecutive draws. Measure the diagnostics instead of asserting the
-    // iid triple (the sampler stacks rows chain-major: chain*n_samples+draw).
-    // Diagnose the active Markov state before lifting: a rectangular gauge can
-    // add deterministic raw coordinates whose zero variance has no R-hat.
-    let mut chains = ndarray::Array3::<f64>::zeros((NUTS_CHAINS, cfg.n_samples, p));
-    for chain in 0..NUTS_CHAINS {
-        for draw in 0..cfg.n_samples {
-            let row = chain * cfg.n_samples + draw;
-            for j in 0..p {
-                chains[(chain, draw, j)] = active_samples[(row, j)];
-            }
-        }
-    }
-    let (rhat, ess) = super::hmc_io::compute_split_rhat_and_ess(&chains);
-    let converged = rhat < 1.1 && ess > 100.0;
+    // consecutive draws. Measure the diagnostics on the kept draws instead of
+    // asserting the iid triple. Diagnose the active Markov state before
+    // lifting: a rectangular gauge can add deterministic raw coordinates whose
+    // zero variance has no R-hat.
+    let (rhat, ess) = super::hmc_io::compute_split_rhat_and_ess(&draws.chains);
+    let converged = super::hmc_io::mixing_converged(rhat, ess);
+    let warmup_transitions = draws.warmup_transitions;
+    let active_samples = draws.into_stacked();
 
     // Public draws use the saved/raw coefficient order. The persisted
     // inequalities and precision live in the gauge's active frame, so sample
@@ -1260,7 +1370,7 @@ fn sample_standard_truncated(
         rhat,
         ess,
         converged,
-        warmup_transitions: 0,
+        warmup_transitions,
         sampler: PosteriorSampler::TruncatedLaplaceHmc,
         covariance: InferenceCovarianceMode::Conditional,
     })
@@ -1698,6 +1808,131 @@ mod tests {
     use super::*;
     use gam_linalg::matrix::{DenseDesignMatrix, DenseDesignOperator, LinearOperator};
     use gam_problem::types::LikelihoodScaleMetadata;
+
+    /// Draws whose sample mean is `mean` and whose sample covariance is exactly
+    /// `covariance`: standard-normal rows, centred and whitened by their own
+    /// sample covariance, then coloured.
+    fn draws_with_exact_moments(
+        mean: &Array1<f64>,
+        covariance: &Array2<f64>,
+        n_draws: usize,
+        seed: u64,
+    ) -> NutsResult {
+        let p = mean.len();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let raw = Array2::from_shape_fn((n_draws, p), |_| sample_standard_normal(&mut rng));
+        let raw_mean = raw.mean_axis(ndarray::Axis(0)).expect("draws");
+        let centred = &raw - &raw_mean;
+        let sample_covariance = centred.t().dot(&centred) / (n_draws as f64 - 1.0);
+        let (values, vectors) = symmetric_eigh(&sample_covariance, "test", "sample").expect("eigh");
+        let whiten = symmetric_function(&values, &vectors, |v| v.sqrt().recip());
+        let (values, vectors) = symmetric_eigh(covariance, "test", "target").expect("eigh");
+        let colour = symmetric_function(&values, &vectors, f64::sqrt);
+        let samples = centred.dot(&whiten).dot(&colour) + mean;
+        NutsResult {
+            posterior_mean: samples.mean_axis(ndarray::Axis(0)).expect("draws"),
+            posterior_std: samples.std_axis(ndarray::Axis(0), 1.0),
+            samples,
+            rhat: 1.0,
+            ess: n_draws as f64,
+            converged: true,
+            warmup_transitions: 0,
+            sampler: PosteriorSampler::Nuts,
+            covariance: InferenceCovarianceMode::Conditional,
+        }
+    }
+
+    fn sample_covariance(samples: &Array2<f64>) -> Array2<f64> {
+        let mean = samples.mean_axis(ndarray::Axis(0)).expect("draws");
+        let centred = samples - &mean;
+        centred.t().dot(&centred) / (samples.nrows() as f64 - 1.0)
+    }
+
+    /// G3: exact-likelihood draws are conditional on `ρ̂`; after the
+    /// correction their covariance must be the smoothing-corrected `V_c` that
+    /// `summary()` publishes, and the result must say so. `V_c` here is the
+    /// cubature shape — wider than `Vb` in one direction and NARROWER in
+    /// another — which no additive displacement can reach.
+    #[test]
+    fn smoothing_correction_gives_draws_the_corrected_covariance() {
+        let conditional = ndarray::array![[0.49, 0.2, -0.1], [0.2, 1.0, 0.3], [-0.1, 0.3, 1.96]];
+        let widen = ndarray::array![[0.9, -0.2], [0.4, 0.6], [-0.3, 1.1]];
+        let mut corrected = &conditional + &widen.dot(&widen.t());
+        let narrow = ndarray::array![0.6, -0.5, 0.2];
+        for i in 0..3 {
+            for j in 0..3 {
+                corrected[(i, j)] -= 0.3 * narrow[i] * narrow[j];
+            }
+        }
+        let direction_variance = |covariance: &Array2<f64>| narrow.dot(&covariance.dot(&narrow));
+        assert!(direction_variance(&corrected) < direction_variance(&conditional));
+
+        let mean = ndarray::array![0.3, -1.2, 2.0];
+        let mut result = draws_with_exact_moments(&mean, &conditional, 500, 7);
+        let before = result.samples.clone();
+        recolor_to_smoothing_corrected_covariance(&mut result, Some(&conditional), Some(&corrected))
+            .expect("SPD covariances must be accepted");
+        assert_eq!(result.covariance, InferenceCovarianceMode::SmoothingCorrected);
+
+        let drawn = sample_covariance(&result.samples);
+        for i in 0..3 {
+            for j in 0..3 {
+                approx::assert_abs_diff_eq!(drawn[(i, j)], corrected[(i, j)], epsilon = 1e-10);
+            }
+            approx::assert_abs_diff_eq!(result.posterior_mean[i], mean[i], epsilon = 1e-10);
+            approx::assert_relative_eq!(
+                result.posterior_std[i],
+                drawn[(i, i)].sqrt(),
+                max_relative = 1e-12
+            );
+        }
+        // The map is affine: a draw's position within the conditional cloud
+        // (and so the likelihood's shape) is carried through, not resampled.
+        let displacement = &result.samples - &before;
+        assert!(displacement.iter().any(|value| value.abs() > 1e-3));
+    }
+
+    #[test]
+    fn smoothing_correction_absent_shared_or_invalid() {
+        let identity = Array2::<f64>::eye(2);
+        let mean = Array1::<f64>::zeros(2);
+        let mut result = draws_with_exact_moments(&mean, &identity, 16, 3);
+        let before = result.samples.clone();
+
+        recolor_to_smoothing_corrected_covariance(&mut result, Some(&identity), None)
+            .expect("no published correction leaves draws alone");
+        assert_eq!(result.samples, before);
+        assert_eq!(result.covariance, InferenceCovarianceMode::Conditional);
+
+        // No smoothing coordinate: the fit publishes `Vb` itself as `V_c`.
+        recolor_to_smoothing_corrected_covariance(&mut result, Some(&identity), Some(&identity))
+            .expect("V_c = Vb is already the corrected posterior");
+        assert_eq!(result.samples, before);
+        assert_eq!(result.covariance, InferenceCovarianceMode::SmoothingCorrected);
+
+        let indefinite = ndarray::array![[1.0, 0.0], [0.0, -0.5]];
+        let err = recolor_to_smoothing_corrected_covariance(
+            &mut result,
+            Some(&identity),
+            Some(&indefinite),
+        )
+        .expect_err("an indefinite corrected matrix is not a covariance");
+        assert!(err.contains("not a covariance"), "{err}");
+        let err = recolor_to_smoothing_corrected_covariance(
+            &mut result,
+            Some(&indefinite),
+            Some(&identity),
+        )
+        .expect_err("an indefinite conditional matrix is not a covariance");
+        assert!(err.contains("not positive definite"), "{err}");
+        let wrong_shape = Array2::<f64>::eye(3);
+        assert!(
+            recolor_to_smoothing_corrected_covariance(&mut result, Some(&identity), Some(&wrong_shape))
+                .is_err()
+        );
+        assert!(recolor_to_smoothing_corrected_covariance(&mut result, None, Some(&identity)).is_err());
+        assert_eq!(result.samples, before);
+    }
 
     #[test]
     fn link_wiggle_dispatch_requires_and_consumes_the_persisted_cone() {

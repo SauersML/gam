@@ -7,9 +7,11 @@ pub enum GpuMixedPrecisionPolicy {
     /// Attempt fp32 Cholesky factorization followed by up to
     /// `REFINEMENT_MAX_STEPS` fp64-residual refinement steps. Policy admits
     /// the attempt only when `p ≥ REFINEMENT_MIN_P` (so that the fp64 GEMV
-    /// overhead is amortized) and the measured residual drops monotonically.
-    /// Falls back to fp64 factorization automatically when the residual does
-    /// not decrease (κ(A)·u ≥ 1 regime) or when the fp32 POTRF itself fails.
+    /// overhead is amortized). The fp32 result is used only when its fp64
+    /// residual is certified inside its rounding band; fp64 factorization is
+    /// used instead when the residual does not decrease (κ(A)·u ≥ 1 regime),
+    /// when the step budget ends above the band, or when the fp32 POTRF itself
+    /// fails.
     Refinement,
     /// Always use fp64 factorization; equivalent to `Off` but signals that
     /// an explicit policy decision was taken.
@@ -27,10 +29,8 @@ pub struct GpuDispatchPolicy {
     pub small_dense_batched_potrf_min_batch: usize,
     pub syevd_min_p: usize,
     pub sparse_min_nnz: usize,
-    pub fused_kernel_min_n: usize,
     pub keep_design_resident_min_bytes: usize,
     pub prefer_gpu_factorization_min_p: usize,
-    pub row_kernel_min_n: usize,
     pub mixed_precision: GpuMixedPrecisionPolicy,
 }
 
@@ -54,10 +54,8 @@ impl Default for GpuDispatchPolicy {
             small_dense_batched_potrf_min_batch: 8,
             syevd_min_p: 256,
             sparse_min_nnz: 1_000_000,
-            fused_kernel_min_n: 100_000,
             keep_design_resident_min_bytes: 32 * 1024 * 1024,
             prefer_gpu_factorization_min_p: 512,
-            row_kernel_min_n: 50_000,
             mixed_precision: GpuMixedPrecisionPolicy::Refinement,
         }
     }
@@ -86,25 +84,6 @@ impl GpuDispatchPolicy {
     /// `p` below this is inadmissible under every reachable policy.
     pub(crate) const MIN_CALIBRATABLE_POTRF_P: usize = 64;
 
-    /// The smallest `row_kernel_min_n` / `xtwx_n_min` ANY production dispatch
-    /// policy can carry: the smallest XtWX calibration row count
-    /// (`calibration::XTWX_DIMS[0].0`, pinned by a compile-time assert there).
-    /// A row-kernel workload with fewer rows is inadmissible under every
-    /// reachable policy, so per-fit GPU-eligibility deciders may refuse it
-    /// BEFORE probing the device.
-    pub const MIN_CALIBRATABLE_ROW_KERNEL_N: usize = 2_048;
-
-    /// The smallest `fused_kernel_min_n` ANY production dispatch policy can
-    /// carry.
-    ///
-    /// Device calibration derives the fused-kernel crossover as twice its
-    /// measured row-kernel crossover. The calibration grid pins that row floor
-    /// to [`Self::MIN_CALIBRATABLE_ROW_KERNEL_N`], so a smaller fused batch is
-    /// inadmissible under every reachable policy and can remain on the CPU
-    /// without probing CUDA merely to discover the device-specific threshold.
-    pub const MIN_CALIBRATABLE_FUSED_KERNEL_N: usize =
-        2 * Self::MIN_CALIBRATABLE_ROW_KERNEL_N;
-
     /// Minimum problem dimension for the fp32+refinement path.
     ///
     /// Below this threshold the fp64 GEMV needed for the residual check costs
@@ -116,12 +95,17 @@ impl GpuDispatchPolicy {
     /// activates when the GPU factorization path is already chosen.
     pub const REFINEMENT_MIN_P: usize = 64;
 
-    /// Maximum number of fp32-correction steps per solve.
+    /// Maximum number of fp32-correction steps per solve: a COST budget, not an
+    /// accuracy guarantee.
     ///
-    /// Two steps suffice for κ(A) ≤ 10⁵ at fp32 (u ≈ 6 × 10⁻⁸): after step
-    /// 1 the error is O(κ u)² ≈ 10⁻⁶, after step 2 it is O(κ u)⁴ ≈ 10⁻¹²,
-    /// which is well within the fp64 unit roundoff of 10⁻¹⁶ × κ. A cap of 3
-    /// is used defensively.
+    /// With a fixed fp32 factor, iterative refinement contracts the error
+    /// linearly — after `k` corrections it is ≈ (κ(A)·u_f32)^{k+1} relative,
+    /// u_f32 ≈ 6 × 10⁻⁸ — so reaching the fp64 band κ(A)·u_f64 within 3
+    /// corrections needs κ(A)³ ≲ u_f64 / u_f32⁴, i.e. κ(A) ≲ 2 × 10⁴. Accuracy
+    /// is decided by the solver's residual certificate
+    /// (`‖b − A·x‖ ≤ γ_{p+1}·(‖A‖_F‖x‖ + ‖b‖)`), not by this count: when the
+    /// budget ends above that band the fp32 path reports failure and the solve
+    /// is done by fp64 POTRF.
     pub const REFINEMENT_MAX_STEPS: usize = 3;
 
     /// Return `true` when the policy and problem size together suggest that
@@ -159,23 +143,6 @@ impl GpuDispatchPolicy {
             && px > 0
             && q > 0
             && self.xtwy_flops(n, px, q) >= self.dense_reduction_flops_min()
-    }
-
-    /// Whether a batched Pólya-Gamma draw of `n` rows is worth dispatching to
-    /// the device.
-    ///
-    /// A PG batch is a fused elementwise kernel: one independent rejection
-    /// sampler per row, no reduction and no cross-row reuse. So the row count
-    /// *is* the work, and what the device has to overcome is launch latency
-    /// plus the `n·(4 + 8)` bytes staged in and `n·8` staged back out — a
-    /// transfer/launch amortisation question rather than an arithmetic-intensity
-    /// one. That is exactly what `fused_kernel_min_n` carries: calibration sets
-    /// it to twice the device's *measured* XtWX crossover row count, so the
-    /// crossover is a per-device measurement rather than a tuned literal, and a
-    /// faster host CPU moves it up on that host instead of failing the kernel.
-    #[inline]
-    pub const fn polya_gamma_batch_target_is_gpu(&self, n: usize) -> bool {
-        n >= self.fused_kernel_min_n
     }
 
     pub const fn dense_hessian_work_target_is_gpu(&self, n: usize, p: usize) -> bool {
@@ -248,7 +215,7 @@ impl GpuDispatchPolicy {
     /// Work-based admission for offloading the **reduced-Schur PCG matvec** (the
     /// InexactPCG hot loop for matrix-free SAE β-blocks) to the device.
     ///
-    /// The dense gates key on row count (`xtwx_n_min`, `row_kernel_min_n`) or on
+    /// The dense gates key on row count (`xtwx_n_min`) or on
     /// one big factorization's flops, and the SAE LLM shape `(n≈2000) × (k≈2048)
     /// × (d≈8)` trips neither: it is thousands of small dense ops. But a CG solve
     /// stages the row frames once and reuses them for `cg_iters` applies, so its
@@ -446,27 +413,6 @@ mod refinement_policy_tests {
         };
         assert!(!pol.iterative_refinement_should_attempt(1024));
     }
-}
-
-#[cfg(test)]
-mod fused_batch_dispatch_tests {
-    use super::*;
-
-    /// The dominant large-scale PG draw shape — one variate per data row per
-    /// Gibbs iteration — is admitted, and a batch small enough that launch and
-    /// staging dominate is refused. The refusal is the load-bearing half: a
-    /// predicate that admitted everything would let a dispatch-worthiness test
-    /// pass without saying anything about the shape it ran.
-    #[test]
-    fn polya_gamma_admits_large_batch_and_refuses_small() {
-        let pol = GpuDispatchPolicy::default();
-        assert!(pol.polya_gamma_batch_target_is_gpu(200_000));
-        assert!(pol.polya_gamma_batch_target_is_gpu(pol.fused_kernel_min_n));
-        assert!(!pol.polya_gamma_batch_target_is_gpu(pol.fused_kernel_min_n - 1));
-        assert!(!pol.polya_gamma_batch_target_is_gpu(16));
-        assert!(!pol.polya_gamma_batch_target_is_gpu(0));
-    }
-
 }
 
 #[cfg(test)]

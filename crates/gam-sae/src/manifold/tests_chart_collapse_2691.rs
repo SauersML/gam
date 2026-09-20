@@ -442,7 +442,6 @@ fn zz_2691_outer_path_chart_collapse_sweep() {
                     top_k: None,
                     threshold: 0.0,
                     seed_refine_routing: refine_routing,
-                    seed_refine_random_state: 20260731,
                     fit_config: SaeFitConfig::default(),
                     temperature_schedule: None,
                     fisher_metric: None,
@@ -686,7 +685,6 @@ fn zz_2691_collapsed_chart_is_refused_by_the_production_entry() {
         top_k: None,
         threshold: 0.0,
         seed_refine_routing: refine_routing,
-        seed_refine_random_state: 20260731,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
         fisher_metric: None,
@@ -1095,15 +1093,21 @@ fn zz_2691_bounded_sigma_witness_returns_an_answer_at_every_sigma() {
             .with_max_iter(8)
             .run(&mut objective, "SAE #2691 bounded σ witness");
         let secs = start.elapsed().as_secs_f64();
+        // A budget-bounded search that does not certify stationarity mints no
+        // fit; it refuses with its best iterate as the checkpoint. That iterate
+        // IS the terminal ρ this witness reads — where the search put the ARD
+        // coordinate when its iterations ran out. Any other error returns no
+        // iterate at all, which is exactly the "no answer at this σ" the test
+        // name forbids.
         let (terminal, converged) = match &result {
             Ok(outcome) => (outcome.rho[ard_index], outcome.converged()),
-            Err(error) => {
-                eprintln!(
-                    "[2691-sigma] {sigma:.3}\t{face:.4}\t{seed:.4}\t-\t-\t-\t{secs:.1}\tREFUSED: {}",
-                    format!("{error}").replace('\n', " ")
-                );
-                continue;
+            Err(EstimationError::RemlDidNotConverge { rho_checkpoint, reason, .. }) => {
+                eprintln!("[2691-sigma] {sigma:.3}\tcheckpoint after: {reason}");
+                (rho_checkpoint[ard_index], false)
             }
+            Err(error) => panic!(
+                "#2691: the bounded σ witness returned no terminal ρ at σ={sigma}: {error}"
+            ),
         };
         let moved = (terminal - seed).abs() > 1.0e-9;
         any_moved |= moved;

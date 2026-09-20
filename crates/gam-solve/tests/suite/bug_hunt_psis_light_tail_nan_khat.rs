@@ -8,7 +8,7 @@
 //! returns `Some` with a finite, non-heavy `k_hat`) and the underlying numerical
 //! defect (`fit_gpd_moments` reports a positive, finite scale on the excesses).
 
-use gam_solve::psis::{MIN_TAIL_COUNT, fit_gpd_moments, pareto_smooth_weights};
+use gam_solve::psis::{MIN_TAIL_COUNT, WeightTailShape, fit_gpd_moments, pareto_smooth_weights};
 
 const BASELINE: f64 = 1.0;
 const TAIL_K: f64 = -0.2; // a genuinely LIGHT (bounded-support, negative-shape) tail
@@ -53,15 +53,13 @@ fn pareto_smooth_weights_fits_a_clean_light_tail() {
     let w = light_tailed_weights();
     let out = pareto_smooth_weights(&w)
         .expect("a clean, well-conditioned light tail must fit (returned None: #1655)");
+    let WeightTailShape::Pareto(k_hat) = out.shape else {
+        panic!("a light tail with distinct excesses must be fitted, got {:?}", out.shape);
+    };
+    assert!(k_hat.is_finite(), "k_hat must be finite for a light tail, got {k_hat}");
     assert!(
-        out.k_hat.is_finite(),
-        "k_hat must be finite for a light tail, got {}",
-        out.k_hat
-    );
-    assert!(
-        out.k_hat < 0.5,
-        "a bounded light tail must NOT be flagged heavy; got k_hat={}",
-        out.k_hat
+        k_hat < 0.5,
+        "a bounded light tail must NOT be flagged heavy; got k_hat={k_hat}"
     );
 }
 

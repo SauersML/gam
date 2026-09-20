@@ -418,6 +418,55 @@ pub(crate) fn dense_locscale_block_designs_cached<'a>(
     Ok((primary, log_sigma))
 }
 
+/// The (primary, log-σ) dense designs a location-scale family's exact joint calculus
+/// runs on (#3015).
+///
+/// When `specs` are given they are the designs the solve runs on, so they are
+/// authoritative. The identifiability canonicaliser can drop columns from the designs a
+/// family was built with, and the solve sizes its coefficient vector from the specs it
+/// hands the family. A family that reads its own stored copy instead returns curvature
+/// of the wrong width, and the solve refuses every trial point. The stored designs serve
+/// only the hooks the caller invokes without specs, which run in the frame the family
+/// was built in. Every location-scale family resolves its designs through this one
+/// rule; the Gaussian location-scale family had it alone (#1504).
+pub(crate) fn exact_joint_locscale_block_designs<'a>(
+    stored: (Option<&'a DesignMatrix>, Option<&'a DesignMatrix>),
+    specs: Option<&'a [ParameterBlockSpec]>,
+    expected_count: usize,
+    family_name: &str,
+    short_family_name: &str,
+    primary_block_idx: usize,
+    log_sigma_block_idx: usize,
+    primary_label: &str,
+    material_policy: &gam_runtime::resource::MaterializationPolicy,
+) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
+    if let Some(specs) = specs {
+        return dense_locscale_block_designs_fromspecs(
+            specs,
+            expected_count,
+            family_name,
+            short_family_name,
+            primary_block_idx,
+            log_sigma_block_idx,
+            primary_label,
+            material_policy,
+        )
+        .map(Some);
+    }
+    match stored {
+        (Some(_), Some(_)) => dense_locscale_block_designs_cached(
+            stored.0,
+            stored.1,
+            family_name,
+            short_family_name,
+            primary_label,
+            material_policy,
+        )
+        .map(Some),
+        _ => Ok(None),
+    }
+}
+
 /// One resolved ψ-direction for a two-axis (primary + log-σ) location-scale
 /// family. Holds the neutral pieces shared by every such family's
 /// `exact_newton_joint_psi_direction`; each family wraps these into its own
@@ -810,6 +859,7 @@ pub(crate) fn gaussian_diagonal_row_kernel(
     location_eta: f64,
     eta_log_sigma: f64,
     obs_weight: f64,
+    sigma_floor: f64,
     ln2pi: f64,
 ) -> Result<GaussianDiagonalRowKernel, String> {
     if !y.is_finite() || !location_eta.is_finite() || !eta_log_sigma.is_finite() {
@@ -828,6 +878,14 @@ pub(crate) fn gaussian_diagonal_row_kernel(
         }
         .into());
     }
+    if !(sigma_floor.is_finite() && sigma_floor > 0.0) {
+        return Err(GamlssError::InvalidInput {
+            reason: format!(
+                "Gaussian location-scale requires a finite positive σ floor; got {sigma_floor}"
+            ),
+        }
+        .into());
+    }
     if obs_weight == 0.0 {
         return Ok(GaussianDiagonalRowKernel {
             log_likelihood: 0.0,
@@ -841,14 +899,16 @@ pub(crate) fn gaussian_diagonal_row_kernel(
         });
     }
 
-    // logb noise link σ = b + exp(η) bounds σ ≥ b > 0 by construction, so the
+    // logb noise link σ = b + exp(η), with `b = sigma_floor` the fit's
+    // measurement-resolution bound (`gaussian_resolution_sigma_floor`), bounds
+    // σ ≥ b > 0 by construction, so the
     // Gaussian location-scale objective ½Σ(y−μ)²/σ² + Σlog σ is bounded below
     // for any finite data. Its working weight 1/σ² is bounded by 1/b², so
     // H_μμ has bounded condition number — no after-the-fact floor or cap is
     // needed (the previous (1e-12, 1e24) clamp was a numerical bandaid for the
     // pure-exp link's σ→0 singularity and is structurally unnecessary here).
     // ApproxKind: Exact — working weight analytically bounded in (0, 1/b²].
-    let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(eta_log_sigma);
+    let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(sigma_floor, eta_log_sigma);
     if !sigma.is_finite() || sigma <= 0.0 {
         return Err(GamlssError::row_geometry_unrepresentable(row, "Gaussian scale link", eta_log_sigma, sigma));
     }

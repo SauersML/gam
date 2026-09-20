@@ -3,11 +3,7 @@ use super::*;
 // their classifier marker rather than restating it.
 use super::outer_objective::ProbeRefusalKind;
 use crate::chart_coordinate_solve::PeriodicCurveExtrema;
-use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge};
-
-/// Maximum number of LM ridge-escalation attempts before declaring the per-row
-/// Hessian unfactorable.
-const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
+use opt::{BacktrackConfig, backtracking_line_search};
 
 const SAE_MANIFOLD_LM_RATIO_LOW: f64 = 0.25;
 const SAE_MANIFOLD_LM_RATIO_HIGH: f64 = 0.75;
@@ -89,10 +85,6 @@ pub(crate) enum JointFitTermination {
     },
     /// The pre-step objective was not finite.
     NonFinitePreStep,
-    /// The documented objective-stall approximation, reached after the
-    /// gauge-orbit block recovered nothing: small strict decreases, not a KKT
-    /// certificate.
-    ObjectiveStall,
     /// The proximal correction errored and the pre-step state was restored.
     ProximalCorrectionFailed,
     NoStrictDecrease,
@@ -107,7 +99,6 @@ impl JointFitTermination {
             Self::Stationary { .. } | Self::NoStrictDecrease => true,
             Self::Frozen
             | Self::NonFinitePreStep
-            | Self::ObjectiveStall
             | Self::ProximalCorrectionFailed
             | Self::IterationGrantExhausted => false,
         }
@@ -5555,10 +5546,8 @@ impl SaeManifoldTerm {
                     layout.expand_row(row, &compact_row, &mut full_delta[row * q..(row + 1) * q]);
                 }
             }
-            // Apply logits from expanded buffer, clamped to the #976 gate-scale
-            // step cap, then canonicalize each softmax row in the same worker.
-            let logit_step_cap =
-                SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * self.assignment.mode.temperature();
+            // Apply logits from expanded buffer, then canonicalize each softmax
+            // row in the same worker.
             if parallel_rows {
                 use rayon::prelude::*;
                 self.assignment
@@ -5569,8 +5558,7 @@ impl SaeManifoldTerm {
                     .for_each(|(row, mut logits)| {
                         let row_base = row * q;
                         for atom_idx in 0..assignment_dim {
-                            logits[atom_idx] += (step_size * full_delta[row_base + atom_idx])
-                                .clamp(-logit_step_cap, logit_step_cap);
+                            logits[atom_idx] += step_size * full_delta[row_base + atom_idx];
                         }
                         if softmax {
                             canonicalize_softmax_logit_row(
@@ -5583,8 +5571,7 @@ impl SaeManifoldTerm {
                     let row_base = row * q;
                     let mut logits = self.assignment.logits.row_mut(row);
                     for atom_idx in 0..assignment_dim {
-                        logits[atom_idx] += (step_size * full_delta[row_base + atom_idx])
-                            .clamp(-logit_step_cap, logit_step_cap);
+                        logits[atom_idx] += step_size * full_delta[row_base + atom_idx];
                     }
                     if softmax {
                         canonicalize_softmax_logit_row(
@@ -5614,9 +5601,6 @@ impl SaeManifoldTerm {
                 ));
             }
             let coord_offsets = self.assignment.coord_offsets();
-            // #976 gate-scale step cap, as in the compact branch above.
-            let logit_step_cap =
-                SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * self.assignment.mode.temperature();
             if parallel_rows {
                 use rayon::prelude::*;
                 self.assignment
@@ -5627,8 +5611,7 @@ impl SaeManifoldTerm {
                     .for_each(|(row, mut logits)| {
                         let row_base = row * q;
                         for atom_idx in 0..assignment_dim {
-                            logits[atom_idx] += (step_size * delta_ext_coord[row_base + atom_idx])
-                                .clamp(-logit_step_cap, logit_step_cap);
+                            logits[atom_idx] += step_size * delta_ext_coord[row_base + atom_idx];
                         }
                         if softmax {
                             canonicalize_softmax_logit_row(
@@ -5641,8 +5624,7 @@ impl SaeManifoldTerm {
                     let row_base = row * q;
                     let mut logits = self.assignment.logits.row_mut(row);
                     for atom_idx in 0..assignment_dim {
-                        logits[atom_idx] += (step_size * delta_ext_coord[row_base + atom_idx])
-                            .clamp(-logit_step_cap, logit_step_cap);
+                        logits[atom_idx] += step_size * delta_ext_coord[row_base + atom_idx];
                     }
                     if softmax {
                         canonicalize_softmax_logit_row(
@@ -5679,10 +5661,19 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// Per-row fixed-decoder step `δ = −(|H| + ridge·I)⁻¹ g` (#3090).
+    ///
+    /// `|H| = V diag(|λ|) Vᵀ` is the saddle-free absolute-value Hessian: for a
+    /// PSD row Hessian it equals `H`, so the step is the ridged Newton step;
+    /// for an indefinite one (the Riemannian correction and a zero-curvature
+    /// ARD majorizer on a periodic axis can make it so) every eigendirection
+    /// keeps a positive weight `1/(|λ|+ridge)`, so `−gᵀδ > 0` whenever
+    /// `g ≠ 0`. The step is a descent direction by construction, which is
+    /// what the line search needs, and there is no ridge escalation schedule.
     pub(crate) fn solve_fixed_decoder_row_step(
         h: ArrayView2<'_, f64>,
         g: ArrayView1<'_, f64>,
-        base_ridge: f64,
+        ridge: f64,
     ) -> Result<Array1<f64>, String> {
         let d = h.nrows();
         if h.ncols() != d || g.len() != d {
@@ -5692,36 +5683,31 @@ impl SaeManifoldTerm {
                 g.len()
             ));
         }
+        if !(ridge.is_finite() && ridge > 0.0) {
+            return Err(format!(
+                "SaeManifoldTerm::solve_fixed_decoder_row_step: ridge must be finite and positive, got {ridge}"
+            ));
+        }
         if d == 0 {
             return Ok(Array1::<f64>::zeros(0));
         }
-        let mut last_err = String::new();
-        escalate_ridge(
-            RidgeSchedule {
-                initial: base_ridge.max(SAE_MANIFOLD_ROW_RIDGE_FLOOR),
-                growth: SAE_MANIFOLD_ROW_RIDGE_GROWTH,
-                max_escalations: SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS,
-            },
-            |ridge| {
-                let mut a = h.to_owned();
-                for axis in 0..d {
-                    a[[axis, axis]] += ridge;
-                }
-                match sae_cholesky_solve_neg_gradient(a.view(), g) {
-                    Ok(delta) => Some(delta),
-                    Err(err) => {
-                        last_err = err;
-                        None
-                    }
-                }
-            },
-        )
-        .map(|success| success.value)
-        .map_err(|_| {
-            format!(
-                "SaeManifoldTerm::solve_fixed_decoder_row_step: row Hessian did not factor after LM escalation; last error: {last_err}"
-            )
-        })
+        if !h.iter().chain(g.iter()).all(|value| value.is_finite()) {
+            return Err(
+                "SaeManifoldTerm::solve_fixed_decoder_row_step: non-finite row Hessian or gradient"
+                    .to_string(),
+            );
+        }
+        let (evals, evecs) = h.to_owned().eigh(Side::Lower).map_err(|err| {
+            format!("SaeManifoldTerm::solve_fixed_decoder_row_step: row Hessian eigh failed: {err}")
+        })?;
+        let projected = evecs.t().dot(&g);
+        let scaled = Array1::from_iter(
+            projected
+                .iter()
+                .zip(evals.iter())
+                .map(|(&coeff, &lambda)| coeff / (lambda.abs() + ridge)),
+        );
+        Ok(-evecs.dot(&scaled))
     }
 
     pub(crate) fn fixed_decoder_step_from_rows(
@@ -5935,40 +5921,46 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// Frozen-decoder encode: minimize the penalized objective over the row
+    /// coordinates and routing logits with every decoder held fixed (#3277).
+    ///
+    /// It returns only from a certified stationary point. The certificate is
+    /// the saddle-free Newton decrement `d = −gᵀΔ` reaching one of two
+    /// rounding floors. The first is the objective's own resolution
+    /// `γ_k·Σ|summands|`: a model decrease that small cannot be told apart
+    /// from the rounding of the computed objective. The second is the rounding band of the contraction itself,
+    /// where the sign of `d` is not resolved.
+    ///
+    /// Every accepted step is a STRICT Armijo decrease of a finite objective.
+    /// A strictly decreasing sequence of floats is finite, so the walk ends
+    /// without an iteration budget. It starts at the unit Newton step, the
+    /// natural length of the saddle-free step (#2267). A line search that finds
+    /// no strict decrease along a resolved descent direction is a typed error,
+    /// never a result.
     pub fn run_fixed_decoder_arrow_schur(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &mut SaeManifoldRho,
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
-        max_iter: usize,
-        step_size: f64,
         ridge_ext_coord: f64,
     ) -> Result<SaeManifoldLoss, String> {
         *rho = rho.clone().for_assignment(&self.assignment);
         self.assignment.validate_rho_domain(rho)?;
-        if !(step_size.is_finite() && step_size > 0.0) {
-            return Err(format!(
-                "SaeManifoldTerm::run_fixed_decoder_arrow_schur: step_size must be finite and positive; got {step_size}"
-            ));
-        }
-        // #2267 — the backtracking search only ever CONTRACTS from its first
-        // trial, so pinning that trial to the caller's `step_size` caps the
-        // per-iteration contraction at `1 - step_size` regardless of how good
-        // the direction is. Clean acceptances ratchet the trial toward the unit
-        // Newton step instead; the Armijo bound is unchanged.
-        let warm_growth = 1.0 / BacktrackConfig::default().contraction;
-        let unit_step_ceiling = step_size.max(1.0);
-        let mut warm_step = step_size;
-        if max_iter < 1 {
+        // An annealing schedule moves the objective between iterates, so no
+        // iterate of the encode could be certified stationary for it.
+        if self.temperature_schedule.is_some() {
             return Err(
-                "SaeManifoldTerm::run_fixed_decoder_arrow_schur: max_iter must be positive".into(),
+                "SaeManifoldTerm::run_fixed_decoder_arrow_schur: the frozen-decoder encode \
+                 minimizes one fixed objective; a temperature schedule is a training-time \
+                 construct"
+                    .to_string(),
             );
         }
+        let warm_growth = 1.0 / BacktrackConfig::default().contraction;
+        let mut warm_step = 1.0_f64;
         let beta_zero = Array1::<f64>::zeros(self.beta_dim());
-        let mut last_loss = self.loss(target, rho)?;
-        for _ in 0..max_iter {
-            self.advance_temperature_schedule()?;
-            let pre_step_loss = self.loss(target, rho)?;
+        let mut iteration = 0_usize;
+        loop {
             // #1407: assemble ONLY the per-row htt/gt block-diagonal — the frozen
             // decoder makes the entire β tier (G/gb/htbeta/hbb/β-penalties) dead
             // work. `fixed_decoder_step_from_rows` below reads only htt/gt.
@@ -5977,8 +5969,17 @@ impl SaeManifoldTerm {
             self.fixed_decoder_assembly = false;
             let sys = sys_result
                 .map_err(|err| format!("SaeManifoldTerm::run_fixed_decoder_arrow_schur: {err}"))?;
+            // The baseline is read after assembly, from the exact represented
+            // state whose gradient and Hessian produced `sys`.
+            let pre_step_loss = self.loss(target, rho)?;
             let pre_step_total =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+            if !pre_step_total.is_finite() {
+                return Err(format!(
+                    "SaeManifoldTerm::run_fixed_decoder_arrow_schur: non-finite objective \
+                     {pre_step_total} at iteration {iteration}"
+                ));
+            }
             let delta_ext_coord = Self::fixed_decoder_step_from_rows(&sys, ridge_ext_coord)?;
             let decrease = sae_manifold_newton_directional_decrease(
                 &sys,
@@ -5986,16 +5987,25 @@ impl SaeManifoldTerm {
                 beta_zero.view(),
             );
             let directional_decrease = decrease.value;
-            let directional_decrease_floor = decrease.rounding_band;
-            let snapshot = self.snapshot_mutable_state();
-            if !(pre_step_total.is_finite()
-                && directional_decrease.is_finite()
-                && directional_decrease > 0.0
-                && directional_decrease > directional_decrease_floor)
-            {
-                self.restore_mutable_state(&snapshot)?;
-                last_loss = pre_step_loss;
-                break;
+            if !directional_decrease.is_finite() {
+                return Err(format!(
+                    "SaeManifoldTerm::run_fixed_decoder_arrow_schur: non-finite Newton \
+                     decrement {directional_decrease} at iteration {iteration}"
+                ));
+            }
+            // The penalized objective is the loss components plus the extra
+            // penalty terms. Its longest accumulation is the data fit over the
+            // `n·p` residual cells, then the five summands are added, so its
+            // computed value cannot resolve a change below `γ_k·Σ|summands|`.
+            let summand_scale = pre_step_loss.data_fit.abs()
+                + pre_step_loss.assignment_sparsity.abs()
+                + pre_step_loss.smoothness.abs()
+                + pre_step_loss.ard.abs()
+                + (pre_step_total - pre_step_loss.total()).abs();
+            let objective_resolution =
+                gam_linalg::roundoff::accumulation_band(target.len() + 4, summand_scale);
+            if directional_decrease <= decrease.rounding_band.max(objective_resolution) {
+                return Ok(pre_step_loss);
             }
 
             // Each trial re-applies the Newton step from the pre-step
@@ -6003,7 +6013,8 @@ impl SaeManifoldTerm {
             // first). A trial whose step application or objective evaluation
             // errors is INVALID (`Ok(None)`): halve without consulting the
             // Armijo test. On acceptance the mutable state already holds the
-            // accepted trial, so the loss is read after the search returns.
+            // accepted trial.
+            let snapshot = self.snapshot_mutable_state();
             let mut first_trial = true;
             let accepted = backtracking_line_search::<_, String>(
                 BacktrackConfig {
@@ -6030,31 +6041,33 @@ impl SaeManifoldTerm {
                 |trial_step_size, post_step_total| {
                     let armijo_bound = pre_step_total
                         - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
-                    post_step_total.is_finite() && post_step_total <= armijo_bound
+                    // Strict: a trial whose objective rounds to the baseline is
+                    // no progress, even when the Armijo bound rounds to it too.
+                    post_step_total.is_finite()
+                        && post_step_total < pre_step_total
+                        && post_step_total <= armijo_bound
                 },
             )?;
-            match accepted {
-                Some(step) => {
-                    // Same ratchet as the joint driver (#2267): this is a Newton
-                    // step too, so its natural length is one, and the caller's
-                    // `step_size` is the conservative first trial, not a ceiling
-                    // the accepted step may never exceed.
-                    warm_step = (if step.step >= warm_step {
-                        warm_step * warm_growth
-                    } else {
-                        step.step * warm_growth
-                    })
-                    .min(unit_step_ceiling);
-                    last_loss = self.loss(target, rho)?;
-                }
-                None => {
-                    self.restore_mutable_state(&snapshot)?;
-                    last_loss = pre_step_loss;
-                    break;
-                }
-            }
+            let Some(step) = accepted else {
+                self.restore_mutable_state(&snapshot)?;
+                return Err(format!(
+                    "SaeManifoldTerm::run_fixed_decoder_arrow_schur: no strict decrease along \
+                     the Newton direction at iteration {iteration} (decrement \
+                     {directional_decrease:.3e}, objective resolution \
+                     {objective_resolution:.3e}, objective {pre_step_total:.17e}); the encode \
+                     did not converge"
+                ));
+            };
+            // Same ratchet as the joint driver (#2267): clean acceptances grow
+            // the next first trial back toward the unit step.
+            warm_step = (if step.step >= warm_step {
+                warm_step * warm_growth
+            } else {
+                step.step * warm_growth
+            })
+            .min(1.0);
+            iteration += 1;
         }
-        Ok(last_loss)
     }
 
     /// Rank-revealing adaptive basis depth for rank-deficient decoder designs
@@ -6259,14 +6272,12 @@ impl SaeManifoldTerm {
     /// coarse KKT band immediately; a Laplace value paired with an implicit
     /// derivative cannot do that, because the resulting warm-start map is flat
     /// inside the band while the analytic adjoint differentiates the exact root.
-    /// Keep the same KKT tolerance as an admission certificate, but bypass both
-    /// its loop-top early exit and the approximate objective-stall shortcut. The
-    /// latter deliberately stops ordinary fits after a few sufficiently small
-    /// but still STRICT decreases; re-entering from that state continues moving,
-    /// so it is not an idempotent root and cannot define the state response used
-    /// by an implicit evidence derivative. Evidence therefore retains only the
-    /// actual no-descent / proximal-no-strict-decrease termination routes before
-    /// the undamped cache is formed (#2253).
+    /// Keep the same KKT tolerance as an admission certificate, but bypass its
+    /// loop-top early exit: a state inside the coarse band is not an idempotent
+    /// root, so it cannot define the state response used by an implicit
+    /// evidence derivative. Evidence therefore retains only the actual
+    /// no-descent / proximal-no-strict-decrease termination routes before the
+    /// undamped cache is formed (#2253).
     pub(crate) fn run_joint_fit_arrow_schur_for_quasi_laplace(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -6300,7 +6311,6 @@ impl SaeManifoldTerm {
             outcome.termination,
             JointFitTermination::Stationary { .. }
                 | JointFitTermination::NonFinitePreStep
-                | JointFitTermination::ObjectiveStall
                 | JointFitTermination::ProximalCorrectionFailed
         ) {
             return Err(
@@ -6912,35 +6922,6 @@ impl SaeManifoldTerm {
         } else {
             None
         };
-        // #2100/#1117 — objective-stagnation convergence for the JOINT outer loop,
-        // the exact analogue of the #1051 stall gate already guarding
-        // `converge_inner_for_undamped_logdet`. On a co-collapsed K≥2 basin (two
-        // atoms decode a SHARED output subspace, μ̂≈1 — the inter-atom
-        // coefficient-rotation gauge orbit), the joint Newton wanders that flat
-        // direction: each Armijo-accepted step lowers the penalised objective by a
-        // sub-√εmach amount while ‖g‖ and the quotient step stay above their
-        // relative tolerances (the near-singular Schur amplifies the weakly-identified
-        // decoder direction), so the grad/step gates never clear and the loop grinds
-        // the full (refine-escalated, ≥1024) `max_iter` at ~1 s/iterate — the
-        // BLOCKER-1 hours-long K=2 planted-circle hang. The grad/quotient-step gates
-        // quotient the SINGLE-atom chart gauge and the decoder-β-null but NOT this
-        // inter-atom shared-subspace gauge, so the objective itself is the honest
-        // stationarity witness here: an iterate whose penalised objective has stopped
-        // decreasing to within √εmach of its scale IS the numerical inner optimum on
-        // whatever quotient the flat direction spans, and ranking the Laplace
-        // criterion there is correct. Break after
-        // `SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS` CONSECUTIVE stalled
-        // iterations (a single flat step can be a benign saddle crossing; a run of
-        // them is sufficient for the ordinary bounded-fit shortcut). Evidence
-        // disables this heuristic because a still-strict decrease is not an
-        // idempotent root. `previous_full_iterate_objective` is the
-        // loop-top objective, which already reflects the PRIOR iteration's step,
-        // guards, retraction and canonicalization, so the measured decrease is the
-        // TOTAL per-iteration progress. Reuses the existing derived stall constants
-        // (no new magic number). A healthy fit clears the grad gate long before its
-        // relative decrease falls below 1e-8, so this never truncates real descent.
-        let mut previous_full_iterate_objective = f64::INFINITY;
-        let mut consecutive_objective_stalls = 0usize;
         // #976 hot-path: the decoder-norm co-collapse guard centers its EV and
         // output-energy signals on the TARGET, an invariant of the whole joint
         // fit. Reduce its per-column means and total centered sum-of-squares ONCE
@@ -6987,35 +6968,13 @@ impl SaeManifoldTerm {
         // the step from GN toward gradient descent (shorter, better-scaled) so the
         // full step is accepted and real progress resumes; shrinking recovers GN's
         // quadratic convergence as the fit enters its local quadratic basin. Uses
-        // ONLY the existing ridge parameters and `SAE_MANIFOLD_ROW_RIDGE_GROWTH`
+        // ONLY the existing ridge parameters and `SAE_MANIFOLD_LM_RIDGE_FACTOR`
         // (no new tuning knob), floored at the caller's ridges, and reset to them
         // on a proximal-correction fallback (which runs its own escalation).
         // Armijo still refereed the true objective, so descent — and the
         // #2235/#2241 certified-termination / typed-exhaustion contract — is
         // unchanged; only the trajectory to the same certified optimum is.
         let mut termination = JointFitTermination::IterationGrantExhausted;
-        // #2762 — whether the gauge-orbit block descent is armed for the NEXT
-        // objective-stall plateau in the ORDINARY lane. Same arm/disarm doctrine
-        // as `terminal_newton_polish_armed` in the evidence refine loop:
-        // consulting the block disarms it, and only a materially-descending
-        // Newton or proximal step re-arms, so a long fit that alternates real
-        // descent with plateaus gets one block consultation per plateau rather
-        // than an unbounded alternation.
-        let mut gauge_block_armed = true;
-        // #2283/#2731 — rounds the PAIRED gauge block (after every accepted iterate,
-        // below) has committed in this call, charged against the loop's own
-        // remaining budget so that block's total over the call stays inside it.
-        // Bounding each visit by `max_iter − outer_iteration` alone charged nothing:
-        // a block that commits at every accepted iterate re-spent the whole
-        // remaining budget there, O(max_iter²) rounds per call. Job 578028 at
-        // 90c86056d (`n = 1024, p = 2048, charts = 32, max_iter = 8`) read
-        // `commit+gauge_hook` = 15.71, 13.82, 11.70, 9.80, 7.89, 6.28, 3.93, 2.03 s
-        // over iterations 0–7, i.e. ≈ 1.96 s × (max_iter − it), against a 1.6 s
-        // assembly. The objective-stall shortcut and the no-strict-decrease rescue
-        // are NOT charged: each precedes a fixed-point exit, and #2762 requires the
-        // block to reach its own stationarity before such a claim
-        // (`the_inner_fit_never_exits_with_material_decrease_left_in_the_removed_span_2762`).
-        let mut paired_gauge_rounds_committed = 0usize;
         let mut state_moved = false;
         // FIRST site to move state — `termination` is set only inside the Newton
         // loop, so without this the out-of-loop sites are unattributable.
@@ -7432,101 +7391,6 @@ impl SaeManifoldTerm {
                 termination = JointFitTermination::NonFinitePreStep;
                 break;
             }
-            // #2100/#1117 ordinary-fit objective-stagnation shortcut (see the
-            // locals above). The
-            // loop-top `pre_step_total` already carries the full effect of the
-            // previous iteration, so a relative decrease below the derived stall
-            // tolerance means that whole iteration (Newton step + guards +
-            // retraction + canonicalization) failed to move the penalised objective
-            // to within √εmach of its scale. On the gauge-orbit crawl this fires
-            // immediately (constant EV ⇒ vanishing objective decrease); on a healthy
-            // fit the grad gate above breaks first. Counting CONSECUTIVE stalls
-            // tolerates a lone flat step; `MIN_ROUNDS` in a row is the fixed point.
-            if allow_heuristic_termination && previous_full_iterate_objective.is_finite() {
-                let round_improvement = (previous_full_iterate_objective - pre_step_total).max(0.0);
-                let objective_scale = previous_full_iterate_objective
-                    .abs()
-                    .max(pre_step_total.abs())
-                    + 1.0;
-                let relative_decrease = round_improvement / objective_scale;
-                if relative_decrease < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL {
-                    consecutive_objective_stalls += 1;
-                    if consecutive_objective_stalls >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS
-                    {
-                        // #2762 — THE SAME BLOCK, AT THE OTHER FIXED-POINT CLAIM.
-                        //
-                        // This comment used to say the shortcut fires "on the
-                        // gauge-orbit crawl ... immediately (constant EV ⇒
-                        // vanishing objective decrease)" — naming the exact
-                        // mechanism and then treating it as a reason to STOP.
-                        // The objective stops moving here because the movers can
-                        // only shorten a step and the remaining decrease lives in
-                        // a near-null block that needs a long one; measured on the
-                        // seeded two-circle fixture, this exit left `7.66e-2` of
-                        // penalized objective — relative `2.3e-3`, five orders
-                        // above the `1e-8` resolution this very branch calls "no
-                        // meaningful change" — recoverable in the removed span.
-                        //
-                        // A stall is only a fixed point if it is a fixed point of
-                        // BOTH blocks, so ask the other one before concluding.
-                        //
-                        // ARMED ONCE PER PLATEAU, on the same doctrine this file
-                        // already uses for the terminal Newton polish: consulting
-                        // the block disarms it, and only a materially-descending
-                        // NEWTON or proximal step re-arms. Without that, the
-                        // block's own decrease breaks the stall streak that
-                        // summoned it, the streak re-forms, and the ordinary
-                        // lane's cheap approximation becomes a budget-limited
-                        // grind — measured on the seeded two-circle fixture as
-                        // `IterationGrantExhausted` at 256 iterations where the
-                        // shipped exit is a bounded heuristic. One consultation
-                        // per plateau is what makes the exit state gauge-
-                        // minimized without changing what the exit MEANS.
-                        let orbit = if gauge_block_armed {
-                            gauge_block_armed = false;
-                            self.descend_gauge_orbit(
-                                target,
-                                rho,
-                                analytic_penalties,
-                                &rho.lambda_smooth_vec()?,
-                                max_iter.saturating_sub(outer_iteration).max(1),
-                            )?
-                        } else {
-                            GaugeOrbitDescent::default()
-                        };
-                        if orbit.moved() {
-                            state_moved = true;
-                            moved_at.get_or_insert(StateMoveSite::GaugeOrbitDescent);
-                            consecutive_objective_stalls = 0;
-                            previous_full_iterate_objective = f64::NAN;
-                            log::trace!(
-                                "run_joint_fit_arrow_schur: gauge-orbit descent recovered \
-                                 {:.6e} over {} round(s) at the objective-stall shortcut, \
-                                 iteration {outer_iteration} (span dim {}, \
-                                 maxᵢ|gᵀvᵢ|={:.6e}, {} objective evaluations)",
-                                orbit.objective_decrease,
-                                orbit.rounds,
-                                orbit.dimension,
-                                orbit.max_directional_derivative,
-                                orbit.evaluations,
-                            );
-                            self.reclaim_arrow_assembly_workspace(&mut sys);
-                            continue;
-                        }
-                        // The ordinary bounded fit has reached its documented
-                        // objective-stall approximation, now in both blocks. The
-                        // pre-step state is unperturbed (the snapshot was taken
-                        // from it, and a descent that commits nothing restores
-                        // it), so no restore is needed.
-                        termination = JointFitTermination::ObjectiveStall;
-                        self.reclaim_arrow_assembly_workspace(&mut sys);
-                        break;
-                    }
-                } else {
-                    consecutive_objective_stalls = 0;
-                }
-            }
-            previous_full_iterate_objective = pre_step_total;
             // A non-descent Newton direction (gᵀΔ ≤ 0 or below the rounding
             // floor) is only a STOPPING criterion when the iterate is actually
             // stationary: the floor exists for benign ill-conditioned
@@ -7660,9 +7524,6 @@ impl SaeManifoldTerm {
             if let Some(step) = accepted_step {
                 state_moved = true;
                 moved_at.get_or_insert(StateMoveSite::AcceptedNewtonStep);
-                // Genuine transverse progress: the next plateau is a new one, so
-                // the gauge block is worth asking again (#2762).
-                gauge_block_armed = true;
                 // #2267 — A NEWTON STEP'S NATURAL LENGTH IS ONE.
                 //
                 // `backtracking_line_search` only ever CONTRACTS from its initial
@@ -7840,17 +7701,19 @@ impl SaeManifoldTerm {
                         analytic_penalties,
                         &rho.lambda_smooth_vec()?,
                         // RUN THE BLOCK TO ITS OWN STATIONARITY, not one step of
-                        // it. `descend_gauge_orbit` returns at the first round
-                        // that cannot commit a material decrease, so this is a
-                        // bound, not a schedule — and the bound is the outer
-                        // loop's OWN remaining budget, so no second budget and
-                        // no constant enter. Measured on `zz2015` with a
-                        // one-round schedule: each round cost a full Newton
-                        // solve + line search + proximal correction to
-                        // rediscover that the transverse block had nothing,
-                        // which is the expensive half of an iteration spent to
-                        // learn something the previous round already proved.
-                        max_iter.saturating_sub(outer_iteration).max(1),
+                        // it, and with no round bound at all. `descend_gauge_orbit`
+                        // returns at the first round that cannot commit a
+                        // material decrease; every committed round clears that
+                        // floor on an objective bounded below, so the block
+                        // terminates by itself. Bounding it by the outer loop's
+                        // remaining grant made the point this loop stops on a
+                        // function of `max_iter` (#3250): a fit object must be
+                        // the same converged point whatever grant reached it.
+                        // Measured on `zz2015` with a one-round schedule: each
+                        // round cost a full Newton solve + line search +
+                        // proximal correction to rediscover that the transverse
+                        // block had nothing.
+                        usize::MAX,
                     )?;
                     if orbit.moved() {
                         state_moved = true;
@@ -7873,37 +7736,32 @@ impl SaeManifoldTerm {
                 }
                 state_moved = true;
                 moved_at.get_or_insert(StateMoveSite::ProximalCorrectionStep);
-                gauge_block_armed = true;
             }
             // #2080/#2228 — the Newton solve deliberately quotients the
             // reconstruction gauge to keep its Schur complement conditioned.
             // Priors make that data-null orbit non-null for the FULL objective,
             // however, so quotienting the step without minimizing its partner
             // block deletes a real gradient component.  Compose both blocks at
-            // every accepted iterate; waiting for an objective-stall rescue left
-            // the orbit residual to become virtually the entire residual first.
-            if gauge_block_armed {
-                gauge_block_armed = false;
-                let orbit = self.descend_gauge_orbit(
-                    target,
-                    rho,
-                    analytic_penalties,
-                    &rho.lambda_smooth_vec()?,
-                    max_iter
-                        .saturating_sub(outer_iteration + paired_gauge_rounds_committed)
-                        .max(1),
-                )?;
-                paired_gauge_rounds_committed += orbit.rounds;
-                if orbit.moved() {
-                    state_moved = true;
-                    moved_at.get_or_insert(StateMoveSite::GaugeOrbitDescent);
-                    log::trace!(
-                        "run_joint_fit_arrow_schur: paired gauge block recovered {:.6e} over \
-                         {} round(s) after accepted iteration {outer_iteration}",
-                        orbit.objective_decrease,
-                        orbit.rounds,
-                    );
-                }
+            // every accepted iterate: one gauge round per Newton iterate, a
+            // block-coordinate sweep. The round is part of the iterate, not a
+            // separate charge against `max_iter`, so the trajectory — and the
+            // point a stationarity exit certifies — does not depend on the
+            // grant (#3250).
+            let orbit = self.descend_gauge_orbit(
+                target,
+                rho,
+                analytic_penalties,
+                &rho.lambda_smooth_vec()?,
+                1,
+            )?;
+            if orbit.moved() {
+                state_moved = true;
+                moved_at.get_or_insert(StateMoveSite::GaugeOrbitDescent);
+                log::trace!(
+                    "run_joint_fit_arrow_schur: paired gauge block recovered {:.6e} \
+                     after accepted iteration {outer_iteration}",
+                    orbit.objective_decrease,
+                );
             }
             // Affine gauge canonicalization is a representation change, but the
             // decoder smoothness term is part of the optimized objective — a
@@ -9013,14 +8871,10 @@ impl SaeManifoldTerm {
         // Carry the assignment-defining metadata that `with_mode` resets to
         // defaults, so the chunk computes the SAME model as the resident term.
         // Without this the streaming/chunked path silently diverges from the dense
-        // path: frozen routing thaws back to the free logits (#1033), and the per-fit
-        // truncated-ordered Beta--Bernoulli α override is dropped (#1777). Both change the
-        // forward gate map, hence the loss, gradient, and log-det.
-        //   * `ordered_beta_bernoulli_alpha_override` is scalar — row-independent.
-        //   * frozen routing is per-row (n×K) — the caller slices it to the chunk's
-        //     rows and passes it as `chunk_frozen_logits`.
-        assignment.ordered_beta_bernoulli_alpha_override =
-            self.assignment.ordered_beta_bernoulli_alpha_override;
+        // path: frozen routing thaws back to the free logits (#1033), which changes
+        // the forward gate map, hence the loss, gradient, and log-det. Frozen routing
+        // is per-row (n×K): the caller slices it to the chunk's rows and passes it as
+        // `chunk_frozen_logits`.
         if let Some(frozen) = chunk_frozen_logits {
             if frozen.dim() != (n_chunk, k_atoms) {
                 return Err(format!(
@@ -9215,9 +9069,68 @@ mod projection_policy_tests {
     use ndarray::array;
     use std::sync::Arc;
 
-    /// #2899 — only stationarity and no strict decrease certify a joint fit. The
-    /// objective-stall approximation, a non-finite pre-step objective, a failed
-    /// proximal correction, the freeze and an exhausted window certify nothing.
+    /// Closed-form `−(A)⁻¹ g` for a symmetric 2×2 `A`, independent of any
+    /// factorization the solver uses.
+    fn neg_inverse_2x2_times(a: &Array2<f64>, g: &Array1<f64>) -> Array1<f64> {
+        let det = a[[0, 0]] * a[[1, 1]] - a[[0, 1]] * a[[1, 0]];
+        array![
+            -(a[[1, 1]] * g[0] - a[[0, 1]] * g[1]) / det,
+            -(-a[[1, 0]] * g[0] + a[[0, 0]] * g[1]) / det,
+        ]
+    }
+
+    /// #3090 — the fixed-decoder row step is the saddle-free Newton step
+    /// `−(|H| + ridge·I)⁻¹ g`, with no ridge escalation. On an indefinite row
+    /// Hessian the old LM schedule inflated the ridge by decades until
+    /// `H + ridge·I` factored (here to ridge 10, shrinking the step ~10×); the
+    /// eigen solve keeps the curvature magnitudes and is a descent direction.
+    /// On a PSD Hessian it is the ridged Newton step exactly. A non-positive or
+    /// non-finite ridge is refused rather than floored.
+    #[test]
+    fn fixed_decoder_row_step_is_saddle_free_newton_without_escalation_3090() {
+        let ridge = 1.0e-6;
+        let g = array![0.7, -1.3];
+        let (c, s) = (0.3_f64.cos(), 0.3_f64.sin());
+        let rotation = array![[c, -s], [s, c]];
+        let signed = rotation
+            .dot(&Array2::from_diag(&array![3.0, -2.0]))
+            .dot(&rotation.t());
+        let absolute = rotation
+            .dot(&Array2::from_diag(&array![3.0, 2.0]))
+            .dot(&rotation.t());
+        let delta =
+            SaeManifoldTerm::solve_fixed_decoder_row_step(signed.view(), g.view(), ridge).unwrap();
+        let expected = neg_inverse_2x2_times(&(&absolute + &(Array2::<f64>::eye(2) * ridge)), &g);
+        for axis in 0..2 {
+            assert!(
+                (delta[axis] - expected[axis]).abs() <= 1.0e-12 * expected[axis].abs().max(1.0),
+                "indefinite H: delta {delta} != saddle-free step {expected}"
+            );
+        }
+        assert!(-g.dot(&delta) > 0.0, "saddle-free step must descend");
+
+        let psd = array![[4.0, 1.0], [1.0, 3.0]];
+        let delta =
+            SaeManifoldTerm::solve_fixed_decoder_row_step(psd.view(), g.view(), ridge).unwrap();
+        let expected = neg_inverse_2x2_times(&(&psd + &(Array2::<f64>::eye(2) * ridge)), &g);
+        for axis in 0..2 {
+            assert!(
+                (delta[axis] - expected[axis]).abs() <= 1.0e-12 * expected[axis].abs().max(1.0),
+                "PSD H: delta {delta} != ridged Newton step {expected}"
+            );
+        }
+
+        for bad in [0.0, -1.0e-6, f64::NAN, f64::INFINITY] {
+            assert!(
+                SaeManifoldTerm::solve_fixed_decoder_row_step(psd.view(), g.view(), bad).is_err(),
+                "ridge {bad} must be refused, not floored"
+            );
+        }
+    }
+
+    /// #2899 — only stationarity and no strict decrease certify a joint fit. A
+    /// non-finite pre-step objective, a failed proximal correction, the freeze
+    /// and an exhausted window certify nothing.
     #[test]
     fn only_stationarity_and_no_strict_decrease_certify_a_joint_fit_2899() {
         let cases = [
@@ -9231,7 +9144,6 @@ mod projection_policy_tests {
                 true,
             ),
             (JointFitTermination::NonFinitePreStep, false),
-            (JointFitTermination::ObjectiveStall, false),
             (JointFitTermination::ProximalCorrectionFailed, false),
             (JointFitTermination::NoStrictDecrease, true),
             (JointFitTermination::IterationGrantExhausted, false),
@@ -9241,7 +9153,6 @@ mod projection_policy_tests {
             let (JointFitTermination::Frozen
             | JointFitTermination::Stationary { .. }
             | JointFitTermination::NonFinitePreStep
-            | JointFitTermination::ObjectiveStall
             | JointFitTermination::ProximalCorrectionFailed
             | JointFitTermination::NoStrictDecrease
             | JointFitTermination::IterationGrantExhausted) = exit;

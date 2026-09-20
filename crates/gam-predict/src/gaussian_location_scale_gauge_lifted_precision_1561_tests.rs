@@ -68,10 +68,10 @@ fn gauge_lifted_precision_predicts_the_dense_covariance_bands_on_a_dropped_colum
     .expect("encode the two-group data");
     let config = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("s(x, bs='tp', by=group)".to_string()),
+        noise_formula: Some("s(x, bs='tps', by=group)".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, bs='tp', by=group)", &data, &config)
+    let result = fit_from_formula("y ~ s(x, bs='tps', by=group)", &data, &config)
         .expect("two-group Gaussian location-scale fit");
     let FitResult::GaussianLocationScale(fitted) = result else {
         panic!("expected a Gaussian location-scale fit result");
@@ -104,7 +104,7 @@ fn gauge_lifted_precision_predicts_the_dense_covariance_bands_on_a_dropped_colum
             .expect("scale block")
             .beta
             .clone(),
-        sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+        sigma_floor: 0.01,
         response_scale: fitted.response_scale,
         covariance: None,
         link_wiggle: None,

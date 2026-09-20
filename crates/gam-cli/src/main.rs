@@ -10,8 +10,8 @@ pub(crate) use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8
 pub(crate) use csv::WriterBuilder;
 
 pub(crate) use gam::estimate::{
-    BlockRole, ContinuousSmoothnessOrderStatus, ModelSummary,
-    ParametricTermSummary, UnifiedFitResult, smooth_term_summary_rows,
+    BlockRole, ContinuousSmoothnessOrderStatus, SummaryBlockOffset, UnifiedFitResult,
+    smooth_term_summary_rows,
 };
 
 pub(crate) use gam::families::survival::latent::fixed_latent_hazard_frailty;
@@ -52,22 +52,16 @@ pub(crate) use gam_predict::linalg::{PredictionCovarianceBackend, rowwise_local_
 pub(crate) use gam::matrix::{DesignMatrix, SymmetricMatrix};
 
 pub(crate) use gam_predict::{
-    FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod, PosteriorMeanOptions,
+    FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod,
     PredictInput, PredictUncertaintyOptions, PredictableModel, predict_gam,
     predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
 
 pub(crate) use gam::report;
 
-pub(crate) use gam::probability::{
-    inverse_gaussian_cdf, normal_cdf, normal_two_sided_probability, standard_normal_quantile,
-    student_t_two_sided_probability,
-};
+pub(crate) use gam::probability::{inverse_gaussian_cdf, standard_normal_quantile};
 
-pub(crate) use gam::smooth::{
-    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
-    SmoothTermSpec, TermCollectionSpec,
-};
+pub(crate) use gam::smooth::{SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
 // #1521: relocated DOWN into gam_terms::smooth (was families::...::drivers).
 pub(crate) use gam::terms::smooth::build_term_collection_design;
 
@@ -91,7 +85,6 @@ pub(crate) use gam::families::survival::location_scale::{
 };
 
 pub(crate) use gam::families::survival::predict::{
-    build_saved_survival_marginal_slope_predictor,
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
     resolve_saved_survival_time_columns, resolve_survival_inverse_link_from_saved,
     resolve_termspec_for_prediction, saved_baseline_timewiggle_components,
@@ -170,6 +163,8 @@ mod run_parameter_decomposition;
 mod run_compare;
 #[path = "main/run_diagnose.rs"]
 mod run_diagnose;
+#[path = "main/run_partial_effect.rs"]
+mod run_partial_effect;
 #[path = "main/run_summary.rs"]
 mod run_summary;
 #[path = "main/run_fit.rs"]
@@ -197,6 +192,7 @@ pub(crate) use run_crosscoder::*;
 pub(crate) use run_parameter_decomposition::*;
 pub(crate) use run_compare::*;
 pub(crate) use run_diagnose::*;
+pub(crate) use run_partial_effect::*;
 pub(crate) use run_summary::*;
 pub(crate) use run_fit::*;
 pub(crate) use run_joint_events::*;
@@ -232,7 +228,8 @@ fn main() {
     // Drive the whole command on a dedicated wide-stack thread (see
     // `CLI_WORKER_STACK_SIZE`). `run` returns the same `CliResult` it would on
     // the main thread; a `join` error means `run` itself panicked, which the
-    // default panic hook has already reported, so we flush and exit non-zero.
+    // default panic hook has already reported. A panic is never the user's
+    // fault, so it exits with the internal-error code.
     let worker = std::thread::Builder::new()
         .name("gam-cli".to_string())
         .stack_size(CLI_WORKER_STACK_SIZE)
@@ -243,7 +240,7 @@ fn main() {
         Err(_) => {
             drop(std::io::Write::flush(&mut std::io::stdout()));
             drop(std::io::Write::flush(&mut std::io::stderr()));
-            HARD_EXIT(1);
+            HARD_EXIT(gam::ErrorCategory::Internal.exit_code());
         }
     };
     if let Err(e) = result {
@@ -253,7 +250,7 @@ fn main() {
         }
         drop(std::io::Write::flush(&mut std::io::stdout()));
         drop(std::io::Write::flush(&mut std::io::stderr()));
-        HARD_EXIT(1);
+        HARD_EXIT(e.error_category().exit_code());
     }
     // Every output artifact has been written and flushed by `run()`. Skip the
     // natural drop chain and exit explicitly: on Linux the cudarc + cuBLAS +
@@ -306,7 +303,9 @@ fn run() -> CliResult<()> {
         Command::TransformationScore(args) => {
             run_transformation_score(args).map_err(CliError::from)
         }
+        Command::LatentResidual(args) => run_latent_residual(args),
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),
+        Command::PartialEffect(args) => run_partial_effect(args).map_err(CliError::from),
         Command::Residuals(args) => run_residuals(args).map_err(CliError::from),
         Command::Compare(args) => run_compare(args).map_err(CliError::from),
         Command::Sample(args) => run_sample(args).map_err(CliError::from),

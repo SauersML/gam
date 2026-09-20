@@ -8,9 +8,13 @@ use super::hessian_paths::{new_cell_moment_cache_stats, new_cell_moment_lru_cach
 use super::install_flex::validate_spec;
 use super::*;
 use crate::fit_orchestration::FitFailure;
+use crate::inference::model::SavedLatentZNormalization;
+use crate::inference::predict_io::{FittedLatentScoreMap, LatentConditioningSpan};
 use crate::marginal_slope_orthogonal::influence_absorber_log_lambda;
 use faer::Side;
-use gam_linalg::faer_ndarray::{FaerEigh, fast_ab, fast_atb, fast_xt_diag_x};
+use gam_linalg::faer_ndarray::{FaerEigh, fast_ab, fast_atb};
+use gam_linalg::roundoff::{accumulation_growth, factor_singular_band};
+use gam_problem::jeffreys_arming::JeffreysArmingEvidence;
 
 /// Sup-norm of the FITTED marginal linear predictor `η = X·β` at which the
 /// probit model becomes numerically degenerate. This is the decisive
@@ -349,15 +353,6 @@ pub(crate) fn widen_marginal_dense_with_influence(
     Ok(Arc::new(widened))
 }
 
-/// Tolerance (relative to the dominant retained eigenvalue) below which a
-/// reduced-basis direction of the W-orthogonalised effective slope Gram is
-/// treated as a confounded null direction and dropped. Directions whose
-/// effective weighted image is (near-)explained by the marginal span collapse to
-/// ~0 eigenvalue in `Gtt` (see [`build_reduced_slope_reparam`]); this keeps
-/// the cut well above floating-point noise but well below any genuine surviving
-/// slope curvature.
-pub(crate) const SLOPE_REDUCED_BASIS_RELATIVE_TOL: f64 = 1.0e-6;
-
 /// An exact reduced-basis reparameterization of the BMS slope design through
 /// the family's OWN internal `slope_design` geometry, expressed as a single
 /// linear map `T` (`p_slope × r`, `r ≤ p_slope`).
@@ -398,14 +393,16 @@ pub(crate) const SLOPE_REDUCED_BASIS_RELATIVE_TOL: f64 = 1.0e-6;
 /// W-orthogonal to `span(M_eff)` has the raw-coordinate Gram
 ///
 /// ```text
-///     Gtt = G_effᵀ W G_eff − (G_effᵀ W M_eff)(M_effᵀ W M_eff + εI)⁻¹(M_effᵀ W G_eff)
+///     Gtt = G_effᵀ W G_eff − (G_effᵀ W M_eff)(M_effᵀ W M_eff)⁺(M_effᵀ W G_eff)
 /// ```
 ///
-/// (a `p_g × p_g` PSD matrix in the raw slope coefficient coordinates). Its
-/// range = the slope directions that survive the confound removal; its null
-/// space = the confounded directions absorbed by the marginal span. The reduced
-/// transform `T` is the orthonormal eigenbasis of `Gtt` for eigenvalues above a
-/// relative tolerance; `r = rank(Gtt)`. The new design `G_reduced = G·T`, the
+/// (a `p_g × p_g` PSD matrix in the raw slope coefficient coordinates). A
+/// direction is confounded when the generalized eigenvalue of
+/// `Gtt v = μ C v`, `C = G_effᵀ W G_eff`, is zero: none of its effective energy
+/// survives the marginal span. The reduced transform `T` is an orthonormal
+/// basis of the directions with `μ` outside the rounding band of 0, decided
+/// scale-free through principal angles (see
+/// [`reduced_slope_transform_effective`]). The new design `G_reduced = G·T`, the
 /// reparameterized penalty `S_reduced = Tᵀ S T`, and the round-trip
 /// `β_slope = T·β'` make the family's geometry consistent at width `r` and
 /// recover the original-basis slope coefficients for prediction/reporting.
@@ -429,22 +426,36 @@ impl ReducedSlopeReparam {
         self.transform.ncols()
     }
 
-    /// Map a reduced-basis slope coefficient `β'` (length `r`) back to the
-    /// original slope basis `β_slope = T·β'` (length `p_slope`), so
-    /// prediction/reporting are unchanged-in-meaning.
-    pub(super) fn recover_original_slope_beta(
-        &self,
-        beta_reduced: &Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        if beta_reduced.len() != self.reduced_cols() {
-            return Err(format!(
-                "reduced slope reparam: β' length ({}) != reduced width ({})",
-                beta_reduced.len(),
-                self.reduced_cols()
-            ));
-        }
-        Ok(self.transform.dot(beta_reduced))
+}
+
+/// The fit's saved-frame lift `J = blockdiag(I, T, I, …)` over its fitted
+/// blocks: the slope block (block 1) returns to the original basis
+/// `β_slope = T·β'`, and every other block (the marginal, with its influence
+/// absorber when active, and any flex or residual block) is carried as is.
+fn reduced_slope_saved_frame(
+    reparam: &ReducedSlopeReparam,
+    blocks: &[gam_solve::model_types::FittedBlock],
+) -> Result<gam_problem::Gauge, String> {
+    let slope_width = blocks.get(1).map(|block| block.beta.len());
+    if slope_width != Some(reparam.reduced_cols()) {
+        return Err(format!(
+            "reduced slope reparam: the fitted slope block has width {slope_width:?}, the \
+             reduced basis has {}",
+            reparam.reduced_cols()
+        ));
     }
+    let transforms: Vec<Array2<f64>> = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            if index == 1 {
+                reparam.transform.clone()
+            } else {
+                Array2::eye(block.beta.len())
+            }
+        })
+        .collect();
+    Ok(gam_problem::Gauge::from_block_transforms(&transforms))
 }
 
 /// Build the reduced-basis slope reparameterization (see
@@ -545,6 +556,90 @@ fn build_reduced_slope_reparam(
              terms or supply covariates that separate them from the marginal index."
                 .to_string(),
         ),
+        ReducedSlopeOutcome::VanishingMetric => Err(
+            "BMS score-slope confound audit has no geometry: the rigid pilot's probit row \
+             metric vanishes on every row where the marginal or score-slope design is \
+             supported, so neither surface is measured at the pilot and no confound between \
+             them can be decided."
+                .to_string(),
+        ),
+    }
+}
+
+/// Whether a learned Gaussian-shift frailty scale is identified (gam#3059).
+///
+/// The probit row likelihood reads the frailty only through the observed slope
+/// `s(σ)·g(x)`, `s = 1/√(1+σ²)`, on every route: the anchor solves
+/// `Σ_m w_m Φ(a + s·g·u_m) = Φ(q)` and the row evaluates `Φ(a + s·g·z)`. The
+/// slope is `g = o + G·β` with the fixed part `o_i = baseline + slope_offset_i`,
+/// so a move of σ is matched exactly by rescaling `β` whenever `s·o` stays in
+/// `span(G)` — that is, whenever `o ∈ span(G)`. The likelihood is then flat in
+/// σ, and the only σ-dependence left in the criterion is the Laplace Jacobian of
+/// the unpenalized slope directions, `p₀·ln s`, which has no stationary point.
+/// `o` is in the span when the sine of its angle to `span(G)` is inside the
+/// rounding band of the orthonormalization, `max(n, p + 1)·ε` (the same
+/// backward-error band as [`reduced_slope_transform_effective`]).
+pub(crate) fn learned_frailty_scale_is_identified(
+    slope: ArrayView2<'_, f64>,
+    slope_offset: &Array1<f64>,
+    baseline_slope: f64,
+) -> Result<bool, String> {
+    let n = slope.nrows();
+    if slope_offset.len() != n {
+        return Err(format!(
+            "learned frailty identifiability: slope design has {n} rows, slope offset {}",
+            slope_offset.len()
+        ));
+    }
+    let fixed = slope_offset.mapv(|offset| offset + baseline_slope);
+    if fixed.iter().any(|v| !v.is_finite()) {
+        return Err("learned frailty identifiability: the fixed slope part is non-finite".to_string());
+    }
+    let norm = fixed.dot(&fixed).sqrt();
+    if norm == 0.0 {
+        return Ok(false);
+    }
+    let direction = fixed / norm;
+    let p = slope.ncols();
+    let band = (n.max(p + 1) as f64) * f64::EPSILON;
+    let (basis, _) = equilibrated_range_basis(&slope.to_owned(), band)?;
+    let residual = &direction - &basis.dot(&basis.t().dot(&direction));
+    Ok(residual.dot(&residual).sqrt() > band)
+}
+
+#[cfg(test)]
+mod learned_frailty_identifiability_tests {
+    use super::learned_frailty_scale_is_identified;
+    use ndarray::{Array1, Array2};
+
+    fn covariate(n: usize) -> Array1<f64> {
+        Array1::from_iter((0..n).map(|i| ((i as f64) * 0.37).sin() + 0.1 * i as f64))
+    }
+
+    #[test]
+    fn intercept_slope_with_constant_fixed_part_is_unidentified_3059() {
+        let n = 50;
+        let slope = Array2::from_elem((n, 1), 1.0);
+        assert!(!learned_frailty_scale_is_identified(slope.view(), &Array1::zeros(n), 0.8).unwrap());
+    }
+
+    #[test]
+    fn covariate_only_slope_with_constant_fixed_part_is_identified_3059() {
+        let n = 50;
+        let slope = covariate(n).insert_axis(ndarray::Axis(1));
+        assert!(learned_frailty_scale_is_identified(slope.view(), &Array1::zeros(n), 0.8).unwrap());
+    }
+
+    #[test]
+    fn slope_offset_inside_the_span_is_unidentified_3059() {
+        let n = 50;
+        let x = covariate(n);
+        let mut slope = Array2::from_elem((n, 2), 1.0);
+        slope.column_mut(1).assign(&x);
+        let offset = x.mapv(|v| 2.5 * v - 0.3);
+        assert!(!learned_frailty_scale_is_identified(slope.view(), &offset, 0.8).unwrap());
+        let outside = x.mapv(|v| v * v);
+        assert!(learned_frailty_scale_is_identified(slope.view(), &outside, 0.8).unwrap());
     }
 }
 
@@ -565,6 +660,10 @@ pub(crate) enum ReducedSlopeOutcome {
     /// `r == 0`: the entire effective slope image is W-explained by the
     /// effective marginal span — the block is unidentified.
     FullyConfounded,
+    /// Neither effective image has a nonzero column: the row metric vanishes
+    /// wherever either design is supported, so the audit has no geometry to
+    /// compare the two spans in. Not a confound: nothing is measured (#3217).
+    VanishingMetric,
 }
 
 /// Build the reduced slope basis `T` (p_g × r) from the EFFECTIVE BMS pilot
@@ -576,16 +675,47 @@ pub(crate) enum ReducedSlopeOutcome {
 /// [`ReducedSlopeOutcome::FullyConfounded`] when the entire effective
 /// slope image collapses into the effective marginal span (`r == 0`), so the
 /// caller can refuse the unidentified block instead of conflating the two
-/// cases.
+/// cases. When the row metric leaves both effective images empty it returns
+/// [`ReducedSlopeOutcome::VanishingMetric`]: that is the metric's degeneracy,
+/// not a confound.
 ///
 /// At the rigid pilot the effective Jacobians are
 ///     M_eff = diag(c) · M,   c_i = sqrt(1 + (s·g_i)²)
 ///     G_eff = diag(f) · G,   f_i = q_i·s²·g_i/c_i + s·z_i
-/// and the raw-coordinate Gram of the slope component W-orthogonal to
-/// `span(M_eff)` is the Schur complement
-///     Gtt = G_effᵀ W G_eff − (G_effᵀ W M_eff)(M_effᵀ W M_eff + εI)⁻¹(M_effᵀ W G_eff).
-/// `T` is the orthonormal eigenbasis of `Gtt` for eigenvalues above a tolerance
-/// relative to the effective slope energy scale.
+/// and the decision is the generalized eigenproblem `Gtt v = μ C v` (gam#3045),
+/// with `C = G_effᵀ W G_eff` and `Gtt` the Gram of the part of `√W·G_eff·v`
+/// W-orthogonal to `span(M_eff)`. `μ ∈ [0, 1]` is the fraction of direction
+/// `v`'s effective energy the marginal span does not explain: `μ = sin²θ` for
+/// the principal angles `θ` between the two spans. It is computed as those
+/// angles directly, never through the squared Grams:
+///
+/// 1. each span gets an orthonormal basis from the thin SVD of its
+///    column-equilibrated weighted design, so the basis is a property of the
+///    span, not of the units a column is recorded in (`G → G·D` leaves every
+///    `μ` and every kept image unchanged);
+/// 2. an effective slope direction with `C v = 0` carries no curvature at all,
+///    is unidentified, and drops first;
+/// 3. the singular values of the slope basis's residual off the marginal
+///    basis are the sines `sin θ_k`, and direction `k` drops when its curvature
+///    is inside the band the joint Hessian forms it within.
+///
+/// The span bases are resolved at the SVD's backward error
+/// ([`factor_singular_band`]: a factorization of an `n × k` matrix with unit
+/// columns is exact for a perturbation of relative size `max(n, k)·ε`). The
+/// drop decision is not an angle test against that band. What the fit reads is
+/// direction `k`'s data curvature in the joint Hessian, `sin²θ_k` along the
+/// joint direction `u_k = [a_k; v_k]` whose effective image is the `k`-th
+/// residual (`v_k` reaches the slope image, `a_k` profiles out its marginal
+/// part), and the Hessian's entries are `n`-row sums, so it forms that curvature
+/// within `γ_n·‖|J|·|u_k|‖²` of exact (gam#3045). A direction whose `sin²θ_k` lies
+/// inside that band plus twice the sine's own SVD rounding is one the joint
+/// Hessian cannot tell from a null direction, however far its sine sits above
+/// `max(n, k)·ε`; one above it carries curvature the inner solve can use.
+/// `|J|·|u_k|` does not move when a column is rescaled, so neither does the
+/// decision. Nothing is tuned.
+///
+/// `T` is an orthonormal basis of the kept generalized eigendirections, which
+/// are `C`-orthogonal to the dropped ones (the complement is coordinate-free).
 pub(crate) fn reduced_slope_transform_effective(
     marginal: ArrayView2<'_, f64>,
     slope: ArrayView2<'_, f64>,
@@ -597,92 +727,101 @@ pub(crate) fn reduced_slope_transform_effective(
     baseline_slope: f64,
     probit_scale: f64,
 ) -> Result<ReducedSlopeOutcome, String> {
+    use gam_linalg::faer_ndarray::FaerSvd;
+
     let n = marginal.nrows();
     let p_m = marginal.ncols();
     let p_g = slope.ncols();
     if p_m == 0 || p_g == 0 {
         return Ok(ReducedSlopeOutcome::FullRank);
     }
+    if row_metric.iter().any(|w| !w.is_finite() || *w < 0.0) {
+        return Err(
+            "reduced slope reparam requires a finite non-negative row metric".to_string(),
+        );
+    }
 
-    // Effective pilot Jacobians M_eff = diag(c)·M and G_eff = diag(f)·G.
+    // Row-metric-weighted effective pilot Jacobians √W·M_eff and √W·G_eff.
     let mut m_eff = Array2::<f64>::zeros((n, p_m));
     let mut g_eff = Array2::<f64>::zeros((n, p_g));
     for i in 0..n {
+        let root_w = row_metric[i].sqrt();
         let q_i = marginal_offset[i] + marginal_baseline;
         let g_i = slope_offset[i] + baseline_slope;
         let sg = probit_scale * g_i;
         let c_i = (1.0 + sg * sg).sqrt();
         let f_i = q_i * probit_scale * probit_scale * g_i / c_i + probit_scale * z[i];
         for j in 0..p_m {
-            m_eff[[i, j]] = c_i * marginal[[i, j]];
+            m_eff[[i, j]] = root_w * c_i * marginal[[i, j]];
         }
         for j in 0..p_g {
-            g_eff[[i, j]] = f_i * slope[[i, j]];
+            g_eff[[i, j]] = root_w * f_i * slope[[i, j]];
         }
     }
-
-    // C = G_effᵀ W G_eff (raw-coordinate effective slope Gram); its diagonal
-    // sets the energy scale for the relative kept-direction tolerance.
-    let c_gram = fast_xt_diag_x(&g_eff, row_metric);
-    let energy_scale = (0..p_g).map(|i| c_gram[[i, i]]).fold(0.0_f64, f64::max);
-    if !energy_scale.is_finite() {
+    if m_eff.iter().chain(g_eff.iter()).any(|v| !v.is_finite()) {
         return Err(
-            "reduced slope reparam: effective slope Gram produced non-finite energy"
-                .to_string(),
+            "reduced slope reparam: the effective pilot Jacobians are non-finite".to_string(),
         );
     }
-    if energy_scale <= 0.0 {
-        // A zero effective slope image (f_i·G_i ≡ 0 in W) carries no joint-
-        // Hessian curvature at all — trivially W-explained by any span.
+    let (marginal_basis, marginal_coefficients) =
+        equilibrated_range_basis(&m_eff, factor_singular_band(n, p_m, 1.0))?;
+    let (slope_basis, slope_coefficients) =
+        equilibrated_range_basis(&g_eff, factor_singular_band(n, p_g, 1.0))?;
+    if slope_basis.ncols() == 0 {
+        // With the marginal image empty too, the metric measured neither
+        // surface: an empty span is not a confound between two (#3217).
+        if marginal_basis.ncols() == 0 {
+            return Ok(ReducedSlopeOutcome::VanishingMetric);
+        }
+        // Every effective slope direction has `C v = 0`: no curvature at all.
         return Ok(ReducedSlopeOutcome::FullyConfounded);
     }
-
-    // A = M_effᵀ W M_eff + εI (ridge relative to the marginal effective energy so
-    // the Schur solve is well-posed even when the marginal pilot Gram is
-    // rank-soft; the ridge only under-removes, i.e. is conservative).
-    let mut a_gram = fast_xt_diag_x(&m_eff, row_metric);
-    let a_scale = (0..p_m).map(|i| a_gram[[i, i]]).fold(0.0_f64, f64::max);
-    let a_ridge = (a_scale * SLOPE_REDUCED_BASIS_RELATIVE_TOL).max(f64::EPSILON);
-    for i in 0..p_m {
-        a_gram[[i, i]] += a_ridge;
+    let cosines = (marginal_basis.ncols() > 0).then(|| fast_atb(&marginal_basis, &slope_basis));
+    let residual = match cosines.as_ref() {
+        Some(cosines) => &slope_basis - &marginal_basis.dot(cosines),
+        None => slope_basis.clone(),
+    };
+    let (_, sines, angle_vt) = residual
+        .svd(false, true)
+        .map_err(|e| format!("reduced slope reparam: principal-angle SVD failed: {e:?}"))?;
+    let angle_vt = angle_vt.ok_or_else(|| {
+        "reduced slope reparam: principal-angle SVD returned no right vectors".to_string()
+    })?;
+    // The joint direction behind sine k, u_k = [a_k; v_k]: v_k = V_Y·q_k reaches the
+    // unit slope image U_Y·q_k, and a_k = −V_X·(U_Xᵀ·U_Y)·q_k profiles out its
+    // marginal part, so J·u_k is the residual image and its data curvature is
+    // exactly sin²θ_k.
+    let rotation = angle_vt.t().to_owned();
+    let slope_directions = fast_ab(&slope_coefficients, &rotation);
+    let marginal_directions = match cosines.as_ref() {
+        Some(cosines) => -fast_ab(&marginal_coefficients, &fast_ab(cosines, &rotation)),
+        None => Array2::<f64>::zeros((p_m, rotation.ncols())),
+    };
+    // The joint Hessian forms that curvature as an n-row sum, within
+    // γ_n·‖|J|·|u_k|‖² of exact; the product |J|·|u_k| does not move when a column
+    // is rescaled (J → J·D, u → D⁻¹·u).
+    let mut absolute_curvature = vec![0.0_f64; rotation.ncols()];
+    for row in 0..n {
+        for (k, total) in absolute_curvature.iter_mut().enumerate() {
+            let mut image = 0.0;
+            for j in 0..p_m {
+                image += m_eff[[row, j]].abs() * marginal_directions[[j, k]].abs();
+            }
+            for j in 0..p_g {
+                image += g_eff[[row, j]].abs() * slope_directions[[j, k]].abs();
+            }
+            *total += image * image;
+        }
     }
-
-    // B = M_effᵀ W G_eff (p_m × p_g);  Gtt = C − Bᵀ A⁻¹ B (p_g × p_g, PSD).
-    let b_cross = gam_linalg::faer_ndarray::fast_xt_diag_y(&m_eff, row_metric, &g_eff);
-    let a_view = gam_linalg::faer_ndarray::FaerArrayView::new(&a_gram);
-    let a_factor =
-        gam_linalg::faer_ndarray::factorize_symmetricwith_fallback(a_view.as_ref(), Side::Lower)
-            .map_err(|e| {
-                format!(
-                    "reduced slope reparam: effective marginal Gram factorization failed: {e}"
-                )
-            })?;
-    let b_view = gam_linalg::faer_ndarray::FaerArrayView::new(&b_cross);
-    let solved = a_factor.solve(b_view.as_ref()); // A⁻¹ B  (p_m × p_g)
-    let a_inv_b = Array2::from_shape_fn((p_m, p_g), |(i, j)| solved[(i, j)]);
-    let schur = fast_atb(&b_cross, &a_inv_b); // Bᵀ A⁻¹ B  (p_g × p_g)
-    let mut stt = &c_gram - &schur;
-    stt = (&stt + &stt.t()) * 0.5;
-    if stt.iter().any(|v| !v.is_finite()) {
-        return Err(
-            "reduced slope reparam: effective Schur Gram produced non-finite entries"
-                .to_string(),
-        );
-    }
-
-    let (evals, evecs) = stt
-        .eigh(Side::Lower)
-        .map_err(|e| format!("reduced slope reparam: eigendecomposition failed: {e:?}"))?;
-    // A `Gtt` eigenvalue far below the effective slope energy scale means that
-    // direction's effective slope column is W-explained by the effective
-    // marginal span — exactly the joint-Hessian rank-soft confounded direction.
-    let tol = energy_scale * SLOPE_REDUCED_BASIS_RELATIVE_TOL;
-    let mut kept: Vec<usize> = (0..evals.len()).filter(|&i| evals[i] > tol).collect();
-    kept.sort_by(|&a, &b| {
-        evals[b]
-            .partial_cmp(&evals[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // The SVD of the residual returns each sine within its backward error on
+    // ‖R‖ ≤ 1, so a computed sin²θ_k is within twice that of the curvature.
+    let sine_rounding = factor_singular_band(n, slope_basis.ncols(), 1.0);
+    let kept: Vec<usize> = (0..sines.len())
+        .filter(|&k| {
+            let formation = accumulation_growth(n) * absolute_curvature[k];
+            sines[k] * sines[k] > formation + 2.0 * sine_rounding
+        })
+        .collect();
     let r = kept.len();
     // r == p_g: no effective-confounded direction to remove — keep the raw
     // design. r == 0: the whole effective slope image is in the effective
@@ -695,16 +834,75 @@ pub(crate) fn reduced_slope_transform_effective(
     if r == 0 {
         return Ok(ReducedSlopeOutcome::FullyConfounded);
     }
-    let mut transform = Array2::<f64>::zeros((p_g, r));
-    for (out_col, &src) in kept.iter().enumerate() {
-        transform.column_mut(out_col).assign(&evecs.column(src));
+    // Raw coefficients of the kept generalized eigendirections, then an
+    // orthonormal basis of their span.
+    let mut kept_angles = Array2::<f64>::zeros((slope_basis.ncols(), r));
+    for (out_col, &k) in kept.iter().enumerate() {
+        kept_angles.column_mut(out_col).assign(&angle_vt.row(k));
     }
-    if transform.iter().any(|v| !v.is_finite()) {
-        return Err(
-            "reduced slope reparam: reduced transform produced non-finite entries".to_string(),
-        );
+    let directions = fast_ab(&slope_coefficients, &kept_angles);
+    let (transform, _, _) = directions
+        .svd(true, false)
+        .map_err(|e| format!("reduced slope reparam: reduced-basis SVD failed: {e:?}"))?;
+    let transform = transform.ok_or_else(|| {
+        "reduced slope reparam: reduced-basis SVD returned no left vectors".to_string()
+    })?;
+    if transform.dim() != (p_g, r) || transform.iter().any(|v| !v.is_finite()) {
+        return Err(format!(
+            "reduced slope reparam: reduced transform is {:?}, expected finite {p_g}x{r}",
+            transform.dim()
+        ));
     }
     Ok(ReducedSlopeOutcome::Reduced(transform))
+}
+
+/// Orthonormal basis `U` (`n × r`) of `range(A)` and the coefficient map `V`
+/// (`p × r`) with `A·V = U`, decided on the column-equilibrated `A·D⁻¹`
+/// (`D = diag‖A_j‖`) so the rank is a property of the span, not the column
+/// units. A zero column is an exact null direction; a singular value at or
+/// below `band·σ_max` of the unit-column matrix is inside its rounding band
+/// (see [`reduced_slope_transform_effective`]).
+fn equilibrated_range_basis(
+    a: &Array2<f64>,
+    band: f64,
+) -> Result<(Array2<f64>, Array2<f64>), String> {
+    use gam_linalg::faer_ndarray::FaerSvd;
+
+    let (n, p) = a.dim();
+    let live: Vec<(usize, f64)> = (0..p)
+        .map(|j| (j, a.column(j).dot(&a.column(j)).sqrt()))
+        .filter(|&(_, norm)| norm > 0.0)
+        .collect();
+    if live.is_empty() {
+        return Ok((Array2::zeros((n, 0)), Array2::zeros((p, 0))));
+    }
+    let mut unit = Array2::<f64>::zeros((n, live.len()));
+    for (col, &(j, norm)) in live.iter().enumerate() {
+        unit.column_mut(col).assign(&(&a.column(j) / norm));
+    }
+    let (u, sigma, vt) = unit
+        .svd(true, true)
+        .map_err(|e| format!("reduced slope reparam: range-basis SVD failed: {e:?}"))?;
+    let (u, vt) = u.zip(vt).ok_or_else(|| {
+        "reduced slope reparam: range-basis SVD returned no singular vectors".to_string()
+    })?;
+    let sigma_max = sigma.iter().copied().fold(0.0_f64, f64::max);
+    let rank = sigma.iter().filter(|&&s| s > band * sigma_max).count();
+    let order: Vec<usize> = {
+        let mut order: Vec<usize> = (0..sigma.len()).collect();
+        order.sort_by(|&x, &y| sigma[y].total_cmp(&sigma[x]));
+        order.truncate(rank);
+        order
+    };
+    let mut basis = Array2::<f64>::zeros((n, rank));
+    let mut coefficients = Array2::<f64>::zeros((p, rank));
+    for (out_col, &k) in order.iter().enumerate() {
+        basis.column_mut(out_col).assign(&u.column(k));
+        for (col, &(j, norm)) in live.iter().enumerate() {
+            coefficients[[j, out_col]] = vt[[k, col]] / (norm * sigma[k]);
+        }
+    }
+    Ok((basis, coefficients))
 }
 
 /// Apply a [`ReducedSlopeReparam`] to a slope `TermCollectionDesign`,
@@ -1045,7 +1243,7 @@ pub(crate) fn bernoulli_marginal_slope_runaway_error(
 mod runaway_tests {
     use super::*;
     use gam_linalg::faer_ndarray::{
-        FaerArrayView, factorize_symmetricwith_fallback, fast_xt_diag_y,
+        FaerArrayView, factorize_symmetricwith_fallback, fast_xt_diag_x, fast_xt_diag_y,
     };
     use gam_terms::smooth::{LinearCoefficientGeometry, LinearTermSpec};
 
@@ -1189,6 +1387,7 @@ mod runaway_tests {
                 match other {
                     ReducedSlopeOutcome::FullRank => "FullRank",
                     ReducedSlopeOutcome::FullyConfounded => "FullyConfounded",
+                    ReducedSlopeOutcome::VanishingMetric => "VanishingMetric",
                     ReducedSlopeOutcome::Reduced(_) => unreachable!(),
                 }
             ),
@@ -1251,6 +1450,42 @@ mod runaway_tests {
         );
     }
 
+    // #3217: a separated pilot's row metric underflows to zero on every row.
+    // The confounded fixture above then measures neither surface, and the audit
+    // must say the metric vanished rather than report the spans confounded;
+    // a metric live on one row still decides the confound.
+    #[test]
+    pub(crate) fn effective_reduction_on_a_vanished_metric_is_not_a_confound_3217() {
+        let m = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 1.0, 1.0]).unwrap();
+        let g = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
+        let z = Array1::from_vec(vec![1.0, 0.5, 1.0 / 3.0]);
+        let zero = Array1::<f64>::zeros(3);
+        let audit = |w: &Array1<f64>| {
+            reduced_slope_transform_effective(
+                m.view(),
+                g.view(),
+                &z,
+                w,
+                &zero,
+                &zero,
+                0.0,
+                0.0,
+                1.0,
+            )
+            .expect("effective reduction must succeed")
+        };
+        let vanished = audit(&zero);
+        assert!(
+            matches!(vanished, ReducedSlopeOutcome::VanishingMetric),
+            "a zero metric must surface VanishingMetric, got {vanished:?}"
+        );
+        let one_row = audit(&Array1::from_vec(vec![0.0, 1.0, 0.0]));
+        assert!(
+            matches!(one_row, ReducedSlopeOutcome::FullyConfounded),
+            "a metric live on one row measures both surfaces, got {one_row:?}"
+        );
+    }
+
     // No effective confound: both effective slope columns stay independent of
     // M_eff, so nothing is reduced (r==p_g ⇒ None) and healthy fits are untouched.
     #[test]
@@ -1277,6 +1512,130 @@ mod runaway_tests {
             matches!(outcome, ReducedSlopeOutcome::FullRank),
             "no effective confound ⇒ FullRank (raw design kept unchanged)"
         );
+    }
+
+    /// gam#3045: the confound decision is a property of the column space.
+    /// Rescaling G's second column by `k` (the closed form of the issue: the old
+    /// relative-eigenvalue rule dropped a direction once k > 354) must leave the
+    /// no-confound fixture FullRank at every scale.
+    #[test]
+    pub(crate) fn effective_reduction_is_invariant_to_slope_column_units_3045() {
+        let m = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 1.0, 1.0]).unwrap();
+        let z = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+        let w = Array1::<f64>::ones(3);
+        let zero = Array1::<f64>::zeros(3);
+        for k in [1.0, 355.0, 1.0e4, 1.0e8, 1.0e-8] {
+            let g = Array2::<f64>::from_shape_vec((3, 2), vec![1.0, 0.0, 0.0, k, 0.0, 0.0])
+                .unwrap();
+            let outcome = reduced_slope_transform_effective(
+                m.view(),
+                g.view(),
+                &z,
+                &w,
+                &zero,
+                &zero,
+                0.0,
+                0.0,
+                1.0,
+            )
+            .expect("effective reduction must succeed");
+            assert!(
+                matches!(outcome, ReducedSlopeOutcome::FullRank),
+                "column scale k={k} must not change the kept set, got {outcome:?}"
+            );
+        }
+    }
+
+    /// gam#3045: in a genuinely confounded fixture the dropped direction and the
+    /// kept effective image do not move with a column's units either.
+    #[test]
+    pub(crate) fn effective_reduction_keeps_the_same_image_under_rescaling_3045() {
+        let m = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 1.0, 1.0]).unwrap();
+        let z = Array1::from_vec(vec![1.0, 0.5, 1.0 / 3.0]);
+        let w = Array1::<f64>::ones(3);
+        let zero = Array1::<f64>::zeros(3);
+        let kept_image = |k: f64| {
+            let g = Array2::<f64>::from_shape_vec((3, 2), vec![1.0, k, 2.0, 2.0 * k, 3.0, 9.0 * k])
+                .unwrap();
+            let t = match reduced_slope_transform_effective(
+                m.view(),
+                g.view(),
+                &z,
+                &w,
+                &zero,
+                &zero,
+                0.0,
+                0.0,
+                1.0,
+            )
+            .expect("effective reduction must succeed")
+            {
+                ReducedSlopeOutcome::Reduced(t) => t,
+                other => panic!("k={k}: the [1,1,1] effective column must drop, got {other:?}"),
+            };
+            assert_eq!(t.ncols(), 1, "k={k}");
+            let mut image = g.dot(&t.column(0)) * &z;
+            let norm = image.dot(&image).sqrt();
+            image /= norm * image[2].signum();
+            image
+        };
+        let reference = kept_image(1.0);
+        for k in [1.0e-6, 355.0, 1.0e6] {
+            let image = kept_image(k);
+            for i in 0..3 {
+                assert!(
+                    (image[i] - reference[i]).abs() < 1.0e-9,
+                    "k={k}: kept effective image {image:?} differs from {reference:?}"
+                );
+            }
+        }
+    }
+
+    /// gam#3045: a direction is kept or dropped on the curvature the joint Hessian
+    /// forms, not on its angle. The slope column's effective image is the marginal
+    /// column plus `δ` times an independent one, so its direction carries data
+    /// curvature `sin²θ ≈ δ²/2` of its energy. At `δ = 1e-9` that is ~5e-19, far
+    /// inside the `γ_n·‖|J|·|u|‖²` (~1e-13) an `n`-row Hessian sum forms it within,
+    /// although `sin θ ≈ 7e-10` sits far above the SVD's `max(n, k)·ε` (~9e-14):
+    /// the Hessian cannot tell the direction from a null one, so it drops and the
+    /// block is refused. At `δ = 1e-3` the curvature (~5e-7) is resolved and the
+    /// direction stays.
+    #[test]
+    pub(crate) fn effective_reduction_drops_a_direction_the_hessian_cannot_resolve_3045() {
+        let n = 400;
+        let m = Array2::<f64>::from_elem((n, 1), 1.0);
+        // With zero offsets and baselines the effective slope scale is f_i = z_i.
+        let z = Array1::from_iter((0..n).map(|i| 0.5 + ((i as f64) * 0.37).sin().abs()));
+        let w = Array1::<f64>::ones(n);
+        let zero = Array1::<f64>::zeros(n);
+        let independent = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.71).cos()));
+        for (delta, resolved) in [(1.0e-9, false), (1.0e-3, true)] {
+            let g = Array2::from_shape_fn((n, 1), |(i, _)| (1.0 + delta * independent[i]) / z[i]);
+            let outcome = reduced_slope_transform_effective(
+                m.view(),
+                g.view(),
+                &z,
+                &w,
+                &zero,
+                &zero,
+                0.0,
+                0.0,
+                1.0,
+            )
+            .expect("effective reduction must succeed");
+            if resolved {
+                assert!(
+                    matches!(outcome, ReducedSlopeOutcome::FullRank),
+                    "δ={delta}: a curvature the Hessian resolves must be kept, got {outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, ReducedSlopeOutcome::FullyConfounded),
+                    "δ={delta}: a curvature inside the Hessian's formation band must drop, got \
+                     {outcome:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1674,7 +2033,7 @@ pub(crate) fn build_marginal_blockspec_bms(
         // marginal columns first and routes any cross-block alias drop into
         // slope.  Equal priorities (the previous default of 100/100)
         // produced a same-priority `hard_alias_pair` whenever a
-        // high-dimensional smooth — e.g. `s(x, type=duchon, centers>=6)`
+        // high-dimensional smooth — e.g. `s(x, bs=duchon, centers>=6)`
         // in the location block — accidentally spanned the slope basis
         // direction, leaving the joint Hessian with a structural null and
         // the spectral Newton solve refusing to step.  The values mirror
@@ -1926,8 +2285,7 @@ fn inner_fit(
     // left the certificate a first-order band, on which gnomon#2359's ρ = −2
     // seed certified a saddle at 128.32 with descent left.
     options.outer_tol = options.outer_tol.max(2.0e-5);
-    crate::custom_family::fit_custom_family_arming_on_evidence(family, blocks, &options)
-        .map_err(FitFailure::from)
+    crate::custom_family::fit_custom_family(family, blocks, &options).map_err(FitFailure::from)
 }
 
 fn inner_fit_from_certified_outer(
@@ -1955,6 +2313,189 @@ struct ClosedFormFallback {
     hints: ThetaHints,
 }
 
+/// A finite latent law in the score's standard units `(m, s)` (gam#3231).
+///
+/// On a finite law `{u_k, w_k}` the anchor `Σ_k w_k Φ(a + b·u_k) = Φ(q)` with
+/// `η = a + b·z` is unchanged under `z → (z − m)/s`, `u_k → (u_k − m)/s`,
+/// `b → b·s`, `a → a + b·m`, so the score's units are a coordinate choice there,
+/// and the fit solves in the coordinates where the score has weighted mean 0 and
+/// SD 1, whatever units it was recorded in. Returns the law on that axis and the
+/// `(m, s)` of the map. The standard-normal law states that the score is
+/// `N(0, 1)` as given, and a calibrated law reads the scale-free `ζ` axis, so
+/// both keep the score's own axis, `(0, 1)`.
+fn finite_law_in_standard_units(
+    kind: LatentMeasureKind,
+    calibration: &LatentMeasureCalibration,
+    (mean, sd): (f64, f64),
+) -> Result<(LatentMeasureKind, (f64, f64)), String> {
+    if !matches!(calibration, LatentMeasureCalibration::None) {
+        return Ok((kind, (0.0, 1.0)));
+    }
+    let standardize = |grid: &EmpiricalZGrid| {
+        EmpiricalZGrid::new(
+            grid.nodes.iter().map(|&u| (u - mean) / sd).collect(),
+            grid.weights.clone(),
+            "bernoulli marginal-slope finite latent law in standard units",
+        )
+    };
+    let kind = match kind {
+        LatentMeasureKind::StandardNormal => return Ok((kind, (0.0, 1.0))),
+        LatentMeasureKind::GlobalEmpirical { grid } => LatentMeasureKind::GlobalEmpirical {
+            grid: standardize(&grid)?,
+        },
+        LatentMeasureKind::LocalEmpirical {
+            feature_cols,
+            input_scales,
+            centers,
+            grids,
+            top_k,
+            bandwidth,
+            mixture,
+            train_row_mixtures,
+        } => LatentMeasureKind::LocalEmpirical {
+            feature_cols,
+            input_scales,
+            centers,
+            grids: grids.iter().map(standardize).collect::<Result<_, _>>()?,
+            top_k,
+            bandwidth,
+            mixture,
+            train_row_mixtures,
+        },
+    };
+    Ok((kind, (mean, sd)))
+}
+
+/// The converged coefficients a re-solve starts from when it reads the score on
+/// the axis `to` and the converged fit read it on `from`, each `(m, s)` with the
+/// score `(z − m)/s`, or `None` for the row-varying calibrated `ζ` axis. The
+/// marginal and residual blocks read no score axis and always carry over. The
+/// slope is `s` times the slope on the score as given, so it carries over scaled
+/// by `s_to/s_from` between two fixed axes (a shift is absorbed by the row
+/// intercept) and not at all to or from `ζ`. The flex deviations are functions on
+/// the axis itself and carry over only onto the same axis.
+fn hints_across_score_axes(
+    from: Option<(f64, f64)>,
+    to: Option<(f64, f64)>,
+    block_states: &[ParameterBlockState],
+    residual: bool,
+    beta_h: Option<&Array1<f64>>,
+    beta_w: Option<&Array1<f64>>,
+) -> ThetaHints {
+    let same_axis = from == to;
+    let slope_beta = match (from, to) {
+        _ if same_axis => Some(block_states[1].beta.clone()),
+        (Some((_, sd_from)), Some((_, sd_to))) => {
+            Some(block_states[1].beta.mapv(|beta| beta * (sd_to / sd_from)))
+        }
+        _ => None,
+    };
+    ThetaHints {
+        marginal_beta: Some(block_states[0].beta.clone()),
+        slope_beta,
+        residual_beta: residual.then(|| block_states[2].beta.clone()),
+        score_warp_beta: if same_axis { beta_h.cloned() } else { None },
+        link_dev_beta: if same_axis { beta_w.cloned() } else { None },
+    }
+}
+
+#[cfg(test)]
+mod score_units_tests {
+    use super::*;
+    use gam_math::probability::normal_cdf;
+
+    /// The law moves onto the score's standard units node by node, keeping its
+    /// masses, and the anchor on it is the raw-unit anchor under
+    /// `b → b·s`, `a → a + b·m` (gam#3231).
+    #[test]
+    fn a_global_finite_law_moves_onto_the_standard_units_and_keeps_its_anchor() {
+        let raw = EmpiricalZGrid::new(vec![1.0, 2.0, 4.0], vec![0.2, 0.5, 0.3], "test law")
+            .expect("a valid law");
+        let (mean, sd) = (2.0, 0.5);
+        let (kind, units) = finite_law_in_standard_units(
+            LatentMeasureKind::GlobalEmpirical { grid: raw.clone() },
+            &LatentMeasureCalibration::None,
+            (mean, sd),
+        )
+        .expect("the law in standard units");
+        assert_eq!(units, (mean, sd));
+        let LatentMeasureKind::GlobalEmpirical { grid } = kind else {
+            panic!("a global law stays global");
+        };
+        assert_eq!(grid.nodes, vec![-2.0, 0.0, 4.0]);
+        assert_eq!(grid.weights, raw.weights);
+
+        let (a, b) = (-0.3, 0.7);
+        let anchor = |a: f64, b: f64, law: &EmpiricalZGrid| {
+            law.pairs().map(|(u, w)| w * normal_cdf(a + b * u)).sum::<f64>()
+        };
+        let raw_anchor = anchor(a, b, &raw);
+        let standard_anchor = anchor(a + b * mean, b * sd, &grid);
+        // Each argument is a few roundings of `|a| + |b|·max|u|` apart, passed
+        // through `φ ≤ 1`, plus the rounding of the three-term sum.
+        let band = f64::EPSILON * (3.0 + 4.0 * (a.abs() + b.abs() * 4.0));
+        assert!(
+            (raw_anchor - standard_anchor).abs() <= band,
+            "the anchor must not depend on the units: {raw_anchor} vs {standard_anchor}"
+        );
+    }
+
+    #[test]
+    fn the_standard_normal_law_keeps_the_score_as_given() {
+        let (kind, units) = finite_law_in_standard_units(
+            LatentMeasureKind::StandardNormal,
+            &LatentMeasureCalibration::None,
+            (2.0, 0.5),
+        )
+        .expect("the standard-normal law");
+        assert_eq!(kind, LatentMeasureKind::StandardNormal);
+        assert_eq!(units, (0.0, 1.0));
+    }
+
+    /// Between two fixed axes the slope carries over as `s` times the slope on
+    /// the score as given; the flex deviations are functions on the axis and
+    /// carry over only onto the same one, and nothing on the axis crosses to ζ.
+    #[test]
+    fn hints_carry_the_slope_across_score_axes() {
+        let state = |beta: Vec<f64>| ParameterBlockState {
+            beta: Array1::from(beta),
+            eta: Array1::zeros(1),
+        };
+        let blocks = [state(vec![0.1, 0.2]), state(vec![3.0])];
+        let flex = Array1::from(vec![0.4]);
+        let rescaled = hints_across_score_axes(
+            Some((0.0, 1.0)),
+            Some((5.0, 0.25)),
+            &blocks,
+            false,
+            Some(&flex),
+            Some(&flex),
+        );
+        assert_eq!(rescaled.marginal_beta, Some(blocks[0].beta.clone()));
+        assert_eq!(rescaled.slope_beta, Some(Array1::from(vec![0.75])));
+        assert_eq!(rescaled.score_warp_beta, None);
+        assert_eq!(rescaled.link_dev_beta, None);
+        assert_eq!(rescaled.residual_beta, None);
+
+        let same = hints_across_score_axes(
+            Some((5.0, 0.25)),
+            Some((5.0, 0.25)),
+            &blocks,
+            false,
+            Some(&flex),
+            Some(&flex),
+        );
+        assert_eq!(same.slope_beta, Some(blocks[1].beta.clone()));
+        assert_eq!(same.score_warp_beta, Some(flex.clone()));
+        assert_eq!(same.link_dev_beta, Some(flex.clone()));
+
+        let to_zeta =
+            hints_across_score_axes(Some((5.0, 0.25)), None, &blocks, false, None, None);
+        assert_eq!(to_zeta.slope_beta, None);
+        assert_eq!(to_zeta.marginal_beta, Some(blocks[0].beta.clone()));
+    }
+}
+
 /// One fit's outcome under its latent-law certificate.
 enum CertifiedFit {
     Fitted(Box<BernoulliMarginalSlopeFitResult>),
@@ -1968,6 +2509,47 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     policy: &gam_runtime::resource::ResourcePolicy,
 ) -> Result<BernoulliMarginalSlopeFitResult, FitFailure> {
+    // #3164: the Jeffreys/Firth arming lifecycle runs over the whole route, so
+    // the fast path and the exact joint search solve one objective. Each run
+    // fits every inner solve, outer evaluation and final fit on one member:
+    // unarmed first, then armed once on that run's typed evidence (#979). A
+    // search that failed contributes its last evaluation's refusal, which
+    // `search_refusal` holds, since the joint driver renders evaluation
+    // refusals as text.
+    let search_refusal = RefCell::new(None);
+    let route = |armed| {
+        fit_bernoulli_marginal_slope_route(
+            data,
+            &spec,
+            options,
+            kappa_options,
+            policy,
+            armed,
+            &search_refusal,
+        )
+    };
+    crate::custom_family::arm_on_evidence(
+        route(false),
+        |result| &mut result.fit,
+        |failure: &FitFailure| {
+            failure
+                .jeffreys_arming_evidence()
+                .or_else(|| search_refusal.take())
+        },
+        |_, _| route(true),
+    )
+}
+
+/// One run of the BMS route on the member `armed` names.
+fn fit_bernoulli_marginal_slope_route(
+    data: ArrayView2<'_, f64>,
+    spec: &BernoulliMarginalSlopeTermSpec,
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    policy: &gam_runtime::resource::ResourcePolicy,
+    armed: bool,
+    search_refusal: &RefCell<Option<JeffreysArmingEvidence>>,
+) -> Result<BernoulliMarginalSlopeFitResult, FitFailure> {
     // gam#2926: a closed form the adequacy screen chose, and the arm a moving law
     // was fitted on, are certified at the converged fit. When the certificate
     // prefers another law, the same spec is re-solved on it from the converged
@@ -1979,16 +2561,20 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
         kappa_options,
         policy,
         None,
+        armed,
+        search_refusal,
     )? {
         CertifiedFit::Fitted(result) => Ok(*result),
         CertifiedFit::ReSolve(fallback) => {
             match fit_bernoulli_marginal_slope_terms_under(
                 data,
-                spec,
+                spec.clone(),
                 options,
                 kappa_options,
                 policy,
                 Some(fallback),
+                armed,
+                search_refusal,
             )? {
                 CertifiedFit::Fitted(result) => Ok(*result),
                 CertifiedFit::ReSolve(_) => Err(FitFailure::raised(
@@ -2008,8 +2594,11 @@ fn fit_bernoulli_marginal_slope_terms_under(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     policy: &gam_runtime::resource::ResourcePolicy,
     fallback: Option<ClosedFormFallback>,
+    armed: bool,
+    search_refusal: &RefCell<Option<JeffreysArmingEvidence>>,
 ) -> Result<CertifiedFit, FitFailure> {
-    use gam_problem::FailureCategory;
+    use gam_problem::{EstimationError, FailureCategory};
+    search_refusal.replace(None);
     let mut spec = spec;
     let data_view = data;
     // The helpers this fit calls before its solve still return text, so each
@@ -2078,7 +2667,16 @@ fn fit_bernoulli_marginal_slope_terms_under(
         &spec.latent_z_policy,
     )
     .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
-    spec.z = z_standardized;
+    // The raw score is kept for the training score below, which is computed from
+    // it through the map prediction applies (gam#3016).
+    let z_raw = std::mem::replace(&mut spec.z, z_standardized);
+    // gam#3231: the score's standard units, the axis a fit on an uncalibrated
+    // finite law solves in.
+    let standard_units = {
+        let units = weighted_location_scale(&spec.z, &spec.weights, "bernoulli marginal-slope")
+            .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+        (units.mean, units.sd)
+    };
     // #2750/#2754/#2761: resolve every AUTO measure-jet representer range
     // against the response before any design is built here.
     //
@@ -2232,19 +2830,9 @@ fn fit_bernoulli_marginal_slope_terms_under(
             feature_cols: context_cols.clone(),
         }
     });
-    // A learnable frailty sigma is differentiated only under the closed-form
-    // Gaussian lowering, so that is this kernel's latent-law capability here.
-    let (support, gate_context) = if sigma_learnable {
-        (
-            EmpiricalLatentMeasureSupport::StandardNormalOnly,
-            "bernoulli marginal-slope with a learnable Gaussian-shift frailty sigma",
-        )
-    } else {
-        (
-            EmpiricalLatentMeasureSupport::Available,
-            "bernoulli marginal-slope",
-        )
-    };
+    // The rigid kernel differentiates a learnable frailty sigma on whichever
+    // law the row anchors on (gam#3059), so every latent law is available.
+    let gate_context = "bernoulli marginal-slope";
     // gam#2926: the re-solve of a fit whose certificate preferred another law
     // anchors on that law, and records why.
     let (fallback_hints, fallback_decision) = match fallback {
@@ -2254,16 +2842,6 @@ fn fit_bernoulli_marginal_slope_terms_under(
     let decision = match (fallback_decision, spec.declared_latent_law.as_ref()) {
         (Some(decision), _) => decision,
         (None, Some(grid)) => {
-            if support == EmpiricalLatentMeasureSupport::StandardNormalOnly {
-                return Err(FitFailure::raised(
-                    gam_problem::FailureCategory::Input,
-                    LatentLawRefusal::EmpiricalKernelUnavailable {
-                        context: gate_context.to_string(),
-                        requested: "declared_latent_law".to_string(),
-                    }
-                    .to_string(),
-                ));
-            }
             // A declared law is the caller's statement about the score AS GIVEN:
             // nothing is estimated or checked, and the law is what the fit
             // anchors on and persists.
@@ -2287,7 +2865,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
             &spec.latent_z_policy,
             conditioning_dense.as_ref().map(|d| d.view()),
             local_context.as_ref(),
-            support,
+            EmpiricalLatentMeasureSupport::Available,
             gate_context,
         )
         .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?,
@@ -2298,8 +2876,20 @@ fn fit_bernoulli_marginal_slope_terms_under(
         empirical_build: latent_measure_build,
         certificate_law: latent_certificate_law,
         consumed: mut latent_law_consumed,
-        moving_law: latent_moving_law,
+        moving_law: mut latent_moving_law,
     } = decision;
+    if let Some(candidates) = latent_moving_law.as_mut() {
+        candidates.set_standard_units(standard_units.0, standard_units.1);
+    }
+    let (latent_measure, fit_units) =
+        finite_law_in_standard_units(latent_measure, &latent_z_calibration, standard_units)
+            .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
+    // The fit's score is `(z − m)/s` in the policy's units, so the saved map
+    // composes the policy's normalisation with it.
+    let z_normalization = LatentZNormalization {
+        mean: z_normalization.mean + z_normalization.sd * fit_units.0,
+        sd: z_normalization.sd * fit_units.1,
+    };
 
     let y = Arc::new(spec.y.clone());
     let weights = Arc::new(spec.weights.clone());
@@ -2308,23 +2898,45 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // term-collection designs, the family's PIRLS loops) sees it; every other
     // law is anchored on the score as given. The calibration is persisted on the
     // fit result so prediction applies the identical map.
-    let z = match &latent_z_calibration {
-        LatentMeasureCalibration::None => Arc::new(spec.z.clone()),
-        LatentMeasureCalibration::ConditionalLocationScale(cal) => {
-            // ζ = (z − m(C))/√v(C) on the marginal-index span. The conditioning
-            // block was built above (raw-z path only), so it is present here.
-            let a_block = conditioning_dense.as_ref().ok_or_else(|| {
-                FitFailure::raised(
-                    FailureCategory::Invariant,
-                    "conditional latent calibration requires the marginal conditioning block",
-                )
-            })?;
-            Arc::new(
-                cal.apply(spec.z.view(), a_block.view())
-                    .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?,
-            )
-        }
+    //
+    // gam#3016: the training score is the raw score through the one fitted
+    // score map, the saved normalisation and then ζ = (z − m(C))/√v(C) on the
+    // marginal-index span, which prediction and
+    // `FittedModel::latent_conditional_residual` apply to their rows as well.
+    let conditional_calibration = match &latent_z_calibration {
+        LatentMeasureCalibration::None => None,
+        LatentMeasureCalibration::ConditionalLocationScale(cal) => Some(cal),
     };
+    // The conditioning block was built above (raw-z path only), so it is
+    // present whenever the conditional law was consumed.
+    if conditional_calibration.is_some() && conditioning_dense.is_none() {
+        return Err(FitFailure::raised(
+            FailureCategory::Invariant,
+            "conditional latent calibration requires the marginal conditioning block",
+        ));
+    }
+    let saved_normalization = SavedLatentZNormalization {
+        mean: z_normalization.mean,
+        sd: z_normalization.sd,
+    };
+    // The slope offset is a slope on the score as given; on the fit's score
+    // `(z − mean)/sd` the same slope is `sd` times it (prediction applies the
+    // identical factor).
+    spec.slope_offset *= saved_normalization.sd;
+    let z = Arc::new(
+        FittedLatentScoreMap {
+            normalization: &saved_normalization,
+            rank_int: None,
+            conditional: conditional_calibration,
+            span: LatentConditioningSpan::PrimaryDesign,
+        }
+        .apply_on_span(
+            &z_raw,
+            conditioning_dense.as_ref().map(|design| design.view()),
+            "bernoulli marginal-slope training rows",
+        )
+        .map_err(|error| FitFailure::raised(FailureCategory::Invariant, error.to_string()))?,
+    );
     let z_train = z.as_ref();
     // gam#2924: the residual repair block, gated and bound to the calibrated
     // score on the marginal-index span. Every unsupported combination is a
@@ -2359,20 +2971,53 @@ fn fit_bernoulli_marginal_slope_terms_under(
             Some(Arc::new(runtime))
         }
     };
-    // Unclassified by name (#2937): the pooled pilot refuses the data (a
-    // length mismatch, no positive weight, one outcome carrying all of it) and
-    // reports its own Newton solve's failure in the same text.
-    let pilot_baseline = pooled_probit_baseline(&spec.y, z_train, &spec.weights)
-        .map_err(|reason| FitFailure::raised(FailureCategory::Unclassified, reason))?;
-    let baseline = (
-        bernoulli_marginal_slope_eta_from_probability(
-            &spec.base_link,
-            normal_cdf(pilot_baseline.0),
-            "bernoulli marginal-slope baseline link inversion",
+    // Unarmed, a latent score that separates the outcomes gives the pooled
+    // probit no finite mode: its certificate is typed arming evidence, so the
+    // route re-solves armed, where the pilot is the Jeffreys-penalized mode
+    // (#3217). Every other refusal is Unclassified by name (#2937): the pilot
+    // refuses the data (a length mismatch, no positive weight, one outcome
+    // carrying all of it) and reports its own Newton solve's failure in the
+    // same text.
+    let pilot_baseline = pooled_probit_baseline(&spec.y, z_train, &spec.weights, armed)
+        .map_err(|refusal| match refusal {
+            PooledPilotRefusal::Separated(separation) => {
+                FitFailure::from(EstimationError::PrefitLatentScoreSeparationDetected {
+                    threshold: separation.threshold,
+                    positive_above_threshold: separation.positive_above_threshold,
+                })
+            }
+            PooledPilotRefusal::Refused(reason) => {
+                FitFailure::raised(FailureCategory::Unclassified, reason)
+            }
+        })?;
+    // The probit marginal index is the pilot's own probit intercept: `q = η`
+    // exactly (gam#2978), with no probability formed and inverted.
+    require_probit_marginal_slope_link(&spec.base_link, "bernoulli marginal-slope baseline")
+        .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+    let baseline = (pilot_baseline.0, pilot_baseline.1 / probit_scale);
+    if sigma_learnable {
+        let slope_dense = slope_design
+            .design
+            .try_to_dense_arc("bernoulli marginal-slope learned frailty identifiability")
+            .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+        let identified = learned_frailty_scale_is_identified(
+            slope_dense.view(),
+            &spec.slope_offset,
+            baseline.1,
         )
-        .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?,
-        pilot_baseline.1 / probit_scale,
-    );
+        .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+        if !identified {
+            return Err(FitFailure::raised(
+                FailureCategory::Input,
+                "bernoulli marginal-slope: a learned GaussianShift frailty scale is not \
+                 identified: the probit likelihood reads σ only through the observed slope \
+                 s(σ)·g(x), s = 1/√(1+σ²), and the fixed part of g (pilot baseline + slope \
+                 offset) lies in the slope design's span, so any σ is matched exactly by \
+                 rescaling the slope coefficients; fix σ (frailty_sd / FrailtyScale::Fixed \
+                 { sigma }) or give the slope a fixed part outside its span (gam#3059)",
+            ));
+        }
+    }
 
     // Score-warp basis construction is β-independent (identifiability is
     // provided by the smoothness-null-space drop on the basis transform,
@@ -2823,6 +3468,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
     let cell_moment_lru = new_cell_moment_lru_cache(policy);
     let cell_moment_cache_stats = new_cell_moment_cache_stats();
+    let jet_scratch = super::hessian_paths::new_jet_scratch();
     let make_family = |marginal_design: &TermCollectionDesign,
                        slope_design: &TermCollectionDesign,
                        sigma: Option<f64>|
@@ -2855,7 +3501,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
             .expect("reduce slope design for family construction")
             .design;
         BernoulliMarginalSlopeFamily {
-            jeffreys_armed: true,
+            jeffreys_armed: armed,
             residual: residual_runtime.clone(),
             search: None,
             y: Arc::clone(&y),
@@ -2871,6 +3517,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
             policy: policy.clone(),
             cell_moment_lru: Arc::clone(&cell_moment_lru),
             cell_moment_cache_stats: Arc::clone(&cell_moment_cache_stats),
+            jet_scratch: Arc::clone(&jet_scratch),
             intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
@@ -3068,11 +3715,9 @@ fn fit_bernoulli_marginal_slope_terms_under(
         &[marginal_terms.clone(), slope_terms.clone()],
         kappa_options_ref,
         &setup,
-        gam_solve::seeding::SeedRiskProfile::GeneralizedLinear,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
-        None,
         Some(walk_signals),
         outer_policy,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
@@ -3089,6 +3734,9 @@ fn fit_bernoulli_marginal_slope_terms_under(
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])
                 .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
+            // The search is over: a refusal it stepped away from proves nothing
+            // about the objective this fit is taken on (#2943).
+            search_refusal.replace(None);
             let sigma = sigma_from_theta(theta);
             final_sigma_cell.set(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
@@ -3144,6 +3792,13 @@ fn fit_bernoulli_marginal_slope_terms_under(
          designs: &[TermCollectionDesign],
          eval_mode,
          owned_value_mode| {
+            // Each evaluation replaces the search's last refusal: the search
+            // steps away from every earlier one (#2943).
+            search_refusal.replace(None);
+            let record_refusal = |error: crate::custom_family::CustomFamilyError| {
+                search_refusal.replace(error.jeffreys_arming_evidence());
+                error.to_string()
+            };
             if let Some(err) = runaway_error.borrow().as_ref().cloned() {
                 return Err(err);
             }
@@ -3217,7 +3872,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                     value_selection,
                     effective_mode,
                 )
-                .map_err(|error| error.to_string())?
+                .map_err(record_refusal)?
             } else {
                 let (first_iterate, candidates) = exact_mode_branch
                     .borrow_mut()
@@ -3236,7 +3891,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                     &candidates,
                     effective_mode,
                 )
-                .map_err(|error| error.to_string())?
+                .map_err(record_refusal)?
             };
             if let Some(err) = bernoulli_marginal_slope_runaway_error(
                 &selection.result.warm_start,
@@ -3297,7 +3952,6 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // their excess-KL estimate prefers that law, the fit is re-solved on it from
     // these coefficients. A declared Gaussian law whose score failed the screen
     // is measured the same way and kept, with the measurement warned about.
-    let mut uncertified: Option<LatentLawConsumed> = None;
     let certificate_pending = matches!(
         &latent_law_consumed,
         LatentLawConsumed::EstimatedGaussianAdequate { residual: None, .. }
@@ -3329,15 +3983,24 @@ fn fit_bernoulli_marginal_slope_terms_under(
         let weight_sum = weights.iter().sum::<f64>();
         let weight_sq_sum = weights.iter().map(|w| w * w).sum::<f64>();
         let sqrt_effective_n = weight_sum / weight_sq_sum.sqrt();
-        let rows = (0..y.len())
-            .into_par_iter()
-            .map(|row| -> Result<(f64, f64, f64, f64), String> {
+        let (rows, noise) = super::closed_form_certificate_pass(
+            y.len(),
+            weights.as_slice().ok_or_else(|| {
+                FitFailure::raised(
+                    FailureCategory::Invariant,
+                    "bernoulli marginal-slope: the row weights are not contiguous",
+                )
+            })?,
+            &law.weights,
+            sqrt_effective_n * sqrt_effective_n,
+            || Ok(()),
+            |_, row| -> Result<[(f64, f64, f64, Vec<f64>); 1], String> {
                 let marginal_eta = block_states[0].eta[row];
                 let slope = block_states[1].eta[row];
                 // gam#2985: with a residual block the row anchors on the joint
                 // (z, r) law; under the estimated law of the score it is the
                 // score-only anchor at the row's (ã, B).
-                let (anchoring_residual, law_sd, mu) = if let Some(runtime) = residual_runtime.as_ref() {
+                let (anchoring_residual, law_sd, mu, probabilities) = if let Some(runtime) = residual_runtime.as_ref() {
                     let joint = super::residual_repair::residual_certificate_row(
                         &certificate_family,
                         runtime,
@@ -3364,17 +4027,13 @@ fn fit_bernoulli_marginal_slope_terms_under(
                         law,
                     )?
                 };
-                Ok((
-                    anchoring_residual,
-                    law_sd / sqrt_effective_n,
-                    mu * (1.0 - mu),
-                    weights[row],
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()
-            .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+                Ok([(anchoring_residual, law_sd, mu * (1.0 - mu), probabilities)])
+            },
+        )
+        .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
         let certificate = ClosedFormAnchorResidual::from_rows(
             &rows,
+            &noise,
             law.nodes.len(),
             sqrt_effective_n * sqrt_effective_n,
         )
@@ -3407,22 +4066,6 @@ fn fit_bernoulli_marginal_slope_terms_under(
                     certificate.summary()
                 );
                 *residual = Some(certificate);
-            } else if support == EmpiricalLatentMeasureSupport::StandardNormalOnly {
-                let missing = format!(
-                    "at the converged closed-form fit the estimated law is expected to be the more \
-                     accurate anchor ({}), and a learnable Gaussian-shift frailty sigma is \
-                     differentiated only under the closed form, so nothing can re-solve on it",
-                    certificate.summary()
-                );
-                log::debug!(
-                    "[{gate_context} latent-z] the closed form stays uncertified: {missing} (gam#2926)"
-                );
-                uncertified = Some(LatentLawConsumed::GaussianUncertified {
-                    evidence: evidence.clone(),
-                    adequacy: Some(adequacy.clone()),
-                    certificate: Some(certificate),
-                    missing,
-                });
             } else {
                 log::debug!(
                     "[{gate_context} latent-z] at the converged closed-form fit the estimated law is \
@@ -3443,19 +4086,19 @@ fn fit_bernoulli_marginal_slope_terms_under(
                         },
                         moving_law: None,
                     },
-                    hints: ThetaHints {
-                        marginal_beta: Some(block_states[0].beta.clone()),
-                        slope_beta: Some(block_states[1].beta.clone()),
-                        residual_beta: residual_runtime.as_ref().map(|_| block_states[2].beta.clone()),
-                        score_warp_beta: beta_h.cloned(),
-                        link_dev_beta: beta_w.cloned(),
-                    },
+                    // The closed form reads the score as given; the finite law
+                    // is solved in its standard units.
+                    hints: hints_across_score_axes(
+                        Some((0.0, 1.0)),
+                        Some(standard_units),
+                        block_states,
+                        residual_runtime.is_some(),
+                        beta_h,
+                        beta_w,
+                    ),
                 }));
             }
         }
-    }
-    if let Some(next) = uncertified {
-        latent_law_consumed = next;
     }
     // gam#2926: certify the arm a moving law was fitted on against the other arms,
     // by their cross-fitted cross-entropy at the converged fit. Each row is anchored
@@ -3560,25 +4203,18 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 certificate.chosen.label(),
                 certificate.summary()
             );
-            // The slope and the flex deviations live on the latent axis: they carry
-            // over only when the chosen arm reads the same axis as the fitted one.
-            let calibrated_axis = |arm: MovingLawArm| {
-                matches!(
-                    arm,
-                    MovingLawArm::LocationScaleGaussian | MovingLawArm::LocationScaleEmpirical
-                )
-            };
-            let same_axis = calibrated_axis(certificate.chosen) == calibrated_axis(certificate.fitted);
+            let hints = hints_across_score_axes(
+                candidates.score_axis(certificate.fitted),
+                candidates.score_axis(certificate.chosen),
+                block_states,
+                residual_runtime.is_some(),
+                beta_h,
+                beta_w,
+            );
             let chosen = certificate.chosen;
             return Ok(CertifiedFit::ReSolve(ClosedFormFallback {
                 decision: candidates.decision_for(chosen, Some(certificate))?,
-                hints: ThetaHints {
-                    marginal_beta: Some(block_states[0].beta.clone()),
-                    slope_beta: same_axis.then(|| block_states[1].beta.clone()),
-                    residual_beta: residual_runtime.as_ref().map(|_| block_states[2].beta.clone()),
-                    score_warp_beta: if same_axis { beta_h.cloned() } else { None },
-                    link_dev_beta: if same_axis { beta_w.cloned() } else { None },
-                },
+                hints,
             }));
         }
     }
@@ -3728,6 +4364,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         solved_fit.covariance_corrected = None;
         if let Some(inference) = solved_fit.inference.as_mut() {
             inference.factorized_standard_errors = None;
+            inference.smoothing_correction_factorized = None;
         }
         log::debug!("[BMS latent-z] {}", declined.explain());
         solved_fit.artifacts.covariance_declined = Some(declined);
@@ -3896,25 +4533,17 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 .fold(0.0_f64, f64::max),
         );
     }
-    // Only after covariance correction is complete may the reported slope
-    // coefficients be lifted from fitted G*T coordinates into the original
-    // full-width G frame used by prediction and reporting.
+    // Only after covariance correction is complete does the fit leave the
+    // fitted G·T coordinates for the full-width G frame used by prediction and
+    // reporting, and it leaves as a whole (gam#3021): lifting the slope block
+    // alone left the flat β, both covariances and the coefficient gauge at the
+    // reduced width, a payload the loader refuses.
     if let Some(reparam) = slope_reduced_reparam.as_ref() {
-        let r = reparam.reduced_cols();
-        if let Some(block) = solved_fit.blocks.get_mut(1)
-            && block.beta.len() == r
-        {
-            block.beta = reparam
-                .recover_original_slope_beta(&block.beta)
-                .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
-        }
-        if let Some(state) = solved_fit.block_states.get_mut(1)
-            && state.beta.len() == r
-        {
-            state.beta = reparam
-                .recover_original_slope_beta(&state.beta)
-                .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
-        }
+        let frame = reduced_slope_saved_frame(reparam, &solved_fit.blocks)
+            .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
+        solved_fit
+            .lift_to_saved_frame(&frame)
+            .map_err(|err| FitFailure::from(err).context("bms reduced-slope saved frame"))?;
     }
     // #461: PREDICT SEAM — when the Stage-1 influence absorber is active
     // (spec.score_influence_jacobian.is_some()), `fit.block_states[0].beta` is
@@ -3944,6 +4573,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         cross_block_warnings,
         latent_law_consumed,
         latent_z_conditional_calibration,
+        latent_score: z.as_ref().clone(),
         residual_repair: residual_runtime
             .as_ref()
             .map(|runtime| runtime.geometry.clone()),

@@ -214,13 +214,19 @@ impl ReferenceTables {
         marks: usize,
         total_nodes: usize,
     ) -> Result<Vec<S>, EventHistoryError> {
+        self.check_carry(held.len(), marks, total_nodes)?;
+        Ok(self.carry_rows(held, marks, 0..total_nodes))
+    }
+
+    /// Whether a held normaliser of `held` entries is conformable with these
+    /// tables and a node set of `total_nodes` nodes.
+    pub(crate) fn check_carry(&self, held: usize, marks: usize, total_nodes: usize) -> Result<(), EventHistoryError> {
         let nodes = self.grid.len();
         let expected = self.strata * nodes * marks;
-        if held.len() != expected {
+        if held != expected {
             return Err(EventHistoryError::InvalidInput {
                 reason: format!(
-                    "a held normaliser of {} entries for {} strata × {nodes} reference nodes × {marks} marks",
-                    held.len(),
+                    "a held normaliser of {held} entries for {} strata × {nodes} reference nodes × {marks} marks",
                     self.strata
                 ),
             });
@@ -233,18 +239,26 @@ impl ReferenceTables {
                 ),
             });
         }
-        let mut out = vec![held[0].constant_like(0.0); total_nodes * marks];
-        for row in 0..total_nodes {
+        Ok(())
+    }
+
+    /// [`Self::carry_to_nodes`] for the node rows `rows` alone, on tables
+    /// [`Self::check_carry`] accepted: a subject reads its own rows where it
+    /// is evaluated instead of every subject's being formed up front.
+    pub(crate) fn carry_rows<S: JetField>(&self, held: &[S], marks: usize, rows: std::ops::Range<usize>) -> Vec<S> {
+        let nodes = self.grid.len();
+        let mut out = Vec::with_capacity(rows.len() * marks);
+        for row in rows {
             let base = self.node_stratum[row] * nodes;
             let lower = (base + self.node_lower[row]) * marks;
             let upper = (base + self.node_lower[row] + 1) * marks;
             let weight = self.node_weight[row];
             for d in 0..marks {
                 let low = &held[lower + d];
-                out[row * marks + d] = low.add(&held[upper + d].sub(low).scale(weight));
+                out.push(low.add(&held[upper + d].sub(low).scale(weight)));
             }
         }
-        Ok(out)
+        out
     }
 }
 
@@ -750,13 +764,19 @@ impl EventHistoryFamily {
         gradient: &mut [f64],
     ) -> Result<(), String> {
         let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
-        for start in (0..values.len()).step_by(W) {
+        // Independent sweeps, run together so one sweep's serial reference
+        // evolution overlaps the others' work.
+        let starts: Vec<usize> = (0..values.len()).step_by(W).collect();
+        let results: Vec<Result<Tangent<W>, EventHistoryError>> = starts.par_iter().map(|&start| {
             let beta: Vec<Tangent<W>> = values.iter().enumerate().map(|(q, value)| {
                 let mut grad = [0.0; W];
                 if q >= start && q < start + W { grad[q - start] = 1.0; }
                 Tangent::seeded(*value, grad)
             }).collect();
-            let result = self.path_value(states, &beta)?;
+            self.path_value(states, &beta)
+        }).collect();
+        for (&start, result) in starts.iter().zip(results) {
+            let result = result?;
             for (slot, value) in result.grad.iter().enumerate().take((values.len() - start).min(W)) {
                 gradient[start + slot] = *value;
             }
@@ -1297,9 +1317,10 @@ pub struct EventHistoryFit {
     /// Authoritative centring at the final coefficient state.
     pub centring: Option<RiskSetCentring>,
     /// The returned reference grid's certificate, in posterior standard
-    /// deviations: the geometric-tail estimate from its first two
-    /// fixed-coefficient refinement steps ([`reference_tail`]), within
-    /// `quadrature_tolerance`; absent for prior centring.
+    /// deviations: its fixed-coefficient refinement steps to the first finer
+    /// grid whose steps contract, plus that grid's geometric-tail estimate
+    /// ([`select_reference_grid`]), within `quadrature_tolerance`; absent for
+    /// prior centring.
     pub reference_certificate: Option<f64>,
 }
 
@@ -1953,8 +1974,9 @@ pub(crate) fn refinement_shift(
 /// 0.059, and the direct move to the grid four halvings finer, 2.19e-4
 /// posterior sd, exceeded the tail, 2.12e-4), so the fit log prints every
 /// step it read.
-/// - `None` when the steps do not contract (`q ≥ 1`): the grid has no tail to
-///   read, and a finer grid is examined.
+/// - `None` when the steps do not contract (`q ≥ 1`): the grid has no tail of
+///   its own, and [`select_reference_grid`] charges it its step to the next
+///   grid and reads that grid's tail.
 /// - Two exact zeros are a grid the objective does not read, as at rank
 ///   zero: certified at zero.
 /// - A first step within its rounding band leaves the ratio unresolved: a
@@ -1979,14 +2001,21 @@ pub(crate) fn reference_tail(first: Shift, second: Shift) -> Result<Option<f64>,
     Ok(Some(first.value + first.band + (second.value + second.band) / (1.0 - ratio)))
 }
 
-/// The first reference grid from `refinement` up whose tail estimate
-/// ([`reference_tail`]) is within `tolerance`, with that estimate and every
-/// step read on the way. `step(level)` is the fixed-coefficient move from grid
-/// `level` to grid `level + 1`, asked once per level, in order from
-/// `refinement`: a grid is examined only after every coarser one failed, so
-/// the selection reads no step past the one after the grid it picks. Nothing
-/// here refits. The steps are errors the fitted coefficients see, so the
-/// setting they pick is where selection is worth repeating.
+/// The coarsest reference grid from `refinement` up whose certificate is
+/// within `tolerance`, with that certificate and every step read on the way.
+/// A move is a norm, so a grid moves to the limit by at most its steps to a
+/// finer grid plus that grid's move: a grid is certified by its steps, each at
+/// its band's edge, to the finest grid read, plus that grid's tail estimate
+/// ([`reference_tail`]). A grid whose own steps do not contract is therefore
+/// charged its step, not refitted (#2986: seed 4's grid-2 steps 2.40e-4 and
+/// 2.45e-4 posterior sd have no tail, and grid 3's tail 3.21e-4 certifies grid
+/// 2 at 5.61e-4 against 0.05). `step(level)` is the fixed-coefficient move
+/// from grid `level` to grid `level + 1`, asked once per level, in order from
+/// `refinement`: a finer tail is read only after every coarser one certified
+/// no grid, so the selection reads no step past the one after the grid whose
+/// tail certifies. Nothing here refits. The steps are errors the fitted
+/// coefficients see, so the setting they pick is where selection is worth
+/// repeating.
 pub(crate) fn select_reference_grid(
     refinement: usize,
     tolerance: f64,
@@ -1996,10 +2025,21 @@ pub(crate) fn select_reference_grid(
     let mut level = refinement;
     loop {
         let (first, second) = (steps[level - refinement], steps[level - refinement + 1]);
-        if let Some(certificate) = reference_tail(first, second)?
-            && certificate <= tolerance
-        {
-            return Ok((level, certificate, steps));
+        if let Some(tail) = reference_tail(first, second)? {
+            let (mut charged, mut certified) = (tail, None);
+            for grid in (refinement..=level).rev() {
+                if grid < level {
+                    let own = steps[grid - refinement];
+                    charged += own.value + own.band;
+                }
+                if !(charged <= tolerance) {
+                    break;
+                }
+                certified = Some((grid, charged));
+            }
+            if let Some((grid, certificate)) = certified {
+                return Ok((grid, certificate, steps));
+            }
         }
         level += 1;
         steps.push(step(level + 1)?);
@@ -3018,7 +3058,7 @@ fn propose_atom(
                 Err(error) => return Err(error),
             }
         }
-        let refined = empirical_bayes_ridge(&directions);
+        let refined = empirical_bayes_ridge(&directions)?;
         let lambda = refined.log_lambda.exp();
         let unresolved: Vec<usize> = directions
             .iter()
@@ -3627,16 +3667,17 @@ fn raise_incumbent(
 /// order and the time mesh ([`RefinementCheck`]): at the fitted coefficients,
 /// by the first-order move each finer grid makes the penalised mode take, in
 /// posterior standard deviations, against the same tolerance. The grid is
-/// certified by the geometric-tail estimate of those moves
+/// certified by those moves, closed by a geometric-tail estimate
 /// ([`reference_tail`]). The
 /// latent order the reference law is integrated at is the fit's own, which the
 /// ladder has already certified: its Gauss-Hermite rung evaluates the
 /// normaliser at the raised order too.
 ///
 /// A grid that fails is not refitted rung by rung. The same fixed-coefficient
-/// steps continue to the first finer grid whose tail estimate is within it
-/// ([`select_reference_grid`]), and selection repeats once, under that
-/// grid's objective; a rank selected under one reference grid is never read
+/// steps continue until a finer grid's tail estimate certifies, the fitted
+/// grid charged its steps to that grid ([`select_reference_grid`]); only
+/// when that charge exceeds the tolerance does selection repeat, once, under
+/// the coarsest grid it certifies; a rank selected under one reference grid is never read
 /// as evidence under another. Each repeat refines the grid strictly, so the
 /// loop ends where the grid's own admission ([`reference_tables`]) or the
 /// evaluation's ([`preflight`]) refuses it, or where a step is no longer
@@ -3692,7 +3733,7 @@ pub(crate) fn fit_event_history(
         })?;
         let nats = coarse.discrepancy(&next.refresh_normaliser(states)?, fit.marks())?;
         log::debug!(
-            "[event-history] reference refinement {refinement} (rank {}, Gauss-Hermite order {}, mesh {}): fixed-coefficient steps {:?} posterior sd (bands {:?}); grid {chosen}'s tail estimate {certificate:.3e} is within {}; the next grid moves the log normalisers by {nats:.3e} nats; {:.3} s",
+            "[event-history] reference refinement {refinement} (rank {}, Gauss-Hermite order {}, mesh {}): fixed-coefficient steps {:?} posterior sd (bands {:?}); grid {chosen}'s certificate {certificate:.3e} is within {}; the next grid moves the log normalisers by {nats:.3e} nats; {:.3} s",
             fit.rank(),
             fit.quadrature.gauss_hermite_order,
             fit.quadrature.mesh_refinement,

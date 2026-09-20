@@ -65,6 +65,18 @@ pub enum JeffreysArmingEvidence {
         lineality_negative: usize,
         copositive_minimum: Option<f64>,
     },
+    /// The fit certified an unconstrained mode whose penalized information is
+    /// singular on `ker(S_λ)`, the `unreached_dim` directions no smoothing
+    /// parameter reaches (#3164): `λ_min` of the reduced information there is at
+    /// or below the Jeffreys plan's own numerical zero `information_floor`. No
+    /// `λ` can bound those directions, so the Laplace posterior is improper and
+    /// the certified mode is a point on a likelihood ray the solve stopped on
+    /// once its decrement fell below the objective's resolution.
+    ImproperPenaltyNullPosterior {
+        unreached_dim: usize,
+        information_min: f64,
+        information_floor: f64,
+    },
     /// The pre-fit certificate found a threshold on one realized design column
     /// that separates the binary outcomes, so the likelihood has no finite
     /// maximizer along that column.
@@ -79,6 +91,13 @@ pub enum JeffreysArmingEvidence {
     PrefitLinearSeparation {
         column_indices: Vec<usize>,
         min_signed_margin: f64,
+    },
+    /// The Bernoulli marginal-slope pre-fit certificate found a threshold on
+    /// the latent score `z` that separates the binary outcomes, so the pooled
+    /// probit likelihood of `y` on `z` (the rigid pilot) has no finite mode.
+    PrefitLatentScoreSeparation {
+        threshold: f64,
+        positive_above_threshold: bool,
     },
 }
 
@@ -98,6 +117,15 @@ impl JeffreysArmingEvidence {
                 format!(
                     "separation: design column {column_index} puts every success {side} \
                      {threshold:.6e}"
+                )
+            }
+            Self::PrefitLatentScoreSeparation {
+                threshold,
+                positive_above_threshold,
+            } => {
+                let side = if *positive_above_threshold { "above" } else { "below" };
+                format!(
+                    "separation: the latent score puts every success {side} {threshold:.6e}"
                 )
             }
             Self::PrefitLinearSeparation {
@@ -128,6 +156,11 @@ impl JeffreysArmingEvidence {
             }
             Self::ImproperConePosterior { .. } => {
                 "the constrained posterior without the Jeffreys prior is improper".to_string()
+            }
+            Self::ImproperPenaltyNullPosterior { .. } => {
+                "the posterior without the Jeffreys prior is improper along a direction no \
+                 penalty reaches"
+                    .to_string()
             }
         }
     }
@@ -161,6 +194,13 @@ impl crate::EstimationError {
             } => Some(JeffreysArmingEvidence::PrefitLinearSeparation {
                 column_indices: column_indices.clone(),
                 min_signed_margin: *min_signed_margin,
+            }),
+            Self::PrefitLatentScoreSeparationDetected {
+                threshold,
+                positive_above_threshold,
+            } => Some(JeffreysArmingEvidence::PrefitLatentScoreSeparation {
+                threshold: *threshold,
+                positive_above_threshold: *positive_above_threshold,
             }),
             Self::DominatedCertifiedPlateau {
                 terminal_refusal, ..

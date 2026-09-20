@@ -2,7 +2,7 @@ use crate::cubic_cell_kernel as exact_kernel;
 use crate::util::span::span_index_for_breakpoints;
 use gam_linalg::faer_ndarray::{FaerEigh, fast_ab};
 use gam_solve::pirls::LinearInequalityConstraints;
-use gam_terms::basis::create_ispline_derivative_dense;
+use gam_terms::basis::ispline_ramp_basis_dense;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 /// Require a breakpoint sequence suitable for BMS span lookup: finite,
@@ -26,13 +26,15 @@ fn validate_breakpoints(breakpoints: &[f64], label: &str) -> Result<(), String> 
 
 /// Deduplicate an ordered BMS knot sequence into strictly increasing
 /// breakpoints.
+///
+/// A repeated knot is a stored copy of the same value, and the B-spline basis
+/// opens a span between any two knots that differ at all. So a knot is merged
+/// only when it equals its predecessor exactly; a tolerance would merge a real
+/// span the basis still has.
 fn breakpoints_from_knots(knots: &[f64], label: &str) -> Result<Vec<f64>, String> {
     let mut breakpoints = Vec::new();
     for &knot in knots {
-        if breakpoints
-            .last()
-            .is_none_or(|prev: &f64| (knot - *prev).abs() > 1e-12)
-        {
+        if breakpoints.last().is_none_or(|prev: &f64| knot != *prev) {
             breakpoints.push(knot);
         }
     }
@@ -131,15 +133,21 @@ pub(crate) fn integrate_polynomial_product(left: &[f64], right: &[f64], width: f
 /// Precomputed per-span polynomial coefficient matrices for a structurally
 /// monotone anchored deviation basis.
 ///
-/// Raw coefficients are monotone I-spline coefficients. The deviation
-/// derivative `w'(x)` is a nonnegative quadratic B-spline combination, so
-/// `w(x)` is a cubic I-spline combination with `C2` continuity at interior
-/// knots and constant tails. The knot vector is clamped, and at a support
-/// endpoint `w'` keeps its one-sided interior value while the tail is flat, so
-/// `w` is only `C0` there: `w'`, `w''` and `w'''` all jump at the two support
-/// endpoints. Zero coefficients still mean the identity map. The fitted
-/// coefficients live in the configured moment-anchor nullspace and are mapped
-/// back to these raw coefficients for monotonicity.
+/// Raw coefficients are monotone I-spline ramp coefficients
+/// ([`ispline_ramp_basis_dense`]). The deviation derivative `w'(x)` is a
+/// quadratic B-spline combination, so `w(x)` is a cubic I-spline combination,
+/// constant outside the union of the ramps' supports and `C2` at every simple
+/// knot. On a warp (simple-ended) knot vector that makes `w` one `C2` function
+/// on all of `ℝ`, the two support ends included: `w'` and `w''` fall to zero
+/// there as they do on the flat tail. A clamped vector's end knots have
+/// multiplicity four, where `w'`, `w''` and `w'''` all jump, so a clamped
+/// deviation is only `C0` at its support ends. That is admissible only for a
+/// deviation evaluated at fixed arguments (the score warp, at the data's `z`);
+/// a deviation whose argument moves with β (the link deviation, at `a + b·z`)
+/// is built on simple ends (gam#2695, gam#3011). Zero coefficients still mean
+/// the identity map. The fitted coefficients live in the configured
+/// moment-anchor nullspace and are mapped back to these raw coefficients for
+/// monotonicity.
 ///
 /// Monotonicity of the full transform `x + w(x)` is enforced by lower bounds
 /// on each span's quadratic Bernstein controls for `w'(x)`.
@@ -281,6 +289,12 @@ pub(crate) fn raw_span_derivative_polynomial_coefficients(
 /// of degree < `derivative_order` — that direction is structurally absent
 /// from the parameterization. This is the β-independent identifiability
 /// constraint that replaces the data-distribution-dependent moment anchor.
+///
+/// A null space can be empty. A ramp basis on simple ends is flat to second
+/// order at both support ends, so it represents no polynomial at all: a
+/// quadratic with `w = w' = w'' = 0` at one end is zero. Every direction is
+/// then penalized, nothing is dropped, and `Z` is the identity, which keeps
+/// each coefficient a local ramp and each monotonicity row sparse.
 pub(crate) fn smoothness_nullspace_orthogonal_complement(
     raw_penalty: &Array2<f64>,
 ) -> Result<Array2<f64>, String> {
@@ -309,12 +323,7 @@ pub(crate) fn smoothness_nullspace_orthogonal_complement(
         );
     }
     if kept.len() == n {
-        return Err(
-            "smoothness penalty has no null directions; nothing to drop. The link-deviation \
-             basis was expected to carry a non-trivial null space (constants/linears) for \
-             absorption by the location block — check the configured penalty derivative order"
-                .to_string(),
-        );
+        return Ok(Array2::eye(n));
     }
     let mut z = Array2::<f64>::zeros((n, kept.len()));
     for (col_out, &col_in) in kept.iter().enumerate() {
@@ -566,12 +575,26 @@ impl DeviationRuntime {
             .into());
         }
 
+        // The spans are the union of the ramps' supports, `[t₁, t_{len−2}]`: ramp
+        // `c` rises on `[t_{c+1}, t_{c+4}]`, so outside that hull every column is
+        // exactly flat and the constant tails below represent it. On a clamped
+        // vector the hull is the whole knot range.
+        let knot_slice = knots.as_slice().ok_or_else(|| {
+            String::from(DeviationRuntimeError::InvalidInput {
+                reason: "DeviationRuntime knots are not contiguous".to_string(),
+            })
+        })?;
+        if knot_slice.len() < 3 {
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "DeviationRuntime needs at least three knots, got {}",
+                    knot_slice.len()
+                ),
+            }
+            .into());
+        }
         let bkpts = breakpoints_from_knots(
-            knots.as_slice().ok_or_else(|| {
-                String::from(DeviationRuntimeError::InvalidInput {
-                    reason: "DeviationRuntime knots are not contiguous".to_string(),
-                })
-            })?,
+            &knot_slice[1..knot_slice.len() - 1],
             "DeviationRuntime breakpoints",
         )?;
         let endpoint_points = Array1::from_vec(bkpts);
@@ -603,15 +626,18 @@ impl DeviationRuntime {
         );
         let right_endpoint = Array1::from_vec(vec![endpoint_points[n_spans]]);
         let internal_degree = 2usize;
+        // The ramp evaluator reads each column as the one function it is on all
+        // of ℝ for any knot vector, and reproduces the clamped convention there,
+        // so a clamped runtime's tables are unchanged.
         let raw_span_c0 =
-            create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 0)
+            ispline_ramp_basis_dense(span_lefts.view(), knots.view(), internal_degree, 0)
                 .map_err(|e| {
                     String::from(DeviationRuntimeError::NumericalFailure {
                         reason: format!("DeviationRuntime cubic I-spline values failed: {e}"),
                     })
                 })?;
         let raw_span_c1 =
-            create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 1)
+            ispline_ramp_basis_dense(span_lefts.view(), knots.view(), internal_degree, 1)
                 .map_err(|e| {
                     String::from(DeviationRuntimeError::NumericalFailure {
                         reason: format!(
@@ -620,7 +646,7 @@ impl DeviationRuntime {
                     })
                 })?;
         let raw_span_c2 =
-            create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 2)
+            ispline_ramp_basis_dense(span_lefts.view(), knots.view(), internal_degree, 2)
                 .map_err(|e| {
                     String::from(DeviationRuntimeError::NumericalFailure {
                         reason: format!(
@@ -630,7 +656,7 @@ impl DeviationRuntime {
                 })?
                 .mapv(|value| 0.5 * value);
         let raw_span_c3 =
-            create_ispline_derivative_dense(span_midpoints.view(), &knots, internal_degree, 3)
+            ispline_ramp_basis_dense(span_midpoints.view(), knots.view(), internal_degree, 3)
                 .map_err(|e| {
                     String::from(DeviationRuntimeError::NumericalFailure {
                         reason: format!(
@@ -640,7 +666,7 @@ impl DeviationRuntime {
                 })?
                 .mapv(|value| value / 6.0);
         let raw_right_boundary_values =
-            create_ispline_derivative_dense(right_endpoint.view(), &knots, internal_degree, 0)
+            ispline_ramp_basis_dense(right_endpoint.view(), knots.view(), internal_degree, 0)
                 .map_err(|e| {
                     String::from(DeviationRuntimeError::NumericalFailure {
                         reason: format!(
@@ -1440,60 +1466,6 @@ impl DeviationRuntime {
         self.right_boundary_value_row.dot(&beta)
     }
 
-    /// Conservative L1 sup-norm bound for the deviation value basis.
-    ///
-    /// For every evaluation point `x`, this returns a finite `K` such that
-    /// `|B(x)·β| <= K * ||β||_∞`.  Each basis column is a cubic on each
-    /// finite span and constant in the two tails, so the supremum is attained
-    /// at a span endpoint, an interior root of the derivative, or a tail
-    /// value.  Summing per-column suprema gives a conservative row-wise L1
-    /// bound that is independent of `x`.
-    pub(crate) fn value_basis_l1_sup_norm(&self) -> f64 {
-        let mut total = 0.0;
-        for basis_idx in 0..self.basis_dim {
-            let mut col_sup = self.span_c0[[0, basis_idx]]
-                .abs()
-                .max(self.right_boundary_value_row[basis_idx].abs());
-            for span_idx in 0..self.span_count() {
-                let left = self.endpoint_points[span_idx];
-                let right = self.endpoint_points[span_idx + 1];
-                let width = right - left;
-                if !width.is_finite() || width <= 0.0 {
-                    continue;
-                }
-                let c0 = self.span_c0[[span_idx, basis_idx]];
-                let c1 = self.span_c1[[span_idx, basis_idx]];
-                let c2 = self.span_c2[[span_idx, basis_idx]];
-                let c3 = self.span_c3[[span_idx, basis_idx]];
-                let eval_abs = |t: f64| (c0 + c1 * t + c2 * t * t + c3 * t * t * t).abs();
-                col_sup = col_sup.max(eval_abs(0.0)).max(eval_abs(width));
-                let a = 3.0 * c3;
-                let b = 2.0 * c2;
-                let c = c1;
-                if a.abs() <= f64::EPSILON {
-                    if b.abs() > f64::EPSILON {
-                        let t = -c / b;
-                        if t > 0.0 && t < width {
-                            col_sup = col_sup.max(eval_abs(t));
-                        }
-                    }
-                } else {
-                    let disc = b * b - 4.0 * a * c;
-                    if disc >= 0.0 {
-                        let sqrt_disc = disc.sqrt();
-                        for t in [(-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)] {
-                            if t > 0.0 && t < width {
-                                col_sup = col_sup.max(eval_abs(t));
-                            }
-                        }
-                    }
-                }
-            }
-            total += col_sup;
-        }
-        total
-    }
-
     // ── monotonicity enforcement ──
 
     pub(super) fn support_interval(&self) -> Result<(f64, f64), String> {
@@ -1617,5 +1589,20 @@ impl DeviationRuntime {
             }
             .into())
         }
+    }
+}
+
+#[cfg(test)]
+mod breakpoint_tests {
+    use super::breakpoints_from_knots;
+
+    #[test]
+    fn breakpoints_merge_only_exactly_repeated_knots_2469() {
+        // 0.25 + 2⁻⁵⁰ is a distinct knot the basis opens a span at, closer to
+        // 0.25 than any fixed tolerance would allow; exact repeats collapse.
+        let near = 0.25 + 2.0_f64.powi(-50);
+        let knots = [0.0, 0.0, 0.25, 0.25, near, 1.0, 1.0];
+        let breakpoints = breakpoints_from_knots(&knots, "test").unwrap();
+        assert_eq!(breakpoints, vec![0.0, 0.25, near, 1.0]);
     }
 }

@@ -65,7 +65,8 @@ impl SurvivalMarginalSlopeFamily {
     /// marginal index `q` is the program's own, solved under `N(0, 1)`; at each node
     /// `u_k` of `law` the program's de-nested index `η(u_k)` gives the survival
     /// probability `Φ(−η(u_k))`. Returns `r = Σ_k w_k Φ(−η(u_k)) − Φ(−q)`, the standard
-    /// deviation of `Φ(−η(U))` under the law, and `Φ(q)Φ(−q)`.
+    /// deviation of `Φ(−η(U))` under the law, `Φ(q)Φ(−q)`, and the smaller-tail
+    /// probabilities at the law's nodes.
     pub(crate) fn flex_survival_anchoring_residual(
         &self,
         q: f64,
@@ -73,7 +74,7 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
         law: &crate::bms::EmpiricalZGrid,
-    ) -> Result<(f64, f64, f64), String> {
+    ) -> Result<(f64, f64, f64, Vec<f64>), String> {
         if self.score_dim() != 1 {
             return Err(
                 "the flex survival anchoring residual is defined for one latent score".to_string(),
@@ -97,7 +98,7 @@ impl SurvivalMarginalSlopeFamily {
                  residual={residual}, sd={law_sd}"
             ));
         }
-        Ok((residual, law_sd, scale))
+        Ok((residual, law_sd, scale, probabilities))
     }
 
     /// The flex program's de-nested index `η(u)` at node `u` and intercept `a`.
@@ -181,22 +182,30 @@ impl SurvivalMarginalSlopeFamily {
         let slopes = self.row_slope_channels(row, block_states).map_err(program)?;
         let beta_h = self.flex_score_beta(block_states).map_err(program)?;
         let beta_w = self.flex_link_beta(block_states).map_err(program)?;
+        // Every arm is scored at the anchor the fit used: the intercept the fitted
+        // family solves on its own law, the closed form on the Gaussian law and the
+        // anchored root on a finite one (as the flex program's own solve does).
+        let fitted_law = self.flex_law_grid(Some(row)).map_err(program)?;
         let anchor = |q: f64, slope: f64| -> Result<(f64, f64), MovingLawError> {
             if beta_h.is_some() || beta_w.is_some() {
-                self.flex_survival_anchor_log_probabilities(q, slope, beta_h, beta_w, law)
-            } else {
-                Ok(crate::bms::estimated_latent_law::closed_form_survival_anchor_log_probabilities(
-                    q,
-                    self.probit_frailty_scale() * slope,
-                    law,
-                )?)
+                return self.flex_survival_anchor_log_probabilities(q, slope, beta_h, beta_w, law);
             }
+            let observed_slope = self.probit_frailty_scale() * slope;
+            let alpha = match fitted_law {
+                Some(grid) => solve_anchor(q, observed_slope, grid).map_err(program)?,
+                None => q * (1.0 + observed_slope * observed_slope).sqrt(),
+            };
+            Ok(crate::bms::estimated_latent_law::survival_anchor_log_probabilities(
+                alpha,
+                observed_slope,
+                law,
+            )?)
         };
         Ok([anchor(q1, slopes.exit)?, anchor(q0, slopes.entry)?])
     }
 
     /// The closed-form certificate's two anchors of one row (gam#2926): the exit and
-    /// entry anchoring residuals `(r, sd, π(1−π))` under `law`, at the row's own
+    /// entry anchoring residuals `(r, sd, π(1−π), node probabilities)` under `law`, at the row's own
     /// marginal indices and on each anchor's own slope channel, through the flex
     /// program when a flex block is installed and the rigid closed form otherwise.
     ///
@@ -212,7 +221,7 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
         law: &crate::bms::EmpiricalZGrid,
-    ) -> Result<[(f64, f64, f64); 2], String> {
+    ) -> Result<[(f64, f64, f64, Vec<f64>); 2], String> {
         let values = self.row_dynamic_q_values(row, block_states)?;
         // A time-constant slope is the degenerate case entry = exit.
         let slopes = self.row_slope_channels(row, block_states)?;
@@ -220,7 +229,7 @@ impl SurvivalMarginalSlopeFamily {
         let beta_w = self.flex_link_beta(block_states)?;
         // A flex block runs the row through its own de-nested program; without one
         // the anchor is the rigid closed form, the same number in O(nodes).
-        let anchor = |q: f64, slope: f64| -> Result<(f64, f64, f64), String> {
+        let anchor = |q: f64, slope: f64| -> Result<(f64, f64, f64, Vec<f64>), String> {
             if beta_h.is_some() || beta_w.is_some() {
                 self.flex_survival_anchoring_residual(q, slope, beta_h, beta_w, law)
             } else {
@@ -237,8 +246,8 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     /// The closed-form certificate's two anchors of one row of a `K ≥ 2` fit
-    /// (gam#2926): the exit and entry anchoring residuals `(r, sd, π(1−π))` of the
-    /// closed form `q·√(1 + s²·rᵀΣ(a)r) + s·rᵀz` under the joint latent law the fit
+    /// (gam#2926): the exit and entry anchoring residuals `(r, sd, π(1−π), atom
+    /// probabilities)` of the closed form `q·√(1 + s²·rᵀΣ(a)r) + s·rᵀz` under the joint latent law the fit
     /// would re-solve on, transported to the row's context (gam#2929). `r` is the
     /// row's per-score slope vector, or the shared slope on every score, read at
     /// each anchor's own follow-up time. Like the scalar certificate it reads no
@@ -249,7 +258,7 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         law: &JointLatentLawRuntime,
         workspace: &mut JointCertificateWorkspace,
-    ) -> Result<[(f64, f64, f64); 2], String> {
+    ) -> Result<[(f64, f64, f64, Vec<f64>); 2], String> {
         let k = law.score_dim();
         if k != self.score_dim() {
             return Err(format!(
@@ -270,7 +279,7 @@ impl SurvivalMarginalSlopeFamily {
         law.row_nodes_into(row, &mut workspace.nodes)?;
         let scale = self.probit_frailty_scale();
         let covariance = self.score_covariance.at_row(row);
-        let mut anchor = |q: f64, slopes: &[f64]| -> Result<(f64, f64, f64), String> {
+        let mut anchor = |q: f64, slopes: &[f64]| -> Result<(f64, f64, f64, Vec<f64>), String> {
             let variance = scale * scale * covariance.quadratic_form_unchecked(slopes);
             let alpha = q * (1.0 + variance).sqrt();
             workspace.probabilities.clear();
@@ -297,7 +306,7 @@ impl SurvivalMarginalSlopeFamily {
                      q={q}: residual={residual}, sd={law_sd}"
                 ));
             }
-            Ok((residual, law_sd, pi_scale))
+            Ok((residual, law_sd, pi_scale, workspace.probabilities.clone()))
         };
         Ok([anchor(values.q1, &exit_slopes)?, anchor(values.q0, &entry_slopes)?])
     }

@@ -318,7 +318,6 @@ fn build_sample_payload(
             n_samples: cfg.n_samples,
             n_warmup: nuts.warmup_transitions,
             n_chains: gam::sample::NUTS_CHAINS,
-            target_accept: cfg.target_accept,
             seed: cfg.seed,
         },
         model_class: prediction_model_class_label(model),
@@ -352,17 +351,12 @@ struct CoefficientStatePayload {
     group_metadata: Option<GroupMetadata>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Clone)]
 struct TermBlock {
     name: String,
     kind: String,
     start: usize,
     end: usize,
-}
-
-#[derive(Deserialize)]
-struct TermBlocksPayload {
-    term_blocks: Vec<TermBlock>,
 }
 
 #[derive(Serialize)]
@@ -389,8 +383,11 @@ fn categorical_level_name_for_bits(
     if !value.is_finite() {
         return None;
     }
+    // A level code is a stored integer, so it round-trips `usize` exactly; a
+    // fractional, negative or out-of-range value does not (the cast truncates
+    // or saturates) and names no level.
     let idx = value as usize;
-    if (idx as f64 - value).abs() > 1e-12 {
+    if idx as f64 != value {
         return None;
     }
     schema
@@ -429,7 +426,6 @@ fn smooth_basis_kind_label(basis: &gam::terms::smooth::SmoothBasisSpec) -> &'sta
 /// build fails (e.g. no training ranges available).
 fn smooth_term_column_ranges(
     payload: &FittedModelPayload,
-    smooth_start: usize,
 ) -> Option<Vec<(String, std::ops::Range<usize>)>> {
     let spec = payload.resolved_termspec.as_ref()?;
     if spec.smooth_terms.is_empty() {
@@ -451,14 +447,9 @@ fn smooth_term_column_ranges(
         data[[0, col]] = lo;
         data[[1, col]] = hi;
     }
-    let design = build_term_collection_design(data.view(), spec).ok()?;
-    let mut out = Vec::with_capacity(design.smooth.terms.len());
-    for term in &design.smooth.terms {
-        let r = term.coeff_range.clone();
-        let global = (smooth_start + r.start)..(smooth_start + r.end);
-        out.push((term.name.clone(), global));
-    }
-    Some(out)
+    let design =
+        gam::terms::smooth::build_term_collection_prediction_design(data.view(), spec).ok()?;
+    Some(design.smooth_ranges)
 }
 
 fn coefficient_provenance_for_state(
@@ -547,8 +538,7 @@ fn coefficient_provenance_for_state(
     // without saved ranges, or unusual basis variants), the columns simply
     // keep their default `__global__` labels.
     if !spec.smooth_terms.is_empty() {
-        let smooth_start = col;
-        if let Some(smooth_ranges) = smooth_term_column_ranges(payload, smooth_start) {
+        if let Some(smooth_ranges) = smooth_term_column_ranges(payload) {
             for ((name, range), term_spec) in smooth_ranges.iter().zip(spec.smooth_terms.iter()) {
                 let kind = smooth_basis_kind_label(&term_spec.basis);
                 for idx in range.clone() {
@@ -637,10 +627,7 @@ fn term_blocks_for_model_impl(
 ) -> Result<Vec<(String, String, usize, usize)>, String> {
     // A scan-routed model has a single smooth term occupying the smoother's
     // entire coefficient space (its per-knot function values). Report that one
-    // contiguous block directly — without round-tripping through
-    // `coefficient_state_json_impl`, which a scan model cannot satisfy (it keeps
-    // no dense coefficient covariance) and which would be O(n²) even if it
-    // could (#1046).
+    // contiguous block directly: it keeps no dense coefficient state (#1046).
     {
         if let Some(scan) = scan_introspection(&model)? {
             return Ok(vec![(
@@ -651,11 +638,12 @@ fn term_blocks_for_model_impl(
             )]);
         }
     }
-    let state_json = coefficient_state_json_impl(model)?;
-    let payload: TermBlocksPayload = serde_json::from_str(&state_json)
-        .map_err(|err| format!("failed to parse coefficient state json: {err}"))?;
-    let mut blocks = Vec::with_capacity(payload.term_blocks.len());
-    for (idx, block) in payload.term_blocks.into_iter().enumerate() {
+    let beta_len = gam::families::survival::predict::saved_fit_result(model)?
+        .beta
+        .len();
+    let (_, term_blocks) = coefficient_provenance_for_state(model.payload(), beta_len);
+    let mut blocks = Vec::with_capacity(term_blocks.len());
+    for (idx, block) in term_blocks.into_iter().enumerate() {
         if block.end < block.start {
             return Err(format!(
                 "term block {idx} has invalid range [{}, {})",
@@ -706,11 +694,11 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
         serde_json::from_str(request_json)
             .map_err(|err| format!("failed to parse difference_smooth request json: {err}"))?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
-    let selected_covariance = gam::inference::effects::select_covariance(
-        &fit,
-        gam::inference::effects::CovarianceSource::SmoothingCorrected,
-    )
-    .map_err(|error| error.to_string())?;
+    // The band prices its SEs off the covariance the fit publishes, as
+    // `summary()` and `partial_dependence` do (#2779); a fit whose correction
+    // is typed unavailable reports the conditional band under that label.
+    let selected_covariance = gam::inference::effects::select_published_covariance(&fit)
+        .map_err(|error| error.to_string())?;
     let payload = model.payload();
     let schema = payload
         .data_schema
@@ -735,7 +723,7 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
         request,
         |headers, rows| {
             let dataset = dataset_with_model_schema(&model, headers, rows)?;
-            standard_mean_design_dense(&model, dataset)
+            gam_predict::partial_effect::standard_mean_design(&model, dataset)
         },
     )?;
     serde_json::to_string(&rows)
@@ -1441,6 +1429,13 @@ fn basis_adequacy_dataset_json_impl(
         }
     };
     let family = model.likelihood();
+    // The refit below is a plain standard fit at the frozen spec — no link
+    // wiggle and no latent-coordinate estimation — so its row law is the
+    // canonical family's whenever the likelihood is.
+    let canonical_family =
+        gam::families::fit_orchestration::drivers::basis_adequacy_canonical_family(
+            &family, false, false,
+        );
     let fitted = gam::families::fit_orchestration::drivers::fit_term_collection_forspec(
         standard.data.view(),
         standard.y.view(),
@@ -1457,6 +1452,11 @@ fn basis_adequacy_dataset_json_impl(
         &fitted.design,
         &spec,
         &fitted.fit,
+        &gam::families::fit_orchestration::drivers::BasisAdequacyResponse {
+            y: standard.y.view(),
+            prior_weights: standard.weights.view(),
+            canonical_family,
+        },
     );
     let payload = BasisAdequacyPayload {
         level: gam::families::fit_orchestration::drivers::BASIS_ADEQUACY_NOTE_LEVEL,
@@ -3821,8 +3821,7 @@ fn predict_competing_risks_survival_result(
     options: &PyPredictOptions,
 ) -> Result<gam::families::survival::predict::CompetingRisksPredictResult, String> {
     use gam::families::survival::predict::{
-        SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
-        predict_competing_risks_survival,
+        SurvivalPredictEstimand, SurvivalPredictRequest, predict_competing_risks_survival,
     };
 
     let col_map = dataset.column_map();
@@ -3832,22 +3831,7 @@ fn predict_competing_risks_survival_result(
         resolve_offset_column(dataset, &col_map, payload.offset_column.as_deref())?;
     let noise_offset = ndarray::Array1::<f64>::zeros(dataset.values.nrows());
     let time_grid_slice: Option<&[f64]> = options.time_grid.as_deref();
-    let covariance_mode = if options.interval.is_some() {
-        match parse_covariance_mode(options.covariance_mode.as_deref())?
-            .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
-        {
-            gam_predict::InferenceCovarianceMode::Conditional => {
-                SurvivalPredictionCovarianceMode::Conditional
-            }
-            gam_predict::InferenceCovarianceMode::SmoothingCorrected => {
-                SurvivalPredictionCovarianceMode::SmoothingCorrected
-            }
-        }
-    } else {
-        // Posterior-mean points always integrate the conditional posterior;
-        // covariance_mode controls uncertainty only.
-        SurvivalPredictionCovarianceMode::Conditional
-    };
+    let covariance_mode = survival_band_covariance_mode(model, options)?;
     let request = SurvivalPredictRequest {
         model,
         data: dataset.values.view(),
@@ -3871,8 +3855,7 @@ fn predict_survival_result(
     options: &PyPredictOptions,
 ) -> Result<gam::families::survival::predict::SurvivalPredictResult, String> {
     use gam::families::survival::predict::{
-        SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
-        predict_survival,
+        SurvivalPredictEstimand, SurvivalPredictRequest, predict_survival,
     };
 
     let col_map = dataset.column_map();
@@ -3905,27 +3888,33 @@ fn predict_survival_result(
         with_uncertainty: options.interval.is_some(),
         estimand: SurvivalPredictEstimand::PosteriorMean,
     };
-    // #2296: the user's covariance_mode governs single-cause survival
-    // uncertainty exactly as it does the competing-risks path. The default
-    // (None -> smoothing-corrected) is a REQUIRED request: when the saved fit
-    // carries no corrected covariance the engine refuses instead of silently
-    // narrowing the bands to conditional Vb. Posterior-mean points without an
-    // interval integrate the conditional posterior, as in the CR wrapper.
-    let covariance_mode = if options.interval.is_some() {
-        match parse_covariance_mode(options.covariance_mode.as_deref())?
-            .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
-        {
-            gam_predict::InferenceCovarianceMode::Conditional => {
-                SurvivalPredictionCovarianceMode::Conditional
-            }
-            gam_predict::InferenceCovarianceMode::SmoothingCorrected => {
-                SurvivalPredictionCovarianceMode::SmoothingCorrected
-            }
-        }
-    } else {
-        SurvivalPredictionCovarianceMode::Conditional
-    };
+    let covariance_mode = survival_band_covariance_mode(model, options)?;
     Ok(predict_survival(request, covariance_mode)?)
+}
+
+/// The covariance definition behind a survival prediction's uncertainty: the
+/// explicit `covariance_mode` when given (a requirement, refused when the fit
+/// cannot supply it), else the definition the saved fit publishes, the same
+/// resolution `gam predict` applies. The engine reads it for the band only;
+/// the posterior-mean point is always the conditional-posterior mean, so
+/// `interval=` never moves it (#2296, #3421).
+fn survival_band_covariance_mode(
+    model: &FittedModel,
+    options: &PyPredictOptions,
+) -> Result<gam::families::survival::predict::SurvivalPredictionCovarianceMode, String> {
+    use gam::families::survival::predict::{SurvivalPredictionCovarianceMode, saved_fit_result};
+    let mode = match parse_covariance_mode(options.covariance_mode.as_deref())? {
+        Some(mode) => mode,
+        None => saved_fit_result(model)?.published_covariance_mode(),
+    };
+    Ok(match mode {
+        gam_predict::InferenceCovarianceMode::Conditional => {
+            SurvivalPredictionCovarianceMode::Conditional
+        }
+        gam_predict::InferenceCovarianceMode::SmoothingCorrected => {
+            SurvivalPredictionCovarianceMode::SmoothingCorrected
+        }
+    })
 }
 
 fn serialize_survival_prediction_payload(
@@ -4560,7 +4549,7 @@ fn manifold_sae_list2<'py>(
 fn manifold_sae_report(py: Python<'_>, value: &Option<serde_json::Value>) -> PyResult<PyObject> {
     match value {
         None => Ok(py.None()),
-        Some(v) => json_value_to_py(py, v.clone()),
+        Some(v) => json_value_to_py(py, v),
     }
 }
 
@@ -5065,12 +5054,6 @@ impl ManifoldSaeCore {
             .map(|b| manifold_sae_owned2(b))
             .collect::<PyResult<_>>()?;
         let hybrid = manifold_sae_hybrid_linear_images(&inner.hybrid_split)?;
-        let max_iter = usize::try_from(inner.max_iter).map_err(|_| {
-            py_value_error(format!(
-                "ManifoldSAE: saved max_iter must be positive; got {}",
-                inner.max_iter
-            ))
-        })?;
         let top_k = inner
             .top_k
             .map(|support| {
@@ -5090,8 +5073,6 @@ impl ManifoldSaeCore {
             inner.alpha,
             inner.tau,
             inner.assignment.clone(),
-            max_iter,
-            inner.learning_rate,
             // Coordinate ridge: Python `_oos_payload` omits it, so the
             // `sae_manifold_predict_oos` pyfunction supplies this `1e-6` default.
             1.0e-6,
@@ -5142,8 +5123,11 @@ impl ManifoldSaeCore {
 
     #[staticmethod]
     fn load(py: Python<'_>, path: std::path::PathBuf) -> PyResult<Py<ManifoldSaeCore>> {
-        let payload_json = std::fs::read_to_string(path)
-            .map_err(|error| py_value_error(format!("ManifoldSAE.load: {error}")))?;
+        // The one saved-model reader every surface shares (gam#3054): a
+        // filesystem refusal raises the `OSError` subclass its kind names, with
+        // the path in its message.
+        let payload_json = gam_model_api::saved_model::read_saved_model_file(&path)
+            .map_err(crate::saved_document_error_to_pyerr)?;
         Self::from_json(py, &payload_json)
     }
 
@@ -5152,7 +5136,7 @@ impl ManifoldSaeCore {
         let json_str = self.inner.to_json().map_err(py_value_error)?;
         let value: serde_json::Value =
             serde_json::from_str(&json_str).map_err(|e| py_value_error(e.to_string()))?;
-        json_value_to_py(py, value)
+        json_value_to_py(py, &value)
     }
 
     /// The canonical JSON payload string (what `save()` writes).
@@ -5162,8 +5146,12 @@ impl ManifoldSaeCore {
 
     fn save(&self, path: std::path::PathBuf) -> PyResult<()> {
         let payload = self.inner.to_json().map_err(py_value_error)?;
-        std::fs::write(path, payload)
-            .map_err(|error| py_value_error(format!("ManifoldSAE.save: {error}")))
+        // The one saved-model writer every surface shares (gam#3054): atomic,
+        // so a failed save leaves the previous file whole, and durable on Unix
+        // before it returns. A filesystem refusal raises the `OSError` subclass
+        // its kind names, with the path in its message.
+        gam_model_api::saved_model::write_saved_model(&path, payload.as_bytes())
+            .map_err(crate::saved_document_error_to_pyerr)
     }
 
     fn __repr__(&self) -> PyResult<String> {
@@ -5267,7 +5255,7 @@ impl ManifoldSaeCore {
         out.set_item("atom_functionals", atom_functionals)?;
         out.set_item(
             "diagnostics",
-            json_value_to_py(py, self.inner.diagnostics.clone())?,
+            json_value_to_py(py, &self.inner.diagnostics)?,
         )?;
         out.set_item("cotrain", manifold_sae_report(py, &self.inner.cotrain)?)?;
         out.set_item("primitives", self.inner.primitive_names.clone())?;
@@ -5841,7 +5829,7 @@ impl ManifoldSaeCore {
             Some(payload) => {
                 let value = serde_json::to_value(payload)
                     .map_err(|error| py_value_error(error.to_string()))?;
-                json_value_to_py(py, value)
+                json_value_to_py(py, &value)
             }
             None => Ok(py.None()),
         }
@@ -5867,7 +5855,7 @@ impl ManifoldSaeCore {
     fn geometry_plans(&self, py: Python<'_>) -> PyResult<PyObject> {
         let value = serde_json::to_value(&self.inner.geometry_plans)
             .map_err(|error| py_value_error(error.to_string()))?;
-        json_value_to_py(py, value)
+        json_value_to_py(py, &value)
     }
     #[getter]
     fn fisher_factors<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray3<f64>>>> {
@@ -6134,7 +6122,7 @@ impl ManifoldSaeCore {
     // --- diagnostic / certificate report-block getters -------------------
     #[getter]
     fn diagnostics(&self, py: Python<'_>) -> PyResult<PyObject> {
-        json_value_to_py(py, self.inner.diagnostics.clone())
+        json_value_to_py(py, &self.inner.diagnostics)
     }
     #[getter]
     fn solver_plan(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -6194,7 +6182,7 @@ impl ManifoldSaeCore {
     fn structured_residual_diagnostics(&self, py: Python<'_>) -> PyResult<PyObject> {
         json_value_to_py(
             py,
-            serde_json::Value::Array(self.inner.structured_residual_diagnostics.clone()),
+            &serde_json::Value::Array(self.inner.structured_residual_diagnostics.clone()),
         )
     }
 }

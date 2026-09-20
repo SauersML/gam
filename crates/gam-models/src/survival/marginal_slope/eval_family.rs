@@ -410,6 +410,12 @@ impl SurvivalMarginalSlopeFamily {
                     .to_string(),
             );
         }
+        // A time wiggle moves the chart through the ζ composition in one row program (gam#3061).
+        if self.timewiggle_zeta_available() {
+            return self
+                .timewiggle_baseline_psi_terms(block_states, axis, options)
+                .map(Some);
+        }
         let use_flex = self.effective_flex_active(block_states)? || self.flex_timewiggle_active();
         let (objective_psi, score_psi, hessian_psi_operator) = if use_flex {
             self.reduce_flex_family_coefficient_terms(block_states, options, |row| {
@@ -458,6 +464,12 @@ impl SurvivalMarginalSlopeFamily {
                 "survival marginal-slope baseline family pairs do not support per-score slope geometry"
                     .to_string(),
             );
+        }
+        // A time wiggle moves the chart through the ζ composition in one row program (gam#3304).
+        if self.timewiggle_zeta_available() {
+            return self
+                .timewiggle_baseline_psi_second_order_terms(block_states, axis, other_axis, options)
+                .map(Some);
         }
         let use_flex = self.effective_flex_active(block_states)? || self.flex_timewiggle_active();
         let (objective_psi_psi, score_psi_psi, hessian_psi_psi_operator) = if use_flex {
@@ -607,6 +619,25 @@ impl SurvivalMarginalSlopeFamily {
                     .to_string(),
             );
         }
+        let missing_block = || {
+            format!(
+                "survival marginal-slope design hyper axis {design_psi_index} has no derivative block"
+            )
+        };
+        // A time wiggle moves both the chart and the design through the ζ composition in one row
+        // program (gam#3304).
+        if self.timewiggle_zeta_available() {
+            return self
+                .timewiggle_baseline_design_psi_second_order_terms(
+                    block_states,
+                    derivative_blocks,
+                    baseline_axis,
+                    design_psi_index,
+                    options,
+                )?
+                .ok_or_else(missing_block)
+                .map(Some);
+        }
         let use_flex = self.effective_flex_active(block_states)? || self.flex_timewiggle_active();
         if !use_flex {
             return Err(
@@ -617,9 +648,7 @@ impl SurvivalMarginalSlopeFamily {
         let Some((block, local_index, coefficient_width, label)) =
             self.psi_block_info(derivative_blocks, design_psi_index)?
         else {
-            return Err(format!(
-                "survival marginal-slope design hyper axis {design_psi_index} has no derivative block"
-            ));
+            return Err(missing_block());
         };
         let derivative = &derivative_blocks[block][local_index];
         let policy = gam_runtime::resource::ResourcePolicy::default_library();
@@ -680,6 +709,12 @@ impl SurvivalMarginalSlopeFamily {
                 slices.total,
             ));
         }
+        // A time wiggle moves the chart through the ζ composition in one row program (gam#3304).
+        if self.timewiggle_zeta_available() {
+            return self
+                .timewiggle_baseline_psi_hessian_drift(block_states, axis, d_beta_flat, options)
+                .map(Some);
+        }
         let use_flex = self.effective_flex_active(block_states)? || self.flex_timewiggle_active();
         let (_, _, operator) = if use_flex {
             self.reduce_flex_family_coefficient_terms(block_states, options, |row| {
@@ -718,6 +753,27 @@ impl SurvivalMarginalSlopeFamily {
             })?
         };
         Ok(Some(operator.to_dense()))
+    }
+
+    /// `{D_β_a ∂_θ H}` along every coefficient axis `a` for the baseline-chart
+    /// coordinate `axis` in one row pass, on every time-wiggle frame the ζ
+    /// composition serves (gam#3061). Elsewhere this returns `None` and a caller
+    /// sweeps the single-direction drift per axis with identical semantics.
+    pub(crate) fn baseline_psi_hessian_directional_derivatives_all_beta_axes_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        axis: usize,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if !self.timewiggle_zeta_available() {
+            return Ok(None);
+        }
+        self.timewiggle_baseline_psi_hessian_all_beta_axes(
+            block_states,
+            axis,
+            &self.rigid_third_row_weights(options),
+        )
+        .map(Some)
     }
 
     /// The outer row measure as one weight per row: a retained row carries its
@@ -943,7 +999,8 @@ impl SurvivalMarginalSlopeFamily {
     /// Jeffreys curvature reads along `(θ, v)` (gam#2765).
     ///
     /// The chart moves the offsets `o` of the location index and leaves the
-    /// coefficient map `J` fixed, so a row contributes `Jᵀ T⁵[o, Jv, J e_a] J`.
+    /// coefficient map `J` fixed, so a row contributes `Jᵀ T⁵[o, Jv, J e_a] J`; see
+    /// `timewiggle_third` for every time-wiggle frame the ζ composition serves (gam#3061).
     pub(crate) fn baseline_exact_joint_psihessian_second_directional_derivative_all_beta_axes_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -951,13 +1008,21 @@ impl SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
         options: &BlockwiseFitOptions,
     ) -> Result<Vec<Array2<f64>>, String> {
+        let d_beta = self.finite_flat_direction(block_states, d_beta_flat)?;
+        let row_weights = self.rigid_third_row_weights(options);
+        if self.timewiggle_zeta_fifth_available() {
+            return self.timewiggle_baseline_psi_third_information_all_axes(
+                block_states,
+                axis,
+                d_beta_flat,
+                &row_weights,
+            );
+        }
         let geometry = self.rigid_baseline_geometry()?;
         self.require_rigid_third(
             block_states,
             "baseline-by-coefficient third information derivative",
         )?;
-        let d_beta = self.finite_flat_direction(block_states, d_beta_flat)?;
-        let row_weights = self.rigid_third_row_weights(options);
         in_slope_frame!(self, P, Frame, {
             let kernel = SurvivalMarginalSlopeRowKernel::<P, Frame>::new(
                 self.clone(),
@@ -976,7 +1041,8 @@ impl SurvivalMarginalSlopeFamily {
     /// `{D_β_a ∂²_θθ' H}` along every coefficient axis `a` for a pair of
     /// baseline-chart coordinates (gam#2765). A row contributes
     /// `Jᵀ(T⁵[o, o', J e_a] + T⁴[o_θθ', J e_a])J`, where `o_θθ'` is the chart's
-    /// second motion of the offsets.
+    /// second motion of the offsets; see `timewiggle_third` for every time-wiggle frame the ζ
+    /// composition serves (gam#3061).
     pub(crate) fn baseline_exact_joint_psisecond_order_hessian_directional_derivative_all_beta_axes_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -984,9 +1050,17 @@ impl SurvivalMarginalSlopeFamily {
         other_axis: usize,
         options: &BlockwiseFitOptions,
     ) -> Result<Vec<Array2<f64>>, String> {
+        let row_weights = self.rigid_third_row_weights(options);
+        if self.timewiggle_zeta_fifth_available() {
+            return self.timewiggle_baseline_psi_pair_third_information_all_axes(
+                block_states,
+                axis,
+                other_axis,
+                &row_weights,
+            );
+        }
         let geometry = self.rigid_baseline_geometry()?;
         self.require_rigid_third(block_states, "baseline-pair third information derivative")?;
-        let row_weights = self.rigid_third_row_weights(options);
         in_slope_frame!(self, P, Frame, {
             let kernel = SurvivalMarginalSlopeRowKernel::<P, Frame>::new(
                 self.clone(),
@@ -1018,7 +1092,7 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<Option<Vec<Array2<f64>>>, String> {
         let d_beta = self.finite_flat_direction(block_states, d_beta_flat)?;
         let row_weights = self.rigid_third_row_weights(options);
-        if self.timewiggle_zeta_available() {
+        if self.timewiggle_zeta_fifth_available() {
             return self.timewiggle_design_psi_third_information_all_axes(
                 block_states,
                 derivative_blocks,
@@ -1055,7 +1129,7 @@ impl SurvivalMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Vec<Array2<f64>>>, String> {
         let row_weights = self.rigid_third_row_weights(options);
-        if self.timewiggle_zeta_available() {
+        if self.timewiggle_zeta_fifth_available() {
             return self.timewiggle_design_psi_pair_third_information_all_axes(
                 block_states,
                 derivative_blocks,

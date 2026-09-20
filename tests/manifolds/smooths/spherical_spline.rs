@@ -35,6 +35,7 @@ fn spherical_basis_builds_raw_wahba_design_and_penalties() {
         max_degree: None,
         wahba_kernel: Default::default(),
         identifiability: Default::default(),
+        adaptive_degree: false,
     };
 
     let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere basis");
@@ -144,7 +145,7 @@ fn sphere_formula_and_mgcv_sos_alias_resolve_to_sphere_basis() {
 #[test]
 fn sphere_m4_wahba_formula_enforces_stable_center_floor_only_for_m4() {
     let parsed = parse_formula(
-        "y ~ sphere(lat, lon, k=25, m=4, kernel=pseudo) + sphere(lat, lon, k=25, m=2, kernel=pseudo)",
+        "y ~ sphere(lat, lon, k=25, penalty_order=4, method=pseudo) + sphere(lat, lon, k=25, penalty_order=2, method=pseudo)",
     )
     .expect("formula parses");
     let values = array![
@@ -235,6 +236,7 @@ fn spherical_harmonic_basis_builds_with_correct_width_and_diagonal_penalty() {
         max_degree: Some(3),
         wahba_kernel: Default::default(),
         identifiability: Default::default(),
+        adaptive_degree: false,
     };
     let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere harmonic basis");
     // dim = L(L+2) = 3*5 = 15
@@ -270,6 +272,7 @@ fn spherical_harmonic_penalty_order_changes_penalty_shape() {
         max_degree: Some(3),
         wahba_kernel: Default::default(),
         identifiability: Default::default(),
+        adaptive_degree: false,
     };
     let built_m1 = build_spherical_spline_basis(data.view(), &spec).expect("m=1 harmonic basis");
     let p1 = &primary_penalty(&built_m1).matrix;
@@ -298,6 +301,7 @@ fn spherical_harmonic_rejects_invalid_penalty_order() {
         max_degree: Some(2),
         wahba_kernel: Default::default(),
         identifiability: Default::default(),
+        adaptive_degree: false,
     };
     let err = build_spherical_spline_basis(data.view(), &spec)
         .expect_err("invalid harmonic penalty order");
@@ -328,6 +332,7 @@ fn spherical_harmonic_basis_rotation_invariant_gram_under_longitude_shift() {
         max_degree: Some(3),
         wahba_kernel: Default::default(),
         identifiability: Default::default(),
+        adaptive_degree: false,
     };
     let a = build_spherical_spline_basis(data.view(), &spec).expect("base");
     let b = build_spherical_spline_basis(rotated.view(), &spec).expect("rotated");
@@ -373,6 +378,7 @@ fn spherical_harmonic_basis_accepts_non_contiguous_views() {
         max_degree: Some(2),
         wahba_kernel: Default::default(),
         identifiability: Default::default(),
+        adaptive_degree: false,
     };
     let built = build_spherical_spline_basis(data, &spec)
         .expect("harmonic basis should not require contiguous lat/lon rows");

@@ -6,14 +6,14 @@
 //! through crate-internal (`pub(crate)`) seams —
 //! [`BernoulliMarginalSlopePredictor::probit_frailty_scale`],
 //! [`build_score_warp_deviation_block_from_seed`], and
-//! [`empirical_intercept_from_marginal`]. The #1521 crate split swept them up
+//! [`empirical_intercept`]. The #1521 crate split swept them up
 //! into the carved `gam-inference` crate's lib test module, which left that
 //! crate's test build red: the seams are `pub(crate)` to `gam-models` and are
 //! not visible across the crate boundary. The code under test lives here in
 //! `gam-models` (`crate::inference::predict_io`, `crate::bms`), so the tests are
 //! homed back next to it.
 
-use crate::bms::{EmpiricalZGrid, LatentMeasureKind, empirical_intercept_from_marginal};
+use crate::bms::{EmpiricalZGrid, LatentMeasureKind, empirical_intercept};
 use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
 use crate::inference::predict_io::{
     BernoulliMarginalSlopePredictor, LatentConditioningSpan, PredictInput,
@@ -316,16 +316,8 @@ fn bernoulli_marginal_slope_predictor_uses_local_empirical_latent_law() {
         .expect("local empirical q tangent");
 
     for (row, grid) in grids.iter().enumerate() {
-        let expected_intercept = empirical_intercept_from_marginal(
-            normal_cdf(0.2),
-            0.2,
-            0.9,
-            1.0,
-            &grid.nodes,
-            &grid.weights,
-            None,
-        )
-        .expect("expected empirical intercept");
+        let expected_intercept = empirical_intercept(0.2, 0.9, 1.0, &grid.nodes, &grid.weights)
+            .expect("expected empirical intercept");
         assert!((eta[row] - expected_intercept).abs() <= 1e-10);
         assert!((chain_eta[row] - eta[row]).abs() <= 1e-12);
         assert!(eta_q[row].is_finite() && eta_q[row] > 0.0);

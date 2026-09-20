@@ -79,7 +79,7 @@ pub enum HmcError {
     /// Sampler state (penalty / Hessian / mode / posterior values) contains
     /// NaN or Inf where finiteness is required.
     NonFiniteState { reason: String },
-    /// Configuration value (e.g. `target_accept`, unit-weight requirement)
+    /// Configuration value (e.g. draw count, unit-weight requirement)
     /// is out of range or otherwise invalid.
     InvalidConfig { reason: String },
     /// Dimensions of the supplied matrices / vectors are inconsistent.
@@ -1125,6 +1125,40 @@ mod tests {
         }
     }
 
+    /// #3090: the mass-matrix configs carry no jitter and no dense-metric cap.
+    /// Their diagonal metric is `(1 - regularize)·var + regularize` with
+    /// `var ≥ 0`, so its positive floor is the regularization itself, for every
+    /// dimension on both sides of the high-dimension threshold.
+    #[test]
+    fn mass_matrix_configs_floor_by_regularization_not_jitter_3090() {
+        for dim in [
+            1usize,
+            super::HIGH_DIM_THRESHOLD,
+            super::HIGH_DIM_THRESHOLD + 1,
+            200,
+        ] {
+            for cfg in [
+                super::robust_mass_matrix_config(dim),
+                super::robust_survival_mass_matrix_config(dim),
+            ] {
+                assert_eq!(cfg.jitter, 0.0, "dim={dim}: mass-matrix jitter must be absent");
+                assert!(
+                    cfg.regularize > 0.0 && cfg.regularize < 1.0,
+                    "dim={dim}: regularize={} must bound the diagonal metric away from zero",
+                    cfg.regularize
+                );
+                assert!(matches!(
+                    cfg.adaptation,
+                    super::MassMatrixAdaptation::Diagonal
+                ));
+                assert_eq!(
+                    cfg.dense_max_dim, 0,
+                    "dim={dim}: no dense-metric cap under diagonal adaptation"
+                );
+            }
+        }
+    }
+
     use super::{FamilyNutsInputs, GlmFlatInputs, NUTS_CHAINS, NutsConfig, NutsPosterior, NutsResult, SharedData, exact_glm_logp_and_grad_into, firth_jeffreys_logp_and_grad, laplace_directional_cubic_diagnostic_on_eigenpairs, laplace_skewness_threshold, laplace_trustworthiness_from_skewness, run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family};
     use gam_linalg::matrix::DesignMatrix;
     use gam_models::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
@@ -1295,6 +1329,7 @@ mod tests {
                 reparam_qs: None,
                 dispersion: gam_solve::estimate::Dispersion::UNIT,
                 factorized_standard_errors: None,
+                smoothing_correction_factorized: None,
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
@@ -1967,7 +2002,6 @@ mod tests {
         let mode = array![0.0, 0.0];
         let cfg = NutsConfig {
             n_samples: 30,
-            target_accept: 0.8,
             seed: 123,
         };
         let out = run_logit_polya_gamma_gibbs(
@@ -2019,7 +2053,6 @@ mod tests {
         let mode = array![0.0, 3.0];
         let cfg = NutsConfig {
             n_samples: 4000,
-            target_accept: 0.8,
             seed: 20_260_919,
         };
         let out = run_logit_polya_gamma_gibbs(
@@ -2114,7 +2147,6 @@ mod tests {
         let non_spdhessian = array![[0.0, 0.0], [0.0, 0.0]];
         let cfg = NutsConfig {
             n_samples: 20,
-            target_accept: 0.8,
             seed: 456,
         };
         let out = run_nuts_sampling_flattened_family(
@@ -2166,7 +2198,6 @@ mod tests {
         let non_spd_hessian = array![[0.0, 0.0], [0.0, 0.0]];
         let cfg = NutsConfig {
             n_samples: 4000,
-            target_accept: 0.8,
             seed: 20260911,
         };
         let out = run_nuts_sampling_flattened_family(
@@ -2266,7 +2297,6 @@ mod tests {
         let non_spdhessian = array![[0.0, 0.0], [0.0, 0.0]];
         let cfg = NutsConfig {
             n_samples: 20,
-            target_accept: 0.8,
             seed: 654,
         };
 
@@ -2309,7 +2339,6 @@ mod tests {
         let hessian = array![[1.5, 0.1], [0.1, 1.2]];
         let cfg = NutsConfig {
             n_samples: 20,
-            target_accept: 0.8,
             seed: 111,
         };
 
@@ -2345,41 +2374,6 @@ mod tests {
     }
 
     #[test]
-    fn run_nuts_sampling_rejects_invalid_target_accept() {
-        let x = array![[1.0], [1.0], [1.0]];
-        let y = array![0.5, -0.5, 1.0];
-        let weights = array![1.0, 1.0, 1.0];
-        let penalty = array![[0.25]];
-        let mode = array![0.0];
-        let hessian = array![[1.25]];
-        let cfg = NutsConfig {
-            n_samples: 10,
-            target_accept: 1.0,
-            seed: 222,
-        };
-
-        let err = super::run_nuts_sampling(
-            x.view(),
-            y.view(),
-            weights.view(),
-            penalty.view(),
-            mode.view(),
-            hessian.view(),
-            nuts_test_likelihood(NutsFamily::Gaussian, 1.0),
-            gam_solve::estimate::Dispersion::UNIT,
-            false,
-            None,
-            &cfg,
-        )
-        .expect_err("invalid target_accept should be rejected before sampling");
-
-        assert!(
-            err.contains("target_accept must be finite and lie in (0, 1)"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
     fn run_nuts_sampling_rejects_zero_or_too_few_samples() {
         // Issue #399: `samples=0` (and `samples` in {1, 2, 3}) reached the
         // engine and panicked across the FFI boundary in `general-mcmc`'s
@@ -2397,7 +2391,6 @@ mod tests {
         for bad_samples in [0usize, 1, 2, 3] {
             let cfg = NutsConfig {
                 n_samples: bad_samples,
-                target_accept: 0.8,
                 seed: 222,
             };
 
@@ -2439,7 +2432,6 @@ mod tests {
 
         let zero_sample_cfg = NutsConfig {
             n_samples: 0,
-            target_accept: 0.8,
             seed: 7,
         };
         let err = super::run_logit_polya_gamma_gibbs(
@@ -2739,6 +2731,263 @@ mod tests {
         assert_eq!(out.node_count, 25);
         assert_eq!(out.axis_orders, vec![5, 5]);
         assert_eq!(out.quadrature_error, 0.0);
+    }
+
+    /// A one-axis block whose likelihood is defined only on `(lower, upper)`. The
+    /// excess is `ΔF(t) = a·t⁴`, so the integrand jumps at each end, or with `root`
+    /// `ΔF(t) = −½·ln(1 + t/c)` for `c = −lower`, a square-root kink at the lower end
+    /// like the inverse-Gaussian canonical link's at `η = 0`. Row 0 bounds the lower
+    /// end and row 1 the upper. The per-row scores are zero, so the moment channels
+    /// carry only what the ends inject. `transported = false` describes no interval,
+    /// and the rule over the whole line drops the infeasible nodes.
+    struct CutBlock {
+        lambdas: Array1<f64>,
+        lower: f64,
+        upper: f64,
+        a: f64,
+        root: bool,
+        transported: bool,
+    }
+    const CUT_ROW_SLOPES: [f64; 2] = [1.5, -0.8];
+    impl CutBlock {
+        /// `ΔF(t)` without the domain, which the reference integral reads at the ends.
+        fn excess_formula(&self, t: f64) -> f64 {
+            if self.root {
+                -0.5 * (1.0 + t / -self.lower).ln()
+            } else {
+                self.a * t.powi(4)
+            }
+        }
+        fn excess_at(&self, t: f64) -> f64 {
+            if self.lower < t && t < self.upper {
+                self.excess_formula(t)
+            } else {
+                f64::INFINITY
+            }
+        }
+        /// `ln ∫ N(t; 0, 1/λ)·e^{−ΔF(t)} dt` over the interval by composite Simpson in
+        /// `v` with `t = lower + v²`, which makes a square-root kink at the lower end
+        /// smooth; the Gaussian tail past twelve standard deviations is below
+        /// roundoff.
+        fn reference_value(&self) -> f64 {
+            let lambda = self.lambdas[0];
+            let top = self.upper.min(12.0 / lambda.sqrt());
+            let v_top = (top - self.lower).sqrt();
+            let intervals = 20_000;
+            let h = v_top / intervals as f64;
+            // At `v = 0` a root's excess is `+∞` and the Jacobian `2v` is zero, so the
+            // integrand is zero there either way.
+            let integrand = |v: f64| {
+                let t = self.lower + v * v;
+                2.0 * v
+                    * (lambda / std::f64::consts::TAU).sqrt()
+                    * (-0.5 * lambda * t * t - self.excess_formula(t)).exp()
+            };
+            let interior: f64 = (1..intervals)
+                .map(|j| (if j % 2 == 1 { 4.0 } else { 2.0 }) * integrand(j as f64 * h))
+                .sum();
+            ((integrand(0.0) + interior + integrand(v_top)) * h / 3.0).ln()
+        }
+    }
+    impl super::BlockExcessTarget for CutBlock {
+        fn block_dim(&self) -> usize {
+            1
+        }
+        fn rho_dim(&self) -> usize {
+            1
+        }
+        fn block_curvatures(&self) -> &Array1<f64> {
+            &self.lambdas
+        }
+        fn excess(&self, t: &Array1<f64>) -> f64 {
+            self.excess_at(t[0])
+        }
+        fn excess_rounding_band(&self, t: &Array1<f64>) -> f64 {
+            gam_linalg::roundoff::accumulation_band(4, self.excess_at(t[0]).abs())
+        }
+        fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
+            // `ρ = ln a` scales the quartic; the root's excess does not depend on it.
+            t.mapv(|x| if self.root { 0.0 } else { self.a * x.powi(4) })
+        }
+        fn displaced_neg_score(&self, t: &Array1<f64>) -> Result<Array1<f64>, String> {
+            assert_eq!(t.len(), self.block_dim(), "displacement dim mismatch");
+            Ok(Array1::zeros(CUT_ROW_SLOPES.len()))
+        }
+        fn base_neg_score(&self) -> Result<Array1<f64>, String> {
+            Ok(Array1::zeros(CUT_ROW_SLOPES.len()))
+        }
+        fn node_working_bytes(&self) -> Option<usize> {
+            Some(std::mem::size_of::<(f64, Option<Array1<f64>>)>() + 3 * std::mem::size_of::<f64>())
+        }
+        fn axis_truncation(
+            &self,
+        ) -> Option<Box<dyn gam_problem::laplace_sampler_contract::BlockAxisTruncation + '_>>
+        {
+            self.transported.then(|| {
+                Box::new(CutAxis { block: self })
+                    as Box<dyn gam_problem::laplace_sampler_contract::BlockAxisTruncation>
+            })
+        }
+    }
+    struct CutAxis<'a> {
+        block: &'a CutBlock,
+    }
+    impl gam_problem::laplace_sampler_contract::BlockAxisTruncation for CutAxis<'_> {
+        fn lower(&self) -> Option<gam_problem::laplace_sampler_contract::BlockAxisCut> {
+            self.block.lower.is_finite().then_some(
+                gam_problem::laplace_sampler_contract::BlockAxisCut {
+                    t: self.block.lower,
+                    row: 0,
+                    row_slope: CUT_ROW_SLOPES[0],
+                },
+            )
+        }
+        fn upper(&self) -> Option<gam_problem::laplace_sampler_contract::BlockAxisCut> {
+            self.block.upper.is_finite().then_some(
+                gam_problem::laplace_sampler_contract::BlockAxisCut {
+                    t: self.block.upper,
+                    row: 1,
+                    row_slope: CUT_ROW_SLOPES[1],
+                },
+            )
+        }
+        fn excess_slope(&self, t: f64, displaced_neg_score: &Array1<f64>) -> f64 {
+            // The engine hands over the score it already evaluated at this node.
+            let at_node = super::BlockExcessTarget::displaced_neg_score(self.block, &array![t])
+                .expect("the double's score");
+            assert_eq!(displaced_neg_score, &at_node, "score of another node at t = {t}");
+            if self.block.root {
+                -0.5 / (t - self.block.lower)
+            } else {
+                4.0 * self.block.a * t.powi(3)
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_block_integrates_a_jump_at_both_ends_geometrically() {
+        // The transported rule resolves a block cut at both ends at order 40, where
+        // the whole-line rule that drops infeasible nodes still misses by ≈1e-1.
+        let block = |transported| CutBlock {
+            lambdas: array![2.0],
+            lower: -0.6,
+            upper: 0.9,
+            a: 0.05,
+            root: false,
+            transported,
+        };
+        let reference = block(true).reference_value();
+        let out = super::block_quadrature_marginal_correction(&block(true), &[40])
+            .expect("transported correction");
+        assert!(
+            (out.value - reference).abs() <= 1e-9,
+            "order-40 transported value {} vs {reference}",
+            out.value
+        );
+        assert!(out.quadrature_error <= 1e-8, "paired error {}", out.quadrature_error);
+        let whole_line = super::block_quadrature_marginal_correction(&block(false), &[40])
+            .expect("whole-line correction");
+        assert!(
+            (whole_line.value - reference).abs() > 1e-3,
+            "the whole-line rule {} should still miss {reference}",
+            whole_line.value
+        );
+    }
+
+    #[test]
+    fn truncated_block_resolves_a_root_at_the_cut_below_the_order_ceiling() {
+        // A square-root kink at the cut (the inverse-Gaussian canonical link at η = 0)
+        // left the whole-line rule's paired difference near 1e-2 at every order, so
+        // the admission refused at the largest representable one. Transported, order
+        // 60 is exact to roundoff. The cut moves with the excess here, and the
+        // integrand vanishes there, so the end's derivative at a fixed excess is zero:
+        // `∂ln Z/∂e` must cancel the transported nodes' motion.
+        let block = |transported| CutBlock {
+            lambdas: array![2.0],
+            lower: -0.6,
+            upper: f64::INFINITY,
+            a: 0.0,
+            root: true,
+            transported,
+        };
+        let reference = block(true).reference_value();
+        let out = super::block_quadrature_marginal_correction(&block(true), &[60])
+            .expect("transported correction");
+        assert!(
+            (out.value - reference).abs() <= 1e-11,
+            "order-60 transported value {} vs {reference}",
+            out.value
+        );
+        assert!(out.quadrature_error <= 1e-11, "paired error {}", out.quadrature_error);
+        let moments = out.moments.expect("moments");
+        assert!(
+            moments.e_neg_score[0].abs() <= 1e-8,
+            "a vanishing integrand gives the cut no derivative, injected {}",
+            moments.e_neg_score[0]
+        );
+        let whole_line = super::block_quadrature_marginal_correction(&block(false), &[200])
+            .expect("whole-line correction");
+        assert!(
+            whole_line.quadrature_error > 1e-4,
+            "the whole-line rule's paired error {} should not resolve",
+            whole_line.quadrature_error
+        );
+    }
+
+    #[test]
+    fn truncated_block_end_derivatives_match_the_moved_cut() {
+        // With the excess fixed, moving an end moves the value by the integrand
+        // there: `∂value/∂t_lo = −N(t_lo)e^{−ΔF(t_lo)}/e^{value}` and the upper end
+        // with the opposite sign. The sampler injects `∂value/∂t_cut / x_row` into
+        // `E_p[ngs_row]` and `t_cut` times it into `E_p[t·ngs_row]`.
+        let block = |lower: f64, upper: f64| CutBlock {
+            lambdas: array![2.0],
+            lower,
+            upper,
+            a: 0.05,
+            root: false,
+            transported: true,
+        };
+        let (lower, upper) = (-0.6, 0.9);
+        let order = 100;
+        let out = super::block_quadrature_marginal_correction(&block(lower, upper), &[order])
+            .expect("correction");
+        let moments = out.moments.expect("moments");
+        let lambda: f64 = 2.0;
+        let integrand = |t: f64| {
+            (lambda / std::f64::consts::TAU).sqrt() * (-0.5 * lambda * t * t - 0.05 * t.powi(4)).exp()
+                / out.value.exp()
+        };
+        let value_at = |lower: f64, upper: f64| {
+            super::block_quadrature_marginal_correction(&block(lower, upper), &[order])
+                .expect("moved correction")
+                .value
+        };
+        let h = 1e-5;
+        let fd_lower = (value_at(lower + h, upper) - value_at(lower - h, upper)) / (2.0 * h);
+        let fd_upper = (value_at(lower, upper + h) - value_at(lower, upper - h)) / (2.0 * h);
+        let injected_lower = moments.e_neg_score[0] * CUT_ROW_SLOPES[0];
+        let injected_upper = moments.e_neg_score[1] * CUT_ROW_SLOPES[1];
+        assert!(
+            (injected_lower + integrand(lower)).abs() <= 1e-11,
+            "lower end {injected_lower} vs {}",
+            -integrand(lower)
+        );
+        assert!(
+            (injected_upper - integrand(upper)).abs() <= 1e-11,
+            "upper end {injected_upper} vs {}",
+            integrand(upper)
+        );
+        assert!((injected_lower - fd_lower).abs() <= 1e-8, "{injected_lower} vs FD {fd_lower}");
+        assert!((injected_upper - fd_upper).abs() <= 1e-8, "{injected_upper} vs FD {fd_upper}");
+        assert!(
+            (moments.e_t_neg_score[(0, 0)] - moments.e_neg_score[0] * lower).abs() <= 1e-15,
+            "lower end's t-moment"
+        );
+        assert!(
+            (moments.e_t_neg_score[(1, 0)] - moments.e_neg_score[1] * upper).abs() <= 1e-15,
+            "upper end's t-moment"
+        );
     }
 
     #[test]
@@ -4281,8 +4530,6 @@ impl HamiltonianTarget<Array1<f64>> for NutsPosterior {
 pub struct NutsConfig {
     /// Draws to collect per chain after warmup
     pub n_samples: usize,
-    /// Target acceptance probability (0.6-0.9 recommended)
-    pub target_accept: f64,
     /// Seed for deterministic chain initialization
     #[serde(default = "default_nuts_seed")]
     pub seed: u64,
@@ -4290,18 +4537,6 @@ pub struct NutsConfig {
 
 fn default_nuts_seed() -> u64 {
     42
-}
-
-fn validate_nuts_target_accept(target_accept: f64) -> Result<(), HmcError> {
-    if target_accept.is_finite() && target_accept > 0.0 && target_accept < 1.0 {
-        Ok(())
-    } else {
-        Err(HmcError::InvalidConfig {
-            reason: format!(
-                "NUTS target_accept must be finite and lie in (0, 1), got {target_accept}"
-            ),
-        })
-    }
 }
 
 /// Minimum number of post-warmup draws per chain that keeps the split-R-hat /
@@ -4318,10 +4553,10 @@ const MIN_NUTS_SAMPLES: usize = 4;
 /// apart from one posterior.
 pub const NUTS_CHAINS: usize = 2;
 
-/// Validate the draw count of a NUTS configuration up front, mirroring
-/// `validate_nuts_target_accept`, so that an out-of-range value surfaces as a
-/// typed `HmcError::InvalidConfig` *before* the sampling engine is constructed
-/// rather than as a panic caught at the FFI boundary.
+/// Validate the draw count of a NUTS configuration up front, so that an
+/// out-of-range value surfaces as a typed `HmcError::InvalidConfig` *before*
+/// the sampling engine is constructed rather than as a panic caught at the FFI
+/// boundary.
 fn validate_nuts_draws(config: &NutsConfig) -> Result<(), HmcError> {
     if config.n_samples < MIN_NUTS_SAMPLES {
         return Err(HmcError::InvalidConfig {
@@ -4339,7 +4574,6 @@ fn validate_nuts_draws(config: &NutsConfig) -> Result<(), HmcError> {
 /// entry point (dense NUTS, link-wiggle, joint (β, ρ), survival, the
 /// auto-selected Pólya-Gamma Gibbs path, and the Laplace-Gaussian fallback).
 pub(crate) fn validate_nuts_config(config: &NutsConfig) -> Result<(), HmcError> {
-    validate_nuts_target_accept(config.target_accept)?;
     validate_nuts_draws(config)?;
     Ok(())
 }
@@ -4402,27 +4636,19 @@ fn draw_logit_pg1_omega(
     Ok(())
 }
 
+/// Dual-averaging acceptance target shared by every NUTS run. It is not a
+/// user option (#3263): the sampler runs in the Laplace-whitened space, where
+/// the leapfrog cost-optimal average acceptance lies in [0.6, 0.9] and its
+/// upper end is the choice robust to departures from Gaussianity (Betancourt,
+/// Byrne & Girolami 2014). Measured on general-mcmc's open warmup (#3263), the
+/// warmup ends fastest here (124 transitions on a 4-D Gaussian against 16380 at
+/// 0.6), while targets at or above 0.98 never end it, because the dual-averaging
+/// bias plateaus the acceptance statistic below the target.
+const NUTS_TARGET_ACCEPT: f64 = 0.9;
+
 /// Parameter dimension above which the posterior is treated as "high-dimensional"
-/// for the purpose of the more conservative sampler heuristics below: a higher
-/// target-acceptance floor (smaller leapfrog steps) and stronger mass-matrix
-/// regularization. The boundary matches the `dense_max_dim` cap at which the
-/// engine stops attempting dense mass-matrix adaptation.
+/// for the mass-matrix regularization below.
 const HIGH_DIM_THRESHOLD: usize = 50;
-
-/// Target-acceptance floor enforced for high-dimensional posteriors
-/// (`dim > HIGH_DIM_THRESHOLD`). NUTS efficiency degrades faster with too-large
-/// steps in high dimensions, so we refuse to honor a requested accept below this.
-const HIGH_DIM_TARGET_ACCEPT_FLOOR: f64 = 0.92;
-/// Target-acceptance floor for low-dimensional posteriors.
-const LOW_DIM_TARGET_ACCEPT_FLOOR: f64 = 0.90;
-/// Upper bound on the effective target acceptance. Pushing target accept toward
-/// 1 collapses the step size and stalls mixing, so we cap the requested value.
-const MAX_TARGET_ACCEPT: f64 = 0.95;
-
-/// Largest parameter dimension for which the engine attempts *dense* mass-matrix
-/// adaptation; above this it falls back to a diagonal metric (an `O(p²)` dense
-/// metric is neither affordable nor reliably estimable from limited warmup).
-const DENSE_MASS_MATRIX_MAX_DIM: usize = 75;
 
 /// Mass-matrix ridge (added to the diagonal of the estimated metric) for the
 /// general (mean-family) sampler. The high-dimensional value is larger because
@@ -4434,29 +4660,15 @@ const MASS_REGULARIZE_LOW_DIM: f64 = 0.10;
 const SURVIVAL_MASS_REGULARIZE_HIGH_DIM: f64 = 0.18;
 const SURVIVAL_MASS_REGULARIZE_LOW_DIM: f64 = 0.12;
 
-/// Jitter added during mass-matrix inversion to keep the metric strictly
-/// positive-definite against round-off in the warmup covariance estimate.
-const MASS_MATRIX_JITTER: f64 = 1e-5;
-
-#[inline]
-fn robust_target_accept(requested: f64, dim: usize) -> f64 {
-    let floor = if dim > HIGH_DIM_THRESHOLD {
-        HIGH_DIM_TARGET_ACCEPT_FLOOR
-    } else {
-        LOW_DIM_TARGET_ACCEPT_FLOOR
-    };
-    requested.max(floor).min(MAX_TARGET_ACCEPT)
-}
-
 fn jittered_initial_positions(
-    config: &NutsConfig,
+    seed: u64,
     dim: usize,
     scale: f64,
     stream: u64,
 ) -> Vec<Array1<f64>> {
     (0..NUTS_CHAINS)
         .map(|chain| {
-            let mut rng = StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, stream));
+            let mut rng = StdRng::seed_from_u64(chain_stream_seed(seed, chain, stream));
             Array1::from_shape_fn(dim, |_| sample_standard_normal(&mut rng) * scale)
         })
         .collect()
@@ -4475,8 +4687,12 @@ fn robust_mass_matrix_config(dim: usize) -> NUTSMassMatrixConfig {
         } else {
             MASS_REGULARIZE_LOW_DIM
         },
-        jitter: MASS_MATRIX_JITTER,
-        dense_max_dim: DENSE_MASS_MATRIX_MAX_DIM,
+        // No jitter: the diagonal metric is `(1 - regularize)·var + regularize`,
+        // so its entries are bounded below by `regularize > 0` and a floor could
+        // never bind (#3090). `dense_max_dim` is read only under dense
+        // adaptation, and both configs are diagonal.
+        jitter: 0.0,
+        dense_max_dim: 0,
     }
 }
 
@@ -4494,8 +4710,12 @@ fn robust_survival_mass_matrix_config(dim: usize) -> NUTSMassMatrixConfig {
         } else {
             SURVIVAL_MASS_REGULARIZE_LOW_DIM
         },
-        jitter: MASS_MATRIX_JITTER,
-        dense_max_dim: DENSE_MASS_MATRIX_MAX_DIM,
+        // No jitter: the diagonal metric is `(1 - regularize)·var + regularize`,
+        // so its entries are bounded below by `regularize > 0` and a floor could
+        // never bind (#3090). `dense_max_dim` is read only under dense
+        // adaptation, and both configs are diagonal.
+        jitter: 0.0,
+        dense_max_dim: 0,
     }
 }
 
@@ -4503,7 +4723,6 @@ impl Default for NutsConfig {
     fn default() -> Self {
         Self {
             n_samples: 1000,
-            target_accept: 0.9,
             seed: 42,
         }
     }
@@ -4532,7 +4751,6 @@ impl NutsConfig {
 
         Self {
             n_samples,
-            target_accept: 0.9,
             seed: 42,
         }
     }
@@ -4641,8 +4859,10 @@ pub struct NutsResult {
     pub sampler: PosteriorSampler,
     /// Which coefficient covariance the draws describe. MCMC on the exact
     /// likelihood is conditional on the fitted smoothing parameters; the
-    /// Laplace path draws from the fit's PUBLISHED covariance, which is the
-    /// smoothing-corrected `Vp` whenever the fit carries one (gam#2777).
+    /// standard-GAM sampler then maps its draws through the linear transport
+    /// `Vb → V_c` so they describe the smoothing-corrected `V_c`, and
+    /// the Laplace path draws from the fit's PUBLISHED covariance, which is
+    /// the smoothing-corrected `Vp` whenever the fit carries one (gam#2777).
     pub covariance: InferenceCovarianceMode,
 }
 
@@ -4655,9 +4875,78 @@ const NUTS_CONVERGENCE: MixingTargets = MixingTargets {
 };
 
 #[inline]
-fn mixing_converged(rhat: f64, ess: f64) -> bool {
+pub(crate) fn mixing_converged(rhat: f64, ess: f64) -> bool {
     rhat < NUTS_CONVERGENCE.max_rhat && ess > NUTS_CONVERGENCE.min_ess
 }
+
+/// Runs `n_chains` Markov chains of dimension `p` until they mix, and returns the
+/// transitions each chain ran. `transition(chain, draw)` advances `chain` by one
+/// transition and writes its new state into `draw`.
+///
+/// Burn-in runs in windows that double from the fewest draws split R-hat needs,
+/// and ends at the first window whose chains meet [`NUTS_CONVERGENCE`]. When every
+/// chain meets the ESS target on its own but the chains disagree in two windows
+/// in a row, they sample different regions and more burn-in cannot join them.
+pub(crate) fn burn_in_until_mixed(
+    n_chains: usize,
+    p: usize,
+    sampler: &str,
+    transitions: &str,
+    mut transition: impl FnMut(usize, ndarray::ArrayViewMut1<'_, f64>) -> Result<(), String>,
+) -> Result<usize, String> {
+    let mut window_len = MIN_NUTS_SAMPLES;
+    let mut burn_in = 0usize;
+    let mut disagreeing_windows = 0usize;
+    loop {
+        let mut window = Array3::<f64>::zeros((n_chains, window_len, p));
+        for chain in 0..n_chains {
+            for t in 0..window_len {
+                transition(chain, window.slice_mut(s![chain, t, ..]))?;
+            }
+        }
+        burn_in += window_len;
+        let (rhat, ess) = compute_split_rhat_and_ess(&window);
+        if mixing_converged(rhat, ess) {
+            return Ok(burn_in);
+        }
+        let mut within_ess = Array1::<f64>::zeros(p);
+        for chain in 0..n_chains {
+            let (_, chain_ess) = split_rhat_mean_ess(window.slice(s![chain..chain + 1, .., ..]));
+            within_ess += &chain_ess;
+        }
+        if within_ess
+            .iter()
+            .all(|value| *value > NUTS_CONVERGENCE.min_ess)
+        {
+            disagreeing_windows += 1;
+            if disagreeing_windows == 2 {
+                return Err(HmcError::SamplingFailed {
+                    reason: format!(
+                        "{sampler} chains disagree after {burn_in} burn-in {transitions} per chain: split R-hat {rhat} stayed at or above {} in two consecutive windows whose chains each met the ESS target",
+                        NUTS_CONVERGENCE.max_rhat
+                    ),
+                }
+                .into());
+            }
+        } else {
+            disagreeing_windows = 0;
+        }
+        window_len = window_len.checked_mul(2).ok_or_else(|| {
+            format!(
+                "{sampler} burn-in window cannot double again after {burn_in} {transitions} per chain"
+            )
+        })?;
+    }
+}
+
+/// Fewer criterion value+gradient evaluations than any converged
+/// [`run_rho_criterion_nuts`] run spends. The ESS estimator bounds the
+/// autocorrelation time below by one, so a window's pooled ESS never exceeds its
+/// pooled draw count: the warmup window that meets [`NUTS_CONVERGENCE`] holds
+/// more than `min_ess` pooled transitions, and the collection that follows it
+/// holds at least as many. Every transition takes at least one leapfrog step,
+/// which is one evaluation.
+pub(crate) const RHO_NUTS_MIN_EVALUATIONS: usize = 2 * NUTS_CONVERGENCE.min_ess as usize;
 
 /// Runs the whitened target until its adaptation has stabilized and its chains
 /// meet [`NUTS_CONVERGENCE`], then collects `config.n_samples` draws per chain.
@@ -4666,7 +4955,6 @@ fn run_whitened_nuts_samples<Target>(
     target: Target,
     initial_positions: Vec<Array1<f64>>,
     config: &NutsConfig,
-    dim: usize,
     mass_cfg: NUTSMassMatrixConfig,
     transition_seed_stream: u64,
     sampling_error_label: &str,
@@ -4677,7 +4965,7 @@ where
     let mut sampler = GenericNUTS::new_with_mass_matrix(
         target,
         initial_positions,
-        robust_target_accept(config.target_accept, dim),
+        NUTS_TARGET_ACCEPT,
         mass_cfg,
     )
     .set_seed(nuts_transition_seed(config.seed, transition_seed_stream));
@@ -4764,7 +5052,6 @@ where
         target,
         initial_positions,
         config,
-        dim,
         mass_cfg,
         transition_seed_stream,
         sampling_error_label,
@@ -5001,55 +5288,18 @@ pub(crate) fn run_logit_polya_gamma_gibbs(
         Ok(())
     };
 
-    // Burn-in runs in windows that double from the fewest draws split R-hat needs,
-    // and ends at the first window whose chains meet NUTS_CONVERGENCE. When every
-    // chain meets the ESS target on its own but the chains disagree in two windows
-    // in a row, they sample different regions and more burn-in cannot join them.
-    let mut window_len = MIN_NUTS_SAMPLES;
-    let mut burn_in = 0usize;
-    let mut disagreeing_windows = 0usize;
-    loop {
-        let mut window = Array3::<f64>::zeros((NUTS_CHAINS, window_len, p));
-        for (chain, state) in chains.iter_mut().enumerate() {
-            for t in 0..window_len {
-                sweep(chain, state)?;
-                window.slice_mut(ndarray::s![chain, t, ..]).assign(&state.beta);
-            }
-        }
-        burn_in += window_len;
-        let (rhat, ess) = compute_split_rhat_and_ess(&window);
-        if mixing_converged(rhat, ess) {
-            break;
-        }
-        let mut within_ess = Array1::<f64>::zeros(p);
-        for chain in 0..NUTS_CHAINS {
-            let (_, chain_ess) =
-                split_rhat_mean_ess(window.slice(ndarray::s![chain..chain + 1, .., ..]));
-            within_ess += &chain_ess;
-        }
-        if within_ess
-            .iter()
-            .all(|value| *value > NUTS_CONVERGENCE.min_ess)
-        {
-            disagreeing_windows += 1;
-            if disagreeing_windows == 2 {
-                return Err(HmcError::SamplingFailed {
-                    reason: format!(
-                        "Pólya-Gamma Gibbs chains disagree after {burn_in} burn-in sweeps per chain: split R-hat {rhat} stayed at or above {} in two consecutive windows whose chains each met the ESS target",
-                        NUTS_CONVERGENCE.max_rhat
-                    ),
-                }
-                .into());
-            }
-        } else {
-            disagreeing_windows = 0;
-        }
-        window_len = window_len.checked_mul(2).ok_or_else(|| {
-            format!(
-                "Pólya-Gamma Gibbs burn-in window cannot double again after {burn_in} sweeps per chain"
-            )
-        })?;
-    }
+    let burn_in = burn_in_until_mixed(
+        NUTS_CHAINS,
+        p,
+        "Pólya-Gamma Gibbs",
+        "sweeps",
+        |chain, mut draw| {
+            let state = &mut chains[chain];
+            sweep(chain, state)?;
+            draw.assign(&state.beta);
+            Ok(())
+        },
+    )?;
 
     let mut samples_array = Array3::<f64>::zeros((NUTS_CHAINS, config.n_samples, p));
     for (chain, state) in chains.iter_mut().enumerate() {
@@ -5179,7 +5429,8 @@ pub(crate) fn run_nuts_sampling(
     let chol = target.chol().clone();
     let mode_arr = target.mode().clone();
 
-    let initial_positions = jittered_initial_positions(config, dim, 0.1, 0x0F65_83B2_BC71_4D9E);
+    let initial_positions =
+        jittered_initial_positions(config.seed, dim, 0.1, 0x0F65_83B2_BC71_4D9E);
     let mass_cfg = robust_mass_matrix_config(dim);
     let (result, run_stats) = run_whitened_nuts_result(
         target,
@@ -5314,13 +5565,6 @@ fn run_conjugate_gaussian_sampling(
     })
 }
 
-/// Penalty subtracted from the log-density when the `ρ`-criterion closure
-/// reports an infeasible / non-finite point during Tier-2 `ρ`-posterior NUTS
-/// (#938). The fallback density is the whitened standard normal shifted down by
-/// this constant, so the sampler sees a smooth, coercive pull back toward the
-/// feasible region around `ρ̂` instead of a `-inf` cliff.
-const RHO_NUTS_INFEASIBLE_LOGP_PENALTY: f64 = 1.0e8;
-
 /// Tier-2 of the marginal-smoothing inference stack (#938): the whitened
 /// `ρ`-criterion Hamiltonian target.
 ///
@@ -5336,12 +5580,19 @@ const RHO_NUTS_INFEASIBLE_LOGP_PENALTY: f64 = 1.0e8;
 /// solve with interior caches), so it is serialized behind a `Mutex`; chains
 /// take turns evaluating, which also keeps the inner warm-start trajectory
 /// coherent.
+///
+/// The criterion is `π(ρ|y)` on all of `ρ`-space, so a position it cannot value
+/// is not a zero-density region: the first such failure is recorded in
+/// `evaluation_failure`, the position is rejected, and the run is failed with
+/// that reason rather than sampled from a density invented for it.
 struct WhitenedRhoCriterionTarget<F> {
-    /// `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`; `None` marks an infeasible point.
+    /// `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`, or why it cannot be valued.
     criterion_and_grad: Mutex<F>,
-    /// `ρ̂`, the converged smoothing parameters (the whitening center).
+    /// The first position the criterion could not value, and why.
+    evaluation_failure: Arc<Mutex<Option<String>>>,
+    /// The whitening center: the sampled density's mode.
     mode: Array1<f64>,
-    /// `L` with `L Lᵀ = H_ρ⁻¹`: maps whitened `z` to `ρ = ρ̂ + L z`.
+    /// `L` with `L Lᵀ = H⁻¹`: maps whitened `z` to `ρ = mode + L z`.
     chol: Array2<f64>,
     /// `Lᵀ`, for the gradient chain rule.
     chol_t: Array2<f64>,
@@ -5351,7 +5602,7 @@ struct WhitenedRhoCriterionTarget<F> {
 
 impl<F> HamiltonianTarget<Array1<f64>> for WhitenedRhoCriterionTarget<F>
 where
-    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
     fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
         let rho = &self.mode + &self.chol.dot(position);
@@ -5362,8 +5613,8 @@ where
                 .expect("rho-criterion mutex poisoned");
             (*criterion)(&rho)
         };
-        match eval {
-            Some((cost, g))
+        let failure = match eval {
+            Ok((cost, g))
                 if cost.is_finite()
                     && g.len() == position.len()
                     && g.iter().all(|v| v.is_finite()) =>
@@ -5372,32 +5623,43 @@ where
                 for (gi, &v) in grad.iter_mut().zip(grad_z.iter()) {
                     *gi = -v;
                 }
-                -(cost - self.cost_hat)
+                return -(cost - self.cost_hat);
             }
-            _ => {
-                // Infeasible criterion: smooth coercive fallback toward ρ̂.
-                let mut quad = 0.0;
-                for (gi, &zi) in grad.iter_mut().zip(position.iter()) {
-                    *gi = -zi;
-                    quad += zi * zi;
-                }
-                -0.5 * quad - RHO_NUTS_INFEASIBLE_LOGP_PENALTY
-            }
-        }
+            Ok((cost, g)) => format!(
+                "criterion at rho {rho:?} is {cost} with a {}-entry gradient {g:?}",
+                g.len()
+            ),
+            Err(detail) => format!("criterion unavailable at rho {rho:?}: {detail}"),
+        };
+        self.evaluation_failure
+            .lock()
+            .expect("rho-criterion failure mutex poisoned")
+            .get_or_insert(failure);
+        grad.fill(0.0);
+        f64::NEG_INFINITY
     }
 }
 
 /// Run NUTS over the smoothing parameters `ρ` with the exact profiled criterion
 /// and gradient (#938 Tier 2).
 ///
-/// * `rho_hat` — converged `ρ̂` (the whitening center and chain seed).
-/// * `outer_hessian` — exact finite symmetric positive-definite outer Hessian
-///   `H_ρ` at `ρ̂`, factored without perturbation for whitening.
-/// * `criterion_and_grad` — `ρ ↦ (LAML(ρ), ∇_ρ LAML(ρ))`, both exact; `None`
-///   for infeasible `ρ`. Each call is one warm inner profile solve.
-/// * `config` — sampler configuration; determinism comes from `config.seed`
-///   through the same splitmix64 chain/transition streams as every other NUTS
-///   entry point (no clock, no global RNG).
+/// * `rho_hat` — the whitening center and chain seed: the sampled density's
+///   mode (#3293).
+/// * `outer_hessian` — finite symmetric positive-definite Hessian of the
+///   sampled density at that center, factored without perturbation for
+///   whitening.
+/// * `criterion_and_grad` — `ρ ↦ (LAML(ρ), ∇_ρ LAML(ρ))`, both exact, or the
+///   reason it cannot value `ρ`; any such position fails the run with that
+///   reason. Each call is one warm inner profile solve.
+/// * `seed` — determinism comes from the seed through the same splitmix64
+///   chain/transition streams as every other NUTS entry point (no clock, no
+///   global RNG).
+///
+/// The draw count is not an option (#3187). The open warmup ends at the first
+/// window whose pooled draws meet [`NUTS_CONVERGENCE`], and no window is longer
+/// than the warmup's transitions per chain; so the run collects as many draws
+/// per chain as the warmup took transitions, at least a window's worth at the
+/// adapted step size.
 ///
 /// Returns draws in the ORIGINAL `ρ` space (un-whitened), with split-R̂/ESS
 /// diagnostics.
@@ -5405,12 +5667,11 @@ pub(crate) fn run_rho_criterion_nuts<F>(
     rho_hat: ArrayView1<f64>,
     outer_hessian: ArrayView2<f64>,
     mut criterion_and_grad: F,
-    config: &NutsConfig,
+    seed: u64,
 ) -> Result<NutsResult, String>
 where
-    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
-    validate_nuts_config(config).map_err(String::from)?;
     let dim = rho_hat.len();
     if dim == 0 {
         return Err("rho-posterior NUTS: zero-dimensional rho".to_string());
@@ -5431,41 +5692,74 @@ where
     )?;
 
     let cost_hat = match criterion_and_grad(&mode) {
-        Some((cost, _)) if cost.is_finite() => cost,
-        _ => {
-            return Err(
-                "rho-posterior NUTS: criterion is infeasible at rho_hat itself".to_string(),
-            );
+        Ok((cost, _)) if cost.is_finite() => cost,
+        Ok((cost, _)) => {
+            return Err(format!("rho-posterior NUTS: criterion at rho_hat is {cost}"));
+        }
+        Err(detail) => {
+            return Err(format!(
+                "rho-posterior NUTS: criterion is unavailable at rho_hat itself: {detail}"
+            ));
         }
     };
 
     let chol = whitening.chol;
+    let evaluation_failure = Arc::new(Mutex::new(None));
     let target = WhitenedRhoCriterionTarget {
         criterion_and_grad: Mutex::new(criterion_and_grad),
+        evaluation_failure: Arc::clone(&evaluation_failure),
         mode: mode.clone(),
         chol: chol.clone(),
         chol_t: whitening.chol_t,
         cost_hat,
     };
-    let initial_positions = jittered_initial_positions(config, dim, 0.1, 0x3D8A_91C4_E27B_5F60);
+    let take_failure = || {
+        evaluation_failure
+            .lock()
+            .expect("rho-criterion failure mutex poisoned")
+            .take()
+    };
+    let initial_positions = jittered_initial_positions(seed, dim, 0.1, 0x3D8A_91C4_E27B_5F60);
     // The rho target is already whitened by the exact outer Hessian at rho_hat,
     // so the local mass matrix in z-space is identity. Re-adapting a diagonal or
     // dense metric during warmup would spend expensive profile solves estimating
     // curvature we have already supplied analytically.
-    let mass_cfg = NUTSMassMatrixConfig::disabled();
-    let (result, run_stats) = run_whitened_nuts_result(
+    let mut sampler = GenericNUTS::new_with_mass_matrix(
         target,
-        &mode,
-        &chol,
         initial_positions,
-        config,
-        dim,
-        mass_cfg,
-        0x6B42_E9A1_05D7_C83F,
-        "rho-posterior NUTS sampling failed",
-        mode.clone(),
-    )?;
-    log::debug!("rho-posterior NUTS (#938 tier 2): sampling complete dim={dim} {run_stats}");
+        NUTS_TARGET_ACCEPT,
+        NUTSMassMatrixConfig::disabled(),
+    )
+    .set_seed(nuts_transition_seed(seed, 0x6B42_E9A1_05D7_C83F));
+    // A position the criterion could not value is the run's failure, whether or
+    // not the sampler itself then stopped.
+    let warmup_run = sampler.run_adaptive(MIN_NUTS_SAMPLES, NUTS_CONVERGENCE);
+    if let Some(failure) = take_failure() {
+        return Err(format!("rho-posterior NUTS: {failure}"));
+    }
+    let (head, _, warmup) =
+        warmup_run.map_err(|e| format!("rho-posterior NUTS sampling failed: {e}"))?;
+    // Continue each chain from its last collected draw at the adapted step size:
+    // `run` returns that draw as its first row, then one row per transition.
+    let continuation = sampler.run(warmup.transitions.saturating_sub(MIN_NUTS_SAMPLES) + 1, 0);
+    if let Some(failure) = take_failure() {
+        return Err(format!("rho-posterior NUTS: {failure}"));
+    }
+    let samples_array =
+        ndarray::concatenate(Axis(1), &[head.view(), continuation.slice(s![.., 1.., ..])])
+            .map_err(|e| format!("rho-posterior NUTS: joining the collected draws failed: {e}"))?;
+    let samples = unwhiten_samples(&samples_array, &mode, &chol, dim, 0);
+    let result =
+        summarize_unwhitened_nuts_samples(samples, &samples_array, mode, warmup.transitions);
+    log::debug!(
+        "rho-posterior NUTS (#938 tier 2): sampling complete dim={dim} warmup: {} transitions \
+         per chain over {} windows; {} draws per chain, rhat={:.4} ess={:.1}",
+        warmup.transitions,
+        warmup.windows,
+        samples_array.shape()[1],
+        result.rhat,
+        result.ess
+    );
     Ok(result)
 }
 
@@ -6589,6 +6883,16 @@ fn batch_length_refusal(returned: usize, nodes: usize) -> BlockQuadratureRefusal
 /// the orders so every axis's difference resolves `min(|Δ_b|, 1/n_eff²)`
 /// ([`gam_problem::laplace_sampler_contract::select_block_quadrature_orders`]).
 ///
+/// A one-axis block whose likelihood ends inside the Gaussian's mass
+/// ([`BlockExcessTarget::axis_truncation`]) integrates `q` truncated to the feasible
+/// interval: `exp(Δ_b) = Z·E_{q|interval}[e^{−ΔF}]` with `Z` the interval's `q`-mass,
+/// by every rule transported onto the interval
+/// ([`gam_math::quadrature::TruncatedNormalTransport`]). This is the same integral
+/// the untransported rule approximates by dropping infeasible nodes, but its
+/// integrand has no jump at the ends, so the paired differences resolve at an order
+/// the whole-line rule never reaches. The ends move with the fit, and their
+/// derivative is carried into the moment channels at the rows that bound them.
+///
 /// The rule is streamed (#784): nodes are enumerated lazily and handed to the target
 /// in chunks, and every accumulator runs node by node in the rule's order, so no
 /// buffer grows with the node count. The chunk is the largest the process memory
@@ -6706,6 +7010,63 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
         }
         lower_rules.push(lower);
     }
+    // A one-axis block whose likelihood is defined only on part of the axis is the
+    // integral of the Laplace Gaussian truncated to that part. Every rule, fine and
+    // lower, is transported onto the interval (`TruncatedNormalTransport`) with its
+    // weights unchanged, and the interval's mass `ln Z` joins every estimate, so the
+    // value, the paired differences and the moments are those of the truncated
+    // integral. The fine rule's standard-normal nodes are kept for the ends'
+    // derivatives below.
+    let truncation = target.axis_truncation();
+    let axis_transport = match truncation.as_deref() {
+        Some(truncation) if truncation.lower().is_some() || truncation.upper().is_some() => {
+            if m != 1 {
+                return Err(Integration(format!(
+                    "block_quadrature_marginal_correction: a feasible interval is defined for \
+                     a one-axis block, not a {m}-direction block"
+                )));
+            }
+            let sqrt_lambda = lambdas[0].sqrt();
+            let transport = gam_math::quadrature::TruncatedNormalTransport::new(
+                truncation
+                    .lower()
+                    .map_or(f64::NEG_INFINITY, |cut| sqrt_lambda * cut.t),
+                truncation
+                    .upper()
+                    .map_or(f64::INFINITY, |cut| sqrt_lambda * cut.t),
+            )
+            .map_err(|error| {
+                Integration(format!(
+                    "block_quadrature_marginal_correction: the mode is not inside the block's \
+                     feasible interval: {error}"
+                ))
+            })?;
+            let transport_rule = |rule: &mut Vec<(f64, f64)>| {
+                rule.iter_mut().try_for_each(|(node, _)| {
+                    *node = transport.transport(*node).map_err(|error| {
+                        Integration(format!(
+                            "block_quadrature_marginal_correction: transporting a node onto \
+                             the feasible interval: {error}"
+                        ))
+                    })?;
+                    Ok::<(), BlockQuadratureRefusal>(())
+                })
+            };
+            let standard_nodes: Vec<f64> = log_rules[0].iter().map(|&(node, _)| node).collect();
+            transport_rule(&mut log_rules[0])?;
+            for (_, rule) in lower_rules.iter_mut().flatten() {
+                transport_rule(rule)?;
+            }
+            // `∂ψ_k/∂(lower, upper)` per fine node, in the rule's node order.
+            let sensitivities: Vec<(f64, f64)> = standard_nodes
+                .iter()
+                .zip(log_rules[0].iter())
+                .map(|(&u, &(psi, _))| transport.endpoint_sensitivities(u, psi))
+                .collect();
+            Some((truncation, transport, sensitivities))
+        }
+        _ => None,
+    };
     let Some(node_count) = axis_orders
         .iter()
         .try_fold(1usize, |nodes, &order| nodes.checked_mul(order))
@@ -6722,8 +7083,8 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
     // node's draw column (m) and log weight. For the whole evaluation: the
     // accumulators `E_p[t ⊗ ngs]` (n·m), `E_p[ngs]` (n), `E_p[t tᵀ]` (m²), `E_p[t]` and
     // the node `t` (m each), the explicit gradient and the target's per-node gradient
-    // (k each), the fine and lower rule tables, and the cursor's table slices and
-    // digits.
+    // (k each), the fine and lower rule tables, the cursor's table slices and
+    // digits, and on a truncated axis the fine nodes' end sensitivities.
     let f64_bytes = std::mem::size_of::<f64>();
     let working_memory_refusal = |reason: &str| BlockQuadratureRefusal::WorkingMemory {
         axis_orders: axis_orders.to_vec(),
@@ -6757,6 +7118,13 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
             bytes.checked_add(
                 m.checked_mul(std::mem::size_of::<&[(f64, f64)]>() + std::mem::size_of::<usize>())?,
             )
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(axis_transport.as_ref().map_or(Some(0), |(_, _, sensitivities)| {
+                sensitivities
+                    .len()
+                    .checked_mul(std::mem::size_of::<(f64, f64)>())
+            })?)
         })
         .ok_or_else(|| working_memory_refusal("the accumulators' working bytes overflow usize"))?;
     let governor = gam_runtime::resource::MemoryGovernor::global();
@@ -6800,6 +7168,10 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
     // rule's weight-normalisation roundoff cancels rather than being reported
     // as part of the correction (see `StreamingLogSumExp`).
     let mut fine_norm = StreamingLogSumExp::new();
+    // On a truncated axis, `Σ_k w_k ∂ΔF/∂t(t_k)·∂ψ_k/∂(lower, upper)` on the same
+    // running scale as `sum_w`: the part of each end's derivative that moves the nodes.
+    let mut end_slope_acc = [0.0_f64; 2];
+    let mut node_index = 0usize;
     let mut t = Array1::<f64>::zeros(m);
     visit_product_rule_in_chunks(
         log_rules.iter().map(Vec::as_slice).collect(),
@@ -6810,6 +7182,8 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
             for &log_weight in log_weights {
                 fine_norm.push(log_weight);
             }
+            let chunk_start = node_index;
+            node_index += log_weights.len();
             // The per-node design matvec `s = X_t·(V_b·t_s)` is batched over the
             // chunk's columns (the #1082 hot path).
             let batched = target.excess_with_displaced_neg_score_batch(draws);
@@ -6836,6 +7210,8 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
                     e_tt_acc *= rescale;
                     e_ngs_acc *= rescale;
                     e_t_ngs_acc *= rescale;
+                    end_slope_acc[0] *= rescale;
+                    end_slope_acc[1] *= rescale;
                     max_lw = lw;
                 }
                 let w = (lw - max_lw).exp();
@@ -6858,6 +7234,12 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
                     }
                     e_t_ngs_acc.column_mut(r).scaled_add(wt_r, &ngs);
                 }
+                if let Some((truncation, _, sensitivities)) = axis_transport.as_ref() {
+                    let (d_lower, d_upper) = sensitivities[chunk_start + column];
+                    let slope = w * truncation.excess_slope(t[0], &ngs);
+                    end_slope_acc[0] += slope * d_lower;
+                    end_slope_acc[1] += slope * d_upper;
+                }
             }
             Ok(())
         },
@@ -6868,9 +7250,12 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
                 .to_string(),
         ));
     }
-    let value = (max_lw + sum_w.ln()) - fine_norm.value();
+    let log_mass = axis_transport
+        .as_ref()
+        .map_or(0.0, |(_, transport, _)| transport.log_mass());
+    let value = (max_lw + sum_w.ln()) - fine_norm.value() + log_mass;
     // Self-normalized importance-weighted gradient E_p[−∂ΔF/∂ρ] and moments.
-    let (rho_gradient, moments) = if sum_w > 0.0 {
+    let (rho_gradient, mut moments) = if sum_w > 0.0 {
         (
             grad_acc / sum_w,
             Some(BlockQuadratureMoments {
@@ -6883,6 +7268,44 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
     } else {
         (Array1::zeros(k), None)
     };
+    // A truncated axis's ends move with the mode, the curvature and the block
+    // direction, and the value moves with them: through `ln Z` and through every
+    // transported node `t_k = ψ_k/√λ`,
+    //
+    //   D_e = ∂value/∂e = ∂ln Z/∂e − (1/√λ)·E_p[∂ΔF/∂t · ∂ψ/∂e],   e ∈ {lower, upper}.
+    //
+    // An end at row `i` with slope `x_i = ∂s_i/∂t` sits at `e = √λ·(c − η̂_i)/x_i`
+    // for the boundary constant `c`, so
+    //
+    //   de = −(√λ/x_i)·dη̂_i + (e/2λ)·dλ − (e/x_i)·dx_i.
+    //
+    // The moment channels read `E_p[ngs_i]` as `∂cost/∂η̂_i`, `x_iᵀE_p[t·ngs_i]`
+    // through `M = −½ xᵀE_p[t·ngs] + …` as `λ·∂cost/∂λ`, and `E_p[t·ngs_i]` against
+    // `dx_i = X_i·dv` as `∂cost/∂v`, with `cost = −value`. Adding `D_e·√λ/x_i` to
+    // the first and `D_e·e/x_i` to the second carries all three motions exactly.
+    if let (Some((truncation, transport, _)), Some(moments)) =
+        (axis_transport.as_ref(), moments.as_mut())
+    {
+        let sqrt_lambda = lambdas[0].sqrt();
+        let (log_mass_lower, log_mass_upper) = transport.log_mass_endpoint_gradient();
+        let ends = [
+            (truncation.lower(), transport.lower(), log_mass_lower),
+            (truncation.upper(), transport.upper(), log_mass_upper),
+        ];
+        for ((cut, end, log_mass_gradient), node_part) in ends.into_iter().zip(end_slope_acc) {
+            let Some(cut) = cut else { continue };
+            let end_derivative = log_mass_gradient - node_part / (sum_w * sqrt_lambda);
+            if cut.row >= n_obs || !(cut.row_slope != 0.0) {
+                return Err(Integration(format!(
+                    "block_quadrature_marginal_correction: a feasible-interval end names row {} \
+                     with slope {} in a {n_obs}-row block",
+                    cut.row, cut.row_slope
+                )));
+            }
+            moments.e_neg_score[cut.row] += end_derivative * sqrt_lambda / cut.row_slope;
+            moments.e_t_neg_score[(cut.row, 0)] += end_derivative * end / cut.row_slope;
+        }
+    }
     // Paired-rule difference per axis: repeat only the scalar integral with that
     // axis one and two orders lower, every other axis unchanged, and keep the
     // larger difference. The odd-order and even-order Gauss–Hermite sequences
@@ -6936,8 +7359,8 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
                      {axis} at order {lower_order} was infeasible"
                 )));
             }
-            paired_error =
-                paired_error.max((value - (coarse_log_numerator - coarse_norm.value())).abs());
+            paired_error = paired_error
+                .max((value - (coarse_log_numerator - coarse_norm.value() + log_mass)).abs());
         }
         axis_quadrature_errors.push(paired_error);
     }
@@ -7188,7 +7611,8 @@ mod survival_hmc {
         let mode_arr = target.mode().clone();
         let dim = mode_arr.len();
 
-        let initial_positions = jittered_initial_positions(config, dim, 0.1, 0xEC2D_7A9B_4051_F638);
+        let initial_positions =
+            jittered_initial_positions(config.seed, dim, 0.1, 0xEC2D_7A9B_4051_F638);
 
         let mass_cfg = robust_survival_mass_matrix_config(dim);
         let (result, run_stats) = run_whitened_nuts_result(

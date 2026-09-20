@@ -238,7 +238,8 @@ pub use solver::estimate::reml::reml_outer_engine::PenaltySubspaceTrace;
 // `SharedBorderTopology` (`new` for a named border set, `disjoint` /
 // `fully_coupled` for the two extremes).
 pub use gam_problem::{
-    DeclaredHessianForm, Derivative, EfsEval, FailureCategory, HessianMaterialization,
+    DeclaredHessianForm, Derivative, EfsEval, ErrorCategory, FailureCategory,
+    HessianMaterialization,
     HessianOperator,
     HessianValue, IndexedResponseError, ObjectiveEvalError, OuterEval, OuterStrategyError,
     SeparableCellMeasure, TerminalInnerModeEvidence, checked_exp_log_strength,
@@ -315,14 +316,15 @@ pub use gam_models::fit_orchestration::{
     CtnStage1Recipe, DispersionLocationScaleFitRequest, DispersionLocationScaleFitResult,
     FitConfig, FitRequest, FitResult, FormulaFitResult, GaussianLocationScaleFitRequest,
     LatentBinaryFitRequest, LatentSurvivalFitRequest, LinkWiggleConfig, MaterializedModel,
-    PreparedSurvivalTimeStack, ResidualCascadeInputs, SplineScanInputs,
+    PreparedSurvivalTimeStack, ResidualCascadeInputs, ResidualCascadeSignature, SplineScanInputs,
     StandardBinomialWiggleConfig, StandardFitRequest, StandardFitResult,
     SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult,
     SurvivalMarginalSlopeFitRequest, SurvivalTransformationFitRequest,
     SurvivalTransformationFitResult, SurvivalTransformationTermSpec,
     TransformationNormalFitRequest, WorkflowError, fit_from_formula, fit_from_formula_with_notes,
     fit_model, fit_residual_cascade_from_formula, fit_spline_scan_from_formula, is_binary_response,
-    materialize, prepare_survival_time_stack, residual_cascade_fast_path, resolve_family,
+    materialize, prepare_survival_time_stack, residual_cascade_fast_path,
+    residual_cascade_structural_signature, resolve_family,
     resolve_offset_column, resolve_weight_column, response_column_kind, spline_scan_fast_path,
 };
 pub use gpu::GpuDeviceInfo;

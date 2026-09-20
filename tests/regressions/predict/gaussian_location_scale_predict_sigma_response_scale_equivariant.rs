@@ -5,9 +5,9 @@
 //! ## Background: how the two halves of the pipeline share the response scale
 //!
 //! `fit_gaussian_location_scale_model` standardizes the response by
-//! `s = sample_std(y)` (so the fixed log-σ soft floor `LOGB_SIGMA_FLOOR = 0.01`
-//! is operationally ≈1 % of the spread, mirroring mgcv's `gaulss(b=0.01)`), fits
-//! on `y/s`, then maps the coefficients back to **raw response units** in
+//! `s = sample_std(y)` (the log-σ soft floor `b` is the recording-grid bound
+//! `δ/√12` of the standardized response, see `gaussian_resolution_sigma_floor`),
+//! fits on `y/s`, then maps the coefficients back to **raw response units** in
 //! `rescale_gaussian_location_scale_to_raw`:
 //!
 //!   * the Location/Mean coefficients are multiplied by `s`;
@@ -68,8 +68,6 @@ use gam_predict::gaussian_location_scale::GaussianLocationScalePredictor;
 use gam_predict::{PredictInput, PredictableModel};
 use ndarray::{Array1, Array2};
 
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
-
 /// Deterministic heteroscedastic recipe (seed-42 LCG), matching the #1874
 /// equivariance test so the two regressions describe the same model.
 fn make_data(n: usize) -> (Vec<f64>, Vec<f64>) {
@@ -117,13 +115,14 @@ fn gaussian_location_scale_predict_sigma_matches_fit_reconstruction() {
 
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("1 + s(x, bs='tp')".to_string()),
+        noise_formula: Some("1 + s(x, bs='tps')".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg).expect("gam location-scale fit");
+    let result = fit_from_formula("y ~ s(x, bs='tps')", &ds, &cfg).expect("gam location-scale fit");
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
         fit,
         response_scale,
+        sigma_floor,
         ..
     }) = result
     else {
@@ -154,7 +153,7 @@ fn gaussian_location_scale_predict_sigma_matches_fit_reconstruction() {
         .clone();
 
     // ---- reference σ: the fit-side reconstruction (raw units) ---------------
-    // σ_raw = response_scale·LOGB_SIGMA_FLOOR + exp(η_raw), where η_raw is the
+    // σ_raw = response_scale·sigma_floor + exp(η_raw), where η_raw is the
     // persisted (intercept-shifted) Scale-block predictor. This is byte-for-byte
     // the reconstruction the #1874 equivariance test and the FFI use.
     let mut grid = Array2::<f64>::zeros((n, ncols));
@@ -166,17 +165,17 @@ fn gaussian_location_scale_predict_sigma_matches_fit_reconstruction() {
     let eta_raw = noise_design.design.apply(&beta_noise);
     let sigma_reference: Vec<f64> = eta_raw
         .iter()
-        .map(|&e| response_scale * LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| response_scale * sigma_floor + e.exp())
         .collect();
 
     // ---- production predict path --------------------------------------------
     // Build the predictor EXACTLY as `FittedModel::predictor` does for a
     // Gaussian location-scale model (see gam-predict `lib.rs`): raw beta blocks,
-    // floor = LOGB_SIGMA_FLOOR, response_scale from the payload.
+    // the fit's saved floor and response_scale from the payload.
     let predictor = GaussianLocationScalePredictor {
         beta_mu,
         beta_noise,
-        sigma_floor: LOGB_SIGMA_FLOOR,
+        sigma_floor,
         response_scale,
         covariance: None,
         link_wiggle: None,

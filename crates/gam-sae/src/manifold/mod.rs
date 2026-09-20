@@ -89,8 +89,8 @@
 //!   jet bookkeeping the curvature assembly threads through it.
 //! * `row_layout` — the per-row active-set layout for sparse assignment.
 //! * `shape_uncertainty` — the posterior shape-band payload types.
-//! * `certificate` — the curved-dictionary global-optimality certificate and
-//!   the post-fit diagnostics it feeds.
+//! * `certificate` — the curved-dictionary incoherence/curvature measurements
+//!   and the post-fit diagnostics that carry them.
 //! * `term` — the `SaeManifoldTerm` aggregate, its shared numeric constants,
 //!   and the mutable-state snapshot the inner line search restores.
 //! * `construction` — term construction, accessors, frame/border bookkeeping,
@@ -289,7 +289,7 @@ mod tests_zoo_micro_local;
 mod tests_termination_2235;
 
 #[cfg(test)]
-mod tests_alpha_override_persistence_2933;
+mod tests_alpha_persistence_2933;
 
 #[cfg(test)]
 mod tests_steering_e4;
@@ -547,6 +547,9 @@ mod tests_rho_structural_layout_2253;
 
 #[cfg(test)]
 mod tests_crosscoder_block_fd_2231;
+
+#[cfg(test)]
+mod tests_crosscoder_block_gradient_2231;
 
 #[cfg(test)]
 mod tests_crosscoder_drift;

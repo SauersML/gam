@@ -147,46 +147,18 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
-        // The Tierney-Kadane fallback gate is no longer needed: the analytic
-        // TK value, first ρ-derivative, AND second ρ-derivative paths are
-        // implemented in `tierney_kadane_terms`, which now populates the
-        // `hessian` field whenever the caller requests `ValueGradientHessian`.
-        // The earlier gate (Firth + non-identity link → return false) was
-        // kept during the manual conflict merge that landed the TK Hessian
-        // implementation; it is now stale and was suppressing the analytic
-        // path that was actually in place.
-        // Canonical-logit Firth fits keep their exact Tierney-Kadane outer Hessian
-        // at every problem scale: its row-pair jets run by blocked row pairs or
-        // through design tensors, whichever predicted work is smaller
-        // (`TkRowPairRoute::predicted_rho_hessian`, #2900), so no row count sends
-        // their curvature to BFGS.
+        // The Tierney-Kadane outer ρ-Hessian is analytic for every Firth link:
+        // its fourth η-derivative of the observed-information surface comes
+        // from the six-order Bernoulli log jet
+        // (`pirls::bernoulli_observed_information_jet`), and canonical-logit
+        // row-pair jets run by blocked row pairs or through design tensors,
+        // whichever predicted work is smaller
+        // (`TkRowPairRoute::predicted_rho_hessian`, #2900).
         //
-        // The corrected objective and its exact analytic gradient are
-        // link-general, but an exact TK outer Hessian additionally needs the
-        // fourth eta derivative of the observed-information surface. That
-        // carrier is currently available only for canonical Binomial Logit.
-        // Other Firth links therefore optimize the same TK-corrected objective
-        // with BFGS curvature rather than silently dropping the correction.
-        if reml_robust_jeffreys_link(&self.config).is_some()
-            && !self.tk_exact_hessian_is_canonical_logit()
-        {
-            return false;
-        }
         // A latched #784 block correction splices `Δ_b` with its exact
-        // gradient but no ρ-Hessian, so the criterion it defines has none.
-        !self.block_correction_latched()
-    }
-
-    /// Whether the exact analytic outer Hessian of the Tierney-Kadane
-    /// correction is available. TK value and gradient are link-general; only
-    /// this optimizer-curvature capability remains canonical-logit-specific.
-    pub(crate) fn tk_exact_hessian_is_canonical_logit(&self) -> bool {
-        let spec = reml_spec(&self.config.likelihood);
-        matches!(spec.response, ResponseFamily::Binomial)
-            && matches!(
-                self.runtime_inverse_link(),
-                InverseLink::Standard(StandardLink::Logit)
-            )
+        // gradient and ρ-Hessian, unless `Δ_b` has no closed-form Hessian on
+        // this fit, when the criterion it defines has none.
+        self.block_correction_hessian_refusal().is_none()
     }
 
     pub(crate) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
@@ -2259,13 +2231,10 @@ impl<'a> RemlState<'a> {
         // ρ-Hessian changes at a size window.
         let pirls_result = bundle.pirls_result.as_ref();
         let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
-        // `f = d⁴W_obs/dη⁴` enters only the analytic outer Hessian. The exact
-        // non-canonical observed-information carrier needs a sixth inverse-link
-        // derivative, which is not exposed by the current jet tower, so those
-        // links are deliberately routed to BFGS above. Value and gradient use
-        // only c/d/e and remain exact for every supported Firth link.
+        // `f = d⁴W_obs/dη⁴` enters only the analytic outer Hessian; value and
+        // gradient use c/d/e alone.
         let f_array = if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
-            self.hessian_cdef_arrays(pirls_result)?.3
+            self.hessian_f_array(pirls_result)?
         } else {
             Array1::zeros(e_array.len())
         };
@@ -3143,7 +3112,12 @@ impl<'a> RemlState<'a> {
     /// saturation handling).
     ///
     /// For non-canonical Bernoulli links (Probit, CLogLog, SAS,
-    /// BetaLogistic, Mixture) we use the analytic
+    /// BetaLogistic, Mixture) eᵢ is the third η-derivative of the row's
+    /// observed information from `pirls::bernoulli_observed_information_jet`,
+    /// linear in the derivatives of log μ and log(1−μ), so no division by
+    /// V = μ(1−μ) occurs where μ' and 1−μ underflow together (#3317).
+    ///
+    /// Every other exact-curvature family uses the analytic
     /// `pirls::e_obs_from_jets` formula. It expresses
     ///   ∂³W_obs/∂η³ = W_F''' + h₃ T₁ + 3 h₂ T₂ + 3 h₁ T₃ − (y−μ) T₄
     /// where T = h₁/(φV), T_k = ∂^k T/∂η^k, and W_F = h₁ T. Everything
@@ -3239,53 +3213,65 @@ impl<'a> RemlState<'a> {
             .into_par_iter()
             .map(|i| -> Result<f64, EstimationError> {
                 let eta_raw = final_eta[i];
-                let h1 = dmu_deta[i];
-                let h2 = d2mu_deta2[i];
-                let h3 = d3mu_deta3[i];
-                let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-                    inverse_link_ref,
-                    eta_raw,
-                )?;
-                let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
-                    inverse_link_ref,
-                    eta_raw,
-                )?;
-                if !h1.is_finite()
-                    || !h2.is_finite()
-                    || !h3.is_finite()
-                    || !h4.is_finite()
-                    || !h5.is_finite()
-                {
-                    return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                        row: i,
-                        quantity: "observed Hessian inverse-link five-jet",
-                        eta: eta_raw,
-                        value: h5,
-                    });
-                }
-                let mu_i = mu[i];
-                // #2273 — the complement comes from the LINK, not from `1.0 -
-                // mu`: a saturated cloglog/probit row has `mu == 1.0` exactly,
-                // and `V = mu*(1-mu)` would be a hard zero the whole
-                // observed-information jet then divides by.
-                let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
-                    inverse_link_ref,
-                    eta_raw,
-                    mu_i,
-                );
-                let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i, one_minus_mu);
-                if !(vj.v.is_finite() && vj.v > 0.0) {
-                    return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                        row: i,
-                        quantity: "observed Hessian variance",
-                        eta: eta_raw,
-                        value: vj.v,
-                    });
-                }
-                let pw = weights[i];
-                let y_i = y_view[i];
-                let resid_i = pirls::bernoulli_pair_residual(weight_family, y_i, mu_i, one_minus_mu);
-                let e_i = pirls::e_obs_from_jets(resid_i, h1, h2, h3, h4, h5, vj, phi, pw);
+                let e_i = if matches!(weight_family, pirls::WeightFamily::Binomial) {
+                    // #3317 — a Bernoulli row's jet is linear in the two sides'
+                    // log-probability jets, which never divide by μ(1−μ).
+                    pirls::bernoulli_observed_information_jet(
+                        inverse_link_ref,
+                        eta_raw,
+                        y_view[i],
+                        phi,
+                        weights[i],
+                    )?[3]
+                } else {
+                    let h1 = dmu_deta[i];
+                    let h2 = d2mu_deta2[i];
+                    let h3 = d3mu_deta3[i];
+                    let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+                        inverse_link_ref,
+                        eta_raw,
+                    )?;
+                    let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
+                        inverse_link_ref,
+                        eta_raw,
+                    )?;
+                    if !h1.is_finite()
+                        || !h2.is_finite()
+                        || !h3.is_finite()
+                        || !h4.is_finite()
+                        || !h5.is_finite()
+                    {
+                        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                            row: i,
+                            quantity: "observed Hessian inverse-link five-jet",
+                            eta: eta_raw,
+                            value: h5,
+                        });
+                    }
+                    let mu_i = mu[i];
+                    // #2273 — the complement comes from the LINK, not from `1.0 -
+                    // mu`: a saturated cloglog/probit row has `mu == 1.0` exactly,
+                    // and `V = mu*(1-mu)` would be a hard zero the whole
+                    // observed-information jet then divides by.
+                    let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
+                        inverse_link_ref,
+                        eta_raw,
+                        mu_i,
+                    );
+                    let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i, one_minus_mu);
+                    if !(vj.v.is_finite() && vj.v > 0.0) {
+                        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                            row: i,
+                            quantity: "observed Hessian variance",
+                            eta: eta_raw,
+                            value: vj.v,
+                        });
+                    }
+                    let pw = weights[i];
+                    let y_i = y_view[i];
+                    let resid_i = pirls::bernoulli_pair_residual(weight_family, y_i, mu_i, one_minus_mu);
+                    pirls::e_obs_from_jets(resid_i, h1, h2, h3, h4, h5, vj, phi, pw)
+                };
                 if e_i.is_finite() {
                     Ok(e_i)
                 } else {
@@ -3303,46 +3289,77 @@ impl<'a> RemlState<'a> {
         Ok((c_array, d_array, e_array))
     }
 
-    pub(crate) fn hessian_cdef_arrays(
+    /// `fᵢ = ∂⁴W_obs/∂η⁴` per row, the carrier the analytic Tierney-Kadane
+    /// outer ρ-Hessian adds to c/d/e. Canonical Logit reads it from the
+    /// closed-form 5-jet (`W = h'(η)`, so `f = h⁽⁵⁾`). Every other Bernoulli
+    /// link takes it from `pirls::bernoulli_observed_information_jet`, linear
+    /// in the sixth η-derivatives of log μ and log(1−μ), so no division by
+    /// V = μ(1−μ) occurs where μ' and 1−μ underflow together (#3317, #3203).
+    pub(crate) fn hessian_f_array(
         &self,
         pirls_result: &PirlsResult,
-    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
-        let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
-        let canonical_logit = matches!(
+    ) -> Result<Array1<f64>, EstimationError> {
+        use rayon::prelude::*;
+        if !matches!(
             reml_spec(&pirls_result.likelihood).response,
             ResponseFamily::Binomial
-        ) && matches!(
-            self.runtime_inverse_link(),
-            InverseLink::Standard(StandardLink::Logit)
-        );
-        if !canonical_logit {
-            // Not a defect of this fit: a non-canonical Firth link is routed
-            // to BFGS for the outer search, so no analytic ρ-Hessian exists at
-            // its end. The smoothing correction recognises this exact text as
-            // a typed structural absence (`FIRTH_OUTER_HESSIAN_NOT_ANALYTIC`).
+        ) {
             crate::bail_invalid_estim!(
-                "{}",
-                crate::estimate::smoothing_correction::FIRTH_OUTER_HESSIAN_NOT_ANALYTIC
+                "Tierney-Kadane d4W/deta4 is defined only for the Bernoulli Firth likelihood"
             );
         }
-        let mut f_array = Array1::<f64>::zeros(e_array.len());
-        use rayon::prelude::*;
+        let inverse_link = self.runtime_inverse_link();
         let final_eta = &pirls_result.final_eta;
         let weights = &self.weights;
-        let f_s = f_array.as_slice_mut().expect("f_array must be contiguous");
-        f_s.par_iter_mut().enumerate().for_each(|(i, f_o)| {
-            let jet = crate::mixture_link::logit_inverse_link_jet5(final_eta[i]);
-            *f_o = weights[i] * jet.d5;
-        });
-        if let Some((i, &value)) = f_array.iter().enumerate().find(|(_, v)| !v.is_finite()) {
-            return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                row: i,
-                quantity: "observed Hessian d4W/deta4",
-                eta: final_eta[i],
-                value,
+        let n = final_eta.len();
+        if matches!(&inverse_link, InverseLink::Standard(StandardLink::Logit)) {
+            let mut f_array = Array1::<f64>::zeros(n);
+            let f_s = f_array.as_slice_mut().expect("f_array must be contiguous");
+            f_s.par_iter_mut().enumerate().for_each(|(i, f_o)| {
+                let jet = crate::mixture_link::logit_inverse_link_jet5(final_eta[i]);
+                *f_o = weights[i] * jet.d5;
             });
+            if let Some((i, &value)) = f_array.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "observed Hessian d4W/deta4",
+                    eta: final_eta[i],
+                    value,
+                });
+            }
+            return Ok(f_array);
         }
-        Ok((c_array, d_array, e_array, f_array))
+        let phi = reml_fixed_glm_dispersion(&pirls_result.likelihood)?;
+        let y_view = &self.y;
+        let inverse_link_ref = &inverse_link;
+        // Per-row certificates, scanned in row order so the reported failing
+        // row is deterministic.
+        let certified: Vec<Result<f64, EstimationError>> = (0..n)
+            .into_par_iter()
+            .map(|i| -> Result<f64, EstimationError> {
+                let eta_raw = final_eta[i];
+                let f_i = pirls::bernoulli_observed_information_jet(
+                    inverse_link_ref,
+                    eta_raw,
+                    y_view[i],
+                    phi,
+                    weights[i],
+                )?[4];
+                if f_i.is_finite() {
+                    Ok(f_i)
+                } else {
+                    Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "observed Hessian d4W/deta4",
+                        eta: eta_raw,
+                        value: f_i,
+                    })
+                }
+            })
+            .collect();
+        Ok(Array1::from_vec(
+            certified.into_iter().collect::<Result<_, _>>()?,
+        ))
     }
 
     /// The directions of `rho` along which this criterion is EXACTLY constant
@@ -3472,13 +3489,13 @@ impl<'a> RemlState<'a> {
     /// priors also need the log-precision Jacobian. Every distribution consumer
     /// adds the same correction to the fitting criterion.
     ///
-    /// Returned as `(cost, gradient)` only: the ρ-posterior samplers consume a
-    /// log-density and its gradient, and no consumer of this correction needs
-    /// its curvature.
+    /// The samplers consume the cost and gradient; the curvature (diagonal,
+    /// since every term is per-coordinate) is what places them on the sampled
+    /// density's own Laplace geometry (#3293).
     pub(crate) fn rho_prior_distribution_correction(
         &self,
         rho: &Array1<f64>,
-    ) -> Result<(f64, Array1<f64>), EstimationError> {
+    ) -> Result<crate::rho_prior_eval::DistributionCorrection, EstimationError> {
         // The SAME weight anchoring the criterion's own prior evaluation uses
         // (#877), so the correction is taken at the coordinate the terms it
         // corrects were evaluated at.
@@ -3681,6 +3698,165 @@ impl<'a> RemlState<'a> {
         })
     }
 
+    /// Pin every λ-search-frozen likelihood nuisance (NB θ, Tweedie φ, Gamma
+    /// shape, Beta precision, GLM dispersion) that the outer loop has already
+    /// captured into `likelihood`, so each inner solve of the λ search, and
+    /// every quantity read off the search's likelihood, sees the same
+    /// stationary criterion `F(ρ) = REML(ρ, ψ_frozen)`.
+    pub(crate) fn apply_lambda_search_freezes(
+        &self,
+        likelihood: &mut GlmLikelihoodSpec,
+    ) -> Result<(), EstimationError> {
+        let resolved_likelihood_scale = likelihood
+            .resolved_scale()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+        // Negative-Binomial λ-search θ freeze (#1082). With θ estimated,
+        // the inner solver re-derives θ from each outer iterate's warm-start
+        // η, so the NB working response / deviance / penalty-logdet — and
+        // thus the REML criterion — drift every outer evaluation, defeating
+        // the projected-gradient convergence test and grinding the loop to
+        // max_iter. Once the first non-screening solve has fixed a
+        // data-driven θ (captured into `frozen_negbin_theta` by
+        // `execute_pirls_if_needed`), pin every subsequent λ-search inner
+        // solve to that value so
+        // `F(ρ) = REML(ρ, θ_frozen)` is a stationary function of ρ. θ is
+        // still ML-refreshed at the single final reported fit (the
+        // `refine_dispersion_at_converged_eta = true` accept-fit in
+        // `optimizer.rs`), exactly as the dispersion-at-converged-η contract
+        // requires. No effect on non-NB or user-fixed-θ specs.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_negbin_theta.load(Ordering::Relaxed),
+            "frozen negative-binomial theta",
+            |likelihood, value| likelihood.with_negbin_theta_frozen_for_search(value),
+        )?;
+        // Tweedie λ-search φ freeze (#1477). The same drift mechanism as the
+        // NB θ freeze above, with a sharper failure mode: the Tweedie LAML
+        // `−ℓ(β̂)` omits the φ-dependent saddlepoint normalizer, so a φ
+        // re-estimated from each outer iterate's warm-start η does not merely
+        // make `F(ρ)` drift — it makes the criterion REWARD dispersion
+        // inflation, railing a double-penalty null-space `λ` to the box bound
+        // and shipping a boundary blow-up (#1477). Pin every λ-search inner
+        // solve to the first converged solve's Pearson φ so
+        // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
+        // at the single final reported fit. No effect on non-Tweedie or
+        // user-fixed-φ specs.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Tweedie {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_tweedie_phi.load(Ordering::Relaxed),
+            "frozen Tweedie dispersion",
+            |likelihood, value| likelihood.with_tweedie_phi_frozen_for_search(value),
+        )?;
+        // Gamma λ-search shape freeze (#1074). Same drift mechanism as the NB
+        // θ and Tweedie φ freezes above: with the shape `k` estimated, the
+        // inner solver re-derives it from each outer iterate's warm-start η,
+        // so `k` — and through it BOTH the Gamma curvature `H = k·XᵀX + λS`
+        // and the data-fit `−ℓ = k·½D` (the `k`-saturated normalizer is
+        // dropped, #359) — jumps with ρ. The realized REML cost then develops
+        // deterministic spikes (a flat warm-start η at a just-rejected
+        // over-smoothed trial gives a small `k`, the fitted-surface η at the
+        // neighbor a ~2× larger one), the analytic outer gradient (which
+        // holds `k` fixed) can never match the cost's `k(ρ)` motion, the
+        // projected gradient floors well above tolerance, and the ARC descent
+        // stalls and rails λ to the over-smoothed corner (the #1074 te/Gamma
+        // tensor under-recovery). Pin every λ-search inner solve to the first
+        // converged solve's MLE `k` so `F(ρ) = REML(ρ, k_frozen)` is
+        // stationary in ρ; `k` is still refreshed at the single final
+        // reported fit. No effect on non-Gamma or user-fixed-shape specs.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Gamma {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_gamma_shape.load(Ordering::Relaxed),
+            "frozen Gamma shape",
+            |likelihood, value| likelihood.with_gamma_shape_frozen_for_search(value),
+        )?;
+        // Beta λ-search precision freeze (#2369). Same drift mechanism as the
+        // NB θ / Tweedie φ / Gamma shape freezes above, and the same
+        // stalled-outer symptom: with φ estimated, the inner solver
+        // re-derives it by the Pearson moment estimator from each outer
+        // iterate's warm-start η. The Beta precision does not factor out of
+        // the digamma mean score (`∂ℓ/∂β = φ·Σ xᵢ(y*ᵢ − μ*ᵢ)`), so a φ that
+        // swings with η moves BOTH the mean fit β̂(ρ) and the REML data-fit /
+        // log-det terms with ρ; the analytic outer gradient holds φ fixed and
+        // can never match that motion, the projected gradient floors above
+        // tolerance, and the optimizer refuses ("NOT STATIONARY") for EVERY
+        // fit — the family-unusable #2369 signature. Pin every λ-search inner
+        // solve to the first converged solve's Pearson φ so
+        // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
+        // at the single final reported fit. No effect on non-Beta or
+        // user-fixed-φ specs.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::BetaPrecision {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_beta_phi.load(Ordering::Relaxed),
+            "frozen Beta precision",
+            |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
+        )?;
+        // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
+        // same λ-search freeze as the Tweedie φ.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Dispersion {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_dispersion_phi.load(Ordering::Relaxed),
+            "frozen dispersion",
+            |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
+        )?;
+        Ok(())
+    }
+
+    /// The row weights `W` of the data curvature `XᵀWX` that the λ search's
+    /// penalized Hessian `XᵀWX + S_λ` starts from: the Fisher working weight
+    /// `w·(dμ/dη)²/V(μ)` at the cold P-IRLS start, under the search's likelihood
+    /// with every captured λ-search nuisance pinned
+    /// ([`pirls::start_working_weights`]). No inner solve runs, so the weights
+    /// exist at every ρ, including where the solve refuses; they refuse only when
+    /// the start itself is outside the family's domain (a non-positive mean
+    /// under a reciprocal link), where no fit exists either.
+    pub(crate) fn start_curvature_weights(&self) -> Result<Array1<f64>, EstimationError> {
+        let mut pirls_config = self.config.as_pirls_config();
+        pirls_config.link_kind = self.runtime_inverse_link();
+        self.apply_lambda_search_freezes(&mut pirls_config.likelihood)?;
+        pirls::start_working_weights(
+            self.x(),
+            self.y,
+            self.weights,
+            self.offset.view(),
+            &pirls_config,
+        )
+    }
+
     /// mgcv-style analytic initial smoothing-parameter seed (`initial.sp`).
     ///
     /// For each penalty block `j` this sets
@@ -3690,6 +3866,18 @@ impl<'a> RemlState<'a> {
     /// penalized Hessian `XᵀWX + λ_j S_j` at the same scale. Because `tr(XᵀWX)`
     /// carries the working-weight magnitude, `exp(ρ_j)` is already the correctly
     /// scaled `λ_j` (no separate weight anchoring needed).
+    ///
+    /// `W` is the Fisher working weight `w·(dμ/dη)²/V(μ)` at the cold P-IRLS
+    /// start ([`Self::start_curvature_weights`]), not the prior weight: only a
+    /// working weight makes the seed equivariant under a change of units of
+    /// `y`. Rescaling `y → c·y` scales the working weight of a non-log link by a
+    /// power of `c` (`μ³/4` for the inverse-Gaussian `1/μ²` link, `μ²` for the
+    /// Gamma inverse link) and the optimal `λ` with it; a prior-weight seed
+    /// stays put, so in small units it sits on the over-smoothing plateau
+    /// `λ → ∞`, where the REML gradient vanishes and the outer solve certifies
+    /// the intercept-only fit. The start weight needs no pilot solve, so the
+    /// seed exists even where the inner solve at `base` refuses, which is where
+    /// a second start matters most.
     ///
     /// This replaces the banned log-λ **grid** prepass (#2069 / #1575): a single
     /// data-derived estimate, no lattice search. A smooth whose penalized
@@ -3702,123 +3890,51 @@ impl<'a> RemlState<'a> {
     /// `ρ[j] ↔ canonical_penalties[j]` for the leading smoothing coordinates (the
     /// same 1:1 layout the λ-assembly uses); any trailing ext/ψ coordinates in
     /// `base` are not smoothing parameters and are passed through unchanged.
-    /// Returns `None` (caller keeps `base`) when the design Gram is unavailable
-    /// or its width does not match `p`.
+    /// Returns `Ok(None)` only when there is no smoothing coordinate to seed.
+    /// Every failure is an `Err` with its own type: a start outside the
+    /// family's domain (no inner solve could start from that data either), the
+    /// design Gram diagonal, and a Gram whose length disagrees with the
+    /// problem's.
     pub(crate) fn analytic_initial_sp_rho(
         &self,
         base: &Array1<f64>,
         bounds: OrderedRhoBounds,
-    ) -> Option<Array1<f64>> {
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
         let n_pen = self.canonical_penalties.len();
         let n_rho = base.len().min(n_pen);
         if n_rho == 0 {
-            return None;
+            return Ok(None);
         }
-        let weights = self.weights.to_owned();
-        let gram_diag = self.x.diag_gram(&weights).ok()?;
+        let weights = self.start_curvature_weights()?;
+        let gram_diag = self.x.diag_gram(&weights).map_err(|reason| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "analytic initial-sp seed: design Gram diagonal unavailable: {reason}"
+            ))
+        })?;
         if gram_diag.len() != self.p {
-            return None;
+            return Err(EstimationError::LayoutError(format!(
+                "analytic initial-sp seed: design Gram diagonal has {} entries, expected {}",
+                gram_diag.len(),
+                self.p
+            )));
         }
         // `bounds` is ordered by construction (`OrderedRhoBounds`); no defensive
-        // swap — an inverted box was refused at the seed-prepass boundary (#2379).
+        // swap — an inverted box was refused where the start bounds are built (#2379).
         let mut rho = base.clone();
         for j in 0..n_rho {
             let pen = &self.canonical_penalties[j];
             // tr(S_j): the penalty is PSD, so its trace is the sum of its
             // positive eigenvalues (cached at construction).
             let tr_s: f64 = pen.positive_eigenvalues.iter().sum();
-            // tr(XᵀWX) restricted to this penalty's coefficient columns.
-            let mut tr_xwx = 0.0_f64;
-            for c in pen.col_range.clone() {
-                if let Some(&d) = gram_diag.get(c) {
-                    tr_xwx += d;
-                }
-            }
-            if tr_s > 0.0 && tr_xwx > 0.0 && tr_xwx.is_finite() {
-                let rho_j = (tr_xwx / tr_s).ln();
-                if rho_j.is_finite() {
-                    rho[j] = bounds.clamp(rho_j);
-                }
+            if let Some(rho_j) = crate::seeding::commensurate_curvature_rho(
+                gram_diag.view(),
+                pen.col_range.clone(),
+                tr_s,
+            ) {
+                rho[j] = bounds.clamp(rho_j);
             }
         }
-        Some(rho)
-    }
-
-    /// Certified finite-window single-λ Gaussian-identity REML optimum, mapped
-    /// to a uniform per-block ρ seed. Setting every block's λ equal makes the effective
-    /// penalty `λ·Σ_j S_j`, so the profiled Gaussian REML criterion collapses to
-    /// the one-dimensional closed form on the summed penalty, whose
-    /// finite-window minimizer is selected by stationary-bracket certification
-    /// (`gaussian_reml_closed_form`) rather than descent. The diagonal is the
-    /// best candidate on this explicit one-dimensional restriction of the
-    /// multi-λ problem; it is not represented as a coordinate-wise solution of
-    /// the coupled determinant. The outer optimizer refines it and the
-    /// candidate is adopted only when it strictly lowers the true REML cost, so a
-    /// genuinely split-λ optimum (bend high / null low) and healthy fits are
-    /// unaffected.
-    pub(crate) fn analytic_gaussian_profiled_diagonal_rho(
-        &self,
-        bounds: OrderedRhoBounds,
-    ) -> Result<Option<Array1<f64>>, EstimationError> {
-        if !reml_is_gaussian_identity(&self.config.likelihood) {
-            return Ok(None);
-        }
-        if self.linear_constraints.is_some()
-            || self.coefficient_lower_bounds.is_some()
-            || self.runtime_mixture_link_state.is_some()
-            || self.runtime_sas_link_state.is_some()
-        {
-            return Ok(None);
-        }
-        let k = self.canonical_penalties.len();
-        if k == 0 {
-            return Ok(None);
-        }
-        if !matches!(self.x, DesignMatrix::Dense(_)) {
-            return Ok(None);
-        }
-        let x_dense = self
-            .x
-            .try_to_dense_by_chunks("gaussian_summed_diagonal_seed")
-            .map_err(EstimationError::RemlOptimizationFailed)?;
-        let p = self.p;
-        if x_dense.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "Gaussian profiled diagonal seed design has {} columns, expected {p}",
-                x_dense.ncols()
-            )));
-        }
-        // Sum the canonical penalties into a single p×p `S = Σ_j S_j` — the
-        // effective penalty when every λ_j is equal.
-        let mut s = Array2::<f64>::zeros((p, p));
-        for pen in self.canonical_penalties.iter() {
-            let r = pen.col_range.clone();
-            for (li, gi) in r.clone().enumerate() {
-                for (lj, gj) in r.clone().enumerate() {
-                    s[[gi, gj]] += pen.local[[li, lj]];
-                }
-            }
-        }
-        let mut y_eff = self.y.to_owned();
-        if self.offset.len() == y_eff.len() {
-            y_eff -= &self.offset;
-        }
-        let weights = self.weights.to_owned();
-        let result = crate::gaussian_reml::gaussian_reml_closed_form(
-            x_dense.view(),
-            y_eff.view(),
-            s.view(),
-            Some(weights.view()),
-            None,
-        )?;
-        if !result.rho.is_finite() {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "Gaussian profiled diagonal seed returned a non-finite rho".to_string(),
-            ));
-        }
-        // `bounds` is ordered by construction (`OrderedRhoBounds`); no defensive
-        // swap — an inverted box was refused at the seed-prepass boundary (#2379).
-        Ok(Some(Array1::from_elem(k, bounds.clamp(result.rho))))
+        Ok(Some(rho))
     }
 
     /// Returns the effective Hessian and the ridge value used (if any).
@@ -3963,7 +4079,6 @@ impl<'a> RemlState<'a> {
             ift_mode_response_slot: std::sync::Mutex::new(None),
             ift_joint_mode_response_slot: std::sync::Mutex::new(None),
             warm_start_enabled: AtomicBool::new(true),
-            screening_max_inner_iterations: Arc::new(AtomicUsize::new(0)),
             outer_inner_cap: Arc::new(AtomicUsize::new(0)),
             last_inner_iters: Arc::new(AtomicUsize::new(0)),
             last_inner_converged: Arc::new(AtomicBool::new(false)),
@@ -4232,18 +4347,12 @@ impl<'a> RemlState<'a> {
     /// Creates a sanitized cache key from rho values.
     /// Returns None if any component is NaN, in which case caching is skipped.
     /// Maps -0.0 to 0.0 to ensure consistency in caching.
-    pub(super) fn rhokey_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
+    pub(crate) fn rhokey_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
         // A capped inner solve is a different mathematical state from an
         // uncapped solve at the same rho.  Keep both cap identities in every
         // eval, bundle, and PIRLS key so terminal cap=0 evidence can never
-        // replay a search-time entry produced under cap=3..64.  Screening
-        // normally suppresses cache writes, but including its cap closes the
-        // same identity hole for any bundle retained within a screening call.
-        super::rho_key::sanitized_eval_state_key(
-            rho,
-            self.screening_max_inner_iterations.load(Ordering::Relaxed),
-            self.outer_inner_cap.load(Ordering::Relaxed),
-        )
+        // replay a search-time entry produced under cap=3..64.
+        super::rho_key::sanitized_eval_state_key(rho, self.outer_inner_cap.load(Ordering::Relaxed))
     }
 
     pub(super) fn prepare_eval_bundlewithkey(
@@ -4251,14 +4360,18 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
     ) -> Result<EvalShared, EstimationError> {
-        self.prepare_eval_bundlewithkey_and_row_policy(rho, key, false)
+        self.prepare_eval_bundlewithkey_and_row_policy(rho, key, BundleRows::Observed)
     }
 
+    /// Build the bundle at `rho`. `rows` is the row policy the caller admits:
+    /// `SufficientStatistics` takes the coefficient-space Gaussian solve when
+    /// the surface is eligible, and the returned bundle's `rows` records what
+    /// the solve actually produced.
     fn prepare_eval_bundlewithkey_and_row_policy(
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
-        value_only_rows: bool,
+        rows: BundleRows,
     ) -> Result<EvalShared, EstimationError> {
         // #1575 observability: count every genuine (cache-missing) full-n inner
         // P-IRLS solve. Callers funnel cache hits through `obtain_eval_bundle*`,
@@ -4295,7 +4408,7 @@ impl<'a> RemlState<'a> {
                 match self.prepare_sparse_eval_bundlewithkey(
                     rho,
                     key.clone(),
-                    value_only_rows,
+                    rows,
                     decision.clone(),
                 ) {
                     Ok(bundle) => Ok(bundle),
@@ -4318,42 +4431,48 @@ impl<'a> RemlState<'a> {
                             reason: "sparse_exact_spd_assembly_failed",
                             ..decision
                         };
-                        self.prepare_dense_eval_bundlewithkey(
-                            rho,
-                            key,
-                            value_only_rows,
-                            fallback,
-                        )
+                        self.prepare_dense_eval_bundlewithkey(rho, key, rows, fallback)
                     }
                 }
             }
             RemlGeometry::DenseSpectral => {
-                self.prepare_dense_eval_bundlewithkey(rho, key, value_only_rows, decision)
+                self.prepare_dense_eval_bundlewithkey(rho, key, rows, decision)
             }
         }
     }
 
+    /// The bundle at `rho` with fitted observation rows, for consumers that
+    /// read them (post-fit inference, ext-coordinate builders, EFS).
     pub(crate) fn obtain_eval_bundle(
         &self,
         rho: &Array1<f64>,
     ) -> Result<EvalShared, EstimationError> {
         let key = self.rhokey_sanitized(rho);
-        if let Some(existing) = self.cache_manager.cached_eval_bundle(&key) {
-            return Ok(existing.clone());
+        if let Some(existing) = self
+            .cache_manager
+            .cached_eval_bundle(&key)
+            .filter(|bundle| bundle.rows == BundleRows::Observed)
+        {
+            return Ok(existing);
         }
         let bundle = self.prepare_eval_bundlewithkey(rho, key)?;
         self.cache_manager.store_eval_bundle(bundle.clone());
         Ok(bundle)
     }
 
-    /// Obtain a bundle for a scalar value callback without forcing fixed-design
-    /// Gaussian row materialization.
+    /// The bundle at `rho` for the pure-ρ outer criterion: its value, gradient
+    /// and Hessian.
     ///
-    /// A previously cached full bundle is always reusable. On a cache miss,
-    /// only the eligible Gaussian-identity surface takes the compact row policy,
-    /// and that bundle is not stored in the full-result cache. Other families
-    /// retain the ordinary path and its cache behavior.
-    pub(crate) fn obtain_value_eval_bundle(
+    /// On an eligible fixed-design Gaussian identity surface every one of those
+    /// is a function of `XᵀWX`, `XᵀW(y−offset)`, `(y−offset)ᵀW(y−offset)` and
+    /// the penalties (the dispersion is profiled from the deviance, the
+    /// log-likelihood is `−½·deviance`, and `∂H/∂ρ_k = λ_k S_k` because the
+    /// working weights do not move), so a cache miss solves in coefficient
+    /// space and an outer iteration costs no pass over the `n` rows. Any cached
+    /// bundle at `rho` serves, whichever rows it carries; one built here is
+    /// cached marked `SufficientStatistics`, so `obtain_eval_bundle` still
+    /// realises fitted rows for the consumers that read them.
+    pub(crate) fn obtain_outer_eval_bundle(
         &self,
         rho: &Array1<f64>,
     ) -> Result<EvalShared, EstimationError> {
@@ -4362,9 +4481,15 @@ impl<'a> RemlState<'a> {
         }
         let key = self.rhokey_sanitized(rho);
         if let Some(existing) = self.cache_manager.cached_eval_bundle(&key) {
-            return Ok(existing.clone());
+            return Ok(existing);
         }
-        self.prepare_eval_bundlewithkey_and_row_policy(rho, key, true)
+        let bundle = self.prepare_eval_bundlewithkey_and_row_policy(
+            rho,
+            key,
+            BundleRows::SufficientStatistics,
+        )?;
+        self.cache_manager.store_eval_bundle(bundle.clone());
+        Ok(bundle)
     }
 
     /// Fixes audit answer C for design-moving ext-coords: when the realized
@@ -4377,8 +4502,12 @@ impl<'a> RemlState<'a> {
         theta: &Array1<f64>,
     ) -> Result<EvalShared, EstimationError> {
         let key = self.rhokey_sanitized(theta);
-        if let Some(existing) = self.cache_manager.cached_eval_bundle(&key) {
-            return Ok(existing.clone());
+        if let Some(existing) = self
+            .cache_manager
+            .cached_eval_bundle(&key)
+            .filter(|bundle| bundle.rows == BundleRows::Observed)
+        {
+            return Ok(existing);
         }
         let bundle = self.prepare_eval_bundlewithkey(rho, key)?;
         self.cache_manager.store_eval_bundle(bundle.clone());
@@ -4481,21 +4610,21 @@ impl<'a> RemlState<'a> {
             KKT_TOL_STAT
         };
         // Scale-invariant stationarity, matching the inner active-set solver's
-        // own acceptance contract (`stationarity_rel` in
-        // `solve_newton_direction_with_linear_constraints_impl`): the
-        // stationarity residual `‖grad − Aᵀλ‖∞` is certified relative to the
-        // gradient scale `‖grad‖∞`, not against a bare absolute floor. The
+        // own acceptance contract: the stationarity residual `‖grad − Aᵀλ‖∞` is
+        // certified relative to the gradient's natural scale — the magnitude of
+        // the operands whose cancellation formed it, stored on the diagnostics
+        // by the solve that formed `grad` — and only relative to it. The
         // profiled-REML / least-squares gradient is O(n) in magnitude even at a
         // genuine constrained optimum (issue #879), so the residual bottoms out
-        // at an absolute value (≈5.8e-5 on the n=400 #989 repro) that the fixed
-        // `5e-6` gate can never meet — even though the inner solver already
-        // converged on the relative ratio. We accept when EITHER the absolute
-        // residual is below the gate OR the relative ratio
-        // `stationarity / max(‖grad‖∞, 1)` is, so the outer gate stops on the
-        // same point the solver does instead of spuriously aborting a reachable
-        // constrained optimum (issue #989). `bounded()`, which solves via the
-        // exact-interval path rather than this active-set gate, was unaffected —
-        // hence the two documented ways to bound a coefficient disagreed.
+        // at an absolute value (≈5.8e-5 on the n=400 #989 repro) that a fixed
+        // `5e-6` bar can never meet — even though the inner solver already
+        // converged on the relative ratio. Judging the ratio alone, the outer
+        // gate stops on the same point the solver does instead of spuriously
+        // aborting a reachable constrained optimum (issue #989), and rescaling
+        // the objective by any factor leaves the verdict unchanged. `bounded()`,
+        // which solves via the exact-interval path rather than this active-set
+        // gate, was unaffected — hence the two documented ways to bound a
+        // coefficient disagreed.
         //
         // The dual-feasibility and complementarity channels carry the same
         // gradient units (`λ` solves `g = Aᵀλ` on unit rows) and are judged in
@@ -4557,12 +4686,12 @@ impl<'a> RemlState<'a> {
                 })
                 .unwrap_or_default();
             return Err(EstimationError::ParameterConstraintViolation(format!(
-                "KKT residuals exceed tolerance: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e} (stat_rel={:.3e} vs tol={:.3e}{}; ‖grad‖∞={:.3e}); active={}/{}{}{}{}",
+                "KKT residuals exceed tolerance: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e} (stat_rel={:.3e} vs tol={:.3e}{}; gradient_scale={:.3e}); active={}/{}{}{}{}",
                 kkt.primal_feasibility,
                 kkt.dual_feasibility,
                 kkt.complementarity,
                 kkt.stationarity,
-                kkt.stationarity / gradient_scale.max(1.0),
+                kkt.stationarity / gradient_scale,
                 stationarity_tol,
                 if kkt.working_set_rank_deficient {
                     ", degenerate face"
@@ -4815,12 +4944,25 @@ impl<'a> RemlState<'a> {
             }
             h_proj_inverse[[out_col, out_col]] = 1.0 / h_evals[src_col];
         }
+        // The eigenpairs the kernel drops, from the same decomposition: its derivative couples
+        // them to the kept ones (`PenaltySubspaceTrace::pseudo_inverse_rotation`).
+        let dropped: Vec<usize> = (0..p).filter(|index| !kept.contains(index)).collect();
+        let mut dropped_basis = Array2::<f64>::zeros((p, dropped.len()));
+        let mut dropped_eigenvalues = Array1::<f64>::zeros(dropped.len());
+        for (out_col, &src_col) in dropped.iter().enumerate() {
+            for row in 0..p {
+                dropped_basis[[row, out_col]] = h_evecs[[row, src_col]];
+            }
+            dropped_eigenvalues[out_col] = h_evals[src_col];
+        }
 
         Ok((
             log_det,
             Some(super::reml_outer_engine::PenaltySubspaceTrace {
                 u_s,
                 h_proj_inverse,
+                dropped_basis,
+                dropped_eigenvalues,
                 // Filled by the caller: only it holds the operator's own
                 // `logdet()` that this pseudo-determinant replaces (#2765).
                 logdet_correction: 0.0,
@@ -5879,32 +6021,49 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn reset_outer_seed_state(&self) {
-        self.cache_manager.invalidate_eval_bundle();
-        // Drop cross-call PIRLS LRU entries: cached β may have been computed under a coarsened inner cap, so reusing them on retry skips real work and bit-replays the prior attempt.
-        self.cache_manager
-            .pirls_cache
-            .write()
-            .expect("PIRLS result cache lock poisoned")
-            .clear();
-        // The outer is restarting from a fresh seed — the previous
-        // trajectory's warm-start signals are calibrated to a different
-        // ρ-path and would mislead both predictors and the adaptive cap
-        // policies. Wipe in lockstep so the first solve at the new
-        // seed starts fully cold.
-        self.clear_warm_start_predictor_state();
+        if self.inner_mode_is_seed_independent() {
+            // Every inner solve, and every outer evaluation built on one, is a
+            // function of its key alone, so what the state already holds is what
+            // a cold restart would rebuild, bit for bit: the bundle, the PIRLS
+            // LRU, the outer-eval LRU and the warm start that publishes each
+            // evaluation's `inner_beta_hint` all survive. Their keys carry the
+            // inner cap, which still separates a capped screening solve from a
+            // terminal one. Only the previous-evaluation mirror is trajectory
+            // state, and it goes.
+            self.cache_manager.forget_previous_outer_eval();
+        } else {
+            self.cache_manager.invalidate_eval_bundle();
+            // Drop cross-call PIRLS LRU entries: cached β may have been computed under a coarsened inner cap, so reusing them on retry skips real work and bit-replays the prior attempt.
+            self.cache_manager
+                .pirls_cache
+                .write()
+                .expect("PIRLS result cache lock poisoned")
+                .clear();
+            // The outer is restarting from a fresh seed — the previous
+            // trajectory's warm-start signals are calibrated to a different
+            // ρ-path and would mislead the predictors. Wipe them so the first
+            // solve at the new seed starts fully cold.
+            self.clear_warm_start_predictor_state();
+        }
+        // The previous trajectory's adaptive signals would mislead the adaptive
+        // cap policies of the next one.
         self.clear_warm_start_adaptive_signals();
         // Inner-PIRLS iteration caps are cross-trajectory state: the
         // previous outer's first-order bridge writes `outer_inner_cap`
-        // on every accepted gradient eval, and seed-screening writes
-        // `screening_max_inner_iterations` during cascade probes. A
-        // value left over from the prior trajectory would silently
-        // shape the first PIRLS solve at the new seed under a cap the
-        // new trajectory never chose. The next outer is responsible
-        // for re-establishing any cap it wants via its own bridge or
-        // screening hook; zeroing here is the safe baseline.
+        // on every accepted gradient eval. A value left over from the
+        // prior trajectory would silently shape the first PIRLS solve at
+        // the new seed under a cap the new trajectory never chose. The
+        // next outer is responsible for re-establishing any cap it wants
+        // via its own bridge; zeroing here is the safe baseline.
         self.outer_inner_cap.store(0, Ordering::Relaxed);
-        self.screening_max_inner_iterations
-            .store(0, Ordering::Relaxed);
+    }
+
+    /// Whether the inner mode at a key is a function of that key and the frozen
+    /// state alone. An eligible Gaussian-identity fit has no inner iteration: its
+    /// mode is one direct penalized least-squares solve, which no warm start,
+    /// adaptive signal or cap reaches.
+    fn inner_mode_is_seed_independent(&self) -> bool {
+        self.gaussian_fixed_cache_eligible()
     }
 
     // Accessor methods for private fields
@@ -6257,15 +6416,16 @@ impl<'a> RemlState<'a> {
     }
 
     /// Return the shared fixed-design Gaussian row placeholders used only by
-    /// value-only rho probes.
+    /// pure-ρ outer criterion evaluations (value, gradient and Hessian).
     ///
     /// The exact coefficient solve, score, deviance, Hessian, and REML value
-    /// still come from `GaussianFixedCache` sufficient statistics. The row
-    /// carrier exists solely because `PirlsResult` also transports
-    /// observation-scale diagnostics that the value evaluator never reads.
-    /// Building these invariant arrays once keeps distinct rho trials in
-    /// coefficient space without lying to full gradient or final-fit callers
-    /// about their fitted rows (#2435).
+    /// and its ρ-derivatives still come from `GaussianFixedCache` sufficient
+    /// statistics. The row carrier exists solely because `PirlsResult` also
+    /// transports observation-scale diagnostics that the criterion never
+    /// reads. Building these invariant arrays once keeps distinct rho trials in
+    /// coefficient space; bundles built on them are marked
+    /// `BundleRows::SufficientStatistics`, so row consumers and the final fit
+    /// still receive fitted rows (#2435).
     fn gaussian_cost_only_frozen_rows_if_eligible(
         &self,
     ) -> Result<Option<Arc<crate::pirls::GaussianFrozenRows>>, EstimationError> {
@@ -6307,14 +6467,10 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
-        value_only_rows: bool,
+        rows: BundleRows,
         decision: SparseRemlDecision,
     ) -> Result<EvalShared, EstimationError> {
-        let pirls_result = if value_only_rows {
-            self.execute_pirls_for_value_only(rho)?
-        } else {
-            self.execute_pirls_if_needed(rho)?
-        };
+        let (pirls_result, rows) = self.execute_pirls_if_needed(rho, rows)?;
         let mut h_total = self.effectivehessian(pirls_result.as_ref())?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
         if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
@@ -6385,6 +6541,7 @@ impl<'a> RemlState<'a> {
         Ok(EvalShared {
             key,
             pirls_result,
+            rows,
             geometry: decision,
             h_total: Arc::new(h_total),
             sparse_exact: None,
@@ -6395,7 +6552,7 @@ impl<'a> RemlState<'a> {
             criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
             applied_canonical_penalties: std::sync::OnceLock::new(),
             penalty_scores_at_mode: std::sync::OnceLock::new(),
-            block_local_correction: std::sync::OnceLock::new(),
+            block_local_correction: Default::default(),
         })
     }
 
@@ -6403,14 +6560,10 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
-        value_only_rows: bool,
+        rows: BundleRows,
         decision: SparseRemlDecision,
     ) -> Result<EvalShared, EstimationError> {
-        let pirls_result = if value_only_rows {
-            self.execute_pirls_for_value_only(rho)?
-        } else {
-            self.execute_pirls_if_needed(rho)?
-        };
+        let (pirls_result, rows) = self.execute_pirls_if_needed(rho, rows)?;
         if !matches!(
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::OriginalSparseNative
@@ -6517,6 +6670,7 @@ impl<'a> RemlState<'a> {
         Ok(EvalShared {
             key,
             pirls_result,
+            rows,
             geometry: decision,
             h_total: Arc::new(Array2::zeros((0, 0))),
             sparse_exact: Some(Arc::new({
@@ -6558,72 +6712,56 @@ impl<'a> RemlState<'a> {
                 cell
             },
             penalty_scores_at_mode: std::sync::OnceLock::new(),
-            block_local_correction: std::sync::OnceLock::new(),
+            block_local_correction: Default::default(),
         })
     }
 
-    /// Runs the inner P-IRLS loop, caching the result.
-    pub(super) fn execute_pirls_if_needed(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<Arc<PirlsResult>, EstimationError> {
-        self.execute_pirls_if_needed_with_row_policy(rho, false)
-    }
-
-    /// Gaussian value-only twin of [`Self::execute_pirls_if_needed`].
-    ///
-    /// On an eligible fixed-design Gaussian surface this asks P-IRLS to synthesize
-    /// observation fields from one shared invariant carrier while all numerical
-    /// fit quantities come from exact sufficient statistics. The compact result
-    /// is deliberately not inserted into the ordinary PIRLS cache: a later
-    /// gradient or accepted fit at the same rho must materialize exact rows.
-    fn execute_pirls_for_value_only(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<Arc<PirlsResult>, EstimationError> {
-        self.execute_pirls_if_needed_with_row_policy(rho, true)
-    }
-
     /// The inner P-IRLS iteration budget in force for one solve: the configured
-    /// budget, lowered to the seed-screening cap while screening applies one and
-    /// to the outer schedule's cap when one is set. One definition, read both
-    /// where the solve is configured and where its non-convergence is reported,
-    /// so a refusal never names a budget the solve was not actually given (#2705).
-    fn effective_inner_iteration_budget(
-        configured: usize,
-        screening_iteration_cap_applies: bool,
-        screening_cap: usize,
-        outer_cap: usize,
-    ) -> usize {
-        let mut budget = configured;
-        if screening_iteration_cap_applies {
-            budget = budget.min(screening_cap);
-        }
+    /// budget, lowered to the outer schedule's cap when one is set. One
+    /// definition, read both where the solve is configured and where its
+    /// non-convergence is reported, so a refusal never names a budget the solve
+    /// was not actually given (#2705).
+    fn effective_inner_iteration_budget(configured: usize, outer_cap: usize) -> usize {
         if outer_cap > 0 {
-            budget = budget.min(outer_cap);
+            configured.min(outer_cap)
+        } else {
+            configured
         }
-        budget
     }
 
-    fn execute_pirls_if_needed_with_row_policy(
+    /// Runs the inner P-IRLS loop, caching the result. `rows` is the row kind
+    /// the caller can consume; the returned kind is what the result carries
+    /// (`SufficientStatistics` is only honoured when the frozen Gaussian
+    /// carrier exists).
+    fn execute_pirls_if_needed(
         &self,
         rho: &Array1<f64>,
-        value_only_rows: bool,
-    ) -> Result<Arc<PirlsResult>, EstimationError> {
+        rows: BundleRows,
+    ) -> Result<(Arc<PirlsResult>, BundleRows), EstimationError> {
         let use_cache = self
             .cache_manager
             .pirls_cache_enabled
             .load(Ordering::Relaxed);
         // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
         let key_opt = self.rhokey_sanitized(rho);
+        // A request under an outer iteration cap is also answered by the mode
+        // certified uncapped at the same rho. The outer search probes a trial
+        // rho by value with no cap and then asks for the gradient there under
+        // its schedule's cap; without the stand-in that gradient re-ran P-IRLS
+        // to the mode already in the cache.
         if use_cache
             && let Some(key) = &key_opt
-            && let Some(cached) = self
-                .cache_manager
-                .pirls_cache
-                .write()
-                .expect("PIRLS result cache lock poisoned")
-                .get(key)
+            && let Some(cached) = {
+                let mut cache = self
+                    .cache_manager
+                    .pirls_cache
+                    .write()
+                    .expect("PIRLS result cache lock poisoned");
+                cache.get(key).or_else(|| {
+                    super::rho_key::uncapped_stand_in_key(key)
+                        .and_then(|uncapped| cache.get(&uncapped))
+                })
+            }
         {
             // Do not overwrite the current warm start from cache hits.
             // Line search / multi-eval outer loops revisit older rho keys and
@@ -6632,67 +6770,24 @@ impl<'a> RemlState<'a> {
             if cached.cache_compacted {
                 let mut pirls_config = self.config.as_pirls_config();
                 pirls_config.link_kind = self.runtime_inverse_link();
-                return Ok(Arc::new(cached.rehydrate_after_reml_cache(
-                    self.x(),
-                    self.y,
-                    self.weights,
-                    self.offset.view(),
-                    &pirls_config.link_kind,
-                )?));
+                return Ok((
+                    Arc::new(cached.rehydrate_after_reml_cache(
+                        self.x(),
+                        self.y,
+                        self.weights,
+                        self.offset.view(),
+                        &pirls_config.link_kind,
+                    )?),
+                    BundleRows::Observed,
+                ));
             }
-            return Ok(cached);
+            return Ok((cached, BundleRows::Observed));
         }
 
-        // Detect whether we are running under outer-loop seed screening. While
-        // screening is active the planner caps inner iterations to a small
-        // value (~3); trial seeds are NOT expected to certify a stationary
-        // mode under that cap. Partial fits whose objective (deviance +
-        // penalty), β, Hessian proxy, and residual are all finite are
-        // surfaced as `Ok` so the caller can rank them through the dedicated
-        // value-only `compute_screening_proxy`; KKT enforcement, the
-        // pirls_cache LRU write, and the warm-start update are all
-        // suppressed to keep screening-mode results out of cross-call
-        // state. The single atomic load below feeds both the bool and the
-        // iteration cap from one observation, avoiding a stale-value race
-        // between the two derivations.
-        let screening_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
-        let in_screening = screening_cap > 0;
-        // The shallow (~3-iteration) screening cap ranks candidate ρ by the
-        // partial-fit `min_penalized_deviance` proxy. That proxy is only a
-        // ρ-comparable quality signal when the inner solve descends toward its
-        // optimum at a rate that does not itself depend on ρ — true for the
-        // unconstrained penalized least-squares / P-IRLS Newton solve, which
-        // reaches (near) its minimizer within the cap at every ρ.
-        //
-        // It is FALSE for an inequality-constrained inner solve. With box /
-        // linear shape constraints the inner solver is an active-set QP whose
-        // traversal length varies with ρ: an under-smoothing ρ (the seed that
-        // recovers genuine curvature) must walk OFF the cone vertex / linear
-        // corner and RELEASE many curvature bounds before its penalized
-        // deviance drops, while an over-smoothing ρ sits at the linear corner —
-        // its constrained optimum — from the first iterate. Truncating both at
-        // ~3 iterations therefore makes the under-smoothing seed's proxy look
-        // far worse than its true converged cost, so screening systematically
-        // ranks the flat over-smoothed corner first and the real fit launches
-        // from it. REML then parks at the linear corner (EDF pinned to the
-        // affine null, R²≈0) on a clean convex signal an unconstrained s(x)
-        // recovers — the #1380 collapse, and exactly why it is a sharp SNR×n
-        // cliff (stronger signal lets even a 3-iteration partial solve overtake
-        // the flat seed). The fix is to let each constrained candidate ρ be
-        // judged at its CONVERGED constrained optimum: keep `in_screening`'s
-        // cache/KKT-suppression semantics (these results must still stay out of
-        // cross-call state), but do not apply the iteration cap to the
-        // active-set solve. The other (non-constrained) terms in the same fit
-        // still converge fast, so the screening pass stays cheap.
-        let screening_iteration_cap_applies = in_screening
-            && self.coefficient_lower_bounds.is_none()
-            && self.linear_constraints.is_none();
-        // Outer-aware cap: a sibling atomic that only caps the inner Newton
-        // iteration count. Unlike `screening_cap`, it does NOT suppress
-        // cache writes / warm-start updates / KKT enforcement — it is purely
-        // a budget. Driven by the outer optimizer to coarsen early-iter
-        // inner solves when ρ is far from converged. Both caps are honored
-        // jointly via `min` when both are nonzero.
+        // Outer-aware cap: an atomic that only caps the inner Newton iteration
+        // count. It does NOT suppress cache writes / warm-start updates / KKT
+        // enforcement — it is purely a budget. Driven by the outer optimizer to
+        // coarsen early-iter inner solves when ρ is far from converged.
         let outer_cap = self.outer_inner_cap.load(Ordering::Relaxed);
 
         // Run P-IRLS with original matrices to perform fresh reparameterization
@@ -6702,9 +6797,7 @@ impl<'a> RemlState<'a> {
         // two (ρ, β) pairs to extrapolate β at the new ρ; falls back to
         // the flat last-β when no history). Either path produces a
         // `Coefficients` value used as the inner Newton's seed.
-        if !in_screening {
-            self.load_persistent_warm_start_once();
-        }
+        self.load_persistent_warm_start_once();
         let predicted_warm_start_with_source = if self.warm_start_enabled.load(Ordering::Relaxed) {
             self.predict_warm_start_beta_with_source(rho)
         } else {
@@ -6714,10 +6807,18 @@ impl<'a> RemlState<'a> {
             .as_ref()
             .map(|(c, _)| c.clone());
         let prediction_source = predicted_warm_start_with_source.as_ref().map(|(_, s)| *s);
-        let cost_only_gaussian_rows = if value_only_rows {
+        let cost_only_gaussian_rows = if rows == BundleRows::SufficientStatistics {
             self.gaussian_cost_only_frozen_rows_if_eligible()?
         } else {
             None
+        };
+        // A request for sufficient-statistic rows is only honoured when the
+        // frozen carrier exists; otherwise the solve realises real rows and
+        // the bundle must say so, or row readers would refuse a valid one.
+        let realised_rows = if cost_only_gaussian_rows.is_some() {
+            BundleRows::SufficientStatistics
+        } else {
+            BundleRows::Observed
         };
         let pirls_result = {
             let warm_start_holder = self
@@ -6732,13 +6833,9 @@ impl<'a> RemlState<'a> {
             let warm_start_ref = predicted_warm_start.as_ref().or(fallback_warm_start_ref);
             let mut pirls_config = self.config.as_pirls_config();
             let original_cap = pirls_config.max_iterations;
-            pirls_config.max_iterations = Self::effective_inner_iteration_budget(
-                original_cap,
-                screening_iteration_cap_applies,
-                screening_cap,
-                outer_cap,
-            );
-            if !in_screening && outer_cap == 0 {
+            pirls_config.max_iterations =
+                Self::effective_inner_iteration_budget(original_cap, outer_cap);
+            if outer_cap == 0 {
                 // Full-fidelity samples must resolve the inner mode at the
                 // accuracy the outer derivative budget permits. Resetting the
                 // warm caches also resets the adaptive tolerance history;
@@ -6750,175 +6847,18 @@ impl<'a> RemlState<'a> {
                     .convergence_tolerance
                     .min(self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR);
             }
-            // Seed-screening prepass: rank candidate ρ by a CHEAP partial fit,
-            // never a full PIRLS-to-production-tolerance solve. The iteration cap
-            // above bounds the unconstrained case, but it is deliberately NOT
-            // applied to the inequality-constrained active-set solve (#1380), and
-            // the screening cascade's uncapped final stage
-            // (`SEED_SCREENING_UNCAPPED`) lifts the cap entirely when every capped
-            // stage collapsed — both then run the inner solve all the way to the
-            // tight production inner tolerance just to score a starting basin,
-            // which at large `n` is the dominant #1033/#1575/#1082 prepass cost.
-            // Loosen the inner convergence tolerance to a coarse screening floor
-            // so the solve terminates as soon as the penalized-deviance proxy is
-            // resolved to ranking accuracy. The proxy stays ρ-comparable because
-            // EVERY candidate is judged at the identical coarse tolerance, exactly
-            // as it is judged at the identical iteration cap. Only ever loosens
-            // (`max`), never tightens, so a caller already running a coarser inner
-            // solve keeps it. The winning seed's real fit and every multistart
-            // full solve run with `in_screening == false`, so the converged
-            // optimum (and its bit-results) is byte-for-byte unchanged — this
-            // touches only which seed the descent starts from.
-            if in_screening {
-                pirls_config.convergence_tolerance = pirls_config
-                    .convergence_tolerance
-                    .max(SEED_SCREENING_INNER_CONVERGENCE_TOLERANCE);
-            }
-            if pirls_config.max_iterations != original_cap
-                || (in_screening
-                    && pirls_config.convergence_tolerance > self.config.pirls_convergence_tolerance)
-            {
+            if pirls_config.max_iterations != original_cap {
                 log::trace!(
-                    "[PIRLS cap] inner_max_iterations={} (full={} screening={} outer={}) inner_tol={:.1e} (full_tol={:.1e})",
+                    "[PIRLS cap] inner_max_iterations={} (full={} outer={}) inner_tol={:.1e} (full_tol={:.1e})",
                     pirls_config.max_iterations,
                     original_cap,
-                    if screening_iteration_cap_applies {
-                        screening_cap as i64
-                    } else {
-                        -1
-                    },
                     if outer_cap > 0 { outer_cap as i64 } else { -1 },
                     pirls_config.convergence_tolerance,
                     self.config.pirls_convergence_tolerance,
                 );
             }
             pirls_config.link_kind = self.runtime_inverse_link();
-            let resolved_likelihood_scale = pirls_config
-                .likelihood
-                .resolved_scale()
-                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-            // Negative-Binomial λ-search θ freeze (#1082). With θ estimated,
-            // the inner solver re-derives θ from each outer iterate's warm-start
-            // η, so the NB working response / deviance / penalty-logdet — and
-            // thus the REML criterion — drift every outer evaluation, defeating
-            // the projected-gradient convergence test and grinding the loop to
-            // max_iter. Once the first non-screening solve has fixed a
-            // data-driven θ (captured below into `frozen_negbin_theta`), pin
-            // every subsequent λ-search inner solve to that value so
-            // `F(ρ) = REML(ρ, θ_frozen)` is a stationary function of ρ. θ is
-            // still ML-refreshed at the single final reported fit (the
-            // `refine_dispersion_at_converged_eta = true` accept-fit in
-            // `optimizer.rs`), exactly as the dispersion-at-converged-η contract
-            // requires. No effect on non-NB or user-fixed-θ specs.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_negbin_theta.load(Ordering::Relaxed),
-                "frozen negative-binomial theta",
-                |likelihood, value| likelihood.with_negbin_theta_frozen_for_search(value),
-            )?;
-            // Tweedie λ-search φ freeze (#1477). The same drift mechanism as the
-            // NB θ freeze above, with a sharper failure mode: the Tweedie LAML
-            // `−ℓ(β̂)` omits the φ-dependent saddlepoint normalizer, so a φ
-            // re-estimated from each outer iterate's warm-start η does not merely
-            // make `F(ρ)` drift — it makes the criterion REWARD dispersion
-            // inflation, railing a double-penalty null-space `λ` to the box bound
-            // and shipping a boundary blow-up (#1477). Pin every λ-search inner
-            // solve to the first converged solve's Pearson φ so
-            // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
-            // at the single final reported fit. No effect on non-Tweedie or
-            // user-fixed-φ specs.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Tweedie {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_tweedie_phi.load(Ordering::Relaxed),
-                "frozen Tweedie dispersion",
-                |likelihood, value| likelihood.with_tweedie_phi_frozen_for_search(value),
-            )?;
-            // Gamma λ-search shape freeze (#1074). Same drift mechanism as the NB
-            // θ and Tweedie φ freezes above: with the shape `k` estimated, the
-            // inner solver re-derives it from each outer iterate's warm-start η,
-            // so `k` — and through it BOTH the Gamma curvature `H = k·XᵀX + λS`
-            // and the data-fit `−ℓ = k·½D` (the `k`-saturated normalizer is
-            // dropped, #359) — jumps with ρ. The realized REML cost then develops
-            // deterministic spikes (a flat warm-start η at a just-rejected
-            // over-smoothed trial gives a small `k`, the fitted-surface η at the
-            // neighbor a ~2× larger one), the analytic outer gradient (which
-            // holds `k` fixed) can never match the cost's `k(ρ)` motion, the
-            // projected gradient floors well above tolerance, and the ARC descent
-            // stalls and rails λ to the over-smoothed corner (the #1074 te/Gamma
-            // tensor under-recovery). Pin every λ-search inner solve to the first
-            // converged solve's MLE `k` so `F(ρ) = REML(ρ, k_frozen)` is
-            // stationary in ρ; `k` is still refreshed at the single final
-            // reported fit. No effect on non-Gamma or user-fixed-shape specs.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Gamma {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_gamma_shape.load(Ordering::Relaxed),
-                "frozen Gamma shape",
-                |likelihood, value| likelihood.with_gamma_shape_frozen_for_search(value),
-            )?;
-            // Beta λ-search precision freeze (#2369). Same drift mechanism as the
-            // NB θ / Tweedie φ / Gamma shape freezes above, and the same
-            // stalled-outer symptom: with φ estimated, the inner solver
-            // re-derives it by the Pearson moment estimator from each outer
-            // iterate's warm-start η. The Beta precision does not factor out of
-            // the digamma mean score (`∂ℓ/∂β = φ·Σ xᵢ(y*ᵢ − μ*ᵢ)`), so a φ that
-            // swings with η moves BOTH the mean fit β̂(ρ) and the REML data-fit /
-            // log-det terms with ρ; the analytic outer gradient holds φ fixed and
-            // can never match that motion, the projected gradient floors above
-            // tolerance, and the optimizer refuses ("NOT STATIONARY") for EVERY
-            // fit — the family-unusable #2369 signature. Pin every λ-search inner
-            // solve to the first converged solve's Pearson φ so
-            // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
-            // at the single final reported fit. No effect on non-Beta or
-            // user-fixed-φ specs.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::BetaPrecision {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_beta_phi.load(Ordering::Relaxed),
-                "frozen Beta precision",
-                |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
-            )?;
-            // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
-            // same λ-search freeze as the Tweedie φ.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Dispersion {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_dispersion_phi.load(Ordering::Relaxed),
-                "frozen dispersion",
-                |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
-            )?;
+            self.apply_lambda_search_freezes(&mut pirls_config.likelihood)?;
             // Levenberg-Marquardt damping warm-start: the λ the previous
             // successful PIRLS solve at this surface ended on (0 = no hint).
             // It encodes the curvature regime that solve settled into; PIRLS
@@ -6932,7 +6872,7 @@ impl<'a> RemlState<'a> {
                 pirls_config.initial_lm_lambda =
                     lm_lambda_warm_start_hint(cached_lambda, last_iters, last_converged);
             }
-            let adaptive_kkt_tolerance = if !in_screening {
+            let adaptive_kkt_tolerance =
                 if let Some(outer_grad_norm) = self.previous_outer_gradient_norm(&key_opt) {
                     // Ceiling is pinned to the tight inner tolerance. Loosening
                     // it to a fixed 1e-6 ceiling (#1575) made every inner solve
@@ -6954,10 +6894,7 @@ impl<'a> RemlState<'a> {
                     })
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
             // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
             // XᵀW(y − offset) across every inner solve; for other families /
             // links this returns None and the inner solver falls back to the
@@ -6969,7 +6906,6 @@ impl<'a> RemlState<'a> {
             // iteration's XᵀWX n-free.
             let staged_glm_first_step_handle = self.glm_first_step_gram();
             let flat_glm_first_step_handle = if staged_glm_first_step_handle.is_none()
-                && !in_screening
                 && !self.config.firth_bias_reduction
                 && warm_start_ref.is_some()
                 && (predicted_warm_start.is_none()
@@ -7012,7 +6948,7 @@ impl<'a> RemlState<'a> {
             );
             let pirls_elapsed = pirls_start.elapsed();
             if let Ok((ref res, ref wm)) = result {
-                // Surface every non-screening PIRLS call at INFO so CI logs
+                // Surface every PIRLS call at INFO so CI logs
                 // reveal exactly which inner solves dominate wall-clock at
                 // large scale — the main signal for "what's the slow path"
                 // when an outer BFGS / line-search step blows past the
@@ -7029,10 +6965,10 @@ impl<'a> RemlState<'a> {
                 // derivative request needs them by contract, while a
                 // value-only request that has them found no frozen bundle to
                 // synthesize from.
-                let row_source = match (value_only_rows, cost_only_gaussian_rows.is_some()) {
+                let row_source = match (rows, cost_only_gaussian_rows.is_some()) {
                     (_, true) => "frozen",
-                    (true, false) => "full(no-frozen-bundle)",
-                    (false, false) => "full(derivative-request)",
+                    (BundleRows::SufficientStatistics, false) => "full(no-frozen-bundle)",
+                    (BundleRows::Observed, false) => "full(derivative-request)",
                 };
                 log::debug!(
                     "[STAGE] inner pirls solve iters={} status={:?} max_eta={:.1} jeffreys_logdet={} rows={} elapsed={:.3}s",
@@ -7070,17 +7006,15 @@ impl<'a> RemlState<'a> {
             // with the SAME configuration and the SAME convergence tolerance;
             // only the initializer changes, and a point that fails both ways
             // keeps its original verdict. It costs one extra inner solve on
-            // exactly the path that today returns a wrong +inf. Two exclusions
-            // keep it from firing where a non-minimum is the intended outcome:
-            // seed screening deliberately runs a partial fit, and a solve
-            // stopped at the outer schedule's throttled cap is a budget event
+            // exactly the path that today returns a wrong +inf. One exclusion
+            // keeps it from firing where a non-minimum is the intended outcome:
+            // a solve stopped at the outer schedule's throttled cap is a budget event
             // the schedule itself corrects on the next outer iteration
             // (`inner_budget_exhaustion_was_scheduled`). The first-Fisher-step
             // Gram is deliberately not carried into the retry: the flat variant
             // is admissible only when a warm start supplied its frozen working
             // weight.
             let warm_started_non_minimum = warm_start_ref.is_some()
-                && !in_screening
                 && match &result {
                     Ok((res, _)) => {
                         !matches!(
@@ -7146,14 +7080,7 @@ impl<'a> RemlState<'a> {
         };
 
         if let Err(e) = &pirls_result {
-            if in_screening {
-                // Seed-screening intentionally caps inner iterations very low,
-                // so trial-point failures here are routine and ranked — not
-                // bugs.
-                log::trace!("[seed-screen] P-IRLS rejected candidate: {e:?}");
-            } else {
-                log::debug!("[GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
-            }
+            log::debug!("[GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: {e:?}");
             // Keep the previous successful warm start even when a trial point
             // fails. Outer line search commonly probes unstable candidates and
             // then returns to nearby feasible rho values where the prior warm
@@ -7166,19 +7093,15 @@ impl<'a> RemlState<'a> {
             .likelihood
             .resolved_scale()
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-        // Capture the data-driven NB θ from the first converged non-screening
-        // λ-search solve and freeze it for the rest of the search (#1082).
-        // Screening solves use a tiny inner budget and a partial mode, so they
-        // are never the source of the frozen value.
-        if !in_screening
-            && matches!(
-                resolved_likelihood_scale,
-                gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
-                    estimated: true,
-                    ..
-                }
-            )
-            && self.frozen_negbin_theta.load(Ordering::Relaxed) == 0
+        // Capture the data-driven NB θ from the first converged λ-search solve
+        // and freeze it for the rest of the search (#1082).
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
+                estimated: true,
+                ..
+            }
+        ) && self.frozen_negbin_theta.load(Ordering::Relaxed) == 0
             && matches!(
                 pirls_result.status,
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
@@ -7208,7 +7131,7 @@ impl<'a> RemlState<'a> {
                  measured at the converged η); outer REML criterion now stationary in ρ"
             );
         }
-        // Capture the data-driven Tweedie φ from the first converged non-screening
+        // Capture the data-driven Tweedie φ from the first converged
         // λ-search solve and freeze it for the rest of the search (#1477),
         // exactly as for the NB θ above.
         //
@@ -7218,15 +7141,13 @@ impl<'a> RemlState<'a> {
         // here is a function of (data, model spec) and not of whichever seed the
         // persistent cache donated (#2363). This branch remains the general
         // capture path for any caller that reaches the λ-search without it.
-        if !in_screening
-            && matches!(
-                resolved_likelihood_scale,
-                gam_problem::ResolvedLikelihoodScale::Tweedie {
-                    estimated: true,
-                    ..
-                }
-            )
-            && self.frozen_tweedie_phi.load(Ordering::Relaxed) == 0
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::Tweedie {
+                estimated: true,
+                ..
+            }
+        ) && self.frozen_tweedie_phi.load(Ordering::Relaxed) == 0
             && matches!(
                 pirls_result.status,
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
@@ -7264,7 +7185,7 @@ impl<'a> RemlState<'a> {
             );
         }
         // Capture the data-driven Gamma shape `k = 1/φ` from the first converged
-        // non-screening λ-search solve and freeze it for the rest of the search
+        // λ-search solve and freeze it for the rest of the search
         // (#1074), exactly as for the NB θ and Tweedie φ above. The first solve
         // estimated `k` from the seed η via the converged-η Gamma-shape MLE (this
         // branch only runs when no frozen value exists yet), so the captured
@@ -7274,15 +7195,13 @@ impl<'a> RemlState<'a> {
         // rails λ to the over-smoothed corner) on subsequent outer evaluations.
         // Which solve is "first" is itself pinned by the canonical anchor at
         // ρ = 0 (#2363, see the Tweedie block above).
-        if !in_screening
-            && matches!(
-                resolved_likelihood_scale,
-                gam_problem::ResolvedLikelihoodScale::Gamma {
-                    estimated: true,
-                    ..
-                }
-            )
-            && self.frozen_gamma_shape.load(Ordering::Relaxed) == 0
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::Gamma {
+                estimated: true,
+                ..
+            }
+        ) && self.frozen_gamma_shape.load(Ordering::Relaxed) == 0
             && matches!(
                 pirls_result.status,
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
@@ -7309,6 +7228,7 @@ impl<'a> RemlState<'a> {
             // requires. It only makes the captured ν the ML shape at a
             // converged mean instead of at a half-converged one.
             let shape = pirls::estimate_gamma_shape_from_eta(
+                &pirls_result.likelihood.spec.link,
                 self.y,
                 &pirls_result.final_eta.to_owned(),
                 self.weights,
@@ -7321,7 +7241,7 @@ impl<'a> RemlState<'a> {
             );
         }
         // Capture the data-driven Beta precision `phi` from the first converged
-        // non-screening λ-search solve and freeze it for the rest of the search
+        // λ-search solve and freeze it for the rest of the search
         // (#2369), exactly as for the NB θ / Tweedie φ / Gamma shape above.
         // Measure `phi` at this solve's CONVERGED η, not at whatever value the
         // per-solve moment lock left on `likelihood`: the λ-search runs with
@@ -7340,15 +7260,13 @@ impl<'a> RemlState<'a> {
         // "first" is pinned by the canonical anchor at ρ = 0 (#2363, see the
         // Tweedie block above) — Beta is the family where letting the cache pick
         // it moved the reported criterion by 16%.
-        if !in_screening
-            && matches!(
-                resolved_likelihood_scale,
-                gam_problem::ResolvedLikelihoodScale::BetaPrecision {
-                    estimated: true,
-                    ..
-                }
-            )
-            && self.frozen_beta_phi.load(Ordering::Relaxed) == 0
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::BetaPrecision {
+                estimated: true,
+                ..
+            }
+        ) && self.frozen_beta_phi.load(Ordering::Relaxed) == 0
             && matches!(
                 pirls_result.status,
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
@@ -7371,17 +7289,15 @@ impl<'a> RemlState<'a> {
             );
         }
         // Capture the Gaussian (non-identity link) / inverse Gaussian dispersion
-        // MLE at the first converged non-screening solve's η and hold it for the
-        // rest of the search, exactly as the Tweedie φ above.
-        if !in_screening
-            && matches!(
-                resolved_likelihood_scale,
-                gam_problem::ResolvedLikelihoodScale::Dispersion {
-                    estimated: true,
-                    ..
-                }
-            )
-            && self.frozen_dispersion_phi.load(Ordering::Relaxed) == 0
+        // MLE at the first converged solve's η and hold it for the rest of the
+        // search, exactly as the Tweedie φ above.
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::Dispersion {
+                estimated: true,
+                ..
+            }
+        ) && self.frozen_dispersion_phi.load(Ordering::Relaxed) == 0
             && matches!(
                 pirls_result.status,
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
@@ -7397,7 +7313,7 @@ impl<'a> RemlState<'a> {
             )?;
             self.frozen_dispersion_phi
                 .store(phi.to_bits(), Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[OUTER] dispersion λ-search φ frozen at {phi:.6e} (measured at the \
                  converged η); outer REML criterion now stationary in ρ"
             );
@@ -7405,156 +7321,144 @@ impl<'a> RemlState<'a> {
         // Check the status returned by the P-IRLS routine.
         match pirls_result.status {
             pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
-                if !in_screening {
-                    // Audit a claimed minimum before caching or evaluating it.
-                    // An unfinished solve belongs to the non-convergence arm
-                    // below: that arm records cap feedback and refuses this
-                    // trial. Checking its KKT residual first instead turns
-                    // ordinary trial non-convergence into a fatal constraint
-                    // error and prevents the outer search from recovering.
-                    self.enforce_constraint_kkt(pirls_result.as_ref())?;
-                    if let Some(predicted) = predicted_warm_start.as_ref() {
-                        let converged_original = match pirls_result.coordinate_frame {
-                            pirls::PirlsCoordinateFrame::OriginalSparseNative => {
-                                pirls_result.beta_transformed.as_ref().clone()
-                            }
-                            pirls::PirlsCoordinateFrame::TransformedQs => pirls_result
-                                .reparam_result
-                                .qs
-                                .dot(pirls_result.beta_transformed.as_ref()),
-                        };
-                        // Which predictor produced the β P-IRLS actually
-                        // consumed decides which quality marker carries
-                        // this residual. `WarmStartPredictionSource`'s own
-                        // contract says both accepting branches are
-                        // narrated so the bench runner attributes residual
-                        // percentiles per predictor; only the `Ift` arm was
-                        // wired, so every tangent-line accept was silently
-                        // unmeasured and `[TANGENT-QUALITY]` had no
-                        // producer at all (gam#2617).
-                        let quality_source = match prediction_source {
-                            Some(WarmStartPredictionSource::Ift)
-                            | Some(WarmStartPredictionSource::TangentLine) => prediction_source,
-                            Some(WarmStartPredictionSource::Flat) | None => None,
-                        };
-                        if quality_source.is_some()
-                            && predicted.0.len() == converged_original.len()
-                        {
-                            let mut diff_sq = 0.0_f64;
-                            let mut conv_sq = 0.0_f64;
-                            for (p_val, c_val) in predicted.0.iter().zip(converged_original.iter())
-                            {
-                                let d = c_val - p_val;
-                                diff_sq += d * d;
-                                conv_sq += c_val * c_val;
-                            }
-                            let conv_norm = conv_sq.sqrt();
-                            let pred_residual = diff_sq.sqrt();
-                            let quality = pred_residual / (1.0 + conv_norm);
-                            if quality.is_finite() && quality >= 0.0 {
-                                // The adaptive |Δρ| cap is the IFT
-                                // predictor's own feedback loop, so only an
-                                // IFT accept reads and rewrites it. A
-                                // tangent-line accept is narrated but does
-                                // not touch the cap state: routing it here
-                                // would move solver trajectories, which is
-                                // a separate decision from restoring the
-                                // measurement. Its line therefore carries
-                                // no cap fields rather than reporting a cap
-                                // that does not govern that branch.
-                                if matches!(
-                                    quality_source,
-                                    Some(WarmStartPredictionSource::Ift)
-                                ) {
-                                    let last_residual_bits =
-                                        self.last_ift_prediction_residual.load(Ordering::Relaxed);
-                                    let r = f64::from_bits(last_residual_bits);
-                                    let last_residual = if r.is_finite() && r >= 0.0 {
-                                        Some(r)
-                                    } else {
-                                        None
-                                    };
-                                    let current_cap = self
-                                        .ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
-                                    let cap_predicted = self
-                                        .record_ift_prediction_quality(quality, current_cap)
-                                        .unwrap_or(current_cap);
-                                    log::debug!(
-                                        "[IFT-QUALITY] quality={:.3e} ift={:.3e} pred_residual={:.3e} cap_predicted={:.3e} iters={}",
-                                        quality,
-                                        current_cap,
-                                        pred_residual,
-                                        cap_predicted,
-                                        pirls_result.iteration,
-                                    );
-                                    self.last_ift_prediction_residual
-                                        .store(quality.to_bits(), Ordering::Relaxed);
+                // Audit a claimed minimum before caching or evaluating it.
+                // An unfinished solve belongs to the non-convergence arm
+                // below: that arm records cap feedback and refuses this
+                // trial. Checking its KKT residual first instead turns
+                // ordinary trial non-convergence into a fatal constraint
+                // error and prevents the outer search from recovering.
+                self.enforce_constraint_kkt(pirls_result.as_ref())?;
+                if let Some(predicted) = predicted_warm_start.as_ref() {
+                    let converged_original = match pirls_result.coordinate_frame {
+                        pirls::PirlsCoordinateFrame::OriginalSparseNative => {
+                            pirls_result.beta_transformed.as_ref().clone()
+                        }
+                        pirls::PirlsCoordinateFrame::TransformedQs => pirls_result
+                            .reparam_result
+                            .qs
+                            .dot(pirls_result.beta_transformed.as_ref()),
+                    };
+                    // Which predictor produced the β P-IRLS actually
+                    // consumed decides which quality marker carries
+                    // this residual. `WarmStartPredictionSource`'s own
+                    // contract says both accepting branches are
+                    // narrated so the bench runner attributes residual
+                    // percentiles per predictor; only the `Ift` arm was
+                    // wired, so every tangent-line accept was silently
+                    // unmeasured and `[TANGENT-QUALITY]` had no
+                    // producer at all (gam#2617).
+                    let quality_source = match prediction_source {
+                        Some(WarmStartPredictionSource::Ift)
+                        | Some(WarmStartPredictionSource::TangentLine) => prediction_source,
+                        Some(WarmStartPredictionSource::Flat) | None => None,
+                    };
+                    if quality_source.is_some() && predicted.0.len() == converged_original.len() {
+                        let mut diff_sq = 0.0_f64;
+                        let mut conv_sq = 0.0_f64;
+                        for (p_val, c_val) in predicted.0.iter().zip(converged_original.iter()) {
+                            let d = c_val - p_val;
+                            diff_sq += d * d;
+                            conv_sq += c_val * c_val;
+                        }
+                        let conv_norm = conv_sq.sqrt();
+                        let pred_residual = diff_sq.sqrt();
+                        let quality = pred_residual / (1.0 + conv_norm);
+                        if quality.is_finite() && quality >= 0.0 {
+                            // The adaptive |Δρ| cap is the IFT
+                            // predictor's own feedback loop, so only an
+                            // IFT accept reads and rewrites it. A
+                            // tangent-line accept is narrated but does
+                            // not touch the cap state: routing it here
+                            // would move solver trajectories, which is
+                            // a separate decision from restoring the
+                            // measurement. Its line therefore carries
+                            // no cap fields rather than reporting a cap
+                            // that does not govern that branch.
+                            if matches!(quality_source, Some(WarmStartPredictionSource::Ift)) {
+                                let last_residual_bits =
+                                    self.last_ift_prediction_residual.load(Ordering::Relaxed);
+                                let r = f64::from_bits(last_residual_bits);
+                                let last_residual = if r.is_finite() && r >= 0.0 {
+                                    Some(r)
                                 } else {
-                                    log::debug!(
-                                        "[TANGENT-QUALITY] quality={:.3e} pred_residual={:.3e} iters={}",
-                                        quality,
-                                        pred_residual,
-                                        pirls_result.iteration,
-                                    );
-                                }
+                                    None
+                                };
+                                let current_cap =
+                                    self.ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
+                                let cap_predicted = self
+                                    .record_ift_prediction_quality(quality, current_cap)
+                                    .unwrap_or(current_cap);
+                                log::debug!(
+                                    "[IFT-QUALITY] quality={:.3e} ift={:.3e} pred_residual={:.3e} cap_predicted={:.3e} iters={}",
+                                    quality,
+                                    current_cap,
+                                    pred_residual,
+                                    cap_predicted,
+                                    pirls_result.iteration,
+                                );
+                                self.last_ift_prediction_residual
+                                    .store(quality.to_bits(), Ordering::Relaxed);
+                            } else {
+                                log::debug!(
+                                    "[TANGENT-QUALITY] quality={:.3e} pred_residual={:.3e} iters={}",
+                                    quality,
+                                    pred_residual,
+                                    pirls_result.iteration,
+                                );
                             }
                         }
                     }
-                    self.updatewarm_start_from(pirls_result.as_ref());
-                    // Record the ρ that produced this β so the next call
-                    // can extrapolate. Only meaningful after a successful
-                    // solve (updatewarm_start_from clears history on
-                    // failure); recording here is harmless on failure
-                    // because the warm_start_beta will be None.
-                    self.record_warm_start_rho(rho);
-                    // Inner-PIRLS feedback signal for the adaptive cap
-                    // schedule: record actual iteration count and
-                    // converged flag. Only written for non-screening
-                    // solves so the screening 3-iter cap doesn't
-                    // poison the schedule's history.
-                    self.last_inner_iters
-                        .store(pirls_result.iteration, Ordering::Relaxed);
-                    self.last_inner_converged.store(true, Ordering::Relaxed);
-                    // Persist the converged λ_LM so the next PIRLS call
-                    // at this surface can seed near the right damping.
-                    // Only stash finite-positive values; failure modes
-                    // (NaN, ≤0) fall through to the cold default.
-                    if pirls_result.final_lm_lambda.is_finite()
-                        && pirls_result.final_lm_lambda > 0.0
-                    {
-                        self.last_pirls_lm_lambda
-                            .store(pirls_result.final_lm_lambda.to_bits(), Ordering::Relaxed);
-                    }
-                    // Persist the accepted gain ratio so the cap
-                    // schedule can adapt to inner Newton model fidelity
-                    // alongside `last_iters` and `last_converged`. The
-                    // LM accept-branch invariant (rho > 0 is necessary
-                    // for acceptance) means a finite-positive value is
-                    // the only "meaningful signal" outcome; anything
-                    // else (None, NaN) leaves the NaN sentinel in
-                    // place so the schedule falls back to the
-                    // default margin.
-                    if let Some(rho) = pirls_result.final_accept_rho
-                        && rho.is_finite()
-                        && rho >= 0.0
-                    {
-                        self.last_pirls_accept_rho
-                            .store(rho.to_bits(), Ordering::Relaxed);
-                    }
-                    self.store_persistent_warm_start();
-                    // Cache only if key is valid (not NaN).
-                    if use_cache
-                        && !value_only_rows
-                        && let Some(key) = key_opt
-                    {
-                        self.cache_manager
-                            .pirls_cache
-                            .write()
-                            .expect("PIRLS result cache lock poisoned")
-                            .insert(key, Arc::new(pirls_result.compact_for_reml_cache()));
-                    }
                 }
-                Ok(pirls_result)
+                self.updatewarm_start_from(pirls_result.as_ref());
+                // Record the ρ that produced this β so the next call
+                // can extrapolate. Only meaningful after a successful
+                // solve (updatewarm_start_from clears history on
+                // failure); recording here is harmless on failure
+                // because the warm_start_beta will be None.
+                self.record_warm_start_rho(rho);
+                // Inner-PIRLS feedback signal for the adaptive cap
+                // schedule: record actual iteration count and
+                // converged flag.
+                self.last_inner_iters
+                    .store(pirls_result.iteration, Ordering::Relaxed);
+                self.last_inner_converged.store(true, Ordering::Relaxed);
+                // Persist the converged λ_LM so the next PIRLS call
+                // at this surface can seed near the right damping.
+                // Only stash finite-positive values; failure modes
+                // (NaN, ≤0) fall through to the cold default.
+                if pirls_result.final_lm_lambda.is_finite() && pirls_result.final_lm_lambda > 0.0 {
+                    self.last_pirls_lm_lambda
+                        .store(pirls_result.final_lm_lambda.to_bits(), Ordering::Relaxed);
+                }
+                // Persist the accepted gain ratio so the cap
+                // schedule can adapt to inner Newton model fidelity
+                // alongside `last_iters` and `last_converged`. The
+                // LM accept-branch invariant (rho > 0 is necessary
+                // for acceptance) means a finite-positive value is
+                // the only "meaningful signal" outcome; anything
+                // else (None, NaN) leaves the NaN sentinel in
+                // place so the schedule falls back to the
+                // default margin.
+                if let Some(rho) = pirls_result.final_accept_rho
+                    && rho.is_finite()
+                    && rho >= 0.0
+                {
+                    self.last_pirls_accept_rho
+                        .store(rho.to_bits(), Ordering::Relaxed);
+                }
+                self.store_persistent_warm_start();
+                // Cache only if key is valid (not NaN).
+                if use_cache
+                    && cost_only_gaussian_rows.is_none()
+                    && let Some(key) = key_opt
+                {
+                    self.cache_manager
+                        .pirls_cache
+                        .write()
+                        .expect("PIRLS result cache lock poisoned")
+                        .insert(key, Arc::new(pirls_result.compact_for_reml_cache()));
+                }
+                Ok((pirls_result, realised_rows))
             }
             pirls::PirlsStatus::Unstable => {
                 // The fit was unstable. This is where we throw our specific, user-friendly error.
@@ -7570,117 +7474,67 @@ impl<'a> RemlState<'a> {
                     pirls::PirlsStatus::LmStepSearchExhausted => "LM step search exhausted",
                     _ => "max iterations reached",
                 };
-                // Seed screening's purpose is to rank candidate seeds by an
-                // approximate cost. Requiring full KKT-style convergence under
-                // a 3-iteration cap would discard all informative seeds, so
-                // when the partial state is finite — objective (deviance +
-                // penalty), β coordinates, residual gradient norm, and the
-                // gradient-natural-scale (‖score‖ + ‖Sβ‖ + ridge·‖β‖, which
-                // covers the penalty and ridge contributions to H and
-                // detects state-blowup pathologies upstream of an explicit
-                // O(p²) Hessian-eigenspectrum walk) — we surface the result
-                // as Ok and let downstream cost computation derive a finite
-                // approximate score. The result is not cached, the warm
-                // start is not updated, and KKT is not enforced (the actual
-                // fit at full inner budget will).
-                // Order the predicates so the O(1) scalar finiteness checks
-                // run before the O(p) β-vector walk: short-circuit means a
-                // pathological partial fit (NaN deviance, NaN
-                // gradient_natural_scale, etc.) is rejected without paying
-                // the linear scan over coefficients.
-                if in_screening
-                    && pirls_result.deviance.is_finite()
-                    && pirls_result.stable_penalty_term.is_finite()
-                    && pirls_result.gradient_natural_scale.is_finite()
-                    && pirls_result.lastgradient_norm.is_finite()
-                    && pirls_result
-                        .beta_transformed
-                        .0
-                        .iter()
-                        .all(|v| v.is_finite())
-                {
+                // The only thing that can shorten the inner budget below
+                // the configured one is the outer schedule.
+                // `MaxIterationsReached` under that
+                // throttle is the scheduled budget event the geometric
+                // backoff immediately below exists to correct — NOT a
+                // statement about the fit. Both the gradient norm and the
+                // iteration index describe a solve that was stopped early
+                // on purpose, so reporting them at ERROR under a
+                // certification verdict makes a routine, self-correcting
+                // event indistinguishable from a real refusal to any
+                // consumer reading the log stream. `LmStepSearchExhausted`
+                // is a genuine step-search failure at any budget and keeps
+                // its ERROR.
+                let configured_cap = self.config.max_iterations;
+                let budget_was_throttled = inner_budget_exhaustion_was_scheduled(
+                    pirls_result.status,
+                    pirls_result.iteration,
+                    outer_cap,
+                    configured_cap,
+                );
+                if budget_was_throttled {
                     log::trace!(
-                        "[seed-screen] partial-fit accepted for ranking: {kind} (|g| {:.3e}, r_g {:.3e}, iter {})",
+                        "P-IRLS stopped at the scheduled inner cap: {kind} (gradient norm \
+                         {:.3e}, iter {}; scheduled cap {} of configured budget {}). The \
+                         outer schedule grows the cap for the next outer iteration.",
                         pirls_result.lastgradient_norm,
-                        pirls_result.relative_gradient_norm(),
-                        pirls_result.iteration
-                    );
-                    return Ok(pirls_result);
-                }
-                if in_screening {
-                    log::trace!(
-                        "[seed-screen] P-IRLS rejected: {kind} (gradient norm {:.3e}, iter {})",
-                        pirls_result.lastgradient_norm,
-                        pirls_result.iteration
-                    );
-                } else {
-                    // Outside screening the only thing that can shorten the
-                    // inner budget below the configured one is the outer
-                    // schedule (`screening_iteration_cap_applies` requires
-                    // `in_screening`). `MaxIterationsReached` under that
-                    // throttle is the scheduled budget event the geometric
-                    // backoff immediately below exists to correct — NOT a
-                    // statement about the fit. Both the gradient norm and the
-                    // iteration index describe a solve that was stopped early
-                    // on purpose, so reporting them at ERROR under a
-                    // certification verdict makes a routine, self-correcting
-                    // event indistinguishable from a real refusal to any
-                    // consumer reading the log stream. `LmStepSearchExhausted`
-                    // is a genuine step-search failure at any budget and keeps
-                    // its ERROR.
-                    let configured_cap = self.config.max_iterations;
-                    let budget_was_throttled = inner_budget_exhaustion_was_scheduled(
-                        pirls_result.status,
                         pirls_result.iteration,
                         outer_cap,
                         configured_cap,
                     );
-                    if budget_was_throttled {
-                        log::trace!(
-                            "P-IRLS stopped at the scheduled inner cap: {kind} (gradient norm \
-                             {:.3e}, iter {}; scheduled cap {} of configured budget {}). The \
-                             outer schedule grows the cap for the next outer iteration.",
-                            pirls_result.lastgradient_norm,
-                            pirls_result.iteration,
-                            outer_cap,
-                            configured_cap,
-                        );
-                    } else {
-                        log::debug!(
-                            "P-IRLS could not certify a valid minimum: {kind} (gradient norm \
-                             {:.3e}, iter {} of configured budget {})",
-                            pirls_result.lastgradient_norm,
-                            pirls_result.iteration,
-                            configured_cap,
-                        );
-                    }
-                    // Adaptive-cap feedback: cap was hit. Geometric
-                    // backoff on the next outer iter's cap. Only write
-                    // outside screening so the 3-iter screening cap
-                    // does not corrupt the production schedule history.
-                    self.last_inner_iters
-                        .store(pirls_result.iteration, Ordering::Relaxed);
-                    self.last_inner_converged.store(false, Ordering::Relaxed);
-                    // A failed solve says nothing useful about the
-                    // right damping for the next call; reset the LM
-                    // hint to "no signal" so the next solve cold-starts.
-                    self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
-                    // A failed solve also invalidates the IFT residual
-                    // signal — there's no meaningful "predicted vs
-                    // converged" datum to feed back. Reset so the next
-                    // predict call uses the default 2.0 cap. NaN
-                    // sentinel rather than literal 0 — see
-                    // `IFT_RESIDUAL_NO_SIGNAL_BITS`.
-                    self.last_ift_prediction_residual
-                        .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
-                    self.clear_ift_quality_runtime_state();
+                } else {
+                    log::debug!(
+                        "P-IRLS could not certify a valid minimum: {kind} (gradient norm \
+                         {:.3e}, iter {} of configured budget {})",
+                        pirls_result.lastgradient_norm,
+                        pirls_result.iteration,
+                        configured_cap,
+                    );
                 }
+                // Adaptive-cap feedback: cap was hit. Geometric
+                // backoff on the next outer iter's cap.
+                self.last_inner_iters
+                    .store(pirls_result.iteration, Ordering::Relaxed);
+                self.last_inner_converged.store(false, Ordering::Relaxed);
+                // A failed solve says nothing useful about the
+                // right damping for the next call; reset the LM
+                // hint to "no signal" so the next solve cold-starts.
+                self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
+                // A failed solve also invalidates the IFT residual
+                // signal — there's no meaningful "predicted vs
+                // converged" datum to feed back. Reset so the next
+                // predict call uses the default 2.0 cap. NaN
+                // sentinel rather than literal 0 — see
+                // `IFT_RESIDUAL_NO_SIGNAL_BITS`.
+                self.last_ift_prediction_residual
+                    .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
+                self.clear_ift_quality_runtime_state();
                 Err(EstimationError::PirlsDidNotConverge {
                     iterations: pirls_result.iteration,
                     budget: Self::effective_inner_iteration_budget(
                         self.config.max_iterations,
-                        screening_iteration_cap_applies,
-                        screening_cap,
                         outer_cap,
                     ),
                     stop: kind.to_string(),
@@ -7689,252 +7543,119 @@ impl<'a> RemlState<'a> {
             }
         }
     }
+}
 
-    /// Stateless inner P-IRLS fit at `rho` for the smoothing-correction
-    /// sigma-point cubature path.
-    ///
-    /// This is the cubature analogue of [`execute_pirls_if_needed`] with
-    /// every form of cross-call state removed: no PIRLS-cache lookup, no
-    /// cache insert, no warm-start I/O (neither read nor write), no
-    /// adaptive LM-lambda hint (cold-starts at `pirls_config.initial_lm_lambda`),
-    /// no screening / outer-cap reads, no adaptive-KKT outer-grad lookup,
-    /// no IFT-quality / accept-rho / last-iter / last-converged feedback
-    /// writes, no persistent warm-start load/store. The KKT certificate
-    /// is still enforced on the converged mode because the cubature
-    /// integrand consumes (H⁻¹, β̂) and downstream linear algebra
-    /// (inversion, basis remap) demands a certified minimum.
-    ///
-    /// Two motivations:
-    /// 1. The current `compute_smoothing_correction_auto` Rayon path uses
-    ///    [`AtomicFlagGuard`] swaps on `pirls_cache_enabled` and
-    ///    `warm_start_enabled` to disable the most contention-prone writes
-    ///    on the hot path. Process-wide atomic flips serialize unrelated
-    ///    REML evaluations that race the cubature window and contaminate
-    ///    their feedback signals. A stateless callee lets cubature run
-    ///    concurrently with other PIRLS evaluations without that coupling.
-    /// 2. The forthcoming GPU sigma-point executor needs to drive many
-    ///    PIRLS fits in flight on independent CUDA streams; a callee that
-    ///    threads no mutable cross-call state makes those fits provably
-    ///    independent and stream-safe.
-    ///
-    /// The math (problem, penalty config, link kind, basis, KKT,
-    /// failure-classification → `EstimationError` mapping) is bit-identical
-    /// to the non-screening / non-EFS branch of `execute_pirls_if_needed`.
-    pub(crate) fn execute_pirls_stateless_for_cubature(
-        &self,
-        rho: &Array1<f64>,
-        centre_beta: Option<&Coefficients>,
-    ) -> Result<Arc<PirlsResult>, EstimationError> {
-        let mut pirls_config = self.config.as_pirls_config();
-        pirls_config.link_kind = self.runtime_inverse_link();
-        let resolved_likelihood_scale = pirls_config
-            .likelihood
-            .resolved_scale()
-            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-        // Pin the same λ-search-frozen NB θ the outer loop converged under
-        // (#1082), so the rho-uncertainty sigma-point criterion is evaluated on
-        // the identical stationary surface F(ρ) = REML(ρ, θ_frozen) rather than
-        // re-estimating θ at each off-trajectory σ-point.
-        apply_frozen_search_scale(
-            &mut pirls_config.likelihood,
-            matches!(
-                resolved_likelihood_scale,
-                gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
-                    estimated: true,
-                    ..
-                }
-            ),
-            self.frozen_negbin_theta.load(Ordering::Relaxed),
-            "frozen negative-binomial theta",
-            |likelihood, value| likelihood.with_negbin_theta_frozen_for_search(value),
-        )?;
-        // Pin the same λ-search-frozen Tweedie φ the outer loop converged under
-        // (#1477), so the rho-uncertainty sigma-point criterion is evaluated on
-        // the identical stationary surface F(ρ) = REML(ρ, φ_frozen) rather than
-        // re-estimating φ at each off-trajectory σ-point.
-        apply_frozen_search_scale(
-            &mut pirls_config.likelihood,
-            matches!(
-                resolved_likelihood_scale,
-                gam_problem::ResolvedLikelihoodScale::Tweedie {
-                    estimated: true,
-                    ..
-                }
-            ),
-            self.frozen_tweedie_phi.load(Ordering::Relaxed),
-            "frozen Tweedie dispersion",
-            |likelihood, value| likelihood.with_tweedie_phi_frozen_for_search(value),
-        )?;
-        // Pin the same λ-search-frozen Gamma shape the outer loop converged under
-        // (#1074), so the rho-uncertainty sigma-point criterion is evaluated on
-        // the identical stationary surface F(ρ) = REML(ρ, k_frozen) rather than
-        // re-estimating `k` at each off-trajectory σ-point.
-        apply_frozen_search_scale(
-            &mut pirls_config.likelihood,
-            matches!(
-                resolved_likelihood_scale,
-                gam_problem::ResolvedLikelihoodScale::Gamma {
-                    estimated: true,
-                    ..
-                }
-            ),
-            self.frozen_gamma_shape.load(Ordering::Relaxed),
-            "frozen Gamma shape",
-            |likelihood, value| likelihood.with_gamma_shape_frozen_for_search(value),
-        )?;
-        // Beta precision is part of the same λ-search-frozen likelihood scale
-        // contract as NB, Tweedie, and Gamma (#2369). Cubature evaluates that
-        // same profiled criterion off-trajectory, so it must not re-profile φ
-        // independently at every sigma point (#2632).
-        apply_frozen_search_scale(
-            &mut pirls_config.likelihood,
-            matches!(
-                resolved_likelihood_scale,
-                gam_problem::ResolvedLikelihoodScale::BetaPrecision {
-                    estimated: true,
-                    ..
-                }
-            ),
-            self.frozen_beta_phi.load(Ordering::Relaxed),
-            "frozen Beta precision",
-            |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
-        )?;
-        // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
-        // same λ-search freeze as the Tweedie φ.
-        apply_frozen_search_scale(
-            &mut pirls_config.likelihood,
-            matches!(
-                resolved_likelihood_scale,
-                gam_problem::ResolvedLikelihoodScale::Dispersion {
-                    estimated: true,
-                    ..
-                }
-            ),
-            self.frozen_dispersion_phi.load(Ordering::Relaxed),
-            "frozen dispersion",
-            |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
-        )?;
+#[cfg(test)]
+mod stateless_pirls_tests {
+    use super::*;
 
-        // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
-        // XᵀW(y − offset) across every inner solve; for other families /
-        // links this returns None and the inner solver falls back to the
-        // streaming GEMM. Reading this cache is non-mutating (the cache
-        // belongs to the surface, not to a particular outer iteration), so
-        // it is safe to reuse here for parity with `execute_pirls_if_needed`.
-        let cache_handle = self.gaussian_fixed_cache_if_eligible();
-        let glm_first_step_handle = self.glm_first_step_gram();
-        let problem = pirls::PirlsProblem {
-            x: &self.x,
-            offset: self.offset.view(),
-            y: self.y,
-            priorweights: self.weights,
-            covariate_se: None,
-            gaussian_fixed_cache: cache_handle.as_deref(),
-            glm_first_step_gram: glm_first_step_handle.as_deref(),
-        };
-        let penalty = pirls::PenaltyConfig {
-            canonical_penalties: &self.canonical_penalties,
-            reparam_invariant: Some(&self.reparam_invariant),
-            p: self.p,
-            coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
-            linear_constraints_original: self.linear_constraints.as_ref(),
-        };
+    impl<'a> RemlState<'a> {
+        /// Stateless inner P-IRLS fit at `rho`, for tests that need the
+        /// converged mode at a fixed ρ without touching any cross-call state.
+        ///
+        /// This is [`execute_pirls_if_needed`] with every form of cross-call state
+        /// removed: no PIRLS-cache lookup or insert, no warm-start I/O, no
+        /// adaptive LM-lambda hint, no outer-cap reads and no feedback writes.
+        /// The KKT certificate is still enforced on the converged mode. The
+        /// math is bit-identical to the non-EFS branch of
+        /// `execute_pirls_if_needed`.
+        pub(crate) fn execute_pirls_stateless_for_test(
+            &self,
+            rho: &Array1<f64>,
+        ) -> Result<Arc<PirlsResult>, EstimationError> {
+            let mut pirls_config = self.config.as_pirls_config();
+            pirls_config.link_kind = self.runtime_inverse_link();
+            self.apply_lambda_search_freezes(&mut pirls_config.likelihood)?;
 
-        let pirls_start = std::time::Instant::now();
-        let result = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
-            LogSmoothingParamsView::new(rho.view())?,
-            problem,
-            penalty,
-            &pirls_config,
-            // Seeded from the converged CENTRE mode, not from a per-point
-            // cache. `centre_beta` is one immutable constant shared by every
-            // sigma point, so the fits stay independent of each other and of
-            // the production trajectory — the property this stateless callee
-            // exists to guarantee. What it buys is a seed that is both near
-            // (beta_hat is continuous in rho) and, for a constrained fit,
-            // FEASIBLE; the cold seed is neither, and at an off-trajectory rho
-            // the resulting all-rows-tight active-set face does not recover
-            // (#2601, #873). `None` keeps the old cold-start behaviour for any
-            // caller that has no centre fit to offer.
-            centre_beta,
-            // No adaptive-KKT outer-grad lookup: the outer-grad state is
-            // owned by the production trajectory and the sigma points are
-            // not on it.
-            None,
-            // Sigma-point cubature eval: Gamma scale refinement stays OFF (only
-            // the final reported fit refines — see #678).
-            false,
-            None,
-        );
-        let pirls_elapsed = pirls_start.elapsed();
-        // Name the sigma point. A cubature point is an OFF-TRAJECTORY rho —
-        // potentially tens of log-units from the fitted one, since the sigma
-        // offset scales with the rho-posterior standard deviation and that is
-        // large exactly when a smoothing parameter is railing. Without the rho
-        // in the line, a failure here is indistinguishable in the log from a
-        // failure of the production fit (#2601).
-        let rho_text = rho
-            .iter()
-            .map(|v| format!("{v:.3}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        match result {
-            Ok((ref res, ref wm)) => log::debug!(
-                "[STAGE] sigma-cubature pirls solve rho=[{rho_text}] iters={} status={:?} max_eta={:.1} elapsed={:.3}s",
-                wm.iterations,
-                res.status,
-                res.max_abs_eta,
-                pirls_elapsed.as_secs_f64(),
-            ),
-            Err(ref error) => log::debug!(
-                "[STAGE] sigma-cubature pirls solve rho=[{rho_text}] FAILED in {:.3}s: {error}",
-                pirls_elapsed.as_secs_f64(),
-            ),
-        }
-        let (pirls_result, _) = result?;
-        let pirls_result = Arc::new(pirls_result);
+            // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
+            // XᵀW(y − offset) across every inner solve; for other families /
+            // links this returns None and the inner solver falls back to the
+            // streaming GEMM. Reading this cache is non-mutating (the cache
+            // belongs to the surface, not to a particular outer iteration), so
+            // it is safe to reuse here for parity with `execute_pirls_if_needed`.
+            let cache_handle = self.gaussian_fixed_cache_if_eligible();
+            let glm_first_step_handle = self.glm_first_step_gram();
+            let problem = pirls::PirlsProblem {
+                x: &self.x,
+                offset: self.offset.view(),
+                y: self.y,
+                priorweights: self.weights,
+                covariate_se: None,
+                gaussian_fixed_cache: cache_handle.as_deref(),
+                glm_first_step_gram: glm_first_step_handle.as_deref(),
+            };
+            let penalty = pirls::PenaltyConfig {
+                canonical_penalties: &self.canonical_penalties,
+                reparam_invariant: Some(&self.reparam_invariant),
+                p: self.p,
+                coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
+                linear_constraints_original: self.linear_constraints.as_ref(),
+            };
 
-        // Enforce KKT on the converged mode; the cubature integrand
-        // consumes (H⁻¹, β̂) and demands a certified minimum.
-        self.enforce_constraint_kkt(pirls_result.as_ref())?;
-
-        match pirls_result.status {
-            pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
-                Ok(pirls_result)
+            let pirls_start = std::time::Instant::now();
+            let result = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
+                LogSmoothingParamsView::new(rho.view())?,
+                problem,
+                penalty,
+                &pirls_config,
+                // Cold start: no warm-start state is read.
+                None,
+                // No adaptive-KKT outer-grad lookup: that state is owned by the
+                // production trajectory.
+                None,
+                // Gamma scale refinement stays OFF (only the final reported fit
+                // refines — see #678).
+                false,
+                None,
+            );
+            let pirls_elapsed = pirls_start.elapsed();
+            let rho_text = rho
+                .iter()
+                .map(|v| format!("{v:.3}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            match result {
+                Ok((ref res, ref wm)) => log::debug!(
+                    "[STAGE] stateless pirls solve rho=[{rho_text}] iters={} status={:?} max_eta={:.1} elapsed={:.3}s",
+                    wm.iterations,
+                    res.status,
+                    res.max_abs_eta,
+                    pirls_elapsed.as_secs_f64(),
+                ),
+                Err(ref error) => log::debug!(
+                    "[STAGE] stateless pirls solve rho=[{rho_text}] FAILED in {:.3}s: {error}",
+                    pirls_elapsed.as_secs_f64(),
+                ),
             }
-            pirls::PirlsStatus::Unstable => Err(EstimationError::PerfectSeparationDetected {
-                iteration: pirls_result.iteration,
-                max_abs_eta: pirls_result.max_abs_eta,
-            }),
-            pirls::PirlsStatus::MaxIterationsReached
-            | pirls::PirlsStatus::LmStepSearchExhausted => {
-                // The stateless cubature solve runs under the configured budget
-                // (no scheduled or screening cap), so that is the budget reported.
-                Err(EstimationError::PirlsDidNotConverge {
-                    iterations: pirls_result.iteration,
-                    budget: self.config.max_iterations,
-                    stop: format!("{:?}", pirls_result.status),
-                    last_change: pirls_result.lastgradient_norm,
-                })
+            let (pirls_result, _) = result?;
+            let pirls_result = Arc::new(pirls_result);
+
+            // Enforce KKT on the converged mode.
+            self.enforce_constraint_kkt(pirls_result.as_ref())?;
+
+            match pirls_result.status {
+                pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
+                    Ok(pirls_result)
+                }
+                pirls::PirlsStatus::Unstable => Err(EstimationError::PerfectSeparationDetected {
+                    iteration: pirls_result.iteration,
+                    max_abs_eta: pirls_result.max_abs_eta,
+                }),
+                pirls::PirlsStatus::MaxIterationsReached
+                | pirls::PirlsStatus::LmStepSearchExhausted => {
+                    // The stateless solve runs under the configured budget
+                    // (no scheduled cap), so that is the budget reported.
+                    Err(EstimationError::PirlsDidNotConverge {
+                        iterations: pirls_result.iteration,
+                        budget: self.config.max_iterations,
+                        stop: format!("{:?}", pirls_result.status),
+                        last_change: pirls_result.lastgradient_norm,
+                    })
+                }
             }
         }
     }
 }
-
-/// Coarse inner-PIRLS convergence tolerance used ONLY while the outer
-/// seed-screening prepass ranks candidate ρ (`in_screening == true`). The
-/// prepass needs a ρ-comparable penalized-deviance proxy, not a converged fit:
-/// a coarse `1e-3` inner solve resolves the basin ranking at a small fraction
-/// of the Newton iterations a tight production tolerance (`~1e-8`) demands,
-/// which is the dominant prepass cost at large `n` (#1033/#1575/#1082) on the
-/// two paths the screening iteration cap does NOT bound — the inequality-
-/// constrained active-set solve (#1380, cap deliberately disabled) and the
-/// cascade's uncapped final stage. It is applied with `max`, so it can only
-/// loosen a tighter production tolerance and never tightens a coarser one, and
-/// it is scoped to screening solves alone: the winning seed's real fit and
-/// every multistart full solve run with `in_screening == false`, so the
-/// converged REML/LAML optimum and its bit-results are unchanged.
-pub(crate) const SEED_SCREENING_INNER_CONVERGENCE_TOLERANCE: f64 = 1e-3;
 
 /// Pin an estimated likelihood-scale nuisance parameter to the value frozen for
 /// the lambda search, then re-resolve the scale so an invalid freeze fails here
@@ -7972,10 +7693,9 @@ fn apply_frozen_search_scale(
 /// The outer→inner cap schedule (`first_order_inner_cap_schedule`) hands the
 /// inner solver as few as `INNER_CAP_FLOOR` iterations and grows the budget
 /// geometrically as soon as a solve reports it ran out — the truncation is the
-/// mechanism, and hitting it is the signal the backoff consumes. Outside seed
-/// screening that schedule is the only thing that can shorten the budget below
-/// the configured `max_iterations` (`screening_iteration_cap_applies` requires
-/// `in_screening`), so a `MaxIterationsReached` at or under the scheduled cap
+/// mechanism, and hitting it is the signal the backoff consumes. That schedule
+/// is the only thing that can shorten the budget below the configured
+/// `max_iterations`, so a `MaxIterationsReached` at or under the scheduled cap
 /// is routine and self-correcting: its gradient norm and iteration index
 /// describe a solve stopped early on purpose and say nothing about whether a
 /// minimum exists at this ρ.
@@ -9487,5 +9207,75 @@ mod firth_hessian_direction_reuse_tests {
                 "batched direct[{idx}] not bit-identical to per-direction at n={n}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod capped_request_cache_tests {
+    use super::BundleRows;
+    use super::super::super::RemlConfig;
+    use super::super::super::tests::{binomial_logit_glm_spec, build_logit_state};
+    use ndarray::{Array1, array};
+
+    #[test]
+    fn capped_gradient_request_reuses_uncapped_mode_at_same_rho() {
+        // The outer search probes a trial rho by value with no inner cap, then
+        // asks for the gradient at that rho under its schedule's cap. The
+        // uncapped mode is already certified and cached, so the capped request
+        // must be answered from it rather than re-running P-IRLS: at n=1e4 the
+        // repeat solve was a third of every value+gradient pair.
+        use std::sync::atomic::Ordering;
+        let y = array![0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.5, -0.4],
+            [1.0, 0.0, 0.7],
+            [1.0, 0.4, -0.3],
+            [1.0, 0.9, 0.1],
+            [1.0, 1.3, -0.6],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
+        let rho = array![0.0];
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false);
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+
+        state.outer_inner_cap.store(0, Ordering::Relaxed);
+        state
+            .compute_outer_eval_with_order(&rho, crate::rho_optimizer::OuterEvalOrder::Value)
+            .expect("uncapped value probe should succeed");
+        let uncapped = state
+            .execute_pirls_if_needed(&rho, BundleRows::Observed)
+            .expect("uncapped mode is cached")
+            .0;
+
+        // A fresh solve records its iteration count; a cache answer does not.
+        let untouched = usize::MAX;
+        state.last_inner_iters.store(untouched, Ordering::Relaxed);
+        state.outer_inner_cap.store(5, Ordering::Relaxed);
+        let capped = state
+            .execute_pirls_if_needed(&rho, BundleRows::Observed)
+            .expect("capped request should succeed")
+            .0;
+
+        assert_eq!(
+            state.last_inner_iters.load(Ordering::Relaxed),
+            untouched,
+            "the capped request re-ran P-IRLS instead of reusing the uncapped mode"
+        );
+        assert_eq!(capped.beta_transformed.as_ref(), uncapped.beta_transformed.as_ref());
+
+        // The converse stays closed (#2309): a mode cached under a cap never
+        // answers an uncapped request.
+        let rho_capped_only = array![0.5];
+        state
+            .execute_pirls_if_needed(&rho_capped_only, BundleRows::Observed)
+            .expect("capped solve should succeed");
+        state.outer_inner_cap.store(0, Ordering::Relaxed);
+        state.last_inner_iters.store(untouched, Ordering::Relaxed);
+        state
+            .execute_pirls_if_needed(&rho_capped_only, BundleRows::Observed)
+            .expect("uncapped solve should succeed");
+        assert_ne!(state.last_inner_iters.load(Ordering::Relaxed), untouched);
     }
 }

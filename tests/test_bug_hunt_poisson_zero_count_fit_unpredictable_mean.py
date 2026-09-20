@@ -14,14 +14,14 @@ import gamfit
 
 
 @pytest.mark.parametrize("formula", ["y ~ 1", "y ~ s(x)"])
-@pytest.mark.parametrize("family", ["poisson", "negative_binomial"])
+@pytest.mark.parametrize("family", ["poisson", "negative-binomial"])
 def test_all_zero_count_fit_refuses_with_family_owned_error(
     formula: str, family: str
 ) -> None:
     n = 200
     data = {"x": np.linspace(0.0, 1.0, n), "y": np.zeros(n)}
 
-    with pytest.raises(gamfit.errors.GamError) as excinfo:
+    with pytest.raises(gamfit.errors.GamfitError) as excinfo:
         gamfit.fit(data, formula, family=family)
 
     message = str(excinfo.value)

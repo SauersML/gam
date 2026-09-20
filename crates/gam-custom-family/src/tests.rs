@@ -3,6 +3,7 @@
 //! as `#[cfg(test)] mod tests;`; reaches the FD helper via `super::test_support`.
 
 use super::*;
+use crate::test_support::outerobjectivegradienthessian_labeled;
 
 pub(crate) fn test_design_hyper_layout(
     design_derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
@@ -476,6 +477,58 @@ pub(crate) fn joint_penalty_subspace_trace_matches_projected_logdet_derivative()
 }
 
 #[test]
+pub(crate) fn joint_penalty_subspace_refuses_an_indefinite_laplace_precision_3303() {
+    // #3303: at the survival location-scale link-wiggle modes `M = H + S_λ` had
+    // exactly `rank(S_λ)` positive eigenvalues beside `−4.577` and `−2.217`, and
+    // the penalty floor kept the positive ones and dropped the negative ones
+    // without a word, pricing `log|M₊|` in place of `log|M|`. Here `S_λ` has rank
+    // 3 and `M = diag(4, 3, −4.577, 0)`: two resolved positive eigenvalues, one
+    // material negative one, one structural zero. No Laplace approximation exists
+    // at this saddle, so the criterion refuses the trial point by name.
+    let ranges = vec![(0, 4)];
+    let penalties = vec![array![
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0]
+    ]];
+    let h = array![
+        [3.0, 0.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0, 0.0],
+        [0.0, 0.0, -5.577, 0.0],
+        [0.0, 0.0, 0.0, 0.0]
+    ];
+    let err = joint_penalty_subspace_trace_parts(
+        &JointHessianSource::Dense(h),
+        &ranges,
+        &penalties,
+        4,
+        0.0,
+        None,
+        None,
+        None,
+    )
+    .expect_err("an indefinite Laplace precision has no Laplace criterion");
+    assert!(
+        err.is_trial_point_infeasible(),
+        "a saddle at one trial point is rho-local, got {err}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("indefinite") && message.contains("-4.577"),
+        "the refusal must name the material negative eigenvalue, got {message}"
+    );
+
+    // A negative eigenvalue inside the rounding band `p·ε·‖M‖₂` is not resolved
+    // from zero, so its sign is no measurement and the kept set stands.
+    let band = 4.0 * f64::EPSILON * 4.0;
+    let kept = laplace_precision_kept_eigenpairs(&[4.0, 3.0, 2.0, -0.5 * band], 3)
+        .expect("a within-band negative eigenvalue is roundoff, not a saddle");
+    assert_eq!(kept, vec![0, 1, 2]);
+    assert!(laplace_precision_kept_eigenpairs(&[4.0, 3.0, 2.0, -2.0 * band], 3).is_err());
+}
+
+#[test]
 pub(crate) fn joint_penalty_subspace_logdet_keeps_the_identified_rank_2901() {
     // #2901 V22: the criterion keeps standard REML's identified rank. The stiff
     // curvature `1e17` puts the rounding band `p·ε·‖M‖₂` at `88.8`, so `1e3` is
@@ -504,7 +557,12 @@ pub(crate) fn joint_penalty_subspace_logdet_keeps_the_identified_rank_2901() {
         penalty_rank_at_rounding_band(&penalties[0]).expect("penalty rank"),
         3
     );
-    assert_eq!(laplace_precision_kept_eigenpairs(eigenvalues, 3).len(), 3);
+    assert_eq!(
+        laplace_precision_kept_eigenpairs(eigenvalues, 3)
+            .expect("a positive semidefinite precision has a Laplace kept set")
+            .len(),
+        3
+    );
     let (logdet, kernel) = joint_penalty_subspace_trace_parts(
         &JointHessianSource::Dense(h.clone()),
         &ranges,
@@ -562,9 +620,9 @@ pub(crate) fn identity_face_tangent_reproduces_the_full_space_kernel_bit_for_bit
 /// gam#2894: on an active face the criterion prices `log|Zᵀ M Z|` and the kernel
 /// differentiates it. `M` is indefinite (one eigenvalue near `−1.02`) and positive definite
 /// on the face tangent. The face normal `e₃` is not an eigenvector of `M`, so the
-/// full-space pseudo-determinant, which keeps `M`'s two positive eigenvalues, prices
-/// `log(15.25 / 1.0209…) ≈ 2.70` where the face prices `log 4.75 ≈ 1.56`. That gap is the
-/// control that this fixture discriminates the two geometries.
+/// full-space geometry meets the negative eigenvalue and refuses the point (gam#3303)
+/// where the face prices `log 4.75 ≈ 1.56`. That refusal is the control that this
+/// fixture discriminates the two geometries.
 #[test]
 pub(crate) fn face_tangent_kernel_prices_and_differentiates_the_face_determinant_2894() {
     let ranges = vec![(0, 3)];
@@ -576,7 +634,7 @@ pub(crate) fn face_tangent_kernel_prices_and_differentiates_the_face_determinant
     else {
         panic!("one active row cannot pin a three-coefficient face");
     };
-    let parts = |h: &Array2<f64>, tangent: Option<&Array2<f64>>| {
+    let try_parts = |h: &Array2<f64>, tangent: Option<&Array2<f64>>| {
         joint_penalty_subspace_trace_parts(
             &JointHessianSource::Dense(h.clone()),
             &ranges,
@@ -587,7 +645,9 @@ pub(crate) fn face_tangent_kernel_prices_and_differentiates_the_face_determinant
             None,
             tangent,
         )
-        .expect("projection parts build")
+    };
+    let parts = |h: &Array2<f64>, tangent: Option<&Array2<f64>>| {
+        try_parts(h, tangent).expect("projection parts build")
     };
     let (logdet, kernel) = parts(&h, Some(&z));
     let kernel = kernel.expect("a positive-definite face precision has a kernel");
@@ -595,10 +655,13 @@ pub(crate) fn face_tangent_kernel_prices_and_differentiates_the_face_determinant
     // `M = H + S = [[5, 0.5, 0], [0.5, 1, 2], [0, 2, 1]]`; the face is `span(e₁, e₂)`, so
     // `Zᵀ M Z ≅ [[5, 0.5], [0.5, 1]]` with determinant `5 − 0.25`.
     assert_relative_eq!(logdet, 4.75_f64.ln(), epsilon = 1e-12);
-    let (full_logdet, _) = parts(&h, None);
+    // The full space sees `M`'s eigenvalue near `−1.02`: there the mode is a saddle and has no
+    // Laplace approximation, so the full-space geometry refuses the point (gam#3303) where the
+    // face prices it.
+    let full = try_parts(&h, None).expect_err("the full-space precision is indefinite");
     assert!(
-        (full_logdet - logdet).abs() > 1e-2,
-        "the full-space pseudo-determinant must differ on this fixture: full={full_logdet} face={logdet}"
+        full.is_trial_point_infeasible() && full.to_string().contains("indefinite"),
+        "the full-space geometry must refuse the indefinite precision: {full}"
     );
     let drift = array![[0.7, -0.4, 0.2], [-0.4, 1.3, 0.5], [0.2, 0.5, 2.0]];
     let analytic = kernel.trace_projected_logdet(&drift);
@@ -1568,8 +1631,8 @@ pub(crate) struct OneBlockIdentityFamily;
 #[test]
 pub(crate) fn large_scale_shape_margslope_flex_cycle0_bounds_cg_by_the_dense_route_cost() {
     // p = 51, n = 320k: the dense route builds n·p² and factors p³/3 while one
-    // product streams 2·n·p, so the cycle-0 CG attempt hands the step to the dense
-    // route after 25 products, not after the historical 4·p = 204.
+    // product streams 2·n·p, so a step takes CG only when its iteration bound
+    // costs fewer than 25 products, not the historical 4·p = 204 (gam#3285).
     let total_p = 51;
     let total_n = 320_000;
     assert_eq!(JOINT_PCG_MAX_ITER_MULTIPLIER * total_p, 204);
@@ -2563,21 +2626,6 @@ pub(crate) fn logdet_intent_takes_dense_while_inner_solve_takes_operator() {
             panic!("inner-solve intent must take the operator representation")
         }
     }
-}
-
-#[test]
-pub(crate) fn custom_family_default_outer_seed_config_is_tightened_for_expensive_paths() {
-    let family = OneBlockIdentityFamily;
-
-    let small = family.outer_seed_config(4);
-    assert_eq!(small.max_seeds, 6);
-    assert_eq!(small.seed_budget, 1);
-    assert_eq!(small.screen_max_inner_iterations, 2);
-
-    let large = family.outer_seed_config(16);
-    assert_eq!(large.max_seeds, 4);
-    assert_eq!(large.seed_budget, 1);
-    assert_eq!(large.screen_max_inner_iterations, 2);
 }
 
 #[test]
@@ -3970,48 +4018,6 @@ pub(crate) fn nonconverged_inner_refuses_profile_derivatives() {
 }
 
 #[test]
-pub(crate) fn custom_family_seed_screening_proxy_ranks_partial_fit_without_laplace_terms() {
-    let specs = vec![default_diagonal_exact_hook_spec()];
-    let penalty_counts = validate_blockspecs(&specs).expect("valid test spec");
-    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
-        .expect("valid label layout");
-    let options = BlockwiseFitOptions {
-        use_remlobjective: true,
-        use_outer_hessian: true,
-        compute_covariance: false,
-        inner_max_cycles: 1,
-        ..BlockwiseFitOptions::default()
-    };
-
-    let (score, warm_start, inner_converged) = custom_family_seed_screening_proxy_labeled(
-        &DefaultDiagonalExactHookFamily,
-        &specs,
-        &options,
-        &layout,
-        &array![0.0],
-        None,
-        &gam_problem::RhoPrior::Flat,
-    )
-    .expect("screening proxy should score a finite partial inner solve");
-
-    assert!(score.is_finite());
-    assert!(
-        !inner_converged,
-        "one-cycle screening is expected to be a partial inner fit"
-    );
-    assert_eq!(warm_start.rho, array![0.0]);
-    assert_eq!(warm_start.block_beta.len(), 1);
-    let cached = warm_start
-        .cached_inner
-        .expect("screening warm start owns the partial inner iterate");
-    assert!(!cached.converged);
-    assert!(cached.block_logdet_h.is_none());
-    assert!(cached.block_logdet_s.is_none());
-    let expected = -cached.log_likelihood + cached.penalty_value;
-    assert_eq!(score.to_bits(), expected.to_bits());
-}
-
-#[test]
 pub(crate) fn custom_family_outer_derivatives_exposes_surrogate_second_order_geometry() {
     // RidgedQuadraticReml is the default objective; its analytic outer
     // Hessian is routed to ARC, which handles indefinite Hessians via
@@ -4351,141 +4357,6 @@ pub(crate) fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
     );
 }
 
-/// [`OneBlockQuarticExactFamily`] with a counter on `d2H`, which enters only the
-/// outer Hessian.
-#[derive(Clone)]
-struct D2hCountingQuarticFamily {
-    inner: OneBlockQuarticExactFamily,
-    second_directional_calls: Arc<AtomicUsize>,
-}
-
-impl CustomFamily for D2hCountingQuarticFamily {
-    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
-        self.inner.exact_newton_joint_hessian_beta_dependent()
-    }
-
-    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        self.inner.evaluate(block_states)
-    }
-
-    fn exact_newton_hessian_directional_derivative(
-        &self,
-        block_states: &[ParameterBlockState],
-        block_idx: usize,
-        direction: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.inner
-            .exact_newton_hessian_directional_derivative(block_states, block_idx, direction)
-    }
-
-    fn exact_newton_hessian_second_directional_derivative(
-        &self,
-        block_states: &[ParameterBlockState],
-        block_idx: usize,
-        u: &Array1<f64>,
-        v: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.second_directional_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .exact_newton_hessian_second_directional_derivative(block_states, block_idx, u, v)
-    }
-}
-
-/// #2898: a gradient-only custom-family fit assembles the outer Hessian once, at
-/// the mint.
-///
-/// The runner installs the selected point through `finalize_outer_result` and
-/// then certifies it. The mint requests `ValueGradientHessian` wherever the
-/// Hessian is declared and owns the Hessian the certificate judges; an
-/// installation at that order as well assembled the same Hessian at the same rho
-/// and discarded it. `d2H` is reached only by outer-Hessian assembly (the first
-/// arm checks that), so across the whole fit it must be called exactly as often
-/// as one `ValueGradientHessian` evaluation calls it.
-#[test]
-pub(crate) fn custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let family = D2hCountingQuarticFamily {
-        inner: OneBlockQuarticExactFamily {
-            linear: 3.0,
-            curvature: 0.5,
-            second_scale: 1.0,
-        },
-        second_directional_calls: Arc::clone(&calls),
-    };
-    let specs = vec![ParameterBlockSpec {
-        name: "quartic".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
-        offset: array![0.0],
-        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
-        nullspace_dims: vec![],
-        initial_log_lambdas: array![0.0],
-        initial_beta: Some(array![0.75]),
-        gauge_priority: 100,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    }];
-    let options = BlockwiseFitOptions {
-        inner_tol: 1e-11,
-        use_remlobjective: true,
-        use_outer_hessian: true,
-        compute_covariance: false,
-        ..BlockwiseFitOptions::default()
-    };
-    let penalty_counts = validate_blockspecs(&specs).expect("valid quartic spec");
-    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
-        .expect("valid label layout");
-    let calls_in_one_evaluation = |mode: EvalMode| {
-        calls.store(0, Ordering::Relaxed);
-        let evaluation = outerobjectivegradienthessian_labeled(
-            &family,
-            &specs,
-            &options,
-            &layout,
-            &array![0.0],
-            None,
-            &gam_problem::RhoPrior::Flat,
-            mode,
-        )
-        .expect("quartic outer evaluation");
-        assert!(
-            evaluation.inner_converged,
-            "the calibration evaluation must reach the inner mode"
-        );
-        calls.load(Ordering::Relaxed)
-    };
-    assert_eq!(
-        calls_in_one_evaluation(EvalMode::ValueAndGradient),
-        0,
-        "d2H must stay out of value-and-gradient evaluations, or its count does not price \
-         outer-Hessian assemblies"
-    );
-    let calls_per_assembly = calls_in_one_evaluation(EvalMode::ValueGradientHessian);
-    assert!(
-        calls_per_assembly > 0,
-        "one ValueGradientHessian evaluation must reach d2H"
-    );
-
-    calls.store(0, Ordering::Relaxed);
-    let fit = fit_custom_family(&family, &specs, &options).expect("the quartic REML fit must certify");
-    let fit_calls = calls.load(Ordering::Relaxed);
-    let certificate = fit
-        .artifacts
-        .criterion_certificate
-        .as_ref()
-        .expect("a certified outer optimum carries its criterion certificate");
-    assert!(
-        certificate.hessian_psd().is_some(),
-        "the mint must measure the declared outer Hessian: {certificate:?}"
-    );
-    assert_eq!(
-        fit_calls, calls_per_assembly,
-        "the fit must assemble the outer Hessian exactly once, at the mint: {fit_calls} d2H calls \
-         against {calls_per_assembly} per assembly (outer_iterations={})",
-        fit.outer_iterations
-    );
-}
-
 #[test]
 fn cached_mode_is_corrected_when_the_requested_accuracy_tightens_979() {
     let family = OneBlockQuarticExactFamily {
@@ -4647,7 +4518,11 @@ fn outer_jeffreys_geometry_is_derivative_order_invariant() {
         .expect("Jeffreys term")
         .expect("active Jeffreys term");
     assert!(completion.is_some());
-    assert_eq!(information_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        information_calls.load(Ordering::Relaxed),
+        1,
+        "H_Phi and its second-order completion share one materialized information",
+    );
     assert_eq!(axis_batch_calls.load(Ordering::Relaxed), 1);
     assert_eq!(completion_calls.load(Ordering::Relaxed), 1);
 
@@ -4659,7 +4534,7 @@ fn outer_jeffreys_geometry_is_derivative_order_invariant() {
     );
     assert_eq!(
         information_calls.load(Ordering::Relaxed),
-        3,
+        2,
         "lazy drift construction must materialize the information matrix exactly once",
     );
     assert_eq!(
@@ -4920,7 +4795,6 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("completion")
     .expect("completion present");
@@ -4943,7 +4817,6 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("half-strength completion")
     .expect("half-strength completion present");
@@ -4955,10 +4828,9 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
     );
 }
 
-/// gam#1020: for an expected-information family without a contracted hook, exact
-/// assembly dispatches to the mathematically identical pairwise second-directional
-/// path. The contracted-only policy must decline because that family contract is
-/// absent.
+/// gam#1020: for an expected-information family without a contracted hook, the
+/// completion dispatches to the mathematically identical pairwise second-directional
+/// path.
 #[derive(Clone)]
 struct PairwiseJeffreysSeamFamily;
 
@@ -5025,7 +4897,6 @@ pub(crate) fn jeffreys_second_order_completion_exact_pairwise_when_hook_absent()
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("completion")
     .expect("completion present");
@@ -5048,20 +4919,6 @@ pub(crate) fn jeffreys_second_order_completion_exact_pairwise_when_hook_absent()
     assert!(
         completion.iter().any(|value| value.abs() > 0.0),
         "pairwise completion should be nonzero on this gated fixture"
-    );
-
-    let contracted_only = custom_family_joint_jeffreys_second_order_completion(
-        &family,
-        &states,
-        &specs,
-        &h_joint,
-        &z_joint,
-        JeffreysCompletionAssembly::Contracted,
-    )
-    .expect("contracted-only completion");
-    assert!(
-        contracted_only.is_none(),
-        "contracted-only assembly must decline when the family has no contracted hook"
     );
 }
 
@@ -5173,7 +5030,6 @@ pub(crate) fn jeffreys_second_order_completion_exact_contracts_span_directions_2
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("completion")
     .expect("completion present");
@@ -6979,12 +6835,7 @@ pub(crate) fn certified_test_outer(
         .with_hessian(gam_problem::DeclaredHessianForm::Dense)
         .with_disable_fixed_point(true)
         .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Disabled)
-        .with_initial_rho(theta)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..gam_problem::SeedConfig::default()
-        });
+        .with_initial_rho(theta);
     let mut outer_objective = problem.build_objective(
         (),
         move |_: &mut (), point: &Array1<f64>| {
@@ -7887,6 +7738,7 @@ mod joint_hessian_drift_fd_979;
 
 mod residual_summand_floor_2976;
 mod walk_endpoint_mode_2627;
+mod warm_start_retention_2996;
 
 /// gam#2360. `audit_converged_identifiability` handed the drift audit a bare
 /// `vec![0.0; n]` as the pilot β. The pilot the PRE-FIT audit linearized at is
@@ -8245,15 +8097,10 @@ fn outer_jeffreys_hphi_drift_matches_a_central_difference_of_hphi_2765() {
 
     let hphi_at = |t: f64| -> Array2<f64> {
         let states = vec![jeffreys_seam_state(&beta + &(&direction * t))];
-        let (_, hphi, completion) =
-            custom_family_outer_jeffreys_hphi(&family, &states, &specs, &ranges)
-                .expect("Jeffreys term")
-                .expect("the small information keeps the conditioning gate active");
-        assert!(
-            completion.is_none(),
-            "this fixture declares no contracted-trace completion, so the drift it \
-             differences is the bare divided-difference H_Phi"
-        );
+        // The drift is `D_β H_Φ`; the mode-response completion does not enter it.
+        let (_, hphi, _) = custom_family_outer_jeffreys_hphi(&family, &states, &specs, &ranges)
+            .expect("Jeffreys term")
+            .expect("the small information keeps the conditioning gate active");
         hphi
     };
 

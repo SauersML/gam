@@ -186,8 +186,9 @@ pub fn kl_evaluation_band_nats(
 /// below `B` is therefore within what rounding of the logits and the float64
 /// evaluation ([`kl_evaluation_band_nats`]) can produce by themselves. The band
 /// covers the measurement from logits to KL, not an edit rounded away upstream
-/// inside the forward pass.
-pub fn kl_measurement_band_nats(
+/// inside the forward pass. Private, so every floor is taken through
+/// [`kl_measurement_floor`], which returns `B` beside it.
+fn kl_measurement_band_nats(
     format: LogitFormat,
     vocab_size: usize,
     logit_max_abs: f64,
@@ -198,10 +199,51 @@ pub fn kl_measurement_band_nats(
         + kl_evaluation_band_nats(vocab_size, logit_max_abs, logit_max_abs_change)
 }
 
+/// What one KL measurement can resolve, in nats.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KlMeasurementFloor {
+    /// `E₆₄` ([`kl_evaluation_band_nats`]): a true KL is non-negative, so a computed
+    /// one below `−E₆₄` is not roundoff.
+    pub evaluation_band_nats: f64,
+    /// `B = ½·ulp_F(M)² + E₆₄` in the logits' own format `F`: a KL at or below it is
+    /// within what the arithmetic alone produces.
+    pub measurement_band_nats: f64,
+    /// `max(B, c)` for the control evidence `c`: a measurement resolves a dose only
+    /// strictly above it.
+    pub floor_nats: f64,
+}
+
+/// The one owner of a measurement's floor (gh#2263, gh#2946). Controls that
+/// re-splice the unchanged row measure exactly 0 on a deterministic model, and a
+/// quantity that is identically 0 is no measurement floor. The floor is the record's
+/// derived band `B`, which is strictly positive, raised by the control evidence
+/// `control_nats` only where controls are stochastic. The Rung-3 calibration
+/// (with a control quantile) and the dose-ledger drivers (with a repeated
+/// forward's largest KL, through the Python binding) both floor here.
+pub fn kl_measurement_floor(
+    format: LogitFormat,
+    vocab_size: usize,
+    logit_max_abs: f64,
+    logit_max_abs_change: f64,
+    control_nats: f64,
+) -> KlMeasurementFloor {
+    let measurement_band_nats =
+        kl_measurement_band_nats(format, vocab_size, logit_max_abs, logit_max_abs_change);
+    KlMeasurementFloor {
+        evaluation_band_nats: kl_evaluation_band_nats(
+            vocab_size,
+            logit_max_abs,
+            logit_max_abs_change,
+        ),
+        measurement_band_nats,
+        floor_nats: measurement_band_nats.max(control_nats),
+    }
+}
+
 /// The one production calibration model.  Keeping the model description next
 /// to the design builder makes the Rust library, CLI, and Python binding
 /// consume one contract instead of spelling model policy in each front-end.
-pub const CHART_CALIBRATION_FORMULA: &str = "log_nu ~ s(log_nu_hat) + re(atom)";
+pub const CHART_CALIBRATION_FORMULA: &str = "log_nu ~ s(log_nu_hat) + group(atom)";
 pub const CHART_CALIBRATION_SMOOTH_TERM: &str = "s(log_nu_hat)";
 pub const CHART_CALIBRATION_SMOOTH_CONSTRAINT: &str = "monotone_increasing";
 
@@ -423,28 +465,24 @@ pub fn prepare_intervention_calibration(
     if train_controls.is_empty() {
         return Err(InterventionCalibrationError::NoTrainingControls);
     }
-    // A deterministic model's controls re-splice the unchanged row and measure
-    // exactly 0, so their quantile is no measurement floor. Each record's floor
-    // is its derived measurement band, raised by the control quantile where
-    // controls are stochastic. The band is strictly positive, so every floor is.
+    // Each record's floor is its derived measurement band, raised by the control
+    // quantile where controls are stochastic ([`kl_measurement_floor`]).
     let control_quantile_nats = inclusive_quantile(train_controls, spec.floor_quantile);
-    let band: Vec<f64> = (0..n)
+    let floors: Vec<KlMeasurementFloor> = (0..n)
         .map(|i| {
-            kl_measurement_band_nats(
+            kl_measurement_floor(
                 shard.logit_format,
                 shard.vocab_size,
                 shard.logit_max_abs[i],
                 shard.logit_max_abs_change[i],
+                control_quantile_nats,
             )
         })
         .collect();
-    let floor: Vec<f64> = band
-        .iter()
-        .map(|&record_band| record_band.max(control_quantile_nats))
-        .collect();
+    let floor: Vec<f64> = floors.iter().map(|record| record.floor_nats).collect();
     let measurement_band_nats_max = (0..n)
         .filter(|&i| !eval[i] && !shard.is_control[i])
-        .map(|i| band[i])
+        .map(|i| floors[i].measurement_band_nats)
         .fold(0.0_f64, f64::max);
 
     // Sorted map makes both the Rust API and every binding deterministic.
@@ -2417,6 +2455,35 @@ mod tests {
         let screened = prepare_intervention_calibration(&shard, spec).unwrap();
         assert_eq!(screened.measurable_atoms, vec![10]);
         assert_eq!(screened.below_measurement_floor_atoms, vec![20]);
+    }
+
+    #[test]
+    fn a_measurement_floor_is_its_band_raised_only_by_stochastic_control_evidence_2263() {
+        // bfloat16 logits of magnitude 30 are spaced 2^(4 - 7) = 1/8 apart, so logit
+        // rounding alone can produce 1/128 nats: #2263's frozen L17 ledger, whose
+        // logits come out of a bfloat16 head.
+        let (vocab, extent, change) = (151_936, 30.0, 0.25);
+        let evaluation = kl_evaluation_band_nats(vocab, extent, change);
+        let band = kl_measurement_band_nats(LogitFormat::BFloat16, vocab, extent, change);
+        assert_eq!(band, 1.0 / 128.0 + evaluation);
+        let at = |control: f64| {
+            kl_measurement_floor(LogitFormat::BFloat16, vocab, extent, change, control)
+        };
+        // Deterministic controls measure 0, or a KL negative by roundoff: the band is
+        // the floor.
+        for control in [0.0, -evaluation] {
+            assert_eq!(
+                at(control),
+                KlMeasurementFloor {
+                    evaluation_band_nats: evaluation,
+                    measurement_band_nats: band,
+                    floor_nats: band,
+                }
+            );
+        }
+        // Stochastic controls above the band raise the floor; below it they do not.
+        assert_eq!(at(3.0 * band).floor_nats, 3.0 * band);
+        assert_eq!(at(0.5 * band).floor_nats, band);
     }
 
     /// The runner's float64 KL: `log_softmax` of both vectors, `exp` of the

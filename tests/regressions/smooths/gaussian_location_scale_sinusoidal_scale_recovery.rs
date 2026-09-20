@@ -11,8 +11,6 @@ use gam::{
 };
 use ndarray::Array2;
 
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
-
 fn next_unit(state: &mut u64) -> f64 {
     *state = state
         .wrapping_mul(6364136223846793005)
@@ -62,11 +60,11 @@ fn fit_sinusoidal_location_scale(x: &[f64], y: &[f64]) -> GaussianLocationScaleF
         encode_recordswith_inferred_schema(headers, rows).expect("encode location-scale fixture");
     let config = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("1 + s(x, bs='tp')".to_string()),
+        noise_formula: Some("1 + s(x, bs='tps')".to_string()),
         ..FitConfig::default()
     };
 
-    let result = fit_from_formula("y ~ s(x, bs='tp')", &data, &config)
+    let result = fit_from_formula("y ~ s(x, bs='tps')", &data, &config)
         .expect("fit Gaussian location-scale model");
     let FitResult::GaussianLocationScale(result) = result else {
         panic!("expected GaussianLocationScale fit result");
@@ -105,7 +103,7 @@ fn fitted_channels(fit: &GaussianLocationScaleFitResult, x: &[f64]) -> (Vec<f64>
         .design
         .apply(&beta_scale)
         .iter()
-        .map(|&eta| (fit.response_scale * LOGB_SIGMA_FLOOR + eta.exp()).ln())
+        .map(|&eta| (fit.response_scale * fit.sigma_floor + eta.exp()).ln())
         .collect();
     (fitted_mu, fitted_log_sigma)
 }

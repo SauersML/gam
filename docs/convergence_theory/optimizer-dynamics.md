@@ -40,7 +40,7 @@ Scripts and outputs: `SP/theory/optimizer-dynamics/` (SP = session scratchpad). 
      - q = 1/e for an exponential tail;
      - q = ((p+1)/(p+2))^p for an algebraic tail;
      - q = 1 (no contraction at all) for a log-divergent, unbounded ray.
-   - In the x1+cc(x2) failure the refused Newton steps each lowered V by 1.5·10⁶ × band_f.
+   - In the x1+cyclic(x2) failure the refused Newton steps each lowered V by 1.5·10⁶ × band_f.
 6. **Łojasiewicz theory holds because V is real-analytic in ρ [proven sketch, §3.6].**
    - Monotone ARC iterates have finite length, hence converge to a *single* point or diverge to ∞ (to a face).
    - Rates depend on the Łojasiewicz exponent θ:
@@ -224,7 +224,7 @@ Here r = ΔV/(½λ²) and q = λ²₊/λ² for a pure Newton step in the flat co
 - On an exponential tail g, H and the optimal σ all scale like e^{−ρ}. The accepted step size is therefore stationary at s = ln(1/γ_dec) = ln 2, and q = ½.
 - **[checked P1: 0.693 per step, q → 0.5]**. ARC marches toward a face at constant speed and never arrives. That is why faces need their own certificate (§3.7).
 
-**x1+cc(x2) failure** (`all-tests.log:1009`).
+**x1+cyclic(x2) failure** (`all-tests.log:1009`).
 - Final state: ARC after 84 iterations, V = 266.2455, |Pg| = 1.477e−3 against a bound of 1.352e−6, ρ = [4.2535, 12.2882, −1.7712].
 - Polish steps: λ̂² went 1.452e−4 → 9.175e−5 → 9.426e−5; ΔV = 3.914e−5, then 5.965e−5.
 - So r = 0.539 then 1.30, and q = 0.632 then 1.027. This matches no exponential tail (q = 0.37). It is consistent with a log-like or pre-asymptotic tail (b ln 2 = 6.4e−5) **[conjectured]**.
@@ -415,7 +415,7 @@ The rest of P4:
 |---|---|---|---|
 | Binomial StepSizeTooSmall, railed | lines 324/871/886: \|g\| = 2.28e−5 vs 7.30e−6, ρ at 22.73 in box [−17.36, 22.73] | line-search floor above the certify bound (T4, proven) plus a flat tail (T5) | RA-ARC with exact H; face candidate at w = 0; delete the box |
 | Prostate BFGS | lines 786/822: \|g\| = 9.6e−6 | same floor (T4, conjectured L) | same |
-| x1+cc(x2) "stopped contracting" | line 1009 | false self-concordance premise (T6, proven); refused productive steps | delete the polish budget; Kantorovich certificate plus face candidate |
+| x1+cyclic(x2) "stopped contracting" | line 1009 | false self-concordance premise (T6, proven); refused productive steps | delete the polish budget; Kantorovich certificate plus face candidate |
 | Multinomial "stopped contracting" | — | same (conjectured) | same |
 | Iso-kappa Matérn MaxAttempts | line 15518: \|g\| 3.7e−2 vs 2.5e−2 (and \|Pg\| = 0.331 after 129 iterations) | gradient-only plan (`drivers/spatial_optimization.rs:5468`) plus FD tail probes (`run.rs:7114`) | supply the exact Hessian; delete the probes |
 | Weibull-AFT / statsmodels MaxAttempts | line 33697: 6.99e−2 vs 1.86e−3 | Hessian withheld (`survival/construction.rs:991, 1036`); cos-collapse or non-finite guard (T2) | exact H; the non-finite guard becomes a typed domain error |
@@ -437,14 +437,14 @@ SPEC classes: **C** cap, **F** fallback/retry, **M** magic constant, **B** box, 
 | `opt/src/lib.rs:6780-6800` | ARC tol 1e−5, max_iter 100, σ_min 1e−10, σ_max 1e12, subproblem_max_iterations 80, AutoBfgs, history_cap 12 | M, C | tolerances from bands; no caps; exact-Hessian mode mandatory for the outer path |
 | `opt/src/lib.rs:~903-960` | within_noise_floor → ρ = 1; RejectFloor radius clamp | M, F | Sun–Nocedal relaxed ratio plus audit |
 | `opt/src/lib.rs:7500-7560` | σ_max saturation | C | delete (CGT Lemma 5.2 bound) |
-| `newton_polish.rs:118-126`, `367-372` | "stopped contracting", SC budget | M (false premise) | delete; Kantorovich terminal phase |
+| `newton_polish.rs:118-126`, `367-372` | "stopped contracting", SC budget | M (false premise) | "stopped contracting" **deleted**; the λ₊ ≤ 2λ² face-ordering test remains |
 | `run.rs:1683` | ArcUnprogressingStallCheckpoint | F | delete; audit plus face candidate |
 | `run.rs:14` | OPERATOR_TRUST_RESTART_RADIUS_FLOOR=1e−6 | M, F | delete |
 | `run.rs:3080` | MAX_EXPANSIONS=64 | C | delete |
 | `run.rs:4678` | GRADIENT_REPRODUCIBILITY_WIDENING=2 | M | band_g |
 | `run.rs:4937` | LARGE_STEP_DELTA=1 | M | delete |
 | `run.rs:5744`, `5757`, `5769` | ASYMPTOTE_* (rel tol 1e−4, 18 probes, δ 0.5) | M, D | delete; face certificate |
-| `run.rs:6037`, `6050`, `6154` | FACE_LAW_* (slack 4, order band 0.5, margin 1e−6) | M | delete; exact f_w(0) with band_μ |
+| `run.rs:6037`, `6050`, `6154` | FACE_LAW_* (slack 4, order band 0.5, margin 1e−6) | M | **deleted**: the analytic face proof mints rails with no value probe |
 | `run.rs:6417` | TAIL_SNAP_DRIFT_REL=1e−2 | M | delete |
 | `run.rs:6833`, `7114` | PROBE_DELTA=1.0 (FD tail probe) | D (SPEC violation) | delete |
 | `run.rs:6969` | PROBE_DOMAIN_MARGIN=1e−6 | M | delete |
@@ -506,4 +506,4 @@ The value error from this inner tolerance is ½‖H^{−1/2}r‖², second order
 4. **The λ → 0 face** (ρ_k → −∞, unpenalized limit). The analogous chart is v = e^{ρ_k}, which is analytic when XᵀWX is nonsingular on the penalty's range. The multiplier and its band are not derived here **[open]**.
 5. **Face-set combinatorics.** With many terms, F from the sign rule might cycle (release/re-fix). Monotone acceptance prevents infinite cycling (finitely many faces, V strictly decreasing by > band_f), but no polynomial bound is known **[conjectured]**.
 6. **Global optimality.** All certificates are local. P6 seed 1 shows that face and interior basins coexist (V_int < V_face by 2.1e−3). A global statement needs landscape results (glm-laml-landscape lane).
-7. **x1+cc(x2) tail law.** The observed q ≈ 1 matches a log-divergent or pre-asymptotic ray. Whether the cyclic-cubic null space produces an unbounded-below REML ray (which would be a model-specification error, not an optimizer error) is not determined **[open]**.
+7. **x1+cyclic(x2) tail law.** The observed q ≈ 1 matches a log-divergent or pre-asymptotic ray. Whether the cyclic-cubic null space produces an unbounded-below REML ray (which would be a model-specification error, not an optimizer error) is not determined **[open]**.

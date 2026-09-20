@@ -1466,7 +1466,7 @@ pub(crate) fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
 /// non-associativity lets a reordering perturb the Gram by an ulp. The reparam
 /// eigendecomposition fed by this Gram is near-degenerate (the thin-plate radial
 /// spectrum has a long low-curvature tail), so that ulp rotates its eigenvectors
-/// and makes the fitted `s(x, bs="tp")` basis — and hence the curve — depend on
+/// and makes the fitted `s(x, bs="tps")` basis — and hence the curve — depend on
 /// row order. That is the residual ~2e-7 row-permutation drift owed under
 /// gam#1378 that survives the value-anchored knot set and centroid seed (the
 /// local `bs="cr"/"ps"` bases never form this data-metric radial Gram, so they
@@ -1529,7 +1529,9 @@ fn thin_plate_retained_radial_indices(evals: &Array1<f64>) -> Vec<usize> {
     // Numerical-rank floor: anything at or below `K·ε·λ_max` is roundoff dust
     // from the gauge restriction, not a real bending mode. Everything above it
     // is genuine curvature and is kept.
-    let num_floor = (k as f64) * f64::EPSILON * max_eval;
+    let num_floor = gam_linalg::roundoff::symmetric_spectrum_rounding_band(
+        &evals.to_vec(),
+    );
     evals
         .iter()
         .enumerate()
@@ -1900,7 +1902,7 @@ fn select_thin_plate_knot_rows(
     // points that are symmetric about the mean (the common 1-D case), so the
     // `dist2_to_centroid` comparisons below stop reducing to the
     // value-lexicographic tie-break and the seed — and hence the whole knot set
-    // — flips with row order. That is the residual ~1e-7 `s(x, bs="tp")`
+    // — flips with row order. That is the residual ~1e-7 `s(x, bs="tps")`
     // row-permutation drift owed under gam#1378 (value-anchored `bs="cr"/"ps"`
     // stayed bit-stable because they never seed off this centroid). Sorting the
     // column values yields the identical addition sequence for every permutation
@@ -2762,8 +2764,11 @@ pub fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     let m_psi_constrained = symmetrize_penalty(&z_kernel.t().dot(&omega_psi).dot(&z_kernel));
     let m_pp_constrained = symmetrize_penalty(&z_kernel.t().dot(&omega_psi_psi).dot(&z_kernel));
 
-    // 3) Get V (frozen or fresh from eigh).
-    let (v, lambda) = if let Some(frozen) = spec.radial_reparam.as_ref() {
+    // 3) Get V (frozen or fresh from eigh). A fresh eigh also reports the
+    //    rounding band of its spectrum: two retained eigenvalues whose gap lies
+    //    within twice that band (each carries up to one band of error) are an
+    //    unresolved degenerate pair, not a perturbation-theory denominator.
+    let (v, lambda, spectrum_band) = if let Some(frozen) = spec.radial_reparam.as_ref() {
         if frozen.nrows() != constrained_kernel_cols {
             crate::bail_dim_basis!(
                 "thin-plate frozen radial reparam shape {:?} does not match constrained radial dimension {}",
@@ -2777,9 +2782,9 @@ pub fn build_thin_plate_penalty_psi_derivativeswithworkspace(
         for i in 0..v_owned.ncols() {
             evals[i] = lambda_diag[[i, i]].max(0.0);
         }
-        (v_owned, evals)
+        (v_owned, evals, 0.0)
     } else if constrained_kernel_cols == 0 {
-        (Array2::<f64>::zeros((0, 0)), Array1::<f64>::zeros(0))
+        (Array2::<f64>::zeros((0, 0)), Array1::<f64>::zeros(0), 0.0)
     } else {
         let (mut evals, evecs) =
             FaerEigh::eigh(&m_constrained, Side::Lower).map_err(BasisError::LinalgError)?;
@@ -2789,7 +2794,10 @@ pub fn build_thin_plate_penalty_psi_derivativeswithworkspace(
             }
         }
         let keep = thin_plate_retained_radial_indices(&evals);
-        (evecs.select(Axis(1), &keep), evals.select(Axis(0), &keep))
+        let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(
+            &evals.to_vec(),
+        );
+        (evecs.select(Axis(1), &keep), evals.select(Axis(0), &keep), band)
     };
     let kernel_cols = lambda.len();
     let total_cols = kernel_cols + poly_cols;
@@ -2846,7 +2854,7 @@ pub fn build_thin_plate_penalty_psi_derivativeswithworkspace(
                     continue;
                 }
                 let denom = lambda[i] - lambda[k_idx];
-                if denom.abs() > 1e-14 {
+                if denom.abs() > 2.0 * spectrum_band {
                     acc += 2.0 * a_psi[[i, k_idx]].powi(2) / denom;
                 }
             }
@@ -4057,7 +4065,7 @@ mod retained_radial_indices_tests {
     use ndarray::Array1;
 
     // The eigenvalue spectra below were captured from the live thin-plate
-    // builder (`s(x, bs="tp", k=20)`) on the #1271 regression data. They lock
+    // builder (`s(x, bs="tps", k=20)`) on the #1271 regression data. They lock
     // in the derived selection behaviour: keep EVERY numerically-real bending
     // mode (matching mgcv, which truncates only at the numerical-rank floor),
     // dropping only sub-floor roundoff dust — no tuned magnitude cutoff.

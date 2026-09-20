@@ -375,12 +375,16 @@ on its own axis:
    estimated law at the closed-form intercept, and its sampling standard
    error `se` under that law. `r² − 2·se²` estimates without bias how much
    less accurate the closed form is than the estimated law's own anchor on
-   that row, so the fit keeps the closed form when
-   `D̂ = Σ w (r² − 2·se²)/(π(1−π)) ≤ 0` and records the certificate
-   (`estimated-gaussian-adequate`), and otherwise re-solves on the estimated
-   law from the closed-form coefficients (`estimated-global-by-residual`).
-   Nothing is tuned; on an exactly Gaussian score about 16% of fits
-   re-solve, which costs speed and not expected accuracy;
+   that row, and the fit records `D̂ = Σ w (r² − 2·se²)/(π(1−π))`. It keeps
+   the closed form (`estimated-gaussian-adequate`) unless the residual
+   energy `Σ w r²/(π(1−π))` is beyond what the estimated law's own sampling
+   error gives an exactly Gaussian score: its exact null law is a weighted
+   chi-square over the anchors' shared noise, and the closed form is kept
+   unless the energy is in that law's upper 5%. Otherwise the fit re-solves on
+   the estimated law from the closed-form coefficients
+   (`estimated-global-by-residual`). On exactly Gaussian scores the
+   certificate fired on 1 of 40 fits at 2 000 rows and 3 of 40 at 100 000
+   (design 5%), where the sign of `D̂` fired on 4 and 8 of the same 40;
 3. if none moves and the score fails that check, one finite law of the
    score — a 65-node equal-mass compression that keeps the score's own
    location and scale;
@@ -392,6 +396,19 @@ on its own axis:
    being one of the four nearest, and the pooled share keeps the mixture
    defined where contexts tie, so the law, the anchor and the prediction are
    continuous in the covariates everywhere.
+
+   Where a moment moves the law is chosen among nested arms, simplest first:
+   the Gaussian law, the location-scale law `m(a) + √v(a)·ε` with a Gaussian
+   `ε`, the same with `ε` on its estimated law, and the local laws. An arm
+   that anchors on a Gaussian residual (the score for the Gaussian arm, `ε`
+   for the location-scale Gaussian arm) is a candidate only if that residual
+   passes the standard-normal adequacy screen. The fit is solved on the
+   simplest candidate of the location-scale structure, and at the converged
+   fit the certificate takes the simplest candidate whose cross-fitted
+   excess anchoring loss is within one paired standard error of the lowest
+   candidate's, re-solving on it when it is another arm. A heavy-tailed or
+   skewed `ε` therefore anchors on its estimated law even where the
+   cross-fitted loss does not resolve the Gaussian arm from it.
 
 The conditional test comes first because a score can be exactly `N(0, 1)`
 overall while every conditional law `z | a` is shifted. One pooled law then
@@ -602,9 +619,10 @@ Two limits are worth stating plainly:
   When every score passes the screen, the closed form at `Σ(a)` is
   provisional, and the converged fit certifies it by `D̂` under the joint
   law, each row's residual `Σ_m w_m Φ(−(q·√(1 + rᵀΣ(a)r) + rᵀu_m)) − Φ(−q)`
-  on the row's transported nodes. `D̂ > 0` re-solves on the joint law; where
-  nothing can re-solve on it, as with a slope shared across the scores, the
-  fit keeps the closed form, recorded `gaussian-uncertified` with `D̂`.
+  on the row's transported nodes. Where the certificate fires, the fit
+  re-solves on the joint law; where nothing can re-solve on it, as with a
+  slope shared across the scores, it keeps the closed form, recorded
+  `gaussian-uncertified` with the certificate.
 
 ## Residual genetic repair: reading what the score discarded
 
@@ -788,7 +806,12 @@ are `--offset-column` and `--noise-offset-column`.
 Survival marginal-slope supports no frailty, or
 `frailty_kind="gaussian-shift"` with a fixed `frailty_sd`.
 `"hazard-multiplier"` and a learnable gaussian-shift sigma are rejected
-at fit time.
+at fit time. With the default slope (an intercept in every slope surface and
+no offset, or a constant one), a learnable sigma is rejected because the
+likelihood does not identify it: it reads the frailty only as the observed
+slope `s(σ)·g`, `s(σ) = 1/√(1+σ²)`, so rescaling the slope undoes any change of
+σ and the data cannot tell two values apart (gam#2938). A fixed `frailty_sd`
+only rescales the reported slope.
 
 ```python
 import numpy as np

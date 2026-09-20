@@ -59,6 +59,16 @@ pub const ESCALATE_K_HAT: f64 = 0.7;
 pub const PLUG_IN_ADEQUATE_K_HAT: f64 = 0.5;
 
 impl RhoProposalAdequacy {
+    /// The grade of a weight vector's upper tail. A flat tail has no tail to
+    /// be heavy: its weights are bounded by the threshold they all equal, so it
+    /// grades plug-in adequate without a shape (#3202).
+    pub fn from_tail_shape(shape: WeightTailShape) -> Self {
+        match shape {
+            WeightTailShape::Pareto(k_hat) => Self::from_k_hat(k_hat),
+            WeightTailShape::Flat => RhoProposalAdequacy::PlugInAdequate,
+        }
+    }
+
     pub fn from_k_hat(k_hat: f64) -> Self {
         if !k_hat.is_finite() || k_hat > ESCALATE_K_HAT {
             RhoProposalAdequacy::Escalate
@@ -70,18 +80,73 @@ impl RhoProposalAdequacy {
     }
 }
 
+/// Upper-tail shape of a vector of importance weights (#3202).
+///
+/// The weights' largest `tail_count(M)` values either carry a tail the
+/// generalized Pareto can be fitted to, or all equal the largest weight below
+/// them. The second case is not a tail with a shape of `−∞`: it has no tail at
+/// all, and it arises exactly when the proposal is the target (every weight is
+/// the same number). It is its own variant because the grade must read it as
+/// adequate while `from_k_hat` reads a non-finite shape as `Escalate`, and a
+/// non-finite float has no JSON form.
+///
+/// On the wire a fitted shape is its number, as written before the flat case
+/// was typed, and the flat case is the string `"Flat"`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(from = "WeightTailShapeWire", into = "WeightTailShapeWire")]
+pub enum WeightTailShape {
+    /// The fitted generalized-Pareto shape `k̂` of the upper tail.
+    Pareto(f64),
+    /// Every tail weight equals the threshold weight bit for bit.
+    Flat,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum WeightTailShapeWire {
+    Pareto(f64),
+    Absent(AbsentTail),
+}
+
+#[derive(Serialize, Deserialize)]
+enum AbsentTail {
+    Flat,
+}
+
+impl From<WeightTailShapeWire> for WeightTailShape {
+    fn from(wire: WeightTailShapeWire) -> Self {
+        match wire {
+            WeightTailShapeWire::Pareto(k_hat) => WeightTailShape::Pareto(k_hat),
+            WeightTailShapeWire::Absent(AbsentTail::Flat) => WeightTailShape::Flat,
+        }
+    }
+}
+
+impl From<WeightTailShape> for WeightTailShapeWire {
+    fn from(shape: WeightTailShape) -> Self {
+        match shape {
+            WeightTailShape::Pareto(k_hat) => WeightTailShapeWire::Pareto(k_hat),
+            WeightTailShape::Flat => WeightTailShapeWire::Absent(AbsentTail::Flat),
+        }
+    }
+}
+
 /// The Tier-0 `ρ`-uncertainty adequacy diagnostic for a fit: the PSIS tail
 /// shape of the Laplace proposal's importance weights and the grade read off it.
 ///
-/// Every field persists with the fit, so `k_hat` and `effective_sample_size`
-/// are finite by construction: the producer refuses a non-finite tail shape
-/// ([`RhoPosteriorRefusal::TailShapeNotFinite`]) and weights that do not
-/// normalize ([`RhoPosteriorRefusal::SmoothedWeightsNotNormalizable`]).
+/// Every field persists with the fit, so a fitted `k̂` and
+/// `effective_sample_size` are finite by construction: the producer refuses a
+/// non-finite tail shape ([`RhoPosteriorRefusal::TailShapeNotFinite`]) and
+/// weights that do not normalize
+/// ([`RhoPosteriorRefusal::SmoothedWeightsNotNormalizable`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RhoPosteriorAdequacy {
-    /// Pareto tail-shape of the importance weights — the reliability diagnostic.
-    pub k_hat: f64,
-    /// The adequacy grade read off `k_hat`. `certificate` is its legacy key:
+    /// Upper-tail shape of the importance weights — the reliability
+    /// diagnostic. Its key is `k_hat`, the name it had while only a fitted
+    /// shape could be written.
+    #[serde(rename = "k_hat")]
+    pub tail_shape: WeightTailShape,
+    /// The adequacy grade read off `tail_shape`. `certificate` is its legacy key:
     /// accepted when reading a payload written before #2946 T2, never written.
     #[serde(alias = "certificate")]
     pub adequacy: RhoProposalAdequacy,
@@ -104,17 +169,22 @@ pub enum RhoPosteriorRefusal {
     /// The outer Hessian has no strict Cholesky factor, so there is no Gaussian
     /// proposal with covariance `H_ρ⁻¹`.
     HessianNotPositiveDefinite { detail: String },
-    /// The criterion is infeasible at `ρ̂`.
-    CriterionInfeasibleAtRhoHat,
+    /// The criterion could not be evaluated at `ρ̂`, and why.
+    CriterionUnavailableAtRhoHat { detail: String },
     /// The criterion at `ρ̂` is not finite.
     CriterionNotFiniteAtRhoHat,
-    /// No proposal draw has a finite criterion.
-    NoFiniteProposal,
-    /// Too few finite importance weights for the Pareto tail fit.
-    TooFewFiniteWeights,
+    /// The criterion could not be evaluated at proposal draw `draw`, and why.
+    /// Every draw carries mass, so one the criterion cannot value refuses the
+    /// diagnostic rather than being dropped from it.
+    CriterionUnavailableAtDraw { draw: usize, detail: String },
+    /// The criterion at proposal draw `draw` is not finite.
+    CriterionNotFiniteAtDraw { draw: usize },
+    /// The Pareto tail fit of the importance weights failed.
+    TailFitUnavailable,
     /// The Pareto tail fit returned a non-finite shape, which grades nothing.
     TailShapeNotFinite,
-    /// The smoothed importance weights do not sum to a positive finite total.
+    /// The smoothed importance weights have no positive finite largest weight
+    /// to normalize by.
     SmoothedWeightsNotNormalizable,
 }
 
@@ -127,15 +197,22 @@ impl fmt::Display for RhoPosteriorRefusal {
             Self::HessianNotPositiveDefinite { detail } => {
                 write!(f, "outer Hessian is not positive definite: {detail}")
             }
-            Self::CriterionInfeasibleAtRhoHat => f.write_str("criterion is infeasible at rho_hat"),
+            Self::CriterionUnavailableAtRhoHat { detail } => {
+                write!(f, "criterion is unavailable at rho_hat: {detail}")
+            }
             Self::CriterionNotFiniteAtRhoHat => f.write_str("criterion at rho_hat is not finite"),
-            Self::NoFiniteProposal => f.write_str("no proposal draw has a finite criterion"),
-            Self::TooFewFiniteWeights => {
-                f.write_str("too few finite importance weights for the Pareto tail fit")
+            Self::CriterionUnavailableAtDraw { draw, detail } => {
+                write!(f, "criterion is unavailable at proposal draw {draw}: {detail}")
+            }
+            Self::CriterionNotFiniteAtDraw { draw } => {
+                write!(f, "criterion at proposal draw {draw} is not finite")
+            }
+            Self::TailFitUnavailable => {
+                f.write_str("the Pareto tail fit of the importance weights failed")
             }
             Self::TailShapeNotFinite => f.write_str("the Pareto tail shape is not finite"),
             Self::SmoothedWeightsNotNormalizable => {
-                f.write_str("smoothed importance weights do not sum to a positive finite total")
+                f.write_str("smoothed importance weights have no positive finite largest weight")
             }
         }
     }
@@ -213,8 +290,7 @@ pub struct RhoMixtureNode {
     pub weight: f64,
     /// Normalized log node probability.
     pub log_weight: f64,
-    /// Exact profiled criterion value at the node (`+∞` for infeasible nodes,
-    /// which carry zero weight).
+    /// Exact profiled criterion value at the node.
     pub cost: f64,
 }
 
@@ -255,18 +331,20 @@ pub struct RhoPosteriorSamples {
 }
 
 /// The auto-selected escalation outcome when the Tier-0 grade reads
-/// [`RhoProposalAdequacy::Escalate`] (#938): Tier 1 (deterministic quadrature) for
-/// `K ≤ 4`, Tier 2 (NUTS over `ρ`) for `K ≤ 16`, and an HONEST report that
-/// escalation is unavailable beyond that — never a silently-degraded answer.
+/// [`RhoProposalAdequacy::Escalate`] (#938): Tier 1 (deterministic quadrature)
+/// when its node grid costs no more criterion evaluations than the fewest a
+/// converged Tier-2 NUTS run needs, Tier 2 (NUTS over `ρ`) otherwise, and an
+/// HONEST report when the chosen tier cannot run — never a silently-degraded
+/// answer.
 #[derive(Debug, Clone)]
 pub enum RhoPosteriorEscalation {
-    /// Tier 1: deterministic Gauss-Hermite mixture (`K ≤ 4`).
+    /// Tier 1: deterministic Gauss-Hermite mixture (the cheaper tier).
     Quadrature(RhoPosteriorMixture),
-    /// Tier 2: NUTS draws with the exact profiled gradient (`5 ≤ K ≤ 16`).
+    /// Tier 2: NUTS draws with the exact profiled gradient (the cheaper tier).
     Nuts(RhoPosteriorSamples),
-    /// Escalation could not run (dimension beyond the NUTS cap, or the chosen
-    /// tier failed); intervals remain plug-in + first-order corrected, and the
-    /// fit reports WHY.
+    /// Escalation could not run (no `ρ` to escalate over, or the chosen tier
+    /// failed); intervals remain plug-in + first-order corrected, and the fit
+    /// reports WHY.
     Unavailable { n_params: usize, reason: String },
 }
 
@@ -291,27 +369,30 @@ pub enum RhoPosteriorEscalation {
 /// leaving the plug-in + first-order intervals.
 pub trait RhoPosteriorEscalator: Send + Sync {
     /// Tier-0 PSIS `ρ`-adequacy diagnostic. `criterion` evaluates the outer criterion
-    /// `−log π(ρ|y)` at a trial `ρ` (`None` for infeasible `ρ`). Returns
+    /// `−log π(ρ|y)` at any `ρ`, or says why it cannot; a draw it cannot value
+    /// refuses the diagnostic, since dropping it would drop its mass. Returns
     /// `Ok(None)` when there is nothing to grade (`K = 0`) and the typed
     /// [`RhoPosteriorRefusal`] when the diagnostic cannot be formed.
     fn rho_posterior_adequacy(
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
-        criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
-        n_samples: Option<usize>,
+        criterion: &dyn Fn(&Array1<f64>) -> Result<f64, String>,
     ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal>;
 
     /// Auto-selected escalation (Tier-1 quadrature / Tier-2 NUTS / honest
-    /// `Unavailable`). `criterion` returns the exact profiled criterion value,
-    /// `criterion_and_grad` the value plus the exact LAML `ρ`-gradient; both are
-    /// `None` for infeasible `ρ`.
+    /// `Unavailable`). `criterion` returns the negative log of the sampled
+    /// density, `criterion_and_grad` the value plus its exact `ρ`-gradient;
+    /// either failing at a node or a sampler position makes the tier
+    /// `Unavailable` with that reason. `mode` and `hessian` are that density's
+    /// own Laplace geometry (#3293): the tiers centre and whiten by them.
     fn escalate_rho_posterior(
         &self,
-        rho_hat: &Array1<f64>,
-        outer_hessian: &Array2<f64>,
-        criterion: &mut dyn FnMut(&Array1<f64>) -> Option<f64>,
-        criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send),
+        mode: &Array1<f64>,
+        hessian: &Array2<f64>,
+        criterion: &mut dyn FnMut(&Array1<f64>) -> Result<f64, String>,
+        criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String>
+                  + Send),
     ) -> RhoPosteriorEscalation;
 }
 
@@ -372,6 +453,29 @@ mod tests {
         assert_eq!(RhoProposalAdequacy::from_k_hat(10.0), RhoProposalAdequacy::Escalate);
     }
 
+    /// #3202: a flat tail is no tail, so it grades adequate, and it is written
+    /// as its own token, not as a non-finite shape that JSON cannot carry and
+    /// `from_k_hat` would read as `Escalate`.
+    #[test]
+    fn flat_tail_grades_plug_in_adequate_and_writes_its_own_token_3202() {
+        assert_eq!(
+            RhoProposalAdequacy::from_tail_shape(WeightTailShape::Flat),
+            RhoProposalAdequacy::PlugInAdequate
+        );
+        assert_eq!(
+            RhoProposalAdequacy::from_tail_shape(WeightTailShape::Pareto(0.9)),
+            RhoProposalAdequacy::Escalate
+        );
+        assert_eq!(
+            serde_json::to_string(&WeightTailShape::Flat).expect("shape serializes"),
+            r#""Flat""#
+        );
+        assert_eq!(
+            serde_json::to_string(&WeightTailShape::Pareto(0.25)).expect("shape serializes"),
+            "0.25"
+        );
+    }
+
     #[test]
     fn from_k_hat_nan_is_escalate() {
         assert_eq!(
@@ -411,10 +515,16 @@ mod tests {
                 detail: "Cholesky(NonPositivePivot { index: 0 })".to_string(),
             }),
             RhoPosteriorOutcome::Assessed(RhoPosteriorAdequacy {
-                k_hat: 0.25,
+                tail_shape: WeightTailShape::Pareto(0.25),
                 adequacy: RhoProposalAdequacy::PlugInAdequate,
                 n_samples: 64,
                 effective_sample_size: 61.5,
+            }),
+            RhoPosteriorOutcome::Assessed(RhoPosteriorAdequacy {
+                tail_shape: WeightTailShape::Flat,
+                adequacy: RhoProposalAdequacy::PlugInAdequate,
+                n_samples: 64,
+                effective_sample_size: 64.0,
             }),
         ];
         for outcome in outcomes {
@@ -434,7 +544,7 @@ mod tests {
     #[test]
     fn assessed_outcome_writes_adequacy_tokens_not_certificate_words_2946() {
         let json = serde_json::to_string(&RhoPosteriorOutcome::Assessed(RhoPosteriorAdequacy {
-            k_hat: 0.25,
+            tail_shape: WeightTailShape::Pareto(0.25),
             adequacy: RhoProposalAdequacy::PlugInAdequate,
             n_samples: 64,
             effective_sample_size: 61.5,
@@ -465,7 +575,7 @@ mod tests {
         assert_eq!(
             read,
             RhoPosteriorOutcome::Assessed(RhoPosteriorAdequacy {
-                k_hat: 0.25,
+                tail_shape: WeightTailShape::Pareto(0.25),
                 adequacy: RhoProposalAdequacy::PlugInAdequate,
                 n_samples: 64,
                 effective_sample_size: 61.5,

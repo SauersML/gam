@@ -15,45 +15,27 @@
 //! no-op stub.
 
 use gam_gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
-use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use crate::gpu_kernels::pirls_row::{PirlsRowFamily, PirlsRowRoute};
+use gam_problem::LikelihoodSpec;
 
 /// Result of mapping the engine-level `(ResponseFamily, InverseLink)` pair
 /// to the six built-in JIT-cached families the Stage 3.3 PIRLS loop can
 /// evaluate without going through a Level-B raw-body NVRTC compile.
 ///
-/// `None` means the fit must stay on the CPU LM loop: either the response /
-/// link combination is one of the engine's custom variants (Sas, Mixture,
-/// LatentCLogLog, BetaLogistic, Tweedie, NegativeBinomial, Beta,
-/// RoystonParmar) for which Stage 3.3 has no built-in row kernel, or the
-/// response is supported but the link does not match a built-in pairing
-/// (e.g. Poisson with Identity link).
+/// `None` means the fit must stay on the CPU LM loop, as decided by
+/// [`PirlsRowRoute::for_spec`]: a generic variance × link cell (composed on
+/// the CPU by the exact EDM row kernel), or a custom / blended likelihood
+/// (Sas, Mixture, LatentCLogLog, BetaLogistic, Tweedie, NegativeBinomial,
+/// Beta, RoystonParmar) with no built-in device row kernel.
 pub(crate) fn pirls_loop_family_for(spec: &LikelihoodSpec) -> Option<PirlsLoopFamilyKind> {
-    let link = match &spec.link {
-        InverseLink::Standard(lf) => *lf,
-        // Custom / blended inverse links have no Stage 3.3 row kernel; they
-        // require Stage 6 Level B JIT, which the CPU LM loop calls through
-        // different machinery.
-        _ => return None,
-    };
-    match (&spec.response, link) {
-        (ResponseFamily::Binomial, StandardLink::Logit) => {
-            Some(PirlsLoopFamilyKind::BernoulliLogit)
-        }
-        (ResponseFamily::Binomial, StandardLink::Probit) => {
-            Some(PirlsLoopFamilyKind::BernoulliProbit)
-        }
-        (ResponseFamily::Binomial, StandardLink::CLogLog) => {
-            Some(PirlsLoopFamilyKind::BernoulliCLogLog)
-        }
-        (ResponseFamily::Poisson, StandardLink::Log) => Some(PirlsLoopFamilyKind::PoissonLog),
-        (ResponseFamily::Gaussian, StandardLink::Identity) => {
-            Some(PirlsLoopFamilyKind::GaussianIdentity)
-        }
-        (ResponseFamily::Gamma, StandardLink::Log) => Some(PirlsLoopFamilyKind::GammaLog),
-        // Every other pairing is either not in the JIT-cache set or is a
-        // canonical-pair the row kernels do not currently support.
-        _ => None,
-    }
+    Some(match PirlsRowRoute::for_spec(spec).device_family()? {
+        PirlsRowFamily::BernoulliLogit => PirlsLoopFamilyKind::BernoulliLogit,
+        PirlsRowFamily::BernoulliProbit => PirlsLoopFamilyKind::BernoulliProbit,
+        PirlsRowFamily::BernoulliCLogLog => PirlsLoopFamilyKind::BernoulliCLogLog,
+        PirlsRowFamily::PoissonLog => PirlsLoopFamilyKind::PoissonLog,
+        PirlsRowFamily::GaussianIdentity => PirlsLoopFamilyKind::GaussianIdentity,
+        PirlsRowFamily::GammaLog => PirlsLoopFamilyKind::GammaLog,
+    })
 }
 
 /// Curvature surface the GPU loop should use given the family mapping and the
@@ -104,7 +86,7 @@ mod linux_impl {
         ExportedLaplaceCurvature, FirthDiagnostics, GaussianFrozenRows, HessianCurvatureKind,
         PirlsCoordinateFrame, PirlsResult, PirlsStatus, WorkingModelPirlsResult, WorkingState,
         compute_observed_hessian_curvature_arrays, computeworkingweight_derivatives_from_eta,
-        pirls_data_log_kernel_from_eta,
+        penalized_gradient_natural_scale, pirls_data_log_kernel_from_eta,
     };
     use gam_gpu::device_runtime::GpuRuntime;
     use gam_gpu::gpu_error::GpuError;
@@ -532,9 +514,23 @@ mod linux_impl {
         gradient_total -= &input.linear_shift;
         gradient_total -= &xt_grad_eta;
         let lastgradient_norm = gradient_total.dot(&gradient_total).sqrt();
-        let score_norm = xt_grad_eta.dot(&xt_grad_eta).sqrt();
-        let s_beta_norm = s_beta.dot(&s_beta).sqrt();
-        let gradient_natural_scale = score_norm + s_beta_norm;
+        // The η-space score is `w_solver ⊙ (z − η)`, so `−Xᵀ·score_eta` is the
+        // difference of `XᵀWη` and `XᵀWz`; the natural scale is built from
+        // those operands, which do not cancel at the optimum (#3339).
+        let to_transformed = |row_vector: Array1<f64>| {
+            let xo_row = input.x_original.t().dot(&row_vector);
+            if let Some(qs) = input.qs {
+                qs.t().dot(&xo_row)
+            } else {
+                xo_row
+            }
+        };
+        let xt_w_eta = to_transformed(&final_w_solver * &final_eta);
+        let xt_w_z = to_transformed(&final_w_solver * &finalz);
+        let mut shifted_s_beta = s_beta.clone();
+        shifted_s_beta -= &input.linear_shift;
+        let gradient_natural_scale =
+            penalized_gradient_natural_scale(&xt_w_eta, &xt_w_z, &shifted_s_beta);
 
         // Penalty term = βᵀSβ.
         let penalty_term = beta.dot(&s_beta);
@@ -556,6 +552,7 @@ mod linux_impl {
             Some(compute_constraint_kkt_diagnostics(
                 &beta,
                 &gradient_total,
+                gradient_natural_scale,
                 lin,
             ))
         } else {
@@ -812,20 +809,28 @@ mod linux_impl {
         // cached Gram statistics and every row array is an O(1) `ArcArray1`
         // clone. One optimisation, both routes.
         let frozen = input.frozen_rows.clone();
-        let (gradient_data, rows_eta, rows_mu, rows_z, rows_weights) = if let Some(bundle) =
+        // Original-basis coefficient vectors to the transformed basis.
+        let to_transformed = |v: Array1<f64>| -> Array1<f64> {
+            if let Some(qs_v) = input.qs {
+                qs_v.t().dot(&v)
+            } else {
+                v
+            }
+        };
+        let (gradient_data, score_operands, rows_eta, rows_mu, rows_z, rows_weights) = if let Some(bundle) =
             frozen.as_ref()
         {
             // grad = Qsᵀ(XᵀWX·Qsβ − XᵀWy), identical to the row form by the
             // normal equations, evaluated entirely in coefficient space.
-            let mut grad_orig = input.xtwx_orig.dot(&qbeta);
+            let gram_qbeta = input.xtwx_orig.dot(&qbeta);
+            let mut grad_orig = gram_qbeta.clone();
             grad_orig -= &input.xtwy_orig;
-            let grad: Array1<f64> = if let Some(qs_v) = input.qs {
-                qs_v.t().dot(&grad_orig)
-            } else {
-                grad_orig
-            };
             (
-                grad,
+                to_transformed(grad_orig),
+                [
+                    to_transformed(gram_qbeta),
+                    to_transformed(input.xtwy_orig.to_owned()),
+                ],
                 bundle.eta.clone(),
                 bundle.eta.clone(),
                 bundle.z.clone(),
@@ -845,22 +850,29 @@ mod linux_impl {
             let xt_wr_orig = input
                 .x_original
                 .transpose_vector_multiply(&weighted_residual);
-            // Rotate to transformed coords: QsᵀXᵀWr.
-            let grad: Array1<f64> = if let Some(qs_v) = input.qs {
-                qs_v.t().dot(&xt_wr_orig)
-            } else {
-                xt_wr_orig
-            };
+            // The score's operands XᵀWμ and XᵀWy, whose difference is XᵀWr.
+            let score_operands = [
+                to_transformed(
+                    input
+                        .x_original
+                        .transpose_vector_multiply(&(&finalmu * &input.priorweights)),
+                ),
+                to_transformed(
+                    input
+                        .x_original
+                        .transpose_vector_multiply(&(&finalz * &input.priorweights)),
+                ),
+            ];
             (
-                grad,
+                // Rotate to transformed coords: QsᵀXᵀWr.
+                to_transformed(xt_wr_orig),
+                score_operands,
                 eta.into_shared(),
                 finalmu.into_shared(),
                 finalz.into_shared(),
                 input.priorweights.to_owned().into_shared(),
             )
         };
-        let score_norm = array1_l2_norm(&gradient_data);
-
         // s_beta = S·β − linear_shift.
         let mut s_beta: Array1<f64> = Array1::zeros(p);
         for i in 0..p {
@@ -870,7 +882,8 @@ mod linux_impl {
             }
             s_beta[i] = acc - input.linear_shift[i];
         }
-        let s_beta_norm = array1_l2_norm(&s_beta);
+        let [xt_w_eta, xt_w_z] = &score_operands;
+        let gradient_natural_scale = penalized_gradient_natural_scale(xt_w_eta, xt_w_z, &s_beta);
 
         let mut gradient = gradient_data.clone();
         gradient += &s_beta;
@@ -949,11 +962,16 @@ mod linux_impl {
             penalty_term,
             firth: FirthDiagnostics::Inactive,
             hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: score_norm + s_beta_norm,
+            gradient_natural_scale,
         };
 
         let constraint_kkt_val = if let Some(lin) = input.linear_constraints.as_ref() {
-            Some(compute_constraint_kkt_diagnostics(&beta, &gradient, lin))
+            Some(compute_constraint_kkt_diagnostics(
+                &beta,
+                &gradient,
+                gradient_natural_scale,
+                lin,
+            ))
         } else {
             None
         };
@@ -1045,7 +1063,7 @@ mod linux_impl {
             iteration: 1,
             max_abs_eta,
             lastgradient_norm: gradient_norm,
-            gradient_natural_scale: score_norm + s_beta_norm,
+            gradient_natural_scale,
             penalized_gradient_transformed: working_summary.state.gradient.clone(),
             last_deviance_change: 0.0,
             last_step_halving: 0,
@@ -1080,7 +1098,7 @@ pub(crate) use linux_impl::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_problem::{LikelihoodSpec, MixtureLinkState};
+    use gam_problem::{InverseLink, LikelihoodSpec, MixtureLinkState, ResponseFamily, StandardLink};
     use ndarray::Array1;
 
     fn dummy_mixture_state() -> MixtureLinkState {
@@ -1166,6 +1184,38 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn every_generic_variance_link_cell_routes_to_the_cpu_edm_kernel() {
+        let mut generic_cells = 0;
+        for response in [
+            ResponseFamily::Gaussian,
+            ResponseFamily::Poisson,
+            ResponseFamily::Gamma,
+            ResponseFamily::InverseGaussian,
+            ResponseFamily::Binomial,
+        ] {
+            for link in gam_problem::LinkFunction::ALL {
+                let Ok(standard) = StandardLink::try_from(link) else {
+                    continue;
+                };
+                let spec = LikelihoodSpec::new(response.clone(), InverseLink::Standard(standard));
+                let route = PirlsRowRoute::for_spec(&spec);
+                match gam_problem::GenericEdmCell::classify(&spec.response, &spec.link) {
+                    Some(cell) => {
+                        generic_cells += 1;
+                        assert_eq!(route, PirlsRowRoute::CpuGenericEdm(cell), "for {spec:?}");
+                        assert_eq!(pirls_loop_family_for(&spec), None, "for {spec:?}");
+                    }
+                    None => assert!(
+                        !matches!(route, PirlsRowRoute::CpuGenericEdm(_)),
+                        "{spec:?} is not a generic cell"
+                    ),
+                }
+            }
+        }
+        assert_eq!(generic_cells, 14);
     }
 
     #[test]

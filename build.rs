@@ -207,6 +207,13 @@ fn main() {
     let mut marginal_slope_tower_seed_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_marginal_slope_tower_seeds(&manifest_dir, &mut marginal_slope_tower_seed_offenders);
 
+    // gam#2967, the split-level rule: a Rayon split-level primitive calls the
+    // closures its caller hands it only through `#[inline(never)]` owners, so no
+    // split frame or join recursion frame carries a caller's row program
+    // (`RAYON_SPLIT_LEVEL_RULES`).
+    let mut rayon_split_level_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_rayon_split_level_leaf_calls(&manifest_dir, &mut rayon_split_level_offenders);
+
     // Bare `const <ident>: bool = <literal>;` items are dead-by-construction
     // guards (rustc's `dead_code` cannot prove unreachability through them)
     // or constant truths that should not exist. Real toggles belong in
@@ -520,6 +527,20 @@ fn main() {
                     through the owner)"
                 .to_string(),
             rows: marginal_slope_tower_seed_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !rayon_split_level_offenders.is_empty() {
+        sections.push(Section {
+            title: "Rayon split-level primitive calls a caller's closure in its own body, or a \
+                    leaf owner lost `#[inline(never)]` (gam#2967: the caller's row program then \
+                    sits in every split or join recursion frame, one per nested steal; call it \
+                    through the owner)"
+                .to_string(),
+            rows: rayon_split_level_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -1152,14 +1173,41 @@ fn manifest_const_string(source: &str, key: &str) -> std::io::Result<String> {
     ))
 }
 
+/// The gamfit release line: pyproject.toml's `[tool.gamfit] version`.
+///
+/// `[project]` declares its version dynamic, because the build backend
+/// (`scripts/gamfit_version.py`) derives each build's version from the commit
+/// it is built from, starting at this line (gam#3157). A `release:` commit
+/// sets it together with the two copies checked below.
 fn read_gamfit_project_version(manifest_dir: &Path) -> std::io::Result<String> {
     let path = manifest_dir.join("pyproject.toml");
     let content = fs::read_to_string(&path)?;
-    read_toml_version_line(&content).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "pyproject.toml is missing a top-level version",
-        )
+    toml_table_lines(&content, "tool.gamfit")
+        .find_map(|(_, line)| read_quoted_value_after_prefix(line.trim(), "version = "))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pyproject.toml has no [tool.gamfit] version (the gamfit release line)",
+            )
+        })
+}
+
+/// The lines of one `[table]` of a TOML file, with their indexes: from its
+/// header to the next table or array-of-tables header.
+fn toml_table_lines<'a>(
+    content: &'a str,
+    table: &str,
+) -> impl Iterator<Item = (usize, &'a str)> + use<'a> {
+    let header = format!("[{table}]");
+    let mut inside = false;
+    content.lines().enumerate().filter(move |(_, line)| {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            inside = trimmed == header;
+            return false;
+        }
+        inside
     })
 }
 
@@ -1174,7 +1222,8 @@ fn scan_for_non_latest_gamfit_versions(
         latest,
         offenders,
     );
-    require_uv_lock_gamfit_version(root, latest, offenders);
+    require_dynamic_project_version(root, offenders);
+    require_uv_lock_gamfit_dynamic(root, offenders);
 
     visit_files(root, root, &mut |rel, content| {
         let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -1228,66 +1277,99 @@ fn require_toml_version(
     ));
 }
 
-fn require_uv_lock_gamfit_version(
-    root: &Path,
-    latest: &str,
-    offenders: &mut Vec<(PathBuf, usize, String)>,
-) {
+/// `[project]` must list `version` in `dynamic` and must not set it: the build
+/// backend computes it, and PEP 621 forbids a backend to change a static field.
+fn require_dynamic_project_version(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
+    let rel = Path::new("pyproject.toml");
+    let content = match fs::read_to_string(root.join(rel)) {
+        Ok(content) => content,
+        Err(_) => {
+            offenders.push((rel.to_path_buf(), 1, "missing pyproject.toml".to_string()));
+            return;
+        }
+    };
+    let mut dynamic = false;
+    for (idx, line) in toml_table_lines(&content, "project") {
+        let trimmed = line.trim();
+        if trimmed.starts_with("version =") {
+            offenders.push((
+                rel.to_path_buf(),
+                idx + 1,
+                format!("{line}  <- [project] version is derived by the build backend; list it in dynamic"),
+            ));
+        }
+        if trimmed.starts_with("dynamic =") && trimmed.contains("\"version\"") {
+            dynamic = true;
+        }
+    }
+    if !dynamic {
+        offenders.push((
+            rel.to_path_buf(),
+            1,
+            "[project] must declare dynamic = [\"version\"]: the build backend derives it".to_string(),
+        ));
+    }
+}
+
+/// uv.lock's own `gamfit` package, written the way uv writes a project whose
+/// version is dynamic: `name = "gamfit"` and `source = { editable = "." }` with
+/// no version line. `uv lock` on this tree writes exactly that (measured with
+/// uv 0.12.17, gam#3157), so a version line is a lock written while the
+/// version was static, and a relock is owed.
+fn require_uv_lock_gamfit_dynamic(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
     let rel = Path::new("uv.lock");
     let content = match fs::read_to_string(root.join(rel)) {
         Ok(content) => content,
         Err(_) => {
-            offenders.push((
-                rel.to_path_buf(),
-                1,
-                format!("missing uv.lock gamfit package; expected {latest}"),
-            ));
+            offenders.push((rel.to_path_buf(), 1, "missing uv.lock".to_string()));
             return;
         }
     };
 
     let mut inside_package = false;
-    let mut inside_gamfit = false;
+    let mut gamfit_line = None;
+    let mut editable_root = false;
     for (idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed == "[[package]]" {
-            inside_package = true;
-            inside_gamfit = false;
+        if trimmed.starts_with('[') {
+            // The entry's own keys come before its first sub-table header.
+            if gamfit_line.is_some() {
+                break;
+            }
+            inside_package = trimmed == "[[package]]";
             continue;
         }
         if !inside_package {
             continue;
         }
-        if trimmed == "name = \"gamfit\"" {
-            inside_gamfit = true;
+        if gamfit_line.is_none() {
+            if trimmed == "name = \"gamfit\"" {
+                gamfit_line = Some(idx);
+            }
             continue;
         }
-        if inside_gamfit && trimmed.starts_with("version = ") {
-            match read_quoted_value_after_prefix(trimmed, "version = ") {
-                Some(version) if version == latest => return,
-                Some(_) | None => {
-                    offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
-                    return;
-                }
-            }
+        if trimmed.starts_with("version =") {
+            offenders.push((
+                rel.to_path_buf(),
+                idx + 1,
+                format!("{line}  <- gamfit's version is dynamic; relock with `uv lock`"),
+            ));
+        }
+        if trimmed == "source = { editable = \".\" }" {
+            editable_root = true;
         }
     }
 
-    offenders.push((
-        rel.to_path_buf(),
-        1,
-        format!("missing gamfit package version; expected {latest}"),
-    ));
-}
-
-fn read_toml_version_line(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(version) = read_quoted_value_after_prefix(trimmed, "version = ") {
-            return Some(version.to_string());
-        }
+    match gamfit_line {
+        None => offenders.push((rel.to_path_buf(), 1, "no gamfit package in uv.lock".to_string())),
+        Some(idx) if !editable_root => offenders.push((
+            rel.to_path_buf(),
+            idx + 1,
+            "uv.lock's gamfit package is not the editable project root (source = { editable = \".\" })"
+                .to_string(),
+        )),
+        Some(_) => {}
     }
-    None
 }
 
 fn read_quoted_value_after_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
@@ -3138,6 +3220,297 @@ fn enforce_tower_seed_matcher_invariants() {
         "MyTower40::variable(x,0)",
     ] {
         assert!(tower_seed_positions(other).is_empty(), "tower seed matcher flags {other}");
+    }
+}
+
+/// gam#2967, the split-level rule. Each entry is a Rayon split-level primitive (a
+/// parallel iterator's split closure, or a function recursing through `rayon::join`)
+/// and the closure parameters its caller hands it. Such a function's frame stays live
+/// across every join below it, and a worker that steals while it waits stacks one such
+/// frame per nesting level. A caller's closure called in its body is the inliner's to
+/// place in that frame: gnomon's release build reserved 77,824 to 98,304 bytes per
+/// split frame through `chunked_row_reduction`, and 32,768 bytes per recursion level of
+/// `par_try_block_fold_range`. So in these bodies a closure parameter may be passed on,
+/// never called; the call happens in an owner below.
+const RAYON_SPLIT_LEVEL_RULES: &[(&str, &str, &[&str])] = &[
+    (
+        "crates/gam-models/src/marginal_slope_shared.rs",
+        "chunked_row_reduction",
+        &["init", "process_row", "combine"],
+    ),
+    (
+        "crates/gam-linalg/src/pairwise_reduce.rs",
+        "par_reduce_index_range",
+        &["map", "combine"],
+    ),
+    (
+        "crates/gam-linalg/src/pairwise_reduce.rs",
+        "par_try_block_fold_range",
+        &["base", "combine"],
+    ),
+    (
+        "crates/gam-linalg/src/pairwise_reduce.rs",
+        "par_block_fold_range",
+        &["base", "combine"],
+    ),
+    (
+        "crates/gam-models/src/survival/marginal_slope/row_kernel.rs",
+        "chunked_pullback_reduce",
+        &["per_row"],
+    ),
+    (
+        "crates/gam-models/src/survival/marginal_slope/information_third.rs",
+        "primary_third_information_all_axes_from",
+        &["directions", "fifth"],
+    ),
+];
+
+/// The owners that call those closures, each kept `#[inline(never)]`: the caller's
+/// program then has a frame of its own, live at most once per stack.
+const RAYON_LEAF_OWNERS: &[(&str, &str)] = &[
+    (
+        "crates/gam-models/src/marginal_slope_shared.rs",
+        "reduce_row_chunk",
+    ),
+    (
+        "crates/gam-models/src/marginal_slope_shared.rs",
+        "combine_in_order",
+    ),
+    (
+        "crates/gam-linalg/src/pairwise_reduce.rs",
+        "reduce_index_block",
+    ),
+    ("crates/gam-linalg/src/pairwise_reduce.rs", "fold_leaf"),
+    ("crates/gam-linalg/src/pairwise_reduce.rs", "combine_pair"),
+    (
+        "crates/gam-models/src/survival/marginal_slope/row_kernel.rs",
+        "pullback_chunk",
+    ),
+    (
+        "crates/gam-models/src/survival/marginal_slope/information_third.rs",
+        "primary_third_row_tensor",
+    ),
+];
+
+/// Enforces [`RAYON_SPLIT_LEVEL_RULES`] and [`RAYON_LEAF_OWNERS`] on the stripped
+/// non-test code of each named file. Whitespace is kept only between two identifier
+/// characters, so reformatting cannot hide a call and `return base(` stays two tokens.
+fn scan_for_rayon_split_level_leaf_calls(
+    root: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    enforce_split_level_matcher_invariants();
+    let mut files: Vec<&str> = RAYON_SPLIT_LEVEL_RULES
+        .iter()
+        .map(|rule| rule.0)
+        .chain(RAYON_LEAF_OWNERS.iter().map(|owner| owner.0))
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    for file in files {
+        println!("cargo:rerun-if-changed={file}");
+        let rel = PathBuf::from(file);
+        let Ok(content) = fs::read_to_string(root.join(file)) else {
+            offenders.push((
+                rel,
+                1,
+                "a Rayon split-level primitive's file is missing".to_string(),
+            ));
+            continue;
+        };
+        let mask = compute_test_mask(&content, &rel);
+        let (stream, owner) = identifier_spaced_stream(&strip_file_lines(&content), &mask);
+        let raw_lines: Vec<&str> = content.lines().collect();
+        let line_at = |pos: usize| {
+            let idx = owner.get(pos).copied().unwrap_or(0);
+            (
+                idx + 1,
+                raw_lines
+                    .get(idx)
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default(),
+            )
+        };
+        for (_, split_fn, closures) in RAYON_SPLIT_LEVEL_RULES.iter().filter(|rule| rule.0 == file)
+        {
+            match fn_body_range(&stream, split_fn) {
+                Some(body) => {
+                    for pos in closure_call_positions(&stream[body.clone()], closures) {
+                        let (line, text) = line_at(body.start + pos);
+                        offenders.push((rel.clone(), line, text));
+                    }
+                }
+                None => offenders.push((
+                    rel.clone(),
+                    1,
+                    format!("the split-level primitive `{split_fn}` is missing from this file"),
+                )),
+            }
+        }
+        for (_, name) in RAYON_LEAF_OWNERS.iter().filter(|entry| entry.0 == file) {
+            match fn_item_position(&stream, name) {
+                Some(at) => {
+                    let item_start = stream[..at].rfind(['}', ';']).map_or(0, |b| b + 1);
+                    if !stream[item_start..at].contains("#[inline(never)]") {
+                        let (line, text) = line_at(at);
+                        offenders.push((rel.clone(), line, text));
+                    }
+                }
+                None => offenders.push((
+                    rel.clone(),
+                    1,
+                    format!("the leaf owner `{name}` is missing from this file"),
+                )),
+            }
+        }
+    }
+}
+
+/// The unmasked lines joined into one stream with each whitespace run removed, except
+/// one space where it separated two identifier characters, and the source line of every
+/// byte.
+fn identifier_spaced_stream(lines: &[String], mask: &[bool]) -> (String, Vec<usize>) {
+    let identifier = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let mut stream = String::new();
+    let mut owner: Vec<usize> = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if mask.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let mut gap = true;
+        for ch in line.chars() {
+            if ch.is_whitespace() {
+                gap = true;
+                continue;
+            }
+            if gap && identifier(ch) && stream.chars().next_back().is_some_and(identifier) {
+                stream.push(' ');
+            }
+            gap = false;
+            stream.push(ch);
+            while owner.len() < stream.len() {
+                owner.push(idx);
+            }
+        }
+    }
+    (stream, owner)
+}
+
+/// Where `fn name` starts in a stream from [`identifier_spaced_stream`], generic
+/// (`fn name<`) or not (`fn name(`).
+fn fn_item_position(stream: &str, name: &str) -> Option<usize> {
+    [format!("fn {name}<"), format!("fn {name}(")]
+        .iter()
+        .filter_map(|head| stream.find(head.as_str()))
+        .min()
+}
+
+/// The byte range of `fn name`'s body, braces included, in a stream from
+/// [`identifier_spaced_stream`] (stripped code carries no brace inside a literal).
+fn fn_body_range(stream: &str, name: &str) -> Option<core::ops::Range<usize>> {
+    let at = fn_item_position(stream, name)?;
+    let open = at + stream[at..].find('{')?;
+    let mut depth = 0usize;
+    for (offset, byte) in stream.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open..open + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Offsets in `body` where one of `closures` is called: `name(` not preceded by an
+/// identifier character, a `.` (a method) or a `:` (a path), or `(name)(`.
+fn closure_call_positions(body: &str, closures: &[&str]) -> Vec<usize> {
+    let bytes = body.as_bytes();
+    let mut found = Vec::new();
+    for name in closures {
+        for call in [format!("{name}("), format!("({name})(")] {
+            for (at, _) in body.match_indices(call.as_str()) {
+                let bounded = at == 0 || {
+                    let before = bytes[at - 1];
+                    !(before.is_ascii_alphanumeric() || matches!(before, b'_' | b'.' | b':'))
+                };
+                if bounded {
+                    found.push(at);
+                }
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+fn enforce_split_level_matcher_invariants() {
+    let lines = |text: &str| text.lines().map(str::to_string).collect::<Vec<_>>();
+    let (stream, owner) =
+        identifier_spaced_stream(&lines("fn f() {\n    return   base (lo..hi);\n}"), &[]);
+    assert_eq!(
+        stream, "fn f(){return base(lo..hi);}",
+        "split-level stream normalization"
+    );
+    assert_eq!(owner.len(), stream.len(), "split-level stream line map");
+    let (masked, _) = identifier_spaced_stream(&lines("a();\nb();"), &[true, false]);
+    assert_eq!(masked, "b();", "split-level stream skips masked lines");
+    let body = fn_body_range("fn g<T>(x:T)->T where T:Copy{if a{b}else{c}}fn h(){}", "g");
+    assert_eq!(body, Some(28..44), "split-level body range");
+    let plain = fn_body_range("fn gh(){}fn g(&self,f:impl Fn(usize)->u8)->u8{f(0)}", "g");
+    assert_eq!(
+        plain,
+        Some(45..51),
+        "split-level body range of a non-generic fn"
+    );
+    for (inlined, closures, calls) in [
+        (
+            "{let mut acc=init();for &item in &rows[start..end]{process_row(item,&mut acc)?;}Ok(acc)}",
+            &["init", "process_row", "combine"][..],
+            2,
+        ),
+        (
+            "{if len<=leaf{return base(lo..hi);}}",
+            &["base", "combine"][..],
+            1,
+        ),
+        (
+            "{let(left,right)=rayon::join(a,b);combine(left?,right?)}",
+            &["base", "combine"][..],
+            1,
+        ),
+        (
+            "{let mut acc=map(lo);for i in(lo+1)..hi{acc=combine(acc,map(i));}acc}",
+            &["map", "combine"][..],
+            3,
+        ),
+        ("{(combine)(left,right)}", &["combine"][..], 1),
+    ] {
+        assert_eq!(
+            closure_call_positions(inlined, closures).len(),
+            calls,
+            "split-level matcher misses {inlined}"
+        );
+    }
+    for owned in [
+        "{return fold_leaf(base,lo..hi);}",
+        "{combine_pair(combine,left?,right?)}",
+        "{return reduce_index_block(lo,hi,map,combine);}",
+        "{reduce_row_chunk(&rows[start..end],&init,&process_row)}",
+        "{Ok(combine_in_order(&init,chunk_states,combine))}",
+        "{(0..n_chunks).into_par_iter().map(|chunk_idx|x)}",
+        "{my_base(x);self.combine(a,b);ops::combine(a,b)}",
+    ] {
+        assert!(
+            closure_call_positions(owned, &["init", "process_row", "combine", "map", "base"])
+                .is_empty(),
+            "split-level matcher flags {owned}"
+        );
     }
 }
 

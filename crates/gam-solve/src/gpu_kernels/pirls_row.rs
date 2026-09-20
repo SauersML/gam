@@ -134,6 +134,60 @@ impl PirlsRowFamily {
     }
 }
 
+/// Where the PIRLS rows of a `(response, link)` pair are evaluated.
+///
+/// Only the six canonical fast-path pairs have specialised device sources.
+/// Every generic variance × link cell (identity-Poisson, log-Gaussian,
+/// inverse-Gamma's siblings, log-binomial, ...) is composed on the CPU by
+/// the exact exponential-dispersion row kernel (`gam_math::edm_row`), whose
+/// feasibility-set step rejection has no device counterpart. That routing is
+/// a named decision, never an unmatched fall-through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PirlsRowRoute {
+    /// A specialised device row kernel.
+    Device(PirlsRowFamily),
+    /// A generic variance × link cell: CPU composed EDM row kernel.
+    CpuGenericEdm(gam_problem::GenericEdmCell),
+    /// Custom, blended, or non-EDM likelihoods with no device row kernel.
+    CpuNoDeviceKernel,
+}
+
+impl PirlsRowRoute {
+    pub fn for_spec(spec: &gam_problem::LikelihoodSpec) -> Self {
+        use gam_problem::{InverseLink, ResponseFamily, StandardLink};
+        if let Some(cell) = spec.generic_edm_cell() {
+            return Self::CpuGenericEdm(cell);
+        }
+        let InverseLink::Standard(link) = spec.link else {
+            return Self::CpuNoDeviceKernel;
+        };
+        match (&spec.response, link) {
+            (ResponseFamily::Binomial, StandardLink::Logit) => {
+                Self::Device(PirlsRowFamily::BernoulliLogit)
+            }
+            (ResponseFamily::Binomial, StandardLink::Probit) => {
+                Self::Device(PirlsRowFamily::BernoulliProbit)
+            }
+            (ResponseFamily::Binomial, StandardLink::CLogLog) => {
+                Self::Device(PirlsRowFamily::BernoulliCLogLog)
+            }
+            (ResponseFamily::Poisson, StandardLink::Log) => Self::Device(PirlsRowFamily::PoissonLog),
+            (ResponseFamily::Gaussian, StandardLink::Identity) => {
+                Self::Device(PirlsRowFamily::GaussianIdentity)
+            }
+            (ResponseFamily::Gamma, StandardLink::Log) => Self::Device(PirlsRowFamily::GammaLog),
+            _ => Self::CpuNoDeviceKernel,
+        }
+    }
+
+    pub const fn device_family(self) -> Option<PirlsRowFamily> {
+        match self {
+            Self::Device(family) => Some(family),
+            Self::CpuGenericEdm(_) | Self::CpuNoDeviceKernel => None,
+        }
+    }
+}
+
 /// Curvature surface used to populate `w_hessian` / `w_solver`.
 ///
 /// `Fisher` is the default and matches the CPU Stage-1 path bit-for-bit. The
@@ -886,8 +940,10 @@ __device__ __forceinline__ double bd0(double x, double m) {
     return x * (log(x) - log(m)) + (m - x);
 }
 
-__device__ __forceinline__ double bernoulli_deviance(double y, double mu, double w) {
-    return 2.0 * w * (bd0(y, mu) + bd0(1.0 - y, 1.0 - mu));
+__device__ __forceinline__ double bernoulli_deviance(
+    double y, double mu, double mu_bar, double w
+) {
+    return 2.0 * w * (bd0(y, mu) + bd0(1.0 - y, mu_bar));
 }
 
 __device__ __forceinline__ double logit_deviance(double y, double eta, double w) {
@@ -1244,9 +1300,21 @@ fn bernoulli_logit_body(curvature: CurvatureMode) -> String {
     )
 }
 
+/// The rows of a non-canonical Bernoulli link, taken from the link's
+/// log-probability jet (gam#3329): `a = log μ` and `b = log(1 − μ)` with their
+/// first two η-derivatives, and both probabilities `μ` and `μ̄ = 1 − μ`, each
+/// formed directly by the link so neither is the other's rounded complement.
+/// For a response `y` the row log-likelihood is `y a + (1 − y) b`, so
+///
+/// - score `∂ℓ/∂η = y a' + (1 − y) b'`,
+/// - Fisher weight `μ a'² + μ̄ b'²`,
+/// - observed weight `−(y a'' + (1 − y) b'')`,
+///
+/// and no variance `μ(1 − μ)` divides anything. The jet is defined wherever
+/// both probabilities are positive; the link body refuses the row with
+/// `PIRLS_INVERSE_LINK` exactly where one of them underflows.
 #[cfg(target_os = "linux")]
-fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
-    let tag = curvature_tag(curvature);
+fn bernoulli_log_jet_rows(tag: &str, link_jet: &str) -> String {
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
     double w_hessian = 0.0, w_solver = 0.0, dev = 0.0;
@@ -1256,36 +1324,28 @@ fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
     if (status == PIRLS_OK && wp > 0.0
             && !(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0))
         pirls_refuse(&status, PIRLS_RESPONSE);
-    double dmu_deta = 0.0, d2mu_deta2 = 0.0, v = 0.0;
+    double mu_bar = 0.0, a1 = 0.0, a2 = 0.0, b1 = 0.0, b2 = 0.0;
     if (status == PIRLS_OK) {{
-        mu = std_norm_cdf(eta_i);
-        dmu_deta = std_norm_pdf(eta_i);
-        d2mu_deta2 = -eta_i * dmu_deta;
-        if (!(isfinite(mu) && mu > 0.0 && mu < 1.0
-                && isfinite(dmu_deta) && dmu_deta > 0.0
-                && isfinite(d2mu_deta2)))
+{link_jet}        if (!(mu > 0.0 && mu_bar > 0.0 && isfinite(a1) && isfinite(a2)
+                && isfinite(b1) && isfinite(b2)))
             pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
     if (status == PIRLS_OK && wp > 0.0) {{
-        v = mu * (1.0 - mu);
-        double fisher_per_prior = dmu_deta * dmu_deta / v;
+        double fisher_per_prior = mu * a1 * a1 + mu_bar * b1 * b1;
         w_fisher = wp * fisher_per_prior;
-        if (!(isfinite(v) && v > 0.0 && isfinite(fisher_per_prior)
-                && fisher_per_prior > 0.0 && isfinite(w_fisher) && w_fisher > 0.0))
+        if (!(isfinite(fisher_per_prior) && fisher_per_prior > 0.0
+                && isfinite(w_fisher) && w_fisher > 0.0))
             pirls_refuse(&status, PIRLS_FISHER_WEIGHT);
-        double resid = y_i - mu;
 #ifdef PIRLS_CURVATURE_OBSERVED
-        double bracket = d2mu_deta2 / v
-            - (dmu_deta * dmu_deta) * (1.0 - 2.0 * mu) / (v * v);
-        w_hessian = w_fisher - wp * resid * bracket;
+        w_hessian = -wp * (y_i * a2 + (1.0 - y_i) * b2);
 #else
         w_hessian = w_fisher;
 #endif
         if (!isfinite(w_hessian)) pirls_refuse(&status, PIRLS_OBSERVED_WEIGHT);
         w_solver = w_hessian;
-        grad_eta = wp * resid * dmu_deta / v;
+        grad_eta = wp * (y_i * a1 + (1.0 - y_i) * b1);
         if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
-        dev = bernoulli_deviance(y_i, mu, wp);
+        dev = bernoulli_deviance(y_i, mu, mu_bar, wp);
         if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
@@ -1295,56 +1355,45 @@ fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
     )
 }
 
+/// Probit's log-probability jet: `μ = Φ(η)` and `μ̄ = Φ(−η)`, each from
+/// `erfc` on its own tail, the reverse and forward Mills ratios `a' = φ/Φ(η)`
+/// and `b' = −φ/Φ(−η)`, and, from `φ' = −ηφ`, `a'' = −a'(η + a')` and
+/// `b'' = −b'(η + b')`.
+#[cfg(target_os = "linux")]
+fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
+    bernoulli_log_jet_rows(
+        curvature_tag(curvature),
+        r#"        mu = std_norm_cdf(eta_i);
+        mu_bar = std_norm_cdf(-eta_i);
+        double density = std_norm_pdf(eta_i);
+        a1 = density / mu;
+        b1 = -density / mu_bar;
+        a2 = -a1 * (eta_i + a1);
+        b2 = -b1 * (eta_i + b1);
+"#,
+    )
+}
+
+/// Complementary log-log's log-probability jet. With `t = e^η`,
+/// `b = log μ̄ = −t` exactly, so `b' = b'' = −t`; `μ = −expm1(−t)`,
+/// `a' = t μ̄ / μ`, and `a'' = a'((1 − a') − t)`. The gap
+/// `1 − a' = (1 − (1 + t)e^{−t}) / μ` is summed from `e^{−t}·(e^t − 1 − t)`
+/// inside the radius where `expm1_minus_x` sums its series, so it does not
+/// cancel as `t → 0`, and read as `μ − t μ̄` beyond it, where the two terms
+/// cancel by less than a factor of 8 (at `t = 1/2`) and by less further out.
 #[cfg(target_os = "linux")]
 fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
-    let tag = curvature_tag(curvature);
-    format!(
-        r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, dev = 0.0;
-    if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
-    if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
-        pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
-    if (status == PIRLS_OK && wp > 0.0
-            && !(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0))
-        pirls_refuse(&status, PIRLS_RESPONSE);
-    double inner = 0.0, dmu_deta = 0.0, d2mu_deta2 = 0.0, v = 0.0;
-    if (status == PIRLS_OK) {{
-        inner = exp(eta_i);
-        double complement = exp(-inner);
-        mu = -expm1(-inner);
-        dmu_deta = inner * complement;
-        d2mu_deta2 = dmu_deta * (1.0 - inner);
-        if (!(isfinite(mu) && mu > 0.0 && mu < 1.0
-                && isfinite(dmu_deta) && dmu_deta > 0.0
-                && isfinite(d2mu_deta2)))
-            pirls_refuse(&status, PIRLS_INVERSE_LINK);
-    }}
-    if (status == PIRLS_OK && wp > 0.0) {{
-        v = mu * (1.0 - mu);
-        double fisher_per_prior = dmu_deta * dmu_deta / v;
-        w_fisher = wp * fisher_per_prior;
-        if (!(isfinite(v) && v > 0.0 && isfinite(fisher_per_prior)
-                && fisher_per_prior > 0.0 && isfinite(w_fisher) && w_fisher > 0.0))
-            pirls_refuse(&status, PIRLS_FISHER_WEIGHT);
-        double resid = y_i - mu;
-#ifdef PIRLS_CURVATURE_OBSERVED
-        double bracket = d2mu_deta2 / v
-            - (dmu_deta * dmu_deta) * (1.0 - 2.0 * mu) / (v * v);
-        w_hessian = w_fisher - wp * resid * bracket;
-#else
-        w_hessian = w_fisher;
-#endif
-        if (!isfinite(w_hessian)) pirls_refuse(&status, PIRLS_OBSERVED_WEIGHT);
-        w_solver = w_hessian;
-        grad_eta = wp * resid * dmu_deta / v;
-        if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
-        dev = bernoulli_deviance(y_i, mu, wp);
-        if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
-    }}
-    if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, dev))
-        pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
-"#
+    bernoulli_log_jet_rows(
+        curvature_tag(curvature),
+        r#"        double t = exp(eta_i);
+        mu = -expm1(-t);
+        mu_bar = exp(-t);
+        double gap = t <= 0.5 ? mu_bar * expm1_minus_x(t) : mu - t * mu_bar;
+        a1 = t * mu_bar / mu;
+        a2 = a1 * (gap / mu - t);
+        b1 = -t;
+        b2 = -t;
+"#,
     )
 }
 

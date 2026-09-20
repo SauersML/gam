@@ -5,16 +5,15 @@ use crate::estimate::evaluation::{
     sas_log_deltaridgeweight,
 };
 use crate::estimate::edf_accounting::penalized_edf_bundle_within_bands;
-use crate::estimate::penalty::{REML_SEED_SCREENING_RHO_CAP, scaled_covariance};
+use crate::estimate::penalty::scaled_covariance;
 use crate::estimate::prefit::{
-    reject_prefit_binomial_separation, reject_prefit_unidentifiable_unpenalized_space,
+    arm_jeffreys_on_prefit_binomial_separation, reject_prefit_unidentifiable_unpenalized_space,
     reject_prefit_unpenalized_rank_deficiency,
 };
-use crate::estimate::smoothing_correction::AUTO_CUBATURE_MAX_EIGENVECTORS;
 use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
-use gam_problem::{OrderedRhoBounds, SeedConfig, SeedRiskProfile};
+use gam_problem::OrderedRhoBounds;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -289,6 +288,174 @@ fn negbin_theta_stationarity_residual(theta: f64, profile: &pirls::NegbinThetaSc
     (log_theta_gradient / log_theta_curvature).abs()
 }
 
+/// How the conditional-ML log-theta root `τ*` moves with the quantities the
+/// joint certificate resolves only to a band, at frozen theta and the PIRLS
+/// mode.
+struct NegbinThetaRootSensitivity {
+    /// `j_k = dτ*/dρ_k` for every smoothing coordinate.
+    rho_gradient: Array1<f64>,
+    /// `θ‖H⁻¹ Xᵀ g_η‖₂ / c`: the root displacement per unit of penalized
+    /// beta-KKT residual left in the mode.
+    mode_gain: f64,
+}
+
+/// [`NegbinThetaRootSensitivity`] at the accepted PIRLS mode.
+///
+/// The root solves `θ·score(θ, η) = 0`, so the implicit-function theorem gives
+/// `dτ* = θ·dscore / c`, with `c = θ²·info − θ·score` the log-theta curvature
+/// and `dscore = g_ηᵀ X dβ` (`g_η = ∂score/∂η`). The mode moves by
+/// `dβ/dρ_k = −H⁻¹ e^{ρ_k} S_k (β − μ_k)` (the implicit derivative the IFT warm
+/// start extrapolates with) and, for a residual `r` left by the inner solve, by
+/// `δβ = −H⁻¹ r`. One solve `u = H⁻¹ Xᵀ g_η` serves both:
+/// `j_k = −θ e^{ρ_k} uᵀ S_k (β − μ_k) / c`, and `|θ uᵀ r| / c ≤ θ‖u‖‖r‖ / c`.
+///
+/// `None` whenever that derivative is not the one the mode obeys, or cannot be
+/// formed exactly: a Firth-adjusted or inequality-constrained mode moves by a
+/// different law, and the penalized Hessian must factor as SPD without a
+/// perturbation. The caller then judges theta against its rounding band alone.
+fn negbin_theta_root_sensitivity(
+    reml_state: &RemlState<'_>,
+    pirls: &pirls::PirlsResult,
+    rho: &Array1<f64>,
+    score_eta_gradient: &Array1<f64>,
+    theta: f64,
+    curvature: f64,
+) -> Option<NegbinThetaRootSensitivity> {
+    let penalties = reml_state.canonical_penalties.as_ref();
+    if rho.len() != penalties.len()
+        || !(theta.is_finite() && theta > 0.0)
+        || !(curvature.is_finite() && curvature > 0.0)
+        || matches!(pirls.firth, pirls::FirthDiagnostics::Active { .. })
+        || pirls.linear_constraints_transformed.is_some()
+    {
+        return None;
+    }
+    let rhs = reml_state.x.transpose_vector_multiply(score_eta_gradient);
+    let factor = pirls.penalized_hessian_transformed.factorize_spd().ok()?;
+    // `u` in the frame the Hessian and the KKT residual live in, and `β`, `u`
+    // in the original frame the canonical penalties index.
+    let (u_solved, beta_original, u_original) = match pirls.coordinate_frame {
+        pirls::PirlsCoordinateFrame::OriginalSparseNative => {
+            let u = factor.solve(&rhs).ok()?;
+            (u.clone(), pirls.beta_transformed.as_ref().clone(), u)
+        }
+        pirls::PirlsCoordinateFrame::TransformedQs => {
+            let qs = &pirls.reparam_result.qs;
+            if qs.nrows() != rhs.len() || qs.ncols() != pirls.beta_transformed.len() {
+                return None;
+            }
+            let u = factor.solve(&qs.t().dot(&rhs)).ok()?;
+            let u_original = qs.dot(&u);
+            (u, qs.dot(pirls.beta_transformed.as_ref()), u_original)
+        }
+    };
+    if beta_original.len() != u_original.len() {
+        return None;
+    }
+    let mut rho_gradient = Array1::<f64>::zeros(rho.len());
+    for (k, cp) in penalties.iter().enumerate() {
+        let r = &cp.col_range;
+        if r.end > beta_original.len() {
+            return None;
+        }
+        let centered = &beta_original.slice(ndarray::s![r.start..r.end]) - &cp.prior_mean;
+        let pull = cp.local.dot(&centered);
+        let projection = u_original.slice(ndarray::s![r.start..r.end]).dot(&pull);
+        rho_gradient[k] = -rho[k].exp() * theta * projection / curvature;
+    }
+    let mode_gain = theta * u_solved.dot(&u_solved).sqrt() / curvature;
+    (rho_gradient.iter().all(|v| v.is_finite()) && mode_gain.is_finite()).then_some(
+        NegbinThetaRootSensitivity {
+            rho_gradient,
+            mode_gain,
+        },
+    )
+}
+
+/// `‖(ZᵀHZ)⁻¹ Zᵀ j‖₂`: how far the theta root can still move per unit of rho
+/// gradient the rho certificate leaves unresolved.
+///
+/// The rho certificate accepts any point whose rail-projected gradient `g`
+/// satisfies `‖g‖ ≤ b` on the judged subspace `Z` (railed coordinates and
+/// exact criterion invariances removed). To first order such a point sits
+/// `Δρ = Z (ZᵀHZ)⁻¹ Zᵀ g` from the exact stationary point, which displaces the
+/// theta root by `jᵀΔρ`, and Cauchy–Schwarz bounds that by
+/// `‖(ZᵀHZ)⁻¹ Zᵀ j‖₂ · b`. An empty judged subspace (every coordinate railed)
+/// leaves nothing free to move. `None` when the judged curvature is not
+/// positive definite: there is then no finite displacement to derive.
+fn negbin_theta_root_rho_gain(
+    hessian: &Array2<f64>,
+    judged: Option<&Array2<f64>>,
+    root_gradient: &Array1<f64>,
+) -> Option<f64> {
+    use gam_linalg::faer_ndarray::FaerEigh;
+
+    let n = root_gradient.len();
+    if hessian.nrows() != n || hessian.ncols() != n {
+        return None;
+    }
+    let Some(basis) = judged else {
+        return Some(0.0);
+    };
+    if basis.nrows() != n || basis.ncols() == 0 {
+        return None;
+    }
+    if hessian.iter().chain(root_gradient.iter()).any(|v| !v.is_finite()) {
+        return None;
+    }
+    let compressed = crate::penalty_invariance::compress_to_judged_subspace(hessian, basis);
+    let (eigenvalues, eigenvectors) = compressed.eigh(faer::Side::Lower).ok()?;
+    if eigenvalues.iter().any(|value| !(value.is_finite() && *value > 0.0)) {
+        return None;
+    }
+    let projected = basis.t().dot(root_gradient);
+    let coefficients = eigenvectors.t().dot(&projected);
+    let gain = coefficients
+        .iter()
+        .zip(eigenvalues.iter())
+        .map(|(coefficient, value)| (coefficient / value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    gain.is_finite().then_some(gain)
+}
+
+/// The resolution the joint certificate can demand of the theta residual.
+///
+/// The score's own rounding band carried into the log-theta Newton
+/// displacement (`θ·band / c`, what [`negbin_theta_stationarity_residual`]
+/// cannot see below), plus `root_displacement`: how far the theta root can
+/// still sit from where the mode puts it, given the bands the rho and beta
+/// certificates leave that mode in (see [`negbin_theta_root_sensitivity`] and
+/// [`negbin_theta_root_rho_gain`]). Theta is re-solved at the mode the rho
+/// search hands it, so demanding more than those certificates pin the mode to
+/// would make an accurate joint point uncertifiable (#3349). A displacement
+/// that could not be derived is passed as zero and grants nothing.
+fn negbin_theta_joint_bound(
+    theta: f64,
+    profile: &pirls::NegbinThetaScore,
+    root_displacement: f64,
+) -> f64 {
+    let pirls::NegbinThetaScore { score, info, band } = *profile;
+    let curvature = theta * theta * info - theta * score;
+    let rounding = if theta.is_finite()
+        && theta > 0.0
+        && band.is_finite()
+        && band >= 0.0
+        && curvature.is_finite()
+        && curvature > 0.0
+    {
+        theta * band / curvature
+    } else {
+        0.0
+    };
+    let displacement = if root_displacement.is_finite() && root_displacement > 0.0 {
+        root_displacement
+    } else {
+        0.0
+    };
+    rounding + displacement
+}
+
 /// Whether the point a fit is about to ship IS the point the outer certificate
 /// was minted at, compared over EVERY optimized coordinate.
 ///
@@ -347,23 +514,22 @@ struct NegbinJointCheckpoint {
     theta_bound: f64,
 }
 
+/// The square matrices the first-order smoothing correction's assembly holds
+/// live: the dense bundle charges them inside its atomic peak, and a fit whose
+/// inference stayed factorized charges the same owner on its own
+/// ([`reserve_smoothing_correction_workspace`], #3283).
+const FIRST_ORDER_SMOOTHING_WORKSPACES: usize = 8;
+
 /// Reserve the complete peak live set of the optional dense inference path.
 ///
 /// The count is assembled from named algorithmic owners rather than a
 /// dimension cliff: ten square matrices can survive into/alongside the fit
 /// payload, six are base factorization/GEMM workspaces, and eight belong to the
-/// first-order smoothing correction. Cubature can retain one inverse Hessian
-/// for each positive/negative sigma point while every concurrently evaluated
-/// point holds its Hessian and inverse workspace. Charging the whole set
-/// atomically prevents several individually acceptable p×p allocations from
+/// first-order smoothing correction. Charging the whole set atomically prevents several individually acceptable p×p allocations from
 /// jointly exceeding the process-wide memory ledger.
 fn reserve_dense_covariance_bundle(p: usize) -> Option<gam_runtime::resource::MemoryReservation> {
     const STORED_SQUARE_MATRICES: usize = 10;
     const BASE_FACTORIZATION_AND_GEMM_WORKSPACES: usize = 6;
-    const FIRST_ORDER_SMOOTHING_WORKSPACES: usize = 8;
-    const CUBATURE_SIGMA_POINTS: usize = 2 * AUTO_CUBATURE_MAX_EIGENVECTORS;
-    const RETAINED_CUBATURE_INVERSES: usize = CUBATURE_SIGMA_POINTS;
-    const IN_FLIGHT_CUBATURE_HESSIAN_AND_INVERSE: usize = 2 * CUBATURE_SIGMA_POINTS;
     /// A constrained fit assembles its truncated covariance as a sum of Grams
     /// (`ConstrainedPosteriorCorrection::truncated_covariance_psd`, #2705 group
     /// A), which holds three `p × p` blocks live at once: the Cholesky factor of
@@ -379,9 +545,7 @@ fn reserve_dense_covariance_bundle(p: usize) -> Option<gam_runtime::resource::Me
     const PEAK_SQUARE_MATRIX_EQUIVALENTS: usize = STORED_SQUARE_MATRICES
         + BASE_FACTORIZATION_AND_GEMM_WORKSPACES
         + FIRST_ORDER_SMOOTHING_WORKSPACES
-        + CONSTRAINED_TRUNCATION_WORKSPACES
-        + RETAINED_CUBATURE_INVERSES
-        + IN_FLIGHT_CUBATURE_HESSIAN_AND_INVERSE;
+        + CONSTRAINED_TRUNCATION_WORKSPACES;
 
     let policy = gam_runtime::resource::ResourcePolicy::for_problem(
         gam_runtime::resource::ProblemHints::default(),
@@ -474,6 +638,77 @@ pub(crate) fn apply_marginal_constraint_truncation(
     Ok(Ok(()))
 }
 
+/// Reserve the first-order smoothing correction's workspace on a fit whose
+/// inference stayed factorized (#3283).
+///
+/// The correction is assembled exactly as on the dense branch, whose bundle
+/// charges this owner inside its atomic peak; only its result differs, the
+/// `p × r` factor instead of the `p × p` Gram. A refusal is the typed absence
+/// [`crate::model_types::SmoothingCorrectionAbsence::CorrectionWorkspaceRefused`].
+fn reserve_smoothing_correction_workspace(
+    p: usize,
+) -> Result<gam_runtime::resource::MemoryReservation, String> {
+    gam_runtime::resource::MemoryGovernor::global()
+        .try_reserve_dense_f64_copies(
+            p,
+            p,
+            FIRST_ORDER_SMOOTHING_WORKSPACES,
+            "factorized-branch first-order smoothing correction workspace",
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// The truncation of the ρ-marginal `Vp = Vb + B·Bᵀ` to the fit's feasible set
+/// on the factorized branch (#3283), where neither covariance is formed.
+///
+/// It is [`apply_marginal_constraint_truncation`]'s construction: `Vp`'s own
+/// lift and orthant moments at `W_p = A·Vp·Aᵀ`, built from the only block the
+/// decomposition reads, `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`, with
+/// `conditional_times_constraints = Vb·Aᵀ` solved through the Hessian factor.
+/// `Ok(Ok(None))` means no retained face moves the answer; a MOMENT failure is
+/// `Ok(Err(reason))`, which the caller publishes as the typed absence, and a
+/// STRUCTURAL mismatch is fatal, both exactly as on the dense branch. A declined
+/// geometry never truncated the conditional law, and the caller does not call
+/// this for one.
+fn factorized_marginal_constraint_truncation(
+    geometry: &crate::constrained_posterior::ConstrainedPosteriorGeometry,
+    conditional_times_constraints: &Array2<f64>,
+    factor: &Array2<f64>,
+) -> Result<Result<Option<crate::constrained_posterior::ConstrainedPosteriorCorrection>, String>, EstimationError>
+{
+    let constraints = &geometry.constraints;
+    let p = factor.nrows();
+    if constraints.a.ncols() != p
+        || conditional_times_constraints.dim() != (p, constraints.a.nrows())
+    {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "constrained posterior geometry has {}x{} constraints against a {p}-row smoothing \
+             correction factor and a {:?} conditional normal block",
+            constraints.a.nrows(),
+            constraints.a.ncols(),
+            conditional_times_constraints.dim(),
+        )));
+    }
+    let center = match geometry.unconstrained_center() {
+        Ok(center) if center.len() == p => center,
+        Ok(center) => {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "constrained posterior geometry carries a length-{} centre against a {p}-row \
+                 smoothing correction factor",
+                center.len(),
+            )));
+        }
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let marginal_times_constraints =
+        conditional_times_constraints + &factor.dot(&factor.t().dot(&constraints.a.t()));
+    Ok(crate::constrained_posterior::constrained_posterior_correction(
+        marginal_times_constraints.view(),
+        center,
+        constraints,
+    ))
+}
+
 /// Reserve the square matrices that remain live even when inference stays
 /// factorized: the two PIRLS Hessian surfaces, the fitted reparameterization,
 /// its exported copy, the reusable factor, the exported original-basis
@@ -530,62 +765,6 @@ where
         None,
         opts,
     )
-}
-
-pub(crate) fn external_reml_seed_config(k: usize, gaussian_identity: bool) -> SeedConfig {
-    if gaussian_identity {
-        // Profiled Gaussian REML already constructs and scores two
-        // data-derived starts below: the commensurate-curvature `initial.sp`
-        // point and the certified summed-penalty diagonal profile.  Sending
-        // their winner into the generic generated-seed lattice repeats the
-        // same basin decision with arbitrary global shifts and an absolute
-        // `rho=8` probe.  Besides violating SPEC's no-grid-search contract,
-        // that screen dominates small fits: a converged zero-iteration
-        // `y ~ s(x)` fit paid 68 outer cost evaluations / 104 inner solves,
-        // while a ten-penalty saturated fold paid 415 inner solves.
-        //
-        // The analytic candidates are evaluated against the true coupled REML
-        // criterion and adopted only on strict improvement, so they retain the
-        // #1074 over-smoothing escape without a second heuristic search.  A
-        // single generated seed is still required when neither analytic point
-        // beats the invariant neutral anchor.  The ordinary optimizer and its
-        // analytic terminal certificate remain mandatory either way.
-        return SeedConfig {
-            max_seeds: 1,
-            // The generic lattice remains disabled. The three budget slots are
-            // for the unique analytic candidates assembled below: base,
-            // initial.sp, and the summed-penalty diagonal restriction.
-            seed_budget: 3,
-            risk_profile: SeedRiskProfile::Gaussian,
-            screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
-            num_auxiliary_trailing: 0,
-            over_smoothing_probe_rho: None,
-        };
-    }
-    if k >= REML_SEED_SCREENING_RHO_CAP {
-        return SeedConfig {
-            max_seeds: 2,
-            seed_budget: 2,
-            risk_profile: SeedRiskProfile::GeneralizedLinear,
-            screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
-            num_auxiliary_trailing: 0,
-            over_smoothing_probe_rho: None,
-        };
-    }
-    SeedConfig {
-        max_seeds: if k <= 4 {
-            6
-        } else if k <= 12 {
-            8
-        } else {
-            10
-        },
-        seed_budget: 2,
-        risk_profile: SeedRiskProfile::GeneralizedLinear,
-        screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
-        num_auxiliary_trailing: 0,
-        over_smoothing_probe_rho: None,
-    }
 }
 
 /// The resolution the outer certificate's curvature verdict was decided at,
@@ -887,7 +1066,7 @@ pub(crate) fn conditioned_outer_response(
 /// load-bearing, and was wrong, is WHERE ψ got captured.
 ///
 /// Until this call existed, ψ was captured opportunistically at the first
-/// non-screening solve that happened to converge — and the persistent warm-start
+/// inner solve that happened to converge — and the persistent warm-start
 /// cache decides which solve that is. It donates `initial_rho`, which
 /// `run_outer_with_plan` inserts as seed 0, and it donates the warm β that
 /// decides whether the pre-search reference solve at ρ = 0 converges at all. So
@@ -903,8 +1082,9 @@ pub(crate) fn conditioned_outer_response(
 /// label ρ-coordinates) on a state that has no warm start attached and no
 /// persistent session open, and let the ordinary capture path freeze ψ at THAT
 /// solve's converged η. If the reference point's inner solve does not converge,
-/// the deterministic seed candidates are walked in their generated order, so the
-/// anchor stays a pure function of the problem in every branch.
+/// the caller's full-length heuristic ρ (clamped into the design's
+/// resolvability envelope) is the one other anchor tried, so the anchor stays a
+/// pure function of the problem in every branch.
 ///
 /// The warm-start slots are emptied on the way IN, so the anchor solve cannot
 /// inherit a caller-supplied β. They are deliberately NOT emptied on the way out:
@@ -936,14 +1116,12 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor(
     resolved_likelihood_scale: &gam_problem::ResolvedLikelihoodScale,
     k: usize,
     heuristic_log_lambdas: Option<&[f64]>,
-    seed_config: &SeedConfig,
 ) -> Result<(), EstimationError> {
     freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
         reml_state,
         resolved_likelihood_scale,
         k,
         heuristic_log_lambdas,
-        seed_config,
         0,
     )
 }
@@ -960,7 +1138,6 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
     resolved_likelihood_scale: &gam_problem::ResolvedLikelihoodScale,
     k: usize,
     heuristic_log_lambdas: Option<&[f64]>,
-    seed_config: &SeedConfig,
     external_hyper_count: usize,
 ) -> Result<(), EstimationError> {
     let (frozen, family) = match resolved_likelihood_scale {
@@ -996,6 +1173,9 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
 
     // The anchors are clamped into the envelope of the design's own #2812
     // resolvability domain, the domain the λ search then runs on (#2902 row 9).
+    // Past the ρ = 0 anchor they are tried only when its inner solve refused.
+    // They are read at the prior weights: the start working weight carries the
+    // nuisance this freeze is about to fix, so it is not yet defined here.
     let (domain_lower, domain_upper) =
         crate::estimate::rho_domain::resolvability_domain_from_design(
             reml_state.weights,
@@ -1003,20 +1183,17 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
             &reml_state.canonical_penalties,
         )
         .map_err(EstimationError::LayoutError)?;
+    let envelope = gam_problem::OrderedRhoBounds::envelope(
+        domain_lower.iter().copied(),
+        domain_upper.iter().copied(),
+    )?;
     let mut anchors = vec![Array1::<f64>::zeros(k)];
-    anchors.extend(
-        crate::seeding::generate_rho_candidates(
-            k,
-            heuristic_log_lambdas,
-            seed_config,
-            gam_problem::OrderedRhoBounds::envelope(
-                domain_lower.iter().copied(),
-                domain_upper.iter().copied(),
-            )?,
-        )
-        .into_iter()
-        .filter(|candidate| candidate.iter().any(|value| *value != 0.0)),
-    );
+    if let Some(heuristic) = heuristic_log_lambdas.filter(|h| h.len() == k) {
+        let clamped = Array1::from_iter(heuristic.iter().map(|&value| envelope.clamp(value)));
+        if clamped.iter().any(|value| *value != 0.0) {
+            anchors.push(clamped);
+        }
+    }
     for anchor in &anchors {
         if let Err(error) =
             reml_state.compute_cost_with_ext_count(anchor, external_hyper_count)
@@ -1044,10 +1221,10 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
         // No deterministic anchor produced a converged inner solve. The search
         // is about to try the same points and will report its own refusal;
         // leaving the freeze unset keeps the pre-existing capture path rather
-        // than converting a seed-cascade failure into a different error here.
+        // than converting an outer-search failure into a different error here.
         log::debug!(
             "[OUTER] no deterministic anchor converged for the {family} λ-search freeze; \
-             the outer criterion cannot be pinned before the seed cascade"
+             the outer criterion cannot be pinned before the outer search"
         );
     }
     Ok(())
@@ -1116,7 +1293,8 @@ where
         cfg.likelihood = cfg.likelihood.clone().with_student_t(sigma, nu);
     }
     reject_prefit_unpenalized_rank_deficiency(w, &x_fit, &canonical)?;
-    reject_prefit_binomial_separation(&cfg, y, w, &x_fit, &canonical)?;
+    let jeffreys_arming_evidence =
+        arm_jeffreys_on_prefit_binomial_separation(&mut cfg, opts, y, w, &x_fit, &canonical)?;
 
     let design_kind = match &x {
         DesignMatrix::Dense(_) => "dense",
@@ -1201,20 +1379,6 @@ where
         .as_ref()
         .map_or_else(|| y_o.view(), |conditioned| conditioned.view());
 
-    // #2812 / #2902 row 8: the λ-selection domain of each coordinate is derived
-    // from the conditioned design's Gram on that penalty's columns and the
-    // penalty's spectrum, not the picked ±RHO_BOUND box (SPEC rule 20).
-    let crate::estimate::rho_domain::ResolvabilityDomain {
-        lower: rho_domain_lower,
-        upper: rho_domain_upper,
-        lower_is_limit: rho_lower_is_limit,
-        upper_is_limit: rho_upper_is_limit,
-    } = crate::estimate::rho_domain::resolvability_domain_and_limit_faces_from_design(
-        w_o.view(),
-        &x_fit,
-        canonical_shared.as_slice(),
-    )
-    .map_err(EstimationError::LayoutError)?;
     let mut reml_state = RemlState::newwith_offset_shared(
         reml_y_view,
         x_fit,
@@ -1264,7 +1428,6 @@ where
             .store(theta_seed.to_bits(), Ordering::Relaxed);
     }
 
-    let reml_seed_config = external_reml_seed_config(k, cfg.likelihood.spec.is_gaussian_identity());
     // #2363: pin the λ-search nuisance BEFORE any warm start — external, in
     // memory, or on disk — can reach this state. `freeze_lambda_search_nuisance_at_canonical_anchor`
     // documents why the criterion is otherwise a function of the search path.
@@ -1273,8 +1436,40 @@ where
         &resolved_likelihood_scale,
         k,
         heuristic_log_lambdas,
-        &reml_seed_config,
     )?;
+    // #2812 / #2902 row 8: the λ-selection domain of each coordinate is derived
+    // from the conditioned design's Gram on that penalty's columns and the
+    // penalty's spectrum, not the picked ±RHO_BOUND box (SPEC rule 20). The
+    // Gram is the data curvature `XᵀWX` of the penalized Hessian, so `W` is the
+    // Fisher working weight at the cold P-IRLS start under the search's frozen
+    // nuisance: its scale follows the response's units (`μ³/4` for the
+    // inverse-Gaussian `1/μ²` link), and a prior-weight Gram leaves the domain
+    // fixed while `λ̂` moves with those units, off the domain's lower face in
+    // small units. It needs no inner solve, so it exists where the solve at the
+    // canonical anchor refuses.
+    let domain_weights = if k == 0 {
+        w_o.to_owned()
+    } else {
+        reml_state.start_curvature_weights()?
+    };
+    let rho_resolvability =
+        crate::estimate::rho_domain::resolvability_domain_and_limit_faces_from_design(
+            domain_weights.view(),
+            &reml_state.x,
+            canonical_shared.as_slice(),
+        )
+        .map_err(EstimationError::LayoutError)?;
+    // The domain is a numerical device, not the prior: the ρ-posterior
+    // integrates over all of ℝ^K and continues the criterion past each
+    // saturated face (#2812).
+    let rho_continuation = rho_resolvability.continuation();
+    let crate::estimate::rho_domain::ResolvabilityDomain {
+        lower: rho_domain_lower,
+        upper: rho_domain_upper,
+        lower_is_limit: rho_lower_is_limit,
+        upper_is_limit: rho_upper_is_limit,
+        ..
+    } = rho_resolvability;
     if let Some(store) = opts.persistent_warm_start_store.clone() {
         // Attach only after the canonical nuisance anchor so cache history
         // cannot influence the criterion frame.
@@ -1392,19 +1587,6 @@ where
                     ),
                 )
                 .with_tolerance(reml_tol)
-                // The corrected continuation starts from the certified Laplace
-                // optimum alone: a seed plan would price the correction at every
-                // start for a criterion whose admission that optimum decided.
-                .with_seed_config(if corrected_continuation {
-                    SeedConfig {
-                        max_seeds: 1,
-                        seed_budget: 1,
-                        ..reml_seed_config
-                    }
-                } else {
-                    reml_seed_config
-                })
-                .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
                 .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
                 .with_problem_size(n_obs, x_o.ncols())
                 .with_bounds(rho_model_domain.0.clone(), rho_model_domain.1.clone())
@@ -1462,251 +1644,54 @@ where
             // weights 1 (or any fixed-dispersion family) the anchor is exactly 0, so
             // those fits stay byte-identical.
             let weight_log_geom_mean: f64 = reml_state.rho_weight_anchor();
-            let gaussian_risk = matches!(
-                reml_seed_config.risk_profile,
-                SeedRiskProfile::Gaussian | SeedRiskProfile::GaussianLocationScale
-            );
-            // Score a small set of analytic, data-derived starts before the outer
-            // solve. These are initial conditions only: the optimizer must converge
-            // from the selected start, and no seed is promoted directly to a fit.
-            // `rho_weight_anchor` is exactly 0 for unit weights and fixed dispersion (#2469).
-            let run_gaussian_anchored_prepass = gaussian_risk && weight_log_geom_mean != 0.0;
-            // A caller-supplied rho seed (`init_rhos`/`heuristic_log_lambdas`, now in
-            // rho-space) is an explicit warm-start installed via `with_initial_rho`
-            // above. It still ANCHORS the initial.sp prepass below rather than
-            // short-circuiting it: the prepass only adopts its analytic candidate
-            // when that STRICTLY lowers the true REML/LAML cost, so a healthy warm
-            // seed is returned unchanged (the candidate never beats it → byte-
-            // identical behaviour). What the anchor-and-adopt rescues is a warm seed
-            // TRAPPED in a shallow under-smoothing local basin: when the design's
-            // kernel collapses (e.g. the constant-curvature `curv()` smooth fitted
-            // at a trial κ on the +chart side — the geodesic-exponential kernel's
-            // off-diagonals → 1, so its global REML optimum is a LARGE λ that the
-            // local outer optimizer, warm-started from the previous-κ λ̂, slides away
-            // from into the spurious low-λ optimum). The shallow optimum's
-            // spuriously-low deviance made the κ outer objective monotone toward the
-            // +chart bound for any curved data (gam#1464 — hyperbolic truth recovered
-            // as spherical); the analytic high-λ `initial.sp` candidate lets the
-            // prepass jump into the correct high-λ basin so the per-κ REML cost
-            // matches the textbook profiled-REML and the curvature SIGN is
-            // identifiable. Same machinery as the gam#1266 double-penalty rescue.
-            let caller_seeded_rho = rho_warm_start.is_some_and(|h| h.len() == k);
-            let prepass_candidates: Vec<Array1<f64>> = 'prepass: {
-                // The corrected continuation has one start, the optimum that
-                // admitted the correction (#1082).
-                if corrected_continuation {
-                    break 'prepass Vec::new();
-                }
-                // The prepass scores its analytic candidates against the TRUE
-                // REML/LAML cost and adopts one only on strict improvement, so its
-                // window is the domain the outer optimizer itself searches: the
-                // envelope of the #2812 resolvability domain, both faces (#2902
-                // row 9). A double-penalty null-space smooth (gam#1266) or a
-                // collapsing-kernel spatial smooth (gam#1464) has its global REML
-                // optimum at a large λ beyond a fixed seed band, and a
-                // well-determined smooth can have its commensurate-curvature start
-                // below one. Clamping either to a picked wall moves a data-derived
-                // start onto a face the search does not have. The default anchor is
-                // itself data-derived (the risk shift on the weight scale), so the
-                // lower face is a clamp, not an origin. With no penalty there is no
-                // coordinate to place, and the precision box stands in for the empty
-                // envelope. `OrderedRhoBounds::new` still refuses a non-finite or
-                // inverted interval (#2379).
-                let (envelope_lower, envelope_upper) = if rho_model_domain.0.is_empty() {
-                    crate::estimate::rho_domain::coordinate_domain(None, None)
-                } else {
-                    (
-                        rho_model_domain.0.iter().copied().fold(f64::INFINITY, f64::min),
-                        rho_model_domain.1.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                    )
-                };
-                let seed_bounds = OrderedRhoBounds::new(envelope_lower, envelope_upper)?;
-                // risk_shift is the default seed bias when no caller warm-start is given;
-                // it is NOT applied on top of a caller-supplied rho seed.
-                let risk_shift: f64 = match reml_seed_config.risk_profile {
-                    SeedRiskProfile::Gaussian | SeedRiskProfile::GaussianLocationScale => 0.0,
-                    SeedRiskProfile::GeneralizedLinear => 1.0,
-                    SeedRiskProfile::Survival => 2.0,
-                };
-                // Anchor the prepass at the caller-supplied `heuristic_log_lambdas` when
-                // one is present (it is already in rho-space, used as-is) — the
-                // analytic candidate is scored relative to the warm start and keeps
-                // it unless it is strictly better. Otherwise anchor the default
-                // risk-shift origin to the weight scale (issue #877).
-                let base = if let Some(h) = rho_warm_start.filter(|h| h.len() == k) {
-                    Array1::from_iter(h.iter().map(|&v| seed_bounds.clamp(v)))
-                } else {
-                    Array1::from_elem(k, seed_bounds.clamp(risk_shift + weight_log_geom_mean))
-                };
-                // #2069 / #1575: the analytic mgcv-style `initial.sp` seed
-                // replaces the banned log-λ grid prepass. One commensurate-
-                // curvature estimate — `ρ_j = ln(tr(XᵀWX_j)/tr(S_j))` — proposes a
-                // single candidate relative to `base` (the caller warm-start or the
-                // weight-anchored origin). A smooth whose penalized subspace carries
-                // little data support gets a large `λ_j` by construction, so the
-                // #1266/#1464 high-λ basin is reached analytically without a lattice
-                // search; `seed_bounds` spans the domain's faces so a
-                // genuinely large `λ_j` is not clipped to the seed band. The seed is
-                // order-independent, so no canonical permutation is needed.
-                // Two principled, data-derived candidates are scored against the
-                // anchor, each adopted only when it STRICTLY lowers the true
-                // REML/LAML cost — exactly the criterion the old grid used, but
-                // scoring a handful of hand-derived candidates instead of a
-                // lattice. A healthy warm start stays byte-identical (no candidate
-                // beats it → none adopted).
-                //
-                //   1. The mgcv-style analytic `initial.sp` seed
-                //      `ρ_j = ln(tr(XᵀWX_j)/tr(S_j))` (#2069/#1575) — a
-                //      commensurate-curvature start that jumps a warm seed
-                //      trapped in a shallow UNDER-smoothing basin into the
-                //      analytic high-λ basin (#1266 double-penalty null-space,
-                //      #1464 collapsing-kernel spatial).
-                //
-                // The generated-seed screen (`generate_rho_candidates` +
-                // `rank_seeds_with_screening`) remains the multi-basin backstop.
-                let initial_sp = reml_state.analytic_initial_sp_rho(&base, seed_bounds);
-                //   2. The certified single-λ (diagonal) profiled optimum on the
-                //      SUMMED penalty `Σ_j S_j`, broadcast to a uniform per-block
-                //      ρ. This is an honest one-dimensional restriction of the
-                //      coupled multi-λ objective: overlapping penalty blocks make
-                //      the penalty pseudo-determinant nonseparable, so there is no
-                //      per-block "exact" cyclic closed form. The candidate is
-                //      admitted only after the true coupled REML cost scores it.
-                // A FAILED seed heuristic must never be fatal. The summed-penalty
-                // profiled-diagonal candidate solves a closed-form REML on the
-                // collapsed 1-D restriction; on a tiny / near-degenerate design
-                // (e.g. `n ≈ nullity` of the summed penalty, the `p ≥ n` corner
-                // reached by `y ~ s(x)` on very few rows, #2355) that closed form
-                // can honestly refuse. That refusal only means "this ONE seed is
-                // unavailable" — the generated-seed screen and the neutral/base
-                // anchors remain, and the outer optimizer is the sole authority on
-                // whether the fit certifies. Propagating the seed error with `?`
-                // instead killed the entire fit for a mere unavailable candidate.
-                // Treat an errored candidate as absent (`None`) so the search still
-                // runs from the surviving seeds.
-                let summed_diagonal = reml_state
-                    .analytic_gaussian_profiled_diagonal_rho(seed_bounds)
-                    .ok()
-                    .flatten()
-                    .map(|rho_blocks| {
-                        let mut seed = base.clone();
-                        for (coord, &r) in seed.iter_mut().zip(rho_blocks.iter()) {
-                            *coord = seed_bounds.clamp(r);
-                        }
-                        seed
-                    });
-                let base_cost = reml_state
-                    .compute_cost(&base)
-                    .ok()
-                    .filter(|c| c.is_finite());
-                let mut ranked_candidates: Vec<(f64, Array1<f64>)> = base_cost
-                    .map(|cost| vec![(cost, base.clone())])
-                    .unwrap_or_default();
-                // Keep the strictly-cheapest certified/scored candidate.
-                //
-                // #2607: this choice is a COMPARISON OF NUMBERS, and until now the
-                // log recorded only its outcome (`base -> refined`). That is not
-                // enough to read a seed that lands on a wall. On `hifreq_tensor_k10`
-                // the selected seed is the ρ ceiling in every coordinate and the fit
-                // converges in ONE outer iteration at `edf = 1.294` of `p = 576` —
-                // the intercept — and from the old line alone there is no way to
-                // tell whether the heuristic malfunctioned or whether the criterion
-                // genuinely scores the wall below the origin. Those two call for
-                // completely different fixes, so the costs that decided it are now
-                // reported next to the point they scored.
-                let mut refined = base.clone();
-                let mut best_cost = base_cost;
-                let mut scored: Vec<(&str, Option<f64>)> = vec![("base", base_cost)];
-                for (name, candidate) in [
-                    ("initial_sp", initial_sp),
-                    ("summed_diagonal", summed_diagonal),
-                ] {
-                    let Some(candidate) = candidate else {
-                        scored.push((name, None));
-                        continue;
-                    };
-                    let candidate_cost = reml_state
-                        .compute_cost(&candidate)
-                        .ok()
-                        .filter(|c| c.is_finite());
-                    scored.push((name, candidate_cost));
-                    if let Some(cost) = candidate_cost {
-                        ranked_candidates.push((cost, candidate.clone()));
-                    }
-                    let candidate_beats_best = match (candidate_cost, best_cost) {
-                        (Some(cc), Some(bc)) => cc < bc,
-                        (Some(_), None) => true,
-                        _ => false,
-                    };
-                    if candidate_beats_best {
-                        refined = candidate;
-                        best_cost = candidate_cost;
-                    }
-                }
-                let scored_report = scored
-                    .iter()
-                    .map(|(name, cost)| match cost {
-                        Some(value) => format!("{name}={value:.9e}"),
-                        None => format!("{name}=unavailable"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let seed_moved = refined
-                    .iter()
-                    .zip(base.iter())
-                    // `refined` is `base` bit for bit unless a strictly cheaper candidate
-                    // replaced it, so moved means differs (#2469).
-                    .any(|(&a, &b)| a != b);
-                // For a caller-seeded fit, adopt the analytic result only when it
-                // strictly moved the warm seed (found a strictly-cheaper basin); an
-                // unmoved result leaves the warm start exactly as installed above, so
-                // healthy warm-started fits stay byte-identical. The Gaussian
-                // weight-anchored emit only applies on the non-caller-seeded origin.
-                if seed_moved || (run_gaussian_anchored_prepass && !caller_seeded_rho) {
-                    // Report the start-point comparison, but do not confuse its
-                    // cheapest point with the eventual fit: Gaussian sends every
-                    // unique finite analytic candidate through a certified full
-                    // solve below and keeps the best converged REML value.
-                    log::debug!(
-                        "[OUTER] standard REML analytic-start ranking: {:?} -> {:?} \
-                         (scored: {scored_report}; bounds {:.3}..{:.3})",
-                        base.as_slice().unwrap_or(&[]),
-                        refined.as_slice().unwrap_or(&[]),
-                        seed_bounds.lower(),
-                        seed_bounds.upper(),
-                    );
-                }
-
-                if gaussian_risk {
-                    // A start-point cost is not a basin certificate. Preserve
-                    // every unique finite analytic candidate, ordered only to
-                    // put the cheapest start first; the outer runner performs a
-                    // full certified solve from each and keeps the lowest
-                    // converged REML value. This restores multimodal robustness
-                    // without restoring the arbitrary log-lambda lattice.
-                    ranked_candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    let mut candidates = Vec::with_capacity(ranked_candidates.len());
-                    for (_, candidate) in ranked_candidates {
-                        if !candidates.iter().any(|existing| existing == &candidate) {
-                            candidates.push(candidate);
-                        }
-                    }
-                    candidates
-                } else if seed_moved
-                    || (run_gaussian_anchored_prepass && !caller_seeded_rho)
-                {
-                    vec![refined]
-                } else {
-                    Vec::new()
-                }
-            };
-            let problem = if let Some((first, remaining)) = prepass_candidates.split_first() {
-                problem
-                    .with_initial_rho(first.clone())
-                    .with_initial_rho_candidates(remaining.to_vec())
+            // The outer search enters from ONE deterministic, data-derived start
+            // and the certified second-order search owns everything after it.
+            // No candidate is scored, ranked or restarted: a start-point cost is
+            // not a basin certificate, and a lattice of starts is a grid search.
+            //
+            // A caller-supplied full-length ρ (a warm start, a cached optimum, or
+            // the Negative-Binomial alternation's previous ρ̂) is that start as
+            // given, clamped into the search box. Otherwise the start is the
+            // mgcv-style commensurate-curvature `initial.sp` point
+            // `ρ_j = ln(tr(XᵀWX_j)/tr(S_j))` (#2069/#1575), which balances each
+            // penalty block against the data curvature it regularizes, so a
+            // block with little data support starts at a large λ_j by
+            // construction (#1266/#1464). Coordinates it cannot place fall back
+            // to the weight-scale anchor `rho_weight_anchor` (exactly 0 for unit
+            // weights and every fixed-dispersion family; #877/#893).
+            //
+            // The window is the domain the outer optimizer itself searches: the
+            // envelope of the #2812 resolvability domain (#2902 row 9). With no
+            // penalty there is no coordinate to place, and the precision box
+            // stands in for the empty envelope. `OrderedRhoBounds::new` refuses a
+            // non-finite or inverted interval (#2379).
+            let (envelope_lower, envelope_upper) = if rho_model_domain.0.is_empty() {
+                crate::estimate::rho_domain::coordinate_domain(None, None)
             } else {
-                problem
+                (
+                    rho_model_domain.0.iter().copied().fold(f64::INFINITY, f64::min),
+                    rho_model_domain.1.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                )
             };
+            let start_bounds = OrderedRhoBounds::new(envelope_lower, envelope_upper)?;
+            let outer_start = if let Some(h) = rho_warm_start.filter(|h| h.len() == k) {
+                Array1::from_iter(h.iter().map(|&v| start_bounds.clamp(v)))
+            } else {
+                let anchor = Array1::from_elem(k, start_bounds.clamp(weight_log_geom_mean));
+                // The `initial.sp` point balances each penalty against the
+                // working weight at the cold P-IRLS start, which needs no inner
+                // solve, so it exists even where the solve at `anchor` refuses.
+                reml_state
+                    .analytic_initial_sp_rho(&anchor, start_bounds)?
+                    .unwrap_or(anchor)
+            };
+            log::debug!(
+                "[OUTER] standard REML single start: {:?} (bounds {:.3}..{:.3})",
+                outer_start.as_slice().unwrap_or(&[]),
+                start_bounds.lower(),
+                start_bounds.upper(),
+            );
+            let problem = problem.with_initial_rho(outer_start);
             // Attach the outer-loop cache session. The session shares its
             // realized-fit-context key with the inner beta record (different
             // payload namespace), so a SIGKILL mid-outer-iter leaves both the
@@ -1717,7 +1702,7 @@ where
                 None => problem,
             };
 
-            let obj = problem.build_objective_with_screening_proxy(
+            let obj = problem.build_objective_with_eval_order(
                 &mut reml_state,
                 |state: &mut &mut crate::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
                     state.compute_cost(rho)
@@ -1753,9 +1738,6 @@ where
                         state.compute_efs_steps(rho)
                     },
                 ),
-                |state: &mut &mut crate::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
-                    state.compute_screening_proxy(rho)
-                },
             );
             // #2348 Inc 5: standard REML can form its own λ→∞ face limit
             // exactly (the null-space-restricted fit plus the analytic
@@ -1842,13 +1824,6 @@ where
             } else {
                 None
             };
-            let aux_dim_outer = mixture_dim + sas_dim + student_t_dim;
-            let mut reml_seed_config_mix = reml_seed_config;
-            reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
-            if theta_dim >= REML_SEED_SCREENING_RHO_CAP {
-                reml_seed_config_mix.max_seeds = 1;
-                reml_seed_config_mix.seed_budget = 1;
-            }
             use crate::rho_optimizer::OuterProblem;
             use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
             let initial_link_kind = cfg.link_kind.clone();
@@ -1917,8 +1892,6 @@ where
                     ),
                 )
                 .with_tolerance(reml_tol)
-                .with_seed_config(reml_seed_config_mix)
-                .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
                 .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
                 .with_bounds(theta_lower, theta_upper);
             let problem = if let Some(h) = heuristic_theta_ref {
@@ -2257,11 +2230,17 @@ where
                 )));
             }
 
-            // Re-evaluate value, rho gradient, and the fixed-theta PIRLS mode
-            // through one cache generation. Both partial stationarity checks below
-            // therefore refer to the identical (rho, theta, beta) point.
+            // Re-evaluate value, rho gradient, rho curvature, and the
+            // fixed-theta PIRLS mode through one cache generation. Both partial
+            // stationarity checks below therefore refer to the identical
+            // (rho, theta, beta) point.
             reml_state.reset_outer_seed_state();
-            let (joint_cost, rho_gradient) = reml_state.compute_cost_and_gradient(&final_rho)?;
+            let joint_eval = reml_state.compute_outer_eval_with_order(
+                &final_rho,
+                crate::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
+            )?;
+            let joint_cost = joint_eval.cost;
+            let rho_gradient = joint_eval.gradient;
             let joint_bundle = reml_state.obtain_eval_bundle(&final_rho)?;
             pirls_res = joint_bundle.pirls_result.as_ref().clone();
             pirls_res.likelihood = cfg.likelihood.clone().with_negbin_theta(theta);
@@ -2270,11 +2249,6 @@ where
             let theta_profile =
                 pirls::negbin_theta_score_and_info(y_o.view(), &final_eta, w_o.view(), theta)?;
             let theta_residual = negbin_theta_stationarity_residual(theta, &theta_profile);
-            // This residual is a Newton displacement in the outer log-theta
-            // coordinate, so it shares the outer REML tolerance. The beta
-            // PIRLS tolerance certifies a different coordinate system and must
-            // not silently set the theta fixed-point threshold.
-            let theta_bound = reml_tol;
 
             let rho_lower = rho_model_domain.0.clone();
             let rho_upper = rho_model_domain.1.clone();
@@ -2294,6 +2268,78 @@ where
                 .map(|certificate| certificate.stationarity.bound())
                 .unwrap_or(reml_tol)
                 .max(f64::EPSILON);
+            // The theta residual is a Newton displacement in log theta taken
+            // at the mode the rho search hands over, so it can resolve no finer
+            // than the rho and beta certificates pin that mode: judge it
+            // against the root displacement their bands still allow plus the
+            // score's own rounding band (#3349), not a literal outer tolerance.
+            let log_theta_curvature =
+                theta * theta * theta_profile.info - theta * theta_profile.score;
+            let root_sensitivity = pirls::negbin_theta_score_eta_gradient(
+                y_o.view(),
+                &final_eta,
+                w_o.view(),
+                theta,
+            )
+            .ok()
+            .and_then(|score_eta_gradient| {
+                negbin_theta_root_sensitivity(
+                    &reml_state,
+                    &pirls_res,
+                    &final_rho,
+                    &score_eta_gradient,
+                    theta,
+                    log_theta_curvature,
+                )
+            });
+            let theta_root_displacement = root_sensitivity.as_ref().map_or(0.0, |sensitivity| {
+                // The inner certificate accepts `‖r‖ < tol · natural scale`.
+                let mode_band = pirls_res
+                    .final_kkt_tolerance
+                    .map_or(0.0, |tolerance| tolerance * pirls_res.gradient_natural_scale);
+                let mode_displacement = sensitivity.mode_gain * mode_band;
+                let rho_gain = if final_rho.is_empty() {
+                    Some(0.0)
+                } else {
+                    match joint_eval.hessian.materialize_dense() {
+                        Ok(Some(hessian)) => {
+                            let railed = outer_result
+                                .criterion_certificate
+                                .as_ref()
+                                .map(|certificate| certificate.lambdas_railed.clone())
+                                .unwrap_or_default();
+                            let invariance =
+                                reml_state.criterion_invariant_directions(&final_rho);
+                            let judged = crate::penalty_invariance::judged_subspace_basis(
+                                final_rho.len(),
+                                &railed,
+                                invariance.as_ref(),
+                            );
+                            negbin_theta_root_rho_gain(
+                                &hessian,
+                                judged.as_ref(),
+                                &sensitivity.rho_gradient,
+                            )
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            log::debug!(
+                                "[OUTER] negative-binomial joint certificate: rho Hessian \
+                                 unavailable for the theta root gain ({error:?})"
+                            );
+                            None
+                        }
+                    }
+                };
+                let rho_displacement = rho_gain.map_or(0.0, |gain| gain * rho_bound);
+                if mode_displacement.is_finite() && rho_displacement.is_finite() {
+                    mode_displacement + rho_displacement
+                } else {
+                    0.0
+                }
+            });
+            let theta_bound =
+                negbin_theta_joint_bound(theta, &theta_profile, theta_root_displacement);
             let rho_certificate_ok = final_rho.is_empty()
                 || (outer_result.converged()
                     && outer_result
@@ -2308,8 +2354,13 @@ where
             let pirls_certificate_ok = pirls_res.status.is_converged();
             let theta_certificate_ok = theta_residual.is_finite() && theta_residual <= theta_bound;
 
+            let theta_ratio = if theta_residual == 0.0 {
+                0.0
+            } else {
+                theta_residual / theta_bound
+            };
             let merit = (rho_residual / rho_bound)
-                .max(theta_residual / theta_bound)
+                .max(theta_ratio)
                 .max(if pirls_certificate_ok {
                     0.0
                 } else {
@@ -2356,6 +2407,8 @@ where
                     && reml_state.block_correction_admission_deferred()
                     && reml_state.decide_block_correction_admission(&final_rho)?
                 {
+                    // The corrected search continues from that optimum, its one
+                    // start (#1082).
                     negbin_rho_seed = Some(final_rho.clone());
                     corrected_continuation = true;
                     continuation_curvature = outer_result.final_hessian.clone();
@@ -2420,6 +2473,8 @@ where
             && reml_state.block_correction_admission_deferred()
             && reml_state.decide_block_correction_admission(&final_rho)?
         {
+            // The corrected search continues from that optimum, its one start
+            // (#1082).
             negbin_rho_seed = Some(final_rho.clone());
             corrected_continuation = true;
             continuation_curvature = outer_result.final_hessian.clone();
@@ -2495,7 +2550,7 @@ where
     // Report the outer iteration count that was MEASURED, including a genuine
     // zero. A seed that is a prior fit's terminal certificate and is still
     // stationary here is accepted without iterating
-    // (`certified_resume_is_already_stationary`), so zero is a reachable,
+    // (`claim_prior_terminal_certificate`), so zero is a reachable,
     // meaningful outcome; flooring it to one made the reported count a claim no
     // measurement supports, and every consumer asking "did a fit happen" then
     // read a fabricated pass (#2622).
@@ -2604,10 +2659,9 @@ where
     let mut edf_total = 0.0;
     let mut smoothing_correction = None;
     let mut smoothing_correction_method = None;
-    // The exact first-order IFT correction, RETAINED even when the primary
-    // pair above escalates to a cubature upgrade (#946): the corrected-EDF/AIC
-    // channel reads these instead of the primary pair so it does not go dark
-    // exactly when smoothing-parameter uncertainty is large enough to matter.
+    // The exact first-order IFT correction the corrected-EDF/AIC channel reads
+    // (#946). The primary pair above IS the first-order correction, so the two
+    // pairs carry the same matrix.
     let mut smoothing_correction_first_order = None;
     let mut smoothing_correction_method_first_order = None;
     let mut smoothing_correction_absence = None;
@@ -2615,6 +2669,10 @@ where
     let mut penalized_hessian = Array2::<f64>::zeros((0, 0));
     let mut beta_covariance = None;
     let mut factorized_standard_errors = None;
+    // #3283: the factorized branch's smoothing correction, as its square-root
+    // factor, and the corrected standard errors solved beside the conditional
+    // ones.
+    let mut smoothing_correction_factorized = None;
     let mut beta_covariance_corrected = None;
     // #2705 group A: carried from where the constrained-posterior correction is
     // APPLIED to where the corrected covariance is READ, so the refusal below
@@ -3437,7 +3495,7 @@ where
             (beta_covariance_unscaled.as_ref(), posterior_factor.as_ref())
         {
             // Full inverse available: wrap as phi-scaled covariance, compute
-            // frequentist quantities, and pass to smoothing-correction cubature.
+            // frequentist quantities, and form the smoothing correction.
             let mut posterior_covariance = scaled_covariance(h_inv.clone(), cov_scale);
             let constrained_correction = constrained_posterior
                 .as_ref()
@@ -3609,21 +3667,34 @@ where
             beta_covariance_frequentist = Some(ve);
         }
 
-        // Smoothing-parameter correction (first-order delta + optional cubature).
-        // The dense branch can return the complete matrix and optionally
-        // upgrade it by cubature. On governor refusal the factorized branch
-        // computes only diag(J V_rho J') from cached p×k mode responses; calling
-        // `compute_smoothing_correction_auto(..., None, ...)` is not sufficient
-        // because that routine constructs the full p×p first-order product
-        // before it notices that the base covariance is absent.
-        // `cov_scale` is the coefficient-covariance multiplier at the optimum
-        // (σ̂² for profiled Gaussian, 1 for every weight-carries-dispersion
-        // family). The cubature path multiplies its dispersion-free curvature
-        // block `E_ρ[H(ρ)⁻¹] − H_opt⁻¹` by this scale so the FULL cubature
-        // correction lands on the same c² variance scale as `Vb = cov_scale·H_opt⁻¹`
-        // (#582); the var_beta = Cov_ρ[β̂] block is already on that scale and
-        // stays unscaled.
-        if beta_covariance_unscaled.is_some() {
+        // Smoothing-parameter correction `J·V_ρ·Jᵀ` (Wood, Pya & Säfken 2016,
+        // mgcv's Vc1), analytic for any number of smoothing parameters, on BOTH
+        // inference branches. It is assembled as its square-root factor `B`
+        // (`p × r`, `C = B·Bᵀ`). The dense branch forms `C` for `Vp = Vb + C`.
+        // The factorized branch keeps `B` and solves the corrected standard
+        // errors beside the conditional ones below, because a `p × p` matrix is
+        // what its governor refused (#3283); it charges the correction's
+        // workspace here, where the dense bundle already holds it.
+        let smoothing_workspace = if beta_covariance_unscaled.is_some() {
+            Ok(None)
+        } else {
+            reserve_smoothing_correction_workspace(qs.nrows()).map(Some)
+        };
+        let mut smoothing_correction_factor: Option<Array2<f64>> = None;
+        if let Err(detail) = smoothing_workspace.as_ref() {
+            if !final_rho.is_empty() {
+                log::debug!(
+                    "[SMOOTHING-CORRECTION] factorized branch could not reserve the correction's \
+                     workspace ({detail}); publishing the typed absence"
+                );
+                smoothing_correction_absence = Some(
+                    crate::model_types::SmoothingCorrectionAbsence::CorrectionWorkspaceRefused {
+                        detail: detail.clone(),
+                    },
+                );
+            }
+        }
+        if let Ok(smoothing_workspace_reservation) = smoothing_workspace {
             let no_outer_gradient = Array1::<f64>::zeros(0);
             // #2748 -- THE RESOLUTION THE CERTIFICATE'S VERDICT WAS TAKEN AT.
             //
@@ -3720,17 +3791,10 @@ where
                         .collect()
                 })
                 .unwrap_or_default();
-            let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
+            let smoothing_outcome = reml_state.compute_smoothing_correction_outcome(
                 &final_rho,
-                // The box the outer arm searched and the shipped-point
-                // certificate above judged rails against, so it contains the
-                // certified mode by construction.
-                &rho_model_domain,
                 &lambdas,
                 &pirls_res,
-                beta_covariance_unscaled.as_ref(),
-                cov_scale,
-                finalgrad_norm,
                 // #2428: the residual gradient the outer certificate itself
                 // used to accept this ρ̂ is the resolution floor the ρ-Hessian's
                 // definiteness must be judged against. Without it the
@@ -3756,114 +3820,68 @@ where
                 // error, refusing fits this certificate accepted (#2428). Empty
                 // when the certificate cleared nothing.
                 &measured_hessian_error,
-                // The coordinates the certificate judged railed on a face of
-                // that same box, and judged the ρ-Hessian OFF. They are
-                // boundary estimates with `∂β̂/∂ρ_k = 0`: the first-order
-                // inverse gives their axes zero variance instead of judging a
-                // curvature the certificate never looked at (a roundoff-negative
-                // `H_kk` there refused the correction for every direction), and
-                // the cubature conditions on them at the face instead of
-                // stepping off it.
+                // The coordinates the certificate held at a rail and excluded
+                // from its own PSD test. They are boundary estimates with
+                // `∂β̂/∂ρ_k = 0`, so the correction gives their axes zero
+                // variance instead of re-judging a curvature the certificate
+                // never looked at.
                 &certified_railed_rho,
-            )?;
+            );
             match smoothing_outcome {
                 super::reml::eval::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
-                    // A fit certified at an infinite-smoothing rail (typed
-                    // AsymptoteRail, or box-railed coordinates) has NO finite
-                    // ρ-variance along the rail direction — the outer Hessian
-                    // is legitimately non-PD there, so the first-order
-                    // smoothing correction is TYPED-unavailable rather than a
-                    // defect. Ship the certified fit with the plug-in
-                    // covariance and no correction; the downstream corrected
-                    // EDF/AIC channels report the typed absence (#946/#1027)
-                    // instead of the whole fit dying over an enhancement. The
-                    // railed axes themselves no longer land here — they are
-                    // excluded above with zero variance — so this is reached
-                    // only when an interior direction of such a fit is refused.
-                    // A fit WITHOUT rail evidence keeps the fail-loud error: an
-                    // unexpectedly uninvertible outer Hessian on a
-                    // well-conditioned interior optimum is a real defect.
-                    let rail_certified =
-                        outer_result
-                            .criterion_certificate
-                            .as_ref()
-                            .is_some_and(|certificate| {
-                                matches!(
-                            certificate.stationarity,
-                            crate::model_types::OuterStationarityCertificate::AsymptoteRail { .. }
-                        ) || !certificate.lambdas_railed.is_empty()
-                            });
-                    // The same typed absence applies when the outer Hessian has
-                    // no analytic form for this fit at all (a non-canonical
-                    // Firth link, routed to BFGS): nothing about the optimum is
-                    // suspect, the correction simply cannot be formed, and the
-                    // fit was accepted with that link on purpose (#2158).
-                    let structurally_not_analytic = matches!(
-                        reason,
-                        crate::estimate::smoothing_correction::SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { .. }
-                    );
-                    if !rail_certified && !structurally_not_analytic {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "exact smoothing-corrected covariance unavailable: {reason:?}"
-                        )));
-                    }
-                    log::debug!(
-                        "[SMOOTHING-CORRECTION] typed-unavailable on a {} fit ({reason:?}); \
-                         shipping the plug-in covariance without a smoothing correction",
-                        if rail_certified { "rail-certified" } else { "non-analytic-outer-Hessian" }
-                    );
-                    let detail = format!("{reason:?}");
-                    smoothing_correction_absence = Some(if rail_certified {
-                        crate::model_types::SmoothingCorrectionAbsence::RailCertified { detail }
-                    } else {
-                        crate::model_types::SmoothingCorrectionAbsence::OuterHessianNotAnalytic {
-                            detail,
-                        }
-                    });
-                    rho_covariance = None;
-                    smoothing_correction = None;
-                    smoothing_correction_method = None;
-                    smoothing_correction_first_order = None;
-                    smoothing_correction_method_first_order = None;
+                    // Every Firth link carries its analytic outer ρ-Hessian
+                    // (#3203), so an unavailable correction is a real defect.
+                    // Railed coordinates are not a reason: the correction
+                    // excludes them exactly as the certificate did, so a
+                    // refusal on a railed fit is a real defect like any other.
+                    return Err(EstimationError::InvalidInput(format!(
+                        "exact smoothing-corrected covariance unavailable: {reason:?}"
+                    )));
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
-                    (
-                        smoothing_correction,
-                        smoothing_correction_method,
-                        smoothing_correction_first_order,
-                        smoothing_correction_method_first_order,
-                    ) = outcome.into_correction_with_method();
+                    let (factor, method) = outcome.into_correction_with_method();
+                    smoothing_correction_method = method;
+                    if beta_covariance_unscaled.is_some() {
+                        smoothing_correction = factor
+                            .as_ref()
+                            .map(crate::estimate::smoothing_correction::smoothing_correction_gram);
+                        smoothing_correction_first_order = smoothing_correction.clone();
+                        smoothing_correction_method_first_order = smoothing_correction_method;
+                    } else {
+                        smoothing_correction_factor = factor;
+                    }
                 }
             }
+            // The correction's assembly transients are gone; its `p × r` factor
+            // is all that stays live on the factorized branch.
+            drop(smoothing_workspace_reservation);
         }
 
-        // Tier-0 marginal-smoothing adequacy diagnostic (#938): while the REML objective
-        // is still live, sample the outer criterion around the converged ρ̂ to
-        // read the PSIS k̂ that says whether the plug-in + first-order V_ρ
-        // correction is adequate. This is the objective-lifecycle seam — the
-        // diagnostic runs against the SAME objective the fit converged on, so
-        // its criterion is the fit's own bit-for-bit (no retain/rebuild). Absent
-        // when there are no smoothing parameters or the outer Hessian is
-        // unavailable; never fatal.
+        // Tier-0 marginal-smoothing adequacy diagnostic (#938): while the REML
+        // objective is still live, sample the outer criterion around the
+        // converged ρ̂ to read the PSIS k̂ that says whether the plug-in +
+        // first-order V_ρ correction is adequate. It runs against the SAME
+        // objective the fit converged on, so its criterion is the fit's own
+        // bit-for-bit.
         //
-        // The Tier-0 diagnostic is CHEAP (a handful of outer-criterion
-        // evaluations) so it is emitted regardless of `skip_rho_posterior_inference`
-        // whenever it is available (#1810) — the standard formula/CLI fit surfaces
-        // its ρ-posterior adequacy grade by default. Only the EXPENSIVE escalation
-        // tiers (Tier-1 quadrature / Tier-2 NUTS over ρ) are gated by the flag:
-        // interactive formula/CLI fits keep `skip_rho_posterior_inference = true`
-        // so a fit whose plug-in grades `Escalate` never turns into a sampler
-        // benchmark, while lower-level callers that opt in (`skip = false`) get
-        // the auto-selected escalation tier (quadrature for K≤4, NUTS over ρ for
-        // K≤16, honest Unavailable beyond) at this same live seam.
-        (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
-            &final_rho,
-            // The searched and certified box is the posterior's support.
-            &rho_model_domain,
-            !opts.skip_rho_posterior_inference,
-            None,
-        );
+        // The returned fit does not need it: the covariance above is complete
+        // without it, and the diagnostic costs 2155 inner solves plus a
+        // fresh ρ-Hessian. So it runs only when the caller requests ρ-posterior
+        // inference (`skip_rho_posterior_inference = false`), together with the
+        // escalation tier it grades for (quadrature or NUTS over ρ, whichever
+        // needs fewer criterion evaluations). Every other fit keeps the typed
+        // `NotComputed(InferenceNotRequested)` set above.
+        if !opts.skip_rho_posterior_inference {
+            (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
+                &final_rho,
+                // The box is where λ is numerically resolvable, not the
+                // posterior's support: a draw past a saturated face is valued by
+                // the criterion's exact affine limit from that face, so no
+                // posterior mass is dropped when the box edge moves.
+                &rho_continuation,
+            );
+        }
 
         // Standard errors: prefer the diagonal of the full inverse when
         // available; otherwise use the factorised Hessian from the EDF pass
@@ -3941,12 +3959,9 @@ where
                     ))
                 })?
                 .flatten();
-            factorized_standard_errors = Some(crate::estimate::penalty::factorized_standard_errors(
+            let inverse_diagonal = crate::estimate::penalty::factorized_published_inverse_diagonal(
                 &conditioning,
                 qs,
-                cov_scale,
-                correction,
-                zero_covariance_boundary,
                 se_chunk_cols,
                 |rhs, rows| {
                     factor_t.certified_solve(
@@ -3958,7 +3973,71 @@ where
                         ),
                     )
                 },
+            )?;
+            factorized_standard_errors = Some(crate::estimate::penalty::factorized_standard_errors(
+                &conditioning,
+                &inverse_diagonal,
+                cov_scale,
+                None,
+                correction,
+                zero_covariance_boundary,
             )?);
+            // #3283: the corrected standard errors of `Vp = Vb + B·Bᵀ` from the
+            // same solved diagonal. A constrained fit truncates `Vp` at its own
+            // lift, as the dense branch does, from `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`:
+            // `m` solves against the factor instead of a `p × p` product.
+            if let Some(factor) = smoothing_correction_factor.take() {
+                let truncation = match constrained_posterior
+                    .as_ref()
+                    .filter(|geometry| geometry.decline().is_none())
+                {
+                    Some(geometry) => {
+                        let constraints_transpose = geometry.constraints.a.t().to_owned();
+                        let solved = factor_t.certified_solve(
+                            &pirls_res.stabilizedhessian_transformed,
+                            &qs.t().dot(&constraints_transpose),
+                            "smoothing-corrected constrained posterior normal geometry",
+                        )?;
+                        let conditional_times_constraints = qs.dot(&solved) * cov_scale;
+                        factorized_marginal_constraint_truncation(
+                            geometry,
+                            &conditional_times_constraints,
+                            &factor,
+                        )?
+                    }
+                    None => Ok(None),
+                };
+                match truncation {
+                    Ok(marginal_correction) => {
+                        let standard_errors = crate::estimate::penalty::factorized_standard_errors(
+                            &conditioning,
+                            &inverse_diagonal,
+                            cov_scale,
+                            Some(&factor),
+                            marginal_correction.as_ref(),
+                            false,
+                        )?;
+                        smoothing_correction_factorized = Some(
+                            crate::model_types::FactorizedSmoothingCorrection {
+                                factor,
+                                standard_errors,
+                            },
+                        );
+                    }
+                    Err(reason) => {
+                        log::debug!(
+                            "[CONSTRAINED-Vp] the factorized smoothing-corrected law could not be \
+                             truncated to the feasible set ({reason}); publishing the typed absence"
+                        );
+                        smoothing_correction_absence = Some(
+                            crate::model_types::SmoothingCorrectionAbsence::ConstrainedTruncationRefused {
+                                detail: reason,
+                            },
+                        );
+                        smoothing_correction_method = None;
+                    }
+                }
+            }
         } else {
             // `edf_factor` is set on every `compute_inference` fit, so one of
             // the two branches above runs. Reaching here would publish an
@@ -3999,9 +4078,9 @@ where
         // with `G` and `Δ` derived from `Σ`, not from `Vp`. Along a coordinate
         // the constraint pins, `(GΔGᵀ)_ii` cancels `Σ_ii` to eleven digits, so
         // whatever `(Vp − Σ)_ii` happens to be becomes the WHOLE reported
-        // variance — and `Vp − Σ` is a legitimately sign-indefinite second-order
-        // increment (the cubature branch is `φ̂·E_ρ[H(ρ)⁻¹] + Cov_ρ[β̂] − φ̂·H_opt⁻¹`,
-        // a difference of two averages, PSD only as a SUM with `Vb`). On
+        // variance — and `Vp − Σ` need not be resolvable against that
+        // cancellation (any increment is PSD only as a SUM with `Vb` once the
+        // truncation has removed most of `Σ_ii`). On
         // `y ~ s(x, shape=convex)` that left `Σ_ii = 2.30e-2` truncated to
         // `6.23e-13` with a `−3.03e-9` smoothing increment on top, i.e. a
         // materially negative published variance, and `se_from_covariance`
@@ -4134,6 +4213,7 @@ where
         reparam_qs: Some(pirls_res.reparam_result.qs.clone()),
         dispersion,
         factorized_standard_errors,
+        smoothing_correction_factorized,
         beta_covariance_frequentist,
         coefficient_influence,
         weighted_gram,
@@ -4323,6 +4403,7 @@ where
             // Persist the optimized target's Firth state so saved-model
             // sampling reconstructs the same posterior (#2245 finding 16).
             firth_bias_reduction: cfg.firth_bias_reduction,
+            jeffreys_arming_evidence,
             ..Default::default()
         },
         inference,
@@ -4489,8 +4570,14 @@ mod shipped_joint_point_identity_2727_tests {
 
 #[cfg(test)]
 mod negative_binomial_joint_certificate_tests {
-    use super::negbin_theta_stationarity_residual;
-    use crate::pirls::NegbinThetaScore;
+    use super::{
+        negbin_theta_joint_bound, negbin_theta_root_rho_gain, negbin_theta_stationarity_residual,
+    };
+    use crate::penalty_invariance::judged_subspace_basis;
+    use crate::pirls::{
+        NegbinThetaScore, negbin_theta_score_and_info, negbin_theta_score_eta_gradient,
+    };
+    use ndarray::array;
 
     fn profile(score: f64, info: f64, band: f64) -> NegbinThetaScore {
         NegbinThetaScore { score, info, band }
@@ -4544,5 +4631,111 @@ mod negative_binomial_joint_certificate_tests {
         assert!(
             negbin_theta_stationarity_residual(1.0, &profile(1.0e-3, 1.0, f64::NAN)).is_infinite()
         );
+    }
+
+    fn close(actual: f64, expected: f64) -> bool {
+        (actual - expected).abs() <= 64.0 * f64::EPSILON * expected.abs().max(1.0)
+    }
+
+    /// With no rail and no invariance the gain is `‖H⁻¹ j‖₂`, coupled
+    /// curvature included.
+    #[test]
+    fn rho_gain_is_the_curvature_weighted_root_gradient() {
+        let diagonal = array![[2.0, 0.0], [0.0, 4.0]];
+        let judged = judged_subspace_basis(2, &[], None);
+        let gain = negbin_theta_root_rho_gain(&diagonal, judged.as_ref(), &array![1.0, 2.0])
+            .expect("positive-definite curvature");
+        assert!(close(gain, 0.5_f64.sqrt()), "{gain}");
+
+        let coupled = array![[3.0, 1.0], [1.0, 2.0]];
+        let j: ndarray::Array1<f64> = array![1.0, -2.0];
+        // H⁻¹ = [[2, -1], [-1, 3]] / 5.
+        let solved = array![(2.0 * j[0] - j[1]) / 5.0, (-j[0] + 3.0 * j[1]) / 5.0];
+        let expected = solved.dot(&solved).sqrt();
+        let gain = negbin_theta_root_rho_gain(&coupled, judged.as_ref(), &j)
+            .expect("positive-definite curvature");
+        assert!(close(gain, expected), "{gain} vs {expected}");
+    }
+
+    /// A railed coordinate is not free to move, so its root sensitivity grants
+    /// nothing; with every coordinate railed the gain is exactly zero.
+    #[test]
+    fn rho_gain_excludes_railed_coordinates() {
+        let hessian = array![[2.0, 0.0], [0.0, 4.0]];
+        let judged = judged_subspace_basis(2, &[1], None);
+        let gain = negbin_theta_root_rho_gain(&hessian, judged.as_ref(), &array![1.0, 100.0])
+            .expect("positive-definite judged curvature");
+        assert!(close(gain, 0.5), "{gain}");
+        assert_eq!(
+            negbin_theta_root_rho_gain(&hessian, None, &array![1.0, 100.0]),
+            Some(0.0)
+        );
+    }
+
+    /// Without positive-definite judged curvature there is no finite
+    /// displacement to derive, so no gain is granted.
+    #[test]
+    fn rho_gain_refuses_curvature_that_is_not_positive_definite() {
+        let judged = judged_subspace_basis(2, &[], None);
+        let j = array![1.0, 1.0];
+        for hessian in [
+            array![[1.0, 0.0], [0.0, 0.0]],
+            array![[1.0, 2.0], [2.0, 1.0]],
+            array![[f64::NAN, 0.0], [0.0, 1.0]],
+        ] {
+            assert_eq!(negbin_theta_root_rho_gain(&hessian, judged.as_ref(), &j), None);
+        }
+        assert_eq!(
+            negbin_theta_root_rho_gain(&array![[1.0]], judged.as_ref(), &j),
+            None
+        );
+    }
+
+    /// The bound is the score's rounding band carried into the log-theta
+    /// Newton displacement plus the derived root displacement; an underivable
+    /// displacement grants nothing.
+    #[test]
+    fn joint_bound_adds_rounding_band_and_root_displacement() {
+        let theta = 2.0;
+        let scores = profile(3.0, 5.0, 1.0e-9);
+        let rounding = theta * 1.0e-9 / (theta * theta * 5.0 - theta * 3.0);
+        assert_eq!(negbin_theta_joint_bound(theta, &scores, 0.0), rounding);
+        assert_eq!(negbin_theta_joint_bound(theta, &scores, 1.0e-6), rounding + 1.0e-6);
+        for undefined in [f64::NAN, f64::INFINITY, -1.0] {
+            assert_eq!(negbin_theta_joint_bound(theta, &scores, undefined), rounding);
+        }
+        assert_eq!(negbin_theta_joint_bound(theta, &profile(2.0, 1.0, 1.0e-9), 0.0), 0.0);
+    }
+
+    /// `∂score/∂η` against a central difference of the profile score itself.
+    #[test]
+    fn theta_score_eta_gradient_matches_the_profile_score() {
+        let y = array![0.0, 3.0, 7.0, 1.0];
+        let weights = array![1.0, 2.0, 0.5, 0.0];
+        let eta = array![0.2, 1.1, 1.9, -0.4];
+        let theta = 1.7;
+        let gradient =
+            negbin_theta_score_eta_gradient(y.view(), &eta, weights.view(), theta).expect("valid");
+        let step = 1.0e-5;
+        for i in 0..eta.len() {
+            let mut up = eta.clone();
+            let mut down = eta.clone();
+            up[i] += step;
+            down[i] -= step;
+            let score = |at: &ndarray::Array1<f64>| {
+                negbin_theta_score_and_info(y.view(), at, weights.view(), theta)
+                    .expect("valid")
+                    .score
+            };
+            let difference = (score(&up) - score(&down)) / (2.0 * step);
+            // Central-difference truncation `h²|f'''|/6 ~ 1e-11` and
+            // cancellation `ε|score|/h ~ 1e-11` on these O(1) rows.
+            assert!(
+                (gradient[i] - difference).abs() <= 1.0e-9 * difference.abs().max(1.0),
+                "row {i}: {} vs {difference}",
+                gradient[i]
+            );
+        }
+        assert_eq!(gradient[3], 0.0);
     }
 }

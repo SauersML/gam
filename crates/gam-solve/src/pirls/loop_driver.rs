@@ -35,6 +35,7 @@ use super::{
     // misc helpers
     array1_l2_norm,
     attach_penalty_shift,
+    penalized_gradient_natural_scale,
     // compute functions
     calculate_deviance_from_eta,
     // edf helpers
@@ -48,8 +49,9 @@ use super::{
     should_use_sparse_native_pirls,
     solve_penalized_least_squares_implicit,
     standard_inverse_link_jet,
+    update_glmvectors,
 };
-use super::{GamModelFinalState, project_coefficients_to_lower_bounds};
+use super::{GamModelFinalState, WorkingLikelihood, project_coefficients_to_lower_bounds};
 use crate::active_set;
 use crate::estimate::EstimationError;
 use crate::gpu::pirls_host_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
@@ -185,6 +187,7 @@ pub(crate) fn exact_lambdas_from_rho(rho: LogSmoothingParamsView<'_>) -> Array1<
 
 pub(super) fn default_beta_guess_external(
     p: usize,
+    response: &ResponseFamily,
     link_function: LinkFunction,
     y: ArrayView1<f64>,
     priorweights: ArrayView1<f64>,
@@ -263,6 +266,7 @@ pub(super) fn default_beta_guess_external(
                     // if these are ever reached unexpectedly.
                     LinkFunction::Log
                     | LinkFunction::Identity
+                    | LinkFunction::Sqrt
                     | LinkFunction::Inverse
                     | LinkFunction::InverseSquared => (prevalence / (1.0 - prevalence)).ln(),
                 };
@@ -288,6 +292,22 @@ pub(super) fn default_beta_guess_external(
                 beta[intercept_col] = weighted_sum / totalweight;
             }
         }
+        LinkFunction::Log if matches!(response, ResponseFamily::Binomial) => {
+            // Relative-risk regression: the intercept-only root of the
+            // Bernoulli score under `μ = exp(η)` is `η = ln p̂`. The
+            // Jeffreys-smoothed prevalence `(Σwy + ½)/(Σw + 1)` lies strictly
+            // inside (0, 1), so the seed lies strictly inside the feasible set
+            // `η < 0` even when every response is one.
+            let mut weighted_sum = 0.0;
+            let mut totalweight = 0.0;
+            for (&yi, &wi) in y.iter().zip(priorweights.iter()) {
+                weighted_sum += wi * yi;
+                totalweight += wi;
+            }
+            if totalweight > 0.0 {
+                beta[intercept_col] = ((weighted_sum + 0.5) / (totalweight + 1.0)).ln();
+            }
+        }
         LinkFunction::Log => {
             // For log link, intercept = ln(weighted mean of y)
             let mut weighted_sum = 0.0;
@@ -304,6 +324,25 @@ pub(super) fn default_beta_guess_external(
                 // of an invented floor (#2469).
                 if mean_y > 0.0 {
                     beta[intercept_col] = mean_y.ln();
+                }
+            }
+        }
+        LinkFunction::Sqrt => {
+            // The intercept-only root of every variance function's score under
+            // `μ = η²` is `μ = ȳ` (weighted), i.e. `η = √ȳ`, inside the link's
+            // branch `η > 0`. A non-positive mean has no such root; the
+            // intercept keeps its zero seed and the solve reports the domain
+            // violation itself.
+            let mut weighted_sum = 0.0;
+            let mut totalweight = 0.0;
+            for (&yi, &wi) in y.iter().zip(priorweights.iter()) {
+                weighted_sum += wi * yi;
+                totalweight += wi;
+            }
+            if totalweight > 0.0 {
+                let mean_y = weighted_sum / totalweight;
+                if mean_y > 0.0 {
+                    beta[intercept_col] = mean_y.sqrt();
                 }
             }
         }
@@ -332,6 +371,61 @@ pub(super) fn default_beta_guess_external(
         }
     }
     beta
+}
+
+/// The Fisher working weights `w·(dμ/dη)²/V(μ)` at the cold P-IRLS start: the
+/// coefficient guess [`default_beta_guess_external`] that an inner solve with
+/// no warm start begins from, pushed through the same working update that
+/// solve's first iterate makes. It plays the part of the working weight at
+/// `mustart` in mgcv's `initial.sp`: it needs no solve, so it exists wherever
+/// an inner solve could refuse, and it follows the response's units exactly as
+/// the fitted working weight does, because the start mean is the weighted mean
+/// of `y`. The start is the unconstrained guess; shape constraints and coefficient
+/// bounds only move it inside their cone during the solve.
+pub(crate) fn start_working_weights(
+    x: &DesignMatrix,
+    y: ArrayView1<'_, f64>,
+    priorweights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    config: &PirlsConfig,
+) -> Result<Array1<f64>, EstimationError> {
+    let beta = default_beta_guess_external(
+        x.ncols(),
+        &config.likelihood.spec.response,
+        config.link_function(),
+        y,
+        priorweights,
+        config.link_kind.mixture_state(),
+        config.link_kind.sas_state(),
+    );
+    let eta = x.matrixvectormultiply(&beta) + &offset;
+    let n = eta.len();
+    let mut mu = Array1::<f64>::zeros(n);
+    let mut weights = Array1::<f64>::zeros(n);
+    let mut z = Array1::<f64>::zeros(n);
+    match &config.link_kind {
+        InverseLink::Standard(_) => config.likelihood.irls_update(
+            y,
+            &eta,
+            priorweights,
+            &mut mu,
+            &mut weights,
+            &mut z,
+            None,
+            None,
+        )?,
+        link => update_glmvectors(
+            y,
+            &eta,
+            link,
+            priorweights,
+            &mut mu,
+            &mut weights,
+            &mut z,
+            None,
+        )?,
+    }
+    Ok(weights)
 }
 
 pub(super) fn solve_intercept_for_prevalence(
@@ -985,11 +1079,23 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             /// path.
             working_eta: LinearPredictor,
             gradient_data: Array1<f64>,
+            /// The data score's operands `XᵀWη` and `XᵀWz` in the active basis,
+            /// whose difference is `gradient_data`: the natural gradient scale
+            /// is built from them (#3339).
+            score_operands: [Array1<f64>; 2],
             deviance: f64,
             log_likelihood: f64,
             max_abs_eta: f64,
         }
 
+        // Original-basis coefficient vectors to the active basis the gradient
+        // is reported in.
+        let to_active_basis = |v: Array1<f64>| {
+            transform_active
+                .as_ref()
+                .map(|transform| transform.apply_transpose(&v))
+                .unwrap_or(v)
+        };
         let rows = if let Some(cache) = sufficient_only_row_cache {
             // #1868 FAST PATH: the criterion, gradient and inner solve are served
             // entirely from k-space Gram sufficient statistics; the length-`n`
@@ -998,8 +1104,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             // the producer attached the once-built frozen bundle we clone its
             // `ArcArray1` handles (O(1), zero element touches) instead of
             // re-materialising ~16·n elements per κ callback — the #1868 fix.
-            let mut grad_orig = cache.xtwx_orig.dot(&qbeta);
+            let gram_qbeta = cache.xtwx_orig.dot(&qbeta);
+            let mut grad_orig = gram_qbeta.clone();
             grad_orig -= &cache.xtwy_orig;
+            let score_operands = [
+                to_active_basis(gram_qbeta),
+                to_active_basis(cache.xtwy_orig.clone()),
+            ];
             // #2624: `z^T W z - 2 qb^T b + qb^T G qb` regrouped as
             // `(z^T W z - qb^T b) + qb^T (G qb - b)`. The two are the same
             // number in exact arithmetic; they are not the same computation.
@@ -1012,10 +1123,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             // of what this buys, which is much smaller than the claim it was
             // landed under.
             let residual_inner = qbeta.dot(&grad_orig);
-            let gradient_data = transform_active
-                .as_ref()
-                .map(|transform| transform.apply_transpose(&grad_orig))
-                .unwrap_or(grad_orig);
+            let gradient_data = to_active_basis(grad_orig);
             let weighted_rss = (cache.centered_weighted_y_sq
                 - compensated_dot(&qbeta, &cache.xtwy_orig)
                 + residual_inner)
@@ -1051,6 +1159,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     solve_d_array: bundle.solve_d_array.clone(),
                     working_eta: LinearPredictor::new(Array1::zeros(0)),
                     gradient_data,
+                    score_operands,
                     deviance,
                     log_likelihood: bundle.log_likelihood,
                     max_abs_eta: bundle.max_abs_eta,
@@ -1094,6 +1203,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     solve_d_array: d.into_shared(),
                     working_eta: LinearPredictor::new(Array1::zeros(0)),
                     gradient_data,
+                    score_operands,
                     deviance,
                     log_likelihood,
                     max_abs_eta,
@@ -1114,10 +1224,11 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             weighted_residual *= &priorweights_owned;
             // gradient = Qs^T X^T (w * residual) (composed)
             let xt_wr = x_original.apply_transpose(&weighted_residual);
-            let gradient_data = transform_active
-                .as_ref()
-                .map(|transform| transform.apply_transpose(&xt_wr))
-                .unwrap_or(xt_wr);
+            let gradient_data = to_active_basis(xt_wr);
+            let score_operands = [
+                to_active_basis(x_original.apply_transpose(&(&finalmu * &priorweights_owned))),
+                to_active_basis(x_original.apply_transpose(&(&y * &priorweights_owned))),
+            ];
             let deviance = calculate_deviance_from_eta(
                 y,
                 &final_eta,
@@ -1155,6 +1266,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 solve_c_array: c.into_shared(),
                 solve_d_array: d.into_shared(),
                 gradient_data,
+                score_operands,
                 deviance,
                 log_likelihood,
                 max_abs_eta,
@@ -1173,13 +1285,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             solve_d_array,
             working_eta,
             gradient_data,
+            score_operands: [xt_w_eta, xt_w_z],
             deviance,
             log_likelihood,
             max_abs_eta,
         } = rows;
-        let score_norm = array1_l2_norm(&gradient_data);
         let s_beta = penalty_active.shifted_gradient(beta_transformed.as_ref());
-        let s_beta_norm = array1_l2_norm(&s_beta);
+        let gradient_natural_scale = penalized_gradient_natural_scale(&xt_w_eta, &xt_w_z, &s_beta);
         let mut gradient = gradient_data;
         gradient += &s_beta;
         let penalty_term = penalty_active.shifted_quadratic(beta_transformed.as_ref());
@@ -1201,7 +1313,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             penalty_term,
             firth: FirthDiagnostics::Inactive,
             hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: score_norm + s_beta_norm,
+            gradient_natural_scale,
         };
 
         let zero_iter_penalized = deviance + penalty_term;
@@ -1216,7 +1328,12 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             last_step_halving: 0,
             max_abs_eta,
             constraint_kkt: linear_constraints.as_ref().map(|lin| {
-                compute_constraint_kkt_diagnostics(beta_transformed.as_ref(), &gradient, lin)
+                compute_constraint_kkt_diagnostics(
+                    beta_transformed.as_ref(),
+                    &gradient,
+                    gradient_natural_scale,
+                    lin,
+                )
             }),
             min_penalized_deviance: if zero_iter_penalized.is_finite() {
                 zero_iter_penalized
@@ -1272,7 +1389,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             iteration: 1,
             max_abs_eta,
             lastgradient_norm: gradient_norm,
-            gradient_natural_scale: score_norm + s_beta_norm,
+            gradient_natural_scale,
             penalized_gradient_transformed: gradient.clone(),
             last_deviance_change: 0.0,
             last_step_halving: 0,
@@ -1344,6 +1461,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         .unwrap_or_else(|| {
             Coefficients::new(default_beta_guess_external(
                 penalty.p,
+                &config.likelihood.spec.response,
                 link_function,
                 y,
                 priorweights,
@@ -1447,8 +1565,8 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         adaptive_kkt_tolerance,
         // LM step-halving is a per-iteration damping retry budget; it is
         // independent of the total outer-iteration cap. Tying the two
-        // together collapsed step halving to 3 under seed screening (where
-        // max_iterations is intentionally capped low), turning recoverable
+        // together collapsed step halving to 3 under a low outer-imposed
+        // iteration cap, turning recoverable
         // damping into spurious failures.
         max_step_halving: base_max_step_halving,
         firth_bias_reduction: firth_active,
@@ -1505,7 +1623,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // so the gain ratio compares one objective. That lock is correct *within* a
     // solve, but it pins ν to whatever η the solve started from. When the fit
     // cold-starts (the final dedicated fit at the converged ρ passes
-    // `warm_start_beta = None`, and seed screening starts from a default guess),
+    // `warm_start_beta = None`, and the first outer eval starts from a default guess),
     // that warm-start η has not yet captured the mean structure; the leftover
     // spread of μ inflates the Gamma deviance term `mean[y/μ − ln(y/μ) − 1]` and
     // biases ν **down** (φ up) by >2× whenever μ varies appreciably. The mean
@@ -1546,6 +1664,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         const SHAPE_REFRESH_REL_TOL: f64 = 1e-4;
         for refresh_iter in 0..MAX_SHAPE_REFRESH {
             let refreshed_shape = super::estimate_gamma_shape_from_eta(
+                &working_model.likelihood.spec.link,
                 y,
                 working_summary.state.eta.as_ref(),
                 priorweights,

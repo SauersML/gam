@@ -411,8 +411,9 @@ mod constant_curvature_kappa_range_identification_tests {
         // What the FIT writes back: the range this criterion profiles to at one
         // κ. Taken at the box's hyperbolic end, which is where `ℓ̂` is furthest
         // from the auto rule.
-        let derived = ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
-            .expect("profile is constructible from an auto-range spec");
+        let derived =
+            ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
+                .expect("profile is constructible from an auto-range spec");
         let anchor_kappa = -0.9 * cap;
         let (eta_at_anchor, _, _) = derived
             .minimize_over_eta(anchor_kappa)
@@ -453,9 +454,60 @@ mod constant_curvature_kappa_range_identification_tests {
                     b.to_string(),
                     "κ={kappa}: the two profiles refuse for different reasons"
                 ),
-                (a, b) => panic!(
-                    "κ={kappa}: one profile evaluated and the other refused: {a:?} vs {b:?}"
-                ),
+                (a, b) => {
+                    panic!("κ={kappa}: one profile evaluated and the other refused: {a:?} vs {b:?}")
+                }
+            }
+        }
+    }
+
+    /// The η-profile read off a jet taken AWAY from η's minimizer is the
+    /// profile, not the κ slice beside it (gam#3426).
+    ///
+    /// The inner solve certifies η̂ by its Newton decrement against `1/(2n)`, so
+    /// the jet `evaluate` reduces carries a residual `V_η ≠ 0`, and the plain
+    /// envelope `V_p′ = V_κ` is then short by `V_κη·V_η/V_ηη` — measured at
+    /// `1.5e-2` on the FD fixture below. On a quadratic `V` the Newton minimizer
+    /// of the jet's quadratic in η IS the minimizer, so the reduction must return
+    /// the closed-form profile exactly, at every η the jet is taken at.
+    #[test]
+    fn the_eta_profile_of_an_off_minimum_jet_is_the_profile() {
+        // V(κ, η) = ½(a κ² + 2b κη + c η²) + g κ + f η, c > 0.
+        let (a, b, c, g, f) = (3.0_f64, 1.7, 2.5, -0.4, 0.9);
+        let v = |kappa: f64, eta: f64| {
+            0.5 * (a * kappa * kappa + 2.0 * b * kappa * eta + c * eta * eta) + g * kappa + f * eta
+        };
+        // η*(κ) = −(bκ + f)/c, so V_p(κ) = V(κ, η*(κ)) with
+        // V_p′ = (a − b²/c)κ + g − b f/c and V_p″ = a − b²/c.
+        for kappa in [-0.7_f64, 0.0, 1.3] {
+            let eta_star = -(b * kappa + f) / c;
+            let exact = (
+                v(kappa, eta_star),
+                (a - b * b / c) * kappa + g - b * f / c,
+                a - b * b / c,
+            );
+            for offset in [-0.3_f64, 0.0, 0.05, 0.8] {
+                let eta = eta_star + offset;
+                let jet = ProfiledRemlPsiJet {
+                    value: v(kappa, eta),
+                    rho_at_bound: false,
+                    gradient: [a * kappa + b * eta + g, b * kappa + c * eta + f],
+                    hessian: [[a, b], [b, c]],
+                };
+                let (value, first, second) =
+                    jet.eta_profiled_kappa_jet().expect("V_ηη > 0 identifies η");
+                let scale = 1.0 + exact.0.abs().max(exact.1.abs()).max(exact.2.abs());
+                for (name, got, want) in [
+                    ("V_p", value, exact.0),
+                    ("V_p′", first, exact.1),
+                    ("V_p″", second, exact.2),
+                ] {
+                    assert!(
+                        (got - want).abs() <= 16.0 * f64::EPSILON * scale,
+                        "κ={kappa}, η−η*={offset}: {name}={got:.17e} against the closed-form \
+                         profile {want:.17e}"
+                    );
+                }
             }
         }
     }
@@ -465,8 +517,9 @@ mod constant_curvature_kappa_range_identification_tests {
     /// `constant_curvature_kappa_jet_fd_tests` differences `V(κ, η)` at fixed
     /// `η`. Nothing differences `V_p(κ) = min_η V(κ, η)`, and the reduction from
     /// one to the other is where the range coordinate's whole cost lands:
-    /// `V_p′ = V_κ` by the envelope theorem, and `V_p″ = V_κκ − V_κη²/V_ηη` by
-    /// one more differentiation. The Schur term is NON-POSITIVE, so a profile
+    /// `V_p′ = V_κ` by the envelope theorem (with the certified residual `V_η`
+    /// carried, gam#3426), and `V_p″ = V_κκ − V_κη²/V_ηη` by one more
+    /// differentiation. The Schur term is NON-POSITIVE, so a profile
     /// that fails to apply it does not produce a wrong fit — it produces an
     /// OVERSTATED curvature, which is what the outer solve's terminal
     /// stationarity certificate is denominated in (#2458). Exactly the class of
@@ -617,5 +670,72 @@ mod constant_curvature_kappa_range_identification_tests {
         // fixture.
         ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
             .expect("the default single-penalty term still profiles");
+    }
+
+    /// The κ route is held to the fit's own `tol`, like every other outer route.
+    ///
+    /// It used to declare `options.tol.max(√ε)`. The canonical fit tolerance is
+    /// `1e-10`, and `√ε ≈ 1.49e-8` is larger, so the floor was always the value
+    /// used: this one route quietly loosened the stationarity band by about 150x
+    /// while every other route passed `tol` straight through. The exact
+    /// `d²V_p/dκ²` and the declared size set what this route can resolve. A floor
+    /// set by a machine constant does not.
+    #[test]
+    fn the_kappa_route_holds_the_fits_own_tolerance() {
+        let n = 120usize;
+        let centers = 6usize;
+        let seed = 0x5EED_2747_0000_0007_u64;
+        let (probe_feats, _) = dataset_in_span(n, 0.0, 0.6, 1.0, centers, 0.0, seed);
+        let (_, cap) = seed_range_and_box(&probe_feats, centers);
+        let (feats, y) = dataset_in_span(n, 0.5, 0.6, 1.0, centers, 0.05, seed);
+        let profile =
+            ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
+                .expect("profile is constructible on the fixture");
+        for tol in [1e-10_f64, 1e-6] {
+            let options = FitOptions {
+                tol,
+                ..FitOptions::default()
+            };
+            let problem = constant_curvature_kappa_problem(n, &profile, &options, -cap, cap);
+            assert_eq!(
+                problem.tolerance(),
+                tol,
+                "the κ problem must declare the fit's tol {tol:e} verbatim"
+            );
+        }
+    }
+
+    /// At the canonical `tol = 1e-10`, with the floor gone, the κ solve still
+    /// reaches a converged optimum with an interior κ̂. The floor was not what
+    /// made the route converge.
+    #[test]
+    fn the_kappa_solve_converges_at_the_canonical_tolerance() {
+        let n = 240usize;
+        let centers = 6usize;
+        let radius = 0.6_f64;
+        let seed = 0x5EED_2747_0000_0008_u64;
+        let kappa_star = 0.7_f64;
+        let (probe_feats, _) = dataset_in_span(n, 0.0, radius, 1.0, centers, 0.0, seed);
+        let (ell_ref, cap) = seed_range_and_box(&probe_feats, centers);
+        let (feats, y) = dataset_in_span(n, kappa_star, radius, ell_ref, centers, 0.03, seed);
+        let profile =
+            ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
+                .expect("profile is constructible on the fixture");
+        let options = FitOptions {
+            tol: 1e-10,
+            ..FitOptions::default()
+        };
+        let optimum = solve_constant_curvature_kappa_profile(n, profile, &options, -cap, cap, 0)
+            .expect("the κ solve must converge at the canonical tolerance");
+        eprintln!(
+            "[κ tol] planted κ⋆ = {kappa_star}, κ̂ = {:.6}, ℓ̂ = {:.6}, box = ±{cap:.4}",
+            optimum.kappa, optimum.length_scale
+        );
+        assert!(
+            optimum.kappa > -cap && optimum.kappa < cap,
+            "κ̂ = {} must be interior to the box ±{cap}",
+            optimum.kappa
+        );
+        assert!(optimum.length_scale.is_finite() && optimum.length_scale > 0.0);
     }
 }

@@ -26,7 +26,7 @@ use crate::transformation_normal::{
     transformation_normal_pit_score,
 };
 use gam_problem::BlockRole;
-use gam_terms::smooth::build_term_collection_design;
+use gam_terms::smooth::build_term_collection_prediction_design;
 
 /// Typed errors emitted while assembling a [`PredictInput`] from a saved model.
 ///
@@ -515,7 +515,7 @@ impl SavedCtnChart {
 /// from silently truncating the predictive law at the training range.
 fn transformation_normal_quantile_grid(
     model: &FittedModel,
-    design: &gam_terms::smooth::TermCollectionDesign,
+    design: &gam_terms::smooth::TermCollectionPredictionDesign,
     n: usize,
     offset: &Array1<f64>,
 ) -> Result<CtnTransformTable, PredictInputError> {
@@ -651,7 +651,7 @@ fn transformation_normal_quantile_grid(
 /// `block_states[0].eta` to round-off — the invariant gam#2680 broke.
 fn transformation_normal_observed_scores(
     model: &FittedModel,
-    design: &gam_terms::smooth::TermCollectionDesign,
+    design: &gam_terms::smooth::TermCollectionPredictionDesign,
     response: &Array1<f64>,
     offset: &Array1<f64>,
 ) -> Result<Array1<f64>, PredictInputError> {
@@ -792,7 +792,7 @@ fn transformation_normal_mean_z_nodes() -> Result<Vec<f64>, PredictInputError> {
 /// without one is refused rather than silently reporting the plug-in.
 fn transformation_normal_posterior_mean_correction(
     model: &FittedModel,
-    design: &gam_terms::smooth::TermCollectionDesign,
+    design: &gam_terms::smooth::TermCollectionPredictionDesign,
     n: usize,
     offset: &Array1<f64>,
     table: &CtnTransformTable,
@@ -1052,7 +1052,7 @@ impl CtnPredictiveTail {
 /// The predictor refuses a band that reads either, naming which.
 fn transformation_normal_predictive_ladder(
     model: &FittedModel,
-    design: &gam_terms::smooth::TermCollectionDesign,
+    design: &gam_terms::smooth::TermCollectionPredictionDesign,
     n: usize,
     offset: &Array1<f64>,
     table: &CtnTransformTable,
@@ -1256,7 +1256,7 @@ pub fn build_transformation_normal_quantile_grid(
     .map_err(|e| String::from(PredictInputError::from(e)))?;
     let clipped = model.axis_clip_to_training_ranges(data, col_map);
     let design_input = clipped.as_ref().map_or(data, |arr| arr.view());
-    let design = build_term_collection_design(design_input, &spec)
+    let design = build_term_collection_prediction_design(design_input, &spec)
         .map_err(|e| format!("failed to build generation design: {e}"))?;
     let n = data.nrows();
     if offset.len() != n {
@@ -1310,7 +1310,7 @@ pub fn build_transformation_normal_observed_scores(
     .map_err(|error| String::from(PredictInputError::from(error)))?;
     let clipped = model.axis_clip_to_training_ranges(data, col_map);
     let design_input = clipped.as_ref().map_or(data, |array| array.view());
-    let design = build_term_collection_design(design_input, &spec)
+    let design = build_term_collection_prediction_design(design_input, &spec)
         .map_err(|error| format!("failed to build observed-score design: {error}"))?;
     transformation_normal_observed_scores(model, &design, response, offset).map_err(Into::into)
 }
@@ -1332,7 +1332,7 @@ fn build_predict_input_for_model_inner(
     )?;
     let clipped = model.axis_clip_to_training_ranges(data, col_map);
     let design_input = clipped.as_ref().map_or(data, |arr| arr.view());
-    let design = build_term_collection_design(design_input, &spec).map_err(|e| {
+    let design = build_term_collection_prediction_design(design_input, &spec).map_err(|e| {
         PredictInputError::InvalidInput {
             reason: format!("failed to build prediction design: {e}"),
         }
@@ -1422,7 +1422,7 @@ fn build_predict_input_for_model_inner(
                 col_map,
                 "resolved_termspec_noise",
             )?;
-            let design_noise_raw = build_term_collection_design(design_input, &spec_noise)
+            let design_noise_raw = build_term_collection_prediction_design(design_input, &spec_noise)
                 .map_err(|e| PredictInputError::InvalidInput {
                     reason: format!("failed to build noise prediction design: {e}"),
                 })?;
@@ -1472,7 +1472,7 @@ fn build_predict_input_for_model_inner(
                 col_map,
                 "resolved_slopespec",
             )?;
-            let design_slope = build_term_collection_design(design_input, &spec_slope)
+            let design_slope = build_term_collection_prediction_design(design_input, &spec_slope)
                 .map_err(|e| PredictInputError::InvalidInput {
                     reason: format!("failed to build slope prediction design: {e}"),
                 })?;
@@ -1481,11 +1481,23 @@ fn build_predict_input_for_model_inner(
                 .map_err(|error| PredictInputError::InvalidInput {
                     reason: error.to_string(),
                 })?;
+            // The slope offset is a slope on the score as given; the model reads the
+            // score `(z − mean)/sd`, on which the same slope is `sd` times it, the
+            // factor the fit applied (gam#3231).
+            let score_sd = model
+                .latent_z_normalization
+                .as_ref()
+                .ok_or_else(|| PredictInputError::MissingMetadata {
+                    reason: "marginal-slope prediction requires the saved latent-z normalization"
+                        .to_string(),
+                })?
+                .sd;
             let slope_offset = design_slope
                 .compose_offset(offset_noise.view(), "marginal-slope slope prediction")
                 .map_err(|error| PredictInputError::InvalidInput {
                     reason: error.to_string(),
-                })?;
+                })?
+                * score_sd;
             let local = build_marginal_slope_local_auxiliary_matrix(model, design_input, col_map)?;
             let auxiliary_matrix = match model.residual_repair.as_ref() {
                 None => local,
@@ -1646,7 +1658,7 @@ impl FittedModel {
         )?;
         let clipped = self.axis_clip_to_training_ranges(data, col_map);
         let design_input = clipped.as_ref().map_or(data, |arr| arr.view());
-        let design = build_term_collection_design(design_input, &spec).map_err(|e| {
+        let design = build_term_collection_prediction_design(design_input, &spec).map_err(|e| {
             PredictInputError::InvalidInput {
                 reason: format!("failed to build the conditioning design: {e}"),
             }

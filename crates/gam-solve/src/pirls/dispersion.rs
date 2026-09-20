@@ -28,6 +28,46 @@ fn certified_log_means(eta: &Array1<f64>) -> Result<Vec<f64>, EstimationError> {
     super::par_certified_rows(eta.len(), |i| crate::mixture_link::log_link_solver_exp(eta[i]))
 }
 
+/// Per-row means read from the same inverse-link surface as the PIRLS working
+/// state: the generic variance × link cell's link, a reciprocal power
+/// `μ = η^{−a}`, the log link, or the Gaussian identity. An `η` outside the
+/// link domain fails exactly as the PIRLS row does.
+fn certified_link_means(
+    response: &ResponseFamily,
+    inverse_link: &InverseLink,
+    eta: &Array1<f64>,
+) -> Result<Vec<f64>, EstimationError> {
+    if let Some(cell) = GenericEdmCell::classify(response, inverse_link) {
+        return super::par_certified_rows(eta.len(), |i| generic_edm_mean(cell, i, eta[i]));
+    }
+    if let Some((link, exponent)) = reciprocal_power_link(inverse_link) {
+        return super::par_certified_rows(eta.len(), |i| {
+            require_reciprocal_link_domain(link, eta[i])?;
+            let mu = (-exponent * eta[i].ln()).exp();
+            if mu.is_finite() && mu > 0.0 {
+                Ok(mu)
+            } else {
+                Err(EstimationError::pirls_row_geometry_unrepresentable(i, "mean", eta[i], mu))
+            }
+        });
+    }
+    match (response, inverse_link) {
+        (_, InverseLink::Standard(StandardLink::Log)) => certified_log_means(eta),
+        (ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)) => {
+            super::par_certified_rows(eta.len(), |i| {
+                if eta[i].is_finite() {
+                    Ok(eta[i])
+                } else {
+                    Err(EstimationError::pirls_row_geometry_unrepresentable(i, "mean", eta[i], eta[i]))
+                }
+            })
+        }
+        (_, other) => crate::bail_invalid_estim!(
+            "nuisance-scale estimation has no inverse link surface for {response:?} with {other:?}"
+        ),
+    }
+}
+
 #[inline]
 fn certified_prior_weight(row: usize, eta: f64, weight: f64) -> Result<f64, EstimationError> {
     if weight.is_finite() && weight >= 0.0 {
@@ -87,12 +127,15 @@ fn gamma_shape_statistic(response: f64, mean: f64) -> f64 {
     }
 }
 
+/// Exact Gamma shape MLE at a certified linear predictor, with `μ` read from
+/// the fit's own inverse link.
 pub(crate) fn estimate_gamma_shape_from_eta(
+    inverse_link: &InverseLink,
     y: ArrayView1<'_, f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
 ) -> Result<f64, EstimationError> {
-    let means = certified_log_means(eta)?;
+    let means = certified_link_means(&ResponseFamily::Gamma, inverse_link, eta)?;
     let rows: Vec<(f64, f64)> = super::par_certified_rows(eta.len(), |i| {
         let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
         if wi == 0.0 {
@@ -291,8 +334,9 @@ pub(crate) fn estimate_tweedie_phi_from_eta(
 /// (`d = (y−μ)²`) and the inverse Gaussian (`d = (y−μ)²/(y μ²)`).
 ///
 /// `μ` is read from the same inverse-link surface as the working state
-/// (reciprocal power `μ = η^{−a}` or the log link), so an `η` outside the link
-/// domain fails exactly as the PIRLS row does.
+/// (the generic variance × link cell's link, a reciprocal power
+/// `μ = η^{−a}`, or the log link), so an `η` outside the link domain fails
+/// exactly as the PIRLS row does.
 pub(crate) fn estimate_dispersion_phi_from_eta(
     response: &ResponseFamily,
     inverse_link: &InverseLink,
@@ -307,33 +351,13 @@ pub(crate) fn estimate_dispersion_phi_from_eta(
             "dispersion φ̂ is defined for the Gaussian and inverse Gaussian families, not {other:?}"
         ),
     };
-    let reciprocal = reciprocal_power_link(inverse_link);
-    let mean = |i: usize| -> Result<f64, EstimationError> {
-        match (reciprocal, inverse_link) {
-            (Some((link, exponent)), _) => {
-                require_reciprocal_link_domain(link, eta[i])?;
-                Ok((-exponent * eta[i].ln()).exp())
-            }
-            (None, InverseLink::Standard(StandardLink::Log)) => {
-                crate::mixture_link::log_link_solver_exp(eta[i])
-            }
-            (None, InverseLink::Standard(StandardLink::Identity)) if !inverse_gaussian => {
-                Ok(eta[i])
-            }
-            (None, other) => crate::bail_invalid_estim!(
-                "dispersion φ̂ has no inverse link surface for {other:?}"
-            ),
-        }
-    };
+    let means = certified_link_means(response, inverse_link, eta)?;
     let rows: Vec<(f64, f64)> = super::par_certified_rows(eta.len(), |i| {
         let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
         if wi == 0.0 {
             return Ok((0.0, 0.0));
         }
-        let mu = mean(i)?;
-        if !mu.is_finite() {
-            return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "mean", eta[i], mu));
-        }
+        let mu = means[i];
         let statistic = if inverse_gaussian {
             if !(y[i].is_finite() && y[i] > 0.0) {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(
@@ -419,7 +443,7 @@ mod gamma_tweedie_profile_math_tests {
         let y = Array1::from(vec![1.0 - 1.0e-8, 1.0 + 1.0e-8]);
         let eta = Array1::zeros(2);
         let weights = Array1::ones(2);
-        let shape = estimate_gamma_shape_from_eta(y.view(), &eta, weights.view())
+        let shape = estimate_gamma_shape_from_eta(&InverseLink::Standard(StandardLink::Log), y.view(), &eta, weights.view())
             .expect("a nonzero dispersion has a finite Gamma shape");
         let mean_square = 0.5 * ((y[0] - 1.0).powi(2) + (y[1] - 1.0).powi(2));
         assert!((shape * mean_square - 1.0).abs() < 1.0e-7);
@@ -428,11 +452,11 @@ mod gamma_tweedie_profile_math_tests {
         assert!(gamma_shape_score(1.01 * shape, target) < 0.0);
 
         let large_y = Array1::from(vec![1.0e200]);
-        let shape = estimate_gamma_shape_from_eta(large_y.view(), &Array1::zeros(1), Array1::ones(1).view())
+        let shape = estimate_gamma_shape_from_eta(&InverseLink::Standard(StandardLink::Log), large_y.view(), &Array1::zeros(1), Array1::ones(1).view())
             .expect("a large profile target has a small finite Gamma shape");
         assert!((shape * large_y[0] - 1.0).abs() < 1.0e-12);
 
-        assert!(estimate_gamma_shape_from_eta(Array1::ones(2).view(), &eta, weights.view()).is_err());
+        assert!(estimate_gamma_shape_from_eta(&InverseLink::Standard(StandardLink::Log), Array1::ones(2).view(), &eta, weights.view()).is_err());
     }
 
     #[test]
@@ -529,6 +553,52 @@ pub(crate) fn negbin_theta_score_and_info(
 ) -> Result<NegbinThetaScore, EstimationError> {
     let means = certified_log_means(eta)?;
     negbin_theta_score_and_info_from_means(y, eta, &means, priorweights, theta)
+}
+
+/// The linear predictor's pull on the NB2 profile score: `∂(∂ℓ/∂θ)/∂η_i`
+/// under the log link, `w_i μ_i (y_i − μ_i) / (θ + μ_i)²`, from the per-row
+/// score `ψ(y+θ) − ψ(θ) + ln θ + 1 − ln(θ+μ) − (θ+y)/(θ+μ)` whose
+/// `μ`-derivative is `(y − μ)/(θ + μ)²` and `dμ/dη = μ`.
+pub(crate) fn negbin_theta_score_eta_gradient(
+    y: ArrayView1<'_, f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+    theta: f64,
+) -> Result<Array1<f64>, EstimationError> {
+    if !(theta.is_finite() && theta > 0.0) {
+        crate::bail_invalid_estim!("negative-binomial theta must be finite and positive");
+    }
+    let means = certified_log_means(eta)?;
+    let rows = super::par_certified_rows(eta.len(), |i| {
+        let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
+        if wi == 0.0 {
+            return Ok(0.0);
+        }
+        let yi = y[i];
+        if !valid_count_response(yi) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                i,
+                "negative-binomial response",
+                eta[i],
+                yi,
+            ));
+        }
+        let theta_plus_mu = theta + means[i];
+        // Two bounded ratios instead of `(θ + μ)²`, which can overflow when
+        // the derivative itself is representable.
+        let pull = wi * (means[i] / theta_plus_mu) * ((yi - means[i]) / theta_plus_mu);
+        if pull.is_finite() {
+            Ok(pull)
+        } else {
+            Err(EstimationError::pirls_row_geometry_unrepresentable(
+                i,
+                "negative-binomial theta-score eta derivative",
+                eta[i],
+                pull,
+            ))
+        }
+    })?;
+    Ok(Array1::from_vec(rows))
 }
 
 /// Profile the NB2 theta: the smallest representable theta at which the profile

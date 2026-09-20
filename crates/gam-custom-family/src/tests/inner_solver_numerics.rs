@@ -747,6 +747,7 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
+        0.0,
         false,
     );
     assert_eq!(
@@ -774,6 +775,7 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
+        0.0,
         false,
     );
     assert!(
@@ -797,6 +799,7 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
+        0.0,
         false,
     );
     assert!(
@@ -815,6 +818,7 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
+        0.0,
         false,
     );
     assert!(
@@ -831,6 +835,102 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
         "accept_model_noise_floor",
         "the gam#2637 branch must not swallow steps the model CAN resolve"
     );
+}
+
+/// gam#2977 S2 (gnomon#2370): the gam#2637 override converts a rejection into
+/// an accept on the premise that the realized change is a fact about `β`. With
+/// nothing measured yet its floor is the `|F|·1e-14` fallback, a LOWER bound on
+/// the evaluation's rounding, so a rounding-level change cleared it. Measured on
+/// gnomon's 48-row Gaussian location-scale fixture at 605dff0f92, cycle 0
+/// attempt 3: `|F| = 2.4`, `pred ≈ 2e-22`, realized `+2.330e-11`, while the
+/// witness measured the evaluation's rounding at `2.644462e-11` one ladder
+/// later (so the arithmetic ceiling, which admitted that measurement, is at
+/// least that). The accept ended the ladder, the noise-decided shrinks stood at
+/// `r = 1.160e-10`, and the solve refused on a fully-rejected stall.
+#[test]
+pub(crate) fn a_rounding_level_change_is_not_a_measured_decrease_2977() {
+    const OLD_RADIUS: f64 = 4.64e-10;
+    const STEP_NORM: f64 = 4.64e-10;
+    const OBJECTIVE_SCALE: f64 = 2.4;
+    const OBJECTIVE_TOL: f64 = 1.0e-6 * (1.0 + OBJECTIVE_SCALE);
+    const REALIZED: f64 = 2.330e-11;
+    const PREDICTED: f64 = 2.0e-22;
+    const CEILING: f64 = 2.644462e-11;
+
+    let noise_floor = OBJECTIVE_SCALE * JOINT_TRUST_NOISE_FLOOR_REL;
+    assert!(
+        PREDICTED <= noise_floor && REALIZED > noise_floor && REALIZED <= CEILING,
+        "fixture must clear the fallback floor {noise_floor:.3e} yet sit inside the ceiling \
+         {CEILING:.3e}: realized={REALIZED:.3e} pred={PREDICTED:.3e}"
+    );
+
+    let refused = update_joint_trust_region_radius(
+        OLD_RADIUS,
+        STEP_NORM,
+        REALIZED,
+        PREDICTED,
+        PREDICTED,
+        OBJECTIVE_SCALE,
+        OBJECTIVE_TOL,
+        0.0,
+        CEILING,
+        true,
+    );
+    assert!(
+        !refused.accepted,
+        "a change {REALIZED:.3e} within the evaluation's rounding ceiling {CEILING:.3e} is not \
+         evidence of a decrease; got {}",
+        refused.decision.label()
+    );
+    assert_ne!(refused.decision.label(), "accept_model_noise_floor");
+
+    // Control: the same attempt with the ceiling set to zero is the pre-fix
+    // controller, and it takes the rounding as a decrease.
+    let pre_fix = update_joint_trust_region_radius(
+        OLD_RADIUS,
+        STEP_NORM,
+        REALIZED,
+        PREDICTED,
+        PREDICTED,
+        OBJECTIVE_SCALE,
+        OBJECTIVE_TOL,
+        0.0,
+        0.0,
+        true,
+    );
+    assert_eq!(pre_fix.decision.label(), "accept_model_noise_floor");
+
+    // A change that clears the ceiling is still taken, so the gam#2637 branch
+    // keeps its purpose.
+    let resolvable = update_joint_trust_region_radius(
+        OLD_RADIUS,
+        STEP_NORM,
+        4.0 * CEILING,
+        PREDICTED,
+        PREDICTED,
+        OBJECTIVE_SCALE,
+        OBJECTIVE_TOL,
+        0.0,
+        CEILING,
+        true,
+    );
+    assert_eq!(resolvable.decision.label(), "accept_model_noise_floor");
+    assert!(resolvable.accepted);
+
+    // An evaluation the ceiling cannot size certifies no change.
+    let unsizable = update_joint_trust_region_radius(
+        OLD_RADIUS,
+        STEP_NORM,
+        4.0 * CEILING,
+        PREDICTED,
+        PREDICTED,
+        OBJECTIVE_SCALE,
+        OBJECTIVE_TOL,
+        0.0,
+        f64::INFINITY,
+        true,
+    );
+    assert_ne!(unsizable.decision.label(), "accept_model_noise_floor");
 }
 
 #[test]
@@ -860,8 +960,6 @@ pub(crate) fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() 
         use_remlobjective: false,
         compute_covariance: false,
         use_outer_hessian: false,
-        screening_max_inner_iterations: None,
-        seed_screening: false,
         early_exit_threshold: None,
         outer_score_subsample: None,
         auto_outer_subsample: false,
@@ -870,7 +968,6 @@ pub(crate) fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() 
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
         joint_penalties: None,
-        screen_initial_rho: true,
     };
     let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
     let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)
@@ -1597,7 +1694,7 @@ pub(crate) fn joint_proposal_at_step_floor_suppresses_descent_substitution_near_
 ///     positive quantity `stabilized_joint_solver_diagonal_ridge`
 ///     adds to lift a negative-eigenvalue joint Hessian above the
 ///     SPD floor.
-///   * **TRIAL OBJECTIVE** path (`total_quadratic_penalty`) uses
+///   * **TRIAL OBJECTIVE** path (`BlockPenaltyRoots::value`) uses
 ///     only `joint_mode_diagonal_ridge` (zero: no ridge enters the
 ///     objective `f`), which does NOT include the stabilizing shift.
 ///
@@ -5107,20 +5204,20 @@ pub(crate) fn rowwise_kronecker_psi_row_chunks_are_window_consistent() {
 
 #[test]
 pub(crate) fn joint_trust_region_radius_update_accept_reject_logic() {
-    let accepted = update_joint_trust_region_radius(1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, false);
+    let accepted = update_joint_trust_region_radius(1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, 0.0, false);
     assert!(accepted.accepted);
     assert!((accepted.rho - 1.0).abs() < 1.0e-12);
     assert!((accepted.radius - 2.0).abs() < 1.0e-12);
     assert_eq!(accepted.decision.label(), "grow_at_boundary");
 
-    let rejected = update_joint_trust_region_radius(1.0, 0.5, -0.1, 2.0, 2.0, 1.0, 1.0e-6, 0.0, false);
+    let rejected = update_joint_trust_region_radius(1.0, 0.5, -0.1, 2.0, 2.0, 1.0, 1.0e-6, 0.0, 0.0, false);
     assert!(!rejected.accepted);
     assert!(rejected.rho < 0.0);
     assert!((rejected.radius - 0.25).abs() < 1.0e-12);
     assert_eq!(rejected.decision.label(), "shrink_reject");
 
     let rejected_inside_radius =
-        update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0, 2.0, 1.0, 1.0e-6, 0.0, false);
+        update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0, 2.0, 1.0, 1.0e-6, 0.0, 0.0, false);
     assert!(!rejected_inside_radius.accepted);
     assert!(
         rejected_inside_radius.radius < 1.0e-3,
@@ -5129,7 +5226,7 @@ pub(crate) fn joint_trust_region_radius_update_accept_reject_logic() {
     assert!((rejected_inside_radius.radius - 5.0e-4).abs() < 1.0e-12);
     assert_eq!(rejected_inside_radius.decision.label(), "shrink_reject");
 
-    let poor = update_joint_trust_region_radius(1.0, 0.5, 0.1, 1.0, 1.0, 1.0, 1.0e-6, 0.0, false);
+    let poor = update_joint_trust_region_radius(1.0, 0.5, 0.1, 1.0, 1.0, 1.0, 1.0e-6, 0.0, 0.0, false);
     assert!(poor.accepted);
     assert!((poor.rho - 0.1).abs() < 1.0e-12);
     assert!((poor.radius - 0.25).abs() < 1.0e-12);
@@ -5155,6 +5252,7 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
+        0.0,
         false,
     );
     assert!(below_tolerance.accepted);
@@ -5169,6 +5267,7 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
         2.0 * OBJECTIVE_TOL,
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
+        0.0,
         0.0,
         false,
     );
@@ -5185,6 +5284,7 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
+        0.0,
         false,
     );
     assert!(!rejected_below_tolerance.accepted);
@@ -5199,6 +5299,7 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
         2.0 * OBJECTIVE_TOL,
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
+        0.0,
         0.0,
         false,
     );
@@ -5294,6 +5395,7 @@ pub(crate) fn a_truncated_convex_chord_grows_the_region_its_own_prediction_would
         OBJECTIVE,
         objective_tol,
         0.0,
+        0.0,
         true,
     );
     assert!(held.accepted);
@@ -5312,6 +5414,7 @@ pub(crate) fn a_truncated_convex_chord_grows_the_region_its_own_prediction_would
         along_ray,
         OBJECTIVE,
         objective_tol,
+        0.0,
         0.0,
         true,
     );
@@ -5334,6 +5437,7 @@ pub(crate) fn a_truncated_convex_chord_grows_the_region_its_own_prediction_would
         along_ray,
         OBJECTIVE,
         objective_tol,
+        0.0,
         0.0,
         true,
     );
@@ -5368,7 +5472,7 @@ pub(crate) fn joint_newton_collapsed_trust_region_all_reject_exits_before_grindi
     let mut radius = 1.0_f64;
     for _ in 0..200 {
         let rejected =
-            update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, false);
+            update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, 0.0, false);
         assert!(
             !rejected.accepted,
             "a genuine objective increase must reject"
@@ -5380,7 +5484,7 @@ pub(crate) fn joint_newton_collapsed_trust_region_all_reject_exits_before_grindi
         "sustained rejection must collapse the radius to its absolute 1e-12 floor"
     );
     assert_eq!(
-        update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, false)
+        update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, 0.0, false)
             .decision
             .label(),
         "reject_floor",
@@ -5485,6 +5589,7 @@ pub(crate) fn joint_trust_region_noise_floor_accepts_round_off_negative_actual()
         objective_scale,
         objective_tol,
         0.0,
+        0.0,
         false,
     );
     assert!(
@@ -5512,6 +5617,7 @@ pub(crate) fn joint_trust_region_noise_floor_rejects_genuine_increase() {
         predicted,
         objective_scale,
         objective_tol,
+        0.0,
         0.0,
         false,
     );
@@ -5648,6 +5754,7 @@ pub(crate) fn the_runaway_step_is_rejected_once_its_resolution_claim_is_refused_
             objective_scale,
             objective_tol,
             measured_resolution,
+            0.0,
             true, // the stationarity residual is far above tolerance
         )
     };
@@ -6127,6 +6234,7 @@ pub(crate) fn a_boundary_step_below_the_model_noise_floor_grows_the_region_2612(
         objective_scale,
         objective_tol,
         0.0,
+        0.0,
         true,
     );
     assert_eq!(
@@ -6153,6 +6261,7 @@ pub(crate) fn a_boundary_step_below_the_model_noise_floor_grows_the_region_2612(
         objective_scale,
         objective_tol,
         0.0,
+        0.0,
         true,
     );
     assert_eq!(
@@ -6175,6 +6284,7 @@ pub(crate) fn a_boundary_step_below_the_model_noise_floor_grows_the_region_2612(
         predicted,
         objective_scale,
         objective_tol,
+        0.0,
         0.0,
         false,
     );
@@ -6261,6 +6371,7 @@ pub(crate) fn the_joint_norm_is_what_lets_a_well_modelled_boundary_step_grow_261
         objective_scale,
         objective_tol,
         0.0,
+        0.0,
         false,
     );
     assert!(joint.accepted, "rho = 1 must accept");
@@ -6278,6 +6389,7 @@ pub(crate) fn the_joint_norm_is_what_lets_a_well_modelled_boundary_step_grow_261
         predicted,
         objective_scale,
         objective_tol,
+        0.0,
         0.0,
         false,
     );
@@ -6508,6 +6620,7 @@ pub(crate) fn joint_trust_region_rosenbrock_like_quadratic_is_armijo_safe() {
         predicted,
         old_objective,
         objective_tol,
+        0.0,
         0.0,
         false,
     );
@@ -7271,10 +7384,9 @@ fn the_domain_edges_are_where_the_term_is_unpenalized_or_switched_off_2812() {
     );
 }
 
-/// gam#1854 / gam#1395: the multinomial Firth/Jeffreys separation fallback assembles
-/// the outer joint Hessian `H_unpen + S_λ + scale·H_Φ` and, for small systems
-/// (`total <= JOINT_LOGDET_GUARD_MAX_DIM`), realizes its `0.5·log|H|` Laplace term
-/// through `BlockCoupledOperator::from_joint_hessian_with_mode` →
+/// gam#1854: the multinomial Firth/Jeffreys separation fallback assembles the outer
+/// joint Hessian `H_unpen + S_λ + scale·H_Φ` and realizes its `0.5·log|H|` Laplace
+/// term through `BlockCoupledOperator::from_joint_hessian_with_mode` →
 /// `DenseSpectralOperator::from_symmetric_with_mode` → `eigh(Side::Lower)`. That
 /// eigensolver reads ONLY the lower triangle and ASSUMES the input is symmetric.
 ///
@@ -7282,20 +7394,14 @@ fn the_domain_edges_are_where_the_term_is_unpenalized_or_switched_off_2812() {
 /// second-order completion) carries an `O(1e10)` curvature scale, so reduction-order
 /// floating-point noise desyncs the assembled matrix's mirror entries by an amount
 /// that is *large in absolute terms*. Reading the raw lower triangle then yields a
-/// materially different spectrum — and logdet — than the symmetrized matrix. The
-/// gam#1395 ground-truth guard in `joint_outer_evaluate` reconstructs the SAME matrix
-/// but symmetrizes it first, so an unsymmetrized assembly makes the assembled-vs-
-/// reference logdet diverge and the guard `assert!` fires (caught by the fallback's
-/// `catch_unwind` and degraded to the clean separation error — the #1854 symptom).
+/// materially different spectrum — and logdet — than the symmetrized matrix, which
+/// is why `joint_outer_evaluate` symmetrizes the assembled joint Hessian in place
+/// before constructing the `BlockCoupledOperator`.
 ///
-/// The fix symmetrizes the assembled joint Hessian in place before constructing the
-/// `BlockCoupledOperator`, mirroring the guard's ground truth and the matrix-free
-/// dense-assemble path. This test pins that invariant at the operator boundary that
-/// the guard compares across: on a symmetric input the `BlockCoupledOperator` and the
-/// guard's `DenseSpectralOperator` realize the identical logdet (the guard's apples-to-
-/// apples assumption), while the RAW asymmetric matrix — the pre-symmetrization state —
-/// diverges by FAR more than the guard tolerance. That divergence is exactly why the
-/// symmetrization is load-bearing; removing it re-opens the #1854 guard trip.
+/// This test pins both halves at the operator boundary: on the symmetrized input the
+/// `BlockCoupledOperator` route IS the dense spectral operator (bit-identical logdet),
+/// while the raw asymmetric matrix shifts the logdet by the closed-form `ln 4` of the
+/// fixture below.
 #[test]
 fn multinomial_firth_joint_hessian_logdet_needs_symmetrization_1854() {
     let mode = PseudoLogdetMode::Smooth;
@@ -7310,7 +7416,6 @@ fn multinomial_firth_joint_hessian_logdet_needs_symmetrization_1854() {
     raw[[0, 1]] = 0.0; // upper mirror entry
     raw[[1, 0]] = 2.0e5; // lower mirror entry — desynced from the upper one
 
-    // Guard ground truth: symmetrize first, then the dense spectral operator.
     let mut symmetric = raw.clone();
     symmetrize_dense_in_place(&mut symmetric);
     let reference = DenseSpectralOperator::from_symmetric_with_mode(&symmetric, mode)
@@ -7321,38 +7426,30 @@ fn multinomial_firth_joint_hessian_logdet_needs_symmetrization_1854() {
         "reference logdet must be finite: {reference_logdet}"
     );
 
-    // Post-fix assembly route: `BlockCoupledOperator` on the SAME symmetrized matrix.
+    // Assembly route: `BlockCoupledOperator` on the SAME symmetrized matrix.
     let assembled = BlockCoupledOperator::from_joint_hessian_with_mode(&symmetric, mode)
         .expect("assembled BlockCoupledOperator on the symmetrized joint Hessian");
-    let assembled_logdet = assembled.logdet();
-
-    // Guard tolerance, verbatim from `joint_outer_evaluate`'s gam#1395 check.
-    let total = 3usize;
-    let tol = 1e-7 * (total as f64) * (1.0 + reference_logdet.abs());
-
-    // Apples-to-apples: on a symmetric input the two operator routes realize the
-    // identical logdet, so the guard passes. This is the property the symmetrization
-    // restores.
-    assert!(
-        (assembled_logdet - reference_logdet).abs() <= tol,
-        "symmetrized assembly must match the gam#1395 reference logdet within guard \
-         tolerance: assembled={assembled_logdet:.9e} reference={reference_logdet:.9e} \
-         tol={tol:.3e}"
+    assert_eq!(
+        assembled.logdet().to_bits(),
+        reference_logdet.to_bits(),
+        "on a symmetric input the assembly route must realize the dense spectral \
+         operator's logdet exactly: assembled={:.9e} reference={reference_logdet:.9e}",
+        assembled.logdet()
     );
 
-    // Load-bearing check: feeding the RAW asymmetric matrix (the pre-symmetrization
-    // state) to the same operator route makes `eigh(Side::Lower)` read the desynced
-    // lower triangle, diverging from the guard's reference by FAR more than the guard
-    // tolerance — i.e. skipping the symmetrization trips the gam#1395 guard exactly as
-    // reported in #1854.
+    // Load-bearing check: the symmetrized off-diagonal pair is 1e5, so the leading
+    // 2×2 determinant is `5e10 − 1e10`; the lower triangle alone reads 2e5 and gives
+    // `5e10 − 4e10`. Skipping the symmetrization therefore moves the logdet by
+    // `ln 4`, an O(1) shift that factorization roundoff cannot produce.
     let unsymmetrized = BlockCoupledOperator::from_joint_hessian_with_mode(&raw, mode)
         .expect("BlockCoupledOperator on the raw asymmetric joint Hessian");
     let unsymmetrized_logdet = unsymmetrized.logdet();
+    let shift = reference_logdet - unsymmetrized_logdet;
     assert!(
-        (unsymmetrized_logdet - reference_logdet).abs() > 1.0e3 * tol,
-        "raw asymmetric assembly must diverge from the reference (symmetrization is \
+        shift > 0.5 * 4.0_f64.ln(),
+        "raw asymmetric assembly must shift the logdet by ln 4 (symmetrization is \
          load-bearing): raw={unsymmetrized_logdet:.9e} reference={reference_logdet:.9e} \
-         tol={tol:.3e}"
+         shift={shift:.3e}"
     );
 }
 

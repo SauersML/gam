@@ -9,13 +9,11 @@ use super::evaluation::{
     sas_effective_epsilon, sas_effective_epsilon_second, sas_log_delta_edge_barriercostgrad,
     sas_log_delta_edge_barriercostgradhess,
 };
-use super::external_options::resolve_external_family;
-use super::optimizer::{
-    external_reml_seed_config, freeze_lambda_search_nuisance_at_canonical_anchor,
-};
-use super::penalty::REML_SEED_SCREENING_RHO_CAP;
+use super::external_options::{resolve_external_family, resolved_external_config};
+use super::optimizer::freeze_lambda_search_nuisance_at_canonical_anchor;
 use super::prefit::{
-    PrefitRegularityDiagnostic, detect_prefit_binomial_single_column_separation_in_design,
+    PrefitRegularityDiagnostic, arm_jeffreys_on_prefit_binomial_separation,
+    detect_prefit_binomial_single_column_separation_in_design,
     detect_prefit_unpenalized_rank_deficiency_in_design, reject_prefit_binomial_separation,
     reject_prefit_unidentifiable_unpenalized_space, reject_prefit_unpenalized_rank_deficiency,
 };
@@ -25,61 +23,11 @@ use crate::mixture_link::{
     sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials, sas_link_complement,
 };
 use gam_linalg::utils::StableSolver;
-use gam_problem::{
-    InverseLink, LikelihoodSpec, ResponseFamily, SeedRiskProfile, StandardLink,
-};
+use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::sync::atomic::Ordering;
-
-#[test]
-fn gaussian_external_reml_uses_one_analytic_seed() {
-    // The profiled-Gaussian path scores its data-derived `initial.sp` and
-    // summed-penalty diagonal candidates before constructing the outer
-    // problem.  The generic lattice must not repeat that basin decision.
-    let cfg = external_reml_seed_config(2, true);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
-    assert_eq!(cfg.max_seeds, 1);
-    assert_eq!(cfg.seed_budget, 3);
-    assert_eq!(cfg.over_smoothing_probe_rho, None);
-}
-
-#[test]
-fn high_dimensional_gaussian_external_reml_does_not_restore_a_lattice() {
-    // Coordinate count must not silently re-enable heuristic global shifts:
-    // the coupled analytic candidates own the same decision at every k.
-    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, true);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
-    assert_eq!(cfg.max_seeds, 1);
-    assert_eq!(cfg.seed_budget, 3);
-    assert_eq!(cfg.over_smoothing_probe_rho, None);
-}
-
-#[test]
-fn high_dimensional_glm_external_reml_requests_arc_seed_pair() {
-    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, false);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
-    assert_eq!(
-        cfg.max_seeds, 2,
-        "high-dimensional GLM REML must generate the alternate ARC startup basin"
-    );
-    assert_eq!(
-        cfg.seed_budget, 2,
-        "high-dimensional GLM REML must request both generated starts so ARC's GLM cap is not nullified"
-    );
-}
-
-#[test]
-fn generalized_external_reml_keeps_multistart_policy() {
-    let cfg = external_reml_seed_config(2, false);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
-    assert!(cfg.max_seeds > 1);
-    assert_eq!(
-        cfg.seed_budget, 2,
-        "GLM REML must request the alternate ARC startup basin"
-    );
-}
 
 /// Two-smooth fixture for the outer-curvature routing check: an intercept plus
 /// one Gaussian-bump block per covariate, each block under its own
@@ -504,6 +452,154 @@ fn prefit_binomial_logit_rejects_before_outer_solver() {
             ..
         }
     ));
+}
+
+fn binomial_arming_options(link: InverseLink, sas_link: Option<SasLinkSpec>) -> ExternalOptimOptions {
+    ExternalOptimOptions {
+        family: LikelihoodSpec::new(ResponseFamily::Binomial, link),
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        optimize_sas: sas_link.is_some(),
+        sas_link,
+        compute_inference: false,
+        skip_rho_posterior_inference: false,
+        max_iter: 50,
+        tol: 1e-7,
+        nullspace_dims: Vec::new(),
+        linear_constraints: None,
+        firth_bias_reduction: None,
+        rho_prior: Default::default(),
+        persistent_warm_start_store: None,
+    }
+}
+
+fn dense_design(x: Array2<f64>) -> DesignMatrix {
+    DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x))
+}
+
+/// #3129: the prior is decided from the realized design before any solve. A
+/// certified separator arms the Jeffreys prior and returns the certificate as
+/// the recorded reason; a design with a finite maximum likelihood keeps the
+/// flat prior and records nothing.
+#[test]
+fn prefit_separation_certificate_arms_jeffreys_before_any_solve_3129() {
+    let w = Array1::<f64>::ones(4);
+    for link in [StandardLink::Logit, StandardLink::Probit, StandardLink::CLogLog] {
+        let opts = binomial_arming_options(InverseLink::Standard(link), None);
+
+        let separated = dense_design(array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]]);
+        let y = array![0.0, 0.0, 1.0, 1.0];
+        let (mut cfg, _) = resolved_external_config(&opts).expect("binomial config");
+        assert!(!cfg.firth_bias_reduction);
+        let evidence = arm_jeffreys_on_prefit_binomial_separation(
+            &mut cfg,
+            &opts,
+            y.view(),
+            w.view(),
+            &separated,
+            &[],
+        )
+        .expect("a Firth-capable separated design is fitted, not refused");
+        assert!(
+            matches!(
+                evidence,
+                Some(gam_problem::jeffreys_arming::JeffreysArmingEvidence::PrefitColumnSeparation {
+                    column_index: 1,
+                    ..
+                })
+            ),
+            "{link:?}: {evidence:?}"
+        );
+        assert!(cfg.firth_bias_reduction, "{link:?}: the Jeffreys prior must be armed");
+
+        // The class supports interleave, so no line separates them and the
+        // MLE is finite.
+        let overlapping = dense_design(array![[1.0, -2.0], [1.0, 1.0], [1.0, -1.0], [1.0, 2.0]]);
+        let y = array![0.0, 0.0, 1.0, 1.0];
+        let (mut cfg, _) = resolved_external_config(&opts).expect("binomial config");
+        let evidence = arm_jeffreys_on_prefit_binomial_separation(
+            &mut cfg,
+            &opts,
+            y.view(),
+            w.view(),
+            &overlapping,
+            &[],
+        )
+        .expect("an overlapping design has a finite maximum likelihood");
+        assert!(evidence.is_none(), "{link:?}: {evidence:?}");
+        assert!(!cfg.firth_bias_reduction, "{link:?}: the flat prior must be kept");
+    }
+}
+
+/// #3129: the decision is a function of the design, so a perturbation of the
+/// covariate far below any separating gap cannot switch the estimator. The
+/// old reactive rescue switched on whether the flat-prior solve happened to
+/// fail, which such a perturbation can change.
+#[test]
+fn prefit_jeffreys_decision_is_stable_under_covariate_perturbation_3129() {
+    let n = 40;
+    let mut rng = StdRng::seed_from_u64(3129);
+    let opts = binomial_arming_options(InverseLink::Standard(StandardLink::Logit), None);
+    let w = Array1::<f64>::ones(n);
+    let base: Vec<f64> = (0..n).map(|i| -2.0 + 4.0 * i as f64 / (n as f64 - 1.0)).collect();
+    // Separated at 0, and overlapping through two swapped labels at the ends.
+    let separated_y = Array1::from_iter(base.iter().map(|&x| if x > 0.0 { 1.0 } else { 0.0 }));
+    let mut overlapping_y = separated_y.clone();
+    overlapping_y[0] = 1.0;
+    overlapping_y[n - 1] = 0.0;
+    for (y, expect_armed) in [(&separated_y, true), (&overlapping_y, false)] {
+        for trial in 0..8 {
+            let jitter = if trial == 0 { 0.0 } else { 1e-9 };
+            let mut x = Array2::<f64>::ones((n, 2));
+            for (i, &value) in base.iter().enumerate() {
+                x[[i, 1]] = value + jitter * (rng.random::<f64>() - 0.5);
+            }
+            let (mut cfg, _) = resolved_external_config(&opts).expect("binomial config");
+            let evidence = arm_jeffreys_on_prefit_binomial_separation(
+                &mut cfg,
+                &opts,
+                y.view(),
+                w.view(),
+                &dense_design(x),
+                &[],
+            )
+            .expect("a Firth-capable binomial design is never refused");
+            assert_eq!(evidence.is_some(), expect_armed, "trial {trial}: {evidence:?}");
+            assert_eq!(cfg.firth_bias_reduction, expect_armed, "trial {trial}");
+        }
+    }
+}
+
+/// #2654: an optimized SAS link appends outer coordinates the Firth outer
+/// derivative does not define, so its separation certificate stays a
+/// refusal instead of arming a prior the fit cannot carry.
+#[test]
+fn prefit_separation_with_optimized_sas_link_stays_a_refusal_3129() {
+    let sas = SasLinkSpec {
+        initial_epsilon: 0.0,
+        initial_log_delta: 0.0,
+    };
+    let state = crate::mixture_link::state_from_sasspec(sas).expect("valid SAS state");
+    let opts = binomial_arming_options(InverseLink::Sas(state), Some(sas));
+    let (mut cfg, _) = resolved_external_config(&opts).expect("SAS binomial config");
+    let design = dense_design(array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]]);
+    let y = array![0.0, 0.0, 1.0, 1.0];
+    let w = Array1::<f64>::ones(4);
+    let err = arm_jeffreys_on_prefit_binomial_separation(
+        &mut cfg,
+        &opts,
+        y.view(),
+        w.view(),
+        &design,
+        &[],
+    )
+    .expect_err("an optimized SAS link cannot carry the Jeffreys prior");
+    assert!(matches!(
+        err,
+        EstimationError::PrefitPerfectSeparationDetected { column_index: 1, .. }
+    ));
+    assert!(!cfg.firth_bias_reduction);
 }
 
 #[test]
@@ -1156,6 +1252,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
             dispersion: Dispersion::estimated(1.1 * 1.1)
                 .expect("profiled Gaussian phi-hat = sigma-hat^2 is a valid estimate"),
             factorized_standard_errors: None,
+            smoothing_correction_factorized: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
@@ -2309,7 +2406,7 @@ fn cubature_pirls_uses_lambda_search_frozen_beta_precision_2632() {
         .store(frozen_phi.to_bits(), Ordering::Relaxed);
 
     let result = state
-        .execute_pirls_stateless_for_cubature(&array![0.0], None)
+        .execute_pirls_stateless_for_test(&array![0.0])
         .expect("the Beta cubature sigma-point fit must converge");
     let (realized_phi, estimated) = match result
         .likelihood
@@ -2367,10 +2464,9 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         ),
         "fixture precondition: the freeze under test only exists for an ESTIMATED Beta precision"
     );
-    let seed_config = external_reml_seed_config(1, false);
 
     let pristine = beta_precision_anchor_state(&y, &w, &x, &cfg);
-    freeze_lambda_search_nuisance_at_canonical_anchor(&pristine, &resolved, 1, None, &seed_config)
+    freeze_lambda_search_nuisance_at_canonical_anchor(&pristine, &resolved, 1, None)
         .expect("the anchor must succeed on a pristine state");
     let anchored_bits = pristine.frozen_beta_phi.load(Ordering::Relaxed);
     assert_ne!(
@@ -2398,7 +2494,6 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         &resolved,
         1,
         Some(&[3.0]),
-        &seed_config,
     )
     .expect("the anchor must succeed regardless of what a caller donated");
     assert_eq!(
@@ -2443,7 +2538,6 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         &resolved,
         1,
         None,
-        &seed_config,
     );
     assert!(
         matches!(refusal, Err(EstimationError::InvalidInput(_))),
@@ -2745,7 +2839,7 @@ fn estimated_nuisance_fits_land_in_the_same_place_cold_and_warm_2363() {
         // the seeded optimum, or re-certify it in place?
         //
         // The cache hit logs `action=resume-and-recertify` and installs the
-        // prior fit's ρ as `initial_rho` with `screen_initial_rho = false`
+        // prior fit's ρ as `initial_rho`
         // (`rho_optimizer/run.rs`, the `CacheSeedDecision::ExactFinal` arm),
         // plus the prior β as an inner seed. If that point is already
         // certified, the outer search has nothing to do and must return it

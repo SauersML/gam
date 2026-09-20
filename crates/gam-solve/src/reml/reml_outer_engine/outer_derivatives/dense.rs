@@ -173,13 +173,12 @@ pub(crate) fn compute_outer_hessian(
     //
     // A block-local coordinate with no correction keeps `Ḣₖ = Aₖ` as its root
     // (`h_k_matrices[idx] = None`) when every consumer below can take it that
-    // way: the backend contracts roots in the cross trace, there is no
-    // projected kernel or dense spectral batch to feed, and no ext coordinate
-    // pairs with it. A many-level random effect's `Aₖ` is `p × p` and
-    // diagonal; its root costs `O(levels)`.
+    // way: the backend contracts roots in the cross trace (the dense spectral
+    // batch takes them as roots too), there is no projected kernel to feed,
+    // and no ext coordinate pairs with it. A many-level random effect's `Aₖ`
+    // is `p × p` and diagonal; its root costs `O(levels)`.
     let keep_block_roots = hop.contracts_block_root_drifts()
         && solution.penalty_subspace_trace.is_none()
-        && hop.as_exact_dense_spectral().is_none()
         && ext_dim == 0;
     let mut a_k_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(k);
     let mut h_k_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(k);
@@ -376,21 +375,27 @@ pub(crate) fn compute_outer_hessian(
     // reduced drifts `R_d = U_Sᵀ Ḣ_d U_S` once and reuse them for every
     // pair; per-pair cost is then O(r²) instead of O(p²) per cross.
     let subspace = solution.penalty_subspace_trace.as_deref();
-    let reduced_h_drifts: Option<Vec<Array2<f64>>> = subspace.map(|kernel| {
+    // The kept–dropped blocks `B_d = U_Sᵀ Ḣ_d U_D` ride with them: the kernel's
+    // pseudo-inverse rotates into the eigenpairs it drops, and that rotation is
+    // part of the exact cross term (gam#2952).
+    let reduced_h_drifts: Option<(Vec<Array2<f64>>, Vec<Array2<f64>>)> = subspace.map(|kernel| {
         let mut drifts = (0..k)
             .map(|idx| DriftDerivResult::Dense(dense_h_k(idx).clone()))
             .collect::<Vec<_>>();
         drifts.extend(ext_h_drifts.iter().cloned());
-        penalty_subspace_reduce_drifts_batched(kernel, &drifts)
+        (
+            penalty_subspace_reduce_drifts_batched(kernel, &drifts),
+            penalty_subspace_couple_dropped_drifts_batched(kernel, &drifts),
+        )
     });
     let exact_logdet_cross_traces = if incl_logdet_h {
-        if let (Some(kernel), Some(reduced)) = (subspace, reduced_h_drifts.as_ref()) {
+        if let (Some(kernel), Some((reduced, coupled))) = (subspace, reduced_h_drifts.as_ref()) {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let n = reduced.len();
             // Each `(i, j)` upper-triangular pair is an independent cross
-            // trace `−tr(K · A_i · K · A_j)` over the projected kernel
-            // `K = U_S (U_Sᵀ H U_S)⁻¹ U_Sᵀ`; the kernel and `reduced` slice
-            // are both read-only borrows so the K(K+1)/2 pairs dispatch in
+            // term of the exact pseudo-logdet second derivative over the
+            // spectral kernel `K = U_S diag(1/σ) U_Sᵀ`; the kernel and the
+            // blocks are read-only borrows so the K(K+1)/2 pairs dispatch in
             // parallel, then we stitch the symmetric `n × n` Array2
             // sequentially.
             let pair_count = n * (n + 1) / 2;
@@ -398,11 +403,11 @@ pub(crate) fn compute_outer_hessian(
                 .into_par_iter()
                 .map(|pair_idx| {
                     let (i, j) = upper_triangle_pair_from_index(pair_idx, n);
-                    let value =
-                        -kernel.trace_projected_logdet_cross_reduced(&reduced[i], &reduced[j]);
-                    (i, j, value)
+                    kernel
+                        .pseudo_logdet_cross(&reduced[i], &reduced[j], &coupled[i], &coupled[j])
+                        .map(|value| (i, j, value))
                 })
-                .collect();
+                .collect::<Result<_, String>>()?;
             let mut out = Array2::<f64>::zeros((n, n));
             for (i, j, value) in pair_values {
                 out[[i, j]] = value;
@@ -412,10 +417,15 @@ pub(crate) fn compute_outer_hessian(
             }
             Some(out)
         } else if let Some(dense_hop) = hop.as_exact_dense_spectral() {
-            let dense_drifts: Vec<&Array2<f64>> = (0..k).map(dense_h_k).collect();
+            let rho_drifts: Vec<EigenbasisDrift<'_>> = (0..k)
+                .map(|idx| match &h_k_matrices[idx] {
+                    Some(h_k) => EigenbasisDrift::Rotated(dense_hop.rotate_to_eigenbasis(h_k)),
+                    None => EigenbasisDrift::Root(root_drift(idx)),
+                })
+                .collect();
             Some(trace_logdet_hessian_crosses_dense_spectral_drifts(
                 dense_hop,
-                &dense_drifts,
+                rho_drifts,
                 &ext_h_drifts,
             ))
         } else {
@@ -494,8 +504,8 @@ pub(crate) fn compute_outer_hessian(
     };
     let second_mode_kernel = mode_kernel();
 
-    let batched_rho_pair_corrections: Option<Vec<f64>> = if incl_logdet_h
-        && subspace.is_some()
+    let batched_rho_pair_corrections: Option<Vec<f64>> = if let Some(kernel) = subspace
+        && incl_logdet_h
         && effective_deriv.has_corrections()
         && effective_deriv.has_batched_hessian_second_derivative_corrections()
     {
@@ -522,23 +532,47 @@ pub(crate) fn compute_outer_hessian(
                 )
             })
             .collect();
-        let corrections = effective_deriv.hessian_second_derivative_corrections_result(&triples)?;
-        let mut correction_values = vec![0.0_f64; corrections.len()];
-        if let Some(kernel) = subspace {
-            let mut present_indices = Vec::new();
-            let mut present_drifts = Vec::new();
-            for (idx, correction) in corrections.into_iter().enumerate() {
-                if let Some(drift) = correction {
-                    present_indices.push(idx);
-                    present_drifts.push(drift);
+        // The subspace trace is `tr(Fᵀ·C·F)` with the kernel's own factor
+        // `F·Fᵀ = K`, so a provider whose row kernel contracts `F` itself
+        // answers every pair's trace without forming the drifts (gam#2922,
+        // #3322), exactly as on the full-space path below.
+        let traced = if effective_deriv.has_hessian_second_derivative_correction_traces() {
+            effective_deriv.hessian_second_derivative_correction_traces(
+                &penalty_subspace_trace_factor(kernel),
+                &triples,
+            )?
+        } else {
+            None
+        };
+        match traced {
+            Some(values) => {
+                if values.len() != rho_pair_count {
+                    return Err(format!(
+                        "outer Hessian correction traces: {} for {rho_pair_count} pairs",
+                        values.len()
+                    ));
                 }
+                Some(values)
             }
-            let traced = penalty_subspace_trace_drifts_batched(kernel, &present_drifts);
-            for (idx, value) in present_indices.into_iter().zip(traced) {
-                correction_values[idx] = value;
+            None => {
+                let corrections =
+                    effective_deriv.hessian_second_derivative_corrections_result(&triples)?;
+                let mut correction_values = vec![0.0_f64; corrections.len()];
+                let mut present_indices = Vec::new();
+                let mut present_drifts = Vec::new();
+                for (idx, correction) in corrections.into_iter().enumerate() {
+                    if let Some(drift) = correction {
+                        present_indices.push(idx);
+                        present_drifts.push(drift);
+                    }
+                }
+                let traced = penalty_subspace_trace_drifts_batched(kernel, &present_drifts);
+                for (idx, value) in present_indices.into_iter().zip(traced) {
+                    correction_values[idx] = value;
+                }
+                Some(correction_values)
             }
         }
-        Some(correction_values)
     } else {
         None
     };

@@ -26,8 +26,9 @@
 //!     through `materialize_location_scale` -> `FitRequest::GaussianLocationScale`.
 //!   * gam standardizes the response while fitting, then maps coefficients back
 //!     to raw units. Consequently the raw-unit noise link is
-//!     `sigma = response_scale * LOGB_SIGMA_FLOOR + exp(eta_scale)`; the
-//!     response-relative soft floor is part of the saved fit contract.
+//!     `sigma = response_scale * sigma_floor + exp(eta_scale)`, where
+//!     `sigma_floor` is the fit's recording-grid bound δ/√12 of the standardized
+//!     response; that data-derived floor is part of the saved fit contract.
 //!   * The spec's `linkwiggle(...)` term is a *binomial-only* link correction
 //!     (`reject_explicit_linkwiggle_for_nonbinomial` rejects it for a Gaussian
 //!     response); it is meaningless for a Gaussian location-scale fit, so the
@@ -46,10 +47,6 @@ use gam::{
 };
 use ndarray::Array2;
 use std::path::Path;
-
-/// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale).
-/// Mirrors `families::sigma_link::LOGB_SIGMA_FLOOR` (and mgcv `gaulss(b=0.01)`).
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
 #[test]
 fn gam_gaussian_location_scale_matches_gamlss() {
@@ -106,16 +103,17 @@ fn gam_gaussian_location_scale_matches_gamlss() {
     let x_idx = col["x"];
     let ncols = ds.headers.len();
 
-    // ---- fit with gam: mu ~ s(x, bs='tp'), log-sigma ~ 1 + s(x, bs='tp') ----
+    // ---- fit with gam: mu ~ s(x, bs='tps'), log-sigma ~ 1 + s(x, bs='tps') ----
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("1 + s(x, bs='tp')".to_string()),
+        noise_formula: Some("1 + s(x, bs='tps')".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg).expect("gam location-scale fit");
+    let result = fit_from_formula("y ~ s(x, bs='tps')", &ds, &cfg).expect("gam location-scale fit");
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
         fit,
         response_scale,
+        sigma_floor,
         ..
     }) = result
     else {
@@ -154,7 +152,7 @@ fn gam_gaussian_location_scale_matches_gamlss() {
 
     // Rebuild the SAME frozen mean / log-sigma designs at the grid points and
     // apply each block's coefficients. mu = X_mean*beta_location;
-    // sigma = response_scale*LOGB_SIGMA_FLOOR + exp(X_scale*beta_scale).
+    // sigma = response_scale*sigma_floor + exp(X_scale*beta_scale).
     let mean_design_grid = build_term_collection_design(grid.view(), &fit.meanspec_resolved)
         .expect("rebuild mean design at grid");
     let scale_design_grid = build_term_collection_design(grid.view(), &fit.noisespec_resolved)
@@ -164,7 +162,7 @@ fn gam_gaussian_location_scale_matches_gamlss() {
     let gam_eta_sigma: Vec<f64> = scale_design_grid.design.apply(&beta_scale).to_vec();
     let gam_sigma: Vec<f64> = gam_eta_sigma
         .iter()
-        .map(|&e| response_scale * LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| response_scale * sigma_floor + e.exp())
         .collect();
     let gam_log_sigma: Vec<f64> = gam_sigma.iter().map(|&s| s.ln()).collect();
 
@@ -462,14 +460,15 @@ fn gam_gaussian_location_scale_matches_gamlss_on_real_data() {
         // ---- fit gam on TRAIN: mu ~ s(Age), log-sigma ~ 1 + s(Age) -------
         let cfg = FitConfig {
             family: Some("gaussian".to_string()),
-            noise_formula: Some("1 + s(Age, bs='tp')".to_string()),
+            noise_formula: Some("1 + s(Age, bs='tps')".to_string()),
             ..FitConfig::default()
         };
-        let result = fit_from_formula("GAG ~ s(Age, bs='tp')", &train_ds, &cfg)
+        let result = fit_from_formula("GAG ~ s(Age, bs='tps')", &train_ds, &cfg)
             .expect("gam location-scale fit");
         let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
             fit,
             response_scale,
+            sigma_floor,
             ..
         }) = result
         else {
@@ -504,7 +503,7 @@ fn gam_gaussian_location_scale_matches_gamlss_on_real_data() {
             .design
             .apply(&beta_scale)
             .iter()
-            .map(|&e| response_scale * LOGB_SIGMA_FLOOR + e.exp())
+            .map(|&e| response_scale * sigma_floor + e.exp())
             .collect();
 
         // Constant-sigma context: gam's own mean with homoscedastic noise set to

@@ -1,5 +1,5 @@
 // The per-term random-effect test — the driver that turns a fitted standard GAM
-// into "does each `group()`/`re()` block carry a between-group effect?".
+// into "does each `group()` block carry a between-group effect?".
 //
 // `include!`d into `drivers/mod.rs` like the other self-contained inference
 // subsystems, so it shares the driver's flat namespace and import surface.
@@ -10,15 +10,14 @@
 // over; every term gets a record, and a term the test cannot score carries the
 // typed reason instead of a p-value.
 
-/// The variance-component (or, for an unpenalized factor block, fixed-effect)
-/// test of every random-effect block of a fitted standard GAM.
+/// The variance-component test of every random-effect block of a fitted
+/// standard GAM.
 ///
 /// Never fails: a fit without the row state the score needs yields one
 /// `NoIrlsRowState` record per block, so the summary always has an answer for
 /// each random-effect row.
 pub fn random_effect_test_records(
     design: &gam_terms::smooth::TermCollectionDesign,
-    spec: &gam_terms::smooth::TermCollectionSpec,
     fit: &UnifiedFitResult,
 ) -> Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord> {
     use gam_terms::inference::random_effect_test::{
@@ -60,16 +59,17 @@ pub fn random_effect_test_records(
     }
     // Same scale contract as the basis-adequacy score test: a profiled
     // dispersion is estimated, otherwise the score's variance is scaled by the
-    // multiplier the fit publishes on its coefficient covariance.
+    // multiplier the fit publishes on its coefficient covariance. A known scale
+    // the fit cannot publish is a typed reason, never a unit dispersion: a
+    // substituted 1 would calibrate every p-value against the wrong variance.
     let scale = if fit.likelihood_scale.wald_scale_is_estimated() {
         RandomEffectTestScale::Estimated
     } else {
-        RandomEffectTestScale::Known {
-            dispersion: fit
-                .coefficient_covariance_scale()
-                .ok()
-                .filter(|value| value.is_finite() && *value > 0.0)
-                .unwrap_or(1.0),
+        match fit.coefficient_covariance_scale() {
+            Ok(dispersion) if dispersion.is_finite() && dispersion > 0.0 => {
+                RandomEffectTestScale::Known { dispersion }
+            }
+            _ => return unavailable(RandomEffectTestUnavailable::KnownScaleUnavailable),
         }
     };
     let basis = match RandomEffectTestBasis::new(RandomEffectTestInput {
@@ -85,13 +85,8 @@ pub fn random_effect_test_records(
     };
     let requests: Vec<RandomEffectTermRequest> = ranges
         .iter()
-        .map(|(name, range)| RandomEffectTermRequest {
+        .map(|(_, range)| RandomEffectTermRequest {
             range: range.clone(),
-            penalized: spec
-                .random_effect_terms
-                .iter()
-                .find(|term| term.name == *name)
-                .is_none_or(|term| term.penalized),
         })
         .collect();
     records(

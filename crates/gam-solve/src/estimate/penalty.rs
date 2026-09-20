@@ -1,12 +1,5 @@
 use super::*;
 
-/// Above this rho dimension, startup work must be linear in "one real solve",
-/// not "rank a seed lattice with capped PIRLS solves". The heuristic seed is
-/// deterministic and already centered on the current penalty scale; BFGS/ARC
-/// globalizes from there. Low-dimensional classic smooths keep screening
-/// because the extra probes are cheap and sometimes useful.
-pub(crate) const REML_SEED_SCREENING_RHO_CAP: usize = 4;
-
 const KAHAN_SWITCH_ELEMS: usize = 10_000;
 
 pub(crate) fn faer_frob_inner(a: MatRef<'_, f64>, b: MatRef<'_, f64>) -> f64 {
@@ -455,7 +448,13 @@ impl ParametricColumnConditioning {
             // `factorized_standard_errors` is left as it is: a diagonal does not
             // survive the congruence, because `diag(M·Σ·Mᵀ)` reads the intercept
             // cross-covariances, so the factorized branch solves those standard
-            // errors in the original coordinates directly (#2960).
+            // errors in the original coordinates directly (#2960). The corrected
+            // standard errors beside them are solved the same way; the smoothing
+            // correction's factor `B` maps like a coefficient displacement,
+            // `C_orig = M·B·Bᵀ·Mᵀ = (M·B)(M·B)ᵀ` (#3283).
+            if let Some(factorized) = inf.smoothing_correction_factorized.as_mut() {
+                factorized.factor = self.left_multiply_by_m(&factorized.factor);
+            }
             inf.beta_covariance_frequentist = inf
                 .beta_covariance_frequentist
                 .take()
@@ -600,8 +599,9 @@ pub(crate) fn scaled_covariance(cov: Array2<f64>, phi: f64) -> Array2<f64> {
     }
 }
 
-/// Standard errors of the published coefficients `β_orig = M·β_int` on the
-/// factorized inference branch, where no dense covariance exists (#2960).
+/// The solved diagonal behind the standard errors of the published
+/// coefficients `β_orig = M·β_int` on the factorized inference branch, where
+/// no dense covariance exists (#2960).
 ///
 /// The published covariance is `M·Σ·Mᵀ` with `Σ = s·Qs·H_t⁻¹·Qsᵀ − G·Δ·Gᵀ`, so
 /// its diagonal entry `i` is `s·r_iᵀ·H_t⁻¹·r_i − g_iᵀ·Δ·g_i`, with `r_i` row `i`
@@ -616,13 +616,13 @@ pub(crate) fn scaled_covariance(cov: Array2<f64>, phi: f64) -> Array2<f64> {
 /// That is why these standard errors used to be dropped on every conditioned
 /// design.
 ///
-/// `solve` returns `H_t⁻¹·rhs` for a right-hand side holding the rows `range`.
-pub(crate) fn factorized_standard_errors(
+/// This returns the unscaled solved diagonal `r_iᵀ·H_t⁻¹·r_i`, which the
+/// conditional and the smoothing-corrected standard errors share
+/// ([`factorized_standard_errors`]); `solve` returns `H_t⁻¹·rhs` for a
+/// right-hand side holding the rows `range`.
+pub(crate) fn factorized_published_inverse_diagonal(
     conditioning: &ParametricColumnConditioning,
     qs: &Array2<f64>,
-    cov_scale: f64,
-    correction: Option<&crate::constrained_posterior::ConstrainedPosteriorCorrection>,
-    zero_covariance_boundary: bool,
     chunk_cols: usize,
     mut solve: impl FnMut(&Array2<f64>, std::ops::Range<usize>) -> Result<Array2<f64>, EstimationError>,
 ) -> Result<Array1<f64>, EstimationError> {
@@ -671,6 +671,43 @@ pub(crate) fn factorized_standard_errors(
         }
         col_start = col_end;
     }
+    if let Some((index, variance_unscaled)) = diag_inv
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|&(_, value)| !(value.is_finite() && value > 0.0))
+    {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "exact factorized SPD inverse has invalid diagonal {index}: {variance_unscaled:?}"
+        )));
+    }
+    Ok(diag_inv)
+}
+
+/// Standard errors of the published coefficients on the factorized inference
+/// branch, from the solved diagonal [`factorized_published_inverse_diagonal`]
+/// returns.
+///
+/// The published variance of coefficient `i` is `s·r_iᵀ·H_t⁻¹·r_i`, plus the
+/// smoothing correction's `‖(M·B)_i‖²` when `smoothing_factor` carries its
+/// square-root factor `B` (`C = B·Bᵀ`, #3283), minus the truncation's
+/// `g_iᵀ·Δ·g_i` on a constrained fit. `B` and the correction's lift `G` are in
+/// the internal coordinates, as `Σ` is, and `correction` must be the
+/// truncation of the covariance the standard errors describe: the lift at `Σ`
+/// for the conditional ones, and the lift at `Vp` for the corrected ones.
+///
+/// `zero_covariance_boundary` is the conditional law's zero-dispersion
+/// Gaussian boundary, where `Σ = 0` exactly; it asserts nothing about a
+/// corrected law.
+pub(crate) fn factorized_standard_errors(
+    conditioning: &ParametricColumnConditioning,
+    inverse_diagonal: &Array1<f64>,
+    cov_scale: f64,
+    smoothing_factor: Option<&Array2<f64>>,
+    correction: Option<&crate::constrained_posterior::ConstrainedPosteriorCorrection>,
+    zero_covariance_boundary: bool,
+) -> Result<Array1<f64>, EstimationError> {
+    let p_cov = inverse_diagonal.len();
     let removed_variance = match correction {
         Some(correction) => {
             let mut mapped = correction.clone();
@@ -679,14 +716,23 @@ pub(crate) fn factorized_standard_errors(
         }
         None => Array1::<f64>::zeros(p_cov),
     };
-    let mut se = Array1::<f64>::zeros(p_cov);
-    for (index, &variance_unscaled) in diag_inv.iter().enumerate() {
-        if !(variance_unscaled.is_finite() && variance_unscaled > 0.0) {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "exact factorized SPD inverse has invalid diagonal {index}: {variance_unscaled:?}"
-            )));
+    let smoothing_variance = match smoothing_factor {
+        Some(factor) => {
+            if factor.nrows() != p_cov {
+                return Err(EstimationError::RemlOptimizationFailed(format!(
+                    "smoothing correction factor has {} rows against {p_cov} published \
+                     coefficients",
+                    factor.nrows()
+                )));
+            }
+            let mapped = conditioning.left_multiply_by_m(factor);
+            Array1::from_iter(mapped.rows().into_iter().map(|row| row.dot(&row)))
         }
-        let base = cov_scale * variance_unscaled;
+        None => Array1::<f64>::zeros(p_cov),
+    };
+    let mut se = Array1::<f64>::zeros(p_cov);
+    for (index, &variance_unscaled) in inverse_diagonal.iter().enumerate() {
+        let base = cov_scale * variance_unscaled + smoothing_variance[index];
         let removed = removed_variance[index];
         let variance = base - removed;
         // #2705 group A. The dense branch assembles this quantity as a
@@ -747,15 +793,20 @@ mod factorized_standard_errors_2960_tests {
         q
     }
 
-    /// `sqrt(diag(M·Σ·Mᵀ))` from the dense `Σ = s·Qs·H_t⁻¹·Qsᵀ − G·Δ·Gᵀ`.
+    /// `sqrt(diag(M·Σ·Mᵀ))` from the dense `Σ = s·Qs·H_t⁻¹·Qsᵀ + B·Bᵀ − G·Δ·Gᵀ`
+    /// (`B` absent for the conditional law).
     fn dense_standard_errors(
         conditioning: &ParametricColumnConditioning,
         qs: &Array2<f64>,
         inverse_hessian: &Array2<f64>,
         cov_scale: f64,
+        smoothing_factor: Option<&Array2<f64>>,
         correction: Option<&crate::constrained_posterior::ConstrainedPosteriorCorrection>,
     ) -> Array1<f64> {
         let mut internal = qs.dot(inverse_hessian).dot(&qs.t()) * cov_scale;
+        if let Some(factor) = smoothing_factor {
+            internal += &factor.dot(&factor.t());
+        }
         if let Some(correction) = correction {
             internal -= &correction
                 .lift
@@ -801,8 +852,10 @@ mod factorized_standard_errors_2960_tests {
 
         // The fixture moves the intercept row: its internal-coordinate
         // standard error is not the published one.
-        let internal = dense_standard_errors(&unconditioned, &qs, &inverse_hessian, cov_scale, None);
-        let published = dense_standard_errors(&conditioned, &qs, &inverse_hessian, cov_scale, None);
+        let internal =
+            dense_standard_errors(&unconditioned, &qs, &inverse_hessian, cov_scale, None, None);
+        let published =
+            dense_standard_errors(&conditioned, &qs, &inverse_hessian, cov_scale, None, None);
         assert!(
             (internal[0] - published[0]).abs() > 1.0e-3 * published[0],
             "the conditioning must move the intercept standard error: internal {} published {}",
@@ -810,20 +863,52 @@ mod factorized_standard_errors_2960_tests {
             published[0]
         );
 
+        // #3283: a rank-two smoothing-correction factor, moving the intercept
+        // row as well, so the corrected standard errors read `(M·B)_i`.
+        let smoothing_factor = array![
+            [0.3, -0.2],
+            [0.1, 0.4],
+            [-0.2, 0.1],
+            [0.25, 0.05],
+            [0.0, -0.3],
+        ];
+
         let solve = |rhs: &Array2<f64>, rows: std::ops::Range<usize>| {
             assert_eq!(rhs.ncols(), rows.len(), "one right-hand-side column per row");
             Ok::<_, EstimationError>(inverse_hessian.dot(rhs))
         };
-        for (label, conditioning, constraint) in [
-            ("unconditioned", &unconditioned, None),
-            ("conditioned", &conditioned, None),
-            ("conditioned and constrained", &conditioned, Some(&correction)),
+        for (label, conditioning, factor, constraint) in [
+            ("unconditioned", &unconditioned, None, None),
+            ("conditioned", &conditioned, None, None),
+            ("conditioned and constrained", &conditioned, None, Some(&correction)),
+            ("conditioned, smoothing-corrected", &conditioned, Some(&smoothing_factor), None),
+            (
+                "conditioned, constrained and smoothing-corrected",
+                &conditioned,
+                Some(&smoothing_factor),
+                Some(&correction),
+            ),
         ] {
-            let expected =
-                dense_standard_errors(conditioning, &qs, &inverse_hessian, cov_scale, constraint);
-            let factorized =
-                factorized_standard_errors(conditioning, &qs, cov_scale, constraint, false, 3, solve)
-                    .expect("the factorized standard errors solve");
+            let expected = dense_standard_errors(
+                conditioning,
+                &qs,
+                &inverse_hessian,
+                cov_scale,
+                factor,
+                constraint,
+            );
+            let inverse_diagonal =
+                factorized_published_inverse_diagonal(conditioning, &qs, 3, solve)
+                    .expect("the factorized diagonal solves");
+            let factorized = factorized_standard_errors(
+                conditioning,
+                &inverse_diagonal,
+                cov_scale,
+                factor,
+                constraint,
+                false,
+            )
+            .expect("the factorized standard errors assemble");
             for (index, (&got, &want)) in factorized.iter().zip(expected.iter()).enumerate() {
                 assert!(
                     (got - want).abs() <= 1.0e-12 * want.max(1.0),

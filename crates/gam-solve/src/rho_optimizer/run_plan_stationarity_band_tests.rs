@@ -106,13 +106,7 @@ fn zz_measure_2613_gradient_only_stiff_ridge_trajectory() {
             Array1::from_elem(1, -WRONG_RAIL_FACE),
             Array1::from_elem(1, WRONG_RAIL_FACE),
         )
-        .with_initial_rho(reseed)
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(reseed);
     let mut recovery_obj = recovery_problem.build_objective(
         (),
         move |_: &mut (), rho: &Array1<f64>| Ok(cost(rho)),
@@ -138,15 +132,15 @@ fn zz_measure_2613_gradient_only_stiff_ridge_trajectory() {
 // ─── #2613 the cost-stall guard counts ACCEPTED steps, not evaluations ────────
 
 /// `‖Pg‖` at every point in the #2613 window tests: below the guard's `1e-3`
-/// stationarity threshold, so a filled window certifies as `Converged` rather
-/// than routing through the `StuckKeepDescending` escape budget. The escape
-/// ladder is a different mechanism with its own tests; keeping it out of these
-/// makes the halt index a clean function of the window alone.
+/// stationarity threshold, so a stall certifies as `Converged` rather than routing
+/// through the `StuckKeepDescending` escape. The escape ladder is a different
+/// mechanism with its own tests; keeping it out of these makes the halt index a
+/// clean function of the accepted steps alone.
 const STATIONARY_GRAD_2613: f64 = 5.0e-4;
 
 /// The plateau every #2613 window test sits on: a Strong-Wolfe zoom's trials
 /// converging geometrically to one point, so consecutive costs differ by ~1e-9
-/// against a `1e-7 · (1 + 4996.7) ≈ 5e-4` improvement floor while the ITERATE
+/// against each value's resolution `1e-7 · (1 + 4996.7) ≈ 5e-4` while the ITERATE
 /// has not moved once.
 fn zoom_plateau_schedule_2613(len: usize) -> Vec<(f64, f64, f64)> {
     (0..len)
@@ -202,8 +196,16 @@ fn drive_first_order_bridge_2613(
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-7, COST_STALL_WINDOW, &claim_band_config(1.0e-3), exit.clone());
-    guard.observe_seed(&seed_rho, seed_cost, seed_grad);
+    let config = claim_band_config(1.0e-3);
+    let mut guard = CostStallGuard::new(outer_criterion_resolution(&config), &config, exit.clone());
+    // The scripted objective publishes no evidence, so the seed value carries the
+    // resolution the certificate asserts, as every later sample does (#3018).
+    guard.observe_seed(
+        &seed_rho,
+        seed_cost,
+        outer_criterion_resolution(&config),
+        seed_grad,
+    );
     let mut bridge = OuterFirstOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),
@@ -215,10 +217,13 @@ fn drive_first_order_bridge_2613(
         value_probe_cache: Vec::new(),
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-30.0], array![30.0])),
-        consecutive_probe_refusals: 0,
         accepted_steps: ledger,
         pending_first_order: Vec::new(),
-        incumbent: Some((seed_rho, seed_cost)),
+        incumbent: Some(OuterIncumbent {
+            rho: seed_rho,
+            cost: seed_cost,
+            gradient: array![seed_grad],
+        }),
         stratum_rank: None,
         stratum_probe: None,
     };
@@ -251,7 +256,7 @@ fn drive_first_order_bridge_2613(
 /// else, which is the whole content of the fix.
 #[test]
 fn line_search_probes_never_advance_the_cost_stall_window_2613() {
-    let schedule = zoom_plateau_schedule_2613(COST_STALL_WINDOW * 4);
+    let schedule = zoom_plateau_schedule_2613(24);
     let offered: Arc<Mutex<Vec<(usize, f64)>>> = Arc::new(Mutex::new(Vec::new()));
     let (outcomes, published) = drive_first_order_bridge_2613(
         schedule.clone(),
@@ -306,12 +311,12 @@ fn line_search_probes_never_advance_the_cost_stall_window_2613() {
 }
 
 /// #2613 — the guard's own job is untouched: a genuine run of accepted outer
-/// steps with no improvement still halts, on exactly the
-/// `COST_STALL_WINDOW`-th accepted step, and still certifies a stationary
-/// plateau as converged.
+/// steps with no resolvable improvement still halts, on exactly the first
+/// accepted step that stalls (#3018), and still certifies a stationary plateau
+/// as converged.
 #[test]
 fn accepted_steps_still_trip_the_cost_stall_window_2613() {
-    let schedule = zoom_plateau_schedule_2613(COST_STALL_WINDOW * 4);
+    let schedule = zoom_plateau_schedule_2613(24);
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let incumbent = Arc::new(Mutex::new(-4996.7_f64));
     let (outcomes, published) = {
@@ -327,6 +332,7 @@ fn accepted_steps_still_trip_the_cost_stall_window_2613() {
                     iter: idx,
                     step_norm: 1.0e-6,
                     actual_decrease: *prev - cost,
+                    predicted_decrease: *prev - cost,
                 });
                 *prev = cost;
             },
@@ -342,12 +348,13 @@ fn accepted_steps_still_trip_the_cost_stall_window_2613() {
         "the halt must use the shared cost-stall sentinel",
     );
     // The accept for evaluation `i` is published after it and drained at the
-    // top of evaluation `i+1`, so the window closes on evaluation
-    // `COST_STALL_WINDOW`. One evaluation of latency is inherent:
+    // top of evaluation `i+1`, so the first accepted step, a stall (its
+    // decrease is ~1e-9 against resolutions of ~5e-4, and it sits inside the
+    // band), is judged on evaluation 1. One evaluation of latency is inherent:
     // `on_step_accepted` fires after the line search that produced the step.
     assert_eq!(
-        halted, COST_STALL_WINDOW,
-        "the window must close on the {COST_STALL_WINDOW}th accepted step: {outcomes:?}",
+        halted, 1,
+        "the halt must come at the first accepted step that stalls: {outcomes:?}",
     );
     let published = published.expect("a stalled run must publish its best iterate");
     assert!(
@@ -366,14 +373,14 @@ fn accepted_steps_still_trip_the_cost_stall_window_2613() {
 #[test]
 fn accepted_step_resolves_by_cost_not_by_recency_2613() {
     // Evaluation 0 is the accepted trial; 1 and 2 are rescue pokes that lose.
-    // Then a plateau at the accepted cost, long enough to close the window.
+    // Then a plateau at the accepted cost, long enough for a stall to be judged.
     let mut schedule = vec![
         (-100.0, 11.0, STATIONARY_GRAD_2613),
         (-99.0, 11.5, STATIONARY_GRAD_2613),
         (-98.5, 10.5, STATIONARY_GRAD_2613),
     ];
     schedule.extend(
-        (0..(COST_STALL_WINDOW + 3)).map(|_| (-100.0, 11.0, STATIONARY_GRAD_2613)),
+        (0..4).map(|_| (-100.0, 11.0, STATIONARY_GRAD_2613)),
     );
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let (outcomes, published) = {
@@ -395,13 +402,14 @@ fn accepted_step_resolves_by_cost_not_by_recency_2613() {
                     // repeats the accepted cost, so every later step decreases
                     // by nothing.
                     actual_decrease: if idx == 2 { 90.0 } else { -100.0 - cost },
+                    predicted_decrease: if idx == 2 { 90.0 } else { -100.0 - cost },
                 });
             },
         )
     };
     assert!(
         outcomes.iter().position(Result::is_err).is_some(),
-        "the plateau must eventually close the window: {outcomes:?}",
+        "the plateau must stall and halt: {outcomes:?}",
     );
     let published = published.expect("the closed window must publish an incumbent");
     assert_eq!(
@@ -777,6 +785,9 @@ fn certificate_band_never_undercuts_a_resolvable_solver_band_2954() {
 
 // ─── #2458 the derived standard, and the typed inability to reach it ─────────
 
+/// The observations the #2458 fixture declares.
+const N_OBS_2458: usize = 5_000;
+
 /// One second-order-stationary point, certified twice: once by a route that
 /// declares a Dense analytic Hessian, once by a route that declares none.
 ///
@@ -786,6 +797,9 @@ fn certificate_band_never_undercuts_a_resolvable_solver_band_2954() {
 /// outer objective tolerance, i.e. the point is stationary to second order and
 /// the curvature-resolvability rung is exactly what exists to say so.
 ///
+/// The fixture declares `n = 5000` observations, so the criterion resolution
+/// is `τ_stat = 1/(2n) = 1e-4`.
+///
 /// `declares_hessian` is the ONLY difference between the two calls.
 fn certify_quadratic_at_declared_curvature_2458(
     declares_hessian: bool,
@@ -794,6 +808,10 @@ fn certify_quadratic_at_declared_curvature_2458(
 ) -> Result<OuterCriterionCertificate, EstimationError> {
     let config = OuterConfig {
         tolerance: 1.0e-12,
+        problem_size: crate::rho_optimizer::OuterProblemSize {
+            n_obs: Some(N_OBS_2458),
+            p_coefficients: Some(1),
+        },
         ..OuterConfig::default()
     };
     let mut obj = OuterProblem::new(1)
@@ -912,9 +930,9 @@ fn exact_curvature_reaches_the_derived_standard_and_its_absence_is_recorded_2458
 /// lands orders BELOW the gradient it is judging. Widening is not rescuing.
 #[test]
 fn the_curvature_rung_still_refuses_genuine_nonstationarity_2458() {
-    // |Pg| = 1 against a unit Hessian gives Δpred = 0.5 against
-    // τ = 1e-7·(1+0.5) = 1.5e-7, so the bound is √(3e-7) = 5.477e-4: the widest
-    // rung on the ladder, and 1826x below the gradient.
+    // |Pg| = 1 against a unit Hessian gives Δpred = 0.5 against the declared
+    // τ_stat = 1/(2·5000) = 1e-4, so the bound is √(1e-4/0.5) = 1.414e-2: the
+    // widest rung on the ladder, and 71x below the gradient.
     let refusal = certify_quadratic_at_declared_curvature_2458(true, 1.0, 1)
         .expect_err("a point with a half-unit predicted decrease is not stationary");
     let message = refusal.to_string();
@@ -923,13 +941,13 @@ fn the_curvature_rung_still_refuses_genuine_nonstationarity_2458() {
         "the refusal must be the ordinary non-stationarity one: {message}",
     );
     assert!(
-        message.contains("bound=5.477e-4"),
+        message.contains("bound=1.414e-2"),
         "the widened bound must be the decrement test's own answer, not a rescue: {message}",
     );
-    // The point of the assertion: three orders of margin between the widest
+    // The point of the assertion: nearly two orders of margin between the widest
     // bound the ladder can produce here and the gradient it is judging.
     assert!(
-        message.contains("|Pg|=1.000e0 > bound=5.477e-4"),
+        message.contains("|Pg|=1.000e0 > bound=1.414e-2"),
         "the refusal must compare the two directly: {message}",
     );
 }

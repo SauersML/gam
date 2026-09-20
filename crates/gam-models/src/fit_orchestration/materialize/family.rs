@@ -5,11 +5,86 @@ binomial/bernoulli, binomial-logit/bernoulli-logit/logistic, \
 binomial-probit/bernoulli-probit/probit, \
 binomial-cloglog/bernoulli-cloglog/cloglog, latent-cloglog-binomial, \
 poisson, poisson-log, gamma, gamma-log, \
-inverse-gaussian/inverse.gaussian/inv-gauss/invgauss, beta/beta-regression, \
-beta-logit/beta-regression-logit, tweedie/tw, tweedie-log, \
-negative-binomial/negbin/nb, negative-binomial-log/negbin-log, \
-student-t/t, royston-parmar, transformation-normal; any family also accepts \
-an mgcv-style link argument, e.g. gamma(inverse)";
+inverse-gaussian, beta/beta-regression, \
+beta-logit/beta-regression-logit, tweedie, tweedie-log, \
+negative-binomial, negative-binomial-log, \
+student-t, royston-parmar, transformation-normal; any family also accepts \
+a parenthesized link argument, e.g. gamma(inverse)";
+
+/// Every scalar family head [`scalar_family_from_name`] resolves, in the
+/// spelling it accepts. Used to point an underscore spelling at its hyphen
+/// form; `every_listed_scalar_family_head_resolves` keeps it in sync with the
+/// resolver's match.
+const SCALAR_FAMILY_HEADS: &[&str] = &[
+    "gaussian",
+    "gaussian-identity",
+    "binomial",
+    "bernoulli",
+    "binomial-logit",
+    "bernoulli-logit",
+    "logistic",
+    "binomial-probit",
+    "bernoulli-probit",
+    "probit",
+    "binomial-cloglog",
+    "bernoulli-cloglog",
+    "cloglog",
+    "latent-cloglog-binomial",
+    "poisson",
+    "poisson-log",
+    "negative-binomial",
+    "negative-binomial-log",
+    "beta",
+    "beta-regression",
+    "beta-logit",
+    "beta-regression-logit",
+    "student-t",
+    "gamma",
+    "gamma-log",
+    "inverse-gaussian",
+    "royston-parmar",
+    "transformation-normal",
+    "tweedie",
+    "tweedie-log",
+];
+
+/// Family spellings that are not accepted, each with the one spelling that
+/// names the same family (SPEC R25: one spelling per behavior).
+const REMOVED_FAMILY_SPELLINGS: &[(&str, &str)] = &[
+    ("tw", "tweedie"),
+    ("nb", "negative-binomial"),
+    ("negbin", "negative-binomial"),
+    ("negbin-log", "negative-binomial-log"),
+    ("t", "student-t"),
+    ("inverse.gaussian", "inverse-gaussian"),
+    ("inversegaussian", "inverse-gaussian"),
+    ("inv-gauss", "inverse-gaussian"),
+    ("invgauss", "inverse-gaussian"),
+    ("inv-gaussian", "inverse-gaussian"),
+];
+
+/// The accepted spelling for an unaccepted family head, if there is exactly
+/// one: a removed alias, or an underscore spelling of a hyphenated family.
+fn canonical_family_head(head: &str) -> Option<&'static str> {
+    let lookup = |spelling: &str| -> Option<&'static str> {
+        REMOVED_FAMILY_SPELLINGS
+            .iter()
+            .find(|(removed, _)| *removed == spelling)
+            .map(|(_, canonical)| *canonical)
+            .or_else(|| SCALAR_FAMILY_HEADS.iter().copied().find(|h| *h == spelling))
+    };
+    if let Some(canonical) = REMOVED_FAMILY_SPELLINGS
+        .iter()
+        .find(|(removed, _)| *removed == head)
+        .map(|(_, canonical)| *canonical)
+    {
+        return Some(canonical);
+    }
+    if head.contains('_') {
+        return lookup(&head.replace('_', "-"));
+    }
+    None
+}
 
 /// Project an ingest-layer [`ColumnKindTag`] (plus the column's level table)
 /// onto the [`ResponseColumnKind`] consumed by the family layer.
@@ -96,16 +171,19 @@ fn require_legal_link(response: &ResponseFamily, link: LinkFunction) -> Result<(
     }
     Err(WorkflowError::InvalidConfig {
         reason: format!(
-            "link `{}` is not supported for family `{}`; {}",
+            "link `{}` is not supported for family `{}`; {}{}",
             link.name(),
             response.name(),
-            LikelihoodSpec::legal_links_clause(response)
+            LikelihoodSpec::legal_links_clause(response),
+            LikelihoodSpec::illegal_cell_hint(response, link)
+                .map(|hint| format!("; {hint}"))
+                .unwrap_or_default()
         ),
     }
     .into())
 }
 
-/// Apply an explicit mgcv-style `family(link)` link argument to an
+/// Apply an explicit parenthesized `family(link)` link argument to an
 /// already-resolved family spec.
 ///
 /// `base` is the `(spec, link_pinned)` pair the bare family head resolved to
@@ -282,15 +360,11 @@ pub fn scalar_family_from_name(
         }
         Ok((theta, fixed))
     };
-    // Accept both '-' and '_' as separators so e.g. "binomial_logit" and
-    // "negative-binomial" resolve identically. Also accept mgcv's
-    // parenthesized form `family(link)` (e.g. "binomial(logit)",
-    // "Binomial(Probit)") which is how mgcv writes a GLM family with an
-    // explicit link in R. Canonicalize all forms to `family-link`.
-    let lowered = name.to_ascii_lowercase().replace('_', "-");
-    // mgcv writes a GLM family carrying an explicit link as
-    // `family(link)` (e.g. "poisson(log)", "Gamma(log)",
-    // "gaussian(identity)", "binomial(probit)"). Parse that form
+    // Family names are case-insensitive and hyphen-separated; an underscore
+    // spelling (`student_t`) is refused with the hyphen spelling named. A
+    // family may carry an explicit link as `family(link)` (e.g.
+    // "poisson(log)", "Gamma(log)", "gaussian(identity)",
+    // "binomial(probit)"). Parse that form
     // *structurally* — separate the family head from the link argument —
     // rather than flattening it to a `family-link` string and depending
     // on a hand-written match arm existing for that exact pair.
@@ -303,6 +377,7 @@ pub fn scalar_family_from_name(
     // rejects illegal ones with a precise message. Non-parenthesized
     // names — bare (`poisson`) and the historical hyphen spellings
     // (`binomial-probit`) — match the table directly as before.
+    let lowered = name.to_ascii_lowercase();
     let (head_name, paren_link): (&str, Option<&str>) = if let Some(open) =
         lowered.find('(')
         && lowered.ends_with(')')
@@ -320,7 +395,7 @@ pub fn scalar_family_from_name(
     } else {
         (lowered.as_str(), None)
     };
-    // mgcv's `tw()` carries the Tweedie variance power as its
+    // Tweedie carries its variance power as the
     // parenthesized argument (`tweedie(1.6)` / `tweedie(p=1.6)`), NOT a
     // link name. When the head is Tweedie and the argument parses as a
     // number, interpret it as the power `p` and consume the argument so
@@ -329,7 +404,7 @@ pub fn scalar_family_from_name(
     // no user-facing way to set `p`. A non-numeric argument
     // (e.g. `tweedie(log)`) still flows through to the link resolver.
     let (paren_link, tweedie_p_override): (Option<&str>, Option<f64>) =
-        if matches!(head_name, "tweedie" | "tw" | "tweedie-log")
+        if matches!(head_name, "tweedie" | "tweedie-log")
             && let Some(arg) = paren_link
         {
             let numeric = arg.strip_prefix("p=").unwrap_or(arg).trim();
@@ -360,7 +435,7 @@ pub fn scalar_family_from_name(
     // same validity gate as the parenthesized `tweedie(p=…)` form above, so one
     // bad power fails identically whichever surface named the family. A power
     // written into the name wins, because it is the more specific statement.
-    if matches!(head_name, "tweedie" | "tw" | "tweedie-log")
+    if matches!(head_name, "tweedie" | "tweedie-log")
         && tweedie_p_override.is_none()
     {
         return Err(WorkflowError::InvalidConfig {
@@ -449,7 +524,7 @@ pub fn scalar_family_from_name(
         // `FixedNegBinTheta` scale → the PIRLS refresh gate, which opens only
         // for `EstimatedNegBinTheta`, stays closed). With no flag,
         // θ is the running ML estimate (the #802 default seed 1.0).
-        "nb" | "negbin" | "negative-binomial" => {
+        "negative-binomial" => {
             let (theta, theta_fixed) = resolve_negative_binomial_theta()?;
             (
                 LikelihoodSpec::new(
@@ -459,7 +534,7 @@ pub fn scalar_family_from_name(
                 false,
             )
         }
-        "negative-binomial-log" | "negbin-log" => {
+        "negative-binomial-log" => {
             let (theta, theta_fixed) = resolve_negative_binomial_theta()?;
             (
                 LikelihoodSpec::new(
@@ -487,7 +562,7 @@ pub fn scalar_family_from_name(
         // hyperparameters: the optimizer replaces this placeholder with its
         // data-derived seed (σ = weighted MAD of y, ν = 1) before the first
         // evaluation, so the values written here never reach a fit.
-        "student-t" | "t" => (
+        "student-t" => (
             LikelihoodSpec::new(
                 ResponseFamily::StudentT {
                     sigma: 1.0,
@@ -511,11 +586,9 @@ pub fn scalar_family_from_name(
             ),
             true,
         ),
-        // Inverse-Gaussian with its canonical `1/μ²` link; mgcv spells it
-        // `inverse.gaussian`, pyGAM `inv_gauss`. The log link is reached
-        // through `inverse-gaussian(log)`.
-        "inverse-gaussian" | "inverse.gaussian" | "inversegaussian" | "inv-gauss"
-        | "invgauss" | "inv-gaussian" => (
+        // Inverse-Gaussian with its canonical `1/μ²` link. The log link is
+        // reached through `inverse-gaussian(log)`.
+        "inverse-gaussian" => (
             LikelihoodSpec::new(
                 ResponseFamily::InverseGaussian,
                 InverseLink::Standard(StandardLink::InverseSquared),
@@ -541,14 +614,13 @@ pub fn scalar_family_from_name(
             true,
         ),
         // Tweedie compound-Poisson-Gamma family. The variance power p
-        // must lie strictly in (1, 2). mgcv's `tw()` has NO canonical
-        // p — it *estimates* p by profile likelihood. We require callers to set
-        // it explicitly via `tweedie(1.6)` / `tweedie(p=1.6)`: profiling it
-        // without an analytic p-derivative would violate SPEC.md's ban on
+        // must lie strictly in (1, 2) and callers set it explicitly via
+        // `tweedie(1.6)` / `tweedie(p=1.6)`: profiling it without an
+        // analytic p-derivative would violate SPEC.md's ban on
         // derivative-free hyperparameter search. The link is fixed to
         // log (the only link wired through the Tweedie working-response
-        // and dispersion machinery). "tw" matches mgcv's family alias.
-        "tweedie" | "tw" => (
+        // and dispersion machinery).
+        "tweedie" => (
             LikelihoodSpec::new(
                 ResponseFamily::Tweedie {
                     p: tweedie_p_override.expect("explicit Tweedie power validated above"),
@@ -566,7 +638,7 @@ pub fn scalar_family_from_name(
             ),
             true,
         ),
-        head if MULTINOMIAL_FAMILY_NAMES.contains(&head) => {
+        head if MULTINOMIAL_FAMILY_NAMES.contains(&head.replace('_', "-").as_str()) => {
             // Multinomial-logit is a vector-response family with K-1
             // active linear predictors and a per-row dense Fisher
             // block — it cannot be represented by the scalar
@@ -593,16 +665,19 @@ pub fn scalar_family_from_name(
             }
             .into());
         }
-        _ => {
+        head => {
             return Err(WorkflowError::InvalidConfig {
-                reason: format!(
-                    "unknown family '{name}'; expected one of: {SCALAR_FAMILY_NAMES_HELP}"
-                ),
+                reason: match canonical_family_head(head) {
+                    Some(canonical) => format!("unknown family `{head}`; use `{canonical}`"),
+                    None => format!(
+                        "unknown family '{name}'; expected one of: {SCALAR_FAMILY_NAMES_HELP}"
+                    ),
+                },
             }
             .into());
         }
     };
-    // Apply an explicit mgcv-style `(link)` argument to the resolved
+    // Apply an explicit parenthesized `(link)` argument to the resolved
     // family, validating legality. A bare family name leaves the
     // family's default link untouched.
     let resolved = match paren_link {
@@ -677,22 +752,34 @@ pub fn resolve_family(
                     ResponseFamily::Gaussian,
                     InverseLink::Standard(StandardLink::Identity),
                 ),
-                // `log` (Poisson, Gamma, Tweedie, NB, Inverse-Gaussian) and
-                // `1/μ` (Gaussian, Gamma) are each legal for several families,
-                // and nothing in the link distinguishes them: a variance
-                // function is a modelling choice, not something to read off
-                // whether `y` happens to be integer-valued. The caller names
-                // the family. With an explicit family only `from_link.link`
-                // is carried below, so the response here is immaterial.
+                // `log`, `sqrt`, `1/μ` and `1/μ²` are each legal for several
+                // families (the generic variance × link cells carry the
+                // non-canonical ones), and nothing in the link distinguishes
+                // them: a variance function is a modelling choice, not
+                // something to read off whether `y` happens to be
+                // integer-valued. The caller names the family. With an
+                // explicit family only `from_link.link` is carried below, so
+                // the response here is immaterial.
                 LinkFunction::Log if explicit.is_some() => LikelihoodSpec::new(
                     ResponseFamily::Gamma,
                     InverseLink::Standard(StandardLink::Log),
+                ),
+                LinkFunction::Sqrt if explicit.is_some() => LikelihoodSpec::new(
+                    ResponseFamily::Gamma,
+                    InverseLink::Standard(StandardLink::Sqrt),
                 ),
                 LinkFunction::Inverse if explicit.is_some() => LikelihoodSpec::new(
                     ResponseFamily::Gamma,
                     InverseLink::Standard(StandardLink::Inverse),
                 ),
-                link @ (LinkFunction::Log | LinkFunction::Inverse) => {
+                LinkFunction::InverseSquared if explicit.is_some() => LikelihoodSpec::new(
+                    ResponseFamily::Gamma,
+                    InverseLink::Standard(StandardLink::InverseSquared),
+                ),
+                link @ (LinkFunction::Log
+                | LinkFunction::Sqrt
+                | LinkFunction::Inverse
+                | LinkFunction::InverseSquared) => {
                     return Err(WorkflowError::InvalidConfig {
                         reason: format!(
                             "link '{}' does not determine a response family; name one \
@@ -703,12 +790,6 @@ pub fn resolve_family(
                     }
                     .into());
                 }
-                // `1/μ²` is the canonical Inverse-Gaussian link and legal for
-                // no other family.
-                LinkFunction::InverseSquared => LikelihoodSpec::new(
-                    ResponseFamily::InverseGaussian,
-                    InverseLink::Standard(StandardLink::InverseSquared),
-                ),
                 LinkFunction::Logit => LikelihoodSpec::new(
                     ResponseFamily::Binomial,
                     InverseLink::Standard(StandardLink::Logit),
@@ -843,7 +924,7 @@ pub fn resolve_family(
 
 #[cfg(test)]
 mod tweedie_power_tests {
-    //! #2026: the mgcv-style parenthesized Tweedie power `tweedie(p)` must be
+    //! #2026: the parenthesized Tweedie power `tweedie(p)` must be
     //! parsed as the variance power (not misrouted to the link resolver), so
     //! callers whose true `p != 1.5` can set it and get calibrated observation
     //! intervals (`Var(Y|x) = phi * mu^p`).
@@ -872,16 +953,57 @@ mod tweedie_power_tests {
     fn tweedie_paren_power_parses() {
         // Each of these was rejected before #2026 as `unknown link '<num>'`.
         assert_eq!(tweedie_p("tweedie(1.7)"), 1.7);
-        assert_eq!(tweedie_p("tw(1.3)"), 1.3);
         assert_eq!(tweedie_p("tweedie(p=1.6)"), 1.6);
         assert_eq!(tweedie_p("Tweedie(1.25)"), 1.25);
         assert_eq!(tweedie_p("tweedie-log(1.9)"), 1.9);
     }
 
+    /// `SCALAR_FAMILY_HEADS` feeds the underscore hint below; every entry must
+    /// be a head the resolver's match accepts.
+    #[test]
+    fn every_listed_scalar_family_head_resolves() {
+        for head in SCALAR_FAMILY_HEADS {
+            scalar_family_from_name(
+                head,
+                FamilyNuisanceOverrides {
+                    tweedie_power: Some(1.5),
+                    ..FamilyNuisanceOverrides::default()
+                },
+            )
+            .unwrap_or_else(|err| panic!("listed head `{head}` must resolve: {err}"));
+        }
+    }
+
+    /// SPEC R25: one spelling per family. The other spellings are refused
+    /// with an error that names the accepted one.
+    #[test]
+    fn removed_family_spellings_name_the_canonical_one() {
+        for (raw, expected) in [
+            ("tw(1.5)", "unknown family `tw`; use `tweedie`"),
+            ("nb", "unknown family `nb`; use `negative-binomial`"),
+            ("negbin", "unknown family `negbin`; use `negative-binomial`"),
+            ("NegBin-Log", "unknown family `negbin-log`; use `negative-binomial-log`"),
+            ("t", "unknown family `t`; use `student-t`"),
+            ("student_t", "unknown family `student_t`; use `student-t`"),
+            ("inverse.gaussian", "unknown family `inverse.gaussian`; use `inverse-gaussian`"),
+            ("invgauss", "unknown family `invgauss`; use `inverse-gaussian`"),
+            ("inverse_gaussian", "unknown family `inverse_gaussian`; use `inverse-gaussian`"),
+            ("negative_binomial(log)", "unknown family `negative_binomial`; use `negative-binomial`"),
+        ] {
+            let err = scalar_family_from_name(raw, FamilyNuisanceOverrides::default())
+                .expect_err(raw);
+            assert!(err.contains(expected), "{raw}: {err}");
+        }
+        for canonical in ["negative-binomial", "student-t", "inverse-gaussian", "tweedie(1.5)"] {
+            scalar_family_from_name(canonical, FamilyNuisanceOverrides::default())
+                .unwrap_or_else(|err| panic!("`{canonical}` must resolve: {err}"));
+        }
+    }
+
     #[test]
     fn tweedie_bare_requires_explicit_power_instead_of_derivative_free_profiling() {
         let y = array![0.0, 1.2, 3.4];
-        for family in ["tweedie", "tw", "tweedie(log)"] {
+        for family in ["tweedie", "tweedie(log)"] {
             let error = resolve_family(
                 Some(family),
                 None,
@@ -917,7 +1039,7 @@ mod tweedie_power_tests {
         assert!(require_legal_link(&ResponseFamily::Gaussian, LinkFunction::LogLog).is_err());
         assert!(require_legal_link(&ResponseFamily::Gaussian, LinkFunction::Cauchit).is_err());
 
-        // End-to-end resolver path (mgcv-style `family(link)`) must now accept
+        // End-to-end resolver path (`family(link)`) must now accept
         // both links and carry the requested inverse link into the spec.
         let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
         for (raw, want) in [
@@ -960,9 +1082,13 @@ mod tweedie_power_tests {
         for (link, admitting) in [
             (
                 LinkFunction::Log,
-                "poisson|tweedie|negative-binomial|gamma|inverse-gaussian",
+                "gaussian|binomial|poisson|tweedie|negative-binomial|gamma|inverse-gaussian",
             ),
-            (LinkFunction::Inverse, "gaussian|gamma"),
+            (
+                LinkFunction::Inverse,
+                "gaussian|poisson|gamma|inverse-gaussian",
+            ),
+            (LinkFunction::Sqrt, "gaussian|poisson|gamma|inverse-gaussian"),
         ] {
             let choice = LinkChoice {
                 mode: LinkMode::Strict,

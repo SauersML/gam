@@ -14,7 +14,7 @@ expected to relieve.
 
 What it asserts (two independent, objective bars — no reference tool):
   1. CONVERGENCE: the stagewise fit returns a model instead of raising the
-     RemlConvergenceError / GamError inner-stall sentinel.
+     RemlConvergenceError / GamfitError inner-stall sentinel.
   2. LATENCY: it returns within a wall budget (default 300 s, the issue's own
      "does not return within 5 min" bar).
 

@@ -4,7 +4,7 @@ in as if it were a user-facing level.
 
     y ~ s(x) + factor(b)          # b in {"b0", "b1", "b2"}
     model.partial_dependence("s(x)", data)
-    -> gamfit._rust.GamError: unseen level '\\x00b0' in categorical column 'b' at row 1
+    -> gamfit._rust.GamfitError: unseen level '\\x00b0' in categorical column 'b' at row 1
 
 ``y ~ s(x) + b`` (bare string column) fails identically. Drop the factor and the
 same call succeeds, so nothing about the smooth is at fault -- the mgcv
@@ -36,7 +36,7 @@ has never seen. The persisted schema is not a workaround either: its levels come
 back quoted (``["'b0'", "'b1'", "'b2'"]``), so the ``levels[0]`` fallback a few
 lines below would inject ``"'b0'"``.
 
-Observed: ``GamError: unseen level '\\x00...'`` for every model with a
+Observed: ``GamfitError: unseen level '\\x00...'`` for every model with a
 categorical term.
 
 Expected: ``partial_dependence`` returns the term's partial effect. Because the
@@ -76,9 +76,7 @@ def _oracle(model: Any, grid: np.ndarray, frame: dict[str, Any]) -> tuple[np.nda
     """``X_t beta_t`` and ``sqrt(diag(X_t V_t X_t^T))`` for the ``s(x)`` block."""
     summary = model.summary()
     beta = np.asarray([c["estimate"] for c in summary.coefficients], dtype=float)
-    cov = np.asarray(summary.covariance_flat, dtype=float).reshape(
-        summary.covariance_n, summary.covariance_n
-    )
+    cov = summary.covariance
     block = next(b for b in model.term_blocks if b.name == "s(x)")
     design = np.asarray(model.design_matrix(frame).matrix, dtype=float)
     columns = design[:, block.start : block.end]
@@ -94,12 +92,12 @@ def test_oracle_agrees_with_partial_dependence_without_a_factor() -> None:
     model = gamfit.fit({"x": data["x"], "y": data["y"]}, "y ~ s(x)", family="gaussian")
 
     result = model.partial_dependence("s(x)", n_points=9)
-    grid = np.asarray(result["grid"], dtype=float)
+    grid = result.x
     expected_fit, expected_se = _oracle(model, grid, {"x": grid})
 
-    np.testing.assert_allclose(np.asarray(result["predicted"], dtype=float), expected_fit, atol=1e-12)
+    np.testing.assert_allclose(result.fit, expected_fit, atol=1e-12)
     np.testing.assert_allclose(
-        np.asarray(result["standard_error"], dtype=float), expected_se, atol=1e-12
+        result.se, expected_se, atol=1e-12
     )
 
 
@@ -110,18 +108,18 @@ def test_partial_dependence_with_a_string_factor(formula: str) -> None:
 
     result = model.partial_dependence("s(x)", n_points=9)
 
-    grid = np.asarray(result["grid"], dtype=float)
+    grid = result.x
     frame = {"x": grid, "b": np.array(["b0"] * grid.size)}
     expected_fit, expected_se = _oracle(model, grid, frame)
 
     np.testing.assert_allclose(
-        np.asarray(result["predicted"], dtype=float),
+        result.fit,
         expected_fit,
         atol=1e-10,
         err_msg="partial_dependence disagrees with X_t @ beta_t for the s(x) block",
     )
     np.testing.assert_allclose(
-        np.asarray(result["standard_error"], dtype=float),
+        result.se,
         expected_se,
         atol=1e-10,
         err_msg="partial_dependence SE disagrees with sqrt(diag(X_t V_t X_t^T))",

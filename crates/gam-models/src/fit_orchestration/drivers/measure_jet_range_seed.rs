@@ -24,7 +24,7 @@
 //   0.2163      -246.4           0.0110
 //   0.8030      -256.3           0.0084     <- GLOBAL minimum, 21.7 deeper
 //   1.0438      -198.5           0.0538     <- past the diameter: block collapses
-//   s(x, bs="tp")  -247.4        0.0123
+//   s(x, bs="tps")  -247.4        0.0123
 // ```
 //
 // The free search lands at `V = -234.6`: it never leaves the first basin. The
@@ -288,21 +288,27 @@ fn screen_measure_jet_range(
     let refuse = |error: EstimationError| EstimationError::TrialPointRefused {
         reason: error.to_string(),
     };
+    // The screen's REML is over `[1 | X(ℓ)]`, and the Gaussian kernel keeps
+    // `X(ℓ)` at one column per center for every ℓ > 0, so the coefficient
+    // count the engine sizes its resolution by is fixed across the window.
+    let p_coefficients = {
+        let mut sizing = spec.clone();
+        sizing.length_scale = bracket.nodes.iter().copied().find(|node| node.is_finite() && *node > 0.0)?;
+        sizing.double_penalty = false;
+        gam_terms::basis::build_measure_jet_basis(data, &sizing).ok()?.design.ncols() + 1
+    };
     let mut best: Option<(f64, f64)> = None;
     for &node in &bracket.nodes {
         let start = node.ln();
         if !start.is_finite() {
             continue;
         }
-        let mut seed_config = gam_problem::SeedConfig::default();
-        seed_config.max_seeds = 1;
-        seed_config.seed_budget = 1;
         let problem = OuterProblem::new(1)
+            .with_problem_size(y.len(), p_coefficients)
             .with_gradient(Derivative::Analytic)
             .with_hessian(gam_problem::DeclaredHessianForm::Dense)
             .with_bounds(Array1::from_vec(vec![lower]), Array1::from_vec(vec![upper]))
-            .with_initial_rho(Array1::from_vec(vec![start.clamp(lower, upper)]))
-            .with_seed_config(seed_config);
+            .with_initial_rho(Array1::from_vec(vec![start.clamp(lower, upper)]));
         let mut objective = problem.build_objective(
             (),
             |_: &mut (), rho: &Array1<f64>| {
