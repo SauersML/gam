@@ -5540,9 +5540,11 @@ fn spectral_oracle(
     order: usize,
     steps: usize,
 ) -> [f64; 4] {
-    let rule = gam_math::quadrature::gauss_hermite_rule(order).expect("Gauss-Hermite rule");
-    let z: Vec<f64> = rule.nodes.iter().map(|x| std::f64::consts::SQRT_2 * x).collect();
-    let v: Vec<f64> = rule.weights.iter().map(|w| w / std::f64::consts::PI.sqrt()).collect();
+    let (z, v): (Vec<f64>, Vec<f64>) =
+        gam_math::quadrature::standard_normal_gauss_hermite_rule(order)
+            .expect("Gauss-Hermite rule")
+            .into_iter()
+            .unzip();
     // basis[n][i] = ψ_n(z_i), with ψ_{n+1} = (z ψ_n − √n ψ_{n−1}) / √(n+1).
     let mut basis = vec![vec![0.0; order]; order];
     for i in 0..order {
