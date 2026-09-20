@@ -1764,7 +1764,7 @@ mod tests {
             let d = data(family, n, &mut rng);
             let x = rng.random::<f64>() * 2.0 - 1.0;
             let o = rng.random::<f64>() * 0.4 - 0.2;
-            let _ = draw(family, eta_true(x) + o, &mut rng);
+            let y_star = draw(family, eta_true(x) + o, &mut rng);
             if !reps.contains(&rep) {
                 continue;
             }
@@ -1781,6 +1781,15 @@ mod tests {
                 Some(0.0),
                 "rep {rep}: {:?}",
                 set.intervals
+            );
+            let covered = set
+                .intervals
+                .iter()
+                .any(|r| r.lo <= y_star && y_star <= r.hi);
+            assert_eq!(
+                covered,
+                sub.count_member(&test, y_star, u, &twin, tau),
+                "rep {rep}: y* {y_star}"
             );
         }
     }
