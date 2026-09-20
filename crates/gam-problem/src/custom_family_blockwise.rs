@@ -110,6 +110,20 @@ pub fn validate_blockspec_consistency(
                 ),
             });
         }
+        // `nullspace_dims` is either empty (eigenvalue rank detection) or one
+        // structural nullity per penalty. Any other length is not a third
+        // mode: the penalty-root assembly would silently drop the declared
+        // nullities and fall back to numerical rank detection.
+        if !spec.nullspace_dims.is_empty() && spec.nullspace_dims.len() != spec.penalties.len() {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {b} nullspace_dims length {} does not match penalties {} \
+                     (must be empty or one structural nullity per penalty)",
+                    spec.nullspace_dims.len(),
+                    spec.penalties.len()
+                ),
+            });
+        }
         for (k, &log_lambda) in spec.initial_log_lambdas.iter().enumerate() {
             if let Err(error) = crate::validate_log_strength(log_lambda) {
                 return Err(CustomFamilyError::ConstraintViolation {
@@ -205,6 +219,27 @@ mod validate_blockspec_tests {
             "an offset length mismatch is structural, got: {error:?}"
         );
         assert!(!error.is_trial_point_infeasible(), "{error}");
+    }
+
+    #[test]
+    fn a_nullspace_dims_length_mismatch_refuses_instead_of_falling_back() {
+        // A declared nullity list whose length disagrees with the penalty list
+        // used to pass validation and be silently ignored by the penalty-root
+        // assembly (`declared = len == penalties.len()`), so the structural
+        // nullities the caller supplied were replaced by eigenvalue rank
+        // detection without a word.
+        let mut spec = block("b0");
+        spec.nullspace_dims = vec![1];
+        let error = super::validate_blockspec_consistency(&[spec])
+            .expect_err("a nullspace_dims/penalties length mismatch must be refused");
+        assert!(
+            matches!(error, CustomFamilyError::DimensionMismatch { .. }),
+            "a nullspace_dims length mismatch is structural, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("nullspace_dims length 1"),
+            "{error}"
+        );
     }
 
     #[test]

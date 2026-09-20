@@ -22,8 +22,11 @@
 //! topology race stays the judge — `curl` only submits a race-ready seed.
 //!
 //! `flatten` is the inverse demotion, so the move pair is falsifiable *inside*
-//! the dictionary's life, not just at birth: a Gaussian-fill radius law demotes
-//! a circle to a rank-2 flat plane, a diameter collapse demotes it to rank-1.
+//! the dictionary's life, not just at birth: it is the exact complement of the
+//! ring recognition `curl` promotes on, read on the atom's image in its own
+//! principal plane and on the rows it parses. A parse that is no longer a
+//! recognizable ring (e.g. Gaussian fill) demotes the circle to a rank-2 flat
+//! plane; a diameter collapse of either demotes it to rank-1.
 //!
 //! # The proposer pipeline (Phase 4)
 //!
@@ -212,6 +215,11 @@ pub struct RingRecognition {
     pub resultant2: f64,
     /// `√E[r²]`, the RMS in-plane radius, measured with no noise model.
     pub rms_radius: f64,
+    /// The plane has collapsed to a diameter: `R₂` is past the screen that
+    /// `covered` refuses. It is the one diameter screen both directions of the
+    /// curl/flatten pair read, so a plane cannot be neither curlable nor
+    /// flattenable (#3506).
+    pub diameter: bool,
     /// The angle is covered (`R₁` small) and the plane is not a diameter (`R₂`
     /// small).
     pub covered: bool,
@@ -233,8 +241,8 @@ fn recognize(law: &RadiusLaw, alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> 
     // 2σ level using the uniform-null SE 1/√n for each resultant.
     let res_se = 1.0 / (law.n as f64).sqrt();
     let coverage_ok = resultant1 < CURL_Z * res_se + 0.15; // lenient absolute floor
-    let not_diameter = resultant2 < 0.5;
-    let covered = coverage_ok && not_diameter;
+    let diameter = !(resultant2 < 0.5);
+    let covered = coverage_ok && !diameter;
     RingRecognition {
         kappa: law.kappa,
         kappa_se: law.kappa_se,
@@ -242,6 +250,7 @@ fn recognize(law: &RadiusLaw, alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> 
         resultant1,
         resultant2,
         rms_radius: law.m2.sqrt(),
+        diameter,
         covered,
         recognized: z_below_gaussian > CURL_Z && covered,
     }
@@ -414,15 +423,23 @@ pub fn curl_seed(
 }
 
 /// The verdict for the inverse move — demoting a circle back to flat.
+///
+/// It is the exact complement of [`ring_recognition`] read on two planes of the
+/// same atom: its own image in the principal plane of that image (geometry), and
+/// the rows the atom parses projected onto that plane (the data). A circle that
+/// would not be recognized as a ring today is not carrying rotational structure
+/// and is demoted, so curl and flatten share one threshold set and no plane is
+/// both curlable and flattenable, or neither (#3506).
 #[derive(Debug, Clone)]
 pub struct FlattenVerdict {
-    /// `κ` of the radius law (`≈ 2` ⇒ Gaussian fill ⇒ rank-2 plane).
-    pub kappa: f64,
-    /// Second resultant (`≈ 1` ⇒ diameter collapse ⇒ rank-1 line).
-    pub resultant2: f64,
-    /// The residual rank the circle should be demoted to: `2` = flat plane
-    /// (Gaussian fill), `1` = line (diameter collapse). Meaningful only when
-    /// `recommend_flatten`.
+    /// Ring witnesses of the atom's own image `Φ·B` in its principal plane.
+    pub image: RingRecognition,
+    /// Ring witnesses of the parsed rows projected on the same plane.
+    pub parse: RingRecognition,
+    /// The residual rank the circle should be demoted to: `1` = line (diameter
+    /// collapse of the image or of the parse), `2` = flat plane (the parse is not
+    /// a recognizable ring, e.g. a Gaussian fill with `κ ≈ 2`). Meaningful only
+    /// when `recommend_flatten`.
     pub residual_rank: usize,
     /// True ⇒ this "circle" is not carrying rotational structure and should be
     /// demoted.
@@ -431,41 +448,46 @@ pub struct FlattenVerdict {
 
 /// Adjudicate whether a fitted circle has degenerated and should be flattened.
 ///
-/// `radii` and `angles` are the per-row fitted polar coordinates of the atom.
-/// A Gaussian-fill radius law (κ ≈ 2) means the "circle" is really a flat 2-D
-/// Gaussian blob — demote to rank 2. A diameter collapse (second resultant ≈ 1,
-/// the angle mass on one line) means it is rank 1. A healthy ring (κ ≈ 1, angles
-/// covering the circle) is left alone.
+/// `(image_alpha, image_beta)` are the atom's own image rows `Φ·B` (centered)
+/// in the principal plane of that image; `(parse_alpha, parse_beta)` are the
+/// rows the atom parses, centered and projected on the same plane. Both are
+/// read with [`ring_recognition`]:
+///
+///   * a diameter in either plane (`R₂` past the screen `covered` refuses) is a
+///     rank-1 line — the decoder traces a segment, or the data it explains lie
+///     on one;
+///   * otherwise a parse that is not recognized as a ring (κ not resolvably below
+///     the Gaussian-fill value 2, or the angle not covered) is a rank-2 plane;
+///   * otherwise the ring stands.
+///
+/// No threshold is introduced here: every cut is the one `curl` promotes on.
 pub fn flatten_verdict(
-    radii: ArrayView1<f64>,
-    angles: ArrayView1<f64>,
+    image_alpha: ArrayView1<f64>,
+    image_beta: ArrayView1<f64>,
+    parse_alpha: ArrayView1<f64>,
+    parse_beta: ArrayView1<f64>,
 ) -> Result<FlattenVerdict, String> {
-    let n = radii.len();
-    if angles.len() != n {
-        return Err("flatten_verdict: radii/angles length mismatch".to_string());
+    let n = image_alpha.len();
+    if image_beta.len() != n || parse_alpha.len() != n || parse_beta.len() != n {
+        return Err(format!(
+            "flatten_verdict: plane length mismatch (image α {n}, image β {}, parse α {}, parse β {})",
+            image_beta.len(),
+            parse_alpha.len(),
+            parse_beta.len()
+        ));
     }
-    if n < 2 {
-        return Err("flatten_verdict: need at least 2 rows".to_string());
-    }
-    let alpha: Array1<f64> = (0..n).map(|i| radii[i] * angles[i].cos()).collect();
-    let beta: Array1<f64> = (0..n).map(|i| radii[i] * angles[i].sin()).collect();
-    let law = radius_law(alpha.view(), beta.view())?;
-    let (_r1, resultant2) = circular_resultants(alpha.view(), beta.view());
-
-    // Diameter collapse takes precedence: even a Gaussian-looking radius law on a
-    // single line is a rank-1 structure.
-    let diameter = resultant2 > 0.7;
-    let gaussian_fill = law.kappa > 1.5;
-    let (recommend_flatten, residual_rank) = if diameter {
+    let image = ring_recognition(image_alpha, image_beta)?;
+    let parse = ring_recognition(parse_alpha, parse_beta)?;
+    let (recommend_flatten, residual_rank) = if image.diameter || parse.diameter {
         (true, 1)
-    } else if gaussian_fill {
+    } else if !parse.recognized {
         (true, 2)
     } else {
         (false, 2)
     };
     Ok(FlattenVerdict {
-        kappa: law.kappa,
-        resultant2,
+        image,
+        parse,
         residual_rank,
         recommend_flatten,
     })
@@ -1081,19 +1103,36 @@ mod tests {
         assert!(max_err < 1e-10, "reconstruction max err {max_err:.3e}");
     }
 
+    /// A healthy ring image `(α, β) = r(cos θ, sin θ)`, `r ≈ 2`, θ uniform.
+    fn noisy_ring(s: &mut u64, n: usize) -> (Array1<f64>, Array1<f64>) {
+        let mut alpha = Array1::<f64>::zeros(n);
+        let mut beta = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let r = 2.0 + 0.02 * lcg_normal(s);
+            let th = TAU * lcg(s);
+            alpha[i] = r * th.cos();
+            beta[i] = r * th.sin();
+        }
+        (alpha, beta)
+    }
+
     #[test]
     fn flatten_demotes_gaussian_fill_to_rank2() {
+        // A ring decoder whose rows parse an isotropic Gaussian blob: the image
+        // is a ring, the data are not.
         let mut s = 0x9F1_u64;
         let n = 3000usize;
-        let mut radii = Array1::<f64>::zeros(n);
-        let mut angles = Array1::<f64>::zeros(n);
+        let (image_alpha, image_beta) = noisy_ring(&mut s, n);
+        let mut alpha = Array1::<f64>::zeros(n);
+        let mut beta = Array1::<f64>::zeros(n);
         for i in 0..n {
-            let a = 2.0 * lcg_normal(&mut s);
-            let b = 2.0 * lcg_normal(&mut s);
-            radii[i] = (a * a + b * b).sqrt();
-            angles[i] = b.atan2(a);
+            alpha[i] = 2.0 * lcg_normal(&mut s);
+            beta[i] = 2.0 * lcg_normal(&mut s);
         }
-        let v = flatten_verdict(radii.view(), angles.view()).unwrap();
+        let v = flatten_verdict(image_alpha.view(), image_beta.view(), alpha.view(), beta.view())
+            .unwrap();
+        assert!(v.image.recognized, "the image is a ring (κ={:.3})", v.image.kappa);
+        assert!(!v.parse.recognized, "a Gaussian parse is no ring (κ={:.3})", v.parse.kappa);
         assert!(v.recommend_flatten);
         assert_eq!(v.residual_rank, 2);
     }
@@ -1102,15 +1141,30 @@ mod tests {
     fn flatten_demotes_diameter_to_rank1() {
         let mut s = 0x33A_u64;
         let n = 3000usize;
-        let mut radii = Array1::<f64>::zeros(n);
-        let mut angles = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            // amplitude along a single line θ ≈ 0 (or π): a diameter.
-            let g = 3.0 * lcg_normal(&mut s);
-            radii[i] = g.abs();
-            angles[i] = if g >= 0.0 { 0.0 } else { PI };
-        }
-        let v = flatten_verdict(radii.view(), angles.view()).unwrap();
+        // amplitude along a single line θ ∈ {0, π}: a diameter.
+        let alpha = Array1::from_shape_fn(n, |_| 3.0 * lcg_normal(&mut s));
+        let beta = Array1::<f64>::zeros(n);
+        let v = flatten_verdict(alpha.view(), beta.view(), alpha.view(), beta.view()).unwrap();
+        assert!(v.image.diameter && v.parse.diameter);
+        assert!(v.recommend_flatten);
+        assert_eq!(v.residual_rank, 1);
+    }
+
+    /// #3506 — the segment image `α = R cos φ, β = 0` under evenly spread phases
+    /// `φ`. Paired with the PHASE angle its radius law reads `κ = E[cos⁴]/E[cos²]²
+    /// = 3/2` exactly, with `R₂ = 0`: a covered "ring" sitting on the old magic
+    /// `κ > 1.5` cut and never flattened. Read geometrically it is a diameter.
+    #[test]
+    fn flatten_demotes_segment_under_uniform_phases_to_rank1_3506() {
+        let n = 400usize;
+        let alpha = Array1::from_shape_fn(n, |i| 3.0 * (TAU * i as f64 / n as f64).cos());
+        let beta = Array1::<f64>::zeros(n);
+        let v = flatten_verdict(alpha.view(), beta.view(), alpha.view(), beta.view()).unwrap();
+        assert!(
+            v.image.diameter,
+            "a segment is a diameter (R₂ = {:.4})",
+            v.image.resultant2
+        );
         assert!(v.recommend_flatten);
         assert_eq!(v.residual_rank, 1);
     }
@@ -1119,18 +1173,32 @@ mod tests {
     fn healthy_ring_not_flattened() {
         let mut s = 0x77C_u64;
         let n = 3000usize;
-        let mut radii = Array1::<f64>::zeros(n);
-        let mut angles = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            radii[i] = 2.0 + 0.02 * lcg_normal(&mut s);
-            angles[i] = TAU * lcg(&mut s);
-        }
-        let v = flatten_verdict(radii.view(), angles.view()).unwrap();
+        let (alpha, beta) = noisy_ring(&mut s, n);
+        let v = flatten_verdict(alpha.view(), beta.view(), alpha.view(), beta.view()).unwrap();
         assert!(
             !v.recommend_flatten,
             "healthy ring must not flatten (κ={:.3} R2={:.3})",
-            v.kappa, v.resultant2
+            v.parse.kappa, v.parse.resultant2
         );
+    }
+
+    /// The flatten verdict is the exact complement of the ring recognition curl
+    /// promotes on: whenever image and parse coincide, a plane flattens iff it
+    /// is not recognized as a ring.
+    #[test]
+    fn flatten_is_the_complement_of_ring_recognition() {
+        let mut s = 0xC0DE_u64;
+        let n = 800usize;
+        let (ring_a, ring_b) = noisy_ring(&mut s, n);
+        let gauss_a = Array1::from_shape_fn(n, |_| lcg_normal(&mut s));
+        let gauss_b = Array1::from_shape_fn(n, |_| lcg_normal(&mut s));
+        let half_a = Array1::from_shape_fn(n, |i| (PI * i as f64 / n as f64).cos());
+        let half_b = Array1::from_shape_fn(n, |i| (PI * i as f64 / n as f64).sin());
+        for (alpha, beta) in [(&ring_a, &ring_b), (&gauss_a, &gauss_b), (&half_a, &half_b)] {
+            let rec = ring_recognition(alpha.view(), beta.view()).unwrap();
+            let v = flatten_verdict(alpha.view(), beta.view(), alpha.view(), beta.view()).unwrap();
+            assert_eq!(v.recommend_flatten, !rec.recognized);
+        }
     }
 
     #[test]
