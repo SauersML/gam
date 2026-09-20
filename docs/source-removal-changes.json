@@ -3103,5 +3103,13 @@
     ],
     "reason": "#4134: remove an assertion-free four-fit diagnostic that swallowed fit errors and printed a hard-coded convergence certificate. The same seed-7/n400 hypothesis remains covered by registered Wahba/Sobolev/pseudo-spline fit-quality assertions.",
     "evidence": "Read-only source audit verified the removed diagnostic has no quality assertion, both retained test modules remain registered, their fixture seed/size agree, and the m4 quality test requires RMSE <= 0.10 while the kernel sweeps collect fit errors as failures. No production code changes; no numerical fit rerun is claimed."
+  },
+  {
+    "base": "3d5860de06e3a78f23057094432b081b88fc0c9d",
+    "items": [
+      "crates/gam-models/tests/suite/bms_generated_regressor_covariance_2943.rs:const:SURFACE"
+    ],
+    "reason": "#4549: replace the expensive six-dimensional Duchon fixture with a bounded one-dimensional smooth that still fires latent-score calibration, selects the empirical measure, and fits smoothing coordinates. The unused old surface-formula constant is removed.",
+    "evidence": "The exact revised fixture passes through unchanged production formula-to-payload dispatch in8.23seconds on MSI, including both covariance/SE pairs and save-load checks. Its exact integration-test source also compiles against the coherent phase4 dependency graph with warnings denied."
   }
 ]
