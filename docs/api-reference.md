@@ -189,6 +189,17 @@ Everything else lives in a public submodule, imported on first access
       heading_level: 3
       members_order: source
 
+::: gamfit.results.PartialEffect
+    options:
+      show_root_heading: true
+      heading_level: 3
+      members_order: source
+
+::: gamfit.results.AxisLevels
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: gamfit.MultinomialModel
     options:
       show_root_heading: true

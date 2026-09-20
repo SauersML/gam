@@ -236,6 +236,7 @@ impl SurvivalPredictionCovarianceMode {
 }
 
 /// Inputs to the unified survival predict pipeline.
+#[derive(Clone, Copy)]
 pub struct SurvivalPredictRequest<'a> {
     pub model: &'a SavedModel,
     pub data: ArrayView2<'a, f64>,
@@ -1192,20 +1193,69 @@ impl SurvivalPosteriorIntegration {
 /// [`SurvivalPosteriorIntegration::ExactAnchor`] and
 /// [`SurvivalPosteriorIntegration::TruncatedLaw`] are refused for a model they do
 /// not cover.
+///
+/// The published point is always the conditional-posterior mean
+/// `E[S | D, ρ̂]`, exactly as on the competing-risks and standard-family paths:
+/// `covariance_mode` governs only the reported uncertainty, so requesting an
+/// interval (or a covariance definition for it) never moves the point
+/// (gam#398, gam#3421). A smoothing-corrected band integrates its second
+/// moments under the corrected law in a separate pass over the same rule.
 pub fn predict_survival_posterior_mean_with(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
     integration: SurvivalPosteriorIntegration,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    predict_survival_posterior_mean_integrated(req, covariance_mode, integration, integration)
+}
+
+/// [`predict_survival_posterior_mean_with`] with the point's conditional law
+/// integrated by `point_integration` and a smoothing-corrected band's law by
+/// `band_integration`.
+fn predict_survival_posterior_mean_integrated(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+    point_integration: SurvivalPosteriorIntegration,
+    band_integration: SurvivalPosteriorIntegration,
+) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    let point_request = SurvivalPredictRequest {
+        with_uncertainty: false,
+        ..req
+    };
+    let (mut result, point) = survival_posterior_moments(
+        point_request,
+        SurvivalPredictionCovarianceMode::Conditional,
+        point_integration,
+    )?;
+    let band = match (req.with_uncertainty, covariance_mode) {
+        (false, _) => None,
+        (true, SurvivalPredictionCovarianceMode::Conditional) => None,
+        (true, SurvivalPredictionCovarianceMode::SmoothingCorrected) => Some(
+            survival_posterior_moments(point_request, covariance_mode, band_integration)?.1,
+        ),
+    };
+    let uncertainty = req
+        .with_uncertainty
+        .then(|| (band.as_ref().unwrap_or(&point), covariance_mode));
+    publish_survival_posterior_moments(&mut result, &point, uncertainty)?;
+    Ok(result)
+}
+
+/// The plug-in prediction beside the posterior moments of every cell under
+/// the `covariance_mode` coefficient law, integrated by `integration`.
+fn survival_posterior_moments(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+    integration: SurvivalPosteriorIntegration,
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     match integration {
         SurvivalPosteriorIntegration::SigmaPoint => {
-            predict_survival_sigma_point_posterior_mean(req, covariance_mode)
+            survival_sigma_point_posterior_moments(req, covariance_mode)
         }
         SurvivalPosteriorIntegration::ExactAnchor => {
-            predict_survival_exact_anchor_posterior_mean(req, covariance_mode)
+            survival_exact_anchor_posterior_moments(req, covariance_mode)
         }
         SurvivalPosteriorIntegration::TruncatedLaw => {
-            predict_survival_truncated_law_posterior_mean(req, covariance_mode)
+            survival_truncated_law_posterior_moments(req, covariance_mode)
         }
     }
 }
@@ -1214,8 +1264,21 @@ fn predict_survival_posterior_mean(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let integration = SurvivalPosteriorIntegration::default_for(req.model, covariance_mode)?;
-    predict_survival_posterior_mean_with(req, covariance_mode, integration)
+    // Each law takes the integration that covers it: the cone truncates only
+    // the conditional posterior (gam#3038), so a truncated location-scale
+    // point integrates the truncated law while its smoothing-corrected band
+    // integrates the corrected normal.
+    let point_integration = SurvivalPosteriorIntegration::default_for(
+        req.model,
+        SurvivalPredictionCovarianceMode::Conditional,
+    )?;
+    let band_integration = SurvivalPosteriorIntegration::default_for(req.model, covariance_mode)?;
+    predict_survival_posterior_mean_integrated(
+        req,
+        covariance_mode,
+        point_integration,
+        band_integration,
+    )
 }
 
 /// First and second posterior moments of a single-event survival prediction,
@@ -1249,30 +1312,32 @@ impl SurvivalPosteriorMoments {
 /// predictive law's own hazard; the posterior mean of the hazard, `E_θ[f/S]`,
 /// is a different quantity wherever `S` varies across the posterior and is
 /// never published (`hazard_mean` only tells a zero hazard from an infinite
-/// one where `S̄ = 0`). Posterior standard deviations are added when uncertainty
-/// was requested, and the plug-in survival is kept by name in `survival_plugin`.
+/// one where `S̄ = 0`). When `uncertainty` names the band's moments and their
+/// covariance definition, the posterior standard deviations under that law are
+/// added; the plug-in survival is kept by name in `survival_plugin`.
 fn publish_survival_posterior_moments(
     result: &mut SurvivalPredictResult,
     moments: &SurvivalPosteriorMoments,
-    with_uncertainty: bool,
-    covariance_mode: SurvivalPredictionCovarianceMode,
+    uncertainty: Option<(&SurvivalPosteriorMoments, SurvivalPredictionCovarianceMode)>,
 ) -> Result<(), SurvivalPredictError> {
     let (n_rows, n_times) = result.survival.dim();
-    if moments.survival_mean.dim() != (n_rows, n_times) || moments.eta_mean.len() != n_rows {
-        return Err(SurvivalPredictError::IncompatibleSchema {
-            reason: format!(
-                "posterior survival moments have shape {:?}, but the prediction is {n_rows}x{n_times}",
-                moments.survival_mean.dim()
-            ),
-        });
+    for published in std::iter::once(moments).chain(uncertainty.map(|(band, _)| band)) {
+        if published.survival_mean.dim() != (n_rows, n_times)
+            || published.eta_mean.len() != n_rows
+        {
+            return Err(SurvivalPredictError::IncompatibleSchema {
+                reason: format!(
+                    "posterior survival moments have shape {:?}, but the prediction is {n_rows}x{n_times}",
+                    published.survival_mean.dim()
+                ),
+            });
+        }
     }
     let SurvivalPosteriorMoments {
         survival_mean,
-        survival_second,
         density_mean,
         hazard_mean,
-        eta_mean,
-        eta_second,
+        ..
     } = moments;
     // `result` is the plug-in prediction and the loop below overwrites its
     // surfaces with the posterior means, so the plug-in survival is taken
@@ -1305,21 +1370,21 @@ fn publish_survival_posterior_moments(
             };
         }
     }
-    result.survival_se = with_uncertainty.then(|| {
+    result.survival_se = uncertainty.map(|(band, _)| {
         Array2::from_shape_fn((n_rows, n_times), |(row, time)| {
-            (survival_second[[row, time]] - survival_mean[[row, time]] * survival_mean[[row, time]])
+            let mean = band.survival_mean[[row, time]];
+            (band.survival_second[[row, time]] - mean * mean)
                 .max(0.0)
                 .sqrt()
         })
     });
-    result.eta_se = with_uncertainty.then(|| {
+    result.eta_se = uncertainty.map(|(band, _)| {
         Array1::from_shape_fn(n_rows, |row| {
-            (eta_second[row] - eta_mean[row] * eta_mean[row])
-                .max(0.0)
-                .sqrt()
+            let mean = band.eta_mean[row];
+            (band.eta_second[row] - mean * mean).max(0.0).sqrt()
         })
     });
-    result.covariance_source = with_uncertainty.then_some(covariance_mode);
+    result.covariance_source = uncertainty.map(|(_, covariance_mode)| covariance_mode);
     result.survival_plugin = Some(survival_plugin);
     Ok(())
 }
@@ -1540,17 +1605,16 @@ impl ExactAnchorPosterior {
     }
 }
 
-fn predict_survival_exact_anchor_posterior_mean(
+fn survival_exact_anchor_posterior_moments(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let with_uncertainty = req.with_uncertainty;
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let (_, active_covariance, _) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
     let posterior = ExactAnchorPosterior {
         covariance: active_covariance,
     };
-    let (mut result, moments) = predict_survival_surfaces(
+    let (result, moments) = predict_survival_surfaces(
         SurvivalPredictRequest {
             with_uncertainty: false,
             estimand: SurvivalPredictEstimand::Plugin,
@@ -1566,8 +1630,7 @@ fn predict_survival_exact_anchor_posterior_mean(
     // (`survival_plugin`), so its curve is held to the same domain as when it
     // is published alone.
     refuse_decreasing_survival(&result)?;
-    publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
-    Ok(result)
+    Ok((result, moments))
 }
 
 /// The cone-truncated coefficient posterior of a location-scale fit under
@@ -1591,11 +1654,10 @@ fn truncated_survival_posterior_draws(
         .map_err(|reason| SurvivalPredictError::PosteriorCovariance { reason })
 }
 
-fn predict_survival_truncated_law_posterior_mean(
+fn survival_truncated_law_posterior_moments(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let with_uncertainty = req.with_uncertainty;
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let draws = truncated_survival_posterior_draws(req.model, covariance_mode)?.ok_or_else(|| {
         SurvivalPredictError::UnsupportedConfiguration {
             reason: format!(
@@ -1605,7 +1667,7 @@ fn predict_survival_truncated_law_posterior_mean(
             ),
         }
     })?;
-    let (mut result, moments) = predict_survival_surfaces(
+    let (result, moments) = predict_survival_surfaces(
         SurvivalPredictRequest {
             with_uncertainty: false,
             estimand: SurvivalPredictEstimand::Plugin,
@@ -1618,17 +1680,16 @@ fn predict_survival_truncated_law_posterior_mean(
         "internal error: the truncated-law survival pass returned no posterior moments".to_string()
     })?;
     refuse_decreasing_survival(&result)?;
-    publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
-    Ok(result)
+    Ok((result, moments))
 }
 
-fn predict_survival_sigma_point_posterior_mean(
+fn survival_sigma_point_posterior_moments(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let (posterior_mean, active_covariance, cone_coords) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
-    let mut result = predict_survival(
+    let result = predict_survival(
         SurvivalPredictRequest {
             model: req.model,
             data: req.data,
@@ -1702,8 +1763,7 @@ fn predict_survival_sigma_point_posterior_mean(
         Ok(())
     })?;
 
-    publish_survival_posterior_moments(&mut result, &moments, req.with_uncertainty, covariance_mode)?;
-    Ok(result)
+    Ok((result, moments))
 }
 
 fn predict_competing_risks_with_posterior(
@@ -1711,16 +1771,20 @@ fn predict_competing_risks_with_posterior(
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<CompetingRisksPredictResult, SurvivalPredictError> {
     let posterior_mean_estimand = req.estimand == SurvivalPredictEstimand::PosteriorMean;
+    // The public posterior-mean point is always the conditional-posterior
+    // estimand. `covariance_mode` governs only the reported uncertainty,
+    // exactly as on the single-event and standard-family paths, so a request
+    // without uncertainty integrates the conditional law whatever mode it
+    // names, and a smoothing-corrected interval computes the conditional point
+    // once and the corrected second moments separately (gam#3421).
+    let covariance_mode = if req.with_uncertainty {
+        covariance_mode
+    } else {
+        SurvivalPredictionCovarianceMode::Conditional
+    };
     let (posterior_mean, active_covariance, cone_coords) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
-    // The public posterior-mean point is always the conditional-posterior
-    // estimand. A smoothing-corrected interval changes only its reported
-    // uncertainty, exactly as on the standard-family path. If corrected
-    // covariance becomes available for this model class, compute the
-    // conditional point once and the corrected second moments separately;
-    // never silently change the point estimand with the interval mode.
     let separate_conditional_point = posterior_mean_estimand
-        && req.with_uncertainty
         && covariance_mode == SurvivalPredictionCovarianceMode::SmoothingCorrected;
     let mut result = if separate_conditional_point {
         predict_competing_risks_with_posterior(
