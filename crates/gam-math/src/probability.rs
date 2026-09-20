@@ -2150,7 +2150,7 @@ mod tests {
     /// They span every branch: the power series, the continued fraction and the
     /// uniform expansion, the far tails, and the large shapes of #4068 where
     /// the old 1000-term caps truncated both loops.
-    const INCOMPLETE_GAMMA_REFERENCE: [(f64, f64, bool, f64); 20] = [
+    const INCOMPLETE_GAMMA_REFERENCE: [(f64, f64, bool, f64); 21] = [
         (1e5, 99_700.0, true, 0.171_417_314_514_502_92),
         (1e6, 999_500.0, true, 0.308_625_556_890_815_32),
         (1e6 + 1.0, 1e6, true, 0.499_734_038_513_716_35),
@@ -2171,6 +2171,8 @@ mod tests {
         (1e12, 1e12 - 3e6, true, 0.001_349_886_213_392_037_9),
         (2.5e5, 2.5e5 + 10.0, false, 0.491_755_886_962_368_81),
         (5e6, 5e6 - 1.0, true, 0.499_881_058_383_401_94),
+        // Past 2^53, where `a + 1 == a`: no term-by-term sum can resolve it.
+        (1e16, 1.000_000_02e16, false, 0.022_750_132_488_088_87),
     ];
 
     #[test]
