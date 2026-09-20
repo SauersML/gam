@@ -208,7 +208,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
                     self.core.dmu_dq[row],
                     self.core.d2mu_dq2[row],
                     self.core.d3mu_dq3[row],
-                );
+                )?;
                 Ok([0.0, 0.0, information, first, second])
             }
         }
@@ -478,7 +478,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
                 self.core.dmu_dq[row],
                 self.core.d2mu_dq2[row],
                 self.core.d3mu_dq3[row],
-            );
+            )?;
             // Row carries no expected information (weight 0 / saturated tail):
             // every coefficient below is a multiple of f or f1, so leave the
             // zero-initialized entries.
@@ -555,7 +555,7 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
                 self.core.dmu_dq[row],
                 self.core.d2mu_dq2[row],
                 self.core.d3mu_dq3[row],
-            );
+            )?;
             if f == 0.0 && f1 == 0.0 && f2 == 0.0 {
                 continue;
             }

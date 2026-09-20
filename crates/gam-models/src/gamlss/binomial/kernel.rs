@@ -252,10 +252,20 @@ pub(crate) fn binomial_expected_q_information_derivatives(
     d1: f64,
     d2: f64,
     d3: f64,
-) -> (f64, f64, f64) {
+) -> Result<(f64, f64, f64), String> {
     if weight == 0.0 {
-        return (0.0, 0.0, 0.0);
+        return Ok((0.0, 0.0, 0.0));
     }
+    if !weight.is_finite() || weight < 0.0 || !q.is_finite() {
+        return Err(format!("binomial expected information requires finite q and nonnegative finite weight: q={q}, weight={weight}"));
+    }
+    let certify = |f: f64, f1: f64, f2: f64| {
+        if f.is_finite() && f >= 0.0 && f1.is_finite() && f2.is_finite() {
+            Ok((f, f1, f2))
+        } else {
+            Err(format!("binomial expected information is not representable at q={q}: information={f}, first={f1}, second={f2}"))
+        }
+    };
     if let InverseLink::Standard(
         link @ (StandardLink::Logit
         | StandardLink::Probit
@@ -266,11 +276,7 @@ pub(crate) fn binomial_expected_q_information_derivatives(
     {
         let (w0, w1, w2, _, _) = gam_solve::mixture_link::fisher_weight_jet5(*link, q);
         let (f, f1, f2) = (weight * w0, weight * w1, weight * w2);
-        return if f.is_finite() && f1.is_finite() && f2.is_finite() {
-            (f, f1, f2)
-        } else {
-            (0.0, 0.0, 0.0)
-        };
+        return certify(f, f1, f2);
     }
     if !mu.is_finite()
         || !d1.is_finite()
@@ -278,13 +284,12 @@ pub(crate) fn binomial_expected_q_information_derivatives(
         || !d3.is_finite()
         || mu <= 0.0
         || mu >= 1.0
-        || d1 == 0.0
     {
-        return (0.0, 0.0, 0.0);
+        return Err(format!("binomial expected information requires a finite inverse-link jet with interior mean at q={q}: mu={mu}, d1={d1}, d2={d2}, d3={d3}"));
     }
     let var = mu * (1.0 - mu);
     if !var.is_finite() || var <= 0.0 {
-        return (0.0, 0.0, 0.0);
+        return Err(format!("binomial expected information requires a finite inverse-link jet with interior mean at q={q}: mu={mu}, d1={d1}, d2={d2}, d3={d3}"));
     }
     let var1 = d1 * (1.0 - 2.0 * mu);
     let var2 = d2 * (1.0 - 2.0 * mu) - 2.0 * d1 * d1;
@@ -294,11 +299,7 @@ pub(crate) fn binomial_expected_q_information_derivatives(
     let f1 = weight * num1 / (var * var);
     let num1_prime = 2.0 * (d2 * d2 + d1 * d3) * var - d1 * d1 * var2;
     let f2 = weight * (num1_prime / (var * var) - 2.0 * num1 * var1 / (var * var * var));
-    if f.is_finite() && f1.is_finite() && f2.is_finite() {
-        (f, f1, f2)
-    } else {
-        (0.0, 0.0, 0.0)
-    }
+    certify(f, f1, f2)
 }
 
 pub(crate) fn binomial_expected_location_scale_second_coefficients(
@@ -1245,7 +1246,7 @@ mod expected_information_tail_tests {
     fn expected_information(link: StandardLink, q: f64) -> (f64, f64, f64) {
         let link = InverseLink::Standard(link);
         let jet = inverse_link_jet_for_inverse_link(&link, q).expect("inverse-link jet");
-        binomial_expected_q_information_derivatives(1.0, q, &link, jet.mu, jet.d1, jet.d2, jet.d3)
+        binomial_expected_q_information_derivatives(1.0, q, &link, jet.mu, jet.d1, jet.d2, jet.d3).expect("finite expected information")
     }
 
     fn close(a: f64, b: f64, rel: f64) -> bool {
@@ -1362,5 +1363,21 @@ mod cloglog_saturation_tests {
         let ll_fail = binomial_location_scale_log_likelihood(0.0, weight, -800.0, &cloglog, 0.0)
             .expect("an underflowed failure row has log-survival 0");
         assert_eq!(ll_fail, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod expected_information_refusal_tests {
+    use super::*;
+    #[test]
+    fn invalid_or_unrepresentable_information_is_refused() {
+        let logit = InverseLink::Standard(StandardLink::Logit);
+        for (weight, q) in [(f64::INFINITY, 0.0), (-1.0, 0.0), (1.0, f64::NAN)] {
+            assert!(binomial_expected_q_information_derivatives(weight, q, &logit, 0.5, 0.25, 0.0, -0.125).is_err());
+        }
+        let identity = InverseLink::Standard(StandardLink::Identity);
+        assert!(binomial_expected_q_information_derivatives(1.0, 0.0, &identity, 0.0, 1.0, 0.0, 0.0).is_err());
+        assert!(binomial_expected_q_information_derivatives(f64::MAX, 0.0, &identity, 0.5, 1.0, 0.0, 0.0).is_err());
+        assert_eq!(binomial_expected_q_information_derivatives(0.0, 0.0, &logit, 0.5, 0.25, 0.0, -0.125).unwrap(), (0.0, 0.0, 0.0));
     }
 }

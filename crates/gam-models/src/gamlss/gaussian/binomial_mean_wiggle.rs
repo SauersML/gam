@@ -789,7 +789,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                 jet.d1,
                 jet.d2,
                 jet.d3,
-            );
+            )?;
             for (quantity, value, nonnegative) in [
                 ("binomial mean-wiggle row log likelihood", row_ll, false),
                 ("binomial mean-wiggle q score", m1, false),
