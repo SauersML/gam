@@ -12,11 +12,15 @@
 //! error surfaced, only a non-blocking warning.
 //!
 //! Contract: a returned `monotone_increasing` model MUST have non-decreasing
-//! predictions, family-independent — OR `fit` must FAIL rather than silently
-//! return an infeasible model. This test enforces exactly that: the Poisson
-//! monotone fit must either (a) return predictions that are actually
-//! non-decreasing, or (b) surface a clear error. It must NEVER be a silent
-//! infeasible success.
+//! predictions, family-independent, and a well-posed constrained fit must
+//! SUCCEED. Both fixtures are well-posed: a constant β is feasible, the
+//! penalized Poisson/log objective is strictly convex in η with linear shape
+//! rows, and the positive counts spread over (0, 1) keep the constrained optimum
+//! finite (a binding constraint only puts it on a face of the cone). So the
+//! Poisson monotone fit must return a Standard model whose predictions are
+//! actually non-decreasing. A refusal is the constrained inner solve failing —
+//! the #1786 defect itself — and fails the test (SPEC.md: "In general, do not
+//! paper over solver issues.").
 //!
 //! The load-bearing protection is the post-fit feasibility audit
 //! `enforce_term_constraint_feasibility` (in
@@ -27,9 +31,9 @@
 //! non-box path) and returns `ParameterConstraintViolation` if the returned β
 //! violates them beyond a small tolerance — so a keep-best / best-iterate β that
 //! the constrained inner solve could not certify is surfaced as an error rather
-//! than shipped as a silent infeasible `Model`. This test is the family-
-//! independent regression lock on that guarantee (the audit previously had no
-//! test asserting the feasible-or-error contract for a non-canonical family).
+//! than shipped as a silent infeasible `Model`. That audit is a backstop, not a
+//! resolution: this test requires the constrained solve to actually produce the
+//! feasible optimum, so an audit refusal here is a failure too.
 //!
 //! The Gaussian control on the identical integer response (identity link) is
 //! kept as a regression anchor: the shape-constraint machinery itself is
@@ -107,62 +111,51 @@ fn make_binding_hump_poisson_data() -> (Vec<f64>, Vec<f64>) {
     (x, y)
 }
 
-/// Assert the returned/failed fit honors the #1786 contract: a returned Model's
-/// predictions on a dense grid must be non-decreasing, OR `fit` must surface a
-/// clear error — never a silent infeasible success.
-fn assert_monotone_or_error(outcome: Result<(FitResult, usize, usize), String>) {
-    match outcome {
-        Ok((FitResult::Standard(fit), n_headers, x_idx)) => {
-            // A returned model MUST honor the constraint: predictions on a dense
-            // grid must be non-decreasing (the log link is monotone, so eta
-            // non-decreasing ⇔ mu non-decreasing). The bug was that this model
-            // was shipped with a genuinely non-monotone eta (a SILENT infeasible
-            // success), which the contract forbids.
-            let n_grid = 600usize;
-            let eta =
-                predict_eta_on_grid(&fit.resolvedspec, &fit.fit.beta, n_headers, x_idx, n_grid);
-            assert!(
-                eta.iter().all(|v| v.is_finite()),
-                "poisson monotone prediction must be finite"
-            );
-            let range = {
-                let lo = eta.iter().cloned().fold(f64::INFINITY, f64::min);
-                let hi = eta.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                hi - lo
-            };
-            let step_tol = 1e-6 * range.max(1.0);
-            let mut worst_drop = 0.0_f64;
-            let mut n_drops = 0usize;
-            for w in eta.windows(2) {
-                let drop = w[0] - w[1];
-                if drop > step_tol {
-                    n_drops += 1;
-                    worst_drop = worst_drop.max(drop);
-                }
-            }
-            assert_eq!(
-                n_drops,
-                0,
-                "SILENT INFEASIBLE MODEL: poisson monotone_increasing fit returned a Model \
-                 whose predictions DECREASE at {n_drops}/{} grid steps (worst drop {worst_drop:.3e}, \
-                 range {range:.3e}). The contract requires either non-decreasing predictions or a \
-                 surfaced error — never a silent infeasible success.",
-                eta.len() - 1
-            );
-        }
-        Ok((_, _, _)) => panic!("expected a Standard GAM fit for poisson s(x)"),
-        Err(e) => {
-            // Acceptable outcome (b): the constrained solve could not certify a
-            // feasible monotone optimum, so `fit` surfaced a clear error rather
-            // than silently returning an infeasible model. This satisfies the
-            // contract. Assert the error is non-empty so it is genuinely
-            // actionable.
-            assert!(
-                !e.is_empty(),
-                "poisson monotone fit failed but surfaced an empty error message"
-            );
+/// Assert the #1786 contract: the fit succeeded with a Standard model whose
+/// predictions on a dense grid are non-decreasing.
+fn assert_fits_monotone(outcome: Result<(FitResult, usize, usize), String>) {
+    let (result, n_headers, x_idx) = outcome.unwrap_or_else(|e| {
+        panic!(
+            "poisson monotone_increasing fit on a well-posed low-count problem must \
+             succeed; it errored: {e}"
+        )
+    });
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a Standard GAM fit for poisson s(x)");
+    };
+    // The returned model MUST honor the constraint: predictions on a dense grid
+    // must be non-decreasing (the log link is monotone, so eta non-decreasing ⇔
+    // mu non-decreasing). The bug was that this model was shipped with a
+    // genuinely non-monotone eta (a SILENT infeasible success).
+    let n_grid = 600usize;
+    let eta = predict_eta_on_grid(&fit.resolvedspec, &fit.fit.beta, n_headers, x_idx, n_grid);
+    assert!(
+        eta.iter().all(|v| v.is_finite()),
+        "poisson monotone prediction must be finite"
+    );
+    let range = {
+        let lo = eta.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = eta.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        hi - lo
+    };
+    let step_tol = 1e-6 * range.max(1.0);
+    let mut worst_drop = 0.0_f64;
+    let mut n_drops = 0usize;
+    for w in eta.windows(2) {
+        let drop = w[0] - w[1];
+        if drop > step_tol {
+            n_drops += 1;
+            worst_drop = worst_drop.max(drop);
         }
     }
+    assert_eq!(
+        n_drops,
+        0,
+        "INFEASIBLE MODEL: poisson monotone_increasing fit returned a Model whose \
+         predictions DECREASE at {n_drops}/{} grid steps (worst drop {worst_drop:.3e}, \
+         range {range:.3e}).",
+        eta.len() - 1
+    );
 }
 
 /// Build a temp CSV, fit `formula` under `cfg`, and return the fit result plus
@@ -221,7 +214,7 @@ fn predict_eta_on_grid(
 }
 
 #[test]
-fn poisson_low_count_monotone_increasing_is_feasible_or_errors_1786() {
+fn poisson_low_count_monotone_increasing_fits_and_is_feasible_1786() {
     init_parallelism();
 
     // The issue's exact repro: n=200, x=linspace(0,1), y ~ Poisson(exp(-1+2x)).
@@ -240,9 +233,8 @@ fn poisson_low_count_monotone_increasing_is_feasible_or_errors_1786() {
         ..FitConfig::default()
     };
 
-    // Contract: non-decreasing predictions OR a surfaced error — never a silent
-    // infeasible success.
-    assert_monotone_or_error(fit_formula(
+    // Contract: the well-posed constrained fit succeeds and is non-decreasing.
+    assert_fits_monotone(fit_formula(
         "y ~ s(x, shape=monotone_increasing)",
         &x,
         &y,
@@ -251,14 +243,14 @@ fn poisson_low_count_monotone_increasing_is_feasible_or_errors_1786() {
 }
 
 #[test]
-fn poisson_binding_hump_monotone_increasing_is_feasible_or_errors_1786() {
+fn poisson_binding_hump_monotone_increasing_fits_and_is_feasible_1786() {
     init_parallelism();
 
     // The stress face: a low-count Poisson HUMP where the monotone_increasing
     // constraint genuinely binds on the falling half. This is the regime that
     // drives the constrained P-IRLS inner solve into the ill-conditioned
     // collapsed-working-weight corner #1786 identifies. The contract must still
-    // hold: feasible monotone predictions, or a clear error.
+    // hold: the fit succeeds with feasible monotone predictions.
     let (x, y) = make_binding_hump_poisson_data();
     let zeros = y.iter().filter(|&&v| v == 0.0).count();
     assert!(
@@ -272,7 +264,7 @@ fn poisson_binding_hump_monotone_increasing_is_feasible_or_errors_1786() {
         ..FitConfig::default()
     };
 
-    assert_monotone_or_error(fit_formula(
+    assert_fits_monotone(fit_formula(
         "y ~ s(x, k=15, shape=monotone_increasing)",
         &x,
         &y,

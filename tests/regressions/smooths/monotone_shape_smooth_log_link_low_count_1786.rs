@@ -17,19 +17,25 @@
 //! identical integer response under `family=gaussian` honors the constraint
 //! exactly, which isolates the log-link constrained inner solve as the culprit.
 //!
-//! This test asserts BOTH acceptable resolutions of the bug:
-//!   * the Poisson/log fit either RETURNS AN ERROR (surfacing the violation), or
-//!   * returns a Model whose link-scale predictions on a fine grid are
-//!     non-decreasing (max downward step >= -1e-6). Because `exp` is strictly
-//!     increasing, link-scale monotonicity is equivalent to mean-scale
-//!     monotonicity, so checking the linear predictor is sufficient and exact.
+//! This test asserts the contract directly: the Poisson/log fit must SUCCEED
+//! with a Standard model whose link-scale predictions on a fine grid are
+//! non-decreasing (max downward step < 1e-6). Because `exp` is strictly
+//! increasing, link-scale monotonicity is equivalent to mean-scale
+//! monotonicity, so checking the linear predictor is sufficient and exact.
+//! A refusal is not an acceptable outcome: the problem is well-posed (a constant
+//! β is feasible, the penalized Poisson objective is strictly convex in η and
+//! the shape rows are linear, and the positive counts spread over (0, 1) keep
+//! the constrained optimum finite), so an `Err` here is the constrained inner
+//! solve failing — the #1786 defect — surfaced by the post-fit feasibility
+//! audit rather than fixed. SPEC.md: "In general, do not paper over solver
+//! issues."
 //! It ALSO asserts the gaussian-identity control on the SAME integer data is
 //! monotone, locking the isolation.
 //!
 //! Before the fix: the Poisson fit returned `Ok(..)` and its predictions
 //! DECREASED (max downward step >> 1e-6) — the test fails. After the fix the
-//! Poisson fit returns a feasible non-decreasing model (or errors), so the test
-//! passes; the gaussian control passes throughout.
+//! Poisson fit returns a feasible non-decreasing model, so the test passes; the
+//! gaussian control passes throughout.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -108,7 +114,7 @@ fn max_downward_step(pred: &[f64]) -> f64 {
 }
 
 #[test]
-fn monotone_increasing_shape_smooth_log_link_low_count_is_feasible_or_errors() {
+fn monotone_increasing_shape_smooth_log_link_low_count_fits_and_is_feasible() {
     init_parallelism();
 
     let (x, y) = low_rate_poisson_data();
@@ -155,36 +161,29 @@ fn monotone_increasing_shape_smooth_log_link_low_count_is_feasible_or_errors() {
         family: Some("poisson".to_string()),
         ..FitConfig::default()
     };
-    match fit_from_formula(formula, &ds, &pois_cfg) {
-        Err(e) => {
-            // Acceptable resolution #2: the fit surfaces the constraint
-            // violation to the caller rather than silently shipping an
-            // infeasible model.
-            eprintln!("[#1786] poisson/log monotone fit errored (acceptable): {e}");
-        }
-        Ok(result) => {
-            let FitResult::Standard(pois_fit) = result else {
-                panic!("poisson log-link smooth => expected FitResult::Standard");
-            };
-            let pois_pred = link_predictions_on_grid(&pois_fit, x_idx, width, &grid);
-            assert!(
-                pois_pred.iter().all(|v| v.is_finite()),
-                "poisson monotone prediction must be finite"
-            );
-            let violation = max_downward_step(&pois_pred);
-            eprintln!(
-                "[#1786] poisson/log monotone fit returned Ok; \
-                 max downward step = {violation:.3e}"
-            );
-            // Acceptable resolution #1 (preferred): the returned model's
-            // point predictions are non-decreasing. A returned
-            // monotone_increasing model MUST honor the constraint.
-            assert!(
-                violation < 1e-6,
-                "poisson/log monotone_increasing model was returned Ok but its point \
-                 predictions DECREASE: max downward step {violation:.3e} exceeds 1e-6 \
-                 (an infeasible model must not be silently shipped)"
-            );
-        }
-    }
+    // A well-posed constrained fit (see the module docs): refusing it is the
+    // constrained inner solve failing, not an acceptable resolution.
+    let result = fit_from_formula(formula, &ds, &pois_cfg).unwrap_or_else(|e| {
+        panic!(
+            "poisson/log monotone_increasing fit on a well-posed low-count problem \
+             must succeed; it errored: {e}"
+        )
+    });
+    let FitResult::Standard(pois_fit) = result else {
+        panic!("poisson log-link smooth => expected FitResult::Standard");
+    };
+    let pois_pred = link_predictions_on_grid(&pois_fit, x_idx, width, &grid);
+    assert!(
+        pois_pred.iter().all(|v| v.is_finite()),
+        "poisson monotone prediction must be finite"
+    );
+    let violation = max_downward_step(&pois_pred);
+    eprintln!("[#1786] poisson/log monotone fit: max downward step = {violation:.3e}");
+    // A returned monotone_increasing model MUST honor the constraint.
+    assert!(
+        violation < 1e-6,
+        "poisson/log monotone_increasing model's point predictions DECREASE: max \
+         downward step {violation:.3e} exceeds 1e-6 (an infeasible model must not \
+         be shipped)"
+    );
 }
