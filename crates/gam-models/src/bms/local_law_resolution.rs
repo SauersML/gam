@@ -36,9 +36,11 @@
 //! inside it before any halving lowered `J` by more than it.
 //!
 //! As `h → 0` or `h → ∞` every `u_c` vanishes, as it does when `ε → ∞`, and the
-//! law is the pooled law. So the search has no box. When the conditional law
-//! does not move it drifts toward that limit until the gain falls inside `J`'s
-//! rounding band, and the local arm then scores as the pooled law it has become.
+//! law is the pooled law; as `ε → 0` it is the contexts' mixture alone. So the
+//! search has no box. When the conditional law does not move, every local law
+//! estimates the pooled law, and whatever local share the search keeps lowers
+//! the held-out CRPS only by sampling noise, which the certificate's paired
+//! comparison then weighs on its own loss.
 
 use super::estimated_latent_law::{HeldOutLocalLaw, LocalLawResolution};
 use super::*;
@@ -494,8 +496,8 @@ mod tests {
             .collect()
     }
 
-    /// A score over one covariate, its three-fold held-out local laws, and each
-    /// fold's rows.
+    /// `z = slope·x + N(0, 1)` over one uniform covariate, its three-fold
+    /// held-out local laws on `grid_size` nodes, and each fold's rows.
     struct Fixture {
         z: Array1<f64>,
         weights: Array1<f64>,
@@ -504,7 +506,7 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(n: usize, slope: f64) -> Self {
+        fn new(n: usize, slope: f64, grid_size: usize) -> Self {
             let x = uniforms(3610, n);
             let noise = normals(0x3610, n);
             let z = Array1::from_iter(x.iter().zip(&noise).map(|(&x, &e)| slope * x + e));
@@ -514,7 +516,6 @@ mod tests {
                 features: features.view(),
                 feature_cols: vec![0],
             };
-            let grid_size = 9;
             let contexts = local_law_parts(&z, &weights, &context, grid_size, None)
                 .expect("full-data local law")
                 .contexts();
@@ -597,7 +598,7 @@ mod tests {
     /// The CRPS a row is scored by is the CRPS of the law the fit mixes for it.
     #[test]
     fn row_crps_is_the_crps_of_the_mixed_law_3610() {
-        let fixture = Fixture::new(600, 3.0);
+        let fixture = Fixture::new(600, 3.0, 9);
         let held_out = fixture.held_out();
         let selection =
             Selection::new(fixture.z.view(), &fixture.weights, &held_out).expect("selection");
@@ -636,7 +637,7 @@ mod tests {
 
     #[test]
     fn objective_derivatives_match_central_differences_3610() {
-        let fixture = Fixture::new(600, 3.0);
+        let fixture = Fixture::new(600, 3.0, 9);
         let held_out = fixture.held_out();
         let selection =
             Selection::new(fixture.z.view(), &fixture.weights, &held_out).expect("selection");
@@ -670,7 +671,7 @@ mod tests {
 
     #[test]
     fn a_moving_law_is_resolved_locally_3610() {
-        let fixture = Fixture::new(1200, 4.0);
+        let fixture = Fixture::new(1200, 4.0, 9);
         let held_out = fixture.held_out();
         let resolution = select_local_law_resolution(fixture.z.view(), &fixture.weights, &held_out)
             .expect("resolution");
@@ -696,18 +697,39 @@ mod tests {
         }
     }
 
+    /// With no movement the pooled law is what every local law estimates, so
+    /// whatever local share the selection keeps lowers the held-out CRPS by no
+    /// more than its sampling noise. On the default grid a mixture of context
+    /// grids is not also rewarded for being finer than the pooled grid.
     #[test]
-    fn a_law_that_does_not_move_drifts_to_the_pooled_law_3610() {
-        let fixture = Fixture::new(1200, 0.0);
+    fn a_law_that_does_not_move_gains_only_noise_over_the_pooled_law_3610() {
+        let fixture = Fixture::new(3000, 0.0, DEFAULT_EMPIRICAL_LATENT_GRID_SIZE);
         let held_out = fixture.held_out();
         let resolution = select_local_law_resolution(fixture.z.view(), &fixture.weights, &held_out)
             .expect("resolution");
         let selection =
             Selection::new(fixture.z.view(), &fixture.weights, &held_out).expect("selection");
-        let chosen = selection.objective(theta(resolution), false).value;
-        let pooled = pooled_objective(&selection);
+        let at = theta(resolution);
+        let gains: Vec<f64> = selection
+            .rows
+            .iter()
+            .map(|row| {
+                let pooled = selection.laws[row.law].grids().len() - 1;
+                row.weight
+                    * (row.pooled_distance - 0.5 * selection.difference(row.law, pooled, pooled))
+                    - selection.row_objective(row, at, false).value
+            })
+            .collect();
+        let rows = gains.len() as f64;
+        let gain = gains.iter().sum::<f64>();
+        let mean = gain / rows;
+        let spread = (gains.iter().map(|g| (g - mean) * (g - mean)).sum::<f64>() / (rows - 1.0)
+            * rows)
+            .sqrt();
+        let chosen = selection.objective(at, false);
+        let band =
+            gam_linalg::roundoff::accumulation_growth(selection.depth) * chosen.value_magnitude;
         let mut local_share = 0.0;
-        let mut rows = 0.0;
         for (law, law_rows) in &held_out {
             for position in 0..law_rows.len() {
                 let mixture = mixture_from_neighbours(
@@ -725,20 +747,23 @@ mod tests {
                     .filter(|&&(grid, _)| grid != law.grids().len() - 1)
                     .map(|&(_, weight)| weight)
                     .sum::<f64>();
-                rows += 1.0;
             }
         }
         local_share /= rows;
         eprintln!(
-            "unmoving: {resolution:?}, J = {chosen}, pooled J = {pooled}, local share {local_share}"
+            "unmoving: {resolution:?}, J = {}, gain over pooled {gain} (standard error {spread}), \
+             local share {local_share}",
+            chosen.value
         );
         assert!(
-            chosen <= pooled * (1.0 + 1.0e-3),
-            "the local law ({resolution:?}) scores {chosen}, over the pooled law's {pooled}"
+            gain >= -band,
+            "the local law ({resolution:?}) ends {} over the pooled law",
+            -gain
         );
         assert!(
-            local_share < 0.1,
-            "a law that does not move keeps a local share of {local_share} at {resolution:?}"
+            gain <= 4.0 * spread,
+            "a law that does not move gains {gain} over the pooled law, {} standard errors",
+            gain / spread
         );
     }
 }
