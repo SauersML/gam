@@ -6988,6 +6988,8 @@ fn pca_function_mass_penalty(
     mut raw_score_gram: Array2<f64>,
     n_rows: usize,
 ) -> Result<Array2<f64>, BasisError> {
+    use gam_linalg::faer_ndarray::FaerEigh;
+
     let k = raw_score_gram.ncols();
     if raw_score_gram.nrows() != k {
         crate::bail_dim_basis!(
@@ -7013,22 +7015,41 @@ fn pca_function_mass_penalty(
         crate::bail_invalid_basis!("Pca score design produced a non-finite function Gram");
     }
 
-    // Use the same design-rank convention as the global identifiability audit.
-    // `rrqr_from_gram_with_permutation` recovers the column-pivoted QR verdict
-    // from Z^T Z while retaining the tall design's row-count-aware tolerance.
-    let rrqr = gam_linalg::faer_ndarray::rrqr_from_gram_with_permutation(
-        &raw_score_gram,
-        n_rows,
-        gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
-    )
-    .map_err(BasisError::LinalgError)?;
-    if rrqr.rank != k {
-        let redundant_columns = &rrqr.column_permutation[rrqr.rank..];
+    // Rank of the realized score design, read off the Gram's spectrum against
+    // the Gram's own resolution. `G = ZᵀZ` is accumulated over `n_rows` rows,
+    // each entry product rounding at most twice (the streamed operator forms
+    // `x·w·x`), so its formation error is bounded in spectral norm by
+    // `γ_{n+1}·tr G` ([`gam_linalg::roundoff::weighted_gram_assembly_band`]);
+    // the eigensolver adds its own `k·ε·λ_max`. An eigenvalue inside that band
+    // is not resolved from zero: an exactly dependent score column lands there.
+    //
+    // The pivot magnitudes of a column-pivoted QR run on the Gram's eigen square
+    // root cannot make this call. Squaring floors a true zero singular value at
+    // the Gram's rounding, `≈ ε·σ_max²`, and the square root resurrects it as a
+    // pivot of order `√ε·σ_max`, far above that QR's `O(n·ε)·|R₀₀|` cutoff, so a
+    // duplicated component would pass as full rank whenever its computed
+    // eigenvalue rounded positive.
+    let (eigenvalues, _) = FaerEigh::eigh(&raw_score_gram, faer::Side::Lower)
+        .map_err(BasisError::LinalgError)?;
+    let eigenvalues = eigenvalues.to_vec();
+    let trace: f64 = raw_score_gram.diag().iter().sum();
+    let formation_band = gam_linalg::roundoff::weighted_gram_assembly_band(n_rows, 2, trace);
+    let rank = gam_linalg::roundoff::resolved_eigenvalue_count(&eigenvalues, formation_band);
+    if rank != k {
+        // Name the columns the pivoted order places last: the pivot sequence
+        // depends only on the column geometry, never on a rank cutoff.
+        let pivoted = gam_linalg::faer_ndarray::rrqr_from_gram_with_permutation(
+            &raw_score_gram,
+            n_rows,
+            gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
+        )
+        .map_err(BasisError::LinalgError)?;
+        let redundant_columns = &pivoted.column_permutation[rank..];
         crate::bail_invalid_basis!(
-            "Pca score design is rank deficient under canonical RRQR: rank {} < {} (tolerance {:.6e}); redundant score columns {:?}; remove zero or dependent components instead of stabilizing them with a coefficient ridge",
-            rrqr.rank,
+            "Pca score design is rank deficient: rank {} < {} (score Gram eigenvalues at or below the resolution band {:.6e}); redundant score columns {:?}; remove zero or dependent components instead of stabilizing them with a coefficient ridge",
+            rank,
             k,
-            rrqr.rank_tol,
+            gam_linalg::roundoff::resolved_eigenvalue_band(&eigenvalues, formation_band),
             redundant_columns
         );
     }
