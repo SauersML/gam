@@ -457,15 +457,17 @@ fn a_gaussian_declaration_on_a_mildly_skewed_k2_score_keeps_a_loss_within_noise_
     );
 }
 
-/// gam#2968: the first of K = 2 scores stretched threefold above +1σ, a skew that
-/// moves each anchor at first order, costs the declaration an excess anchoring loss
-/// on the joint law beyond its sampling noise at n = 3 000: the declaration is
-/// refused, naming the failed ledger.
+/// gam#2968: the upper half of the first of K = 2 scores halved, a skew that moves
+/// the bulk of the law and so each anchor at first order, costs the declaration an
+/// excess anchoring loss on the joint law beyond its sampling noise at n = 3 000:
+/// the declaration is refused, naming the failed ledger. A stretched upper tail is
+/// not this test: its loss sits on the few anchors whose far nodes the closed form
+/// gives almost no probability, and so does its sampling noise.
 #[test]
 fn a_gaussian_declaration_on_a_skewed_k2_score_is_refused_beyond_noise_2968() {
     install();
-    let upper_stretch = |e: f64| if e > 1.0 { 1.0 + 3.0 * (e - 1.0) } else { e };
-    match declared_on_planted_scores(0x2929_0000_0006, upper_stretch) {
+    let upper_half_halved = |e: f64| if e > 0.0 { 0.5 * e } else { e };
+    match declared_on_planted_scores(0x2929_0000_0006, upper_half_halved) {
         Ok((adequacy, certificate)) => panic!(
             "a strongly skewed K=2 score must refuse the Gaussian declaration; it was kept with \
              {adequacy:?} | {certificate:?}"
