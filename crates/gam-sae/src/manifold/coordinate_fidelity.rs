@@ -51,6 +51,9 @@
 //! more-uniform-coordinate basin wins, because EV alone provably cannot break
 //! that tie.
 
+use std::collections::BinaryHeap;
+
+use gam_math::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use ndarray::{Array1, ArrayView1};
 
 use crate::chart_canonicalization::{
@@ -435,8 +438,9 @@ pub(crate) fn watson_u2_uniform_weighted(
 // across three model classes: the uniform density (0 free location parameters),
 // a single wrapped Gaussian (the continuous unimodal / von-Mises-like
 // alternative), and a `k`-anchor wrapped-Gaussian mixture. The anchor count is
-// walked upward from `k = 2` one order at a time, and the walk ends at the first
-// order whose evidence does not improve on the order below it, so every count
+// the BIC minimiser over every order from `k = 2` up to one below the row count
+// (#4323). The walk ends early only where a certified ceiling on the mixture
+// likelihood of every higher order proves none of them can win, so every count
 // the data can carry is reachable and no hand-picked ladder of counts is
 // consulted (SPEC rule 18, #2902). The winning class is the occupancy law; when a
 // `k ≥ 2` anchor model wins, the atom carries a discrete measure of `k` anchors
@@ -618,27 +622,280 @@ fn classify_occupancy_weighted_impl(
             best_law = OccupancyLaw::Continuous;
         }
     }
-    // Walk the anchor count up from two and stop at the first order that does not
-    // improve on the order below it (or whose evidence is not computable). The
-    // walk is bounded by the rows themselves: a mixture needs fewer anchors than
-    // points.
-    let mut previous_order_bic = f64::INFINITY;
+    // #4323 — the law is the BIC minimiser over every anchor order below the row
+    // count, not the first local minimum: with one shared width, orders below
+    // the true anchor count merge clusters and can RAISE the BIC, and the drop
+    // arrives only at the true count. The walk ends where the likelihood
+    // ceiling proves that no order from `k` on can beat the best BIC so far,
+    // which ends it exactly where a scan of every order would stop changing
+    // the answer.
+    let mut ceiling = MixtureLikelihoodCeiling::new(&pts, &w, mass, sigma_floor, circular);
     for k in 2..pairs.len() {
+        if ceiling.excludes_orders_from(k, ln_n, best_bic) {
+            break;
+        }
+        // An order whose density underflows at some row has a log-likelihood
+        // of `−∞` in f64, so its BIC is `+∞` and it cannot win.
         let Some(bic) =
             wrapped_gaussian_mixture_bic_weighted(&pts, &w, k, sigma_floor, ln_n, circular, mass)
         else {
-            break;
+            continue;
         };
-        if !(bic < previous_order_bic) {
-            break;
-        }
-        previous_order_bic = bic;
         if bic < best_bic {
             best_bic = bic;
             best_law = OccupancyLaw::Discrete { anchors: k };
         }
     }
     best_law
+}
+
+/// #4323 — a certified ceiling on the maximised log-likelihood of every
+/// shared-width mixture order at once, so the order walk can stop where no
+/// higher order can win.
+///
+/// The widths are floored at `σ_f`, and `φ_σ = φ_{σ_f} ∗ φ_τ` with
+/// `τ² = σ² − σ_f²` (wrapped kernels on the circle compose the same way). So
+/// every mixture density `f` of any order is a mixture over locations `ν` of
+/// the floor kernel `W(x − ν)`. The model keeps finitely many images, so its
+/// density is at most that. Write `S(ν) = Σ_i w_i W(x_i − ν)` and
+/// `S* = sup_ν S(ν)`. The tangent bound `ln f ≤ ln c + f/c − 1` then gives
+/// `Σ_i w_i f(x_i)/c ≤ S*/c`, and at `c = S*/mass` it gives
+///
+/// ```text
+///   ℓ_k ≤ mass · ln(S*/mass)          for every order k,
+///   BIC_k ≥ −2 mass ln(S*/mass) + 2k ln n.
+/// ```
+///
+/// Once the right side reaches the best BIC, no order from `k` on can beat it.
+/// The same ceiling also bounds `ℓ_k` when the fit is an exact maximum.
+///
+/// The test is `S* ≤ mass (e^v √(2π) σ_f − T)`, in units of the unnormalised
+/// kernel `e(d) = exp(−d²/(2σ_f²))`, with `v = (k ln n − best/2)/mass` and
+/// `T` the images beyond the nearest one. For a nearest-image offset
+/// `|d| ≤ ½`, each side's `q`-th further image sits at least `q − ½` away and
+/// the terms shrink by `e^{−q/σ_f²}`, so `T ≤ 2 e(½)/(1 − e^{−1/σ_f²})`.
+///
+/// `S*` is bounded by branch-and-bound over closed cells between consecutive
+/// distinct rows, plus the wrap cell on the circle. On the line, `S` outside
+/// the hull is at most its value at the nearer end. A cell's bound is
+/// `Σ w_i e(dist(x_i, cell))` over the rows within `R` of it, plus the other
+/// rows' mass times `e(R)`. `R` puts `e(R)` at one unit roundoff of the peak,
+/// and the bound is inflated by its rounding band. A cell above the threshold
+/// is split at its midpoint, and the midpoint's value is a point of `S`. If
+/// that point already exceeds the threshold, or the cell is too narrow to
+/// split in f64, the order cannot be excluded and is evaluated.
+///
+/// The threshold never falls as `k` grows and the best BIC improves, so cells
+/// are split once and kept across orders.
+struct MixtureLikelihoodCeiling<'a> {
+    pts: &'a [f64],
+    weights: &'a [f64],
+    cumulative: Vec<f64>,
+    mass: f64,
+    sigma_floor: f64,
+    circular: bool,
+    reach: f64,
+    reach_kernel: f64,
+    image_tail: f64,
+    term_growth: f64,
+    cells: BinaryHeap<CeilingCell>,
+    attained: f64,
+}
+
+/// One closed cell `[lo, hi]` of candidate locations, ordered by the bound on
+/// `S` anywhere in it.
+struct CeilingCell {
+    lo: f64,
+    hi: f64,
+    bound: f64,
+}
+
+impl PartialEq for CeilingCell {
+    fn eq(&self, other: &Self) -> bool {
+        self.bound.total_cmp(&other.bound).is_eq()
+    }
+}
+
+impl Eq for CeilingCell {}
+
+impl PartialOrd for CeilingCell {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CeilingCell {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.bound.total_cmp(&other.bound)
+    }
+}
+
+impl<'a> MixtureLikelihoodCeiling<'a> {
+    fn new(
+        pts: &'a [f64],
+        weights: &'a [f64],
+        mass: f64,
+        sigma_floor: f64,
+        circular: bool,
+    ) -> Self {
+        let log_inverse_roundoff = (1.0 / UNIT_ROUNDOFF).ln();
+        let reach_z = (2.0 * log_inverse_roundoff).sqrt();
+        let reach = sigma_floor * reach_z;
+        let image_tail = if circular {
+            let half = 0.5 / sigma_floor;
+            2.0 * (-0.5 * half * half).exp()
+                / (1.0 - (-1.0 / (sigma_floor * sigma_floor)).exp())
+        } else {
+            0.0
+        };
+        // Rounding of one kernel term, relative to its value. The offset is
+        // formed in at most three operations on coordinates below 2, so it is
+        // off by at most `2·γ₃` in absolute terms. That moves the exponent by
+        // at most `z_R · 2γ₃ / σ_f`. Squaring and scaling cost `γ₄` of an
+        // exponent that is at most `ln(1/u)` inside the reach. `exp` and the
+        // weight product cost `γ₃`.
+        let term_growth = reach_z * 2.0 * accumulation_growth(3) / sigma_floor
+            + accumulation_growth(4) * log_inverse_roundoff
+            + accumulation_growth(3);
+        let mut cumulative = Vec::with_capacity(weights.len() + 1);
+        cumulative.push(0.0);
+        let mut running = 0.0_f64;
+        for &weight in weights {
+            running += weight;
+            cumulative.push(running);
+        }
+        let mut ceiling = Self {
+            pts,
+            weights,
+            cumulative,
+            mass,
+            sigma_floor,
+            circular,
+            reach,
+            reach_kernel: (-0.5 * reach_z * reach_z).exp(),
+            image_tail,
+            term_growth,
+            cells: BinaryHeap::new(),
+            attained: 0.0,
+        };
+        let mut spans: Vec<(f64, f64)> = pts
+            .windows(2)
+            .filter(|pair| pair[0] < pair[1])
+            .map(|pair| (pair[0], pair[1]))
+            .collect();
+        if circular {
+            if let (Some(&first), Some(&last)) = (pts.first(), pts.last()) {
+                spans.push((last, first + 1.0));
+            }
+        }
+        for (lo, hi) in spans {
+            let cell = ceiling.cell(lo, hi);
+            ceiling.cells.push(cell);
+        }
+        ceiling
+    }
+
+    /// Whether `BIC_k ≥ best_bic` is certified for every order from `k` on.
+    fn excludes_orders_from(&mut self, k: usize, ln_n: f64, best_bic: f64) -> bool {
+        let v = (k as f64 * ln_n - 0.5 * best_bic) / self.mass;
+        // `v` and the threshold are formed in eight operations. `exp` turns an
+        // error in `v` into a relative error `|v|` times as large.
+        let threshold = self.mass
+            * (v.exp() * std::f64::consts::TAU.sqrt() * self.sigma_floor - self.image_tail)
+            * (1.0 - accumulation_growth(8) * (1.0 + v.abs()));
+        if !(threshold > 0.0) {
+            return false;
+        }
+        loop {
+            if self.attained > threshold {
+                return false;
+            }
+            let Some(top) = self.cells.peek() else {
+                return true;
+            };
+            if top.bound <= threshold {
+                return true;
+            }
+            let (lo, hi) = (top.lo, top.hi);
+            let mid = lo + 0.5 * (hi - lo);
+            if !(lo < mid && mid < hi) {
+                return false;
+            }
+            self.cells.pop();
+            // A point value is an attained lower bound on `S*`. Its own
+            // rounding can only make the walk evaluate one more order.
+            let (at_mid, _, _) = self.kernel_sum(mid, mid);
+            self.attained = self.attained.max(at_mid);
+            let left = self.cell(lo, mid);
+            let right = self.cell(mid, hi);
+            self.cells.push(left);
+            self.cells.push(right);
+        }
+    }
+
+    fn cell(&self, lo: f64, hi: f64) -> CeilingCell {
+        let (near, within, count) = self.kernel_sum(lo, hi);
+        let outside = (self.mass - within).max(0.0);
+        let bound = (near + outside * self.reach_kernel)
+            * (1.0 + self.term_growth + accumulation_growth(count + 2));
+        CeilingCell { lo, hi, bound }
+    }
+
+    /// `Σ w_i e(dist(x_i, [lo, hi]))` over the rows within the reach of the
+    /// cell, with the mass and the number of those rows.
+    fn kernel_sum(&self, lo: f64, hi: f64) -> (f64, f64, usize) {
+        let (mut sum, mut within, mut count) = (0.0_f64, 0.0_f64, 0usize);
+        for (start, end) in self.window(lo, hi) {
+            for i in start..end {
+                let z = self.distance(self.pts[i], lo, hi) / self.sigma_floor;
+                sum += self.weights[i] * (-0.5 * z * z).exp();
+            }
+            within += self.cumulative[end] - self.cumulative[start];
+            count += end - start;
+        }
+        (sum, within, count)
+    }
+
+    /// Index ranges of the sorted rows within the reach of `[lo, hi]`.
+    fn window(&self, lo: f64, hi: f64) -> [(usize, usize); 2] {
+        let n = self.pts.len();
+        let first_at_or_above = |x: f64| self.pts.partition_point(|&p| p < x);
+        let first_above = |x: f64| self.pts.partition_point(|&p| p <= x);
+        if !self.circular {
+            return [
+                (
+                    first_at_or_above(lo - self.reach),
+                    first_above(hi + self.reach),
+                ),
+                (0, 0),
+            ];
+        }
+        let span = hi - lo + 2.0 * self.reach;
+        if span >= 1.0 {
+            return [(0, n), (0, 0)];
+        }
+        let from = (lo - self.reach).rem_euclid(1.0);
+        let to = from + span;
+        if to < 1.0 {
+            [(first_at_or_above(from), first_above(to)), (0, 0)]
+        } else {
+            [(first_at_or_above(from), n), (0, first_above(to - 1.0))]
+        }
+    }
+
+    /// Distance from `x` to the closed cell `[lo, hi]`, taken to the nearest
+    /// image on the circle.
+    fn distance(&self, x: f64, lo: f64, hi: f64) -> f64 {
+        if !self.circular {
+            return (lo - x).max(x - hi).max(0.0);
+        }
+        let lifted = lo + (x - lo).rem_euclid(1.0);
+        if lifted <= hi {
+            0.0
+        } else {
+            (lifted - hi).min(lo + 1.0 - lifted)
+        }
+    }
 }
 
 fn wrapped_gaussian_mixture_bic_weighted(

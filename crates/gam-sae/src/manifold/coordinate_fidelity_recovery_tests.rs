@@ -42,16 +42,19 @@ fn uniform_and_discrete_occupancy_survive_the_collapse_guard_2691() {
         .map(|row| (row % 7) as f64 / 7.0 + 0.0005 * ((row / 7) as f64 - 5.5))
         .collect();
     let weights = Array1::ones(84);
-    for coordinates in [&uniform, &weekdays] {
-        let law = classify_occupancy_weighted(coordinates, weights.view());
-        assert!(
-            matches!(
-                law,
-                OccupancyLaw::Uniform | OccupancyLaw::Continuous | OccupancyLaw::Discrete { .. }
-            ),
-            "separated support must survive the collapse guard, got {law:?}"
-        );
-    }
+    assert_eq!(
+        classify_occupancy_weighted(&uniform, weights.view()),
+        OccupancyLaw::Uniform
+    );
+    // #4323 — seven tight clusters are seven anchors. The mixture BIC over
+    // `k = 1..9` reads 15.3, 25.8, 35.8, 39.2, 47.8, 36.5, −310.4, −300.9,
+    // −291.4: merging clusters RAISES it until the drop at `k = 7`, so a walk
+    // that stopped at the first non-improving order (`k = 2`) called this
+    // coordinate uniform.
+    assert_eq!(
+        classify_occupancy_weighted(&weekdays, weights.view()),
+        OccupancyLaw::Discrete { anchors: 7 }
+    );
 }
 
 #[test]
