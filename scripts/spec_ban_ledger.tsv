@@ -23,19 +23,14 @@ box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_U_CLAMP)	https://g
 box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_U_CLAMP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_U_CLAMP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_U_CLAMP)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_U_CLAMP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/reml_outer_engine/efs.rs	clamp(+-EFS_MAX_STEP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/reml_outer_engine/efs.rs	clamp(+-EFS_MAX_STEP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/reml_outer_engine/efs.rs	const EFS_MAX_STEP	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/reml_outer_engine/outer_entry_helpers.rs	clamp(+-EFS_MAX_STEP)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-solve/src/reml/state_caches.rs	const IFT_STEP_CAP_GROW_FACTOR	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-solve/src/reml/state_caches.rs	const IFT_STEP_CAP_SHRINK_FACTOR	https://github.com/SauersML/gam/issues/2902
 jitter	crates/gam-sae/src/manifold/seed_routing.rs	diag += jitter	https://github.com/SauersML/gam/issues/3090
 magic	crates/gam-custom-family/src/covariance.rs	> 1.0e-10	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-custom-family/src/joint_newton.rs	<= 1e-3	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-event-history/src/static_state.rs	> 1e-8	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/bms/block_specs.rs	.max(2.0e-5)	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/bms/block_specs.rs	.max(2.0e-5)	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/bms/mod.rs	< 1e-18	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/bms/mod.rs	<= 1e-8	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/fit_orchestration/drivers/constant_curvature_kappa_jet.rs	> 1.0e-7	https://github.com/SauersML/gam/issues/2469
@@ -75,7 +70,6 @@ magic	crates/gam-solve/src/gaussian_reml.rs	> 1.0e-14	https://github.com/SauersM
 magic	crates/gam-solve/src/gaussian_reml.rs	> 1.0e-14	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-solve/src/pirls/deviance.rs	<= 1.0e-6	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-solve/src/pirls/deviance.rs	> 1.0e-10	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-solve/src/pirls/newton_solve.rs	> 1.0e-3	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-solve/src/quadrature.rs	<= 1e-10	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-solve/src/reml/reml_outer_engine/objective.rs	<= 1e-9	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-solve/src/reml/reml_outer_engine/objective.rs	> 1e-7	https://github.com/SauersML/gam/issues/2469

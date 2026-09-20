@@ -5175,7 +5175,7 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
             continue;
         }
         let sym = (&raw + &raw.t()) * 0.5;
-        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym);
+        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym)?;
         candidates.push(PenaltyCandidate {
             matrix: ConstructiveQuadratic::try_from_dense_psd(matrix, "Matérn operator penalty")?,
             source,
@@ -5186,7 +5186,7 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
     }
     if let Some(gram) = ops.third_order_gram.as_ref() {
         let sym = (gram + &gram.t()) * 0.5;
-        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym);
+        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym)?;
         candidates.push(PenaltyCandidate {
             matrix: ConstructiveQuadratic::try_from_dense_psd(
                 matrix,
@@ -5201,19 +5201,26 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
     filter_penalty_candidates(candidates)
 }
 
-pub(crate) fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>, f64) {
+pub(crate) fn normalize_penalty_in_constrained_space(
+    matrix: &Array2<f64>,
+) -> Result<(Array2<f64>, f64), BasisError> {
     // Constrained-space normalization:
     //   c = ||S_con||_F,  S_tilde = S_con / c.
     // This is the only normalization coherent with a REML objective that is
     // evaluated entirely in constrained coordinates.
     let matrix = (matrix + &matrix.t().to_owned()) * 0.5;
-    // Clamp noise-floor negative eigenvalues so β'Sβ is non-negative as a contract, not just in exact arithmetic.
-    let matrix = crate::basis::project_penalty_to_psd_cone(&matrix);
+    // Clamp noise-floor negative eigenvalues so β'Sβ is non-negative as a
+    // contract, not just in exact arithmetic. Material negative curvature is
+    // refused there, not clamped into a different penalty (#3673).
+    let matrix = crate::basis::project_penalty_to_psd_cone(
+        &matrix,
+        "constrained-space penalty normalization",
+    )?;
     let c = matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
     if c.is_finite() && c > 0.0 {
-        (matrix.mapv(|v| v / c), c)
+        Ok((matrix.mapv(|v| v / c), c))
     } else {
-        (matrix, 1.0)
+        Ok((matrix, 1.0))
     }
 }
 
@@ -5995,7 +6002,7 @@ pub(crate) fn build_tensor_bspline_basis(
     let normalized_marginal_penalties: Vec<(Array2<f64>, f64)> = marginal_penalties
         .iter()
         .map(normalize_penalty_in_constrained_space)
-        .collect();
+        .collect::<Result<_, _>>()?;
     if marginal_function_grams.len() != marginalnum_basis.len() {
         crate::bail_dim_basis!(
             "TensorBSpline requires one function Gram per margin; got {} for {} margins",
@@ -6199,7 +6206,7 @@ pub(crate) fn build_tensor_bspline_basis(
                 // relative amount of smoothing seen by the LAML/REML optimizer.
                 // Keep the physical scale in metadata and give the optimizer
                 // unit-scale constrained penalties for every tensor margin.
-                let (_, c_new) = normalize_penalty_in_constrained_space(restricted.dense());
+                let (_, c_new) = normalize_penalty_in_constrained_space(restricted.dense())?;
                 let matrix = restricted.scaled(
                     1.0 / c_new,
                     "normalized tensor penalty after identifiability",
@@ -6229,7 +6236,7 @@ pub(crate) fn build_tensor_bspline_basis(
             &marginal_function_grams,
             z_opt.as_ref(),
         )? {
-            let (_, scale) = normalize_penalty_in_constrained_space(ridge.dense());
+            let (_, scale) = normalize_penalty_in_constrained_space(ridge.dense())?;
             candidates.push(PenaltyCandidate {
                 matrix: ridge.scaled(1.0 / scale, "normalized tensor null-function block ridge")?,
                 source: PenaltySource::TensorGlobalRidge,
@@ -7266,7 +7273,7 @@ pub(crate) fn build_by_smooth_local(
                     s_big
                         .slice_mut(s![off..off + p, off..off + p])
                         .assign(&base_penalty.matrix);
-                    let (s_big, scale) = normalize_penalty_in_constrained_space(&s_big);
+                    let (s_big, scale) = normalize_penalty_in_constrained_space(&s_big)?;
                     candidates.push(PenaltyCandidate {
                         matrix: ConstructiveQuadratic::try_from_dense_psd(
                             s_big,
@@ -7731,7 +7738,7 @@ pub(crate) fn build_factor_smooth(
                 .slice_mut(s![start..start + p, start..start + p])
                 .assign(&s_inner);
         }
-        let (s_big, factor_smooth_scale) = normalize_penalty_in_constrained_space(&s_big);
+        let (s_big, factor_smooth_scale) = normalize_penalty_in_constrained_space(&s_big)?;
         candidates.push(PenaltyCandidate {
             matrix: ConstructiveQuadratic::try_from_dense_psd(
                 s_big,
@@ -7793,7 +7800,7 @@ pub(crate) fn build_factor_smooth(
                     .slice_mut(s![start..start + p, start..start + p])
                     .assign(&p_k);
             }
-            let (s_null, null_scale) = normalize_penalty_in_constrained_space(&s_null);
+            let (s_null, null_scale) = normalize_penalty_in_constrained_space(&s_null)?;
             candidates.push(PenaltyCandidate {
                 matrix: ConstructiveQuadratic::try_from_dense_psd(
                     s_null,
@@ -8230,7 +8237,7 @@ pub(crate) fn build_single_local_smooth_term_for(
                 // Emit `L` independent per-level blocks for this marginal penalty.
                 for which_level in 0..=l_minus_one {
                     let raw = stz_per_group_penalty(&base_penalty.matrix, which_level);
-                    let (s_big, group_scale) = normalize_penalty_in_constrained_space(&raw);
+                    let (s_big, group_scale) = normalize_penalty_in_constrained_space(&raw)?;
                     candidates.push(PenaltyCandidate {
                         matrix: ConstructiveQuadratic::try_from_dense_psd(
                             s_big,
@@ -8277,7 +8284,7 @@ pub(crate) fn build_single_local_smooth_term_for(
                     s_big
                 };
                 let (s_null, null_scale) =
-                    normalize_penalty_in_constrained_space(&stz_pooled_null);
+                    normalize_penalty_in_constrained_space(&stz_pooled_null)?;
                 candidates.push(PenaltyCandidate {
                     matrix: ConstructiveQuadratic::try_from_dense_psd(
                         s_null,
@@ -8764,7 +8771,7 @@ pub(crate) fn build_single_local_smooth_term_for(
                 info,
                 ..
             } = penalty;
-            let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
+            let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix)?;
             let normalization_scale = info.normalization_scale * c_new;
             let op_scale = 1.0 / c_new;
             let kronecker_scale = 1.0 / c_new;
