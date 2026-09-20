@@ -2734,7 +2734,7 @@
     "evidence": "git grep finds no caller of posterior_eta_bands, posterior_eta_bands_impl, eta_bands_from_matrix_link, LinkSelector or posterior_quantile_from_sorted after the deletion."
   },
   {
-    "base": "5918b6a8f8b59e4138bdf2e8e13679386c46b2eb",
+    "base": "db8172c18d77f3cf412550268a6ce520be42b002",
     "items": [
       "crates/gam-solve/src/reml/jeffreys_subspace.rs:fn:ramp_down",
       "crates/gam-solve/src/reml/jeffreys_subspace.rs:fn:ramp_down_value_and_deriv",
