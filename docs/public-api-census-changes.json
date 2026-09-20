@@ -4852,5 +4852,109 @@
     },
     "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
     "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
+  },
+  {
+    "base": "d5f641efbdb2e3e5c9b1d26621a7ad3890d5eabe",
+    "removed": {
+      "crates/gam-solve/src/reml/gradient_hessian.rs::adaptive_ift_max_drho": 1,
+      "crates/gam-solve/src/reml/gradient_hessian.rs::adaptive_tangent_alpha_cap": 1,
+      "crates/gam-solve/src/reml/gradient_hessian.rs::clear_ift_quality_runtime_state": 1,
+      "crates/gam-solve/src/reml/gradient_hessian.rs::ift_quality_step_cap": 1,
+      "crates/gam-solve/src/reml/gradient_hessian.rs::record_ift_prediction_quality": 1,
+      "crates/gam-solve/src/reml/gradient_hessian.rs::take_ift_quality_flat_override": 1,
+      "crates/gam-solve/src/reml/objective.rs::adaptive_ift_max_drho_follows_quality_tiers": 1,
+      "crates/gam-solve/src/reml/objective.rs::adaptive_tangent_alpha_cap_follows_quality_tiers": 1
+    },
+    "reason": "Replace the IFT/tangent warm-start step caps (#2902) with a derived trust radius: the tiered |dρ| budget (2.0 default, 0.5..4.0 by residual tier), the tangent α tiers, and the grow/shrink step controller with its hand quality bands and flat override are hand bounds and magic constants forbidden by SPEC. The radius R = s·F/E is measured from each accepted prediction's miss E against the flat seed's miss F at step s.",
+    "evidence": "ift_predictor_rejects_large_drho: an unmeasured predictor now takes the |dρ| = 3 step the 2.0 default cap rejected; a measured radius of 2 rejects it and 4 accepts it. warm_start_trust_radius_is_the_step_where_the_predictor_ties_the_flat_seed pins R = s·F/E, R = ∞ for an exact prediction, no update for E = F = 0 or non-finite input, and reset on clear. The same-slot test now checks the radius and staged step do not leak across RemlStates."
+  },
+  {
+    "base": "88af7f36c95adcede13b6507ad702acc78ab4bd0",
+    "removed": {
+      "crates/gam-gpu/src/solver.rs::cholesky_logdet": 1,
+      "crates/gam-gpu/src/solver.rs::cholesky_logdet_from_col_major": 1,
+      "crates/gam-gpu/src/solver.rs::cholesky_solve_gpu": 1,
+      "crates/gam-gpu/src/solver.rs::iterative_refinement_cholesky_solve": 1
+    },
+    "reason": "#3547/#3548: fp32 + fp64-residual refinement now returns a solution only once its residual reaches the attainable band, and GpuDispatchPolicy keeps only fields a dispatch reads. cholesky_solve_gpu returned (solution, logdet) through iterative_refinement_cholesky_solve's need_logdet branch, whose extra fp64 POTRF was cuda::cholesky_logdet; no production code called it (its only callers were three arrow_gpu tests, now on cholesky_solve_only_gpu), so cholesky_solve_only_gpu is the single entry point and folds iterative_refinement_cholesky_solve in. The fp64 device solve no longer downloads its factor for a logdet nobody reads, so cholesky_logdet_from_col_major has no caller. GpuMixedPrecisionPolicy's Off and Never variants were unreachable (no code built a policy with them) and Refinement was the only live value, so the enum and the mixed_precision field go, with the two unit tests that pinned the unreachable variants (off_policy_never_attempts_refinement, never_policy_never_attempts_refinement); iterative_refinement_should_attempt is now an associated fn of p.",
+    "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base 88af7f36c95adcede13b6507ad702acc78ab4bd0 (main after the #3547 certificate landed) and head the change's commit list exactly these removals. Read-proof at the head: git grep -w -c finds 0 occurrences of GpuMixedPrecisionPolicy, cholesky_solve_gpu, iterative_refinement_cholesky_solve and the two test names anywhere in crates/ tests/ examples/; cholesky_logdet survives only as gam-terms grid_spline_2d::cholesky_logdet (a different function) and its users; cholesky_logdet_from_col_major only in a historical doc sentence in gam-solve pirls_gpu.rs. Before the change git grep -n cholesky_solve_gpu on main found callers only in tests/arrow_gpu (gpu_solver_dimension_mismatch_returns_error.rs, gpu_solver_matches_cpu_on_small_spd_system.rs, misc/owed_1412.rs)."
+  },
+  {
+    "base": "9e4544cb8f0785925cdca5cc448efcb22afd9fb8",
+    "removed": {
+      "crates/gam-models/src/bms/block_specs.rs::learned_frailty_scale_is_identified": 1
+    },
+    "reason": "gam#2938 commit 2 (gam#3059): the Bernoulli marginal-slope fit asks the shared identification rule crate::survival::lognormal_kernel::frailty_identification (landed in dc80110867) instead of its own pub(crate) copy learned_frailty_scale_is_identified, which is deleted. The same entry is in docs/source-removal-changes.json.",
+    "evidence": "public_api_census.py with base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate refuses exactly this identity (13820 -> 13819 public function declarations). In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences."
+  },
+  {
+    "base": "f978f1d043baca9753bc81e60ef5a8ac0de02060",
+    "removed": {
+      "crates/gam-predict/src/posterior_bands.rs::eta_bands_from_matrix_link": 1
+    },
+    "reason": "#3604: dead posterior_eta_bands path deleted; draw_bands_from_matrices is the single posterior-band reducer.",
+    "evidence": "No caller of eta_bands_from_matrix_link remains in the workspace."
+  },
+  {
+    "base": "db8172c18d77f3cf412550268a6ce520be42b002",
+    "removed": {
+      "crates/gam-models/src/bms/mod.rs::weighted_ridge_sandwich_cov": 1
+    },
+    "reason": "#3047/#3030/#3010 (PR #3222, pr-land comment 5748106176). The stacked first-stage variance now inverts the block-triangular bread J = [[M,0],[M_vm,N]] as J^-1 = [[M+,0],[K,N+]] with K = N+ M_vm M+ in stacked_first_stage_inverse_bread, and carries the constant variance stage in theta1 (dzeta/dv = -zeta/(2v)). That replaces weighted_ridge_sandwich_cov (the mean-only sandwich that omitted the variance stage, #3030) and signed_weighted_gram (whose -2 M_vm cross block gave the wrong sign, #3047); the rank-deficient finiteness test exercised only the deleted sandwich.",
+    "evidence": "At base b3832b92 weighted_ridge_sandwich_cov is pub(crate) at bms/mod.rs:2039 with its callers in bms/mod.rs and one rigid test; at the head it is gone and stacked_first_stage_sandwich_cov (built on stacked_first_stage_inverse_bread) is the only first-stage covariance. cargo check --workspace --tests is clean."
+  },
+  {
+    "base": "b6be6bb6ec166b7e98ee17e8aa77af19faa754d3",
+    "removed": {
+      "crates/gam-sae/src/manifold/rho.rs::ard_sharing": 1,
+      "crates/gam-sae/src/manifold/rho.rs::max_ard_axes": 1,
+      "crates/gam-sae/src/manifold/rho.rs::new_shared_ard": 1,
+      "crates/gam-sae/src/manifold/tests.rs::shared_ard_flat_index_aliases_in_bounds_1026": 1
+    },
+    "reason": "#3824: the SAE coordinate prior switched from per-atom ARD to one ARD precision per axis index broadcast to every atom once K >= SAE_SHARED_ARD_K_THRESHOLD = 256, so the prior family and the REML/LAML criterion changed at an arbitrary atom count. Per-atom ARD costs 1+K+sum_k d_k outer coordinates against 1+K+max_d, both Theta(K), and the per-(k,j) energies were already assembled, so no derived crossover exists. The threshold, ArdSharing, the ard_sharing accessor, SaeManifoldRho::new_shared_ard and max_ard_axes go, with the tests that pinned the shared mode (shared_ard_flat_index_aliases_in_bounds_1026, shared_ard_collapses_outer_param_count_at_large_k, shared_ard_is_a_convergent_outer_coordinate_1026).",
+    "evidence": "manifold::tests::ard_flat_index_is_unique_per_atom_axis_3824 and sae owed_1026::ard_outer_coordinates_are_per_atom_at_every_k_3824: for K in {2,255,256,1000} the flat length is 1+K+K and every (k,j) index is distinct; a heterogeneous d=[2,1,2] from_flat round trip is exact."
+  },
+  {
+    "base": "e5e926b4bfc6f5f3b77b314c8f0b66f5c4e2769b",
+    "removed": {
+      "crates/gam-solve/src/constrained_posterior/cone_laplace.rs::retained_normals": 1
+    },
+    "reason": "#4485: ParameterExecutor had no implementor, bound or caller anywhere (its doc claimed a native Rust implementation and a Python wrapper that do not exist); executed rows are built directly as ExecutedExperiment. ConeLaplace::retained_normals (A^T) had no caller; its cone_normalizer twin was already deleted as dead.",
+    "evidence": "public_api_census.py with this base and the landing commit as head refuses exactly this identity; git grep -w retained_normals finds 0 occurrences under crates, src, tests or python in the head tree."
+  },
+  {
+    "base": "c78ebbfb47498180e00fa0b6721359b1ff02948c",
+    "removed": {
+      "crates/gam-models/src/inference/saved_summary.rs::saved_models_log_evidence_ratio": 1
+    },
+    "reason": "#3878: saved_models_log_evidence_ratio is replaced by saved_models_evidence_ratio, which returns the ratio formed in Rust.",
+    "evidence": "PR #3895."
+  },
+  {
+    "base": "03f9a1216aae0cc61e83bf828877243b2bf6a425",
+    "removed": {
+      "crates/gam-linalg/src/utils.rs::stable_logistic": 1,
+      "crates/gam-linalg/src/utils.rs::stable_softplus": 1
+    },
+    "reason": "#3735: gam_linalg::utils::{stable_softplus, stable_logistic} duplicated gam_math::special::{softplus, logistic} expression for expression. SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'. All callers now import the gam-math kernels.",
+    "evidence": "At head git grep -w finds no occurrence of stable_softplus or stable_logistic; every former caller (gam-model-kernels, gam-models, gam-sae, gam-solve, gam-terms, gam-inference, gam-pyffi) depends on gam-math directly."
+  },
+  {
+    "base": "00b33efd500f54529a61bab8ba3dcc5da54a8745",
+    "removed": {
+      "crates/gam-solve/src/model_types/result_types.rs::working_geometry": 1,
+      "crates/gam-solve/src/model_types/result_types.rs::working_response": 1
+    },
+    "reason": "#4466: the saved-model payload carried write-only mirrors (sas_param_covariance, mixture_link_param_covariance, beta_noise, slope_formulas, baseline_slopes, latent_score_contract). Predict reads the link covariance from fit_result.fitted_link, the noise coefficients from the fit's Scale block and the marginal-slope contract from slope_formula/baseline_slope/z_columns, so the mirrors could be edited or drift with no effect on any reloaded prediction. They are deleted with SavedLatentScoreContract, the struct only latent_score_contract held, and the FitResult::working_response/working_geometry accessors, which had no caller outside each other.",
+    "evidence": "At 00b33efd50, git grep finds no reader of the six payload keys (beta_noise only behind a dead fallback after the fit's Scale block) outside their writers in model_payload_builders.rs, the new()/validate_numeric_finiteness boilerplate in model.rs and tests; SavedLatentScoreContract is named only in model.rs; '.working_response()' has no call site and '.working_geometry()' is called only by working_response, both in result_types.rs. stateful_saved_model_sync now asserts the SAS covariance round-trips through fit_result.fitted_link and pins 96 payload keys (the pin had also missed gaussian_sigma_floor and informational_notes)."
+  },
+  {
+    "base": "d4a58ec52168803d9123f73231e2c562953ac9cc",
+    "removed": {
+      "crates/gam-linalg/src/utils.rs::add": 1,
+      "crates/gam-linalg/src/utils.rs::sum": 1
+    },
+    "reason": "#4306: remove the KahanSum type and migrate all live consumers directly to gam_math::sparse_grid::CompensatedSum. The shared Neumaier algorithm preserves low-order bits under a larger addend and folds final compensation into the result; no compatibility wrapper or alias remains.",
+    "evidence": "Four exact cancellation/copy/reset/quadrature regressions execute against rebuilt gam-math; complete changed consumer crates and their transitive dependency metadata compile with warnings denied on MSI. Source census enumerates all direct consumers and removed declarations."
   }
 ]

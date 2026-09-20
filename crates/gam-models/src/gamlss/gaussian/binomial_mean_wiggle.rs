@@ -744,7 +744,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                 return Err(GamlssError::row_geometry_unrepresentable(i, "binomial mean-wiggle warp slope", eta[i], slope));
             }
             if wi == 0.0 {
-                rows.push((0.0, eta[i], 0.0, etaw[i], 0.0));
+                rows.push((0.0, 0.0, 0.0, 0.0, 0.0));
                 continue;
             }
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
@@ -781,8 +781,15 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                 jet.d3,
                 &self.link_kind,
             );
-            let (fisher, _, _) =
-                binomial_expected_q_information_derivatives(wi, jet.mu, jet.d1, jet.d2, jet.d3);
+            let (fisher, _, _) = binomial_expected_q_information_derivatives(
+                wi,
+                q,
+                &self.link_kind,
+                jet.mu,
+                jet.d1,
+                jet.d2,
+                jet.d3,
+            )?;
             for (quantity, value, nonnegative) in [
                 ("binomial mean-wiggle row log likelihood", row_ll, false),
                 ("binomial mean-wiggle q score", m1, false),
@@ -792,33 +799,28 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                     return Err(GamlssError::row_geometry_unrepresentable(i, quantity, q, value));
                 }
             }
-            // η block working geometry — dead when the warp slope vanishes or the
-            // row carries no expected information (saturated μ).
-            let (z_eta_i, w_eta_i) = if slope == 0.0 || fisher == 0.0 {
-                (eta[i], 0.0)
-            } else {
-                let weight = fisher * slope * slope;
-                if !weight.is_finite() || weight <= 0.0 {
-                    return Err(GamlssError::row_geometry_unrepresentable(i, "binomial mean-wiggle eta working weight", eta[i], weight));
-                }
-                let response = eta[i] - m1 / (fisher * slope);
-                if !response.is_finite() {
-                    return Err(GamlssError::row_geometry_unrepresentable(i, "binomial mean-wiggle eta working response", eta[i], response));
-                }
-                (response, weight)
-            };
-            // wiggle block working geometry — dead when the row carries no
-            // expected information.
-            let (z_wiggle_i, w_wiggle_i) = if fisher == 0.0 {
-                (etaw[i], 0.0)
-            } else {
-                let z_wiggle_i = etaw[i] - m1 / fisher;
-                if !z_wiggle_i.is_finite() {
-                    return Err(GamlssError::row_geometry_unrepresentable(i, "binomial mean-wiggle wiggle working response", etaw[i], z_wiggle_i));
-                }
-                (z_wiggle_i, fisher)
-            };
-            rows.push((row_ll, z_eta_i, w_eta_i, z_wiggle_i, w_wiggle_i));
+            // Natural-coordinate working geometry. The row score is carried
+            // directly rather than as an IRLS pseudo-response
+            // `z = η − m1/(f·slope)`: in a saturated tail the expected
+            // information `f` underflows to 0 (probit y=0 at q ≳ 8.3 gives
+            // μ == 1.0 in double; logit at q ≳ 36.7) while the exact score
+            // `−m1` stays finite and non-zero, so the pseudo-response does not
+            // exist and a `(z=η, w=0)` placeholder would silently drop the
+            // score from the joint gradient (`Xᵀ(w⊙(z−η)) = 0`), disagreeing
+            // with the log-likelihood the objective still reports. See
+            // `BlockWorkingSet::NaturalDiagonal`.
+            //
+            // η block: `∂q/∂η = slope`, so score `−m1·slope`, curvature `f·slope²`.
+            let score_eta_i = -m1 * slope;
+            let curv_eta_i = fisher * slope * slope;
+            if !score_eta_i.is_finite() {
+                return Err(GamlssError::row_geometry_unrepresentable(i, "binomial mean-wiggle eta score", eta[i], score_eta_i));
+            }
+            if !curv_eta_i.is_finite() {
+                return Err(GamlssError::row_geometry_unrepresentable(i, "binomial mean-wiggle eta curvature", eta[i], curv_eta_i));
+            }
+            // wiggle block: `∂q/∂η_w = 1`, so score `−m1`, curvature `f`.
+            rows.push((row_ll, score_eta_i, curv_eta_i, -m1, fisher));
         }
 
         let mut ll = 0.0;
@@ -828,16 +830,22 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                 return Err(GamlssError::row_geometry_unrepresentable(i, "binomial mean-wiggle cumulative log likelihood", eta[i], ll));
             }
         }
-        let z_eta = Array1::from_iter(rows.iter().map(|row| row.1));
-        let w_eta = Array1::from_iter(rows.iter().map(|row| row.2));
-        let z_wiggle = Array1::from_iter(rows.iter().map(|row| row.3));
-        let w_wiggle = Array1::from_iter(rows.iter().map(|row| row.4));
+        let score_eta = Array1::from_iter(rows.iter().map(|row| row.1));
+        let curv_eta = Array1::from_iter(rows.iter().map(|row| row.2));
+        let score_wiggle = Array1::from_iter(rows.iter().map(|row| row.3));
+        let curv_wiggle = Array1::from_iter(rows.iter().map(|row| row.4));
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
             blockworking_sets: vec![
-                BlockWorkingSet::diagonal_checked(z_eta, w_eta)?,
-                BlockWorkingSet::diagonal_checked(z_wiggle, w_wiggle)?,
+                BlockWorkingSet::NaturalDiagonal {
+                    score: score_eta,
+                    observed_curvature: curv_eta,
+                },
+                BlockWorkingSet::NaturalDiagonal {
+                    score: score_wiggle,
+                    observed_curvature: curv_wiggle,
+                },
             ],
         })
     }
@@ -847,8 +855,8 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        // Assemble the exact joint score from the per-block IRLS working sets
-        // (X_bᵀ(w⊙(z−η)) per block), the same source of truth the inner
+        // Assemble the exact joint score from the per-block natural working
+        // sets (X_bᵀ score per block), the same source of truth the inner
         // joint-Newton RHS uses — consistent with the family's explicit joint
         // Hessian and matching FD of the log-likelihood.
         let eval = self.evaluate(block_states)?;
@@ -1774,6 +1782,63 @@ mod exact_frozen_monotonicity_tests {
             stacked_offset: None,
         };
         (family, spec)
+    }
+
+    /// A row whose fitted probability rounds to exactly 1 while `y = 0` is a
+    /// valid likelihood tail: the expected information `w·μ'²/(μ(1−μ))`
+    /// underflows to 0 but the score `∂ℓ/∂q` is finite and far from 0 (probit
+    /// `≈ −q`, logit `−1`). The joint gradient assembled from `evaluate`'s
+    /// working sets must still equal the central difference of the
+    /// log-likelihood that `evaluate` reports, row by row. A `(z = η, w = 0)`
+    /// pseudo-response placeholder drops those scores to 0.
+    #[test]
+    fn saturated_rows_keep_their_score_in_the_joint_gradient() {
+        let n = 4;
+        let etaw = Array1::from(vec![0.3, -0.5, 9.0, 40.0]);
+        for link in [StandardLink::Probit, StandardLink::Logit] {
+            let (mut family, wiggle_spec) = frozen_family_and_wiggle_spec();
+            family.link_kind = InverseLink::Standard(link);
+            let mut eta_spec = wiggle_spec.clone();
+            eta_spec.name = "eta".to_string();
+            eta_spec.design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Array2::<f64>::eye(n),
+            ));
+            let specs = vec![eta_spec, wiggle_spec];
+            let states = vec![
+                ParameterBlockState {
+                    beta: Array1::zeros(n),
+                    eta: Array1::zeros(n),
+                },
+                ParameterBlockState {
+                    beta: Array1::zeros(specs[1].design.ncols()),
+                    eta: etaw.clone(),
+                },
+            ];
+            let gradient = family
+                .exact_newton_joint_gradient_evaluation(&states, &specs)
+                .expect("joint gradient")
+                .expect("the family supplies a joint gradient")
+                .gradient;
+            let ll_at = |row: usize, delta: f64| {
+                let mut shifted = states.clone();
+                shifted[BinomialMeanWiggleFamily::BLOCK_ETA].eta[row] += delta;
+                family.evaluate(&shifted).expect("evaluate").log_likelihood
+            };
+            let h = 1e-5;
+            for row in 0..n {
+                let fd = (ll_at(row, h) - ll_at(row, -h)) / (2.0 * h);
+                let tol = 1e-6 * (1.0 + fd.abs());
+                assert!(
+                    (gradient[row] - fd).abs() <= tol,
+                    "{link:?} row {row} (q = {}): joint gradient {} but the log-likelihood \
+                     central difference is {fd}",
+                    etaw[row],
+                    gradient[row],
+                );
+            }
+            // NON-VACUITY: the saturated rows carry a real score.
+            assert!(gradient[3].abs() > 0.5, "{link:?}: q = 40 row score {}", gradient[3]);
+        }
     }
 
     /// The two blocks' COEFFICIENT COORDINATES, as this family answers for them
