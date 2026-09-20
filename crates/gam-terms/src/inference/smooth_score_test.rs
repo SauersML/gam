@@ -616,38 +616,19 @@ mod tests {
         })
     }
 
-    /// Two-sided calibration of the whole null law. The p-values must pass a
-    /// Kolmogorov–Smirnov test of uniformity at level 0.001, and the size at
-    /// 0.10, 0.05 and 0.01 must sit within three Monte-Carlo standard errors of
-    /// the level on both sides: a conservative test fails exactly as an
-    /// anti-conservative one does. Both reference laws are checked, the known
-    /// scale `Σ w χ²₁` and the estimated scale over `χ²_ρ/ρ`.
+    /// Both reference laws are uniform under the null ([`assert_uniform`]):
+    /// the known scale `Σ w χ²₁` and the estimated scale over `χ²_ν/ν` on the
+    /// unpenalized residual.
     #[test]
     fn the_score_test_is_uniform_under_the_null() {
         let design = design(120);
         let reps = 2000;
         for scale in [SmoothTestScale::Known, SmoothTestScale::Estimated] {
             let mut rng = StdRng::seed_from_u64(0x5c07e);
-            let mut p_values: Vec<f64> = (0..reps)
+            let p_values: Vec<f64> = (0..reps)
                 .map(|_| test(&design, &fit(&design, &null_response(&design, &mut rng)), scale).p_value)
                 .collect();
-            p_values.sort_by(f64::total_cmp);
-            let ks = p_values
-                .iter()
-                .enumerate()
-                .map(|(i, &p)| ((i + 1) as f64 / reps as f64 - p).max(p - i as f64 / reps as f64))
-                .fold(0.0_f64, f64::max);
-            let ks_level: f64 = 0.001;
-            let ks_critical = (-0.5 * (ks_level / 2.0).ln()).sqrt() / (reps as f64).sqrt();
-            assert!(ks <= ks_critical, "{scale:?}: KS distance {ks} above {ks_critical}");
-            for level in [0.10, 0.05, 0.01] {
-                let size = p_values.iter().filter(|&&p| p <= level).count() as f64 / reps as f64;
-                let mcse = (level * (1.0 - level) / reps as f64).sqrt();
-                assert!(
-                    (size - level).abs() <= 3.0 * mcse,
-                    "{scale:?}: size {size} at level {level} (MCSE {mcse})"
-                );
-            }
+            assert_uniform(&format!("{scale:?}"), p_values);
         }
     }
 
@@ -992,9 +973,7 @@ mod tests {
     /// holds at any `n`: 10.1%, 5.0% and 0.95% at 0.10, 0.05 and 0.01.
     #[test]
     fn the_estimated_scale_is_calibrated_at_small_n() {
-        let mut design = design(32);
-        design.penalty[[2, 2]] = 0.5;
-        design.penalty[[3, 3]] = 0.5;
+        let design = small_n_design();
         let reps = 8000;
         let mut rng = StdRng::seed_from_u64(0x3832);
         let p_values: Vec<f64> = (0..reps)
@@ -1003,10 +982,102 @@ mod tests {
                     .p_value
             })
             .collect();
+        assert_uniform("estimated scale, n = 32", p_values);
+    }
+
+    /// The small-`n` fixture of gam#3832: 32 rows, 14 columns, the other
+    /// smooth's two columns only lightly penalized, so `ν = 32 − 14 = 18` and
+    /// the penalized fit spends a partial edf on every shrunk direction.
+    fn small_n_design() -> Design {
+        let mut design = design(32);
+        design.penalty[[2, 2]] = 0.5;
+        design.penalty[[3, 3]] = 0.5;
+        design
+    }
+
+    /// The power direction at small `n`: the D′ reference spends
+    /// `rank(X) − edf` fewer denominator degrees of freedom than the penalized
+    /// `n − edf`, and that price must not cost the test its power. With common
+    /// random noise across amplitudes, the rejection rate at 0.05 exceeds the
+    /// level by more than three Monte-Carlo standard errors at every positive
+    /// amplitude, never decreases as the smooth effect of `x2` grows, and
+    /// reaches 0.9.
+    #[test]
+    fn the_estimated_scale_keeps_its_power_at_small_n() {
+        let design = small_n_design();
+        let reps = 400;
+        let level = 0.05;
+        let mcse = (level * (1.0 - level) / reps as f64).sqrt();
+        let effect = design.x.column(4).to_owned();
+        let mut previous = 0.0;
+        for amplitude in [1.0, 2.0, 4.0] {
+            let mut rng = StdRng::seed_from_u64(0x3832_0001);
+            let rejections = (0..reps)
+                .filter(|_| {
+                    let y = null_response(&design, &mut rng) + &(&effect * amplitude);
+                    test(&design, &fit(&design, &y), SmoothTestScale::Estimated).p_value <= level
+                })
+                .count();
+            let power = rejections as f64 / reps as f64;
+            assert!(power > level + 3.0 * mcse, "power {power} at amplitude {amplitude}");
+            assert!(power >= previous, "power fell to {power} from {previous} at amplitude {amplitude}");
+            previous = power;
+        }
+        assert!(previous >= 0.9, "power {previous} at the largest amplitude");
+    }
+
+    /// A row of weight zero is an absent row: it adds nothing to `D′` and no
+    /// degree of freedom to `ν = n⁺ − rank(G)`, so appending one leaves the
+    /// p-value where the fit without it put it. The comparison is exact: the
+    /// row enters every row sum of the fit (`XᵀWX`, `XᵀWy`, the score
+    /// `W(y − Xβ̂)`) as a product with its weight `0` and a finite factor,
+    /// which is `±0`, and `a + ±0 = a` in IEEE arithmetic. `WorkingResidual`
+    /// skips the row, so the test sees bitwise the same `(β̂, H, G, D′, n⁺)`.
+    #[test]
+    fn a_zero_weight_row_is_an_absent_row() {
+        let mut padded = design(33);
+        padded.weights[32] = 0.0;
+        let trimmed = Design {
+            x: padded.x.slice(ndarray::s![..32, ..]).to_owned(),
+            weights: padded.weights.slice(ndarray::s![..32]).to_owned(),
+            penalty: padded.penalty.clone(),
+            wiggle: padded.wiggle.clone(),
+            null_space: padded.null_space.clone(),
+            term: padded.term.clone(),
+        };
+        let mut rng = StdRng::seed_from_u64(0x3832_0002);
+        let mut y = null_response(&padded, &mut rng);
+        // The absent row's response is arbitrary; a large one shows it is unread.
+        y[32] = 1.0e3;
+        let with_row = fit(&padded, &y);
+        let without_row = fit(&trimmed, &y.slice(ndarray::s![..32]).to_owned());
+        assert_eq!(with_row.residual.rows, 32);
+        assert_eq!(with_row.residual, without_row.residual);
+        let p_with = test(&padded, &with_row, SmoothTestScale::Estimated).p_value;
+        let p_without = test(&trimmed, &without_row, SmoothTestScale::Estimated).p_value;
+        assert_eq!(p_with, p_without, "p {p_with} with the row, {p_without} without");
+    }
+
+    /// Two-sided calibration of a whole null law: the p-values pass a
+    /// Kolmogorov–Smirnov test of uniformity at level 0.001, and the size at
+    /// 0.10, 0.05 and 0.01 sits within three Monte-Carlo standard errors of the
+    /// level on both sides, so a conservative test fails exactly as an
+    /// anti-conservative one does.
+    fn assert_uniform(label: &str, mut p_values: Vec<f64>) {
+        let reps = p_values.len();
+        p_values.sort_by(f64::total_cmp);
+        let ks = p_values
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| ((i + 1) as f64 / reps as f64 - p).max(p - i as f64 / reps as f64))
+            .fold(0.0_f64, f64::max);
+        let ks_level: f64 = 0.001;
+        let ks_critical = (-0.5 * (ks_level / 2.0).ln()).sqrt() / (reps as f64).sqrt();
+        assert!(ks <= ks_critical, "{label}: KS distance {ks} above {ks_critical}");
         for level in [0.10, 0.05, 0.01] {
             let size = p_values.iter().filter(|&&p| p <= level).count() as f64 / reps as f64;
             let mcse = (level * (1.0 - level) / reps as f64).sqrt();
-            assert!((size - level).abs() <= 3.0 * mcse, "size {size} at level {level} (MCSE {mcse})");
+            assert!((size - level).abs() <= 3.0 * mcse, "{label}: size {size} at level {level} (MCSE {mcse})");
         }
     }
 }
