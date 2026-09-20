@@ -3432,11 +3432,13 @@ fn publish_expectile_sandwich_covariance(
 /// at this seam (the formula DSL exposes none for this term class), so no
 /// pinned-λ mapping arises.
 ///
-/// Identifiability transforms on the smooth (centering / linear-trend
-/// removal / orthogonality-to-intercept) are accepted as eligible: they only
-/// re-coordinate the unpenalized null space against the implicit intercept
-/// and do not change the fitted posterior of `E[y|x]`, which is what the
-/// scan returns directly.
+/// Only two identifiability policies are eligible: `none` and sum-to-zero
+/// centring. Each removes at most the constant, and the intercept puts it
+/// back, so the model spans the same `{1, x, …} ⊕ wiggle` the scan solves.
+/// Linear-trend removal (`identifiability="linear"`) takes the `x` direction
+/// out of the model. Design-column orthogonality and a frozen transform can
+/// impose any constraint. The scan honours none of these, so they fall through
+/// to the dense path (#3870).
 pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineScanInputs> {
     if !request.family.is_gaussian_identity() {
         return None;
@@ -3506,6 +3508,11 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
     if !(1..=3).contains(&order)
         || bspec.degree != 2 * order - 1
         || bspec.double_penalty
+        || !matches!(
+            bspec.identifiability,
+            gam_terms::basis::BSplineIdentifiability::None
+                | gam_terms::basis::BSplineIdentifiability::WeightedSumToZero { .. }
+        )
         || !bspec.boundary_conditions.is_free()
         || !matches!(bspec.boundary, gam_terms::basis::OneDimensionalBoundary::Open)
         || matches!(
@@ -4272,5 +4279,57 @@ mod joint_expectile_scale_posterior_tests {
                  {plug_in:?} (integrated {integrated:?})"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod spline_scan_identifiability_routing_tests {
+    use super::*;
+    use csv::StringRecord;
+    use gam_data::encode_recordswith_inferred_schema;
+
+    fn trend_data() -> Dataset {
+        let headers: Vec<String> = ["x", "y"].iter().map(|h| h.to_string()).collect();
+        let rows = (0..60)
+            .map(|i| {
+                let x = i as f64 / 59.0;
+                let y = 2.0 * x + 0.3 * (7.0 * x).sin() + 0.05 * ((i * 37 % 11) as f64 - 5.0);
+                StringRecord::from(vec![x.to_string(), y.to_string()])
+            })
+            .collect();
+        encode_recordswith_inferred_schema(headers, rows).expect("encode")
+    }
+
+    fn routes_to_scan(identifiability: &str) -> bool {
+        let data = trend_data();
+        let config = FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        };
+        let formula = format!(
+            "y ~ s(x, bs=\"ps\", degree=3, penalty_order=2, double_penalty=False{identifiability})"
+        );
+        match materialize(&formula, &data, &config)
+            .expect("materialize")
+            .request
+        {
+            FitRequest::Standard(request) => spline_scan_fast_path(&request).is_some(),
+            _ => panic!("a Gaussian s(x) formula materializes a standard request"),
+        }
+    }
+
+    /// Sum-to-zero centring spans `{1, x} ⊕ wiggle` with the intercept, which
+    /// is exactly the scan's model.
+    #[test]
+    fn centred_smooths_keep_the_scan() {
+        assert!(routes_to_scan(""));
+        assert!(routes_to_scan(", identifiability=\"sum_tozero\""));
+    }
+
+    /// `identifiability="linear"` removes the `x` direction, which the scan's
+    /// unpenalized null space would fit back in (#3870).
+    #[test]
+    fn linear_trend_removal_falls_through_to_the_dense_path() {
+        assert!(!routes_to_scan(", identifiability=\"linear\""));
     }
 }
