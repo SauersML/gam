@@ -204,20 +204,25 @@ class Model:
             NB theta frozen at its fitted value) and Gamma-log (Pearson score,
             so the set is a band in ``y / mu``) refit the augmented penalized
             likelihood per candidate at the frozen penalty. Discrete ties are
-            broken by a seeded uniform so the set is exact rather than
-            conservative. Offsets are honoured. A model fitted with prior
+            broken by one independent uniform per prediction row. Numerical
+            uncertainty is enclosed conservatively. Offsets are honoured. A model
+            fitted with prior
             weights raises ``InvalidConfigurationError``: the candidate point
             has no weight, so use ``calibration=`` (split conformal) instead.
             The saved model carries only the ``p x p`` frozen penalty and its
             smoothing-parameter count, never per-row training data, so the
             labeled rows are passed again here. The per-row
             ``conformal_certificate`` output column is 0 (exact_frozen: nothing
-            to re-select) or 1 (honest_refit) where the guarantee holds; a
+            to re-select), 1 (honest_refit), or 2 (conservative_frozen: GLM
+            numerical enclosure) where the guarantee holds; a
             negative code is a typed refusal where the row carries the
             frozen-penalty set with no finite-sample guarantee for the
             selection step (several smoothing parameters, a payload without the
             count, a degenerate criterion, or ``-7`` glm_frozen_penalty for a
             non-Gaussian fit that selected a smoothing parameter or NB theta).
+            Coverage is marginal under exchangeability of the supplied rows
+            and a fixed symmetric design/penalty construction, not conditional
+            on features. A training-only learned basis need not satisfy this.
             The set is a union of ``conformal_set_components`` intervals and
             the bounds report its outer envelope (NaN for an empty randomized
             set). With ``calibration`` it is the

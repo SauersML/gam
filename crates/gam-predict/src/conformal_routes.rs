@@ -102,7 +102,8 @@ impl From<String> for FullConformalError {
 ///   conservative.
 ///
 /// The `conformal_certificate` column says what each row carries: `0`
-/// exact_frozen (no strength to re-select), `1` honest_refit, and a negative
+/// exact_frozen (Gaussian, no strength to re-select), `1` honest_refit,
+/// `2` conservative_frozen (GLM numerical enclosure), and a negative
 /// code for a typed refusal (`-1` multi_penalty, `-2`
 /// unknown_penalty_structure, `-3` augmented_gram_singular, `-4`
 /// reml_undefined, `-5` refit_outside_tube, `-6` refit_failed, `-7`
