@@ -2433,7 +2433,15 @@
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3392 (fix-3299-support-space-ep, Fixes #3299) merged as 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af's own tree with --base 53dfd6479c37a261096d31a5bf0763668ca8a229 --head 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 8 items. Read-proof: git grep -w -c <name> 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af -- <its path> gives 0 for every item except posterior (19, other uses of the same word)."
   },
   {
-    "base": "2d4b9ce53a61db906be4977b1a4aab76c45d8d57",
+    "base": "391a766e1012d99b0e0b43d8ff0b3db941b82523",
+    "items": [
+      "crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs:fn:set_degenerate_gaussian_reml_items"
+    ],
+    "reason": "#3310 (backfill for e8568910a9, PR #3367, which landed the removal without an entry): the single-smooth closed-form Gaussian REML entries gaussian_reml_fit and gaussian_reml_fit_positions mapped EstimationError::ModelIsIllConditioned to this payload (status 'degenerate', lambda NaN, edf 0, all-zero coefficients and fitted values), which no Python caller read as a failure. Both entries now propagate the engine's typed error, so a singular X'WX raises IllConditionedError, and the payload has no producer left.",
+    "evidence": "git grep -n -w set_degenerate_gaussian_reml_items at 391a766e10 finds its declaration in crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs and exactly two calls, the ModelIsIllConditioned arms of gaussian_reml_fit and gaussian_reml_fit_positions in crates/gam-pyffi/src/model/model_ffi.rs, which 8fae1cc34e removes. scripts/source_removal_guard.py --base 391a766e10 --head e8568910a9 names exactly this item (production_occurrences 3). The removal was measured independently by the direct gate run dy5 w2saeb-3310-g1 (direct-dy5-w2saeb-3310-g1.log), whose source-removal guard named the same item for an equivalent change."
+  },
+  {
+    "base": "8195d75d0aebc3f4c886b20efd5ef0201ac719c7",
     "items": [
       "crates/gam-terms/src/basis/center_selection.rs:const:LOWER_MASK",
       "crates/gam-terms/src/basis/center_selection.rs:const:M",
