@@ -60,11 +60,15 @@
 //! **3. Positions from a complex eigenproblem.** Let `V_m` hold the first `m`
 //! right singular vectors (columns of `V`, each of length `L + 1`). Deleting the
 //! **last** row gives `V₁` and deleting the **first** row gives `V₂`, both
-//! `L × m`. Shift invariance of the Vandermonde structure makes the `z_j` the
-//! eigenvalues of `Φ = V₁⁺ V₂` (a total-least-squares matrix pencil; `V₁⁺` is
-//! the least-squares pseudo-inverse via QR). `Φ` is `m × m` and complex, so its
-//! eigenvalues are computed by a complex `evd`. Then
-//! `t_j = arg(z_j) / (2π) mod 1`.
+//! `L × m`. `Φ = V₁⁺ V₂` is the matrix pencil (`V₁⁺` is the least-squares
+//! pseudo-inverse via QR); it is `m × m` and complex, so its eigenvalues come
+//! from a complex `evd`. Those eigenvalues are the CONJUGATES `z̄_j`, for every
+//! input: the Hankel factors as `Y = C·Bᵀ` with the Vandermonde
+//! `B[k, j] = z_j^k` and `C[i, j] = a_j z_j^{i+1}`, and faer's SVD is
+//! `Y = U S Vᴴ` (on the wide path too, which transposes and then conjugates both
+//! factors), so `span(V) = colspace(Yᴴ) = span(conj(B))`. The shift invariance
+//! `conj(B)[k+1, j] = z̄_j·conj(B)[k, j]` then gives `Φ = T⁻¹ diag(z̄) T`. So
+//! `z_j = conj(λ_j(Φ))` and `t_j = arg(z_j) / (2π) mod 1`.
 //!
 //! **4. Amplitudes by least squares.** With the `z_j` fixed, `a` solves the
 //! `N × m` Vandermonde system `Σ_j a_j (z_j)^{h} = y_h`, `h = 1..H`, in the
@@ -246,80 +250,54 @@ pub fn recover_spikes(fourier_coeffs: &[(f64, f64)], sigma: f64) -> Result<Spike
         .eigenvalues()
         .map_err(|e| format!("matrix-pencil eigenproblem failed: {e:?}"))?;
 
-    // Unit-modulus phasors from the pencil eigenvalues. The shift-invariance
-    // pencil `Φ = V1⁺V2` built from `svd.V()` recovers the generating phasors
-    // `z_j = e^{2πi t_j}` only up to a GLOBAL complex-conjugation: faer's SVD `V`
-    // is pinned only up to a per-column unit-phase factor, and for some inputs the
-    // whole right basis returns conjugated, so every eigenvalue comes back as
-    // `conj(z_j)` — the reflected circle position `1 − t_j`. This is not a fixed
-    // convention (it is data-dependent), so it cannot be assumed away: e.g.
-    // planted {0.285, 0.801} was returned as its reflection {0.199, 0.715} with
-    // spurious near-zero/negative amplitudes, and the measure readout then
-    // (correctly) rejected the mis-fit and collapsed a genuine two-spike code to
-    // one — silently destroying multiplicity detection.
-    //
-    // The data disambiguates without any tuning: the samples `y_h` are not
-    // conjugate-symmetric, so the TRUE phasor set fits them with a real,
-    // low-residual amplitude solve while the reflected set inflates the residual.
-    // Solve both the phasor set and its global conjugate, and keep whichever
-    // reconstructs the samples better — a closed-form, threshold-free branch
-    // selection that leaves the already-correct branch untouched (its residual is
-    // strictly smaller, so nothing regresses).
-    let unit_phasors: Vec<c64> = roots
+    // The pencil eigenvalues are the conjugates `z̄_j` of the generating phasors
+    // (module docs, step 3: faer's `Y = U S Vᴴ` puts `span(V)` on `conj(B)`), so
+    // the phasors are their conjugates, normalized to the unit circle.
+    let phasors: Vec<c64> = roots
         .iter()
-        .map(|z| {
+        .map(|root| {
+            let z = root.conj();
             let norm = z.norm();
             if norm > 0.0 {
-                *z / norm
+                z / norm
             } else {
                 c64::new(1.0, 0.0)
             }
         })
         .collect();
+    let positions: Vec<f64> = phasors
+        .iter()
+        .map(|z| {
+            let t = z.arg() / std::f64::consts::TAU;
+            if t < 0.0 { t + 1.0 } else { t }
+        })
+        .collect();
 
-    let solve_branch = |phasors: &[c64]| -> (Vec<Spike>, f64) {
-        let positions: Vec<f64> = phasors
-            .iter()
-            .map(|z| {
-                let t = z.arg() / std::f64::consts::TAU;
-                if t < 0.0 { t + 1.0 } else { t }
-            })
-            .collect();
-        // Amplitudes: least-squares Vandermonde solve of Σ_j a_j z_j^{k+1} = y_k.
-        let vander = Mat::<c64>::from_fn(n, model_order, |k, j| phasors[j].powu((k + 1) as u32));
-        let rhs = Mat::<c64>::from_fn(n, 1, |k, _| samples[k]);
-        let amps = vander.qr().solve_lstsq(&rhs);
-        let mut spikes: Vec<Spike> = (0..model_order)
-            .map(|j| Spike {
-                t: positions[j],
-                amplitude: amps[(j, 0)].re,
-            })
-            .collect();
-        spikes.sort_by(|a, b| a.t.total_cmp(&b.t));
-        // Residual of the recovered physical model (real amplitudes, unit phasors).
-        let mut residual_sq = 0.0;
-        for (k, y) in samples.iter().enumerate() {
-            let mut fit = c64::new(0.0, 0.0);
-            for spike in &spikes {
-                let phasor = c64::new(
-                    (std::f64::consts::TAU * spike.t).cos(),
-                    (std::f64::consts::TAU * spike.t).sin(),
-                );
-                fit += phasor.powu((k + 1) as u32) * spike.amplitude;
-            }
-            residual_sq += (y - fit).norm_sqr();
+    // Amplitudes: least-squares Vandermonde solve of Σ_j a_j z_j^{k+1} = y_k.
+    let vander = Mat::<c64>::from_fn(n, model_order, |k, j| phasors[j].powu((k + 1) as u32));
+    let rhs = Mat::<c64>::from_fn(n, 1, |k, _| samples[k]);
+    let amps = vander.qr().solve_lstsq(&rhs);
+    let mut spikes: Vec<Spike> = (0..model_order)
+        .map(|j| Spike {
+            t: positions[j],
+            amplitude: amps[(j, 0)].re,
+        })
+        .collect();
+    spikes.sort_by(|a, b| a.t.total_cmp(&b.t));
+
+    // Residual of the recovered physical model (real amplitudes, unit phasors).
+    let mut residual_sq = 0.0;
+    for (k, y) in samples.iter().enumerate() {
+        let mut fit = c64::new(0.0, 0.0);
+        for spike in &spikes {
+            let phasor = c64::new(
+                (std::f64::consts::TAU * spike.t).cos(),
+                (std::f64::consts::TAU * spike.t).sin(),
+            );
+            fit += phasor.powu((k + 1) as u32) * spike.amplitude;
         }
-        (spikes, residual_sq)
-    };
-
-    let conj_phasors: Vec<c64> = unit_phasors.iter().map(|z| z.conj()).collect();
-    let (spikes_direct, residual_direct) = solve_branch(&unit_phasors);
-    let (spikes_reflected, residual_reflected) = solve_branch(&conj_phasors);
-    let (spikes, residual_sq) = if residual_reflected < residual_direct {
-        (spikes_reflected, residual_reflected)
-    } else {
-        (spikes_direct, residual_direct)
-    };
+        residual_sq += (y - fit).norm_sqr();
+    }
 
     Ok(SpikeRecovery {
         spikes,
@@ -506,6 +484,47 @@ mod tests {
             "position error {t_err:.3e}"
         );
         assert!(a_err < 5.0 * sigma, "amplitude error {a_err:.3e}");
+    }
+
+    /// The pencil eigenvalues are always the conjugate phasors (faer's
+    /// `Y = U S Vᴴ`), so taking their conjugate is exact for every input: an
+    /// asymmetric single spike comes back at `t`, never at its reflection `1 − t`,
+    /// for every `H` in `2..=17`. Odd `H` builds a square Hankel and even `H` a
+    /// wide one, which faer factors through its transpose-and-conjugate path.
+    #[test]
+    fn single_spike_is_recovered_unreflected_for_every_hankel_shape_3733() {
+        for n_harmonics in 2..=17 {
+            for t in [0.07, 0.19, 0.285, 0.41, 0.63, 0.801, 0.93] {
+                let planted = [(t, 1.3)];
+                let coeffs = coeffs_from_spikes(&planted, n_harmonics);
+                let rec = recover_spikes(&coeffs, 0.0).expect("recovery");
+                assert_eq!(rec.model_order, 1, "H={n_harmonics} t={t}: order");
+                let (t_err, a_err) = match_error(&rec.spikes, &planted);
+                assert!(
+                    t_err < 1e-9,
+                    "H={n_harmonics} t={t}: recovered t={} (reflection is {})",
+                    rec.spikes[0].t,
+                    1.0 - t
+                );
+                assert!(a_err < 1e-9, "H={n_harmonics} t={t}: amplitude error {a_err:.3e}");
+            }
+        }
+    }
+
+    /// The two-spike code {0.285, 0.801} whose reflection {0.199, 0.715} the
+    /// unconjugated pencil returns is recovered exactly, on both Hankel shapes.
+    #[test]
+    fn two_spike_code_is_recovered_unreflected_3733() {
+        let planted = [(0.285, 1.0), (0.801, 0.6)];
+        for n_harmonics in [8, 9] {
+            let coeffs = coeffs_from_spikes(&planted, n_harmonics);
+            let rec = recover_spikes(&coeffs, 0.0).expect("recovery");
+            assert_eq!(rec.model_order, 2, "H={n_harmonics}: order");
+            let (t_err, a_err) = match_error(&rec.spikes, &planted);
+            assert!(t_err < 1e-9, "H={n_harmonics}: position error {t_err:.3e}");
+            assert!(a_err < 1e-9, "H={n_harmonics}: amplitude error {a_err:.3e}");
+            assert!(rec.residual < 1e-9, "H={n_harmonics}: residual {:.3e}", rec.residual);
+        }
     }
 
     #[test]
