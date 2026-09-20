@@ -2,8 +2,9 @@
 //! marginal-slope families the noise offset is the slope predictor's offset: the
 //! library materializer reads it there, the saved payload records it and
 //! `gam predict` replays it. The CLI must not refuse it for want of
-//! `--predict-noise`, while a fit with neither a noise formula nor a
-//! marginal-slope predictor still refuses a column it would drop.
+//! `--predict-noise`, while a fit on the standard route still meets the
+//! library's refusal of a column it would drop (the CLI keeps no mirror of the
+//! route predicate).
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -116,7 +117,7 @@ fn bms_noise_offset_column_is_the_slope_offset_on_the_cli() {
     );
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        stderr.contains("--noise-offset-column requires --predict-noise"),
+        stderr.contains("noise_offset_column requires a location-scale model"),
         "the refusal names what the column needs: {stderr}"
     );
     assert!(!dir.join("plain.gam").exists(), "a refused fit writes no model");
