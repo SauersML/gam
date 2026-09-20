@@ -65,11 +65,13 @@ pub(crate) fn latent_penalty_targets(
         let obj = raw_block
             .as_object()
             .ok_or_else(|| format!("latents['{key}'] must be an object"))?;
-        let name = obj
-            .get("name")
-            .and_then(JsonValue::as_str)
-            .unwrap_or(key)
-            .to_string();
+        let name = match obj.get("name").filter(|value| !value.is_null()) {
+            None => key.clone(),
+            Some(raw) => raw
+                .as_str()
+                .ok_or_else(|| format!("latents['{key}'].name must be a string; got {raw}"))?
+                .to_string(),
+        };
         let n = json_positive_u64_to_usize(
             obj.get("n")
                 .and_then(JsonValue::as_u64)
@@ -124,15 +126,29 @@ fn penalty_target_for_descriptor<'a>(
     ))
 }
 
+/// The value stored under `key`, treating an explicit JSON `null` as absent.
+///
+/// Every optional descriptor field goes through this: absent/`null` selects the
+/// documented default, while a present value must have the field's JSON type —
+/// a wrong-typed value is an error, never a silent fallback to the default.
+fn descriptor_present<'a>(
+    descriptor: &'a serde_json::Map<String, JsonValue>,
+    key: &str,
+) -> Option<&'a JsonValue> {
+    descriptor.get(key).filter(|value| !value.is_null())
+}
+
 fn descriptor_f64(
     descriptor: &serde_json::Map<String, JsonValue>,
     key: &str,
     default: f64,
 ) -> Result<f64, String> {
-    let value = descriptor
-        .get(key)
-        .and_then(JsonValue::as_f64)
-        .unwrap_or(default);
+    let value = match descriptor_present(descriptor, key) {
+        None => default,
+        Some(raw) => raw
+            .as_f64()
+            .ok_or_else(|| format!("analytic penalty {key} must be a number; got {raw}"))?,
+    };
     if !(value.is_finite() && value > 0.0) {
         return Err(format!("analytic penalty {key} must be finite and > 0"));
     }
@@ -144,10 +160,51 @@ fn descriptor_usize(
     key: &str,
     default: usize,
 ) -> Result<usize, String> {
-    let Some(raw) = descriptor.get(key).and_then(JsonValue::as_u64) else {
+    let Some(raw) = descriptor_present(descriptor, key) else {
         return Ok(default);
     };
-    json_positive_u64_to_usize(raw, &format!("analytic penalty {key}"))
+    let value = raw
+        .as_u64()
+        .ok_or_else(|| format!("analytic penalty {key} must be a positive integer; got {raw}"))?;
+    json_positive_u64_to_usize(value, &format!("analytic penalty {key}"))
+}
+
+fn descriptor_bool(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<bool>, String> {
+    descriptor_present(descriptor, key)
+        .map(|raw| {
+            raw.as_bool()
+                .ok_or_else(|| format!("{context}.{key} must be a boolean; got {raw}"))
+        })
+        .transpose()
+}
+
+/// The `learnable` flag (default `false`). A wrong-typed value is an error so a
+/// penalty the caller asked to make learnable is never silently held fixed.
+fn descriptor_learnable(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    context: &str,
+) -> Result<bool, String> {
+    Ok(descriptor_bool(descriptor, "learnable", context)?.unwrap_or(false))
+}
+
+/// A lower-cased, `-`→`_` normalized string field, or `default` when absent.
+fn descriptor_name(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    default: &str,
+    context: &str,
+) -> Result<String, String> {
+    let raw = match descriptor_present(descriptor, key) {
+        None => default,
+        Some(raw) => raw
+            .as_str()
+            .ok_or_else(|| format!("{context}.{key} must be a string; got {raw}"))?,
+    };
+    Ok(raw.to_ascii_lowercase().replace('-', "_"))
 }
 
 fn descriptor_no_unknown_keys(
@@ -272,9 +329,19 @@ fn descriptor_temperature_schedule(
         .ok_or_else(|| {
             format!("{context}.temperature_schedule.tau_start must be a finite number")
         })?;
-    let tau_min = schedule
-        .get("tau_min")
-        .or_else(|| schedule.get("tau_end"))
+    let tau_min_raw = match (
+        descriptor_present(schedule, "tau_min"),
+        descriptor_present(schedule, "tau_end"),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{context}.temperature_schedule sets both tau_min and its alias tau_end; pass exactly one"
+            ));
+        }
+        (Some(raw), None) | (None, Some(raw)) => Some(raw),
+        (None, None) => None,
+    };
+    let tau_min = tau_min_raw
         .and_then(JsonValue::as_f64)
         .ok_or_else(|| format!("{context}.temperature_schedule.tau_min must be a finite number"))?;
     let decay_name = schedule
@@ -285,10 +352,40 @@ fn descriptor_temperature_schedule(
         .replace('-', "_");
     let decay = match decay_name.as_str() {
         "geometric" | "exponential" => {
-            let rate = schedule
-                .get("rate")
-                .and_then(JsonValue::as_f64)
-                .unwrap_or(0.9);
+            // A geometric schedule is specified either by an explicit `rate` or
+            // by the `(tau_start, tau_min, steps)` endpoints, from which the
+            // rate is derived by the single-source
+            // `ScheduleKind::geometric_rate_from_steps`. There is no default
+            // rate: an unspecified decay law is an error, exactly as for the
+            // geometric `weight_schedule`.
+            let rate = match (
+                descriptor_present(schedule, "rate"),
+                descriptor_present(schedule, "steps"),
+            ) {
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "{context}.temperature_schedule sets both rate and steps for geometric decay; pass exactly one"
+                    ));
+                }
+                (Some(raw_rate), None) => raw_rate.as_f64().ok_or_else(|| {
+                    format!("{context}.temperature_schedule.rate must be a finite number")
+                })?,
+                (None, Some(raw_steps)) => {
+                    let steps = raw_steps.as_u64().ok_or_else(|| {
+                        format!("{context}.temperature_schedule.steps must be a positive integer")
+                    })?;
+                    let steps = json_positive_u64_to_usize(
+                        steps,
+                        &format!("{context}.temperature_schedule.steps"),
+                    )?;
+                    ScheduleKind::geometric_rate_from_steps(tau_start, tau_min, steps)
+                }
+                (None, None) => {
+                    return Err(format!(
+                        "{context}.temperature_schedule requires rate or steps for geometric decay"
+                    ));
+                }
+            };
             ScheduleKind::Geometric { rate }
         }
         "linear" => {
@@ -330,12 +427,7 @@ fn descriptor_difference_op(
     descriptor: &serde_json::Map<String, JsonValue>,
     context: &str,
 ) -> Result<DifferenceOpKind, String> {
-    let op = descriptor
-        .get("difference_op")
-        .and_then(JsonValue::as_str)
-        .unwrap_or("forward_1d")
-        .to_ascii_lowercase()
-        .replace('-', "_");
+    let op = descriptor_name(descriptor, "difference_op", "forward_1d", context)?;
     match op.as_str() {
         "forward_1d" => Ok(DifferenceOpKind::ForwardDiff1D),
         "graph_edges" => {
@@ -624,10 +716,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let penalty = OrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
                     .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
@@ -651,19 +740,10 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     ],
                 )?;
                 let weight = descriptor_weight_scalar(descriptor, &context)?;
-                let sparsity_kind = descriptor
-                    .get("sparsity_kind")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("smooth_l1")
-                    .to_ascii_lowercase()
-                    .replace('-', "_");
+                let sparsity_kind =
+                    descriptor_name(descriptor, "sparsity_kind", "smooth_l1", &context)?;
                 let eps = descriptor_f64(descriptor, "eps", 1.0e-3)?;
-                let eps_weight = descriptor
-                    .get("eps_weight")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("fixed")
-                    .to_ascii_lowercase()
-                    .replace('-', "_");
+                let eps_weight = descriptor_name(descriptor, "eps_weight", "fixed", &context)?;
                 let mut penalty = match sparsity_kind.as_str() {
                     "smooth_l1" | "smoothed_l1" => {
                         SparsityPenalty::smoothed_l1(PenaltyTier::Psi, eps)
@@ -713,12 +793,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
-                let variant = descriptor
-                    .get("variant")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("mcp")
-                    .to_ascii_lowercase()
-                    .replace('-', "_");
+                let variant = descriptor_name(descriptor, "variant", "mcp", &context)?;
                 let (variant, gamma_default) = match variant.as_str() {
                     "mcp" => (PenaltyConcavity::Mcp, 2.5),
                     "scad" => (PenaltyConcavity::Scad, 3.7),
@@ -730,10 +805,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 };
                 let gamma = descriptor_f64(descriptor, "gamma", gamma_default)?;
                 let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let penalty = ScadMcpPenalty::new(
                     slice,
                     weight,
@@ -754,15 +826,20 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &["kind", "target", "groups", "weight", "n_eff", "learnable"],
+                    &[
+                        "kind",
+                        "target",
+                        "groups",
+                        "weight",
+                        "n_eff",
+                        "learnable",
+                        "weight_schedule",
+                    ],
                 )?;
                 let groups = descriptor_axis_groups(descriptor, "groups", &context)?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let penalty =
                     BlockOrthogonalityPenalty::new(slice, groups, weight, n_eff, learnable)
                         .map_err(|err| format!("{context}: {err}"))?;
@@ -812,10 +889,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 }
                 let p_out = descriptor_usize(descriptor, "p_out", target.n)?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let total: usize = block_sizes.iter().map(|&m| m * p_out).sum();
                 let decoder_slice = PsiSlice {
                     range: 0..total,
@@ -874,11 +948,18 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let alpha = descriptor_f64(descriptor, "alpha", 1.0)?;
                 let tau = descriptor_f64(descriptor, "tau", 1.0)?;
                 let temperature_schedule = descriptor_temperature_schedule(descriptor, &context)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .or_else(|| descriptor.get("learnable_alpha"))
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = match (
+                    descriptor_bool(descriptor, "learnable", &context)?,
+                    descriptor_bool(descriptor, "learnable_alpha", &context)?,
+                ) {
+                    (Some(_), Some(_)) => {
+                        return Err(format!(
+                            "{context} sets both learnable and its alias learnable_alpha; pass exactly one"
+                        ));
+                    }
+                    (Some(flag), None) | (None, Some(flag)) => flag,
+                    (None, None) => false,
+                };
                 let penalty = OrderedBetaBernoulliPenalty::new(k_max, alpha, tau, learnable);
                 let penalty = match temperature_schedule {
                     Some(schedule) => penalty.with_temperature_schedule(schedule),
@@ -933,10 +1014,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
                 let difference_op = descriptor_difference_op(descriptor, &context)?;
                 let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let penalty = TotalVariationPenalty::new(
                     weight,
                     n_eff,
@@ -968,10 +1046,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
                 let row_weights = descriptor_array1_flat(descriptor, "row_weights", &context)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let penalty = HarmonicRoughnessPenalty::new(weight, n_eff, row_weights, learnable)
                     .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
@@ -1004,10 +1079,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     })?,
                 };
                 let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-3)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let penalty = ShapeMonotonicityPenalty::new(
                     weight,
                     n_eff,
@@ -1052,10 +1124,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         )?)
                     }
                 };
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let penalty = NuclearNormPenalty::new(
                     slice,
                     weight,
@@ -1090,10 +1159,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
                 let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let penalty = BlockSparsityPenalty::new(
                     slice,
                     groups,
@@ -1161,10 +1227,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
                 let n_eff = descriptor_f64(descriptor, "n_eff", target.n as f64)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let penalty = MechanismSparsityPenalty::new(
                     mechanism_slice,
                     feature_groups,
@@ -1197,10 +1260,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let lambda_per_row = descriptor_array3_flat(
                     descriptor,
                     "lambda_per_row",
@@ -1236,10 +1296,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let ridge_eps = descriptor_f64(descriptor, "ridge_eps", 1.0e-6)?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let penalty =
                     IvaeRidgeMeanGauge::new(slice, aux, ridge_eps, weight, n_eff, learnable)
                         .map_err(|err| format!("{context}: {err}"))?;
@@ -1270,10 +1327,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
+                let learnable = descriptor_learnable(descriptor, &context)?;
                 let aux = descriptor_array2_flat(descriptor, "aux", "aux_shape", &context)?;
                 let log_alpha = descriptor_array1_flat(descriptor, "log_alpha", &context)?;
                 let raw_beta = descriptor_array1_flat(descriptor, "raw_beta", &context)?;
@@ -1335,11 +1389,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 }
                 let shell_weights: Vec<f64> = shell_array.to_vec();
                 let eps = descriptor_f64(descriptor, "eps", 1.0e-6)?;
-                let tier_str = descriptor
-                    .get("tier")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("psi")
-                    .to_ascii_lowercase();
+                let tier_str = descriptor_name(descriptor, "tier", "psi", &context)?;
                 let tier = match tier_str.as_str() {
                     "psi" => PenaltyTier::Psi,
                     "beta" => PenaltyTier::Beta,
@@ -1639,5 +1689,152 @@ mod tests {
             reject(&penalties),
             "penalties[0].target references latent block \"missing\", but latents declares [w, z]"
         );
+    }
+
+    #[test]
+    fn wrong_typed_optional_fields_are_errors_not_silent_defaults() {
+        // A present field of the wrong JSON type must be rejected; only an
+        // absent (or `null`) field selects the documented default (#3521).
+        assert_eq!(
+            reject(&json!([{ "kind": "orthogonality", "target": "z", "weight": "5" }])),
+            "analytic penalty weight must be a number; got \"5\""
+        );
+        assert_eq!(
+            reject(&json!([{ "kind": "orthogonality", "target": "z", "n_eff": 4.0 }])),
+            "analytic penalty n_eff must be a positive integer; got 4.0"
+        );
+        assert_eq!(
+            reject(&json!([{ "kind": "orthogonality", "target": "z", "n_eff": -3 }])),
+            "analytic penalty n_eff must be a positive integer; got -3"
+        );
+        assert_eq!(
+            reject(&json!([{ "kind": "orthogonality", "target": "z", "learnable": "true" }])),
+            "penalties[0].learnable must be a boolean; got \"true\""
+        );
+        assert_eq!(
+            reject(&json!([{ "kind": "scad_mcp", "target": "z", "variant": 1 }])),
+            "penalties[0].variant must be a string; got 1"
+        );
+        assert_eq!(
+            reject(&json!([{ "kind": "total_variation", "target": "z", "difference_op": 0 }])),
+            "penalties[0].difference_op must be a string; got 0"
+        );
+        // `null` is the documented "use the default" spelling.
+        assert_eq!(
+            kind_tags(&json!([{
+                "kind": "orthogonality",
+                "target": "z",
+                "n_eff": null,
+                "learnable": null
+            }])),
+            vec!["orthogonality".to_string()]
+        );
+    }
+
+    #[test]
+    fn latent_name_must_be_a_string() {
+        let latents = json!({ "z": { "name": 7, "n": 4, "d": 3 } });
+        let err = build_analytic_penalty_registry_from_descriptors(
+            Some(&latents),
+            Some(&json!([{ "kind": "ard", "target": "z" }])),
+        )
+        .expect_err("non-string latent name must be rejected");
+        assert_eq!(err, "latents['z'].name must be a string; got 7");
+    }
+
+    #[test]
+    fn learnable_alias_pair_is_ambiguous() {
+        assert_eq!(
+            reject(&json!([{
+                "kind": "ordered_beta_bernoulli",
+                "target": "z",
+                "learnable": true,
+                "learnable_alpha": false
+            }])),
+            "penalties[0] sets both learnable and its alias learnable_alpha; pass exactly one"
+        );
+    }
+
+    #[test]
+    fn block_orthogonality_accepts_weight_schedule() {
+        let penalties = json!([{
+            "kind": "block_orthogonality",
+            "target": "z",
+            "groups": [[0, 1], [2]],
+            "weight_schedule": {
+                "w_start": 1.0,
+                "w_end": 0.1,
+                "kind": "linear",
+                "steps": 4
+            }
+        }]);
+        assert_eq!(kind_tags(&penalties), vec!["block_orthogonality".to_string()]);
+    }
+
+    fn ordered_beta_bernoulli_with_schedule(schedule: serde_json::Value) -> serde_json::Value {
+        json!([{
+            "kind": "ordered_beta_bernoulli",
+            "target": "z",
+            "temperature_schedule": schedule
+        }])
+    }
+
+    #[test]
+    fn geometric_temperature_schedule_requires_rate_or_steps() {
+        assert_eq!(
+            reject(&ordered_beta_bernoulli_with_schedule(json!({
+                "tau_start": 1.0,
+                "tau_min": 0.01,
+                "decay": "geometric"
+            }))),
+            "penalties[0].temperature_schedule requires rate or steps for geometric decay"
+        );
+        assert_eq!(
+            reject(&ordered_beta_bernoulli_with_schedule(json!({
+                "tau_start": 1.0,
+                "tau_min": 0.01,
+                "decay": "geometric",
+                "rate": 0.5,
+                "steps": 10
+            }))),
+            "penalties[0].temperature_schedule sets both rate and steps for geometric decay; pass exactly one"
+        );
+        assert_eq!(
+            reject(&ordered_beta_bernoulli_with_schedule(json!({
+                "tau_start": 1.0,
+                "tau_min": 0.01,
+                "tau_end": 0.01,
+                "decay": "geometric",
+                "rate": 0.5
+            }))),
+            "penalties[0].temperature_schedule sets both tau_min and its alias tau_end; pass exactly one"
+        );
+    }
+
+    #[test]
+    fn geometric_temperature_schedule_derives_rate_from_steps() {
+        // `(tau_start, tau_min, steps)` must anneal exactly like the explicit
+        // single-source rate `(tau_min / tau_start)^(1/steps)`, never a
+        // default rate that ignores `steps`.
+        let derived = super::descriptor_temperature_schedule(
+            ordered_beta_bernoulli_with_schedule(json!({
+                "tau_start": 1.0,
+                "tau_min": 0.01,
+                "decay": "geometric",
+                "steps": 10
+            }))[0]
+                .as_object()
+                .expect("descriptor object"),
+            "penalties[0]",
+        )
+        .expect("steps-specified geometric schedule parses")
+        .expect("schedule present");
+        let expected_rate = super::ScheduleKind::geometric_rate_from_steps(1.0, 0.01, 10);
+        match derived.decay {
+            super::ScheduleKind::Geometric { rate } => {
+                assert_eq!(rate.to_bits(), expected_rate.to_bits());
+            }
+            other => panic!("expected geometric decay, got {other:?}"),
+        }
     }
 }
