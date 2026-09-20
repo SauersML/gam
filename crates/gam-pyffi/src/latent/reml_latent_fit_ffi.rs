@@ -1453,37 +1453,6 @@ fn batched_gaussian_reml_fits_from_pydict(
     Ok(fits)
 }
 
-fn set_degenerate_gaussian_reml_items<'py>(
-    py: Python<'py>,
-    out: &Bound<'py, PyDict>,
-    n_rows: usize,
-    n_outputs: usize,
-    n_coefficients: usize,
-) -> PyResult<()> {
-    out.set_item("status", "degenerate")?;
-    out.set_item("lambda", f64::NAN)?;
-    out.set_item("rho", f64::NAN)?;
-    out.set_item("reml_score", f64::NAN)?;
-    out.set_item("reml_grad_lambda", f64::NAN)?;
-    out.set_item("reml_hess_lambda", f64::NAN)?;
-    out.set_item("reml_grad_rho", f64::NAN)?;
-    out.set_item("reml_hess_rho", f64::NAN)?;
-    out.set_item("edf", 0.0)?;
-    out.set_item(
-        "coefficients",
-        Array2::<f64>::zeros((n_coefficients, n_outputs)).into_pyarray(py),
-    )?;
-    out.set_item(
-        "fitted",
-        Array2::<f64>::zeros((n_rows, n_outputs)).into_pyarray(py),
-    )?;
-    out.set_item(
-        "sigma2",
-        Array1::<f64>::from_elem(n_outputs, f64::NAN).into_pyarray(py),
-    )?;
-    Ok(())
-}
-
 struct BatchedGaussianRemlResult {
     statuses: Vec<String>,
     lambdas: Array1<f64>,
@@ -3765,11 +3734,16 @@ fn model_debiased_functional_dataset_json_impl(
     let saved_fit =
         gam::families::survival::predict::fit_result_from_saved_model_for_prediction(&model)
             .map_err(|e| format!("debiased_functional: {e}"))?;
-    let h = saved_fit.penalized_hessian().ok_or_else(|| {
-        "debiased_functional: model does not carry a dense penalized Hessian; \
-         refit with a smaller basis (dense fits only)"
-            .to_string()
-    })?;
+    // H and X'WX are read in the saved frame of beta and the rebuilt design
+    // (gam#3346).
+    let h = saved_fit
+        .saved_frame_penalized_hessian()
+        .map_err(|reason| format!("debiased_functional: penalized Hessian: {reason}"))?
+        .ok_or_else(|| {
+            "debiased_functional: model does not carry a dense penalized Hessian; \
+             refit with a smaller basis (dense fits only)"
+                .to_string()
+        })?;
     // Gaussian/identity is the only supported family (enforced below for the
     // score chain). Hoist that check here because the weighted-Gram fallback
     // (#1622) is only valid for the profiled-Gaussian weight convention.
@@ -3784,8 +3758,11 @@ fn model_debiased_functional_dataset_json_impl(
     // is added UNSCALED — see optimizer.rs `cov_scale` contract), so
     // X'WX = Xᵀ diag(w) X exactly and S(λ) = H − X'WX is recovered consistently
     // (for an unpenalized `y ~ x` this gives S(λ)=0, i.e. X'WX == H).
-    let xwx_owned: ndarray::Array2<f64> = match saved_fit.weighted_gram() {
-        Some(g) => g.clone(),
+    let saved_gram = saved_fit
+        .saved_frame_weighted_gram()
+        .map_err(|reason| format!("debiased_functional: weighted Gram: {reason}"))?;
+    let xwx_owned: ndarray::Array2<f64> = match saved_gram {
+        Some(g) => g.into_owned(),
         None => {
             if !is_gaussian_identity {
                 return Err(format!(
@@ -3823,7 +3800,7 @@ fn model_debiased_functional_dataset_json_impl(
     }
 
     // Penalty gradient S_lambda × beta = (H − X'WX) × beta.
-    let s_lambda = h.clone() - xwx.clone();
+    let s_lambda = &*h - xwx;
     let penalty_beta = s_lambda.dot(&beta);
 
     // Per-row score contributions ∂nll_i/∂β.
