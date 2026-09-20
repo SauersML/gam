@@ -153,15 +153,11 @@ pub struct SavedModelHeader {
 /// the model; so the cost is the header's, not the model's. Bytes that are not
 /// a JSON object are `Malformed`.
 pub fn saved_model_header(bytes: &[u8]) -> Result<SavedModelHeader, SavedModelError> {
-    let complete = RefCell::new(None);
+    let stopped = RefCell::new(None);
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let scanned = de::Deserializer::deserialize_map(
-        &mut deserializer,
-        HeaderVisitor {
-            complete: &complete,
-        },
-    );
-    if let Some(header) = complete.into_inner() {
+    let scanned =
+        de::Deserializer::deserialize_map(&mut deserializer, HeaderVisitor { stopped: &stopped });
+    if let Some(header) = stopped.into_inner() {
         return Ok(header);
     }
     scanned.map_err(|error| SavedModelError::Malformed {
@@ -295,20 +291,21 @@ impl<'de, T: DeserializeOwned> Visitor<'de> for DocumentSeed<'_, T> {
     }
 }
 
-/// Reads a document's kind and version, and stops the parse once it has both
-/// by recording the header in `complete` and returning an error.
+/// Reads a document's kind and version. A document that names both before its
+/// end stops the parse there, by recording the header in `stopped` and
+/// returning an error; one that does not is read to its end.
 struct HeaderVisitor<'c> {
-    complete: &'c RefCell<Option<SavedModelHeader>>,
+    stopped: &'c RefCell<Option<SavedModelHeader>>,
 }
 
 impl<'de> Visitor<'de> for HeaderVisitor<'_> {
-    type Value = ();
+    type Value = SavedModelHeader;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a saved-model document")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<SavedModelHeader, A::Error> {
         let mut header = SavedModelHeader {
             kind: None,
             version: None,
@@ -330,13 +327,14 @@ impl<'de> Visitor<'de> for HeaderVisitor<'_> {
                 }
             }
             if header.kind.is_some() && header.version.is_some() {
-                break;
+                *self.stopped.borrow_mut() = Some(header);
+                // Stop here: the rest of the document is the model, which the
+                // header does not need. `serde_json` would otherwise require
+                // the map to end.
+                return Err(de::Error::custom("saved-model header read"));
             }
         }
-        *self.complete.borrow_mut() = Some(header);
-        // Stop here: the rest of the document is the model, which the header
-        // does not need. `serde_json` would otherwise require the map to end.
-        Err(de::Error::custom("saved-model header read"))
+        Ok(header)
     }
 }
 
@@ -447,12 +445,54 @@ mod tests {
     }
 
     #[test]
+    fn a_header_is_read_without_the_model_and_names_only_what_the_document_names() {
+        let header = |text: &str| saved_model_header(text.as_bytes());
+        // The model after a complete header is never parsed, even when it is
+        // not JSON at all.
+        assert_eq!(
+            header("{\"kind\":\"test\",\"version\":3,\"model\": not json").unwrap(),
+            SavedModelHeader {
+                kind: Some("test".to_string()),
+                version: Some(3),
+            }
+        );
+        // A document without a version, and one whose kind is not a string,
+        // is read to its end and names what it names.
+        assert_eq!(
+            header("{\"kind\":\"test\",\"model\":[1,2]}").unwrap(),
+            SavedModelHeader {
+                kind: Some("test".to_string()),
+                version: None,
+            }
+        );
+        assert_eq!(
+            header("{\"schema\":\"old\",\"kind\":7,\"version\":2}").unwrap(),
+            SavedModelHeader {
+                kind: None,
+                version: Some(2),
+            }
+        );
+        assert!(matches!(
+            header("[1, 2]"),
+            Err(SavedModelError::Malformed { .. })
+        ));
+        assert!(matches!(
+            header("{\"kind\":\"test\""),
+            Err(SavedModelError::Malformed { .. })
+        ));
+    }
+
+    #[test]
     fn documents_refuse_other_kinds_versions_and_non_finite_floats() {
         let values = vec![0.1_f64, 2.5e300];
         let text = saved_model_text("test", 3, &values).unwrap();
         assert!(matches!(
             read_saved_model_text::<Vec<f64>>(&text, "test", 4),
-            Err(SavedModelError::Version { found: Some(3), expected: 4, .. })
+            Err(SavedModelError::Version {
+                found: Some(3),
+                expected: 4,
+                ..
+            })
         ));
         assert!(text.starts_with("{\"kind\":\"test\",\"version\":3,"));
         assert!(matches!(
@@ -558,7 +598,10 @@ mod tests {
         ));
         assert!(matches!(
             read_saved_model_text::<Vec<f64>>("{\"version\": 3, \"model\": []}", "test", 3),
-            Err(SavedModelError::Kind { found: None, expected: "test" })
+            Err(SavedModelError::Kind {
+                found: None,
+                expected: "test"
+            })
         ));
         assert!(matches!(
             write_saved_model(Path::new("/"), b"{}"),
