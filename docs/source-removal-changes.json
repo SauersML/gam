@@ -2660,6 +2660,15 @@
   {
     "base": "e695ec5d3137372f183f8c7e625f9dd992bb1ebc",
     "items": [
+      "crates/gam-solve/src/reml/reml_outer_engine/efs.rs:const:EFS_MAX_STEP",
+      "crates/gam-solve/src/reml/reml_outer_engine/efs.rs:const:PSI_INITIAL_ALPHA"
+    ],
+    "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
+    "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "3d306728d71b4e24433564e05043d5e68056f47a",
+    "items": [
       "crates/gam-sae/src/manifold/gauge.rs:const:C",
       "crates/gam-sae/src/manifold/gauge.rs:const:G",
       "crates/gam-sae/src/manifold/gauge.rs:fn:ln_gamma"

@@ -233,16 +233,14 @@ impl core::fmt::Display for FixedLambdaStallReason {
 /// Solver-native first-order residual carried by a fixed-lambda stall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FixedLambdaResidualKind {
-    /// Euclidean norm of the exact penalized likelihood gradient.
-    PenalizedGradientNorm,
-    /// Firth/Jeffreys Newton decrement `0.5 * |score' H^-1 score|`.
+    /// Half the squared Newton decrement `0.5 * score' H^+ score`, in
+    /// objective units (Firth/Jeffreys and penalized vector-GLM solves).
     NewtonDecrement,
 }
 
 impl core::fmt::Display for FixedLambdaResidualKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
-            Self::PenalizedGradientNorm => "penalized gradient norm",
             Self::NewtonDecrement => "Newton decrement",
         })
     }
@@ -1663,7 +1661,7 @@ mod trial_point_classification_tests {
                 reason: FixedLambdaStallReason::IterationBudgetExhausted,
                 objective_value: 12.5,
                 stationarity: FixedLambdaStationarityEvidence {
-                    kind: FixedLambdaResidualKind::PenalizedGradientNorm,
+                    kind: FixedLambdaResidualKind::NewtonDecrement,
                     residual: 1.0e-3,
                     bound: 1.0e-8,
                 },
