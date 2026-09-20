@@ -2702,8 +2702,9 @@ where
     // Factorization of stabilized Hessian in transformed basis, reused for
     // SE computation via solve-on-demand after dispersion is determined.
     let mut edf_factor: Option<InferenceHessianFactor> = None;
-    // The Tier-0 seam runs only inside the inference pass below; a fit run without
-    // inference keeps this typed reason instead of an unexplained absence (#2627).
+    // The Tier-0 seam runs only inside the inference pass below, and only when the
+    // caller requested rho-posterior inference (#3010); any other fit keeps this
+    // typed reason instead of an unexplained absence (#2627).
     let mut rho_posterior = gam_problem::rho_posterior::RhoPosteriorOutcome::NotComputed(
         gam_problem::rho_posterior::RhoPosteriorNotComputed::InferenceNotRequested,
     );
@@ -3680,6 +3681,24 @@ where
         // errors beside the conditional ones below, because a `p × p` matrix is
         // what its governor refused (#3283); it charges the correction's
         // workspace here, where the dense bundle already holds it.
+        //
+        // The ρ-block rails, not the theta-wide `railed_facts`: the Hessians
+        // judged and sampled below (this correction and the Tier-0 proposal)
+        // are ρ-Hessians, and a railed link-shape coordinate is not one of
+        // their axes.
+        let certified_railed_rho: Vec<usize> = outer_result
+            .criterion_certificate
+            .as_ref()
+            .map(|certificate| {
+                certificate
+                    .lambdas_railed
+                    .iter()
+                    .copied()
+                    .chain(certificate.stationarity.rails().iter().map(|rail| rail.index))
+                    .filter(|&index| index < final_rho.len())
+                    .collect()
+            })
+            .unwrap_or_default();
         let smoothing_workspace = if beta_covariance_unscaled.is_some() {
             Ok(None)
         } else {
@@ -3780,22 +3799,6 @@ where
                 )
             }))
             .collect();
-            // The ρ-block rails, not the theta-wide `railed_facts`: the Hessian
-            // judged below is the ρ-Hessian, and a railed link-shape
-            // coordinate is not one of its axes.
-            let certified_railed_rho: Vec<usize> = outer_result
-                .criterion_certificate
-                .as_ref()
-                .map(|certificate| {
-                    certificate
-                        .lambdas_railed
-                        .iter()
-                        .copied()
-                        .chain(certificate.stationarity.rails().iter().map(|rail| rail.index))
-                        .filter(|&index| index < final_rho.len())
-                        .collect()
-                })
-                .unwrap_or_default();
             let smoothing_outcome = reml_state.compute_smoothing_correction_outcome(
                 &final_rho,
                 &lambdas,
@@ -3876,16 +3879,23 @@ where
         // inference (`skip_rho_posterior_inference = false`), together with the
         // escalation tier it grades for (quadrature or NUTS over ρ, whichever
         // needs fewer criterion evaluations). Every other fit keeps the typed
-        // `NotComputed(InferenceNotRequested)` set above.
+        // `NotComputed(InferenceNotRequested)` set above. A requested run is not
+        // charged to the search (#3010), so the fitted model, its search-work
+        // counters included, is the same either way.
         if !opts.skip_rho_posterior_inference {
-            (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
-                &final_rho,
-                // The box is where λ is numerically resolvable, not the
-                // posterior's support: a draw past a saturated face is valued by
-                // the criterion's exact affine limit from that face, so no
-                // posterior mass is dropped when the box edge moves.
-                &rho_continuation,
-            );
+            (rho_posterior, rho_posterior_escalation) =
+                reml_state.arena.without_charging_the_search(|| {
+                    reml_state.rho_posterior_inference(
+                        &final_rho,
+                        // The box is where λ is numerically resolvable, not the
+                        // posterior's support: a draw past a saturated face is
+                        // valued by the criterion's exact affine limit from that
+                        // face, so no posterior mass is dropped when the box
+                        // edge moves.
+                        &rho_continuation,
+                        &certified_railed_rho,
+                    )
+                });
         }
 
         // Standard errors: prefer the diagonal of the full inverse when
