@@ -1,5 +1,6 @@
 use super::*;
 use super::rail_face::RailFaceLimitOutcome;
+use super::zero_smoothing_face::ZeroSmoothingFaceOutcome;
 
 // Re-exported here while the shared EFS contract lives in `gam-problem`.
 pub use gam_problem::{EfsEval, FixedPointCertificateEval, FixedPointCoordinateCertificate};
@@ -172,6 +173,30 @@ pub trait OuterObjective {
         }
         Ok(RailFaceLimitOutcome::OutsideClosedForm {
             reason: "this objective has no analytic face limit".to_string(),
+        })
+    }
+
+    /// The analytic ZERO-smoothing face law (#2348 Inc 5, lower face).
+    ///
+    /// `face` lists the ρ-coordinates sitting at their `λ → 0` bound. An
+    /// objective whose criterion is analytic at `λ_face = 0` returns the exact
+    /// first-order law `V = V(0) + Σ c′_j λ_j + O(λ²)` there, and the outer
+    /// certificate proves the face from the signs of `c′_j` instead of
+    /// probing a tail. The declines are typed exactly as for
+    /// [`Self::rail_face_limit`]; the default declines for every objective.
+    fn zero_smoothing_face(
+        &mut self,
+        rho: &Array1<f64>,
+        face: &[usize],
+    ) -> Result<ZeroSmoothingFaceOutcome, EstimationError> {
+        if face.iter().any(|&k| k >= rho.len()) {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "rail face {face:?} is outside the rho layout of dimension {}",
+                rho.len()
+            )));
+        }
+        Ok(ZeroSmoothingFaceOutcome::OutsideClosedForm {
+            reason: "this objective has no analytic zero-smoothing face law".to_string(),
         })
     }
 
@@ -937,6 +962,14 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         self.inner.rail_face_limit(rho, face)
     }
 
+    fn zero_smoothing_face(
+        &mut self,
+        rho: &Array1<f64>,
+        face: &[usize],
+    ) -> Result<ZeroSmoothingFaceOutcome, EstimationError> {
+        self.inner.zero_smoothing_face(rho, face)
+    }
+
     fn criterion_invariant_directions(&mut self, theta: &Array1<f64>) -> Option<Array2<f64>> {
         // The invariance is a property of the wrapped criterion's penalty map;
         // the checkpoint layer neither adds nor persists one.
@@ -1064,6 +1097,17 @@ pub struct ClosureObjective<
             ) -> Result<RailFaceLimitOutcome, EstimationError>,
         >,
     >,
+    /// Optional analytic λ→0 zero-smoothing face hook (#2348 Inc 5). `None`
+    /// means the objective has no zero-smoothing face law.
+    pub(crate) zero_smoothing_face_fn: Option<
+        Box<
+            dyn FnMut(
+                &mut S,
+                &Array1<f64>,
+                &[usize],
+            ) -> Result<ZeroSmoothingFaceOutcome, EstimationError>,
+        >,
+    >,
     /// Optional criterion-invariance hook (#2676). Installed by objectives whose
     /// penalty map carries an exact linear redundancy; `None` means "no
     /// invariance", and the certificate deflates nothing — the pre-#2676
@@ -1164,6 +1208,25 @@ where
             Some(f) => f(&mut self.state, rho, face),
             None => Ok(RailFaceLimitOutcome::OutsideClosedForm {
                 reason: "this objective does not implement an analytic face limit".to_string(),
+            }),
+        }
+    }
+
+    fn zero_smoothing_face(
+        &mut self,
+        rho: &Array1<f64>,
+        face: &[usize],
+    ) -> Result<ZeroSmoothingFaceOutcome, EstimationError> {
+        if face.iter().any(|&k| k >= rho.len()) {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "rail face {face:?} is outside the rho layout of dimension {}",
+                rho.len()
+            )));
+        }
+        match self.zero_smoothing_face_fn.as_mut() {
+            Some(f) => f(&mut self.state, rho, face),
+            None => Ok(ZeroSmoothingFaceOutcome::OutsideClosedForm {
+                reason: "this objective does not implement a zero-smoothing face law".to_string(),
             }),
         }
     }
@@ -1298,6 +1361,20 @@ impl<S, Fc, Fe, Fr, Fefs, Feo, Fseed> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo,
         self
     }
 
+    /// Install the analytic λ→0 zero-smoothing face hook (#2348 Inc 5).
+    pub(crate) fn with_zero_smoothing_face<Fzero>(mut self, law: Fzero) -> Self
+    where
+        Fzero: FnMut(
+                &mut S,
+                &Array1<f64>,
+                &[usize],
+            ) -> Result<ZeroSmoothingFaceOutcome, EstimationError>
+            + 'static,
+    {
+        self.zero_smoothing_face_fn = Some(Box::new(law));
+        self
+    }
+
     /// Publish the criterion's exact invariance directions (#2676).
     ///
     /// The closure receives the FULL outer point and returns orthonormal
@@ -1356,6 +1433,7 @@ where
             fixed_point_certificate_fn: self.fixed_point_certificate_fn,
             exact_polish_fn: self.exact_polish_fn,
             rail_face_limit_fn: self.rail_face_limit_fn,
+            zero_smoothing_face_fn: self.zero_smoothing_face_fn,
             criterion_invariance_fn: self.criterion_invariance_fn,
             criterion_rank_fn: self.criterion_rank_fn,
             seed_fn: Some(seed_fn),
@@ -2032,6 +2110,54 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
         }
         limit.face = canonical_face;
         Ok(RailFaceLimitOutcome::Available(limit))
+    }
+
+    fn zero_smoothing_face(
+        &mut self,
+        rho: &Array1<f64>,
+        face: &[usize],
+    ) -> Result<ZeroSmoothingFaceOutcome, EstimationError> {
+        // Same index discipline as `rail_face_limit`: permute the face in,
+        // and map the reported face back so every per-coordinate array stays
+        // aligned with canonical names.
+        let native_rho = self.to_native(rho);
+        let mut native_face = Vec::with_capacity(face.len());
+        for &canonical in face.iter() {
+            match self.perm.get(canonical).copied() {
+                Some(native) => native_face.push(native),
+                None => {
+                    return Ok(ZeroSmoothingFaceOutcome::FaceUnavailable {
+                        reason: format!(
+                            "face coordinate {canonical} is outside the canonical permutation"
+                        ),
+                    });
+                }
+            }
+        }
+        let mut law = match self.inner.zero_smoothing_face(&native_rho, &native_face)? {
+            ZeroSmoothingFaceOutcome::Available(law) => law,
+            declined => return Ok(declined),
+        };
+        let mut canonical_of_native = vec![usize::MAX; self.perm.len()];
+        for (canonical, &native) in self.perm.iter().enumerate() {
+            canonical_of_native[native] = canonical;
+        }
+        let mut canonical_face = Vec::with_capacity(law.face.len());
+        for &native in law.face.iter() {
+            match canonical_of_native.get(native).copied() {
+                Some(canonical) if canonical != usize::MAX => canonical_face.push(canonical),
+                _ => {
+                    return Ok(ZeroSmoothingFaceOutcome::FaceUnavailable {
+                        reason: format!(
+                            "the reported face names native coordinate {native}, which the \
+                             permutation does not cover"
+                        ),
+                    });
+                }
+            }
+        }
+        law.face = canonical_face;
+        Ok(ZeroSmoothingFaceOutcome::Available(law))
     }
 
     fn criterion_rank(&self) -> Option<usize> {

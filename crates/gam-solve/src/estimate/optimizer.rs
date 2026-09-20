@@ -1747,6 +1747,14 @@ where
                  rho: &Array1<f64>,
                  face: &[usize]| { state.rail_face_limit(rho, face) },
             );
+            // The λ→0 end: a covered zero-smoothing face is analytic in λ, so
+            // its first-order law is exact and the face is proven from the
+            // signs of the slopes.
+            let obj = obj.with_zero_smoothing_face(
+                |state: &mut &mut crate::estimate::reml::RemlState<'_>,
+                 rho: &Array1<f64>,
+                 face: &[usize]| { state.zero_smoothing_face(rho, face) },
+            );
             // #2676: publish the criterion's EXACT invariance — the directions
             // of rho along which the penalty map, and therefore the criterion,
             // does not move at all. The outer certificate deflates them instead
