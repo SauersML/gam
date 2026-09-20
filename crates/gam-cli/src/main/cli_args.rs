@@ -44,11 +44,7 @@ pub(crate) enum JointEventsAction {
 
 #[derive(Args, Debug)]
 pub(crate) struct JointEventsFitArgs {
-    #[arg(
-        long,
-        value_name = "CSV",
-        help = "Subjects table: columns id, entry, exit"
-    )]
+    #[arg(long, value_name = "CSV", help = "Subjects table: columns id, entry, exit")]
     pub(crate) subjects: PathBuf,
     #[arg(
         long,
@@ -69,11 +65,7 @@ pub(crate) struct JointEventsFitArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct JointEventsForecastArgs {
-    #[arg(
-        long,
-        value_name = "MODEL.json",
-        help = "A model saved by `gam joint-events fit`"
-    )]
+    #[arg(long, value_name = "MODEL.json", help = "A model saved by `gam joint-events fit`")]
     pub(crate) model: PathBuf,
     #[arg(
         long,
@@ -94,11 +86,7 @@ pub(crate) struct JointEventsForecastArgs {
         help = "Forecast horizons as offsets after each history's exit, comma separated"
     )]
     pub(crate) horizons: Vec<f64>,
-    #[arg(
-        long,
-        value_name = "JSON",
-        help = "Write the forecasts here instead of stdout"
-    )]
+    #[arg(long, value_name = "JSON", help = "Write the forecasts here instead of stdout")]
     pub(crate) out: Option<PathBuf>,
 }
 
@@ -496,11 +484,7 @@ pub(crate) struct PredictArgs {
     /// `--level`: with `--training-data` the exact full-conformal set of a
     /// Gaussian-identity fit, or with `--calibration` the split-conformal band
     /// calibrated on a held-out labeled table.
-    #[arg(
-        long = "conformal",
-        default_value_t = false,
-        conflicts_with = "uncertainty"
-    )]
+    #[arg(long = "conformal", default_value_t = false, conflicts_with = "uncertainty")]
     pub(crate) conformal: bool,
     /// Held-out labeled table (CSV or parquet, including the response column)
     /// that calibrates the split-conformal band.
@@ -510,11 +494,7 @@ pub(crate) struct PredictArgs {
     /// response column). The saved model keeps only the p x p frozen penalty,
     /// never per-row training data, so the exact full-conformal set re-reads
     /// its labeled rows from here.
-    #[arg(
-        long = "training-data",
-        requires = "conformal",
-        conflicts_with = "calibration"
-    )]
+    #[arg(long = "training-data", requires = "conformal", conflicts_with = "calibration")]
     pub(crate) training_data: Option<PathBuf>,
 }
 
@@ -550,10 +530,7 @@ pub(crate) struct LatentResidualArgs {
         help = "Dataset containing the score column and the conditioning covariates"
     )]
     pub(crate) data: PathBuf,
-    #[arg(
-        long = "out",
-        help = "Output CSV path for the per-row conditional latent residuals"
-    )]
+    #[arg(long = "out", help = "Output CSV path for the per-row conditional latent residuals")]
     pub(crate) out: PathBuf,
     #[arg(long = "id-column")]
     pub(crate) id_column: Option<String>,

@@ -2,6 +2,7 @@ use super::*;
 use gam::families::inference::saved_summary::{saved_model_report_input, saved_model_summary};
 use gam::families::inference::summary_text::render_summary_text;
 
+
 fn saved_alo_report_data(
     alo: gam_predict::SavedModelAloDiagnostics,
 ) -> Result<report::AloData, String> {
@@ -555,8 +556,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                     // squares inside `γ_{n+1}²·Σy²` is the rounding residue of a constant
                     // response, which has no variance to explain.
                     let energy: f64 = y.iter().map(|&yi| yi * yi).sum();
-                    let band =
-                        gam::linalg::roundoff::accumulation_growth(y.len() + 1).powi(2) * energy;
+                    let band = gam::linalg::roundoff::accumulation_growth(y.len() + 1).powi(2) * energy;
                     if ss_tot > band {
                         r_squared = Some(1.0 - ss_res / ss_tot);
                     }
@@ -871,8 +871,9 @@ fn report_family_residuals(
     // Predictive CDF value → normal scale. Only the exact endpoints have no
     // finite quantile, so u is held inside the representable open interval:
     // the smallest positive double and the largest double below one.
-    let to_normal =
-        |u: f64| standard_normal_quantile(u.clamp(f64::MIN_POSITIVE, 1.0_f64.next_down()));
+    let to_normal = |u: f64| {
+        standard_normal_quantile(u.clamp(f64::MIN_POSITIVE, 1.0_f64.next_down()))
+    };
 
     match response {
         ResponseFamily::Gaussian => {

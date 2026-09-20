@@ -110,10 +110,9 @@ fn a_cli_saved_joint_model_forecasts_bit_identically_in_every_process() {
         &path("forecast.json"),
     ]);
     assert_eq!(forecast.status.code(), Some(0), "{}", stderr(&forecast));
-    let written: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(path("forecast.json")).expect("read forecast"),
-    )
-    .expect("parse forecast");
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path("forecast.json")).expect("read forecast"))
+            .expect("parse forecast");
     let cli = &written["forecasts"][0];
     assert_eq!(cli["id"], "new");
 
@@ -148,18 +147,9 @@ fn a_cli_saved_joint_model_forecasts_bit_identically_in_every_process() {
     // quadrature route, so the comparison covers its reported error too.
     assert!(reloaded.incidence_error.iter().any(|&e| e > 0.0));
     for forecast in [&in_memory, &reloaded] {
-        assert_eq!(
-            json_bits(&cli["horizons"]),
-            bits(forecast.horizons.iter().copied())
-        );
-        assert_eq!(
-            json_bits(&cli["survival"]),
-            bits(forecast.survival.iter().copied())
-        );
-        assert_eq!(
-            json_bits(&cli["incidence"]),
-            bits(forecast.incidence.iter().copied())
-        );
+        assert_eq!(json_bits(&cli["horizons"]), bits(forecast.horizons.iter().copied()));
+        assert_eq!(json_bits(&cli["survival"]), bits(forecast.survival.iter().copied()));
+        assert_eq!(json_bits(&cli["incidence"]), bits(forecast.incidence.iter().copied()));
         assert_eq!(
             json_bits(&cli["incidence_error"]),
             bits(forecast.incidence_error.iter().copied())
@@ -211,10 +201,7 @@ fn a_cli_fit_takes_event_rows_in_any_order_and_refuses_invalid_tables() {
         "shuffled.csv",
         "id,time,mark\nb,5,visit\na,4,cvd_death\nb,1,visit\na,4,diagnosis\n",
     );
-    for (events, model) in [
-        (&sorted, path("sorted.json")),
-        (&shuffled, path("shuffled.json")),
-    ] {
+    for (events, model) in [(&sorted, path("sorted.json")), (&shuffled, path("shuffled.json"))] {
         let fitted = fit(&subjects, events, &model);
         assert_eq!(fitted.status.code(), Some(0), "{}", stderr(&fitted));
     }
@@ -239,14 +226,8 @@ fn a_cli_fit_takes_event_rows_in_any_order_and_refuses_invalid_tables() {
         output.stdout
     };
     assert_eq!(
-        forecast(&write(
-            "new_reversed.csv",
-            "id,time,mark\nnew,2,visit\nnew,1,visit\n"
-        )),
-        forecast(&write(
-            "new_sorted.csv",
-            "id,time,mark\nnew,1,visit\nnew,2,visit\n"
-        ))
+        forecast(&write("new_reversed.csv", "id,time,mark\nnew,2,visit\nnew,1,visit\n")),
+        forecast(&write("new_sorted.csv", "id,time,mark\nnew,1,visit\nnew,2,visit\n"))
     );
 
     let out = path("refused.json");
@@ -257,20 +238,12 @@ fn a_cli_fit_takes_event_rows_in_any_order_and_refuses_invalid_tables() {
     let control = fit(&subjects, &visit, &path("control.json"));
     assert_eq!(control.status.code(), Some(0), "{}", stderr(&control));
     for (subjects, events, reason) in [
-        (
-            &subjects,
-            &unknown,
-            "subject \"c\" is not in the subjects table",
-        ),
+        (&subjects, &unknown, "subject \"c\" is not in the subjects table"),
         (&duplicated, &visit, "subject \"a\" has two rows"),
     ] {
         let refused = fit(subjects, events, &out);
         assert!(!refused.status.success(), "{reason}");
-        assert!(
-            stderr(&refused).contains(reason),
-            "{reason}: {}",
-            stderr(&refused)
-        );
+        assert!(stderr(&refused).contains(reason), "{reason}: {}", stderr(&refused));
         assert!(!std::path::Path::new(&out).exists(), "{reason}");
     }
 }

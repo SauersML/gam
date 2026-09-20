@@ -53,11 +53,7 @@ fn write_fixture(path: &Path, rows: usize, seed: u64, with_response: bool) {
         let z = 3.0 + 2.0 * (M_SHIFT * x + residual_sd * zeta);
         let y = -0.2 + 0.5 * x + 0.6 * zeta + normal() > 0.0;
         let record = if with_response {
-            [
-                format!("{x:.17e}"),
-                format!("{z:.17e}"),
-                u8::from(y).to_string(),
-            ]
+            [format!("{x:.17e}"), format!("{z:.17e}"), u8::from(y).to_string()]
         } else {
             [format!("row{i}"), format!("{x:.17e}"), format!("{z:.17e}")]
         };
@@ -98,11 +94,7 @@ fn fit(scratch: &Path, train: &Path, latent_measure: &str) -> std::path::PathBuf
             &model,
         ],
     );
-    assert!(
-        output.status.success(),
-        "gam fit ({latent_measure}) failed: {}",
-        describe(&output)
-    );
+    assert!(output.status.success(), "gam fit ({latent_measure}) failed: {}", describe(&output));
     model
 }
 
@@ -129,11 +121,7 @@ fn latent_residual_cli_matches_the_saved_model_3016() {
             Path::new("id"),
         ],
     );
-    assert!(
-        output.status.success(),
-        "gam latent-residual failed: {}",
-        describe(&output)
-    );
+    assert!(output.status.success(), "gam latent-residual failed: {}", describe(&output));
 
     let mut reader = csv::Reader::from_path(&out).expect("open residual csv");
     let headers = reader.headers().expect("residual csv header").clone();
@@ -171,19 +159,9 @@ fn latent_residual_cli_matches_the_saved_model_3016() {
     let global = fit(dir, &train, "global-empirical");
     let refused = gam(
         dir,
-        &[
-            Path::new("latent-residual"),
-            &global,
-            &held_out,
-            Path::new("--out"),
-            &out,
-        ],
+        &[Path::new("latent-residual"), &global, &held_out, Path::new("--out"), &out],
     );
-    assert!(
-        !refused.status.success(),
-        "a global-empirical model has no residual: {}",
-        describe(&refused)
-    );
+    assert!(!refused.status.success(), "a global-empirical model has no residual: {}", describe(&refused));
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
         stderr.contains("conditional-location-scale"),

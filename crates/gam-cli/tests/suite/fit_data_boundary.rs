@@ -3,24 +3,9 @@ use std::{fs, process::Command};
 #[test]
 fn cli_fit_reports_degenerate_inputs_at_the_shared_boundary() {
     let cases = [
-        (
-            "y,x\n0,0\n1,NaN\n2,1\n",
-            "y ~ x",
-            "column 'x'",
-            "non-finite",
-        ),
-        (
-            "y,x\n0,0\n1,inf\n2,1\n",
-            "y ~ x",
-            "column 'x'",
-            "non-finite",
-        ),
-        (
-            "y,x\n0,0\n1,-inf\n2,1\n",
-            "y ~ x",
-            "column 'x'",
-            "non-finite",
-        ),
+        ("y,x\n0,0\n1,NaN\n2,1\n", "y ~ x", "column 'x'", "non-finite"),
+        ("y,x\n0,0\n1,inf\n2,1\n", "y ~ x", "column 'x'", "non-finite"),
+        ("y,x\n0,0\n1,-inf\n2,1\n", "y ~ x", "column 'x'", "non-finite"),
         (
             "y,x\n0,NA\n1,4\n2,NA\n",
             "y ~ x",
@@ -33,12 +18,7 @@ fn cli_fit_reports_degenerate_inputs_at_the_shared_boundary() {
             "column 'g'",
             "fewer than two levels",
         ),
-        (
-            "y,x,x\n0,0,1\n1,1,0\n2,2,1\n",
-            "y ~ x",
-            "column 'x'",
-            "duplicate",
-        ),
+        ("y,x,x\n0,0,1\n1,1,0\n2,2,1\n", "y ~ x", "column 'x'", "duplicate"),
     ];
     for (csv, formula, column, problem) in cases {
         let dir = tempfile::tempdir().unwrap();

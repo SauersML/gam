@@ -38,20 +38,14 @@ fn write_training_fixture(path: &Path) {
         (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
     };
     let mut writer = csv::Writer::from_path(path).expect("create training fixture");
-    writer
-        .write_record(["x", "z", "y"])
-        .expect("write training header");
+    writer.write_record(["x", "z", "y"]).expect("write training header");
     let rows = 800;
     for i in 0..rows {
         let x = -2.0 + 4.0 * i as f64 / (rows - 1) as f64;
         let z = normal();
         let y = -0.2 + 0.5 * x + 0.8 * z + normal() > 0.0;
         writer
-            .write_record([
-                format!("{x:.17e}"),
-                format!("{z:.17e}"),
-                u8::from(y).to_string(),
-            ])
+            .write_record([format!("{x:.17e}"), format!("{z:.17e}"), u8::from(y).to_string()])
             .expect("write training row");
     }
     writer.flush().expect("flush training fixture");
@@ -62,12 +56,9 @@ fn a_request_document_without_a_family_accepts_latent_measure_2956() {
     let scratch = tempfile::tempdir().expect("scratch dir");
     let train_path = scratch.path().join("train.csv");
     write_training_fixture(&train_path);
-    let dataset =
-        gam_data::load_csvwith_inferred_schema(&train_path).expect("load training fixture");
+    let dataset = gam_data::load_csvwith_inferred_schema(&train_path).expect("load training fixture");
 
-    for (requested, expect_global_empirical) in
-        [("global-empirical", true), ("standard-normal", false)]
-    {
+    for (requested, expect_global_empirical) in [("global-empirical", true), ("standard-normal", false)] {
         let document = request_document(&format!(
             r#"{{"slope_formula": "1", "z_column": "z", "latent_measure": "{requested}"}}"#
         ));

@@ -10,8 +10,8 @@ pub(crate) use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8
 pub(crate) use csv::WriterBuilder;
 
 pub(crate) use gam::estimate::{
-    BlockRole, ContinuousSmoothnessOrderStatus, ModelSummary, ParametricTermSummary,
-    SummaryBlockOffset, UnifiedFitResult, smooth_term_summary_rows,
+    BlockRole, ContinuousSmoothnessOrderStatus, ModelSummary,
+    ParametricTermSummary, SummaryBlockOffset, UnifiedFitResult, smooth_term_summary_rows,
 };
 
 pub(crate) use gam::families::survival::latent::fixed_latent_hazard_frailty;
@@ -26,7 +26,9 @@ pub(crate) use gam::data::{
 };
 
 pub(crate) use gam::inference::formula_dsl::{
-    LinkChoice, LinkMode, ParsedFormula, ParsedTerm, parse_formula, parse_surv_response,
+    LinkChoice, LinkMode, ParsedFormula, ParsedTerm,
+    parse_formula,
+    parse_surv_response,
 };
 
 pub(crate) use gam::inference::model::{
@@ -36,9 +38,10 @@ pub(crate) use gam::inference::model::{
 pub(crate) use gam_data::ColumnKindTag;
 
 pub(crate) use gam::inference::model_payload_builders::{
-    StandardPayloadInputs, apply_request_metadata, assemble_residual_cascade_payload,
-    assemble_spline_scan_payload, assemble_standard_payload,
-};
+    StandardPayloadInputs,
+    apply_request_metadata,
+    assemble_residual_cascade_payload, assemble_spline_scan_payload, assemble_standard_payload,
+    };
 
 pub(crate) use gam_predict::input::{
     build_predict_input_for_model, build_transformation_normal_observed_scores,
@@ -49,8 +52,8 @@ pub(crate) use gam_predict::linalg::{PredictionCovarianceBackend, rowwise_local_
 pub(crate) use gam::matrix::{DesignMatrix, SymmetricMatrix};
 
 pub(crate) use gam_predict::{
-    FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod, PredictInput,
-    PredictUncertaintyOptions, PredictableModel, predict_gam,
+    FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod,
+    PredictInput, PredictUncertaintyOptions, PredictableModel, predict_gam,
     predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
 
@@ -72,19 +75,19 @@ pub(crate) use gam::families::survival::survival_event_code_from_value;
 
 pub(crate) use gam::families::survival::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
-    add_survival_time_derivative_guard_offset, build_survival_time_basis,
-    build_survival_time_offsets_for_likelihood, build_survival_timewiggle_derivative_design,
-    center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
-    normalize_survival_time_pair, parse_survival_likelihood_mode, parse_survival_time_basis_config,
-    require_structural_survival_time_basis, resolved_survival_time_basis_config_from_build,
-    survival_derivative_guard_for_likelihood,
+    add_survival_time_derivative_guard_offset, build_survival_time_basis, build_survival_time_offsets_for_likelihood,
+    build_survival_timewiggle_derivative_design, center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
+    normalize_survival_time_pair,
+    parse_survival_likelihood_mode, parse_survival_time_basis_config,
+    require_structural_survival_time_basis, resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
 };
 
 pub(crate) use gam::families::wiggle::monotone_wiggle_basis_with_derivative_order;
 
 pub(crate) use gam::families::survival::location_scale::{
-    SurvivalLocationScalePredictInput, SurvivalLocationScaleTimeParameterization,
-    predict_survival_location_scale, replay_survival_covariate_channels,
+    SurvivalLocationScalePredictInput,
+    SurvivalLocationScaleTimeParameterization, predict_survival_location_scale,
+    replay_survival_covariate_channels,
 };
 
 pub(crate) use gam::families::survival::predict::{
@@ -94,13 +97,20 @@ pub(crate) use gam::families::survival::predict::{
     saved_survival_location_scale_fit_result, saved_survival_runtime_baseline_config,
 };
 
-pub(crate) use gam::term_builder::resolve_role_col;
+pub(crate) use gam::term_builder::{
+    resolve_role_col,
+};
 
-pub(crate) use gam::types::{LikelihoodSpec, ResponseFamily};
+pub(crate) use gam::types::{
+    LikelihoodSpec,
+    ResponseFamily,
+};
 
 pub(crate) use gam::families::fit_orchestration::{
-    FitConfig, FitResult, PreparedSurvivalTimeStack, WorkflowError, drop_zero_weight_rows,
-    fit_from_formula_with_notes, fit_required_columns, formula_columns, is_binary_response,
+    FitConfig, FitResult,
+    PreparedSurvivalTimeStack, WorkflowError,
+    drop_zero_weight_rows, fit_from_formula_with_notes, fit_required_columns, formula_columns,
+    is_binary_response,
     prepare_survival_time_stack, resolve_offset_column, resolve_weight_column,
 };
 
@@ -151,26 +161,26 @@ mod model_summary;
 mod multinomial_cli;
 #[path = "main/prediction_csv.rs"]
 mod prediction_csv;
-#[path = "main/run_compare.rs"]
-mod run_compare;
 #[path = "main/run_crosscoder.rs"]
 mod run_crosscoder;
-#[path = "main/run_diagnose.rs"]
-mod run_diagnose;
-#[path = "main/run_fit.rs"]
-mod run_fit;
-#[path = "main/run_fit_events.rs"]
-mod run_fit_events;
-#[path = "main/run_joint_events.rs"]
-mod run_joint_events;
 #[path = "main/run_parameter_decomposition.rs"]
 mod run_parameter_decomposition;
+#[path = "main/run_compare.rs"]
+mod run_compare;
+#[path = "main/run_diagnose.rs"]
+mod run_diagnose;
+#[path = "main/run_summary.rs"]
+mod run_summary;
+#[path = "main/run_fit.rs"]
+mod run_fit;
+#[path = "main/run_joint_events.rs"]
+mod run_joint_events;
 #[path = "main/run_predict.rs"]
 mod run_predict;
 #[path = "main/run_sample_generate_report.rs"]
 mod run_sample_generate_report;
-#[path = "main/run_summary.rs"]
-mod run_summary;
+#[path = "main/run_fit_events.rs"]
+mod run_fit_events;
 #[path = "main/smooth_warnings.rs"]
 mod smooth_warnings;
 
@@ -182,16 +192,16 @@ pub(crate) use model_build::*;
 pub(crate) use model_summary::*;
 pub(crate) use multinomial_cli::*;
 pub(crate) use prediction_csv::*;
-pub(crate) use run_compare::*;
 pub(crate) use run_crosscoder::*;
-pub(crate) use run_diagnose::*;
-pub(crate) use run_fit::*;
-pub(crate) use run_fit_events::*;
-pub(crate) use run_joint_events::*;
 pub(crate) use run_parameter_decomposition::*;
+pub(crate) use run_compare::*;
+pub(crate) use run_diagnose::*;
+pub(crate) use run_summary::*;
+pub(crate) use run_fit::*;
+pub(crate) use run_joint_events::*;
 pub(crate) use run_predict::*;
 pub(crate) use run_sample_generate_report::*;
-pub(crate) use run_summary::*;
+pub(crate) use run_fit_events::*;
 pub(crate) use smooth_warnings::*;
 
 /// Bypass-drop process exit, routed through a fn-pointer indirection so

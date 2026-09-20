@@ -168,8 +168,8 @@ fn build_saved_cause_specific_survival_alo_input(
         .compose_offset(primary_offset.view(), "saved survival ALO covariate block")
         .map_err(|error| error.to_string())?;
 
-    let weibull_baseline_in_beta =
-        likelihood_mode == SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle();
+    let weibull_baseline_in_beta = likelihood_mode == SurvivalLikelihoodMode::Weibull
+        && !model.has_baseline_time_wiggle();
     let time_config = load_survival_time_basis_config_from_model(model)?;
     let mut time_build =
         build_survival_time_basis(&age_entry, &age_exit, time_config.clone(), None)?;
@@ -196,7 +196,8 @@ fn build_saved_cause_specific_survival_alo_input(
             &anchor_row,
         )?;
     }
-    if likelihood_mode != SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle() {
+    if likelihood_mode != SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle()
+    {
         require_structural_survival_time_basis(
             &time_build.basisname,
             "saved transformation survival ALO",
@@ -442,8 +443,10 @@ fn build_saved_marginal_slope_survival_alo_input(
         col_map,
         "resolved_slopespec",
     )?;
-    let slope_build = build_term_collection_design(design_input, &slopespec)
-        .map_err(|error| format!("failed to build saved marginal-slope slope design: {error}"))?;
+    let slope_build =
+        build_term_collection_design(design_input, &slopespec).map_err(|error| {
+            format!("failed to build saved marginal-slope slope design: {error}")
+        })?;
     let mut slope_offset = slope_build
         .compose_offset(
             noise_offset.view(),
@@ -451,7 +454,8 @@ fn build_saved_marginal_slope_survival_alo_input(
         )
         .map_err(|error| error.to_string())?;
     slope_offset += model.baseline_slope.ok_or_else(|| {
-        "saved survival marginal-slope ALO model is missing its fitted slope baseline".to_string()
+        "saved survival marginal-slope ALO model is missing its fitted slope baseline"
+            .to_string()
     })?;
     // gam#2765 / gam#2767: the leave-one-out replay re-evaluates the row
     // program, which reads the slope at entry, at exit, and as an exit-time
@@ -459,17 +463,20 @@ fn build_saved_marginal_slope_survival_alo_input(
     // time-CONSTANT slope, so all three are rebuilt from the saved margin.
     let slope_replay = match model.slope_time_basis.as_ref() {
         None => None,
-        Some(time_basis) => Some(gam::families::survival::replay_slope_follow_up_designs(
-            &age_entry,
-            &age_exit,
-            time_basis,
-            &slope_build.design,
-        )?),
+        Some(time_basis) => Some(
+            gam::families::survival::replay_slope_follow_up_designs(
+                &age_entry,
+                &age_exit,
+                time_basis,
+                &slope_build.design,
+            )?,
+        ),
     };
     let slope_exit_design = slope_replay
         .as_ref()
         .map_or_else(|| slope_build.design.clone(), |replay| replay.exit.clone());
-    let slope_follow_up = slope_replay.map(|replay| (replay.entry, replay.derivative_exit));
+    let slope_follow_up = slope_replay
+        .map(|replay| (replay.entry, replay.derivative_exit));
 
     let time_config = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_config, None)?;
@@ -1214,13 +1221,7 @@ pub(crate) fn run_predict_model(
     } else {
         None
     };
-    run_predict_unified(
-        args,
-        model,
-        &pred_input,
-        &*predictor,
-        extrapolation_variance,
-    )
+    run_predict_unified(args, model, &pred_input, &*predictor, extrapolation_variance)
 }
 
 pub(crate) fn validate_level(level: f64) -> Result<(), String> {
@@ -1420,11 +1421,7 @@ fn run_predict_conformal(
         (Some(training_path), None) => {
             let extras = vec![response_column("--training-data")?];
             let training = load_datasetwith_model_schema_extra(training_path, model, &extras)?;
-            require_dataset_rows(
-                "predict --training-data",
-                training_path,
-                training.values.nrows(),
-            )?;
+            require_dataset_rows("predict --training-data", training_path, training.values.nrows())?;
             let training_col_map = training.column_map();
             gam_predict::conformal_routes::full_conformal_prediction_columns(
                 model,
@@ -1448,13 +1445,8 @@ fn run_predict_conformal(
                     .flatten()
                     .map(str::to_string),
             );
-            let calibration =
-                load_datasetwith_model_schema_extra(calibration_path, model, &extras)?;
-            require_dataset_rows(
-                "predict --calibration",
-                calibration_path,
-                calibration.values.nrows(),
-            )?;
+            let calibration = load_datasetwith_model_schema_extra(calibration_path, model, &extras)?;
+            require_dataset_rows("predict --calibration", calibration_path, calibration.values.nrows())?;
             let calibration_col_map = calibration.column_map();
             let (calibration_offset, calibration_noise_offset) = resolve_predict_offsets(
                 model,
@@ -1512,9 +1504,7 @@ pub(crate) fn run_predict(args: PredictArgs) -> CliResult<()> {
     // standard load so `SavedModel::load_from_path` is never handed one.
     if is_multinomial_model_file(&args.model) {
         if args.conformal {
-            return Err("--conformal supports standard models only"
-                .to_string()
-                .into());
+            return Err("--conformal supports standard models only".to_string().into());
         }
         return run_predict_multinomial(&args).map_err(CliError::from);
     }
@@ -2489,7 +2479,8 @@ pub(crate) fn run_predict_survival(
             &time_anchor_row,
         )?;
     }
-    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle()
+    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
+        && !model.has_baseline_time_wiggle()
     {
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }

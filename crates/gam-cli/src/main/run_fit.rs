@@ -125,17 +125,8 @@ pub(crate) fn run_fit(args: FitArgs) -> CliResult<()> {
     if fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some() {
         let out = args.out.as_ref().ok_or("CTN fitting requires --out")?;
         let required = gam::inference::ctn::required_fit_columns(&formula_text, &fit_config)?;
-        let dataset = load_fit_dataset_with_roles(
-            &args.data,
-            &required.into_iter().collect::<Vec<_>>(),
-            &parsed,
-            false,
-        )?;
-        let payload = gam::inference::model_payload_builders::fit_formula_to_payload(
-            formula_text,
-            &dataset,
-            &fit_config,
-        )?;
+        let dataset = load_fit_dataset_with_roles(&args.data, &required.into_iter().collect::<Vec<_>>(), &parsed, false)?;
+        let payload = gam::inference::model_payload_builders::fit_formula_to_payload(formula_text, &dataset, &fit_config)?;
         let model = SavedModel::from_payload(payload);
         return Ok(write_model_json(out, &model)?);
     }
@@ -160,12 +151,7 @@ pub(crate) fn run_fit(args: FitArgs) -> CliResult<()> {
         .as_deref()
         .is_some_and(gam::families::fit_orchestration::is_multinomial_family_name)
     {
-        return Ok(run_fit_multinomial(
-            &args,
-            &parsed,
-            &formula_text,
-            &fit_config,
-        )?);
+        return Ok(run_fit_multinomial(&args, &parsed, &formula_text, &fit_config)?);
     }
     // Transformation-normal fits go through the library materializer, which refuses
     // link(...), linkwiggle(...), frailty, a noise formula and marginal-slope
@@ -180,9 +166,7 @@ pub(crate) fn run_fit(args: FitArgs) -> CliResult<()> {
         }
         if !family_names_transformation_normal {
             if let Some(family) = fit_config.family.as_deref() {
-                return Err(
-                    format!("--transformation-normal conflicts with --family {family}").into(),
-                );
+                return Err(format!("--transformation-normal conflicts with --family {family}").into());
             }
         }
         return run_library_formula_fit(&args, &parsed, formula_text, &fit_config);
@@ -214,9 +198,8 @@ pub(crate) fn run_fit(args: FitArgs) -> CliResult<()> {
     }
     // Several expectile levels are one joint location-scale fit, which the
     // library's formula-to-payload service assembles like any location-scale model.
-    let joint_expectile =
-        gam::families::fit_orchestration::expectile_levels_for_config(&fit_config)?
-            .is_some_and(|levels| levels.len() > 1);
+    let joint_expectile = gam::families::fit_orchestration::expectile_levels_for_config(&fit_config)?
+        .is_some_and(|levels| levels.len() > 1);
     if joint_expectile {
         return run_library_formula_fit(&args, &parsed, formula_text, &fit_config);
     }
@@ -454,7 +437,9 @@ fn run_library_formula_fit(
     let phase_start = std::time::Instant::now();
     log::debug!("[PHASE] formula fit start n={}", dataset.values.nrows());
     let payload = gam::inference::model_payload_builders::fit_formula_to_payload(
-        formula, &dataset, fit_config,
+        formula,
+        &dataset,
+        fit_config,
     )
     .map_err(|error| CliError::from(error).context("formula fit failed"))?;
     log::debug!(
@@ -497,15 +482,10 @@ fn refuse_survival_only_settings_without_surv(fit_config: &FitConfig) -> Result<
         || !fit_config
             .resolved_survival_likelihood()
             .eq_ignore_ascii_case("transformation")
-        || !fit_config
-            .baseline_target
-            .trim()
-            .eq_ignore_ascii_case("linear")
+        || !fit_config.baseline_target.trim().eq_ignore_ascii_case("linear")
         || !fit_config.time_basis.trim().eq_ignore_ascii_case("ispline");
     if survival_only {
-        return Err(
-            "survival-only options require a Surv(entry, exit, event) response".to_string(),
-        );
+        return Err("survival-only options require a Surv(entry, exit, event) response".to_string());
     }
     if fit_config.noise_offset_column.is_some() && fit_config.noise_formula.is_none() {
         return Err("--noise-offset-column requires --predict-noise".to_string());
@@ -659,3 +639,4 @@ pub(crate) fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize>
         }
     }
 }
+

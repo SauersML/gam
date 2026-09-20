@@ -2,13 +2,13 @@
 //! write a JSON summary with optional forecasts.
 
 use crate::cli_args::FitEventsArgs;
+use gam::families::custom_family::BlockwiseFitOptions;
 use gam::event_history::{
     CovariateCells, CovariateSegment, Event, EventHistoryCohort, ForecastRequest, FutureSegment,
     MarkKind, PopulationForecastRequest, ReferenceStrata, SubjectHistory,
     fit_event_history_formulas, forecast, latent_state, pit_uniform_distance, population_forecast,
     predictive_pit, resolve_mark_vocabulary,
 };
-use gam::families::custom_family::BlockwiseFitOptions;
 use ndarray::Array2;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -106,10 +106,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
             let (name, kind) = spec
                 .split_once(':')
                 .ok_or_else(|| format!("--marks entry {spec:?} is not name:kind"))?;
-            pairs.push((
-                name.trim().to_string(),
-                MarkKind::parse(kind).map_err(|e| e.to_string())?,
-            ));
+            pairs.push((name.trim().to_string(), MarkKind::parse(kind).map_err(|e| e.to_string())?));
         }
         Some(pairs)
     };
@@ -296,10 +293,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
             "reference_refinements".to_string(),
             json!(fit.reference_refinements),
         );
-        summary.insert(
-            "reference_masks".to_string(),
-            json!(fit.centring.as_ref().map_or(0, |c| c.masks)),
-        );
+        summary.insert("reference_masks".to_string(), json!(fit.centring.as_ref().map_or(0, |c| c.masks)));
         summary.insert(
             "reference_certificate".to_string(),
             json!(fit.reference_certificate),
@@ -362,11 +356,10 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
     summary.insert("log_likelihood".to_string(), json!(fit.fit.log_likelihood));
     summary.insert(
         "reml_score".to_string(),
-        json!(
-            fit.fit
-                .comparable_reml_score()
-                .map_err(|err| format!("failed to compute comparable REML score: {err}"))?
-        ),
+        json!(fit
+            .fit
+            .comparable_reml_score()
+            .map_err(|err| format!("failed to compute comparable REML score: {err}"))?),
     );
     summary.insert("raw_reml_score".to_string(), json!(fit.fit.reml_score()));
     summary.insert(

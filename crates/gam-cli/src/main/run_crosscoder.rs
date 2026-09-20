@@ -66,7 +66,12 @@ pub(crate) fn read_npy_array(path: &Path) -> Result<ArrayD<f64>, String> {
         Order::C => ArrayD::from_shape_vec(IxDyn(&shape), values),
         Order::Fortran => ArrayD::from_shape_vec(IxDyn(&shape).f(), values),
     };
-    result.map_err(|err| format!("NPY {} has invalid shape {shape:?}: {err}", path.display()))
+    result.map_err(|err| {
+        format!(
+            "NPY {} has invalid shape {shape:?}: {err}",
+            path.display()
+        )
+    })
 }
 
 /// Load one floating-point, two-dimensional NPY. Row alignment, finite values, and

@@ -60,11 +60,7 @@ fn fit_and_predict(dir: &Path, csv_body: &str, formula: &str) -> Vec<f64> {
     let pred = dir.join("pred.csv");
     std::fs::write(&data, csv_body).expect("write training CSV");
     let fit = gam(&["fit", path_str(&data), formula, "--out", path_str(&model)]);
-    assert!(
-        fit.status.success(),
-        "fit `{formula}` failed: {}",
-        stderr(&fit)
-    );
+    assert!(fit.status.success(), "fit `{formula}` failed: {}", stderr(&fit));
     let predict = gam(&[
         "predict",
         path_str(&model),
@@ -87,8 +83,7 @@ fn zero_plus_x_is_least_squares_through_the_origin() {
     for (xi, yi) in x.iter().zip(&y) {
         csv.push_str(&format!("{yi},{xi}\n"));
     }
-    let slope =
-        x.iter().zip(&y).map(|(a, b)| a * b).sum::<f64>() / x.iter().map(|a| a * a).sum::<f64>();
+    let slope = x.iter().zip(&y).map(|(a, b)| a * b).sum::<f64>() / x.iter().map(|a| a * a).sum::<f64>();
 
     // An unpenalized slope with the intercept removed is exactly OLS through
     // the origin; both spellings of intercept removal lower to that model.
@@ -119,10 +114,7 @@ fn zero_plus_x_is_least_squares_through_the_origin() {
             "`y ~ 0 + x` at x={xi}: fitted {fi} is not proportional to x (slope {ratio})"
         );
     }
-    assert!(
-        ratio > 0.0 && ratio <= slope * (1.0 + 1e-12),
-        "slope {ratio} vs OLS {slope}"
-    );
+    assert!(ratio > 0.0 && ratio <= slope * (1.0 + 1e-12), "slope {ratio} vs OLS {slope}");
 }
 
 #[test]
@@ -212,10 +204,7 @@ fn malformed_option_values_fail_naming_term_and_option() {
 
     for (formula, needles) in [
         ("y ~ s(x, k=ten)", &["s(x", "k=ten"][..]),
-        (
-            "y ~ s(x, degree=2, penalty_order=3)",
-            &["s(x", "penalty_order=3"][..],
-        ),
+        ("y ~ s(x, degree=2, penalty_order=3)", &["s(x", "penalty_order=3"][..]),
     ] {
         let out = gam(&["fit", path_str(&data), formula, "--out", path_str(&model)]);
         assert_eq!(
@@ -226,10 +215,7 @@ fn malformed_option_values_fail_naming_term_and_option() {
         );
         let error = stderr(&out);
         for needle in needles {
-            assert!(
-                error.contains(needle),
-                "`{formula}` error lacks `{needle}`: {error}"
-            );
+            assert!(error.contains(needle), "`{formula}` error lacks `{needle}`: {error}");
         }
     }
 }

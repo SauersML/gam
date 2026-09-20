@@ -336,16 +336,10 @@ impl Pair {
     fn load(dir: &Path) -> Result<Self, String> {
         let meta = read_json(&dir.join("meta.json"))?;
         if meta.get("stage").and_then(Value::as_str) != Some("pair") {
-            return Err(format!(
-                "{} is not an export_block.py pair export",
-                dir.display()
-            ));
+            return Err(format!("{} is not an export_block.py pair export", dir.display()));
         }
         if meta.get("use_parallel_residual").and_then(Value::as_bool) != Some(true) {
-            return Err(
-                "the composition reads x_first = x_in + attn + y_first, a parallel residual"
-                    .to_string(),
-            );
+            return Err("the composition reads x_first = x_in + attn + y_first, a parallel residual".to_string());
         }
         if meta.get("norm_class").and_then(Value::as_str) != Some("LayerNorm") {
             return Err("the declared second stage freezes a LayerNorm".to_string());
@@ -388,12 +382,8 @@ impl Pair {
         };
         let norm = |index: u64| -> Result<LayerNorm, String> {
             Ok(LayerNorm {
-                weight: read_vector(
-                    &dir.join(format!("layer{index}.post_attention_layernorm.weight.npy")),
-                )?,
-                bias: read_vector(
-                    &dir.join(format!("layer{index}.post_attention_layernorm.bias.npy")),
-                )?,
+                weight: read_vector(&dir.join(format!("layer{index}.post_attention_layernorm.weight.npy")))?,
+                bias: read_vector(&dir.join(format!("layer{index}.post_attention_layernorm.bias.npy")))?,
                 eps,
             })
         };
@@ -466,8 +456,7 @@ impl LayerNorm {
             gamma * variance + 2.0 * centred.mapv(f64::abs).dot(&centred_error) / width as f64;
         let scale_relative = 0.5 * variance_error / (variance + self.eps) + 2.0 * u;
         let normalised = &centred / scale;
-        let normalised_error =
-            &centred_error / scale + &(normalised.mapv(f64::abs) * (scale_relative + u));
+        let normalised_error = &centred_error / scale + &(normalised.mapv(f64::abs) * (scale_relative + u));
         let out = &normalised * &self.weight + &self.bias;
         &(self.weight.mapv(f64::abs) * &normalised_error)
             + &((&(&normalised * &self.weight).mapv(f64::abs) + &out.mapv(f64::abs)) * u)
@@ -482,15 +471,9 @@ fn gamma_n(n: usize, u: f64) -> f64 {
 
 /// `∂ᵏσ` for every `k < order` (`order` 1 or 2) at every entry of `pre`, through gam-math's owner at zero variance,
 /// where `T_0 σ = σ`.
-fn activation_jet(
-    activation: GaussianActivation,
-    pre: &Array2<f64>,
-    order: usize,
-) -> Result<Vec<Array2<f64>>, String> {
+fn activation_jet(activation: GaussianActivation, pre: &Array2<f64>, order: usize) -> Result<Vec<Array2<f64>>, String> {
     if !(1..=2).contains(&order) {
-        return Err(format!(
-            "activation jet of order {order}: only the value and the slope are read"
-        ));
+        return Err(format!("activation jet of order {order}: only the value and the slope are read"));
     }
     let entries = pre
         .as_standard_layout()
@@ -506,20 +489,14 @@ fn activation_jet(
         .collect::<Result<Vec<[f64; 2]>, String>>()?;
     (0..order)
         .map(|derivative| {
-            Array2::from_shape_vec(
-                pre.dim(),
-                entries.iter().map(|jet| jet[derivative]).collect(),
-            )
-            .map_err(|error| format!("activation jet shape: {error}"))
+            Array2::from_shape_vec(pre.dim(), entries.iter().map(|jet| jet[derivative]).collect())
+                .map_err(|error| format!("activation jet shape: {error}"))
         })
         .collect()
 }
 
 /// `σ` at every entry of `pre`.
-fn activation_values(
-    activation: GaussianActivation,
-    pre: &Array2<f64>,
-) -> Result<Array2<f64>, String> {
+fn activation_values(activation: GaussianActivation, pre: &Array2<f64>) -> Result<Array2<f64>, String> {
     activation_jet(activation, pre, 1)?
         .pop()
         .ok_or_else(|| "an order-1 jet holds the value".to_string())
@@ -581,19 +558,16 @@ fn gap_report(computed: &Array2<f64>, exported: &Array2<f64>, bound: &Array2<f64
     let mut beyond = 0_usize;
     let mut gap_sq = 0.0;
     let mut norm_sq = 0.0;
-    Zip::from(computed)
-        .and(exported)
-        .and(bound)
-        .for_each(|&value, &reference, &limit| {
-            let gap = (value - reference).abs();
-            max_gap = max_gap.max(gap);
-            max_ratio = max_ratio.max(gap / limit);
-            if gap > 2.0 * limit {
-                beyond += 1;
-            }
-            gap_sq += gap * gap;
-            norm_sq += reference * reference;
-        });
+    Zip::from(computed).and(exported).and(bound).for_each(|&value, &reference, &limit| {
+        let gap = (value - reference).abs();
+        max_gap = max_gap.max(gap);
+        max_ratio = max_ratio.max(gap / limit);
+        if gap > 2.0 * limit {
+            beyond += 1;
+        }
+        gap_sq += gap * gap;
+        norm_sq += reference * reference;
+    });
     json!({
         "entries": computed.len(),
         "max_abs_gap": max_gap,
@@ -622,11 +596,9 @@ fn check(pair_dir: &Path, rows: usize, out: &Path) -> Result<(), String> {
     let started = Instant::now();
     let first_norm = norm_check(&pair.first_norm, &x_in, &h_first);
     let second_norm = norm_check(&pair.second_norm, &x_first, &h_second);
-    let (first_mlp_value, first_mlp_bound) =
-        mlp_forward_with_bound(&pair.first, &h_first, FLOAT32_UNIT_ROUNDOFF)?;
+    let (first_mlp_value, first_mlp_bound) = mlp_forward_with_bound(&pair.first, &h_first, FLOAT32_UNIT_ROUNDOFF)?;
     let first_mlp = gap_report(&first_mlp_value, &y_first, &first_mlp_bound);
-    let (second_mlp_value, second_mlp_bound) =
-        mlp_forward_with_bound(&pair.second, &h_second, FLOAT32_UNIT_ROUNDOFF)?;
+    let (second_mlp_value, second_mlp_bound) = mlp_forward_with_bound(&pair.second, &h_second, FLOAT32_UNIT_ROUNDOFF)?;
     let second_mlp = gap_report(&second_mlp_value, &y_second, &second_mlp_bound);
     let attention = &x_first - &x_in - &y_first;
     let frobenius = |rows: &Array2<f64>| rows.iter().map(|value| value * value).sum::<f64>().sqrt();
@@ -648,10 +620,7 @@ fn check(pair_dir: &Path, rows: usize, out: &Path) -> Result<(), String> {
         "seconds": started.elapsed().as_secs_f64(),
     });
     write_json(out, &report)?;
-    println!(
-        "[check] {}",
-        serde_json::to_string(&report).map_err(|error| error.to_string())?
-    );
+    println!("[check] {}", serde_json::to_string(&report).map_err(|error| error.to_string())?);
     Ok(())
 }
 
@@ -687,28 +656,16 @@ impl ColumnMoments {
     fn new() -> Self {
         Self {
             shift: Array1::zeros(0),
-            sums: [
-                Array1::zeros(0),
-                Array1::zeros(0),
-                Array1::zeros(0),
-                Array1::zeros(0),
-            ],
+            sums: [Array1::zeros(0), Array1::zeros(0), Array1::zeros(0), Array1::zeros(0)],
             count: 0,
         }
     }
 
     fn add(&mut self, samples: &Array2<f64>) -> Result<(), String> {
         if self.count == 0 {
-            self.shift = samples
-                .mean_axis(Axis(0))
-                .ok_or("an empty chunk has no mean")?;
+            self.shift = samples.mean_axis(Axis(0)).ok_or("an empty chunk has no mean")?;
             let width = samples.ncols();
-            self.sums = [
-                Array1::zeros(width),
-                Array1::zeros(width),
-                Array1::zeros(width),
-                Array1::zeros(width),
-            ];
+            self.sums = [Array1::zeros(width), Array1::zeros(width), Array1::zeros(width), Array1::zeros(width)];
         }
         let deviations = samples - &self.shift;
         let mut power = deviations.clone();
@@ -766,9 +723,7 @@ fn max_z(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>, se: ArrayView1<'_, f64>
     Zip::from(&a)
         .and(&b)
         .and(&se)
-        .fold(0.0_f64, |largest, &x, &y, &e| {
-            largest.max((x - y).abs() / e)
-        })
+        .fold(0.0_f64, |largest, &x, &y, &e| largest.max((x - y).abs() / e))
 }
 
 fn euclidean(values: ArrayView1<'_, f64>) -> f64 {
@@ -779,11 +734,7 @@ fn euclidean(values: ArrayView1<'_, f64>) -> f64 {
 fn mean_with_se(samples: &[f64]) -> (f64, f64) {
     let n = samples.len() as f64;
     let mean = samples.iter().sum::<f64>() / n;
-    let variance = samples
-        .iter()
-        .map(|value| (value - mean) * (value - mean))
-        .sum::<f64>()
-        / (n - 1.0);
+    let variance = samples.iter().map(|value| (value - mean) * (value - mean)).sum::<f64>() / (n - 1.0);
     (mean, (variance / n).sqrt())
 }
 
@@ -814,26 +765,16 @@ impl DeclaredSpectrum {
             .and_then(Value::as_f64)
             .ok_or("law.json names no total variance")?;
         if rows < 2 {
-            return Err(format!(
-                "law.json declares {rows} rows, which carry no covariance"
-            ));
+            return Err(format!("law.json declares {rows} rows, which carry no covariance"));
         }
         let baseline = read_vector(&law.join("h0.npy"))?;
         let loading = read_rows::<f64>(&law.join("L.npy"), None)?;
-        let variances: Vec<f64> = loading
-            .columns()
-            .into_iter()
-            .map(|column| column.dot(&column))
-            .collect();
+        let variances: Vec<f64> = loading.columns().into_iter().map(|column| column.dot(&column)).collect();
         let largest = variances.iter().copied().fold(0.0_f64, f64::max);
-        let scaled_row_norm =
-            (rows as f64 * baseline.dot(&baseline) / (rows - 1) as f64 + total_variance).sqrt();
-        let root_band = FLOAT32_UNIT_ROUNDOFF * scaled_row_norm
-            + factor_singular_band(rows, loading.nrows(), largest.sqrt());
-        Ok(Self {
-            variances,
-            root_band,
-        })
+        let scaled_row_norm = (rows as f64 * baseline.dot(&baseline) / (rows - 1) as f64 + total_variance).sqrt();
+        let root_band =
+            FLOAT32_UNIT_ROUNDOFF * scaled_row_norm + factor_singular_band(rows, loading.nrows(), largest.sqrt());
+        Ok(Self { variances, root_band })
     }
 
     /// The latent coordinates resolved from zero, in declared order.
@@ -859,14 +800,10 @@ impl LatentFrame {
         let (kind, count) = spec
             .split_once(':')
             .ok_or(format!("frame {spec:?} is not KIND:COUNT"))?;
-        let retained: usize = count
-            .parse()
-            .map_err(|error| format!("frame {spec:?}: {error}"))?;
+        let retained: usize = count.parse().map_err(|error| format!("frame {spec:?}: {error}"))?;
         let latent_dim = block.input_dim();
         if retained == 0 || retained > latent_dim {
-            return Err(format!(
-                "frame {spec:?} retains {retained} of {latent_dim} coordinates"
-            ));
+            return Err(format!("frame {spec:?} retains {retained} of {latent_dim} coordinates"));
         }
         let basis = match kind {
             "top" => {
@@ -891,9 +828,7 @@ impl LatentFrame {
                     ));
                 }
                 let mut basis = Array2::<f64>::zeros((latent_dim, retained));
-                for (column, &coordinate) in
-                    resolved[resolved.len() - retained..].iter().enumerate()
-                {
+                for (column, &coordinate) in resolved[resolved.len() - retained..].iter().enumerate() {
                     basis[[coordinate, column]] = 1.0;
                 }
                 basis
@@ -913,11 +848,7 @@ impl LatentFrame {
                 }
                 basis
             }
-            other => {
-                return Err(format!(
-                    "frame kind {other:?} is none of top, bottom and readers"
-                ));
-            }
+            other => return Err(format!("frame kind {other:?} is none of top, bottom and readers")),
         };
         Ok(Self {
             name: spec.to_string(),
@@ -931,10 +862,7 @@ impl LatentFrame {
 
     /// `n` retained points `Q c`, `c ~ N(0, I_q)`, as rows.
     fn points(&self, count: usize, state: &mut u64) -> Result<Array2<f64>, String> {
-        Ok(fast_abt(
-            &standard_normal_rows(count, self.retained(), state)?,
-            &self.basis,
-        ))
+        Ok(fast_abt(&standard_normal_rows(count, self.retained(), state)?, &self.basis))
     }
 
     /// `Q Qᵀ z + (I − Q Qᵀ) z̃` for each row: `retained` supplies `Q Qᵀ z` (rows in `ℝ^k`, or one row broadcast to
@@ -964,24 +892,17 @@ impl Declared {
         let first = declared_block(&pair.first, law)?;
         let x_first = pair.rows("x_first", None)?;
         let y_first = pair.rows("y_first", None)?;
-        let held_stream = (&x_first - &y_first)
-            .mean_axis(Axis(0))
-            .ok_or("no exported rows")?;
+        let held_stream = (&x_first - &y_first).mean_axis(Axis(0)).ok_or("no exported rows")?;
         let mean_stream = x_first.mean_axis(Axis(0)).ok_or("no exported rows")?;
         let (centred_mean, frozen_scale) = pair.second_norm.centred_and_scale(mean_stream.view());
         let hidden = held_stream.len();
         // `LN(r̄ + y) = β + γ ⊙ C r̄ / s₀ + (diag(γ) C / s₀) y` with the scale frozen at `s₀`.
         let held_mean = held_stream.sum() / hidden as f64;
         let held_centred = held_stream.mapv(|value| value - held_mean);
-        let norm_baseline =
-            &pair.second_norm.bias + &(&pair.second_norm.weight * &held_centred / frozen_scale);
+        let norm_baseline = &pair.second_norm.bias + &(&pair.second_norm.weight * &held_centred / frozen_scale);
         let mut norm_loading = Array2::<f64>::from_elem((hidden, hidden), -1.0 / hidden as f64);
         norm_loading.diag_mut().mapv_inplace(|value| value + 1.0);
-        for (mut row, &weight) in norm_loading
-            .rows_mut()
-            .into_iter()
-            .zip(pair.second_norm.weight.iter())
-        {
+        for (mut row, &weight) in norm_loading.rows_mut().into_iter().zip(pair.second_norm.weight.iter()) {
             row *= weight / frozen_scale;
         }
         let second = pair
@@ -1058,9 +979,7 @@ fn compose(
     for spec in frames {
         let frame = LatentFrame::parse(spec, &declared.first, &spectrum)?;
         if frame.retained() == latent_dim {
-            return Err(format!(
-                "frame {spec:?} retains everything: nothing is composed through a discarded law"
-            ));
+            return Err(format!("frame {spec:?} retains everything: nothing is composed through a discarded law"));
         }
         let retained_points = frame.points(sizes.points, &mut state)?;
 
@@ -1126,30 +1045,18 @@ fn compose(
             let executed_variance = pre.variance();
             let exact_means = closure.preactivation_means.row(point);
             let exact_variances = closure.preactivation_variances.row(point);
-            worst_first_z = worst_first_z.max(max_z(
-                first_mean.row(point),
-                first.mean().view(),
-                first.mean_se().view(),
-            ));
+            worst_first_z = worst_first_z.max(max_z(first_mean.row(point), first.mean().view(), first.mean_se().view()));
             let mean_z = max_z(exact_means, pre.mean().view(), mean_se.view());
-            let variance_z = max_z(
-                exact_variances,
-                executed_variance.view(),
-                variance_se.view(),
-            );
+            let variance_z = max_z(exact_variances, executed_variance.view(), variance_se.view());
             worst_mean_z = worst_mean_z.max(mean_z);
             worst_variance_z = worst_variance_z.max(variance_z);
             let resolved = Zip::from(&exact_variances)
                 .and(&variance_se)
-                .fold(0, |count, &variance, &se| {
-                    count + usize::from(variance > pre_multiple * se)
-                });
+                .fold(0, |count, &variance, &se| count + usize::from(variance > pre_multiple * se));
             resolved_variances += resolved;
             rejected_zero_variances += Zip::from(&executed_variance)
                 .and(&variance_se)
-                .fold(0, |count, &variance, &se| {
-                    count + usize::from(variance > pre_multiple * se)
-                });
+                .fold(0, |count, &variance, &se| count + usize::from(variance > pre_multiple * se));
             let frozen_mean = frozen.mean();
             let frozen_se = frozen.mean_se();
             let closure_row = closure.approximate_response.row(point);
@@ -1196,10 +1103,7 @@ fn compose(
         let coupled_started = Instant::now();
         let base = standard_normal_rows(sizes.pairs, latent_dim, &mut state)?;
         let independent = standard_normal_rows(sizes.pairs, latent_dim, &mut state)?;
-        let coupled = frame.couple(
-            &frame.project(&base),
-            &standard_normal_rows(sizes.pairs, latent_dim, &mut state)?,
-        );
+        let coupled = frame.couple(&frame.project(&base), &standard_normal_rows(sizes.pairs, latent_dim, &mut state)?);
         let base_pre = declared.preactivations(&base)?.1;
         let half_squared = |other: &Array2<f64>| -> Vec<f64> {
             (&base_pre - other)
@@ -1328,24 +1232,15 @@ fn a3_draw(
     let mut state = seed;
     let z = standard_normal_rows(sizes.rows, latent_dim, &mut state)?;
     let z_tilde = standard_normal_rows(sizes.rows, latent_dim, &mut state)?;
-    let mut blocks: Vec<(String, Array2<f64>)> = vec![
-        ("z".to_string(), z.clone()),
-        ("z_tilde".to_string(), z_tilde.clone()),
-    ];
+    let mut blocks: Vec<(String, Array2<f64>)> = vec![("z".to_string(), z.clone()), ("z_tilde".to_string(), z_tilde.clone())];
     for frame in &frames {
-        blocks.push((
-            format!("coupled:{}", frame.name),
-            frame.couple(&frame.project(&z), &z_tilde),
-        ));
+        blocks.push((format!("coupled:{}", frame.name), frame.couple(&frame.project(&z), &z_tilde)));
     }
     let points = points_frame.points(sizes.points, &mut state)?;
     for point in 0..sizes.points {
         let anchor = points.row(point).insert_axis(Axis(0)).to_owned();
         let free = standard_normal_rows(sizes.point_draws, latent_dim, &mut state)?;
-        blocks.push((
-            format!("point:{point}"),
-            points_frame.couple(&anchor, &free),
-        ));
+        blocks.push((format!("point:{point}"), points_frame.couple(&anchor, &free)));
     }
     std::fs::create_dir_all(out).map_err(|err| format!("create {}: {err}", out.display()))?;
     let total: usize = blocks.iter().map(|block| block.1.nrows()).sum();
@@ -1356,27 +1251,13 @@ fn a3_draw(
     for (name, latent) in &blocks {
         let mut h = fast_abt(latent, &loading);
         h += &baseline;
-        h_rows
-            .slice_mut(s![start..start + latent.nrows(), ..])
-            .assign(&h);
+        h_rows.slice_mut(s![start..start + latent.nrows(), ..]).assign(&h);
         layout.push(json!({"name": name, "start": start, "rows": latent.nrows()}));
         start += latent.nrows();
     }
-    write_npy(
-        &out.join("h.npy"),
-        &[total as u64, hidden as u64],
-        h_rows.iter().copied(),
-    )?;
-    write_npy(
-        &out.join("points.npy"),
-        &[sizes.points as u64, latent_dim as u64],
-        points.iter().copied(),
-    )?;
-    write_npy(
-        &out.join("z.npy"),
-        &[sizes.rows as u64, latent_dim as u64],
-        z.iter().copied(),
-    )?;
+    write_npy(&out.join("h.npy"), &[total as u64, hidden as u64], h_rows.iter().copied())?;
+    write_npy(&out.join("points.npy"), &[sizes.points as u64, latent_dim as u64], points.iter().copied())?;
+    write_npy(&out.join("z.npy"), &[sizes.rows as u64, latent_dim as u64], z.iter().copied())?;
     write_json(
         &out.join("draw.json"),
         &json!({
@@ -1399,13 +1280,7 @@ fn a3_draw(
 }
 
 /// A3, stage 2: the analytic operator against the executed block.
-fn a3(
-    pair_dir: &Path,
-    law: &Path,
-    draw_dir: &Path,
-    executed_path: &Path,
-    out: &Path,
-) -> Result<(), String> {
+fn a3(pair_dir: &Path, law: &Path, draw_dir: &Path, executed_path: &Path, out: &Path) -> Result<(), String> {
     let layout = read_json(&draw_dir.join("draw.json"))?;
     let block_name = layout
         .get("block")
@@ -1424,11 +1299,7 @@ fn a3(
     let forward_rows = 256.min(executed.nrows());
     let h_rows = read_rows::<f64>(&draw_dir.join("h.npy"), Some(forward_rows))?;
     let (forward_value, forward_bound) = mlp_forward_with_bound(raw, &h_rows, f64::EPSILON / 2.0)?;
-    let forward = gap_report(
-        &forward_value,
-        &executed.slice(s![..forward_rows, ..]).to_owned(),
-        &forward_bound,
-    );
+    let forward = gap_report(&forward_value, &executed.slice(s![..forward_rows, ..]).to_owned(), &forward_bound);
 
     let z = block_rows("z")?;
     let z_tilde = block_rows("z_tilde")?;
@@ -1439,11 +1310,7 @@ fn a3(
         .and_then(Value::as_array)
         .ok_or("draw.json names no frames")?
         .iter()
-        .map(|spec| {
-            spec.as_str()
-                .map(str::to_string)
-                .ok_or("a frame spec is not a string".to_string())
-        })
+        .map(|spec| spec.as_str().map(str::to_string).ok_or("a frame spec is not a string".to_string()))
         .collect::<Result<Vec<String>, String>>()?;
     let comparisons = 1 + 4 * frame_specs.len();
     let multiple = comparison_multiple(comparisons)?;
@@ -1609,10 +1476,7 @@ fn metric_squared_norms(rows: &Array2<f64>, metric: ArrayView2<'_, f64>) -> Vec<
 fn perturbed_frame(frame: &LatentFrame) -> Result<Array2<f64>, String> {
     let (latent_dim, retained) = frame.basis.dim();
     if retained >= latent_dim {
-        return Err(format!(
-            "frame {} spans every latent axis; no axis lies outside it",
-            frame.name
-        ));
+        return Err(format!("frame {} spans every latent axis; no axis lies outside it", frame.name));
     }
     let (axis, _) = frame
         .basis
@@ -1621,11 +1485,7 @@ fn perturbed_frame(frame: &LatentFrame) -> Result<Array2<f64>, String> {
         .map(|row| 1.0 - row.dot(&row))
         .enumerate()
         .fold((0, f64::NEG_INFINITY), |best, (axis, distance)| {
-            if distance > best.1 {
-                (axis, distance)
-            } else {
-                best
-            }
+            if distance > best.1 { (axis, distance) } else { best }
         });
     // `e_a − Q Qᵀ e_a = e_a − Q (row a of Q)ᵀ`.
     let mut residual = frame.basis.dot(&frame.basis.row(axis)).mapv(|value| -value);
@@ -1708,9 +1568,7 @@ fn a7(
     let mut frame_reports = Vec::new();
     for spec in frames {
         if !drawn_frames.contains(&spec.as_str()) {
-            return Err(format!(
-                "frame {spec} is not one of the A3 draw's frames {drawn_frames:?}"
-            ));
+            return Err(format!("frame {spec} is not one of the A3 draw's frames {drawn_frames:?}"));
         }
         let frame = LatentFrame::parse(spec, &known, &spectrum)?;
         let coupled = block_rows(&format!("coupled:{spec}"))?;
@@ -1727,9 +1585,7 @@ fn a7(
         let perturbed = perturbed_frame(&frame)?;
         let perturbed_at = compiled
             .evaluate_coordinates(fast_ab(&latent, &perturbed).view())
-            .map_err(|error| {
-                format!("compiled response through the perturbed frame at {spec}: {error}")
-            })?;
+            .map_err(|error| format!("compiled response through the perturbed frame at {spec}: {error}"))?;
         let best = known
             .retained_response(frame.basis.view(), frame.project(&latent).view())
             .map_err(|error| format!("retained response at {spec}: {error}"))?;
@@ -1742,11 +1598,7 @@ fn a7(
         let executed_split = |fitted: &Array2<f64>| -> (Vec<f64>, Vec<f64>, Vec<f64>) {
             let total = metric_squared_norms(&(&at_draw - fitted), metric);
             let paired = total.iter().zip(&discarded).map(|(t, d)| t - d).collect();
-            let cancelled = total
-                .iter()
-                .zip(&residual_to_best)
-                .map(|(t, r)| t - r)
-                .collect();
+            let cancelled = total.iter().zip(&residual_to_best).map(|(t, r)| t - r).collect();
             (total, paired, cancelled)
         };
         let (total, paired, cancelled) = executed_split(&compiled_at);
@@ -1754,10 +1606,9 @@ fn a7(
         let (total_mc, total_se) = mean_with_se(&total);
         let (control_total_mc, control_total_se) = mean_with_se(&control_total);
         let (discarded_mc, discarded_se) = mean_with_se(&discarded);
-        let total_z =
-            (total_mc - split.total()).abs() / total_se.hypot(split.function_error_standard_error);
-        let control_total_z = (control_total_mc - split.total()).abs()
-            / control_total_se.hypot(split.function_error_standard_error);
+        let total_z = (total_mc - split.total()).abs() / total_se.hypot(split.function_error_standard_error);
+        let control_total_z =
+            (control_total_mc - split.total()).abs() / control_total_se.hypot(split.function_error_standard_error);
 
         let dominance = compiled.dominance_call();
         let price = compiled.price();
@@ -1854,52 +1705,26 @@ fn a7(
 }
 
 /// The rows of the named block of `layout` inside `executed`.
-fn layout_rows<'a>(
-    layout: &Value,
-    executed: &'a Array2<f64>,
-    name: &str,
-) -> Result<ArrayView2<'a, f64>, String> {
+fn layout_rows<'a>(layout: &Value, executed: &'a Array2<f64>, name: &str) -> Result<ArrayView2<'a, f64>, String> {
     let entry = layout
         .get("blocks")
         .and_then(Value::as_array)
-        .and_then(|blocks| {
-            blocks
-                .iter()
-                .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
-        })
+        .and_then(|blocks| blocks.iter().find(|entry| entry.get("name").and_then(Value::as_str) == Some(name)))
         .ok_or(format!("draw.json has no block {name}"))?;
-    let start = entry
-        .get("start")
-        .and_then(Value::as_u64)
-        .ok_or("block without start")? as usize;
-    let rows = entry
-        .get("rows")
-        .and_then(Value::as_u64)
-        .ok_or("block without rows")? as usize;
+    let start = entry.get("start").and_then(Value::as_u64).ok_or("block without start")? as usize;
+    let rows = entry.get("rows").and_then(Value::as_u64).ok_or("block without rows")? as usize;
     if start + rows > executed.nrows() {
-        return Err(format!(
-            "block {name} ends at row {} of {}",
-            start + rows,
-            executed.nrows()
-        ));
+        return Err(format!("block {name} ends at row {} of {}", start + rows, executed.nrows()));
     }
     Ok(executed.slice(s![start..start + rows, ..]))
 }
 
 /// `|a_i − b_i|² / 2` for each row pair.
 fn half_squared_distances(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Vec<f64> {
-    (&a - &b)
-        .rows()
-        .into_iter()
-        .map(|row| 0.5 * row.dot(&row))
-        .collect()
+    (&a - &b).rows().into_iter().map(|row| 0.5 * row.dot(&row)).collect()
 }
 
-fn write_npy(
-    path: &Path,
-    shape: &[u64],
-    values: impl IntoIterator<Item = f64>,
-) -> Result<(), String> {
+fn write_npy(path: &Path, shape: &[u64], values: impl IntoIterator<Item = f64>) -> Result<(), String> {
     let file = File::create(path).map_err(|err| format!("create {}: {err}", path.display()))?;
     let mut writer = npyz::WriteOptions::<f64>::new()
         .default_dtype()
@@ -1917,11 +1742,7 @@ fn write_npy(
 
 /// `J = I + U diag(σ'(c)) W J_LN(x)` of `x ↦ x + MLP(LN(x))` at the stream `x`, with
 /// `J_LN(x) = diag(γ) (C − x̂ x̂ᵀ / D) / s`, `x̂ = C x / s`.
-fn transition_jacobian(
-    block: &UnabsorbedBlock,
-    norm: &LayerNorm,
-    stream: ArrayView1<'_, f64>,
-) -> Result<Array2<f64>, String> {
+fn transition_jacobian(block: &UnabsorbedBlock, norm: &LayerNorm, stream: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
     let hidden = stream.len();
     let (centred, scale) = norm.centred_and_scale(stream);
     let normalised = &centred / scale;
@@ -1937,12 +1758,7 @@ fn transition_jacobian(
     let row_sums = scaled_readers.sum_axis(Axis(1));
     let along = scaled_readers.dot(&normalised);
     let mut through_norm = scaled_readers;
-    for ((mut row, &row_sum), &projection) in through_norm
-        .rows_mut()
-        .into_iter()
-        .zip(row_sums.iter())
-        .zip(along.iter())
-    {
+    for ((mut row, &row_sum), &projection) in through_norm.rows_mut().into_iter().zip(row_sums.iter()).zip(along.iter()) {
         row -= &(&normalised * (projection / hidden as f64));
         row -= row_sum / hidden as f64;
         row /= scale;
@@ -1964,13 +1780,7 @@ fn blocks(pair_dir: &Path, maps: usize, seed: u64, out: &Path) -> Result<(), Str
     }
     let started = Instant::now();
     let jacobians = (0..maps)
-        .map(|index| {
-            transition_jacobian(
-                &pair.second,
-                &pair.second_norm,
-                streams.row(index * (count / maps)),
-            )
-        })
+        .map(|index| transition_jacobian(&pair.second, &pair.second_norm, streams.row(index * (count / maps))))
         .collect::<Result<Vec<_>, String>>()?;
     let jacobian_seconds = started.elapsed().as_secs_f64();
     let ones = Array1::<f64>::ones(hidden);
@@ -1980,14 +1790,11 @@ fn blocks(pair_dir: &Path, maps: usize, seed: u64, out: &Path) -> Result<(), Str
         .fold(0.0_f64, f64::max);
     let transposed_line_residual = jacobians
         .iter()
-        .map(|jacobian| {
-            euclidean((&jacobian.t().dot(&ones) - &ones).view()) / euclidean(ones.view())
-        })
+        .map(|jacobian| euclidean((&jacobian.t().dot(&ones) - &ones).view()) / euclidean(ones.view()))
         .fold(f64::INFINITY, f64::min);
 
     let decompose_started = Instant::now();
-    let decomposition = StateBlocks::decompose(jacobians.clone())
-        .map_err(|error| format!("state blocks: {error}"))?;
+    let decomposition = StateBlocks::decompose(jacobians.clone()).map_err(|error| format!("state blocks: {error}"))?;
     let decompose_seconds = decompose_started.elapsed().as_secs_f64();
     let describe = |decomposition: &StateBlocks| -> Value {
         Value::Array(
@@ -2034,8 +1841,7 @@ fn blocks(pair_dir: &Path, maps: usize, seed: u64, out: &Path) -> Result<(), Str
         })
         .collect::<Vec<_>>();
     let planted_started = Instant::now();
-    let recovered = StateBlocks::decompose(planted)
-        .map_err(|error| format!("planted state blocks: {error}"))?;
+    let recovered = StateBlocks::decompose(planted).map_err(|error| format!("planted state blocks: {error}"))?;
     let planted_seconds = planted_started.elapsed().as_secs_f64();
     let planted_distances = recovered
         .components
@@ -2073,19 +1879,13 @@ fn blocks(pair_dir: &Path, maps: usize, seed: u64, out: &Path) -> Result<(), Str
         },
     });
     write_json(out, &report)?;
-    println!(
-        "[blocks] {}",
-        serde_json::to_string(&report).map_err(|error| error.to_string())?
-    );
+    println!("[blocks] {}", serde_json::to_string(&report).map_err(|error| error.to_string())?);
     Ok(())
 }
 
 /// `‖B Bᵀ − F Fᵀ‖₂` for orthonormal `basis` and `span`: the sine of their largest principal angle,
 /// `√(1 − σ_min(Bᵀ F)²)`, when their dimensions agree, and `1` when they differ.
-fn projector_distance(
-    basis: ArrayView2<'_, f64>,
-    span: ArrayView2<'_, f64>,
-) -> Result<f64, String> {
+fn projector_distance(basis: ArrayView2<'_, f64>, span: ArrayView2<'_, f64>) -> Result<f64, String> {
     if basis.ncols() != span.ncols() {
         return Ok(1.0);
     }
@@ -2095,18 +1895,13 @@ fn projector_distance(
         .svd(false, false)
         .map_err(|error| format!("SVD of the principal-angle cosines: {error}"))?
         .1;
-    let smallest = singular
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min)
-        .min(1.0);
+    let smallest = singular.iter().copied().fold(f64::INFINITY, f64::min).min(1.0);
     Ok((1.0 - smallest * smallest).max(0.0).sqrt())
 }
 
 fn open_npy(path: &Path) -> Result<NpyFile<BufReader<File>>, String> {
     let file = File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
-    let npy = NpyFile::new(BufReader::new(file))
-        .map_err(|err| format!("read .npy header {}: {err}", path.display()))?;
+    let npy = NpyFile::new(BufReader::new(file)).map_err(|err| format!("read .npy header {}: {err}", path.display()))?;
     if let Order::Fortran = npy.order() {
         return Err(format!("{} is Fortran-ordered", path.display()));
     }
@@ -2114,18 +1909,11 @@ fn open_npy(path: &Path) -> Result<NpyFile<BufReader<File>>, String> {
 }
 
 /// The leading `max_rows` rows (all rows when `None`) of a 2-D .npy, as float64.
-fn read_rows<T: npyz::Deserialize + Into<f64>>(
-    path: &Path,
-    max_rows: Option<usize>,
-) -> Result<Array2<f64>, String> {
+fn read_rows<T: npyz::Deserialize + Into<f64>>(path: &Path, max_rows: Option<usize>) -> Result<Array2<f64>, String> {
     let npy = open_npy(path)?;
     let shape = npy.shape().to_vec();
     let [rows, cols] = shape.as_slice() else {
-        return Err(format!(
-            "{} must be 2-D; it has {} axes",
-            path.display(),
-            shape.len()
-        ));
+        return Err(format!("{} must be 2-D; it has {} axes", path.display(), shape.len()));
     };
     let rows = usize::try_from(*rows).map_err(|err| format!("{}: {err}", path.display()))?;
     let cols = usize::try_from(*cols).map_err(|err| format!("{}: {err}", path.display()))?;
@@ -2138,8 +1926,7 @@ fn read_rows<T: npyz::Deserialize + Into<f64>>(
         .map(|value| value.map(Into::into))
         .collect::<std::io::Result<Vec<f64>>>()
         .map_err(|err| format!("read {}: {err}", path.display()))?;
-    Array2::from_shape_vec((take, cols), values)
-        .map_err(|err| format!("{} has an invalid shape: {err}", path.display()))
+    Array2::from_shape_vec((take, cols), values).map_err(|err| format!("{} has an invalid shape: {err}", path.display()))
 }
 
 /// A float64 .npy of any rank.
@@ -2156,8 +1943,7 @@ fn read_array(path: &Path) -> Result<ArrayD<f64>, String> {
     let values = reader
         .collect::<std::io::Result<Vec<f64>>>()
         .map_err(|err| format!("read {}: {err}", path.display()))?;
-    ArrayD::from_shape_vec(shape, values)
-        .map_err(|err| format!("{} has an invalid shape: {err}", path.display()))
+    ArrayD::from_shape_vec(shape, values).map_err(|err| format!("{} has an invalid shape: {err}", path.display()))
 }
 
 fn read_vector(path: &Path) -> Result<Array1<f64>, String> {
@@ -2175,13 +1961,11 @@ fn read_vector(path: &Path) -> Result<Array1<f64>, String> {
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
-    let text =
-        std::fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let text = std::fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
     serde_json::from_str(&text).map_err(|err| format!("parse {}: {err}", path.display()))
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(value)
-        .map_err(|err| format!("encode {}: {err}", path.display()))?;
+    let text = serde_json::to_string_pretty(value).map_err(|err| format!("encode {}: {err}", path.display()))?;
     std::fs::write(path, text).map_err(|err| format!("write {}: {err}", path.display()))
 }
