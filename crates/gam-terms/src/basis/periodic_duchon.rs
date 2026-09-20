@@ -1894,7 +1894,7 @@ pub(crate) fn duchon_structural_trend_null_frame(
             }
             let kernel_rows_t = transform.slice(s![..kernel_cols, ..]).t().to_owned();
             let (frame, _rank) =
-                gam_linalg::faer_ndarray::rrqr_nullspace_basis(&kernel_rows_t, 1.0)
+                gam_linalg::faer_ndarray::rrqr_nullspace_basis(&kernel_rows_t)
                     .map_err(BasisError::LinalgError)?;
             Ok(frame)
         }

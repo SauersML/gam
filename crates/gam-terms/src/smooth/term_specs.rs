@@ -5648,7 +5648,7 @@ fn chart_preimage_of_span(
     let projected = &left - &frame.dot(&frame.t().dot(&left));
     // `rrqr_nullspace_basis(a)` spans `null(aᵀ)`.
     let (angle_null, _) =
-        rrqr_nullspace_basis(&projected.t().to_owned(), 1.0).map_err(BasisError::LinalgError)?;
+        rrqr_nullspace_basis(&projected.t().to_owned()).map_err(BasisError::LinalgError)?;
     if angle_null.ncols() == 0 {
         return Ok(Array2::zeros((width, 0)));
     }

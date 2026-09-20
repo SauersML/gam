@@ -2210,10 +2210,11 @@ fn transport_structural_null_frame(
     let projected = transform - &frame.dot(&frame.t().dot(transform));
     // `rrqr_nullspace_basis(a)` returns an orthonormal basis of `null(aᵀ)`,
     // so pass `projectedᵀ` to obtain `null(projected)` over the reduced
-    // coordinates. Machine-precision cutoff: the singular values here are
-    // sines of principal angles between orthonormal frames, so the rank gap
-    // is O(1) unless the chart genuinely grazes the subspace.
-    gam_linalg::faer_ndarray::rrqr_nullspace_basis(&projected.t().to_owned(), 1.0)
+    // coordinates. The rank is the factorization's own backward-error band
+    // (#4045); the singular values here are sines of principal angles between
+    // orthonormal frames, so the rank gap is O(1) unless the chart genuinely
+    // grazes the subspace.
+    gam_linalg::faer_ndarray::rrqr_nullspace_basis(&projected.t().to_owned())
         .ok()
         .map(|(null, _)| null)
 }
@@ -2765,7 +2766,6 @@ pub(crate) fn positive_spectral_frame_from_gram(
     gram: &Array2<f64>,
 ) -> Result<Array2<f64>, BasisError> {
     let (eigenvalues, eigenvectors) = gram.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
-    let n = gram.nrows();
     let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
     // Scale-invariant rank tolerance: the cutoff is the eigensolver's own
     // backward-error band `n·ε·max|λ|` (Weyl), so `keep` is invariant to a

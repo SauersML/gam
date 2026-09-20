@@ -1739,7 +1739,7 @@ mod tests {
         let err = SymmetricLowRankPreconditioner::from_scaled_subspace(
             vec![1.0; 8],
             candidate,
-            |basis, image, _exact_negation| {
+            |basis, image, _| {
                 image.assign(basis);
                 image.mapv_inplace(|value| -value);
             },
