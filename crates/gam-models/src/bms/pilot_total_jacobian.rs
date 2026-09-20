@@ -59,6 +59,24 @@ pub(crate) struct BmsCalibratedPilot<'a> {
     marginal_scale: Array1<f64>,
 }
 
+/// The training rows and rigid baseline a [`BmsCalibratedPilot`] is built from.
+pub(crate) struct BmsPilotInputs<'a> {
+    pub(crate) latent_measure: &'a LatentMeasureKind,
+    pub(crate) base_link: &'a InverseLink,
+    pub(crate) y: &'a Array1<f64>,
+    pub(crate) z: &'a Array1<f64>,
+    pub(crate) weights: &'a Array1<f64>,
+    pub(crate) marginal_design: &'a DesignMatrix,
+    pub(crate) marginal_offset: &'a Array1<f64>,
+    pub(crate) slope_offset: &'a Array1<f64>,
+    /// Rigid marginal predictor, added to each row's marginal offset.
+    pub(crate) baseline_marginal: f64,
+    /// Rigid pre-scale slope, added to each row's slope offset.
+    pub(crate) baseline_slope: f64,
+    /// Probit scale `s`.
+    pub(crate) probit_scale: f64,
+}
+
 /// The calibration tilt `ν_i ∝ π(u)·φ(A_i + B_i·u)` of one row.
 enum RowTilt<'g> {
     Gaussian {
@@ -91,20 +109,20 @@ impl<'a> BmsCalibratedPilot<'a> {
     /// identify takes no step. It moves the pilot off the rigid point, where
     /// every row shares one `(A, B)` up to its offsets and the link argument
     /// is affine in `z`, onto the covariate structure of the marginal block.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn build(
-        latent_measure: &'a LatentMeasureKind,
-        base_link: &InverseLink,
-        y: &Array1<f64>,
-        z: &'a Array1<f64>,
-        weights: &Array1<f64>,
-        marginal_design: &DesignMatrix,
-        marginal_offset: &Array1<f64>,
-        slope_offset: &Array1<f64>,
-        baseline_marginal: f64,
-        baseline_slope: f64,
-        probit_scale: f64,
-    ) -> Result<Self, String> {
+    pub(crate) fn build(inputs: BmsPilotInputs<'a>) -> Result<Self, String> {
+        let BmsPilotInputs {
+            latent_measure,
+            base_link,
+            y,
+            z,
+            weights,
+            marginal_design,
+            marginal_offset,
+            slope_offset,
+            baseline_marginal,
+            baseline_slope,
+            probit_scale,
+        } = inputs;
         let n = z.len();
         for (name, len) in [
             ("y", y.len()),

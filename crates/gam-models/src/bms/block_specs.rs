@@ -6,7 +6,7 @@ use super::family::*;
 use super::gradient_paths::*;
 use super::hessian_paths::{new_cell_moment_cache_stats, new_cell_moment_lru_cache};
 use super::install_flex::validate_spec;
-use super::pilot_total_jacobian::BmsCalibratedPilot;
+use super::pilot_total_jacobian::{BmsCalibratedPilot, BmsPilotInputs};
 use super::*;
 use crate::fit_orchestration::FitFailure;
 use crate::inference::model::SavedLatentZNormalization;
@@ -3118,19 +3118,19 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // the raw basis at the training rows instead drops ramps that are flat
     // over the training arguments but live over the latent measure.
     let flex_pilot = if spec.score_warp.is_some() || spec.link_dev.is_some() {
-        let pilot = BmsCalibratedPilot::build(
-            &latent_measure,
-            &spec.base_link,
-            &spec.y,
-            z_train,
-            &spec.weights,
-            &marginal_design.design,
-            &spec.marginal_offset,
-            &spec.slope_offset,
-            baseline.0,
-            baseline.1,
+        let pilot = BmsCalibratedPilot::build(BmsPilotInputs {
+            latent_measure: &latent_measure,
+            base_link: &spec.base_link,
+            y: &spec.y,
+            z: z_train,
+            weights: &spec.weights,
+            marginal_design: &marginal_design.design,
+            marginal_offset: &spec.marginal_offset,
+            slope_offset: &spec.slope_offset,
+            baseline_marginal: baseline.0,
+            baseline_slope: baseline.1,
             probit_scale,
-        )
+        })
         .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
         let fisher_row_metric = pilot.fisher_row_metric(&spec.weights);
         let parametric_jacobians = vec![
