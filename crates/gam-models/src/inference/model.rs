@@ -4720,8 +4720,7 @@ impl FittedModel {
         col_map: &HashMap<String, usize>,
     ) -> Result<Option<Array1<f64>>, FittedModelError> {
         use gam_terms::basis::{
-            CenterStrategy, MeasureJetExtrapolationSpectrum, MeasureJetIdentifiability,
-            PenaltySource,
+            CenterStrategy, MeasureJetExtrapolationSpectrum, PenaltySource,
         };
         use gam_terms::smooth::SmoothBasisSpec;
         use gam_terms::smooth::build_term_collection_design;
@@ -4999,16 +4998,6 @@ impl FittedModel {
             // `mj.length_scale`, and σ_coord are all standardized consistently.
             if let Some(sigma_coord) = frozen.sigma_coord {
                 'input_var: {
-                    let MeasureJetIdentifiability::FrozenTransform { transform } =
-                        &mj.identifiability
-                    else {
-                        log::debug!(
-                            "measure-jet term '{}': identifiability is not a frozen transform; \
-                             skipping its input-measurement-error variance",
-                            term.name
-                        );
-                        break 'input_var;
-                    };
                     let full_cols = design.design.ncols();
                     if fit.beta.len() != full_cols {
                         log::debug!(
@@ -5031,6 +5020,23 @@ impl FittedModel {
                         );
                         break 'input_var;
                     }
+                    // The replayed term's composed chart `z_local·Q·T` maps its
+                    // reduced coefficients to the raw representer+head ones. The
+                    // frozen spec carries only the term-local `z_local`; `Q` and
+                    // the collection chart `T` are applied on top of it (#3001),
+                    // so the composition is read off the replayed metadata.
+                    let gam_terms::basis::BasisMetadata::MeasureJet {
+                        constraint_transform: Some(transform),
+                        ..
+                    } = &design.smooth.terms[smooth_idx].metadata
+                    else {
+                        log::debug!(
+                            "measure-jet term '{}': replayed metadata carries no coefficient \
+                             chart; skipping its input-measurement-error variance",
+                            term.name
+                        );
+                        break 'input_var;
+                    };
                     let m = centers.nrows();
                     let m_aug = transform.nrows();
                     let reduced = transform.ncols();
