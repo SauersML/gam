@@ -138,10 +138,9 @@ fn response_band(fit: &FitResult, level: f64) -> (Array1<f64>, Array1<f64>) {
         .clone()
         .expect("fit records its likelihood family");
     // Audit the core Vp credible band the response-scale surface is built on:
-    // the central `σ(η) ± z·se` transform-of-η band. The optional predictor
-    // corrections (bias / Edgeworth / boundary / observation interval) are
-    // switched off so the gate measures the calibration of the band itself, not
-    // a confounding correction — the same central band #1871 compares to INLA.
+    // the central `σ(η) ± z·se` transform-of-η band. The observation interval
+    // is switched off so the gate measures the calibration of the band itself —
+    // the same central band #1871 compares to INLA.
     let options = PredictUncertaintyOptions {
         confidence_level: level,
         covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
