@@ -68,6 +68,7 @@ mod run;
 mod run_plan;
 mod inner_progress;
 mod saddle_escape_latch;
+pub mod zero_smoothing_face;
 
 pub(crate) use crate::model_types::CERTIFICATE_RAIL_MARGIN;
 pub use crate::model_types::{
