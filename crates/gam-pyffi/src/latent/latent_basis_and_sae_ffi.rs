@@ -1160,7 +1160,6 @@ fn sae_manifold_fit_inner<'py>(
     top_k: Option<usize>,
     threshold_gate_threshold: f64,
     seed_refine_routing: bool,
-    seed_refine_random_state: u64,
     // WP-D output-Fisher shard (#980). Magic-by-default: the *presence* of
     // `fisher_u` activates `RowMetric::OutputFisher` — there is no flag. `fisher_u`
     // is `(n_obs, p_out, rank)` row-major (`U[n, i, k]`), exactly the harvest
@@ -1267,7 +1266,6 @@ fn sae_manifold_fit_inner<'py>(
         top_k,
         threshold: threshold_gate_threshold,
         seed_refine_routing,
-        seed_refine_random_state,
         fit_config: gam::terms::sae::manifold::SaeFitConfig {
             separation_barrier_strength_override,
             gpu_policy,
