@@ -2939,18 +2939,18 @@ fn cloglog_inverse_link_controlled_values(
     mu: f64,
     sigma: f64,
     max_order: usize,
-) -> ([f64; 6], IntegratedExpectationMode) {
-    assert!(max_order <= 5);
+) -> ([f64; 7], IntegratedExpectationMode) {
+    assert!(max_order <= 6);
     if sigma <= 1e-10 {
         let (mean, d1, d2, d3, d4, d5) = cloglog_point_jet5(mu);
         return (
-            [mean, d1, d2, d3, d4, d5],
+            [mean, d1, d2, d3, d4, d5, cloglog_point_d6(mu)],
             IntegratedExpectationMode::ExactClosedForm,
         );
     }
 
     let (k, log_k0, mode) = latent_cloglog_kernel_terms(ctx, mu, sigma, max_order);
-    let mut values = [0.0; 6];
+    let mut values = [0.0; 7];
     values[0] = if log_k0.is_finite() {
         -log_k0.exp_m1()
     } else {
@@ -2970,6 +2970,9 @@ fn cloglog_inverse_link_controlled_values(
         if max_order >= 5 {
             values[5] = integrate_normal_adaptive(mu, sigma, |x| cloglog_point_jet5(x).5);
         }
+        if max_order >= 6 {
+            values[6] = integrate_normal_adaptive(mu, sigma, cloglog_point_d6);
+        }
         return (
             values,
             worse_integrated_expectation_mode(mode, IntegratedExpectationMode::QuadratureFallback),
@@ -2986,6 +2989,9 @@ fn cloglog_inverse_link_controlled_values(
     }
     if max_order >= 5 {
         values[5] = k[1] - 15.0 * k[2] + 25.0 * k[3] - 10.0 * k[4] + k[5];
+    }
+    if max_order >= 6 {
+        values[6] = k[1] - 31.0 * k[2] + 90.0 * k[3] - 65.0 * k[4] + 15.0 * k[5] - k[6];
     }
     (values, mode)
 }
@@ -3026,6 +3032,19 @@ pub struct LatentCLogLogJet5 {
     pub d4: f64,
     pub d5: f64,
     pub mode: IntegratedExpectationMode,
+}
+
+/// Sixth η-derivative of the latent-cloglog inverse link (= fifth derivative of
+/// its density), from the same lognormal-Laplace kernel terms `K_{k,1}` as
+/// [`latent_cloglog_jet5`]: `μ⁽⁶⁾ = K₁ − 31K₂ + 90K₃ − 65K₄ + 15K₅ − K₆`.
+pub fn latent_cloglog_d6(
+    quadctx: &QuadratureContext,
+    eta: f64,
+    sigma: f64,
+) -> Result<f64, EstimationError> {
+    validate_latent_cloglog_inputs(eta, sigma)?;
+    let (values, _) = cloglog_inverse_link_controlled_values(quadctx, eta, sigma, 6);
+    Ok(values[6])
 }
 
 pub fn latent_cloglog_jet5(
@@ -3089,9 +3108,9 @@ fn latent_cloglog_kernel_terms(
     mu: f64,
     sigma: f64,
     max_order: usize,
-) -> ([f64; 6], f64, IntegratedExpectationMode) {
+) -> ([f64; 7], f64, IntegratedExpectationMode) {
     let sigma2 = sigma * sigma;
-    let mut k = [0.0; 6];
+    let mut k = [0.0; 7];
     let mut log_k0 = f64::NEG_INFINITY;
     let mut mode = IntegratedExpectationMode::ExactClosedForm;
 
@@ -3764,6 +3783,19 @@ pub(crate) fn cloglog_point_jet5(t: f64) -> (f64, f64, f64, f64, f64, f64) {
         cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0, -3.0, 1.0]),
         cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0, -7.0, 6.0, -1.0]),
         cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0, -15.0, 25.0, -10.0, 1.0]),
+    )
+}
+
+/// Sixth derivative of the point cloglog inverse link `1 − exp(−eᵗ)`, the next
+/// Touchard row after [`cloglog_point_jet5`]: `e^{−eᵗ}·Σ_j S(6, j)(−1)^{j+1} e^{jt}`.
+#[inline]
+pub(crate) fn cloglog_point_d6(t: f64) -> f64 {
+    if t.is_nan() {
+        return f64::NAN;
+    }
+    cloglog_stable_poly_times_exp_neg(
+        safe_exp(t),
+        &[0.0, 1.0, -31.0, 90.0, -65.0, 15.0, -1.0],
     )
 }
 

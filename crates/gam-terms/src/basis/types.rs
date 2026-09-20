@@ -239,8 +239,9 @@ pub enum BSplineKnotSpec {
     },
     Automatic {
         /// Internal-knot count. Always resolved by the caller (the formula
-        /// default is `pilot_internal_knots_for_column`); the basis builder has no
-        /// second, row-count-based default of its own.
+        /// default is `provisioned_internal_knots_for_column`, and the standard
+        /// workflow starts a default it grows at its pilot); the basis builder
+        /// has no second, row-count-based default of its own.
         num_internal_knots: usize,
         placement: BSplineKnotPlacement,
         /// `true` when nobody chose `num_internal_knots`: it is the formula
