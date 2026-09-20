@@ -233,16 +233,14 @@ impl core::fmt::Display for FixedLambdaStallReason {
 /// Solver-native first-order residual carried by a fixed-lambda stall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FixedLambdaResidualKind {
-    /// Euclidean norm of the exact penalized likelihood gradient.
-    PenalizedGradientNorm,
-    /// Firth/Jeffreys Newton decrement `0.5 * |score' H^-1 score|`.
+    /// Half the squared Newton decrement `0.5 * score' H^+ score`, in
+    /// objective units (Firth/Jeffreys and penalized vector-GLM solves).
     NewtonDecrement,
 }
 
 impl core::fmt::Display for FixedLambdaResidualKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
-            Self::PenalizedGradientNorm => "penalized gradient norm",
             Self::NewtonDecrement => "Newton decrement",
         })
     }
@@ -587,6 +585,17 @@ pub enum EstimationError {
         min_signed_margin: f64,
         num_unpenalized_columns: usize,
         column_indices: Vec<usize>,
+    },
+
+    #[error(
+        "Pre-fit separation detected in the Bernoulli marginal-slope latent score: the threshold \
+        {threshold:.6e} on z separates the binary outcomes (positive_above_threshold={positive_above_threshold}), \
+        so the pooled probit likelihood of y on z has no finite mode. Enable Firth/Jeffreys bias \
+        reduction or supply a latent score that does not separate the outcomes."
+    )]
+    PrefitLatentScoreSeparationDetected {
+        threshold: f64,
+        positive_above_threshold: bool,
     },
 
     #[error(
@@ -1143,6 +1152,9 @@ impl EstimationError {
             Self::PrefitLinearSeparationDetected { column_indices, .. } => Some(format!(
                 "Detected separation driven by unpenalized columns {column_indices:?}. {PREFIT_SEPARATION}"
             )),
+            Self::PrefitLatentScoreSeparationDetected { .. } => Some(format!(
+                "Detected separation driven by the marginal-slope latent score. {SEPARATION}"
+            )),
             Self::LinkFeasibilityBoundaryOptimum { link, .. } => Some(format!(
                 "The {link} link's range exceeds the family's mean domain and the data put \
                  a fitted mean on the edge of that domain. Use a link whose range is the \
@@ -1224,6 +1236,7 @@ impl EstimationError {
             | Self::BetaPrecisionRefinementDidNotConverge { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
@@ -1415,6 +1428,7 @@ impl EstimationError {
             | Self::LinkFeasibilityBoundaryOptimum { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
@@ -1496,6 +1510,9 @@ impl EstimationError {
             }
             Self::PrefitLinearSeparationDetected { .. } => {
                 "EstimationError::PrefitLinearSeparationDetected"
+            }
+            Self::PrefitLatentScoreSeparationDetected { .. } => {
+                "EstimationError::PrefitLatentScoreSeparationDetected"
             }
             Self::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
                 "EstimationError::PrefitUnpenalizedSpaceExceedsObservations"
@@ -1644,7 +1661,7 @@ mod trial_point_classification_tests {
                 reason: FixedLambdaStallReason::IterationBudgetExhausted,
                 objective_value: 12.5,
                 stationarity: FixedLambdaStationarityEvidence {
-                    kind: FixedLambdaResidualKind::PenalizedGradientNorm,
+                    kind: FixedLambdaResidualKind::NewtonDecrement,
                     residual: 1.0e-3,
                     bound: 1.0e-8,
                 },
