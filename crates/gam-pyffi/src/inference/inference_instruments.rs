@@ -31,7 +31,7 @@ use pyo3::types::PyDict;
 use gam::inference::full_conformal::{CanonicalGlmFamily, GlmHomotopyFullConformal};
 use gam::inference::lawley::{
     RhoPenaltyComponent, RowExpectedJets, RowKappas, lawley_lr_bartlett_factor,
-    lawley_lr_mean_shift_with_rho_variation,
+    lawley_lr_correction_estimated_lambda,
 };
 use gam::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use gam::inference::structure_evidence::{
@@ -561,9 +561,14 @@ pub(crate) fn lawley_bartlett_factor<'py>(
 /// [`gam::inference::lawley::lawley_lr_mean_shift_with_rho_variation`] from the
 /// curvature of the deterministic conditional shift in the log-smoothing
 /// parameters and the inverse REML/LAML **outer Hessian** `Cov(ρ̂)` (the #740
-/// quantity). Returns the **total** estimated-λ factor `c = 1 + Δε(ρ̂)/d`
-/// alongside the conditional one, so the caller can read the size correction
-/// attributable specifically to ρ̂-variation as `c − c_conditional`.
+/// quantity). The two pieces enter the reference differently
+/// ([`gam::inference::lawley::LawleyLrCorrection`]): the conditional shift is
+/// taken at the same λ as `d` and vanishes with it, so it is the scale
+/// `c = 1 + Δε(ρ̂)/d`; the ρ̂-variation increment `δ_ρ` does not vanish as the
+/// tested block is absorbed (`d → 0` is where `Cov(ρ̂)` is largest), so it is an
+/// additive location. The corrected reference is `c·χ²_d + δ_ρ` and the
+/// corrected statistic `max(W − δ_ρ, 0)/c`. `bartlett_factor` is therefore `c`
+/// (equal to `bartlett_factor_conditional`) and `rho_variation_shift` is `δ_ρ`.
 ///
 /// Inputs mirror [`lawley_bartlett_factor`] plus:
 /// * `penalty` — the **total** fitted `S_λ = Σ_b λ_b S_b^unit` (`k × k`), the
@@ -641,48 +646,26 @@ pub(crate) fn lawley_bartlett_factor_estimated_lambda<'py>(
         .collect();
     let rho_cov_owned = rho_cov.as_array().to_owned();
 
-    // Conditional (fixed-λ) factor — the existing deterministic-penalty path.
-    let factor_conditional = lawley_lr_bartlett_factor(
-        x,
-        &kappas,
-        Some(penalty_owned.view()),
-        tested_start..tested_end,
-        ref_df,
-    )
-    .map_err(py_value_error)?;
-
-    // Total estimated-λ mean shift = conditional + ½·tr(Hᵨᵨ Cov(ρ̂)).
-    let total_shift = lawley_lr_mean_shift_with_rho_variation(
+    // The fixed-λ factor is the reference's scale; the ρ̂-variation increment
+    // `½·tr(Hᵨᵨ Cov(ρ̂))` is its location (it does not scale with `d`).
+    let correction = lawley_lr_correction_estimated_lambda(
         x,
         &kappas,
         penalty_owned.view(),
         tested_start..tested_end,
         &comps,
         rho_cov_owned.view(),
+        ref_df,
     )
     .map_err(py_value_error)?;
-    let mean_w = ref_df + total_shift;
-    let factor = gam::inference::higher_order::bartlett_factor_from_mean(mean_w, ref_df)
-        .ok_or_else(|| {
-            py_value_error(format!(
-                "lawley_bartlett_estimated: degenerate mean {mean_w} (Δε(ρ̂) = {total_shift}, d = {ref_df})"
-            ))
-        })?;
-    if !(factor.is_finite() && factor > 0.0) {
-        return Err(py_value_error(format!(
-            "lawley_bartlett_estimated: degenerate factor {factor}"
-        )));
-    }
+    let mean_shift_conditional = (correction.scale - 1.0) * ref_df;
 
     let out = PyDict::new(py);
-    out.set_item("bartlett_factor", factor)?;
-    out.set_item("bartlett_factor_conditional", factor_conditional)?;
-    out.set_item("mean_shift", total_shift)?;
-    // Conditional shift Δε(ρ̂) = (c_cond − 1)·d; the ρ̂-variation increment is the
-    // difference the estimated-λ correction adds on top.
-    let mean_shift_conditional = (factor_conditional - 1.0) * ref_df;
+    out.set_item("bartlett_factor", correction.scale)?;
+    out.set_item("bartlett_factor_conditional", correction.scale)?;
+    out.set_item("mean_shift", correction.mean_shift(ref_df))?;
     out.set_item("mean_shift_conditional", mean_shift_conditional)?;
-    out.set_item("rho_variation_shift", total_shift - mean_shift_conditional)?;
+    out.set_item("rho_variation_shift", correction.location)?;
     out.set_item("ref_df", ref_df)?;
     if let Some(stat) = lr_statistic {
         if !(stat.is_finite() && stat >= 0.0) {
@@ -690,7 +673,7 @@ pub(crate) fn lawley_bartlett_factor_estimated_lambda<'py>(
                 "lawley_bartlett_estimated: lr_statistic must be finite and non-negative; got {stat}"
             )));
         }
-        let corrected = stat / factor;
+        let corrected = correction.corrected_statistic(stat);
         out.set_item("corrected_statistic", corrected)?;
         out.set_item("p_value_corrected", chi_square_sf(corrected, ref_df))?;
         out.set_item("p_value_uncorrected", chi_square_sf(stat, ref_df))?;

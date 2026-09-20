@@ -9,6 +9,17 @@
   mixed-precision entry point are removed; the direction is always taken on
   `descent_curvature(H)` under the one certificate.
 
+- **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
+  `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
+  `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and
+  `C_κ = 0.125` and no derivation behind the inequality, and it published that as
+  `Verdict::Certified`. The verdict, both constants and its phase-diagram test are
+  deleted. The measurements stay, renamed `CertificateInputs` →
+  `DictionaryIncoherenceReport`: `μ̂`, per-atom `κ̂`, the activity floor and the SNR
+  proxy. The Python `incoherence_report` dict loses the `global_optimality`,
+  `global_optimality_certified` and `global_optimality_margin` keys, and the report
+  is no longer recorded in the certificate ledger.
+
 - **A learned Gaussian-shift frailty in survival marginal-slope is refused as not identified.**
   The likelihood reads σ only through the observed slope `s(σ)·g`, `s = 1/√(1+σ²)`, so with
   the default slope (an intercept in every slope surface and a constant or no offset) any σ
