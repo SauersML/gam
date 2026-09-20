@@ -488,33 +488,29 @@ mod amortized_encoder_tests {
 mod outer_gradient_error_classification_1451_tests {
     use super::OuterGradientError;
 
-    /// #1451 — the three numerical/linear-algebra failure sites inside the
-    /// deflation path (`apply_cached_arrow_hessian`, the projected `h_span.eigh`,
-    /// and `DeflatedArrowSolver::from_orthonormal_gauges`) must distinguish a
-    /// genuine near-singular conditioning trip (`IllConditioned`) from an
-    /// internal-invariant defect — a shape/dimension mismatch or a non-finite
-    /// intermediate (`InternalInvariant`). Both propagate if the projected
+    /// #1451 — the exact stationarity solve feeding the analytic outer
+    /// gradient must distinguish a genuine near-singular conditioning trip
+    /// (the caller's typed conditioning class, `NonIdentifiable` at the live
+    /// site) from an internal-invariant defect — a shape/dimension mismatch or a
+    /// non-finite intermediate (`InternalInvariant`). Both propagate if the
     /// implicit solve cannot complete, but the typed diagnosis must stay exact.
     ///
-    /// `OuterGradientError::classify_arrow_solver_error` is the helper all three
-    /// sites route through. Before the #1451 fix every failure there was
-    /// re-labelled `IllConditioned` (the original `conditioning_err`), so the
-    /// shape/non-finite cases below would have been misdiagnosed as numerical
-    /// conditioning. This test pins that a shape/non-finite error classifies to
-    /// `InternalInvariant` while a genuine finite, correctly-shaped
-    /// near-singular failure stays `IllConditioned`.
+    /// `OuterGradientError::classify_arrow_solver_error` is the helper that site
+    /// routes through. This test pins that a shape/non-finite error classifies
+    /// to `InternalInvariant` while a genuine finite, correctly-shaped
+    /// near-singular failure keeps the conditioning class.
     #[test]
     fn classify_arrow_solver_error_routes_shape_and_nonfinite_to_internal_1451() {
-        let conditioning = || OuterGradientError::IllConditioned {
-            reason: "near-singular joint Hessian (min/max pivot ratio 5.3e-16)".to_string(),
+        let conditioning = || OuterGradientError::NonIdentifiable {
+            reason: "near-singular joint Hessian".to_string(),
         };
 
-        // Shape/dimension-mismatch markers emitted by the deflation helpers must
+        // Shape/dimension-mismatch markers emitted by the solver helpers must
         // classify as InternalInvariant.
         let shape_messages = [
             "apply_cached_arrow_hessian: vector shapes (t=3, beta=2) != cache shapes (t=4, beta=2)",
-            "DeflatedArrowSolver: gauge length 5 != cache full length 6",
-            "DeflatedArrowSolver: solution length 5 != cache full length 6",
+            "solve_exact_stationarity: gauge length 5 != cache full length 6",
+            "solve_exact_stationarity: solution length 5 != cache full length 6",
         ];
         for msg in shape_messages {
             let classified = OuterGradientError::classify_arrow_solver_error(msg, conditioning());
@@ -526,8 +522,8 @@ mod outer_gradient_error_classification_1451_tests {
 
         // Non-finite-intermediate markers must likewise propagate as internal.
         let nonfinite_messages = [
-            "DeflatedArrowSolver: gauge stiffness must be finite and positive; got NaN",
-            "outer_gradient_arrow_solver: non-finite entry in projected gauge Hessian",
+            "solve_exact_stationarity: right-hand side must be finite; got NaN",
+            "solve_exact_stationarity: non-finite entry in the spectral pseudoinverse",
         ];
         for msg in nonfinite_messages {
             let classified = OuterGradientError::classify_arrow_solver_error(msg, conditioning());
@@ -539,19 +535,19 @@ mod outer_gradient_error_classification_1451_tests {
         }
 
         // A genuine near-singular linear-algebra failure on a finite, correctly
-        // shaped input (back-solve / Cholesky/Woodbury factor that tripped on
-        // rank-deficiency) is the legitimate #1273 conditioning case: it must
-        // KEEP IllConditioned.
+        // shaped input (a back-solve or factor that tripped on rank-deficiency)
+        // is the legitimate #1273 conditioning case: it must KEEP the
+        // conditioning class.
         let conditioning_messages = [
-            "DeflatedArrowSolver: gauge Woodbury factor failed: matrix is not positive definite",
-            "DeflatedArrowSolver: gauge back-solve: singular factor",
+            "solve_exact_stationarity: factor failed: matrix is not positive definite",
+            "solve_exact_stationarity: back-solve: singular factor",
         ];
         for msg in conditioning_messages {
             let classified = OuterGradientError::classify_arrow_solver_error(msg, conditioning());
             assert!(
-                matches!(classified, OuterGradientError::IllConditioned { .. }),
+                matches!(classified, OuterGradientError::NonIdentifiable { .. }),
                 "a finite, correctly-shaped near-singular failure must KEEP \
-                 IllConditioned (#1451 / #1273); got {classified}"
+                 the conditioning class (#1451 / #1273); got {classified}"
             );
         }
     }

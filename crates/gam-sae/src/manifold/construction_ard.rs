@@ -712,11 +712,16 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
+    /// Dense oracle for [`Self::ard_log_precision_hessian_trace_from_probes`]:
+    /// the same trace read off the materialized plain-arrow selected inverse.
+    /// The outer gradient prices this trace from probes only (#2712, #4181).
+    ///
     /// `operator` (#2515) names WHICH curvature the `∂H/∂log α` operand is:
     /// `Majorizer` differentiates `B`'s PSD-clamped `α·s_{τ₀}(cos κt)`,
     /// `ExactObservedInformation` differentiates `A`'s unmajorized `α·cos κt`.
     /// It must agree with the operator whose inverse `solver` factors, which is
     /// why every trace entry point takes it explicitly rather than defaulting.
+    #[cfg(test)]
     pub(crate) fn ard_log_precision_hessian_trace(
         &self,
         rho: &SaeManifoldRho,
@@ -874,11 +879,10 @@ impl SaeManifoldTerm {
     }
 
     /// Per-atom, per-axis `½ tr(H⁻¹ ∂H/∂logα_{kj})` — the ARD ½log|H| ρ-gradient
-    /// channel [`Self::ard_log_precision_hessian_trace`] computes — from the #2080
-    /// SHARED selected-inverse bundle instead of the dense `DeflatedArrowSolver`
-    /// (`latent_inverse_diagonal` + per-column `solve`). The massive-lane /
-    /// eventual-dense-cache-retirement replacement for the last dense `S⁻¹` in the
-    /// analytic outer ρ-gradient's ARD block.
+    /// channel — from the #2080 SHARED selected-inverse bundle. This is the only
+    /// production route; the dense `ard_log_precision_hessian_trace`
+    /// (`latent_inverse_diagonal` + per-column `solve`) survives as its test
+    /// oracle (#4181).
     ///
     /// Each ARD component differentiates ONE coordinate-slot diagonal entry, so the
     /// trace is `Σ_{row, slot s(k,j)} ½·(H⁻¹)_tt[s,s]·(w_row·hess)`. The diagonal is

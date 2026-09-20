@@ -17,8 +17,6 @@ use super::*;
 /// authorizing a degraded fallback direction.
 #[derive(Clone, Debug)]
 pub(crate) enum OuterGradientError {
-    /// Near-singular or ill-conditioned joint Hessian at a feasible ρ.
-    IllConditioned { reason: String },
     /// A non-identifiable / gauge-degenerate direction at this ρ.
     NonIdentifiable { reason: String },
     /// Unexpected: shape/dimension mismatch, non-finite intermediate, or a
@@ -36,20 +34,19 @@ impl OuterGradientError {
         }
     }
 
-    /// #1451 — classify a `String` error surfaced by the deflation linear-algebra
-    /// path (`apply_cached_arrow_hessian`, `DeflatedArrowSolver::from_orthonormal_gauges`)
+    /// #1451 — classify a `String` error surfaced by the exact stationarity
+    /// solve (`solve_exact_stationarity`, `solve_exact_stationarity_matrix_free`)
     /// into the correct [`OuterGradientError`] class.
     ///
     /// A genuine rank-deficiency / near-singularity failure (a back-solve or
-    /// Cholesky/Woodbury factor that tripped on a finite, correctly-shaped input)
-    /// is a legitimate #1273 conditioning failure and keeps `conditioning_err`
-    /// (`IllConditioned`). A
-    /// shape/dimension mismatch or a non-finite intermediate is an
+    /// spectral factor that tripped on a finite, correctly-shaped input) is a
+    /// legitimate #1273 conditioning failure and keeps the caller's
+    /// `conditioning_err`. A shape/dimension mismatch or a non-finite intermediate is an
     /// internal-invariant defect and MUST propagate ([`Self::internal`]) instead
     /// of being masked as a plausible-but-wrong descent direction — exactly the
     /// #1436 contract.
     ///
-    /// The two solver helpers return `String` (not a typed error), so the
+    /// The solver helpers return `String` (not a typed error), so the
     /// distinction is drawn from the stable markers those helpers emit for their
     /// shape/non-finite guards (`vector shapes`, `gauge length`, `must be finite`,
     /// `non-finite`). Everything else — including the `cholesky`/back-solve
@@ -77,7 +74,6 @@ impl OuterGradientError {
 impl std::fmt::Display for OuterGradientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::IllConditioned { reason } => write!(f, "ill-conditioned: {reason}"),
             Self::NonIdentifiable { reason } => write!(f, "non-identifiable: {reason}"),
             Self::InternalInvariant { reason } => write!(f, "internal invariant: {reason}"),
         }
@@ -97,8 +93,7 @@ impl From<OuterGradientError> for EstimationError {
     fn from(error: OuterGradientError) -> Self {
         let reason = error.to_string();
         match error {
-            OuterGradientError::IllConditioned { .. }
-            | OuterGradientError::NonIdentifiable { .. } => {
+            OuterGradientError::NonIdentifiable { .. } => {
                 EstimationError::TrialPointRefused { reason }
             }
             OuterGradientError::InternalInvariant { .. } => {

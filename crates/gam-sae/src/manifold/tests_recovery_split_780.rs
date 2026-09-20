@@ -820,32 +820,6 @@ pub(crate) fn warmstart_test_objective_with_evaluator() -> SaeManifoldOuterObjec
     SaeManifoldOuterObjective::new(term, target, None, rho, 8, 1.0, 1.0e-6, 1.0e-6)
 }
 
-pub(crate) fn near_singular_outer_gradient_cache() -> ArrowFactorCache {
-    ArrowFactorCache {
-        htt_factors: ArrowFactorSlab::from_blocks(vec![array![[1.0_f64, 0.0], [0.0, 1.0e-7]]]),
-        htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
-        schur_factor: Some(array![[1.0_f64]]),
-        schur_factor_is_undamped: true,
-        beta_schur_conditioning: None,
-        joint_hessian_log_det: None,
-        solver_mode: ArrowSolverMode::Direct,
-        ridge_t: 0.0,
-        ridge_beta: 0.0,
-        htbeta: ArrowHtbetaCache::Disabled { estimated_bytes: 0 },
-        d: 2,
-        row_dims: Arc::from(vec![2usize].into_boxed_slice()),
-        row_offsets: Arc::from(vec![0usize, 2usize].into_boxed_slice()),
-        k: 1,
-        manifold_mode_fingerprint: 0,
-        row_hessian_fingerprint: 0,
-        pcg_diagnostics: ArrowPcgDiagnostics::default(),
-        gauge_deflated_directions: 0,
-        deflated_row_directions: std::sync::Arc::from(Vec::new()),
-        deflation_row_spectra: std::sync::Arc::from(Vec::new()),
-        beta_gauge_quotient: None,
-    }
-}
-
 pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
     let dim = diagonal.len();
     let mut factor = Array2::<f64>::zeros((dim, dim));
@@ -877,218 +851,8 @@ pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
     }
 }
 
-#[test]
-pub(crate) fn outer_gradient_solver_rejects_near_singular_cache_without_matching_gauge() {
-    let cache = near_singular_outer_gradient_cache();
-    let obj = warmstart_test_objective();
 
-    // The raw conditioning gate is what names the ill-conditioned joint Hessian
-    // and reports the pivot ratio + floor. Pin that message HERE, at its source
-    // (`outer_gradient_conditioning_error`), so the diagnostic stays covered even
-    // though the solver below now re-classifies the gauge-degenerate case.
-    let conditioning_err = match SaeManifoldTerm::outer_gradient_conditioning_error(&cache) {
-        Err(err) => err.to_string(),
-        Ok(()) => panic!("near-singular cache must trip the pivot-ratio conditioning gate"),
-    };
-    assert!(
-        conditioning_err.contains("joint Hessian numerically singular"),
-        "conditioning gate must name the ill-conditioned joint Hessian; got: {conditioning_err}"
-    );
-    assert!(
-        conditioning_err.contains("min/max pivot ratio") && conditioning_err.contains("floor"),
-        "conditioning gate must report the pivot ratio and floor; got: {conditioning_err}"
-    );
 
-    // #1436 (commit 21c49d14b): when the conditioning gate fires but NO chart
-    // gauge / decoder-β-null / decoder-channel-null candidate can be recovered to
-    // deflate the flat subspace, the flatness is genuinely OUTSIDE the gauge orbit
-    // — a distinct, more specific diagnosis the solver surfaces as
-    // `OuterGradientError::NonIdentifiable` (rather than echoing the raw
-    // pivot-ratio `IllConditioned` trip). Both classes are FD-eligible, so the
-    // recovery behaviour is unchanged; only the diagnostic is sharper. This is the
-    // exact "without a matching gauge" path the test name describes.
-    let err = match obj
-        .term
-        .outer_gradient_arrow_solver(&cache, &obj.current_rho.lambda_smooth_vec().unwrap())
-    {
-        Err(err) => err,
-        Ok(..) => panic!("near-singular criterion factor without a matching gauge must reject"),
-    };
-    assert!(
-        matches!(err, OuterGradientError::NonIdentifiable { .. }),
-        "no-deflatable-direction rejection must be the NonIdentifiable diagnosis; got: {err}"
-    );
-    let err = err.to_string();
-    assert!(
-        err.contains("no deflatable gauge/decoder-null direction"),
-        "guard error must name the absent deflation candidate; got: {err}"
-    );
-}
-
-/// #1051: a euclidean-patch atom whose decoder design is RANK-DEFICIENT
-/// (a straight line in a `p = 2` ambient: the decoder column space is rank
-/// 1, so one output-channel direction is unidentified by the data) leaves a
-/// genuine near-null direction of the joint Hessian in the β (decoder)
-/// block. That direction is OUTSIDE the closed-form chart gauge orbit
-/// (`dense_step_gauge_vectors` only spans per-latent-axis reparametrisation,
-/// never per-output-channel decoder freedom), so before the fix
-/// `outer_gradient_arrow_solver` could not deflate it and rejected the
-/// trial ρ with "analytic outer gradient undefined" — the singular-pivot
-/// continuation stall that made every euclidean/multi-atom atlas tile
-/// TIMEOUT. With the β-basis admitted as a deflation candidate the flat
-/// direction is Faddeev-Popov-deflated and the solve succeeds, regularising
-/// the near-null β response to the Hessian scale (bounded, not 1e13).
-pub(crate) fn rank_deficient_euclidean_outer_gradient_objective() -> SaeManifoldOuterObjective {
-    // Linear euclidean basis Φ(t) = [1, t] (m = 2) over a 1-D latent.
-    let coords = array![[-0.7_f64], [-0.2], [0.3], [0.8]];
-    let n = coords.nrows();
-    let mut phi = Array2::<f64>::zeros((n, 2));
-    let mut jet = Array3::<f64>::zeros((n, 2, 1));
-    for row in 0..n {
-        phi[[row, 0]] = 1.0;
-        phi[[row, 1]] = coords[[row, 0]];
-        jet[[row, 1, 0]] = 1.0; // d/dt of the linear column.
-    }
-    // p = 2 ambient, but the decoder maps only into output channel 0 (its
-    // second column is identically zero), so the reconstruction `Φ·B` lives on
-    // the 1-D subspace `{x : x₁ = 0}` of R² and output channel 1 is genuinely
-    // unidentified. The decoder's right-singular null vector is then exactly the
-    // channel-1 axis `(0, 1)`, matching the near-null direction the joint-Hessian
-    // cache below places on that axis (β indices 1 and 3). This is the rank-1
-    // decoder column-span deficiency `decoder_channel_null_directions` must
-    // recover (#1051/#1273).
-    let decoder = array![[1.0_f64, 0.0], [0.5, 0.0]];
-    let atom = SaeManifoldAtom::new_with_provided_function_gram(
-        "euclidean_line",
-        SaeAtomBasisKind::EuclideanPatch,
-        1,
-        phi,
-        jet,
-        decoder,
-        Array2::<f64>::eye(2),
-    )
-    .unwrap();
-    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-        array![[0.9_f64], [0.8], [0.7], [0.6]],
-        vec![coords],
-        vec![LatentManifold::Euclidean],
-        AssignmentMode::softmax(0.7),
-    )
-    .unwrap();
-    let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
-    let target = array![[-1.0_f64, -2.0], [-0.3, -0.6], [0.4, 0.8], [1.1, 2.2]];
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
-    SaeManifoldOuterObjective::new(term, target, None, rho, 8, 1.0, 1.0e-6, 1.0e-6)
-}
-
-/// A joint Hessian cache whose β block carries one genuine near-null
-/// direction along the SECOND output channel (`out_col = 1`) — the
-/// rank-deficient decoder's unidentified direction — with the latent block
-/// well-conditioned and `H_tβ = 0` so the singularity is purely in β. The
-/// chart gauge orbit cannot reach this direction (#1051).
-pub(crate) fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
-    // The latent block must be dimensionally consistent with the paired
-    // objective `rank_deficient_euclidean_outer_gradient_objective` so the
-    // channel-null candidates (whose full length is the objective's
-    // `n·q + β_dim`) survive the `dir.len() == full_len` guard in
-    // `outer_gradient_arrow_solver`. That objective has n = 4 data rows and
-    // `row_block_dim q = 1` (one latent axis, K = 1 softmax ⇒ no assignment
-    // coord), so `delta_t_len` must be `n·q = 4`. A mismatched single-row cache
-    // makes `full_len = 5` while the candidates have length 8, silently
-    // dropping every channel-null direction and re-introducing the bug.
-    let htt = ArrowFactorSlab::from_blocks(vec![
-        array![[1.0_f64]],
-        array![[1.0_f64]],
-        array![[1.0_f64]],
-        array![[1.0_f64]],
-    ]);
-    // β dim = m · p = 2 · 2 = 4, laid out (col, out_col) row-major like
-    // `dense_step_gauge_vector_from_field`. Make output channel 1 (indices
-    // 1 and 3) near-null: its lower-Cholesky pivot is 1e-7, so the
-    // min/max pivot ratio falls below the 1e-12 floor and the conditioning
-    // path engages. H_tβ = 0 (zero Dense blocks) decouples β from latent.
-    let schur = array![
-        [1.0_f64, 0.0, 0.0, 0.0],
-        [0.0, 1.0e-7, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0e-7],
-    ];
-    ArrowFactorCache {
-        htt_factors: htt,
-        htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
-        schur_factor: Some(schur),
-        schur_factor_is_undamped: true,
-        beta_schur_conditioning: None,
-        joint_hessian_log_det: None,
-        solver_mode: ArrowSolverMode::Direct,
-        ridge_t: 0.0,
-        ridge_beta: 0.0,
-        htbeta: ArrowHtbetaCache::Dense {
-            blocks: Arc::from(
-                vec![
-                    Array2::<f64>::zeros((1, 4)),
-                    Array2::<f64>::zeros((1, 4)),
-                    Array2::<f64>::zeros((1, 4)),
-                    Array2::<f64>::zeros((1, 4)),
-                ]
-                .into_boxed_slice(),
-            ),
-            estimated_bytes: 0,
-        },
-        d: 4,
-        row_dims: Arc::from(vec![1usize, 1usize, 1usize, 1usize].into_boxed_slice()),
-        row_offsets: Arc::from(vec![0usize, 1usize, 2usize, 3usize, 4usize].into_boxed_slice()),
-        k: 4,
-        manifold_mode_fingerprint: 0,
-        row_hessian_fingerprint: 0,
-        pcg_diagnostics: ArrowPcgDiagnostics::default(),
-        gauge_deflated_directions: 0,
-        deflated_row_directions: std::sync::Arc::from(Vec::new()),
-        deflation_row_spectra: std::sync::Arc::from(Vec::new()),
-        beta_gauge_quotient: None,
-    }
-}
-
-#[test]
-pub(crate) fn outer_gradient_solver_deflates_rank_deficient_decoder_beta_null() {
-    let obj = rank_deficient_euclidean_outer_gradient_objective();
-    let cache = rank_deficient_beta_outer_gradient_cache();
-    // Sanity: the cache genuinely trips the conditioning floor (the bug's
-    // precondition) — without it this test would not exercise the fix.
-    assert!(
-        SaeManifoldTerm::outer_gradient_conditioning_error(&cache).is_err(),
-        "fixture must be sub-floor singular so the conditioning path engages"
-    );
-    // The fix: the β-block near-null direction is admitted as a deflation
-    // candidate and Faddeev-Popov-deflated, so the solver SUCCEEDS instead
-    // of rejecting with "analytic outer gradient undefined".
-    let solver = obj
-        .term
-        .outer_gradient_arrow_solver(&cache, &obj.current_rho.lambda_smooth_vec().unwrap())
-        .expect("rank-deficient decoder β-null must be deflated, not rejected (#1051/#1273)");
-    // The deflated solve must REGULARISE the near-null β response: a plain
-    // inverse divides by the 1e-7 pivot and explodes; the deflated solve is
-    // bounded at the Hessian scale.
-    let beta_null_rhs = array![0.0_f64, 0.0, 0.0, 1.0]; // output channel 1, col 1.
-    let rhs_t = Array1::<f64>::zeros(cache.delta_t_len());
-    let plain = cache
-        .full_inverse_apply(rhs_t.view(), beta_null_rhs.view())
-        .expect("plain solve")
-        .1;
-    let deflated = solver
-        .solve(rhs_t.view(), beta_null_rhs.view())
-        .expect("deflated solve")
-        .beta;
-    assert!(
-        plain[3].abs() > 1.0e13,
-        "plain near-null β solve must explode; got {}",
-        plain[3]
-    );
-    assert!(
-        deflated.iter().all(|v| v.is_finite()) && deflated[3].abs() < 10.0,
-        "deflated near-null β solve must be bounded at the Hessian scale; got {deflated:?}"
-    );
-}
 
 /// #1436 — the analytic derivative error taxonomy must keep internal-invariant
 /// failures distinct from genuine conditioning/non-identifiability. Every class
@@ -1096,16 +860,12 @@ pub(crate) fn outer_gradient_solver_deflates_rank_deficient_decoder_beta_null() 
 /// the diagnostic must remain machine-distinguishable.
 #[test]
 pub(crate) fn outer_gradient_internal_invariant_is_typed_1436() {
-    let ill_conditioned = OuterGradientError::IllConditioned {
-        reason: "near-singular joint Hessian".to_string(),
-    };
     let non_identifiable = OuterGradientError::NonIdentifiable {
         reason: "gauge-degenerate direction".to_string(),
     };
     let internal = OuterGradientError::InternalInvariant {
         reason: "shape mismatch".to_string(),
     };
-    assert!(ill_conditioned.to_string().contains("ill-conditioned"));
     assert!(non_identifiable.to_string().contains("non-identifiable"));
     assert!(
         internal.to_string().contains("internal invariant"),
@@ -1120,21 +880,14 @@ pub(crate) fn outer_gradient_internal_invariant_is_typed_1436() {
 /// invariant violations still invalidate the whole optimization.
 #[test]
 pub(crate) fn outer_gradient_failure_preserves_rho_locality_2653() {
-    for error in [
-        OuterGradientError::IllConditioned {
-            reason: "finite projected solve lost residual reduction".to_string(),
-        },
-        OuterGradientError::NonIdentifiable {
-            reason: "gauge-deflated operator remains singular".to_string(),
-        },
-    ] {
-        let error = EstimationError::from(error);
-        assert!(
-            matches!(error, EstimationError::TrialPointRefused { .. })
-                && error.is_trial_point_infeasible(),
-            "conditioning at one rho must reject only that trial: {error}"
-        );
-    }
+    let error = EstimationError::from(OuterGradientError::NonIdentifiable {
+        reason: "exact stationarity operator remains singular".to_string(),
+    });
+    assert!(
+        matches!(error, EstimationError::TrialPointRefused { .. })
+            && error.is_trial_point_infeasible(),
+        "conditioning at one rho must reject only that trial: {error}"
+    );
 
     let invariant = EstimationError::from(OuterGradientError::InternalInvariant {
         reason: "gradient length differs from rho layout".to_string(),

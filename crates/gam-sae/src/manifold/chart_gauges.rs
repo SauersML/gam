@@ -285,9 +285,12 @@ impl SaeManifoldTerm {
         Ok(dense.to_owned())
     }
 
-    /// Orthonormal analytic chart-gauge basis in one assembled arrow layout.
-    /// Both dense exact-A quotient geometry and matrix-free arrow consumers use
-    /// this basis, so the physical subspace cannot depend on representation.
+    /// Orthonormal analytic chart-gauge basis in one assembled arrow layout: the
+    /// test instrument that measures gradient mass along the closed-form chart
+    /// gauges (#2720) and pins the TopK compact-chart restriction (#2653). No
+    /// production solve deflates it since the outer gradient reads the exact-A
+    /// spectral null policy (#4181).
+    #[cfg(test)]
     pub(crate) fn joint_chart_gauge_basis_for_arrow_layout(
         &self,
         row_offsets: &[usize],
@@ -301,13 +304,8 @@ impl SaeManifoldTerm {
         // full-to-compact map always agrees on the border; only the row widths
         // move (the filed 132 -> 84 case). When the border itself differs, this
         // operator is not a compaction of the joint chart at all and the
-        // closed-form chart gauges simply do not live in its space. That is the
-        // "no matching gauge" condition the caller already diagnoses as
-        // `NonIdentifiable` — reporting it as an internal invariant error instead
-        // converts a legitimate, more specific refusal into a bug report
-        // (regression: `outer_gradient_solver_rejects_near_singular_cache_without_matching_gauge`
-        // saw `arrow border dimension 1 != term border dimension 3`).
-        // Row-layout disagreement stays a typed invariant error below, because
+        // closed-form chart gauges simply do not live in its space, so the basis
+        // is empty rather than an internal invariant error. Row-layout disagreement stays a typed invariant error below, because
         // there the gauge IS mappable and silently skipping it would put an
         // analytic chart null back into the physical spectrum.
         if border_dim != self.factored_border_dim() {

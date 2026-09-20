@@ -7,8 +7,8 @@
 //!  1. **Outer-gradient parity.** The #1026 test proved the cache returned by
 //!     `penalized_quasi_laplace_criterion_streaming_exact_with_cache` is a drop-in for the EFS
 //!     consumers (`ard_inverse_traces` / `reconstruction_dispersion`). But the
-//!     ANALYTIC OUTER ρ-GRADIENT lane (`outer_gradient_arrow_solver` →
-//!     `analytic_outer_rho_gradient_components_with_bundle`) also reads the returned cache,
+//!     ANALYTIC OUTER ρ-GRADIENT lane
+//!     (`analytic_outer_rho_gradient_components_with_bundle`) also reads the returned cache,
 //!     and it is that lane the seed startup-validation and the small-BFGS regime
 //!     consume. This test forces the streaming route at a size where the dense
 //!     path also fits and asserts the outer gradient assembled off the streaming

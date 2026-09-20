@@ -6,91 +6,22 @@ pub(crate) struct SaeArrowVector {
     pub beta: Array1<f64>,
 }
 
+/// Test-only dense oracle over the plain bordered-arrow inverse an
+/// [`ArrowFactorCache`] factors. The analytic outer gradient prices every
+/// selected-inverse trace from the shared probe bundle
+/// ([`row_selected_inverse_from_probes`], #2712) and takes its adjoint from the
+/// exact-A spectral pseudoinverse (#4181); this oracle is what the from-probes
+/// parity tests compare against. Row deflation lives inside the cache's
+/// conditioned factors, so the name still describes the inverse it applies.
+#[cfg(test)]
 pub(crate) struct DeflatedArrowSolver<'a> {
     pub(crate) cache: &'a ArrowFactorCache,
-    pub(crate) gauge_basis: Vec<Array1<f64>>,
-    pub(crate) gauge_response_physical: Vec<Array1<f64>>,
-    /// `M = GᵀH⁻¹G`, the gauge metric the Woodbury factor was built from.
-    pub(crate) gauge_metric: Array2<f64>,
-    pub(crate) woodbury_factor: Option<FaerCholeskyFactor>,
-    pub(crate) gauge_stiffness: f64,
 }
 
+#[cfg(test)]
 impl<'a> DeflatedArrowSolver<'a> {
     pub(crate) fn plain(cache: &'a ArrowFactorCache) -> Self {
-        Self {
-            cache,
-            gauge_basis: Vec::new(),
-            gauge_response_physical: Vec::new(),
-            gauge_metric: Array2::<f64>::zeros((0, 0)),
-            woodbury_factor: None,
-            gauge_stiffness: 0.0,
-        }
-    }
-
-    pub(crate) fn from_orthonormal_gauges(
-        cache: &'a ArrowFactorCache,
-        gauge_basis: Vec<Array1<f64>>,
-        stiffness: f64,
-    ) -> Result<Self, String> {
-        if gauge_basis.is_empty() {
-            return Ok(Self::plain(cache));
-        }
-        if !(stiffness.is_finite() && stiffness > 0.0) {
-            return Err(format!(
-                "DeflatedArrowSolver: gauge stiffness must be finite and positive; got {stiffness}"
-            ));
-        }
-        let full_len = cache.delta_t_len() + cache.k;
-        let mut gauge_responses = Vec::with_capacity(gauge_basis.len());
-        for gauge in &gauge_basis {
-            if gauge.len() != full_len {
-                return Err(format!(
-                    "DeflatedArrowSolver: gauge length {} != cache full length {full_len}",
-                    gauge.len()
-                ));
-            }
-            let (sol_t, sol_beta) = cache
-                .full_inverse_apply(
-                    gauge.slice(s![..cache.delta_t_len()]),
-                    gauge.slice(s![cache.delta_t_len()..]),
-                )
-                .map_err(|err| format!("DeflatedArrowSolver: gauge back-solve: {err}"))?;
-            gauge_responses.push(flatten_arrow_parts(sol_t.view(), sol_beta.view()));
-        }
-
-        let rank = gauge_basis.len();
-        let stiffness_recip = stiffness.recip();
-        let mut gauge_metric = Array2::<f64>::zeros((rank, rank));
-        let mut woodbury = Array2::<f64>::eye(rank);
-        for i in 0..rank {
-            woodbury[[i, i]] *= stiffness_recip;
-            for j in 0..rank {
-                let value = gauge_basis[i].dot(&gauge_responses[j]);
-                gauge_metric[[i, j]] = value;
-                woodbury[[i, j]] += value;
-            }
-        }
-        let woodbury_factor = woodbury
-            .cholesky(Side::Lower)
-            .map_err(|err| format!("DeflatedArrowSolver: gauge Woodbury factor failed: {err}"))?;
-        let mut gauge_response_physical = gauge_responses;
-        for j in 0..rank {
-            for i in 0..rank {
-                let coeff = gauge_metric[[i, j]];
-                for row in 0..full_len {
-                    gauge_response_physical[j][row] -= coeff * gauge_basis[i][row];
-                }
-            }
-        }
-        Ok(Self {
-            cache,
-            gauge_basis,
-            gauge_response_physical,
-            gauge_metric,
-            woodbury_factor: Some(woodbury_factor),
-            gauge_stiffness: stiffness,
-        })
+        Self { cache }
     }
 
     pub(crate) fn solve(
@@ -98,67 +29,16 @@ impl<'a> DeflatedArrowSolver<'a> {
         rhs_t: ArrayView1<'_, f64>,
         rhs_beta: ArrayView1<'_, f64>,
     ) -> Result<SaeArrowVector, String> {
-        let (sol_t, sol_beta) = self
+        let (t, beta) = self
             .cache
             .full_inverse_apply(rhs_t, rhs_beta)
             .map_err(|err| format!("DeflatedArrowSolver: full inverse: {err}"))?;
-        let Some(factor) = self.woodbury_factor.as_ref() else {
-            return Ok(SaeArrowVector {
-                t: sol_t,
-                beta: sol_beta,
-            });
-        };
-
-        let full_len = self.cache.delta_t_len() + self.cache.k;
-        let mut flat = flatten_arrow_parts(sol_t.view(), sol_beta.view());
-        if flat.len() != full_len {
-            return Err(format!(
-                "DeflatedArrowSolver: solution length {} != cache full length {full_len}",
-                flat.len()
-            ));
-        }
-        let mut gauge_coeffs = Array1::<f64>::zeros(self.gauge_basis.len());
-        for (idx, gauge) in self.gauge_basis.iter().enumerate() {
-            gauge_coeffs[idx] = gauge.dot(&flat);
-        }
-        let weights = factor.solvevec(&gauge_coeffs);
-        for (gauge, &coeff) in self.gauge_basis.iter().zip(gauge_coeffs.iter()) {
-            for i in 0..flat.len() {
-                flat[i] -= gauge[i] * coeff;
-            }
-        }
-        for (response, &weight) in self.gauge_response_physical.iter().zip(weights.iter()) {
-            for i in 0..flat.len() {
-                flat[i] -= response[i] * weight;
-            }
-        }
-        for (gauge, &weight) in self.gauge_basis.iter().zip(weights.iter()) {
-            let coeff = self.gauge_stiffness.recip() * weight;
-            for i in 0..flat.len() {
-                flat[i] += gauge[i] * coeff;
-            }
-        }
-        Ok(SaeArrowVector {
-            t: flat.slice(s![..self.cache.delta_t_len()]).to_owned(),
-            beta: flat.slice(s![self.cache.delta_t_len()..]).to_owned(),
-        })
+        Ok(SaeArrowVector { t, beta })
     }
 
-    /// #932 FRONT C — whether the cheap row-local Takahashi selected inverse
-    /// ([`Self::beta_inv`] / [`Self::selected_inverse_row_blocks`]) reproduces
-    /// `solve`'s selected entries EXACTLY. It does so only on the plain bordered
-    /// arrow: when a gauge Woodbury deflation is active (`woodbury_factor`) the
-    /// `solve` output carries the rank-`R` gauge correction the row-local blocks
-    /// omit. Callers must then fall back to the per-row `solve` loop.
-    pub(crate) fn plain_selected_inverse_available(&self) -> bool {
-        self.woodbury_factor.is_none()
-    }
-
-    /// #932 FRONT C — the full `(H⁻¹)_ββ = S⁻¹` block (`K×K`), formed ONCE per
-    /// outer step from the cached dense Schur factor (no per-column full-system
-    /// `solve`). On the plain arrow this equals the `beta_inv` the logdet /
-    /// α-trace consumers used to build with `K` calls to [`Self::solve`] with
-    /// unit β-RHS. ONLY valid when [`Self::plain_selected_inverse_available`].
+    /// #932 FRONT C — the full `(H⁻¹)_ββ = S⁻¹` block (`K×K`), formed ONCE from
+    /// the cached dense Schur factor (no per-column full-system `solve`). It
+    /// equals `K` calls to [`Self::solve`] with unit β-RHS.
     pub(crate) fn beta_inv(&self) -> Result<Array2<f64>, String> {
         let k = self.cache.k;
         if k == 0 {
@@ -183,8 +63,7 @@ impl<'a> DeflatedArrowSolver<'a> {
     /// ```
     ///
     /// Touches ONLY row `i`'s own factor, its `H_tβ^(i)` coupling, and the shared
-    /// `S⁻¹` — O(q·(q+K)) per row, no `n`-sweep. ONLY valid when
-    /// [`Self::plain_selected_inverse_available`]; pass the `S⁻¹` from
+    /// `S⁻¹` — O(q·(q+K)) per row, no `n`-sweep. Pass the `S⁻¹` from
     /// [`Self::beta_inv`].
     pub(crate) fn selected_inverse_row_blocks(
         &self,
@@ -247,56 +126,16 @@ impl<'a> DeflatedArrowSolver<'a> {
         Ok((inv_vv, inv_vbeta))
     }
 
-    /// Diagonal of the latent block of the operator [`Self::solve`] inverts.
-    ///
-    /// Plain arrow: the selected-inverse diagonal of `H⁻¹`. With gauges `G`
-    /// (orthonormal columns `g_a`) at stiffness `s`, `solve` is `(H + s·GGᵀ)⁻¹`, and
-    /// its `idx` diagonal entry reads off `solve(e_idx)` in closed form. With
-    /// `c_a = (H⁻¹g_a)[idx] = R_a[idx] + Σ_b M[b,a]·g_b[idx]` (`R_a` the stored
-    /// physical responses, `M = GᵀH⁻¹G`) and `w = W⁻¹c`, `W = I/s + M`:
-    ///
-    /// ```text
-    ///   out[idx] = (H⁻¹)[idx,idx] − Σ_a (g_a[idx]·c_a + R_a[idx]·w_a − g_a[idx]·w_a/s)
-    /// ```
-    ///
-    /// That is `solve`'s own elimination applied to `e_idx`, so the result equals
-    /// the per-coordinate `solve` loop up to rounding, at `O(r²)` per coordinate
-    /// on top of the plain diagonal instead of one full bordered solve per
-    /// coordinate (#2900).
+    /// Diagonal of the latent block of `H⁻¹`: the plain selected-inverse diagonal.
     pub(crate) fn latent_inverse_diagonal(&self) -> Result<Array1<f64>, String> {
-        let mut out = self
-            .cache
+        self.cache
             .latent_block_inverse_diagonal()
-            .map_err(|err| format!("DeflatedArrowSolver: latent inverse diagonal: {err}"))?;
-        let Some(factor) = self.woodbury_factor.as_ref() else {
-            return Ok(out);
-        };
-        let rank = self.gauge_basis.len();
-        let stiffness_recip = self.gauge_stiffness.recip();
-        let mut coeffs = Array1::<f64>::zeros(rank);
-        for idx in 0..out.len() {
-            for a in 0..rank {
-                let mut value = self.gauge_response_physical[a][idx];
-                for b in 0..rank {
-                    value += self.gauge_metric[[b, a]] * self.gauge_basis[b][idx];
-                }
-                coeffs[a] = value;
-            }
-            let weights = factor.solvevec(&coeffs);
-            let mut correction = 0.0_f64;
-            for a in 0..rank {
-                let gauge = self.gauge_basis[a][idx];
-                correction += gauge * coeffs[a] + self.gauge_response_physical[a][idx] * weights[a]
-                    - stiffness_recip * gauge * weights[a];
-            }
-            out[idx] -= correction;
-        }
-        Ok(out)
+            .map_err(|err| format!("DeflatedArrowSolver: latent inverse diagonal: {err}"))
     }
 }
 
-/// #2712 — the matrix-free sibling of
-/// [`DeflatedArrowSolver::selected_inverse_row_blocks`]: row `i`'s own
+/// #2712 — the matrix-free replacement for the dense (now test-only oracle)
+/// `DeflatedArrowSolver::selected_inverse_row_blocks`: row `i`'s own
 /// `(H⁻¹)_tt` (`q×q`) and `(H⁻¹)_tβ` (`q×K`) blocks of the bordered arrow,
 /// reconstructed from a shared reduced-Schur probe bundle `(z_l, S⁻¹ z_l)`
 /// instead of a materialized `K×K` `S⁻¹`. Single source of truth for the three
@@ -328,8 +167,8 @@ impl<'a> DeflatedArrowSolver<'a> {
 /// `cache.deflated_row_directions[i]` — not of the raw `H_tt^(i)`, and the
 /// reduced Schur `S` behind the bundle is that same conditioned arrow's Schur
 /// complement. So `A_i⁻¹ + G_i S⁻¹ G_iᵀ` is the DEFLATED per-row inverse block,
-/// exactly the object [`DeflatedArrowSolver::selected_inverse_row_blocks`]
-/// returns from the dense route and exactly the object the Daleckii–Krein
+/// exactly the object the dense `DeflatedArrowSolver::selected_inverse_row_blocks`
+/// oracle returns and exactly the object the Daleckii–Krein
 /// deflation correction `tr(inv_vv·(D − DΦ[D]))` must be contracted against.
 ///
 /// The from-probes channels used to hard-refuse deflated rows on the stated
@@ -480,59 +319,10 @@ mod selected_inverse_row_blocks_oracle_tests {
         }
     }
 
-    /// #2900 — with gauges installed, `latent_inverse_diagonal` reads the latent
-    /// diagonal of `(H + s·GGᵀ)⁻¹` in closed form. It must equal the per-coordinate
-    /// `solve(e_idx)` route it replaced. The control requires the gauge correction to
-    /// move the diagonal off the plain `H⁻¹` diagonal, so the closed form's correction
-    /// term is exercised.
-    #[test]
-    fn woodbury_latent_diagonal_matches_per_coordinate_solves_2900() {
-        let cache = coupled_arrow_cache();
-        let total_t = cache.delta_t_len();
-        let norm = 3.0_f64.sqrt().recip();
-        let gauges = vec![
-            array![1.0_f64, 1.0, 0.0, 1.0, 0.0].mapv(|v| v * norm),
-            array![1.0_f64, -1.0, 1.0, 0.0, 0.0].mapv(|v| v * norm),
-        ];
-        let solver = DeflatedArrowSolver::from_orthonormal_gauges(&cache, gauges, 0.7)
-            .expect("gauge Woodbury solver");
-        assert!(!solver.plain_selected_inverse_available());
-        let closed_form = solver.latent_inverse_diagonal().expect("closed-form diagonal");
-        let plain = cache
-            .latent_block_inverse_diagonal()
-            .expect("plain selected-inverse diagonal");
-        assert_eq!(closed_form.len(), total_t);
-        let rhs_beta = Array1::<f64>::zeros(cache.k);
-        let mut largest_correction = 0.0_f64;
-        for idx in 0..total_t {
-            let mut rhs_t = Array1::<f64>::zeros(total_t);
-            rhs_t[idx] = 1.0;
-            let solved = solver
-                .solve(rhs_t.view(), rhs_beta.view())
-                .expect("per-coordinate Woodbury solve");
-            let expected = solved.t[idx];
-            assert!(
-                (closed_form[idx] - expected).abs() <= 1.0e-12 * expected.abs(),
-                "coordinate {idx}: closed form {:.15e} vs per-coordinate solve {expected:.15e}",
-                closed_form[idx]
-            );
-            largest_correction = largest_correction.max((expected - plain[idx]).abs() / expected.abs());
-        }
-        assert!(
-            largest_correction > 1.0e-2,
-            "the gauge stiffening must move the latent diagonal off the plain inverse; \
-             largest relative correction {largest_correction:.3e}"
-        );
-    }
-
     #[test]
     fn row_local_blocks_match_per_row_solve() {
         let cache = coupled_arrow_cache();
         let solver = DeflatedArrowSolver::plain(&cache);
-        assert!(
-            solver.plain_selected_inverse_available(),
-            "plain cache must take the fast selected-inverse path"
-        );
         let total_t = cache.delta_t_len();
         let k = cache.k;
 

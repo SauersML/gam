@@ -3987,7 +3987,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         OuterCapability {
             // The planner always has an analytic outer update. Two regimes:
             //  * Dense-admitted: the exact analytic outer gradient is assembled
-            //    from the joint-Hessian IFT (`outer_gradient_arrow_solver`), for
+            //    from the joint-Hessian IFT (the exact-A spectral pseudoinverse), for
             //    every assignment mode, including ordered Beta--Bernoulli (#1006).
             //  * Matrix-free (dense criterion factor exceeds the in-core budget,
             //    e.g. large-K / wide-border duchon): the rational value emits one
@@ -4210,16 +4210,15 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // half of that gradient entry, and the scaled-block residual carries the
         // `½·R̃_ℓ` half through the data term.
         let cost = cost + self.block_jacobian(&rho_state);
-        // The gradient is the EXACT implicit derivative: `outer_gradient_arrow_
-        // solver` solves the implicit-function system through the rank-revealing
-        // gauge/decoder-null deflation (Rayleigh-band + Faddeev–Popov stiffness),
-        // and a genuinely singular system surfaced above as a typed
-        // `OuterGradientError` instead of a degraded direction. No secondary
-        // finite-difference safeguard is layered on top (SPEC: FD never leaves
-        // tests) — a near-flat inner direction that corrupts the `Γ·θ̂_ρ`
-        // envelope term is a deflation-candidate gap to fix in
-        // `outer_gradient_arrow_solver`, not something to paper over with a
-        // differenced value path.
+        // The gradient is the EXACT implicit derivative: the single adjoint
+        // `a = A⁺Γ` is read off the exact-A spectral pseudoinverse of the lane that
+        // priced the value (the dense eigensystem, the arrow-orbit elimination, or
+        // the matrix-free reduced-Schur solve), and a genuinely singular system
+        // surfaced above as a typed `OuterGradientError` instead of a degraded
+        // direction. No secondary finite-difference safeguard is layered on top
+        // (SPEC: FD never leaves tests) — a near-flat inner direction that corrupts
+        // the `Γ·θ̂_ρ` envelope term is a gap to fix in that pseudoinverse's null
+        // policy, not something to paper over with a differenced value path.
         self.current_rho = rho_state;
         self.last_loss = Some(evaluation.loss);
         self.record_search_criterion(cost, Some(gradient.dot(&gradient).sqrt()));
