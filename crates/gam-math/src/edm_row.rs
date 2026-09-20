@@ -32,6 +32,7 @@
 
 use crate::jet_scalar::JetScalar;
 use crate::jet_tower::RowProgram;
+use crate::special::{bd0, log1p_minus_x};
 
 /// The variance function of an exponential-dispersion response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,25 +88,33 @@ impl EdmVariance {
     ///
     /// with `0 · ln 0 = 0`. `μ` must lie in [`Self::mean_in_domain`] and `y` in
     /// the family's response support; the caller certifies both.
+    ///
+    /// The Poisson, Gamma and Bernoulli forms above each subtract two `O(δ)`
+    /// terms to leave an `O(δ²)` deviance, `δ = (y − μ)/μ`, so they are
+    /// evaluated through the exact cancellation-free identities
+    ///
+    /// ```text
+    /// Poisson    2·bd0(y, μ)
+    /// Gamma      −2·log1p_minus_x((y − μ)/μ)
+    /// Bernoulli  2[bd0(y, μ) + bd0(1 − y, 1 − μ)]
+    /// ```
+    ///
+    /// (the Bernoulli pair's linear terms cancel exactly), the same primitives
+    /// the canonical solver rows use.
     #[inline]
     pub fn unit_deviance(self, y: f64, mu: f64, one_minus_mu: f64) -> f64 {
-        fn x_ln_x_over(x: f64, m: f64) -> f64 {
-            if x == 0.0 { 0.0 } else { x * (x / m).ln() }
-        }
         match self {
             Self::Gaussian => {
                 let r = y - mu;
                 r * r
             }
-            Self::Poisson => 2.0 * (x_ln_x_over(y, mu) - (y - mu)),
-            Self::Gamma => 2.0 * ((y - mu) / mu - (y / mu).ln()),
+            Self::Poisson => 2.0 * bd0(y, mu),
+            Self::Gamma => -2.0 * log1p_minus_x((y - mu) / mu),
             Self::InverseGaussian => {
                 let r = y - mu;
                 r * r / (y * mu * mu)
             }
-            Self::Bernoulli => {
-                2.0 * (x_ln_x_over(y, mu) + x_ln_x_over(1.0 - y, one_minus_mu))
-            }
+            Self::Bernoulli => 2.0 * (bd0(y, mu) + bd0(1.0 - y, one_minus_mu)),
         }
     }
 }
@@ -258,5 +267,46 @@ impl EdmRow {
             c: t.g[0],
             d: t.h[0][0],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EdmVariance;
+
+    fn assert_relative(label: &str, got: f64, expected: f64) {
+        assert!(
+            (got - expected).abs() <= 1e-13 * expected.abs(),
+            "{label}: got {got:e}, expected {expected:e}"
+        );
+    }
+
+    /// Near `y = μ` each deviance is `O(δ²)`, the difference of two `O(δ)`
+    /// terms; the unit deviance must keep full relative precision there, where
+    /// every converged fit evaluates it. `δ = 2⁻²⁰` is exact in binary, so the
+    /// references are the Taylor series in `δ` truncated past rounding.
+    #[test]
+    fn unit_deviance_keeps_relative_precision_near_the_mean() {
+        let delta = 2.0_f64.powi(-20);
+        let (mu, y) = (1.0, 1.0 + delta);
+        let d2 = delta * delta;
+        assert_relative(
+            "Poisson",
+            EdmVariance::Poisson.unit_deviance(y, mu, 0.0),
+            d2 * (1.0 - delta / 3.0 + d2 / 6.0),
+        );
+        assert_relative(
+            "Gamma",
+            EdmVariance::Gamma.unit_deviance(y, mu, 0.0),
+            d2 * (1.0 - 2.0 * delta / 3.0 + d2 / 2.0),
+        );
+        // Bernoulli about one half: y = (1 + u)/2 gives
+        // d = (1 + u)ln(1 + u) + (1 − u)ln(1 − u) = u² + u⁴/6 + u⁶/15 + ….
+        let u = delta;
+        assert_relative(
+            "Bernoulli",
+            EdmVariance::Bernoulli.unit_deviance(0.5 * (1.0 + u), 0.5, 0.5),
+            u * u * (1.0 + u * u / 6.0),
+        );
     }
 }

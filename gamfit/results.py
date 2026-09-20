@@ -25,6 +25,10 @@ from ._sampling import (
     PosteriorSamples,
     SamplingConfig,
 )
+from ._partial_effect import (
+    AxisLevels,
+    PartialEffect,
+)
 from ._tables import (
     PredictionResult,
 )
@@ -41,6 +45,7 @@ from ._validation import (
 
 __all__ = [
     "AffineDesign",
+    "AxisLevels",
     "CompetingRisksCIF",
     "CompetingRisksPrediction",
     "CumulativeIncidenceDraws",
@@ -48,6 +53,7 @@ __all__ = [
     "FormulaValidation",
     "MultinomialPrediction",
     "PairedPosteriorSamples",
+    "PartialEffect",
     "PosteriorPredictive",
     "PosteriorSamples",
     "PredictionResult",
