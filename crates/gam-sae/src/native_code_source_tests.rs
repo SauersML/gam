@@ -898,6 +898,24 @@ fn native_description_length_charges_gate_amplitudes_on_a_fixed_support_2933_f10
     // ½log₂(0.135 / 0.0675) = ½ bit. A constant gate on the same support transmits
     // nothing, and its residual, whose whole energy is the delivered distortion,
     // is free.
+    let n = 9;
+    let plans = [periodic_plan()];
+    let width = plans[0].basis_size().expect("plan width");
+    let mut decoder = Array2::<f64>::zeros((width, 1));
+    decoder[[0, 0]] = 3.0;
+    let decoders = [decoder];
+    let coords = [Array2::from_elem((n, 1), 0.25)];
+    let varying = Array2::from_shape_fn((n, 1), |(i, _)| 0.1 + 0.1 * i as f64);
+    let constant = Array2::from_elem((n, 1), 0.5);
+    let output = decoded(&plans, &decoders, &coords, &varying);
+    let mean = output.sum() / n as f64;
+    let output_variance =
+        output.iter().map(|value| (value - mean) * (value - mean)).sum::<f64>() / (n - 1) as f64;
+    assert!(
+        (output_variance - 0.675).abs() < 1.0e-12,
+        "fixture: the decoded output varies ({output_variance})"
+    );
+
     let amplitude = 0.135_f64.sqrt();
     let residual = Array2::from_shape_fn((n, 1), |(i, _)| {
         if i % 2 == 0 { amplitude } else { -amplitude }
