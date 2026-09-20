@@ -1519,24 +1519,18 @@ impl<'a> RemlState<'a> {
 
         let firth_op = if let Some(jeffreys_link) = firth_jeffreys_link {
             let x_dense = x_dense.expect("Firth hyper terms require dense active-basis design");
-            if free_basis_opt.is_none() {
-                if let Some(cached) = bundle.firth_dense_operator.as_ref() {
-                    Some(cached.as_ref().clone())
-                } else {
-                    Some(Self::build_firth_dense_operator_for_link(
+            // Share the bundle's operator by `Arc`: it holds five n×p dense
+            // blocks, so a deep copy per evaluation is pure memory traffic.
+            match (free_basis_opt.as_ref(), bundle.firth_dense_operator.as_ref()) {
+                (None, Some(cached)) => Some(std::sync::Arc::clone(cached)),
+                _ => Some(std::sync::Arc::new(
+                    Self::build_firth_dense_operator_for_link(
                         &jeffreys_link,
                         x_dense,
                         &pirls_result.final_eta.to_owned(),
                         self.weights,
-                    )?)
-                }
-            } else {
-                Some(Self::build_firth_dense_operator_for_link(
-                    &jeffreys_link,
-                    x_dense,
-                    &pirls_result.final_eta.to_owned(),
-                    self.weights,
-                )?)
+                    )?,
+                )),
             }
         } else {
             None
@@ -1927,7 +1921,7 @@ impl<'a> RemlState<'a> {
                             .clone();
                             Some(std::sync::Arc::new(FirthAugmentedSingleHyperOperator {
                                 base: core,
-                                firth_op: std::sync::Arc::new(op.clone()),
+                                firth_op: std::sync::Arc::clone(op),
                                 tau_kernel: kernel.clone(),
                                 x_tau_dense: x_tau_j_dense_mat,
                                 p: p_dim,
@@ -2162,43 +2156,8 @@ impl<'a> RemlState<'a> {
         };
         let x_tau_terms = TauDesignTerm::for_directions_in_basis(hyper_dirs, &basis)?;
 
-        let firth_jeffreys_link = super::outer_eval::reml_robust_jeffreys_link(&self.config);
-        let firth_op = if let Some(jeffreys_link) = firth_jeffreys_link {
-            let x_dense_arc = pirls_result
-                .x_transformed
-                .try_to_dense_arc("build_tau_fixed_drift_deriv requires dense transformed design for Firth operator")
-                .map_err(EstimationError::InvalidInput)?;
-            let x_dense_owned = free_basis_opt.as_ref().map(|z| {
-                DenseRightProductView::new(x_dense_arc.as_ref())
-                    .with_factor(z)
-                    .materialize()
-            });
-            let x_dense = x_dense_owned
-                .as_ref()
-                .unwrap_or_else(|| x_dense_arc.as_ref());
-            let op = if free_basis_opt.is_none() {
-                if let Some(cached) = bundle.firth_dense_operator.as_ref() {
-                    cached.as_ref().clone()
-                } else {
-                    Self::build_firth_dense_operator_for_link(
-                        &jeffreys_link,
-                        x_dense,
-                        &pirls_result.final_eta.to_owned(),
-                        self.weights,
-                    )?
-                }
-            } else {
-                Self::build_firth_dense_operator_for_link(
-                    &jeffreys_link,
-                    x_dense,
-                    &pirls_result.final_eta.to_owned(),
-                    self.weights,
-                )?
-            };
-            Some(std::sync::Arc::new(op))
-        } else {
-            None
-        };
+        let firth_op =
+            self.build_dense_firth_operator_for_outer_basis(pirls_result, bundle, &free_basis_opt)?;
 
         Self::build_tau_fixed_drift_deriv_from_terms(
             x_design,
@@ -2916,10 +2875,14 @@ impl<'a> RemlState<'a> {
         let firth_logit_active =
             super::outer_eval::reml_robust_jeffreys_link(&self.config).is_some();
         let (firth_op_arc, x_tau_dense_list, x_tau_tau_dense) = if firth_logit_active {
-            let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> = bundle
-                .firth_dense_operator
-                .as_ref()
-                .map(|c| std::sync::Arc::new(c.as_ref().clone()));
+            // The operator must live in the same (Qs, free-basis) frame as
+            // `beta_eval` and the `X_τ` blocks below, which the shared builder
+            // guarantees; the cached full-basis operator is reused by `Arc`.
+            let op_opt = self.build_dense_firth_operator_for_outer_basis(
+                pirls_result,
+                bundle,
+                &free_basis_opt,
+            )?;
             let dense_list: Vec<Option<Array2<f64>>> = x_tau_terms
                 .iter()
                 .map(|t| match t {
@@ -3446,30 +3409,31 @@ impl<'a> RemlState<'a> {
     pub(crate) fn link_ext_effective_design(
         &self,
         bundle: &EvalShared,
-    ) -> Result<Array2<f64>, EstimationError> {
+    ) -> Result<std::sync::Arc<Array2<f64>>, EstimationError> {
         let pirls_result = bundle.pirls_result.as_ref();
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
         let x_dense_arc = pirls_result
             .x_transformed
             .try_to_dense_arc("link-ext pair assembly requires dense transformed design")
             .map_err(EstimationError::InvalidInput)?;
-        let mut x = match free_basis_opt.as_ref() {
-            Some(z) => DenseRightProductView::new(x_dense_arc.as_ref())
-                .with_factor(z)
-                .materialize(),
-            None => x_dense_arc.as_ref().clone(),
-        };
+        if let Some(z) = free_basis_opt.as_ref() {
+            return Ok(std::sync::Arc::new(
+                DenseRightProductView::new(x_dense_arc.as_ref())
+                    .with_factor(z)
+                    .materialize(),
+            ));
+        }
+        let qs = &pirls_result.reparam_result.qs;
         let needs_rotation = matches!(
             pirls_result.coordinate_frame,
             crate::pirls::PirlsCoordinateFrame::TransformedQs
-        ) && free_basis_opt.is_none();
+        ) && x_dense_arc.ncols() == qs.nrows();
         if needs_rotation {
-            let qs = &pirls_result.reparam_result.qs;
-            if x.ncols() == qs.nrows() {
-                x = x.dot(&qs.t());
-            }
+            return Ok(std::sync::Arc::new(x_dense_arc.dot(&qs.t())));
         }
-        Ok(x)
+        // Already in the coords' basis: share the governed dense design
+        // instead of deep-copying n×p per outer evaluation.
+        Ok(x_dense_arc)
     }
 
     /// Build the ext-ext (link-link) second-order pair callback and the
@@ -3522,7 +3486,7 @@ impl<'a> RemlState<'a> {
             return Ok(None);
         };
         let aux_dim = jets.aux_dim;
-        let x_eff = std::sync::Arc::new(self.link_ext_effective_design(bundle)?);
+        let x_eff = self.link_ext_effective_design(bundle)?;
         let nobs = jets.rows.len();
 
         let mut a_pairs = Array2::<f64>::zeros((aux_dim, aux_dim));
@@ -3574,7 +3538,7 @@ impl<'a> RemlState<'a> {
         jets: &[crate::pirls::StudentTThetaJet],
     ) -> Result<LinkExtPairObjects, EstimationError> {
         let aux_dim = 2usize;
-        let x_eff = std::sync::Arc::new(self.link_ext_effective_design(bundle)?);
+        let x_eff = self.link_ext_effective_design(bundle)?;
         let mut a_pairs = Array2::<f64>::zeros((aux_dim, aux_dim));
         let mut d2u = Vec::with_capacity(aux_dim * aux_dim);
         let mut d2w = Vec::with_capacity(aux_dim * aux_dim);
