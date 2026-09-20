@@ -763,11 +763,42 @@ fn constant_curvature_range_only_optimum(
     Ok(length_scale_hat)
 }
 
+/// The preconditions under which the profile criterion IS the fitted model's
+/// criterion for the curvature and range of `curv(...)` term `term_idx`.
+///
+/// The profile's design is `[1 | curv block]` and nothing else (see
+/// [`constant_curvature_psi_profile_value`]). A κ̂ and ℓ̂ selected on it, and
+/// the CI and flatness p-value read off it, describe the fitted model only
+/// when that model is exactly the intercept plus this one term. Any other
+/// parametric, random-effect or smooth term (or a removed intercept) makes
+/// them estimates for a model the fit does not realize, which is the same
+/// reason `ConstantCurvatureProfile::new` refuses `double_penalty=` (gam#3763).
 fn validate_constant_curvature_profile_inputs(
+    resolvedspec: &TermCollectionSpec,
+    term_idx: usize,
     weights: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
     family: &LikelihoodSpec,
 ) -> Result<(), EstimationError> {
+    let sole_curvature_term = resolvedspec.linear_terms.is_empty()
+        && resolvedspec.random_effect_terms.is_empty()
+        && resolvedspec.smooth_terms.len() == 1
+        && term_idx == 0
+        && matches!(resolvedspec.level, gam_terms::smooth::ModelLevel::Intercept);
+    if !sole_curvature_term {
+        crate::bail_invalid_estim!(
+            "curvature-as-an-estimand profile for term {term_idx} requires the model to be \
+             exactly `y ~ curv(...)` (intercept plus this one term): its criterion carries \
+             only the intercept and the curvature block, so with {} linear, {} random-effect \
+             and {} smooth terms (level {:?}) the κ̂, ℓ̂, CI and flatness p-value would \
+             describe a model the fit does not realize. Pin `kappa=` and `length_scale=` \
+             to take fixed geometry inside a larger model.",
+            resolvedspec.linear_terms.len(),
+            resolvedspec.random_effect_terms.len(),
+            resolvedspec.smooth_terms.len(),
+            resolvedspec.level,
+        );
+    }
     if *family != LikelihoodSpec::gaussian_identity() {
         crate::bail_invalid_estim!(
             "curvature-as-an-estimand profile currently requires Gaussian identity likelihood"
@@ -984,4 +1015,32 @@ fn solve_constant_curvature_kappa_profile(
         kappa: kappa_hat,
         length_scale: length_scale_hat,
     })
+}
+
+#[cfg(test)]
+mod profile_model_contract_tests {
+    use super::*;
+    use crate::fit_orchestration::{FitConfig,FitRequest,materialize};
+
+    #[test]
+    fn curvature_and_range_profiles_require_the_actual_model() {
+        let headers=["x","z","y"].into_iter().map(String::from).collect();
+        let rows=(0..80).map(|i| {
+            let x=0.25*(i as f64*0.71).sin();
+            let z=0.25*(i as f64*0.53).cos();
+            csv::StringRecord::from(vec![x.to_string(),z.to_string(),(x*z+0.1*z).to_string()])
+        }).collect();
+        let data=gam_data::encode_recordswith_inferred_schema(headers,rows).unwrap();
+        let config=FitConfig {family:Some("gaussian".into()),..FitConfig::default()};
+        for (formula,accepted) in [
+            ("y ~ curv(x, z, centers=20)",true),
+            ("y ~ x + curv(x, z, centers=20)",false),
+            ("y ~ x + curv(x, z, kappa=1, centers=20)",false),
+            ("y ~ 0 + curv(x, z, kappa=1, centers=20)",false),
+        ] {
+            let FitRequest::Standard(request)=materialize(formula,&data,&config).unwrap().request else {panic!("standard request")};
+            let verdict=validate_constant_curvature_profile_inputs(&request.spec,0,request.weights.view(),request.offset.view(),&request.family);
+            if accepted {verdict.unwrap();} else {assert!(verdict.unwrap_err().to_string().contains("exactly `y ~ curv(...)`"),"{formula}");}
+        }
+    }
 }

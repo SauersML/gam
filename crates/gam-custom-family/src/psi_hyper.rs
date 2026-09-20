@@ -18,6 +18,94 @@ pub struct ExplicitJeffreysCurvatureDrifts {
         Arc<dyn Fn(usize, &Array1<f64>) -> Result<Array2<f64>, CustomFamilyError> + Send + Sync>,
 }
 
+/// The rows the explicit Jeffreys ψ calculus reads `∂_ψH_info`, `∂²_ψH_info` and their
+/// coefficient-axis drifts from (gam#4313).
+///
+/// `Φ = ½ log|Z_Jᵀ H_info Z_J|₊` is priced on the full-data information. It is a
+/// log-determinant, not a row sum, so a Horvitz–Thompson reweighting of its rows
+/// estimates neither `Φ` nor its ψ motion. The likelihood ψ workspace follows the outer
+/// score subsample; the Jeffreys terms differentiate the `Φ` the criterion prices.
+#[derive(Clone)]
+pub enum JeffreysPsiWorkspace {
+    /// The likelihood ψ calculus reads every row, so it also serves `Φ`.
+    Likelihood,
+    /// The likelihood ψ workspace reads an outer score subsample. `Φ` reads this
+    /// full-data workspace, or the family's full-data per-axis ψ hooks when it is `None`.
+    FullData(Option<Arc<dyn ExactNewtonJointPsiWorkspace>>),
+}
+
+impl JeffreysPsiWorkspace {
+    /// The Jeffreys ψ rows for an evaluation whose likelihood ψ calculus reads
+    /// `likelihood`, built with `options`.
+    ///
+    /// Only an observed-Hessian Jeffreys information that moves with ψ reads the ψ
+    /// workspace; another information publishes its own full-data motion (gam#2922), and
+    /// no likelihood workspace means the family's full-data per-axis hooks serve both.
+    pub fn for_evaluation<F: CustomFamily + ?Sized>(
+        family: &F,
+        states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        options: &BlockwiseFitOptions,
+        likelihood: Option<&Arc<dyn ExactNewtonJointPsiWorkspace>>,
+    ) -> Result<Self, CustomFamilyError> {
+        if likelihood.is_none()
+            || options.outer_score_subsample.is_none()
+            || !family.joint_jeffreys_term_required()
+            || !family.joint_jeffreys_information_depends_on_psi()
+            || !family.joint_jeffreys_information_matches_observed_hessian()
+        {
+            return Ok(Self::Likelihood);
+        }
+        Ok(Self::FullData(
+            family.exact_newton_joint_psi_workspace(states, specs, hyper_layout)?,
+        ))
+    }
+
+    /// The workspace the Jeffreys terms read, given the likelihood's.
+    pub fn information_workspace(
+        &self,
+        likelihood: Option<&Arc<dyn ExactNewtonJointPsiWorkspace>>,
+    ) -> Option<Arc<dyn ExactNewtonJointPsiWorkspace>> {
+        match self {
+            Self::Likelihood => likelihood.cloned(),
+            Self::FullData(workspace) => workspace.clone(),
+        }
+    }
+}
+
+/// `∂²_ψH` of one axis pair as a dense `total × total` matrix, when it has one.
+fn dense_psi_psi_hessian(
+    dense: &Array2<f64>,
+    operator: Option<&Arc<dyn HyperOperator>>,
+    total: usize,
+) -> Option<Array2<f64>> {
+    if dense.dim() == (total, total) {
+        Some(dense.clone())
+    } else {
+        operator.map(|op| op.mul_mat(&Array2::<f64>::eye(total)))
+    }
+}
+
+/// One drift as a dense `total × total` matrix.
+fn densify_drift(drift: &DriftDerivResult, total: usize) -> Array2<f64> {
+    match drift {
+        DriftDerivResult::Dense(matrix) => matrix.clone(),
+        DriftDerivResult::Operator(operator) => operator.mul_mat(&Array2::<f64>::eye(total)),
+    }
+}
+
+/// `∂_ψH` of one axis's first-order terms as a dense `total × total` matrix, when it has one.
+fn dense_psi_hessian(terms: &ExactNewtonJointPsiTerms, total: usize) -> Option<Array2<f64>> {
+    if let Some(op) = terms.hessian_psi_operator.as_ref() {
+        Some(op.mul_mat(&Array2::<f64>::eye(total)))
+    } else if terms.hessian_psi.dim() == (total, total) {
+        Some(terms.hessian_psi.clone())
+    } else {
+        None
+    }
+}
+
 /// The typed refusal of an explicit-ψ Jeffreys term when the Jeffreys information is not the
 /// observed joint Hessian and the family publishes no motion of it (gam#2922), carrying the
 /// family's reason. The observed Hessian's motion would differentiate a different matrix than the
@@ -758,6 +846,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     s_logdet_blocks: Option<&[PenaltyPseudologdet]>,
     hessian_beta_independent: bool,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
+    jeffreys_psi_workspace: &JeffreysPsiWorkspace,
 ) -> Result<Vec<HyperCoord>, CustomFamilyError> {
     let ranges = block_param_ranges(specs);
     let total = beta_flat.len();
@@ -838,6 +927,36 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     let jeffreys_information_is_observed =
         family.joint_jeffreys_information_matches_observed_hessian();
 
+    // gam#4313: the explicit Jeffreys terms read `∂_ψH_info` and its drifts on the rows
+    // that price `Φ`, which a subsampled likelihood workspace does not.
+    let jeffreys_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>> =
+        jeffreys_psi_workspace.information_workspace(psi_workspace.as_ref());
+    let full_data_jeffreys_terms: Option<Vec<ExactNewtonJointPsiTerms>> =
+        match (jeffreys_psi_workspace, jeffreys_workspace.as_ref()) {
+            (JeffreysPsiWorkspace::FullData(_), Some(workspace))
+                if jeffreys_hphi_ctx.is_some()
+                    && jeffreys_info_depends_on_psi
+                    && jeffreys_information_is_observed =>
+            {
+                workspace.first_order_terms_all()?
+            }
+            _ => None,
+        };
+    if let Some(terms) = full_data_jeffreys_terms.as_ref()
+        && terms.len() != total_axes
+    {
+        return Err(CustomFamilyError::trial_point(format!(
+            "custom-family full-data Jeffreys workspace returned {} first-order axes for layout \
+             length {total_axes}",
+            terms.len()
+        )));
+    }
+    let jeffreys_batched_terms: Option<&Vec<ExactNewtonJointPsiTerms>> =
+        match jeffreys_psi_workspace {
+            JeffreysPsiWorkspace::Likelihood => batched_terms.as_ref(),
+            JeffreysPsiWorkspace::FullData(_) => full_data_jeffreys_terms.as_ref(),
+        };
+
     // The reduced Jeffreys spectrum — `Z_Jᵀ H_info Z_J`, its eigendecomposition,
     // the conditioning gate, the relative floor and the dominant/worst
     // eigenvalue indices — is a property of the SNAPSHOT `(H_info, Z_J)` alone.
@@ -899,22 +1018,14 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
         Vec<Array2<f64>>,
         Vec<gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysExplicitMixedTraceWeights>,
     )> = match (
-        batched_terms.as_ref(),
+        jeffreys_batched_terms,
         jeffreys_plan.as_ref(),
         jeffreys_hphi_base.as_ref(),
     ) {
         (Some(terms), Some(plan), Some(_)) if jeffreys_information_is_observed => {
             let infos: Vec<Array2<f64>> = terms
                 .iter()
-                .filter_map(|axis_terms| {
-                    if let Some(op) = axis_terms.hessian_psi_operator.as_ref() {
-                        Some(op.mul_mat(&Array2::<f64>::eye(total)))
-                    } else if axis_terms.hessian_psi.dim() == (total, total) {
-                        Some(axis_terms.hessian_psi.clone())
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(|axis_terms| dense_psi_hessian(axis_terms, total))
                 .collect();
             if infos.len() == total_axes {
                 let weights = infos
@@ -935,7 +1046,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     // reads `⟨mixed_information, ∂_ψHdot[e_a]⟩`, and the curvature drift reads
     // `⟨∂_ψHdot[e_a], K_b⟩` against the drift base's ambient kernels.
     let contracted_explicit_jeffreys: Option<Vec<(Array2<f64>, Array1<f64>)>> = match (
-        psi_workspace
+        jeffreys_workspace
             .as_ref()
             .and_then(|workspace| workspace.all_beta_axes_contractions()),
         batched_explicit_jeffreys.as_ref(),
@@ -1062,14 +1173,30 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else if let Some((infos, _)) = batched_explicit_jeffreys.as_ref() {
                 Some(infos[psi_global].clone())
             } else if jeffreys_hphi_ctx.is_some() && jeffreys_info_depends_on_psi {
-                if let Some(op) = psi_terms.hessian_psi_operator.as_ref() {
-                    Some(op.mul_mat(&ndarray::Array2::<f64>::eye(total)))
-                } else if psi_terms.hessian_psi.nrows() == total
-                    && psi_terms.hessian_psi.ncols() == total
-                {
-                    Some(psi_terms.hessian_psi.clone())
-                } else {
-                    None
+                match jeffreys_psi_workspace {
+                    JeffreysPsiWorkspace::Likelihood => dense_psi_hessian(&psi_terms, total),
+                    JeffreysPsiWorkspace::FullData(_) => {
+                        let full_data_terms = match jeffreys_workspace.as_ref() {
+                            Some(workspace) => match workspace.first_order_terms(psi_global)? {
+                                Some(terms) => Some(terms),
+                                None => family.exact_newton_joint_psi_terms(
+                                    synced_states,
+                                    specs,
+                                    hyper_layout,
+                                    psi_global,
+                                )?,
+                            },
+                            None => family.exact_newton_joint_psi_terms(
+                                synced_states,
+                                specs,
+                                hyper_layout,
+                                psi_global,
+                            )?,
+                        };
+                        full_data_terms
+                            .as_ref()
+                            .and_then(|terms| dense_psi_hessian(terms, total))
+                    }
                 }
             } else {
                 None
@@ -1110,7 +1237,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                         synced_states,
                         specs,
                         hyper_layout,
-                        psi_workspace.as_deref(),
+                        jeffreys_workspace.as_deref(),
                         psi_global,
                         total,
                     )?
@@ -1196,7 +1323,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                         synced_states,
                         specs,
                         hyper_layout,
-                        psi_workspace.as_deref(),
+                        jeffreys_workspace.as_deref(),
                         psi_global,
                         total,
                     )?,
@@ -1236,7 +1363,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 synced_states,
                                 specs,
                                 hyper_layout,
-                                psi_workspace.as_deref(),
+                                jeffreys_workspace.as_deref(),
                                 psi_global,
                                 &e_a,
                                 total,
@@ -1319,7 +1446,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 synced_states,
                                 specs,
                                 hyper_layout,
-                                psi_workspace.as_deref(),
+                                jeffreys_workspace.as_deref(),
                                 psi_global,
                                 dir,
                                 total,
@@ -1533,6 +1660,7 @@ pub fn build_contracted_psi_hook(
     penalty_counts: &[usize],
     s_logdet_blocks: Option<&[PenaltyPseudologdet]>,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
+    jeffreys_psi_workspace: JeffreysPsiWorkspace,
     jeffreys_ctx: Option<(Array2<f64>, Array2<f64>)>,
     explicit_curvature: Option<Arc<ExplicitJeffreysCurvatureDrifts>>,
 ) -> Result<Option<ContractedPsiSecondOrderFn>, CustomFamilyError> {
@@ -1542,6 +1670,23 @@ pub fn build_contracted_psi_hook(
     let Some(workspace) = psi_workspace else {
         return Ok(None);
     };
+    // gam#4313: the explicit Jeffreys ψψ terms read the full-data information motion when
+    // the likelihood workspace reads a score subsample. Without a full-data workspace the
+    // per-pair path, which reads the family's full-data hooks, serves them.
+    let information_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>> =
+        match (&jeffreys_psi_workspace, jeffreys_ctx.as_ref()) {
+            (_, None) | (JeffreysPsiWorkspace::Likelihood, _) => None,
+            (JeffreysPsiWorkspace::FullData(Some(full_data)), Some(_)) => {
+                Some(Arc::clone(full_data))
+            }
+            (JeffreysPsiWorkspace::FullData(None), Some(_)) => {
+                log::debug!(
+                    "[outer-hvp contracted-psi] declined: the Jeffreys information has no \
+                     full-data psi workspace"
+                );
+                return Ok(None);
+            }
+        };
 
     let total = beta_flat.len();
     let ranges = block_param_ranges(specs);
@@ -1615,6 +1760,15 @@ pub fn build_contracted_psi_hook(
                 terms.hessian.len(),
             )));
         }
+        if let Some(information) = information_workspace.as_ref()
+            && information.second_order_terms_contracted(&basis)?.is_none()
+        {
+            log::debug!(
+                "[outer-hvp contracted-psi] declined: full-data Jeffreys workspace does not \
+                 cover psi basis axis {axis_idx}"
+            );
+            return Ok(None);
+        }
     }
 
     let hyper_layout = Arc::clone(&hyper_layout);
@@ -1639,14 +1793,15 @@ pub fn build_contracted_psi_hook(
             Some((z_j, h_joint))
                 if z_j.nrows() == total && h_joint.nrows() == total && h_joint.ncols() == total =>
             {
+                let first_workspace = information_workspace.as_ref().unwrap_or(&workspace);
                 let first_terms: Option<Vec<ExactNewtonJointPsiTerms>> =
-                    match workspace.first_order_terms_all()? {
+                    match first_workspace.first_order_terms_all()? {
                         Some(all) if all.len() == psi_dim => Some(all),
                         _ => {
                             let mut per_axis = Vec::with_capacity(psi_dim);
                             let mut ok = true;
                             for j in 0..psi_dim {
-                                match workspace.first_order_terms(j)? {
+                                match first_workspace.first_order_terms(j)? {
                                     Some(t) => per_axis.push(t),
                                     None => {
                                         ok = false;
@@ -1659,21 +1814,11 @@ pub fn build_contracted_psi_hook(
                     };
                 match first_terms {
                     Some(terms) => {
-                        let mut pert_first: Vec<Array2<f64>> = Vec::with_capacity(psi_dim);
-                        let mut ok = true;
-                        for t in &terms {
-                            if let Some(op) = t.hessian_psi_operator.as_ref() {
-                                pert_first.push(op.mul_mat(&Array2::<f64>::eye(total)));
-                            } else if t.hessian_psi.nrows() == total
-                                && t.hessian_psi.ncols() == total
-                            {
-                                pert_first.push(t.hessian_psi.clone());
-                            } else {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if ok {
+                        let pert_first: Vec<Array2<f64>> = terms
+                            .iter()
+                            .filter_map(|t| dense_psi_hessian(t, total))
+                            .collect();
+                        if pert_first.len() == psi_dim {
                             Some(Arc::new(JeffreysPsiWeightCache::new(
                                 &z_j, &h_joint, pert_first,
                             )?))
@@ -1721,15 +1866,43 @@ pub fn build_contracted_psi_hook(
                     hessian.len(),
                 )));
             }
+            // `∂_{ψ_i}∂_{ψ(α)}H_info` on the rows that price `Φ` (gam#4313).
+            let information_mixed: Option<Vec<Array2<f64>>> =
+                match (firth_ctx.as_ref(), information_workspace.as_ref()) {
+                    (Some(_), Some(information)) => {
+                        let Some(terms) = information.second_order_terms_contracted(alpha_psi)?
+                        else {
+                            return Err(CustomFamilyError::trial_point(
+                                "contracted ψψ hook: the full-data Jeffreys workspace declined a \
+                                 combined psi direction its likelihood workspace serves",
+                            ));
+                        };
+                        if terms.hessian.len() != psi_dim {
+                            return Err(CustomFamilyError::trial_point(format!(
+                                "contracted ψψ hook: full-data Jeffreys workspace returned {} \
+                                 hessian rows, psi_dim={psi_dim}",
+                                terms.hessian.len()
+                            )));
+                        }
+                        Some(
+                            terms
+                                .hessian
+                                .iter()
+                                .map(|drift| densify_drift(drift, total))
+                                .collect(),
+                        )
+                    }
+                    _ => None,
+                };
 
         for i in 0..psi_dim {
             // EXPLICIT Firth/Jeffreys ψψ VALUE second derivative (gam#1607):
             //   objective[i] -= ∂_{ψ_i}∂_{ψ(α)}Φ.
             // This applies to both design/penalty and family-owned axes.
             if let Some(jeffreys) = firth_ctx.as_ref() {
-                let pert_i_alpha = match &hessian[i] {
-                    DriftDerivResult::Dense(m) => m.clone(),
-                    DriftDerivResult::Operator(op) => op.mul_mat(&Array2::<f64>::eye(total)),
+                let pert_i_alpha = match information_mixed.as_ref() {
+                    Some(mixed) => mixed[i].clone(),
+                    None => densify_drift(&hessian[i], total),
                 };
                 let mut pert_alpha = Array2::<f64>::zeros((total, total));
                 for (j, &aj) in alpha_psi.iter().enumerate() {
@@ -1896,6 +2069,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     penalty_counts: &[usize],
     s_logdet_blocks: Option<&[PenaltyPseudologdet]>,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
+    jeffreys_psi_workspace: JeffreysPsiWorkspace,
     jeffreys_ctx: Option<(Array2<f64>, Array2<f64>)>,
     explicit_curvature: Option<Arc<ExplicitJeffreysCurvatureDrifts>>,
 ) -> Result<
@@ -1987,6 +2161,10 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     // gam#2922: `hessian_psi` moves the observed joint Hessian; another information moves by
     // the family's own derivatives.
     let jeffreys_information_is_observed = family.joint_jeffreys_information_matches_observed_hessian();
+    // gam#4313: `∂_ψH_info` and `∂²_ψH_info` on the rows that price `Φ`.
+    let jeffreys_reads_likelihood = matches!(jeffreys_psi_workspace, JeffreysPsiWorkspace::Likelihood);
+    let jeffreys_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>> =
+        jeffreys_psi_workspace.information_workspace(psi_workspace.as_ref());
     let firth_pair_ctx: Option<Arc<JeffreysPsiWeightCache>> =
         match jeffreys_ctx {
             Some((z_j, h_joint))
@@ -1994,7 +2172,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             {
                 let psi_dim = hyper_layout.len();
                 let batched_first: Option<Vec<ExactNewtonJointPsiTerms>> =
-                    match psi_workspace.as_ref() {
+                    match jeffreys_workspace.as_ref() {
                         Some(ws) if jeffreys_information_is_observed => ws.first_order_terms_all()?,
                         _ => None,
                     };
@@ -2025,7 +2203,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     }
                     let terms = if let Some(all) = batched_first.as_ref() {
                         all[axis].clone()
-                    } else if let Some(ws) = psi_workspace.as_ref() {
+                    } else if let Some(ws) = jeffreys_workspace.as_ref() {
                         if let Some(t) = ws.first_order_terms(axis)? {
                             t
                         } else {
@@ -2054,15 +2232,12 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                                 format!("typed hyper axis {axis} has no exact first-order terms")
                             })?
                     };
-                    if let Some(op) = terms.hessian_psi_operator.as_ref() {
-                        pert_first.push(op.mul_mat(&Array2::<f64>::eye(total)));
-                    } else if terms.hessian_psi.nrows() == total
-                        && terms.hessian_psi.ncols() == total
-                    {
-                        pert_first.push(terms.hessian_psi.clone());
-                    } else {
-                        ok = false;
-                        break;
+                    match dense_psi_hessian(&terms, total) {
+                        Some(info) => pert_first.push(info),
+                        None => {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
                 if ok {
@@ -2166,6 +2341,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let psi_penalty_cache = Arc::clone(&psi_penalty_cache);
         let family_arc = Arc::clone(&family_arc);
         let psi_workspace = psi_workspace.clone();
+        let jeffreys_workspace = jeffreys_workspace.clone();
         let firth_pair_ctx = firth_pair_ctx.clone();
         let family_pair_cache = Arc::clone(&family_pair_cache);
 
@@ -2272,12 +2448,27 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                                         unpublished_jeffreys_information_psi_motion(psi_i, &reason)
                                     })?,
                             )
-                        } else if b_mat.nrows() == total && b_mat.ncols() == total {
-                            Some(b_mat.clone())
+                        } else if jeffreys_reads_likelihood {
+                            dense_psi_psi_hessian(&b_mat, b_operator.as_ref(), total)
                         } else {
-                            b_operator
-                                .as_ref()
-                                .map(|op| op.mul_mat(&Array2::<f64>::eye(total)))
+                            let terms = match jeffreys_workspace.as_ref() {
+                                Some(workspace) => workspace.second_order_terms(psi_i, psi_j)?,
+                                None => family_arc.exact_newton_joint_psisecond_order_terms(
+                                    &synced_arc,
+                                    &specs_arc,
+                                    &hyper_layout,
+                                    psi_i,
+                                    psi_j,
+                                )?,
+                            };
+                            match terms {
+                                Some(t) => dense_psi_psi_hessian(
+                                    &t.hessian_psi_psi,
+                                    t.hessian_psi_psi_operator.as_ref(),
+                                    total,
+                                ),
+                                None => Some(Array2::zeros((total, total))),
+                            }
                         };
                     if let Some(pert_ij) = pert_ij_opt {
                         let phi_psi_psi = jeffreys
@@ -3140,6 +3331,16 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         } else {
             None
         };
+        let jeffreys_psi_workspace = JeffreysPsiWorkspace::for_evaluation(
+            family,
+            synced_joint_states.as_ref(),
+            specs,
+            hyper_layout.as_ref(),
+            options,
+            psi_workspace.as_ref(),
+        )?;
+        let jeffreys_information_workspace =
+            jeffreys_psi_workspace.information_workspace(psi_workspace.as_ref());
 
         let rho_slice = rho_current
             .as_slice()
@@ -3158,6 +3359,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 s_logdet_blocks.as_deref(),
                 hessian_beta_independent,
                 psi_workspace.clone(),
+                &jeffreys_psi_workspace,
             )?;
 
             let (ext_ext_fn, rho_ext_fn, drift_fn, contracted_psi_fn, explicit_completion) =
@@ -3195,7 +3397,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         synced_joint_states.as_ref(),
                         specs,
                         Arc::clone(&hyper_layout),
-                        psi_workspace.clone(),
+                        jeffreys_information_workspace.clone(),
                         jeffreys_ctx.as_ref(),
                     )?;
                     let (ext_ext_fn, rho_ext_fn) = build_psi_pair_callbacks(
@@ -3208,6 +3410,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         penalty_counts,
                         s_logdet_blocks.as_deref(),
                         psi_workspace.clone(),
+                        jeffreys_psi_workspace.clone(),
                         jeffreys_ctx.clone(),
                         explicit_curvature.clone(),
                     )?;
@@ -3233,6 +3436,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         penalty_counts,
                         s_logdet_blocks.as_deref(),
                         contracted_psi_workspace,
+                        jeffreys_psi_workspace.clone(),
                         jeffreys_ctx,
                         explicit_curvature.clone(),
                     )?;
@@ -3273,7 +3477,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         synced_joint_states.as_ref(),
                         specs,
                         Arc::clone(&hyper_layout),
-                        psi_workspace.clone(),
+                        jeffreys_information_workspace.clone(),
                         jeffreys_ctx.as_ref(),
                     )?;
                     (None, None, None, None, explicit_curvature)
@@ -3820,8 +4024,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         format!("missing dynamic design for block {b} diagonal correction")
                     })?;
                     let wwork = certify_finite_working_weights(working_weights)?;
-                    let x_dense = x_dyn.to_dense();
-                    let n = x_dense.nrows();
+                    let n = x_dyn.nrows();
 
                     let mut d_eta = x_dyn.matrixvectormultiply(direction);
                     let geom = family.block_geometry_directional_derivative(
@@ -3830,28 +4033,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         spec,
                         direction,
                     )?;
-                    let mut correction_mat = Array2::<f64>::zeros((p, p));
+                    let mut d_design = None;
 
                     if let Some(geom_dir) = geom {
                         d_eta += &geom_dir.d_offset;
                         if let Some(dx) = geom_dir.d_design {
                             d_eta += &dx.dot(&beta_flat);
-                            let mut wx = x_dense.clone();
-                            let mut wdx = dx.clone();
-                            ndarray::Zip::from(wx.rows_mut())
-                                .and(wdx.rows_mut())
-                                .and(wwork.view())
-                                .par_for_each(|mut wxr, mut wdxr, &wi| {
-                                    if wi != 1.0 {
-                                        wxr.mapv_inplace(|v| v * wi);
-                                        wdxr.mapv_inplace(|v| v * wi);
-                                    }
-                                });
-                            // Same X'(W·Y) pattern as the parallel sibling at
-                            // line ~9258; route through faer for SIMD GEMM
-                            // (n × p² flops at large-scale moderate scale).
-                            correction_mat += &fast_atb(&dx, &wx);
-                            correction_mat += &fast_atb(&x_dense, &wdx);
+                            d_design = Some(dx);
                         }
                     }
 
@@ -3875,14 +4063,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             ),
                         });
                     }
-                    let mut scaled_x = x_dense.clone();
-                    ndarray::Zip::from(scaled_x.rows_mut())
-                        .and(&dw)
-                        .par_for_each(|mut sr, &dwi| sr.mapv_inplace(|v| v * dwi));
-                    // X'(diag(dW)·X) outer correction term — faer route, same
-                    // rationale as above.
-                    correction_mat += &fast_atb(&x_dense, &scaled_x);
-
+                    let correction_mat = diagonal_block_hessian_drift(
+                        x_dyn,
+                        &dw,
+                        d_design.as_ref().map(|dx| (dx, wwork)),
+                    )?;
                     Ok(Some(DriftDerivResult::Dense(correction_mat)))
                 }
             }
@@ -3923,8 +4108,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
                     format!("missing dynamic design for block {b} diagonal second correction")
                 })?;
-                let x_dense = x_dyn.to_dense();
-                let n = x_dense.nrows();
+                let n = x_dyn.nrows();
 
                 let reject_second_order_geometry =
                     |label: &str,
@@ -3984,11 +4168,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         ),
                     });
                 }
-                let mut scaled_x = x_dense.clone();
-                ndarray::Zip::from(scaled_x.rows_mut())
-                    .and(&d2w)
-                    .par_for_each(|mut sr, &d2wi| sr.mapv_inplace(|value| value * d2wi));
-                Ok(Some(DriftDerivResult::Dense(fast_atb(&x_dense, &scaled_x))))
+                Ok(Some(DriftDerivResult::Dense(diagonal_block_hessian_drift(
+                    x_dyn, &d2w, None,
+                )?)))
             }
         }
     };
@@ -4803,6 +4985,14 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     } else {
         None
     };
+    let jeffreys_psi_workspace = JeffreysPsiWorkspace::for_evaluation(
+        family,
+        synced_joint_states.as_ref(),
+        specs,
+        hyper_layout.as_ref(),
+        options,
+        psi_workspace.as_ref(),
+    )?;
     let rho_slice = rho_current
         .as_slice()
         .ok_or_else(|| "outer rho vector must be contiguous".to_string())?;
@@ -4817,6 +5007,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         s_logdet_blocks.as_deref(),
         hessian_beta_independent,
         psi_workspace.clone(),
+        &jeffreys_psi_workspace,
     )?;
     let ext_bundle = ExtCoordBundle {
         completion_psi: None,

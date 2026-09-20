@@ -30,18 +30,8 @@ fn zz_measure_2613_gradient_only_stiff_ridge_trajectory() {
     // where 29.9 is interior.
     const WRONG_RAIL_FACE: f64 = 30.0;
 
-    // A second `try_init` in one process is an `Err`, and that is the expected
-    // state whenever another test installed the logger first. Either way trace
-    // output is reachable, which is all this diagnostic needs; the result is
-    // reported rather than discarded.
-    if env_logger::builder()
-        .filter_level(log::LevelFilter::Trace)
-        .is_test(false)
-        .try_init()
-        .is_err()
-    {
-        log::trace!("zz_measure #2613: a logger was already installed by another test");
-    }
+    gam_runtime::test_support::install_diagnostic_logger();
+    log::set_max_level(log::LevelFilter::Trace);
 
     let calls = Arc::new(Mutex::new(Vec::<(char, f64, f64, f64)>::new()));
     let cost_log = Arc::clone(&calls);
@@ -200,7 +190,7 @@ fn drive_first_order_bridge_2613(
     let mut guard = CostStallGuard::new(&config, exit.clone());
     // The scripted objective publishes no evidence, so the seed value carries
     // only its own rounding, as every later sample does (#3287).
-    guard.observe_seed(&seed_rho, seed_cost, value_rounding(seed_cost), seed_grad);
+    guard.observe_seed(&seed_rho, seed_cost, value_representation_band(seed_cost), seed_grad);
     let mut bridge = OuterFirstOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),

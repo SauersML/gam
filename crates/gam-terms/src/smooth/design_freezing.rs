@@ -685,22 +685,56 @@ pub fn freeze_term_collection_from_design(
         .iter_mut()
         .zip(design.smooth.terms.iter())
     {
-        // Persist joint-null absorption rotation captured at fit time so
-        // save → load → predict re-applies `X_new_raw · Q` identically to
-        // in-memory prediction. `None` when the smooth had no joint null
-        // space, or when rotation was suppressed (shape-constrained smooths
-        // whose cone geometry would not survive arbitrary orthogonal
-        // rotation). Without this propagation, models reloaded from disk
-        // produce wrong η at predict-time for any smooth with `Some(Q)`.
-        term.joint_null_rotation = fitted.joint_null_rotation.clone();
-        // Persist the row-space correction of the span-preserving parametric
-        // orthogonalization (#2747). The coefficient transform beside it is
-        // absorbed into the basis metadata below; this half cannot be, because
-        // it multiplies the CONSTRAINT block rather than the basis, and without
-        // it a reloaded model rebuilds an unresidualized design its own
+        // A term with a collection chart but no gauge was REPLAYED from a spec
+        // this freeze already wrote. A replay decides nothing; the fit already
+        // did, and the spec it was rebuilt from is that decision. Refreezing
+        // from its metadata would fold the chart's `T` into the basis a second
+        // time.
+        if fitted.collection_gauge.is_none() && fitted.parametric_residualization.is_some() {
+            continue;
+        }
+        // Factor-smooth kinds cannot absorb the collection chart into their
+        // metadata; they persist it as an unabsorbed chart below instead.
+        let absorbs_collection_chart = !matches!(
+            &term.basis,
+            SmoothBasisSpec::FactorSumToZero { .. } | SmoothBasisSpec::FactorSmooth { .. }
+        );
+        match fitted.collection_gauge.as_ref() {
+            Some(gauge) if absorbs_collection_chart => {
+                // The fit built this term as `((B·z_local)·Q)·T` and then
+                // subtracted `C·R`, and its metadata records the composition
+                // `z_local·Q·T`. Floating-point products do not reassociate, so
+                // a replay from that one composed chart rebuilds a design that
+                // differs from the fit's in the last bits (#3001). The frozen
+                // spec therefore keeps the local chart in its basis, `Q` on the
+                // term, and `T` with `R` on the residualization chart, and the
+                // replay applies them in the fit's order.
+                term.joint_null_rotation = gauge.joint_null_rotation.clone();
+                let local_metadata = super::term_design::with_replaced_identifiability_transform(
+                    &fitted.metadata,
+                    gauge.local_identifiability_transform.as_ref(),
+                )?;
+                freeze_smooth_basis_from_metadata(&mut term.basis, &local_metadata, &term.name)?;
+            }
+            _ => {
+                // Persist joint-null absorption rotation captured at fit time
+                // so save → load → predict re-applies `X_new_raw · Q`
+                // identically to in-memory prediction. `None` when the smooth
+                // had no joint null space, or when rotation was suppressed
+                // (shape-constrained smooths whose cone geometry would not
+                // survive arbitrary orthogonal rotation). Without this
+                // propagation, models reloaded from disk produce wrong η at
+                // predict-time for any smooth with `Some(Q)`.
+                term.joint_null_rotation = fitted.joint_null_rotation.clone();
+                freeze_smooth_basis_from_metadata(&mut term.basis, &fitted.metadata, &term.name)?;
+            }
+        }
+        // Persist the span-preserving parametric orthogonalization (#2747):
+        // its coefficient chart `T` and its row-space correction `R`, which
+        // multiplies the CONSTRAINT block rather than the basis. Without it a
+        // reloaded model rebuilds an unresidualized design its own
         // coefficients no longer match.
         term.frozen_parametric_residualization = fitted.parametric_residualization.clone();
-        freeze_smooth_basis_from_metadata(&mut term.basis, &fitted.metadata, &term.name)?;
         // Persist the global-orthogonality chart the metadata could not absorb
         // (factor-smooth kinds residualized against an overlapping owner
         // smooth, #978). Without this, save → load → predict rebuilds the

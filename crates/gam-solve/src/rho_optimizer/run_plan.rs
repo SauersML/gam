@@ -1104,13 +1104,20 @@ pub(crate) fn run_outer_with_plan(
                         // decrement: on an interior step its predicted decrease
                         // IS ½gᵀH⁻¹g. Handing it the certificate's tolerance
                         // makes the stopping rule and the acceptance rule one
-                        // standard. τ_stat is absolute, so the threshold is
-                        // fixed for the run and does not depend on the units
-                        // of y or an additive constant in V. A route that
-                        // declares no size passes 0, which opt reads as "no
-                        // decrement stop"; the certificate then decides.
-                        .with_model_decrement_tolerance(super::run::outer_criterion_resolution(
-                            config,
+                        // standard. opt takes ONE number for the run, so the
+                        // stop decides at the criterion's resolution at the
+                        // seed's value (`outer_resolution` of its band, #3286):
+                        // `τ_stat` less that band, or on a route that declares
+                        // no size, which has no statistical slack, the band
+                        // itself. Passing the bare `τ_stat` handed such a route
+                        // 0, which opt reads as "no decrement stop".
+                        .with_model_decrement_tolerance(super::decrement_bands::outer_resolution(
+                            super::run::outer_criterion_resolution(config),
+                            super::decrement_bands::outer_value_band(
+                                config,
+                                seed_eval.cost,
+                                Some(&seed_evidence),
+                            ),
                         ));
                     // Installed unconditionally now that it also carries the
                     // trajectory census (#2735): a walk that ends on its budget
@@ -1308,10 +1315,19 @@ pub(crate) fn run_outer_with_plan(
                     // different critical cone than the iterates that follow it.
                     let seed_rail_bounds = rail_relaxed_bounds(&(lo.clone(), hi.clone()));
                     // Judged at the same criterion curvature resolution the
-                    // bridge's later verdicts use (#1082), so the seed is not a
-                    // strict saddle by a standard the iterates never face.
-                    let seed_curvature_resolution =
-                        super::run::criterion_curvature_resolution(criterion_resolution);
+                    // bridge's later verdicts use (#1082), at the seed's own
+                    // value (#3286), so the seed is not a strict saddle by a
+                    // standard the iterates never face.
+                    let seed_curvature_resolution = super::run::criterion_curvature_resolution(
+                        super::decrement_bands::outer_resolution(
+                            criterion_resolution,
+                            super::decrement_bands::outer_value_band(
+                                config,
+                                seed_eval.cost,
+                                Some(&seed_evidence),
+                            ),
+                        ),
+                    );
                     let seed_hessian_psd = seed_hessian.as_ref().and_then(|dense| {
                         reduced_hessian_psd_at_point(
                             &seed,
@@ -1713,7 +1729,12 @@ pub(crate) fn run_outer_with_plan(
                         // The host BFGS arm's cost-stall resolution, so the device
                         // walk ends on the same progress test instead of its
                         // iteration count (#2817).
-                        cost_stall_resolution: super::run::outer_criterion_resolution(config),
+                        // A per-step stall threshold, as the host guard charges an
+                        // unbanded value: `τ` floored at the seed value's own
+                        // representation error, never `0` (#3286).
+                        cost_stall_resolution: super::run::outer_criterion_resolution(config).max(
+                            super::decrement_bands::value_representation_band(seed_eval_dev.cost),
+                        ),
                         // opt's cost stall takes one number before the walk
                         // starts, so it gets the solver band this walk was driven
                         // to; the 1e-3 floor it used to add had no derivation, and
@@ -1908,7 +1929,7 @@ pub(crate) fn run_outer_with_plan(
                     let mut stratum_eval = seed_eval;
                     let mut stratum_evidence = seed_evidence;
                     let mut crossed_iterations = 0usize;
-                    let (outcome, cost_stall_exit, last_objective_error) = loop {
+                    let (outcome, cost_stall_exit, last_objective_error, rank_boundary) = loop {
                         let stratum_rank = obj.criterion_rank();
                         let stratum_probe: Arc<Mutex<Option<StratumProbe>>> = Arc::default();
                         let (lo, hi) = &bounds_template;
@@ -1947,8 +1968,7 @@ pub(crate) fn run_outer_with_plan(
                         );
                         let last_objective_error: Arc<Mutex<Option<ObjectiveEvalError>>> =
                             Arc::new(Mutex::new(None));
-                        let objective = RetainingObjective::new(
-                            OuterFirstOrderBridge {
+                        let mut bridge = OuterFirstOrderBridge {
                                 obj,
                                 layout,
                                 outer_inner_cap: config.outer_inner_cap.clone(),
@@ -1968,7 +1988,9 @@ pub(crate) fn run_outer_with_plan(
                                 }),
                                 stratum_rank,
                                 stratum_probe: Some(Arc::clone(&stratum_probe)),
-                            },
+                            };
+                        let objective = RetainingObjective::new(
+                            &mut bridge,
                             Arc::clone(&last_objective_error),
                         );
                         // Hand the precomputed (cost, gradient) seed eval to
@@ -2117,18 +2139,24 @@ pub(crate) fn run_outer_with_plan(
                         });
                         let outcome = optimizer.run();
                         drop(optimizer);
+                        let rank_boundary = match &outcome {
+                            Err(BfgsError::LineSearchFailed { last_solution, .. }) =>
+                                bridge.terminal_rank_boundary(&last_solution.final_point),
+                            _ => None,
+                        };
+                        drop(bridge);
                         let probe = stratum_probe.lock().ok().and_then(|mut slot| slot.take());
                         let run_end = stratum_run_end(&outcome, &cost_stall_exit);
                         let (Some(from_rank), Some(probe), Some((final_value, run_iterations))) =
                             (stratum_rank, probe, run_end)
                         else {
-                            break (outcome, cost_stall_exit, last_objective_error);
+                            break (outcome, cost_stall_exit, last_objective_error, rank_boundary);
                         };
                         // The criterion value's own roundoff: a value lower by no more than
                         // this is not a lower criterion.
                         let resolution = f64::EPSILON * (1.0 + final_value.abs());
                         if !(probe.cost < final_value - resolution) {
-                            break (outcome, cost_stall_exit, last_objective_error);
+                            break (outcome, cost_stall_exit, last_objective_error, rank_boundary);
                         }
                         let (crossing_eval, crossing_evidence) =
                             super::bridges::evaluate_with_certificate_evidence(true, || {
@@ -2171,7 +2199,7 @@ pub(crate) fn run_outer_with_plan(
                                     final_value,
                                     resolution,
                                 );
-                                break (outcome, cost_stall_exit, last_objective_error);
+                                break (outcome, cost_stall_exit, last_objective_error, rank_boundary);
                             }
                             Err(err) => {
                                 log::debug!(
@@ -2179,7 +2207,7 @@ pub(crate) fn run_outer_with_plan(
                                      the refused rank-{} trial did not re-evaluate: {err} (#2765)",
                                     probe.rank,
                                 );
-                                break (outcome, cost_stall_exit, last_objective_error);
+                                break (outcome, cost_stall_exit, last_objective_error, rank_boundary);
                             }
                         }
                     };
@@ -2265,6 +2293,7 @@ pub(crate) fn run_outer_with_plan(
                                     solution_into_outer_result(*last_solution, false, *the_plan);
                                 outer_result.line_search_failure =
                                     Some((failure_reason, max_attempts));
+                                outer_result.rank_boundary_stall = rank_boundary;
                                 Ok(outer_result)
                             } else {
                                 Err(EstimationError::RemlOptimizationFailed(

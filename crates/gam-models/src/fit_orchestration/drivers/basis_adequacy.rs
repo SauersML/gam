@@ -49,6 +49,11 @@ pub enum BasisAdequacyProvenance {
     /// The test itself declined: no estimable enrichment direction survived the
     /// projection, or the assembled quadratic form was not finite.
     StatisticUnavailable,
+    /// The coefficient-covariance multiplier that scales the score's variance
+    /// (`φ̂` for the profiled Gaussian, `1` for families carrying their
+    /// dispersion in the IRLS weight) could not be resolved to a finite
+    /// positive value, so the score has no scale to be read against.
+    DispersionUnavailable,
     /// Canonical binomial/Poisson fits only: the unpenalized null-model MLE the
     /// conditional reference is built at did not certify on the test's rows
     /// (a rank-deficient unpenalized design, or a line search that stalled in
@@ -75,6 +80,7 @@ impl BasisAdequacyProvenance {
             Self::NoIrlsRowState => "no_irls_row_state",
             Self::DesignGramUnavailable => "design_gram_unavailable",
             Self::StatisticUnavailable => "statistic_unavailable",
+            Self::DispersionUnavailable => "dispersion_unavailable",
             Self::NullFitUnavailable => "null_fit_unavailable",
             Self::ConditionalReferenceUnavailable => "conditional_reference_unavailable",
         }
@@ -707,12 +713,19 @@ pub fn basis_adequacy_report(
             // The dispersion that scales the score's variance is the same
             // multiplier the fit publishes on its coefficient covariance (`1`
             // for every family carrying its dispersion inside the IRLS weight,
-            // `φ̂` for the profiled Gaussian).
-            let dispersion = fit
-                .coefficient_covariance_scale()
-                .ok()
-                .filter(|value| value.is_finite() && *value > 0.0)
-                .unwrap_or(1.0);
+            // `φ̂` for the profiled Gaussian). One the fit cannot resolve is a
+            // typed absence, never a substituted `1`: that would publish a
+            // p-value on a scale the fit never had.
+            let dispersion = match fit.coefficient_covariance_scale() {
+                Ok(value) if value.is_finite() && value > 0.0 => value,
+                _ => {
+                    return (0..term_count)
+                        .map(|idx| {
+                            undetermined(idx, BasisAdequacyProvenance::DispersionUnavailable)
+                        })
+                        .collect();
+                }
+            };
             let scale = if fit.likelihood_scale.wald_scale_is_estimated() {
                 gam_terms::inference::smooth_test::SmoothTestScale::Estimated
             } else {

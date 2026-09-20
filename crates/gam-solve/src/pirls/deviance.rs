@@ -445,8 +445,10 @@ fn log_tweedie_half_deviance(log_weight: f64, log_y: f64, eta: f64, p: f64) -> f
     }
 }
 
+/// `(μ, 1 − μ)` of the logistic inverse link, each formed from its own tail so
+/// the smaller member keeps full relative precision on both sides of `η = 0`.
 #[inline]
-fn logit_probability_pair(eta: f64) -> (f64, f64) {
+pub(crate) fn logit_probability_pair(eta: f64) -> (f64, f64) {
     if eta >= 0.0 {
         let tail = (-eta).exp();
         let one_minus_mu = tail / (1.0 + tail);

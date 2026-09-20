@@ -281,14 +281,16 @@ fn apply_paren_link(
 /// versus "estimate it from the data" is a distinction the type can express
 /// (`Some` vs `None`) rather than one each caller re-invents — the FFI
 /// previously collapsed both onto a bare `f64` default and therefore had to
-/// treat every supplied theta as a mere seed.
+/// treat every supplied theta as a mere seed. Each override belongs to
+/// exactly one family and is refused for any other.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FamilyNuisanceOverrides {
     /// `Some(theta)` pins the negative-binomial theta; `None` seeds it and
     /// leaves it to be estimated (#983).
     pub negative_binomial_theta: Option<f64>,
     /// Tweedie variance power supplied out of band. A power written into the
-    /// name itself (`tweedie(1.6)`) wins over this; absent both, 1.5.
+    /// name itself (`tweedie(1.6)`) wins over this; absent both, a Tweedie
+    /// family is refused (the power is never profiled).
     pub tweedie_power: Option<f64>,
     /// Beta-regression precision. `None` is the neutral 1.0.
     pub beta_phi: Option<f64>,
@@ -329,6 +331,7 @@ pub fn scalar_family_from_name(
         tweedie_power,
         beta_phi,
     } = overrides;
+    let beta_phi_supplied = beta_phi.is_some();
     // The Beta precision is a nuisance parameter of the family, not of the
     // name; validate it at the one place the family is minted so every
     // surface rejects the same values.
@@ -677,6 +680,41 @@ pub fn scalar_family_from_name(
             .into());
         }
     };
+    // A nuisance override the resolved family does not carry is a
+    // contradictory request, not a value to drop: `family="poisson"` with a
+    // negative-binomial theta must not silently fit an equidispersed Poisson.
+    // Refuse it here, where the family is minted, so every surface (CLI,
+    // `gamfit.fit`, the latent FFI) refuses the same pairs.
+    for (supplied, carries, option, family_name) in [
+        (
+            negative_binomial_theta.is_some(),
+            matches!(resolved.0.response, ResponseFamily::NegativeBinomial { .. }),
+            "negative_binomial_theta",
+            "negative-binomial",
+        ),
+        (
+            beta_phi_supplied,
+            matches!(resolved.0.response, ResponseFamily::Beta { .. }),
+            "beta_phi",
+            "beta",
+        ),
+        (
+            tweedie_power.is_some(),
+            matches!(resolved.0.response, ResponseFamily::Tweedie { .. }),
+            "tweedie_power",
+            "tweedie",
+        ),
+    ] {
+        if supplied && !carries {
+            return Err(WorkflowError::InvalidConfig {
+                reason: format!(
+                    "{option} applies only to family='{family_name}'; family '{name}' \
+                     does not carry it"
+                ),
+            }
+            .into());
+        }
+    }
     // Apply an explicit parenthesized `(link)` argument to the resolved
     // family, validating legality. A bare family name leaves the
     // family's default link untouched.
@@ -963,15 +1001,71 @@ mod tweedie_power_tests {
     #[test]
     fn every_listed_scalar_family_head_resolves() {
         for head in SCALAR_FAMILY_HEADS {
+            // Only a Tweedie head carries (and requires) a variance power.
+            let tweedie_power = head.starts_with("tweedie").then_some(1.5);
             scalar_family_from_name(
                 head,
                 FamilyNuisanceOverrides {
-                    tweedie_power: Some(1.5),
+                    tweedie_power,
                     ..FamilyNuisanceOverrides::default()
                 },
             )
             .unwrap_or_else(|err| panic!("listed head `{head}` must resolve: {err}"));
         }
+    }
+
+    /// A nuisance override supplied for a family that does not carry it is
+    /// refused, never silently dropped: `poisson` + theta must not fit a
+    /// Poisson as though the theta had not been asked for.
+    #[test]
+    fn a_nuisance_override_for_a_family_that_does_not_carry_it_is_refused() {
+        let theta = FamilyNuisanceOverrides {
+            negative_binomial_theta: Some(2.0),
+            ..FamilyNuisanceOverrides::default()
+        };
+        let phi = FamilyNuisanceOverrides {
+            beta_phi: Some(7.5),
+            ..FamilyNuisanceOverrides::default()
+        };
+        let power = FamilyNuisanceOverrides {
+            tweedie_power: Some(1.6),
+            ..FamilyNuisanceOverrides::default()
+        };
+        for (name, overrides, option) in [
+            ("poisson", theta, "negative_binomial_theta"),
+            ("gaussian(log)", theta, "negative_binomial_theta"),
+            ("tweedie(1.5)", theta, "negative_binomial_theta"),
+            ("gamma-log", phi, "beta_phi"),
+            ("negative-binomial", phi, "beta_phi"),
+            ("poisson-log", power, "tweedie_power"),
+            ("beta", power, "tweedie_power"),
+        ] {
+            let err = scalar_family_from_name(name, overrides)
+                .expect_err(&format!("{name} + {option} must be refused"));
+            assert!(err.contains(&format!("{option} applies only to")), "{name}: {err}");
+        }
+        // Each override still reaches the family that carries it.
+        let (nb, _) = scalar_family_from_name("negative-binomial", theta).expect("nb + theta");
+        assert!(matches!(
+            nb.response,
+            ResponseFamily::NegativeBinomial { theta, theta_fixed: true } if theta == 2.0
+        ));
+        let (beta, _) = scalar_family_from_name("beta", phi).expect("beta + phi");
+        assert!(matches!(beta.response, ResponseFamily::Beta { phi } if phi == 7.5));
+        let (tw, _) = scalar_family_from_name("tweedie", power).expect("tweedie + power");
+        assert!(matches!(tw.response, ResponseFamily::Tweedie { p } if p == 1.6));
+        // The CLI surface refuses the same pair through `resolve_family`.
+        let y = array![0.0, 1.0, 3.0, 2.0];
+        let err = resolve_family(
+            Some("poisson"),
+            Some(2.0),
+            None,
+            y.view(),
+            ResponseColumnKind::Numeric,
+            "y",
+        )
+        .expect_err("--family poisson --negative-binomial-theta must be refused");
+        assert!(err.contains("negative_binomial_theta applies only to"), "{err}");
     }
 
     /// SPEC R25: one spelling per family. The other spellings are refused

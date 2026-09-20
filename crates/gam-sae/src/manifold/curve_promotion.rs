@@ -85,12 +85,15 @@ use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array1, Array2, ArrayView2};
 
 use super::curl::{CircleSeed, RingRecognition, curl_seed, ring_recognition};
-use super::geometry_plan::SaeAtomGeometryPlan;
 use crate::description_length::{
     BirthMdlPrescreen, BirthProposalPriority, CirclePhaseCode, DescriptionLengthScoreKind,
     ScoreComparison, ScoredBits, birth_proposal_priority, circle_phase_code,
     description_length_delta, scalar_rate_bits,
 };
+// One span estimate and one span→topology map for the #2233 pre-screen, shared
+// with the residual-birth path so the two producers cannot price the same span
+// differently (#2749).
+use crate::structure_harvest::{curved_topology_for_span, participation_ratio};
 
 /// An active Tier-1 linear community `B`: the block's linear atoms and the
 /// per-row code cloud on them. The block's OWN contribution is `y_B = C · W`
@@ -416,34 +419,6 @@ fn gram_schmidt(atoms: ArrayView2<'_, f64>) -> Vec<Array1<f64>> {
         }
     }
     basis
-}
-
-/// The participation ratio `(Σλ)² / Σλ²` of a non-negative energy spectrum — the
-/// effective number of significant ambient directions the cloud occupies
-/// (circle ≈ 2). Zero on a degenerate spectrum.
-fn participation_ratio(spectrum: &[f64]) -> f64 {
-    let sum: f64 = spectrum.iter().map(|&e| e.max(0.0)).sum();
-    let sum_sq: f64 = spectrum.iter().map(|&e| e.max(0.0) * e.max(0.0)).sum();
-    if sum_sq > 0.0 {
-        (sum * sum) / sum_sq
-    } else {
-        0.0
-    }
-}
-
-/// The curved topology `(intrinsic_dim d, basis_size m)` matched to an ambient
-/// span. A 2-plane span promotes to a circle (`d=1`, `m=2·d+1=3` harmonic rows);
-/// higher spans to the sphere/torus atoms.
-///
-/// #2749: this was a SECOND transcription of the structured-birth path's
-/// span→topology map, and both copies priced the sphere at the basis width of
-/// the `(lat, lon)` chart deleted in `1dfa70140`. There is now one definition —
-/// [`SaeAtomGeometryPlan::curved_prescreen_atom_for_span`] — and both call sites
-/// read `d` and `m` off the plan it builds, so this pre-screen and the one in
-/// `structure_harvest` cannot drift apart, or away from the birth race, again.
-fn curved_topology_for_span(span: f64) -> Result<(usize, usize), String> {
-    let plan = SaeAtomGeometryPlan::curved_prescreen_atom_for_span(span)?;
-    Ok((plan.intrinsic_dim(), plan.basis_size()?))
 }
 
 #[cfg(test)]

@@ -453,6 +453,28 @@ pub fn polygamma_half_shift_gap_stack(x: f64, orders: usize) -> [f64; 5] {
     crate::jet_tower::polygamma_half_shift_gap_stack(x, orders)
 }
 
+/// `[ψ(x+s) − ψ(x), ψ₁(x+s) − ψ₁(x), …]` through the first `orders` entries (at
+/// most five), zero past them; for `x ≤ 0`, non-finite `x`, or a shift that is
+/// negative or non-finite those entries are `NaN`.
+///
+/// Each gap is accurate to a few ulps relative at every `x` and shift, where the
+/// difference of two [`polygamma_stack`] values loses about `log₂(x/s)` bits.
+/// Integer-shifted gaps are the `θ`-derivatives of the negative-binomial
+/// normalizer `ln Γ(θ + y) − ln Γ(θ)`, which cancel toward the Poisson limit.
+#[inline]
+pub fn polygamma_shift_gap_stack(x: f64, shift: f64, orders: usize) -> [f64; 5] {
+    crate::jet_tower::polygamma_shift_gap_stack(x, shift, orders)
+}
+
+/// `ln Γ(x + s) − ln Γ(x)` for `x > 0` and finite `s ≥ 0` (`NaN` otherwise).
+/// Two separate `ln Γ` values of size `x ln x` would leave an `x ln x · ε`
+/// error; this is within a few ulps of `max(|gap|, 1)` at `x ≥ 20` and about
+/// `10⁻¹⁴ · max(|gap|, 1)` below it.
+#[inline]
+pub fn ln_gamma_shift_gap(x: f64, shift: f64) -> f64 {
+    crate::jet_tower::ln_gamma_shift_gap(x, shift)
+}
+
 /// Gauss-Legendre nodes and weights on `[-1, 1]` for `n` points, computed via
 /// Newton iteration on the Legendre-polynomial roots (Bonnet's three-term
 /// recurrence, cosine initial guess). Returns `(nodes, weights)` with nodes
@@ -1111,6 +1133,11 @@ mod exponential_family_kernel_tests {
         }
         assert_eq!(softplus(800.0), 800.0);
         assert_eq!(softplus(-800.0), 0.0);
+        assert_eq!(logistic(800.0), 1.0);
+        assert_eq!(logistic(-800.0), 0.0);
+        for &x in &[0.5_f64, 1.0, 2.0, 5.0, 40.0] {
+            assert!((logistic(x) + logistic(-x) - 1.0).abs() <= f64::EPSILON);
+        }
     }
 
     #[test]

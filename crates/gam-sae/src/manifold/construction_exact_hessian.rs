@@ -1696,7 +1696,6 @@ impl SaeManifoldTerm {
                 sphere_tangents: self.sphere_tangent_blocks(&cache.row_dims)?,
             });
         }
-        let p = self.output_dim();
         let n = self.n_obs();
         let k_atoms = self.k_atoms();
         let second_jets = self.atom_second_jets()?;
@@ -1733,37 +1732,16 @@ impl SaeManifoldTerm {
                 let jets = jet_window.pop_front().ok_or_else(|| {
                     format!("prepare_residual_curvature_rows: the jet refill built no row {row}")
                 })?;
-                let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
 
                 // √w-scaled metric-applied per-row residual `error_metric = √w·M_n r_n`
                 // (the SAME object the assembly's β-tier gradient contracts). The
                 // data-fit `½ r_nᵀ M_n r_n` has residual curvature `Σ (M_n r_n)·∂²f`,
                 // so this is exactly the residual contracted against the raw `∂²f`
                 // jets. `M_n = I` on the isotropic path ⇒ `error_metric = √w·r`.
-                let mut decoded = vec![0.0_f64; p];
-                let mut fitted = Array1::<f64>::zeros(p);
-                let mut error = Array1::<f64>::zeros(p);
-                let active_atoms = self
-                    .last_row_layout
-                    .as_ref()
-                    .map(|layout| layout.active_atoms[row].as_slice());
-                for k in 0..k_atoms {
-                    if active_atoms.is_some_and(|active| active.binary_search(&k).is_err()) {
-                        continue;
-                    }
-                    self.atoms[k].fill_decoded_row(row, &mut decoded);
-                    let a_k = assignments[k];
-                    for out_col in 0..p {
-                        fitted[out_col] += a_k * decoded[out_col];
-                    }
-                }
-                for out_col in 0..p {
-                    error[out_col] = sqrt_row_w * (fitted[out_col] - target[[row, out_col]]);
-                }
-                let error_metric: Vec<f64> = match self.row_metric.as_ref() {
-                    Some(metric) if whitens => metric.apply_metric_row(row, error.view()),
-                    _ => error.to_vec(),
-                };
+                // Built by the one residual producer every exact-A route shares.
+                let w_row = row_loss_w.map_or(1.0, |w| w[row]);
+                let error_metric =
+                    self.patchd_row_error_metric(row, w_row, target, &assignments, whitens);
 
                 let mut residual_tt = vec![0.0_f64; q * q];
                 for a in 0..q {
@@ -3109,7 +3087,10 @@ impl SaeManifoldTerm {
     /// coordinate-block leg all build it ONCE rather than three times. A route
     /// that reconstructed the residual with a different weighting would produce a
     /// Patch-D leg that silently disagreed with the operator it is supposed to
-    /// differentiate, which is the failure this whole front is about.
+    /// differentiate, which is the failure this whole front is about. The
+    /// residual-curvature row plan, the dense `A − B` row assembly and the
+    /// softmax row-jet plan's HVP probe read this producer too, so every
+    /// exact-A leg contracts one residual.
     pub(crate) fn patchd_row_error_metric(
         &self,
         row: usize,
@@ -4175,13 +4156,15 @@ impl SaeManifoldTerm {
     /// channels contract, and the exact-`A` variant carries that operator's own
     /// factor cache. `cache` stays the `B` stationarity geometry on every route.
     ///
-    /// When `evidence` is `Some`, the THREE reduced-logdet channels
-    /// that have matrix-free siblings — the per-atom decoder smoothness EDF
-    /// `tr(H⁻¹ M_k)`, the per-(atom,axis) ARD log-precision Hessian trace
-    /// `½tr(H⁻¹ ∂H/∂logα)`, and the #1006 envelope Γ = tr(H⁻¹ ∂H/∂θ) — are evaluated
-    /// off that bundle (`decoder_smoothness_effective_dof_per_atom_from_probes` /
-    /// `ard_log_precision_hessian_trace_from_probes` / `logdet_theta_adjoint_from_probes`)
-    /// instead of the dense `DeflatedArrowSolver` selected inverse. For the
+    /// When `evidence` is `Some`, the reduced-logdet channels — the assignment
+    /// log-strength trace, the per-atom decoder smoothness EDF `tr(H⁻¹ M_k)`, the
+    /// per-(atom,axis) ARD log-precision Hessian trace `½tr(H⁻¹ ∂H/∂logα)`, and the
+    /// #1006 envelope Γ = tr(H⁻¹ ∂H/∂θ) — are evaluated off that bundle
+    /// (`assignment_log_strength_hessian_trace_from_probes` /
+    /// `decoder_smoothness_effective_dof_per_atom_from_probes` /
+    /// `ard_log_precision_hessian_trace_from_probes` / `logdet_theta_adjoint_from_probes`).
+    /// When it is `None`, the evaluation's exact-A geometry supplies every one of
+    /// them (`dense_exact_a_logdet_channels` / `arrow_orbit_logdet_channels`). For the
     /// rational route the two slices are the identical weighted vectors emitted
     /// by `RationalLogdetPlan::into_directional_derivative_bundle`, so every
     /// contraction is the derivative of the SAME shifted rational value, not a
@@ -4200,12 +4183,10 @@ impl SaeManifoldTerm {
     /// single adjoint solve is the ONLY solver-bound step, so the whole assembler
     /// runs matrix-free at massive K: pass `matrix_free_system = Some(system)` to
     /// route it through [`Self::solve_exact_stationarity_matrix_free`] (the
-    /// reduced-Schur CG on the reassembled undamped operator) with
-    /// `solver = DeflatedArrowSolver::plain(cache)` for the cheap per-row
-    /// `coordinate_block_*` subtractions — the K≥4096, direct-logdet-not-admitted
-    /// route, mirroring the matrix-free branch of this complete assembler.
-    /// Pass `matrix_free_system = None` to use the dense [`DeflatedArrowSolver`]
-    /// adjoint (the direct-logdet-admitted route). Both produce the same complete
+    /// reduced-Schur CG on the reassembled undamped operator) — the K≥4096,
+    /// direct-logdet-not-admitted route. Pass `matrix_free_system = None` to take
+    /// the adjoint off the evaluation's exact-A geometry (the direct-logdet-admitted
+    /// route). Both produce the same complete
     /// derivative; the from-probes trace channels and the matrix-free adjoint
     /// convert together as one all-or-nothing matrix-free cluster (invariant #1).
     ///
@@ -4218,7 +4199,6 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
-        solver: &DeflatedArrowSolver<'_>,
         evidence: Option<BundleEvidenceGeometry<'_>>,
         matrix_free_system: Option<&ArrowSchurSystem>,
         dense_geometry: Option<&DenseExactAGeometry>,
@@ -4228,7 +4208,6 @@ impl SaeManifoldTerm {
             rho,
             loss,
             cache,
-            solver,
             evidence,
             matrix_free_system,
             dense_geometry.map(ExactAGeometry::Dense),
@@ -4244,7 +4223,6 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
-        solver: &DeflatedArrowSolver<'_>,
         geometry: &ArrowOrbitGeometry,
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
         self.analytic_outer_rho_gradient_components_on_route(
@@ -4252,7 +4230,6 @@ impl SaeManifoldTerm {
             rho,
             loss,
             cache,
-            solver,
             None,
             None,
             Some(ExactAGeometry::ArrowOrbit(geometry)),
@@ -4265,7 +4242,6 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
-        solver: &DeflatedArrowSolver<'_>,
         evidence: Option<BundleEvidenceGeometry<'_>>,
         matrix_free_system: Option<&ArrowSchurSystem>,
         exact_geometry: Option<ExactAGeometry<'_>>,
@@ -4445,22 +4421,18 @@ impl SaeManifoldTerm {
             // likelihood and its Gauss--Newton blocks have no direct alpha
             // derivative. Structurally fixed assignments have no sparse index
             // and skip this channel entirely.
-            if !exact_a_logdet_route {
-                let joint_trace = match logdet_derivative_bundle {
-                    Some((probes, sinv)) => self
-                        .assignment_log_strength_hessian_trace_from_probes(
-                            rho,
-                            evidence_cache,
-                            probes,
-                            sinv,
-                            evidence_operator,
-                        )
-                        .map_err(OuterGradientError::internal)?,
-                    None => self
-                        .assignment_log_strength_hessian_trace(rho, cache, solver)
-                        .map_err(OuterGradientError::internal)?,
-                };
-                logdet_trace[sparse_index] = joint_trace;
+            // Off the bundle route, `dense_exact_a_logdet_channels` /
+            // `arrow_orbit_logdet_channels` below supply this trace.
+            if let Some((probes, sinv)) = logdet_derivative_bundle {
+                logdet_trace[sparse_index] = self
+                    .assignment_log_strength_hessian_trace_from_probes(
+                        rho,
+                        evidence_cache,
+                        probes,
+                        sinv,
+                        evidence_operator,
+                    )
+                    .map_err(OuterGradientError::internal)?;
             }
         }
 
@@ -4487,34 +4459,23 @@ impl SaeManifoldTerm {
             }
         }
         // #2080: the per-atom smoothness logdet derivative off the shared
-        // low-rank derivative representation when the rational lane supplied it;
-        // the dense `DeflatedArrowSolver` selected inverse otherwise.
-        let smooth_logdet = if exact_a_logdet_route {
-            None
-        } else {
-            Some(match logdet_derivative_bundle {
-                Some((probes, sinv)) => self
-                    .decoder_smoothness_effective_dof_per_atom_from_probes(
-                        probes,
-                        sinv,
-                        &lambda_smooth_vec,
-                    )
-                    .map_err(|err| OuterGradientError::InternalInvariant {
-                        reason: format!(
-                            "analytic_outer_rho_gradient_components_with_bundle: smooth dof (matrix-free): {err}"
-                        ),
-                    })?,
-                None => self
-                    .decoder_smoothness_effective_dof_with_solver_per_atom(
-                        cache,
-                        solver,
-                        &lambda_smooth_vec,
-                    )
-                    .map_err(|err| OuterGradientError::InternalInvariant {
-                        reason: format!("analytic_outer_rho_gradient_components_with_bundle: {err}"),
-                    })?,
+        // low-rank derivative representation on the bundle route. Off it,
+        // `dense_exact_a_logdet_channels` / `arrow_orbit_logdet_channels` below
+        // supply the whole `logdet_trace`.
+        let smooth_logdet = logdet_derivative_bundle
+            .map(|(probes, sinv)| {
+                self.decoder_smoothness_effective_dof_per_atom_from_probes(
+                    probes,
+                    sinv,
+                    &lambda_smooth_vec,
+                )
+                .map_err(|err| OuterGradientError::InternalInvariant {
+                    reason: format!(
+                        "analytic_outer_rho_gradient_components_with_bundle: smooth dof (matrix-free): {err}"
+                    ),
+                })
             })
-        };
+            .transpose()?;
         let smooth_occam = self
             .reml_occam_log_lambda_smooth_derivative(rho)
             .map_err(OuterGradientError::internal)?;
@@ -4571,45 +4532,28 @@ impl SaeManifoldTerm {
             .map_err(OuterGradientError::internal)?;
         // #2080: the per-(atom,axis) ARD log-precision Hessian derivative off the
         // SAME shared low-rank representation (the all-or-nothing cluster's
-        // second channel) when present; the dense
-        // deflated selected inverse otherwise. The from-probes channel HARD-REFUSES
-        // any row carrying gauge/rotation deflation (the plain-S⁻¹ bundle cannot
-        // reconstruct the Daleckii–Krein correction), routing that fit to the dense
-        // channel rather than silently dropping the correction.
-        let ard_logdet_traces = if exact_a_logdet_route {
-            None
-        } else {
-            let joint = match logdet_derivative_bundle {
-                Some((probes, sinv)) => self
-                    .ard_log_precision_hessian_trace_from_probes(
-                        rho,
-                        evidence_cache,
-                        probes,
-                        sinv,
-                        evidence_operator,
-                    )
-                    .map_err(|err| OuterGradientError::InternalInvariant {
-                        reason: format!(
-                            "analytic_outer_rho_gradient_components_with_bundle: ARD logdet trace \
-                             (matrix-free): {err}"
-                        ),
-                    })?,
-                None => self
-                    .ard_log_precision_hessian_trace(rho, cache, solver, evidence_operator)
-                    .map_err(|err| OuterGradientError::InternalInvariant {
-                        reason: format!("analytic_outer_rho_gradient_components_with_bundle: {err}"),
-                    })?,
-            };
-            Some(joint)
-        };
-        // #1026 shared-ARD: `ard_flat_index` maps `(k, axis)` onto the flat outer
-        // coordinate for BOTH parameterizations. In `Shared` mode several atoms
-        // alias one axis coordinate `1+K+axis`, and the outer derivative there is
-        // `∂/∂log α_axis = Σ_{k owns axis} ∂/∂log α_{k,axis}` (chain rule through
-        // the broadcast), so we ACCUMULATE. In `PerAtom` mode each `(k, axis)` has
-        // a unique coordinate, so `+=` is identical to the historical `=`. Walking
-        // a raw per-atom cursor in `Shared` mode would index past the flat length
-        // `1+K+max_d` (OOB) and split one shared strength across phantom slots.
+        // second channel) on the bundle route. It prices gauge/rotation deflation
+        // rather than refusing it (#2712: `A_i⁻¹ + G_i S⁻¹ G_iᵀ` on the conditioned
+        // row Cholesky IS the deflated block), and any error it does raise
+        // propagates — there is no dense channel to fall back to.
+        let ard_logdet_traces = logdet_derivative_bundle
+            .map(|(probes, sinv)| {
+                self.ard_log_precision_hessian_trace_from_probes(
+                    rho,
+                    evidence_cache,
+                    probes,
+                    sinv,
+                    evidence_operator,
+                )
+                .map_err(|err| OuterGradientError::InternalInvariant {
+                    reason: format!(
+                        "analytic_outer_rho_gradient_components_with_bundle: ARD logdet trace \
+                         (matrix-free): {err}"
+                    ),
+                })
+            })
+            .transpose()?;
+        // `ard_flat_index` maps each `(k, axis)` onto its own flat outer coordinate.
         for k in 0..rho.log_ard.len() {
             for axis in 0..rho.log_ard[k].len() {
                 let idx = rho.ard_flat_index(k, axis);
@@ -4652,10 +4596,8 @@ impl SaeManifoldTerm {
         // same Daleckii–Krein correction the dense route subtracts instead of routing
         // the fit away. Ordered Beta--Bernoulli uses its row-local PSD majorizer
         // and shared-mass derivative directly.
-        // This completes the matrix-free selected-inverse cluster (smoothness EDF + ARD
-        // Hessian trace + θ-adjoint); assignment log-strength traces remain
-        // solver-bound
-        // — the last gaps before the routing flip (see the docstring).
+        // This completes the matrix-free selected-inverse cluster (assignment
+        // log-strength trace + smoothness EDF + ARD Hessian trace + θ-adjoint).
         //
         // #2333 — a bundle is the only producer here. The pairing refusal above
         // admits no bundle-free route other than the dense exact-A one, whose Γ
@@ -7158,7 +7100,6 @@ impl SaeManifoldTerm {
                     .to_string(),
             );
         }
-        let p = self.output_dim();
         let n = self.n_obs();
         let k_atoms = self.k_atoms();
         let second_jets = self.atom_second_jets()?;
@@ -7195,9 +7136,6 @@ impl SaeManifoldTerm {
             .row_metric
             .as_ref()
             .is_some_and(|metric| metric.whitens_likelihood());
-        let mut decoded = vec![0.0_f64; p];
-        let mut fitted = Array1::<f64>::zeros(p);
-        let mut error = Array1::<f64>::zeros(p);
         let mut assignments = Array1::<f64>::zeros(k_atoms);
 
         let sphere_tangents = self.sphere_tangent_blocks(row_dims)?;
@@ -7225,32 +7163,11 @@ impl SaeManifoldTerm {
             let jets = jet_window
                 .pop_front()
                 .expect("jet window must be non-empty");
-            let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
             let w_row = row_loss_w.map_or(1.0, |w| w[row]);
 
             // The same sqrt(w)-scaled metric-applied residual the applier contracts.
-            fitted.fill(0.0);
-            let active_atoms = self
-                .last_row_layout
-                .as_ref()
-                .map(|layout| layout.active_atoms[row].as_slice());
-            for k in 0..k_atoms {
-                if active_atoms.is_some_and(|active| active.binary_search(&k).is_err()) {
-                    continue;
-                }
-                self.atoms[k].fill_decoded_row(row, &mut decoded);
-                let a_k = assignments[k];
-                for out_col in 0..p {
-                    fitted[out_col] += a_k * decoded[out_col];
-                }
-            }
-            for out_col in 0..p {
-                error[out_col] = sqrt_row_w * (fitted[out_col] - target[[row, out_col]]);
-            }
-            let error_metric: Vec<f64> = match self.row_metric.as_ref() {
-                Some(metric) if whitens => metric.apply_metric_row(row, error.view()),
-                _ => error.to_vec(),
-            };
+            let error_metric =
+                self.patchd_row_error_metric(row, w_row, target, &assignments, whitens);
 
             let mut tt = Array2::<f64>::zeros((q, q));
             let mut tbeta = Array2::<f64>::zeros((q, border.len()));
@@ -7361,9 +7278,8 @@ impl SaeManifoldTerm {
 #[cfg(test)]
 mod test_support {
     use super::Side;
-    use super::{
-        ArrowFactorCache, DeflatedArrowSolver, SaeArrowVector, SaeManifoldRho,
-    };
+    use super::{ArrowFactorCache, SaeArrowVector, SaeManifoldRho};
+    use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
     use gam_linalg::faer_ndarray::FaerEigh;
     use ndarray::{Array1, Array2};
 
