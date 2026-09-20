@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const CACHE_ROOT_COMPONENTS: [&str; 4] = ["gam", "gpu", "policy", "v1"];
 const GEMM_DIMS: [usize; 3] = [64, 128, 256];
 const POTRF_DIMS: [usize; 3] = [64, 128, 256];
@@ -29,21 +29,28 @@ const _: () = assert!(
 );
 const _: () = assert!(POTRF_DIMS[0] == GpuDispatchPolicy::MIN_CALIBRATABLE_POTRF_P);
 
+/// What the calibration cache persists: the device's CPU/GPU timings at each
+/// point of the fixed measurement grid, in grid order. The policy is NOT
+/// cached. It is rebuilt from these timings and the current build's
+/// [`GpuDispatchPolicy::default`] on every load, so the never-calibrated
+/// fields always carry this build's defaults and the calibrated fields can only
+/// land on a current grid point (the bound the pre-probe gates rely on).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedCalibration {
     schema_version: u32,
     device_fingerprint: String,
-    policy: GpuDispatchPolicy,
-    measurements: Vec<MeasurementRecord>,
+    timings: GridTimings,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct MeasurementRecord {
-    operation: String,
-    rows: usize,
-    cols: usize,
-    inner: usize,
-    flops: usize,
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct GridTimings {
+    gemm: [Timing; GEMM_DIMS.len()],
+    potrf: [Timing; POTRF_DIMS.len()],
+    xtwx: [Timing; XTWX_DIMS.len()],
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct Timing {
     cpu_seconds: f64,
     gpu_seconds: f64,
 }
@@ -52,11 +59,8 @@ struct MeasurementRecord {
 struct Measurement {
     operation: &'static str,
     rows: usize,
-    cols: usize,
-    inner: usize,
     flops: usize,
-    cpu_seconds: f64,
-    gpu_seconds: f64,
+    timing: Timing,
 }
 
 pub(crate) fn calibrated_policy_for_device(device: &GpuDeviceInfo) -> GpuDispatchPolicy {
@@ -69,10 +73,14 @@ pub(crate) fn calibrated_policy_for_device(device: &GpuDeviceInfo) -> GpuDispatc
         return cached;
     }
 
-    match calibrate_device(device, fingerprint) {
-        Ok(record) => {
-            let policy = record.policy.clone();
-            store_cached_policy(fingerprint, &record);
+    match calibrate_device(device.ordinal) {
+        Ok(timings) => {
+            let policy = policy_from_timings(&timings);
+            log::debug!(
+                "[GPU] calibrated dispatch policy for {} ({fingerprint})",
+                device.name
+            );
+            store_cached_timings(fingerprint, timings);
             policy
         }
         Err(err) => {
@@ -86,20 +94,111 @@ pub(crate) fn calibrated_policy_for_device(device: &GpuDeviceInfo) -> GpuDispatc
     }
 }
 
-fn calibrate_device(
-    device: &GpuDeviceInfo,
-    fingerprint: Fingerprint,
-) -> Result<CachedCalibration, GpuError> {
-    let mut measurements = Vec::new();
-    measurements.extend(measure_gemm(device.ordinal)?);
-    measurements.extend(measure_potrf(device.ordinal)?);
-    measurements.extend(measure_xtwx(device.ordinal)?);
-    if measurements.is_empty() {
-        return Err(GpuError::CalibrationFailed {
-            reason: "no GPU calibration measurements completed".to_string(),
-        });
+fn calibrate_device(ordinal: usize) -> Result<GridTimings, GpuError> {
+    Ok(GridTimings {
+        gemm: time_grid(GEMM_DIMS, |dim| {
+            let a = deterministic_matrix(dim, dim, 0.13);
+            let b = deterministic_matrix(dim, dim, 0.37);
+            Ok(Timing {
+                cpu_seconds: time_cpu(|| a.dot(&b))?,
+                gpu_seconds: time_gpu(|| {
+                    crate::blas::gemm_on_ordinal_cuda(ordinal, a.view(), b.view(), false, false)
+                })?,
+            })
+        })?,
+        potrf: time_grid(POTRF_DIMS, |dim| {
+            let a = deterministic_spd_matrix(dim);
+            Ok(Timing {
+                cpu_seconds: time_gpu_result(|| {
+                    a.cholesky(Side::Lower)
+                        .map(|factor| factor.lower_triangular())
+                        .map_err(|err| format!("cpu POTRF failed: {err}"))
+                })?,
+                gpu_seconds: time_gpu_result(|| {
+                    crate::solver::cholesky_lower_on_ordinal_gpu(ordinal, a.view())
+                })?,
+            })
+        })?,
+        xtwx: time_grid(XTWX_DIMS, |(n, p)| {
+            let x = deterministic_matrix(n, p, 0.61);
+            let w = deterministic_weights(n);
+            Ok(Timing {
+                cpu_seconds: time_cpu(|| cpu_xtwx(&x, &w))?,
+                gpu_seconds: time_gpu(|| {
+                    crate::blas::xt_diag_x_on_ordinal_cuda(ordinal, x.view(), w.view())
+                })?,
+            })
+        })?,
+    })
+}
+
+fn time_grid<D: Copy, const N: usize>(
+    dims: [D; N],
+    mut time: impl FnMut(D) -> Result<Timing, GpuError>,
+) -> Result<[Timing; N], GpuError> {
+    let mut out = [Timing {
+        cpu_seconds: 0.0,
+        gpu_seconds: 0.0,
+    }; N];
+    for (slot, dim) in out.iter_mut().zip(dims) {
+        *slot = time(dim)?;
+    }
+    Ok(out)
+}
+
+impl GridTimings {
+    /// Pair each timing with its grid point's shape and flop count.
+    fn measurements(&self) -> Vec<Measurement> {
+        let gemm = GEMM_DIMS
+            .iter()
+            .zip(self.gemm)
+            .map(|(&dim, timing)| Measurement {
+                operation: "gemm",
+                rows: dim,
+                flops: 2usize
+                    .saturating_mul(dim)
+                    .saturating_mul(dim)
+                    .saturating_mul(dim),
+                timing,
+            });
+        let potrf = POTRF_DIMS
+            .iter()
+            .zip(self.potrf)
+            .map(|(&dim, timing)| Measurement {
+                operation: "potrf",
+                rows: dim,
+                flops: dim.saturating_mul(dim).saturating_mul(dim) / 3,
+                timing,
+            });
+        let xtwx = XTWX_DIMS
+            .iter()
+            .zip(self.xtwx)
+            .map(|(&(n, p), timing)| Measurement {
+                operation: "xtwx",
+                rows: n,
+                flops: 2usize.saturating_mul(n).saturating_mul(p).saturating_mul(p),
+                timing,
+            });
+        gemm.chain(potrf).chain(xtwx).collect()
     }
 
+    /// Every timing is a finite positive duration, as `time_gpu_result`
+    /// guarantees for a fresh measurement.
+    fn is_valid(&self) -> bool {
+        self.gemm
+            .iter()
+            .chain(&self.potrf)
+            .chain(&self.xtwx)
+            .all(|timing| {
+                [timing.cpu_seconds, timing.gpu_seconds]
+                    .into_iter()
+                    .all(|seconds| seconds.is_finite() && seconds > 0.0)
+            })
+    }
+}
+
+fn policy_from_timings(timings: &GridTimings) -> GpuDispatchPolicy {
+    let measurements = timings.measurements();
     let mut policy = GpuDispatchPolicy::default();
     if let Some(flops) = crossover_flops(&measurements, "gemm", policy.gemm_min_flops) {
         policy.gemm_min_flops = flops;
@@ -114,92 +213,7 @@ fn calibrate_device(
         policy.potrf_min_p = p;
         policy.prefer_gpu_factorization_min_p = p;
     }
-
-    log::debug!(
-        "[GPU] calibrated dispatch policy for {} ({fingerprint}) from {} measurements",
-        device.name,
-        measurements.len()
-    );
-
-    Ok(CachedCalibration {
-        schema_version: SCHEMA_VERSION,
-        device_fingerprint: fingerprint.to_hex(),
-        policy,
-        measurements: measurements
-            .into_iter()
-            .map(Measurement::into_record)
-            .collect(),
-    })
-}
-
-fn measure_gemm(ordinal: usize) -> Result<Vec<Measurement>, GpuError> {
-    let mut out = Vec::with_capacity(GEMM_DIMS.len());
-    for dim in GEMM_DIMS {
-        let a = deterministic_matrix(dim, dim, 0.13);
-        let b = deterministic_matrix(dim, dim, 0.37);
-        let cpu_seconds = time_cpu(|| a.dot(&b))?;
-        let gpu_seconds = time_gpu(|| {
-            crate::blas::gemm_on_ordinal_cuda(ordinal, a.view(), b.view(), false, false)
-        })?;
-        out.push(Measurement {
-            operation: "gemm",
-            rows: dim,
-            cols: dim,
-            inner: dim,
-            flops: 2usize
-                .saturating_mul(dim)
-                .saturating_mul(dim)
-                .saturating_mul(dim),
-            cpu_seconds,
-            gpu_seconds,
-        });
-    }
-    Ok(out)
-}
-
-fn measure_potrf(ordinal: usize) -> Result<Vec<Measurement>, GpuError> {
-    let mut out = Vec::with_capacity(POTRF_DIMS.len());
-    for dim in POTRF_DIMS {
-        let a = deterministic_spd_matrix(dim);
-        let cpu_seconds = time_gpu_result(|| {
-            a.cholesky(Side::Lower)
-                .map(|factor| factor.lower_triangular())
-                .map_err(|err| format!("cpu POTRF failed: {err}"))
-        })?;
-        let gpu_seconds =
-            time_gpu_result(|| crate::solver::cholesky_lower_on_ordinal_gpu(ordinal, a.view()))?;
-        out.push(Measurement {
-            operation: "potrf",
-            rows: dim,
-            cols: dim,
-            inner: dim,
-            flops: dim.saturating_mul(dim).saturating_mul(dim) / 3,
-            cpu_seconds,
-            gpu_seconds,
-        });
-    }
-    Ok(out)
-}
-
-fn measure_xtwx(ordinal: usize) -> Result<Vec<Measurement>, GpuError> {
-    let mut out = Vec::with_capacity(XTWX_DIMS.len());
-    for (n, p) in XTWX_DIMS {
-        let x = deterministic_matrix(n, p, 0.61);
-        let w = deterministic_weights(n);
-        let cpu_seconds = time_cpu(|| cpu_xtwx(&x, &w))?;
-        let gpu_seconds =
-            time_gpu(|| crate::blas::xt_diag_x_on_ordinal_cuda(ordinal, x.view(), w.view()))?;
-        out.push(Measurement {
-            operation: "xtwx",
-            rows: n,
-            cols: p,
-            inner: p,
-            flops: 2usize.saturating_mul(n).saturating_mul(p).saturating_mul(p),
-            cpu_seconds,
-            gpu_seconds,
-        });
-    }
-    Ok(out)
+    policy
 }
 
 fn time_cpu<F>(mut f: F) -> Result<f64, GpuError>
@@ -283,7 +297,9 @@ fn crossover_measurement<'a>(
     measurements
         .iter()
         .filter(|measurement| measurement.operation == operation)
-        .find(|measurement| measurement.gpu_seconds <= measurement.cpu_seconds * GPU_WIN_RATIO)
+        .find(|measurement| {
+            measurement.timing.gpu_seconds <= measurement.timing.cpu_seconds * GPU_WIN_RATIO
+        })
 }
 
 fn deterministic_matrix(rows: usize, cols: usize, phase: f64) -> Array2<f64> {
@@ -318,15 +334,18 @@ fn load_cached_policy(fingerprint: Fingerprint) -> Option<GpuDispatchPolicy> {
     let path = cache_path(fingerprint);
     let bytes = fs::read(path).ok()?;
     let record: CachedCalibration = serde_json::from_slice(&bytes).ok()?;
-    if record.schema_version == SCHEMA_VERSION && record.device_fingerprint == fingerprint.to_hex()
-    {
-        Some(record.policy)
-    } else {
-        None
-    }
+    (record.schema_version == SCHEMA_VERSION
+        && record.device_fingerprint == fingerprint.to_hex()
+        && record.timings.is_valid())
+    .then(|| policy_from_timings(&record.timings))
 }
 
-fn store_cached_policy(fingerprint: Fingerprint, record: &CachedCalibration) {
+fn store_cached_timings(fingerprint: Fingerprint, timings: GridTimings) {
+    let record = CachedCalibration {
+        schema_version: SCHEMA_VERSION,
+        device_fingerprint: fingerprint.to_hex(),
+        timings,
+    };
     let path = cache_path(fingerprint);
     if let Some(parent) = path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
@@ -335,7 +354,7 @@ fn store_cached_policy(fingerprint: Fingerprint, record: &CachedCalibration) {
         }
     }
     let tmp = path.with_extension("json.tmp");
-    let bytes = match serde_json::to_vec_pretty(record) {
+    let bytes = match serde_json::to_vec_pretty(&record) {
         Ok(bytes) => bytes,
         Err(err) => {
             log::debug!("[GPU] unable to serialize calibration cache: {err}");
@@ -390,20 +409,6 @@ const fn bool_fingerprint_value(value: bool) -> u64 {
     if value { 1 } else { 0 }
 }
 
-impl Measurement {
-    fn into_record(self) -> MeasurementRecord {
-        MeasurementRecord {
-            operation: self.operation.to_string(),
-            rows: self.rows,
-            cols: self.cols,
-            inner: self.inner,
-            flops: self.flops,
-            cpu_seconds: self.cpu_seconds,
-            gpu_seconds: self.gpu_seconds,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,7 +417,6 @@ mod tests {
     fn measurement(
         operation: &'static str,
         rows: usize,
-        cols: usize,
         flops: usize,
         cpu_seconds: f64,
         gpu_seconds: f64,
@@ -420,20 +424,20 @@ mod tests {
         Measurement {
             operation,
             rows,
-            cols,
-            inner: cols,
             flops,
-            cpu_seconds,
-            gpu_seconds,
+            timing: Timing {
+                cpu_seconds,
+                gpu_seconds,
+            },
         }
     }
 
     #[test]
     fn calibration_crossover_uses_first_measured_gpu_win() {
         let measurements = vec![
-            measurement("gemm", 64, 64, 524_288, 0.001, 0.004),
-            measurement("gemm", 128, 128, 4_194_304, 0.010, 0.009),
-            measurement("gemm", 256, 256, 33_554_432, 0.080, 0.010),
+            measurement("gemm", 64, 524_288, 0.001, 0.004),
+            measurement("gemm", 128, 4_194_304, 0.010, 0.009),
+            measurement("gemm", 256, 33_554_432, 0.080, 0.010),
         ];
 
         assert_eq!(
@@ -445,9 +449,9 @@ mod tests {
     #[test]
     fn calibration_crossover_raises_threshold_when_gpu_never_wins() {
         let measurements = vec![
-            measurement("xtwx", 2_048, 32, 4_194_304, 0.001, 0.004),
-            measurement("xtwx", 4_096, 64, 33_554_432, 0.010, 0.040),
-            measurement("xtwx", 8_192, 96, 150_994_944, 0.080, 0.400),
+            measurement("xtwx", 2_048, 4_194_304, 0.001, 0.004),
+            measurement("xtwx", 4_096, 33_554_432, 0.010, 0.040),
+            measurement("xtwx", 8_192, 150_994_944, 0.080, 0.400),
         ];
 
         assert_eq!(
@@ -455,6 +459,70 @@ mod tests {
             Some(301_989_888)
         );
         assert_eq!(crossover_rows(&measurements, "xtwx", 50_000), Some(50_000));
+    }
+
+    fn uniform_timings(cpu_seconds: f64, gpu_seconds: f64) -> GridTimings {
+        let timing = Timing {
+            cpu_seconds,
+            gpu_seconds,
+        };
+        GridTimings {
+            gemm: [timing; GEMM_DIMS.len()],
+            potrf: [timing; POTRF_DIMS.len()],
+            xtwx: [timing; XTWX_DIMS.len()],
+        }
+    }
+
+    #[test]
+    fn cached_timings_rebuild_policy_on_current_grid_and_defaults() {
+        let record = CachedCalibration {
+            schema_version: SCHEMA_VERSION,
+            device_fingerprint: "unit-test".to_string(),
+            timings: uniform_timings(1.0, 0.5),
+        };
+        let bytes = serde_json::to_vec(&record).expect("serialize calibration record");
+        let loaded: CachedCalibration =
+            serde_json::from_slice(&bytes).expect("deserialize calibration record");
+        assert!(loaded.timings.is_valid());
+
+        let policy = policy_from_timings(&loaded.timings);
+        let seed = GpuDispatchPolicy::default();
+        assert_eq!(
+            policy.gemm_min_flops as u128,
+            GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS
+        );
+        assert_eq!(
+            policy.potrf_min_p,
+            GpuDispatchPolicy::MIN_CALIBRATABLE_POTRF_P
+        );
+        assert_eq!(policy.prefer_gpu_factorization_min_p, POTRF_DIMS[0]);
+        assert_eq!(policy.xtwx_n_min, XTWX_DIMS[0].0);
+        assert_eq!(
+            policy.xtwx_flops_min,
+            2 * XTWX_DIMS[0].0 * XTWX_DIMS[0].1 * XTWX_DIMS[0].1
+        );
+        assert_eq!(
+            GpuDispatchPolicy {
+                xtwx_n_min: seed.xtwx_n_min,
+                xtwx_flops_min: seed.xtwx_flops_min,
+                gemm_min_flops: seed.gemm_min_flops,
+                potrf_min_p: seed.potrf_min_p,
+                prefer_gpu_factorization_min_p: seed.prefer_gpu_factorization_min_p,
+                ..policy
+            },
+            seed
+        );
+    }
+
+    #[test]
+    fn cached_timings_reject_non_positive_or_non_finite_durations() {
+        assert!(uniform_timings(1.0, 0.5).is_valid());
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(!uniform_timings(bad, 0.5).is_valid());
+            let mut timings = uniform_timings(1.0, 0.5);
+            timings.xtwx[2].gpu_seconds = bad;
+            assert!(!timings.is_valid());
+        }
     }
 
     #[test]

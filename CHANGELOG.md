@@ -1,5 +1,14 @@
 ## Unreleased
 
+- **GPU calibration cache stores timings, not a policy** (#4082). The cache under
+  `$TMPDIR/gam/gpu/policy/v1/` held a whole `GpuDispatchPolicy`, so a file written by an
+  older build pinned that build's defaults for every never-calibrated field and could
+  carry calibrated floors below the current measurement grid. It now holds the CPU/GPU
+  timings at each grid point, and every load rebuilds the policy from them and the
+  current defaults, exactly as a fresh calibration does. Old cache files are ignored
+  (schema version 2), and `GpuDispatchPolicy` / `GpuMixedPrecisionPolicy` no longer
+  implement `Serialize`/`Deserialize`.
+
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
   `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and

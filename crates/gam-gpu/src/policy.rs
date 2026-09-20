@@ -1,6 +1,4 @@
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GpuMixedPrecisionPolicy {
     /// Always use fp64 factorization; no refinement attempted.
     Off,
@@ -18,7 +16,7 @@ pub enum GpuMixedPrecisionPolicy {
     Never,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GpuDispatchPolicy {
     pub xtwx_n_min: usize,
     pub xtwx_flops_min: usize,
