@@ -70,15 +70,21 @@ def _sweep() -> list[dict[str, float]]:
                 "term_edf": term_edf,
                 "ref_df": float(rec["ref_df"]),
                 "p": float(rec["p_value_corrected"]),
-                # A fit that stalls without converging (the flat-valley REML
-                # stall on an unidentified term, #1762) has an untrustworthy edf,
-                # so smooth_significance deliberately references it against the
-                # conservative full basis dimension rather than the tight edf1.
-                # The tight-band assertion below therefore only applies to
-                # CONVERGED fits; the pure-noise flat fits routinely stall.
-                "converged": int(model.outer_iterations) < 200,
+                # The fit's own convergence certificate, not an iteration-count
+                # proxy. Every fit in this sweep is well posed (a flat or a
+                # smooth mean, Gaussian noise, N = 300 >> K = 20), so each one
+                # must certify: a pure-noise fit that stalls is a solver defect
+                # to fix, not a fit to leave out of the band check (SPEC.md:
+                # "In general, do not paper over solver issues.").
+                "certified": bool(model.convergence["certified"]),
             }
         )
+    uncertified = [r["freq"] for r in out if not r["certified"]]
+    assert not uncertified, (
+        "well-posed y ~ s(x) fits did not certify convergence (freq = "
+        f"{uncertified}); the ref_df band cannot be judged on a fit whose "
+        "smoothing parameters are not at a stationary point"
+    )
     return out
 
 
@@ -87,16 +93,12 @@ def test_ref_df_stays_in_edf1_band_not_basis_dimension() -> None:
     # block lie in [0, 1]). For a CONVERGED fit the reference d.f. must respect
     # the upper side too; the buggy per-penalty-sum floor pinned it to ~K-1 and
     # blew past this band for every moderately-shrunk fit.
-    checked = 0
+    sweep = _sweep()
     offenders = []
-    for r in _sweep():
-        if not r["converged"]:
-            continue  # non-converged fits are deliberately referenced at ~K
-        checked += 1
+    for r in sweep:
         upper = 2.0 * r["term_edf"] + 3.0  # generous slack over the 2*edf bound
         if r["ref_df"] > upper:
             offenders.append(r)
-    assert checked >= 3, f"expected several converged fits in the sweep, got {checked}"
     assert not offenders, (
         "ref_df exceeded the edf1 band [term_edf, 2*term_edf+3] on a CONVERGED "
         "fit — it is saturating toward the basis dimension instead of tracking "
@@ -112,11 +114,10 @@ def test_ref_df_stays_in_edf1_band_not_basis_dimension() -> None:
 def test_ref_df_varies_with_fitted_complexity() -> None:
     # The single most direct signature of the basis-dimension pin: ref_df is a
     # constant across fits of wildly different complexity. A correct edf1-style
-    # reference spans a wide range as the smooth goes flat -> wiggly. Restrict to
-    # converged fits so the non-converged conservative fallback (~K) does not
-    # itself supply the spread.
-    refs = [r["ref_df"] for r in _sweep() if r["converged"]]
-    assert len(refs) >= 3, f"expected several converged fits, got {len(refs)}"
+    # reference spans a wide range as the smooth goes flat -> wiggly. `_sweep`
+    # requires every fit to certify, so no non-converged fallback (~K) can
+    # supply the spread.
+    refs = [r["ref_df"] for r in _sweep()]
     spread = max(refs) - min(refs)
     assert spread > 4.0, (
         f"ref_df barely varied across a flat->wiggly sweep (spread={spread:.3f}); "
@@ -147,43 +148,61 @@ def test_moderate_signal_is_not_judged_over_conservatively() -> None:
     )
 
 
-def test_nonconverged_flat_fit_is_not_flagged_significant() -> None:
-    # The flat-valley REML stall (#1762) on an unidentified smooth over pure
-    # noise leaves a NON-CONVERGED fit whose smoothing parameters rail out and
-    # whose influence-based edf reads ~0 even though the term still carries a
-    # large, wiggly beta (so the refit LR statistic W is large). Referencing that
-    # large W against the ~0 edf manufactured overwhelming significance — the
-    # dominant driver of the null-FPR blow-up in #1766. smooth_significance now
-    # references a non-converged term against its full basis dimension, so those
-    # stalls are no longer spuriously flagged. Verify the null false-positive
-    # rate stays near alpha ACROSS the seeds where the stall actually happens.
+def test_pure_noise_fits_converge_and_null_p_values_are_uniform() -> None:
+    # Pure noise: the smooth has no effect, so the term's p-value must be
+    # U(0, 1) -- neither piled near 0 (the #1766 collapse, where a stalled
+    # flat-valley fit's large W was referenced against its ~0 edf) nor pushed
+    # toward 1 (a conservative reference such as chi^2 on the full basis
+    # dimension). Both are the same defect seen from the two sides.
+    #
+    # This test used to REQUIRE that some of these fits stall (`stalls > 0`,
+    # a stall being `outer_iterations >= 200`) and to go red when none did, as
+    # the recorded python-contracts run 30600186060 shows. A test that demands
+    # the REML optimizer fail on a well-posed y ~ s(x) fit papers over the
+    # stall it names (SPEC.md: "In general, do not paper over solver
+    # issues."). Every fit must instead certify, which is what the
+    # smooth_significance calibration study measures on its cells
+    # (bench/pvalue_calibration/pv-lr-refit: 500 of 500 fits converged, null
+    # p-values uniform, no mass at p = 1).
+    #
+    # Two-sided gates, derived from the null law with R = 60 fits:
+    #  * the mean p-value of U(0, 1) is 1/2 with variance 1/12, so the mean of
+    #    R null p-values has sd sqrt(1/(12 R)) = 0.037; it must lie within
+    #    4 sd of 1/2;
+    #  * the rejection rate at alpha = 0.05 keeps its existing upper bar of
+    #    0.15 (Binomial(R, alpha) sd on the rate is 0.028, so the bar is 3.6 sd
+    #    above alpha). Its lower side is below zero at this R, which is why the
+    #    mean gate is the one that sees a conservative test.
     n_seeds = 60
-    rej = 0
-    stalls = 0
-    worst = None
+    alpha = 0.05
+    ps: list[float] = []
+    uncertified = []
     for seed in range(n_seeds):
         rng = np.random.default_rng(3000 + seed)
         x = np.linspace(0.0, 1.0, N)
         y = rng.standard_normal(N)  # pure noise: no smooth effect
         model = gamfit.fit({"x": list(x), "y": list(y)}, "y ~ s(x)")
-        summary = model.summary()
+        if not bool(model.convergence["certified"]):
+            uncertified.append((seed, int(model.outer_iterations)))
         rec = model.smooth_significance({"x": list(x), "y": list(y)})[0]
-        p = float(rec["p_value_corrected"])
-        if int(model.outer_iterations) >= 200:  # the stall signature
-            stalls += 1
-            if worst is None or p < worst[1]:
-                worst = (seed, p, float(rec["statistic_lr"]), float(rec["ref_df"]))
-        if p < 0.05:
-            rej += 1
-    fpr = rej / n_seeds
-    assert stalls > 0, (
-        "setup: expected some fits to hit the flat-valley stall; none did — "
-        "the guard is untested by this sample"
+        ps.append(float(rec["p_value_corrected"]))
+    assert not uncertified, (
+        f"pure-noise y ~ s(x) fits did not certify convergence "
+        f"(seed, outer_iterations) = {uncertified}; the flat-valley REML stall "
+        "(#1762) is a solver defect, not an expected outcome"
+    )
+    mean_p = float(np.mean(ps))
+    mean_sd = (1.0 / (12.0 * n_seeds)) ** 0.5
+    fpr = sum(p < alpha for p in ps) / n_seeds
+    assert abs(mean_p - 0.5) <= 4.0 * mean_sd, (
+        f"null p-values are not U(0, 1): mean p = {mean_p:.3f} over {n_seeds} "
+        f"pure-noise fits, outside 1/2 +- 4 sd = +-{4.0 * mean_sd:.3f} "
+        f"({'conservative' if mean_p > 0.5 else 'anti-conservative'}); "
+        f"sorted p = {[round(p, 3) for p in sorted(ps)]}"
     )
     assert fpr <= 0.15, (
-        f"null false-positive rate {fpr:.3f} ({rej}/{n_seeds}) on pure noise "
-        f"exceeds the tolerance; the non-converged over-rejection is back. "
-        f"({stalls} fits stalled; worst stalled p={worst})"
+        f"null false-positive rate {fpr:.3f} at alpha = {alpha} over {n_seeds} "
+        "pure-noise fits exceeds 0.15; the #1766 over-rejection is back"
     )
 
 
@@ -191,5 +210,5 @@ if __name__ == "__main__":  # pragma: no cover - manual smoke run
     test_ref_df_stays_in_edf1_band_not_basis_dimension()
     test_ref_df_varies_with_fitted_complexity()
     test_moderate_signal_is_not_judged_over_conservatively()
-    test_nonconverged_flat_fit_is_not_flagged_significant()
+    test_pure_noise_fits_converge_and_null_p_values_are_uniform()
     print("ok")
