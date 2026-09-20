@@ -4706,7 +4706,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(flat_to_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(extract_row_ids, module)?)?;
-    module.add_function(wrap_pyfunction!(default_survival_time_grid, module)?)?;
     module.add_function(wrap_pyfunction!(torch_from_fitted, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;

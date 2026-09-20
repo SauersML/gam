@@ -153,7 +153,6 @@ __all__ = [
     "curvature_inference_json",
     "cyclic_bspline_roughness_penalty",
     "debiased_functional",
-    "default_survival_time_grid",
     "derive_ivae_aux_scale",
     "diagnostics_anchor_consistency_report",
     "diagnostics_aux_richness",
@@ -1696,8 +1695,6 @@ def curvature_inference_json(model: _FittedModel, headers: Sequence[str], rows: 
 def cyclic_bspline_roughness_penalty(num_basis: int, degree: int = ..., period: float = ..., order: int = ...) -> NDArray[np.float64]: ...
 
 def debiased_functional(beta: NDArray[np.float64], penalized_hessian: NDArray[np.float64], row_scores: NDArray[np.float64], penalty_beta: NDArray[np.float64], target: str, design_row: NDArray[np.float64] | None = ..., design_row_b: NDArray[np.float64] | None = ..., design_matrix: NDArray[np.float64] | None = ..., weights: NDArray[np.float64] | None = ..., leverage: NDArray[np.float64] | None = ...) -> dict[Any, Any]: ...
-
-def default_survival_time_grid(model_class: str, formula: str, headers: Sequence[str], rows: _EncodedTable, model_bytes: Sequence[int] | None = ...) -> list[float] | None: ...
 
 def derive_ivae_aux_scale(aux: NDArray[np.float64]) -> NDArray[np.float64]: ...
 
