@@ -443,8 +443,10 @@ impl SaeManifoldTerm {
                     ) {
                         continue;
                     }
+                    // The Killing field is an ambient 3-vector; every component is
+                    // part of the orbit direction the evidence factor qualifies.
                     let mut rotation = Array1::<f64>::zeros(q_row);
-                    for axis in 0..2 {
+                    for axis in 0..3 {
                         rotation[coord_start + axis] = direction[axis];
                     }
                     row_dirs.push(rotation);
@@ -549,5 +551,53 @@ impl SaeManifoldTerm {
             }
         }
         Ok(Some(gauge))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifold::tests_gauge_posterior_flatness_2720::{
+        planted_circle_cloud, seeded_term_of_kind,
+    };
+
+    /// Every per-row sphere deflation candidate must be the whole ambient Killing
+    /// field `e_g × u` at that row's cover point, not a truncation of it: only the
+    /// full field is tangent to the sphere and hence an orbit direction.
+    #[test]
+    fn sphere_row_gauge_deflations_are_full_killing_fields() {
+        let target = planted_circle_cloud();
+        let term = seeded_term_of_kind(target.view(), "sphere", 2);
+        assert!(matches!(
+            term.atoms[0].basis_kind(),
+            SaeAtomBasisKind::Sphere
+        ));
+        let coords = term.assignment.coords[0].as_matrix();
+        let start = term.assignment.coord_offsets()[0];
+        let deflation = term
+            .row_gauge_deflation_for_layout(None)
+            .expect("row gauge deflation")
+            .expect("a seeded sphere atom declares row gauge candidates");
+        let mut checked = 0usize;
+        let mut third_component_exercised = false;
+        for (row, directions) in deflation.directions.iter().enumerate() {
+            let u = [coords[[row, 0]], coords[[row, 1]], coords[[row, 2]]];
+            let killing = ambient_sphere_killing_directions(u);
+            for direction in directions {
+                let candidate = [direction[start], direction[start + 1], direction[start + 2]];
+                assert!(
+                    killing.iter().any(|field| field == &candidate),
+                    "row {row}: candidate {candidate:?} is not one of the Killing fields {killing:?}"
+                );
+                let tangency: f64 = (0..3).map(|axis| candidate[axis] * u[axis]).sum();
+                let magnitude: f64 = (0..3).map(|axis| (candidate[axis] * u[axis]).abs()).sum();
+                assert!(tangency.abs() <= 8.0*f64::EPSILON*magnitude,
+                    "sphere orbit direction must be tangent: {candidate:?} at {u:?}");
+                third_component_exercised |= candidate[2] != 0.0;
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no sphere row gauge candidate was emitted");
+        assert!(third_component_exercised, "fixture must exercise the missing third component");
     }
 }
