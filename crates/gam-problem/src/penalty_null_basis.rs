@@ -34,10 +34,20 @@
 //! When `δ > 0`, `‖sin Θ(N̂, ker S)‖₂ ≤ ρ/δ` (Davis and Kahan 1970, the sin Θ
 //! theorem in residual form), and `min_Q ‖N̂ − N₀Q‖₂ ≤ √2·sin Θ` for an
 //! orthonormal basis `N₀` of `ker S`. The eigensolver's loss of orthogonality,
-//! `p·ε`, is added to that. When `δ ≤ 0`, the declared null space is not
-//! separated from the rest of the spectrum, and no basis is taken. That loses
-//! nothing: the spectrum then resolves fewer than `p − m` eigenvalues, so the
-//! declared cap `min(resolved, p − m)` would not bind anyway.
+//! `p·ε`, is added to that.
+//!
+//! When `δ ≤ 0`, the declared null space is not separated from the rest of
+//! the spectrum at the stored matrix's resolution. Davis–Kahan then bounds
+//! nothing (`sin Θ` may be 1). The stored matrix does not determine which
+//! `m`-dimensional subspace is `ker S`, so no basis drawn from it certifies a
+//! positive reduced nullity, and no basis is taken. The certified reduced
+//! nullity is then 0, which is a lower bound. The reduced penalty's rank is
+//! then read by the spectral rule alone, as for any undeclared penalty. This is
+//! a decision the problem's own quantities make (the residual `ρ` against the
+//! gap `λ̂_m − E`), and 0 is the largest nullity they certify. It is not a
+//! retry after a failure. What it can cost is the cap on the reduced penalty:
+//! a reduced null direction stored above the band stays in the root. The
+//! unreduced penalty keeps its own declaration.
 //!
 //! `ρ` includes the stored null eigenvalues themselves. They are the part of
 //! the formation error that shows up in the null space, so a producer that
@@ -61,8 +71,13 @@
 //! The reduced matrix inherits the stored penalty's absolute rounding, so an
 //! eigenvalue below `S`'s own resolution `p·ε·‖S‖₂ + formation_band` is not a
 //! measurement. The pulled-back declaration is therefore used only when
-//! `4b²‖S‖₂ ≤ resolution·(1 − 4b²)`. Otherwise it is 0, and the spectral rule
-//! decides alone.
+//! `4b²‖S‖₂ ≤ resolution·(1 − 4b²)`. Otherwise the error bound cannot keep an
+//! over-cut below what the stored penalty resolves, so again 0 is the largest
+//! certified nullity, and the spectral rule decides alone. Every quantity in
+//! this test is computed from the problem: `S`'s spectrum and rounding band,
+//! the producer's formation band, and `T`'s measured orthonormality defect.
+//! The constants `4`, `√2` and the `γ_k` growth factors come from the bounds
+//! above. None of them is a tuning choice.
 //!
 //! # Block-local penalties
 //!
