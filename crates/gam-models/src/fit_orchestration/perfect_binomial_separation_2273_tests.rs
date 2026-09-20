@@ -77,12 +77,16 @@ use super::request::{FitConfig, FitResult, StandardFitResult};
 use csv::StringRecord;
 use gam_data::encode_recordswith_inferred_schema;
 
-/// Build the issue's EXACT (not statistically near-) separation fixture:
-/// `n/2` rows of class 0 at `x = 1.0, 1.1, 1.2, ...` and `n/2` rows of class
-/// 1 at `x = 10.0, 10.1, 10.2, ...` — a genuine gap between the two support
-/// intervals `[1, 1+0.1·(n/2−1)]` and `[10, 10+0.1·(n/2−1)]`, deterministic
-/// (no RNG), mirroring the issue's `sep_n6.csv`/n-sweep table verbatim. `n`
-/// must be even (every n the issue reports, 6..400, is).
+/// Build the issue's separation fixture: `n/2` rows of class 0 at
+/// `x = 1.0, 1.1, 1.2, ...` and `n/2` rows of class 1 at
+/// `x = 10.0, 10.1, 10.2, ...`, deterministic (no RNG), mirroring the issue's
+/// `sep_n6.csv`/n-sweep table verbatim. `n` must be even (every n the issue
+/// reports, 6..400, is).
+///
+/// The support intervals `[1, 1+0.1·(n/2−1)]` and `[10, 10+0.1·(n/2−1)]` have
+/// a genuine gap only while `1+0.1·(n/2−1) < 10`, i.e. `n < 182`
+/// ([`fixture_is_separated`]). The issue's n=400 row overlaps: its classes
+/// share `x ∈ [10, 20.9]` and it has a finite maximum likelihood.
 fn perfectly_separated_binomial(n: usize) -> gam_data::EncodedDataset {
     assert_eq!(n % 2, 0, "perfectly_separated_binomial requires an even n");
     let half = n / 2;
@@ -97,6 +101,12 @@ fn perfectly_separated_binomial(n: usize) -> gam_data::EncodedDataset {
         rows.push(StringRecord::from(vec![x.to_string(), "1".to_string()]));
     }
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
+}
+
+/// Whether [`perfectly_separated_binomial`]'s two class supports are
+/// disjoint, i.e. the largest class-0 `x` lies below the smallest class-1 `x`.
+fn fixture_is_separated(n: usize) -> bool {
+    1.0 + 0.1 * (n / 2 - 1) as f64 < 10.0
 }
 
 /// Fit `formula` on the exact-separation fixture at `n` through the
@@ -140,19 +150,22 @@ fn assert_exact_separation_mints(n: usize, formula: &str, firth: bool) {
         "#2273: minted fit (n={n}, formula={formula:?}) must report a finite \
          positive edf, got {edf}"
     );
-    // #3129: the separated design is fitted under the Jeffreys prior from the
-    // first solve. Without `--firth` the prefit certificate armed it and is
-    // the recorded reason; with `--firth` the caller asked for it and no
-    // certificate was needed.
-    assert!(
+    // #3129: the estimator is a function of the data. A separated design is
+    // fitted under the Jeffreys prior from the first solve: without `--firth`
+    // the prefit certificate armed it and is the recorded reason; with
+    // `--firth` the caller asked for it and no certificate was needed. An
+    // overlapping design keeps the flat prior unless the caller asked.
+    let separated = fixture_is_separated(n);
+    assert_eq!(
         fit.artifacts.firth_bias_reduction,
-        "#3129: exact-separation fit (n={n}, formula={formula:?}, firth={firth}) \
-         must be fitted under the Jeffreys prior"
+        firth || separated,
+        "#3129: fit (n={n}, formula={formula:?}, firth={firth}, separated={separated}) \
+         chose the wrong prior"
     );
     assert_eq!(
         fit.artifacts.jeffreys_arming_evidence.is_some(),
-        !firth,
-        "#3129: exact-separation fit (n={n}, formula={formula:?}, firth={firth}) \
+        !firth && separated,
+        "#3129: fit (n={n}, formula={formula:?}, firth={firth}, separated={separated}) \
          recorded arming evidence {:?}",
         fit.artifacts.jeffreys_arming_evidence
     );
@@ -164,7 +177,8 @@ fn assert_exact_separation_mints(n: usize, formula: &str, firth: bool) {
 /// that happened to already converge (60, 80, 400) — must mint a model.
 /// The non-monotonic fail/pass-by-n pattern in the original report is
 /// exactly why every one of these is asserted individually rather than
-/// spot-checking a single n.
+/// spot-checking a single n. The n=400 row overlaps, so it is also the
+/// control for arming: it is fitted under the flat prior.
 #[test]
 fn exact_separation_linear_n_sweep_mints_2273() {
     for &n in &[6usize, 10, 20, 30, 40, 60, 80, 100, 150, 400] {
