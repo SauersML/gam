@@ -250,20 +250,6 @@ pub(crate) struct OuterConfig {
     pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
     pub(crate) operator_initial_trust_radius: Option<f64>,
     pub(crate) arc_initial_regularization: Option<f64>,
-    /// BFGS line-search infinity-norm cap applied to the leading `rho_dim`
-    /// outer parameters (log-λ axes). Documented natural step for
-    /// `log(lambda)` is ≈ 5 (`e^5 ≈ 148`-fold smoothing-parameter change
-    /// per accepted outer iter — matches typical quasi-Newton direction
-    /// magnitude on flat REML surfaces). Setting this `None` disables the
-    /// rho-axis cap entirely.
-    pub(crate) bfgs_step_cap: Option<f64>,
-    /// BFGS line-search infinity-norm cap applied to the trailing `psi_dim`
-    /// outer parameters (kappa / aniso-log-scale axes). Required because
-    /// the kernel scale axes need much tighter control (`e^1 ≈ 2.7`-fold
-    /// per iter is plenty) — using the rho-axis cap here lets the optimizer
-    /// jump kappa by orders of magnitude per step and oscillate. Setting
-    /// this `None` disables the psi-axis cap.
-    pub(crate) bfgs_step_cap_psi: Option<f64>,
     /// Optional persistent-cache session. When `Some`, every finite objective
     /// evaluation is written through to disk (rate-limited, atomic-rename)
     /// and the best on-disk rho is prepended as a seed at the start of each
@@ -424,8 +410,6 @@ impl Default for OuterConfig {
             outer_inner_cap: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
-            bfgs_step_cap: None,
-            bfgs_step_cap_psi: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
             problem_size: OuterProblemSize::default(),
@@ -472,8 +456,6 @@ pub struct OuterProblem {
     outer_inner_cap: Option<InnerProgressFeedback>,
     operator_initial_trust_radius: Option<f64>,
     arc_initial_regularization: Option<f64>,
-    bfgs_step_cap: Option<f64>,
-    bfgs_step_cap_psi: Option<f64>,
     cache_session: Option<Arc<CacheSession>>,
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
     problem_size: OuterProblemSize,
@@ -516,8 +498,6 @@ impl OuterProblem {
             outer_inner_cap: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
-            bfgs_step_cap: None,
-            bfgs_step_cap_psi: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
             problem_size: OuterProblemSize::default(),
@@ -568,8 +548,7 @@ impl OuterProblem {
     // 3-coordinate measure-jet ψ group (s, α, ln τ) — `psi_dim` is generic,
     // `with_bounds` carries the s ∈ (0, 2) box (the same convention matern κ
     // uses for its log-κ window; no logistic reparameterization exists or is
-    // needed in-house), `with_bfgs_step_cap_psi` caps per-iteration ψ moves,
-    // and `DirectionalHyperParam::new_compact` (solver/reml/mod.rs) carries
+    // needed in-house), and `DirectionalHyperParam::new_compact` (solver/reml/mod.rs) carries
     // penalty-only first/second/cross jets with `is_penalty_like`
     // auto-derived from the identically-zero design drift (∂X/∂ψ ≡ 0).
     // Every remaining registration arm is formula-layer dispatch in
@@ -766,30 +745,6 @@ impl OuterProblem {
         self
     }
 
-    /// Cap the infinity-norm displacement of BFGS cost-only line-search probes
-    /// on the **rho axes** (the first `n_params - psi_dim` outer parameters,
-    /// = log-λ). Also scales the initial inverse metric so the first trial
-    /// direction respects the same local budget coordinate-wise. Documented
-    /// natural step on log-λ is ≈ 5; tighter values throttle BFGS and starve
-    /// convergence on flat REML valleys.
-    pub fn with_bfgs_step_cap(mut self, cap: Option<f64>) -> Self {
-        self.bfgs_step_cap = cap.filter(|v| v.is_finite() && *v > 0.0);
-        self
-    }
-
-    /// Cap the infinity-norm displacement of BFGS cost-only line-search probes
-    /// on the **psi axes** (the trailing `psi_dim` outer parameters, = kappa
-    /// or anisotropic log-scales). Mirrors [`Self::with_bfgs_step_cap`] but
-    /// scoped to kernel-scale parameters whose natural step is much smaller
-    /// than log-λ (≈ ln 2 per iter keeps kappa from oscillating). Without
-    /// this split, a uniform rho-scale cap lets psi explode while a uniform
-    /// psi-scale cap throttles rho — both fail the survival-marginal-slope
-    /// path at large scale, where rho needs |d|≈5 while psi wants |d|≤1.
-    pub fn with_bfgs_step_cap_psi(mut self, cap: Option<f64>) -> Self {
-        self.bfgs_step_cap_psi = cap.filter(|v| v.is_finite() && *v > 0.0);
-        self
-    }
-
     pub fn with_cache_session(mut self, session: Arc<CacheSession>) -> Self {
         self.cache_session = Some(session);
         self
@@ -871,8 +826,6 @@ impl OuterProblem {
             outer_inner_cap: self.outer_inner_cap.clone(),
             operator_initial_trust_radius: self.operator_initial_trust_radius,
             arc_initial_regularization: self.arc_initial_regularization,
-            bfgs_step_cap: self.bfgs_step_cap,
-            bfgs_step_cap_psi: self.bfgs_step_cap_psi,
             cache_session: self.cache_session.clone(),
             cache_mirror_sessions: self.cache_mirror_sessions.clone(),
             problem_size: self.problem_size,
@@ -8059,27 +8012,6 @@ pub(crate) fn sanitized_operator_trust_restart_radius(radius: Option<f64>) -> Op
     radius
         .filter(|value| value.is_finite() && *value > 0.0)
         .map(|value| value.max(OPERATOR_TRUST_RESTART_RADIUS_FLOOR))
-}
-
-pub(crate) fn bfgs_axis_step_caps(
-    config: &OuterConfig,
-    layout: OuterThetaLayout,
-) -> Option<Array1<f64>> {
-    if config.bfgs_step_cap.is_none() && config.bfgs_step_cap_psi.is_none() {
-        return None;
-    }
-    let mut caps = Array1::from_elem(layout.n_params, f64::INFINITY);
-    if let Some(cap) = config.bfgs_step_cap {
-        for i in 0..layout.rho_dim() {
-            caps[i] = cap;
-        }
-    }
-    if let Some(cap) = config.bfgs_step_cap_psi {
-        for i in layout.rho_dim()..layout.n_params {
-            caps[i] = cap;
-        }
-    }
-    Some(caps)
 }
 
 pub(crate) enum FixedPointOuterRunError {

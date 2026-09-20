@@ -1155,7 +1155,7 @@ mod tests {
         let exact_a = slq_logdet_exact_a_classified(
             dim,
             nan_apply,
-            |_direction| Ok((1.0, 1.0)),
+            |_| Ok((1.0, 1.0)),
             8,
             dim,
             3,
