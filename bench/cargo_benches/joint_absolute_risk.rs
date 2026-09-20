@@ -209,11 +209,12 @@ use gam::event_history::{
 };
 use gam::event_history::joint::{JointTables, fit_joint_event_model};
 use gam::families::custom_family::BlockwiseFitOptions;
+use gam_math::probability::normal_cdf;
+use gam_math::special::{logistic, softplus};
 use ndarray::{Array1, Array2};
 use opt::{Bfgs, BfgsError, FirstOrderSample, FusedObjective, MaxIterations, ObjectiveEvalError, Tolerance};
 use rayon::prelude::*;
 use statrs::distribution::{ContinuousCDF, Normal};
-use statrs::function::erf::erfc;
 
 const SIGNATURES: usize = 3;
 const SCORES: usize = 3;
@@ -343,24 +344,11 @@ impl Rng {
     }
 }
 
-fn softplus(x: f64) -> f64 {
-    x.max(0.0) + (-x.abs()).exp().ln_1p()
-}
-
-fn sigmoid(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
-}
-
 fn logit(p: f64) -> f64 {
     (p / (1.0 - p)).ln()
 }
 
-/// `sigmoid(x)` by the same operations as [`sigmoid`], with its running rounding bound `mu`,
+/// `logistic(x)` by the same operations as [`logistic`], with its running rounding bound `mu`,
 /// given the bound `mu_x` of `x`. The exponential charges its accuracy, cited from the runtime
 /// libm (glibc 2.28 on MSI, < 1 ulp), times its value, plus the propagated operand bound.
 fn sigmoid_bound(x: f64, mu_x: f64) -> (f64, f64) {
@@ -487,10 +475,6 @@ fn bounded_auc(rows: &[(f64, bool, Bounded)]) -> Bounded {
         controls = controls.add(control_weight);
     }
     numerator.div(cases.mul(controls))
-}
-
-fn normal_cdf(x: f64) -> f64 {
-    0.5 * erfc(-x / std::f64::consts::SQRT_2)
 }
 
 fn report(line: String) {
@@ -1010,7 +994,7 @@ impl TruthLaw {
     }
 
     fn attendance_probability(&self, person: &Person, state: &MarkovState) -> f64 {
-        sigmoid(
+        logistic(
             self.attendance_intercept
                 + self.attendance_sex * person.sex
                 + self.attendance_pc2 * person.pcs[1]
@@ -2981,7 +2965,7 @@ fn aladyn_forecast(
                 let total: f64 = weights.iter().sum();
                 let mut mixture = 0.0;
                 for (signature, weight) in weights.iter().enumerate() {
-                    mixture += weight / total * sigmoid(fit[phi_start + (signature * DISEASES + disease) * t + bin]);
+                    mixture += weight / total * logistic(fit[phi_start + (signature * DISEASES + disease) * t + bin]);
                 }
                 survival *= 1.0 - kappa * mixture;
             }
@@ -3433,7 +3417,7 @@ fn recalibration_standard_error(items: &[Scored], a: f64, b: f64, slope: bool) -
         .filter(|item| item.weight > 0.0 && item.prediction > 0.0 && item.prediction < 1.0)
     {
         let z = logit(item.prediction);
-        let p = sigmoid(a + b * z);
+        let p = logistic(a + b * z);
         let curvature = item.weight * p * (1.0 - p);
         hessian[0] += curvature;
         hessian[1] += curvature * z;
@@ -4472,13 +4456,13 @@ fn self_check() -> usize {
     let mut overconfident = Vec::new();
     while calibrated.len() < 20000 {
         let logit_value = -1.0 + rng.normal();
-        let outcome = if rng.bernoulli(sigmoid(logit_value)) {
+        let outcome = if rng.bernoulli(logistic(logit_value)) {
             Outcome::Case(1.0)
         } else {
             Outcome::Control
         };
-        calibrated.push(Scored { prediction: sigmoid(logit_value), outcome, weight: 1.0, at_risk_until: 1.0 });
-        overconfident.push(Scored { prediction: sigmoid(2.0 * logit_value), outcome, weight: 1.0, at_risk_until: 1.0 });
+        calibrated.push(Scored { prediction: logistic(logit_value), outcome, weight: 1.0, at_risk_until: 1.0 });
+        overconfident.push(Scored { prediction: logistic(2.0 * logit_value), outcome, weight: 1.0, at_risk_until: 1.0 });
     }
     let (a, b) = recalibration(&calibrated, false);
     checks.monte_carlo("calibrated-intercept", a, 0.0, recalibration_standard_error(&calibrated, a, b, false), 0.0);

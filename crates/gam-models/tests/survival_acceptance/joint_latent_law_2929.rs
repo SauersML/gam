@@ -24,6 +24,7 @@
 use csv::StringRecord;
 use gam_data::encode_recordswith_inferred_schema;
 use gam_linalg::utils::splitmix64;
+use gam_math::probability::normal_cdf;
 use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use gam_models::inference::model::FittedModel;
 use gam_models::inference::model_payload_builders::fit_formula_to_payload;
@@ -45,10 +46,6 @@ const CORRELATION_AMPLITUDE: f64 = 0.8;
 
 fn next_unit(state: &mut u64) -> f64 {
     ((splitmix64(state) >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-}
-
-fn normal_cdf(x: f64) -> f64 {
-    gam_math::probability::normal_cdf(x)
 }
 
 /// Standard-normal quantile by bisection on `Φ`, independent of the crate.

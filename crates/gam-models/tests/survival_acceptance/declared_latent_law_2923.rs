@@ -35,6 +35,7 @@ use ndarray::Array1;
 use std::collections::HashMap;
 
 use gam_linalg::utils::splitmix64;
+use gam_math::probability::normal_cdf;
 
 const N: usize = 2_400;
 /// Planted slope of the latent score on the probit survival index. Large
@@ -48,10 +49,6 @@ const LOCATION_TREND: f64 = 0.95;
 
 fn next_unit(state: &mut u64) -> f64 {
     (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
-}
-
-fn normal_cdf(x: f64) -> f64 {
-    gam_math::probability::normal_cdf(x)
 }
 
 /// Standard-normal quantile by bisection on `Φ`. Deliberately not imported from

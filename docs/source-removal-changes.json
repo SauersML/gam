@@ -2665,5 +2665,22 @@
     ],
     "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
     "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "8887329660b68e029b7ecef370539e4879d5c0af",
+    "items": [
+      "crates/gam-cli/examples/finite_response_teacher_2946.rs:fn:logistic",
+      "crates/gam-inference/src/skovgaard.rs:fn:normal_pdf",
+      "crates/gam-models/src/fit_orchestration/drivers/measure_jet_range_seed.rs:fn:normal_cdf",
+      "crates/gam-models/src/fit_orchestration/drivers/measure_jet_range_seed.rs:fn:normal_pdf",
+      "crates/gam-models/tests/survival_acceptance/covariate_constant_slope_2930.rs:fn:normal_cdf",
+      "crates/gam-models/tests/survival_acceptance/declared_latent_law_2923.rs:fn:normal_cdf",
+      "crates/gam-models/tests/survival_acceptance/joint_latent_law_2929.rs:fn:normal_cdf",
+      "crates/gam-models/tests/survival_acceptance/landmark_short_horizon_calibration_2336.rs:fn:normal_cdf",
+      "crates/gam-models/tests/survival_acceptance/moving_law_certificate_2926.rs:fn:normal_cdf",
+      "crates/gam-models/tests/survival_arming_route_2995.rs:fn:normal_cdf"
+    ],
+    "reason": "#4406: private scalar kernels outside tests/ duplicated gam_math. The bench softplus/sigmoid, the gam-cli example logistic and the root example sigmoid were gam_math::special::{softplus, logistic}; the bench, measure_jet_range_seed test module and gam-models survival test normal_cdf copies (statrs erf/erfc or pass-through wrappers) and the repro979 A&S erf_approx were gam_math::probability::normal_cdf; the skovgaard and measure_jet_range_seed test normal_pdf copies were gam_math::probability::normal_pdf. SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'.",
+    "evidence": "https://github.com/SauersML/gam/issues/4406: every former call site now imports the canonical gam_math kernel; git grep -w finds no remaining call to a removed name in the edited files."
   }
 ]

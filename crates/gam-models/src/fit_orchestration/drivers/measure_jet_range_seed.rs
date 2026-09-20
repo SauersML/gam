@@ -533,6 +533,7 @@ pub(crate) fn seed_measure_jet_auto_ranges(
 #[cfg(test)]
 mod marginal_slope_screen_response_tests {
     use super::*;
+    use gam_math::probability::{normal_cdf, normal_pdf};
 
     fn splitmix(state: &mut u64) -> u64 {
         *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -551,14 +552,6 @@ mod marginal_slope_screen_response_tests {
         let u1 = unit(state);
         let u2 = unit(state);
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-    }
-
-    fn normal_cdf(x: f64) -> f64 {
-        0.5 * (1.0 + statrs::function::erf::erf(x / std::f64::consts::SQRT_2))
-    }
-
-    fn normal_pdf(x: f64) -> f64 {
-        (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
     }
 
     fn pearson(a: &[f64], b: &[f64]) -> f64 {
