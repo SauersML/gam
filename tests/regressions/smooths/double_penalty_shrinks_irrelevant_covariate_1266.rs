@@ -112,7 +112,6 @@ fn smooth_term_edf(fit: &FitResult, needle: &str) -> f64 {
     let rows = smooth_term_summary_rows(
         &std_fit.design,
         &std_fit.fit,
-        None,
         SummaryBlockOffset::default(),
     );
     rows.iter()

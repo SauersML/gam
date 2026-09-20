@@ -375,21 +375,27 @@ pub(crate) fn compute_outer_hessian(
     // reduced drifts `R_d = U_Sᵀ Ḣ_d U_S` once and reuse them for every
     // pair; per-pair cost is then O(r²) instead of O(p²) per cross.
     let subspace = solution.penalty_subspace_trace.as_deref();
-    let reduced_h_drifts: Option<Vec<Array2<f64>>> = subspace.map(|kernel| {
+    // The kept–dropped blocks `B_d = U_Sᵀ Ḣ_d U_D` ride with them: the kernel's
+    // pseudo-inverse rotates into the eigenpairs it drops, and that rotation is
+    // part of the exact cross term (gam#2952).
+    let reduced_h_drifts: Option<(Vec<Array2<f64>>, Vec<Array2<f64>>)> = subspace.map(|kernel| {
         let mut drifts = (0..k)
             .map(|idx| DriftDerivResult::Dense(dense_h_k(idx).clone()))
             .collect::<Vec<_>>();
         drifts.extend(ext_h_drifts.iter().cloned());
-        penalty_subspace_reduce_drifts_batched(kernel, &drifts)
+        (
+            penalty_subspace_reduce_drifts_batched(kernel, &drifts),
+            penalty_subspace_couple_dropped_drifts_batched(kernel, &drifts),
+        )
     });
     let exact_logdet_cross_traces = if incl_logdet_h {
-        if let (Some(kernel), Some(reduced)) = (subspace, reduced_h_drifts.as_ref()) {
+        if let (Some(kernel), Some((reduced, coupled))) = (subspace, reduced_h_drifts.as_ref()) {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let n = reduced.len();
             // Each `(i, j)` upper-triangular pair is an independent cross
-            // trace `−tr(K · A_i · K · A_j)` over the projected kernel
-            // `K = U_S (U_Sᵀ H U_S)⁻¹ U_Sᵀ`; the kernel and `reduced` slice
-            // are both read-only borrows so the K(K+1)/2 pairs dispatch in
+            // term of the exact pseudo-logdet second derivative over the
+            // spectral kernel `K = U_S diag(1/σ) U_Sᵀ`; the kernel and the
+            // blocks are read-only borrows so the K(K+1)/2 pairs dispatch in
             // parallel, then we stitch the symmetric `n × n` Array2
             // sequentially.
             let pair_count = n * (n + 1) / 2;
@@ -397,11 +403,11 @@ pub(crate) fn compute_outer_hessian(
                 .into_par_iter()
                 .map(|pair_idx| {
                     let (i, j) = upper_triangle_pair_from_index(pair_idx, n);
-                    let value =
-                        -kernel.trace_projected_logdet_cross_reduced(&reduced[i], &reduced[j]);
-                    (i, j, value)
+                    kernel
+                        .pseudo_logdet_cross(&reduced[i], &reduced[j], &coupled[i], &coupled[j])
+                        .map(|value| (i, j, value))
                 })
-                .collect();
+                .collect::<Result<_, String>>()?;
             let mut out = Array2::<f64>::zeros((n, n));
             for (i, j, value) in pair_values {
                 out[[i, j]] = value;

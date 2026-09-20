@@ -175,6 +175,54 @@ pub(crate) fn xt_projected_kernel_diagonal_iterator_matches_scalar_reference_bit
     }
 }
 
+/// gam#2952: where the kernel drops a nonzero (here negative) eigenvalue, the cross term of the
+/// exact second derivative of the kept-spectrum `log|M|₊` is `−tr(K E K G)` plus the kept–dropped
+/// rotation. `M(s, t) = M₀ + s E + t G` has `M̈ = 0`, so the mixed derivative of `Σ_kept ln σ` is
+/// that cross term alone, and a Richardson difference of the kept eigenvalues grades it.
+#[test]
+pub(crate) fn pseudo_logdet_cross_differentiates_the_kept_spectrum_logdet_2952() {
+    let q0 = array![[0.8, -0.6, 0.0], [0.36, 0.48, -0.8], [0.48, 0.64, 0.6]];
+    let m0 = q0.dot(&Array2::from_diag(&array![2.0, 0.9, -0.3])).dot(&q0.t());
+    let e = array![[0.3, -0.2, 0.5], [-0.2, 0.1, 0.4], [0.5, 0.4, -0.6]];
+    let g = array![[-0.1, 0.6, 0.2], [0.6, 0.3, -0.5], [0.2, -0.5, 0.4]];
+    let kept_logdet = |s: f64, t: f64| {
+        let m = &m0 + &(&e * s) + &(&g * t);
+        let operator = DenseSpectralOperator::from_symmetric(&m).expect("symmetric fixture");
+        let mut spectrum = operator.raw_spectrum().to_vec();
+        spectrum.sort_by(|a, b| b.total_cmp(a));
+        assert!(spectrum[2] < 0.0 && spectrum[1] > 0.0, "the kernel keeps the two positive pairs");
+        spectrum[0].ln() + spectrum[1].ln()
+    };
+    let kernel = PenaltySubspaceTrace {
+        u_s: q0.slice(ndarray::s![.., 0..2]).to_owned(),
+        h_proj_inverse: array![[1.0 / 2.0, 0.0], [0.0, 1.0 / 0.9]],
+        dropped_basis: q0.slice(ndarray::s![.., 2..3]).to_owned(),
+        dropped_eigenvalues: array![-0.3],
+        logdet_correction: 0.0,
+    };
+    let (reduced_e, reduced_g) = (kernel.reduce(&e), kernel.reduce(&g));
+    let analytic = kernel
+        .pseudo_logdet_cross(&reduced_e, &reduced_g, &kernel.couple_dropped(&e), &kernel.couple_dropped(&g))
+        .expect("spectral kernel");
+    let mixed = |h: f64| {
+        (kept_logdet(h, h) - kept_logdet(h, -h) - kept_logdet(-h, h) + kept_logdet(-h, -h))
+            / (4.0 * h * h)
+    };
+    let (coarse, fine) = (mixed(1.0e-3), mixed(5.0e-4));
+    let difference = (4.0 * fine - coarse) / 3.0;
+    let bar = (fine - coarse).abs() + 1.0e-8;
+    assert!(
+        (analytic - difference).abs() <= bar,
+        "cross term {analytic} against the mixed difference {difference} (bar {bar})"
+    );
+    // Positive control: the kept–kept cross trace alone misses by far more than the bar.
+    let kept_only = -kernel.trace_projected_logdet_cross_reduced(&reduced_e, &reduced_g);
+    assert!(
+        (kept_only - difference).abs() > 1.0e3 * bar,
+        "positive control: −tr(K E K G) alone gives {kept_only} against {difference} (bar {bar})"
+    );
+}
+
 #[test]
 pub(crate) fn projected_logdet_cross_reduced_uses_trace_product_reference() {
     let kernel = PenaltySubspaceTrace {
