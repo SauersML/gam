@@ -2674,5 +2674,17 @@
     ],
     "reason": "#3819: gaussian_reml's private matrix_fingerprint folded each f64's bits into one word with fnv1a_mix, a word-level fold under which X and X with a negated column (whose Grams X'X differ only by a sign conjugation) could collide, so the eigen cache accepted a design it was not built for. Every fingerprint in the file now goes through gam_linalg::matrix::array2_bits_fingerprint, the canonical byte-wise FNV-1a over (nrows, ncols, each value's bits), and the block canonical key hashes the (design, penalty) fingerprint pair with DefaultHasher (it only orders rho blocks in-process). Neither helper has a caller left.",
     "evidence": "scripts/source_removal_guard.py --base 74c2b1d788902aa74c5a7306ae4014e37749e4e3 lists exactly these two private removals. Read-proof: before the change git grep -w -c on 74c2b1d788902aa74c5a7306ae4014e37749e4e3 finds matrix_fingerprint/fnv1a_mix only in crates/gam-solve/src/gaussian_reml.rs (20 occurrences, all the two definitions and their in-file callers); at the head git grep -w finds 0 occurrences in crates/ tests/ examples/. New test eigen_cache_refuses_the_design_with_a_negated_column pins the refusal."
+  },
+  {
+    "base": "a9ab22c1139986a36b3594264e54cf1ae386413d",
+    "items": [
+      "crates/gam-solve/src/reml/firth.rs:fn:apply_hadamard_gram_to_matrix_by_row_blocks",
+      "crates/gam-solve/src/reml/firth.rs:fn:hphisecond_direction_apply_eye_cached",
+      "crates/gam-solve/src/reml/firth.rs:fn:hphisecond_eye_cached_matches_per_pair_bit_identical_1575",
+      "crates/gam-solve/src/reml/firth.rs:fn:tk_second_direction_eye_cache",
+      "crates/gam-solve/src/reml/firth.rs:struct:FirthSecondDirEyeCache"
+    ],
+    "reason": "fz0034 timeout (binomial n=500, PR #3441 follow-up): the Tierney-Kadane rho-Hessian no longer materializes any second derivative H_ab or K_ab. Every term that reads K_ab is linear in it, so the whole K_ab part is one trace <K_ab, Pi> = tr(H_a J_b) + tr(H_b J_a) - tr(H_ab Omega), and tr(H_ab Omega) reaches the Firth part through the O(k) trace jet hphi_direction_trace_jet. The per-pair D^2 H_phi[dir_a, dir_b](I) eye cache (FirthSecondDirEyeCache, tk_second_direction_eye_cache, hphisecond_direction_apply_eye_cached) therefore has no caller and is deleted with its bit-identity test. apply_hadamard_gram_to_matrix_by_row_blocks is generalized into the cost-dispatched apply_cross_hadamard_gram_to_matrix, which covers the same product.",
+    "evidence": "In the landing tree, grep -rn for each removed name under crates/ finds 0 matches. tk_hessian_trace_identity_matches_materialized_second_derivatives (gradient_hessian.rs) pins the trace-only rho-Hessian against a reference that materializes every H_ab (via hphi_direction plus hphisecond_direction_apply on the identity) and K_ab, with and without Firth, to 1e-10 relative. hphi_direction_trace_jet_matches_materialized_contractions and cross_hadamard_gram_routes_match_dense_hadamard_product (firth.rs) pin the new Firth trace jet and both cross Hadamard-Gram routes against dense products. tk_rho_hessian_pair_routes_match_the_row_pair_jet_sum pins the pair blocks with the <K_ab, W> term traced back in. The release lib tests filtered on tk_, firth and hadamard_gram pass."
   }
 ]
