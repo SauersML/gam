@@ -2193,9 +2193,10 @@ pub enum BlockQuadratureCorrectionStage {
         gap: f64,
         tolerance: f64,
     },
-    /// The admission latched the axis-by-axis block marginal, whose analytic mixed-axis term
-    /// requires the Laplace Hessian weights to be the likelihood's own second derivative, and
-    /// this rho's inner solve converged under the expected-information surrogate instead.
+    /// The admission latched the axis-by-axis block marginal, whose mixed-axis term is exact
+    /// to its order only when the excess over the Laplace Gaussian starts at cubic order, which
+    /// needs the Laplace Hessian weights to be the likelihood's own second derivative, and this
+    /// rho's inner solve converged under the expected-information surrogate instead.
     AxisSplitWithoutExactCurvature { block_dim: usize },
 }
 
@@ -2261,8 +2262,8 @@ impl std::fmt::Display for BlockQuadratureCorrectionStage {
             Self::AxisSplitWithoutExactCurvature { block_dim } => write!(
                 f,
                 "the {block_dim}-direction block was admitted axis by axis, whose mixed-axis term \
-                 needs the observed Hessian, and this rho's inner solve converged under the \
-                 expected-information surrogate"
+                 needs an excess that starts at cubic order and so the observed Hessian, and this \
+                 rho's inner solve converged under the expected-information surrogate"
             ),
         }
     }
