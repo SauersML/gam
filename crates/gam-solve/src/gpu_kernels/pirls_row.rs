@@ -1272,7 +1272,7 @@ fn bernoulli_logit_body(curvature: CurvatureMode) -> String {
     if (status == PIRLS_OK) {{
         mu = eta_i >= 0.0 ? 1.0 / denom : tail / denom;
         if (!(isfinite(mu) && mu >= 0.0 && mu <= 1.0
-                && isfinite(dmu_deta) && dmu_deta > 0.0))
+                && isfinite(dmu_deta) && dmu_deta >= 0.0))
             pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
     if (status == PIRLS_OK && wp > 0.0) {{
@@ -1284,7 +1284,10 @@ fn bernoulli_logit_body(curvature: CurvatureMode) -> String {
             residual = y_i - mu;
         }}
         w_fisher = wp * dmu_deta;
-        if (!(isfinite(w_fisher) && w_fisher > 0.0))
+        // A saturated row (mu' rounded to zero past |eta| ~ 745.13) whose
+        // residual rounded to zero with it is the analytic zero-weight limit.
+        bool saturated_consistent = dmu_deta == 0.0 && residual == 0.0;
+        if (!(isfinite(w_fisher) && (w_fisher > 0.0 || saturated_consistent)))
             pirls_refuse(&status, PIRLS_FISHER_WEIGHT);
         w_hessian = w_fisher;
         w_solver = w_hessian;

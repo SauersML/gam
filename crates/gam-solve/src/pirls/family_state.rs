@@ -40,7 +40,7 @@ pub(crate) fn bernoulli_logit_geometry_from_jet(
         && jet.mu >= 0.0
         && jet.mu <= 1.0
         && jet.d1.is_finite()
-        && jet.d1 > 0.0
+        && jet.d1 >= 0.0
         && jet.d2.is_finite()
         && jet.d3.is_finite())
     {
@@ -53,6 +53,24 @@ pub(crate) fn bernoulli_logit_geometry_from_jet(
     }
     let fisher = jet.d1;
     let (weight, z, c, d) = if priorweight == 0.0 {
+        (0.0, eta, 0.0, 0.0)
+    } else if fisher == 0.0 {
+        // Saturated row: `|eta|` is past the point (about 745.13) where
+        // `mu' = e^{-|eta|}/(1+e^{-|eta|})^2` rounds to zero, so the Fisher weight and
+        // its eta-derivatives are exactly zero in f64. A consistent row (`y` on the
+        // saturated boundary) has a residual `y - mu` below the smallest subnormal
+        // too: its whole working geometry (weight, score, `c`, `d`) is the analytic
+        // zero-weight limit, the output of the `priorweight == 0` branch. An
+        // inconsistent row keeps a unit-order score with no representable weight,
+        // which the working response `z = eta + (y - mu)/mu'` cannot carry.
+        if canonical_logit_residual(eta, y) != 0.0 {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                row,
+                "saturated canonical-logit row inconsistent with response",
+                eta,
+                y,
+            ));
+        }
         (0.0, eta, 0.0, 0.0)
     } else {
         let weight = priorweight * fisher;
@@ -98,19 +116,7 @@ fn canonical_logit_working_response(
     if !(y.is_finite() && (0.0..=1.0).contains(&y)) {
         return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "binomial response", eta, y));
     }
-    let tail = (-eta.abs()).exp();
-    let residual = if eta >= 0.0 {
-        let one_minus_mu = tail / (1.0 + tail);
-        if y == 1.0 {
-            one_minus_mu
-        } else {
-            (y - 1.0) + one_minus_mu
-        }
-    } else {
-        let mu = tail / (1.0 + tail);
-        y - mu
-    };
-    let z = eta + residual / dmu_deta;
+    let z = eta + canonical_logit_residual(eta, y) / dmu_deta;
     if z.is_finite() {
         Ok(z)
     } else {
@@ -120,6 +126,24 @@ fn canonical_logit_working_response(
             eta,
             z,
         ))
+    }
+}
+
+/// Canonical-logit residual `y - mu`, taken from the tail complement
+/// `e^{-|eta|}/(1+e^{-|eta|})` on the side where `mu` rounds to its boundary.
+#[inline]
+fn canonical_logit_residual(eta: f64, y: f64) -> f64 {
+    let tail = (-eta.abs()).exp();
+    if eta >= 0.0 {
+        let one_minus_mu = tail / (1.0 + tail);
+        if y == 1.0 {
+            one_minus_mu
+        } else {
+            (y - 1.0) + one_minus_mu
+        }
+    } else {
+        let mu = tail / (1.0 + tail);
+        y - mu
     }
 }
 
