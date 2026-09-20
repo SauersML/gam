@@ -809,7 +809,6 @@ fn fit_log_innovation(
     total_weight: f64,
     innovation_floor: f64,
 ) -> Result<(Vec<f64>, [f64; 2]), String> {
-    let n = residual.len();
     let raw = residual
         .iter()
         .zip(weights.iter())
@@ -850,9 +849,35 @@ fn fit_log_innovation(
         return Ok((constant, constant_range));
     }
 
+    let gamma = fisher_score_log_linear_variance(residual, basis, weights, homoskedastic.ln())?;
+    let range = linear_predictor_range(&gamma, basis, weights);
+    Ok((gamma, range))
+}
+
+/// Maximum-likelihood fit of the Gaussian log-linear variance model
+/// `ε_i ~ N(0, exp(A_iᵀγ))` by exact Fisher scoring with a step-halving line
+/// search, started from the constant model `γ = (seed_log_variance, 0, …)`.
+///
+/// With `d_i = exp(A_iᵀγ)` the weighted log-likelihood score and Fisher
+/// information are `s(γ) = ½ Σ_i w_i A_i (ε_i²/d_i − 1)` and
+/// `I(γ) = ½ Σ_i w_i A_i A_iᵀ`, so the scoring step is the weighted
+/// least-squares fit of `ε²/d − 1` on `A`. The returned `γ` is the fixed point
+/// where that step vanishes, i.e. `Σ_i w_i A_i (ε_i²/d_i − 1) = 0`: the ridge of
+/// the step's solve damps the step and never moves the root.
+///
+/// Shared by the conditional score covariance's innovation variances and the
+/// K = 1 conditional latent calibration (gam#4019), so both variance models
+/// are the same estimator.
+pub(crate) fn fisher_score_log_linear_variance(
+    residual: &[f64],
+    basis: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    seed_log_variance: f64,
+) -> Result<Vec<f64>, String> {
+    let n = residual.len();
     let width = basis.ncols();
     let mut gamma = vec![0.0_f64; width];
-    gamma[0] = homoskedastic.ln();
+    gamma[0] = seed_log_variance;
 
     // The Gaussian log-likelihood of the log-linear variance model, up to a
     // constant: `ℓ(γ) = −½ Σ w (A_iᵀγ + ε_i²·exp(−A_iᵀγ))`, with the rounding band
@@ -905,10 +930,7 @@ fn fit_log_innovation(
     // property a strictly concave objective actually supports, and the same run
     // then converges in 22 accepted steps.
     let (mut current, mut current_band) = log_likelihood(&gamma).ok_or_else(|| {
-        format!(
-            "conditional score covariance log-variance seed log d = {} is not evaluable",
-            gamma[0]
-        )
+        format!("log-linear variance seed log v = {} is not evaluable", gamma[0])
     })?;
     // Every step that continues gains more than the two evaluations' bands, and a
     // concave likelihood bounded above admits only finitely many such gains, so
@@ -923,10 +945,7 @@ fn fit_log_innovation(
             deviation[row] = residual[row] * residual[row] * (-linear).exp() - 1.0;
         }
         if !deviation.iter().all(|value| value.is_finite()) {
-            return Err(
-                "conditional score covariance log-variance iterate left the representable range"
-                    .to_string(),
-            );
+            return Err("log-linear variance iterate left the representable range".to_string());
         }
         let (step, _) = weighted_ridge_columns(
             basis,
@@ -973,8 +992,7 @@ fn fit_log_innovation(
             break;
         }
     }
-    let range = linear_predictor_range(&gamma, basis, weights);
-    Ok((gamma, range))
+    Ok(gamma)
 }
 
 /// `[min, max]` of `coeffs·[1 | a]` over the training rows that carry weight.

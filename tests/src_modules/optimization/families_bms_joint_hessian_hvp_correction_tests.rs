@@ -3115,12 +3115,11 @@ fn bernoulli_rigid_batched_all_axes_first_directional_matches_per_axis_scatter()
 
 fn murphy_topel_test_calibration() -> LatentZConditionalCalibration {
     // Mean-and-variance conditional calibration over a single conditioning
-    // covariate a(C) (basis_ncols = 1), so θ₁ = (mean_coeffs[2], var_coeffs[2]).
+    // covariate a(C) (basis_ncols = 1), so θ₁ = (mean_coeffs[2], log_var_coeffs[2]).
     LatentZConditionalCalibration {
-        mean_coeffs: vec![0.1, 0.4], // m(C) = 0.1 + 0.4·a
-        var_coeffs: vec![1.2, 0.3],  // v(C) = max(1.2 + 0.3·a, floor)
+        mean_coeffs: vec![0.1, 0.4],      // m(C) = 0.1 + 0.4·a
+        log_var_coeffs: vec![0.18, 0.25], // v(C) = exp(0.18 + 0.25·a)
         basis_ncols: 1,
-        var_floor: 0.05,
         homoskedastic_var: 1.0,
         post_mean: 0.0,
         post_sd: 1.0,
@@ -3142,8 +3141,7 @@ fn murphy_topel_test_calibration() -> LatentZConditionalCalibration {
 fn generated_regressor_correction_is_psd_and_inflates_slope_se_when_gate_fires() {
     let cal = murphy_topel_test_calibration();
     let p_beta = 2usize;
-    // Conditioning covariate a(C) (well above the variance floor everywhere) and
-    // raw latent scores z.
+    // Conditioning covariate a(C) and raw latent scores z.
     let a_block = ndarray::array![[0.3], [-0.5], [0.8], [0.1], [-0.2]];
     let z = ndarray::array![0.6, -0.4, 1.1, 0.05, -0.9];
     // A nonzero per-row slope-score-to-ζ sensitivity (n × p_β): the gate fires.
@@ -3201,17 +3199,10 @@ fn generated_regressor_correction_is_psd_and_inflates_slope_se_when_gate_fires()
 }
 
 #[test]
-fn generated_regressor_correction_vanishes_when_all_rows_floored() {
-    // When the conditional variance is on the floor for EVERY row, ∂ζ/∂v = 0,
-    // and with a mean block whose sensitivity is also driven to zero the whole
-    // J_zeta is zero ⇒ G = 0 ⇒ correction = 0 (the floored-row property: a
-    // floored row carries no first-stage uncertainty into β̂).
-    //
-    // Construct a calibration whose raw v(C) sits below the floor everywhere so
-    // the variance sensitivity vanishes, AND scale the mean sensitivity to be
-    // checked separately. Here we instead test the cleanest invariant: with a
-    // zero score-sensitivity s_i ≡ 0 the correction is exactly zero regardless
-    // of J_zeta (no second-stage coupling to the first stage).
+fn generated_regressor_correction_vanishes_when_no_score_responds_to_zeta() {
+    // With a zero score-sensitivity s_i ≡ 0 the correction is exactly zero
+    // regardless of J_zeta: G = Σ_i s_i ⊗ ∂ζ_i/∂θ₁ = 0, so no first-stage
+    // uncertainty reaches β̂ (no second-stage coupling to the first stage).
     let cal = murphy_topel_test_calibration();
     let n = 4usize;
     let a_block = ndarray::array![[0.3], [-0.5], [0.8], [0.1]];
@@ -3453,9 +3444,8 @@ fn score_zeta_sensitivity_equals_jacobian_transpose_of_mixed_z_partial() {
 fn murphy_topel_test_calibration_basis2() -> LatentZConditionalCalibration {
     LatentZConditionalCalibration {
         mean_coeffs: vec![0.05, 0.3],
-        var_coeffs: vec![1.1, 0.2],
+        log_var_coeffs: vec![0.1, 0.18],
         basis_ncols: 1,
-        var_floor: 0.05,
         homoskedastic_var: 1.0,
         post_mean: 0.0,
         post_sd: 1.0,
@@ -3501,17 +3491,18 @@ impl SplitMix64 {
 
 /// Shifts component `k` of `θ₁ = (mean_coeffs, variance stage)` by `delta`, in
 /// the order of [`LatentZConditionalCalibration::zeta_theta1_jacobian_row`]: the
-/// variance stage is `var_coeffs` when the Breusch-Pagan stage fired and the
-/// estimated constant `homoskedastic_var` when it did not (gam#3030).
+/// variance stage is `log_var_coeffs` when the Breusch-Pagan stage fired and
+/// the log of the estimated constant `homoskedastic_var` when it did not
+/// (gam#3030, gam#4019).
 fn shift_theta1_component(cal: &mut LatentZConditionalCalibration, k: usize, delta: f64) {
     let dm = cal.mean_coeffs.len();
     if k < dm {
         cal.mean_coeffs[k] += delta;
-    } else if cal.var_coeffs.is_empty() {
+    } else if cal.log_var_coeffs.is_empty() {
         assert_eq!(k, dm, "constant variance stage has one component");
-        cal.homoskedastic_var += delta;
+        cal.homoskedastic_var *= delta.exp();
     } else {
-        cal.var_coeffs[k - dm] += delta;
+        cal.log_var_coeffs[k - dm] += delta;
     }
 }
 
@@ -3752,7 +3743,6 @@ fn murphy_topel_correction_matches_two_stage_sampling_variance() {
             delta *= pert_scale;
             shift_theta1_component(&mut cal_star, r, delta);
         }
-        // Reject draws that floor the variance (out of the linear regime); rare.
         let beta_star = refit_beta(&cal_star);
         let nb = (b + 1) as f64;
         let d = beta_star - boot_mean;

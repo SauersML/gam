@@ -1166,9 +1166,8 @@ mod persistence_tests {
     fn conditional() -> LatentMeasureCalibration {
         LatentMeasureCalibration::ConditionalLocationScale(LatentZConditionalCalibration {
             mean_coeffs: vec![0.0, 0.5],
-            var_coeffs: Vec::new(),
+            log_var_coeffs: Vec::new(),
             basis_ncols: 1,
-            var_floor: 1e-8,
             homoskedastic_var: 0.75,
             post_mean: 0.0,
             post_sd: 1.0,

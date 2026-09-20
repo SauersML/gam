@@ -164,10 +164,22 @@ use std::path::Path;
 // recorded `(p+1)²`. A v34 payload still loads and predicts; its generated-regressor
 // correction refuses the narrower covariance by name, so no interval is published
 // without the stage.
-pub const MODEL_PAYLOAD_VERSION: u32 = 35;
+// v36 fits the latent-Z calibration's conditional variance log-linearly, `log v(C) =
+// γ·[1 | a(C)]` (gam#4019), stored as `log_var_coeffs`, and drops the linear fit's
+// `var_coeffs` and `var_floor`; the variance stage of `theta1_cov` is in log units.
+// `log_var_coeffs` carries no serde default, so a v35 or older payload with a
+// conditional calibration fails to load on its absence instead of having linear
+// coefficients read as log-variance ones. Every other v35 payload loads unchanged.
+pub const MODEL_PAYLOAD_VERSION: u32 = 36;
+
+/// The schema before the log-linear conditional variance (gam#4019), whose only
+/// difference is the latent-Z conditional calibration, which a payload without one
+/// does not carry and a payload with one fails to deserialize.
+const LINEAR_VARIANCE_STAGE_PAYLOAD_VERSION: u32 = 35;
 
 /// The schema before the constant variance stage in the first-stage covariance
-/// (gam#3030), whose only difference is that covariance's width.
+/// (gam#3030), whose only difference from [`LINEAR_VARIANCE_STAGE_PAYLOAD_VERSION`] is
+/// that covariance's width.
 const CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION: u32 = 34;
 
 /// The schema before the closed-form certificate's null law (gam#2926), whose only
@@ -249,8 +261,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 18] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 19] = [
     MODEL_PAYLOAD_VERSION,
+    LINEAR_VARIANCE_STAGE_PAYLOAD_VERSION,
     CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
     CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
     CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
@@ -7955,6 +7968,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            LINEAR_VARIANCE_STAGE_PAYLOAD_VERSION,
             CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
             CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
             CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
@@ -7978,7 +7992,11 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
-        assert_eq!(CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(LINEAR_VARIANCE_STAGE_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(
+            CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
+            LINEAR_VARIANCE_STAGE_PAYLOAD_VERSION - 1
+        );
         assert_eq!(
             CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
             CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION - 1

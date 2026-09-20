@@ -4222,7 +4222,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // location-scale gate fired, the slope fit above treated the calibrated
     // score `ζ = (z − m̂(C))/√v̂(C)` as KNOWN, so `solved_fit.beta_covariance()`
     // is the naive second-stage covariance `V_β^naive = H_β⁻¹` that ignores the
-    // first-stage estimation error in `θ₁ = (mean_coeffs, var_coeffs)`. The
+    // first-stage estimation error in `θ₁ = (mean_coeffs, log_var_coeffs)`. The
     // honest two-stage covariance is
     //   `V_β = V_β^naive + (H_β⁻¹ G) V₁ (H_β⁻¹ G)ᵀ`,  `G = ∂(score_β)/∂θ₁`.
     // The closed-form first-stage covariance `V₁` and the per-row chain-rule
@@ -4236,8 +4236,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // `LatentZConditionalCalibration::generated_regressor_correction` (mod.rs):
     // given the per-row reduced-frame slope-score sensitivity to the
     // calibrated score `s_i = ∂score_β,i/∂ζ_i` (an `n × p_β` matrix), it
-    //   1. builds `J_zeta` row-by-row via `zeta_theta1_jacobian_row` (exact-zero
-    //      on floored rows, so `G`'s support is the gate-fired rows),
+    //   1. builds `J_zeta` row-by-row via `zeta_theta1_jacobian_row`,
     //   2. accumulates `G = Σ_i s_i ⊗ (∂ζ_i/∂θ₁)` (`p_β × dim θ₁`),
     //   3. forms `Vb·G = solved_fit.beta_covariance()·G` (the naive reduced-frame
     //      covariance IS `H_β⁻¹`, so `H_β⁻¹ G = Vb·G`), and
