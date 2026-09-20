@@ -233,16 +233,14 @@ impl core::fmt::Display for FixedLambdaStallReason {
 /// Solver-native first-order residual carried by a fixed-lambda stall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FixedLambdaResidualKind {
-    /// Euclidean norm of the exact penalized likelihood gradient.
-    PenalizedGradientNorm,
-    /// Firth/Jeffreys Newton decrement `0.5 * |score' H^-1 score|`.
+    /// Half the squared Newton decrement `0.5 * score' H^+ score`, in
+    /// objective units (Firth/Jeffreys and penalized vector-GLM solves).
     NewtonDecrement,
 }
 
 impl core::fmt::Display for FixedLambdaResidualKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
-            Self::PenalizedGradientNorm => "penalized gradient norm",
             Self::NewtonDecrement => "Newton decrement",
         })
     }
@@ -624,23 +622,6 @@ pub enum EstimationError {
         rank: usize,
         num_unpenalized_columns: usize,
         min_eigenvalue: f64,
-        tolerance: f64,
-        column_indices: Vec<usize>,
-    },
-
-    #[error(
-        "Pre-fit near-degeneracy detected in the realized unpenalized design: the {num_unpenalized_columns} \
-        unpenalized columns span a numerically rank-degenerate direction (Gram condition number {condition_number:.3e} \
-        exceeds tolerance {tolerance:.3e}; min eigenvalue {min_eigenvalue:.3e}, max eigenvalue {max_eigenvalue:.3e}, \
-        columns {column_indices:?}). The unpenalized normal equations are effectively singular along this direction, \
-        so the fit would grind/diverge. Remove/reparameterize the near-aliased columns or add an explicit \
-        penalty/constraint before fitting."
-    )]
-    PrefitNearDegenerateDesignDetected {
-        num_unpenalized_columns: usize,
-        condition_number: f64,
-        min_eigenvalue: f64,
-        max_eigenvalue: f64,
         tolerance: f64,
         column_indices: Vec<usize>,
     },
@@ -1163,8 +1144,7 @@ impl EstimationError {
                  whole mean domain (the canonical link), or remove the predictor or rows \
                  that force the mean to the boundary."
             )),
-            Self::PrefitRankDeficientDesignDetected { column_indices, .. }
-            | Self::PrefitNearDegenerateDesignDetected { column_indices, .. } => Some(format!(
+            Self::PrefitRankDeficientDesignDetected { column_indices, .. } => Some(format!(
                 "Matrix conditioning issue in unpenalized columns {column_indices:?}. {CONDITIONING}"
             )),
             Self::ModelIsIllConditioned { .. }
@@ -1241,7 +1221,6 @@ impl EstimationError {
             | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
-            | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::HessianNotPositiveDefinite { .. }
             | Self::LaplacePrecisionIndefinite { .. }
             | Self::IdentifiedRankNotLocallyConstant { .. }
@@ -1314,16 +1293,6 @@ impl EstimationError {
         matches!(self, EstimationError::OuterObjectiveEvaluationFailed { .. })
     }
 
-    /// Classifies inner-solve failures that the outer REML loop should
-    /// treat as a soft retreat (return +inf cost / infeasible outer-eval)
-    /// rather than propagate as a hard error.
-    ///
-    /// Why: when the penalised Hessian becomes effectively singular at the
-    /// current rho, when P-IRLS hits a perfect-separation diagnostic, or when
-    /// it exhausts its iteration budget, the outer optimiser's correct
-    /// response is to back away from this rho — not to terminate the fit.
-    /// All three variants encode "the inner problem at this rho is too hard
-    /// to evaluate, try a different rho".
     /// Re-report this failure with more context WITHOUT changing whether it
     /// is a trial-point refusal.
     ///
@@ -1334,17 +1303,42 @@ impl EstimationError {
     /// `InnerSolveNotConverged` reached it as `RemlOptimizationFailed` and did
     /// the same (#2590). Any site that adds context to an error it did not
     /// produce should use this instead of choosing a variant for it.
+    ///
+    /// The fatal branch keeps the source typed. Re-rendering it into
+    /// `InvalidInput` preserved the fatal verdict but replaced the producer's
+    /// variant: a `LinearSystemSolveFailed` or `HessianNotPositiveDefinite`
+    /// raised inside the evaluator reached the caller as an `Input` failure,
+    /// under the wrong variant name, CLI exit code and advice. Wrapping it as
+    /// [`Self::OuterObjectiveEvaluationFailed`] carries the context while
+    /// `innermost_estimation_error`, `failure_category` and `advice` still
+    /// answer for the source.
     #[must_use]
     pub fn wrap_preserving_trial_point(self, context: &str) -> Self {
-        let infeasible = self.is_trial_point_infeasible();
-        let reason = format!("{context}: {self}");
-        if infeasible {
-            Self::TrialPointRefused { reason }
+        if self.is_trial_point_infeasible() {
+            Self::TrialPointRefused {
+                reason: format!("{context}: {self}"),
+            }
         } else {
-            Self::InvalidInput(reason)
+            // This operation adds context even if the source is already wrapped.
+            // The orchestration helper intentionally deduplicates fatal wrappers,
+            // so using it here would silently discard the new caller context.
+            Self::OuterObjectiveEvaluationFailed {
+                context: context.to_string(),
+                source: OuterObjectiveErrorSource::Estimation(Box::new(self)),
+            }
         }
     }
 
+    /// Classifies inner-solve failures that the outer REML loop should
+    /// treat as a soft retreat (return +inf cost / infeasible outer-eval)
+    /// rather than propagate as a hard error.
+    ///
+    /// Why: when the penalised Hessian becomes effectively singular at the
+    /// current rho, when P-IRLS hits a perfect-separation diagnostic, or when
+    /// it exhausts its iteration budget, the outer optimiser's correct
+    /// response is to back away from this rho — not to terminate the fit.
+    /// Each of them encodes "the inner problem at this rho is too hard
+    /// to evaluate, try a different rho".
     pub fn is_inner_solve_retreat(&self) -> bool {
         // ONE table. This method and `is_trial_point_infeasible` ask the same
         // question -- "is this a statement about this rho, or about the
@@ -1433,7 +1427,6 @@ impl EstimationError {
             | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
-            | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::MultinomialSeparationDetected { .. }
             | Self::PredictiveIntervalsDeclined { .. }
             | Self::ModelIsIllConditioned { .. }
@@ -1522,9 +1515,6 @@ impl EstimationError {
             Self::PrefitRankDeficientDesignDetected { .. } => {
                 "EstimationError::PrefitRankDeficientDesignDetected"
             }
-            Self::PrefitNearDegenerateDesignDetected { .. } => {
-                "EstimationError::PrefitNearDegenerateDesignDetected"
-            }
             Self::MultinomialSeparationDetected { .. } => {
                 "EstimationError::MultinomialSeparationDetected"
             }
@@ -1558,8 +1548,12 @@ impl EstimationError {
             Self::ModelIsIllConditioned { .. } => "EstimationError::ModelIsIllConditioned",
             Self::InvalidInput(_) => "EstimationError::InvalidInput",
             Self::FitResultInvariantViolated(_) => "EstimationError::FitResultInvariantViolated",
-            Self::ProfiledResidualUnresolved { .. } => "EstimationError::ProfiledResidualUnresolved",
-            Self::InverseLinkDomainViolation { .. } => "EstimationError::InverseLinkDomainViolation",
+            Self::ProfiledResidualUnresolved { .. } => {
+                "EstimationError::ProfiledResidualUnresolved"
+            }
+            Self::InverseLinkDomainViolation { .. } => {
+                "EstimationError::InverseLinkDomainViolation"
+            }
             Self::LinkFeasibilityBoundaryOptimum { .. } => {
                 "EstimationError::LinkFeasibilityBoundaryOptimum"
             }
@@ -1663,7 +1657,7 @@ mod trial_point_classification_tests {
                 reason: FixedLambdaStallReason::IterationBudgetExhausted,
                 objective_value: 12.5,
                 stationarity: FixedLambdaStationarityEvidence {
-                    kind: FixedLambdaResidualKind::PenalizedGradientNorm,
+                    kind: FixedLambdaResidualKind::NewtonDecrement,
                     residual: 1.0e-3,
                     bound: 1.0e-8,
                 },
@@ -1919,6 +1913,88 @@ mod tests {
             1,
             "fatal provenance must not be re-wrapped at every orchestration layer"
         );
+    }
+
+    #[test]
+    fn wrap_preserving_trial_point_keeps_a_fatal_source_typed() {
+        let wrapped = EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: -1.0,
+        }
+        .wrap_preserving_trial_point("survival smoothing LAML evaluation failed");
+        assert!(!wrapped.is_trial_point_infeasible());
+        assert!(wrapped.is_fatal_outer_evaluation());
+        assert!(
+            wrapped
+                .to_string()
+                .contains("survival smoothing LAML evaluation failed"),
+            "{wrapped}"
+        );
+        assert_eq!(wrapped.failure_category(), FailureCategory::Numerical);
+        assert_eq!(
+            wrapped.variant_name(),
+            "EstimationError::HessianNotPositiveDefinite"
+        );
+        let advice = wrapped
+            .advice()
+            .expect("conditioning advice survives the wrap");
+        assert!(advice.contains("conditioning"), "{advice}");
+
+        let input = EstimationError::InvalidInput("frame mismatch".to_string())
+            .wrap_preserving_trial_point("inner state");
+        assert!(!input.is_trial_point_infeasible());
+        assert_eq!(input.failure_category(), FailureCategory::Input);
+    }
+
+    #[test]
+    fn wrap_preserving_trial_point_keeps_a_refusal_recoverable() {
+        let wrapped = EstimationError::TrialPointRefused {
+            reason: "lambda out of range".to_string(),
+        }
+        .wrap_preserving_trial_point("inner state");
+        assert!(wrapped.is_trial_point_infeasible());
+        assert!(!wrapped.is_fatal_outer_evaluation());
+        assert!(
+            wrapped.to_string().contains("lambda out of range"),
+            "{wrapped}"
+        );
+    }
+
+    #[test]
+    fn repeated_trial_context_preserves_typed_source_and_each_context() {
+        let wrapped = EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: -0.5,
+        }
+        .wrap_preserving_trial_point("row likelihood")
+        .wrap_preserving_trial_point("outer smoothing");
+        let message = wrapped.to_string();
+        assert!(message.contains("row likelihood"), "{message}");
+        assert!(message.contains("outer smoothing"), "{message}");
+        assert!(matches!(wrapped.innermost_estimation_error(),
+            EstimationError::HessianNotPositiveDefinite { min_eigenvalue } if *min_eigenvalue == -0.5));
+        assert_eq!(wrapped.failure_category(), FailureCategory::Numerical);
+        assert_eq!(
+            wrapped.variant_name(),
+            "EstimationError::HessianNotPositiveDefinite"
+        );
+        assert!(
+            wrapped
+                .advice()
+                .expect("typed advice")
+                .contains("conditioning")
+        );
+        assert!(std::error::Error::source(&wrapped).is_some());
+        assert!(!wrapped.is_trial_point_infeasible());
+
+        let refused = EstimationError::TrialPointRefused {
+            reason: "outside domain".into(),
+        }
+        .wrap_preserving_trial_point("row likelihood")
+        .wrap_preserving_trial_point("outer smoothing");
+        assert!(refused.is_trial_point_infeasible());
+        assert!(!refused.is_fatal_outer_evaluation());
+        for context in ["outside domain", "row likelihood", "outer smoothing"] {
+            assert!(refused.to_string().contains(context));
+        }
     }
 
     // ── error message content ─────────────────────────────────────────────────

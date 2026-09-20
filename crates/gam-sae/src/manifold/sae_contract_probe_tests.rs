@@ -10,6 +10,7 @@ use super::tests::{
     warmstart_test_objective_with_evaluator,
 };
 use super::*;
+use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
 use crate::assignment::{AssignmentMode, SaeAssignment};
 use approx::assert_abs_diff_eq;
 use gam_terms::latent::LatentManifold;
@@ -1344,7 +1345,7 @@ fn smooth_threshold_hdiag_third_derivative_matches_central_difference_1415() {
     // J''(ℓ) = 2a(1 − a)/τ² (`GateLogitJacobian`), which is exact and enters `B` and `A`
     // alike, so both theta-adjoints carry its logit derivative too.
     let p2 = |logit: f64| -> f64 {
-        let a = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+        let a = gam_math::special::logistic((logit - threshold) * inv_tau);
         let s = a * (1.0 - a);
         sparsity * s * (1.0 - 2.0 * a) * inv_tau * inv_tau + 2.0 * s * inv_tau * inv_tau
     };
@@ -1378,7 +1379,7 @@ fn smooth_threshold_hdiag_third_derivative_matches_central_difference_1415() {
                 None,
                 false,
             );
-            let a_here = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+            let a_here = gam_math::special::logistic((logit - threshold) * inv_tau);
             let signed = 1.0 - 2.0 * a_here;
             if signed > 1.0e-4 {
                 // Clamp inactive: `B` IS `A` here, so must be their adjoints.

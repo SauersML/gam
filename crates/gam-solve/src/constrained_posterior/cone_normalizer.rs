@@ -82,6 +82,9 @@
 //! basis `N` whose Gram under `M` is `K` (`R = M⁻¹Aᵀ` in row coordinates, `M⁻¹` on the
 //! supported columns otherwise), so the precision's motion is read only on `span{y, N}`.
 
+use faer::linalg::matmul::matmul;
+use faer::{Accum, Mat, MatRef};
+use gam_linalg::faer_ndarray::{FaerLu, matmul_parallelism};
 use gam_math::probability::{normal_logcdf_derivatives, standard_normal_quantile};
 use gam_math::roundoff::accumulation_growth;
 use ndarray::{Array1, Array2, s};
@@ -169,6 +172,19 @@ fn invert(mut a: Array2<f64>, what: &str) -> Result<Array2<f64>, ConeNormalizerR
         }
     }
     Ok(inverse)
+}
+
+/// The LU factor of `a`, refused when a column has no pivot.
+fn lu_factor(a: MatRef<'_, f64>, what: &str) -> Result<FaerLu, ConeNormalizerRefusal> {
+    FaerLu::new(a).map_err(|col| ConeNormalizerRefusal::Singular {
+        reason: format!("{what} has no pivot in column {col} of {}", a.nrows()),
+    })
+}
+
+/// `A⁻¹ rhs` from the LU factor of `A`.
+fn lu_solve(lu: &FaerLu, rhs: &Array1<f64>) -> Array1<f64> {
+    let solved = lu.solve(Mat::from_fn(rhs.len(), 1, |i, _| rhs[i]).as_ref());
+    Array1::from_shape_fn(rhs.len(), |i| solved[(i, 0)])
 }
 
 /// `ln|det A|` and the summed magnitude of its pivot logarithms, by LU with partial pivoting.
@@ -285,16 +301,16 @@ struct Marginals {
 /// and `m` is smaller.
 #[derive(Clone, Debug)]
 enum SiteSystem {
-    /// `(I − ∂F/∂s)⁻¹`, `2q × 2q`.
-    Direct(Array2<f64>),
+    /// The LU factor of `I − ∂F/∂s`, `2q × 2q`.
+    Direct(FaerLu),
     /// Woodbury through the posterior coordinates.
     Capacitance {
         /// `(I + D_j)⁻¹`, row-major `2 × 2`.
         site_inverse: Vec<[f64; 4]>,
         /// `P_j = (I + D_j)⁻¹ D_j C_j`, row-major `2 × 2`.
         coupling: Vec<[f64; 4]>,
-        /// `(I_m − V (I + D)⁻¹ DC Rd)⁻¹`.
-        capacitance_inverse: Array2<f64>,
+        /// The LU factor of `I_m − V (I + D)⁻¹ DC Rd`.
+        capacitance: FaerLu,
         marginals: Marginals,
     },
 }
@@ -654,8 +670,8 @@ impl OrthantLogMass {
     fn solve_site_system(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, ConeNormalizerRefusal> {
         let q = self.m0.len();
         match self.site_system()? {
-            SiteSystem::Direct(inverse) => Ok(inverse.dot(rhs)),
-            SiteSystem::Capacitance { site_inverse, coupling, capacitance_inverse, marginals } => {
+            SiteSystem::Direct(system) => Ok(lu_solve(system, rhs)),
+            SiteSystem::Capacitance { site_inverse, coupling, capacitance, marginals } => {
                 let b = &self.loadings;
                 let r = b.ncols();
                 let quad = r * (r + 1) / 2;
@@ -676,7 +692,7 @@ impl OrthantLogMass {
                 }
                 let linear = b.t().dot(&(&x_nu - &(&marginals.mean * &x_tau)));
                 moved.slice_mut(s![quad..]).assign(&linear);
-                let solved = capacitance_inverse.dot(&moved);
+                let solved = lu_solve(capacitance, &moved);
                 // ds = x₀ + P·Rd·solved, with Rd reading (−wᵀZw, wᵀz) off each row w_j.
                 let mut z_matrix = Array2::<f64>::zeros((r, r));
                 for (index, &(a, c)) in upper_pairs(r).iter().enumerate() {
@@ -753,43 +769,50 @@ impl OrthantLogMass {
             // s_j → [−(2 − δ_ac) w_a w_c; 0] and μ_j → [0; w_j]. It is accumulated over blocks
             // of m sites, so no intermediate is larger than m × 2m.
             let pairs = upper_pairs(r);
-            let mut capacitance = Array2::<f64>::eye(m);
+            let mut capacitance = Mat::<f64>::identity(m, m);
             let block = m.max(1);
             let mut start = 0;
             while start < q {
                 let end = (start + block).min(q);
                 let n = end - start;
-                let mut v = Array2::<f64>::zeros((m, 2 * n));
-                let mut read = Array2::<f64>::zeros((2 * n, m));
+                let mut v = Mat::<f64>::zeros(m, 2 * n);
+                let mut read = Mat::<f64>::zeros(2 * n, m);
                 for (i, j) in (start..end).enumerate() {
                     let row = b.row(j);
                     let w = marginals.loaded.row(j);
                     let p = coupling[j];
                     for (index, &(a, c)) in pairs.iter().enumerate() {
-                        v[[index, 2 * i]] = row[a] * row[c];
+                        v[(index, 2 * i)] = row[a] * row[c];
                         let weight = if a == c { 1.0 } else { 2.0 };
                         let spread = weight * w[a] * w[c];
-                        read[[2 * i, index]] = -p[0] * spread;
-                        read[[2 * i + 1, index]] = -p[2] * spread;
+                        read[(2 * i, index)] = -p[0] * spread;
+                        read[(2 * i + 1, index)] = -p[2] * spread;
                     }
                     for a in 0..r {
-                        v[[quad + a, 2 * i]] = -marginals.mean[j] * row[a];
-                        v[[quad + a, 2 * i + 1]] = row[a];
-                        read[[2 * i, quad + a]] = p[1] * w[a];
-                        read[[2 * i + 1, quad + a]] = p[3] * w[a];
+                        v[(quad + a, 2 * i)] = -marginals.mean[j] * row[a];
+                        v[(quad + a, 2 * i + 1)] = row[a];
+                        read[(2 * i, quad + a)] = p[1] * w[a];
+                        read[(2 * i + 1, quad + a)] = p[3] * w[a];
                     }
                 }
-                capacitance -= &v.dot(&read);
+                matmul(
+                    capacitance.as_mut(),
+                    Accum::Add,
+                    v.as_ref(),
+                    read.as_ref(),
+                    -1.0,
+                    matmul_parallelism(m, m, 2 * n),
+                );
                 start = end;
             }
-            let capacitance_inverse = invert(capacitance, "the EP site system's capacitance")?;
-            SiteSystem::Capacitance { site_inverse, coupling, capacitance_inverse, marginals }
+            let capacitance = lu_factor(capacitance.as_ref(), "the EP site system's capacitance")?;
+            SiteSystem::Capacitance { site_inverse, coupling, capacitance, marginals }
         } else {
             // Per unit site change a row's marginal moves by `ds_j/dτ̃_k = −Σ_jk²`,
             // `dμ_j/dτ̃_k = −Σ_jk μ_k` and `dμ_j/dν̃_k = Σ_jk`, `Σ_u = BΣ_zBᵀ`.
             let sigma_u = marginals.loaded.dot(&b.t());
             let mu = &marginals.mean;
-            let mut system = Array2::<f64>::eye(2 * q);
+            let mut system = Mat::<f64>::identity(2 * q, 2 * q);
             for j in 0..q {
                 let [dt_dtc, dt_dnc, dn_dtc, dn_dnc] = jacobians[j];
                 let s_jj = marginals.variance[j];
@@ -801,15 +824,15 @@ impl OrthantLogMass {
                     let (dtc, dnc) =
                         cavity_rate(-sigma_u[[j, k]] * sigma_u[[j, k]], -sigma_u[[j, k]] * mu[k]);
                     let dtc = if k == j { dtc - 1.0 } else { dtc };
-                    system[[j, k]] -= dt_dtc * dtc + dt_dnc * dnc;
-                    system[[q + j, k]] -= dn_dtc * dtc + dn_dnc * dnc;
+                    system[(j, k)] -= dt_dtc * dtc + dt_dnc * dnc;
+                    system[(q + j, k)] -= dn_dtc * dtc + dn_dnc * dnc;
                     let (dtc, dnc) = cavity_rate(0.0, sigma_u[[j, k]]);
                     let dnc = if k == j { dnc - 1.0 } else { dnc };
-                    system[[j, q + k]] -= dt_dtc * dtc + dt_dnc * dnc;
-                    system[[q + j, q + k]] -= dn_dtc * dtc + dn_dnc * dnc;
+                    system[(j, q + k)] -= dt_dtc * dtc + dt_dnc * dnc;
+                    system[(q + j, q + k)] -= dn_dtc * dtc + dn_dnc * dnc;
                 }
             }
-            SiteSystem::Direct(invert(system, "the linearized EP fixed point")?)
+            SiteSystem::Direct(lu_factor(system.as_ref(), "the linearized EP fixed point")?)
         };
         Ok(self.site_system.get_or_init(|| system))
     }

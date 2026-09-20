@@ -533,6 +533,21 @@ mod tests {
     }
 
     #[test]
+    fn factorized_covariance_scaling_matches_independent_diagonal_inverse() {
+        let rhs = array![[1.0, -3.0], [2.0, 5.0]];
+        for phi in [0.0, -0.0, 1.0e-8, 0.25, 1.0, 2.5] {
+            let backend = PredictionCovarianceBackend::from_factorized_hessian_scaled(
+                SymmetricMatrix::Dense(array![[4.0, 0.0], [0.0, 9.0]]), phi).unwrap();
+            let got = backend.apply_columns(&rhs).unwrap();
+            for row in 0..2 { for col in 0..2 {
+                let expected = phi * rhs[[row,col]] / [4.0,9.0][row];
+                assert!((got[[row,col]]-expected).abs() <= 4.0*f64::EPSILON*expected.abs(),
+                    "phi={phi}, row={row}, col={col}: {} vs {expected}", got[[row,col]]);
+            }}
+        }
+    }
+
+    #[test]
     fn factorized_backend_applies_a_zero_scale_and_refuses_an_invalid_one() {
         let precision = array![[4.0, 0.6], [0.6, 3.0]];
         let rhs = array![[1.0, -0.5], [0.2, 2.0]];
@@ -546,7 +561,7 @@ mod tests {
         .expect("a zero coefficient-covariance scale is valid");
         let columns = zero.apply_columns(&rhs).expect("covariance columns");
         assert!(columns.iter().all(|&v| v == 0.0), "{columns:?}");
-        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -f64::MIN_POSITIVE] {
             let refusal = PredictionCovarianceBackend::from_factorized_hessian_scaled(
                 SymmetricMatrix::Dense(precision.clone()),
                 bad,

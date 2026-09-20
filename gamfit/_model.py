@@ -8,7 +8,6 @@ arguments through the FFI, hands payloads off to ``_survival`` /
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal, Sequence, cast, overload
@@ -804,14 +803,14 @@ class Model:
         :math:`\\nu` and ``reference_scale`` :math:`g` (the two-moment summary),
         ``reference_residual_df``/``reference_deterministic_offset`` (the
         estimated-scale channel above, ``None`` off the profiled Gaussian),
-        ``bartlett_factor``
-        :math:`c`, ``statistic_corrected`` :math:`W^*`, ``p_value_uncorrected``,
+        ``bartlett_factor`` :math:`c` (the fixed-λ Lawley scale),
+        ``statistic_corrected`` :math:`W^* = W/c`, ``p_value_uncorrected``,
         ``p_value_corrected`` (the raw evaluated tail behind ``p_value`` /
         ``p_value_upper_bound``), ``material`` (the
         n-too-small-here diagnostic — ``True`` when the correction moves the
         Bartlett factor or the p-value by more than 10%), and
-        ``correction_provenance`` — ``"lawley_lr_estimated_lambda"`` or
-        ``"lawley_lr_fixed_lambda"`` when the family carries
+        ``correction_provenance`` — ``"lawley_lr_fixed_lambda"`` when the
+        family carries
         closed-form cumulant jets (gaussian / poisson / binomial / gamma) and the
         factor is computable at this ``n``, else
         ``"none"`` (the uncorrected reference stands, never weakened).
@@ -1570,8 +1569,9 @@ class Model:
         (``Summary.aic_corrected``) that ``gamfit.compare_models`` ranks on
         (Burnham & Anderson's relative likelihood). Returns ``> 1`` when this
         fit is better supported than ``other`` and ``< 1`` otherwise, agreeing
-        with the winner ``gamfit.compare_models`` reports. Both fits must share
-        the response family and the number of observations.
+        with the winner ``gamfit.compare_models`` reports; ``inf`` / ``0.0``
+        once the ratio leaves the float range (AIC_c gap past ~1419.6). Both
+        fits must share the response family and the number of observations.
 
         This is **not** a Bayes factor: it integrates over no prior and must
         not be read against Jeffreys / Kass-Raftery thresholds.
@@ -1581,10 +1581,9 @@ class Model:
             raise TypeError(
                 f"evidence_ratio_vs expects a gamfit.Model, got {type(other).__name__}"
             )
-        log_ratio = rust_module().log_evidence_ratio(
+        return rust_module().evidence_ratio(
             self._prediction_model, other._prediction_model
         )
-        return math.exp(log_ratio)
 
     def _model_class_from_payload(self) -> str:
         return self._prediction_model.predict_class_name

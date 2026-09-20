@@ -435,20 +435,20 @@ impl ProcessResourceSnapshot {
         let mut snapshot = Self::default();
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             for line in status.lines() {
-                if let Some(value) = parse_status_kb(line, "VmRSS:") {
+                if let Some(value) = parse_proc_value(line, "VmRSS:") {
                     snapshot.rss_kb = Some(value);
-                } else if let Some(value) = parse_status_kb(line, "VmHWM:") {
+                } else if let Some(value) = parse_proc_value(line, "VmHWM:") {
                     snapshot.peak_rss_kb = Some(value);
-                } else if let Some(value) = parse_status_count(line, "Threads:") {
+                } else if let Some(value) = parse_proc_value(line, "Threads:") {
                     snapshot.threads = Some(value);
                 }
             }
         }
         if let Ok(io) = std::fs::read_to_string("/proc/self/io") {
             for line in io.lines() {
-                if let Some(value) = parse_io_bytes(line, "read_bytes:") {
+                if let Some(value) = parse_proc_value(line, "read_bytes:") {
                     snapshot.read_bytes = Some(value);
-                } else if let Some(value) = parse_io_bytes(line, "write_bytes:") {
+                } else if let Some(value) = parse_proc_value(line, "write_bytes:") {
                     snapshot.write_bytes = Some(value);
                 }
             }
@@ -457,22 +457,16 @@ impl ProcessResourceSnapshot {
     }
 }
 
+/// The integer that follows `key` on a `/proc/self/{status,io}` line: the
+/// first whitespace-separated token, so a trailing unit (`VmRSS:  1234 kB`)
+/// is ignored and a bare counter (`read_bytes: 65536`) reads the same way.
 #[cfg(target_os = "linux")]
-fn parse_status_kb(line: &str, key: &str) -> Option<u64> {
-    let rest = line.strip_prefix(key)?.trim();
-    rest.split_whitespace().next()?.parse().ok()
-}
-
-#[cfg(target_os = "linux")]
-fn parse_status_count(line: &str, key: &str) -> Option<u64> {
-    let rest = line.strip_prefix(key)?.trim();
-    rest.split_whitespace().next()?.parse().ok()
-}
-
-#[cfg(target_os = "linux")]
-fn parse_io_bytes(line: &str, key: &str) -> Option<u64> {
-    let rest = line.strip_prefix(key)?.trim();
-    rest.parse().ok()
+fn parse_proc_value(line: &str, key: &str) -> Option<u64> {
+    line.strip_prefix(key)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn format_count(value: Option<u64>) -> String {
@@ -616,41 +610,33 @@ mod format_tests {
         assert_eq!(format_kb(Some(1)), "1.0KiB");
     }
 
-    // ── parse_status_kb / parse_status_count / parse_io_bytes (Linux) ─────────
+    // ── parse_proc_value (Linux) ───────────────────────────────────────────────
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn parse_status_kb_valid_line() {
-        assert_eq!(parse_status_kb("VmRSS:\t1234 kB", "VmRSS:"), Some(1234));
+    fn parse_proc_value_reads_the_number_before_a_unit() {
+        assert_eq!(parse_proc_value("VmRSS:\t1234 kB", "VmRSS:"), Some(1234));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn parse_status_kb_wrong_key_returns_none() {
-        assert_eq!(parse_status_kb("VmRSS:\t1234 kB", "VmPeak:"), None);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parse_status_count_valid_line() {
+    fn parse_proc_value_reads_a_bare_counter() {
+        assert_eq!(parse_proc_value("Threads:\t42", "Threads:"), Some(42));
         assert_eq!(
-            parse_status_count("voluntary_ctxt_switches:\t42", "voluntary_ctxt_switches:"),
-            Some(42)
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parse_io_bytes_valid_line() {
-        assert_eq!(
-            parse_io_bytes("read_bytes: 65536", "read_bytes:"),
+            parse_proc_value("read_bytes: 65536", "read_bytes:"),
             Some(65536)
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn parse_io_bytes_wrong_key_returns_none() {
-        assert_eq!(parse_io_bytes("read_bytes: 65536", "write_bytes:"), None);
+    fn parse_proc_value_wrong_key_returns_none() {
+        assert_eq!(parse_proc_value("VmRSS:\t1234 kB", "VmPeak:"), None);
+        assert_eq!(parse_proc_value("read_bytes: 65536", "write_bytes:"), None);
+        // Anchored at the line start: `cancelled_write_bytes:` is not `write_bytes:`.
+        assert_eq!(
+            parse_proc_value("cancelled_write_bytes: 7", "write_bytes:"),
+            None
+        );
     }
 }

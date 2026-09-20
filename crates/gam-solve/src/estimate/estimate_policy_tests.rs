@@ -1016,7 +1016,6 @@ fn prefit_rank_check_detects_unpenalized_duplicate_column() {
                 "duplicate-column min eigenvalue should be at the rank tolerance"
             );
         }
-        other => panic!("expected exact rank deficiency, got {other:?}"),
     }
 }
 
@@ -1066,56 +1065,65 @@ fn prefit_rank_check_rejects_before_reml_state_construction() {
     ));
 }
 
-#[test]
-fn prefit_rank_check_detects_near_degenerate_unpenalized_design() {
-    // Two near-collinear columns (alias to ~1e-7 perturbation) keep full
-    // numeric rank but blow the Gram condition number past the
-    // near-degeneracy tolerance, so the fit would grind/diverge.
+fn near_collinear_unpenalized_design(perturbation: f64) -> DesignMatrix {
     let x = array![
-        [1.0, -2.0, -2.0 + 1e-7],
-        [1.0, -1.0, -1.0 - 1e-7],
-        [1.0, 1.0, 1.0 + 1e-7],
-        [1.0, 2.0, 2.0 - 1e-7]
+        [1.0, -2.0, -2.0 + perturbation],
+        [1.0, -1.0, -1.0 - perturbation],
+        [1.0, 1.0, 1.0 + perturbation],
+        [1.0, 2.0, 2.0 - perturbation]
     ];
-    let w = Array1::ones(x.nrows());
-    let design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x));
+    DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x))
+}
+
+#[test]
+fn prefit_rank_check_accepts_resolvable_ill_conditioned_unpenalized_design() {
+    // A 1e-6 alias leaves λ_min(Gram) ≈ 1.8e-12 against λ_max ≈ 20. The Gram
+    // condition number is about 1.1e13, and the noise floor is
+    // 4·ε·20 ≈ 1.8e-14, so the weakest direction sits 100× above the floor.
+    // Every unpenalized direction is resolved, so the model is fittable: the
+    // weak direction is poorly identified, but that shows up as wide
+    // intervals. It is not grounds for a pre-fit refusal.
+    let design = near_collinear_unpenalized_design(1e-6);
+    let w = Array1::ones(4);
     let diagnostic =
         detect_prefit_unpenalized_rank_deficiency_in_design(w.view(), &design, &[true, true, true])
-            .unwrap_or_else(|e| {
-                panic!(
-                    "{} failed: {:?}",
-                    "rank check should stream dense design", e
-                )
-            })
-            .expect("near-collinear unpenalized columns are near-degenerate");
+            .expect("rank check should stream dense design");
+    assert_eq!(
+        diagnostic, None,
+        "a resolvable ill-conditioned unpenalized design must not be pre-fit rejected"
+    );
+    reject_prefit_unpenalized_rank_deficiency(w.view(), &design, &[])
+        .expect("a resolvable ill-conditioned unpenalized design must reach the solver");
+}
 
+#[test]
+fn prefit_rank_check_rejects_near_collinear_design_below_the_noise_floor() {
+    // A 1e-9 alias puts the exact λ_min(Gram) ≈ 1.8e-18 below the 4·ε·λ_max
+    // noise floor. Float64 cannot tell this direction apart from exact
+    // aliasing, so it is refused as rank loss.
+    let design = near_collinear_unpenalized_design(1e-9);
+    let w = Array1::ones(4);
+    let diagnostic =
+        detect_prefit_unpenalized_rank_deficiency_in_design(w.view(), &design, &[true, true, true])
+            .expect("rank check should stream dense design")
+            .expect("an alias below the noise floor is rank deficient");
     match diagnostic {
-        PrefitRegularityDiagnostic::NearDegenerate {
+        PrefitRegularityDiagnostic::RankDeficient {
+            rank,
             num_unpenalized_columns,
-            condition_number,
+            min_eigenvalue,
             tolerance,
             column_indices,
-            ..
         } => {
+            assert_eq!(rank, 2);
             assert_eq!(num_unpenalized_columns, 3);
             assert_eq!(column_indices, vec![0, 1, 2]);
             assert!(
-                condition_number > tolerance,
-                "near-degenerate Gram condition number {condition_number:.3e} should exceed tolerance {tolerance:.3e}"
+                min_eigenvalue <= tolerance,
+                "min eigenvalue {min_eigenvalue:.3e} should be at or below the noise floor {tolerance:.3e}"
             );
         }
-        other => panic!("expected near-degenerate diagnostic, got {other:?}"),
     }
-
-    let err = reject_prefit_unpenalized_rank_deficiency(w.view(), &design, &[])
-        .expect_err("near-degenerate unpenalized design should fail before REML/PIRLS");
-    assert!(matches!(
-        err,
-        EstimationError::PrefitNearDegenerateDesignDetected {
-            num_unpenalized_columns: 3,
-            ..
-        }
-    ));
 }
 
 #[test]
@@ -1257,6 +1265,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
             coefficient_influence: None,
             weighted_gram: None,
             identified_subspace: None,
+            working_residual: None,
         }),
         fitted_link: FittedLinkState::Standard(None),
         geometry: Some(FitGeometry {

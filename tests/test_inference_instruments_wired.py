@@ -84,9 +84,13 @@ def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
         return matrix.shape, seed
 
     with pytest.raises(TypeError, match="control_seed"):
-        gamfit.sae.run_shape_controlled_census(np.ones((4, 2)), pipeline, control_seed=True)
+        gamfit.sae.run_shape_controlled_census(
+            np.ones((4, 2)), pipeline, control_seed=True
+        )
     with pytest.raises(ValueError, match="pipeline_seed"):
-        gamfit.sae.run_shape_controlled_census(np.ones((4, 2)), pipeline, pipeline_seed=-1)
+        gamfit.sae.run_shape_controlled_census(
+            np.ones((4, 2)), pipeline, pipeline_seed=-1
+        )
     accepted = gamfit.sae.run_shape_controlled_census(
         np.ones((4, 2)),
         pipeline,
@@ -103,7 +107,9 @@ def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
             np.ones((4, 2), dtype=np.complex64) * (1.0 + 2.0j), pipeline
         )
     with pytest.raises(TypeError, match="complex dtype"):
-        gamfit.sae.run_shape_controlled_census([[1.0 + 2.0j, 3.0], [4.0, 5.0]], pipeline)
+        gamfit.sae.run_shape_controlled_census(
+            [[1.0 + 2.0j, 3.0], [4.0, 5.0]], pipeline
+        )
 
 
 def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
@@ -341,8 +347,11 @@ def test_layer_transport_fit_reaches_python():
     rng = np.random.default_rng(0)
     t = np.sort(rng.uniform(0.0, 2.0 * math.pi, size=200))
     # Identity-ish circle->circle map plus small wiggle: degree 1, low defect.
+    # The pairs are noiseless, so they are declared deterministic.
     s = (t + 0.05 * np.sin(t)) % (2.0 * math.pi)
-    report = gamfit.sae.layer_transport_fit(t, s, "circle", "circle")
+    report = gamfit.sae.layer_transport_fit(
+        t, s, "circle", "circle", pairs="deterministic"
+    )
     assert report["degree"] == 1
     assert report["topology_preserved"] is True
     assert report["isometry_defect"] >= 0.0
@@ -361,7 +370,9 @@ def test_fit_transport_object_inverts_and_composes():
     # g_A(t) = t + 0.25*sin(2*pi*t)/(2*pi): h' = 1 + 0.25*cos(2*pi*t) in
     # [0.75, 1.25], strictly increasing.
     a_warp = frm + 0.25 * np.sin(2.0 * math.pi * frm) / (2.0 * math.pi)
-    g_a = gamfit.sae.fit_transport(frm, a_warp, "interval", "interval")
+    g_a = gamfit.sae.fit_transport(
+        frm, a_warp, "interval", "interval", pairs="deterministic"
+    )
     assert g_a.topology_preserved is True
     assert g_a.isometry_defect >= 0.0
     assert set(g_a.report().keys()) >= {
@@ -381,7 +392,9 @@ def test_fit_transport_object_inverts_and_composes():
     # g_B(t) = t - 0.25*sin(2*pi*t)/(2*pi): h' = 1 - 0.25*cos(2*pi*t) in
     # [0.75, 1.25], strictly increasing.
     b_warp = frm - 0.25 * np.sin(2.0 * math.pi * frm) / (2.0 * math.pi)
-    g_b = gamfit.sae.fit_transport(frm, b_warp, "interval", "interval")
+    g_b = gamfit.sae.fit_transport(
+        frm, b_warp, "interval", "interval", pairs="deterministic"
+    )
     # Targets in g_A's image; recover the pre-image and compose.
     t_true = np.array([0.2, 0.5, 0.8])
     y = g_a.eval(t_true)
@@ -399,12 +412,12 @@ def test_fit_transport_invert_rejects_non_finite_targets():
     # inverse target must raise ValueError rather than silently returning a
     # boundary coordinate.
     frm = np.linspace(0.0, 1.0, 64)
-    # Keep the setup inside the estimable REML regime. An exact affine response
-    # lies wholly in the second-derivative penalty nullspace, has zero residual
-    # scale, and therefore has no identifiable smoothing parameter or posterior;
-    # that unrelated refusal used to prevent this test from reaching invert().
+    # Noiseless pairs are declared deterministic: the transport is the exact
+    # minimum-curvature interpolant, so no dispersion needs to be identified.
     target = 0.5 * frm + 0.01 * np.sin(2.0 * math.pi * frm)
-    g = gamfit.sae.fit_transport(frm, target, "interval", "interval")
+    g = gamfit.sae.fit_transport(
+        frm, target, "interval", "interval", pairs="deterministic"
+    )
     for bad in (np.nan, np.inf, -np.inf):
         with pytest.raises(ValueError):
             g.invert(np.array([bad]))
@@ -418,7 +431,9 @@ def test_fit_transport_invert_rejects_folded_map():
     # A clear fold: rises then falls (a non-monotone, fold-bearing map).
     target = np.sin(2.0 * math.pi * frm)
     lo, hi = float(target.min()), float(target.max())
-    g = gamfit.sae.fit_transport(frm, target, "interval", "interval")
+    g = gamfit.sae.fit_transport(
+        frm, target, "interval", "interval", pairs="deterministic"
+    )
     assert g.topology_preserved is False
     with pytest.raises(ValueError):
         g.invert(np.array([0.5 * (lo + hi)]))
@@ -429,7 +444,7 @@ def test_fit_transport_degree_minus_one_circle_round_trips():
     # through the Python API.
     t = np.linspace(0.0, 2.0 * math.pi, 256, endpoint=False)
     s = (-t + 0.4 + 0.15 * np.sin(t)) % (2.0 * math.pi)
-    g = gamfit.sae.fit_transport(t, s, "circle", "circle")
+    g = gamfit.sae.fit_transport(t, s, "circle", "circle", pairs="deterministic")
     assert g.degree == -1
     assert g.topology_preserved is True
     probe = (np.arange(7) + 0.5) * (2.0 * math.pi / 7.0)
@@ -505,6 +520,20 @@ def test_kl_optimal_probe_design_reaches_python():
     )
     assert blind is None
 
+    # A malformed level is a ValueError, not the None that means "steering
+    # cannot distinguish the hypotheses".
+    with pytest.raises(ValueError):
+        gamfit.sae.plan_probe_for_contested_claim(
+            delta, predicted_null, predicted_alt, fisher, 1.5
+        )
+    with pytest.raises(ValueError):
+        gamfit.sae.plan_probe_for_contested_claim(
+            delta, predicted_null, predicted_alt, fisher, 0.05, current_log_e=math.nan
+        )
+    with pytest.raises(ValueError):
+        gamfit.sae.expected_resolution_budget(0.0, 1.01)
+    assert gamfit.sae.expected_resolution_budget(0.05, 0.0) is None
+
 
 def test_lawley_bartlett_factor_exponential_fixture():
     # Exponential (Gamma-log, phi=1), intercept-only: ε_0 = 0 so the factor is
@@ -559,9 +588,17 @@ def test_lawley_bartlett_factor_estimated_lambda_reaches_python():
     assert estimated["mean_shift"] == pytest.approx(
         estimated["mean_shift_conditional"] + estimated["rho_variation_shift"]
     )
-    assert estimated["bartlett_factor"] == pytest.approx(1.0 + estimated["mean_shift"])
+    # The fixed-λ shift is the reference's scale; the ρ̂-variation increment is
+    # an additive location, never divided by ref_df.
+    assert estimated["bartlett_factor"] == pytest.approx(
+        estimated["bartlett_factor_conditional"]
+    )
+    assert estimated["bartlett_factor"] == pytest.approx(
+        1.0 + estimated["mean_shift_conditional"]
+    )
     assert estimated["corrected_statistic"] == pytest.approx(
-        4.0 / estimated["bartlett_factor"]
+        max(4.0 - estimated["rho_variation_shift"], 0.0)
+        / estimated["bartlett_factor"]
     )
     assert estimated["p_value_corrected"] >= 0.0
 
@@ -601,8 +638,6 @@ def test_smooth_significance_auto_applies_lawley_and_surfaces_material_flag():
         "statistic_lr",
         "ref_df",
         "bartlett_factor",
-        "bartlett_factor_conditional",
-        "rho_variation_shift",
         "statistic_corrected",
         "p_value_uncorrected",
         "p_value_corrected",
@@ -611,13 +646,9 @@ def test_smooth_significance_auto_applies_lawley_and_surfaces_material_flag():
     ):
         assert key in row, f"smooth_significance row missing '{key}'"
     # Poisson carries closed-form Lawley jets, so the correction auto-applies.
-    # The term's λ̂ selection is replayed in its reference, which already carries
-    # the estimation of λ; only the fixed-λ factor applies on top of it, and the
-    # ρ-variation lane (which would count that estimation a second time) is not
-    # entered.
     assert row["correction_provenance"] == "lawley_lr_fixed_lambda"
-    assert row["bartlett_factor_conditional"] is None and row["rho_variation_shift"] is None
-    # The corrected statistic is the raw LR divided by the Bartlett factor.
+    # The corrected statistic is the raw LR divided by the fixed-λ factor; the
+    # λ̂-sampling variation is in the reference's selection replay, not in W*.
     assert row["statistic_corrected"] == pytest.approx(
         row["statistic_lr"] / row["bartlett_factor"], rel=1e-9
     )
@@ -645,7 +676,9 @@ def test_glm_full_conformal_bernoulli_reaches_python_and_covers():
     x = np.column_stack([np.ones(n), rng.normal(size=n)])
     eta = x @ np.array([0.3, 1.1])
     y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
-    out = gamfit.inference.glm_full_conformal(x, y, s_lambda, x_star, "bernoulli", alpha)
+    out = gamfit.inference.glm_full_conformal(
+        x, y, s_lambda, x_star, "bernoulli", alpha
+    )
     assert out["n_augmented"] == n + 1
     assert set(out["candidates"]) == {0.0, 1.0}
     # p-values are honest conformal p-values in (0, 1]; membership = p > alpha.
@@ -670,7 +703,9 @@ def test_glm_full_conformal_bernoulli_reaches_python_and_covers():
         yt = (rng.uniform(size=n_small) < 1.0 / (1.0 + np.exp(-et))).astype(float)
         p_star = 1.0 / (1.0 + np.exp(-(x_star @ beta_true)))
         y_star = float(rng.uniform() < p_star)
-        res = gamfit.inference.glm_full_conformal(xt, yt, s_lambda, x_star, "bernoulli", alpha)
+        res = gamfit.inference.glm_full_conformal(
+            xt, yt, s_lambda, x_star, "bernoulli", alpha
+        )
         if y_star in res["members"]:
             covered += 1
     # Allow a small Monte-Carlo slack below the nominal 1 - alpha = 0.8.

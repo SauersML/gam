@@ -587,27 +587,28 @@ pub(crate) fn custom_family_blockwise_edf(
 /// trace edf is invariant under the canonical reparameterization, the resulting
 /// `edf_total` / per-penalty / per-block values are the same as they would be
 /// in the raw basis and are reported directly on the lifted raw fit. Returns
-/// `None` when no reduced geometry is available, so the caller can leave
-/// `precomputed_edf` unset (and the raw-geometry fallback applies).
+/// `Ok(None)` when no reduced geometry is available, so the caller can leave
+/// `precomputed_edf` unset (and the raw-geometry fallback applies). A reduced
+/// geometry whose trace fails is an error: the lifted raw geometry carries a
+/// non-identity gauge that refuses the raw fallback, so returning `None` here
+/// would replace the trace's own reason with that refusal.
 pub(crate) fn reduced_blockwise_edf(
     reduced_geometry: Option<&FitGeometry>,
     canonical: &gam_identifiability::canonical::CanonicalSpecs,
     lambdas: &Array1<f64>,
-) -> Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>, Vec<gam_solve::estimate::EdfRankBound>)> {
-    let geom = reduced_geometry?;
-    match custom_family_blockwise_edf(
+) -> Result<
+    Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>, Vec<gam_solve::estimate::EdfRankBound>)>,
+    CustomFamilyError,
+> {
+    let Some(geom) = reduced_geometry else {
+        return Ok(None);
+    };
+    custom_family_blockwise_edf(
         geom.penalized_hessian.as_array(),
         &canonical.reduced_specs,
         &lambdas.view(),
-    ) {
-        Ok(triple) => Some(triple),
-        Err(err) => {
-            log::debug!(
-                "[custom-family inference] reduced-space effective degrees of freedom unavailable: {err}"
-            );
-            None
-        }
-    }
+    )
+    .map(Some)
 }
 
 fn require_converged_outer_for_assembly(outer_converged: bool) -> Result<(), CustomFamilyError> {
@@ -1153,6 +1154,7 @@ pub fn blockwise_fit_from_parts(
         coefficient_influence: None,
         weighted_gram,
         identified_subspace: None,
+        working_residual: None,
     });
 
     gam_solve::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
