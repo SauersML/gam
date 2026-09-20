@@ -4528,8 +4528,7 @@ impl SaeManifoldTerm {
         // Magic-by-default offline bounds, auto-derived from the fit so no caller
         // supplies a knob. `target_norm_bound` is the largest target row L2 norm
         // (bounds `‖x‖` over the corpus); `amplitude_bound[k]` is the largest
-        // fitted assignment mass for atom `k` (bounds `|z_k|`), with a strictly
-        // positive floor so a near-inactive atom still certifies a finite radius.
+        // fitted assignment mass for atom `k` (bounds `|z_k|`).
         let mut target_norm_bound = 0.0_f64;
         for row in 0..n {
             let norm = targets.row(row).dot(&targets.row(row)).sqrt();
@@ -4546,10 +4545,15 @@ impl SaeManifoldTerm {
                     bound = z;
                 }
             }
-            // A strictly positive amplitude floor keeps the offline Lipschitz
-            // scaling finite for atoms with no active row in this corpus (those
-            // rows encode to the chart center via the certificate anyway).
-            amplitude_bound[atom_idx] = bound.max(1.0);
+            // The sup itself, with no floor. The encode `L`
+            // (`hessian_lipschitz_constant`) is nondecreasing in `|z|`, so the sup
+            // bounds it for every row of this corpus. Any larger bound only inflates
+            // each row's Kantorovich `h = β·η·L` and flags certifiable starts.
+            // Posterior gates lie in `[0, 1]`, so a floor at 1 would replace every
+            // atom's bound by 1. An atom with no active row gets the exact `L` of
+            // its zero-amplitude objective (the data term's part vanishes), which
+            // is the only amplitude this corpus encodes it at.
+            amplitude_bound[atom_idx] = bound;
         }
 
         let atlas = crate::encode::EncodeAtlas::build(
