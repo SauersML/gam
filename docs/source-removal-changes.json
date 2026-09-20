@@ -2642,5 +2642,25 @@
     ],
     "reason": "Replace the IFT/tangent warm-start step caps (#2902) with a derived trust radius: the tiered |dρ| budget (2.0 default, 0.5..4.0 by residual tier), the tangent α tiers, and the grow/shrink step controller with its hand quality bands and flat override are hand bounds and magic constants forbidden by SPEC. The radius R = s·F/E is measured from each accepted prediction's miss E against the flat seed's miss F at step s.",
     "evidence": "ift_predictor_rejects_large_drho: an unmeasured predictor now takes the |dρ| = 3 step the 2.0 default cap rejected; a measured radius of 2 rejects it and 4 accepts it. warm_start_trust_radius_is_the_step_where_the_predictor_ties_the_flat_seed pins R = s·F/E, R = ∞ for an exact prediction, no update for E = F = 0 or non-finite input, and reset on clear. The same-slot test now checks the radius and staged step do not leak across RemlStates."
+  },
+  {
+    "base": "080d090c4b6d5aa0c89c632fb618d59450b75a32",
+    "items": [
+      "crates/gam-models/src/multinomial_reml.rs:fn:second_difference_penalty",
+      "crates/gam-solve/src/estimate/binomial_reml_outer_cost_1575_tests.rs:fn:second_difference_penalty",
+      "crates/gam-solve/src/estimate/inner_residual_charge_2954_tests.rs:fn:second_difference_penalty",
+      "crates/gam-solve/src/gaussian_reml.rs:fn:second_difference_penalty",
+      "crates/gam-solve/tests/block_quadrature_units_784.rs:fn:second_difference_penalty",
+      "tests/autodiff/misc/contract_gradient_gates.rs:fn:second_difference_penalty",
+      "tests/autodiff/misc/derivative_consistency_fd.rs:fn:second_difference_penalty",
+      "tests/autodiff/misc/objective_gradient_consistency_universal.rs:fn:second_difference_penalty",
+      "tests/regressions/misc/bug_hunt_2623_sampled_marginal_outer_gradient_frame.rs:fn:second_difference_penalty",
+      "tests/regressions/misc/large_scale_dense_regression_guard.rs:fn:second_difference_penalty",
+      "tests/regressions/optimization/large_scale_convergence_regression.rs:fn:second_difference_penalty",
+      "tests/regressions/optimization/reml_laml_rho_derivatives_fd_bug_hunt.rs:fn:second_difference_penalty",
+      "tests/regressions/optimization/reml_unified_2_3.rs:fn:second_difference_penalty"
+    ],
+    "reason": "#4245: test-local second_difference_penalty(k) copies were the same D2'D2 matrix as the shared test fixture gam_linalg_test_support::coefficient_difference_penalty(k, 2) (re-exported as gam::test_support::coefficient_difference_penalty); every caller now uses the shared fixture.",
+    "evidence": "https://github.com/SauersML/gam/issues/4245"
   }
 ]

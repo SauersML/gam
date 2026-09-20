@@ -143,21 +143,6 @@ fn max_rel_err(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
 // Objective 1: universal GLM-family REML/LAML objective
 // ======================================================================
 
-/// Second-difference penalty `S = D₂ᵀD₂` on a `k`-column block. Rank
-/// `k−2`; null space `{constant, linear}` (dimension 2). This is the
-/// canonical rank-deficient smoothing penalty whose kernel exercises the
-/// `penalty_subspace_trace` branch of the unified outer evaluator — the
-/// branch that desynced in `#752` / `#808`.
-fn second_difference_penalty(k: usize) -> Array2<f64> {
-    let mut d = Array2::<f64>::zeros((k - 2, k));
-    for i in 0..(k - 2) {
-        d[[i, i]] = 1.0;
-        d[[i, i + 1]] = -2.0;
-        d[[i, i + 2]] = 1.0;
-    }
-    d.t().dot(&d)
-}
-
 /// Identity ridge on columns `1..p` (intercept column 0 unpenalized).
 fn identity_ridge(p: usize) -> Array2<f64> {
     let mut s = Array2::<f64>::zeros((p, p));
@@ -338,8 +323,8 @@ fn gaussian_near_degenerate_two_block(seed: u64) -> GlmFixture {
     let w = Array1::<f64>::ones(n);
     let offset = Array1::<f64>::zeros(n);
     let s_list = vec![
-        BlockwisePenalty::new(1..(1 + k), second_difference_penalty(k)),
-        BlockwisePenalty::new((1 + k)..p, second_difference_penalty(k)),
+        BlockwisePenalty::new(1..(1 + k), gam::test_support::coefficient_difference_penalty(k, 2)),
+        BlockwisePenalty::new((1 + k)..p, gam::test_support::coefficient_difference_penalty(k, 2)),
     ];
     GlmFixture {
         x,

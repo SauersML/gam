@@ -29,18 +29,6 @@ use std::sync::Arc;
 //  Shared problem construction
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Squared second-difference penalty `D₂ᵀD₂` (k×k). Rank `k-2`; nullspace is
-/// {constant, linear}.
-fn second_difference_penalty(k: usize) -> Array2<f64> {
-    let mut d = Array2::<f64>::zeros((k - 2, k));
-    for i in 0..(k - 2) {
-        d[[i, i]] = 1.0;
-        d[[i, i + 1]] = -2.0;
-        d[[i, i + 2]] = 1.0;
-    }
-    d.t().dot(&d)
-}
-
 /// A small single-smooth Gaussian problem: intercept + a degree-`block_k`
 /// polynomial block penalized by a second-difference penalty. Returns the
 /// design, response, weights, offset, the penalty list, the per-penalty
@@ -82,7 +70,7 @@ fn build_gaussian_problem(seed: u64) -> GaussianProblem {
     let w = Array1::<f64>::ones(n);
     let offset = Array1::<f64>::zeros(n);
 
-    let s_block = second_difference_penalty(block_k);
+    let s_block = gam::test_support::coefficient_difference_penalty(block_k, 2);
     let start = 1usize;
     let s_list = vec![BlockwisePenalty::new(
         start..(start + block_k),

@@ -30,16 +30,6 @@ fn opts(nullspace_dims: Vec<usize>) -> ExternalOptimOptions {
     }
 }
 
-fn second_difference_penalty(k: usize) -> Array2<f64> {
-    let mut d = Array2::<f64>::zeros((k - 2, k));
-    for i in 0..(k - 2) {
-        d[[i, i]] = 1.0;
-        d[[i, i + 1]] = -2.0;
-        d[[i, i + 2]] = 1.0;
-    }
-    d.t().dot(&d)
-}
-
 fn build_problem(
     seed: u64,
     blocks: usize,
@@ -86,7 +76,7 @@ fn build_problem(
         let end = start + block_k;
         penalties.push(BlockwisePenalty::new(
             start..end,
-            second_difference_penalty(block_k),
+            gam::test_support::coefficient_difference_penalty(block_k, 2),
         ));
         nullspace_dims.push(2usize);
     }

@@ -145,28 +145,13 @@ fn build_gaussian_rank_deficient_two_block(
     let y = Array1::from_iter(eta.iter().map(|e| e + rng.random_range(-0.4..0.4)));
     let w = Array1::<f64>::ones(n);
 
-    let s1 = second_difference_penalty(k1);
-    let s2 = second_difference_penalty(k2);
+    let s1 = gam::test_support::coefficient_difference_penalty(k1, 2);
+    let s2 = gam::test_support::coefficient_difference_penalty(k2, 2);
     let s_list = vec![
         BlockwisePenalty::new(1..(1 + k1), s1),
         BlockwisePenalty::new((1 + k1)..p, s2),
     ];
     (x, y, w, s_list)
-}
-
-/// k×k second-difference penalty S = D₂ᵀD₂. The (k−2)×k matrix D₂ has
-/// rows [..,1,-2,1,..]; therefore S has rank k−2 and a 2-D null space
-/// spanned by {constant, linear} on the index set. This is the
-/// standard rank-deficient smoothing penalty (mgcv calls these
-/// "improper" priors).
-fn second_difference_penalty(k: usize) -> Array2<f64> {
-    let mut d = Array2::<f64>::zeros((k - 2, k));
-    for i in 0..(k - 2) {
-        d[[i, i]] = 1.0;
-        d[[i, i + 1]] = -2.0;
-        d[[i, i + 2]] = 1.0;
-    }
-    d.t().dot(&d)
 }
 
 // -----------------------------------------------------------------------

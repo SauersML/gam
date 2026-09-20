@@ -161,16 +161,6 @@ impl LaplaceMarginalCorrector for QuadraticCoefficientProbe {
     }
 }
 
-fn second_difference_penalty(k: usize) -> Array2<f64> {
-    let mut root = Array2::<f64>::zeros((k - 2, k));
-    for row in 0..(k - 2) {
-        root[[row, row]] = 1.0;
-        root[[row, row + 1]] = -2.0;
-        root[[row, row + 2]] = 1.0;
-    }
-    root.t().dot(&root)
-}
-
 /// Two harmonic blocks over two covariates with Gamma(shape 20) responses about
 /// `μ = exp(2·signal)`, drawn deterministically through the Wilson–Hilferty cube
 /// of a golden-ratio normal sequence: the n=240, k=8 cell of sweep 1147402.
@@ -198,8 +188,14 @@ fn gamma_fixture(n: usize, k: usize) -> (Array1<f64>, Array2<f64>, Vec<Blockwise
         y[i] = (2.0 * signal).exp() * cube_root.powi(3);
     }
     let penalties = vec![
-        BlockwisePenalty::new(1..(1 + k), second_difference_penalty(k)),
-        BlockwisePenalty::new((1 + k)..p, second_difference_penalty(k)),
+        BlockwisePenalty::new(
+            1..(1 + k),
+            gam_linalg_test_support::coefficient_difference_penalty(k, 2),
+        ),
+        BlockwisePenalty::new(
+            (1 + k)..p,
+            gam_linalg_test_support::coefficient_difference_penalty(k, 2),
+        ),
     ];
     (y, x, penalties)
 }
