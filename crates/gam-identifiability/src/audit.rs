@@ -2180,7 +2180,7 @@ pub fn audit_identifiability_channel_aware(
         // own diagonal sub-Gram (the original within-block behaviour).
         let (pivot_gram, joint) = if use_joint_residual {
             (
-                block_cross_residual_gram(&geometry.gram_struct, &col_offsets, block_idx),
+                block_cross_residual_gram(&geometry.gram_struct, &col_offsets, block_idx)?,
                 true,
             )
         } else {
@@ -2590,7 +2590,7 @@ fn block_cross_residual_gram(
     gram_struct: &Array2<f64>,
     col_offsets: &[usize],
     block_idx: usize,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, EstimationError> {
     let p_total = gram_struct.ncols();
     let b_start = col_offsets[block_idx];
     let b_end = col_offsets[block_idx + 1];
@@ -2603,7 +2603,7 @@ fn block_cross_residual_gram(
         .slice(ndarray::s![b_start..b_end, b_start..b_end])
         .to_owned();
     if a_cols.is_empty() || p_b == 0 {
-        return g_bb;
+        return Ok(g_bb);
     }
     let n_a = a_cols.len();
     // G_AA (n_a × n_a) and G_Ab (n_a × p_b) gathered from the joint Gram.
@@ -2620,12 +2620,12 @@ fn block_cross_residual_gram(
         }
     }
     // M = G_AA⁺ · G_Ab via eigenvalue pseudoinverse (same relative tolerance as
-    // the compiler's `solve_psd_system`). On eigendecomposition failure fall back
-    // to the bare diagonal sub-Gram (no spurious demotion).
-    let (evals, evecs) = match g_aa.eigh(Side::Lower) {
-        Ok(pair) => pair,
-        Err(_) => return g_bb,
-    };
+    // the compiler's `solve_psd_system`). A failed factorisation is an error: the
+    // bare diagonal sub-Gram is a different pivot matrix, and substituting it
+    // would report a within-block drop set as the joint residual's.
+    let (evals, evecs) = g_aa
+        .eigh(Side::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
     let tol = lambda_max * 64.0 * (n_a.max(1) as f64) * f64::EPSILON;
     // M = U · diag(1/λ_kept) · Uᵀ · G_Ab
@@ -2649,7 +2649,7 @@ fn block_cross_residual_gram(
             r[[j, i]] = avg;
         }
     }
-    r
+    Ok(r)
 }
 
 fn channel_aware_penalty_aware_joint_rank(
