@@ -3708,15 +3708,24 @@ fn fit_bernoulli_marginal_slope_terms_under(
         let weight_sum = weights.iter().sum::<f64>();
         let weight_sq_sum = weights.iter().map(|w| w * w).sum::<f64>();
         let sqrt_effective_n = weight_sum / weight_sq_sum.sqrt();
-        let rows = (0..y.len())
-            .into_par_iter()
-            .map(|row| -> Result<(f64, f64, f64, f64), String> {
+        let (rows, noise) = super::closed_form_certificate_pass(
+            y.len(),
+            weights.as_slice().ok_or_else(|| {
+                FitFailure::raised(
+                    FailureCategory::Invariant,
+                    "bernoulli marginal-slope: the row weights are not contiguous",
+                )
+            })?,
+            &law.weights,
+            sqrt_effective_n * sqrt_effective_n,
+            || Ok(()),
+            |_, row| -> Result<[(f64, f64, f64, Vec<f64>); 1], String> {
                 let marginal_eta = block_states[0].eta[row];
                 let slope = block_states[1].eta[row];
                 // gam#2985: with a residual block the row anchors on the joint
                 // (z, r) law; under the estimated law of the score it is the
                 // score-only anchor at the row's (ã, B).
-                let (anchoring_residual, law_sd, mu) = if let Some(runtime) = residual_runtime.as_ref() {
+                let (anchoring_residual, law_sd, mu, probabilities) = if let Some(runtime) = residual_runtime.as_ref() {
                     let joint = super::residual_repair::residual_certificate_row(
                         &certificate_family,
                         runtime,
@@ -3743,17 +3752,13 @@ fn fit_bernoulli_marginal_slope_terms_under(
                         law,
                     )?
                 };
-                Ok((
-                    anchoring_residual,
-                    law_sd / sqrt_effective_n,
-                    mu * (1.0 - mu),
-                    weights[row],
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()
-            .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+                Ok([(anchoring_residual, law_sd, mu * (1.0 - mu), probabilities)])
+            },
+        )
+        .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
         let certificate = ClosedFormAnchorResidual::from_rows(
             &rows,
+            &noise,
             law.nodes.len(),
             sqrt_effective_n * sqrt_effective_n,
         )
