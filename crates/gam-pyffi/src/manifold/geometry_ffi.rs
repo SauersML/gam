@@ -7215,8 +7215,8 @@ fn predict_columns(
         false,
     )?;
     let predictor = model
-        .predictor()
-        .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
+        .try_predictor()
+        .map_err(|reason| format!("saved model could not construct a predictor: {reason}"))?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
 
     let mut columns = BTreeMap::<String, Vec<f64>>::new();

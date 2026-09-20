@@ -984,28 +984,50 @@ where
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub trait FittedModelPredictExt {
-    fn predictor(&self) -> Option<Box<dyn PredictableModel>>;
+    /// The saved model's canonical predictor, or the reason it cannot be
+    /// rebuilt (a malformed payload, a missing coefficient block, a model
+    /// class with no generic predictor). Callers that report the failure
+    /// should use this so the user sees why prediction is unavailable.
+    fn try_predictor(&self) -> Result<Box<dyn PredictableModel>, String>;
+    /// [`Self::try_predictor`] with the reason discarded, for callers that
+    /// only branch on availability.
+    fn predictor(&self) -> Option<Box<dyn PredictableModel>> {
+        self.try_predictor().ok()
+    }
     fn bernoulli_marginal_slope_predictor(&self)
     -> Result<BernoulliMarginalSlopePredictor, String>;
     fn block_roles(&self) -> Option<Vec<BlockRole>>;
 }
 
 impl FittedModelPredictExt for FittedModel {
-    fn predictor(&self) -> Option<Box<dyn PredictableModel>> {
-        let runtime = self.saved_prediction_runtime().ok()?;
-        match self.predict_model_class() {
+    fn try_predictor(&self) -> Result<Box<dyn PredictableModel>, String> {
+        let class = self.predict_model_class();
+        let runtime = self
+            .saved_prediction_runtime()
+            .map_err(|err| format!("{class:?} predictor runtime: {err}"))?;
+        let missing_fit = || format!("{class:?} predictor requires a saved fit result");
+        let noise_beta = |fit: &UnifiedFitResult| {
+            location_scale_noise_beta(fit)
+                .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))
+                .ok_or_else(|| {
+                    format!("{class:?} predictor requires a noise (scale) coefficient block")
+                })
+        };
+        match class {
             PredictModelClass::GaussianLocationScale => {
-                let fit = self.fit_result.as_ref()?;
-                let beta_mu = gaussian_location_scale_mean_beta(fit)?;
-                let beta_noise = location_scale_noise_beta(fit)
-                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
+                let fit = self.fit_result.as_ref().ok_or_else(missing_fit)?;
+                let beta_mu = gaussian_location_scale_mean_beta(fit).ok_or_else(|| {
+                    "Gaussian location-scale predictor requires a location coefficient block"
+                        .to_string()
+                })?;
+                let beta_noise = noise_beta(fit)?;
                 let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
                 let sigma_floor =
                     gam_models::inference::model::gaussian_location_scale_saved_sigma_floor(
                         self.payload(),
                     )
-                    .ok()?;
-                Some(Box::new(GaussianLocationScalePredictor {
+                    .map_err(|err| format!("Gaussian location-scale predictor: {err}"))?;
+                Ok(Box::new(GaussianLocationScalePredictor {
                     beta_mu,
                     beta_noise,
                     sigma_floor,
@@ -1017,9 +1039,15 @@ impl FittedModelPredictExt for FittedModel {
             PredictModelClass::Standard => {
                 let family = self.family_state.likelihood();
                 let link_kind = runtime.inverse_link.clone();
-                let fit = self.fit_result.as_ref()?;
+                let fit = self.fit_result.as_ref().ok_or_else(missing_fit)?;
                 let beta = if runtime.link_wiggle.is_some() {
-                    fit.block_by_role(BlockRole::Mean)?.beta.clone()
+                    fit.block_by_role(BlockRole::Mean)
+                        .ok_or_else(|| {
+                            "standard link-wiggle predictor requires a Mean coefficient block"
+                                .to_string()
+                        })?
+                        .beta
+                        .clone()
                 } else if let Some(unified) = self.unified() {
                     StandardPredictor::from_unified(
                         unified,
@@ -1034,7 +1062,7 @@ impl FittedModelPredictExt for FittedModel {
                     fit.beta.clone()
                 };
                 let covariance = fit.beta_covariance().cloned();
-                Some(Box::new(StandardPredictor {
+                Ok(Box::new(StandardPredictor {
                     beta,
                     family,
                     link_kind,
@@ -1050,7 +1078,9 @@ impl FittedModelPredictExt for FittedModel {
                         ..
                     } if survival_likelihood == "marginal-slope"
                 ) {
-                    return None;
+                    return Err(
+                        "survival marginal-slope models have no generic predictor".to_string()
+                    );
                 }
                 // `resolved_inverse_link` is `None` for every survival family, so
                 // the fitted survival link lives only in the saved `link` (the
@@ -1059,21 +1089,30 @@ impl FittedModelPredictExt for FittedModel {
                 // fitted link wiggle, so a wiggled survival fit has no generic
                 // predictor rather than one on the wrong link.
                 if runtime.link_wiggle.is_some() {
-                    return None;
+                    return Err("survival predictor cannot replay a fitted link wiggle".to_string());
                 }
-                let unified = self.unified()?;
-                let inverse_link = self.payload().link.clone()?;
+                let unified = self
+                    .unified()
+                    .ok_or_else(|| "survival predictor requires a unified fit".to_string())?;
+                let inverse_link = self.payload().link.clone().ok_or_else(|| {
+                    "survival predictor requires the saved fitted link".to_string()
+                })?;
                 SurvivalPredictor::from_unified(unified, inverse_link)
-                    .ok()
                     .map(|p| Box::new(p) as Box<dyn PredictableModel>)
+                    .map_err(|err| format!("survival predictor: {err}"))
             }
             PredictModelClass::BinomialLocationScale => {
-                let inverse_link = runtime.inverse_link.clone()?;
-                let fit = self.fit_result.as_ref()?;
-                let beta_threshold = binomial_location_scale_threshold_beta(fit)?;
-                let beta_noise = location_scale_noise_beta(fit)
-                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
-                Some(Box::new(BinomialLocationScalePredictor {
+                let inverse_link = runtime.inverse_link.clone().ok_or_else(|| {
+                    "binomial location-scale predictor requires a resolved inverse link".to_string()
+                })?;
+                let fit = self.fit_result.as_ref().ok_or_else(missing_fit)?;
+                let beta_threshold =
+                    binomial_location_scale_threshold_beta(fit).ok_or_else(|| {
+                        "binomial location-scale predictor requires a threshold coefficient block"
+                            .to_string()
+                    })?;
+                let beta_noise = noise_beta(fit)?;
+                Ok(Box::new(BinomialLocationScalePredictor {
                     beta_threshold,
                     beta_noise,
                     covariance: fit.beta_covariance().cloned(),
@@ -1082,12 +1121,14 @@ impl FittedModelPredictExt for FittedModel {
                 }) as Box<dyn PredictableModel>)
             }
             PredictModelClass::DispersionLocationScale => {
-                let fit = self.fit_result.as_ref()?;
-                let beta_mu = gaussian_location_scale_mean_beta(fit)?;
-                let beta_noise = location_scale_noise_beta(fit)
-                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
+                let fit = self.fit_result.as_ref().ok_or_else(missing_fit)?;
+                let beta_mu = gaussian_location_scale_mean_beta(fit).ok_or_else(|| {
+                    "dispersion location-scale predictor requires a location coefficient block"
+                        .to_string()
+                })?;
+                let beta_noise = noise_beta(fit)?;
                 let inverse_link = runtime.inverse_link.clone();
-                Some(Box::new(DispersionLocationScalePredictor {
+                Ok(Box::new(DispersionLocationScalePredictor {
                     beta_mu,
                     beta_noise,
                     likelihood: self.family_state.likelihood(),
@@ -1097,12 +1138,11 @@ impl FittedModelPredictExt for FittedModel {
             }
             PredictModelClass::BernoulliMarginalSlope => self
                 .bernoulli_marginal_slope_predictor()
-                .ok()
                 .map(|p| Box::new(p) as Box<dyn PredictableModel>),
-            PredictModelClass::TransformationNormal => self
-                .fit_result
-                .is_some()
-                .then_some(Box::new(TransformationNormalPredictor) as Box<dyn PredictableModel>),
+            PredictModelClass::TransformationNormal => {
+                self.fit_result.as_ref().ok_or_else(missing_fit)?;
+                Ok(Box::new(TransformationNormalPredictor) as Box<dyn PredictableModel>)
+            }
         }
     }
 
@@ -4545,6 +4585,16 @@ mod tests {
                 .predictor()
                 .is_none(),
             "a survival payload without its fitted link must not predict on a substitute link"
+        );
+        // The refusal carries its reason so the CLI / Python error names the
+        // missing state instead of a bare "could not construct a predictor".
+        let reason = match saved_survival_location_scale_model(None).try_predictor() {
+            Ok(_) => panic!("a survival payload without its fitted link must not predict"),
+            Err(reason) => reason,
+        };
+        assert!(
+            reason.contains("link"),
+            "the predictor refusal must name the missing fitted link, got: {reason}"
         );
     }
 
