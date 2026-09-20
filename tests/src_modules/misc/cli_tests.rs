@@ -4026,6 +4026,37 @@ fn parse_bounded_linear_termwith_uniform_prior() {
 }
 
 #[test]
+fn parse_bounded_linear_without_prior_is_the_box_constrained_linear_term() {
+    // gam#3923: `prior=none` is flat on the box of the coefficient, which is
+    // exactly the unpenalised box-constrained linear term; there is no
+    // flat-chart variant.
+    let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=none) + z")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
+    assert_eq!(parsed.terms.len(), 2);
+    match &parsed.terms[0] {
+        ParsedTerm::Linear {
+            name,
+            explicit,
+            double_penalty,
+            coefficient_min,
+            coefficient_max,
+        } => {
+            assert_eq!(name, "mu_hat");
+            assert!(*explicit);
+            assert!(!*double_penalty);
+            assert_eq!(*coefficient_min, Some(0.0));
+            assert_eq!(*coefficient_max, Some(1.0));
+        }
+        other => panic!("unexpected term: {other:?}"),
+    }
+    assert!(
+        parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=none, double_penalty=true)")
+            .is_err(),
+        "the unpenalised constrained fit cannot take a double penalty"
+    );
+}
+
+#[test]
 fn parse_bounded_linear_target_strength_maps_to_beta_prior() {
     let parsed = parse_formula("y ~ bounded(mu_hat, min=-1, max=1, target=0.5, strength=4)")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));

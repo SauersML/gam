@@ -2678,12 +2678,15 @@ fn parse_survival_formulaspec(
     })
 }
 
+/// The prior a `bounded()` term asks for, or `None` for `prior=none`: no prior
+/// beyond the box itself, which is the box-constrained linear term rather than
+/// a prior on the interval chart.
 fn parse_bounded_priorspec(
     options: &BTreeMap<String, String>,
     min: f64,
     max: f64,
     raw: &str,
-) -> Result<BoundedCoefficientPriorSpec, String> {
+) -> Result<Option<BoundedCoefficientPriorSpec>, String> {
     let prior_mode = options.get("prior").map(|s| s.to_ascii_lowercase());
     let target = parse_optional_f64_option(options, "target", raw)?;
     let strength = parse_optional_f64_option(options, "strength", raw)?;
@@ -2698,10 +2701,10 @@ fn parse_bounded_priorspec(
 
     if let Some(priorname) = prior_mode {
         return match priorname.as_str() {
-            "shrinkage" => Ok(BoundedCoefficientPriorSpec::Shrinkage),
-            "none" => Ok(BoundedCoefficientPriorSpec::None),
-            "uniform" => Ok(BoundedCoefficientPriorSpec::Uniform),
-            "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
+            "shrinkage" => Ok(Some(BoundedCoefficientPriorSpec::Shrinkage)),
+            "none" => Ok(None),
+            "uniform" => Ok(Some(BoundedCoefficientPriorSpec::Uniform)),
+            "center" => Ok(Some(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 })),
             other => Err(FormulaDslError::InvalidArgument {
                 reason: match removed_spellings::canonical_for(
                     removed_spellings::BOUNDED_PRIORS,
@@ -2741,11 +2744,11 @@ fn parse_bounded_priorspec(
         let z = (targetvalue - min) / (max - min);
         let a = 1.0 + strengthvalue * z;
         let b = 1.0 + strengthvalue * (1.0 - z);
-        return Ok(BoundedCoefficientPriorSpec::Beta { a, b });
+        return Ok(Some(BoundedCoefficientPriorSpec::Beta { a, b }));
     }
 
     // No prior option: shrink toward the null with a REML-estimated strength.
-    Ok(BoundedCoefficientPriorSpec::Shrinkage)
+    Ok(Some(BoundedCoefficientPriorSpec::Shrinkage))
 }
 
 // ---------------------------------------------------------------------------
@@ -3455,7 +3458,39 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
-                let prior = parse_bounded_priorspec(&options, min, max, raw)?;
+                let double_penalty = option_bool(&options, "double_penalty")?;
+                let Some(prior) = parse_bounded_priorspec(&options, min, max, raw)? else {
+                    // `prior=none` is flat on the box of the coefficient. A
+                    // flat prior on the logit chart of the interval transform
+                    // is improper: as the chart runs to either infinity the
+                    // likelihood tends to its value at the rail, a positive
+                    // constant, so that posterior has no mean, and at a binding
+                    // box the fit stalled at the chart clamp and armed Jeffreys
+                    // (gam#3923). Flat on the box itself is proper, and it is
+                    // the box-constrained linear term: the two constraint rows
+                    // `beta >= min` and `beta <= max`, whose KKT solve puts the
+                    // mode (the constrained MLE) on the rail when the box binds,
+                    // and whose published coefficient is the truncated
+                    // posterior's mean.
+                    if double_penalty == Some(true) {
+                        return Err(FormulaDslError::IncompatibleTerm {
+                            reason: format!(
+                                "bounded(prior=none) is the unpenalised constrained fit and cannot \
+                                 take double_penalty=true; write linear({}, min={min}, max={max}) \
+                                 for a penalised box-constrained slope: {raw}",
+                                vars[0]
+                            ),
+                        }
+                        .into());
+                    }
+                    return Ok(ParsedTerm::Linear {
+                        name: vars[0].clone(),
+                        explicit: true,
+                        double_penalty: false,
+                        coefficient_min: Some(min),
+                        coefficient_max: Some(max),
+                    });
+                };
                 return Ok(ParsedTerm::BoundedLinear {
                     name: vars[0].clone(),
                     min,
@@ -3468,8 +3503,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     // "bounded linear term ... cannot also use double_penalty"),
                     // so the default must be `false`, not the `linear()`/`s()`
                     // convention of `true`.
-                    double_penalty: option_bool(&options, "double_penalty")?
-                        .unwrap_or(false),
+                    double_penalty: double_penalty.unwrap_or(false),
                 });
             }
             "group" | "factor" => {

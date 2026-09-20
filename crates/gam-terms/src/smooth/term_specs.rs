@@ -1068,11 +1068,15 @@ pub(crate) struct RawSmoothDesign {
 /// carries under [`BoundedCoefficientPriorSpec::Shrinkage`].
 pub const BOUNDED_SHRINKAGE_PENALTY_SOURCE: &str = "BoundedShrinkage";
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// The prior a `bounded()` coefficient carries on its interval chart.
+///
+/// There is no flat-chart variant: a flat prior on the logit chart is improper,
+/// because the likelihood tends to a positive constant as the chart runs to
+/// either rail (gam#3923). `bounded(x, min, max, prior=none)` is flat on the
+/// box of the coefficient instead, which the formula parser lowers to the
+/// box-constrained linear term `linear(x, min, max, double_penalty=false)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BoundedCoefficientPriorSpec {
-    /// Constrained MLE: no prior term on the bounded coefficient (`prior=none`).
-    #[default]
-    None,
     /// The formula default: a Gaussian prior on the latent logit coordinate,
     /// centred at the null, whose precision REML estimates like any other
     /// smoothing parameter. The null is `beta = 0` when zero lies strictly
@@ -1093,7 +1097,6 @@ pub enum LinearCoefficientGeometry {
     Bounded {
         min: f64,
         max: f64,
-        #[serde(default)]
         prior: BoundedCoefficientPriorSpec,
     },
 }
@@ -1523,8 +1526,7 @@ impl TermCollectionSpec {
                     .into());
                 }
                 match prior {
-                    BoundedCoefficientPriorSpec::None
-                    | BoundedCoefficientPriorSpec::Shrinkage
+                    BoundedCoefficientPriorSpec::Shrinkage
                     | BoundedCoefficientPriorSpec::Uniform => {}
                     BoundedCoefficientPriorSpec::Beta { a, b } => {
                         if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {

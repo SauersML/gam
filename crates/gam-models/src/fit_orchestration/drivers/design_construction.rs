@@ -727,8 +727,6 @@ fn bounded_latent_derivatives(
 /// user-scale coefficient, or `None` when the coefficient carries no prior term.
 fn bounded_prior_shapes(prior: &BoundedCoefficientPriorSpec) -> Result<Option<(f64, f64)>, String> {
     let (a, b) = match prior {
-        // `None` means constrained MLE with no extra prior term on the bounded coefficient.
-        BoundedCoefficientPriorSpec::None => return Ok(None),
         // The shrinkage prior is Gaussian on the latent coordinate; the fit
         // carries it as a REML-weighted penalty block, not as a prior term.
         BoundedCoefficientPriorSpec::Shrinkage => return Ok(None),
@@ -3013,8 +3011,7 @@ fn fit_bounded_term_collection_with_design(
                 BoundedCoefficientPriorSpec::Shrinkage => {
                     bounded_shrinkage_latent_center(min_internal, max_internal)
                 }
-                BoundedCoefficientPriorSpec::None
-                | BoundedCoefficientPriorSpec::Uniform
+                BoundedCoefficientPriorSpec::Uniform
                 | BoundedCoefficientPriorSpec::Beta { .. } => 0.0,
             };
             bounded_terms.push(BoundedLinearTermMeta {
