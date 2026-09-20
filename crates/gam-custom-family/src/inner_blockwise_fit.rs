@@ -1,5 +1,5 @@
-//! The blockwise inner-fit driver (`inner_blockwise_fit`), the joint
-//! Newton polish step, and inner-result assembly, split out of
+//! The blockwise inner-fit driver (`inner_blockwise_fit`) and inner-result
+//! assembly, split out of
 //! `outer_objective.rs` by concern (#1145). Re-exported via
 //! `custom_family` so existing paths stay stable.
 
@@ -4916,38 +4916,6 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         }
     }
 
-    // ── Polishing joint Newton step ──
-    //
-    // For block-coupled multi-block families (e.g. GAMLSS wiggle), Gauss-Seidel
-    // blockwise iteration can reach step_inf < inner_tol while the joint KKT
-    // residual (||Sβ − grad_ℓ||_∞) remains at ~10× inner_tol. This is because
-    // each block is solved conditionally on other blocks' current values —
-    // block-conditional stationarity does not imply joint stationarity when
-    // the likelihood couples blocks off-diagonally.
-    //
-    // Once blockwise has placed β near the true joint optimum, a single (or
-    // a few) damped joint Newton steps can tighten the joint residual to the
-    // floor set by β magnitudes. This polishing phase is essential for the
-    // outer REML gradient formula (which assumes exact β̂ stationarity); a
-    // non-converged β̂ produces large envelope-theorem violations in the
-    // analytic outer gradient.
-    if use_joint_newton && !converged {
-        polish_joint_newton_step(
-            family,
-            specs,
-            options,
-            &s_lambdas,
-            &penalty_roots,
-            joint_bundle,
-            inner_tol,
-            &cached_active_sets,
-            &mut states,
-            &mut cached_eval,
-            &mut current_penalty,
-            &mut converged,
-        )?;
-    }
-
     assemble_inner_blockwise_result(
         family,
         specs,
@@ -4968,268 +4936,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
     )
 }
 
-/// Polishing joint-Newton step for the blockwise fall-through path of
-/// [`inner_blockwise_fit`].
-///
-/// For block-coupled multi-block families (e.g. GAMLSS wiggle), Gauss-Seidel
-/// blockwise iteration can reach `step_inf < inner_tol` while the joint KKT
-/// residual (`||Sβ − grad_ℓ||_∞`) remains at ~10× `inner_tol`. Once blockwise
-/// has placed β near the joint optimum, a few damped joint-Newton steps tighten
-/// the joint residual to the floor set by β magnitudes; this is essential for the
-/// outer REML gradient formula (which assumes exact β̂ stationarity).
-///
-/// Behavior is identical to the inline loop it replaced: the `?`-propagation, the
-/// per-iteration `break` exits (gradient/Hessian unavailable, non-finite delta,
-/// solver failure, residual-tolerance reached, line-search failure) and the
-/// inner backtracking-search `continue` are preserved verbatim. Mutates `states`,
-/// `cached_eval`, `current_penalty`, and `converged` in place exactly as before.
-pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    s_lambdas: &[Array2<f64>],
-    penalty_roots: &BlockPenaltyRoots,
-    joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
-    inner_tol: f64,
-    cached_active_sets: &[Option<Vec<usize>>],
-    states: &mut Vec<ParameterBlockState>,
-    cached_eval: &mut FamilyEvaluation,
-    current_penalty: &mut f64,
-    converged: &mut bool,
-) -> Result<(), CustomFamilyError> {
-    let ranges_joint: Vec<(usize, usize)> = {
-        let mut offset = 0;
-        specs
-            .iter()
-            .map(|s| {
-                let start = offset;
-                offset += s.design.ncols();
-                (start, offset)
-            })
-            .collect()
-    };
-    let total_p_joint: usize = ranges_joint.last().map_or(0, |r| r.1);
-    let trace_diagonal_ridge = JOINT_TRACE_STABILITY_RIDGE;
-
-    // Allow up to a few polishing steps. The blockwise endpoint is close
-    // to optimum, so step sizes should be small and line search should
-    // accept full steps quickly.
-    const POLISH_MAX_ITER: usize = 16;
-    for _polish_iter in 0..POLISH_MAX_ITER {
-        // Re-evaluate at current β to get the joint gradient and Hessian.
-        refresh_all_block_etas(family, specs, states)?;
-        let eval_for_polish = family.evaluate(states)?;
-        let grad_full =
-            match exact_newton_joint_gradient_from_eval(&eval_for_polish, specs, states)? {
-                Some(g) => g,
-                None => break,
-            };
-        // Spec-aware joint Hessian: canonical coupled-curvature source
-        // (see the joint-Newton availability gate). Families overriding
-        // only `_with_specs` return `None` from the spec-less default.
-        let h_joint_opt = family.exact_newton_joint_hessian_with_specs(states, specs)?;
-        let Some(h_joint) = h_joint_opt else { break };
-        let mut h_dense = match symmetrized_square_matrix(
-            h_joint,
-            total_p_joint,
-            "joint polish Hessian shape mismatch",
-        ) {
-            Ok(matrix) => matrix,
-            Err(_) => break,
-        };
-        let h_unpenalized_dense = h_dense.clone();
-        add_joint_penalty_to_matrix(
-            &mut h_dense,
-            &ranges_joint,
-            s_lambdas,
-            trace_diagonal_ridge,
-            joint_bundle,
-        );
-        let joint_polish_diagonal_ridge = stabilized_joint_solver_diagonal_ridge(
-            family,
-            &JointHessianSource::Dense(h_unpenalized_dense),
-            &ranges_joint,
-            s_lambdas,
-            trace_diagonal_ridge,
-            options.ridge_floor,
-            joint_bundle,
-        );
-        if joint_polish_diagonal_ridge != trace_diagonal_ridge {
-            for d in 0..h_dense.nrows() {
-                h_dense[[d, d]] += joint_polish_diagonal_ridge - trace_diagonal_ridge;
-            }
-        }
-
-        let mut beta_joint = Array1::<f64>::zeros(total_p_joint);
-        for b in 0..specs.len() {
-            let (start, end) = ranges_joint[b];
-            beta_joint
-                .slice_mut(ndarray::s![start..end])
-                .assign(&states[b].beta);
-        }
-        let penalty_beta = apply_joint_block_penalty(
-            &ranges_joint,
-            s_lambdas,
-            &beta_joint,
-            0.0,
-            joint_bundle,
-        );
-        let rhs = &grad_full - &penalty_beta;
-
-        // Respect constraints that block line search on the boundary.
-        // Gauss-Seidel blockwise leaves the joint KKT residual at a floor
-        // around |λ_k S_k β̂| for boundary-active components. The residual
-        // magnitude on FREE components is a better measure of whether we
-        // should keep polishing: if β_i is clipped at the boundary and
-        // KKT multiplier μ_i > 0, then rhs[i] is the multiplier, not a
-        // free-space gradient violation.
-        let block_constraints_now = collect_block_linear_constraints(family, states, specs)?;
-        let joint_constraints_now = assemble_joint_linear_constraints(
-            &block_constraints_now,
-            &ranges_joint,
-            total_p_joint,
-        )?;
-        let mut active_mask: Vec<bool> = vec![false; total_p_joint];
-        if let Some(ref constraints) = joint_constraints_now
-            && let Ok(Some(bounds)) = extract_simple_lower_bounds(constraints, total_p_joint)
-        {
-            for (idx, (bound, beta_val)) in bounds
-                .lower_bounds
-                .iter()
-                .zip(beta_joint.iter())
-                .enumerate()
-            {
-                if *bound > f64::NEG_INFINITY && (*beta_val - *bound).abs() < 1e-12 {
-                    active_mask[idx] = true;
-                }
-            }
-        }
-        let res_inf_free = rhs
-            .iter()
-            .zip(active_mask.iter())
-            .filter(|(_, active)| !**active)
-            .map(|(v, _)| v.abs())
-            .fold(0.0_f64, f64::max);
-        // Scale-aware residual tolerance — the joint stationarity
-        // residual ‖∇ℓ − Sβ‖_∞ scales with |obj| (≈ O(n) at large-scale
-        // scale), so the historical absolute `inner_tol = 1e-6` is
-        // unachievable here even at the true minimum. Same rationale
-        // as the joint-Newton convergence test above.
-        let polish_obj = -cached_eval.log_likelihood + *current_penalty;
-        let polish_residual_tol = inner_tol * (1.0 + polish_obj.abs());
-        if res_inf_free <= polish_residual_tol {
-            *converged = true;
-            break;
-        }
-
-        // Solve constrained Newton system if simple bounds are present,
-        // else unconstrained.
-        let delta = if let Some(ref constraints) = joint_constraints_now {
-            let warm = flatten_joint_active_set(cached_active_sets, &block_constraints_now);
-            let lower_bounds_opt = extract_simple_lower_bounds(constraints, total_p_joint)
-                .ok()
-                .flatten();
-            if let Some(bounds) = lower_bounds_opt.as_ref() {
-                match solve_quadratic_with_simple_lower_bounds(
-                    &h_dense,
-                    &rhs,
-                    &beta_joint,
-                    bounds,
-                    warm.as_deref(),
-                ) {
-                    Ok((beta_new, _active)) => &beta_new - &beta_joint,
-                    Err(_) => break,
-                }
-            } else {
-                match gam_solve::active_set::solve_quadratic_with_constraint_set(
-                    &h_dense,
-                    &rhs,
-                    &beta_joint,
-                    constraints,
-                    warm.as_deref(),
-                ) {
-                    Ok((beta_new, _active)) => &beta_new - &beta_joint,
-                    Err(_) => break,
-                }
-            }
-        } else {
-            let solver = gam_linalg::utils::StableSolver::new();
-            let factor = match solver.factorize(&h_dense) {
-                Ok(factor) => factor,
-                Err(_) => break,
-            };
-            let mut direction = rhs.clone();
-            let mut direction_matrix =
-                gam_linalg::faer_ndarray::array1_to_col_matmut(&mut direction);
-            factor.solve_in_place(direction_matrix.as_mut());
-            if !direction.iter().all(|value| value.is_finite()) {
-                break;
-            }
-            direction
-        };
-        if !delta.iter().all(|v| v.is_finite()) {
-            break;
-        }
-        // Keep polishing until the free-space joint residual is small; a
-        // tiny delta alone is not a certificate of stationarity.
-        // Damped line search with projection.
-        let old_states: Vec<ParameterBlockState> = states.clone();
-        let old_obj = -eval_for_polish.log_likelihood + *current_penalty;
-        let mut accepted_polish = false;
-        for bt in 0..10 {
-            let alpha = 0.5f64.powi(bt);
-            for b in 0..specs.len() {
-                let (start, end) = ranges_joint[b];
-                let mut trial_beta = old_states[b].beta.clone();
-                trial_beta.scaled_add(alpha, &delta.slice(ndarray::s![start..end]));
-                let projected =
-                    family.post_update_block_beta(&old_states, b, &specs[b], trial_beta.clone())?;
-                reject_constrained_post_update_repair(
-                    b,
-                    &specs[b],
-                    &trial_beta,
-                    &projected,
-                    block_constraints_now[b].as_ref(),
-                )?;
-                states[b].beta.assign(&projected);
-            }
-            refresh_all_block_etas(family, specs, states)?;
-            let trial_ll = match family.log_likelihood_only(states) {
-                Ok(v) => v,
-                Err(_) => {
-                    for (b, s) in old_states.iter().enumerate() {
-                        states[b] = s.clone();
-                    }
-                    refresh_all_block_etas(family, specs, states)?;
-                    continue;
-                }
-            };
-            let trial_penalty = penalty_roots.value_of_states(states).value;
-            let trial_obj = -trial_ll + trial_penalty;
-            // Not worse beyond the objective's own rounding, the band every other
-            // accept test in the inner solve reads.
-            if trial_obj.is_finite()
-                && trial_obj <= old_obj + joint_objective_roundoff_slack(old_obj, trial_obj, 0.0)
-            {
-                *current_penalty = trial_penalty;
-                *cached_eval = family.evaluate(states)?;
-                accepted_polish = true;
-                break;
-            }
-        }
-        if !accepted_polish {
-            // Restore and stop polishing.
-            for (b, s) in old_states.iter().enumerate() {
-                states[b] = s.clone();
-            }
-            refresh_all_block_etas(family, specs, states)?;
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// Final result assembly for the blockwise / polish fall-through path of
+/// Final result assembly for the blockwise fall-through path of
 /// [`inner_blockwise_fit`]. Computes the penalty value, the (converged-only)
 /// projected KKT residual for the IFT, the active-constraint block, and — only
 /// for a Laplace-ready product — the block log-dets, then moves `states`,
@@ -5237,7 +4944,7 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
 /// [`BlockwiseInnerResult`]. Every unconstrained converged result with exact
 /// joint curvature is re-certified at the coefficient vector being returned,
 /// independently of which product was requested; this includes modes minted by
-/// the blockwise fall-through and joint-polish paths.
+/// the blockwise fall-through path.
 fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -5298,7 +5005,7 @@ fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'stat
         certified_workspace = certificate.workspace;
         if has_negative_curvature {
             return Err(CustomFamilyError::trial_point(format!(
-                "blockwise/joint-polish tentative convergence rejected by fresh exact returned-mode curvature: lambda_min={:.6e} < -floor={:.6e}; an indefinite coefficient point cannot define a Laplace mode",
+                "blockwise tentative convergence rejected by fresh exact returned-mode curvature: lambda_min={:.6e} < -floor={:.6e}; an indefinite coefficient point cannot define a Laplace mode",
                 minimum_whitened_eigenvalue, numerical_floor,
             )));
         }
