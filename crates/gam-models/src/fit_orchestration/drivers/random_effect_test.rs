@@ -1,5 +1,5 @@
 // The per-term random-effect test — the driver that turns a fitted standard GAM
-// into "does each `group()`/`re()` block carry a between-group effect?".
+// into "does each `group()` block carry a between-group effect?".
 //
 // `include!`d into `drivers/mod.rs` like the other self-contained inference
 // subsystems, so it shares the driver's flat namespace and import surface.

@@ -68,7 +68,7 @@ fn multinomial_smooth_significance_pvalue_is_not_oversized_under_the_null() {
             init_lambda: 1.0,
             max_iter: 60,
             tol: 1e-8,
-            ..MultinomialFitRequest::new(&data, "y ~ s(x, bs='tp', k=8)", &config)
+            ..MultinomialFitRequest::new(&data, "y ~ s(x, bs='tps', k=8)", &config)
         })
         .unwrap_or_else(|e| panic!("multinomial null smooth fit failed (rep {rep}): {e:?}"));
 

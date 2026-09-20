@@ -361,7 +361,7 @@ fn dispersion_location_scale_generate_matches_predict_variance_gamma() {
 fn dispersion_location_scale_generate_matches_predict_variance_negbin() {
     run_scenario(&Scenario {
         name: "negbin-LS",
-        family: "negbin".to_string(),
+        family: "negative-binomial".to_string(),
         fam: Fam::NegativeBinomial,
         likelihood: DispersionFamilyKind::NegativeBinomial.likelihood_spec(),
     });

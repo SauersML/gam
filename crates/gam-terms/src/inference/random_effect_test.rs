@@ -2,7 +2,7 @@
 //!
 //! # The question this answers
 //!
-//! A `group(g)`/`re(g)` term is `η = Xβ + X_R b` with `b ~ N(0, σ²_b Σ_b)` and a
+//! A `group(g)` term is `η = Xβ + X_R b` with `b ~ N(0, σ²_b Σ_b)` and a
 //! ridge penalty on `b`. "Does this term matter?" is `H₀: σ²_b = 0`, and that
 //! null sits on the BOUNDARY of the parameter space. None of the reference laws
 //! the smooth table uses are valid there:
