@@ -30,8 +30,8 @@
 //! (a deliberately over-confident posterior) is required to *fail* the gate,
 //! which proves the rank + uniformity logic has teeth.
 
+use gam_math::probability::chi_square_quantile;
 use ndarray::{ArrayView1, ArrayView2};
-use statrs::distribution::ContinuousCDF;
 
 /// Posterior draws per SBC replication.
 ///
@@ -809,8 +809,7 @@ pub fn audit_across_function_coverage(
     }
     let variance = 2.0 * trace_r2 / (p * p);
     let dof = 2.0 / variance;
-    let chi2 = statrs::distribution::ChiSquared::new(dof).expect("positive Satterthwaite dof");
-    let bound = 0.5 * variance * chi2.inverse_cdf(1.0 - alpha);
+    let bound = 0.5 * variance * chi_square_quantile(1.0 - alpha, dof);
     AcrossFunctionCoverage {
         q,
         variance,
