@@ -2310,7 +2310,7 @@ pub fn create_duchon_basis_1d_derivative_dense_with_radial_reparam(
         return Ok(basis);
     }
 
-    let mut z =
+    let z =
         kernel_constraint_nullspace(center_matrix.view(), effective_order, &mut workspace.cache)?;
     if let Some(radial_reparam) = radial_reparam {
         if radial_reparam.nrows() != z.ncols() {
@@ -2320,10 +2320,17 @@ pub fn create_duchon_basis_1d_derivative_dense_with_radial_reparam(
                 z.ncols()
             );
         }
-        z = fast_ab(&z, &radial_reparam.to_owned());
     }
-    let kernel_cols = z.ncols();
+    let kernel_cols = radial_reparam.map_or(z.ncols(), |v| v.ncols());
     let poly_cols = polynomial_block_from_order(data.view(), effective_order).ncols();
+    // The forward design assembles its polynomial null-space block in the
+    // center-cloud-centred frame `t − t̄_c` (#1375), so the polynomial columns
+    // here — and their t-derivatives — are the monomials of that same centred
+    // coordinate. The raw `t` monomials span the same space but are a different
+    // basis: coefficients fitted against the forward design would be read back
+    // against the wrong columns.
+    let center_mean = centers.sum() / centers.len() as f64;
+    let t_centered = t.mapv(|v| v - center_mean);
 
     // The scale-free kernel evaluates the literal spectral power, exactly as
     // the forward 1-D design (`build_duchon_basis`) does. Truncating it to an
@@ -2371,11 +2378,23 @@ pub fn create_duchon_basis_1d_derivative_dense_with_radial_reparam(
     }
 
     let mut basis = Array2::<f64>::zeros((t.len(), kernel_cols + poly_cols));
-    let design_kernel = fast_ab(&raw_kernel, &z);
+    // `(K·Z)·V`, the product order the forward design takes (#1355): `K·(Z·V)`
+    // is the same matrix only in exact arithmetic.
+    let constrained_kernel = fast_ab(&raw_kernel, &z);
+    let design_kernel = match radial_reparam {
+        Some(v) => fast_ab(&constrained_kernel, &v.to_owned()),
+        None => constrained_kernel,
+    };
     basis
         .slice_mut(s![.., 0..kernel_cols])
         .assign(&design_kernel);
-    fill_duchon_1d_polynomial_derivative(&mut basis, kernel_cols, t, effective_order, order);
+    fill_duchon_1d_polynomial_derivative(
+        &mut basis,
+        kernel_cols,
+        t_centered.view(),
+        effective_order,
+        order,
+    );
     Ok(basis)
 }
 
