@@ -71,7 +71,6 @@ use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::{AnalyticPenaltyRegistry, IsometryEvaluationOrder, PenaltyTier};
 use ndarray::s;
-const SPHERE_NORMAL_PIN: f64 = 1.0;
 static NEXT_LATENT_COORD_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_latent_coord_id() -> u64 {
@@ -840,9 +839,22 @@ impl LatentManifold {
 
     /// Dense ambient matrix representation of the tangent Hessian action.
     ///
-    /// Normal directions are pinned with an identity block for embedded
-    /// constrained factors so existing BA Cholesky code can factor the ambient
-    /// matrix while RHS/cross blocks stay tangent-projected.
+    /// On an embedded sphere factor the tangent action is `P·H·P` with
+    /// `P = I − t tᵀ`, singular along the normal `t`. The ambient matrix adds the
+    /// complementary projector `I − P = t tᵀ`, so it is `P·H·P ⊕ 1` on
+    /// `T_t ⊕ span(t)` and the Cholesky code can factor it. RHS and cross blocks
+    /// stay tangent-projected, so the normal line decouples exactly:
+    /// * a Newton step has no normal component;
+    /// * `log|A|` equals the intrinsic tangent log-determinant (the normal
+    ///   eigenvalue is exactly one, `log 1 = 0`);
+    /// * `tr(A⁻¹ ∂A)` gains nothing, since `∂(t tᵀ) = ṫ tᵀ + t ṫᵀ` with
+    ///   `ṫ ∈ T_t` and `A⁻¹ t = t` give `2 tᵀṫ = 0`.
+    ///
+    /// The normal line is not an integrated dimension. The Laplace `−½·log 2π`
+    /// the criterion pairs into the sphere's prior partition counts only the
+    /// `d − 1` tangent dimensions (#2933 F26). Any other normal eigenvalue `c`
+    /// would add an unpriced `½·log c` per sphere row, so the block is the
+    /// projector itself, not a tunable pin.
     pub fn riemannian_hessian_matrix(
         &self,
         t: ArrayView1<'_, f64>,
@@ -870,9 +882,10 @@ impl LatentManifold {
         match self {
             Self::Sphere { dim } => {
                 assert_eq!(t.len(), *dim);
+                // The normal projector `I − P = t tᵀ` (see `riemannian_hessian_matrix`).
                 for a in 0..*dim {
                     for b in 0..*dim {
-                        matrix[[a, b]] += SPHERE_NORMAL_PIN * t[a] * t[b];
+                        matrix[[a, b]] += t[a] * t[b];
                     }
                 }
             }
@@ -1988,6 +2001,71 @@ mod tests {
         assert_eq!(
             rhess, eh,
             "Circle Riemannian Hessian must equal the Euclidean Hessian"
+        );
+    }
+
+    /// #2933 F26: the ambient block of an embedded sphere factor is the tangent
+    /// Hessian plus the normal projector, so its normal eigenvalue is exactly one
+    /// and its log-determinant is the intrinsic tangent-chart log-determinant. A
+    /// `Product(Euclidean, S²)` row checks the recursion as well.
+    #[test]
+    fn sphere_normal_block_is_the_projector_and_prices_log_one_2933_f26() {
+        let manifold = LatentManifold::Product(vec![
+            LatentManifold::Euclidean,
+            LatentManifold::Sphere { dim: 3 },
+        ]);
+        let raw = [0.3_f64, -0.5, 0.81];
+        let norm = raw.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let x = raw.map(|v| v / norm);
+        let t = array![0.7, x[0], x[1], x[2]];
+        // `xᵀg < 0` keeps the connection term `−(xᵀg)·P` positive, so the fixture is SPD.
+        let eg = array![0.4, 1.1, -0.6, -2.3];
+        let root = array![
+            [1.2, 0.1, -0.3, 0.2],
+            [0.0, 0.9, 0.4, -0.1],
+            [0.0, 0.0, 1.5, 0.3],
+            [0.0, 0.0, 0.0, 0.8]
+        ];
+        let eh = root.t().dot(&root);
+        let ambient = manifold.riemannian_hessian_matrix(t.view(), eg.view(), eh.view());
+
+        let normal = array![0.0, x[0], x[1], x[2]];
+        let image = ambient.dot(&normal);
+        for a in 0..4 {
+            assert!(
+                (image[a] - normal[a]).abs() <= 1.0e-14,
+                "the sphere normal must be an exact unit eigenvector: A n = {image:?}"
+            );
+        }
+
+        // Orthonormal chart basis of the 3-D tangent space: the line axis, then
+        // `u1 ∝ e_x − x_0·x` and `u2 = x × u1` on the sphere.
+        let u1_raw = [1.0 - x[0] * x[0], -x[0] * x[1], -x[0] * x[2]];
+        let u1_norm = u1_raw.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let u1 = u1_raw.map(|v| v / u1_norm);
+        let u2 = [
+            x[1] * u1[2] - x[2] * u1[1],
+            x[2] * u1[0] - x[0] * u1[2],
+            x[0] * u1[1] - x[1] * u1[0],
+        ];
+        let chart = Array2::from_shape_fn((4, 3), |(i, j)| match (i, j) {
+            (0, 0) => 1.0,
+            (0, _) | (_, 0) => 0.0,
+            (_, 1) => u1[i - 1],
+            _ => u2[i - 1],
+        });
+        let chart_hessian = chart.t().dot(&ambient).dot(&chart);
+        let log_det = |m: &Array2<f64>| -> f64 {
+            let (evals, _) = m.eigh(Side::Lower).expect("symmetric eigensolve");
+            assert!(evals.iter().all(|&v| v > 0.0), "SPD fixture: {evals:?}");
+            evals.iter().map(|v| v.ln()).sum()
+        };
+        let ambient_log_det = log_det(&ambient);
+        let chart_log_det = log_det(&chart_hessian);
+        assert!(
+            (ambient_log_det - chart_log_det).abs() <= 1.0e-13,
+            "ambient log|A| {ambient_log_det} must equal the tangent-chart log|H_T| \
+             {chart_log_det}: the normal line prices log 1 = 0"
         );
     }
 

@@ -69,14 +69,7 @@ struct TopologyTerm {
     required_dim: Option<usize>,
 }
 
-const SIZE_OPTION_KEYS: &[&str] = &[
-    "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
-    "centers",
-    "knots",
-];
+const SIZE_OPTION_KEYS: &[&str] = &["k", "centers", "knots"];
 const STRUCTURAL_OPTION_KEYS: &[&str] = &[
     "periodic", "cyclic", "bc", "period", "periods", "origin", "origins",
 ];
@@ -402,7 +395,7 @@ fn topology_term(
             penalty_order,
             double_penalty,
         } => {
-            let mut options: Vec<String> = vec!["type=cyclic".to_string()];
+            let mut options: Vec<String> = vec!["bs=cyclic".to_string()];
             if !has_size {
                 options.push(format!("k={n_knots}"));
             }
@@ -426,7 +419,7 @@ fn topology_term(
             radians,
             double_penalty,
         } => {
-            let mut options: Vec<String> = vec!["type=sphere".to_string()];
+            let mut options: Vec<String> = vec!["bs=sphere".to_string()];
             if !has_size {
                 options.push(format!("centers={n_centers}"));
             }
@@ -434,7 +427,7 @@ fn topology_term(
                 options.push(format!("penalty_order={penalty_order}"));
             }
             if kernel != "sobolev" {
-                options.push(format!("kernel={}", python_quote(kernel)));
+                options.push(format!("method={}", python_quote(kernel)));
             }
             if *radians {
                 options.push("radians=true".to_string());
@@ -494,7 +487,7 @@ fn topology_term(
             }
             let order = duchon_formula_order(*m);
             let mut options: Vec<String> =
-                vec!["type=duchon".to_string(), format!("order={order}")];
+                vec!["bs=duchon".to_string(), format!("order={order}")];
             if !has_size {
                 if let Some(c) = centers_int {
                     options.push(format!("centers={c}"));
@@ -608,7 +601,7 @@ mod tests {
         let out = assemble_candidate_formula("y ~ s(t, type=AUTO)", &candidate, true)
             .unwrap()
             .unwrap();
-        assert_eq!(out, "y ~ s(t, type=cyclic, k=20)");
+        assert_eq!(out, "y ~ s(t, bs=cyclic, k=20)");
     }
 
     #[test]
@@ -623,7 +616,7 @@ mod tests {
         let out = assemble_candidate_formula("y ~ s(lat, lon, type=AUTO)", &candidate, true)
             .unwrap()
             .unwrap();
-        assert_eq!(out, "y ~ s(lat, lon, type=sphere, centers=64)");
+        assert_eq!(out, "y ~ s(lat, lon, bs=sphere, centers=64)");
     }
 
     #[test]

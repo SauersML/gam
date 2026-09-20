@@ -101,10 +101,9 @@ pub struct StructuredResidualPassDiagnostic {
     pub pass: usize,
     pub gamma: f64,
     pub factor_rank: usize,
-    /// The structured residual model's rank-ladder score, `−BIC/2`
-    /// (`StructuredResidualModel::bic_penalized_log_likelihood`). Not a marginal
-    /// likelihood.
-    pub bic_penalized_log_likelihood: f64,
+    /// Laplace log marginal likelihood of the selected factor rank
+    /// (`StructuredResidualModel::log_evidence`), in raw residual units.
+    pub log_evidence: f64,
     pub factor_energy: f64,
     pub diagonal_mean: f64,
     pub dispersion_before: f64,
@@ -180,21 +179,19 @@ fn sae_structured_residual_model(
     // the fit tail's own assignment read).
     let assignments = term.assignment.assignments();
     let activity: ndarray::Array1<f64> = (0..n).map(|r| assignments.row(r).sum()).collect();
-    // Let the BIC ladder pick the rank up to p-1 (`fit` re-caps to p-1 and
-    // scores r = 0..=cap, keeping the −BIC/2 maximizer).
-    let max_factor_rank = p.saturating_sub(1);
+    // Let the evidence pick the rank over every rank a p-channel factor model
+    // identifies (up to the Ledermann bound).
     match StructuredResidualModel::fit(ResidualFactorInput {
         residuals: residuals.view(),
         activity: activity.view(),
-        max_factor_rank,
     }) {
         Ok(m) => Ok(Some(m)),
         // Propagate a genuine fit failure instead of swallowing it (#2070/#2021).
         // The only benign "nothing to mine" case — fewer than two output channels
         // — is already handled by the early `Ok(None)` above, and the evidence
-        // ladder always scores at least rank 0, so every error reaching here is a
+        // search always scores at least rank 0, so every error reaching here is a
         // real breakdown (non-finite residuals/activity, a dimension mismatch, or
-        // an inner-alternation numerical failure). Accepting-on-any-error would
+        // a rank whose posterior mode could not be certified). Accepting-on-any-error would
         // silently degrade to prior-pass geometry and hide the failure; surface it.
         Err(e) => Err(format!(
             "sae_structured_residual_model: structured residual-covariance fit failed: {e}"
@@ -334,9 +331,11 @@ pub struct SaeInstalledInnerKktAudit {
     pub quotient_gradient_norm: f64,
     pub stationarity_bound: f64,
     pub parameter_space: SaeParameterSpaceKktAudit,
-    /// `½λ²/(|f| + 1)`, the Newton decrement on the deflated exact factor at the
-    /// installed state: the affine-invariant certificate the native inner solve
-    /// accepts on (#2263). `Err` carries the reason that factorization failed.
+    /// `½λ²/(|f| + 1)` at the installed state, the affine-invariant certificate the
+    /// native inner solve accepts on (#2263). It is read off the deflated evidence
+    /// factor, and then off the exact information wherever that classifies the state
+    /// (#2933 F08). `Err` carries the reason the factorization failed, or why the exact
+    /// information refused the state.
     pub newton_decrement_relative: Result<f64, String>,
 }
 
@@ -1491,9 +1490,6 @@ fn finalize_sae_fit_report(
     certificate_ledger.record(&TopologyPersistenceCertificate::new(
         &fit_diagnostics.topology_persistence,
     ));
-    if let Some(report) = &fit_diagnostics.incoherence_report {
-        certificate_ledger.record(report);
-    }
 
     let active_mask: Vec<bool> = (0..k_atoms)
         .map(|atom_idx| assignments.column(atom_idx).sum() > 1.0e-8)
@@ -1799,7 +1795,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitOutcom
                 pass: pass + 1,
                 gamma,
                 factor_rank: model.factor_rank(),
-                bic_penalized_log_likelihood: model.bic_penalized_log_likelihood(),
+                log_evidence: model.log_evidence(),
                 factor_energy,
                 diagonal_mean,
                 dispersion_before,

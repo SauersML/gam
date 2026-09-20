@@ -81,15 +81,11 @@ impl SurvivalRowJetCapability {
 /// Which kernel evaluates this batch, through the one row-kernel decision.
 ///
 /// The batch runs one independent row program per row with no cross-row
-/// reduction, so the row count is the work, and what the device has to
-/// overcome is probe, transfer and launch latency. That crossover is the
-/// dispatch policy's `fused_kernel_min_n`; the Pólya-Gamma batch takes the
-/// same threshold. A batch below
-/// `GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N`, which no reachable
-/// policy admits, is decided under `auto` without probing the device, so a
-/// CPU-sized fit creates no CUDA context, and neither does a model outside
-/// the row jet's declaration. The row count used to be compared against a
-/// local 100,000-row literal (#2900 row 6.11).
+/// reduction, so each executor costs a per-call overhead plus a per-row cost,
+/// and under `auto` the row jet is weighed by its own two executors timed on
+/// this shape (gam#3024). It used to borrow twice the xtwx Gram's crossover
+/// and, before that, a local 100,000-row literal (#2900 row 6.11). The shape
+/// is the row count, the four rigid primaries and the CPU worker count.
 ///
 /// Admission is a capability decision made before execution, not an
 /// operating-system guess. A large CPU-only Linux fit therefore stays on the
@@ -102,12 +98,19 @@ pub(crate) fn survival_rigid_row_vgh_decision(
     let decision = gam_gpu::decide_row_kernel(
         gam_gpu::global_policy(),
         gam_gpu::RowKernelAdmission {
-            kernel: gam_gpu::GpuKernel::SurvivalMarginalSlopeRows,
             missing_capability: SURVIVAL_ROWJET_CAPABILITY.missing_for(model),
             compiled: cfg!(target_os = "linux"),
-            rows: n_rows,
-            floor: gam_gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N,
-            threshold: |device| device.fused_kernel_min_n,
+            shape: gam_gpu::RowKernelShape {
+                kernel: gam_gpu::GpuKernel::SurvivalMarginalSlopeRows,
+                rows: n_rows,
+                widths: [
+                    crate::survival::marginal_slope::slope_geometry::STATIC_SLOPE_PRIMARIES,
+                    0,
+                    0,
+                    0,
+                ],
+                threads: rayon::current_num_threads(),
+            },
         },
         &mut gam_gpu::RuntimeDeviceProbe,
     )

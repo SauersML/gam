@@ -558,6 +558,88 @@ impl SaeManifoldTerm {
         Ok(None)
     }
 
+    /// #2933 F08 stage 1 — the acceptance of a state admitted on the majorizer Newton
+    /// decrement.
+    ///
+    /// That decrement `½λ²/scale` is read off the arrow system `B`, which majorizes the exact
+    /// information `A`, so `gᵀB⁻¹g` can sit far below `gᵀA⁻¹g`. At the #3327 reproducer the
+    /// stall certificate read `½λ²/scale` 4.8e-9 to 5.2e-9 at `‖g‖` 1.74e-2, 140× the
+    /// gradient band. The exact decrement at the same states read 1.68e-7 to 7.15e-7.
+    /// Because the refinement did not certify, those states were priced anyway. The
+    /// criterion then carried the frozen-state slope +2.75 against the analytic total
+    /// derivative −3.0e-3.
+    ///
+    /// The admitted state is first carried to its root ([`Self::refine_accepted_root`]), and
+    /// a refined root that certifies is priced. Otherwise the admitted state is priced only
+    /// if its own exact verdict admits it. That verdict ([`Self::refined_root_verdict`]) is
+    /// the certificate a refined root answers to. Above the dense admission, and in a
+    /// basin the concave clamp explains, it is `Unclassified` / `ClampBasin`, and the
+    /// majorizer gate stands.
+    ///
+    /// `None` means the exact information refused the state. The state and loss are then
+    /// the ones the acceptance admitted, and the caller does not return: it continues the
+    /// solve or refuses.
+    fn certified_decrement_acceptance(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        assembly_rho: Option<&SaeManifoldRho>,
+        rho_fixed: &mut SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        lambda_smooth: &[f64],
+        options: &ArrowSolveOptions,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+        loss: &mut SaeManifoldLoss,
+        criterion_fixed_point: &mut bool,
+        total_inner_iter: &mut usize,
+        accepted_sys: &ArrowSchurSystem,
+        accepted_cache: ArrowFactorCache,
+    ) -> Result<Option<ArrowFactorCache>, String> {
+        if let Some(refined) = self.refine_accepted_root(
+            target,
+            assembly_rho,
+            rho_fixed,
+            registry,
+            lambda_smooth,
+            options,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            loss,
+            criterion_fixed_point,
+            total_inner_iter,
+        )? {
+            return Ok(Some(refined.cache));
+        }
+        let accepted_rho: &SaeManifoldRho = match assembly_rho {
+            Some(rho) => rho,
+            None => &*rho_fixed,
+        };
+        let mut sys = accepted_sys.clone();
+        let verdict =
+            self.refined_root_verdict(target, accepted_rho, registry, &mut sys, &accepted_cache)?;
+        if verdict.admits() {
+            log::debug!(
+                "[SAE-ACCEPT] the admitted state's exact verdict admits it [{}]: {verdict}",
+                verdict.tag(),
+            );
+            return Ok(Some(accepted_cache));
+        }
+        self.evidence_root_telemetry
+            .0
+            .exact_refused_acceptances
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::debug!(
+            "[SAE-ACCEPT] the exact information refuses the majorizer-decrement acceptance [{}]: \
+             {verdict}; the solve continues",
+            verdict.tag(),
+        );
+        Ok(None)
+    }
+
     /// #2228 / #2933 F08 — whether a refined root may be priced in place of the state the
     /// acceptance admitted.
     ///
@@ -905,7 +987,6 @@ mod evidence_root_gauge_projection_2822_tests {
             top_k: None,
             threshold: 0.0,
             seed_refine_routing: minimal.refine_routing,
-            seed_refine_random_state: 0,
             fit_config: SaeFitConfig::default(),
             temperature_schedule: None,
             fisher_metric: None,

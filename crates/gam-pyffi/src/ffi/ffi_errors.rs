@@ -615,6 +615,51 @@ pub(crate) fn data_error_to_pyerr(error: gam::data::DataError) -> PyErr {
     Python::attach(|py| workflow_error_to_pyerr(py, error.into()))
 }
 
+/// A saved model this binary refuses to read raises the class of its category
+/// (`FittedModelError::error_category`), with the `variant:` / `category:`
+/// lines and attributes a fit failure carries (#2937, gam#3008). Load used to
+/// flatten the typed refusal to prose, so a payload the engine cannot read was
+/// raised as a formula error with no variant.
+pub(crate) fn saved_model_error_to_pyerr(
+    py: Python<'_>,
+    err: gam::inference::model::FittedModelError,
+) -> PyErr {
+    let variant = err.variant_name();
+    let category = err.error_category();
+    let exc = category_error(
+        category,
+        format!("{err}\nvariant: {variant}\ncategory: {}", category.label()),
+    );
+    let bound = exc.value(py);
+    // As for a fit failure: the class is the contract, the attributes are
+    // enrichment, so one that cannot be set is reported as unraisable.
+    let attach_result: PyResult<()> = (|| {
+        bound.setattr("variant", variant)?;
+        bound.setattr("category", category.label())?;
+        Ok(())
+    })();
+    if let Err(attach_err) = attach_result {
+        attach_err.write_unraisable(py, Some(&bound));
+    }
+    exc
+}
+
+/// A saved document that could not be written or read through
+/// `gam_model_api::saved_model`. A filesystem refusal raises the `OSError`
+/// subclass its kind names (`FileNotFoundError`, `PermissionError`, ...), with
+/// the path in its message; a document the engine refuses is a `DataError`, the
+/// category of a payload (gam#3008, gam#3054).
+pub(crate) fn saved_document_error_to_pyerr(
+    error: gam_model_api::saved_model::SavedModelError,
+) -> PyErr {
+    match error {
+        gam_model_api::saved_model::SavedModelError::Io { path, source } => {
+            PyErr::from(std::io::Error::new(source.kind(), format!("{path}: {source}")))
+        }
+        refused => DataError::new_err(refused.to_string()),
+    }
+}
+
 /// A Rust panic caught at the boundary is an engine defect whatever the input,
 /// so it reaches Python as `InternalError`, never as an abort.
 fn py_panic_error(context: &'static str, payload: Box<dyn std::any::Any + Send>) -> PyErr {
@@ -1400,6 +1445,54 @@ mod fit_failure_dispatch_tests {
                 .cast::<pyo3::types::PyDict>()
                 .expect("fields is a dict");
             assert!(trial_fields.is_empty(), "only the fit-ending variant exposes evidence");
+        });
+    }
+}
+
+#[cfg(test)]
+mod saved_model_error_dispatch_tests {
+    use super::*;
+
+    /// gam#3008: a payload load refuses raises the class of its category, a
+    /// `DataError`, naming its variant and category in the message and as
+    /// attributes, not an untyped refusal that cannot be told from any other.
+    #[test]
+    fn a_refused_saved_model_raises_its_category_with_its_variant_3008() {
+        Python::attach(|py| {
+            let refused = crate::load_model_impl(b"{\"not\": \"a saved model\"}")
+                .err()
+                .expect("bytes that are not a saved model must be refused");
+            let err = saved_model_error_to_pyerr(py, refused);
+            assert!(err.is_instance_of::<DataError>(py));
+            assert!(err.is_instance_of::<GamfitError>(py));
+            assert!(
+                !err.is_instance_of::<FormulaError>(py),
+                "a payload refusal is not a request error"
+            );
+            let value = err.value(py);
+            let variant: String =
+                value.getattr("variant").and_then(|v| v.extract()).expect("variant");
+            let category: String =
+                value.getattr("category").and_then(|v| v.extract()).expect("category");
+            assert_eq!(variant, "FittedModelError::PayloadCorrupt");
+            assert_eq!(category, "data");
+            let message = value.str().expect("message").to_string();
+            assert!(
+                message.contains("failed to parse model json")
+                    && message.contains("variant: FittedModelError::PayloadCorrupt")
+                    && message.contains("category: data"),
+                "the message must carry the refusal, its variant and its category: {message}"
+            );
+
+            let mismatch = saved_model_error_to_pyerr(
+                py,
+                gam::inference::model::FittedModelError::SchemaMismatch {
+                    reason: "fixture: saved covariance has the wrong shape".to_string(),
+                },
+            );
+            let variant: String =
+                mismatch.value(py).getattr("variant").and_then(|v| v.extract()).expect("variant");
+            assert_eq!(variant, "FittedModelError::SchemaMismatch");
         });
     }
 }

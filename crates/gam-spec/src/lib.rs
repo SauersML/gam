@@ -173,36 +173,63 @@ impl LinkFunction {
         }
     }
 
-    /// Accepted spellings beyond the canonical [`Self::name`], normalized
-    /// (lower-case, `_` read as `-`). These are the names other GAM/GLM
-    /// packages use for the same link (R's `1/mu^2`, pyGAM's `inv_squared`),
-    /// and the binomial links' family-qualified names (`binomial-probit`), so a
+    /// Link spellings that are not accepted, each with the one canonical
+    /// [`Self::name`] that means the same link (SPEC R25: one spelling per
+    /// behavior). [`UnknownLinkName`] names the canonical spelling when a
+    /// caller writes one of these.
+    const REMOVED_SPELLINGS: [(&'static str, Self); 5] = [
+        ("1/mu", Self::Inverse),
+        ("1/mu^2", Self::InverseSquared),
+        ("inv-squared", Self::InverseSquared),
+        ("inv_squared", Self::InverseSquared),
+        ("betalogistic", Self::BetaLogistic),
+    ];
+
+    /// The binomial links' family-qualified names (`binomial-probit`), so a
     /// `--family` value is also a valid `--link` / `link(type=...)` / `link=`.
-    const fn aliases(self) -> &'static [&'static str] {
+    const fn family_qualified_name(self) -> Option<&'static str> {
         match self {
-            Self::Logit => &["binomial-logit"],
-            Self::Probit => &["binomial-probit"],
-            Self::CLogLog => &["binomial-cloglog"],
-            Self::Inverse => &["1/mu"],
-            Self::InverseSquared => &["inv-squared", "1/mu^2"],
-            Self::BetaLogistic => &["betalogistic"],
+            Self::Logit => Some("binomial-logit"),
+            Self::Probit => Some("binomial-probit"),
+            Self::CLogLog => Some("binomial-cloglog"),
             Self::LogLog
             | Self::Cauchit
             | Self::Sas
+            | Self::BetaLogistic
             | Self::Identity
             | Self::Log
-            | Self::Sqrt => &[],
+            | Self::Sqrt
+            | Self::Inverse
+            | Self::InverseSquared => None,
         }
     }
 
-    /// Parse a link name. Case-insensitive; `_` and `-` are interchangeable.
-    /// Returns `None` for an unknown name; callers report it through
-    /// [`UnknownLinkName`], whose message lists [`Self::ALL`].
+    /// Parse a link name: one of the canonical [`Self::name`]s (or a binomial
+    /// link's family-qualified name), compared case-insensitively. Returns
+    /// `None` for any other spelling; callers report it through
+    /// [`UnknownLinkName`], whose message lists [`Self::ALL`] and names the
+    /// canonical spelling of a removed one.
     pub fn from_name(raw: &str) -> Option<Self> {
-        let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
+        let normalized = raw.trim().to_ascii_lowercase();
         Self::ALL.into_iter().find(|link| {
-            link.name() == normalized || link.aliases().iter().any(|alias| *alias == normalized)
+            link.name() == normalized || link.family_qualified_name() == Some(normalized.as_str())
         })
+    }
+
+    /// The canonical link a refused spelling stands for: a removed alias, or
+    /// an underscore spelling of a hyphenated name (`inverse_squared`).
+    pub fn canonical_for_unknown(raw: &str) -> Option<Self> {
+        let normalized = raw.trim().to_ascii_lowercase();
+        Self::REMOVED_SPELLINGS
+            .into_iter()
+            .find(|(removed, _)| *removed == normalized)
+            .map(|(_, link)| link)
+            .or_else(|| {
+                normalized
+                    .contains('_')
+                    .then(|| Self::from_name(&normalized.replace('_', "-")))
+                    .flatten()
+            })
     }
 
     /// `a|b|c` listing of the given links' canonical names.
@@ -222,12 +249,20 @@ pub struct UnknownLinkName(pub String);
 
 impl std::fmt::Display for UnknownLinkName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "unsupported link type '{}'; use one of {}",
-            self.0,
-            LinkFunction::join_names(&LinkFunction::ALL)
-        )
+        match LinkFunction::canonical_for_unknown(&self.0) {
+            Some(canonical) => write!(
+                f,
+                "unknown link `{}`; use `{}`",
+                self.0.trim(),
+                canonical.name()
+            ),
+            None => write!(
+                f,
+                "unsupported link type '{}'; use one of {}",
+                self.0,
+                LinkFunction::join_names(&LinkFunction::ALL)
+            ),
+        }
     }
 }
 
@@ -844,45 +879,6 @@ impl ResponseFamily {
             | Self::NegativeBinomial { .. }
             | Self::Gamma
             | Self::InverseGaussian => None,
-        }
-    }
-
-    /// Closed numeric bounds of the **response support** — the closure of the
-    /// set of values a single observation `Y` can take — used to clamp the
-    /// *observation (prediction) interval* so a predictive band never reports
-    /// values the response can never attain.
-    ///
-    /// This is deliberately distinct from [`Self::mean_clamp_bounds`], which
-    /// governs the *mean* (confidence) interval. `mean_clamp_bounds` returns
-    /// `None` for the non-negative-real families (Poisson / Tweedie /
-    /// NegativeBinomial / Gamma) because their default mean interval is built
-    /// by transforming the η endpoints through a positive inverse link, which
-    /// cannot escape the support. The observation interval, by contrast, is the
-    /// symmetric response-scale band `μ ± z·σ_pred`; for a small fitted mean its
-    /// lower endpoint crosses below the support floor (e.g. a Poisson count band
-    /// going negative), so it must be floored at the response support here.
-    ///
-    /// The lower edge is the infimum of the support (`0` for every non-negative
-    /// family, including the open-at-zero Gamma, whose predictive lower bound is
-    /// reported at the boundary `0`). The upper edge is `+∞` where the response
-    /// is unbounded above, which leaves the upper band untouched, or `1` for the
-    /// `[0, 1]`-valued families. `None` means the response is supported on the
-    /// whole real line (Gaussian) or has its support enforced downstream
-    /// (Royston–Parmar), and the predictive band is passed through unclamped.
-    ///
-    /// The match arms mirror `Self::response_support_contains`: a new family
-    /// must update both together so the support a value is validated against and
-    /// the support a predictive band is clamped to stay consistent.
-    #[inline]
-    pub fn response_support_bounds(&self) -> Option<(f64, f64)> {
-        match self {
-            Self::Gamma
-            | Self::InverseGaussian
-            | Self::Poisson
-            | Self::NegativeBinomial { .. }
-            | Self::Tweedie { .. } => Some((0.0, f64::INFINITY)),
-            Self::Beta { .. } | Self::Binomial => Some((0.0, 1.0)),
-            Self::Gaussian | Self::StudentT { .. } | Self::RoystonParmar => None,
         }
     }
 
@@ -4368,7 +4364,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ResponseFamily::mean_clamp_bounds / response_support_bounds
+    // ResponseFamily::mean_clamp_bounds
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4397,27 +4393,6 @@ mod tests {
     #[test]
     fn mean_clamp_bounds_poisson_none() {
         assert_eq!(ResponseFamily::Poisson.mean_clamp_bounds(), None);
-    }
-
-    #[test]
-    fn response_support_bounds_gamma_nonneg_to_inf() {
-        assert_eq!(
-            ResponseFamily::Gamma.response_support_bounds(),
-            Some((0.0, f64::INFINITY))
-        );
-    }
-
-    #[test]
-    fn response_support_bounds_binomial_unit_interval() {
-        assert_eq!(
-            ResponseFamily::Binomial.response_support_bounds(),
-            Some((0.0, 1.0))
-        );
-    }
-
-    #[test]
-    fn response_support_bounds_gaussian_none() {
-        assert_eq!(ResponseFamily::Gaussian.response_support_bounds(), None);
     }
 
     // -----------------------------------------------------------------------
@@ -4595,22 +4570,41 @@ mod tests {
         for link in LinkFunction::ALL {
             assert_eq!(LinkFunction::from_name(link.name()), Some(link));
             assert_eq!(
-                LinkFunction::from_name(&link.name().to_ascii_uppercase().replace('-', "_")),
+                LinkFunction::from_name(&link.name().to_ascii_uppercase()),
                 Some(link),
-                "case and `_`/`-` spelling must not matter for {}",
+                "case must not matter for {}",
                 link.name()
             );
         }
-        // Other packages' spellings of the reciprocal links.
-        assert_eq!(LinkFunction::from_name("inv_squared"), Some(LinkFunction::InverseSquared));
-        assert_eq!(LinkFunction::from_name("1/mu^2"), Some(LinkFunction::InverseSquared));
-        assert_eq!(LinkFunction::from_name("1/mu"), Some(LinkFunction::Inverse));
         // The binomial family names name their link too.
         assert_eq!(LinkFunction::from_name("binomial-logit"), Some(LinkFunction::Logit));
-        assert_eq!(LinkFunction::from_name("binomial_probit"), Some(LinkFunction::Probit));
         assert_eq!(LinkFunction::from_name("Binomial-CLogLog"), Some(LinkFunction::CLogLog));
+        assert_eq!(LinkFunction::from_name("binomial_probit"), None);
         assert_eq!(LinkFunction::from_name("sqrt"), Some(LinkFunction::Sqrt));
         assert_eq!(LinkFunction::from_name("cube-root"), None);
+    }
+
+    /// SPEC R25: each link has one spelling. The other spellings are refused,
+    /// and the error names the canonical one.
+    #[test]
+    fn removed_link_spellings_are_refused_and_name_the_canonical_one() {
+        for (raw, canonical) in [
+            ("1/mu", "inverse"),
+            ("1/mu^2", "inverse-squared"),
+            ("inv_squared", "inverse-squared"),
+            ("inv-squared", "inverse-squared"),
+            ("betalogistic", "beta-logistic"),
+            ("inverse_squared", "inverse-squared"),
+            ("Beta_Logistic", "beta-logistic"),
+        ] {
+            assert_eq!(LinkFunction::from_name(raw), None, "{raw} must be refused");
+            let message = UnknownLinkName(raw.to_string()).to_string();
+            assert_eq!(
+                message,
+                format!("unknown link `{raw}`; use `{canonical}`"),
+                "{raw}"
+            );
+        }
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //!
 //! Realistic use-case: a geostatistical regression of event magnitude on a
 //! smooth spatial surface plus a smooth depth effect,
-//!   `mag ~ s(long, lat, bs="tp") + s(depth)` (Gaussian / identity link).
+//!   `mag ~ s(long, lat, bs="tps") + s(depth)` (Gaussian / identity link).
 //!
 //! There is no known ground-truth surface (real data), so objective quality is
 //! out-of-sample predictive accuracy.
@@ -106,7 +106,7 @@ fn gam_spatial_smooth_predicts_quakes_better_than_baseline() {
         let mut train_ds = ds.clone();
         train_ds.values = train_values;
 
-        let result = fit_from_formula("mag ~ s(long, lat, bs=\"tp\") + s(depth)", &train_ds, &cfg)
+        let result = fit_from_formula("mag ~ s(long, lat, bs=\"tps\") + s(depth)", &train_ds, &cfg)
             .expect("gam fit");
         let FitResult::Standard(fit) = result else {
             panic!("expected a standard GAM fit for a gaussian spatial smooth");
@@ -229,7 +229,7 @@ fn gam_spatial_smooth_predicts_quakes_better_than_baseline() {
 /// Real-data arm: ISOLATE the 2-D spatial truth recovery. Where the arm above
 /// fits the full geostatistical model `s(long,lat) + s(depth)`, this arm drops
 /// the depth term and fits the PURE isotropic thin-plate surface
-/// `mag ~ s(long, lat, bs="tp")` — so the held-out predictive accuracy is
+/// `mag ~ s(long, lat, bs="tps")` — so the held-out predictive accuracy is
 /// attributable to the spatial smoother alone (the assigned "2-D spatial truth
 /// recovery" primary). It uses an INDEPENDENT deterministic split (every 6th
 /// row held out) so the two arms exercise distinct train/test partitions.
@@ -295,7 +295,7 @@ fn gam_spatial_smooth_predicts_quakes_better_than_baseline_on_real_data() {
     let mut train_ds = ds.clone();
     train_ds.values = train_values;
 
-    // ---- fit gam on TRAIN: mag ~ s(long, lat, bs="tp"), REML ---------------
+    // ---- fit gam on TRAIN: mag ~ s(long, lat, bs="tps"), REML ---------------
     // The pure two-variable spatial smooth routes through the isotropic
     // thin-plate radial kernel — mgcv's spatial smoother, with no other terms.
     let cfg = FitConfig {
@@ -303,7 +303,7 @@ fn gam_spatial_smooth_predicts_quakes_better_than_baseline_on_real_data() {
         ..FitConfig::default()
     };
     let result =
-        fit_from_formula("mag ~ s(long, lat, bs=\"tp\")", &train_ds, &cfg).expect("gam fit");
+        fit_from_formula("mag ~ s(long, lat, bs=\"tps\")", &train_ds, &cfg).expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian spatial smooth");
     };
@@ -392,7 +392,7 @@ fn gam_spatial_smooth_predicts_quakes_better_than_baseline_on_real_data() {
 }
 
 // ============================ #1074 DIAGNOSTIC ============================
-// TEMPORARY: localize the quakes s(long,lat,bs=tp) EDF inflation (edf~104 vs
+// TEMPORARY: localize the quakes s(long,lat,bs=tps) EDF inflation (edf~104 vs
 // mgcv ~15, held-out R^2~0.02). R-free. Dumps per-term log_lambdas, edf_by_block,
 // beta length, and held-out R^2.
 #[test]
@@ -429,11 +429,11 @@ fn diag_quakes_spatial_1074() {
     };
 
     for formula in [
-        "mag ~ s(long, lat, bs=\"tp\") + s(depth)",
-        "mag ~ s(long, lat, bs=\"tp\", double_penalty=FALSE) + s(depth)",
-        "mag ~ s(long, lat, bs=\"tp\")",
+        "mag ~ s(long, lat, bs=\"tps\") + s(depth)",
+        "mag ~ s(long, lat, bs=\"tps\", double_penalty=FALSE) + s(depth)",
+        "mag ~ s(long, lat, bs=\"tps\")",
         "mag ~ s(depth)",
-        "mag ~ s(long, lat, bs=\"tp\", k=60) + s(depth)",
+        "mag ~ s(long, lat, bs=\"tps\", k=60) + s(depth)",
     ] {
         let result = fit_from_formula(formula, &train_ds, &cfg).unwrap();
         let FitResult::Standard(fit) = result else {

@@ -2073,23 +2073,6 @@ fn validate_aux_conditional_prior_lambda(
             "AuxConditionalPriorPenalty.lambda_per_row must be finite",
         ));
     }
-
-    let mut max_asym = 0.0_f64;
-    for obs in 0..n_obs {
-        for row in 0..rows {
-            for col in 0..cols {
-                let asym = (view[IxDyn(&[obs, row, col])] - view[IxDyn(&[obs, col, row])]).abs();
-                if asym > max_asym {
-                    max_asym = asym;
-                }
-            }
-        }
-    }
-    if max_asym >= 1.0e-10 {
-        return Err(PyValueError::new_err(format!(
-            "AuxConditionalPriorPenalty.lambda_per_row matrices must be symmetric within 1e-10; max asymmetry is {max_asym:.3e}"
-        )));
-    }
     Ok(())
 }
 
@@ -4620,6 +4603,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_kind, module)?)?;
+    module.add_function(wrap_pyfunction!(write_saved_model_file, module)?)?;
     module.add_function(wrap_pyfunction!(is_multinomial_family_name, module)?)?;
     module.add("RESPONSE_GEOMETRY_SCHEMA", RESPONSE_GEOMETRY_SCHEMA)?;
     module.add_function(wrap_pyfunction!(saved_model_class_traits, module)?)?;
@@ -6730,7 +6714,7 @@ fn fit_dataset_impl(
     // `warm_start_from` (gam#3002): the saved model's certified outer point,
     // resolved against exactly the data and request this fit runs on.
     if let Some(model_bytes) = warm_start_model {
-        let prior = load_model_impl(model_bytes)?;
+        let prior = load_model_impl(model_bytes).map_err(String::from)?;
         fit_config.warm_start = Some(gam::families::fit_orchestration::resolve_warm_start(
             prior.payload(),
             &formula,
@@ -6756,9 +6740,17 @@ fn fit_dataset_impl(
     })
 }
 
-fn load_model_impl(model_bytes: &[u8]) -> Result<FittedModel, String> {
-    let model: FittedModel = serde_json::from_slice(model_bytes)
-        .map_err(|err| format!("failed to parse model json: {err}"))?;
+/// A saved model's bytes, parsed and validated, or the typed refusal that says
+/// why they are not a model this binary can read (gam#3008). Callers raise it
+/// through `saved_model_error_to_pyerr`, as the class of its category.
+fn load_model_impl(
+    model_bytes: &[u8],
+) -> Result<FittedModel, gam::inference::model::FittedModelError> {
+    let model: FittedModel = serde_json::from_slice(model_bytes).map_err(|err| {
+        gam::inference::model::FittedModelError::PayloadCorrupt {
+            reason: format!("failed to parse model json: {err}"),
+        }
+    })?;
     model.validate_for_persistence()?;
     model.validate_numeric_finiteness()?;
     Ok(model)

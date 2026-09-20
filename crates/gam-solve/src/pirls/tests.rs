@@ -2835,6 +2835,66 @@ mod tests {
         assert!(err.is_trial_point_infeasible());
     }
 
+    /// The cold-start working weight is the Fisher weight at the weighted mean:
+    /// for the inverse-Gaussian inverse-squared link `W = w·ȳ³/(4φ)` on every
+    /// row, whatever the other design columns hold. Rescaling `y → c·y` with the
+    /// dispersion `φ → φ/c` scales it by `c⁴`, exactly as the fitted working
+    /// weight does, which is the unit covariance the analytic `initial.sp` seed
+    /// and the ρ-domain Gram rely on. The weight needs no solve, so it exists at
+    /// responses where the inner solve at the seed point refuses (the fuzzer's
+    /// inverse-Gaussian n = 50 cells lost their seed to such a refusal).
+    #[test]
+    pub(crate) fn start_working_weights_follow_response_units() {
+        let t = array![-1.0, -0.4, 0.1, 0.5, 0.9, 1.3];
+        let mut x = Array2::<f64>::ones((t.len(), 2));
+        x.column_mut(1).assign(&t);
+        let design = DesignMatrix::from(x);
+        let y = array![0.6, 1.4, 0.9, 2.2, 1.1, 3.0];
+        let w = array![1.0, 2.0, 0.5, 1.5, 1.0, 3.0];
+        let offset = Array1::zeros(y.len());
+        let config_at = |phi: f64| {
+            let link = InverseLink::Standard(StandardLink::InverseSquared);
+            PirlsConfig {
+                likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                    ResponseFamily::InverseGaussian,
+                    link.clone(),
+                ))
+                .with_dispersion_phi_frozen_for_search(phi),
+                link_kind: link,
+                max_iterations: 100,
+                convergence_tolerance: 1e-8,
+                firth_bias_reduction: false,
+                initial_lm_lambda: None,
+            }
+        };
+        let phi = 0.7;
+        let weights = super::start_working_weights(
+            &design,
+            y.view(),
+            w.view(),
+            offset.view(),
+            &config_at(phi),
+        )
+        .expect("start weights at a positive response");
+        let ybar = y.dot(&w) / w.sum();
+        for (&wi, &wt) in w.iter().zip(weights.iter()) {
+            assert_relative_eq!(wt, wi * ybar.powi(3) / (4.0 * phi), max_relative = 1e-12);
+        }
+
+        let c = 3.0;
+        let scaled = super::start_working_weights(
+            &design,
+            (&y * c).view(),
+            w.view(),
+            offset.view(),
+            &config_at(phi / c),
+        )
+        .expect("start weights at a rescaled response");
+        for (&wt, &ws) in weights.iter().zip(scaled.iter()) {
+            assert_relative_eq!(ws, c.powi(4) * wt, max_relative = 1e-12);
+        }
+    }
+
     #[test]
     pub(crate) fn poisson_cache_rehydration_preserves_log_derivatives() {
         let x = array![[1.0], [1.0], [1.0], [1.0]];
@@ -3643,23 +3703,102 @@ mod root_cause_tests {
         }
     }
 
-    /// Hypothesis 1: `projected_gradient_norm` uses `bound_tol = 1e-10` which
-    /// is too tight.  A coefficient at 1e-6 above its lower bound with a
-    /// positive gradient (KKT multiplier) should be recognized as "at the
-    /// bound" and excluded from the projected gradient.
+    /// A coordinate is at its lower bound exactly when the bound's unit row is
+    /// active by the inequality system's one activity rule, at the solver's
+    /// published feasibility resolution (#3180). Then a positive gradient is a
+    /// KKT multiplier and drops out. A coordinate 1e-6 above its bound is 100
+    /// times outside that resolution: it is interior, a step of 1e-6 toward the
+    /// bound still lowers the objective by about `0.5 · 1e-6`, and its gradient
+    /// is a stationarity defect. The band this used to pass under
+    /// (`1e-6·max(|β|, |lb|, 1) + 1e-10`) called that point stationary.
     #[test]
     pub(crate) fn projected_gradient_excludes_near_bound_kkt_forces() {
         let gradient = array![0.5, 1e-4];
-        let beta = array![1e-6, 2.0];
         let lower_bounds = array![0.0, f64::NEG_INFINITY];
+        for at_bound in [0.0, 0.5 * gam_problem::PRIMAL_FEASIBILITY_TOL] {
+            let beta = array![at_bound, 2.0];
+            let norm = projected_gradient_norm(&gradient, &beta, Some(&lower_bounds));
+            assert_eq!(
+                norm, 1e-4,
+                "the multiplier of a bound at slack {at_bound:e} must drop out"
+            );
+        }
+        let beta = array![1e-6, 2.0];
         let norm = projected_gradient_norm(&gradient, &beta, Some(&lower_bounds));
-        // Correct: only beta[1]'s gradient counts -> norm ~ 1e-4.
-        // BUG: bound_tol=1e-10 misses beta[0] at 1e-6 -> norm ~ 0.5.
-        assert!(
-            norm < 0.01,
-            "projected gradient should exclude near-bound KKT force (beta=1e-6, lb=0), got {:.6e}",
-            norm
+        assert_eq!(
+            norm,
+            (0.5_f64 * 0.5 + 1e-4 * 1e-4).sqrt(),
+            "an interior coordinate's gradient is a stationarity defect"
         );
+    }
+
+    /// The issue's repro (#3180): `f(β) = ½(β − c)²`, `lb = 0`, `c = −3e-7`, at
+    /// `β = 5e-7`. The constrained minimizer is `β* = 0`, so this point is not
+    /// stationary, and `g = β − c = 8e-7` is the defect the norm must report.
+    #[test]
+    pub(crate) fn projected_gradient_reports_an_interior_point_short_of_its_bound_3180() {
+        let c = -3e-7;
+        let beta = array![5e-7];
+        let gradient = array![beta[0] - c];
+        let norm = projected_gradient_norm(&gradient, &beta, Some(&array![0.0]));
+        assert_eq!(norm, gradient[0]);
+        assert!(norm > 0.0);
+    }
+
+    /// One activity rule (#3180): on every instance, the bounds the P-IRLS box
+    /// path treats as binding are exactly the rows `active_face` marks active on
+    /// the same bounds written as unit rows, among those the gradient presses
+    /// into. Slacks straddle the feasibility resolution from both sides.
+    #[test]
+    pub(crate) fn box_bounds_bind_exactly_where_the_active_face_is_active_3180() {
+        let tol = gam_problem::PRIMAL_FEASIBILITY_TOL;
+        let slacks = [
+            0.0,
+            0.25 * tol,
+            tol,
+            1.5 * tol,
+            1e-7,
+            5e-7,
+            1e-6,
+            0.3,
+            -0.5 * tol,
+        ];
+        let bounds = [0.0, -2.0, 1.0, 1e3];
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _instance in 0..64 {
+            let p = 7;
+            let mut beta = Array1::<f64>::zeros(p);
+            let mut lower_bounds = Array1::<f64>::zeros(p);
+            let mut gradient = Array1::<f64>::zeros(p);
+            for i in 0..p {
+                let lb = bounds[(next() % bounds.len() as u64) as usize];
+                lower_bounds[i] = lb;
+                beta[i] = lb + slacks[(next() % slacks.len() as u64) as usize];
+                gradient[i] = ((next() % 2001) as f64 - 1000.0) / 250.0;
+            }
+            let constraints = LinearInequalityConstraints {
+                a: Array2::<f64>::eye(p),
+                b: lower_bounds.clone(),
+            };
+            let face = crate::active_set::active_face(&beta, &constraints)
+                .expect("unit rows match the coefficient width");
+            let expected = (0..p)
+                .filter(|&i| !(face.active_idx.contains(&i) && gradient[i] > 0.0))
+                .map(|i| gradient[i] * gradient[i])
+                .sum::<f64>()
+                .sqrt();
+            let norm = projected_gradient_norm(&gradient, &beta, Some(&lower_bounds));
+            assert_eq!(
+                norm, expected,
+                "beta={beta:?} lb={lower_bounds:?} g={gradient:?}"
+            );
+        }
     }
 
     /// Hypothesis 2: with loosened active_tol, the solver identifies near-bound

@@ -591,8 +591,9 @@ class Model:
 
         Gaussian: ``sigma_hat^2 = RSS_w / (n - edf_total)`` (mgcv's
         ``gam.scale``); Gamma: ``1 / shape``; fixed-scale families (Poisson,
-        binomial): ``1``. ``None`` only for a custom family that declares no
-        dispersion.
+        binomial): ``1``. ``None`` exactly when the family's scale contract
+        has no scalar dispersion: a custom family that declares none, or
+        Royston-Parmar survival.
         """
         return self.summary().scale
 
@@ -1279,8 +1280,12 @@ class Model:
         return pd.DataFrame(rows_out)
 
     def save(self, path: str | Path) -> None:
-        """Serialise the fitted model to ``path``."""
-        Path(path).write_bytes(self._model_bytes)
+        """Serialise the fitted model to ``path``.
+
+        The save is atomic: a failed save leaves the file at ``path`` as it
+        was. On Unix it is durable before it returns.
+        """
+        rust_module().write_saved_model_file(path, self._model_bytes)
 
     def extend_with_group(
         self,
@@ -1721,10 +1726,11 @@ class MultinomialModel:
     def save(self, path: str | Path) -> None:
         """Serialise the fitted multinomial model to ``path``.
 
-        Mirrors :meth:`Model.save`; the resulting file round-trips through
-        :func:`gamfit.load`, which reconstructs a :class:`MultinomialModel`.
+        Mirrors :meth:`Model.save`, atomic and durable alike; the resulting
+        file round-trips through :func:`gamfit.load`, which reconstructs a
+        :class:`MultinomialModel`.
         """
-        Path(path).write_bytes(self._model_bytes)
+        rust_module().write_saved_model_file(path, self._model_bytes)
 
     def dumps(self) -> bytes:
         """Return the serialised multinomial model as raw bytes."""
