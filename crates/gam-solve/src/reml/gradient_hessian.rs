@@ -3143,7 +3143,12 @@ impl<'a> RemlState<'a> {
     /// saturation handling).
     ///
     /// For non-canonical Bernoulli links (Probit, CLogLog, SAS,
-    /// BetaLogistic, Mixture) we use the analytic
+    /// BetaLogistic, Mixture) eᵢ is the third η-derivative of the row's
+    /// observed information from `pirls::bernoulli_observed_information_jet`,
+    /// linear in the derivatives of log μ and log(1−μ), so no division by
+    /// V = μ(1−μ) occurs where μ' and 1−μ underflow together (#3317).
+    ///
+    /// Every other exact-curvature family uses the analytic
     /// `pirls::e_obs_from_jets` formula. It expresses
     ///   ∂³W_obs/∂η³ = W_F''' + h₃ T₁ + 3 h₂ T₂ + 3 h₁ T₃ − (y−μ) T₄
     /// where T = h₁/(φV), T_k = ∂^k T/∂η^k, and W_F = h₁ T. Everything
@@ -3239,53 +3244,65 @@ impl<'a> RemlState<'a> {
             .into_par_iter()
             .map(|i| -> Result<f64, EstimationError> {
                 let eta_raw = final_eta[i];
-                let h1 = dmu_deta[i];
-                let h2 = d2mu_deta2[i];
-                let h3 = d3mu_deta3[i];
-                let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-                    inverse_link_ref,
-                    eta_raw,
-                )?;
-                let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
-                    inverse_link_ref,
-                    eta_raw,
-                )?;
-                if !h1.is_finite()
-                    || !h2.is_finite()
-                    || !h3.is_finite()
-                    || !h4.is_finite()
-                    || !h5.is_finite()
-                {
-                    return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                        row: i,
-                        quantity: "observed Hessian inverse-link five-jet",
-                        eta: eta_raw,
-                        value: h5,
-                    });
-                }
-                let mu_i = mu[i];
-                // #2273 — the complement comes from the LINK, not from `1.0 -
-                // mu`: a saturated cloglog/probit row has `mu == 1.0` exactly,
-                // and `V = mu*(1-mu)` would be a hard zero the whole
-                // observed-information jet then divides by.
-                let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
-                    inverse_link_ref,
-                    eta_raw,
-                    mu_i,
-                );
-                let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i, one_minus_mu);
-                if !(vj.v.is_finite() && vj.v > 0.0) {
-                    return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                        row: i,
-                        quantity: "observed Hessian variance",
-                        eta: eta_raw,
-                        value: vj.v,
-                    });
-                }
-                let pw = weights[i];
-                let y_i = y_view[i];
-                let resid_i = pirls::bernoulli_pair_residual(weight_family, y_i, mu_i, one_minus_mu);
-                let e_i = pirls::e_obs_from_jets(resid_i, h1, h2, h3, h4, h5, vj, phi, pw);
+                let e_i = if matches!(weight_family, pirls::WeightFamily::Binomial) {
+                    // #3317 — a Bernoulli row's jet is linear in the two sides'
+                    // log-probability jets, which never divide by μ(1−μ).
+                    pirls::bernoulli_observed_information_jet(
+                        inverse_link_ref,
+                        eta_raw,
+                        y_view[i],
+                        phi,
+                        weights[i],
+                    )?[3]
+                } else {
+                    let h1 = dmu_deta[i];
+                    let h2 = d2mu_deta2[i];
+                    let h3 = d3mu_deta3[i];
+                    let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+                        inverse_link_ref,
+                        eta_raw,
+                    )?;
+                    let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
+                        inverse_link_ref,
+                        eta_raw,
+                    )?;
+                    if !h1.is_finite()
+                        || !h2.is_finite()
+                        || !h3.is_finite()
+                        || !h4.is_finite()
+                        || !h5.is_finite()
+                    {
+                        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                            row: i,
+                            quantity: "observed Hessian inverse-link five-jet",
+                            eta: eta_raw,
+                            value: h5,
+                        });
+                    }
+                    let mu_i = mu[i];
+                    // #2273 — the complement comes from the LINK, not from `1.0 -
+                    // mu`: a saturated cloglog/probit row has `mu == 1.0` exactly,
+                    // and `V = mu*(1-mu)` would be a hard zero the whole
+                    // observed-information jet then divides by.
+                    let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
+                        inverse_link_ref,
+                        eta_raw,
+                        mu_i,
+                    );
+                    let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i, one_minus_mu);
+                    if !(vj.v.is_finite() && vj.v > 0.0) {
+                        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                            row: i,
+                            quantity: "observed Hessian variance",
+                            eta: eta_raw,
+                            value: vj.v,
+                        });
+                    }
+                    let pw = weights[i];
+                    let y_i = y_view[i];
+                    let resid_i = pirls::bernoulli_pair_residual(weight_family, y_i, mu_i, one_minus_mu);
+                    pirls::e_obs_from_jets(resid_i, h1, h2, h3, h4, h5, vj, phi, pw)
+                };
                 if e_i.is_finite() {
                     Ok(e_i)
                 } else {
@@ -4194,7 +4211,7 @@ impl<'a> RemlState<'a> {
     /// Creates a sanitized cache key from rho values.
     /// Returns None if any component is NaN, in which case caching is skipped.
     /// Maps -0.0 to 0.0 to ensure consistency in caching.
-    pub(super) fn rhokey_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
+    pub(crate) fn rhokey_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
         // A capped inner solve is a different mathematical state from an
         // uncapped solve at the same rho.  Keep both cap identities in every
         // eval, bundle, and PIRLS key so terminal cap=0 evidence can never
@@ -4207,14 +4224,18 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
     ) -> Result<EvalShared, EstimationError> {
-        self.prepare_eval_bundlewithkey_and_row_policy(rho, key, false)
+        self.prepare_eval_bundlewithkey_and_row_policy(rho, key, BundleRows::Observed)
     }
 
+    /// Build the bundle at `rho`. `rows` is the row policy the caller admits:
+    /// `SufficientStatistics` takes the coefficient-space Gaussian solve when
+    /// the surface is eligible, and the returned bundle's `rows` records what
+    /// the solve actually produced.
     fn prepare_eval_bundlewithkey_and_row_policy(
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
-        value_only_rows: bool,
+        rows: BundleRows,
     ) -> Result<EvalShared, EstimationError> {
         // #1575 observability: count every genuine (cache-missing) full-n inner
         // P-IRLS solve. Callers funnel cache hits through `obtain_eval_bundle*`,
@@ -4251,7 +4272,7 @@ impl<'a> RemlState<'a> {
                 match self.prepare_sparse_eval_bundlewithkey(
                     rho,
                     key.clone(),
-                    value_only_rows,
+                    rows,
                     decision.clone(),
                 ) {
                     Ok(bundle) => Ok(bundle),
@@ -4274,42 +4295,48 @@ impl<'a> RemlState<'a> {
                             reason: "sparse_exact_spd_assembly_failed",
                             ..decision
                         };
-                        self.prepare_dense_eval_bundlewithkey(
-                            rho,
-                            key,
-                            value_only_rows,
-                            fallback,
-                        )
+                        self.prepare_dense_eval_bundlewithkey(rho, key, rows, fallback)
                     }
                 }
             }
             RemlGeometry::DenseSpectral => {
-                self.prepare_dense_eval_bundlewithkey(rho, key, value_only_rows, decision)
+                self.prepare_dense_eval_bundlewithkey(rho, key, rows, decision)
             }
         }
     }
 
+    /// The bundle at `rho` with fitted observation rows, for consumers that
+    /// read them (post-fit inference, ext-coordinate builders, EFS).
     pub(crate) fn obtain_eval_bundle(
         &self,
         rho: &Array1<f64>,
     ) -> Result<EvalShared, EstimationError> {
         let key = self.rhokey_sanitized(rho);
-        if let Some(existing) = self.cache_manager.cached_eval_bundle(&key) {
-            return Ok(existing.clone());
+        if let Some(existing) = self
+            .cache_manager
+            .cached_eval_bundle(&key)
+            .filter(|bundle| bundle.rows == BundleRows::Observed)
+        {
+            return Ok(existing);
         }
         let bundle = self.prepare_eval_bundlewithkey(rho, key)?;
         self.cache_manager.store_eval_bundle(bundle.clone());
         Ok(bundle)
     }
 
-    /// Obtain a bundle for a scalar value callback without forcing fixed-design
-    /// Gaussian row materialization.
+    /// The bundle at `rho` for the pure-ρ outer criterion: its value, gradient
+    /// and Hessian.
     ///
-    /// A previously cached full bundle is always reusable. On a cache miss,
-    /// only the eligible Gaussian-identity surface takes the compact row policy,
-    /// and that bundle is not stored in the full-result cache. Other families
-    /// retain the ordinary path and its cache behavior.
-    pub(crate) fn obtain_value_eval_bundle(
+    /// On an eligible fixed-design Gaussian identity surface every one of those
+    /// is a function of `XᵀWX`, `XᵀW(y−offset)`, `(y−offset)ᵀW(y−offset)` and
+    /// the penalties (the dispersion is profiled from the deviance, the
+    /// log-likelihood is `−½·deviance`, and `∂H/∂ρ_k = λ_k S_k` because the
+    /// working weights do not move), so a cache miss solves in coefficient
+    /// space and an outer iteration costs no pass over the `n` rows. Any cached
+    /// bundle at `rho` serves, whichever rows it carries; one built here is
+    /// cached marked `SufficientStatistics`, so `obtain_eval_bundle` still
+    /// realises fitted rows for the consumers that read them.
+    pub(crate) fn obtain_outer_eval_bundle(
         &self,
         rho: &Array1<f64>,
     ) -> Result<EvalShared, EstimationError> {
@@ -4318,9 +4345,15 @@ impl<'a> RemlState<'a> {
         }
         let key = self.rhokey_sanitized(rho);
         if let Some(existing) = self.cache_manager.cached_eval_bundle(&key) {
-            return Ok(existing.clone());
+            return Ok(existing);
         }
-        self.prepare_eval_bundlewithkey_and_row_policy(rho, key, true)
+        let bundle = self.prepare_eval_bundlewithkey_and_row_policy(
+            rho,
+            key,
+            BundleRows::SufficientStatistics,
+        )?;
+        self.cache_manager.store_eval_bundle(bundle.clone());
+        Ok(bundle)
     }
 
     /// Fixes audit answer C for design-moving ext-coords: when the realized
@@ -4333,8 +4366,12 @@ impl<'a> RemlState<'a> {
         theta: &Array1<f64>,
     ) -> Result<EvalShared, EstimationError> {
         let key = self.rhokey_sanitized(theta);
-        if let Some(existing) = self.cache_manager.cached_eval_bundle(&key) {
-            return Ok(existing.clone());
+        if let Some(existing) = self
+            .cache_manager
+            .cached_eval_bundle(&key)
+            .filter(|bundle| bundle.rows == BundleRows::Observed)
+        {
+            return Ok(existing);
         }
         let bundle = self.prepare_eval_bundlewithkey(rho, key)?;
         self.cache_manager.store_eval_bundle(bundle.clone());
@@ -6243,15 +6280,16 @@ impl<'a> RemlState<'a> {
     }
 
     /// Return the shared fixed-design Gaussian row placeholders used only by
-    /// value-only rho probes.
+    /// pure-ρ outer criterion evaluations (value, gradient and Hessian).
     ///
     /// The exact coefficient solve, score, deviance, Hessian, and REML value
-    /// still come from `GaussianFixedCache` sufficient statistics. The row
-    /// carrier exists solely because `PirlsResult` also transports
-    /// observation-scale diagnostics that the value evaluator never reads.
-    /// Building these invariant arrays once keeps distinct rho trials in
-    /// coefficient space without lying to full gradient or final-fit callers
-    /// about their fitted rows (#2435).
+    /// and its ρ-derivatives still come from `GaussianFixedCache` sufficient
+    /// statistics. The row carrier exists solely because `PirlsResult` also
+    /// transports observation-scale diagnostics that the criterion never
+    /// reads. Building these invariant arrays once keeps distinct rho trials in
+    /// coefficient space; bundles built on them are marked
+    /// `BundleRows::SufficientStatistics`, so row consumers and the final fit
+    /// still receive fitted rows (#2435).
     fn gaussian_cost_only_frozen_rows_if_eligible(
         &self,
     ) -> Result<Option<Arc<crate::pirls::GaussianFrozenRows>>, EstimationError> {
@@ -6293,14 +6331,10 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
-        value_only_rows: bool,
+        rows: BundleRows,
         decision: SparseRemlDecision,
     ) -> Result<EvalShared, EstimationError> {
-        let pirls_result = if value_only_rows {
-            self.execute_pirls_for_value_only(rho)?
-        } else {
-            self.execute_pirls_if_needed(rho)?
-        };
+        let (pirls_result, rows) = self.execute_pirls_if_needed(rho, rows)?;
         let mut h_total = self.effectivehessian(pirls_result.as_ref())?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
         if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
@@ -6371,6 +6405,7 @@ impl<'a> RemlState<'a> {
         Ok(EvalShared {
             key,
             pirls_result,
+            rows,
             geometry: decision,
             h_total: Arc::new(h_total),
             sparse_exact: None,
@@ -6389,14 +6424,10 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
-        value_only_rows: bool,
+        rows: BundleRows,
         decision: SparseRemlDecision,
     ) -> Result<EvalShared, EstimationError> {
-        let pirls_result = if value_only_rows {
-            self.execute_pirls_for_value_only(rho)?
-        } else {
-            self.execute_pirls_if_needed(rho)?
-        };
+        let (pirls_result, rows) = self.execute_pirls_if_needed(rho, rows)?;
         if !matches!(
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::OriginalSparseNative
@@ -6503,6 +6534,7 @@ impl<'a> RemlState<'a> {
         Ok(EvalShared {
             key,
             pirls_result,
+            rows,
             geometry: decision,
             h_total: Arc::new(Array2::zeros((0, 0))),
             sparse_exact: Some(Arc::new({
@@ -6548,28 +6580,6 @@ impl<'a> RemlState<'a> {
         })
     }
 
-    /// Runs the inner P-IRLS loop, caching the result.
-    pub(super) fn execute_pirls_if_needed(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<Arc<PirlsResult>, EstimationError> {
-        self.execute_pirls_if_needed_with_row_policy(rho, false)
-    }
-
-    /// Gaussian value-only twin of [`Self::execute_pirls_if_needed`].
-    ///
-    /// On an eligible fixed-design Gaussian surface this asks P-IRLS to synthesize
-    /// observation fields from one shared invariant carrier while all numerical
-    /// fit quantities come from exact sufficient statistics. The compact result
-    /// is deliberately not inserted into the ordinary PIRLS cache: a later
-    /// gradient or accepted fit at the same rho must materialize exact rows.
-    fn execute_pirls_for_value_only(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<Arc<PirlsResult>, EstimationError> {
-        self.execute_pirls_if_needed_with_row_policy(rho, true)
-    }
-
     /// The inner P-IRLS iteration budget in force for one solve: the configured
     /// budget, lowered to the outer schedule's cap when one is set. One
     /// definition, read both where the solve is configured and where its
@@ -6583,11 +6593,15 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    fn execute_pirls_if_needed_with_row_policy(
+    /// Runs the inner P-IRLS loop, caching the result. `rows` is the row kind
+    /// the caller can consume; the returned kind is what the result carries
+    /// (`SufficientStatistics` is only honoured when the frozen Gaussian
+    /// carrier exists).
+    fn execute_pirls_if_needed(
         &self,
         rho: &Array1<f64>,
-        value_only_rows: bool,
-    ) -> Result<Arc<PirlsResult>, EstimationError> {
+        rows: BundleRows,
+    ) -> Result<(Arc<PirlsResult>, BundleRows), EstimationError> {
         let use_cache = self
             .cache_manager
             .pirls_cache_enabled
@@ -6620,15 +6634,18 @@ impl<'a> RemlState<'a> {
             if cached.cache_compacted {
                 let mut pirls_config = self.config.as_pirls_config();
                 pirls_config.link_kind = self.runtime_inverse_link();
-                return Ok(Arc::new(cached.rehydrate_after_reml_cache(
-                    self.x(),
-                    self.y,
-                    self.weights,
-                    self.offset.view(),
-                    &pirls_config.link_kind,
-                )?));
+                return Ok((
+                    Arc::new(cached.rehydrate_after_reml_cache(
+                        self.x(),
+                        self.y,
+                        self.weights,
+                        self.offset.view(),
+                        &pirls_config.link_kind,
+                    )?),
+                    BundleRows::Observed,
+                ));
             }
-            return Ok(cached);
+            return Ok((cached, BundleRows::Observed));
         }
 
         // Outer-aware cap: an atomic that only caps the inner Newton iteration
@@ -6654,10 +6671,18 @@ impl<'a> RemlState<'a> {
             .as_ref()
             .map(|(c, _)| c.clone());
         let prediction_source = predicted_warm_start_with_source.as_ref().map(|(_, s)| *s);
-        let cost_only_gaussian_rows = if value_only_rows {
+        let cost_only_gaussian_rows = if rows == BundleRows::SufficientStatistics {
             self.gaussian_cost_only_frozen_rows_if_eligible()?
         } else {
             None
+        };
+        // A request for sufficient-statistic rows is only honoured when the
+        // frozen carrier exists; otherwise the solve realises real rows and
+        // the bundle must say so, or row readers would refuse a valid one.
+        let realised_rows = if cost_only_gaussian_rows.is_some() {
+            BundleRows::SufficientStatistics
+        } else {
+            BundleRows::Observed
         };
         let pirls_result = {
             let warm_start_holder = self
@@ -6929,10 +6954,10 @@ impl<'a> RemlState<'a> {
                 // derivative request needs them by contract, while a
                 // value-only request that has them found no frozen bundle to
                 // synthesize from.
-                let row_source = match (value_only_rows, cost_only_gaussian_rows.is_some()) {
+                let row_source = match (rows, cost_only_gaussian_rows.is_some()) {
                     (_, true) => "frozen",
-                    (true, false) => "full(no-frozen-bundle)",
-                    (false, false) => "full(derivative-request)",
+                    (BundleRows::SufficientStatistics, false) => "full(no-frozen-bundle)",
+                    (BundleRows::Observed, false) => "full(derivative-request)",
                 };
                 log::debug!(
                     "[STAGE] inner pirls solve iters={} status={:?} max_eta={:.1} jeffreys_logdet={} rows={} elapsed={:.3}s",
@@ -7413,7 +7438,7 @@ impl<'a> RemlState<'a> {
                 self.store_persistent_warm_start();
                 // Cache only if key is valid (not NaN).
                 if use_cache
-                    && !value_only_rows
+                    && cost_only_gaussian_rows.is_none()
                     && let Some(key) = key_opt
                 {
                     self.cache_manager
@@ -7422,7 +7447,7 @@ impl<'a> RemlState<'a> {
                         .expect("PIRLS result cache lock poisoned")
                         .insert(key, Arc::new(pirls_result.compact_for_reml_cache()));
                 }
-                Ok(pirls_result)
+                Ok((pirls_result, realised_rows))
             }
             pirls::PirlsStatus::Unstable => {
                 // The fit was unstable. This is where we throw our specific, user-friendly error.
