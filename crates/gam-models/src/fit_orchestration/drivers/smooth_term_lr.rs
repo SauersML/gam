@@ -2555,8 +2555,9 @@ fn consumed_coordinates(dimension: usize, profiled: bool) -> usize {
 /// The spread is accumulated CENTRED (Welford): `M₂ = Σ (dᵢ − d̄)²` grows by
 /// `(d − d̄_old)(d − d̄_new)`, and `d̄_new = d̄_old + (d − d̄_old)/i` is the
 /// rounding of a point between `d̄_old` and `d`, so it lies in that closed
-/// interval and both factors carry the same sign. Every increment is therefore `≥ 0` in floating
-/// point, a constant sample gives exactly `M₂ = 0`, and no clamp is needed. The
+/// interval and both factors carry the same sign. Every increment is therefore
+/// `≥ 0` in floating point, a constant sample gives exactly `M₂ = 0`, and no
+/// clamp is needed. The
 /// one-pass `Σd²/N − d̄²` it replaces differences two quantities of size `d̄²`
 /// and resolves the variance only in steps of `ulp(d̄²)`, reporting a positive
 /// error on a draw set that is constant (#4086).
