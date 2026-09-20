@@ -114,19 +114,20 @@ impl PyEventHistoryModel {
         self.cohort.subjects.iter().map(|s| s.exit).collect()
     }
 
-    fn rank(&self) -> usize {
-        self.fit.rank()
-    }
-
-    /// Advisories the term builder recorded while lowering the formulas: where
-    /// the fitted terms differ from the literal formula.
+    /// Advisories from the covariate formulas: where the fitted bases differ
+    /// from the literal request.
     fn inference_notes(&self) -> Vec<String> {
         self.fit.inference_notes.advisories.clone()
     }
 
-    /// Defaults the term builder chose on the caller's behalf.
+    /// Defaults the covariate formulas' term builder chose on the user's
+    /// behalf.
     fn informational_notes(&self) -> Vec<String> {
         self.fit.inference_notes.informational.clone()
+    }
+
+    fn rank(&self) -> usize {
+        self.fit.rank()
     }
 
     /// Per reference grid the fit ran on, the move the next grid makes at the

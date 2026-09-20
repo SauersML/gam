@@ -109,16 +109,15 @@ class EventHistoryModel:
 
     @property
     def notes(self) -> list[str]:
-        """Notes the term builder recorded while lowering the formula(s),
+        """Notes the covariate formulas recorded while this model was fit,
         advisories first.
 
-        An *advisory* says the fitted terms differ from the literal formula —
-        a ``k`` capped to a covariate's distinct values, a basis degraded to a
-        line, a feature owned by both a smooth and a linear term;
-        :func:`fit_event_history` also emits each one as a
-        :class:`gamfit.errors.GamInferenceWarning`. An *informational* note
-        records a default chosen on the caller's behalf. With one formula per
-        mark, each note names its mark.
+        An *advisory* says a fitted basis differs from what the formula
+        literally requested (for example a cubic-regression ``k`` capped to
+        the covariate's distinct values); :func:`fit_event_history` also emits
+        each one as a :class:`gamfit.errors.GamInferenceWarning`. An
+        *informational* note records a default chosen on the caller's behalf.
+        With one formula per mark each note names its mark.
         """
         return [*self._native.inference_notes(), *self._native.informational_notes()]
 
@@ -586,5 +585,6 @@ def fit_event_history(
         reference_rows,
         subject_stratum,
     )
+    # A basis the formula did not literally ask for is never silent (#4002).
     emit_inference_warnings(native.inference_notes())
     return EventHistoryModel(native)

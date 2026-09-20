@@ -597,21 +597,28 @@ fn build_cohort(
     Ok(cohort)
 }
 
+/// The frozen schema is the joint model's whole record of its bases, so a
+/// basis the term builder built differently from the declared formula (an
+/// advisory: a capped `k`, a degraded basis, a kept intercept) is refused by
+/// name rather than frozen under a formula it does not implement. A default
+/// the builder chose (an informational note) is what the formula means, and is
+/// logged.
 fn frozen_basis(
     formula: &str,
     rows: ArrayView2<'_, f64>,
     cohort: &EventHistoryCohort,
     basis: &'static str,
 ) -> Result<FrozenBasis, JointDataError> {
-    // The joint schema has no notes channel to a front end, so a basis whose
-    // lowering the term builder flags as differing from the declared formula
-    // (a capped or degraded basis, a feature owned twice) is refused rather
-    // than frozen and saved as if it were what was declared. The informational
-    // notes name defaults whose resolved values the frozen spec below records.
     let mut notes = FitNotes::default();
     let spec = covariate_spec_from_formula(formula, rows, cohort, &mut notes)?;
-    if let Some(advisory) = notes.advisories.first() {
-        return Err(invalid(format!("{basis} formula {formula:?}: {advisory}")));
+    if !notes.advisories.is_empty() {
+        return Err(invalid(format!(
+            "the {basis} formula {formula:?} does not build as written: {}",
+            notes.advisories.join("; ")
+        )));
+    }
+    for note in &notes.informational {
+        log::info!("[joint event model] {basis} formula {formula:?}: {note}");
     }
     let design = build_term_collection_design(rows, &spec)
         .map_err(|error| invalid(format!("{basis} design: {error}")))?;

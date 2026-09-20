@@ -1260,6 +1260,24 @@ fn option_numeric_expr(
     }
 }
 
+/// An explicit `length_scale=` on a kernel smooth whose spec stores the auto
+/// request as the numeric marker `0.0` (thin-plate, curvature, measure-jet).
+/// A typed value must be a finite positive range: accepting `0` would make the
+/// explicit request indistinguishable from the auto marker and silently swap
+/// it for the data-derived seed (#3764). `None` is the auto request.
+fn explicit_positive_length_scale(
+    options: &BTreeMap<String, String>,
+    smooth: &str,
+) -> Result<Option<f64>, String> {
+    match option_f64(options, "length_scale")? {
+        None => Ok(None),
+        Some(value) if value.is_finite() && value > 0.0 => Ok(Some(value)),
+        Some(value) => Err(format!(
+            "{smooth} smooth length_scale must be a positive finite value (or omitted for auto); got {value}"
+        )),
+    }
+}
+
 fn parse_periods_option(
     options: &BTreeMap<String, String>,
     dim: usize,
@@ -3276,7 +3294,8 @@ pub(crate) fn build_smooth_basis(
                     // smooth.rs `auto_init_length_scale_in_place`) that the
                     // spatial optimizer could not escape, leaving TPS terms
                     // initialized off the data scale.
-                    length_scale: option_f64(options, "length_scale")?.unwrap_or(0.0),
+                    length_scale: explicit_positive_length_scale(options, "thinplate")?
+                        .unwrap_or(0.0),
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)
                         .map_err(|e| e.to_string())?,
@@ -3469,14 +3488,12 @@ pub(crate) fn build_smooth_basis(
             // outer estimation, seeded by the auto rule. The range must be fitted
             // by default because it is confounded with κ — pinning it makes κ
             // absorb the range error rather than measure curvature.
-            let length_scale_opt = option_f64(options, "length_scale")?;
+            // An explicit 0 is rejected rather than read as the auto marker:
+            // with `length_scale_fixed` set it would pin ℓ at the auto seed,
+            // neither the requested value nor a fitted range (#3764).
+            let length_scale_opt = explicit_positive_length_scale(options, "curvature")?;
             let length_scale_fixed = length_scale_opt.is_some();
             let length_scale = length_scale_opt.unwrap_or(0.0);
-            if !length_scale.is_finite() || length_scale < 0.0 {
-                return Err(format!(
-                    "curvature smooth length_scale must be positive (or omitted for auto); got {length_scale}"
-                ));
-            }
             let centers = parse_countwith_basis_alias(
                 options,
                 "centers",
@@ -3518,14 +3535,19 @@ pub(crate) fn build_smooth_basis(
             // geometry (centers, masses, scale band) is read off the measure
             // at build time — magic by default, every option optional.
             validate_known_options("mjs", options, MEASURE_JET_SMOOTH_OPTION_KEYS)?;
-            let order_s = option_f64(options, "s")?.unwrap_or(0.0);
-            // 0.0 = auto sentinel; explicit values must sit inside the
-            // admissible order interval of the affine-jet (r = 2) energy.
-            if !(order_s.is_finite() && (order_s == 0.0 || (order_s > 0.0 && order_s < 2.0))) {
-                return Err(format!(
-                    "measurejet smooth s must lie in (0, 2) (or be omitted for auto); got {order_s}"
-                ));
-            }
+            // An omitted `s=` stores the 0.0 auto marker; an explicit value
+            // must sit inside the admissible order interval of the affine-jet
+            // (r = 2) energy, so an explicit 0 is rejected rather than read
+            // as auto (#3764).
+            let order_s = match option_f64(options, "s")? {
+                None => 0.0,
+                Some(s) if s > 0.0 && s < 2.0 => s,
+                Some(s) => {
+                    return Err(format!(
+                        "measurejet smooth s must lie in (0, 2) (or be omitted for auto); got {s}"
+                    ));
+                }
+            };
             // Default to the spec Default (α = 1, density-WEIGHTED Hessian
             // energy — the module-header default). The density-free α = 3/2
             // (q^{−2}) over-smooths low-intrinsic-dimension manifolds where the
@@ -3539,12 +3561,8 @@ pub(crate) fn build_smooth_basis(
                 return Err("measurejet smooth requires a finite alpha".to_string());
             }
             let num_scales = option_usize(options, "scales")?.unwrap_or(0);
-            let length_scale = option_f64(options, "length_scale")?.unwrap_or(0.0);
-            if !length_scale.is_finite() || length_scale < 0.0 {
-                return Err(format!(
-                    "measurejet smooth length_scale must be positive (or omitted for auto); got {length_scale}"
-                ));
-            }
+            let length_scale_opt = explicit_positive_length_scale(options, "measurejet")?;
+            let length_scale = length_scale_opt.unwrap_or(0.0);
             let centers = parse_countwith_basis_alias(
                 options,
                 "centers",
@@ -3574,7 +3592,7 @@ pub(crate) fn build_smooth_basis(
             // explicitly-scaled Matérn. `learn_length_scale=` overrides either
             // way.
             let learn_length_scale =
-                option_bool(options, "learn_length_scale")?.unwrap_or(length_scale == 0.0);
+                option_bool(options, "learn_length_scale")?.unwrap_or(length_scale_opt.is_none());
             Ok(SmoothBasisSpec::MeasureJet {
                 feature_cols: cols.to_vec(),
                 spec: MeasureJetBasisSpec {

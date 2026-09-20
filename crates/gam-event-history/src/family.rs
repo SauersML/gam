@@ -1203,6 +1203,10 @@ pub(crate) struct EventHistorySpec {
     /// the incidence among those still at risk (see `super::preserve`).
     pub reference: Option<ReferenceStrata>,
     pub options: BlockwiseFitOptions,
+    /// What the covariate formulas' term builder recorded about the model it
+    /// built — where that differs from the literal request, or a default it
+    /// chose — carried onto the fit for the caller to surface.
+    pub inference_notes: FitNotes,
 }
 
 impl EventHistorySpec {
@@ -1214,6 +1218,7 @@ impl EventHistorySpec {
             quadrature_tolerance: 5e-2,
             reference: None,
             options: BlockwiseFitOptions::default(),
+            inference_notes: FitNotes::default(),
         }
     }
 }
@@ -1323,11 +1328,11 @@ pub struct EventHistoryFit {
     /// ([`select_reference_grid`]), within `quadrature_tolerance`; absent for
     /// prior centring.
     pub reference_certificate: Option<f64>,
-    /// What the term builder recorded while lowering the formulas
-    /// ([`fit_event_history_formulas`]): advisories where the fitted terms
-    /// differ from the literal formula, informational notes for defaults chosen
-    /// on the caller's behalf. With one formula per mark each note names its
-    /// mark. Empty for a fit built from a ready term collection.
+    /// The term builder's notes on the covariate formulas: `advisories` where
+    /// the fitted basis differs from the literal request (for example a
+    /// smooth given fewer knots than it asked for because its covariate has
+    /// fewer distinct values), `informational` for defaults chosen on the
+    /// user's behalf. With one formula per mark each note names its mark.
     pub inference_notes: FitNotes,
 }
 
@@ -1562,15 +1567,30 @@ pub fn fit_event_history_formulas<F: AsRef<str>>(
     let mut spec = EventHistorySpec::new(Vec::new());
     spec.options = options;
     let rows = design_rows(cohort, spec.quadrature_order)?;
+    let (covariates, notes) = covariate_specs_from_formulas(cohort, formulas, rows.view())?;
+    spec.covariates = covariates;
+    spec.inference_notes = notes;
+    spec.reference = reference;
+    fit_event_history(cohort, &spec)
+}
+
+/// Resolve one formula shared by every mark, or one per mark, against the
+/// design rows, with the term builder's notes on each. With one formula per
+/// mark an error or a note names the mark its formula belongs to.
+pub(crate) fn covariate_specs_from_formulas<F: AsRef<str>>(
+    cohort: &EventHistoryCohort,
+    formulas: &[F],
+    rows: ArrayView2<'_, f64>,
+) -> Result<(Vec<TermCollectionSpec>, FitNotes), EventHistoryError> {
     let mut covariates = Vec::with_capacity(formulas.len());
-    let mut inference_notes = FitNotes::default();
+    let mut notes = FitNotes::default();
     for (d, formula) in formulas.iter().enumerate() {
-        let mut notes = FitNotes::default();
+        let mut formula_notes = FitNotes::default();
         let terms = super::formula::covariate_spec_from_formula(
             formula.as_ref(),
-            rows.view(),
+            rows,
             cohort,
-            &mut notes,
+            &mut formula_notes,
         )
         .map_err(|error| {
             if formulas.len() == 1 {
@@ -1581,26 +1601,22 @@ pub fn fit_event_history_formulas<F: AsRef<str>>(
                 }
             }
         })?;
-        if formulas.len() == 1 {
-            inference_notes.advisories.extend(notes.advisories);
-            inference_notes.informational.extend(notes.informational);
-        } else {
-            let mark = &cohort.mark_names[d];
-            let named = |note: String| format!("mark {mark:?}: {note}");
-            inference_notes
-                .advisories
-                .extend(notes.advisories.into_iter().map(named));
-            inference_notes
-                .informational
-                .extend(notes.informational.into_iter().map(named));
-        }
         covariates.push(terms);
+        let label = |note: String| {
+            if formulas.len() == 1 {
+                note
+            } else {
+                format!("mark {:?}: {note}", cohort.mark_names[d])
+            }
+        };
+        notes
+            .advisories
+            .extend(formula_notes.advisories.into_iter().map(label));
+        notes
+            .informational
+            .extend(formula_notes.informational.into_iter().map(label));
     }
-    spec.covariates = covariates;
-    spec.reference = reference;
-    let mut fit = fit_event_history(cohort, &spec)?;
-    fit.inference_notes = inference_notes;
-    Ok(fit)
+    Ok((covariates, notes))
 }
 
 /// The family and its block specs at one (order, mesh refinement) setting.
@@ -2780,7 +2796,7 @@ fn assemble(
         reference_refinements: Vec::new(),
         centring,
         reference_certificate: None,
-        inference_notes: FitNotes::default(),
+        inference_notes: spec.inference_notes.clone(),
     })
 }
 
