@@ -137,6 +137,7 @@ pub use estimation_error::{
 pub use estimation_error::FitStationarityEvidence;
 pub use execution_path::ExecutionPath;
 pub use failure_category::FailureCategory;
+pub use gam_spec::ErrorCategory;
 pub use family_options::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
 pub use finite_validation::{
     bail_if_cached_beta_non_finite,
@@ -161,7 +162,10 @@ pub use identifiability_audit::{
     MapUniquenessError,
 };
 pub use indexed_response::{IndexedResponseError, SeparableCellMeasure};
-pub use joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec};
+pub use joint_penalty::{
+    JointPenaltyBundle, JointPenaltyError, JointPenaltySpec, PenaltyRootError,
+    structural_penalty_root,
+};
 pub use linear_constraints::LinearInequalityConstraints;
 pub use log_strength::{
     log_gradient_resolution,

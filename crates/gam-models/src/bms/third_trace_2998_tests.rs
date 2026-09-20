@@ -7,15 +7,23 @@
 //! Ban-scanner-safe: a bare `#[cfg(test)] mod third_trace_2998_tests;` in
 //! `bms/mod.rs` with the allowed `*_tests` name.
 
-use super::flex_measure_932_tests::{build_fixture_with_runtime, mpoint, tier_knots};
+use super::flex_measure_932_tests::{build_fixture_with_runtime, mpoint};
 use super::hessian_paths::BernoulliMarginalSlopeRowExactContext;
 use super::*;
 use ndarray::Array1;
 
 /// A deviation runtime whose primary width `2 + basis_dim` is `width`.
+///
+/// A clamped cubic vector with `k` internal knots keeps `k + 1` directions after
+/// the smoothness drop, so every width from three up is reachable. A simple-ended
+/// vector needs eight knots, three ramps, before it has any direction (gam#3011).
 fn runtime_at_width(width: usize) -> DeviationRuntime {
-    (2..=64usize)
-        .filter_map(|n_knots| DeviationRuntime::try_new(tier_knots(n_knots), 0.0, 3).ok())
+    let seed = Array1::from_vec(vec![-2.45_f64, 2.55]);
+    (0..=62usize)
+        .filter_map(|internal| {
+            gam_terms::basis::initializewiggle_knots_from_seed(seed.view(), 3, internal).ok()
+        })
+        .filter_map(|knots| DeviationRuntime::try_new(knots, 0.0, 3).ok())
         .find(|runtime| 2 + runtime.basis_dim() == width)
         .expect("a knot count lands the BMS primary width on every tested width")
 }

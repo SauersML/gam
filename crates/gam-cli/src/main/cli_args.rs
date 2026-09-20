@@ -1,9 +1,21 @@
 use super::*;
 
+/// `gam --version`: the package version, which every commit between releases
+/// shares, then the commit and saved-model payload version that tell two
+/// engines apart (gam#3007, gam#3157).
+static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}\ncommit {}\nmodel payload version {}",
+        env!("CARGO_PKG_VERSION"),
+        gam_build_identity::describe(),
+        gam::inference::model::MODEL_PAYLOAD_VERSION
+    )
+});
+
 #[derive(Parser, Debug)]
 #[command(name = "gam")]
 #[command(about = "Formula-first GAM CLI", long_about = None)]
-#[command(version)]
+#[command(version, long_version = LONG_VERSION.as_str())]
 #[command(arg_required_else_help = true)]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -96,6 +108,9 @@ pub(crate) enum Command {
     Predict(PredictArgs),
     /// Evaluate a fitted conditional transformation model at observed responses.
     TransformationScore(TransformationScoreArgs),
+    /// Evaluate a marginal-slope model's conditional latent residual
+    /// `(z − m(a))/√v(a)` on a dataset.
+    LatentResidual(LatentResidualArgs),
     /// Compute diagnostics (residuals, calibration, optional ALO) on a dataset.
     Diagnose(DiagnoseArgs),
     /// Print a fitted model's per-row residuals on a labeled dataset as JSON.
@@ -307,7 +322,7 @@ pub(crate) struct FitArgs {
         required_unless_present = "request",
         conflicts_with = "request",
         help = "Model formula, e.g. 'y ~ x + smooth(age) + bounded(mu_hat, min=0, max=1)'",
-        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): parametric effect with a zero-centered REML shrinkage ridge that can remove it\n- linear(x, double_penalty=false): opt out of the ridge (unpenalized/MLE parametric effect)\n- linear(x, min=..., max=...): shrunk parametric effect with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for generic coefficient constraints, shrunk like linear(x)\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no shrinkage ridge or extra coefficient prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), cyclic(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n- linear shrinkage uses each realized effect's function mass and is invariant to coefficient-basis rescaling\n- `type=cyclic` / `cyclic(x)` uses periodic cubic P-spline boundaries; `duchon(x, cyclic=true)` uses periodic 1D Duchon distances; `type=duchon` is pure scale-free Duchon by default; add `length_scale=...` only to opt into the hybrid Duchon-Matern variant\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ linear(age, double_penalty=false) + smooth(bmi)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(logv_hat, min=0, max=2, target=1, strength=5) + x'"
+        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): parametric effect with a zero-centered REML shrinkage ridge that can remove it\n- linear(x, double_penalty=false): opt out of the ridge (unpenalized/MLE parametric effect)\n- linear(x, min=..., max=...): shrunk parametric effect with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for generic coefficient constraints, shrunk like linear(x)\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and a REML shrinkage prior toward the null (0 when inside the box, else the box midpoint)\n- bounded(x, ..., prior=\"none\"): opt out of the shrinkage prior (constrained MLE)\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), cyclic(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n- linear shrinkage uses each realized effect's function mass and is invariant to coefficient-basis rescaling\n- `type=cyclic` / `cyclic(x)` uses periodic cubic P-spline boundaries; `duchon(x, cyclic=true)` uses periodic 1D Duchon distances; `type=duchon` is pure scale-free Duchon by default; add `length_scale=...` only to opt into the hybrid Duchon-Matern variant\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ linear(age, double_penalty=false) + smooth(bmi)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(logv_hat, min=0, max=2, target=1, strength=5) + x'"
     )]
     pub(crate) formula_positional: Option<String>,
     /// Fit a second RHS-only formula for the scale/noise block in
@@ -499,6 +514,24 @@ pub(crate) struct TransformationScoreArgs {
     pub(crate) out: PathBuf,
     #[arg(long = "offset-column")]
     pub(crate) offset_column: Option<String>,
+    #[arg(long = "id-column")]
+    pub(crate) id_column: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct LatentResidualArgs {
+    #[arg(
+        value_name = "MODEL",
+        help = "Fitted marginal-slope model with a conditional latent law, from `gam fit`"
+    )]
+    pub(crate) model: PathBuf,
+    #[arg(
+        value_name = "DATA",
+        help = "Dataset containing the score column and the conditioning covariates"
+    )]
+    pub(crate) data: PathBuf,
+    #[arg(long = "out", help = "Output CSV path for the per-row conditional latent residuals")]
+    pub(crate) out: PathBuf,
     #[arg(long = "id-column")]
     pub(crate) id_column: Option<String>,
 }

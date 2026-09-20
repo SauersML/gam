@@ -24,11 +24,14 @@ def _rust_exception_instance(name):
 @pytest.mark.parametrize(
     "name",
     [
-        "GamError",
+        "GamfitError",
+        "FormulaError",
+        "DataError",
+        "ConvergenceError",
+        "NotFittedError",
+        "InternalError",
         "InvalidInputError",
-        "SurvivalMarginalSlopeError",
         "IntegrationError",
-        "FitError",
         "FitConvergenceError",
         "InnerModeConvergenceError",
         "FitSeedError",
@@ -49,9 +52,9 @@ def test_rust_exception_classes_are_importably_picklable(name):
     "name",
     [
         "InvalidInputError",
-        "SurvivalMarginalSlopeError",
         "IntegrationError",
-        "FitError",
+        "ConvergenceError",
+        "NotFittedError",
         "FitSeedError",
     ],
 )

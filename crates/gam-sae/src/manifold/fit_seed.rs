@@ -395,13 +395,9 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
                 .to_owned(),
         );
     }
-    let assignment_alpha = request
-        .fit_config
-        .ordered_beta_bernoulli_alpha_override
-        .unwrap_or(request.alpha);
     let mode = request.assignment_kind.mode(
         request.tau,
-        assignment_alpha,
+        request.alpha,
         request.learnable_alpha,
         request.threshold,
         request.top_k,

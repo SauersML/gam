@@ -42,7 +42,7 @@ mod joint_event_ffi;
 // Re-export the foundation modules at the crate root. The concern modules
 // (and the `#[pyfunction]`s in the included fragments) reach the exception
 // classes / converters and the `PyObject` alias through their bare crate-root
-// names (`crate::py_value_error`, `crate::GamError`, `crate::PyObject`, …), so
+// names (`crate::py_value_error`, `crate::GamfitError`, `crate::PyObject`, …), so
 // the boundary error contract and the shared engine alias each live in exactly
 // one place.
 pub(crate) use ffi::ffi_errors::*;

@@ -416,19 +416,28 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         psi_index: usize,
         total: usize,
     ) -> Result<Option<Vec<gam_problem::DriftDerivResult>>, String> {
-        if self
+        let batched = match self
             .family
             .family_hyper_role(&self.hyper_layout, psi_index)?
-            .is_none()
-            && let Some(axes) = self
+        {
+            None => self
                 .family
                 .psi_hessian_directional_derivatives_all_beta_axes_with_options(
                     &self.block_states,
                     self.hyper_layout.design_derivative_blocks(),
                     psi_index,
                     &self.options,
-                )?
-        {
+                )?,
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => self
+                .family
+                .baseline_psi_hessian_directional_derivatives_all_beta_axes_with_options(
+                    &self.block_states,
+                    axis,
+                    &self.options,
+                )?,
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma) => None,
+        };
+        if let Some(axes) = batched {
             if axes.len() != total {
                 return Err(format!(
                     "survival marginal-slope joint workspace: batched psi-Hessian sweep produced {} axes, expected {total}",

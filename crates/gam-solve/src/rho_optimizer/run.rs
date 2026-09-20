@@ -8,7 +8,7 @@ use super::asymptote_certificate::{
     MIN_TAIL_SAMPLES, assess_coordinate,
 };
 use super::rail_face::{
-    RailFaceLimit, RailFaceLimitOutcome, RailFaceProof, RailFaceVerdict, certify_rail_face,
+    RailFaceLimitOutcome, RailFaceProof, RailFaceVerdict, certify_rail_face,
 };
 
 pub(crate) const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
@@ -2010,9 +2010,9 @@ pub(crate) fn audit_stationary_point_in(
 // travel together, so the smoothing correction re-judges a direction at the certificate's shift
 // rather than at its own eigensolver's backward error.
 pub(crate) use opt::{
-    certificate_curvature_shift,
+    NegativeCurvatureClaim, certificate_curvature_shift,
     hessian_is_psd_at_resolution as certificate_hessian_is_psd_at_resolution,
-    newton_predicted_decrease, newton_predicted_decrease_at_resolution,
+    negative_curvature_claim, newton_predicted_decrease, newton_predicted_decrease_at_resolution,
 };
 
 /// PSD verdict of the outer Hessian restricted to its UN-RAILED coordinates
@@ -2357,53 +2357,6 @@ pub(crate) fn interior_curvature_floor_clearance(
     })
 }
 
-/// Whether a negative-curvature claim is falsifiable by any step the
-/// adjudication may take (#3036).
-///
-/// At a stationary point the claim `vᵀHv = λ_min < 0` predicts
-/// `V(ρ ± αv) − V(ρ) ≈ ½λ_min α²` for every step `α ≤ α_max`. It is falsifiable
-/// iff the largest step predicts a decrease the criterion can represent,
-/// `½|λ_min|·α_max² > objective_resolution`; its falsifiable range is then
-/// `[α_min, α_max]` with `α_min = sqrt(2·objective_resolution/|λ_min|)`.
-/// Otherwise no allowed step can produce a decrease the criterion resolves, and
-/// no probe outcome — a decrease under the resolution, a rise, or a failed
-/// evaluation — can confirm or falsify the claim.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum NegativeCurvatureClaim {
-    /// The claim can be falsified by steps from `α_max` down to `alpha_min`.
-    Resolvable { alpha_min: f64 },
-    /// Even the largest step predicts only `predicted_at_largest`, which the
-    /// criterion's resolution does not exceed.
-    Unresolvable { predicted_at_largest: f64 },
-}
-
-/// Classify a negative-curvature claim against the criterion's resolution
-/// ([`NegativeCurvatureClaim`]). `None` when the inputs carry no claim to judge:
-/// `λ_min` not a finite negative number, `α_max` not a finite positive step, or
-/// no finite positive resolution.
-pub(crate) fn negative_curvature_claim(
-    lambda_min: f64,
-    alpha_max: f64,
-    objective_resolution: f64,
-) -> Option<NegativeCurvatureClaim> {
-    if !(lambda_min.is_finite() && lambda_min < 0.0)
-        || !(alpha_max.is_finite() && alpha_max > 0.0)
-        || !(objective_resolution.is_finite() && objective_resolution > 0.0)
-    {
-        return None;
-    }
-    let predicted_at_largest = 0.5 * lambda_min.abs() * alpha_max * alpha_max;
-    Some(if predicted_at_largest > objective_resolution {
-        NegativeCurvatureClaim::Resolvable {
-            alpha_min: (2.0 * objective_resolution / lambda_min.abs()).sqrt(),
-        }
-    } else {
-        NegativeCurvatureClaim::Unresolvable {
-            predicted_at_largest,
-        }
-    })
-}
-
 /// What the CRITERION said about a Hessian's reported negative direction
 /// (#2357/#2155/#2612).
 ///
@@ -2674,7 +2627,7 @@ pub(crate) fn adjudicate_negative_curvature(
     // when they evaluate and "decline" when they fail, and the declined exit
     // refused the point on a curvature its criterion cannot resolve.
     let lambda_min = eigenvalues[min_idx];
-    let alpha_max = 1.0_f64;
+    let alpha_max = NEGATIVE_CURVATURE_LADDER_LARGEST_STEP;
     let alpha_min = match negative_curvature_claim(lambda_min, alpha_max, objective_resolution) {
         Some(NegativeCurvatureClaim::Resolvable { alpha_min }) => alpha_min,
         Some(NegativeCurvatureClaim::Unresolvable {
@@ -5981,36 +5934,14 @@ fn try_certify_asymptote_rail(
     )))
 }
 
-/// The analytic face law is falsified against production criterion VALUES, so
-/// the admissible discrepancy is exactly the error sources the comparison is
-/// made of: the run's own cost resolution (absolute, once per evaluation), the
-/// law's `O(e^{−ρ})` second-order remainder (relative), and the digits the
-/// Gram/Schur assembly loses. `FACE_LAW_ERROR_SLACK` widens that budget by the
-/// factor a two-point difference accumulates — each evaluation carries its own
-/// resolution error and the remainder enters both the predicted and the
-/// measured side — so a CORRECT law is never refused by its own error bars,
-/// while a wrong one (which misses by orders of magnitude, not by slack) still
-/// is. The falsification only runs where the budget leaves a discriminating
-/// band; where it does not, the analytic route declines rather than minting
-/// unfalsifiable evidence.
-const FACE_LAW_ERROR_SLACK: f64 = 4.0;
-
-/// Floor on the falsification band.
-///
-/// The derived numerical budget can land many orders below the honest fidelity
-/// of a closed form that deliberately does not model the criterion's
-/// stabilization ridge or its reparameterization; holding the law to that
-/// budget would reject a CORRECT law over a difference that changes no
-/// decision. What the falsification exists to catch is a structurally wrong law
-/// — a missing Schur term, the wrong dispersion convention, a sign error — and
-/// those miss by orders of magnitude, not by slack (measured on a fixture whose
-/// released directions genuinely earned their cost: 100%). Half the predicted
-/// drop is the coarsest band that still separates those two worlds.
-const FACE_LAW_ORDER_BAND: f64 = 0.5;
-
 /// Prove the rail face analytically (#2348 Inc 5): ask the objective for the
-/// exact λ→∞ limit, test the first-order form, and falsify the resulting law
-/// against the production criterion before minting anything from it.
+/// exact λ→∞ limit, test the first-order form, and mint the rails from it.
+///
+/// The proof spends no criterion evaluation. Whether each objective's closed
+/// form expands the criterion it actually minimizes is a property of that
+/// code, pinned by the value- and gradient-domain tests beside
+/// `RemlState::rail_face_limit`. It is not re-measured here by differencing
+/// two criterion values against a slack.
 ///
 /// Returns the minted rail coordinates plus the proof, or a human-readable
 /// decline that the caller logs before falling back to the measured tail.
@@ -6064,9 +5995,6 @@ fn try_certify_face_analytically(
             proof.estimand_travel
         )));
     }
-    if let Err(reason) = falsify_face_law(obj, inputs, &limit, &proof)? {
-        return Ok(Err(reason));
-    }
     let rails: Vec<RailCoordinate> = limit
         .face
         .iter()
@@ -6093,102 +6021,6 @@ fn try_certify_face_analytically(
         })
         .collect();
     Ok(Ok((rails, proof)))
-}
-
-/// Falsify the analytic face law against the production criterion.
-///
-/// The law predicts `V(ρ) − V_∞ = ½tr((Σλ_kQᵀS_kQ)⁻¹C)`, so pulling every face
-/// coordinate back by `Δ` must raise the criterion by exactly
-/// `gap·(e^{Δ} − 1)`. That is a VALUE comparison — no derivative, no
-/// cancellation — and it costs two evaluations instead of a probe ladder.
-///
-/// `Δ` is not a knob: the measurement error is `resolution/(gap·(e^Δ−1))` and
-/// the law's own remainder is `O(e^{Δ−ρ})`, so their sum is minimized at
-/// `Δ* = ½(ln(resolution/gap) + ρ)`, where both equal `√(resolution·e^{−ρ}/gap)`.
-fn falsify_face_law(
-    obj: &mut dyn OuterObjective,
-    inputs: &AsymptoteRailInputs<'_>,
-    limit: &RailFaceLimit,
-    proof: &RailFaceProof,
-) -> Result<Result<(), String>, EstimationError> {
-    const FACE_LAW_DOMAIN_MARGIN: f64 = 1.0e-6;
-    let rho = inputs.rho;
-    let (lower, _) = inputs.bounds;
-    let gap = proof.value_gap;
-    let resolution = inputs.objective_tol;
-    if !(gap > 0.0) || !(resolution > 0.0) {
-        return Ok(Err(format!(
-            "the face law carries no resolvable value gap: gap={gap:.3e}, cost resolution \
-             {resolution:.3e}"
-        )));
-    }
-    let deepest = limit
-        .face_rho
-        .iter()
-        .fold(f64::INFINITY, |acc, v| acc.min(*v));
-    let ideal = 0.5 * ((resolution / gap).ln() + deepest);
-    let room = limit
-        .face
-        .iter()
-        .zip(limit.face_rho.iter())
-        .map(|(&k, &rho_k)| rho_k - lower[k] - FACE_LAW_DOMAIN_MARGIN)
-        .fold(f64::INFINITY, f64::min);
-    let delta = ideal.min(room);
-    // One e-fold is the natural unit of the law being tested; below that the
-    // predicted change is not a statement about a tail.
-    if !(delta >= 1.0) || !delta.is_finite() {
-        return Ok(Err(format!(
-            "no room inside the box to falsify the face law: Δ={delta:.3e} e-folds"
-        )));
-    }
-    let predicted = gap * (delta.exp() - 1.0);
-    let measurement_error = resolution / predicted;
-    let remainder_error = (delta - deepest).exp();
-    let assembly_error = f64::EPSILON.sqrt() * limit.form_conditioning.sqrt();
-    let budget = measurement_error + remainder_error + assembly_error;
-    let admissible = (FACE_LAW_ERROR_SLACK * budget).max(FACE_LAW_ORDER_BAND);
-    if !(admissible < 1.0) {
-        return Ok(Err(format!(
-            "the face law cannot be falsified here: error budget {budget:.3e} (measurement \
-             {measurement_error:.3e}, remainder {remainder_error:.3e}, assembly \
-             {assembly_error:.3e}) leaves no discriminating band"
-        )));
-    }
-    let baseline = obj.eval_cost(rho)?;
-    let mut pulled_back = rho.clone();
-    for &k in limit.face.iter() {
-        pulled_back[k] -= delta;
-    }
-    let pulled = obj.eval_cost(&pulled_back);
-    // Every exit below ships the certified point, so restore it before judging.
-    obj.eval_cost(rho)?;
-    let pulled_value = match pulled {
-        Ok(value) => value,
-        // A refused pulled-back point is a statement about that point: the face
-        // law cannot be tested there, so the falsification declines instead of
-        // ending the fit (#2735).
-        Err(error) if error.is_trial_point_infeasible() => {
-            return Ok(Err(format!(
-                "the criterion refuses the pulled-back falsification point: {error}"
-            )));
-        }
-        Err(error) => return Err(error),
-    };
-    if !baseline.is_finite() || !pulled_value.is_finite() {
-        return Ok(Err(
-            "the criterion is not finite at the falsification points".to_string()
-        ));
-    }
-    let measured = pulled_value - baseline;
-    let discrepancy = (predicted - measured).abs() / predicted;
-    if discrepancy > admissible {
-        return Ok(Err(format!(
-            "the analytic face law does not reproduce the criterion: pulling the face back \
-             {delta:.2} e-folds should raise V by {predicted:.6e}, measured {measured:.6e} \
-             (relative {discrepancy:.3e} > admissible {admissible:.3e})"
-        )));
-    }
-    Ok(Ok(()))
 }
 
 /// The coordinates a stationarity residual must still account for.
@@ -7891,7 +7723,7 @@ pub(crate) fn run_outer_uncertified(
     // Every downstream stage — the per-atom EFS path below and
     // `run_outer_with_plan` — projects seeds against these bounds with
     // `f64::clamp`, whose `min > max` (or NaN) precondition panics *inside the
-    // Rust boundary* and surfaces as an opaque `GamError: ... panicked` across
+    // Rust boundary* and surfaces as an opaque `GamfitError: ... panicked` across
     // the FFI, violating the fail-loudly contract. The configured box can invert
     // whenever an independently-derived upper bound drifts below the lower wall
     // (e.g. the custom-family effective-df ceiling vs. `rho_lower_bound`).
@@ -8204,21 +8036,30 @@ pub(crate) fn run_outer_uncertified(
                 // not collapse that checkpoint back into success below;
                 // continue it with the analytic-gradient fallback that the
                 // capability ladder already declared.
+                //
+                // #2822 — the same holds for a walk that stopped without a claim: the
+                // unprogressing-walk guard and the iteration cap both hand back the best
+                // iterate the walk evaluated. The declared BFGS attempt runs either way,
+                // and it resumes from that checkpoint rather than restarting at the seed.
+                // Restarting discarded the walk: planted-circle SAE fits stopped their EFS
+                // walk at |Pg| ≈ 1e-3 on the guard (each step's decrease ~g²/h sits far
+                // under the 1/(2n) resolution), BFGS re-ran from the seed, and the
+                // terminal certificate refused the EFS checkpoint it could not beat.
                 let has_bfgs_fallback = attempts
                     .get(attempt_idx + 1)
                     .is_some_and(|next| matches!(plan(next).solver, Solver::Bfgs));
-                if result.solver_claimed_convergence()
-                    && matches!(the_plan.solver, Solver::Efs | Solver::HybridEfs)
+                if matches!(the_plan.solver, Solver::Efs | Solver::HybridEfs)
                     && has_bfgs_fallback
                 {
                     log::debug!(
-                        "[OUTER] {context}: {:?} stopped at a fixed point, but no \
+                        "[OUTER] {context}: {:?} stopped (solver claim: {}), but no \
                          candidate passed analytic screening; continuing the best finite \
                          checkpoint with analytic-gradient BFGS",
                         the_plan.solver,
+                        result.solver_claimed_convergence(),
                     );
                     last_error = Some(EstimationError::RemlOptimizationFailed(format!(
-                        "{:?} fixed point was refuted by analytic screening",
+                        "{:?} checkpoint was refuted by analytic screening",
                         the_plan.solver,
                     )));
                     spent_iterations = spent_iterations.saturating_add(result.iterations);
@@ -8563,23 +8404,29 @@ pub(crate) fn outer_criterion_resolution(config: &OuterConfig) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// The largest step the negative-curvature adjudication takes along its eigenvector: one
+/// e-fold of `log λ` ([`adjudicate_negative_curvature`]).
+pub(crate) const NEGATIVE_CURVATURE_LADDER_LARGEST_STEP: f64 = 1.0;
+
 /// The criterion's curvature resolution `2·τ` over its objective resolution
 /// `τ` ([`outer_criterion_resolution`]; #1082, #2817).
 ///
 /// Along an eigenvector of `λ < 0` at a stationary point the quadratic model
 /// predicts the decrease `½|λ|α²`. The largest step the negative-curvature
-/// adjudication takes is one e-fold of `log λ` (`α = 1`), so a direction with
-/// `½|λ| ≤ τ` predicts nothing the criterion resolves anywhere in the range
-/// that could falsify it. The bridge's definiteness verdict, the seed's
-/// verdict, and the decrement that both the in-loop stop and the certificate's
-/// curvature rung take all read this one number. `0.0` (the arithmetic shift
+/// adjudication takes is [`NEGATIVE_CURVATURE_LADDER_LARGEST_STEP`], so a direction
+/// with `½|λ|·α_max² ≤ τ` predicts nothing the criterion resolves anywhere in the
+/// range that could falsify it: this is `opt::unresolvable_curvature_magnitude` at
+/// that step and resolution, the number the adjudication's own resolvability verdict
+/// (`opt::negative_curvature_claim`, #3036) reads. The bridge's definiteness verdict,
+/// the seed's verdict, and the decrement that both the in-loop stop and the
+/// certificate's curvature rung take all read it too. `0.0` (the arithmetic shift
 /// alone) when the resolution is zero or unusable.
 pub(crate) fn criterion_curvature_resolution(objective_resolution: f64) -> f64 {
-    if objective_resolution.is_finite() && objective_resolution > 0.0 {
-        2.0 * objective_resolution
-    } else {
-        0.0
-    }
+    opt::unresolvable_curvature_magnitude(
+        NEGATIVE_CURVATURE_LADDER_LARGEST_STEP,
+        objective_resolution,
+    )
+    .unwrap_or(0.0)
 }
 
 /// Whether the certified objective strictly dropped between two refusals of the

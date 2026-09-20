@@ -159,3 +159,5 @@ mod zz_aniso_psi_rotation_2760_tests;
 mod zz_duchon_axis_psi_2735_tests;
 #[cfg(test)]
 mod zz_duchon_chart_psi_979_tests;
+#[cfg(test)]
+mod zz_exterior_boundary_slopes_tests;

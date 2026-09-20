@@ -158,7 +158,7 @@
 //! `(n−M_p)/2·log D_p` and its first variation is `ΔD_p/(2φ̂)`.) The two
 //! penalty logdets have no `β̂`-dependence, so their Schur content is
 //! unchanged, and everything downstream — the `C ≻ 0` proof, per-coordinate
-//! `c_j`, the `Unidentified` typing, the value-domain falsification — is
+//! `c_j`, the `Unidentified` typing — is
 //! family-blind because none of it depends on how `C` was built. Gaussian
 //! identity is the `c ≡ 0` member: the rank-2 term vanishes identically and
 //! the form reduces to the REML one, which is the built-in exactness check.
@@ -214,9 +214,6 @@ pub struct RailFaceLimit {
     pub released_penalties: Vec<Array2<f64>>,
     /// `Qᵀg_c`: the limit score in the released directions.
     pub released_score: Array1<f64>,
-    /// Condition number of the `Z`-block solve that formed the Schur
-    /// complements. It is the error-amplifying step in building `C`.
-    pub form_conditioning: f64,
     /// Rigorous bound on `‖ΔC‖₂`, the floating-point error of the assembled
     /// form. With `γ_p = p·u/(1 − p·u)` (`u = ε/2`, `p` the coefficient
     /// dimension), every product and Schur solve that built `C` contributes
@@ -419,8 +416,6 @@ pub(crate) fn certify_rail_face(limit: &RailFaceLimit) -> RailFaceVerdict {
             .released_penalties
             .iter()
             .any(|a| a.iter().any(|v| !v.is_finite()))
-        || !limit.form_conditioning.is_finite()
-        || limit.form_conditioning < 1.0
     {
         return refuse("face limit data is not finite".to_string());
     }
@@ -1538,7 +1533,6 @@ fn assemble_face_limit(input: FaceLimitAssembly<'_>) -> RailFaceLimitOutcome {
         first_order_form,
         released_penalties,
         released_score,
-        form_conditioning,
         form_error_bound,
         limit_beta,
         limit_dispersion: dispersion,
@@ -1893,7 +1887,6 @@ mod rail_face_tests {
             first_order_form: form,
             released_penalties: penalties,
             released_score: score,
-            form_conditioning: 1.0,
             form_error_bound: 0.0,
             limit_beta: Array1::zeros(0),
             limit_dispersion: 1.0,

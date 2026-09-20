@@ -32,9 +32,10 @@ pub trait JeffreysArming: CustomFamily + Clone {
 /// - A refusal carrying [`CustomFamilyError::jeffreys_arming_evidence`] arms the
 ///   refit from the caller's specs. There is no certified mode to start from. A
 ///   refusal without evidence is returned unchanged.
-/// - A certified fit whose cone-truncated posterior is proved improper arms the
-///   refit, warm-started from the unarmed fit's coefficients and smoothing
-///   strengths.
+/// - A certified fit whose own posterior is proved improper arms the refit,
+///   warm-started from the unarmed fit's coefficients and smoothing strengths:
+///   either its cone-truncated posterior, or, unconstrained, the posterior along
+///   a direction no penalty reaches (`ker(S_λ)` carrying singular information).
 ///
 /// The armed fit publishes its evidence on
 /// `FitArtifacts::jeffreys_arming_evidence`.
@@ -90,9 +91,11 @@ pub fn fit_custom_family_arming_on_evidence_with_rho_prior<
 /// to a caller whose unarmed and armed members each run a whole route, such
 /// as an outer search over length-scale or auxiliary coordinates.
 ///
-/// - `unarmed` is the unarmed member's outcome. A certified fit with no face
-///   evidence (`fit_of`) is returned as it is; a refusal whose
-///   `refusal_evidence` is `None` is returned unchanged.
+/// - `unarmed` is the unarmed member's outcome. A certified fit (`fit_of`)
+///   whose posterior is not proved improper (neither its cone-truncated
+///   posterior nor its unconstrained posterior on `ker(S_λ)`, #3164) is
+///   returned as it is; a refusal whose `refusal_evidence` is `None` is
+///   returned unchanged.
 /// - Otherwise `armed` solves the armed member once, given the evidence and,
 ///   when the unarmed member certified, its outcome to warm-start from.
 ///
@@ -105,7 +108,7 @@ pub fn arm_on_evidence<T, E>(
     armed: impl FnOnce(&JeffreysArmingEvidence, Option<T>) -> Result<T, E>,
 ) -> Result<T, E> {
     let (evidence, certified) = match unarmed {
-        Ok(mut outcome) => match improper_cone_posterior_evidence(fit_of(&mut outcome)) {
+        Ok(mut outcome) => match certified_fit_evidence(fit_of(&mut outcome)) {
             None => return Ok(outcome),
             Some(evidence) => (evidence, Some(outcome)),
         },
@@ -122,6 +125,17 @@ pub fn arm_on_evidence<T, E>(
     let mut refit = armed(&evidence, certified)?;
     fit_of(&mut refit).artifacts.jeffreys_arming_evidence = Some(evidence);
     Ok(refit)
+}
+
+/// The evidence a certified fit carries that its own posterior is improper:
+/// the unconstrained posterior's singular information on the penalty null space
+/// (#3164), recorded by the terminal posterior assembly, or the constrained
+/// mode's cone-truncated posterior (#979).
+fn certified_fit_evidence(fit: &UnifiedFitResult) -> Option<JeffreysArmingEvidence> {
+    fit.artifacts
+        .improper_penalty_null_posterior
+        .clone()
+        .or_else(|| improper_cone_posterior_evidence(fit))
 }
 
 /// The face evidence a certified fit carries: its constrained mode's

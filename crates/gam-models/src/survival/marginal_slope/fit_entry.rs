@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::fit_orchestration::FitFailure;
+use crate::inference::predict_io::FittedLatentScoreMap;
 use std::cell::Cell;
 use crate::latent_law_compression::{CompressedLaw, DesignPoint, default_design};
 
@@ -219,12 +220,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         spec.age_entry
             .mapv(|entry| entry <= crate::survival::base::ENTRY_AT_ORIGIN_THRESHOLD),
     );
-    install_time_nullspace_shrinkage_penalty(
-        &mut spec.time_block,
-        spec.timewiggle_block.as_ref().map_or(0, |wiggle| wiggle.ncols),
-        &entry_at_origin,
-    )
-    .map_err(FitFailure::invariant)?;
     let (z_standardized, z_normalization) = standardize_latent_z_matrix_with_policy(
         &spec.z,
         &spec.weights,
@@ -291,9 +286,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // step drops it #1082 while the certificate requires it #1449) — the
     // survival marginal-slope hang. Applied before the build so the flag is
     // frozen into `joint_specs` and honoured by every subsequent probe / frozen
-    // / kappa rebuild. Mirrors the time block's
-    // `install_time_nullspace_shrinkage_penalty`, via the ordinary builder so
-    // the layered penalty representation stays self-consistent.
+    // / kappa rebuild. Applied via the ordinary builder so the layered penalty
+    // representation stays self-consistent. The time block's affine null space
+    // is deliberately left unpenalized (gam#3003): it is the baseline's level
+    // and log-time slope, identified by `O(n_events)` curvature (gam#1076).
     for surface_spec in design_specs.iter_mut() {
         enable_surface_identifiability_double_penalty(surface_spec);
     }
@@ -534,8 +530,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                              the marginal conditioning block",
                         )
                     })?;
-                    let calibrated = cal
-                        .apply(raw_scores.column(col), a_block.view())
+                    let calibrated = FittedLatentScoreMap::conditional_only(cal)
+                        .calibrate(raw_scores.column(col), Some(a_block.view()))
                         .map_err(FitFailure::invariant)?;
                     spec.z.column_mut(col).assign(&calibrated);
                 }
@@ -992,17 +988,30 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         }
         out
     };
+    // The time penalties act on the base columns and, with a time wiggle, on the
+    // warp's Jacobian at the baseline predictor, not on the design's zero
+    // placeholder tail. Seeds and the ρ domain are both read against that acting
+    // design (#3061).
+    let time_acting_exit = time_block_acting_exit_design(
+        &spec.time_block.design_exit,
+        spec.time_block.offset_exit.view(),
+        spec.timewiggle_block.as_ref(),
+    )
+    .map_err(FitFailure::input)?;
     let core_rho0_seed: Vec<f64> = {
         let mut seeds = Vec::with_capacity(
             time_penalties_len + marginal_design.penalties.len() + slope_design.penalties.len(),
         );
         // A seed refuses a design or penalty with no usable Gram scale, a
         // degenerate block the caller's data produced (#2937).
-        seeds.extend(block_log_lambda_seeds(
-            &spec.time_block.design_exit,
-            spec.time_block.penalties.iter(),
-        )
-        .map_err(FitFailure::input)?);
+        seeds.extend(
+            time_block_log_lambda_seeds(
+                &time_acting_exit,
+                &spec.time_block.penalties,
+                spec.timewiggle_block.as_ref().map_or(0, |wiggle| wiggle.ncols),
+            )
+            .map_err(FitFailure::input)?,
+        );
         seeds.extend(block_log_lambda_seeds(
             &marginal_design.design,
             marginal_design.penalties.iter().map(|bp| &bp.local),
@@ -1016,7 +1025,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         seeds
     };
     // The ρ domain per coordinate, in the layout the seeds above use: the time
-    // block's penalties against its exit design, the marginal and slope blocks
+    // block's penalties against its acting exit design, the marginal and slope blocks
     // against their own designs, the prepared extra blocks against theirs, and
     // the absorber's identity ridge against the residualized influence columns
     // it penalizes (#2812, #2902 item 15).
@@ -1024,7 +1033,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let mut lower = Vec::with_capacity(core_rho0_seed.len() + extra_rho0.len());
         let mut upper = Vec::with_capacity(core_rho0_seed.len() + extra_rho0.len());
         let (lo, hi) = crate::fit_orchestration::drivers::penalized_block_rho_domain(
-            &spec.time_block.design_exit,
+            &time_acting_exit,
             spec.time_block.penalties.iter(),
         );
         lower.extend(lo);
@@ -1821,7 +1830,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         // the capability-query hooks (`outer_hyper_hessian_dense_available`, …)
         // reached from `custom_family_outer_derivatives` below, firing a bare
         // `assert!` panic that PyO3 re-raises as an opaque "panicked inside Rust
-        // boundary" GamError instead of an actionable message.
+        // boundary" GamfitError instead of an actionable message.
         crate::custom_family::validate_blockspecs(&initial_blocks).map_err(|reason| {
             FitFailure::invariant(format!(
                 "[survival-marginal-slope] assembled block specs invalid: {reason}"
@@ -1863,8 +1872,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         // baseline-chart and learned log-σ axes, and between a chart and a design axis only through
         // the FLEX family program. The third derivatives have closed forms on the rigid frame for
         // design and chart axes but not for a learned log σ (gam#2765), and through the ζ
-        // composition of `timewiggle_third` for every time-wiggle frame it serves
-        // whose ψ coordinates are all design axes (gam#2893). Any other θ keeps the analytic
+        // composition of `timewiggle_third` for every time-wiggle frame it serves, on design axes
+        // (gam#2893) and baseline-chart axes (gam#3061). Any other θ keeps the analytic
         // gradient without declared curvature: declaring it would refuse every trial point that
         // asks for curvature.
         //
@@ -1907,8 +1916,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 && initial_family.psi_second_order_pairs_served(setup.log_kappa_dim())
                 && (!initial_family.joint_jeffreys_term_required()
                     || initial_family.rigid_psi_jeffreys_third_served()
-                    || (setup.auxiliary_dim() == 0
-                        && initial_family.timewiggle_zeta_available())));
+                    || initial_family.timewiggle_psi_jeffreys_third_served()));
         let analytic_joint_hessian_available = analytic_joint_derivatives_available
             && joint_hessian.is_analytic()
             && psi_curvature_exact;
