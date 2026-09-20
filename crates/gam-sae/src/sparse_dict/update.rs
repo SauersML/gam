@@ -292,56 +292,77 @@ pub(super) fn decoder_fixed_point_residual(previous: &Array2<f32>, next: &Array2
         .fold(0.0, f64::max)
 }
 
-/// Fixed-point residual of the exposed sparse routing. It is the larger of the
-/// relative coefficient displacement and the reconstruction displacement,
-/// evaluated without materialising either `N×K` codes or a second `N×P` matrix.
+/// Fixed-point residual of the exposed sparse routing: the larger of the code
+/// displacement and the reconstruction displacement, each in loss units relative to
+/// `‖X‖²`, evaluated without materialising either `N×K` codes or a second `N×P` matrix.
+///
+/// A row's code step minimises `‖x − Dᵀc‖² + ρ‖c‖²` on its support, whose Hessian is
+/// `H = DDᵀ + ρI` over the active atoms. At the solved code `ĉ`, the quadratic gives
+/// `F(c) − F(ĉ) = (c − ĉ)ᵀH(c − ĉ)` for every `c` on that support, so the code
+/// displacement is measured in `H`: `‖Dᵀ(c' − c)‖² + ρ‖c' − c‖²` over the union of
+/// both supports at the image decoder. On a retained support this is exactly the loss
+/// the certified codes give up at the image, the currency the stationarity test and
+/// the tolerance `tol·TSS` already use; a support change pays for every entry that
+/// enters or leaves.
+///
+/// The Euclidean relative displacement `‖c' − c‖²/‖c‖²` weights every direction by one,
+/// including those `H` weights by only `λ + ρ`. There [`solve_row_codes`] takes the
+/// coordinate `vᵀDx/(λ + ρ)`, whose right-hand side is a rounding-level quantity for a
+/// near-coincident atom pair, so a rounding-level decoder change moves the split of the
+/// code by `ε_f32·‖x‖/(λ + ρ)` while the fit does not move. At `K > N` every row can own
+/// atoms and such pairs are the fixed point, which that metric refused (#3193,
+/// `large_k_fit_…`: EV 1 − 1.4e-15, decoder residual 2.7e-14, routing 2.2e-6 for 30
+/// epochs). In `H` the same swing costs `(λ + ρ)‖Δ‖²`, which is the loss it moves.
 fn routing_fixed_point_residual(
     x: ArrayView2<'_, f32>,
     previous_decoder: ArrayView2<'_, f32>,
     previous: &[SparseCode],
     next_decoder: ArrayView2<'_, f32>,
     next: &[SparseCode],
+    code_ridge: f32,
 ) -> f64 {
+    let ridge = f64::from(code_ridge);
+    let p = x.ncols();
     let mut code_delta2 = 0.0f64;
-    let mut code_scale2 = 0.0f64;
     let mut reconstruction_delta2 = 0.0f64;
     let mut data_scale2 = 0.0f64;
+    let mut displacement: Vec<(u32, f64)> = Vec::new();
+    let mut image = vec![0.0f64; p];
 
     for row in 0..x.nrows() {
         let old = &previous[row];
         let new = &next[row];
-        for (slot, &atom) in old.indices.iter().enumerate() {
-            let old_value = old.codes[slot] as f64;
-            if old_value == 0.0 {
-                continue;
-            }
-            let new_value = new
-                .indices
-                .iter()
-                .zip(new.codes.iter())
-                .filter(|(candidate, _)| **candidate == atom)
-                .map(|(_, &value)| value as f64)
-                .sum::<f64>();
-            let delta = new_value - old_value;
-            code_delta2 += delta * delta;
-            code_scale2 += old_value * old_value + new_value * new_value;
-        }
-        for (slot, &atom) in new.indices.iter().enumerate() {
-            let new_value = new.codes[slot] as f64;
-            if new_value == 0.0
-                || old
-                    .indices
-                    .iter()
-                    .zip(old.codes.iter())
-                    .any(|(&candidate, &value)| candidate == atom && value != 0.0)
-            {
-                continue;
-            }
-            code_delta2 += new_value * new_value;
-            code_scale2 += new_value * new_value;
-        }
 
-        for column in 0..x.ncols() {
+        // `c' − c` over the union of both supports; a padded slot carries a zero code
+        // and repeated indices accumulate, as in the reconstruction.
+        displacement.clear();
+        let entries = old
+            .indices
+            .iter()
+            .zip(old.codes.iter())
+            .map(|(&atom, &value)| (atom, -f64::from(value)))
+            .chain(
+                new.indices
+                    .iter()
+                    .zip(new.codes.iter())
+                    .map(|(&atom, &value)| (atom, f64::from(value))),
+            );
+        for (atom, delta) in entries {
+            match displacement.iter_mut().find(|(seen, _)| *seen == atom) {
+                Some((_, total)) => *total += delta,
+                None => displacement.push((atom, delta)),
+            }
+        }
+        image.fill(0.0);
+        for &(atom, delta) in &displacement {
+            code_delta2 += ridge * delta * delta;
+            for (slot, &entry) in image.iter_mut().zip(next_decoder.row(atom as usize).iter()) {
+                *slot += delta * f64::from(entry);
+            }
+        }
+        code_delta2 += image.iter().map(|value| value * value).sum::<f64>();
+
+        for column in 0..p {
             let old_value = old
                 .indices
                 .iter()
@@ -363,19 +384,13 @@ fn routing_fixed_point_residual(
         }
     }
 
-    let code_residual = if code_scale2 > 0.0 {
-        code_delta2 / code_scale2
-    } else {
-        0.0
-    };
-    let reconstruction_residual = if data_scale2 > 0.0 {
-        reconstruction_delta2 / data_scale2
-    } else if reconstruction_delta2 == 0.0 {
+    if data_scale2 > 0.0 {
+        code_delta2.max(reconstruction_delta2) / data_scale2
+    } else if code_delta2 == 0.0 && reconstruction_delta2 == 0.0 {
         0.0
     } else {
         f64::INFINITY
-    };
-    code_residual.max(reconstruction_residual)
+    }
 }
 
 /// [`route_and_code_all`] for an epoch that has certified codes to descend from.
@@ -988,6 +1003,7 @@ fn run_from_decoder(
             &certified_codes,
             decoder.view(),
             &next_codes,
+            config.code_ridge,
         );
 
         // Per-epoch heartbeat at debug level: silent by default, and streamed
@@ -5925,6 +5941,154 @@ mod exact_solve_tests {
             fit.explained_variance > 0.999_999,
             "an exact 1-sparse fit must reconstruct at EV≈1; got {}",
             fit.explained_variance
+        );
+    }
+    /// #3193: the routing residual measures code displacement in the row loss's own
+    /// Hessian `DDᵀ + ρI`. On a fixed support it equals the loss the displaced codes
+    /// give up against the solved codes; a split swing across a near-coincident atom
+    /// pair costs only its `(λ + ρ)` share, where the Euclidean relative displacement
+    /// is order one; and a swap to a distinct atom costs the whole row.
+    #[test]
+    fn routing_residual_is_the_row_loss_the_code_displacement_gives_up_3193() {
+        use super::routing_fixed_point_residual;
+        use crate::sparse_dict::codes::solve_row_codes;
+
+        let loss = |x: &[f64], decoder: &Array2<f32>, code: &SparseCode, ridge: f64| -> f64 {
+            let mut fit = vec![0.0f64; x.len()];
+            let mut penalty = 0.0f64;
+            for (&atom, &value) in code.indices.iter().zip(code.codes.iter()) {
+                penalty += f64::from(value) * f64::from(value);
+                for (slot, &entry) in fit.iter_mut().zip(decoder.row(atom as usize).iter()) {
+                    *slot += f64::from(value) * f64::from(entry);
+                }
+            }
+            x.iter()
+                .zip(fit.iter())
+                .map(|(observed, fitted)| (observed - fitted) * (observed - fitted))
+                .sum::<f64>()
+                + ridge * penalty
+        };
+
+        // Fixed support, well-conditioned pair: the residual is the loss gap.
+        let decoder =
+            Array2::from_shape_vec((2, 3), vec![1.0f32, 0.0, 0.0, 0.6, 0.8, 0.0]).unwrap();
+        let x = Array2::from_shape_vec((1, 3), vec![0.9f32, 0.5, 0.3]).unwrap();
+        let ridge = 0.125f32;
+        let solved = solve_row_codes(x.row(0), decoder.view(), &[(0, 0.0), (1, 0.0)], 2, ridge);
+        let displaced = SparseCode {
+            indices: solved.indices.clone(),
+            codes: vec![solved.codes[0] + 0.25, solved.codes[1] - 0.125],
+        };
+        let row: Vec<f64> = x.iter().map(|&value| f64::from(value)).collect();
+        let data_scale2: f64 = row.iter().map(|value| value * value).sum();
+        let gap = loss(&row, &decoder, &displaced, f64::from(ridge))
+            - loss(&row, &decoder, &solved, f64::from(ridge));
+        let residual = routing_fixed_point_residual(
+            x.view(),
+            decoder.view(),
+            std::slice::from_ref(&displaced),
+            decoder.view(),
+            std::slice::from_ref(&solved),
+            ridge,
+        );
+        // The stored codes are the solve rounded to f32, `ĉ = c* + δ` with
+        // `‖δ‖ ≤ ε_f32‖ĉ‖`, so the gap carries the linear term `2δᵀHΔ`, at most
+        // `2‖H‖·ε_f32‖ĉ‖·‖Δ‖` with `‖H‖ ≤ tr(G) + ρ = 2 + ρ` for two unit atoms.
+        let norm = |code: &SparseCode| {
+            code.codes
+                .iter()
+                .map(|&value| f64::from(value) * f64::from(value))
+                .sum::<f64>()
+                .sqrt()
+        };
+        let step = displaced
+            .codes
+            .iter()
+            .zip(solved.codes.iter())
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let linear =
+            2.0 * (2.0 + f64::from(ridge)) * f64::from(f32::EPSILON) * norm(&solved) * step;
+        assert!(
+            (residual * data_scale2 - gap).abs() <= linear,
+            "fixed-support residual {:.9e} must equal the loss gap {:.9e}",
+            residual * data_scale2,
+            gap
+        );
+
+        // Near-coincident pair at the production ridge: a split swing is invisible
+        // to the fit and costs only its (λ + ρ) share.
+        let theta = 2.0f64.powi(-10);
+        let decoder = Array2::from_shape_vec(
+            (3, 2),
+            vec![
+                1.0f32,
+                0.0,
+                theta.cos() as f32,
+                theta.sin() as f32,
+                0.0,
+                1.0,
+            ],
+        )
+        .unwrap();
+        let x = Array2::from_shape_vec((1, 2), vec![1.0f32, 0.0]).unwrap();
+        let ridge = 1.0e-6f32;
+        let before = SparseCode {
+            indices: vec![0, 1],
+            codes: vec![0.625, 0.375],
+        };
+        let after = SparseCode {
+            indices: vec![0, 1],
+            codes: vec![0.375, 0.625],
+        };
+        // The Euclidean relative displacement of this swing is order one.
+        let euclidean = before
+            .codes
+            .iter()
+            .zip(after.codes.iter())
+            .map(|(&a, &b)| (f64::from(b) - f64::from(a)).powi(2))
+            .sum::<f64>()
+            / norm(&before).powi(2);
+        assert!(
+            euclidean > 0.1,
+            "the fixture must swing the split: {euclidean:.3e}"
+        );
+        let swing = routing_fixed_point_residual(
+            x.view(),
+            decoder.view(),
+            std::slice::from_ref(&before),
+            decoder.view(),
+            std::slice::from_ref(&after),
+            ridge,
+        );
+        let bound = 2.0 * 0.25f64 * 0.25 * (theta * theta + f64::from(ridge));
+        assert!(
+            swing <= bound,
+            "a split swing across a coincident pair moved the residual to {swing:.3e}, \
+             above its (λ + ρ) share {bound:.3e}"
+        );
+
+        // A swap to a distinct atom moves the whole row.
+        let swapped = SparseCode {
+            indices: vec![2, 1],
+            codes: vec![1.0, 0.0],
+        };
+        let whole = SparseCode {
+            indices: vec![0, 1],
+            codes: vec![1.0, 0.0],
+        };
+        let swap = routing_fixed_point_residual(
+            x.view(),
+            decoder.view(),
+            std::slice::from_ref(&whole),
+            decoder.view(),
+            std::slice::from_ref(&swapped),
+            ridge,
+        );
+        assert!(
+            swap >= 1.0,
+            "a swap to a distinct atom must cost the row; got {swap:.3e}"
         );
     }
 }
