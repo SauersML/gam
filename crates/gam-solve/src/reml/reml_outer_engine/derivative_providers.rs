@@ -664,7 +664,7 @@ impl BarrierConfig {
     /// `ParametricColumnConditioning::transform_linear_constraints_to_internal`'s
     /// output (`estimate/optimizer.rs`, `fit_linear_constraints`) — and that
     /// transform divides column `j` by the column's conditioning scale, so a
-    /// `linear(x, min, max)` / `constrain()` / `nonnegative()` box row assembled
+    /// `linear(x, min, max)` / `nonnegative()` box row assembled
     /// exactly as `±e_j` (`gam-terms/src/smooth/term_design.rs`) arrives as
     /// `±1/scale_j`. For any predictor that is not already unit-scaled that is
     /// not within `1e-14` of `±1`, so EVERY such box row was silently dropped and

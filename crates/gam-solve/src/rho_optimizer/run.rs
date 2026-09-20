@@ -393,7 +393,9 @@ pub(crate) struct OuterConfig {
 ///   stuck-stall escapes, license another filled cost-stall window only after
 ///   resolved descent or a smaller incumbent residual
 ///   (`CostStallGuard::license_continuation`).
-/// - The fixed-point and per-atom walks carry `FixedPointProgress`.
+/// - The fixed-point and per-atom walks carry `FixedPointProgress`, which
+///   stops at an evaluation that buys neither a resolved improvement nor a
+///   contraction of its step (#3176).
 /// - The device BFGS walk carries opt's native cost stall.
 ///
 /// A stationary point stops on the certificate's own rungs. The 200-iteration
@@ -4161,13 +4163,11 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // or the caller's own requirement. No rung is a magic relative constant, and
     // none is selected by how the search exited.
     let mut stationarity_bound = solver_bound;
-    // #2568/#2688 -- the caller's requirement is applied once, inside
-    // `outer_certificate_band_at`, which labels the band it capped
-    // (audited just above). A second cap used to sit here for a bound that a
-    // widening between the two pushed back past the requirement; the only such
-    // widening was the probe-noise rung, and with it deleted (#2817) nothing
-    // above this point can widen the already-capped band, so that cap could
-    // never fire and was removed.
+    // #2568/#2688 -- the caller's requirement caps `outer_certificate_band_at`'s
+    // band (audited just above), and caps the ladder's top again once the
+    // widening rungs below have run: the Newton-decrement verdict, the
+    // curvature-resolvability rung and the reproducibility floor all replace
+    // this band, and a cap applied only before them was defeated by each (#3311).
     audit_outer_value_agreement(
         context,
         value_only,
@@ -4223,7 +4223,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // a candidate it refused was discarded rather than deferred.
     //
     // Measured (#2596, lognormal location-scale AFT with a double-penalty
-    // `s(z, bs="tp", k=10)`): the BFGS converged to the correct interior optimum
+    // `s(z, bs="tps", k=10)`): the BFGS converged to the correct interior optimum
     // ρ = (0.378, −4.975) at cost 4.1926 with |Pg| = 7.29e-5 against a solver
     // band of 5.19e-5 — refused by a factor of 1.4. Both interior seeds were
     // refused, the multi-start fell through to the seed lattice's
@@ -4620,6 +4620,14 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         }
     }
 
+    // #2568 -- the caller's requirement caps the ladder's TOP, after every
+    // widening rung above (#3311: an exact block Gaussian REML fit that asked for
+    // |Pg| ≤ 1e-8 was minted at |Pg| = 9.8e-3 on the curvature-resolvability
+    // rung, and its envelope-theorem weight VJP was off by that gradient).
+    let capped = cap_at_caller_requirement(config, stationarity_bound, bound_source);
+    stationarity_bound = capped.bound;
+    bound_source = capped.source;
+
     // #2458/#2479 -- the bound's own provenance, emitted UNCONDITIONALLY rather
     // than only when a rung happens to widen. A certificate that does not carry
     // which of its five terms decided it can only be re-derived from source,
@@ -4926,8 +4934,9 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                          |Pg|={certified_projected_grad_norm:.3e} (#2954)",
                         source.label(),
                     );
-                    stationarity_bound = bound;
-                    bound_source = source;
+                    let capped = cap_at_caller_requirement(config, bound, source);
+                    stationarity_bound = capped.bound;
+                    bound_source = capped.source;
                 }
             }
         }
@@ -7181,18 +7190,21 @@ pub(crate) fn run_outer_uncertified(
     // there instead of replaying the same refuted fixed-point walk or throwing
     // away useful work.
     let mut refuted_fixed_point_continuation: Option<OuterResult> = None;
+    // The lowest finite state an earlier attempt of THIS ladder ended at without a
+    // claim (#3306). A degraded plan changes how the search moves, not the
+    // objective, so it resumes that state instead of re-searching from the seed:
+    // restarting discarded every accepted step of the refused attempt. On a binary
+    // Bernoulli marginal-slope fit the gradient-only BFGS attempt ended at the
+    // certified value to seven digits, and exact-curvature ARC re-searched from
+    // the seed. A state carried in from an earlier search is only this ladder's
+    // comparator (`carried_checkpoint`), never its start: the caller chose this
+    // ladder's seed, and a multistart member keeps its own basin.
+    let mut ladder_incumbent: Option<OuterResult> = None;
     // Iterations spent by attempts whose results this function discards: a plan
     // the degraded ladder replaces, a fixed-point walk handed to BFGS.
     // `OuterResult.iterations` is the total across solver restarts and these are
     // the restarts, so the returned result carries them (#2817).
     let mut spent_iterations: usize = 0;
-    // #2980 — the lowest state an attempt of THIS ladder ended on without converging. The next
-    // plan continues the search from it, as the fixed-point continuations below do (#2822),
-    // instead of re-descending from the derived start: a gradient-only search that stopped in
-    // a flat valley hands the declared-curvature attempt its stationary point, not the start
-    // it left. A checkpoint the caller carried in is judged against (#2953) but is not a start:
-    // the ladder's first attempt searches from the start it was given.
-    let mut ladder_continuation: Option<OuterResult> = None;
 
     'plan_attempts: for (attempt_idx, attempt_cap) in attempts.iter().enumerate() {
         let the_plan = plan(attempt_cap);
@@ -7209,25 +7221,24 @@ pub(crate) fn run_outer_uncertified(
         // would be. Otherwise this attempt could publish the optimum an earlier attempt declined
         // (#2953).
         attempt_config.carried_checkpoint = best_checkpoint.as_ref().map(carried_checkpoint_of);
-        let continues_a_fixed_point =
-            fixed_point_continuation.is_some() || refuted_fixed_point_continuation.is_some();
-        if !continues_a_fixed_point && let Some(checkpoint) = ladder_continuation.as_ref() {
-            attempt_config.initial_rho = Some(checkpoint.rho.clone());
-            // `OuterResult` carries no inner mode; the objective warm-starts its inner solve
-            // at the checkpoint the way it would at any other trial point.
+        if let Some(incumbent) = ladder_incumbent.as_ref() {
+            attempt_config.initial_rho = Some(incumbent.rho.clone());
+            // The configured inner seed belongs to the configured start, not to
+            // this incumbent; the inner solve warm-starts from its own cache.
             attempt_config.initial_inner_seed = None;
-            // A mid-ladder stop, not a terminal certificate imported from a prior fit, so the
-            // zero-iteration resume path must not accept it without searching.
+            // A mid-run incumbent is not a terminal certificate imported from a
+            // prior fit, and a transferred Hessian is bound to that prior fit's
+            // rho, not to this state.
             attempt_config.initial_rho_is_prior_terminal_certificate = false;
-            // A transferred Hessian is bound to the prior fit's terminal rho, not to this
-            // checkpoint.
             attempt_config.warm_start_outer_hessian = None;
             log::debug!(
-                "[OUTER] {context}: continuing {the_plan} from the lowest state the {:?} \
-                 attempt ended on after {} iteration(s): cost={:.6e}",
-                checkpoint.plan_used.solver,
-                checkpoint.iterations,
-                checkpoint.final_value,
+                "[OUTER] {context}: resuming {the_plan} from the lowest finite state an \
+                 earlier attempt of this ladder ended at ({:?}, {} iteration(s)): \
+                 cost={:.6e}, |g|={:?}",
+                incumbent.plan_used.solver,
+                incumbent.iterations,
+                incumbent.final_value,
+                incumbent.final_grad_norm,
             );
         }
         if let Some(checkpoint) = fixed_point_continuation.take() {
@@ -7421,12 +7432,12 @@ pub(crate) fn run_outer_uncertified(
                         !checkpoint.final_value.is_finite()
                             || result.final_value < checkpoint.final_value
                     });
-                let improves_continuation = result.final_value.is_finite()
-                    && ladder_continuation.as_ref().is_none_or(|continuation| {
-                        result.final_value < continuation.final_value
-                    });
-                if improves_continuation {
-                    ladder_continuation = Some(result.clone());
+                let improves_incumbent = result.final_value.is_finite()
+                    && ladder_incumbent
+                        .as_ref()
+                        .is_none_or(|incumbent| result.final_value < incumbent.final_value);
+                if improves_incumbent {
+                    ladder_incumbent = Some(result.clone());
                 }
                 if improves_checkpoint {
                     best_checkpoint = Some(result);
@@ -7559,7 +7570,6 @@ pub(crate) fn run_per_atom_efs_if_frontier(
         config.max_iter,
         lower,
         upper,
-        outer_criterion_resolution(config),
     );
     let topology = crate::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
 
@@ -8347,7 +8357,7 @@ pub(crate) fn run_fixed_point_outer_solver(
     // test, never stationarity (see the certificate after the walk), so a seed
     // that is already stationary is walked anyway: a smoothing parameter on its
     // rail keeps proposing an outward EFS step, and nothing short of the
-    // unprogressing-walk window ends it. On the ISLR `Default` logistic fit the
+    // unprogressing-walk stop ends it. On the ISLR `Default` logistic fit the
     // #784 corrected continuation starts from the certified Laplace optimum, which
     // is stationary under the correction too (the BFGS continuation later
     // certified it at zero iterations, |g| = 5.9e-6), yet the walk spent ~60
@@ -8363,7 +8373,7 @@ pub(crate) fn run_fixed_point_outer_solver(
             &mut seed_result,
             CertificationFidelity::Screening,
         ) {
-            log::info!(
+            log::debug!(
                 "[OUTER] {context}: {label} seed is already stationary at cost={:.6e}; \
                  no fixed-point step taken",
                 seed_result.final_value,
@@ -8392,7 +8402,7 @@ pub(crate) fn run_fixed_point_outer_solver(
         recurrent_incumbent_exit: Arc::clone(&recurrent_incumbent_exit),
         // The same criterion resolution the gradient routes' cost-stall guard
         // uses, and its first-order window.
-        progress: FixedPointProgress::new(outer_criterion_resolution(config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(),
         unprogressing_exit: Arc::clone(&unprogressing_exit),
     };
     let seed_sample = match objective.eval_step(seed) {
@@ -8481,11 +8491,12 @@ pub(crate) fn run_fixed_point_outer_solver(
                 };
                 return Ok(result);
             }
-            // The bridge stopped a walk that bought nothing since its previous
-            // window (#2817). That is no convergence claim: the best iterate the
+            // The bridge stopped a walk at an evaluation that bought neither a
+            // resolved improvement nor a contraction of its step (#2817, #3176).
+            // That is no convergence claim: the best iterate the
             // walk evaluated is the point it leaves behind. It is judged below
             // exactly as a step-norm stop is, because an unprogressing EFS walk
-            // is the same failure one window later: the ratio-of-traces map has
+            // is the same failure: the ratio-of-traces map has
             // stopped moving the criterion, which says nothing about the
             // gradient. On the K=1 generated-seed circle (#2153) the walk
             // stalled 32 iterations in at |g| = 7.3e-3, and publishing that

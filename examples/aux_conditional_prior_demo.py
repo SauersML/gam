@@ -26,7 +26,7 @@ def main() -> None:
 
     model = gamfit.fit(
         data,
-        "y ~ s(t, type='duchon', centers=32)",
+        "y ~ s(t, bs='duchon', centers=32)",
         family="gaussian",
         latents={"t": gamfit.smooth.LatentCoord(n=n, d=d, init=t_init)},
         penalties=[

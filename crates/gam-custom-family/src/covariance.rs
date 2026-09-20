@@ -2219,7 +2219,9 @@ pub(crate) fn joint_penalty_subspace_trace_parts(
     let m_slice = m_evals
         .as_slice()
         .expect("eigh returns an owned standard-layout eigenvalue vector");
-    let kept = laplace_precision_kept_eigenpairs(m_slice, penalty_rank);
+    let kept = laplace_precision_kept_eigenpairs(m_slice, penalty_rank).map_err(|reason| {
+        CustomFamilyError::trial_point(format!("joint penalty subspace: {reason}"))
+    })?;
     let logdet: f64 = kept.iter().map(|&eig_idx| m_evals[eig_idx].ln()).sum();
     // Full Moore–Penrose pseudo-inverse `M⁺` (drop ker(H+Sλ)) in spectral
     // form: kept eigenvectors as the kernel basis, diag(1/σ) as the reduced
