@@ -377,10 +377,6 @@ pub fn smooth_pvalue_unavailable(shape: &ShapeSpec) -> Option<SmoothPValueUnavai
     }
 }
 
-/// The label a term's EDF carries when a penalty block among its `count` blocks from
-/// `start` is not rank-bound certified (#2901): "rank bound not assessed" when the
-/// governor refused a certificate, else "rank bound not certified". Such a block's
-/// trace is published raw, so the term's EDF is not clamped to its dimension.
 /// The smoothing parameters of the `count` penalty blocks a term owns from
 /// `start` in the fit's flat layout — the same window its EDF is read over.
 fn term_lambdas(fit: &UnifiedFitResult, start: usize, count: usize) -> Vec<f64> {
@@ -391,6 +387,10 @@ fn term_lambdas(fit: &UnifiedFitResult, start: usize, count: usize) -> Vec<f64> 
         .unwrap_or_default()
 }
 
+/// The label a term's EDF carries when a penalty block among its `count` blocks from
+/// `start` is not rank-bound certified (#2901): "rank bound not assessed" when the
+/// governor refused a certificate, else "rank bound not certified". Such a block's
+/// trace is published raw, so the term's EDF is not clamped to its dimension.
 fn edf_rank_bound_label(fit: &UnifiedFitResult, start: usize, count: usize) -> Option<String> {
     let bounds = fit.edf_rank_bound().get(start..start + count)?;
     if bounds
