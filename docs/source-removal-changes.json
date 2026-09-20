@@ -2613,5 +2613,13 @@
     ],
     "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
     "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
+  },
+  {
+    "base": "b9758d35a07556d8233277172814d07401129bb5",
+    "items": [
+      "crates/gam-sae/src/manifold/penalties.rs:fn:live_decoder_incoherence_penalty"
+    ],
+    "reason": "#3515: the DecoderIncoherence routing coactivation is frozen per assembly and carried through CollapsePreventionGates, so the line-search value and gradient see one gate. The live per-evaluation recomputation (live_decoder_incoherence_penalty) is replaced by decoder_incoherence_penalty over the frozen gate plus refresh_decoder_incoherence_gate at assembly/reset.",
+    "evidence": "No remaining callers: the only call site in penalties.rs now reads decoder_incoherence_penalty(base) with the frozen gate; covered by gam-sae lib collapse_prevention and decoder_incoherence tests."
   }
 ]
