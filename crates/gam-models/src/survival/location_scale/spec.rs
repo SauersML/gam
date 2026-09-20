@@ -830,6 +830,7 @@ pub fn survival_fit_from_parts(
             null_space_logdet: None,
             null_space_dim: None,
             null_deviance: None,
+            binomial_trial_counts: false,
             survival_link_wiggle_knots: link_wiggle_knots,
             survival_link_wiggle_degree: link_wiggle_degree,
             criterion_certificate,

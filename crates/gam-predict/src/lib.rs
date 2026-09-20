@@ -41,15 +41,15 @@ pub(crate) use crate::standard::StandardPredictor;
 use crate::survival::SurvivalPredictor;
 use crate::transformation_normal::TransformationNormalPredictor;
 use gam_inference::probability::{
-    beta_moment_matched_interval, gamma_moment_matched_interval,
-    inverse_gaussian_moment_matched_interval, negative_binomial_moment_matched_interval, poisson_moment_matched_interval,
-    tweedie_moment_matched_interval,
+    beta_moment_matched_interval, binomial_proportion_interval, gamma_moment_matched_interval,
+    inverse_gaussian_moment_matched_interval, negative_binomial_moment_matched_interval,
+    poisson_moment_matched_interval, tweedie_moment_matched_interval,
 };
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
 use gam_linalg::utils::predict_gam_dimension_mismatch_message;
-use gam_math::probability::normal_cdf;
+use gam_math::probability::{is_binomial_trial_count, normal_cdf};
 use gam_models::family_runtime::{
     FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_for_spec,
     strategy_from_fit,
@@ -578,6 +578,13 @@ pub trait UncertaintyCovarianceSource {
     fn interval_reference(&self) -> Result<IntervalReference, EstimationError> {
         Ok(IntervalReference::Normal)
     }
+    /// Whether a binomial fit read its prior weights as trial counts
+    /// (`FitArtifacts::binomial_trial_counts`), so a new row's weight is its trial count `m*` and its observation law is
+    /// `Binomial(m*, p)/m*`. A raw covariance carries no fit and reports `false`:
+    /// its binomial rows are Bernoulli.
+    fn binomial_weights_are_trial_counts(&self) -> bool {
+        false
+    }
 }
 
 impl UncertaintyCovarianceSource for UnifiedFitResult {
@@ -612,6 +619,9 @@ impl UncertaintyCovarianceSource for UnifiedFitResult {
     }
     fn interval_reference(&self) -> Result<IntervalReference, EstimationError> {
         IntervalReference::of_fit(self)
+    }
+    fn binomial_weights_are_trial_counts(&self) -> bool {
+        self.artifacts.binomial_trial_counts
     }
 }
 
@@ -1700,8 +1710,11 @@ pub struct PredictUncertaintyOptions {
     /// PREDICTION frame's weight column (the same column / unit-weight default
     /// `sample_replicates` uses) and threaded into `family_observation_band`.
     /// `None` (the default) or unit weights leave unweighted fits byte-identical.
-    /// Only the Gaussian observation band consumes this; every other family
-    /// encodes dispersion through its own precision parameter.
+    /// On a binomial fit that read its weights as trial counts (a proportion
+    /// response, #4228) each weight is the new row's trial count `m*`, and its
+    /// observation law is `Binomial(m*, p)/m*`; there a weight must be an integer
+    /// `≥ 1`. The Gaussian and trial-count binomial bands are the only consumers;
+    /// every other family encodes dispersion through its own precision parameter.
     pub observation_prior_weights: Option<Array1<f64>>,
 }
 
@@ -2296,12 +2309,15 @@ fn gaussian_observation_variance_per_row(
 /// - Beta:       `E[μ(1−μ)]/(1+φ) + v = (m·c + φ·v)/(1+φ)`
 /// - Bernoulli (Binomial, and Royston–Parmar's horizon indicator `1{T > t}`):
 ///   `E[μ(1−μ)] + v = m·c`, exactly
+/// - Binomial proportion `K/w` of a row with `w` trials, on a fit whose weights
+///   are trial counts (`binomial_weights_are_trial_counts`, #4228):
+///   `E[μ(1−μ)]/w + v = m·c/w + v(w−1)/w`, which is the Bernoulli row at `w = 1`
 /// - Student-t:  `σ²ν/(ν−2) + v`, finite only for ν > 2
 ///
 /// Every term is a non-negative quantity and no difference of two of them is ever
 /// formed, so the total is non-negative by construction and nothing is floored.
-/// The Beta and Bernoulli rows collect `E[μ(1−μ)] = m·c − v` into the sum rather
-/// than evaluate it, and read `m(1 − m)` as `m·c` off the complement the caller
+/// The Beta, Bernoulli and binomial-proportion rows collect `E[μ(1−μ)] = m·c − v`
+/// into the sum rather than evaluate it, and read `m(1 − m)` as `m·c` off the complement the caller
 /// carried: where μ rounds to one, `1 − m` is exactly zero while `c` is not
 /// (#3140). Without that complement those families return `None`, as every family
 /// does without the fitted dispersion its law needs (`observation_phi` /
@@ -2368,6 +2384,13 @@ where
             let phi = source.observation_phi()?;
             let c = mean_complement?;
             Some(rows(&|i, m| (m * c[i] + phi * v[i]) / (1.0 + phi)))
+        }
+        ResponseFamily::Binomial if source.binomial_weights_are_trial_counts() => {
+            let c = mean_complement?;
+            Some(match prior_weights {
+                Some(w) => rows(&|i, m| m * c[i] / w[i] + v[i] * (w[i] - 1.0) / w[i]),
+                None => rows(&|i, m| m * c[i]),
+            })
         }
         ResponseFamily::Binomial | ResponseFamily::RoystonParmar => {
             let c = mean_complement?;
@@ -2621,6 +2644,68 @@ where
         // quantile; no observation band is reported rather than a Gaussian
         // surrogate that would under-cover the heavy tails.
         ResponseFamily::StudentT { .. } => Ok((None, None)),
+        ResponseFamily::Binomial if source.binomial_weights_are_trial_counts() => {
+            // A proportion response `k/m` fitted with its trial counts as weights
+            // (#4228): a new row's weight is its own trial count `m*`, and the
+            // fitted likelihood says its observed proportion is
+            // `Binomial(m*, p)/m*`. Estimation uncertainty in `p` makes the
+            // predictive the beta-binomial of the moment-matched Beta, whose
+            // equal-tailed quantiles are the band, each a multiple of `1/m*`. A
+            // row with one trial is the Bernoulli row below, exactly; without a
+            // weight column every row has one trial. A weight that is not a
+            // trial count has no binomial law and is refused, never rounded.
+            let Some(trials) = prior_weights else {
+                return Ok(bernoulli_observation_band(
+                    mean,
+                    z_lower_per_row,
+                    z_upper_per_row,
+                    reference,
+                ));
+            };
+            if trials.len() != mean.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "binomial observation band: {} trial counts for {} rows",
+                    trials.len(),
+                    mean.len()
+                )));
+            }
+            if let Some((row, &value)) = trials
+                .iter()
+                .enumerate()
+                .find(|&(_, &value)| !is_binomial_trial_count(value))
+            {
+                return Err(EstimationError::InvalidInput(format!(
+                    "binomial observation band at row {row}: the fit read its weights as trial \
+                     counts, so a new row's weight is its trial count, an integer in [1, 2^53]; \
+                     got {value}"
+                )));
+            }
+            let complement = mean_complement.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "binomial trial-count observation band needs the posterior mean of the \
+                     complement 1 − μ beside the mean"
+                        .to_string(),
+                )
+            })?;
+            let total_var = predictive_variance().expect("the complement is present");
+            skew_predictive_bounds(total_var, &|i, _, p_lo, p_hi| {
+                if trials[i] == 1.0 {
+                    Some((
+                        bernoulli_predictive_quantile(mean[i], p_lo),
+                        bernoulli_predictive_quantile(mean[i], p_hi),
+                    ))
+                } else {
+                    binomial_proportion_interval(
+                        mean[i],
+                        complement[i],
+                        trials[i],
+                        mean_variance[i],
+                        p_lo,
+                        p_hi,
+                    )
+                }
+            })
+        }
         ResponseFamily::Binomial | ResponseFamily::RoystonParmar => {
             // Royston–Parmar reports the survival probability S(t) at the
             // requested horizon, so its fresh observation is the Bernoulli
@@ -2639,18 +2724,34 @@ where
             // edges are support points whatever `m` is, and a tail mass
             // `q ∈ (0, 1)` is compared with `1 − m` at a resolution the complement
             // never reaches, so the mean enters as it is.
-            let n = mean.len();
-            let mut lower = Array1::<f64>::zeros(n);
-            let mut upper = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let p_lo = reference.cdf(-z_lower_per_row[i]);
-                let p_hi = reference.cdf(z_upper_per_row[i]);
-                lower[i] = bernoulli_predictive_quantile(mean[i], p_lo);
-                upper[i] = bernoulli_predictive_quantile(mean[i], p_hi);
-            }
-            Ok((Some(lower), Some(upper)))
+            Ok(bernoulli_observation_band(
+                mean,
+                z_lower_per_row,
+                z_upper_per_row,
+                reference,
+            ))
         }
     }
+}
+
+/// Equal-tailed quantiles of the marginal Bernoulli predictive `P(Y = 1) = E[μ]`
+/// at each row's tail masses `F(−z_lower)` and `F(z_upper)` under `reference`.
+fn bernoulli_observation_band(
+    mean: &Array1<f64>,
+    z_lower_per_row: &Array1<f64>,
+    z_upper_per_row: &Array1<f64>,
+    reference: IntervalReference,
+) -> (Option<Array1<f64>>, Option<Array1<f64>>) {
+    let n = mean.len();
+    let mut lower = Array1::<f64>::zeros(n);
+    let mut upper = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let p_lo = reference.cdf(-z_lower_per_row[i]);
+        let p_hi = reference.cdf(z_upper_per_row[i]);
+        lower[i] = bernoulli_predictive_quantile(mean[i], p_lo);
+        upper[i] = bernoulli_predictive_quantile(mean[i], p_hi);
+    }
+    (Some(lower), Some(upper))
 }
 
 /// Per-row equal-tailed observation band for the dispersion location-scale
@@ -5725,6 +5826,73 @@ mod tests {
             lower[0],
             upper[0]
         );
+    }
+
+    /// #4228: a binomial fit whose responses were proportions `k/m` read its
+    /// weights as trial counts, so a new row's weight is its trial count `m*` and
+    /// its observed proportion is `Binomial(m*, p)/m*`. With no estimation
+    /// uncertainty the band is the exact binomial's equal-tailed quantiles over
+    /// `m*`; with it, the moment-matched beta-binomial's; with one trial, the
+    /// Bernoulli set. A fit whose weights were case weights keeps the Bernoulli
+    /// set whatever the weight, and a weight that is not a trial count is refused
+    /// with its row.
+    #[test]
+    fn a_trial_count_binomial_band_is_on_the_observed_proportion_4228() {
+        let mut fit = test_fit_with_covariance(array![0.0], Array2::eye(1));
+        fit.artifacts.binomial_trial_counts = true;
+        let mean = array![0.5, 0.5, 0.5];
+        let complement = array![0.5, 0.5, 0.5];
+        let standard_error = array![0.0, 0.1, 0.1];
+        let trials = array![100.0, 100.0, 1.0];
+        let z = Array1::from_elem(3, standard_normal_quantile(0.975).unwrap());
+        let band = |source: &UnifiedFitResult, weights: &Array1<f64>| {
+            family_observation_band(
+                &ResponseFamily::Binomial,
+                &mean,
+                Some(&complement),
+                &standard_error,
+                &z,
+                &z,
+                IntervalReference::Normal,
+                source,
+                Some(weights),
+            )
+        };
+        let (lower, upper) = band(&fit, &trials).expect("trial counts name a binomial law");
+        let (lower, upper) = (lower.expect("lower edge"), upper.expect("upper edge"));
+        // Binomial(100, 0.5) has 2.5% and 97.5% quantiles 40 and 60; the
+        // beta-binomial with mean 0.5 and Var(p) = 0.01 has 28 and 72.
+        assert_eq!((lower[0], upper[0]), (0.40, 0.60));
+        assert_eq!((lower[1], upper[1]), (0.28, 0.72));
+        assert_eq!(
+            (lower[2], upper[2]),
+            (0.0, 1.0),
+            "one trial is the Bernoulli set"
+        );
+
+        let variance = family_predictive_variance(
+            &ResponseFamily::Binomial,
+            &mean,
+            Some(&complement),
+            &standard_error.mapv(|s| s * s),
+            &fit,
+            Some(&trials),
+        )
+        .expect("the proportion's predictive variance");
+        // Var(K/m) = μc/m + Var(p)(m − 1)/m.
+        let expected = [0.0025, 0.0025 + 0.01 * 0.99, 0.25];
+        for (i, (&got, want)) in variance.iter().zip(expected).enumerate() {
+            assert!((got - want).abs() < 1e-15, "row {i}: {got} vs {want}");
+        }
+
+        let case_weighted = test_fit_with_covariance(array![0.0], Array2::eye(1));
+        let (lower, upper) = band(&case_weighted, &trials).expect("the Bernoulli set");
+        assert_eq!(lower.expect("lower edge"), array![0.0, 0.0, 0.0]);
+        assert_eq!(upper.expect("upper edge"), array![1.0, 1.0, 1.0]);
+
+        let refused = band(&fit, &array![100.0, 12.5, 1.0])
+            .expect_err("a fractional trial count names no binomial law");
+        assert!(refused.to_string().contains("row 1"), "{refused}");
     }
 
     #[test]

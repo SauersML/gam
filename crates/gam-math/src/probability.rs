@@ -417,6 +417,15 @@ pub fn inverse_gaussian_cdf(x: f64, mu: f64, lambda: f64) -> f64 {
     (body + reflected).min(1.0)
 }
 
+/// Whether `trials` is the trial count of a binomial row: an integer in
+/// `[1, 2⁵³]`, the range in which every integer is an exact `f64`.
+pub fn is_binomial_trial_count(trials: f64) -> bool {
+    trials.is_finite()
+        && trials >= 1.0
+        && trials.fract() == 0.0
+        && trials <= (1_u64 << f64::MANTISSA_DIGITS) as f64
+}
+
 /// Two-sided standard-normal probability `P(|Z| ≥ |z|)`.
 ///
 /// The exact symmetric identity is `erfc(|z|/√2)`. Evaluating that identity

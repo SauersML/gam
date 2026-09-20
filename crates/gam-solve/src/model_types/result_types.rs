@@ -2538,6 +2538,15 @@ pub struct FitArtifacts {
     /// or on a saved model that predates the field.
     #[serde(default)]
     pub null_deviance: Option<f64>,
+    /// Whether this binomial fit read its prior weights as trial counts: the
+    /// response carried a proportion strictly inside `(0, 1)`, so a row with
+    /// weight `m` is `Binomial(m, p)/m` and a new row's weight is its own trial
+    /// count. `false` for every other family and for a 0/1 response, whose
+    /// weights are case weights on a Bernoulli row. Recorded at fit time because
+    /// a saved model keeps no response; the observation band and generative
+    /// draws read it to pick the predictive law.
+    #[serde(default)]
+    pub binomial_trial_counts: bool,
     #[serde(default)]
     pub survival_link_wiggle_knots: Option<Array1<f64>>,
     #[serde(default)]
@@ -2866,6 +2875,7 @@ impl std::fmt::Debug for FitArtifacts {
             .field("null_space_logdet", &self.null_space_logdet)
             .field("null_space_dim", &self.null_space_dim)
             .field("null_deviance", &self.null_deviance)
+            .field("binomial_trial_counts", &self.binomial_trial_counts)
             .field(
                 "survival_link_wiggle_knots",
                 &self
