@@ -4835,7 +4835,7 @@
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3144 (pygam-spec-aliases) merged as c663ba6dbaaaab008f9ec054a7ea349637fb649a with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from c663ba6dbaaaab008f9ec054a7ea349637fb649a's own tree with --base a5c3a5b6e7df11b78179fc274d6843687abe66a3 --head c663ba6dbaaaab008f9ec054a7ea349637fb649a (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> c663ba6dbaaaab008f9ec054a7ea349637fb649a -- <its path> gives 0 for every item."
   },
   {
-    "base": "099331c0c51cb1d21b432e99b5a73e2fbc2262ce",
+    "base": "37a134fac69c3a9139c9818d8a59e68843860c45",
     "removed": {
       "crates/gam-linalg/src/utils.rs::stable_logistic": 1,
       "crates/gam-linalg/src/utils.rs::stable_softplus": 1

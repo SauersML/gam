@@ -2548,7 +2548,7 @@
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3352 (fix-3090-seed-logit-jitter, part of #3090) merged as 93285a585bf63554ef43831f1a7f4a4758115f98 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 93285a585bf63554ef43831f1a7f4a4758115f98's own tree with --base d058855331e8384f91083846d36df994f5187d9b --head 93285a585bf63554ef43831f1a7f4a4758115f98 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 2 items. Read-proof: git grep -w -c <name> 93285a585bf63554ef43831f1a7f4a4758115f98 -- <its path> gives 0 for every item."
   },
   {
-    "base": "099331c0c51cb1d21b432e99b5a73e2fbc2262ce",
+    "base": "37a134fac69c3a9139c9818d8a59e68843860c45",
     "items": [
       "crates/gam-inference/src/hmc_io.rs:fn:log1pexp_is_finite_for_extreme_eta",
       "crates/gam-inference/src/hmc_io.rs:fn:sigmoid_stable_behaves_at_extremes",
