@@ -75,7 +75,6 @@ def plot(
     model: "Model",
     data: Any,
     *,
-    x: str | None = None,
     y: str | None = None,
     interval: float | None = 0.95,
     kind: str = "prediction",
@@ -96,13 +95,17 @@ def plot(
     if kind == "prediction":
         response_name = diagnostics.response_name
         candidate_columns = [name for name in columns if name != response_name]
-        x_name = x or (candidate_columns[0] if len(candidate_columns) == 1 else None)
-        if x_name is None:
+        # The full-model prediction is a curve in one column only when it is the
+        # model's sole feature: with more, rows sorted by that column trace a
+        # zigzag through the other features' values. A term's own effect is a
+        # partial effect, which plot_terms draws.
+        if len(candidate_columns) != 1:
             raise ValueError(
-                "prediction plots require x='column_name' when multiple feature columns are present"
+                f"prediction plots draw the model against its one feature column, but the data "
+                f"has {len(candidate_columns)} ({candidate_columns}); use "
+                "model.plot_terms() to draw each term's partial effect"
             )
-        if x_name not in columns:
-            raise ValueError(f"plot column '{x_name}' is missing from the supplied data")
+        x_name = candidate_columns[0]
         x_values = coerce_numeric_vector(columns[x_name], label=x_name)
         ordering = sorted(range(len(x_values)), key=lambda index: x_values[index])
         x_sorted = [x_values[index] for index in ordering]

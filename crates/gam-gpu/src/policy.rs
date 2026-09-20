@@ -63,17 +63,17 @@ impl GpuDispatchPolicy {
     /// activates when the GPU factorization path is already chosen.
     pub const REFINEMENT_MIN_P: usize = 64;
 
-    /// Maximum number of fp32-correction steps per solve: a cost cap, not an
+    /// Maximum number of fp32-correction steps per solve: a COST budget, not an
     /// accuracy guarantee.
     ///
-    /// Refinement against a fixed fp32 factor contracts the error LINEARLY,
-    /// `‖e_{k+1}‖ ≲ κ(A)·u_f32·‖e_k‖`, so `k` corrections leave about
-    /// `(κ·u_f32)^{k+1}` of it. Each correction is one fp32 POTRS plus one fp64
-    /// GEMV (O(p²)); past a few of them the fp64 POTRF that answers the system
-    /// directly is the cheaper route. Accuracy is decided only by the residual
-    /// certificate in `iterative_refinement_solve_impl`: a solve that has not
-    /// reached its attainable residual within this many steps returns `Err`
-    /// and the caller factors in fp64.
+    /// With a fixed fp32 factor, iterative refinement contracts the error
+    /// linearly — after `k` corrections it is ≈ (κ(A)·u_f32)^{k+1} relative,
+    /// u_f32 ≈ 6 × 10⁻⁸ — so reaching the fp64 band κ(A)·u_f64 within 3
+    /// corrections needs κ(A)³ ≲ u_f64 / u_f32⁴, i.e. κ(A) ≲ 2 × 10⁴. Accuracy
+    /// is decided by the solver's residual certificate
+    /// (`‖b − A·x‖ ≤ γ_{p+1}·(‖A‖_F‖x‖ + ‖b‖)`), not by this count: when the
+    /// budget ends above that band the fp32 path reports failure and the solve
+    /// is done by fp64 POTRF.
     pub const REFINEMENT_MAX_STEPS: usize = 3;
 
     /// Return `true` when the problem is large enough that attempting fp32
