@@ -375,107 +375,82 @@ pub(crate) enum SurvivalInterceptSlotKind {
     Exit = 1,
 }
 
-/// Per-row warm-start storage for the survival calibration root solver.
-///
-/// Two slots per row (entry intercept against `q0`, exit intercept against
-/// `q1`). Each slot stores the certified intercept `a` alongside a
-/// `beta_tag: u64` — [`hash_intercept_warm_start_key`] of every input of the
-/// calibration equation `a` solves. Reads return `Some(a)` only when the
-/// caller's tag matches the stored tag AND the stored value is finite, so a
-/// hit is the certified root of the very equation being solved: a rejected
-/// trust-region trial or a subsampled probe keys under its own inputs, and a
-/// change to any of them (not just the deviation coefficients) is a miss.
-///
-/// The "never written" sentinel is `beta_tag == 0`; the key remaps `0` to `1`
-/// so the sentinel can never collide with a real key.
-///
-/// Memory ordering is a sequence lock: the writer invalidates the tag, fences
-/// (`Release`), writes the value and publishes the tag with `Release`; the
-/// reader loads the tag with `Acquire`, reads the value, fences (`Acquire`) and
-/// re-reads the tag. The fences keep the value accesses between the two tag
-/// accesses on both sides, so a matching tag pair means the value is the one
-/// written under that tag.
+/// Per-row roots keyed by the complete calibration equation. Each slot's
+/// key and value share a mutex: concurrent trial writers cannot publish a
+/// value under another trial's key, even when an equation key recurs.
 pub(crate) struct SurvivalInterceptWarmStartCache {
-    pub(crate) entry_value: Vec<std::sync::atomic::AtomicU64>,
-    pub(crate) entry_tag: Vec<std::sync::atomic::AtomicU64>,
-    pub(crate) exit_value: Vec<std::sync::atomic::AtomicU64>,
-    pub(crate) exit_tag: Vec<std::sync::atomic::AtomicU64>,
+    entry: Vec<std::sync::Mutex<Option<(u64, f64)>>>,
+    exit: Vec<std::sync::Mutex<Option<(u64, f64)>>>,
 }
 
 impl SurvivalInterceptWarmStartCache {
-    #[inline]
-    pub(crate) fn slots_for(
-        &self,
-        kind: SurvivalInterceptSlotKind,
-    ) -> (
-        &[std::sync::atomic::AtomicU64],
-        &[std::sync::atomic::AtomicU64],
-    ) {
+    fn slots_for(&self, kind: SurvivalInterceptSlotKind)
+        -> &[std::sync::Mutex<Option<(u64, f64)>>]
+    {
         match kind {
-            SurvivalInterceptSlotKind::Entry => (&self.entry_value, &self.entry_tag),
-            SurvivalInterceptSlotKind::Exit => (&self.exit_value, &self.exit_tag),
+            SurvivalInterceptSlotKind::Entry => &self.entry,
+            SurvivalInterceptSlotKind::Exit => &self.exit,
         }
     }
 
-    /// Return the cached intercept iff the slot's stored `beta_tag` matches
-    /// the caller's `beta_tag` and the stored value is finite. Otherwise
-    /// returns `None` (cache miss — caller seeds from the rigid closed form).
-    #[inline]
-    pub(crate) fn load(
-        &self,
-        row: usize,
-        kind: SurvivalInterceptSlotKind,
-        beta_tag: u64,
-    ) -> Option<f64> {
-        let (values, tags) = self.slots_for(kind);
-        let value_slot = values.get(row)?;
-        let tag_slot = tags.get(row)?;
-        let tag_before = tag_slot.load(std::sync::atomic::Ordering::Acquire);
-        if tag_before != beta_tag {
-            return None;
-        }
-        let bits = value_slot.load(std::sync::atomic::Ordering::Relaxed);
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-        let tag_after = tag_slot.load(std::sync::atomic::Ordering::Relaxed);
-        if tag_after != beta_tag {
-            return None;
-        }
-        let value = f64::from_bits(bits);
-        value.is_finite().then_some(value)
+    pub(crate) fn load(&self, row: usize, kind: SurvivalInterceptSlotKind, beta_tag: u64)
+        -> Option<f64>
+    {
+        let slot = self.slots_for(kind).get(row)?.lock()
+            .expect("survival intercept cache lock poisoned");
+        let (tag, value) = (*slot)?;
+        (tag == beta_tag && value.is_finite()).then_some(value)
     }
 
-    /// Stamp the slot with the converged intercept under `beta_tag`. Concurrent
-    /// writers from different trials race; the last writer wins, which is fine
-    /// because every reader gates on its own tag and only accepts a match.
-    #[inline]
     pub(crate) fn store(&self, row: usize, kind: SurvivalInterceptSlotKind, a: f64, beta_tag: u64) {
-        let (values, tags) = self.slots_for(kind);
-        if let (Some(value_slot), Some(tag_slot)) = (values.get(row), tags.get(row)) {
-            // Invalidate before writing the new value so an interleaved
-            // reader cannot see the new tag paired with the old value.
-            tag_slot.store(0, std::sync::atomic::Ordering::Relaxed);
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            value_slot.store(a.to_bits(), std::sync::atomic::Ordering::Relaxed);
-            tag_slot.store(beta_tag, std::sync::atomic::Ordering::Release);
+        if let Some(slot) = self.slots_for(kind).get(row) {
+            *slot.lock().expect("survival intercept cache lock poisoned") = Some((beta_tag, a));
         }
     }
 }
 
 pub(crate) fn new_intercept_warm_start_cache(n: usize) -> Arc<SurvivalInterceptWarmStartCache> {
     Arc::new(SurvivalInterceptWarmStartCache {
-        entry_value: (0..n)
-            .map(|_| std::sync::atomic::AtomicU64::new(f64::NAN.to_bits()))
-            .collect(),
-        entry_tag: (0..n)
-            .map(|_| std::sync::atomic::AtomicU64::new(0))
-            .collect(),
-        exit_value: (0..n)
-            .map(|_| std::sync::atomic::AtomicU64::new(f64::NAN.to_bits()))
-            .collect(),
-        exit_tag: (0..n)
-            .map(|_| std::sync::atomic::AtomicU64::new(0))
-            .collect(),
+        entry: (0..n).map(|_| std::sync::Mutex::new(None)).collect(),
+        exit: (0..n).map(|_| std::sync::Mutex::new(None)).collect(),
     })
+}
+
+#[cfg(test)]
+mod intercept_cache_concurrency_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_trials_preserve_equation_value_pairs() {
+        let cache = new_intercept_warm_start_cache(1);
+        std::thread::scope(|scope| {
+            for tag in 1..=2 {
+                let cache = &cache;
+                scope.spawn(move || {
+                    for _ in 0..20_000 {
+                        cache.store(0, SurvivalInterceptSlotKind::Exit, tag as f64, tag);
+                        if let Some(value) = cache.load(0, SurvivalInterceptSlotKind::Exit, tag) {
+                            assert_eq!(value, tag as f64);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn rows_slots_and_invalid_values_are_isolated() {
+        let cache = new_intercept_warm_start_cache(2);
+        cache.store(0, SurvivalInterceptSlotKind::Entry, 1.0, 7);
+        cache.store(1, SurvivalInterceptSlotKind::Exit, 2.0, 7);
+        assert_eq!(cache.load(0, SurvivalInterceptSlotKind::Entry, 7), Some(1.0));
+        assert_eq!(cache.load(1, SurvivalInterceptSlotKind::Exit, 7), Some(2.0));
+        assert_eq!(cache.load(0, SurvivalInterceptSlotKind::Exit, 7), None);
+        assert_eq!(cache.load(0, SurvivalInterceptSlotKind::Entry, 8), None);
+        cache.store(0, SurvivalInterceptSlotKind::Entry, f64::NAN, 7);
+        assert_eq!(cache.load(0, SurvivalInterceptSlotKind::Entry, 7), None);
+        assert_eq!(cache.load(2, SurvivalInterceptSlotKind::Exit, 7), None);
+    }
 }
 
 /// Reusable FLEX jet arenas whose retained tapes are on the governor's ledger
