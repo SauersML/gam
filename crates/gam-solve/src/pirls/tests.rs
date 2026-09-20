@@ -2642,6 +2642,74 @@ mod tests {
         );
     }
 
+    #[test]
+    pub(crate) fn binomial_latent_cloglog_takes_the_observed_curvature_path_3802() {
+        // The latent-cloglog mean `μ(η) = E[1 − exp(−Z e^η)]` (lognormal `Z`) is
+        // not the canonical Bernoulli link, so `W_obs = W_F − (y−μ)·B` with
+        // `B ≠ 0` and the Laplace approximation needs the observed information.
+        // The gate used to omit this link, so these fits silently built the
+        // LAML from Fisher curvature.
+        let state = gam_problem::types::LatentCLogLogState::new(0.4)
+            .expect("valid latent cloglog state");
+        let link = InverseLink::LatentCLogLog(state);
+        let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            link.clone(),
+        ));
+        assert!(super::supports_observed_hessian_curvature_for_likelihood(
+            &likelihood,
+            &link
+        ));
+
+        let eta = array![-2.0, -0.7, 0.0, 0.6, 1.4, -1.1];
+        let y = array![1.0, 0.0, 1.0, 0.0, 1.0, 1.0];
+        let prior = Array1::<f64>::ones(eta.len());
+        let mut fisher = Array1::<f64>::zeros(eta.len());
+        let mut tower = Vec::with_capacity(eta.len());
+        for i in 0..eta.len() {
+            let jet = crate::mixture_link::inverse_link_jet_for_inverse_link(&link, eta[i])
+                .expect("latent cloglog jet");
+            let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+                &link, eta[i],
+            )
+            .expect("latent cloglog pdf third derivative");
+            let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
+                &link, eta[i], jet.mu,
+            );
+            fisher[i] = jet.d1 * jet.d1 / (jet.mu * one_minus_mu);
+            tower.push(observed_weight_dispatch(
+                WeightFamily::Binomial,
+                WeightLink::Other,
+                y[i],
+                jet.mu,
+                one_minus_mu,
+                1.0,
+                1.0,
+                jet,
+                h4,
+            ));
+        }
+
+        let (w_obs, c_obs, d_obs) =
+            compute_observed_hessian_curvature_arrays(&likelihood, &link, &eta, y.view(), &fisher, prior.view())
+                .expect("latent cloglog observed curvature");
+        for i in 0..eta.len() {
+            // Two algebraic arrangements of the same five jet values: the
+            // log-probability jet and the ratio tower agree to rounding.
+            let (w_ref, c_ref, d_ref) = tower[i];
+            assert_relative_eq!(w_obs[i], w_ref, max_relative = 1e-9, epsilon = 1e-12);
+            assert_relative_eq!(c_obs[i], c_ref, max_relative = 1e-9, epsilon = 1e-12);
+            assert_relative_eq!(d_obs[i], d_ref, max_relative = 1e-9, epsilon = 1e-12);
+            // Non-canonical: the residual term moves the weight off Fisher.
+            assert!(
+                (w_obs[i] - fisher[i]).abs() > 1e-6 * fisher[i].abs(),
+                "row {i}: observed {} equals Fisher {} on a non-canonical link",
+                w_obs[i],
+                fisher[i]
+            );
+        }
+    }
+
     /// Intercept-only Gamma PIRLS fit under `link`: returns the fitted shape,
     /// the shape re-profiled at the converged η, and the fitted mean.
     fn intercept_only_gamma_fit(link: StandardLink, y: &Array1<f64>) -> (f64, f64, f64) {

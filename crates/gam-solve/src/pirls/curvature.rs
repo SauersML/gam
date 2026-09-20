@@ -386,6 +386,7 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
             | InverseLink::Standard(StandardLink::CLogLog)
             | InverseLink::Standard(StandardLink::LogLog)
             | InverseLink::Standard(StandardLink::Cauchit)
+            | InverseLink::LatentCLogLog(_)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
             | InverseLink::Mixture(_)
