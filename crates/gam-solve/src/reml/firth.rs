@@ -22,20 +22,13 @@ struct FirthReducedCore {
 }
 
 /// Single-index sub-blocks of the exact mixed second directional derivative
-/// `D²H_φ[u,v]`, precomputed once against the fixed `eye` rhs used by the
-/// exact-Hessian TK outer loop. See
+/// `D²H_φ[u,v]` (its `p×p`, identity-rhs form), precomputed once per direction
+/// for the exact-Hessian TK outer loop. See
 /// [`FirthDenseOperator::tk_second_direction_eye_cache`] (#1575).
 pub(crate) struct FirthSecondDirEyeCache {
-    /// The fixed identity rhs (`p×p`), kept so per-pair `fast_ab(.., &eye)`
-    /// matmuls reproduce the original byte-for-byte.
-    eye: Array2<f64>,
-    /// `X·I` — index-independent.
-    eta_rhs: Array2<f64>,
-    /// `(Bᵀ P B-base)·I` — index-independent.
-    p_b_rhs: Array2<f64>,
-    /// Per-direction `apply_hadamard_gram(eta_rhs ⊙ b_uvec_i)`.
+    /// Per-direction `P B_i = apply_hadamard_gram(X ⊙ b_uvec_i)`.
     p_bx: Vec<Array2<f64>>,
-    /// Per-direction `apply_p_u(a_u_reduced_i, w' ⊙ eta_rhs)`.
+    /// Per-direction `P_i B = apply_p_u(a_u_reduced_i, B)`, `B = w' ⊙ X`.
     pu_qv: Vec<Array2<f64>>,
 }
 
@@ -944,6 +937,10 @@ impl FirthDenseOperator {
         out
     }
 
+    /// General-rhs form of `D(Hφ)[u] V`. Production only ever needs `V = I`,
+    /// which [`Self::hphi_direction`] evaluates without the identity products;
+    /// this form stays as the independent reference those tests check against.
+    #[cfg(test)]
     pub(crate) fn hphi_direction_apply(
         &self,
         dir: &FirthDirection,
@@ -990,20 +987,43 @@ impl FirthDenseOperator {
 
     pub(crate) fn hphi_direction(&self, dir: &FirthDirection) -> Array2<f64> {
         let p = self.x_dense.ncols();
-        let eye = Array2::<f64>::eye(p);
-        let mut out = self.hphi_direction_apply(dir, &eye);
+        if p == 0 {
+            return Array2::<f64>::zeros((0, 0));
+        }
         // Exact first directional derivative of H_φ:
         //   D H_φ[u]
         //   = 0.5 [ Xᵀ diag(c_u) X
         //           - (B_uᵀ P B + Bᵀ P B_u + Bᵀ P_u B) ],
         // where
         //   c_u = w''' ⊙ δη_u ⊙ h + w'' ⊙ Dh[u],
-        //   B   = diag(w') X.
+        //   B   = diag(w') X,  B_u = diag(w'' ⊙ δη_u) X.
         //
         // Matrix-free contraction map used below:
-        //   Bᵀ P B      via apply_hadamard_gram_to_matrix(Z, K_r, K_r, B)
-        //   Bᵀ P_u B    via apply_hadamard_gram_to_matrix(Z, K_r, A_u, B), then *(-2)
+        //   P B         = `p_b_base`, direction-free and built once with the operator
+        //   P B_u       via apply_hadamard_gram_to_matrix(Z, K_r, K_r, B_u)
+        //   P_u B       via apply_hadamard_gram_to_matrix(Z, K_r, A_u, B), then *(-2)
         // where P = M⊙M and P_u = -2(M⊙N_u), but M/N_u are never formed explicitly.
+        //
+        // This is `hphi_direction_apply(dir, I)` with the identity products
+        // removed: `X·I = X`, `w' ⊙ (X·I) = B = b_base`, and the one
+        // direction-free Hadamard-Gram apply `P B` is the operator's cached
+        // `p_b_base` instead of an O(n·r²·p) rebuild on every call.
+        let x_bu = &self.x_dense * &dir.b_uvec.view().insert_axis(Axis(1));
+        let p_bu = RemlState::apply_hadamard_gram_to_matrix(
+            &self.x_reduced,
+            &self.k_reduced,
+            &self.k_reduced,
+            &x_bu,
+        );
+        let p_u_b = self.apply_p_u_to_matrix(&dir.a_u_reduced, &self.b_base);
+        let c_u = &(&self.w3 * &dir.deta) * &self.h_diag + &(&self.w2 * &dir.dh);
+        let diag_term = self
+            .x_dense_t
+            .dot(&(&self.x_dense * &c_u.view().insert_axis(Axis(1))));
+        let term1 = self.left_scaled_xt(&dir.b_uvec, &self.p_b_base);
+        let term2 = self.left_scaled_xt(&self.w1, &p_bu);
+        let term3 = self.left_scaled_xt(&self.w1, &p_u_b);
+        let mut out = 0.5 * (diag_term - (term1 + term2 + term3));
         symmetrize_in_place(&mut out);
         out
     }
@@ -1012,7 +1032,7 @@ impl FirthDenseOperator {
     /// fixed symmetric `Π` (p×p).
     ///
     /// With `L = X Π Xᵀ`, `M = Z K_r Zᵀ`, `P = M⊙M` and the terms of
-    /// [`Self::hphi_direction_apply`] at `V = I`:
+    /// `hphi_direction_apply` at `V = I` (equivalently [`Self::hphi_direction`]):
     ///   tr(Xᵀ diag(c_u) X Π)            = c_uᵀ ℓ,             ℓ = diag(L),
     ///   tr(B_uᵀ P B Π) = tr(Bᵀ P B_u Π) = b_uᵀ v,             v = (P⊙L) w',
     ///   tr(Bᵀ P_u B Π)                  = -2 ⟨A_u, R⟩,         R = Zᵀ diag(w')(M⊙L) diag(w') Z,
@@ -1099,6 +1119,11 @@ impl FirthDenseOperator {
         0.5 * (diag_term - (hadamard_terms + p_u_term))
     }
 
+    /// General-rhs form of `D²H_φ[u,v] V`. Production only ever needs `V = I`,
+    /// which [`Self::hphisecond_direction`] evaluates without the identity
+    /// products; this form stays as the independent reference those tests
+    /// check against.
+    #[cfg(test)]
     pub(crate) fn hphisecond_direction_apply(
         &self,
         u: &FirthDirection,
@@ -1227,89 +1252,63 @@ impl FirthDenseOperator {
         0.5 * (diag_term - d2_j2)
     }
 
-    /// Precompute, for a FIXED identity rhs, every sub-block of the mixed second
-    /// directional derivative `D²H_φ[u,v]` that depends on a SINGLE direction
-    /// index (or on nothing but the operator). The exact-Hessian TK outer loop
-    /// (`tk_hessian_rho_canonical_logit`) evaluates `hphisecond_direction_apply`
-    /// for every one of the `k(k+1)/2` penalty pairs against the same `eye` rhs;
-    /// the four heavy single-index reduced Hadamard-Gram applies inside it
-    /// (`p_bu_rhs`/`p_bv_rhs` and `p_u_b_rhs`/`pv_b_rhs`) therefore have only `k`
-    /// distinct values but were rebuilt `O(k²)` times. Caching them once per
-    /// index here turns that into `O(k)` of those O(n·r²·p) applies, with the
-    /// per-pair work limited to the genuinely mixed (`u`,`v`) blocks. This is
-    /// exact: each cached block is a pure function of `(operator, direction[i])`
-    /// for the fixed `eye` rhs, so the contraction it feeds is bit-identical to
-    /// `hphisecond_direction_apply(.., &eye)` (#1575).
-    pub(crate) fn tk_second_direction_eye_cache(
+    /// Exact mixed second directional derivative `D²H_φ[u,v]` as a `p×p`
+    /// matrix (the `V = I` form of the test-only general-rhs
+    /// `hphisecond_direction_apply`, which
+    /// is the only form production needs).
+    ///
+    /// The identity products of the general-rhs form are gone: `X·I = X`,
+    /// `w' ⊙ (X·I) = B = b_base`, `(P B)·I` is the operator's cached
+    /// `p_b_base`, and the mixed blocks `P B_uv` and `P_uv B` are used as they
+    /// come out of their Hadamard-Gram applies instead of being post-multiplied
+    /// by `I`.
+    pub(crate) fn hphisecond_direction(
         &self,
-        dirs: &[FirthDirection],
-    ) -> FirthSecondDirEyeCache {
-        let p = self.x_dense.ncols();
-        let eye = Array2::<f64>::eye(p);
-        // eta_rhs = X·I and qv = w' ⊙ eta_rhs are rhs-only (index-independent).
-        let eta_rhs = fast_ab(&self.x_dense, &eye);
-        let qv = &eta_rhs * &self.w1.view().insert_axis(Axis(1));
-        // p_b_rhs = (Bᵀ P B-base)·I is rhs-only; precompute it once.
-        let p_b_rhs = fast_ab(&self.p_b_base, &eye);
-        // Each direction's two single-index blocks are independent O(n·r²·p)
-        // reduced Hadamard-Gram applies. Fan them across Rayon with the nested-BLAS
-        // guard (inner faer GEMMs pinned to `Par::Seq`, no oversubscription) when
-        // there are several directions AND more than one thread; with a single
-        // direction (k=1) run serially so the inner GEMMs keep the global faer
-        // pool instead of being pinned to `Par::Seq`. The result is collected in
-        // direction order either way, so the cached blocks are identical to the
-        // serial build — bit-for-bit at fixture scale, where the inner GEMMs are
-        // already `Par::Seq` (#1575).
-        let compute_blocks = |d: &FirthDirection| -> (Array2<f64>, Array2<f64>) {
-            // p_b{u,v}_rhs: depends only on this direction's b_uvec.
-            let p_b = RemlState::apply_hadamard_gram_to_matrix(
-                &self.x_reduced,
-                &self.k_reduced,
-                &self.k_reduced,
-                &(&eta_rhs * &d.b_uvec.view().insert_axis(Axis(1))),
-            );
-            // p_u_b_rhs / pv_b_rhs: depends only on a_u_reduced.
-            let pu = self.apply_p_u_to_matrix(&d.a_u_reduced, &qv);
-            (p_b, pu)
-        };
-        let (p_bx, pu_qv): (Vec<Array2<f64>>, Vec<Array2<f64>>) =
-            if dirs.len() > 1 && rayon::current_num_threads() > 1 {
-                use rayon::prelude::*;
-                dirs.par_iter()
-                    .map(|d| gam_problem::with_nested_parallel(|| compute_blocks(d)))
-                    .unzip()
-            } else {
-                dirs.iter().map(compute_blocks).unzip()
-            };
-        FirthSecondDirEyeCache {
-            eye,
-            eta_rhs,
-            p_b_rhs,
-            p_bx,
-            pu_qv,
-        }
+        u: &FirthDirection,
+        v: &FirthDirection,
+    ) -> Array2<f64> {
+        let (p_bu, p_u_b) = self.second_direction_single_index_blocks(u);
+        let (p_bv, pv_b) = self.second_direction_single_index_blocks(v);
+        self.hphisecond_direction_from_single_index_blocks(u, v, &p_bu, &p_bv, &p_u_b, &pv_b)
     }
 
-    /// Exact mixed second directional derivative `D²H_φ[u,v]` against the fixed
-    /// `eye` rhs, reusing the single-index sub-blocks precomputed once by
-    /// [`Self::tk_second_direction_eye_cache`]. Bit-identical to
-    /// `hphisecond_direction_apply(&dirs[i], &dirs[j], &Array2::eye(p))`; only
-    /// the redundant per-pair recomputation of the single-index blocks is
-    /// removed (#1575).
-    pub(crate) fn hphisecond_direction_apply_eye_cached(
+    /// The two sub-blocks of `D²H_φ[u,v]` that depend on ONE direction only:
+    /// `P B_d` (`B_d = diag(w'' ⊙ δη_d) X`) and `P_d B`. Each is an
+    /// O(n·r²·p) reduced Hadamard-Gram apply.
+    fn second_direction_single_index_blocks(
         &self,
-        cache: &FirthSecondDirEyeCache,
-        dirs: &[FirthDirection],
-        i: usize,
-        j: usize,
+        d: &FirthDirection,
+    ) -> (Array2<f64>, Array2<f64>) {
+        let x_bd = &self.x_dense * &d.b_uvec.view().insert_axis(Axis(1));
+        let p_bd = RemlState::apply_hadamard_gram_to_matrix(
+            &self.x_reduced,
+            &self.k_reduced,
+            &self.k_reduced,
+            &x_bd,
+        );
+        let p_d_b = self.apply_p_u_to_matrix(&d.a_u_reduced, &self.b_base);
+        (p_bd, p_d_b)
+    }
+
+    /// `D²H_φ[u,v]` from its single-index sub-blocks (`P B_u`, `P B_v`,
+    /// `P_u B`, `P_v B`); every genuinely mixed `(u,v)` block is built here.
+    /// The single source of truth behind both [`Self::hphisecond_direction`]
+    /// and the cached pair loop [`Self::hphisecond_direction_apply_eye_cached`].
+    fn hphisecond_direction_from_single_index_blocks(
+        &self,
+        u: &FirthDirection,
+        v: &FirthDirection,
+        p_bu: &Array2<f64>,
+        p_bv: &Array2<f64>,
+        p_u_b: &Array2<f64>,
+        pv_b: &Array2<f64>,
     ) -> Array2<f64> {
-        let u = &dirs[i];
-        let v = &dirs[j];
         let p = self.x_dense.ncols();
-        let cols = cache.eta_rhs.ncols();
-        if p == 0 || cols == 0 {
-            return Array2::<f64>::zeros((p, cols));
+        if p == 0 {
+            return Array2::<f64>::zeros((0, 0));
         }
+        // D² H_φ[u,v] = 0.5 [ Xᵀ diag(c_uv) X - D²J₂[u,v] ], J₂ = Bᵀ P B; see
+        // `hphisecond_direction_apply` for the derivation of each block.
         let deta_uv = &u.deta * &v.deta;
         let s_uv = &self.w2 * &deta_uv;
         let g_uv_reduced = RemlState::reducedweighted_gram(&self.x_reduced, &s_uv);
@@ -1325,40 +1324,27 @@ impl FirthDenseOperator {
             + &(&self.w3 * &(&v.deta * &u.dh))
             + &(&self.w2 * &d2h);
 
-        let eta_rhs = &cache.eta_rhs;
         let diag_term = fast_ab(
             &self.x_dense_t,
-            &(eta_rhs * &c_uv.view().insert_axis(Axis(1))),
+            &(&self.x_dense * &c_uv.view().insert_axis(Axis(1))),
         );
 
         let b_uvvec = &self.w3 * &deta_uv;
         let b_uv_base = &self.x_dense * &b_uvvec.view().insert_axis(Axis(1));
-
-        // Single-index blocks reused from the cache (the O(k²)→O(k) win).
-        let p_b_rhs = &cache.p_b_rhs;
-        let p_bu_rhs = &cache.p_bx[i];
-        let p_bv_rhs = &cache.p_bx[j];
-        let p_u_b_rhs = &cache.pu_qv[i];
-        let pv_b_rhs = &cache.pu_qv[j];
-
-        // Genuinely mixed (u,v) blocks — must be rebuilt per pair.
-        let p_buv_base = RemlState::apply_hadamard_gram_to_matrix(
+        let p_buv = RemlState::apply_hadamard_gram_to_matrix(
             &self.x_reduced,
             &self.k_reduced,
             &self.k_reduced,
             &b_uv_base,
         );
-        let p_buv_rhs = fast_ab(&p_buv_base, &cache.eye);
-
-        let pv_bu_rhs = self.apply_p_u_to_matrix(
+        let pv_bu = self.apply_p_u_to_matrix(
             &v.a_u_reduced,
-            &(eta_rhs * &u.b_uvec.view().insert_axis(Axis(1))),
+            &(&self.x_dense * &u.b_uvec.view().insert_axis(Axis(1))),
         );
-        let p_u_bv_rhs = self.apply_p_u_to_matrix(
+        let p_u_bv = self.apply_p_u_to_matrix(
             &u.a_u_reduced,
-            &(eta_rhs * &v.b_uvec.view().insert_axis(Axis(1))),
+            &(&self.x_dense * &v.b_uvec.view().insert_axis(Axis(1))),
         );
-
         let p_nu_nv_base = RemlState::apply_hadamard_gram_to_matrix(
             &self.x_reduced,
             &u.a_u_reduced,
@@ -1371,26 +1357,92 @@ impl FirthDenseOperator {
             &a_uv_reduced,
             &self.b_base,
         );
-        let p_uv_base = 2.0 * p_nu_nv_base - 2.0 * p_hw_nuv_base;
-        let p_uv_rhs = fast_ab(&p_uv_base, &cache.eye);
+        let p_uv = 2.0 * p_nu_nv_base - 2.0 * p_hw_nuv_base;
 
+        // Nine-term expansion of D²J₂[u,v] with J₂ = Bᵀ P B.
         let d2_terms = [
-            self.left_scaled_xt(&b_uvvec, p_b_rhs),
-            self.left_scaled_xt(&self.w1, &p_buv_rhs),
-            self.left_scaled_xt(&u.b_uvec, p_bv_rhs),
-            self.left_scaled_xt(&v.b_uvec, p_bu_rhs),
-            self.left_scaled_xt(&u.b_uvec, pv_b_rhs),
-            self.left_scaled_xt(&self.w1, &pv_bu_rhs),
-            self.left_scaled_xt(&v.b_uvec, p_u_b_rhs),
-            self.left_scaled_xt(&self.w1, &p_u_bv_rhs),
-            self.left_scaled_xt(&self.w1, &p_uv_rhs),
+            self.left_scaled_xt(&b_uvvec, &self.p_b_base),
+            self.left_scaled_xt(&self.w1, &p_buv),
+            self.left_scaled_xt(&u.b_uvec, p_bv),
+            self.left_scaled_xt(&v.b_uvec, p_bu),
+            self.left_scaled_xt(&u.b_uvec, pv_b),
+            self.left_scaled_xt(&self.w1, &pv_bu),
+            self.left_scaled_xt(&v.b_uvec, p_u_b),
+            self.left_scaled_xt(&self.w1, &p_u_bv),
+            self.left_scaled_xt(&self.w1, &p_uv),
         ];
-        let mut d2_j2 = Array2::<f64>::zeros((p, cols));
+        let mut d2_j2 = Array2::<f64>::zeros((p, p));
         for term in d2_terms {
             d2_j2 += &term;
         }
 
         0.5 * (diag_term - d2_j2)
+    }
+
+    /// Precompute every sub-block of the mixed second directional derivative
+    /// `D²H_φ[u,v]` that depends on a SINGLE direction index. The exact-Hessian
+    /// TK outer loop (`tk_hessian_rho_canonical_logit`) evaluates `D²H_φ` for
+    /// every one of the `k(k+1)/2` penalty pairs; the four heavy single-index
+    /// reduced Hadamard-Gram applies inside it (`P B_u`/`P B_v` and
+    /// `P_u B`/`P_v B`) therefore have only `k` distinct values but were rebuilt
+    /// `O(k²)` times. Caching them once per index here turns that into `O(k)` of
+    /// those O(n·r²·p) applies, with the per-pair work limited to the genuinely
+    /// mixed (`u`,`v`) blocks. This is exact: each cached block is a pure
+    /// function of `(operator, direction[i])`, and the pair contraction is the
+    /// same [`Self::hphisecond_direction_from_single_index_blocks`] that
+    /// [`Self::hphisecond_direction`] runs, so the result is bit-identical to
+    /// `hphisecond_direction(&dirs[i], &dirs[j])` (#1575).
+    pub(crate) fn tk_second_direction_eye_cache(
+        &self,
+        dirs: &[FirthDirection],
+    ) -> FirthSecondDirEyeCache {
+        // Each direction's two single-index blocks are independent O(n·r²·p)
+        // reduced Hadamard-Gram applies. Fan them across Rayon with the nested-BLAS
+        // guard (inner faer GEMMs pinned to `Par::Seq`, no oversubscription) when
+        // there are several directions AND more than one thread; with a single
+        // direction (k=1) run serially so the inner GEMMs keep the global faer
+        // pool instead of being pinned to `Par::Seq`. The result is collected in
+        // direction order either way, so the cached blocks are identical to the
+        // serial build — bit-for-bit at fixture scale, where the inner GEMMs are
+        // already `Par::Seq` (#1575).
+        let (p_bx, pu_qv): (Vec<Array2<f64>>, Vec<Array2<f64>>) =
+            if dirs.len() > 1 && rayon::current_num_threads() > 1 {
+                use rayon::prelude::*;
+                dirs.par_iter()
+                    .map(|d| {
+                        gam_problem::with_nested_parallel(|| {
+                            self.second_direction_single_index_blocks(d)
+                        })
+                    })
+                    .unzip()
+            } else {
+                dirs.iter()
+                    .map(|d| self.second_direction_single_index_blocks(d))
+                    .unzip()
+            };
+        FirthSecondDirEyeCache { p_bx, pu_qv }
+    }
+
+    /// Exact mixed second directional derivative `D²H_φ[u,v]` for directions
+    /// `dirs[i]`, `dirs[j]`, reusing the single-index sub-blocks precomputed once
+    /// by [`Self::tk_second_direction_eye_cache`]. Bit-identical to
+    /// `hphisecond_direction(&dirs[i], &dirs[j])`; only the redundant per-pair
+    /// recomputation of the single-index blocks is removed (#1575).
+    pub(crate) fn hphisecond_direction_apply_eye_cached(
+        &self,
+        cache: &FirthSecondDirEyeCache,
+        dirs: &[FirthDirection],
+        i: usize,
+        j: usize,
+    ) -> Array2<f64> {
+        self.hphisecond_direction_from_single_index_blocks(
+            &dirs[i],
+            &dirs[j],
+            &cache.p_bx[i],
+            &cache.p_bx[j],
+            &cache.pu_qv[i],
+            &cache.pu_qv[j],
+        )
     }
 
     pub(super) fn rowwise_dot(a: &Array2<f64>, b: &Array2<f64>) -> Array1<f64> {
@@ -1696,7 +1748,7 @@ impl FirthDenseOperator {
     // do NOT introduce any dense n×n or p×p×p object; every contraction is
     // routed through reduced-space Hadamard-Gram applies and rowwise
     // bilinear forms, in the same spirit as hphi_tau_partial_apply and
-    // hphisecond_direction_apply.
+    // hphisecond_direction.
     //
     // Both are exact in the smooth-regime operating point assumed by this
     // module: X SPD-full-rank on its identifiable subspace, Q held fixed
@@ -1720,7 +1772,7 @@ impl FirthDenseOperator {
     // ½ Xᵀ (w' ⊙ h) once more in β, and the second collects the IFT-mediated
     // β-derivative of h = diag(X_r K_r X_rᵀ) through K_r = I_r^{-1}.  This is
     // the same form the existing hphi_direction code implements in directional
-    // form (cf. firth.rs hphi_direction / hphisecond_direction_apply, the
+    // form (cf. firth.rs hphi_direction / hphisecond_direction, the
     // 9-term D²J₂ expansion with J₂ = BᵀPB).
     //
     // ─────────────────────────────────────────────────────────────────────────
@@ -1841,7 +1893,7 @@ impl FirthDenseOperator {
     //       (x_tau_reduced, η̇, İ, K̇, Ṁ operator pieces, ḣ, b_uvec = w''⊙η̇).
     //     The existing `dot_i_and_h_from_reduced` yields İ and ḣ already;
     //     the per-direction "A_u" analog is A_τ = K_r İ K_r, matching the
-    //     FirthDirection form used by hphisecond_direction_apply.
+    //     FirthDirection form used by hphisecond_direction.
     //   • Use apply_hadamard_gram_to_matrix with
     //       (A_left, A_right) ∈ { (K_r, K_r), (K_r, A_τ_i), (K_r, A_τ_j),
     //                             (A_τ_i, A_τ_j) }
@@ -3395,8 +3447,9 @@ mod tests {
 
     /// #1575: the cached single-index second-direction path
     /// (`tk_second_direction_eye_cache` + `hphisecond_direction_apply_eye_cached`)
-    /// must be BIT-IDENTICAL to the per-pair `hphisecond_direction_apply(.., &eye)`
-    /// it replaces in the exact-Hessian TK outer loop. This locks the work-elision
+    /// must be BIT-IDENTICAL to the per-pair `hphisecond_direction` it
+    /// replaces in the exact-Hessian TK outer loop, and both must equal the
+    /// general-rhs `hphisecond_direction_apply(.., &eye)` to rounding. This locks the work-elision
     /// invariant: it removes redundant O(n·r²·p) reduced Hadamard-Gram applies, it
     /// must NOT change a single bit of the resulting Hessian contribution.
     #[test]
@@ -3430,7 +3483,7 @@ mod tests {
         let cache = op.tk_second_direction_eye_cache(&dirs);
         for i in 0..dirs.len() {
             for j in 0..=i {
-                let reference = op.hphisecond_direction_apply(&dirs[i], &dirs[j], &eye);
+                let reference = op.hphisecond_direction(&dirs[i], &dirs[j]);
                 let cached = op.hphisecond_direction_apply_eye_cached(&cache, &dirs, i, j);
                 assert_eq!(
                     reference.dim(),
@@ -3445,8 +3498,108 @@ mod tests {
                          reference={a}, cached={b}"
                     );
                 }
+                // The rhs-free form equals the general-rhs operator at V = I.
+                let general = op.hphisecond_direction_apply(&dirs[i], &dirs[j], &eye);
+                assert_close_rel(&reference, &general, 1e-13, &format!("D²H_φ[{i},{j}]"));
             }
         }
+    }
+
+    /// Relative Frobenius closeness `‖a−b‖ ≤ tol·max(‖b‖, f64::MIN_POSITIVE)`.
+    fn assert_close_rel(a: &Array2<f64>, b: &Array2<f64>, tol: f64, what: &str) {
+        assert_eq!(a.dim(), b.dim(), "{what}: shape mismatch");
+        let diff = (a - b).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let scale = b
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt()
+            .max(f64::MIN_POSITIVE);
+        assert!(
+            diff <= tol * scale,
+            "{what}: rel diff {:.3e} > {tol:e}",
+            diff / scale
+        );
+    }
+
+    /// `hphi_direction` / `hphisecond_direction` drop the identity products and
+    /// the direction-free `P B` rebuild of the general-rhs forms. On a
+    /// production-sized logit problem they must reproduce the general-rhs
+    /// operators at `V = I` to rounding, while doing strictly less work; the
+    /// wall-clock of both forms is printed for the record (run with
+    /// `--nocapture --release`).
+    #[test]
+    fn firth_identity_rhs_forms_match_general_apply_and_time_hn49() {
+        let n = 4000;
+        let p = 40;
+        let x = Array2::from_shape_fn((n, p), |(i, j)| {
+            let t = i as f64 / n as f64;
+            if j == 0 {
+                1.0
+            } else {
+                let f = j as f64;
+                (f * 2.3 * t + 0.37 * f).sin() * (1.0 + 0.5 * (f * t).cos()) / f.sqrt()
+            }
+        });
+        let beta = Array1::from_shape_fn(p, |j| 0.4 * ((j as f64) * 0.9 + 0.3).sin());
+        let op = build_link_firth_op(StandardLink::Logit, &x, &beta);
+        let eye = Array2::<f64>::eye(p);
+        let dirs: Vec<FirthDirection> = (0..3)
+            .map(|d| {
+                let v = Array1::from_shape_fn(p, |j| ((d * p + j) as f64 * 0.61).cos());
+                op.direction_from_deta(x.dot(&v))
+            })
+            .collect();
+
+        let t0 = std::time::Instant::now();
+        let first_general: Vec<Array2<f64>> = dirs
+            .iter()
+            .map(|d| {
+                let mut m = op.hphi_direction_apply(d, &eye);
+                symmetrize_in_place(&mut m);
+                m
+            })
+            .collect();
+        let first_general_s = t0.elapsed().as_secs_f64();
+        let t0 = std::time::Instant::now();
+        let first_direct: Vec<Array2<f64>> = dirs.iter().map(|d| op.hphi_direction(d)).collect();
+        let first_direct_s = t0.elapsed().as_secs_f64();
+        for (k, (a, b)) in first_direct.iter().zip(first_general.iter()).enumerate() {
+            assert_close_rel(a, b, 1e-12, &format!("DH_φ[{k}]"));
+        }
+
+        let pairs: Vec<(usize, usize)> = (0..dirs.len())
+            .flat_map(|i| (0..=i).map(move |j| (i, j)))
+            .collect();
+        let t0 = std::time::Instant::now();
+        let second_general: Vec<Array2<f64>> = pairs
+            .iter()
+            .map(|&(i, j)| op.hphisecond_direction_apply(&dirs[i], &dirs[j], &eye))
+            .collect();
+        let second_general_s = t0.elapsed().as_secs_f64();
+        let t0 = std::time::Instant::now();
+        let second_direct: Vec<Array2<f64>> = pairs
+            .iter()
+            .map(|&(i, j)| op.hphisecond_direction(&dirs[i], &dirs[j]))
+            .collect();
+        let second_direct_s = t0.elapsed().as_secs_f64();
+        for (&(i, j), (a, b)) in pairs
+            .iter()
+            .zip(second_direct.iter().zip(second_general.iter()))
+        {
+            assert_close_rel(a, b, 1e-12, &format!("D²H_φ[{i},{j}]"));
+        }
+
+        eprintln!(
+            "HN-49 timing n={n} p={p}: D H_φ x{} general-rhs {:.4}s -> direct {:.4}s; \
+             D² H_φ x{} general-rhs {:.4}s -> direct {:.4}s",
+            dirs.len(),
+            first_general_s,
+            first_direct_s,
+            pairs.len(),
+            second_general_s,
+            second_direct_s
+        );
     }
 
     /// A fixed, well-conditioned full-rank design (deterministic, no RNG).
