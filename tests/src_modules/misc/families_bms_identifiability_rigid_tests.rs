@@ -129,6 +129,23 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
 }
 
 #[test]
+fn persistent_fingerprint_refuses_invalid_block_rows_and_tolerance() {
+    let family = test_family_with_intercept_designs(array![0.0, 1.0], array![1.0, 1.0], array![-1.0, 1.0]);
+    let mut options = BlockwiseFitOptions::default();
+    let mut specs = vec![dummy_blockspec(1, 2)];
+    assert!(family.persistent_warm_start_fingerprint(&specs, &options).is_some());
+    assert!(family.persistent_warm_start_fingerprint(&[], &options).is_none());
+    assert!(family.persistent_warm_start_fingerprint(&[dummy_blockspec(1, 1)], &options).is_none());
+    specs[0].offset = Array1::zeros(1);
+    assert!(family.persistent_warm_start_fingerprint(&specs, &options).is_none());
+    specs[0].offset = Array1::zeros(2);
+    for tolerance in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        options.inner_tol = tolerance;
+        assert!(family.persistent_warm_start_fingerprint(&specs, &options).is_none());
+    }
+}
+
+#[test]
 fn bernoulli_marginal_slope_declares_its_certified_multistart_levels() {
     // Every declared start gets its own full certified search in a parallel
     // multistart (gnomon#2359); the family names them, nothing ranks them.
