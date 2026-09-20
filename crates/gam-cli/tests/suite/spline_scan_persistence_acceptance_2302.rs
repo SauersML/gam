@@ -134,7 +134,10 @@ fn fresh_processes_replay_saved_scan_for_predict_and_report() {
         .collect::<Result<Vec<_>, _>>()
         .expect("parse prediction rows");
     assert_eq!(rows.len(), query.len());
-    let z = gam::probability::standard_normal_quantile(0.95).expect("90% normal quantile");
+    // The profiled σ̂² divides the innovations quadratic by n − order (48 rows,
+    // cubic order 2), so the 90% band's multiplier is t_{0.95, 46}, not z_{0.95}.
+    assert_eq!(scan.residual_degrees_of_freedom(), 46.0);
+    let z = gam_math::probability::student_t_quantile(0.95, 46.0).expect("90% Student-t quantile");
     for ((row, &x), row_index) in rows.iter().zip(&query).zip(0..) {
         let (mean, variance) = scan.predict(x).expect("direct saved-scan prediction");
         let se = variance.max(0.0).sqrt();
