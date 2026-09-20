@@ -738,16 +738,25 @@ pub(crate) fn fit_latent_survival_terms(
     // surrogate whose β/σ land in the interval basin, threaded via `initial_beta`
     // (consumed by every inner solve, including each ρ-seed validation fit).
     //
-    // Surrogate = right-censored at the bracket LOWER bound `L`. Its survival
-    // mass `S(L) = K_{0,B(L)}` is log-concave (PD Hessian) and — crucially —
-    // its time-block design is the SAME fixed-knot I-spline basis the interval
-    // fit uses, which is FULL RANK regardless of how heavily the inspection-grid
-    // `L` values are TIED (the basis columns are functions of the frozen knots,
-    // not of the observed time multiplicities). Unlike an exact-event surrogate
-    // it imposes NO per-row `q̇(L) > 0` hazard-derivative feasibility condition
+    // Surrogate = right-censored at the bracket LOWER bound `L`, whenever the
+    // data carry a positive-weight exact failure. Its survival mass
+    // `S(L) = K_{0,B(L)}` is log-concave (PD Hessian) and — crucially — its
+    // time-block design is the SAME fixed-knot I-spline basis the interval fit
+    // uses, which is FULL RANK regardless of how heavily the inspection-grid `L`
+    // values are TIED (the basis columns are functions of the frozen knots, not
+    // of the observed time multiplicities). Unlike an exact-event surrogate it
+    // imposes NO per-row `q̇(L) > 0` hazard-derivative feasibility condition
     // (which the tied/degenerate cold-start derivative design can violate), so it
     // is robust where exact-event-at-L is not. The warm σ then refines from the
     // bracket-width spread inside the (now in-basin) interval fit.
+    //
+    // Without a positive-weight exact failure the right-censored-at-L surrogate
+    // has no failures at all: its likelihood increases toward the zero-hazard
+    // boundary (β_time → −∞) and has no interior optimum to seed from. That is a
+    // property of the data, read before any solve, so the surrogate is chosen
+    // from it: those fits take the finite lower-endpoint event surrogate (each
+    // interval row an exact event at `L`), whose failures pin an interior
+    // optimum. Neither surrogate is a retry of the other.
     //
     // Failure is NON-SILENT (#1108): a surrogate that errors or returns a
     // non-finite / all-zero degenerate β is surfaced as a hard error rather than
@@ -759,86 +768,60 @@ pub(crate) fn fit_latent_survival_terms(
         .iter()
         .any(|&code| code == LATENT_SURVIVAL_EVENT_INTERVAL);
     if has_interval_rows {
-        let censored_warm_event_target = spec.event_target.mapv(|code| {
+        let has_exact_failure =
+            spec.event_target
+                .iter()
+                .zip(spec.weights.iter())
+                .any(|(&code, &weight)| {
+                    weight > 0.0
+                        && matches!(
+                            latent_survival_event_type_for(code),
+                            LatentSurvivalEventType::ExactEvent
+                        )
+                });
+        // Interval rows become right-censored (0) or exact events (1) at `L`.
+        let interval_code_at_lower_bound = if has_exact_failure { 0u8 } else { 1u8 };
+        let surrogate_name = if has_exact_failure {
+            "right-censored-at-L"
+        } else {
+            "lower-endpoint event"
+        };
+        let mut warm_family = family.clone();
+        warm_family.event_target = spec.event_target.mapv(|code| {
             if code == LATENT_SURVIVAL_EVENT_INTERVAL {
-                0u8
+                interval_code_at_lower_bound
             } else {
                 code
             }
         });
-        let mut warm_family = family.clone();
-        warm_family.event_target = censored_warm_event_target;
-        // Right-censored-at-L ignores the interval upper bound `R`, so the
-        // (unused) `q_right` channel cannot drift the fit; leaving the right
-        // design/mass in place is harmless (no interval row remains to read it).
+        // The surrogate reads interval rows at `L` only, so the (unused)
+        // `q_right` channel cannot drift the fit; leaving the right design/mass
+        // in place is harmless (no interval row remains to read it).
         // Fixed-λ surrogate: no outer smoothing loop runs here, and the inner
         // solve is convergence-gated inside `fit_custom_family_fixed_log_lambdas`,
         // so the assembled surrogate fit is (vacuously) outer-converged.
-        let warm_fit_result = fit_custom_family_fixed_log_lambdas(
-            &warm_family,
-            &blocks,
-            options,
-            None,
-        );
-        let warm_fit = match warm_fit_result {
-            Ok(fit) => fit,
-            Err(censored_error) => {
-                let has_finite_event_in_censored_surrogate =
-                    warm_family.event_target.iter().any(|&code| code != 0);
-                if has_finite_event_in_censored_surrogate {
-                    // The surrogate's solver error, carried whole (#2937).
-                    return Err(FitFailure::from(censored_error).context(
-                        "latent interval warm start: right-censored-at-L surrogate fit failed \
-                         (so the interval fit cannot be safely warm-started; this surrogate is \
-                         log-concave and should converge — investigate the surrogate, not the \
-                         interval kernel)",
-                    ));
-                }
-
-                // When every observed row is interval-censored, the
-                // right-censored-at-L surrogate contains no failures at all.
-                // Its likelihood is maximized only on the zero-hazard boundary
-                // (β_time -> -∞), so the fixed-λ Newton solve is correctly
-                // allowed to refuse it even though the objective is concave.
-                // Use the finite lower-endpoint event surrogate solely to obtain
-                // an interior β/σ seed for the exact interval likelihood below;
-                // no fitted surrogate likelihood or derivative is reused.
-                let lower_event_warm_target = spec.event_target.mapv(|code| {
-                    if code == LATENT_SURVIVAL_EVENT_INTERVAL {
-                        1u8
-                    } else {
-                        code
-                    }
-                });
-                let mut event_warm_family = family.clone();
-                event_warm_family.event_target = lower_event_warm_target;
-                fit_custom_family_fixed_log_lambdas(
-                    &event_warm_family,
-                    &blocks,
-                    options,
-                    None,
-                )
-                .map_err(|event_error| {
-                    FitFailure::from(event_error).context(format!(
-                        "latent interval warm start failed: the right-censored-at-L surrogate \
-                         has no finite failures and refused its boundary optimum ({censored_error}); \
-                         the finite lower-endpoint event surrogate also failed"
-                    ))
-                })?
-            }
-        };
+        let warm_fit = fit_custom_family_fixed_log_lambdas(&warm_family, &blocks, options, None)
+            .map_err(|surrogate_error| {
+                // The surrogate's solver error, carried whole (#2937).
+                FitFailure::from(surrogate_error).context(format!(
+                    "latent interval warm start: the {surrogate_name} surrogate fit failed \
+                     (so the interval fit cannot be safely warm-started; the surrogate has an \
+                     interior optimum and should converge — investigate the surrogate, not the \
+                     interval kernel)"
+                ))
+            })?;
         let warm_beta_usable = warm_fit
             .block_states
             .iter()
             .any(|s| s.beta.iter().all(|v| v.is_finite()) && s.beta.iter().any(|&v| v != 0.0));
         if !warm_beta_usable {
-            return Err(FitFailure::numerical(
-                "latent interval warm start: right-censored-at-L surrogate returned a \
+            return Err(FitFailure::numerical(format!(
+                "latent interval warm start: the {surrogate_name} surrogate returned a \
                  degenerate (non-finite or all-zero) β across every block; the warm start \
                  cannot seed the interval fit. This indicates the surrogate's time-block \
                  design is rank-deficient or the inner solve stalled at the seed — \
-                 investigate the surrogate before retrying the interval fit.",
-            ));
+                 investigate the surrogate before retrying the interval fit."
+            )));
         }
         for (block, state) in blocks.iter_mut().zip(warm_fit.block_states.iter()) {
             if state.beta.iter().all(|v| v.is_finite()) {
