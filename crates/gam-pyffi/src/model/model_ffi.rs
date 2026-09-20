@@ -3533,6 +3533,33 @@ fn sphere_kernel_kind_from_str(
     }
 }
 
+/// Column count of the S² basis `sphere_basis` / `sphere_basis_with_centers`
+/// build for `n_centers` centers (the harmonic truncation degree under
+/// `kernel = "harmonic"`), read without evaluating it through
+/// `gam::terms::basis::spherical_spline_basis_width`, the builder's own width
+/// rule. A descriptor the builder refuses (a harmonic degree past the cap, a
+/// pseudo width past it, fewer than two Wahba centers) is refused here with
+/// the same error.
+#[pyfunction(signature = (n_centers, kernel = "sobolev"))]
+fn sphere_basis_size(n_centers: usize, kernel: &str) -> PyResult<usize> {
+    let (method, wahba_kernel) = sphere_kernel_kind_from_str(kernel, "sphere_basis_size")?;
+    let max_degree = matches!(method, SphereMethod::Harmonic).then_some(n_centers);
+    let spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::FarthestPoint {
+            num_centers: n_centers,
+        },
+        penalty_order: 2,
+        double_penalty: false,
+        radians: false,
+        method,
+        max_degree,
+        wahba_kernel,
+        identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
+    };
+    gam::terms::basis::spherical_spline_basis_width(&spec, 0).map_err(basis_error_to_pyerr)
+}
+
 /// Analytic DESIGN jet `∂Φ/∂(lat, lon)` of the spherical-spline basis built by
 /// `sphere_basis` (auto Wahba farthest-point centers, or harmonic degree `L =
 /// n_centers`).

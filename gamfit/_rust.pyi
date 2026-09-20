@@ -398,6 +398,7 @@ __all__ = [
     "sphere_basis_hessian",
     "sphere_basis_jet",
     "sphere_basis_jet_with_centers",
+    "sphere_basis_size",
     "sphere_basis_with_centers",
     "sphere_frechet_mean",
     "sphere_input_location_first_derivative",
@@ -2185,6 +2186,8 @@ def sphere_basis_hessian(points: NDArray[np.float64], n_centers: int, centers: N
 def sphere_basis_jet(points: NDArray[np.float64], n_centers: int, penalty_order: int = ..., kernel: str = ..., radians: bool = ...) -> NDArray[np.float64]: ...
 
 def sphere_basis_jet_with_centers(points: NDArray[np.float64], centers: NDArray[np.float64], penalty_order: int = ..., kernel: str = ..., radians: bool = ...) -> NDArray[np.float64]: ...
+
+def sphere_basis_size(n_centers: int, kernel: str = ...) -> int: ...
 
 def sphere_basis_with_centers(points: NDArray[np.float64], centers: NDArray[np.float64], penalty_order: int = ..., kernel: str = ..., radians: bool = ...) -> tuple[NDArray[np.float64], NDArray[np.float64]]: ...
 
