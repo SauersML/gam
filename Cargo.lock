@@ -4087,6 +4087,7 @@ dependencies = [
  "ndarray 0.17.2",
  "npyz 0.9.1",
  "rand 0.10.2",
+ "statrs 0.19.0",
 ]
 
 [[package]]
