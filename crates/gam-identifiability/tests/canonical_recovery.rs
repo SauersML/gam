@@ -678,6 +678,10 @@ fn penalty_covered_competing_risks_redundancy_canonicalises_cleanly_1590() {
             &Array2::<f64>::eye(width),
             "the retained data-null direction must remain penalty-identified"
         );
+        // gam#3023: an identity pullback carries the declared nullity; a
+        // column selection leaves it to the spectrum.
+        let expected_nullity: Vec<usize> = if width == 4 { vec![0] } else { Vec::new() };
+        assert_eq!(spec.nullspace_dims, expected_nullity, "block '{}'", spec.name);
     }
     assert_eq!(
         rank(&reduced_joint),

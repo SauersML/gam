@@ -2878,25 +2878,22 @@ pub(crate) fn build_smooth_basis(
             option_usize(options, "degree")?.unwrap_or(DEFAULT_BSPLINE_DEGREE)
         };
         // For a factor smooth every group's curve is fit from THAT group's rows
-        // alone, so the marginal's flexibility must respect the least-resolved
-        // group, not the pooled column. The pooled heuristic can hand the marginal
-        // a basis that saturates (or exceeds) a small group's sample — e.g. the
-        // sleepstudy panel has 8 training days per subject, and a default cubic
-        // basis of 8 functions interpolates each subject's 8 points, leaving no
-        // room for the wiggliness penalty to collapse the curve toward the
-        // per-subject line. The factor smooth then fits within-group noise and
-        // extrapolates badly (held-out forecast worse than the population mean).
-        //
-        // Size the shared marginal from the least-populated group: its pilot is
-        // the penalized resolution rank of THAT group's row count (the same
-        // rate rule as a univariate `s()`), and it is held below the minimum
-        // per-group covariate resolution so the penalty always retains residual
-        // degrees of freedom to shrink each group's curvature toward its linear
-        // null space (the random-slope estimand). The adaptive formula workflow
-        // then grows the shared marginal only while the fit's REML evidence
-        // prefers it. The explicit `re` random-effect form takes neither rule:
-        // it is a raw linear `[1, x]` random effect (0 internal knots), handled
-        // in the branch below.
+        // alone, so the default marginal is the univariate `s()` default applied
+        // to the least-informed group: its pilot is the penalized resolution
+        // rank of the smallest group's row count (`pilot_internal_knots`, the
+        // same rate rule as a univariate `s()`), and it is held to the least
+        // per-group distinct-value support by the same rank bound a univariate
+        // `s()` obeys (`support_capped_bspline_dimension`). A group with `u`
+        // distinct covariate values gives its block of the marginal design rank
+        // at most `u`, so a marginal with more functions has directions in that
+        // group identified by the penalty alone. Inside that bound the penalty
+        // and REML, not the basis size, decide the effective degrees of freedom,
+        // and the adaptive formula workflow grows the shared marginal only while
+        // the fit's REML evidence prefers it. The explicit `re` random-effect
+        // form takes neither rule: it is a raw linear `[1, x]` random effect
+        // (0 internal knots), handled in the branch below.
+        let group_column = ds.values.column(cols[group_idx]);
+        let min_group_resolution = min_per_group_unique_count(ds.values.column(c), group_column);
         let default_internal = if type_opt == "re" {
             // `bs="re"` is a PARAMETRIC random effect, not a smooth of the
             // covariate: `s(x, g, bs="re")` is the mgcv random intercept+slope
@@ -2912,29 +2909,22 @@ pub(crate) fn build_smooth_basis(
             // raw linear basis is both the correct `re` semantics and fast.
             0
         } else {
-            let group_column = ds.values.column(cols[group_idx]);
-            let min_group_resolution =
-                min_per_group_unique_count(ds.values.column(c), group_column);
-            let min_group_rows = min_per_group_row_count(group_column);
             let marginal_penalty_order = parse_penalty_order_alias(options)?
                 .unwrap_or(DEFAULT_PENALTY_ORDER)
                 .min(degree)
                 .max(1);
-            let pilot_internal =
-                pilot_internal_knots(min_group_rows, degree, marginal_penalty_order);
-            // Per-group basis dim = degree + 1 + internal. Hold it below the
-            // smallest group's resolution (leave at least two residual points per
-            // group) so the smooth cannot interpolate that group and the
-            // wiggliness penalty retains the room to collapse each curve toward
-            // its linear null space. Never drop below `degree + 2`, which keeps
-            // exactly the linear span plus a single curvature direction — the
-            // minimal smoother that can still bend if the data demand it.
-            let basis_cap = min_group_resolution.saturating_sub(2).max(degree + 2);
-            let internal_cap = basis_cap.saturating_sub(degree + 1);
-            pilot_internal.max(1).min(internal_cap.max(1))
+            pilot_internal_knots(
+                min_per_group_row_count(group_column),
+                degree,
+                marginal_penalty_order,
+            )
         };
-        let (n_knots, knots_inferred, effective_degree) =
+        let (mut n_knots, knots_inferred, mut effective_degree) =
             parse_ps_internal_knots(options, degree, default_internal)?;
+        if knots_inferred && type_opt != "re" && min_group_resolution >= 2 {
+            (n_knots, effective_degree) =
+                support_capped_bspline_dimension(n_knots, effective_degree, min_group_resolution);
+        }
         // `m=` is mgcv's spelling of `penalty_order=` and is resolved as its
         // alias here (#2791). It used to be read further down as a boolean gate
         // on the `Fs` null-penalty path instead, which made every value >= 1 the

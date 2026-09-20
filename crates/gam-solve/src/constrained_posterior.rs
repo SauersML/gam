@@ -164,6 +164,7 @@ pub use cone_normalizer::{
 mod cone_laplace;
 pub use cone_laplace::{
     ConeLaplace, ConeLaplaceFirstOrder, ConeLaplaceMotion, ConeLaplacePairMotion, ConeLaplaceRefusal,
+    ConeRowMotion,
 };
 
 /// Relative accuracy demanded of the orthant-moment cubature, measured against

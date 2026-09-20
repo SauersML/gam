@@ -2197,5 +2197,31 @@
     ],
     "reason": "#3024 slice A: the survival row jet and the Polya-Gamma batch are admitted under gpu=auto on their own two executors measured on their own workload (gam_gpu::row_kernel_race), not at fused_kernel_min_n, which calibration set to twice the xtwx Gram's crossover. GpuDispatchPolicy::fused_kernel_min_n is deleted with every reader: its pre-probe floor MIN_CALIBRATABLE_FUSED_KERNEL_N and the compile-time assert (const _) that pinned that floor to 2 * XTWX_DIMS[0]; GpuRuntime::resolve_if_fused_batch_exceeds_floor, the size-gated resolve built on the floor; and GpuDispatchPolicy::polya_gamma_batch_target_is_gpu, the PG predicate on it, with its pin polya_gamma_admits_large_batch_and_refuses_small. The PG seam test sub_crossover_batch_routes_to_cpu_bitwise_on_every_host is renamed an_untimed_batch_returns_the_cpu_draws_bitwise_on_every_host_3024: there is no crossover left to be under, and the same bitwise-CPU property now holds for any batch size the process has not timed.",
     "evidence": "In the landing tree git grep -w finds none of fused_kernel_min_n, MIN_CALIBRATABLE_FUSED_KERNEL_N, resolve_if_fused_batch_exceeds_floor or polya_gamma_batch_target_is_gpu under crates, src or tests. an_untimed_batch_returns_the_cpu_draws_bitwise_on_every_host_3024 and rigid_row_jet_device_admission_and_parity_2900 pass. The race logic is pinned by a_measured_law_decides_every_row_count_3024, an_unfixed_law_is_raced_3024, a_race_returns_the_cpu_value_and_records_the_shape_3024 and a_measured_row_kernel_races_an_untimed_shape_and_then_reads_its_timing_3024."
+  },
+  {
+    "base": "ce53546019d9a566866ae8b17b123bda7cef298e",
+    "items": [
+      "crates/gam-solve/src/pirls/newton_solve.rs:const:ACTIVE_BOUND_ABS_TOL",
+      "crates/gam-solve/src/pirls/newton_solve.rs:const:ACTIVE_BOUND_REL_TOL"
+    ],
+    "reason": "#3180: the P-IRLS box path's second activity rule for lower bounds (1e-6 relative + 1e-10 absolute) is deleted with the duplicate path it guarded. A lower bound is the unit row beta_i >= lb_i of the inequality system, whose one activity rule is active_set::row_is_active (scaled slack <= PRIMAL_FEASIBILITY_TOL), already applied to the same rows by active_face for the exact face decrement and the geometric KKT channels. projected_gradient_norm and the bound QP's warm-start seed now read it through newton_solve.rs lower_bound_binds.",
+    "evidence": "In the landing tree ACTIVE_BOUND_REL_TOL and ACTIVE_BOUND_ABS_TOL occur 0 times (git grep -c); both were pub(crate) and read only at newton_solve.rs projected_gradient_norm and solve_newton_directionwith_lower_bounds. gam-solve all targets at the candidate: the new pins projected_gradient_reports_an_interior_point_short_of_its_bound_3180 and box_bounds_bind_exactly_where_the_active_face_is_active_3180 pass, and the only reds are the four also red at base."
+  },
+  {
+    "base": "b7f57a0fd4754157b2068201f65d69b8ea35b192",
+    "items": [
+      "crates/gam-custom-family/src/assembly.rs:fn:outerobjectivegradienthessian_internal",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:outerobjectivegradienthessian_labeled"
+    ],
+    "reason": "#3173: every production outer evaluation of a custom family now goes through evaluate_on_branch, which solves a certified mode from each start (correct_labeled_laplace_mode, or the branch continuation for the incumbent) and prices only the mode the lowest-penalized-objective rule selects (outerobjective_from_coefficient_mode_labeled). The single-seed evaluators outerobjectivegradienthessian_labeled and outerobjectivegradienthessian_internal were the solve-and-price route that evaluation used; they have no production caller left and move verbatim into the cfg(test) test_support module, where tests that price the criterion at a mode they chose still call them.",
+    "evidence": "At the gate base 4b87357bf0 source_removal_guard.py and public_api_census.py report exactly these two identities (production_occurrences 0 for both). At the head tree git grep -w finds both names only in crates/gam-custom-family/src/test_support.rs (the moved definitions) and in test modules. cargo check --workspace --all-targets rc 0 and cargo build --workspace --lib rc 0 at the gate; the gam-custom-family lib suite passes except the main red a_double_well_fit_publishes_its_uncertified_trace_2901, identical at base."
+  },
+  {
+    "base": "b3fbbbab2e0eae7c217bc986ddf46c6e36754731",
+    "items": [
+      "crates/gam-models/src/gamlss/dispersion_family.rs:fn:outer_hyper_hessian_dense_available"
+    ],
+    "reason": "DispersionGlmLocationScaleFamily's override of CustomFamily::outer_hyper_hessian_dense_available returned `specs.len() < 2`. It declined the dense outer Hessian on every two-block fit because the family had no joint second directional derivative D2_beta H_L[u, v], and the trait default for that hook is block-diagonal, which drops the mean/precision cross curvature. The family now implements exact_newton_joint_hessian_second_directional_derivative_with_specs from its contracted fourth row surfaces, so the override is deleted and the trait default (dense outer Hessian available) applies. The trait method and every other family's implementation are unchanged.",
+    "evidence": "Direct gate dy7 run w2tha-g1-predict (direct-dy7-w2tha-g1-predict.log) at 96a81f3bca on this change gave RC_CHECK 0, SCANNER_ERRORS 0 and RC_PYFFI 0. The gam-predict gamma, negbin and tweedie dispersion_location_scale_assembles_covariance_and_is_predictable tests passed 3 of 3; gamma had been red at 64f2129d00 (dy3 w2o-3140-basectl) and at 96a81f3bca (dy6 w2tha-pr1b). The guard's only hit is this override. The name's other occurrences are the trait declaration, its callers and other families' own overrides, none of which change."
   }
 ]
