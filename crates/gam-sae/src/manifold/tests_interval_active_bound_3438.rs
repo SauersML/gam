@@ -234,9 +234,11 @@ fn interval_active_bound_slot_leaves_the_exact_information_3438() {
          {raw_diagonal:?}; projected coupling {coupling:.6e} diagonal {diagonal:?}; max|A| \
          {a_scale:.6e}"
     );
-    // `B_raw` is recovered from the conditioned factor by subtracting the row
-    // deflation it added, so its pinned row is zero up to that subtraction's
-    // rounding, `ε·max|A|` per entry.
+    // With `ΔC` projected, the pinned row of `A` is the evidence row deflation
+    // alone: the flat slot carried at the metric's unit stiffness and coupled to
+    // nothing, so the pencil `(A, Φ)` prices it at `log 1 = 0`. What remains is
+    // the rounding of recovering `B_raw` from the conditioned factor,
+    // `ε·max|A|` per entry.
     let rounding = f64::EPSILON * a_scale.max(1.0);
     assert!(
         coupling <= rounding,
@@ -244,8 +246,9 @@ fn interval_active_bound_slot_leaves_the_exact_information_3438() {
     );
     for value in &diagonal {
         assert!(
-            value.abs() <= rounding,
-            "A prices curvature on the pinned slot: {value:.6e} (rounding {rounding:.3e})"
+            (value - 1.0).abs() <= rounding,
+            "A prices curvature on the pinned slot beyond the metric's unit stiffness: \
+             {value:.6e} (rounding {rounding:.3e})"
         );
     }
 
