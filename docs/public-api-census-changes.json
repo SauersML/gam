@@ -4809,7 +4809,7 @@
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3389 (fix-3346-lift-weighted-gram, Fixes #3346) merged as ed78ff5628326615b5ca13682cb99e0935bb8d15 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from ed78ff5628326615b5ca13682cb99e0935bb8d15's own tree with --base c5eb78d6864c62efd309cf31043d55e891e7506e --head ed78ff5628326615b5ca13682cb99e0935bb8d15 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> ed78ff5628326615b5ca13682cb99e0935bb8d15 -- <its path> gives 0 for every item except weighted_gram (17, other uses of the same word)."
   },
   {
-    "base": "e80292d60d5628541767bbcd438ca7a8ce0b2a85",
+    "base": "8256e9b70f568d96c311c361f4724ab8589e0be2",
     "removed": {
       "crates/gam-cli/src/main/model_summary.rs::build_model_summary": 1
     },
