@@ -144,19 +144,24 @@ pub(crate) fn ceil_to_template_r(r: usize) -> Option<usize> {
         .find(|template| *template >= r)
 }
 
-/// Stable cache key for one NVRTC compilation. The CC pair lets one host
-/// process drive multiple device generations without re-compiling on every
-/// launch; `p_max` lets the kernel use a static shared-memory layout sized
-/// for `P × P` and `P × R` doubles.
+/// Stable cache key for one NVRTC compilation: `p_max` and `r_template` size
+/// the kernel's static `P × P` and `P × R` shared-memory layout. The target
+/// architecture needs no key field because the module is compiled for, and
+/// loaded on, the one device the process-wide runtime selects.
 // Consumed only by the linux-gated `mod cuda` NVRTC module cache; gated to match
 // so it is not dead on non-linux release builds.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct FusedModuleCacheKey {
-    pub cc_major: i32,
-    pub cc_minor: i32,
     pub p_max: u32,
     pub r_template: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for FusedModuleCacheKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "p_max={} r={}", self.p_max, self.r_template)
+    }
 }
 
 /// Forward-pass NVRTC source template. Two compile-time macros — `P_MAX` for

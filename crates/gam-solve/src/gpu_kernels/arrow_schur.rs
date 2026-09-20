@@ -1901,7 +1901,7 @@ mod cuda {
     use gam_gpu::driver::to_i32;
     use gam_gpu::linalg_dispatch::{DispatchOp, route_through_gpu};
     use ndarray::Array1;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, LazyLock};
 
     /// Per-row work slot for the row-block-granular multi-GPU solve. Inputs are
     /// the packed single-row buffers (`d×d` D block + ρ_t ridge, `d×k` B block,
@@ -3078,55 +3078,28 @@ mod cuda {
     // without re-uploading the local factors.
     // ────────────────────────────────────────────────────────────────────
 
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    /// One compiled NVRTC module per `(cc_major, cc_minor, p_max, r_template)`.
-    /// `cc_*` lets one process drive multiple device generations; the
-    /// `(p_max, r_template)` pair selects the shared-memory layout baked into
-    /// the kernel source.
-    struct FusedModuleCache {
-        modules: Mutex<
-            HashMap<crate::gpu_kernels::arrow_schur_nvrtc::FusedModuleCacheKey, Arc<CudaModule>>,
-        >,
-    }
-
-    fn fused_module_cache() -> &'static FusedModuleCache {
-        static CACHE: OnceLock<FusedModuleCache> = OnceLock::new();
-        CACHE.get_or_init(|| FusedModuleCache {
-            modules: Mutex::new(HashMap::new()),
-        })
-    }
-
+    /// One compiled NVRTC module per `(p_max, r_template)`: the pair selects
+    /// the shared-memory layout baked into the kernel source. Compile and load
+    /// faults surface as `SchurFactorFailed` carrying the driver's message.
     fn fused_module_for(
         ctx: &Arc<CudaContext>,
         key: crate::gpu_kernels::arrow_schur_nvrtc::FusedModuleCacheKey,
     ) -> Result<Arc<CudaModule>, ArrowSchurGpuFailure> {
-        let cache = fused_module_cache();
-        if let Ok(guard) = cache.modules.lock() {
-            if let Some(existing) = guard.get(&key) {
-                return Ok(existing.clone());
-            }
-        }
-        let src = crate::gpu_kernels::arrow_schur_nvrtc::forward_kernel_source(
-            key.p_max as usize,
-            key.r_template as usize,
-        );
-        let ptx = gam_gpu::device_cache::compile_ptx_arch(&src).map_err(|err| {
-            ArrowSchurGpuFailure::SchurFactorFailed {
-                reason: format!(
-                    "arrow-schur fused NVRTC compile (p_max={}, r={}): {err}",
-                    key.p_max, key.r_template
-                ),
-            }
-        })?;
-        let module = ctx
-            .load_module(ptx)
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        if let Ok(mut guard) = cache.modules.lock() {
-            guard.entry(key).or_insert_with(|| module.clone());
-        }
-        Ok(module)
+        static CACHE: LazyLock<
+            gam_gpu::device_cache::KeyedPtxModuleCache<
+                crate::gpu_kernels::arrow_schur_nvrtc::FusedModuleCacheKey,
+            >,
+        > = LazyLock::new(gam_gpu::device_cache::KeyedPtxModuleCache::new);
+        CACHE
+            .get_or_compile(ctx, key, "arrow-schur fused", |key| {
+                crate::gpu_kernels::arrow_schur_nvrtc::forward_kernel_source(
+                    key.p_max as usize,
+                    key.r_template as usize,
+                )
+            })
+            .map_err(|err| ArrowSchurGpuFailure::SchurFactorFailed {
+                reason: err.to_string(),
+            })
     }
 
     const PCG_VECTOR_KERNEL_SOURCE: &str = r#"
@@ -5296,10 +5269,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         let stream = ctx
             .new_stream()
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        let cap = &runtime.device.capability;
         let key = crate::gpu_kernels::arrow_schur_nvrtc::FusedModuleCacheKey {
-            cc_major: cap.compute_major,
-            cc_minor: cap.compute_minor,
             p_max: p_max as u32,
             r_template: r_template as u32,
         };
@@ -5564,10 +5534,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         let stream = ctx
             .new_stream()
             .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
-        let cap = &runtime.device.capability;
         let key = crate::gpu_kernels::arrow_schur_nvrtc::FusedModuleCacheKey {
-            cc_major: cap.compute_major,
-            cc_minor: cap.compute_minor,
             p_max: p_max as u32,
             r_template: r_template as u32,
         };

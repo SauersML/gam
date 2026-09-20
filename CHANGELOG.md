@@ -1,5 +1,12 @@
 ## Unreleased
 
+- **The fused Arrow-Schur kernel's module cache is the shared `KeyedPtxModuleCache`** (#4344).
+  A failure to load the compiled module is now reported as `SchurFactorFailed` with the
+  driver's message, like a compile failure, instead of being dropped as `Unavailable`. A
+  poisoned lock no longer disables caching. `FusedModuleCacheKey` drops `cc_major` and
+  `cc_minor`, which were the same for every key because the process-wide runtime selects
+  one device.
+
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
   point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is
