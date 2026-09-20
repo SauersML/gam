@@ -634,8 +634,8 @@ mod tests {
             let cfg = RemlConfig::external(likelihood, 1e-9, true).with_max_iterations(500);
             let state = build_logit_state(&y, &w, &x, &s, &cfg);
             assert!(
-                !state.analytic_outer_hessian_enabled(),
-                "{link:?} should use BFGS curvature until exact f_obs is available"
+                state.analytic_outer_hessian_enabled(),
+                "{link:?} Firth must carry its analytic TK outer Hessian (#3203)"
             );
 
             let bundle = state
@@ -1640,6 +1640,41 @@ mod tests {
 
     #[test]
     pub(crate) fn firth_outer_hessian_matches_gradient_finite_difference_with_tk_terms() {
+        assert_firth_outer_hessian_matches_gradient_finite_difference(
+            binomial_logit_glm_spec(),
+            2.0e-3,
+        );
+    }
+
+    /// #3203: non-canonical Firth links take `f = d⁴W_obs/dη⁴` from the
+    /// six-order Bernoulli log jet; the analytic TK outer ρ-Hessian must match
+    /// the central difference of the analytic gradient. The central-difference
+    /// truncation `δ²|∇³V|/6` is ~1e-10 at δ = 2e-5 and the inner-solve residual
+    /// at tol 1e-9 keeps every entry within 4e-8 of the difference, while
+    /// dropping the `f` term moves at least one entry per link by ≥ 1e-4, so the
+    /// 1e-6 band certifies the `f` carrier itself rather than only c/d/e.
+    #[test]
+    fn noncanonical_firth_outer_hessian_matches_gradient_finite_difference_3203() {
+        for link in [
+            StandardLink::Probit,
+            StandardLink::CLogLog,
+            StandardLink::LogLog,
+            StandardLink::Cauchit,
+        ] {
+            assert_firth_outer_hessian_matches_gradient_finite_difference(
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(link),
+                )),
+                1.0e-6,
+            );
+        }
+    }
+
+    fn assert_firth_outer_hessian_matches_gradient_finite_difference(
+        likelihood: GlmLikelihoodSpec,
+        rel_tol: f64,
+    ) {
         let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1654,8 +1689,8 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.1], [0.0, 0.1, 0.7],];
         let s1 = array![[0.0, 0.0, 0.0], [0.0, 0.4, -0.05], [0.0, -0.05, 0.9],];
-        let cfg =
-            RemlConfig::external(binomial_logit_glm_spec(), 1e-9, true).with_max_iterations(500);
+        let link_label = format!("{:?}", likelihood);
+        let cfg = RemlConfig::external(likelihood, 1e-9, true).with_max_iterations(500);
         let p_dim = x.ncols();
         use crate::estimate::PenaltySpec;
         let specs = vec![PenaltySpec::Dense(s0), PenaltySpec::Dense(s1)];
@@ -1677,6 +1712,10 @@ mod tests {
             None,
         )
         .expect("state");
+        assert!(
+            state.analytic_outer_hessian_enabled(),
+            "{link_label}: Firth must carry its analytic outer Hessian"
+        );
         let rho = array![0.15, -0.25];
         let eval = state
             .compute_outer_eval_with_order(
@@ -1715,8 +1754,8 @@ mod tests {
                 let an = h[[row, col]];
                 let rel = (fd - an).abs() / fd.abs().max(an.abs()).max(1e-6);
                 assert!(
-                    rel < 2.0e-3,
-                    "Hessian mismatch ({row},{col}): analytic={an:.9e}, fd={fd:.9e}, rel={rel:.3e}"
+                    rel < rel_tol,
+                    "{link_label}: Hessian mismatch ({row},{col}): analytic={an:.9e}, fd={fd:.9e}, rel={rel:.3e}"
                 );
             }
         }
@@ -5693,8 +5732,18 @@ pub(crate) enum BlockCorrectionDecision {
 /// orders are latched (#2748). `hessian_refusal` is the mathematical reason
 /// `Δ_b` has no closed-form ρ-Hessian on this fit, or `None` when the
 /// correction carries its exact ρ-Hessian into the criterion.
+///
+/// The block itself is latched as its SPECTRAL POSITIONS: the ranks, in the
+/// ascending eigenvalue order of the penalized Hessian, of the directions the
+/// admission integrated (a rank, so it does not depend on which order the
+/// criterion's eigensolver returns its pairs in). Each later ρ takes the eigenvectors at those
+/// positions, so axis `r`'s order stays attached to the direction it was
+/// certified on, and the block moves with ρ as continuously as the
+/// eigenvectors at those positions do (continuously away from an eigenvalue
+/// coincidence with a neighbouring position, steeply near an avoided one).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
+    pub(crate) block_positions: Vec<usize>,
     pub(crate) axis_orders: Vec<usize>,
     pub(crate) axis_quadrature_errors: Vec<f64>,
     pub(crate) axis_split: bool,

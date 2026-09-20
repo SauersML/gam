@@ -2,9 +2,10 @@
 //! request, and it has to be honoured wherever it is raised.
 //!
 //! `OuterFixedPointBridge` emits [`FirstOrderFallbackRequest`] when the
-//! fixed-point step is not a descent direction it can rescue (ψ stagnation, or
-//! a step every halving rejected on both the full vector and the ρ/τ-only
-//! fallback). `automatic_fallback_attempts` builds exactly the plan it is
+//! fixed-point step is not a descent direction it can rescue (a nonstationary ψ
+//! block whose step is at arithmetic resolution, or a step no resolvable
+//! contraction of which stays within the criterion resolution of the current
+//! cost, #3539). `automatic_fallback_attempts` builds exactly the plan it is
 //! asking for — the `disable_fixed_point` BFGS attempt — for any
 //! analytic-gradient EFS/HybridEFS primary.
 //!

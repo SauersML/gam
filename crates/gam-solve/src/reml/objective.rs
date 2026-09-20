@@ -775,7 +775,6 @@ impl<'a> RemlState<'a> {
     pub(crate) fn build_sparse_derivative_context(
         &self,
         pirls_result: &PirlsResult,
-        bundle: &EvalShared,
     ) -> Result<DerivativeContext, EstimationError> {
         use super::reml_outer_engine::{
             DispersionHandling, FirthAwareGlmDerivatives, GaussianDerivatives,
@@ -789,14 +788,18 @@ impl<'a> RemlState<'a> {
         let firth_op = if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
             let x_dense = self
                 .x()
-                .try_to_dense_arc("sparse exact REML runtime requires dense design for Firth operator")
+                .try_to_dense_arc(
+                    "sparse exact REML runtime requires dense design for Firth operator",
+                )
                 .map_err(EstimationError::InvalidInput)?;
-            Some(std::sync::Arc::new(Self::build_firth_dense_operator_for_link(
-                &jeffreys_link,
-                x_dense.as_ref(),
-                &pirls_result.final_eta.to_owned(),
-                self.weights,
-            )?))
+            Some(std::sync::Arc::new(
+                Self::build_firth_dense_operator_for_link(
+                    &jeffreys_link,
+                    x_dense.as_ref(),
+                    &pirls_result.final_eta.to_owned(),
+                    self.weights,
+                )?,
+            ))
         } else {
             None
         };
@@ -1527,7 +1530,7 @@ impl<'a> RemlState<'a> {
             second: det2,
         };
 
-        let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
+        let ctx = self.build_sparse_derivative_context(pirls_result)?;
         // Sparse-exact `log|H|` is the ordinary Cholesky log determinant of
         //
         //     H(ρ) = X'W(ρ)X + S_λ(ρ),
@@ -1917,7 +1920,7 @@ impl<'a> RemlState<'a> {
             );
         }
 
-        let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
+        let ctx = self.build_sparse_derivative_context(pirls_result)?;
         // Original-basis envelope residual: `β` and `H` here are rotated into
         // the original basis, and `build_dense_original_assembly` is only ever
         // reached on the unconstrained QS frame, so the transformed residual
@@ -2833,25 +2836,13 @@ impl<'a> RemlState<'a> {
             ));
         }
 
-        let decision = match order {
-            // Value+gradient: this evaluator's assembly contract requires a
-            // gradient (see the `result.gradient` demand below), so fulfil it as
-            // value+gradient with the Hessian skipped.
-            crate::rho_optimizer::OuterEvalOrder::Value
-            | crate::rho_optimizer::OuterEvalOrder::ValueAndGradient => None,
-            crate::rho_optimizer::OuterEvalOrder::ValueGradientHessian => {
-                if allow_second_order {
-                    Some(self.selecthessian_strategy_policy(&bundle))
-                } else {
-                    None
-                }
-            }
-        };
-        let eval_mode = match decision.as_ref().map(|decision| decision.strategy) {
-            Some(HessianEvalStrategyKind::SpectralExact) => {
-                super::reml_outer_engine::EvalMode::ValueGradientHessian
-            }
-            _ => super::reml_outer_engine::EvalMode::ValueAndGradient,
+        // `Value` returned above. A ValueGradientHessian order whose analytic
+        // outer Hessian is disabled is fulfilled as value+gradient with the
+        // Hessian reported Unavailable.
+        let eval_mode = if allow_second_order {
+            super::reml_outer_engine::EvalMode::ValueGradientHessian
+        } else {
+            super::reml_outer_engine::EvalMode::ValueAndGradient
         };
 
         let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
@@ -2875,9 +2866,10 @@ impl<'a> RemlState<'a> {
             .gradient_for_mode(eval_mode, p.len())
             .map_err(|reason| EstimationError::TrialPointRefused { reason })?;
 
-        let hessian = match decision.map(|decision| decision.strategy) {
-            Some(HessianEvalStrategyKind::SpectralExact) => result.hessian,
-            None => HessianValue::Unavailable,
+        let hessian = if allow_second_order {
+            result.hessian
+        } else {
+            HessianValue::Unavailable
         };
 
         // Cost, gradient, and optional Hessian are projections of the same
