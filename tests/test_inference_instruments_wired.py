@@ -573,8 +573,10 @@ def test_lawley_bartlett_factor_estimated_lambda_reaches_python():
     )
     assert estimated["p_value_corrected"] >= 0.0
 
-    with pytest.raises(ValueError, match="rho_cov must be symmetric"):
-        gamfit.inference.lawley_bartlett_factor_estimated_lambda(
+    # ½·tr(H·Cov) with H symmetric reads only the symmetric part of Cov, so an
+    # input whose triangles differ is its symmetrization, not a refusal.
+    def rho_shift(cov):
+        return gamfit.inference.lawley_bartlett_factor_estimated_lambda(
             design,
             "poisson",
             eta,
@@ -582,9 +584,15 @@ def test_lawley_bartlett_factor_estimated_lambda_reaches_python():
             2,
             1.0,
             penalty=penalty,
-            components=[penalty, penalty],
-            rho_cov=np.array([[1.0, 0.25], [0.20, 1.0]]),
-        )
+            components=[0.5 * penalty, 0.5 * penalty],
+            rho_cov=cov,
+        )["rho_variation_shift"]
+
+    assert rho_shift(np.array([[1.0, 0.25], [0.20, 1.0]])) == pytest.approx(
+        rho_shift(np.array([[1.0, 0.225], [0.225, 1.0]])), rel=1e-12
+    )
+    with pytest.raises(ValueError, match="must be non-negative"):
+        rho_shift(np.array([[-1.0, 0.0], [0.0, 1.0]]))
 
 
 def test_smooth_significance_auto_applies_lawley_and_surfaces_material_flag():

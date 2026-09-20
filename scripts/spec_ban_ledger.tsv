@@ -91,7 +91,6 @@ magic	crates/gam-terms/src/basis/types.rs	> 1e-8	https://github.com/SauersML/gam
 magic	crates/gam-terms/src/basis/types.rs	> 1e-9	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-terms/src/construction.rs	<= 1e-10	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-terms/src/construction.rs	<= 1e-10	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-terms/src/inference/lawley.rs	< -1e-14	https://github.com/SauersML/gam/issues/2469
 python-math	gamfit/torch/fit.py	torch.linalg.svd	https://github.com/SauersML/gam/issues/2899
 python-math	gamfit/torch/harvest.py	torch.linalg.eigh	https://github.com/SauersML/gam/issues/2899
 python-math	gamfit/torch/harvest.py	torch.linalg.qr	https://github.com/SauersML/gam/issues/2899
