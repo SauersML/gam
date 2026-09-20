@@ -18,7 +18,7 @@ use std::sync::{Mutex, PoisonError};
 
 use gam_linalg::matrix::DesignMatrix;
 use gam_problem::laplace_sampler_contract::{
-    BlockExcessTarget, BlockQuadratureMarginal, BlockQuadratureMoments, BlockQuadratureOrderRefusal,
+    AxisBreakpoint, BlockExcessTarget, BlockQuadratureMarginal, BlockQuadratureMoments, BlockQuadratureOrderRefusal,
     BlockQuadratureOrderStep, BlockQuadratureRefusal, CompositeAxisMarginal,
     LaplaceMarginalCorrector, set_laplace_marginal_corrector,
 };
@@ -163,6 +163,17 @@ impl LaplaceMarginalCorrector for QuadraticCoefficientProbe {
                 resolution_target: next_order_remainder,
                 cause,
             })
+    }
+
+    /// A latched one-axis piece is probed on its partition as at admission.
+    fn composite_axis_marginal_correction_on_partition(
+        &self,
+        target: &dyn BlockExcessTarget,
+        breakpoints: &[AxisBreakpoint],
+    ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal> {
+        let mut out = self.composite_axis_marginal_correction(target, f64::INFINITY)?;
+        out.breakpoints = breakpoints.to_vec();
+        Ok(out)
     }
 
     /// The probe reports every axis resolved at the first rule it is asked for, so the

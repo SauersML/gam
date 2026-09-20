@@ -5611,23 +5611,53 @@ pub(crate) enum BlockCorrectionDecision {
     AdmittedAtOptimum,
 }
 
-/// The #784 block quadrature latched beside the admission (#2623): the
-/// Gauss–Hermite order of each block axis, and whether the block marginal is
-/// integrated axis by axis with the analytic mixed-axis term, or as one tensor
-/// rule over the whole block. Beside them sit the paired-rule errors measured
-/// at that admission: the certificate every later evaluation at those orders
-/// carries, since the paired error no longer switches anything once the
-/// orders are latched (#2748).
-///
-/// A one-axis piece (every piece under the split, or a one-direction block) is
-/// integrated by the composite Gauss–Kronrod rule instead, whose partition is
-/// adapted at every evaluation to that evaluation's axis; its `axis_orders` entry is
-/// the admission's node count.
+/// The #784 block quadrature latched beside the admission (#2623): whether the
+/// block marginal is integrated axis by axis with the analytic mixed-axis term or as
+/// one tensor rule over the whole block, and each piece's rule. Every later
+/// evaluation integrates on these rules, so the criterion is one fixed rule's value
+/// at every ρ and its gradient is that rule's derivative (#2748).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
-    pub(crate) axis_orders: Vec<usize>,
-    pub(crate) axis_quadrature_errors: Vec<f64>,
+    pub(crate) pieces: Vec<LatchedPieceRule>,
     pub(crate) axis_split: bool,
+}
+
+impl BlockQuadratureLatch {
+    /// The number of block axes the latched pieces cover.
+    pub(crate) fn block_dim(&self) -> usize {
+        self.pieces.iter().map(LatchedPieceRule::width).sum()
+    }
+}
+
+/// One latched piece of a #784 block. The variant is the rule, so a consumer that
+/// rebuilds a piece's nodes (a second-order pass, an audit) must name which rule it
+/// rebuilds rather than read a node count as a Gauss–Hermite order.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LatchedPieceRule {
+    /// A tensor Gauss–Hermite rule of these per-axis orders, with the paired-rule
+    /// errors measured at admission: the certificate every later evaluation at those
+    /// orders carries, since the paired error switches nothing once they are latched.
+    /// A one-axis piece whose target is truncated (a positive-domain link) is
+    /// integrated here, by the truncated-normal transport of its Gauss–Hermite rule.
+    GaussHermite {
+        axis_orders: Vec<usize>,
+        certified_axis_errors: Vec<f64>,
+    },
+    /// One axis, integrated by the composite Gauss–Kronrod rule on the partition the
+    /// admission adapted, in the logistic image of the standardized axis `z = √λ·t`
+    /// oriented so its standardized skewness is positive.
+    Composite {
+        breakpoints: Vec<gam_problem::laplace_sampler_contract::AxisBreakpoint>,
+    },
+}
+
+impl LatchedPieceRule {
+    pub(crate) fn width(&self) -> usize {
+        match self {
+            Self::GaussHermite { axis_orders, .. } => axis_orders.len(),
+            Self::Composite { .. } => 1,
+        }
+    }
 }
 
 pub(crate) struct RemlState<'a> {

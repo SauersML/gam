@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gam_linalg::matrix::DesignMatrix;
 use gam_problem::laplace_sampler_contract::{
-    BlockExcessTarget, BlockQuadratureMarginal, BlockQuadratureOrderRefusal,
+    AxisBreakpoint, BlockExcessTarget, BlockQuadratureMarginal, BlockQuadratureOrderRefusal,
     BlockQuadratureOrderStep, BlockQuadratureRefusal, CompositeAxisMarginal,
     LaplaceMarginalCorrector, set_laplace_marginal_corrector,
 };
@@ -80,6 +80,19 @@ impl LaplaceMarginalCorrector for DiagnosticCounter {
             "a zero-skewness diagnostic never reaches the composite rule ({}-axis block, \
              next_order_remainder={next_order_remainder:e})",
             target.block_dim()
+        )
+    }
+
+    fn composite_axis_marginal_correction_on_partition(
+        &self,
+        target: &dyn BlockExcessTarget,
+        breakpoints: &[AxisBreakpoint],
+    ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal> {
+        panic!(
+            "a zero-skewness diagnostic never reaches the composite rule ({}-axis block, \
+             {} breakpoints)",
+            target.block_dim(),
+            breakpoints.len()
         )
     }
 

@@ -3608,6 +3608,13 @@ mod tests {
         ) -> Result<super::CompositeAxisMarginal, super::BlockQuadratureOrderRefusal> {
             super::composite_axis_marginal_correction(target, next_order_remainder)
         }
+        fn composite_axis_marginal_correction_on_partition(
+            &self,
+            target: &dyn super::BlockExcessTarget,
+            breakpoints: &[super::AxisBreakpoint],
+        ) -> Result<super::CompositeAxisMarginal, super::BlockQuadratureOrderRefusal> {
+            super::composite_axis_marginal_correction_on_partition(target, breakpoints)
+        }
         fn publish_order_search_step(
             &self,
             step: &gam_problem::laplace_sampler_contract::BlockQuadratureOrderStep,
@@ -3794,54 +3801,81 @@ mod tests {
         }
     }
 
-    /// The composite rule's value and error over the interior `breakpoints`, with every
-    /// node's excess read from `target`: the pass a partition carried from another ρ
-    /// would make.
-    fn composite_error_on_partition(
-        target: &WallAxis,
-        breakpoints: &[super::AxisBreakpoint],
-    ) -> (f64, f64) {
-        let rule = super::CompositeKronrodRule::new().expect("the Kronrod pair");
-        let ends: Vec<super::AxisBreakpoint> = std::iter::once(super::AxisBreakpoint {
-            v: 0.0,
-            one_minus_v: 1.0,
-        })
-        .chain(breakpoints.iter().copied())
-        .chain(std::iter::once(super::AxisBreakpoint {
-            v: 1.0,
-            one_minus_v: 0.0,
-        }))
-        .collect();
-        let inv_sqrt_lambda = target.lambdas[0].sqrt().recip();
-        let cells: Vec<super::CompositeCell> = ends
-            .windows(2)
-            .map(|pair| {
-                let mut cell = super::CompositeCell::new(pair[0], pair[1], &rule).expect("a cell");
-                for i in 0..cell.z.len() {
-                    let excess = super::BlockExcessTarget::excess(
-                        target,
-                        &Array1::from_elem(1, cell.z[i] * inv_sqrt_lambda),
-                    );
-                    cell.x[i] = if excess.is_finite() { -excess } else { f64::NEG_INFINITY };
-                }
-                cell
-            })
-            .collect();
-        let shares: Vec<super::CompositeCellSums> =
-            cells.iter().map(|cell| super::CompositeCellSums::of(cell, &rule)).collect();
-        let sums = super::combine_composite_sums(&shares).expect("the partition integrates");
-        (sums.value, sums.error)
+    #[test]
+    fn composite_axis_on_a_fixed_partition_is_the_adapted_rule_784() {
+        // Evaluated on the partition the adaptive pass returned, the fixed-partition
+        // rule is the same rule: its value, error, gradient channel and moments are the
+        // adapted pass's to the bit, and it returns the partition it was given.
+        let remainder = 1.5e-9;
+        let wall = WallAxis {
+            lambdas: array![1.7],
+            b: 30.0,
+            z0: 0.23,
+            z_step: None,
+        };
+        let adapted = super::composite_axis_marginal_correction(&wall, remainder)
+            .expect("the wall resolves");
+        assert!(!adapted.breakpoints.is_empty(), "the wall needs a bisection");
+        let fixed = super::composite_axis_marginal_correction_on_partition(&wall, &adapted.breakpoints)
+            .expect("the latched partition integrates");
+        assert_eq!(fixed.breakpoints, adapted.breakpoints);
+        let (a, f) = (&adapted.marginal, &fixed.marginal);
+        assert_eq!(f.value.to_bits(), a.value.to_bits());
+        assert_eq!(f.quadrature_error.to_bits(), a.quadrature_error.to_bits());
+        assert_eq!(f.node_count, a.node_count);
+        assert_eq!(f.rho_gradient[0].to_bits(), a.rho_gradient[0].to_bits());
+        let (fm, am) = (f.moments.as_ref().expect("moments"), a.moments.as_ref().expect("moments"));
+        assert_eq!(fm.e_t[0].to_bits(), am.e_t[0].to_bits());
+        assert_eq!(fm.e_tt[(0, 0)].to_bits(), am.e_tt[(0, 0)].to_bits());
+        // Out-of-order breakpoints are refused, typed, before any node is evaluated.
+        let mut reversed = adapted.breakpoints.clone();
+        reversed.reverse();
+        if reversed.len() > 1 {
+            assert!(super::composite_axis_marginal_correction_on_partition(&wall, &reversed).is_err());
+        }
     }
 
     #[test]
-    fn composite_axis_resolves_the_mirrored_wall_a_carried_partition_misses_784() {
-        // The block axes are Hessian eigenvectors, whose sign is arbitrary and whose wall
-        // moves with ρ. `WallAxis { b: −b, z0: −z0 }` is the same wall seen along the
-        // flipped axis, ΔF(z) ↦ ΔF(−z), so it has the same Δ. On adult the fit latched
-        // the admission's partitions, and every later evaluation stayed near 1e-3
-        // against its 1.5e-9 target: a partition bisected down onto the wall at +z0
-        // leaves the wall at −z0 in a coarse cell. Adapting at every evaluation
-        // resolves both walls to the target.
+    fn composite_axis_latched_partition_is_differentiable_in_the_wall_784() {
+        // The landing review of #3195: a partition re-adapted at every evaluation makes
+        // the criterion a different rule at every ρ, so it is not differentiable at the
+        // resolution target. On the latched partition the nodes are fixed in z, and the
+        // rule's derivative in the wall position z0 is its own gradient channel:
+        // ∂ΔF/∂z0 = −b·ΔF and the channel reads −∂ΔF/∂ρ with ∂ΔF/∂ρ = ΔF, so
+        // dΔ/dz0 = −b·(channel). A central difference of the latched value must agree
+        // to O(h²), across a wall that moves by 2h through the partition.
+        let remainder = 1.5e-9;
+        let at = |z0: f64| WallAxis {
+            lambdas: array![1.7],
+            b: 30.0,
+            z0,
+            z_step: None,
+        };
+        let admitted = super::composite_axis_marginal_correction(&at(0.23), remainder)
+            .expect("the admission resolves");
+        let latched = |z0: f64| {
+            super::composite_axis_marginal_correction_on_partition(&at(z0), &admitted.breakpoints)
+                .expect("the latched partition integrates")
+                .marginal
+        };
+        let centre = latched(0.23);
+        let slope = -30.0 * centre.rho_gradient[0];
+        for h in [1e-4, 1e-5] {
+            let difference = (latched(0.23 + h).value - latched(0.23 - h).value) / (2.0 * h);
+            assert!(
+                (difference - slope).abs() <= 1e-6 * slope.abs(),
+                "h = {h:e}: central difference {difference} against the channel's {slope}"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_axis_partition_is_oriented_by_the_axis_784() {
+        // `WallAxis { b: −b, z0: −z0 }` is the same wall seen along the flipped axis,
+        // ΔF(z) ↦ ΔF(−z), with the same Δ. A partition bisected onto the wall at +z0
+        // leaves the wall at −z0 in a coarse cell, which is why the solver orients each
+        // block axis canonically before it latches or reuses a partition. Reflected with
+        // the axis (v ↦ 1 − v), the latched partition is the mirrored wall's rule.
         let remainder = 1.5e-9;
         let wall = WallAxis {
             lambdas: array![1.7],
@@ -3857,33 +3891,32 @@ mod tests {
         };
         let adapted = super::composite_axis_marginal_correction(&wall, remainder)
             .expect("the wall resolves");
-        assert!(!adapted.breakpoints.is_empty(), "the wall needs a bisection");
-        assert!(adapted.marginal.quadrature_error < remainder);
-        // The helper reproduces the adapted pass on its own partition.
-        let (value, error) = composite_error_on_partition(&wall, &adapted.breakpoints);
-        assert_eq!(value.to_bits(), adapted.marginal.value.to_bits());
-        assert_eq!(error.to_bits(), adapted.marginal.quadrature_error.to_bits());
-        // Carried to the mirrored axis, the same partition does not resolve the wall.
-        let (carried_value, carried_error) =
-            composite_error_on_partition(&mirrored, &adapted.breakpoints);
+        let carried = super::composite_axis_marginal_correction_on_partition(&mirrored, &adapted.breakpoints)
+            .expect("the carried partition integrates");
         assert!(
-            carried_error > remainder,
-            "the carried partition resolved the mirrored wall: value {carried_value}, error \
-             {carried_error:e} against {remainder:e}"
+            carried.marginal.quadrature_error > remainder,
+            "the unoriented partition resolved the mirrored wall: error {:e}",
+            carried.marginal.quadrature_error
         );
-        // Adapted afresh, the mirrored wall resolves, to the wall's own Δ.
-        let readapted = super::composite_axis_marginal_correction(&mirrored, remainder)
-            .expect("the mirrored wall resolves");
-        let marginal = &readapted.marginal;
-        assert!(marginal.quadrature_error < remainder, "error {:e}", marginal.quadrature_error);
+        let reflected: Vec<super::AxisBreakpoint> = adapted
+            .breakpoints
+            .iter()
+            .rev()
+            .map(|b| super::AxisBreakpoint {
+                v: b.one_minus_v,
+                one_minus_v: b.v,
+            })
+            .collect();
+        let oriented = super::composite_axis_marginal_correction_on_partition(&mirrored, &reflected)
+            .expect("the reflected partition integrates");
+        let (o, a) = (&oriented.marginal, &adapted.marginal);
+        assert!(o.quadrature_error < remainder, "error {:e}", o.quadrature_error);
         assert!(
-            (marginal.value - adapted.marginal.value).abs()
-                <= marginal.quadrature_error + adapted.marginal.quadrature_error,
+            (o.value - a.value).abs() <= 64.0 * f64::EPSILON * a.value.abs(),
             "mirrored {} against {}",
-            marginal.value,
-            adapted.marginal.value
+            o.value,
+            a.value
         );
-        assert_ne!(readapted.breakpoints, adapted.breakpoints);
     }
 
     #[test]
@@ -4005,6 +4038,13 @@ mod tests {
             next_order_remainder: f64,
         ) -> Result<super::CompositeAxisMarginal, super::BlockQuadratureOrderRefusal> {
             super::composite_axis_marginal_correction(target, next_order_remainder)
+        }
+        fn composite_axis_marginal_correction_on_partition(
+            &self,
+            target: &dyn super::BlockExcessTarget,
+            breakpoints: &[super::AxisBreakpoint],
+        ) -> Result<super::CompositeAxisMarginal, super::BlockQuadratureOrderRefusal> {
+            super::composite_axis_marginal_correction_on_partition(target, breakpoints)
         }
         fn publish_order_search_step(
             &self,
@@ -7020,6 +7060,14 @@ impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector
         composite_axis_marginal_correction(target, next_order_remainder)
     }
 
+    fn composite_axis_marginal_correction_on_partition(
+        &self,
+        target: &dyn BlockExcessTarget,
+        breakpoints: &[AxisBreakpoint],
+    ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal> {
+        composite_axis_marginal_correction_on_partition(target, breakpoints)
+    }
+
     fn publish_order_search_step(
         &self,
         step: &gam_problem::laplace_sampler_contract::BlockQuadratureOrderStep,
@@ -8208,14 +8256,48 @@ pub fn composite_axis_marginal_correction<T: BlockExcessTarget + ?Sized>(
     target: &T,
     next_order_remainder: f64,
 ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal> {
-    composite_axis_marginal_correction_in_chunks(target, next_order_remainder, usize::MAX)
+    composite_axis_marginal_correction_in_chunks(
+        target,
+        CompositePartition::Adapt { next_order_remainder },
+        usize::MAX,
+    )
+}
+
+/// The composite rule on the fixed partition `breakpoints` (interior, increasing, in
+/// `v`): every cell is evaluated once and none is bisected, so the result is the
+/// rule's exact value on those nodes and its gradient channels are that rule's
+/// derivative. The Gauss–Kronrod error is measured on the same cells and reported,
+/// never acted on. The refusal's `resolution_target` is `∞`: nothing is resolved.
+pub fn composite_axis_marginal_correction_on_partition<T: BlockExcessTarget + ?Sized>(
+    target: &T,
+    breakpoints: &[AxisBreakpoint],
+) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal> {
+    composite_axis_marginal_correction_in_chunks(
+        target,
+        CompositePartition::Fixed { breakpoints },
+        usize::MAX,
+    )
+}
+
+/// How [`composite_axis_marginal_correction_in_chunks`] forms its partition.
+#[derive(Clone, Copy)]
+enum CompositePartition<'b> {
+    /// Start from the whole axis and bisect until the error resolves
+    /// `min(|Δ|, next_order_remainder)`.
+    Adapt { next_order_remainder: f64 },
+    /// Integrate on these interior breakpoints as given.
+    Fixed { breakpoints: &'b [AxisBreakpoint] },
 }
 
 fn composite_axis_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>(
     target: &T,
-    next_order_remainder: f64,
+    partition: CompositePartition<'_>,
     chunk_limit: usize,
 ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal> {
+    let next_order_remainder = match partition {
+        CompositePartition::Adapt { next_order_remainder } => next_order_remainder,
+        CompositePartition::Fixed { .. } => f64::INFINITY,
+    };
     use BlockQuadratureRefusal::Integration;
     let refuse = |cause: BlockQuadratureRefusal,
                   node_count: usize,
@@ -8358,11 +8440,38 @@ fn composite_axis_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>(
         v: 1.0,
         one_minus_v: 0.0,
     };
-    let mut cells = vec![CompositeCell::new(whole_lower, whole_upper, &rule).map_err(early)?];
-    let mut shares = Vec::with_capacity(1);
-    let mut excess_bands = Vec::with_capacity(1);
-    let mut moments = Vec::with_capacity(1);
-    for (share, band, cell_moments) in evaluate(&mut cells, table_bytes(1)).map_err(early)? {
+    let ends: Vec<AxisBreakpoint> = match partition {
+        CompositePartition::Adapt { .. } => vec![whole_lower, whole_upper],
+        CompositePartition::Fixed { breakpoints } => {
+            let ends: Vec<AxisBreakpoint> = std::iter::once(whole_lower)
+                .chain(breakpoints.iter().copied())
+                .chain(std::iter::once(whole_upper))
+                .collect();
+            // Each end must be interior and strictly increasing in both coordinates,
+            // so every cell has positive width in the one it is formed in.
+            if let Some(pair) = ends
+                .windows(2)
+                .find(|pair| !(pair[0].v < pair[1].v && pair[0].one_minus_v > pair[1].one_minus_v))
+            {
+                return Err(early(Integration(format!(
+                    "composite partition breakpoints are not strictly increasing: \
+                     v = {:e} (1 − v = {:e}) then v = {:e} (1 − v = {:e})",
+                    pair[0].v, pair[0].one_minus_v, pair[1].v, pair[1].one_minus_v
+                ))));
+            }
+            ends
+        }
+    };
+    let mut cells = ends
+        .windows(2)
+        .map(|pair| CompositeCell::new(pair[0], pair[1], &rule))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(early)?;
+    let mut shares = Vec::with_capacity(cells.len());
+    let mut excess_bands = Vec::with_capacity(cells.len());
+    let mut moments = Vec::with_capacity(cells.len());
+    let initial_table = table_bytes(cells.len());
+    for (share, band, cell_moments) in evaluate(&mut cells, initial_table).map_err(early)? {
         shares.push(share);
         excess_bands.push(band);
         moments.push(cell_moments);
@@ -8373,7 +8482,10 @@ fn composite_axis_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>(
             refuse(cause, node_count, f64::INFINITY, next_order_remainder)
         })?;
         let resolution_target = sums.value.abs().min(next_order_remainder);
-        if sums.error == 0.0 || sums.error < resolution_target {
+        if matches!(partition, CompositePartition::Fixed { .. })
+            || sums.error == 0.0
+            || sums.error < resolution_target
+        {
             break sums;
         }
         // Bisect the largest error share that is a measurement: above the band

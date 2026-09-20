@@ -504,12 +504,8 @@ impl<'a> RemlState<'a> {
             return Ok(zero());
         }
         let m = block_cols.len();
-        let mut block_vecs = Array2::<f64>::zeros((p, m));
-        let mut block_lambdas = Array1::<f64>::zeros(m);
-        for (j, &r) in block_cols.iter().enumerate() {
-            block_vecs.column_mut(j).assign(&evecs.column(r));
-            block_lambdas[j] = evals[r];
-        }
+        let (block_vecs, block_lambdas) =
+            oriented_block_axes(&evecs, &evals, &directional, &block_cols);
 
         // Penalty scores S_k β̂ in the TRANSFORMED frame, and λ_k = e^{ρ_k}.
         // β̂ = `pirls_result.beta_transformed` lives in the stable
@@ -623,8 +619,7 @@ impl<'a> RemlState<'a> {
         // (#2748), so a latched evaluation integrates the fine rule alone and
         // carries the admission's paired errors as its certificate: on a
         // three-axis block the lower rules are five times the fine rule's nodes.
-        // A one-axis piece is the exception: its composite rule adapts to every
-        // evaluation's axis (below).
+        // A one-axis piece latches its composite partition the same way (below).
         let laplace_floor = if n_eff > 0.0 {
             1.0 / n_eff
         } else {
@@ -636,7 +631,7 @@ impl<'a> RemlState<'a> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .filter(|latch| latch.axis_orders.len() == m);
+            .filter(|latch| latch.block_dim() == m);
 
         // ── Axis by axis, or one tensor rule ─────────────────────────────
         //
@@ -703,6 +698,7 @@ impl<'a> RemlState<'a> {
         let piece_count = if axis_split { m } else { 1 };
         let mut pieces: Vec<BlockPieceQuadrature> = Vec::with_capacity(piece_count);
         let mut axis_orders: Vec<usize> = Vec::with_capacity(m);
+        let mut piece_rules: Vec<LatchedPieceRule> = Vec::with_capacity(piece_count);
         for k in 0..piece_count {
             let (first_axis, width) = if axis_split { (k, 1) } else { (0, m) };
             let axis_target;
@@ -723,37 +719,72 @@ impl<'a> RemlState<'a> {
                         stage: BlockQuadratureCorrectionStage::OrderSearchRefused(refusal),
                     }
                 };
-            let mut quadrature = if width == 1 {
-                // One axis: the composite Gauss–Kronrod rule, whose bisection resolves a
-                // wall no representable Gauss–Hermite order reaches. Its partition is
-                // adapted at every evaluation, latched or not: the axis is a Hessian
-                // eigenvector at this ρ, whose sign is arbitrary and whose wall moves,
-                // and on adult the admission's partitions carried to the next ρ left
-                // every axis near 1e-3 against its 1.5e-9 target. Each evaluation's own
-                // rule resolves its target, so the criterion moves by less than the
-                // targets between rules, and its gradient is the derivative of the rule
-                // that priced it.
-                corrector
-                    .composite_axis_marginal_correction(piece_target, next_order_remainder)
-                    .map_err(order_search_refused)?
-                    .marginal
-            } else {
-                match &latched_quadrature {
-                    Some(latch) => corrector
+            // A one-axis piece is integrated by the composite Gauss–Kronrod rule, whose
+            // bisection resolves a wall no representable Gauss–Hermite order reaches.
+            // The partition is adapted once, at admission, and latched: every later ρ
+            // integrates on the same cells in the oriented standardized axis, so the
+            // criterion is one rule's value and its channels are that rule's gradient.
+            // A truncated axis (a positive-domain link) keeps the Gauss–Hermite rule,
+            // whose truncated-normal transport integrates exactly to the cut; the
+            // composite rule would meet the cut as infeasible nodes.
+            let latched_piece = latched_quadrature.as_ref().map(|latch| &latch.pieces[k]);
+            let composite_axis = match latched_piece {
+                Some(rule) => matches!(rule, LatchedPieceRule::Composite { .. }),
+                None => width == 1 && piece_target.axis_truncation().is_none(),
+            };
+            let (mut quadrature, piece_rule) = match latched_piece {
+                Some(LatchedPieceRule::Composite { breakpoints }) => (
+                    corrector
+                        .composite_axis_marginal_correction_on_partition(piece_target, breakpoints)
+                        .map_err(order_search_refused)?
+                        .marginal,
+                    LatchedPieceRule::Composite {
+                        breakpoints: breakpoints.clone(),
+                    },
+                ),
+                Some(LatchedPieceRule::GaussHermite {
+                    axis_orders: orders,
+                    certified_axis_errors,
+                }) => (
+                    corrector
                         .block_quadrature_marginal_correction_at_certified_orders(
                             piece_target,
-                            &latch.axis_orders[first_axis..first_axis + width],
-                            &latch.axis_quadrature_errors[first_axis..first_axis + width],
+                            orders,
+                            certified_axis_errors,
                         )
                         .map_err(|refusal| EstimationError::InvalidInput(refusal.to_string()))?,
-                    None => gam_problem::laplace_sampler_contract::select_block_quadrature_orders(
-                        corrector,
-                        piece_target,
-                        next_order_remainder,
+                    LatchedPieceRule::GaussHermite {
+                        axis_orders: orders.clone(),
+                        certified_axis_errors: certified_axis_errors.clone(),
+                    },
+                ),
+                None if composite_axis => {
+                    let adapted = corrector
+                        .composite_axis_marginal_correction(piece_target, next_order_remainder)
+                        .map_err(order_search_refused)?;
+                    (
+                        adapted.marginal,
+                        LatchedPieceRule::Composite {
+                            breakpoints: adapted.breakpoints,
+                        },
                     )
-                    .map_err(order_search_refused)?,
+                }
+                None => {
+                    let selected =
+                        gam_problem::laplace_sampler_contract::select_block_quadrature_orders(
+                            corrector,
+                            piece_target,
+                            next_order_remainder,
+                        )
+                        .map_err(order_search_refused)?;
+                    let rule = LatchedPieceRule::GaussHermite {
+                        axis_orders: selected.axis_orders.clone(),
+                        certified_axis_errors: selected.axis_quadrature_errors.clone(),
+                    };
+                    (selected, rule)
                 }
             };
+            piece_rules.push(piece_rule);
             axis_orders.extend_from_slice(&quadrature.axis_orders);
             let Some(moments) = quadrature.moments.take() else {
                 // The corrector's contract reserves absent moments for the empty
@@ -843,7 +874,7 @@ impl<'a> RemlState<'a> {
             }
             log::debug!(
                 "[#784] block-local correction spliced UNRESOLVED (admission already latched, \
-                 #2748): paired Gauss-Hermite error {:.4e} does not resolve \
+                 #2748): the latched rule's measured error {:.4e} does not resolve \
                  min(|Δ|, 1/n_eff²)={:.4e} (|Δ_b|={abs_value:.4e}, m={m}, axis split={axis_split}, \
                  max|γ|={:.3}, τ={:.3}, axis orders={:?}, nodes={node_count}, 1/n_eff={:.3e})",
                 piece.quadrature.quadrature_error,
@@ -865,8 +896,7 @@ impl<'a> RemlState<'a> {
                 .block_correction_axis_orders
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(BlockQuadratureLatch {
-                axis_orders: axis_orders.clone(),
-                axis_quadrature_errors: axis_quadrature_errors.clone(),
+                pieces: piece_rules,
                 axis_split,
             });
             let mut decision = self.block_correction_decision_guard();
@@ -1246,6 +1276,33 @@ fn block_correction_design_admission(
 /// `ρ₂ = 18.4366` and `18.4473` where its smooth variation is 1e-7, and the
 /// corrected BFGS continuation failed its line search on the step until
 /// `StepSizeTooSmall`.
+/// The block axes `V_b` and their curvatures, each axis oriented so its standardized
+/// skewness is positive.
+///
+/// An eigenvector's sign is the eigensolver's, not the model's, and `γ_r` is odd in
+/// it, so `γ_r > 0` names one of the two directions from (H, γ) alone. A latched
+/// composite partition is a rule in this oriented axis: in the solver's sign it would
+/// be carried onto the mirror image of the integrand whenever the eigensolver flips
+/// the vector between two ρ (#784). The gradient's eigenframe term `V G V_bᵀ` carries
+/// the sign in both `G`'s column and `V_b`'s, so it is unchanged.
+fn oriented_block_axes(
+    evecs: &Array2<f64>,
+    evals: &Array1<f64>,
+    directional: &Array1<f64>,
+    block_cols: &[usize],
+) -> (Array2<f64>, Array1<f64>) {
+    let mut block_vecs = Array2::<f64>::zeros((evecs.nrows(), block_cols.len()));
+    let mut block_lambdas = Array1::<f64>::zeros(block_cols.len());
+    for (j, &r) in block_cols.iter().enumerate() {
+        let orientation = if directional[r] < 0.0 { -1.0 } else { 1.0 };
+        block_vecs
+            .column_mut(j)
+            .assign(&evecs.column(r).mapv(|v| orientation * v));
+        block_lambdas[j] = evals[r];
+    }
+    (block_vecs, block_lambdas)
+}
+
 fn order_block_axes_by_curvature(block_cols: &mut [usize], evals: &Array1<f64>) {
     block_cols.sort_by(|&a, &b| evals[a].total_cmp(&evals[b]).then(a.cmp(&b)));
 }
@@ -1625,6 +1682,34 @@ mod block_axis_order_tests {
     /// (stacked-root SVD) eigensystem must give every axis position the same
     /// direction, or the latched per-axis orders land on different directions
     /// when the criterion switches route.
+    /// Flipping an eigenvector's sign flips its `γ_r` (odd in the vector), and the
+    /// oriented block axis is the same vector either way, so a latched composite
+    /// partition lands on the same side of the integrand whichever sign the eigensolver
+    /// returned (#784).
+    #[test]
+    fn block_axes_do_not_depend_on_the_eigenvector_sign() {
+        let evecs = Array2::from_shape_fn((4, 4), |(i, j)| ((i * 5 + j * 3) as f64 * 0.7).sin());
+        let evals = Array1::from(vec![0.5, 1.5, 2.5, 3.5]);
+        let directional = Array1::from(vec![0.9, -1.4, 0.2, -0.05]);
+        let block_cols = [1usize, 3, 0];
+        let (reference, lambdas) = oriented_block_axes(&evecs, &evals, &directional, &block_cols);
+        for flipped in 0..4 {
+            let mut evecs_flipped = evecs.clone();
+            evecs_flipped.column_mut(flipped).mapv_inplace(|v| -v);
+            let mut directional_flipped = directional.clone();
+            directional_flipped[flipped] = -directional_flipped[flipped];
+            let (vecs, flipped_lambdas) =
+                oriented_block_axes(&evecs_flipped, &evals, &directional_flipped, &block_cols);
+            assert_eq!(vecs, reference, "flipping column {flipped} moved the block axes");
+            assert_eq!(flipped_lambdas, lambdas);
+        }
+        // Every oriented axis has positive skewness: γ of the output is |γ|.
+        for (j, &r) in block_cols.iter().enumerate() {
+            let sign = reference.column(j).dot(&evecs.column(r)).signum();
+            assert_eq!(sign * directional[r], directional[r].abs());
+        }
+    }
+
     #[test]
     fn axis_positions_do_not_depend_on_the_eigensolver_order() {
         let ascending = Array1::from(vec![2.092e-1, 1.545, 2.772, 1.160e1, 1.753e1, 1.054e2]);

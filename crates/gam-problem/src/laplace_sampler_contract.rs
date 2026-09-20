@@ -822,11 +822,11 @@ pub trait LaplaceMarginalCorrector: Send + Sync {
     ///
     /// The partition starts as the whole axis and the cell with the largest error
     /// share is bisected until the axis error resolves `min(|Δ|, next_order_remainder)`.
-    /// It is adapted afresh on every call: the axis is an eigenvector of the Hessian
-    /// at this ρ, whose sign is arbitrary and whose wall moves with ρ, so a partition
-    /// adapted at another ρ is a rule for another integrand (#784: on `adult` the
-    /// admission's partitions left every later evaluation near `1e-3` against a
-    /// `1.5e-9` target).
+    /// This is the admission's rule: the partition it returns is latched, and every
+    /// later evaluation integrates on it through
+    /// [`Self::composite_axis_marginal_correction_on_partition`], so the criterion is
+    /// one fixed rule's value, a smooth function of ρ, and its gradient channels are
+    /// that rule's derivative (#784).
     ///
     /// The error is the Gauss–Kronrod difference of each cell's embedded Gauss rule,
     /// taken on the self-normalised value, so a Gaussian axis (`ΔF ≡ 0`) reports
@@ -836,6 +836,18 @@ pub trait LaplaceMarginalCorrector: Send + Sync {
         &self,
         target: &dyn BlockExcessTarget,
         next_order_remainder: f64,
+    ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal>;
+
+    /// The composite rule of [`Self::composite_axis_marginal_correction`] on the fixed
+    /// interior `breakpoints` a latched admission carries: no cell is bisected, and
+    /// the Gauss–Kronrod error of those cells is measured and reported, not acted on.
+    /// The breakpoints are in the logistic image of the standardized axis
+    /// `z = √λ·t`, so the rule moves with the axis's curvature and mode exactly as a
+    /// latched Gauss–Hermite order does. The returned `breakpoints` are the input.
+    fn composite_axis_marginal_correction_on_partition(
+        &self,
+        target: &dyn BlockExcessTarget,
+        breakpoints: &[AxisBreakpoint],
     ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal>;
 
     /// Publish one step of [`select_block_quadrature_orders`]: the rule it evaluated,
