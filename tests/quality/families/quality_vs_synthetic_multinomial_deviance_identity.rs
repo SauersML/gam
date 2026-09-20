@@ -44,9 +44,9 @@
 //!   downstream AIC/LRT consumer.
 //!
 //! Combination under test (bugs hide in combinations): a single multinomial fit
-//! that simultaneously loads a cyclic 1-D smooth `s(x1, bs='cc')`, a thin-plate
-//! 1-D smooth `s(x2, bs='tp')`, AND a tensor-product interaction
-//! `te(x1, x2, bs=c('cc','tp'))` — three penalty blocks per active class,
+//! that simultaneously loads a cyclic 1-D smooth `s(x1, bs='cyclic')`, a thin-plate
+//! 1-D smooth `s(x2, bs='tps')`, AND a tensor-product interaction
+//! `te(x1, x2, bs=c('cyclic','tps'))` — three penalty blocks per active class,
 //! replicated across `K-1 = 2` softmax linear predictors.
 
 use gam::data::EncodedDataset;
@@ -222,7 +222,7 @@ fn multinomial_recovers_decision_boundary_on_held_out_split() {
     // Cyclic 1-D smooth on x1 (the angular covariate), thin-plate 1-D smooth on
     // x2, and a tensor-product interaction across both. Three penalty blocks
     // per active class, replicated over K-1 = 2 softmax predictors.
-    let formula = "y ~ s(x1, bs='cc', k=8) + s(x2, bs='tp', k=5) + te(x1, x2, bs=c('cc','tp'))";
+    let formula = "y ~ s(x1, bs='cyclic', k=8) + s(x2, bs='tps', k=5) + te(x1, x2, bs=c('cyclic','tps'))";
     let cfg = FitConfig::default();
     let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
         data: &ds_train,

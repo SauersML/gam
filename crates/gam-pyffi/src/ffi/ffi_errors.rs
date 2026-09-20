@@ -494,6 +494,9 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         EstimationError::PrefitLinearSeparationDetected { .. } => {
             PerfectSeparationError::new_err(message)
         }
+        EstimationError::PrefitLatentScoreSeparationDetected { .. } => {
+            PerfectSeparationError::new_err(message)
+        }
         EstimationError::MultinomialSeparationDetected { .. } => {
             PerfectSeparationError::new_err(message)
         }
@@ -644,6 +647,22 @@ pub(crate) fn saved_model_error_to_pyerr(
     exc
 }
 
+/// A saved document that could not be written or read through
+/// `gam_model_api::saved_model`. A filesystem refusal raises the `OSError`
+/// subclass its kind names (`FileNotFoundError`, `PermissionError`, ...), with
+/// the path in its message; a document the engine refuses is a `DataError`, the
+/// category of a payload (gam#3008, gam#3054).
+pub(crate) fn saved_document_error_to_pyerr(
+    error: gam_model_api::saved_model::SavedModelError,
+) -> PyErr {
+    match error {
+        gam_model_api::saved_model::SavedModelError::Io { path, source } => {
+            PyErr::from(std::io::Error::new(source.kind(), format!("{path}: {source}")))
+        }
+        refused => DataError::new_err(refused.to_string()),
+    }
+}
+
 /// A Rust panic caught at the boundary is an engine defect whatever the input,
 /// so it reaches Python as `InternalError`, never as an abort.
 fn py_panic_error(context: &'static str, payload: Box<dyn std::any::Any + Send>) -> PyErr {
@@ -739,16 +758,19 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, PredictError> + Send + 'static,
 {
-    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(PredictError::SchemaMismatch(message))) => {
-            Err(SchemaMismatchError::new_err(message))
+    detach_typed_py_result(py, context, f, |_, err| predict_error_to_pyerr(err))
+}
+
+/// The typed Python exception for a [`PredictError`]: `SchemaMismatch` →
+/// `SchemaMismatchError`, `Input` → `PredictInputError`, everything else →
+/// `PredictionError`.
+pub(crate) fn predict_error_to_pyerr(err: PredictError) -> PyErr {
+    match err {
+        PredictError::SchemaMismatch(message) => SchemaMismatchError::new_err(message),
+        PredictError::Input(error) => {
+            PredictInputError::new_err(message_with_advice(&error, error.advice()))
         }
-        Ok(Err(PredictError::Input(error))) => Err(PredictInputError::new_err(
-            message_with_advice(&error, error.advice()),
-        )),
-        Ok(Err(PredictError::Other(message))) => Err(PredictionError::new_err(message)),
-        Err(payload) => Err(py_panic_error(context, payload)),
+        PredictError::Other(message) => PredictionError::new_err(message),
     }
 }
 

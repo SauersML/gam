@@ -6,8 +6,8 @@
 //! the Jeffreys change, and is measured against a Hessian that carries the
 //! Jeffreys curvature. On perfectly separated binomial data the mis-targeted
 //! correction was orders of magnitude above `1/n_eff` and left the outer search
-//! unable to certify, so every separated fit the automatic Firth rescue should
-//! have recovered was refused. The correction must not be consulted at all for a
+//! unable to certify, so every separated fit the Jeffreys prior is armed for
+//! was refused. The correction must not be consulted at all for a
 //! Firth fit, and must still be consulted for the same fit without Firth.
 //!
 //! Only this binary's process registers the corrector double below, so no other

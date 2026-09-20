@@ -21,8 +21,8 @@ _CASES = (
     ("y ~ smooth(a) + smooth(b) + smooth(c) + d", "add_d"),
     ("y ~ cyclic(b) + smooth(a) + c", "cyclic"),
     ("y ~ smooth(a) + smooth(b) + smooth(c) + e", "add_e"),
-    ("y ~ tensor(a, b) + smooth(c) + d", "tensor_smooth"),
-    ("y ~ tensor(a, b) + tensor(c, e) + f", "tensor_tensor"),
+    ("y ~ te(a, b) + smooth(c) + d", "tensor_smooth"),
+    ("y ~ te(a, b) + te(c, e) + f", "tensor_tensor"),
 )
 
 

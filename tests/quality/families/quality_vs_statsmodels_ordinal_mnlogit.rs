@@ -42,7 +42,7 @@
 //! ## Identical inputs to both engines
 //!
 //! We build gam's design once — intercept + linear `x1` + cyclic cubic spline basis
-//! of `x2` (`s(x2, bs="cc")`) — via the real formula → design path, then feed that
+//! of `x2` (`s(x2, bs="cyclic")`) — via the real formula → design path, then feed that
 //! dense design (and the smooth's block penalty) to `fit_penalized_multinomial`,
 //! and hand the *same* dense design columns (including the intercept) to `MNLogit`.
 //! Both see byte-identical features and the identical integer response. gam uses a
@@ -134,7 +134,7 @@ fn gam_multinomial_recovers_true_class_simplex() {
         }
     }
 
-    // ---- build gam's design from the formula (intercept + x1 + cc(x2)) -------
+    // ---- build gam's design from the formula (intercept + x1 + cyclic(x2)) -------
     let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
     let rows = (0..N)
         .map(|i| {
@@ -147,8 +147,8 @@ fn gam_multinomial_recovers_true_class_simplex() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ x1 + s(x2, bs=\"cc\")", &ds, &cfg)
-        .expect("gam builds the x1 + cc(x2) design");
+    let result = fit_from_formula("y ~ x1 + s(x2, bs=\"cyclic\")", &ds, &cfg)
+        .expect("gam builds the x1 + cyclic(x2) design");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit to expose the design");
     };

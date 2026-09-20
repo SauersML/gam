@@ -5,60 +5,92 @@ use std::sync::RwLock;
 impl<'a> RemlState<'a> {
     pub(crate) const POLISH_NORM_RATIO: f64 = 0.25;
 
-    pub(crate) fn ift_quality_step_cap(&self, default_cap: f64) -> f64 {
-        self.ift_quality_runtime
-            .lock()
-            .expect("IFT quality runtime mutex poisoned")
-            .next_step_cap
-            .filter(|cap| cap.is_finite() && *cap > 0.0)
-            .unwrap_or(default_cap)
-    }
-
-    pub(crate) fn take_ift_quality_flat_override(&self) -> bool {
-        let mut state = self
-            .ift_quality_runtime
-            .lock()
-            .expect("IFT quality runtime mutex poisoned");
-        let fallback = state.fallback_next_flat;
-        state.fallback_next_flat = false;
-        fallback
-    }
-
-    pub(crate) fn clear_ift_quality_runtime_state(&self) {
-        *self
-            .ift_quality_runtime
-            .lock()
-            .expect("IFT quality runtime mutex poisoned") = Default::default();
-    }
-
-    pub(crate) fn record_ift_prediction_quality(
+    /// The measured trust radius of `source` (see [`WarmStartTrustState`]);
+    /// `None` until that predictor has had an error measured, in which case
+    /// nothing yet says it loses to the flat seed.
+    pub(crate) fn warm_start_trust_radius(
         &self,
-        quality: f64,
-        current_cap: f64,
+        source: WarmStartPredictionSource,
     ) -> Option<f64> {
-        if !quality.is_finite() || quality < 0.0 || !current_cap.is_finite() || current_cap <= 0.0 {
+        let state = self
+            .warm_start_trust
+            .lock()
+            .expect("warm-start trust mutex poisoned");
+        match source {
+            WarmStartPredictionSource::Ift => state.ift_radius,
+            WarmStartPredictionSource::TangentLine => state.tangent_radius,
+            WarmStartPredictionSource::Flat => None,
+        }
+    }
+
+    /// Remember the step metric of the prediction about to seed the inner
+    /// solve, so the converged β can measure that predictor's trust radius.
+    pub(crate) fn stage_warm_start_prediction_step(
+        &self,
+        source: WarmStartPredictionSource,
+        step: f64,
+    ) {
+        self.warm_start_trust
+            .lock()
+            .expect("warm-start trust mutex poisoned")
+            .pending = Some((source, step));
+    }
+
+    pub(crate) fn take_staged_warm_start_prediction_step(
+        &self,
+    ) -> Option<(WarmStartPredictionSource, f64)> {
+        self.warm_start_trust
+            .lock()
+            .expect("warm-start trust mutex poisoned")
+            .pending
+            .take()
+    }
+
+    pub(crate) fn clear_warm_start_trust_state(&self) {
+        *self
+            .warm_start_trust
+            .lock()
+            .expect("warm-start trust mutex poisoned") = Default::default();
+    }
+
+    /// Measure `source`'s trust radius from one converged solve: the
+    /// prediction at step metric `step` missed the converged β by
+    /// `predicted_error`, the flat seed by `flat_error`. The prediction's
+    /// error grows one order faster in the step than the flat seed's, so the
+    /// step at which the two cross is `step · flat_error / predicted_error`
+    /// (unbounded when the prediction was exact). Returns the new radius, or
+    /// `None` when the solve carries no information (both errors zero, or a
+    /// non-finite input).
+    pub(crate) fn record_warm_start_prediction_error(
+        &self,
+        source: WarmStartPredictionSource,
+        step: f64,
+        predicted_error: f64,
+        flat_error: f64,
+    ) -> Option<f64> {
+        if !(step.is_finite() && predicted_error.is_finite() && flat_error.is_finite())
+            || step < 0.0
+            || predicted_error < 0.0
+            || flat_error < 0.0
+            || (predicted_error == 0.0 && flat_error == 0.0)
+        {
             return None;
         }
-        let mut state = self
-            .ift_quality_runtime
-            .lock()
-            .expect("IFT quality runtime mutex poisoned");
-        state.quality_history.push(quality);
-        while state.quality_history.len() > IFT_QUALITY_HISTORY_CAP {
-            state.quality_history.remove(0);
-        }
-        let rolling_quality =
-            state.quality_history.iter().sum::<f64>() / state.quality_history.len() as f64;
-        let next_step_cap = if rolling_quality < IFT_QUALITY_GROW_BAND {
-            current_cap * IFT_STEP_CAP_GROW_FACTOR
-        } else if rolling_quality < IFT_QUALITY_SHRINK_BAND {
-            current_cap
+        let radius = if predicted_error == 0.0 {
+            f64::INFINITY
         } else {
-            current_cap * IFT_STEP_CAP_SHRINK_FACTOR
+            step * flat_error / predicted_error
         };
-        state.next_step_cap = Some(next_step_cap);
-        state.fallback_next_flat = rolling_quality >= IFT_QUALITY_FLAT_FALLBACK_BAND;
-        Some(next_step_cap)
+        let mut state = self
+            .warm_start_trust
+            .lock()
+            .expect("warm-start trust mutex poisoned");
+        match source {
+            WarmStartPredictionSource::Ift => state.ift_radius = Some(radius),
+            WarmStartPredictionSource::TangentLine => state.tangent_radius = Some(radius),
+            WarmStartPredictionSource::Flat => return None,
+        }
+        Some(radius)
     }
 
     pub(crate) fn apply_inner_polish_step_to_warm_start(
@@ -147,47 +179,18 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
-        // The Tierney-Kadane fallback gate is no longer needed: the analytic
-        // TK value, first ρ-derivative, AND second ρ-derivative paths are
-        // implemented in `tierney_kadane_terms`, which now populates the
-        // `hessian` field whenever the caller requests `ValueGradientHessian`.
-        // The earlier gate (Firth + non-identity link → return false) was
-        // kept during the manual conflict merge that landed the TK Hessian
-        // implementation; it is now stale and was suppressing the analytic
-        // path that was actually in place.
-        // Canonical-logit Firth fits keep their exact Tierney-Kadane outer Hessian
-        // at every problem scale: its row-pair jets run by blocked row pairs or
-        // through design tensors, whichever predicted work is smaller
-        // (`TkRowPairRoute::predicted_rho_hessian`, #2900), so no row count sends
-        // their curvature to BFGS.
+        // The Tierney-Kadane outer ρ-Hessian is analytic for every Firth link:
+        // its fourth η-derivative of the observed-information surface comes
+        // from the six-order Bernoulli log jet
+        // (`pirls::bernoulli_observed_information_jet`), and canonical-logit
+        // row-pair jets run by blocked row pairs or through design tensors,
+        // whichever predicted work is smaller
+        // (`TkRowPairRoute::predicted_rho_hessian`, #2900).
         //
-        // The corrected objective and its exact analytic gradient are
-        // link-general, but an exact TK outer Hessian additionally needs the
-        // fourth eta derivative of the observed-information surface. That
-        // carrier is currently available only for canonical Binomial Logit.
-        // Other Firth links therefore optimize the same TK-corrected objective
-        // with BFGS curvature rather than silently dropping the correction.
-        if reml_robust_jeffreys_link(&self.config).is_some()
-            && !self.tk_exact_hessian_is_canonical_logit()
-        {
-            return false;
-        }
         // A latched #784 block correction splices `Δ_b` with its exact
         // gradient and ρ-Hessian, unless `Δ_b` has no closed-form Hessian on
         // this fit, when the criterion it defines has none.
         self.block_correction_hessian_refusal().is_none()
-    }
-
-    /// Whether the exact analytic outer Hessian of the Tierney-Kadane
-    /// correction is available. TK value and gradient are link-general; only
-    /// this optimizer-curvature capability remains canonical-logit-specific.
-    pub(crate) fn tk_exact_hessian_is_canonical_logit(&self) -> bool {
-        let spec = reml_spec(&self.config.likelihood);
-        matches!(spec.response, ResponseFamily::Binomial)
-            && matches!(
-                self.runtime_inverse_link(),
-                InverseLink::Standard(StandardLink::Logit)
-            )
     }
 
     pub(crate) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
@@ -2338,13 +2341,10 @@ impl<'a> RemlState<'a> {
         // ρ-Hessian changes at a size window.
         let pirls_result = bundle.pirls_result.as_ref();
         let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
-        // `f = d⁴W_obs/dη⁴` enters only the analytic outer Hessian. The exact
-        // non-canonical observed-information carrier needs a sixth inverse-link
-        // derivative, which is not exposed by the current jet tower, so those
-        // links are deliberately routed to BFGS above. Value and gradient use
-        // only c/d/e and remain exact for every supported Firth link.
+        // `f = d⁴W_obs/dη⁴` enters only the analytic outer Hessian; value and
+        // gradient use c/d/e alone.
         let f_array = if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
-            self.hessian_cdef_arrays(pirls_result)?.3
+            self.hessian_f_array(pirls_result)?
         } else {
             Array1::zeros(e_array.len())
         };
@@ -2954,7 +2954,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn predict_warm_start_beta_joint_ift_with_outcome(
         &self,
         new_rho: &Array1<f64>,
-        max_dtheta_cap: f64,
+        trust_radius: Option<f64>,
     ) -> Option<(Coefficients, IftPredictionOutcome)> {
         let theta = self.pending_joint_ift_theta()?;
         let cache = {
@@ -2994,16 +2994,7 @@ impl<'a> RemlState<'a> {
                 d
             })
             .collect();
-        if !max_abs_dtheta.is_finite() || max_abs_dtheta > max_dtheta_cap {
-            log::debug!(
-                "[IFT-REJECTED] reason=large_dtheta max_dtheta={:.3e} cap={:.3e} joint_dim={}",
-                max_abs_dtheta,
-                max_dtheta_cap,
-                cache.theta.len(),
-            );
-            return None;
-        }
-        if dtheta.iter().all(|d| *d == 0.0) {
+        if max_abs_dtheta.is_finite() && dtheta.iter().all(|d| *d == 0.0) {
             log::debug!(
                 "[IFT-NOOP] reason=all_dtheta_zero max_dtheta={:.3e} joint_dim={}",
                 max_abs_dtheta,
@@ -3013,6 +3004,17 @@ impl<'a> RemlState<'a> {
                 Coefficients::new(cache.beta_original),
                 IftPredictionOutcome::Noop,
             ));
+        }
+        // Beyond the measured trust radius the flat seed is the better one
+        // (see `WarmStartTrustState`).
+        if !max_abs_dtheta.is_finite() || trust_radius.is_some_and(|r| max_abs_dtheta >= r) {
+            log::debug!(
+                "[IFT-REJECTED] reason=large_dtheta max_dtheta={:.3e} cap={:.3e} joint_dim={}",
+                max_abs_dtheta,
+                trust_radius.unwrap_or(f64::INFINITY),
+                cache.theta.len(),
+            );
+            return None;
         }
 
         let solution_original = cache.mode_response_cols.dot(&dtheta);
@@ -3048,6 +3050,7 @@ impl<'a> RemlState<'a> {
             max_abs_dtheta,
             solution_original.dot(&solution_original).sqrt(),
         );
+        self.stage_warm_start_prediction_step(WarmStartPredictionSource::Ift, max_abs_dtheta);
         Some((
             Coefficients::new(predicted),
             IftPredictionOutcome::Predicted,
@@ -3095,7 +3098,7 @@ impl<'a> RemlState<'a> {
         // for noise-floor steps) must not collide with "no signal yet".
         self.last_pirls_accept_rho
             .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
-        self.clear_ift_quality_runtime_state();
+        self.clear_warm_start_trust_state();
     }
 
     pub(crate) fn set_link_states(
@@ -3399,46 +3402,77 @@ impl<'a> RemlState<'a> {
         Ok((c_array, d_array, e_array))
     }
 
-    pub(crate) fn hessian_cdef_arrays(
+    /// `fᵢ = ∂⁴W_obs/∂η⁴` per row, the carrier the analytic Tierney-Kadane
+    /// outer ρ-Hessian adds to c/d/e. Canonical Logit reads it from the
+    /// closed-form 5-jet (`W = h'(η)`, so `f = h⁽⁵⁾`). Every other Bernoulli
+    /// link takes it from `pirls::bernoulli_observed_information_jet`, linear
+    /// in the sixth η-derivatives of log μ and log(1−μ), so no division by
+    /// V = μ(1−μ) occurs where μ' and 1−μ underflow together (#3317, #3203).
+    pub(crate) fn hessian_f_array(
         &self,
         pirls_result: &PirlsResult,
-    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
-        let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
-        let canonical_logit = matches!(
+    ) -> Result<Array1<f64>, EstimationError> {
+        use rayon::prelude::*;
+        if !matches!(
             reml_spec(&pirls_result.likelihood).response,
             ResponseFamily::Binomial
-        ) && matches!(
-            self.runtime_inverse_link(),
-            InverseLink::Standard(StandardLink::Logit)
-        );
-        if !canonical_logit {
-            // Not a defect of this fit: a non-canonical Firth link is routed
-            // to BFGS for the outer search, so no analytic ρ-Hessian exists at
-            // its end. The smoothing correction recognises this exact text as
-            // a typed structural absence (`FIRTH_OUTER_HESSIAN_NOT_ANALYTIC`).
+        ) {
             crate::bail_invalid_estim!(
-                "{}",
-                crate::estimate::smoothing_correction::FIRTH_OUTER_HESSIAN_NOT_ANALYTIC
+                "Tierney-Kadane d4W/deta4 is defined only for the Bernoulli Firth likelihood"
             );
         }
-        let mut f_array = Array1::<f64>::zeros(e_array.len());
-        use rayon::prelude::*;
+        let inverse_link = self.runtime_inverse_link();
         let final_eta = &pirls_result.final_eta;
         let weights = &self.weights;
-        let f_s = f_array.as_slice_mut().expect("f_array must be contiguous");
-        f_s.par_iter_mut().enumerate().for_each(|(i, f_o)| {
-            let jet = crate::mixture_link::logit_inverse_link_jet5(final_eta[i]);
-            *f_o = weights[i] * jet.d5;
-        });
-        if let Some((i, &value)) = f_array.iter().enumerate().find(|(_, v)| !v.is_finite()) {
-            return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                row: i,
-                quantity: "observed Hessian d4W/deta4",
-                eta: final_eta[i],
-                value,
+        let n = final_eta.len();
+        if matches!(&inverse_link, InverseLink::Standard(StandardLink::Logit)) {
+            let mut f_array = Array1::<f64>::zeros(n);
+            let f_s = f_array.as_slice_mut().expect("f_array must be contiguous");
+            f_s.par_iter_mut().enumerate().for_each(|(i, f_o)| {
+                let jet = crate::mixture_link::logit_inverse_link_jet5(final_eta[i]);
+                *f_o = weights[i] * jet.d5;
             });
+            if let Some((i, &value)) = f_array.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "observed Hessian d4W/deta4",
+                    eta: final_eta[i],
+                    value,
+                });
+            }
+            return Ok(f_array);
         }
-        Ok((c_array, d_array, e_array, f_array))
+        let phi = reml_fixed_glm_dispersion(&pirls_result.likelihood)?;
+        let y_view = &self.y;
+        let inverse_link_ref = &inverse_link;
+        // Per-row certificates, scanned in row order so the reported failing
+        // row is deterministic.
+        let certified: Vec<Result<f64, EstimationError>> = (0..n)
+            .into_par_iter()
+            .map(|i| -> Result<f64, EstimationError> {
+                let eta_raw = final_eta[i];
+                let f_i = pirls::bernoulli_observed_information_jet(
+                    inverse_link_ref,
+                    eta_raw,
+                    y_view[i],
+                    phi,
+                    weights[i],
+                )?[4];
+                if f_i.is_finite() {
+                    Ok(f_i)
+                } else {
+                    Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "observed Hessian d4W/deta4",
+                        eta: eta_raw,
+                        value: f_i,
+                    })
+                }
+            })
+            .collect();
+        Ok(Array1::from_vec(
+            certified.into_iter().collect::<Result<_, _>>()?,
+        ))
     }
 
     /// The directions of `rho` along which this criterion is EXACTLY constant
@@ -3568,13 +3602,13 @@ impl<'a> RemlState<'a> {
     /// priors also need the log-precision Jacobian. Every distribution consumer
     /// adds the same correction to the fitting criterion.
     ///
-    /// Returned as `(cost, gradient)` only: the ρ-posterior samplers consume a
-    /// log-density and its gradient, and no consumer of this correction needs
-    /// its curvature.
+    /// The samplers consume the cost and gradient; the curvature (diagonal,
+    /// since every term is per-coordinate) is what places them on the sampled
+    /// density's own Laplace geometry (#3293).
     pub(crate) fn rho_prior_distribution_correction(
         &self,
         rho: &Array1<f64>,
-    ) -> Result<(f64, Array1<f64>), EstimationError> {
+    ) -> Result<crate::rho_prior_eval::DistributionCorrection, EstimationError> {
         // The SAME weight anchoring the criterion's own prior evaluation uses
         // (#877), so the correction is taken at the coordinate the terms it
         // corrects were evaluated at.
@@ -3777,27 +3811,163 @@ impl<'a> RemlState<'a> {
         })
     }
 
-    /// The row weights `W` of the data curvature `XᵀWX` that the penalized
-    /// Hessian `XᵀWX + S_λ` carries at `rho`. On the Gaussian identity link the
-    /// working weight is the prior weight, so no solve is needed; otherwise it
-    /// is the Fisher working weight `w·(dμ/dη)²/V(μ)` of the cached P-IRLS
-    /// solve at `rho`, and a refused solve is returned as its error.
-    pub(crate) fn data_curvature_weights(
+    /// Pin every λ-search-frozen likelihood nuisance (NB θ, Tweedie φ, Gamma
+    /// shape, Beta precision, GLM dispersion) that the outer loop has already
+    /// captured into `likelihood`, so each inner solve of the λ search, and
+    /// every quantity read off the search's likelihood, sees the same
+    /// stationary criterion `F(ρ) = REML(ρ, ψ_frozen)`.
+    pub(crate) fn apply_lambda_search_freezes(
         &self,
-        rho: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
-        if reml_is_gaussian_identity(&self.config.likelihood) {
-            return Ok(self.weights.to_owned());
-        }
-        let (pilot, _) = self.execute_pirls_if_needed(rho, BundleRows::Observed)?;
-        if pilot.solveweights.len() != self.weights.len() {
-            return Err(EstimationError::InvalidInput(format!(
-                "P-IRLS returned {} working weights for {} rows",
-                pilot.solveweights.len(),
-                self.weights.len()
-            )));
-        }
-        Ok(pilot.solveweights.to_owned())
+        likelihood: &mut GlmLikelihoodSpec,
+    ) -> Result<(), EstimationError> {
+        let resolved_likelihood_scale = likelihood
+            .resolved_scale()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+        // Negative-Binomial λ-search θ freeze (#1082). With θ estimated,
+        // the inner solver re-derives θ from each outer iterate's warm-start
+        // η, so the NB working response / deviance / penalty-logdet — and
+        // thus the REML criterion — drift every outer evaluation, defeating
+        // the projected-gradient convergence test and grinding the loop to
+        // max_iter. Once the first non-screening solve has fixed a
+        // data-driven θ (captured into `frozen_negbin_theta` by
+        // `execute_pirls_if_needed`), pin every subsequent λ-search inner
+        // solve to that value so
+        // `F(ρ) = REML(ρ, θ_frozen)` is a stationary function of ρ. θ is
+        // still ML-refreshed at the single final reported fit (the
+        // `refine_dispersion_at_converged_eta = true` accept-fit in
+        // `optimizer.rs`), exactly as the dispersion-at-converged-η contract
+        // requires. No effect on non-NB or user-fixed-θ specs.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_negbin_theta.load(Ordering::Relaxed),
+            "frozen negative-binomial theta",
+            |likelihood, value| likelihood.with_negbin_theta_frozen_for_search(value),
+        )?;
+        // Tweedie λ-search φ freeze (#1477). The same drift mechanism as the
+        // NB θ freeze above, with a sharper failure mode: the Tweedie LAML
+        // `−ℓ(β̂)` omits the φ-dependent saddlepoint normalizer, so a φ
+        // re-estimated from each outer iterate's warm-start η does not merely
+        // make `F(ρ)` drift — it makes the criterion REWARD dispersion
+        // inflation, railing a double-penalty null-space `λ` to the box bound
+        // and shipping a boundary blow-up (#1477). Pin every λ-search inner
+        // solve to the first converged solve's Pearson φ so
+        // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
+        // at the single final reported fit. No effect on non-Tweedie or
+        // user-fixed-φ specs.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Tweedie {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_tweedie_phi.load(Ordering::Relaxed),
+            "frozen Tweedie dispersion",
+            |likelihood, value| likelihood.with_tweedie_phi_frozen_for_search(value),
+        )?;
+        // Gamma λ-search shape freeze (#1074). Same drift mechanism as the NB
+        // θ and Tweedie φ freezes above: with the shape `k` estimated, the
+        // inner solver re-derives it from each outer iterate's warm-start η,
+        // so `k` — and through it BOTH the Gamma curvature `H = k·XᵀX + λS`
+        // and the data-fit `−ℓ = k·½D` (the `k`-saturated normalizer is
+        // dropped, #359) — jumps with ρ. The realized REML cost then develops
+        // deterministic spikes (a flat warm-start η at a just-rejected
+        // over-smoothed trial gives a small `k`, the fitted-surface η at the
+        // neighbor a ~2× larger one), the analytic outer gradient (which
+        // holds `k` fixed) can never match the cost's `k(ρ)` motion, the
+        // projected gradient floors well above tolerance, and the ARC descent
+        // stalls and rails λ to the over-smoothed corner (the #1074 te/Gamma
+        // tensor under-recovery). Pin every λ-search inner solve to the first
+        // converged solve's MLE `k` so `F(ρ) = REML(ρ, k_frozen)` is
+        // stationary in ρ; `k` is still refreshed at the single final
+        // reported fit. No effect on non-Gamma or user-fixed-shape specs.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Gamma {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_gamma_shape.load(Ordering::Relaxed),
+            "frozen Gamma shape",
+            |likelihood, value| likelihood.with_gamma_shape_frozen_for_search(value),
+        )?;
+        // Beta λ-search precision freeze (#2369). Same drift mechanism as the
+        // NB θ / Tweedie φ / Gamma shape freezes above, and the same
+        // stalled-outer symptom: with φ estimated, the inner solver
+        // re-derives it by the Pearson moment estimator from each outer
+        // iterate's warm-start η. The Beta precision does not factor out of
+        // the digamma mean score (`∂ℓ/∂β = φ·Σ xᵢ(y*ᵢ − μ*ᵢ)`), so a φ that
+        // swings with η moves BOTH the mean fit β̂(ρ) and the REML data-fit /
+        // log-det terms with ρ; the analytic outer gradient holds φ fixed and
+        // can never match that motion, the projected gradient floors above
+        // tolerance, and the optimizer refuses ("NOT STATIONARY") for EVERY
+        // fit — the family-unusable #2369 signature. Pin every λ-search inner
+        // solve to the first converged solve's Pearson φ so
+        // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
+        // at the single final reported fit. No effect on non-Beta or
+        // user-fixed-φ specs.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::BetaPrecision {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_beta_phi.load(Ordering::Relaxed),
+            "frozen Beta precision",
+            |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
+        )?;
+        // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
+        // same λ-search freeze as the Tweedie φ.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Dispersion {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_dispersion_phi.load(Ordering::Relaxed),
+            "frozen dispersion",
+            |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
+        )?;
+        Ok(())
+    }
+
+    /// The row weights `W` of the data curvature `XᵀWX` that the λ search's
+    /// penalized Hessian `XᵀWX + S_λ` starts from: the Fisher working weight
+    /// `w·(dμ/dη)²/V(μ)` at the cold P-IRLS start, under the search's likelihood
+    /// with every captured λ-search nuisance pinned
+    /// ([`pirls::start_working_weights`]). No inner solve runs, so the weights
+    /// exist at every ρ, including where the solve refuses; they refuse only when
+    /// the start itself is outside the family's domain (a non-positive mean
+    /// under a reciprocal link), where no fit exists either.
+    pub(crate) fn start_curvature_weights(&self) -> Result<Array1<f64>, EstimationError> {
+        let mut pirls_config = self.config.as_pirls_config();
+        pirls_config.link_kind = self.runtime_inverse_link();
+        self.apply_lambda_search_freezes(&mut pirls_config.likelihood)?;
+        pirls::start_working_weights(
+            self.x(),
+            self.y,
+            self.weights,
+            self.offset.view(),
+            &pirls_config,
+        )
     }
 
     /// mgcv-style analytic initial smoothing-parameter seed (`initial.sp`).
@@ -3810,16 +3980,17 @@ impl<'a> RemlState<'a> {
     /// carries the working-weight magnitude, `exp(ρ_j)` is already the correctly
     /// scaled `λ_j` (no separate weight anchoring needed).
     ///
-    /// `W` is the Fisher working weight `w·(dμ/dη)²/V(μ)` of the pilot fit at
-    /// `base`, not the prior weight: only the working weight makes the seed
-    /// equivariant under a change of units of `y`. Rescaling `y → c·y` scales
-    /// the working weight of a non-log link by a power of `c` (`μ³/4` for the
-    /// inverse-Gaussian `1/μ²` link, `μ²` for the Gamma inverse link) and the
-    /// optimal `λ` with it; a prior-weight seed stays put, so in small units it
-    /// sits on the over-smoothing plateau `λ → ∞`, where the REML gradient
-    /// vanishes and the outer solve certifies the intercept-only fit. For the
-    /// Gaussian identity link the working weight IS the prior weight, so no
-    /// pilot fit is needed there.
+    /// `W` is the Fisher working weight `w·(dμ/dη)²/V(μ)` at the cold P-IRLS
+    /// start ([`Self::start_curvature_weights`]), not the prior weight: only a
+    /// working weight makes the seed equivariant under a change of units of
+    /// `y`. Rescaling `y → c·y` scales the working weight of a non-log link by a
+    /// power of `c` (`μ³/4` for the inverse-Gaussian `1/μ²` link, `μ²` for the
+    /// Gamma inverse link) and the optimal `λ` with it; a prior-weight seed
+    /// stays put, so in small units it sits on the over-smoothing plateau
+    /// `λ → ∞`, where the REML gradient vanishes and the outer solve certifies
+    /// the intercept-only fit. The start weight needs no pilot solve, so the
+    /// seed exists even where the inner solve at `base` refuses, which is where
+    /// a second start matters most.
     ///
     /// This replaces the banned log-λ **grid** prepass (#2069 / #1575): a single
     /// data-derived estimate, no lattice search. A smooth whose penalized
@@ -3833,11 +4004,10 @@ impl<'a> RemlState<'a> {
     /// same 1:1 layout the λ-assembly uses); any trailing ext/ψ coordinates in
     /// `base` are not smoothing parameters and are passed through unchanged.
     /// Returns `Ok(None)` only when there is no smoothing coordinate to seed.
-    /// Every failure is an `Err` with its own type: the pilot P-IRLS solve at
-    /// `base` (the cached solve the caller's `compute_cost(&base)` also runs),
-    /// the design Gram diagonal, and a pilot or Gram whose length disagrees with
-    /// the problem's. The caller decides which of those a seed search can step
-    /// past; this function does not turn any of them into "no candidate".
+    /// Every failure is an `Err` with its own type: a start outside the
+    /// family's domain (no inner solve could start from that data either), the
+    /// design Gram diagonal, and a Gram whose length disagrees with the
+    /// problem's.
     pub(crate) fn analytic_initial_sp_rho(
         &self,
         base: &Array1<f64>,
@@ -3848,7 +4018,7 @@ impl<'a> RemlState<'a> {
         if n_rho == 0 {
             return Ok(None);
         }
-        let weights = self.data_curvature_weights(base)?;
+        let weights = self.start_curvature_weights()?;
         let gram_diag = self.x.diag_gram(&weights).map_err(|reason| {
             EstimationError::RemlOptimizationFailed(format!(
                 "analytic initial-sp seed: design Gram diagonal unavailable: {reason}"
@@ -4018,7 +4188,7 @@ impl<'a> RemlState<'a> {
                 BlockCorrectionDecision::AtFirstEngagedEvaluation,
             ),
             block_correction_axis_orders: std::sync::Mutex::new(None),
-            ift_quality_runtime: std::sync::Mutex::new(Default::default()),
+            warm_start_trust: std::sync::Mutex::new(Default::default()),
             ift_mode_response_slot: std::sync::Mutex::new(None),
             ift_joint_mode_response_slot: std::sync::Mutex::new(None),
             warm_start_enabled: AtomicBool::new(true),
@@ -5432,10 +5602,10 @@ impl<'a> RemlState<'a> {
     /// Returns `None` (caller falls back to tangent-line / flat warm-start) when:
     /// * the IFT cache is empty (no prior converged solve, or one was invalidated),
     /// * ρ has been stamped yet (length 0 — see `record_warm_start_rho`),
-    /// * Δρ is too aggressive for the linearized predictor to trust
-    ///   (max |Δρ_k| > 2.0 — i.e. a single penalty has moved by more than e²
-    ///   in λ-space, well outside the regime where the local linear Jacobian
-    ///   is descriptive),
+    /// * max |Δρ_k| reaches the IFT trust radius measured from this
+    ///   predictor's last error (`WarmStartTrustState`): past it the
+    ///   second-order error of the linearization exceeds the first-order
+    ///   error of the flat seed,
     /// * factorization or back-solve fails / produces non-finite output.
     ///
     /// The factor is cached at `self.ift_cached_factor` and reused across
@@ -5452,22 +5622,9 @@ impl<'a> RemlState<'a> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return None;
         }
-        // The NaN sentinel + the is_finite() check together cover three
-        // cases in one expression: "no signal yet" (sentinel decodes to
-        // NaN, which fails is_finite), "corrupted state" (any non-finite
-        // or negative residual stored by mistake), and "real signal"
-        // (finite non-negative residual → Some).
-        let last_residual_bits = self.last_ift_prediction_residual.load(Ordering::Relaxed);
-        let r = f64::from_bits(last_residual_bits);
-        let last_residual = if r.is_finite() && r >= 0.0 {
-            Some(r)
-        } else {
-            None
-        };
-        let current_ift_step_cap = self.ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
+        let trust_radius = self.warm_start_trust_radius(WarmStartPredictionSource::Ift);
         if self.joint_ift_cache_matches_pending_theta(new_rho) {
-            return self
-                .predict_warm_start_beta_joint_ift_with_outcome(new_rho, current_ift_step_cap);
+            return self.predict_warm_start_beta_joint_ift_with_outcome(new_rho, trust_radius);
         }
         let cache_guard = self
             .ift_warm_start_cache
@@ -5476,8 +5633,8 @@ impl<'a> RemlState<'a> {
         let cache = cache_guard.as_ref()?;
         // Early short-circuit: detect both the no-op case (every
         // |Δρ_k| below the numerical-noise floor → predictor reduces
-        // to identity) AND the large-Δρ rejection case (|Δρ| exceeds
-        // the adaptive cap → predictor would reject) BEFORE acquiring
+        // to identity) AND the large-Δρ rejection case (|Δρ| reaches
+        // the measured trust radius → predictor would reject) BEFORE acquiring
         // the H_pen factor. The inner function detects both cases and
         // returns the same outcome, but only AFTER the factor cache
         // lookup — which on a miss pays a fresh O(p³)/3 Cholesky
@@ -5488,6 +5645,7 @@ impl<'a> RemlState<'a> {
         // ambiguous case (rho-not-stamped, dim mismatch) falls through
         // and lets the inner function emit its precise rejection
         // marker, preserving the single-source-of-truth contract.
+        let mut step = None;
         if !cache.rho.is_empty() && cache.rho.len() == new_rho.len() {
             let mut max_abs_drho = 0.0_f64;
             let mut any_non_finite = false;
@@ -5517,30 +5675,33 @@ impl<'a> RemlState<'a> {
                     IftPredictionOutcome::Noop,
                 ));
             }
-            // Large-Δρ rejection: |Δρ| exceeds the adaptive cap.
-            // `adaptive_ift_max_drho` reads the same `last_residual`
-            // signal we already loaded above. Same marker as the inner
-            // function emits so the rejection-rate aggregator
-            // (`_IFT_REJECTED_PATTERN` in runner.py) is preserved
-            // across both paths.
-            let max_drho_cap = current_ift_step_cap;
-            if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
+            // Large-Δρ rejection: |Δρ| reaches the measured trust
+            // radius. Same marker as the inner function emits so the
+            // rejection-rate aggregator (`_IFT_REJECTED_PATTERN` in
+            // runner.py) is preserved across both paths.
+            if !max_abs_drho.is_finite() || trust_radius.is_some_and(|r| max_abs_drho >= r) {
                 log::debug!(
                     "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
                     max_abs_drho,
-                    max_drho_cap,
+                    trust_radius.unwrap_or(f64::INFINITY),
                     cache.rho.len(),
                 );
                 return None;
             }
+            step = Some(max_abs_drho);
         }
+        let stage = |prediction: Option<(Coefficients, IftPredictionOutcome)>| {
+            if let (Some((_, IftPredictionOutcome::Predicted)), Some(step)) = (&prediction, step) {
+                self.stage_warm_start_prediction_step(WarmStartPredictionSource::Ift, step);
+            }
+            prediction
+        };
         if let Some(rho_mode_response_cols) = self.cached_ift_rho_mode_response_cols(cache) {
             if let Some(prediction) = predict_warm_start_beta_ift_from_mode_response_cols(
                 cache,
                 new_rho,
                 self.p,
-                last_residual,
-                Some(current_ift_step_cap),
+                trust_radius,
                 &rho_mode_response_cols,
             ) {
                 log::debug!(
@@ -5548,7 +5709,7 @@ impl<'a> RemlState<'a> {
                     new_rho.len(),
                     self.p,
                 );
-                return Some(prediction);
+                return stage(Some(prediction));
             }
             log::trace!(
                 "[IFT-CACHE] outcome=mode_response_fallback drho_dim={} p={}",
@@ -5620,15 +5781,14 @@ impl<'a> RemlState<'a> {
                 }
             }
         };
-        predict_warm_start_beta_ift_inner_with_outcome(
+        stage(predict_warm_start_beta_ift_inner_with_outcome(
             cache,
             self.canonical_penalties.as_ref(),
             new_rho,
             self.p,
-            last_residual,
-            Some(current_ift_step_cap),
+            trust_radius,
             Some(factor_arc.as_ref()),
-        )
+        ))
     }
 
     /// Predict β at `new_rho` together with a tag identifying which
@@ -5636,12 +5796,9 @@ impl<'a> RemlState<'a> {
     /// extrapolation across the last two (ρ, β) pairs). Returns `None`
     /// when no predictor can be applied — the warm-start machinery is
     /// disabled, neither cache is populated, the ρ-step direction is
-    /// degenerate, or the extrapolation step `α` exceeds the adaptive
-    /// safety cap (default 1.5 — see `adaptive_tangent_alpha_cap` for
-    /// the residual-driven policy that loosens to 2.0 when prior IFT
-    /// predictions were excellent and tightens to 0.5 when the local
-    /// linear approximation has been shown to collapse toward flat
-    /// warm-start).
+    /// degenerate, or the secant position `|α + 1|` reaches the tangent
+    /// trust radius measured from that predictor's last error
+    /// (`WarmStartTrustState`).
     ///
     /// Callers fall back to the stored `warm_start_beta` (`β(ρ_k)` —
     /// the standard "use last β as-is" warm start) on `None`. So this
@@ -5658,15 +5815,10 @@ impl<'a> RemlState<'a> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return None;
         }
-        if self.take_ift_quality_flat_override()
-            && let Some(cur_beta) = self
-                .warm_start_beta
-                .read()
-                .expect("warm-start beta lock poisoned")
-                .clone()
-        {
-            return Some((cur_beta, WarmStartPredictionSource::Flat));
-        }
+        // A step staged by an earlier call belongs to a prediction that
+        // never reached a converged solve; it must not be attributed to
+        // this one.
+        self.take_staged_warm_start_prediction_step();
         // #1082 / #1033: fixed-design non-Gaussian outer trials can reuse the
         // previous converged data-fit Gram for the next first Fisher step only
         // when the seed is exactly the previous beta. Prefer that flat seed once
@@ -5801,49 +5953,23 @@ impl<'a> RemlState<'a> {
             );
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
-        // Don't extrapolate against the previous step direction (α<0).
-        // The upper cap is adaptive: the same IFT residual signal that
-        // drives `adaptive_ift_max_drho` (commit 06888a1e) and the cap-
-        // schedule margin (commit 4eb3686a) is the most direct proxy
-        // for "how trustworthy is the local linear approximation" —
-        // and the tangent-line predictor IS a local linear
-        // approximation (just along the previous ρ-step direction
-        // rather than the IFT Jacobian's full direction). When the
-        // most recent IFT prediction was excellent, the tangent
-        // approximation can be trusted for slightly larger α; when
-        // it was poor, tighten.
-        // Same NaN-sentinel discipline as the IFT predictor's reader
-        // — see the comment there for the encoding rationale.
-        let last_residual_bits = self.last_ift_prediction_residual.load(Ordering::Relaxed);
-        let r = f64::from_bits(last_residual_bits);
-        let last_residual = if r.is_finite() && r >= 0.0 {
-            Some(r)
-        } else {
-            None
-        };
-        let alpha_cap = adaptive_tangent_alpha_cap(last_residual);
-        if alpha <= 0.0 || alpha > alpha_cap {
+        // The secant through (ρ_prev, β_prev) and (ρ_cur, β_cur) is read at
+        // position 1 + α; it is the better seed while |α + 1| stays inside
+        // the measured tangent trust radius (see `WarmStartTrustState`).
+        // Interpolation (−1 < α < 0) and extrapolation are the same rule.
+        let secant_position = (alpha + 1.0).abs();
+        let trust_radius = self.warm_start_trust_radius(WarmStartPredictionSource::TangentLine);
+        if trust_radius.is_some_and(|r| secant_position >= r) {
             // Emit a structured reject marker so the bench runner can
             // count tangent-line rejections alongside IFT ones.
-            // Tangent-line only fires when IFT returned None for
-            // non-cache reasons (large Δρ, factor failed, etc.), so
-            // this represents the "linear predictor stack failed
-            // entirely → fall back to flat warm-start" case. Counting
-            // the rate at large scale tells us how often the warm-
-            // start is degenerating to flat after IFT rejects.
-            let reason = if alpha <= 0.0 {
-                "alpha_negative"
-            } else {
-                "alpha_above_cap"
-            };
             log::debug!(
-                "[TANGENT-REJECTED] reason={} alpha={:.3e} cap={:.3e}",
-                reason,
+                "[TANGENT-REJECTED] reason=alpha_beyond_trust_radius alpha={:.3e} cap={:.3e}",
                 alpha,
-                alpha_cap,
+                trust_radius.unwrap_or(f64::INFINITY),
             );
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
+        let alpha_cap = trust_radius.unwrap_or(f64::INFINITY);
         // Tangent noop short-circuit: when α is below the
         // numerical-noise floor, `c + α · (c − pp) ≈ c` to machine
         // precision and the per-coefficient mat-add is wasted work.
@@ -5887,6 +6013,10 @@ impl<'a> RemlState<'a> {
             alpha_cap,
             step_dot_d.abs(),
             d_rho_norm_sq,
+        );
+        self.stage_warm_start_prediction_step(
+            WarmStartPredictionSource::TangentLine,
+            secant_position,
         );
         Some((
             Coefficients::new(predicted),
@@ -6618,14 +6748,12 @@ impl<'a> RemlState<'a> {
             h_total: Arc::new(Array2::zeros((0, 0))),
             sparse_exact: Some(Arc::new({
                 let factor = Arc::new(sparse_system.factor);
-                // Compute Takahashi selected inverse from simplicial factorization.
-                // This precomputes H^{-1} entries on the filled pattern of L, enabling
-                // O(nnz) trace computations instead of O(p) column solves.
-                let sfactor =
-                    gam_linalg::sparse_exact::factorize_simplicial(&sparse_system.h_sparse)?;
-                let takahashi = Some(Arc::new(
-                    gam_linalg::sparse_exact::TakahashiInverse::compute(&sfactor)?,
-                ));
+                // Takahashi selected inverse on the filled pattern of the factor
+                // already computed for log|H| (#3634): H^{-1} entries there make
+                // trace computations O(nnz) instead of O(p) column solves, and
+                // refactoring the same H to get them would double the dominant
+                // per-evaluation cost.
+                let takahashi = Some(Arc::new(factor.selected_inverse()?));
                 SparseExactEvalData {
                     factor,
                     takahashi,
@@ -6750,6 +6878,19 @@ impl<'a> RemlState<'a> {
             .as_ref()
             .map(|(c, _)| c.clone());
         let prediction_source = predicted_warm_start_with_source.as_ref().map(|(_, s)| *s);
+        // The flat seed the prediction competed with, kept so the converged
+        // β can measure which of the two was closer (the predictor's trust
+        // radius, `record_warm_start_prediction_error`).
+        let flat_seed_for_trust = match prediction_source {
+            Some(WarmStartPredictionSource::Ift) | Some(WarmStartPredictionSource::TangentLine) => {
+                self.warm_start_beta
+                    .read()
+                    .expect("warm-start beta lock poisoned")
+                    .clone()
+            }
+            Some(WarmStartPredictionSource::Flat) | None => None,
+        };
+        let trust_radius_before = self.warm_start_trust_radius(WarmStartPredictionSource::Ift);
         let cost_only_gaussian_rows = if rows == BundleRows::SufficientStatistics {
             self.gaussian_cost_only_frozen_rows_if_eligible()?
         } else {
@@ -6801,132 +6942,7 @@ impl<'a> RemlState<'a> {
                 );
             }
             pirls_config.link_kind = self.runtime_inverse_link();
-            let resolved_likelihood_scale = pirls_config
-                .likelihood
-                .resolved_scale()
-                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-            // Negative-Binomial λ-search θ freeze (#1082). With θ estimated,
-            // the inner solver re-derives θ from each outer iterate's warm-start
-            // η, so the NB working response / deviance / penalty-logdet — and
-            // thus the REML criterion — drift every outer evaluation, defeating
-            // the projected-gradient convergence test and grinding the loop to
-            // max_iter. Once the first converged solve has fixed a
-            // data-driven θ (captured below into `frozen_negbin_theta`), pin
-            // every subsequent λ-search inner solve to that value so
-            // `F(ρ) = REML(ρ, θ_frozen)` is a stationary function of ρ. θ is
-            // still ML-refreshed at the single final reported fit (the
-            // `refine_dispersion_at_converged_eta = true` accept-fit in
-            // `optimizer.rs`), exactly as the dispersion-at-converged-η contract
-            // requires. No effect on non-NB or user-fixed-θ specs.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_negbin_theta.load(Ordering::Relaxed),
-                "frozen negative-binomial theta",
-                |likelihood, value| likelihood.with_negbin_theta_frozen_for_search(value),
-            )?;
-            // Tweedie λ-search φ freeze (#1477). The same drift mechanism as the
-            // NB θ freeze above, with a sharper failure mode: the Tweedie LAML
-            // `−ℓ(β̂)` omits the φ-dependent saddlepoint normalizer, so a φ
-            // re-estimated from each outer iterate's warm-start η does not merely
-            // make `F(ρ)` drift — it makes the criterion REWARD dispersion
-            // inflation, railing a double-penalty null-space `λ` to the box bound
-            // and shipping a boundary blow-up (#1477). Pin every λ-search inner
-            // solve to the first converged solve's Pearson φ so
-            // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
-            // at the single final reported fit. No effect on non-Tweedie or
-            // user-fixed-φ specs.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Tweedie {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_tweedie_phi.load(Ordering::Relaxed),
-                "frozen Tweedie dispersion",
-                |likelihood, value| likelihood.with_tweedie_phi_frozen_for_search(value),
-            )?;
-            // Gamma λ-search shape freeze (#1074). Same drift mechanism as the NB
-            // θ and Tweedie φ freezes above: with the shape `k` estimated, the
-            // inner solver re-derives it from each outer iterate's warm-start η,
-            // so `k` — and through it BOTH the Gamma curvature `H = k·XᵀX + λS`
-            // and the data-fit `−ℓ = k·½D` (the `k`-saturated normalizer is
-            // dropped, #359) — jumps with ρ. The realized REML cost then develops
-            // deterministic spikes (a flat warm-start η at a just-rejected
-            // over-smoothed trial gives a small `k`, the fitted-surface η at the
-            // neighbor a ~2× larger one), the analytic outer gradient (which
-            // holds `k` fixed) can never match the cost's `k(ρ)` motion, the
-            // projected gradient floors well above tolerance, and the ARC descent
-            // stalls and rails λ to the over-smoothed corner (the #1074 te/Gamma
-            // tensor under-recovery). Pin every λ-search inner solve to the first
-            // converged solve's MLE `k` so `F(ρ) = REML(ρ, k_frozen)` is
-            // stationary in ρ; `k` is still refreshed at the single final
-            // reported fit. No effect on non-Gamma or user-fixed-shape specs.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Gamma {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_gamma_shape.load(Ordering::Relaxed),
-                "frozen Gamma shape",
-                |likelihood, value| likelihood.with_gamma_shape_frozen_for_search(value),
-            )?;
-            // Beta λ-search precision freeze (#2369). Same drift mechanism as the
-            // NB θ / Tweedie φ / Gamma shape freezes above, and the same
-            // stalled-outer symptom: with φ estimated, the inner solver
-            // re-derives it by the Pearson moment estimator from each outer
-            // iterate's warm-start η. The Beta precision does not factor out of
-            // the digamma mean score (`∂ℓ/∂β = φ·Σ xᵢ(y*ᵢ − μ*ᵢ)`), so a φ that
-            // swings with η moves BOTH the mean fit β̂(ρ) and the REML data-fit /
-            // log-det terms with ρ; the analytic outer gradient holds φ fixed and
-            // can never match that motion, the projected gradient floors above
-            // tolerance, and the optimizer refuses ("NOT STATIONARY") for EVERY
-            // fit — the family-unusable #2369 signature. Pin every λ-search inner
-            // solve to the first converged solve's Pearson φ so
-            // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
-            // at the single final reported fit. No effect on non-Beta or
-            // user-fixed-φ specs.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::BetaPrecision {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_beta_phi.load(Ordering::Relaxed),
-                "frozen Beta precision",
-                |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
-            )?;
-            // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
-            // same λ-search freeze as the Tweedie φ.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Dispersion {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_dispersion_phi.load(Ordering::Relaxed),
-                "frozen dispersion",
-                |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
-            )?;
+            self.apply_lambda_search_freezes(&mut pirls_config.likelihood)?;
             // Levenberg-Marquardt damping warm-start: the λ the previous
             // successful PIRLS solve at this surface ended on (0 = no hint).
             // It encodes the curvature regime that solve settled into; PIRLS
@@ -7431,37 +7447,47 @@ impl<'a> RemlState<'a> {
                         let conv_norm = conv_sq.sqrt();
                         let pred_residual = diff_sq.sqrt();
                         let quality = pred_residual / (1.0 + conv_norm);
+                        // The same solve measures the predictor's trust
+                        // radius: its miss against the flat seed's miss, at
+                        // the step it was asked to take.
+                        let staged = self.take_staged_warm_start_prediction_step();
+                        let flat_residual = flat_seed_for_trust
+                            .as_ref()
+                            .filter(|flat| flat.0.len() == converged_original.len())
+                            .map(|flat| {
+                                flat.0
+                                    .iter()
+                                    .zip(converged_original.iter())
+                                    .map(|(f_val, c_val)| (c_val - f_val) * (c_val - f_val))
+                                    .sum::<f64>()
+                                    .sqrt()
+                            });
+                        let trust_radius = match (quality_source, staged, flat_residual) {
+                            (Some(source), Some((staged_source, step)), Some(flat_residual))
+                                if staged_source == source =>
+                            {
+                                self.record_warm_start_prediction_error(
+                                    source,
+                                    step,
+                                    pred_residual,
+                                    flat_residual,
+                                )
+                            }
+                            _ => None,
+                        };
                         if quality.is_finite() && quality >= 0.0 {
-                            // The adaptive |Δρ| cap is the IFT
-                            // predictor's own feedback loop, so only an
-                            // IFT accept reads and rewrites it. A
-                            // tangent-line accept is narrated but does
-                            // not touch the cap state: routing it here
-                            // would move solver trajectories, which is
-                            // a separate decision from restoring the
-                            // measurement. Its line therefore carries
-                            // no cap fields rather than reporting a cap
-                            // that does not govern that branch.
                             if matches!(quality_source, Some(WarmStartPredictionSource::Ift)) {
-                                let last_residual_bits =
-                                    self.last_ift_prediction_residual.load(Ordering::Relaxed);
-                                let r = f64::from_bits(last_residual_bits);
-                                let last_residual = if r.is_finite() && r >= 0.0 {
-                                    Some(r)
-                                } else {
-                                    None
-                                };
-                                let current_cap =
-                                    self.ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
-                                let cap_predicted = self
-                                    .record_ift_prediction_quality(quality, current_cap)
-                                    .unwrap_or(current_cap);
+                                // `ift` is the radius this prediction was
+                                // admitted under, `cap_predicted` the radius
+                                // it measured for the next one.
+                                let admitted_under = trust_radius_before
+                                    .unwrap_or(f64::INFINITY);
                                 log::debug!(
                                     "[IFT-QUALITY] quality={:.3e} ift={:.3e} pred_residual={:.3e} cap_predicted={:.3e} iters={}",
                                     quality,
-                                    current_cap,
+                                    admitted_under,
                                     pred_residual,
-                                    cap_predicted,
+                                    trust_radius.unwrap_or(admitted_under),
                                     pirls_result.iteration,
                                 );
                                 self.last_ift_prediction_residual
@@ -7592,13 +7618,14 @@ impl<'a> RemlState<'a> {
                 self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
                 // A failed solve also invalidates the IFT residual
                 // signal — there's no meaningful "predicted vs
-                // converged" datum to feed back. Reset so the next
-                // predict call uses the default 2.0 cap. NaN
-                // sentinel rather than literal 0 — see
-                // `IFT_RESIDUAL_NO_SIGNAL_BITS`.
+                // converged" datum to feed back. NaN sentinel rather
+                // than literal 0 — see `IFT_RESIDUAL_NO_SIGNAL_BITS`.
+                // The staged prediction step is dropped for the same
+                // reason; the trust radii measured by earlier converged
+                // solves still describe this surface and are kept.
                 self.last_ift_prediction_residual
                     .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
-                self.clear_ift_quality_runtime_state();
+                self.take_staged_warm_start_prediction_step();
                 Err(EstimationError::PirlsDidNotConverge {
                     iterations: pirls_result.iteration,
                     budget: Self::effective_inner_iteration_budget(
@@ -7633,86 +7660,7 @@ mod stateless_pirls_tests {
         ) -> Result<Arc<PirlsResult>, EstimationError> {
             let mut pirls_config = self.config.as_pirls_config();
             pirls_config.link_kind = self.runtime_inverse_link();
-            let resolved_likelihood_scale = pirls_config
-                .likelihood
-                .resolved_scale()
-                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-            // Pin the same λ-search-frozen NB θ the outer loop converged under
-            // (#1082), so the fit is evaluated on the identical stationary surface
-            // F(ρ) = REML(ρ, θ_frozen) rather than re-estimating θ at this ρ.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_negbin_theta.load(Ordering::Relaxed),
-                "frozen negative-binomial theta",
-                |likelihood, value| likelihood.with_negbin_theta_frozen_for_search(value),
-            )?;
-            // Pin the same λ-search-frozen Tweedie φ the outer loop converged under
-            // (#1477).
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Tweedie {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_tweedie_phi.load(Ordering::Relaxed),
-                "frozen Tweedie dispersion",
-                |likelihood, value| likelihood.with_tweedie_phi_frozen_for_search(value),
-            )?;
-            // Pin the same λ-search-frozen Gamma shape the outer loop converged under
-            // (#1074).
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Gamma {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_gamma_shape.load(Ordering::Relaxed),
-                "frozen Gamma shape",
-                |likelihood, value| likelihood.with_gamma_shape_frozen_for_search(value),
-            )?;
-            // Beta precision is part of the same λ-search-frozen likelihood scale
-            // contract as NB, Tweedie, and Gamma (#2369, #2632).
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::BetaPrecision {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_beta_phi.load(Ordering::Relaxed),
-                "frozen Beta precision",
-                |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
-            )?;
-            // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
-            // same λ-search freeze as the Tweedie φ.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Dispersion {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_dispersion_phi.load(Ordering::Relaxed),
-                "frozen dispersion",
-                |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
-            )?;
+            self.apply_lambda_search_freezes(&mut pirls_config.likelihood)?;
 
             // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
             // XᵀW(y − offset) across every inner solve; for other families /
@@ -7968,122 +7916,6 @@ mod scheduled_inner_cap_exhaustion_tests {
     }
 }
 
-/// Default cap on |Δρ_k| beyond which the IFT linear predictor rejects.
-/// Δρ = log(λ_new / λ_old); 2.0 corresponds to a 7.4× change in λ along
-/// any single penalty direction — well outside the regime where the local
-/// first-order Jacobian dβ/dρ is faithful. The cap is now ADAPTIVE: see
-/// `adaptive_ift_max_drho` for the empirical-quality-driven loosening /
-/// tightening policy. This default is used when no IFT-quality history
-/// is available yet (the first PIRLS solve at a fresh surface).
-pub(crate) const IFT_WARM_START_DEFAULT_MAX_DRHO: f64 = 2.0;
-
-/// Shared relative-residual tier breakpoints for the warm-start linear
-/// predictors. `r = ‖β_converged − β_predicted‖ / ‖β_converged‖` from the
-/// previous IFT prediction classifies the local linearization quality into
-/// five bands; both `adaptive_ift_max_drho` and `adaptive_tangent_alpha_cap`
-/// key off the SAME breakpoints so their caps move in lockstep (the two
-/// predictors share one quality signal). One step per decade of residual keeps
-/// the policy stable under noise.
-pub(crate) const IFT_RESIDUAL_TIER_EXCELLENT: f64 = 0.01;
-
-pub(crate) const IFT_RESIDUAL_TIER_VERY_GOOD: f64 = 0.05;
-
-pub(crate) const IFT_RESIDUAL_TIER_OK: f64 = 0.20;
-
-pub(crate) const IFT_RESIDUAL_TIER_MARGINAL: f64 = 0.50;
-
-/// Adaptive |Δρ| cap for the IFT predictor, driven by the residual of
-/// the previous IFT prediction (see `last_ift_prediction_residual`).
-///
-/// `last_residual = ‖β_converged − β_predicted‖ / ‖β_converged‖`:
-/// - `r < 0.01` → linearization was excellent; allow Δρ up to **4.0**
-///   (54× λ-step). At this regime the local Jacobian is faithful and
-///   tightening to 2.0 leaves performance on the table at large-scale Δρ
-///   magnitudes (where outer optimizers commonly take ρ-jumps of ~1).
-/// - `0.01 ≤ r < 0.05` → very good; modest expansion to **3.0**.
-/// - `0.05 ≤ r < 0.20` → ok; default **2.0** (the original constant).
-/// - `0.20 ≤ r < 0.50` → marginal; tighten to **1.0** (2.7× λ-step).
-/// - `r ≥ 0.50` → poor; tighten to **0.5** (1.6× λ-step). The IFT
-///   prediction is not paying off at large-scale Δρ; fall back to flat
-///   warm-start (β_cur) for any non-trivial outer step.
-/// - `None` → no signal yet (first PIRLS solve at this surface) → default 2.0.
-///
-/// The thresholds are deliberately one-step-per-decade-of-residual so
-/// the policy remains stable under noise; small fluctuations in
-/// `last_residual` don't whipsaw the cap.
-pub(crate) fn adaptive_ift_max_drho(last_residual: Option<f64>) -> f64 {
-    let Some(r) = last_residual else {
-        return IFT_WARM_START_DEFAULT_MAX_DRHO;
-    };
-    // Defensive: NaN or negative residuals indicate corrupted state
-    // (bit-pattern unpacking from the atomic encountered an unwritten
-    // slot, or norm-ratio division produced a non-physical value).
-    // Fall back to the documented default rather than committing to
-    // a tier based on garbage. Note: INFINITY is not rejected here —
-    // it represents a catastrophic prediction (predicted_norm finite
-    // but ‖Δβ‖ overflowed), so falling through to the catch-all 0.5
-    // (tightest cap) is the right policy.
-    if r.is_nan() || r < 0.0 {
-        return IFT_WARM_START_DEFAULT_MAX_DRHO;
-    }
-    match r {
-        r if r < IFT_RESIDUAL_TIER_EXCELLENT => 4.0,
-        r if r < IFT_RESIDUAL_TIER_VERY_GOOD => 3.0,
-        r if r < IFT_RESIDUAL_TIER_OK => 2.0,
-        r if r < IFT_RESIDUAL_TIER_MARGINAL => 1.0,
-        _ => 0.5,
-    }
-}
-
-/// Default upper cap on the tangent-line predictor's α (extrapolation
-/// fraction beyond the previous ρ-step). 1.5 means "we permit at most
-/// 50% extrapolation past the last step length"; the original hardcoded
-/// constant from commit dcacf9ee. Used when no IFT-quality history is
-/// available (typically right after the first successful PIRLS solve
-/// at a fresh surface — IFT cache exists but tangent-line history
-/// pair is being assembled). Adaptive policy in
-/// `adaptive_tangent_alpha_cap` adjusts this based on the IFT
-/// residual signal when present.
-pub(crate) const TANGENT_ALPHA_DEFAULT_CAP: f64 = 1.5;
-
-/// Adaptive α-cap for the tangent-line predictor, sharing the IFT
-/// residual signal as a proxy for "how trustworthy is the local linear
-/// approximation". The tangent line IS a local linear approximation
-/// (just along the previous ρ-step direction rather than the IFT
-/// Jacobian's full direction), so the same residual that gates
-/// `adaptive_ift_max_drho` informs the right cap here too:
-///
-/// - `r < 0.01`  → linearization excellent → α_cap = 2.0 (1.5×
-///                  the default; permits a full step beyond the
-///                  previous one)
-/// - `r < 0.05`  → very good → α_cap = 1.75
-/// - `r < 0.20`  → ok → α_cap = 1.5 (the original constant)
-/// - `r < 0.50`  → marginal → α_cap = 1.0 (no extrapolation past
-///                  the previous step length)
-/// - `r ≥ 0.50`  → poor → α_cap = 0.5 (only HALF the previous step;
-///                  the linear approximation has been shown to
-///                  collapse toward flat warm-start at this surface)
-/// - `None` (no signal yet) → default 1.5
-///
-/// Same tier-stable, monotone-non-increasing-in-residual shape as
-/// `adaptive_ift_max_drho`; the two predictors share a single quality
-/// signal so their caps move together.
-pub(crate) fn adaptive_tangent_alpha_cap(last_residual: Option<f64>) -> f64 {
-    let Some(r) = last_residual else {
-        return TANGENT_ALPHA_DEFAULT_CAP;
-    };
-    if r.is_nan() || r < 0.0 {
-        return TANGENT_ALPHA_DEFAULT_CAP;
-    }
-    match r {
-        r if r < IFT_RESIDUAL_TIER_EXCELLENT => 2.0,
-        r if r < IFT_RESIDUAL_TIER_VERY_GOOD => 1.75,
-        r if r < IFT_RESIDUAL_TIER_OK => 1.5,
-        r if r < IFT_RESIDUAL_TIER_MARGINAL => 1.0,
-        _ => 0.5,
-    }
-}
-
 /// What the IFT predictor's inner computation actually did with the
 /// β it returned. Surfaced by the inner predictor so callers don't
 /// need to re-derive noop-ness via O(p) array comparison against
@@ -8112,7 +7944,7 @@ pub(crate) enum IftPredictionOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WarmStartPredictionSource {
     /// The IFT predictor produced a non-identity β (the cache was
-    /// populated and Δρ stayed within the adaptive |Δρ| cap).
+    /// populated and the step stayed inside its measured trust radius).
     Ift,
     /// The tangent-line predictor produced a non-identity β (the IFT
     /// predictor returned None for non-cache reasons, so the
@@ -8174,8 +8006,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
     canonical_penalties: &[gam_terms::construction::CanonicalPenalty],
     new_rho: &Array1<f64>,
     p: usize,
-    last_ift_residual: Option<f64>,
-    max_drho_cap_override: Option<f64>,
+    trust_radius: Option<f64>,
     factor_override: Option<&dyn gam_linalg::matrix::FactorizedSystem>,
 ) -> Option<(Coefficients, IftPredictionOutcome)> {
     // Cache populated but ρ not yet stamped (happens between
@@ -8219,10 +8050,10 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
         return None;
     }
 
-    // Δρ guard: reject in toto if any single component exceeds the cap.
-    // We do not partially clip: the directions we drop matter just as much
-    // as the directions we keep, and a clipped predictor is harder to
-    // reason about than a clean fallback.
+    // Trust-radius guard: beyond the measured radius (see
+    // `WarmStartTrustState`) the flat seed is the better one, so the
+    // prediction is rejected in toto. It is never partially clipped: a
+    // clipped step is not the first-order prediction the radius measures.
     let mut max_abs_drho = 0.0_f64;
     let model_upper_bounds = current_outer_rho_model_upper_bounds_for_ift();
     let upper_active = |idx: usize| -> bool {
@@ -8239,6 +8070,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
             }
             let d = new_rho[i] - cache.rho[i];
             if !d.is_finite() {
+                max_abs_drho = f64::INFINITY;
                 return f64::INFINITY;
             }
             if d.abs() > max_abs_drho {
@@ -8247,10 +8079,9 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
             d
         })
         .collect();
-    let max_drho_cap = max_drho_cap_override
-        .filter(|cap| cap.is_finite() && *cap > 0.0)
-        .unwrap_or_else(|| adaptive_ift_max_drho(last_ift_residual));
-    if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
+    if !max_abs_drho.is_finite()
+        || (max_abs_drho > 0.0 && trust_radius.is_some_and(|r| max_abs_drho >= r))
+    {
         // Emit a structured reject marker so the bench runner can
         // count predictor rejections alongside accepts (the
         // `[IFT-QUALITY]` markers count only the accepts). The
@@ -8261,7 +8092,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
         log::debug!(
             "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
             max_abs_drho,
-            max_drho_cap,
+            trust_radius.unwrap_or(f64::INFINITY),
             k,
         );
         return None;
@@ -8455,8 +8286,7 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
     cache: &super::IftWarmStartCache,
     new_rho: &Array1<f64>,
     p: usize,
-    last_ift_residual: Option<f64>,
-    max_drho_cap_override: Option<f64>,
+    trust_radius: Option<f64>,
     rho_mode_response_cols: &Array2<f64>,
 ) -> Option<(Coefficients, IftPredictionOutcome)> {
     if cache.rho.is_empty() {
@@ -8499,6 +8329,7 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
             }
             let d = new_rho[i] - cache.rho[i];
             if !d.is_finite() {
+                max_abs_drho = f64::INFINITY;
                 return f64::INFINITY;
             }
             if d.abs() > max_abs_drho {
@@ -8507,14 +8338,13 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
             d
         })
         .collect();
-    let max_drho_cap = max_drho_cap_override
-        .filter(|cap| cap.is_finite() && *cap > 0.0)
-        .unwrap_or_else(|| adaptive_ift_max_drho(last_ift_residual));
-    if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
+    if !max_abs_drho.is_finite()
+        || (max_abs_drho > 0.0 && trust_radius.is_some_and(|r| max_abs_drho >= r))
+    {
         log::debug!(
             "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
             max_abs_drho,
-            max_drho_cap,
+            trust_radius.unwrap_or(f64::INFINITY),
             k,
         );
         return None;

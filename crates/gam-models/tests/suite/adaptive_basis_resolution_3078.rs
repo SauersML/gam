@@ -94,7 +94,7 @@ fn cyclic_data(n: usize, seed: u64, signal: fn(f64) -> f64) -> (EncodedDataset, 
 #[test]
 fn cyclic_smooth_resolves_a_high_frequency_periodic_signal() {
     let (data, truth) = cyclic_data(2000, 3078, cyclic_signal);
-    let (width, fitted) = fit("y ~ s(x, bs=cc)", &data);
+    let (width, fitted) = fit("y ~ s(x, bs=cyclic)", &data);
     let err = centered_rmse(&fitted, &truth);
     assert!(
         err < RECOVERY_BOUND,
@@ -107,8 +107,8 @@ fn cyclic_smooth_on_pure_noise_stays_at_its_pilot_and_at_zero() {
     let n = 2000;
     let (null_data, zero) = cyclic_data(n, 3078, |_| 0.0);
     let (signal_data, _) = cyclic_data(n, 3078, cyclic_signal);
-    let (null_width, null_fitted) = fit("y ~ s(x, bs=cc)", &null_data);
-    let (signal_width, _) = fit("y ~ s(x, bs=cc)", &signal_data);
+    let (null_width, null_fitted) = fit("y ~ s(x, bs=cyclic)", &null_data);
+    let (signal_width, _) = fit("y ~ s(x, bs=cyclic)", &signal_data);
     assert!(
         null_width < signal_width,
         "noise must not grow the basis: null width {null_width} vs signal width {signal_width}"
