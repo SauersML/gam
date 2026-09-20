@@ -8,13 +8,17 @@ per failure, most fundamental first):
 ``hang`` / ``memcap`` / ``crash``
     the harness safety net killed the worker, or it died without a RESULT;
 ``raise:<phase>:<Type>: <message head>``
-    a phase raised (``fit``, ``summary``, ``predict``, ``interval``, ``refit``,
-    ``refit_summary``); digits in the message are folded to ``#`` so one root
+    a phase raised (``fit``, ``summary``, ``predict``, ``predict_exact``,
+    ``interval``, ``refit``, ``refit_summary``); digits in the message are folded to ``#`` so one root
     cause with different sizes clusters as one label;
 ``uncertified:<fit|refit>:<outer kind>/<inner status>``
     the fit returned without a convergence certificate that says certified;
 ``nonfinite:<what>``
-    a prediction, interval bound or criterion value is not finite;
+    a prediction, interval bound or criterion value is not finite. A log-link
+    posterior mean ``exp(eta + Var(eta)/2)`` whose exact value is past
+    ``DBL_MAX`` (the worker checks it from the fit's own affine design and
+    conditional covariance, ``pred_nonfinite_exact``) is ``+inf`` correctly
+    rounded, not a failure;
 ``reml_mismatch:<fit|refit>_worse``
     both fits certified but their REML/LAML costs differ by more than
     ``reml_tolerance`` - the same model on permuted rows and affinely
@@ -33,7 +37,16 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-PHASES = ("import", "fit", "summary", "predict", "interval", "refit", "refit_summary")
+PHASES = (
+    "import",
+    "fit",
+    "summary",
+    "predict",
+    "predict_exact",
+    "interval",
+    "refit",
+    "refit_summary",
+)
 # REML/LAML costs are sums over n observations; two certified optima of the
 # same problem agree to the certificate's own stationarity accuracy, far
 # below this relative gap (see README "REML comparison").
@@ -102,7 +115,7 @@ def failure_causes(rec: dict[str, Any]) -> list[str]:
     refit_info = rec.get("refit")
     causes += _fit_causes("fit", fit_info)
     causes += _fit_causes("refit", refit_info)
-    if rec.get("pred_finite") is False:
+    if rec.get("pred_finite") is False and rec.get("pred_nonfinite_exact") is not True:
         causes.append("nonfinite:predict")
     if rec.get("interval_finite") is False:
         causes.append("nonfinite:interval")
