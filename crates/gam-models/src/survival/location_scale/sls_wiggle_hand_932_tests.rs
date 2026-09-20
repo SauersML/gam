@@ -18,7 +18,6 @@ use gam_math::jet_scalar::{
 };
 use gam_math::paired_timing::{SpeedGate, batched, paired_interleaved};
 
-
 /// The jet oracle's per-row order-two lowering: a reset arena, `DynamicOrder2`
 /// seeds over the base primaries and `βw`, and `sls_row_nll_wiggle`. Returns the
 /// gradient and the row-major Hessian.
@@ -367,7 +366,6 @@ fn release_measure_sls_wiggle_schedule_vs_jet_oracle_932() {
     gate.finish();
 }
 
-
 /// The jet oracle's per-row directional third lowering (`DynamicOneSeed`).
 fn jet_row_third(
     p: &[f64; SLS_ROW_K],
@@ -521,7 +519,6 @@ fn schedule_order3_checksum(
         .enumerate()
         .fold(0.0, |acc, (index, value)| acc + value * (1.0 + index as f64 * 1e-3))
 }
-
 
 /// The jet oracle's per-row second-directional fourth lowering (`DynamicTwoSeed`).
 fn jet_row_fourth(

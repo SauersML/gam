@@ -2,8 +2,7 @@ use super::*;
 
 use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar,
-    Order2AtomChannels, RuntimeJetScalar,
+    DynamicJetArena, DynamicOrder2, JetScalar, Order2AtomChannels, RuntimeJetScalar,
 };
 use gam_row_macros::{row_atom, row_program};
 
@@ -2228,28 +2227,6 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
                 }
             }
         }
-    }
-
-    /// The jet oracle's order-two row program over [`sls_row_nll_wiggle`] at this
-    /// row's primaries and βw. Test-only: production reads the row schedule.
-    #[cfg(test)]
-    pub(crate) fn row_jet_order2<'arena>(
-        &self,
-        row: usize,
-        arena: &'arena DynamicJetArena,
-    ) -> Result<DynamicOrder2<'arena>, String> {
-        let (primaries, kernel) = self.base.row_nll_inputs(row)?;
-        let dimension = self.primary_dimension();
-        let vars = arena.alloc_slice_fill_with(dimension, |a| {
-            let x = if a < SLS_ROW_K {
-                primaries[a]
-            } else {
-                self.betaw[a - SLS_ROW_K]
-            };
-            DynamicOrder2::variable(x, a, dimension, arena)
-        });
-        let basis = self.row_basis(row)?;
-        Ok(sls_row_nll_wiggle(vars, &kernel, self.pw, &basis))
     }
 
     /// The row's gradient and Hessian over the `KW` primaries, into
@@ -6115,6 +6092,35 @@ pub(crate) fn q_chain_derivs_scalar(eta_t: f64, eta_ls: f64) -> (f64, f64, f64, 
 }
 
 #[cfg(test)]
+mod wiggle_jet_oracle_tests {
+    use super::*;
+
+    impl SurvivalLsWiggleRowKernel<'_> {
+        /// The jet oracle's order-two row program over [`sls_row_nll_wiggle`] at
+        /// this row's primaries and βw. Test-only: production reads the row
+        /// schedule ([`sls_wiggle_row_order2`]).
+        pub(crate) fn row_jet_order2<'arena>(
+            &self,
+            row: usize,
+            arena: &'arena DynamicJetArena,
+        ) -> Result<DynamicOrder2<'arena>, String> {
+            let (primaries, kernel) = self.base.row_nll_inputs(row)?;
+            let dimension = self.primary_dimension();
+            let vars = arena.alloc_slice_fill_with(dimension, |a| {
+                let x = if a < SLS_ROW_K {
+                    primaries[a]
+                } else {
+                    self.betaw[a - SLS_ROW_K]
+                };
+                DynamicOrder2::variable(x, a, dimension, arena)
+            });
+            let basis = self.row_basis(row)?;
+            Ok(sls_row_nll_wiggle(vars, &kernel, self.pw, &basis))
+        }
+    }
+}
+
+#[cfg(test)]
 mod fifth_order_lowering_tests {
     use super::*;
 
@@ -6560,6 +6566,7 @@ mod patterned_order2_perf_tests {
         (value, gradient, hessian)
     }
     use super::*;
+    use gam_math::jet_scalar::{DynamicOneSeed, DynamicTwoSeed};
 
     /// Test-local axis-mapped order-two scatter: the exact Faà di Bruno
     /// composition `g[a_i] += f' q_i`, `H[a_i,a_j] += f' q_ij + f'' q_i q_j` of one
