@@ -77,58 +77,6 @@ fn formula_shared_tangent_fit_preserves_output_rotations_2627() {
         "fixed smoothing rotation error={fixed_error:e}"
     );
 
-    {
-        // LC4-DIAG (temporary)
-        let (lo, hi) = prepared.resolvability_domain();
-        eprintln!("LC4 domain lo={lo:?} hi={hi:?}");
-        let checkpoint = array![
-            -1.8342073810353838,
-            -5.227852397679767,
-            -6.05912216519084,
-            1.038249825113399
-        ];
-        let exact = prepared.evaluate(&checkpoint).expect("checkpoint eval");
-        eprintln!(
-            "LC4 checkpoint cost={:.12e} g={:?} H={:?} eig={:?}",
-            exact.cost,
-            exact.gradient,
-            exact.hessian,
-            exact.hessian.eigh(Side::Lower).expect("eig").0
-        );
-        for &step in &[1.0e-3, 1.0e-4, f64::EPSILON.cbrt()] {
-            let mut fd_g = Array1::<f64>::zeros(checkpoint.len());
-            let mut fd_h = Array2::<f64>::zeros((checkpoint.len(), checkpoint.len()));
-            for j in 0..checkpoint.len() {
-                let mut plus = checkpoint.clone();
-                let mut minus = checkpoint.clone();
-                plus[j] += step;
-                minus[j] -= step;
-                let p = prepared.evaluate(&plus).expect("plus");
-                let m = prepared.evaluate(&minus).expect("minus");
-                fd_g[j] = (p.cost - m.cost) / (2.0 * step);
-                for k in 0..checkpoint.len() {
-                    fd_h[[k, j]] = (p.gradient[k] - m.gradient[k]) / (2.0 * step);
-                }
-            }
-            eprintln!("LC4 step={step:e} fd_g={fd_g:?} fd_h={fd_h:?}");
-        }
-        // Walk along -g and along the negative eigenvector.
-        let (vals, vecs) = exact.hessian.eigh(Side::Lower).expect("eig");
-        let v = vecs.column(0).to_owned();
-        eprintln!("LC4 negdir v={v:?} (lambda {:e}) g.v={:e}", vals[0], exact.gradient.dot(&v));
-        for &t in &[1.0e-3, 1.0e-2, 0.1, 0.3, 1.0, 3.0] {
-            let along_g = &checkpoint - &(exact.gradient.mapv(|g| g * t / exact.gradient.dot(&exact.gradient).sqrt()));
-            let sign = if exact.gradient.dot(&v) > 0.0 { -1.0 } else { 1.0 };
-            let along_v = &checkpoint + &(v.mapv(|x| x * t * sign));
-            let cg = prepared.evaluate(&along_g).map(|e| e.cost);
-            let cv = prepared.evaluate(&along_v).map(|e| e.cost);
-            eprintln!(
-                "LC4 t={t:e} dcost(-g)={:?} dcost(v)={:?}",
-                cg.map(|c| c - exact.cost).ok(),
-                cv.map(|c| c - exact.cost).ok()
-            );
-        }
-    }
     let base = fit_shared_tangent_reml(request).expect("base shared REML fit");
     let rotated = fit_shared_tangent_reml(rotated_request).expect("rotated shared REML fit");
     let coefficient_error = max_error(&rotated.coefficients, &base.coefficients.dot(&rotation.t()));

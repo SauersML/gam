@@ -21,6 +21,9 @@ use gam_linalg::utils::KahanSum;
 // canonical source, matching every other `gam-models` outer-objective site.
 use gam_problem::{DeclaredHessianForm, Derivative, StationarityStandard};
 use gam_solve::estimate::EstimationError;
+use gam_solve::estimate::outer_eval_capture::{
+    InnerResidualCharge, InnerResidualSource, record_certificate_inner_residual,
+};
 use gam_solve::rho_optimizer::{
     HessianValue, OuterCapability, OuterCriterionCertificate, OuterEval, OuterObjective,
     OuterProblem, SeedOutcome,
@@ -391,6 +394,10 @@ struct Evaluation {
     /// amount of smoothing can remove — and re-deriving it there would be a
     /// second spectral decision about the same matrix.
     combined_penalty_rank: usize,
+    /// The error `cost` carries because `β̂` solves the normal equations to a
+    /// residual rather than exactly ([`normal_equation_residual_charge`]),
+    /// published to the outer search with every evaluation (#3455).
+    inner_residual: InnerResidualCharge,
 }
 
 #[derive(Debug)]
@@ -629,14 +636,24 @@ impl OuterObjective for SharedTangentObjective<'_> {
         }
     }
 
+    // Every order publishes the evaluation's inner-residual charge (#3455).
+    // Without it the outer search can form no objective band for this route, so
+    // it compares two values at the criterion's statistical resolution
+    // `1/(2n)` instead of their own error. This closed form is exact to
+    // rounding. Measured against `1/(2n)`, every step ARC took near a strict
+    // saddle read as "no resolved progress", and the cost-stall guard ended the
+    // search with `|g| ≈ 2e-3` against the caller's `√ε·D` stationarity
+    // requirement.
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-        self.prepared
-            .evaluate(rho)
-            .map(|evaluation| evaluation.cost)
+        self.prepared.evaluate(rho).map(|evaluation| {
+            record_certificate_inner_residual(evaluation.inner_residual);
+            evaluation.cost
+        })
     }
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         let evaluation = self.prepared.evaluate(rho)?;
+        record_certificate_inner_residual(evaluation.inner_residual);
         Ok(OuterEval {
             cost: evaluation.cost,
             gradient: evaluation.gradient,
@@ -955,6 +972,16 @@ impl PreparedSharedTangent {
                             / residual_degrees_of_freedom)
                             .ln()));
         validate_evaluation(cost, &gradient, &hessian)?;
+        // The normal equations `(RᵀR)β̂ = R_Xᵀ(Q_Xᵀy)`, with `R` the augmented
+        // factor, evaluated at the `β̂` the triangular solves returned.
+        let normal_residual = augmented.t().dot(&augmented.dot(&coefficients))
+            - data_root.t().dot(projected_response);
+        let inner_residual = normal_equation_residual_charge(
+            &factor,
+            &normal_residual,
+            residual_degrees_of_freedom,
+            penalized_deviance,
+        );
         Ok(Evaluation {
             cost,
             gradient,
@@ -968,6 +995,7 @@ impl PreparedSharedTangent {
             },
             lambdas,
             combined_penalty_rank: spectrum.rank,
+            inner_residual,
         })
     }
 
@@ -1078,6 +1106,15 @@ impl PreparedSharedTangent {
             return Err(invalid("internal Fisher solution shape mismatch"));
         }
         validate_evaluation(cost, &gradient, &hessian)?;
+        // The joint normal equations `(G + S_λ⊗I_D)β̂ = c` at the `β̂` the
+        // Cholesky solves returned.
+        let normal_residual = (penalized.dot(&beta) - cross).insert_axis(ndarray::Axis(1));
+        let inner_residual = normal_equation_residual_charge(
+            &factor,
+            &normal_residual,
+            residual_degrees_of_freedom,
+            penalized_deviance,
+        );
         Ok(Evaluation {
             cost,
             gradient,
@@ -1091,6 +1128,7 @@ impl PreparedSharedTangent {
             },
             lambdas,
             combined_penalty_rank: spectrum.rank,
+            inner_residual,
         })
     }
 
@@ -1481,6 +1519,35 @@ impl TangentPrecisionFactor {
         self.solve_mat(&rhs.clone().insert_axis(ndarray::Axis(1)))
             .column(0)
             .to_owned()
+    }
+}
+
+/// The error the profiled-REML value carries because `β̂` leaves the normal
+/// equations `Aβ = b` at the residual `r = Aβ̂ − b`, with `A = RᵀR` (#3455).
+///
+/// `D_p(β)` is quadratic with Hessian `2A` and minimum `D_p*` at `β* = A⁻¹b`.
+/// So `D_p(β̂) = D_p* + q` exactly, with `q = rᵀA⁻¹r = ‖R⁻ᵀr‖²_F`. The value
+/// reads `D_p` only through `½·rdf·ln D_p`, so the excess it carries is
+/// `½·rdf·ln(D_p(β̂)/D_p*) = −½·rdf·ln(1 − q/D_p(β̂))`. That is the exact
+/// excess, not a first-order estimate. It is infinite when `q ≥ D_p(β̂)`, where
+/// the residual leaves no bound, and the outer search then forms no band.
+fn normal_equation_residual_charge(
+    factor: &TangentPrecisionFactor,
+    normal_residual: &Array2<f64>,
+    residual_degrees_of_freedom: f64,
+    penalized_deviance: f64,
+) -> InnerResidualCharge {
+    let whitened = factor.whiten(normal_residual);
+    let excess = sum_products(&whitened, &whitened);
+    let relative = excess / penalized_deviance;
+    let energy = if relative < 1.0 {
+        -0.5 * residual_degrees_of_freedom * (-relative).ln_1p()
+    } else {
+        f64::INFINITY
+    };
+    InnerResidualCharge {
+        energy,
+        source: InnerResidualSource::NormalEquations,
     }
 }
 
@@ -1902,6 +1969,48 @@ mod tests {
             for k in 0..rho.len() {
                 let hessian_fd = (plus_eval.gradient[k] - minus_eval.gradient[k]) / (2.0 * step);
                 assert_close(exact.hessian[[k, j]], hessian_fd, 3.0e-6);
+            }
+        }
+    }
+
+    /// #3455: each evaluation carries its own normal-equation residual charge,
+    /// so the outer search compares two values at their own error rather than
+    /// at the criterion's statistical resolution `1/(2n)`. Without the charge,
+    /// ARC's steps near a strict saddle all read as unresolved, and the
+    /// cost-stall guard ended the search with `|g| ≈ 2e-3`. On both statistics
+    /// routes a direct solve's charge must be finite and resolve finer than
+    /// `1/(2n)`. If it did not, publishing it would change nothing.
+    #[test]
+    fn evaluation_publishes_its_normal_equation_residual_charge_3455() {
+        let base = fixture_request(None);
+        let n = base.response.nrows();
+        let d = base.response.ncols();
+        let mut metric = Array3::<f64>::zeros((n, d, d));
+        for row in 0..n {
+            let off = 0.04 * (row as f64 + 1.0);
+            metric[[row, 0, 0]] = 1.2 + 0.1 * row as f64;
+            metric[[row, 0, 1]] = off;
+            metric[[row, 1, 0]] = off;
+            metric[[row, 1, 1]] = 0.9 + 0.05 * row as f64;
+        }
+        for request in [base, fixture_request(Some(metric))] {
+            let prepared = PreparedSharedTangent::from_request(request).expect("prepare");
+            let statistical_resolution =
+                0.5 / (prepared.effective_observations * prepared.n_outputs) as f64;
+            for rho in [array![-0.2, 0.35], array![2.0, -3.0], array![-4.0, 4.0]] {
+                let evaluation = prepared.evaluate(&rho).expect("evaluate");
+                let charge = evaluation.inner_residual;
+                assert_eq!(charge.source, InnerResidualSource::NormalEquations);
+                assert!(
+                    charge.energy.is_finite() && charge.energy >= 0.0,
+                    "charge {charge:?} at rho={rho:?}"
+                );
+                assert!(
+                    charge.energy < statistical_resolution,
+                    "a direct solve's residual charge {:.3e} must resolve finer than 1/(2n) = \
+                     {statistical_resolution:.3e} at rho={rho:?}",
+                    charge.energy
+                );
             }
         }
     }
