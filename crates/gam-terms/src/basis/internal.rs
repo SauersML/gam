@@ -272,6 +272,97 @@ pub(super) fn generate_full_knot_vector_quantile(
     Ok(Array::from_vec(knots))
 }
 
+/// The clamped knot vector of [`BSplineKnotPlacement::UniformRefined`]: the
+/// uniform grid of `num_internal_knots.min(root)` internal knots on
+/// `data_range`, refined level by level, where one level gives every knot
+/// interval that holds at least two distinct values of `data` one knot at
+/// its coarsest separating dyadic point. A partial level refines the
+/// intervals holding the most distinct values first (ties left to right), so
+/// the internal knots at `K` are a subset of those at `K + 1`.
+///
+/// Intervals are half-open `[t_j, t_{j+1})` except the last, which also holds
+/// the range maximum, the same convention the basis evaluation uses.
+pub(super) fn generate_full_knot_vector_refined_uniform(
+    data: ArrayView1<'_, f64>,
+    data_range: (f64, f64),
+    root: usize,
+    num_internal_knots: usize,
+    degree: usize,
+) -> Result<Array1<f64>, BasisError> {
+    let uniform = generate_full_knot_vector(data_range, num_internal_knots.min(root), degree)?;
+    if num_internal_knots <= root {
+        return Ok(uniform);
+    }
+    let mut internal: Vec<f64> = uniform
+        .slice(s![degree + 1..uniform.len() - degree - 1])
+        .to_vec();
+    let mut distinct: Vec<f64> = data.iter().copied().collect();
+    distinct.sort_by(f64::total_cmp);
+    distinct.dedup();
+    while internal.len() < num_internal_knots {
+        // (distinct values held, interval position, separating knot)
+        let mut splits: Vec<(usize, usize, f64)> = Vec::with_capacity(internal.len() + 1);
+        let mut lo = 0usize;
+        for j in 0..=internal.len() {
+            let left = if j == 0 { data_range.0 } else { internal[j - 1] };
+            let last = j == internal.len();
+            let right = if last { data_range.1 } else { internal[j] };
+            let hi = if last {
+                distinct.len()
+            } else {
+                lo + distinct[lo..].partition_point(|&v| v < right)
+            };
+            let held = &distinct[lo..hi];
+            if held.len() >= 2
+                && let Some(knot) = separating_dyadic_point(left, right, held)
+            {
+                splits.push((held.len(), j, knot));
+            }
+            lo = hi;
+        }
+        if splits.is_empty() {
+            crate::bail_invalid_basis!(
+                "no knot interval of {} internal knots holds two separable distinct values; \
+                 {} internal knots exceed what the {} distinct covariate values resolve",
+                internal.len(),
+                num_internal_knots,
+                distinct.len()
+            );
+        }
+        splits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let take = (num_internal_knots - internal.len()).min(splits.len());
+        internal.extend(splits[..take].iter().map(|&(_, _, knot)| knot));
+        internal.sort_by(f64::total_cmp);
+    }
+    let mut knots = Vec::with_capacity(num_internal_knots + 2 * (degree + 1));
+    knots.extend(std::iter::repeat_n(data_range.0, degree + 1));
+    knots.extend(internal);
+    knots.extend(std::iter::repeat_n(data_range.1, degree + 1));
+    Ok(Array::from_vec(knots))
+}
+
+/// The coarsest dyadic point of `(left, right)` that separates the sorted
+/// distinct values `held` (at least two, all in `[left, right]`): bisect
+/// toward the half that holds them all until a midpoint has values on both
+/// sides. `None` only when no representable point strictly inside the
+/// interval separates them.
+fn separating_dyadic_point(mut left: f64, mut right: f64, held: &[f64]) -> Option<f64> {
+    loop {
+        let mid = left + 0.5 * (right - left);
+        if !(mid > left && mid < right) {
+            return None;
+        }
+        let below = held.partition_point(|&v| v < mid);
+        if below == 0 {
+            left = mid;
+        } else if below == held.len() {
+            right = mid;
+        } else {
+            return Some(mid);
+        }
+    }
+}
+
 /// Evaluates all B-spline basis functions at a single point `x`.
 /// This uses a numerically stable implementation of the Cox-de Boor algorithm,
 /// based on Algorithm A2.2 from "The NURBS Book" by Piegl and Tiller.

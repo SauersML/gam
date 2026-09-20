@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{ByVarKind, ByVariableSpec, FactorSmoothFlavour, SmoothBasisSpec};
 use crate::basis::{
-    BSplineKnotSpec, CenterStrategy, DuchonNullspaceOrder, OneDimensionalBoundary,
-    SPHERICAL_HARMONIC_MAX_DEGREE, SphereMethod, center_strategy_is_auto,
+    BSplineKnotPlacement, BSplineKnotSpec, CenterStrategy, DuchonNullspaceOrder,
+    OneDimensionalBoundary, SPHERICAL_HARMONIC_MAX_DEGREE, SphereMethod, center_strategy_is_auto,
     center_strategy_with_num_centers, count_unique_coordinate_rows,
     default_spherical_harmonic_degree, duchon_nullspace_dimension, penalized_resolution_rank,
     refined_harmonic_degree, refined_internal_knots, refined_num_centers, refined_periodic_basis,
@@ -382,9 +382,11 @@ pub fn starting_resolution(
     Some(start.with_value(start.value().min(support.value())))
 }
 
-/// One level of uniform nested refinement of `current` for `basis`: every
-/// knot interval split once, every center cell given one new center, the
-/// harmonic span paired with one new direction per existing one.
+/// One level of nested refinement of `current` for `basis`: every knot
+/// interval split once, every center cell given one new center, the harmonic
+/// span paired with one new direction per existing one. An open B-spline's
+/// split lands where its interval's data can resolve it
+/// ([`BSplineKnotPlacement::UniformRefined`]).
 pub fn refined_adaptive_resolution(current: &AdaptiveResolution) -> AdaptiveResolution {
     match current {
         AdaptiveResolution::Centers(c) => AdaptiveResolution::Centers(refined_num_centers(*c)),
@@ -497,18 +499,25 @@ pub fn adaptive_resolution_width(
 }
 
 /// Write `resolution` into `basis`, keeping its adaptive provenance so every
-/// refit stays owned by the same loop.
+/// refit stays owned by the same loop. `start` is the loop's starting
+/// resolution ([`starting_resolution`]), the root the refinement grows from:
+/// a uniform open B-spline keeps its uniform grid up to `start` and refines
+/// past it along the data-bearing chain
+/// ([`BSplineKnotPlacement::UniformRefined`]), so every resolution the loop
+/// proposes is nested in the next (#3993).
 pub fn apply_adaptive_resolution(
     basis: &mut SmoothBasisSpec,
+    start: &AdaptiveResolution,
     resolution: &AdaptiveResolution,
 ) -> Result<(), String> {
     use SmoothBasisSpec as B;
     let current = adaptive_resolution_of(basis).ok_or_else(|| {
         "adaptive resolution requested for a basis nobody left unsized".to_string()
     })?;
-    if !current.same_kind(resolution) {
+    if !current.same_kind(resolution) || !current.same_kind(start) {
         return Err(format!(
-            "adaptive resolution {resolution:?} does not match the basis resolution {current:?}"
+            "adaptive resolution {resolution:?} from {start:?} does not match the basis \
+             resolution {current:?}"
         ));
     }
     if let AdaptiveResolution::Centers(centers) = resolution {
@@ -525,8 +534,20 @@ pub fn apply_adaptive_resolution(
         (B::BSpline1D { spec, .. }, AdaptiveResolution::InternalKnots(k)) => {
             match &mut spec.knotspec {
                 BSplineKnotSpec::Automatic {
-                    num_internal_knots, ..
-                } => *num_internal_knots = *k,
+                    num_internal_knots,
+                    placement,
+                    ..
+                } => {
+                    *num_internal_knots = *k;
+                    if matches!(
+                        placement,
+                        BSplineKnotPlacement::Uniform | BSplineKnotPlacement::UniformRefined { .. }
+                    ) {
+                        *placement = BSplineKnotPlacement::UniformRefined {
+                            root: start.value(),
+                        };
+                    }
+                }
                 other => return Err(unsupported(&format!("B-spline {other:?}"))),
             }
         }

@@ -157,6 +157,8 @@ mod request;
 mod warm_start_from;
 
 #[cfg(test)]
+mod data_bearing_knot_refinement_3993_tests;
+#[cfg(test)]
 mod gaussian_high_edf_observation_interval_tests;
 
 #[cfg(test)]

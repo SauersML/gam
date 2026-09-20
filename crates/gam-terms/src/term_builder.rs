@@ -4279,19 +4279,21 @@ pub(crate) fn build_smooth_basis(
                     // `k_axis >= 2` and `effective_degree <= k_axis - 1`, so
                     // this cannot underflow.
                     let num_internal_knots = k_axis - effective_degree - 1;
-                    let knotspec = match requested_knot_placement
-                        .unwrap_or(crate::basis::BSplineKnotPlacement::Uniform)
+                    // `knot_placement=` parses to uniform or quantile only.
+                    let knotspec = if requested_knot_placement
+                        == Some(crate::basis::BSplineKnotPlacement::Quantile)
                     {
-                        crate::basis::BSplineKnotPlacement::Uniform => BSplineKnotSpec::Generate {
-                            data_range: domain.unwrap_or((data_min, data_max)),
-                            num_internal_knots,
-                        },
-                        crate::basis::BSplineKnotPlacement::Quantile => quantile_bspline_knotspec(
+                        quantile_bspline_knotspec(
                             ds.values.column(c),
                             num_internal_knots,
                             effective_degree,
                             domain,
-                        )?,
+                        )?
+                    } else {
+                        BSplineKnotSpec::Generate {
+                            data_range: domain.unwrap_or((data_min, data_max)),
+                            num_internal_knots,
+                        }
                     };
                     (knotspec, OneDimensionalBoundary::Open, None)
                 };
@@ -5418,15 +5420,17 @@ fn resolve_nonperiodic_bspline_knotspec(
             adaptive: true,
         });
     }
-    match placement {
-        BSplineKnotPlacement::Uniform => Ok(BSplineKnotSpec::Generate {
-            data_range: knot_range,
-            num_internal_knots: n_knots,
-        }),
+    if placement == BSplineKnotPlacement::Quantile {
         // Building the quantile vector up-front also validates the column, so
         // an unfittable request surfaces a user-correctable error at parse
         // time rather than deep in basis construction.
-        BSplineKnotPlacement::Quantile => quantile_bspline_knotspec(data, n_knots, degree, domain),
+        quantile_bspline_knotspec(data, n_knots, degree, domain)
+    } else {
+        // `knot_placement=` parses to uniform or quantile only.
+        Ok(BSplineKnotSpec::Generate {
+            data_range: knot_range,
+            num_internal_knots: n_knots,
+        })
     }
 }
 

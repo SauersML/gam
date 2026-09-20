@@ -275,6 +275,27 @@ pub enum BSplineKnotSpec {
 pub enum BSplineKnotPlacement {
     Uniform,
     Quantile,
+    /// The nested refinement chain of the adaptive formula default (#3993).
+    ///
+    /// Up to `root` internal knots it is the uniform grid on the covariate's
+    /// range: `root` is the starting resolution the adaptive loop began at,
+    /// so the pilot basis is exactly the uniform one. Beyond `root`, every
+    /// knot of the previous level is kept and each knot interval that holds
+    /// at least two distinct observed values gains one knot: the coarsest
+    /// dyadic point of the interval that separates its observations. An
+    /// interval holding one value or none gains nothing, because a knot there
+    /// cannot separate two observations and adds no identifiable direction.
+    /// A partial level splits the intervals holding the most distinct values
+    /// first (ties left to right), so every count `K` is a prefix of `K + 1`.
+    ///
+    /// When every interval has data on both sides of its midpoint, a level is
+    /// exactly the uniform `2K + 1` grid. A covariate stretched by an outlier
+    /// has empty intervals, and the uniform grid would spend every level on
+    /// them while the bulk of the data never gains a knot; this chain spends
+    /// each level only where the data can resolve it, and it reaches the
+    /// support bound `K = u − degree − 1` because `K + 1` intervals over `u`
+    /// distinct values always leave one that holds two.
+    UniformRefined { root: usize },
 }
 
 /// 1D B-spline basis configuration.
@@ -623,16 +644,18 @@ pub fn starting_num_centers(n: usize, d: usize, nullspace_dim: usize) -> usize {
     nullspace_dim.saturating_add(rank).min(n).max(1)
 }
 
-/// One level of uniform nested refinement of a knot grid: every one of the
-/// `internal_knots + 1` intervals is split at its midpoint, giving
+/// One level of nested refinement of a knot grid: every one of the
+/// `internal_knots + 1` intervals is split once, giving
 /// `2 * internal_knots + 1` internal knots.
 ///
 /// Nesting is what makes the refined fit comparable to the current one: the
 /// old spline space is a subspace of the new, so the refined REML fit can only
 /// resolve *more*, and the evidence comparison in the adequacy loop decides
-/// whether it did. Splitting each interval once is the least refinement that
-/// is both nested and uniform — an integer refinement ratio is required for
-/// nesting and one split per interval is the smallest integer ratio above one.
+/// whether it did. Splitting each interval once is the least nested
+/// refinement that reaches every interval — one split per interval is the
+/// smallest integer ratio above one. Where each split lands, and which
+/// intervals the data can resolve at all, is the knot chain's business
+/// ([`BSplineKnotPlacement::UniformRefined`]): this is only the count.
 pub const fn refined_internal_knots(internal_knots: usize) -> usize {
     internal_knots.saturating_mul(2).saturating_add(1)
 }

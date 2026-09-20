@@ -50,9 +50,10 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
 /// ([`gam_terms::smooth::adaptive_resolution_of`]); every explicit
 /// formula/programmatic size is left alone. A plan entry is the loop's
 /// evidence-backed refinement of that smooth; a missing entry starts it at its
-/// pilot ([`gam_terms::smooth::starting_resolution`]). Python `smooths={...}`
-/// overrides are applied by the caller AFTER this, so they override the
-/// refined value unconditionally.
+/// pilot ([`gam_terms::smooth::starting_resolution`]). The pilot is also the
+/// root every refinement is nested over, so it is written with the target.
+/// Python `smooths={...}` overrides are applied by the caller AFTER this, so
+/// they override the refined value unconditionally.
 fn apply_adaptive_resolution_plan(
     spec: &mut TermCollectionSpec,
     data: &Dataset,
@@ -63,24 +64,25 @@ fn apply_adaptive_resolution_plan(
         return Ok(());
     }
     for (term_index, term) in spec.smooth_terms.iter_mut().enumerate() {
-        let Some(current) = adaptive_resolution_of(&term.basis) else {
-            continue;
-        };
-        let target = match plan.get(term_index).cloned().flatten() {
-            Some(requested) => requested,
-            None => starting_resolution(&term.basis, data.values.view()).ok_or_else(|| {
-                WorkflowError::InvalidConfig {
-                    reason: format!(
-                        "adaptive smooth term '{}' has no starting resolution on these data",
-                        term.name
-                    ),
-                }
-            })?,
-        };
-        if current == target {
+        if adaptive_resolution_of(&term.basis).is_none() {
             continue;
         }
-        apply_adaptive_resolution(&mut term.basis, &target).map_err(
+        let start = starting_resolution(&term.basis, data.values.view()).ok_or_else(|| {
+            WorkflowError::InvalidConfig {
+                reason: format!(
+                    "adaptive smooth term '{}' has no starting resolution on these data",
+                    term.name
+                ),
+            }
+        })?;
+        let target = plan
+            .get(term_index)
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| start.clone());
+        // Applied even when the count already equals the target: the start is
+        // the root the refinement chain grows from, and the spec records it.
+        apply_adaptive_resolution(&mut term.basis, &start, &target).map_err(
             |error| WorkflowError::InvalidConfig {
                 reason: format!(
                     "failed to set the adaptive resolution of smooth term '{}': {error}",
