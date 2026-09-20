@@ -106,20 +106,23 @@ pub(crate) fn materialize_location_scale<'a>(
     }
 
     if family.is_binomial() {
-        let link_kind = match link_choice.as_ref() {
-            Some(c) => match StandardLink::try_from(c.link) {
-                Ok(std_link) => InverseLink::Standard(std_link),
-                Err(e) => {
-                    return Err(WorkflowError::InvalidConfig {
-                        reason: format!(
-                            "binomial location-scale fitting cannot route link `{}` through `InverseLink::Standard`: {e}",
-                            c.link.name()
-                        ),
-                    }
-                    .into());
+        // The resolved family carries the link: a family-pinned link
+        // ("binomial-probit") and a `link(type=...)` choice both land in
+        // `family.link`. Reading `link_choice.link` instead ignored the pinned
+        // link and read the Logit placeholder a blended link carries.
+        let link_kind = match &family.link {
+            InverseLink::Standard(std_link) => InverseLink::Standard(*std_link),
+            other => {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "binomial location-scale fitting supports only a standard link \
+                         (logit, probit, cloglog, loglog, cauchit); link `{}` has no \
+                         location-scale solver",
+                        other.link_function().name()
+                    ),
                 }
-            },
-            None => InverseLink::Standard(StandardLink::Logit),
+                .into());
+            }
         };
         Ok(MaterializedModel {
             survival_time_basis: None,
@@ -154,6 +157,20 @@ pub(crate) fn materialize_location_scale<'a>(
             }
             .into());
         }
+        // The dispersion kernel hard-codes the mean link (`base_link`); any
+        // other resolved link would be fitted as that one.
+        if family.link != kind.base_link() {
+            return Err(WorkflowError::InvalidConfig {
+                reason: format!(
+                    "{} location-scale models fit the mean on the `{}` link; the requested \
+                     link `{}` has no location-scale solver",
+                    kind.family_tag(),
+                    kind.base_link().link_function().name(),
+                    family.link.link_function().name()
+                ),
+            }
+            .into());
+        }
         Ok(MaterializedModel {
             survival_time_basis: None,
             request: FitRequest::DispersionLocationScale(DispersionLocationScaleFitRequest {
@@ -174,6 +191,21 @@ pub(crate) fn materialize_location_scale<'a>(
             unidentified_scalar_terms: Vec::new(),
         })
     } else {
+        // Only a Gaussian identity mean has a location-scale solver here. With
+        // no family named, a count column still routes here (the documented
+        // Gaussian default for `noise_formula`), but a named family is never
+        // replaced by a Gaussian fit.
+        if config.family.is_some() && !family.is_gaussian_identity() {
+            return Err(WorkflowError::InvalidConfig {
+                reason: format!(
+                    "noise_formula has no location-scale model for family {}; the \
+                     location-scale families are gaussian (identity link), binomial, \
+                     negative-binomial, gamma, beta and tweedie",
+                    family.pretty_name()
+                ),
+            }
+            .into());
+        }
         Ok(MaterializedModel {
             survival_time_basis: None,
             request: FitRequest::GaussianLocationScale(GaussianLocationScaleFitRequest {
@@ -206,5 +238,113 @@ fn dispersion_location_scale_kind(response: &ResponseFamily) -> Option<Dispersio
         ResponseFamily::Beta { .. } => Some(DispersionFamilyKind::Beta),
         ResponseFamily::Tweedie { p } => Some(DispersionFamilyKind::Tweedie { p: *p }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod location_scale_link_routing_tests {
+    //! A `noise_formula` fit must fit the family and link the request resolved
+    //! to, or refuse; it must never substitute another mean model.
+    use super::*;
+    use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
+    use ndarray::Array2;
+
+    /// `b` is a {0,1} response, `c` a positive count, `x` a covariate.
+    fn dataset() -> Dataset {
+        let names = ["b", "c", "x"];
+        let kinds = [
+            ColumnKindTag::Binary,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+        ];
+        let b = [0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+        let c = [1.0, 3.0, 2.0, 5.0, 4.0, 2.0, 6.0, 3.0, 1.0, 4.0];
+        let x = [-1.0, -0.7, -0.4, -0.2, 0.0, 0.1, 0.3, 0.5, 0.8, 1.0];
+        let values = Array2::from_shape_fn((b.len(), 3), |(i, j)| [b[i], c[i], x[i]][j]);
+        Dataset {
+            headers: names.iter().map(|n| n.to_string()).collect(),
+            values,
+            schema: DataSchema {
+                columns: names
+                    .iter()
+                    .zip(kinds)
+                    .map(|(name, kind)| SchemaColumn {
+                        name: name.to_string(),
+                        kind,
+                        levels: vec![],
+                    })
+                    .collect(),
+            },
+            column_kinds: kinds.to_vec(),
+        }
+    }
+
+    fn config(family: &str, link: Option<&str>) -> FitConfig {
+        FitConfig {
+            family: Some(family.to_string()),
+            link: link.map(str::to_string),
+            noise_formula: Some("1".to_string()),
+            ..FitConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_family_pinned_binomial_link_reaches_the_location_scale_fit() {
+        let data = dataset();
+        let model = materialize("b ~ x", &data, &config("binomial-probit", None))
+            .expect("binomial-probit location-scale materialization");
+        let FitRequest::BinomialLocationScale(request) = model.request else {
+            panic!("binomial-probit with a noise_formula must be a binomial location-scale fit");
+        };
+        assert_eq!(
+            request.spec.link_kind,
+            InverseLink::Standard(StandardLink::Probit),
+            "the family-pinned probit link must not be replaced by logit"
+        );
+    }
+
+    #[test]
+    fn a_link_without_a_location_scale_solver_is_refused() {
+        let data = dataset();
+        for (formula, family, link, expected) in [
+            // A blended link resolves to a mixture; its `LinkChoice.link`
+            // placeholder is logit, which was fitted in its place.
+            (
+                "b ~ x + link(type=blended(logit,probit))",
+                "binomial",
+                None,
+                "binomial location-scale fitting supports only a standard link",
+            ),
+            // The Gamma dispersion kernel fits a log mean.
+            ("c ~ x", "gamma", Some("inverse"), "fit the mean on the `log` link"),
+            // Only an identity Gaussian mean has a location-scale solver.
+            ("c ~ x", "gaussian", Some("log"), "noise_formula has no location-scale model"),
+            // Poisson has no location-scale model; it was fitted as Gaussian.
+            ("c ~ x", "poisson", None, "noise_formula has no location-scale model"),
+        ] {
+            let message = match materialize(formula, &data, &config(family, link)) {
+                Ok(_) => panic!("family={family} link={link:?} `{formula}` must be refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                message.contains(expected),
+                "family={family} link={link:?} `{formula}`: expected `{expected}`, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_supported_location_scale_families_still_resolve() {
+        let data = dataset();
+        for (formula, family) in [
+            ("c ~ x", "gaussian"),
+            ("b ~ x", "binomial"),
+            ("c ~ x", "gamma"),
+            ("c ~ x", "negative-binomial"),
+        ] {
+            materialize(formula, &data, &config(family, None)).unwrap_or_else(|error| {
+                panic!("family={family} location-scale materialization must succeed: {error}")
+            });
+        }
     }
 }
