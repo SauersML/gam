@@ -2708,7 +2708,17 @@ fn joint_exact_newton_score_matches_loglikelihoodfd_for_non_probit_links() {
 
 #[test]
 fn joint_exact_newton_log_sigma_block_matches_fd_in_far_exp_tail() {
-    let family = survival_exact_newton_test_family();
+    // Row 1 (censored, x_t = 0.4, x_σ = −0.3) is outside f64's range at this
+    // fixture: η_t = 0.4·1.01e303 = 4.06e302 and η_σ = −210.3, so its index
+    // `u = (h − η_t)·e^{−η_σ} ≈ −4.06e302 · 2.15e91 ≈ −8.7e393` overflows to
+    // −∞. Its curvature weight then comes out as NaN (seen at the FD points
+    // `β_σ = 701 ± 1e-4`), which the dense Hessian assembly refuses by name
+    // (#3650) instead of silently zeroing it. The row carries nothing the test
+    // pins (the score below is rows 0 and 2 only, and `log S(−∞) = 0`), so it
+    // is given prior weight 0, which drops it exactly at the row-kernel entry
+    // (`w <= 0` builds no kernel) on every path.
+    let mut family = survival_exact_newton_test_family();
+    family.w[1] = 0.0;
     let beta_time = array![0.2];
     let beta_threshold = array![0.1 * crate::sigma_link::safe_exp(700.0)];
     let beta_log_sigma0 = 701.0_f64;
