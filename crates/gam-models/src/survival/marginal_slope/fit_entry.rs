@@ -2555,14 +2555,12 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         .map_err(FitFailure::invariant)?;
         let block_states = &solved.fit.block_states;
         // The estimated law was compressed from these weighted scores, so its
-        // sampling error scales with their Kish effective size. A declaration is
-        // judged by D̂ against its own standard error, which only it pays for.
+        // sampling error scales with their Kish effective size.
         let sampling = crate::bms::ScoreSampling::from_weights(spec.weights.view())
             .map_err(FitFailure::numerical)?;
-        let second_order = matches!(
-            &latent_law_consumed,
-            crate::bms::LatentLawConsumed::DeclaredGaussian { .. }
-        );
+        let row_weights = spec.weights.as_slice().ok_or_else(|| {
+            FitFailure::invariant("survival marginal-slope: the row weights are not contiguous")
+        })?;
         let certificate = if spec.z.ncols() == 1 {
             let law = laws
                 .as_ref()
@@ -2573,20 +2571,15 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                          estimated law to certify it against",
                     )
                 })?;
-            let fresh = || crate::bms::ClosedFormAnchorAccumulator::new(&law.weights, second_order);
-            (0..n)
-                .into_par_iter()
-                .try_fold(fresh, |mut accumulator, row| -> Result<_, String> {
-                    for anchor in
-                        certificate_family.closed_form_certificate_anchors(row, block_states, law)?
-                    {
-                        accumulator.add(&anchor, spec.weights[row])?;
-                    }
-                    Ok(accumulator)
-                })
-                .try_reduce(fresh, |left, right| Ok(left.merge(right)))
-                .and_then(|accumulator| accumulator.finish(sampling))
-                .map_err(FitFailure::numerical)?
+            crate::bms::closed_form_certificate_pass(
+                n,
+                row_weights,
+                &law.weights,
+                || Ok(()),
+                |_, row| certificate_family.closed_form_certificate_anchors(row, block_states, law),
+            )
+            .and_then(|accumulator| accumulator.finish(sampling))
+            .map_err(FitFailure::numerical)?
         } else {
             let (_, joint_law) = build_joint_latent_law(
                 spec.z.view(),
@@ -2599,38 +2592,27 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 DEFAULT_JOINT_LATENT_NODES,
             )
             .map_err(FitFailure::unclassified)?;
-            let fresh = || {
-                crate::bms::ClosedFormAnchorAccumulator::new(joint_law.weights(), second_order)
-            };
-            (0..n)
-                .into_par_iter()
-                .try_fold(
-                    || {
-                        (
-                            fresh(),
-                            super::calibration::JointCertificateWorkspace::new(
-                                &certificate_family,
-                                &joint_law,
-                            ),
-                        )
-                    },
-                    |(mut accumulator, mut workspace), row| -> Result<_, String> {
-                        let scratch = workspace.as_mut().map_err(|error| error.clone())?;
-                        for anchor in certificate_family.closed_form_joint_certificate_anchors(
-                            row,
-                            block_states,
-                            &joint_law,
-                            scratch,
-                        )? {
-                            accumulator.add(&anchor, spec.weights[row])?;
-                        }
-                        Ok((accumulator, workspace))
-                    },
-                )
-                .map(|state| state.map(|(accumulator, _)| accumulator))
-                .try_reduce(fresh, |left, right| Ok(left.merge(right)))
-                .and_then(|accumulator| accumulator.finish(sampling))
-                .map_err(FitFailure::numerical)?
+            crate::bms::closed_form_certificate_pass(
+                n,
+                row_weights,
+                joint_law.weights(),
+                || {
+                    super::calibration::JointCertificateWorkspace::new(
+                        &certificate_family,
+                        &joint_law,
+                    )
+                },
+                |workspace, row| {
+                    certificate_family.closed_form_joint_certificate_anchors(
+                        row,
+                        block_states,
+                        &joint_law,
+                        workspace,
+                    )
+                },
+            )
+            .and_then(|accumulator| accumulator.finish(sampling))
+            .map_err(FitFailure::numerical)?
         };
         let mut uncertified = None;
         if let crate::bms::LatentLawConsumed::DeclaredGaussian {

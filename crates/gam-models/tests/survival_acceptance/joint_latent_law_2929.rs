@@ -398,6 +398,15 @@ fn declared_on_planted_scores(
         certificate.standard_error.is_some(),
         "a kept declaration's certificate must carry the SE(D̂) it was judged by: {certificate:?}"
     );
+    let null_sd = certificate
+        .null_modes
+        .map(|modes| (2.0 * certificate.noise_energy * certificate.noise_energy / modes).sqrt());
+    eprintln!(
+        "[2926 declared K=2 planted] D̂ = {:.4}, null sd {null_sd:?}, D̂/null sd {:?}, null tail {:?}",
+        certificate.excess_kl,
+        null_sd.map(|sd| certificate.excess_kl / sd),
+        certificate.null_p_value
+    );
     Ok((adequacy.clone(), certificate.clone()))
 }
 
@@ -452,8 +461,13 @@ fn a_gaussian_declaration_on_a_mildly_skewed_k2_score_keeps_a_loss_within_noise_
         "the stretched upper tail must fail the screen on the score's own skewness: {adequacy:?}"
     );
     assert!(
-        certificate.excess_kl > 0.0 && !certificate.closed_form_chosen,
-        "the skew must cost the declaration's anchor a positive excess loss: {certificate:?}"
+        certificate.excess_kl > 0.0
+            && !certificate.closed_form_chosen
+            && certificate
+                .null_p_value
+                .is_some_and(|p| p < gam_models::bms::CLOSED_FORM_CERTIFICATE_ALPHA),
+        "a skewed score must cost the declaration's anchor beyond the estimated law's own \
+         sampling error: {certificate:?}"
     );
 }
 
@@ -593,9 +607,10 @@ fn joint_law_is_persisted_and_replayed_at_prediction_2929() {
 /// gam#2926: the default on the same two conditionally standard-normal scores.
 /// Each score passes the adequacy screen, so the fit lowers the identity in
 /// closed form at the conditional `Σ(x)` provisionally, and the converged fit
-/// certifies it on the joint law of the score vector. Either branch is a result:
-/// `D̂ ≤ 0` keeps the closed form with its certificate, `D̂ > 0` re-solves on the
-/// joint law. Both must be calibrated on the marginal index under the true law.
+/// certifies it on the joint law of the score vector. Either branch is a result: a
+/// null tail at or above the design rate keeps the closed form with its
+/// certificate, and one below it re-solves on the joint law. Both must be
+/// calibrated on the marginal index under the true law.
 #[test]
 fn default_on_several_scores_certifies_its_closed_form_on_the_joint_law_2926() {
     install();
@@ -622,8 +637,12 @@ fn default_on_several_scores_certifies_its_closed_form_on_the_joint_law_2926() {
                  |Φ(−q̂)−Φ(−q)|={marginal_error:.4}"
             );
             assert!(
-                certificate.closed_form_chosen && certificate.excess_kl <= 0.0,
-                "a kept closed form's recorded decision must be the sign of its D̂: {certificate:?}"
+                certificate.closed_form_chosen
+                    && certificate
+                        .null_p_value
+                        .is_some_and(|p| p >= gam_models::bms::CLOSED_FORM_CERTIFICATE_ALPHA),
+                "a kept closed form's recorded decision must be its null tail at or above the design \
+                 rate: {certificate:?}"
             );
             assert!(
                 fit.joint_latent_law.is_none(),
@@ -639,8 +658,12 @@ fn default_on_several_scores_certifies_its_closed_form_on_the_joint_law_2926() {
                  |Φ(−q̂)−Φ(−q)|={marginal_error:.4}"
             );
             assert!(
-                !certificate.closed_form_chosen && certificate.excess_kl > 0.0,
-                "a re-solve's recorded decision must be the sign of its D̂: {certificate:?}"
+                !certificate.closed_form_chosen
+                    && certificate
+                        .null_p_value
+                        .is_some_and(|p| p < gam_models::bms::CLOSED_FORM_CERTIFICATE_ALPHA),
+                "a re-solve's recorded decision must be its null tail below the design rate: \
+                 {certificate:?}"
             );
             assert!(
                 fit.joint_latent_law.is_some(),

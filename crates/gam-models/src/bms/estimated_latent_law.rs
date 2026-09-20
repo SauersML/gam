@@ -1100,7 +1100,7 @@ mod tests {
     /// gam#2968's certificate on a fit-free cell: one Bernoulli closed-form anchor
     /// per row at marginal index `q_i` and slope `b_i` spread over the rows, read
     /// under the law estimated from `z`.
-    fn closed_form_certificate_on(z: &[f64], second_order: bool) -> ClosedFormAnchorResidual {
+    fn closed_form_certificate_on(z: &[f64]) -> ClosedFormAnchorResidual {
         let weights = vec![1.0; z.len()];
         let law = build_empirical_law_on_own_axis(
             ArrayView1::from(z),
@@ -1110,7 +1110,7 @@ mod tests {
         )
         .expect("estimated law");
         let rows = 400;
-        let mut accumulator = ClosedFormAnchorAccumulator::new(&law.weights, second_order);
+        let mut accumulator = ClosedFormAnchorAccumulator::new(&law.weights);
         for row in 0..rows {
             let t = row as f64 / (rows - 1) as f64;
             let q = -1.5 + 3.0 * t;
@@ -1151,8 +1151,8 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(2968);
         for (n, skew) in [(12_000, 1.0), (3000, 0.0)] {
             let z = standardised_scores(&mut rng, n, skew);
-            let certificate = closed_form_certificate_on(&z, true);
-            let standard_error = certificate.standard_error.expect("second-order certificate");
+            let certificate = closed_form_certificate_on(&z);
+            let standard_error = certificate.standard_error.expect("standard error");
             if skew > 0.0 {
                 assert!(
                     certificate.excess_kl > 3.0 * standard_error,
@@ -1160,10 +1160,6 @@ mod tests {
                     certificate.summary()
                 );
             }
-            assert!(
-                closed_form_certificate_on(&z, false).standard_error.is_none(),
-                "a first-order fold measures no standard error"
-            );
             let resamples = 400;
             let mut draws = Vec::with_capacity(resamples);
             let mut resample = vec![0.0; n];
@@ -1171,7 +1167,7 @@ mod tests {
                 for value in resample.iter_mut() {
                     *value = z[rng.random_range(0..n)];
                 }
-                draws.push(closed_form_certificate_on(&resample, false).excess_kl);
+                draws.push(closed_form_certificate_on(&resample).excess_kl);
             }
             let mean = draws.iter().sum::<f64>() / resamples as f64;
             let bootstrap_sd = (draws.iter().map(|d| (d - mean) * (d - mean)).sum::<f64>()
@@ -1205,7 +1201,7 @@ mod tests {
         for n in [1000, 30_000] {
             for _ in 0..if n == 1000 { 400 } else { 40 } {
                 let z = standardised_scores(&mut rng, n, 0.0);
-                let certificate = closed_form_certificate_on(&z, true);
+                let certificate = closed_form_certificate_on(&z);
                 let standard_error = certificate.standard_error.expect("standard error");
                 largest = largest.max(certificate.excess_kl / standard_error);
                 assert_eq!(
@@ -1218,7 +1214,7 @@ mod tests {
         }
         for _ in 0..10 {
             let z = standardised_scores(&mut rng, 30_000, 1.0);
-            let certificate = closed_form_certificate_on(&z, true);
+            let certificate = closed_form_certificate_on(&z);
             assert!(
                 certificate.refuses_declaration().expect("decision").is_some(),
                 "a skew-1 score at n = 30000 was kept: {}",

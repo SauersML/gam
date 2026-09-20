@@ -694,8 +694,9 @@ fn closed_form_agreement_in_se(fitted: &Fitted, law: &Mixture, n: usize) -> f64 
 }
 
 /// The recorded certificate of a fit whose adequacy screen passed, checked against
-/// the fit's recorded decision: the closed form is kept exactly when `D̂ ≤ 0`, and the
-/// label follows the decision.
+/// the fit's recorded decision: the closed form is kept exactly when the residual
+/// energy's null tail is at or above the design rate, and the label follows the
+/// decision.
 fn certified(fitted: &Fitted) -> gam::families::bms::ClosedFormAnchorResidual {
     let Some(certificate) = fitted.certificate.clone() else {
         panic!(
@@ -705,8 +706,11 @@ fn certified(fitted: &Fitted) -> gam::families::bms::ClosedFormAnchorResidual {
     };
     assert_eq!(
         certificate.closed_form_chosen,
-        certificate.excess_kl <= 0.0,
-        "the recorded decision must be the sign of the recorded D̂: {certificate:?}"
+        certificate
+            .null_p_value
+            .is_some_and(|p| p >= gam::families::bms::CLOSED_FORM_CERTIFICATE_ALPHA),
+        "the recorded decision must be the recorded null tail against the design rate: \
+         {certificate:?}"
     );
     let expected = if certificate.closed_form_chosen {
         "estimated-gaussian-adequate"

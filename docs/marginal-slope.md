@@ -375,12 +375,16 @@ on its own axis:
    estimated law at the closed-form intercept, and its sampling standard
    error `se` under that law. `r² − 2·se²` estimates without bias how much
    less accurate the closed form is than the estimated law's own anchor on
-   that row, so the fit keeps the closed form when
-   `D̂ = Σ w (r² − 2·se²)/(π(1−π)) ≤ 0` and records the certificate
-   (`estimated-gaussian-adequate`), and otherwise re-solves on the estimated
-   law from the closed-form coefficients (`estimated-global-by-residual`).
-   Nothing is tuned; on an exactly Gaussian score about 16% of fits
-   re-solve, which costs speed and not expected accuracy;
+   that row, and the fit records `D̂ = Σ w (r² − 2·se²)/(π(1−π))`. It keeps
+   the closed form (`estimated-gaussian-adequate`) unless the residual
+   energy `Σ w r²/(π(1−π))` is beyond what the estimated law's own sampling
+   error gives an exactly Gaussian score: its exact null law is a weighted
+   chi-square over the anchors' shared noise, and the closed form is kept
+   unless the energy is in that law's upper 5%. Otherwise the fit re-solves on
+   the estimated law from the closed-form coefficients
+   (`estimated-global-by-residual`). On exactly Gaussian scores the
+   certificate fired on 1 of 40 fits at 2 000 rows and 3 of 40 at 100 000
+   (design 5%), where the sign of `D̂` fired on 4 and 8 of the same 40;
 3. if none moves and the score fails that check, one finite law of the
    score — a 65-node equal-mass compression that keeps the score's own
    location and scale;
@@ -619,9 +623,10 @@ Two limits are worth stating plainly:
   When every score passes the screen, the closed form at `Σ(a)` is
   provisional, and the converged fit certifies it by `D̂` under the joint
   law, each row's residual `Σ_m w_m Φ(−(q·√(1 + rᵀΣ(a)r) + rᵀu_m)) − Φ(−q)`
-  on the row's transported nodes. `D̂ > 0` re-solves on the joint law; where
-  nothing can re-solve on it, as with a slope shared across the scores, the
-  fit keeps the closed form, recorded `gaussian-uncertified` with `D̂`.
+  on the row's transported nodes. Where the certificate fires, the fit
+  re-solves on the joint law; where nothing can re-solve on it, as with a
+  slope shared across the scores, it keeps the closed form, recorded
+  `gaussian-uncertified` with the certificate.
 
 ## Residual genetic repair: reading what the score discarded
 

@@ -3706,15 +3706,20 @@ fn fit_bernoulli_marginal_slope_terms_under(
             .link_beta(block_states)
             .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
         // The estimated law was compressed from these weighted scores, so its
-        // sampling error scales with their Kish effective size. A declaration is
-        // judged by D̂ against its own standard error, which only it pays for.
+        // sampling error scales with their Kish effective size.
         let sampling = super::ScoreSampling::from_weights(weights.view())
             .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
-        let second_order = matches!(&latent_law_consumed, LatentLawConsumed::DeclaredGaussian { .. });
-        let fresh = || super::ClosedFormAnchorAccumulator::new(&law.weights, second_order);
-        let certificate = (0..y.len())
-            .into_par_iter()
-            .try_fold(fresh, |mut accumulator, row| -> Result<_, String> {
+        let certificate = super::closed_form_certificate_pass(
+            y.len(),
+            weights.as_slice().ok_or_else(|| {
+                FitFailure::raised(
+                    FailureCategory::Invariant,
+                    "bernoulli marginal-slope: the row weights are not contiguous",
+                )
+            })?,
+            &law.weights,
+            || Ok(()),
+            |_, row| -> Result<[super::CertificateAnchor; 1], String> {
                 let marginal_eta = block_states[0].eta[row];
                 let slope = block_states[1].eta[row];
                 // gam#2985: with a residual block the row anchors on the joint
@@ -3747,12 +3752,11 @@ fn fit_bernoulli_marginal_slope_terms_under(
                         law,
                     )?
                 };
-                accumulator.add(&anchor, weights[row])?;
-                Ok(accumulator)
-            })
-            .try_reduce(fresh, |left, right| Ok(left.merge(right)))
-            .and_then(|accumulator| accumulator.finish(sampling))
-            .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+                Ok([anchor])
+            },
+        )
+        .and_then(|accumulator| accumulator.finish(sampling))
+        .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
         if let LatentLawConsumed::DeclaredGaussian {
             adequacy: Some(adequacy),
             residual,
