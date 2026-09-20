@@ -158,6 +158,8 @@ mod warm_start_from;
 
 #[cfg(test)]
 mod gaussian_high_edf_observation_interval_tests;
+#[cfg(test)]
+mod quantile_knot_certification_4024_tests;
 
 #[cfg(test)]
 mod binomial_separation_convergence_1762_tests;
