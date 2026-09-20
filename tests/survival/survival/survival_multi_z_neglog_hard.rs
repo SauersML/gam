@@ -205,6 +205,7 @@ fn neglog_finite_and_continuous_just_above_guard() {
     let log_hi = hi.ln();
 
     let mut values = Vec::with_capacity(n);
+    let mut qd1s = Vec::with_capacity(n);
     for i in 0..n {
         let t = i as f64 / (n - 1) as f64;
         // Sweep log-linearly from hi (2e-6) down to lo (1.01e-6); all > guard 1e-6.
@@ -230,10 +231,33 @@ fn neglog_finite_and_continuous_just_above_guard() {
             "v not finite at i={i} qd1={qd1:.3e}: {v:.17e}"
         );
         values.push(v);
+        qd1s.push(qd1);
     }
-    for (i, w) in values.windows(2).enumerate() {
-        let diff = (w[1] - w[0]).abs();
-        assert!(diff < 1e6, "i={i}: consecutive diff too large: {diff:.3e}");
+    // Continuity is checked against the exact qd1-dependence, not a magnitude
+    // bar. With a time-constant slope the row program's time derivative is
+    // `η′₁ = qd1·c₁`, where `c₁ = √(1 + s²·bᵀΣb)` does not read qd1, and qd1
+    // enters the NLL nowhere else. So for an event row
+    //
+    //     neglog(qd1) = C − w·d·log(qd1),     C independent of qd1,
+    //
+    // and every consecutive step satisfies `v[i+1] − v[i] = w·d·log(qd1[i] /
+    // qd1[i+1])` exactly in real arithmetic (here ≈ 0.0139 per step). A guard
+    // barrier, clamp, or branch switch leaking above the guard breaks that
+    // identity by far more than roundoff. The only error left is the
+    // evaluation of a handful of O(|v|) terms, which 256·ε·max(|v|, 1) bounds
+    // with room to spare.
+    for (i, (w, q)) in values.windows(2).zip(qd1s.windows(2)).enumerate() {
+        let step = w[1] - w[0];
+        let expected = weight * event * (q[0] / q[1]).ln();
+        let tol = 256.0 * f64::EPSILON * w[0].abs().max(w[1].abs()).max(1.0);
+        assert!(
+            (step - expected).abs() <= tol,
+            "i={i}: neglog step {step:.17e} between qd1={:.6e} and {:.6e} is not the \
+             exact -w·d·Δlog(qd1) = {expected:.17e} (|err|={:.3e} > tol={tol:.3e})",
+            q[0],
+            q[1],
+            (step - expected).abs()
+        );
     }
 }
 
