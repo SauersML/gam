@@ -3433,10 +3433,9 @@ impl SaeManifoldTerm {
         }
         // The exact isometry Hessian also needs the decoder third jet `K` for its
         // residual·curvature term. An evaluator that declares its third jet
-        // unavailable installs no `K`, and `hvp` would then return its zero
-        // default, so refuse exactly as a missing second jet is refused (#2933 F02).
-        if corrected.duchon_radial_source.is_none() && corrected.third_decoder_derivative().is_none()
-        {
+        // unavailable installs no `K`, so refuse exactly as a missing second jet
+        // is refused (#2933 F02).
+        if corrected.third_decoder_derivative().is_none() {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: format!(
                     "IsometryPenalty requested for SAE atom '{}' (basis kind {:?}) but this \
@@ -3447,6 +3446,19 @@ impl SaeManifoldTerm {
                 ),
             });
         }
+        // Every SAE isometry evaluation (value, gradient, exact Hessian and the
+        // frozen-normalizer Gauss-Newton blocks) is built from this penalty, so
+        // its full evaluation precondition is checked once here. Past the jets it
+        // refuses an undefined gauge: when the weighted decoder Jacobian vanishes
+        // on every row, `g_n/ḡ` has no value (#3440 F02).
+        corrected
+            .evaluation_state_precondition(
+                gam_terms::analytic_penalties::IsometryEvaluationOrder::Hessian,
+                coord.len(),
+            )
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed {
+                reason: format!("SAE Isometry atom '{}': {reason}", atom.name),
+            })?;
         Ok(AnalyticPenaltyKind::Isometry(Arc::new(corrected)))
     }
 
@@ -3602,15 +3614,15 @@ impl SaeManifoldTerm {
         // scalar on an already-PSD Gram block, so the Schur complement stays PSD,
         // and `1/gbar² ∝ ‖B‖⁻⁴` exactly cancels the raw `‖B‖⁴`. Fold it into `mu`
         // so every `mu * acc` write below carries it. `gbar` is read from the
-        // penalty (the single source of truth shared with the gradient); if it
-        // is unavailable/degenerate we skip the block rather than write a
-        // mis-scaled one.
+        // penalty (the single source of truth shared with the gradient).
         let mu_raw =
             resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index])
                 .expect("analytic-penalty rho must be validated before SAE assembly");
-        let Some(gbar) = corrected.metric_normalizer(d) else {
-            return;
-        };
+        // SAFETY: `corrected` comes from `corrected_isometry_penalty`, whose
+        // evaluation precondition refuses an undefined gauge normalizer.
+        let gbar = corrected
+            .metric_normalizer(d)
+            .unwrap_or_else(|reason| panic!("add_sae_isometry_metric_gn_blocks: {reason}"));
         let mu = mu_raw / (gbar * gbar);
         // A negligible (or non-finite) effective isometry weight contributes a
         // zero curvature block; writing zeros would still flip the solver onto
@@ -3863,14 +3875,15 @@ impl SaeManifoldTerm {
         // so it scales ∝‖B‖⁴ and would re-introduce the #795 step collapse on
         // the β tier. Fold the same `1/gbar²` frozen-normalizer factor in here
         // so the decoder curvature matches its scale-free gradient. PSD-
-        // preserving (positive scalar on a PSD Gram block); skip on a degenerate
-        // normalizer rather than write a mis-scaled block.
+        // preserving (positive scalar on a PSD Gram block).
         let mu_raw =
             resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index])
                 .expect("analytic-penalty rho must be validated before SAE assembly");
-        let Some(gbar) = corrected.metric_normalizer(d) else {
-            return;
-        };
+        // SAFETY: `corrected` comes from `corrected_isometry_penalty`, whose
+        // evaluation precondition refuses an undefined gauge normalizer.
+        let gbar = corrected
+            .metric_normalizer(d)
+            .unwrap_or_else(|reason| panic!("add_sae_isometry_beta_penalty: {reason}"));
         let mu = mu_raw / (gbar * gbar);
         if !(mu.is_finite() && mu > 0.0) {
             return;

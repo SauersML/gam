@@ -959,6 +959,72 @@ fn isometry_grad_target_without_the_jacobian_motion_stops_instead_of_returning_z
     );
 }
 
+/// #3440 F02: the scale-invariant gauge `g_n/ḡ − g^ref_n/ḡ^ref` has no value at a
+/// decoder Jacobian that vanishes on every row. Along `J = εJ₀` the value is the
+/// constant value at `J₀` for every `ε > 0`, so the old zero at `J = 0` was a
+/// jump, not a limit. The precondition refuses that metric by name, and freezing
+/// the penalty into a curvature operator refuses it too.
+#[test]
+fn isometry_refuses_the_undefined_gauge_at_a_vanishing_jacobian_3440() {
+    let (n_obs, p, d, j, h) = isometry_gn_fixture();
+    let n = n_obs * d;
+    let t = Array1::<f64>::zeros(n);
+    let rho = array![0.0_f64];
+    let at = |scale: f64| {
+        let pen = IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(d)), p);
+        pen.refresh_caches(Some(Arc::new(&*j * scale)), Some(Arc::new(&*h * scale)));
+        pen
+    };
+    let reference = at(1.0).value(t.view(), rho.view());
+    assert!(reference > 1.0e-6, "the fixture's J₀ is not isometric: {reference}");
+    for scale in [1.0e-3_f64, 1.0e-60, 1.0e-150] {
+        let value = at(scale).value(t.view(), rho.view());
+        assert_abs_diff_eq!(value, reference, epsilon = 1.0e-9 * reference);
+    }
+
+    let vanishing = at(0.0);
+    let refusal = vanishing
+        .evaluation_state_precondition(IsometryEvaluationOrder::Value, n)
+        .expect_err("the gauge has no value at J = 0");
+    assert!(refusal.contains("gauge") && refusal.contains("undefined"), "{refusal}");
+    assert_eq!(vanishing.metric_normalizer(d), Err(refusal.clone()));
+    let frozen = AnalyticPenaltyKind::Isometry(Arc::new(vanishing)).freeze(t.clone(), rho.clone());
+    assert_eq!(frozen.err(), Some(refusal));
+}
+
+/// The frozen isometry operator is the PSD Newton curvature: its `matvec` probes
+/// the Gauss-Newton majorizer, and its dense form and diagonal must be the same
+/// operator. They used to probe the exact (indefinite) Hessian instead, so the
+/// log-determinant and the preconditioner disagreed with the matvec.
+#[test]
+fn frozen_isometry_dense_and_diag_are_its_psd_matvec_3440() {
+    let (n_obs, p, d, j, h) = isometry_gn_fixture();
+    let n = n_obs * d;
+    let pen = IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(d)), p);
+    pen.refresh_caches(Some(j), Some(h));
+    let t = Array1::<f64>::zeros(n);
+    let op = AnalyticPenaltyKind::Isometry(Arc::new(pen))
+        .freeze(t, array![0.0_f64])
+        .expect("J and H define the frozen majorizer");
+    let dense = op.as_dense();
+    let diag = op.diag();
+    let mut e = Array1::<f64>::zeros(n);
+    let mut column = Array1::<f64>::zeros(n);
+    for k in 0..n {
+        e[k] = 1.0;
+        op.matvec(e.view(), column.view_mut());
+        e[k] = 0.0;
+        for r in 0..n {
+            assert_abs_diff_eq!(dense[[r, k]], column[r], epsilon = 1.0e-12);
+        }
+        assert_abs_diff_eq!(diag[k], column[k], epsilon = 1.0e-12);
+    }
+    let (eigenvalues, _) = dense.eigh(faer::Side::Lower).expect("symmetric eigensolve");
+    let floor = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
+    let scale = eigenvalues.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+    assert!(floor >= -1.0e-12 * scale, "frozen isometry curvature is not PSD: min eig {floor:.3e}");
+}
+
 /// Build the canonical smooth-threshold sweep fixture: a logit grid that straddles
 /// each per-axis scaled threshold so the gate `g = σ((z − τ)/ε)` sweeps both
 /// sides of its inflection `g = ½`, where the true Hessian

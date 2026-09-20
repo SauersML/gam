@@ -215,7 +215,8 @@ impl AnalyticPenaltyRegistry {
     }
 
     /// Check every isometry penalty holds the decoder jets an evaluation of
-    /// `order` reads for a `target_len`-coordinate target, returning the first
+    /// `order` reads for a `target_len`-coordinate target and has a defined
+    /// scale-invariant gauge, returning the first
     /// refusal ([`IsometryPenalty::evaluation_state_precondition`]). No other
     /// registered penalty reads state its owner installs, so the others pass.
     pub fn isometry_evaluation_precondition(
@@ -364,6 +365,13 @@ impl FrozenAnalyticPenaltyOp {
         rho: Array1<f64>,
     ) -> Result<Self, String> {
         penalty.validate_rho(rho.view())?;
+        // Every read of the frozen curvature (matvec, diag, dense) probes the PSD
+        // majorizer, which for an isometry penalty reads the decoder Jacobian and
+        // its motion and needs a defined scale-invariant gauge.
+        if let AnalyticPenaltyKind::Isometry(isometry) = &penalty {
+            isometry
+                .evaluation_state_precondition(IsometryEvaluationOrder::Gradient, target.len())?;
+        }
         Ok(Self {
             penalty,
             target,
@@ -562,23 +570,6 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                     p.scale(self.rho.view()),
                 );
             }
-            AnalyticPenaltyKind::Isometry(p) => {
-                let n = self.target.len();
-                let Some(state) = p.hvp_state(self.target.view()) else {
-                    return Array2::<f64>::zeros((n, n));
-                };
-                let mut dense = Array2::<f64>::zeros((n, n));
-                let mut e = Array1::<f64>::zeros(n);
-                for j in 0..n {
-                    e[j] = 1.0;
-                    let col = p.hvp_with_precomputed_state(&state, self.rho.view(), e.view());
-                    for i in 0..n {
-                        dense[[i, j]] = col[i];
-                    }
-                    e[j] = 0.0;
-                }
-                return dense;
-            }
             // No closed-form dense materialization: fall through to the
             // column-by-column PSD-majorizer probe below. Enumerated rather
             // than wildcarded so a newly registered penalty has to state
@@ -595,6 +586,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::NestedPrefix(_)
             | AnalyticPenaltyKind::ScadMcp(_)
             | AnalyticPenaltyKind::DecoderIncoherence(_)
+            | AnalyticPenaltyKind::Isometry(_)
             | AnalyticPenaltyKind::SheafConsistency(_) => {}
         }
         let n = self.target.len();
@@ -645,21 +637,6 @@ impl FrozenAnalyticPenaltyOp {
                 }
                 return diag;
             }
-            AnalyticPenaltyKind::Isometry(p) => {
-                let n = self.target.len();
-                let Some(state) = p.hvp_state(self.target.view()) else {
-                    return Array1::<f64>::zeros(n);
-                };
-                let mut d = Array1::<f64>::zeros(n);
-                let mut e = Array1::<f64>::zeros(n);
-                for i in 0..n {
-                    e[i] = 1.0;
-                    let h = p.hvp_with_precomputed_state(&state, self.rho.view(), e.view());
-                    d[i] = h[i];
-                    e[i] = 0.0;
-                }
-                return d;
-            }
             // No cached HVP state to exploit: fall through to the generic
             // unit-probe loop below. Enumerated rather than wildcarded so a
             // newly registered penalty has to state which side it is on.
@@ -682,6 +659,7 @@ impl FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::ScadMcp(_)
             | AnalyticPenaltyKind::BlockOrthogonality(_)
             | AnalyticPenaltyKind::DecoderIncoherence(_)
+            | AnalyticPenaltyKind::Isometry(_)
             | AnalyticPenaltyKind::SheafConsistency(_) => {}
         }
         let n = self.target.len();
