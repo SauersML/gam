@@ -16,6 +16,11 @@
 //! envelope of each other tie, and a tie goes to the lower seed index, so the
 //! winner depends neither on which run finished first nor on how many ran at once.
 //!
+//! Once a second certified run confirms the optimum keep-best would publish, a
+//! seed still searching whose evidence cannot reach below it is released at its
+//! next evaluation ([`SeedQuorum`], #3325), so one slow seed no longer gates the
+//! fit after the others agree.
+//!
 //! A finished run's payload (for a custom family, its terminal inner mode and
 //! every O(n) buffer that carries) is kept only while it can still be the one
 //! published, and it keeps its search's grant on the ledger until it is dropped
@@ -274,6 +279,479 @@ fn publishable_payloads(values: &[Option<Option<f64>>]) -> Vec<bool> {
         .collect()
 }
 
+/// The certified quorum one multistart's seeds share, and the floor below which a
+/// still-searching seed must reach to stay in the search (#3325).
+///
+/// Keep-best publishes the run with the lowest certified value. Once a second
+/// certified run reaches the very optimum the current keep-best run certified,
+/// that optimum is confirmed, and a seed still searching can change what is
+/// published only by certifying below it by more than the certificate's own
+/// tolerance. A seed whose every evaluation so far, and whose local model's
+/// minimum, stay above that floor is released: its next evaluation is refused, so
+/// its search ends within one evaluation instead of gating the fit's wall time.
+///
+/// "The same optimum" is judged at the certificate's tolerance
+/// `max(τ − b, b)` ([`DecrementTolerance`]), with `τ = 1/(2n)` the statistical
+/// resolution ([`OuterProblemSize::statistical_resolution`]) and `b` the rounding
+/// envelope of the two certified values ([`outer_value_agreement_bound`]): the
+/// values differ by at most that, and the displacement `δ` between the two
+/// certified points has `½|δᵀHδ|` at most that under both certificates' analytic
+/// outer Hessians. The second condition is what makes the two runs one optimum
+/// rather than two basins that happen to share a value: `½δᵀHδ ≤ τ` bounds every
+/// smooth functional's change along `δ` by `√(2τ)` standard errors, the resolution
+/// the certificate itself stops at. A certificate without an analytic Hessian
+/// never joins a quorum.
+///
+/// A route that declares no observation count has no `τ`, and its multistart
+/// never releases a seed early. Which seeds are released depends on when the
+/// quorum forms, so the published run can differ with timing, but only among
+/// runs whose certified values lie within the tolerance of each other.
+///
+/// [`DecrementTolerance`]: crate::rho_optimizer::decrement_bands::DecrementTolerance
+pub(super) struct SeedQuorum {
+    /// `τ = 1/(2n)`.
+    tau: f64,
+    /// The confirmed keep-best value less the tolerance, as `f64` bits; NaN until
+    /// a quorum forms.
+    floor: std::sync::atomic::AtomicU64,
+    /// Every run certified so far, in seed order.
+    certified: std::sync::Mutex<Vec<QuorumMember>>,
+}
+
+/// A certified run as the quorum judges it.
+struct QuorumMember {
+    index: usize,
+    value: f64,
+    rho: Array1<f64>,
+    hessian: Option<Array2<f64>>,
+}
+
+impl SeedQuorum {
+    fn new(tau: f64) -> Self {
+        Self {
+            tau,
+            floor: std::sync::atomic::AtomicU64::new(f64::NAN.to_bits()),
+            certified: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The floor a still-searching seed must reach below, once a quorum formed.
+    fn floor(&self) -> Option<f64> {
+        let floor = f64::from_bits(self.floor.load(Ordering::Acquire));
+        (!floor.is_nan()).then_some(floor)
+    }
+
+    /// File seed `index`'s certified run, and confirm the keep-best run's optimum
+    /// once another certified run reaches it.
+    fn record(&self, index: usize, certified: &CertifiedOuterResult, context: &str) {
+        let mut members = self
+            .certified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = members.partition_point(|member| member.index < index);
+        members.insert(
+            at,
+            QuorumMember {
+                index,
+                value: certified.final_value(),
+                rho: certified.rho().clone(),
+                hessian: certified.final_hessian().cloned(),
+            },
+        );
+        let Some(best) = keep_best(members.iter().map(|member| Some(member.value))) else {
+            return;
+        };
+        let incumbent = &members[best];
+        let Some((confirming, tolerance)) = members.iter().enumerate().find_map(|(j, member)| {
+            (j != best)
+                .then(|| same_optimum(incumbent, member, self.tau))
+                .flatten()
+                .map(|tolerance| (member.index, tolerance))
+        }) else {
+            return;
+        };
+        let floor = incumbent.value - tolerance;
+        let previous = f64::from_bits(self.floor.swap(floor.to_bits(), Ordering::AcqRel));
+        if previous.is_nan() || previous != floor {
+            log::debug!(
+                "[OUTER] {context}: multistart quorum: seeds {} and {confirming} certified one \
+                 optimum at value={:.9e} (tolerance {tolerance:.3e}); seeds still searching are \
+                 released unless their evidence reaches below {floor:.9e}",
+                incumbent.index,
+                incumbent.value,
+            );
+        }
+    }
+}
+
+/// The certificate's tolerance when `a` and `b` certified one optimum, else `None`
+/// ([`SeedQuorum`]).
+fn same_optimum(a: &QuorumMember, b: &QuorumMember, tau: f64) -> Option<f64> {
+    let tolerance = crate::rho_optimizer::decrement_bands::DecrementTolerance {
+        tau_stat: tau,
+        band_f: outer_value_agreement_bound(a.value, b.value),
+    }
+    .value();
+    if !((a.value - b.value).abs() <= tolerance) || a.rho.len() != b.rho.len() {
+        return None;
+    }
+    let delta = &b.rho - &a.rho;
+    if !delta.iter().all(|d| d.is_finite()) {
+        return None;
+    }
+    for hessian in [a.hessian.as_ref()?, b.hessian.as_ref()?] {
+        if hessian.dim() != (delta.len(), delta.len()) || !hessian.iter().all(|h| h.is_finite())
+        {
+            return None;
+        }
+        if !(0.5 * delta.dot(&hessian.dot(&delta)).abs() <= tolerance) {
+            return None;
+        }
+    }
+    Some(tolerance)
+}
+
+/// One seed's membership in its multistart's [`SeedQuorum`], carried by the seed's
+/// [`OuterProblem`] into [`OuterProblem::run`].
+#[derive(Clone)]
+pub(super) struct SeedReleaseHandle {
+    quorum: Arc<SeedQuorum>,
+    seed: usize,
+}
+
+impl SeedReleaseHandle {
+    /// `inner` behind this seed's release guard, searching the feasible box
+    /// `domain`.
+    pub(super) fn guard<'a>(
+        &'a self,
+        inner: &'a mut dyn OuterObjective,
+        domain: (Array1<f64>, Array1<f64>),
+        context: &str,
+    ) -> ReleasableSeed<'a> {
+        ReleasableSeed {
+            inner,
+            handle: self,
+            domain,
+            context: context.to_string(),
+            best_value: f64::INFINITY,
+            incumbent: None,
+            latest: None,
+            released: None,
+        }
+    }
+}
+
+/// A derivative-bearing evaluation the release test reads: its point, value,
+/// gradient and Hessian.
+type LocalModel = (Array1<f64>, f64, Array1<f64>, HessianValue);
+
+/// A multistart seed's objective behind its release guard ([`SeedQuorum`]).
+///
+/// It delegates every call. Before each evaluation it refuses, with a fatal
+/// evaluation error, once a quorum has formed and this seed's evidence stays
+/// above the quorum's floor: its lowest evaluated value, and a lower bound on
+/// the minimum over the whole feasible box of the local quadratic model at both
+/// its incumbent (the lowest derivative-bearing evaluation) and its latest
+/// derivative-bearing evaluation ([`local_model_floor`]). A model is judged only
+/// on an analytic Hessian; without one it bounds nothing, so a seed without one
+/// is never released, and neither is a seed that has not evaluated with
+/// derivatives yet.
+pub(super) struct ReleasableSeed<'a> {
+    inner: &'a mut dyn OuterObjective,
+    handle: &'a SeedReleaseHandle,
+    /// The feasible box the seed searches.
+    domain: (Array1<f64>, Array1<f64>),
+    context: String,
+    best_value: f64,
+    incumbent: Option<LocalModel>,
+    latest: Option<LocalModel>,
+    /// Why the seed was released, once it was.
+    released: Option<String>,
+}
+
+impl ReleasableSeed<'_> {
+    /// Refuse the next evaluation once this seed is released.
+    fn admit(&mut self) -> Result<(), EstimationError> {
+        if self.released.is_none() {
+            let Some(floor) = self.handle.quorum.floor() else {
+                return Ok(());
+            };
+            if !(self.best_value >= floor) {
+                return Ok(());
+            }
+            let (Some(incumbent), Some(latest)) = (&self.incumbent, &self.latest) else {
+                return Ok(());
+            };
+            let forecast = local_model_floor(incumbent, &self.domain)
+                .min(local_model_floor(latest, &self.domain));
+            if !(forecast >= floor) {
+                return Ok(());
+            }
+            let note = format!(
+                "multistart seed {} released: a certified quorum confirmed the optimum keep-best \
+                 publishes, and this seed cannot reach below {floor:.9e} (lowest evaluated \
+                 value {:.9e}, |g|={:.3e}, local-model minimum {forecast:.9e})",
+                self.handle.seed,
+                self.best_value,
+                latest.2.dot(&latest.2).sqrt(),
+            );
+            log::info!("[OUTER] {}: {note}", self.context);
+            self.released = Some(note);
+        }
+        let note = self.released.clone().unwrap_or_default();
+        Err(EstimationError::fatal_objective_evaluation(
+            self.context.clone(),
+            ::opt::ObjectiveEvalError::fatal(note),
+        ))
+    }
+
+    fn note_value(&mut self, cost: f64) {
+        if cost.is_finite() {
+            self.best_value = self.best_value.min(cost);
+        }
+    }
+
+    fn note_derivatives(&mut self, rho: &Array1<f64>, eval: &OuterEval) {
+        self.note_value(eval.cost);
+        if !eval.cost.is_finite() {
+            return;
+        }
+        let model = (
+            rho.clone(),
+            eval.cost,
+            eval.gradient.clone(),
+            eval.hessian.clone(),
+        );
+        if self
+            .incumbent
+            .as_ref()
+            .is_none_or(|incumbent| eval.cost <= incumbent.1)
+        {
+            self.incumbent = Some(model.clone());
+        }
+        self.latest = Some(model);
+    }
+}
+
+/// A lower bound on the minimum of the local quadratic model
+/// `q(δ) = V + gᵀδ + ½δᵀHδ` over the feasible box, `ρ + δ ∈ [lower, upper]`, or
+/// `−∞` when the Hessian is not an analytic, finite matrix.
+///
+/// Two bounds hold for every `δ` in the box, and the larger is returned:
+/// - `δᵀHδ ≥ λ_min|δ|²` makes `q` at least `V + Σᵢ (gᵢδᵢ + ½λ_min δᵢ²)`, a
+///   separable function whose minimum over the box is taken coordinate by
+///   coordinate. It holds for indefinite curvature too, where the box alone
+///   limits the decrease.
+/// - On a positive-definite Hessian, `q` is at least its unconstrained minimum
+///   `V − ½gᵀH⁻¹g`.
+fn local_model_floor(
+    (rho, value, gradient, hessian): &LocalModel,
+    (lower, upper): &(Array1<f64>, Array1<f64>),
+) -> f64 {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let Ok(Some(hessian)) = hessian.materialize_dense() else {
+        return f64::NEG_INFINITY;
+    };
+    let dim = gradient.len();
+    if hessian.dim() != (dim, dim)
+        || rho.len() != dim
+        || lower.len() != dim
+        || upper.len() != dim
+        || !gradient.iter().chain(rho).all(|x| x.is_finite())
+    {
+        return f64::NEG_INFINITY;
+    }
+    let Ok((values, vectors)) = hessian.eigh(faer::Side::Lower) else {
+        return f64::NEG_INFINITY;
+    };
+    let Some(lambda_min) = values.iter().copied().reduce(f64::min) else {
+        return *value;
+    };
+    if !values.iter().all(|lambda| lambda.is_finite()) {
+        return f64::NEG_INFINITY;
+    }
+    let mut boxed = 0.0;
+    for i in 0..dim {
+        // The step to each face, clamped to 0 so a point on a face reads the
+        // face as the step's one limit there.
+        let (below, above) = ((lower[i] - rho[i]).min(0.0), (upper[i] - rho[i]).max(0.0));
+        if !(below.is_finite() && above.is_finite()) {
+            return f64::NEG_INFINITY;
+        }
+        let along = |step: f64| gradient[i] * step + 0.5 * lambda_min * step * step;
+        boxed += if lambda_min > 0.0 {
+            along((-gradient[i] / lambda_min).clamp(below, above))
+        } else {
+            along(below).min(along(above))
+        };
+    }
+    let mut bound = value + boxed;
+    if lambda_min > 0.0 {
+        let decrease: f64 = values
+            .iter()
+            .enumerate()
+            .map(|(k, &lambda)| {
+                let along = vectors.column(k).dot(gradient);
+                along * along / lambda
+            })
+            .sum();
+        bound = bound.max(value - 0.5 * decrease);
+    }
+    bound
+}
+
+impl OuterObjective for ReleasableSeed<'_> {
+    fn capability(&self) -> OuterCapability {
+        self.inner.capability()
+    }
+
+    fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        self.admit()?;
+        let cost = self.inner.eval_cost(rho)?;
+        self.note_value(cost);
+        Ok(cost)
+    }
+
+    fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+        self.admit()?;
+        let eval = self.inner.eval(rho)?;
+        self.note_derivatives(rho, &eval);
+        Ok(eval)
+    }
+
+    fn eval_with_order(
+        &mut self,
+        rho: &Array1<f64>,
+        order: OuterEvalOrder,
+    ) -> Result<OuterEval, EstimationError> {
+        self.admit()?;
+        let eval = self.inner.eval_with_order(rho, order)?;
+        match order {
+            // A value-only evaluation's gradient slot is a placeholder.
+            OuterEvalOrder::Value => self.note_value(eval.cost),
+            OuterEvalOrder::ValueAndGradient | OuterEvalOrder::ValueGradientHessian => {
+                self.note_derivatives(rho, &eval)
+            }
+        }
+        Ok(eval)
+    }
+
+    fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+        self.admit()?;
+        let eval = self.inner.eval_efs(rho)?;
+        self.note_value(eval.cost);
+        Ok(eval)
+    }
+
+    fn eval_fixed_point_certificate(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<FixedPointCertificateEval, EstimationError> {
+        self.admit()?;
+        let eval = self.inner.eval_fixed_point_certificate(rho)?;
+        self.note_value(eval.cost);
+        Ok(eval)
+    }
+
+    fn rail_face_limit(
+        &mut self,
+        rho: &Array1<f64>,
+        face: &[usize],
+    ) -> Result<RailFaceLimitOutcome, EstimationError> {
+        self.inner.rail_face_limit(rho, face)
+    }
+
+    fn criterion_invariant_directions(&mut self, theta: &Array1<f64>) -> Option<Array2<f64>> {
+        self.inner.criterion_invariant_directions(theta)
+    }
+
+    fn criterion_rank(&self) -> Option<usize> {
+        self.inner.criterion_rank()
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    fn owns_terminal_coefficient_mode(&self) -> bool {
+        self.inner.owns_terminal_coefficient_mode()
+    }
+
+    fn begin_exact_polish(&mut self) -> bool {
+        self.inner.begin_exact_polish()
+    }
+
+    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+        self.inner.seed_inner_state(beta)
+    }
+
+    fn outer_domain_upper_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+        self.inner.outer_domain_upper_bound()
+    }
+
+    fn outer_domain_lower_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+        self.inner.outer_domain_lower_bound()
+    }
+
+    fn outer_device_admission(&self) -> Option<gam_gpu::policy::RemlOuterAdmission> {
+        self.inner.outer_device_admission()
+    }
+
+    fn reactive_domain_scalar_contract(
+        &self,
+    ) -> Result<Option<crate::continuation_path::ContinuationScalarContract>, EstimationError> {
+        self.inner.reactive_domain_scalar_contract()
+    }
+
+    fn install_reactive_domain_scalar_state(
+        &mut self,
+        state: &crate::continuation_path::ContinuationScalarState,
+    ) -> Result<(), EstimationError> {
+        self.inner.install_reactive_domain_scalar_state(state)
+    }
+
+    fn begin_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
+        self.inner.begin_reactive_domain_waypoint()
+    }
+
+    fn commit_reactive_domain_waypoint(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<(), EstimationError> {
+        self.inner.commit_reactive_domain_waypoint(rho)
+    }
+
+    fn rollback_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
+        self.inner.rollback_reactive_domain_waypoint()
+    }
+
+    fn curvature_homotopy_entry(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Option<Result<bool, EstimationError>> {
+        self.inner.curvature_homotopy_entry(rho)
+    }
+
+    fn accept_seed_without_outer_iterations(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<Option<f64>, EstimationError> {
+        self.inner.accept_seed_without_outer_iterations(rho)
+    }
+
+    fn terminal_eval_order(&self) -> Option<OuterEvalOrder> {
+        self.inner.terminal_eval_order()
+    }
+
+    fn finalize_outer_result(
+        &mut self,
+        rho: &Array1<f64>,
+        plan: &OuterPlan,
+    ) -> Result<(), EstimationError> {
+        self.inner.finalize_outer_result(rho, plan)
+    }
+}
+
 impl OuterProblem {
     /// The starts a multistart searches, in seed order: `leading` (a joined warm
     /// start) when given, then this problem's own derived start
@@ -492,6 +970,13 @@ impl OuterProblem {
             governor.remaining_bytes(),
             admission.serial_available_bytes,
         );
+        // A quorum needs two certified runs, and a route that declares no
+        // observation count has no resolution to judge one optimum at.
+        let quorum = problems
+            .first()
+            .and_then(|problem| problem.problem_size.statistical_resolution())
+            .filter(|_| seeds.len() > 1)
+            .map(|tau| Arc::new(SeedQuorum::new(tau)));
         let started = std::time::Instant::now();
         let problems: Vec<std::sync::Mutex<Option<OuterProblem>>> = problems
             .into_iter()
@@ -503,13 +988,17 @@ impl OuterProblem {
         // governor has admitted it.
         let lane = || loop {
             let index = next_seed.fetch_add(1, Ordering::Relaxed);
-            let Some(problem) = problems.get(index).and_then(|slot| {
+            let Some(mut problem) = problems.get(index).and_then(|slot| {
                 slot.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
             }) else {
                 break;
             };
+            problem.seed_release = quorum.as_ref().map(|quorum| SeedReleaseHandle {
+                quorum: Arc::clone(quorum),
+                seed: index,
+            });
             let budget = admission.admit(context);
             let seed_started = std::time::Instant::now();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -518,6 +1007,9 @@ impl OuterProblem {
                 })
             }))
             .map(|(outcome, payload)| (outcome, payload, seed_started.elapsed().as_secs_f64()));
+            if let (Some(quorum), Ok((Ok(certified), _, _))) = (&quorum, &outcome) {
+                quorum.record(index, certified, context);
+            }
             admission.release(finished.file(index, outcome, &budget));
         };
         // From inside a pool (gnomon's calibrate pool, for one) the lanes are tasks
