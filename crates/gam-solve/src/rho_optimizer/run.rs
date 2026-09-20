@@ -8206,7 +8206,6 @@ pub(crate) fn run_fixed_point_outer_solver(
         barrier_config,
         config,
         evaluated_inner_seed: Arc::clone(&evaluated_inner_seed),
-        consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::clone(&recurrent_incumbent_exit),
         // The same criterion resolution the gradient routes' cost-stall guard
