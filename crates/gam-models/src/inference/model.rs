@@ -8048,6 +8048,7 @@ mod tests {
                 }],
                 newton_polish: None,
                 curvature_floor: None,
+                criterion_error: None,
             });
         let payload = marginal_slope_payload(NEWTON_POLISH_ABSENT_PAYLOAD_VERSION, fit);
         let mut older = serde_json::to_value(&payload).expect("serialize the payload");
@@ -8144,6 +8145,7 @@ mod tests {
                 railed_facts: Vec::new(),
                 newton_polish: Some(polish.clone()),
                 curvature_floor: None,
+                criterion_error: None,
             });
         let written = serde_json::to_value(marginal_slope_payload(
             POLISH_STEP_BUDGET_PAYLOAD_VERSION,

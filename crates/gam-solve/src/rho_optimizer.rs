@@ -68,8 +68,8 @@ mod saddle_escape_latch;
 
 pub(crate) use crate::model_types::CERTIFICATE_RAIL_MARGIN;
 pub use crate::model_types::{
-    CurvatureFloorClearance, OuterCriterionCertificate, OuterStationarityCertificate,
-    CertifiedRung, CurvatureEvidence, FacePositivityRoute, RailCoordinate, RailTailEvidence,
+    CriterionErrorBound, CurvatureFloorClearance, OuterCriterionCertificate,
+    OuterStationarityCertificate, CertifiedRung, CurvatureEvidence, FacePositivityRoute, RailCoordinate, RailTailEvidence,
     RailedCoordinateFact,
 };
 pub(crate) use bridges::*;

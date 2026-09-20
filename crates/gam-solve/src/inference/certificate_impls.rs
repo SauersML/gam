@@ -247,6 +247,7 @@ mod tests {
             railed_facts: Vec::new(),
             newton_polish: None,
             curvature_floor: None,
+            criterion_error: None,
         };
         assert_eq!(clean.verdict(), Verdict::Certified);
         assert!(clean.verdict().is_certified());

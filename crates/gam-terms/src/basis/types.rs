@@ -664,38 +664,6 @@ pub fn refined_harmonic_degree(max_degree: usize) -> usize {
     degree
 }
 
-/// Is a fitted spatial smooth's basis SATURATED — i.e. does its own evidence say
-/// the data wants more resolution than its realized coefficient span provides (#1689)?
-///
-/// The penalizable capacity is `realized_width − nullspace_dim`: the unpenalized
-/// polynomial null space is always fully used, so it is excluded from the "is the
-/// PENALIZED part maxed out?" test. The supplied `edf` is the total term EDF;
-/// subtracting `nullspace_dim` yields its penalized contribution, which rises
-/// toward that capacity exactly as REML drives the penalty
-/// λ toward its floor to chase structure the basis cannot resolve. Saturated ⟺
-/// `edf ≥ capacity − ε`, with the margin `ε = capacity · resolution_tol`, floored
-/// at `resolution_tol` so a tiny-capacity block still has a positive margin. The
-/// workflow passes its outer REML convergence tolerance as `resolution_tol`, so
-/// `ε` is a numerical resolution, not a statistical threshold: saturation fires
-/// only once REML has driven λ to its floor and the penalized capacity is used
-/// up. Non-positive capacity (a block whose null space already exhausts its
-/// columns) is never saturated. The criterion SHAPE (edf-vs-capacity, nullspace
-/// excluded, tol-tied margin) is the contract this function pins.
-pub fn basis_is_saturated(
-    edf: f64,
-    realized_width: usize,
-    nullspace_dim: usize,
-    resolution_tol: f64,
-) -> bool {
-    let capacity = realized_width.saturating_sub(nullspace_dim) as f64;
-    if !(capacity > 0.0) || !edf.is_finite() {
-        return false;
-    }
-    let penalized_edf = (edf - nullspace_dim as f64).clamp(0.0, capacity);
-    let margin = (capacity * resolution_tol).max(resolution_tol);
-    penalized_edf >= capacity - margin
-}
-
 /// The one center-placement rule for a spatial (radial-kernel) smooth of
 /// dimension `d`.
 ///
@@ -3397,46 +3365,6 @@ mod saturation_escalation_tests {
             assert!((refined - 1) * (refined + 1) < 2 * l * (l + 2) || refined == l + 1);
         }
         assert_eq!(refined_internal_knots(usize::MAX), usize::MAX);
-    }
-
-    #[test]
-    fn saturation_excludes_the_nullspace_and_tracks_edf() {
-        let tol = 1e-4;
-        // Total term EDF includes the three-dimensional nullspace. Saturation
-        // means its penalized component spends all 97 remaining directions.
-        assert!(basis_is_saturated(100.0, 100, 3, tol));
-        // Half-used basis is NOT saturated.
-        assert!(!basis_is_saturated(48.5, 100, 3, tol));
-        // Just below capacity by more than the derived margin: not saturated.
-        assert!(!basis_is_saturated(90.0, 100, 3, tol));
-        // A block whose null space already exhausts its columns has no penalizable
-        // capacity and is never saturated.
-        assert!(!basis_is_saturated(3.0, 3, 3, tol));
-        assert!(!basis_is_saturated(f64::NAN, 100, 3, tol));
-    }
-
-    #[test]
-    fn saturation_is_monotone_in_edf() {
-        let tol = 1e-3;
-        let (k, null) = (60usize, 3usize);
-        let full_width = k as f64;
-        // Once saturated at some edf, any larger edf stays saturated.
-        let mut first_true: Option<f64> = None;
-        let mut e = full_width - 5.0;
-        while e <= full_width {
-            let sat = basis_is_saturated(e, k, null, tol);
-            if sat && first_true.is_none() {
-                first_true = Some(e);
-            }
-            if let Some(t) = first_true {
-                assert!(
-                    basis_is_saturated(e.max(t), k, null, tol),
-                    "saturation must not flip back to false as edf grows"
-                );
-            }
-            e += 0.25;
-        }
-        assert!(first_true.is_some(), "edf reaching capacity must saturate");
     }
 }
 

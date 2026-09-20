@@ -804,6 +804,7 @@ mod assembly_convergence_tests {
             railed_facts: Vec::new(),
             newton_polish: None,
             curvature_floor: None,
+            criterion_error: None,
         };
         let error =
             blockwise_fit_from_parts(parts_with_outer_evidence(1, true, Some(certificate)), &[])

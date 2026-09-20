@@ -2266,6 +2266,7 @@ mod native_certificate_index_tests {
             railed_facts: vec![fact(0), fact(3)],
             newton_polish: None,
             curvature_floor: None,
+            criterion_error: None,
         };
         criterion_certificate_to_native(&mut certificate, &perm);
         assert_eq!(certificate.lambdas_railed, vec![1, 2, 5]);

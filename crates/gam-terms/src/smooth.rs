@@ -76,8 +76,9 @@ pub use term_design::{
 // a shared home the future family sub-crates can call without depending on gam-models.
 mod adaptive_resolution;
 pub use adaptive_resolution::{
-    AdaptiveResolution, adaptive_resolution_of, adaptive_resolution_support,
-    adaptive_resolution_width, apply_adaptive_resolution, refined_adaptive_resolution,
+    AdaptiveResolution, adaptive_refinement_can_nest, adaptive_resolution_of,
+    adaptive_resolution_support, adaptive_resolution_width, apply_adaptive_resolution,
+    realized_basis_nests, refined_adaptive_resolution,
 };
 
 mod design_freezing;
