@@ -258,8 +258,7 @@ misc::mega_batch_k::sphere_strict_lat_bound_at_90
 misc::mega_batch_k::sphere_wahba_default_method_is_sobolev
 misc::mega_batch_k::sphere_wahba_pseudo_smoke_test
 misc::mega_batch_k::sphere_with_lots_of_data
-misc::mega_batch_k::sphere_with_method_mgcv_alias
-misc::mega_batch_k::sphere_with_method_sos_alias
+misc::mega_batch_k::sphere_with_method_pseudo
 misc::mega_batch_k::sphere_with_minimum_basis_finite
 misc::mega_batch_k::te_recovers_zero_truth
 misc::mega_batch_k::te_with_disparate_scales
