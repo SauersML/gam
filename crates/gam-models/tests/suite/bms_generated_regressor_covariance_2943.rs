@@ -179,6 +179,14 @@ fn assert_corrected_fit_is_consistent_and_loads(payload: FittedModelPayload, lab
             .map(|measure| format!("{measure:?}").chars().take(80).collect::<String>())
             .unwrap_or_else(|| "none".to_string())
     );
+    // #2943 is about a fit whose latent-z conditional calibration FIRED. A
+    // fixture on which it no longer fires never reaches the defective path, and
+    // the load below would pass for a reason unrelated to the fix.
+    assert!(
+        payload.latent_z_conditional_calibration.is_some(),
+        "{label}: the fixture must fire the latent-z conditional calibration \
+         (#2943's precondition); the payload carries none"
+    );
     let fit = payload.fit_result.as_ref().expect("the payload carries its fit result");
     assert!(
         fit.artifacts.covariance_declined.is_none(),
@@ -189,11 +197,23 @@ fn assert_corrected_fit_is_consistent_and_loads(payload: FittedModelPayload, lab
         ("conditional", fit.beta_standard_errors(), fit.beta_covariance()),
         ("corrected", fit.beta_standard_errors_corrected(), fit.beta_covariance_corrected()),
     ] {
-        let Some(standard_errors) = standard_errors else {
-            continue;
-        };
+        // Both pairs are required: this fit has smoothing coordinates and did
+        // not decline its covariance, so a missing pair is a regression, not a
+        // case to skip.
+        let standard_errors = standard_errors
+            .unwrap_or_else(|| panic!("{label}: the {pair} standard errors must be published"));
         let covariance = covariance
             .unwrap_or_else(|| panic!("{label}: {pair} standard errors are published without their covariance"));
+        // `zip` stops at the shorter side, so a length mismatch would silently
+        // compare only a prefix.
+        assert_eq!(
+            standard_errors.len(),
+            covariance.nrows(),
+            "{label}: {pair} publishes {} standard errors for a {}x{} covariance",
+            standard_errors.len(),
+            covariance.nrows(),
+            covariance.ncols()
+        );
         for (i, (se, diagonal)) in standard_errors.iter().zip(covariance.diag().iter()).enumerate() {
             assert!(
                 (se * se - diagonal).abs() <= 1.0e-12 * diagonal.abs().max(1.0),
@@ -203,11 +223,6 @@ fn assert_corrected_fit_is_consistent_and_loads(payload: FittedModelPayload, lab
             );
         }
     }
-    assert!(
-        fit.beta_standard_errors().is_some(),
-        "{label}: the conditional standard errors must be published"
-    );
-
     // What `gamfit.fit` hands `compile_model`: the saved model's bytes, parsed
     // and validated exactly as a load does.
     let bytes = serde_json::to_vec(&FittedModel::from_payload(payload)).expect("serialize the model");
