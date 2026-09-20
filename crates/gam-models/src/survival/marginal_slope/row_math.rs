@@ -194,7 +194,8 @@ pub(crate) fn survival_rigid_pilot_eta(
 /// One-step IRLS refinement of the rigid pilot η along the dominant η₁ row
 /// channel. Starts from `survival_rigid_pilot_eta` (offset+baseline), runs
 /// a single weighted Newton step over the joint location-anchor + slope
-/// design `X = [T_exit | M | G]`, and returns the refined per-row η₁ pilot
+/// design `X = [T_exit | M | G]`, shortened by an Armijo line search on the
+/// pilot's own row objective, and returns the refined per-row η₁ pilot
 /// that the cross-block W metric uses. Prevents the flex-anchor bases
 /// (`link_dev`, `score_warp`) from collapsing onto the same constant scalar
 /// path that the offset-only seed would produce when training offsets are
@@ -205,9 +206,11 @@ pub(crate) fn survival_rigid_pilot_eta(
 /// the location anchor before the solve.
 ///
 /// Returns a [`NonRigidPilot`]: the per-row observed index `eta1` (used by
-/// the cross-block W metric, unchanged from the legacy scalar return) AND the
-/// one-step IRLS estimate of the joint coefficients, split back into the
-/// `[T_exit | M]` location half and the `G` slope half.
+/// the cross-block W metric) AND the accepted coefficient step `t·δ` that
+/// produced it, split back into the `[T_exit | M]` location half and the `G`
+/// slope half. `eta1` is `rigid_observed_eta` evaluated at exactly those
+/// coefficients on every row (#3790), so the W metric and the warm start are
+/// one point of the rigid model.
 ///
 /// `slope_beta` is the #808 operating-point WARM START for the slope
 /// block's `initial_beta`: on clustered-PC designs the slope block is
@@ -418,85 +421,130 @@ pub(crate) fn survival_nonrigid_pilot_eta(
     );
     let projected_rhs = evecs.t().dot(&rhs);
     let mut beta_step = Array1::<f64>::zeros(p_joint);
+    // Predicted first-order decrease of the pilot objective along δ:
+    // -∇f·δ = rhsᵀδ = Σ_{λ_k > threshold} (v_kᵀ rhs)² / λ_k, summed in the
+    // eigenbasis so it is non-negative by construction.
+    let mut predicted_decrease = 0.0_f64;
     for k in 0..p_joint {
         if evals[k] > threshold {
             beta_step.scaled_add(projected_rhs[k] / evals[k], &evecs.column(k));
+            predicted_decrease += projected_rhs[k] * projected_rhs[k] / evals[k];
         }
     }
-    if beta_step.iter().any(|value| !value.is_finite()) {
+    if beta_step.iter().any(|value| !value.is_finite()) || !predicted_decrease.is_finite() {
         return Err(SurvivalMarginalSlopeError::NumericalFailure {
             reason: "survival non-rigid pilot Newton solve produced a non-finite coefficient"
                 .to_string(),
         }
         .into());
     }
-    // Apply the Newton update: pilot q_exit ← q_exit + chain_q · β_loc,
-    // pilot slope ← slope + chain_g · β_g — but the chain factors were
-    // already folded into `x_chain` above so the row delta along η₁ is
-    // simply `x_chain[i,:] · β_step`. We split it back into q and g by
-    // re-projecting through the bare designs (without chain factors).
-    let mut beta_loc = Array1::<f64>::zeros(p_loc);
-    let mut beta_g = Array1::<f64>::zeros(p_g);
-    for j in 0..p_loc {
-        beta_loc[j] = beta_step[j];
+    let beta_loc_full = beta_step.slice(s![..p_loc]).to_owned();
+    let beta_g_full = beta_step.slice(s![p_loc..]).to_owned();
+    let start = NonRigidPilot {
+        eta1,
+        location_beta: Array1::<f64>::zeros(p_loc),
+        slope_beta: Array1::<f64>::zeros(p_g),
+    };
+    if predicted_decrease == 0.0 {
+        // The gradient has no component in the Gram's resolved positive
+        // eigenspace: δ = 0 and the offset-only start is the pilot.
+        return Ok(start);
     }
-    for j in 0..p_g {
-        beta_g[j] = beta_step[p_loc + j];
+    // Step length along δ by Armijo backtracking on the pilot's OWN objective,
+    // the η₁-channel row NLL whose η-gradient and η-curvature built the step:
+    //
+    //   f(β) = Σ_i w_i(1 − d_i)·(−log Φ(−η_i(β))) + w_i d_i·η_i(β)²/2,
+    //   η_i(β) = rigid_observed_eta(q_i + (X_loc β_loc)_i, g_i + (X_g β_g)_i, z_i).
+    //
+    // The pilot is one point of the rigid model, never a per-row edit of η₁:
+    // every trial scales the COEFFICIENT step (β = t·δ) and recomputes η₁ from
+    // it, so the returned η₁ (which builds the cross-block W metric) and the
+    // returned warm-start β are the same point. The minimum-norm solve already
+    // takes no step along unidentified directions, so the search only shortens
+    // a step that is too long along identified ones, as judged by f, not by a
+    // cap in η units. δ is a descent direction (f'(0) = −predicted_decrease <
+    // 0), so a short enough step satisfies the Armijo test; the halving ends
+    // at the latest when t·δ no longer moves any row's η₁ in binary64, at which
+    // point no representable coefficient step improves f and the start is the
+    // pilot (stationary to working precision).
+    let objective_at_start =
+        survival_rigid_pilot_row_objective(&start.eta1, sample_weights, event);
+    if !objective_at_start.is_finite() {
+        return Err(SurvivalMarginalSlopeError::NumericalFailure {
+            reason: format!(
+                "survival non-rigid pilot objective is non-finite at the offset-only start \
+                 ({objective_at_start})"
+            ),
+        }
+        .into());
     }
-    let q_delta = location_anchor_design.apply(&beta_loc);
-    let g_delta = slope_design.apply(&beta_g);
-    // Trust-region cap to prevent a runaway first step on ill-conditioned
-    // pilots: limit |Δη₁| per row to 4·σ_η (σ_η ≈ 1 under probit), measured
-    // by the rigid pilot's η₁ standard deviation. This keeps the pilot in
-    // the regime where the second-order Taylor approximation is meaningful;
-    // the cross-block W metric only needs a per-row varying η₁, not the
-    // converged β.
-    let mut step_cap: f64 = 4.0;
-    {
-        let mean: f64 = eta1.iter().sum::<f64>() / (n as f64).max(1.0);
-        let mut var: f64 = 0.0;
+    let mut step_length = 1.0_f64;
+    loop {
+        let location_beta = &beta_loc_full * step_length;
+        let slope_beta = &beta_g_full * step_length;
+        let q_delta = location_anchor_design.apply(&location_beta);
+        let g_delta = slope_design.apply(&slope_beta);
+        let mut trial_eta = Array1::<f64>::zeros(n);
+        let mut moved = false;
+        let mut finite = true;
         for i in 0..n {
-            let d = eta1[i] - mean;
-            var += d * d;
+            let eta = rigid_observed_eta(
+                q_exit[i] + q_delta[i],
+                slope[i] + g_delta[i],
+                z_primary[i],
+                probit_scale,
+            );
+            finite &= eta.is_finite();
+            moved |= eta != start.eta1[i];
+            trial_eta[i] = eta;
         }
-        let sd = (var / (n as f64).max(1.0)).sqrt();
-        if sd.is_finite() && sd > 0.0 {
-            step_cap = (4.0_f64).max(4.0 * sd);
+        if !moved {
+            return Ok(start);
         }
-    }
-    let mut pilot_eta = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let q_new = q_exit[i] + q_delta[i];
-        let g_new = slope[i] + g_delta[i];
-        let proposed = rigid_observed_eta(q_new, g_new, z_primary[i], probit_scale);
-        if !proposed.is_finite() {
-            return Err(SurvivalMarginalSlopeError::NumericalFailure {
-                reason: format!(
-                    "survival non-rigid pilot row {i} produced a non-finite updated eta1"
-                ),
+        if finite {
+            let objective = survival_rigid_pilot_row_objective(&trial_eta, sample_weights, event);
+            if objective
+                <= objective_at_start - opt::constants::ARMIJO_C1 * step_length * predicted_decrease
+            {
+                // Warm starts (#808 slope, #2627 location): both halves of the
+                // SAME accepted coefficient step that produced `trial_eta`.
+                return Ok(NonRigidPilot {
+                    eta1: trial_eta,
+                    location_beta,
+                    slope_beta,
+                });
             }
-            .into());
         }
-        let delta = proposed - eta1[i];
-        let capped = if delta.abs() > step_cap {
-            eta1[i] + step_cap.copysign(delta)
-        } else {
-            proposed
-        };
-        pilot_eta[i] = capped;
+        step_length *= opt::constants::BACKTRACK_CONTRACTION;
     }
-    // Warm starts (#808 slope, #2627 location). Both halves of the SAME
-    // joint Newton step; `beta_step` was already finite-checked above, so
-    // neither half can carry a non-finite entry past this point.
-    Ok(NonRigidPilot {
-        eta1: pilot_eta,
-        location_beta: beta_loc,
-        slope_beta: beta_g,
-    })
+}
+
+/// The rigid pilot's η₁-channel row objective at a per-row index `eta`:
+/// `Σ_i w_i(1 − d_i)·(−log Φ(−η_i)) + w_i d_i·η_i²/2`. Its η-gradient and
+/// η-curvature are exactly the `grad_eta1` / `hess_eta1` that
+/// [`survival_nonrigid_pilot_eta`] builds its Newton step from (and the
+/// curvature is the W metric of [`survival_pilot_irls_row_metric_at_eta`]),
+/// so the step and its line search are judged by one function. A zero-weight
+/// censored channel contributes nothing (its `−log Φ` factor is never formed).
+fn survival_rigid_pilot_row_objective(
+    eta: &Array1<f64>,
+    sample_weights: &Array1<f64>,
+    event: &Array1<f64>,
+) -> f64 {
+    let mut total = 0.0_f64;
+    for i in 0..eta.len() {
+        let censored_w = sample_weights[i] * (1.0 - event[i]);
+        if censored_w != 0.0 {
+            total -= censored_w * crate::probability::normal_logcdf(-eta[i]);
+        }
+        total += 0.5 * sample_weights[i] * event[i] * eta[i] * eta[i];
+    }
+    total
 }
 
 /// One-step non-rigid pilot output: the per-row η₁ the cross-block W metric
-/// consumes, plus both halves of the joint Newton step that produced it.
+/// consumes, plus both halves of the accepted joint coefficient step that
+/// produced it (`eta1` is `rigid_observed_eta` at exactly these coefficients).
 ///
 /// `location_beta` is laid out exactly as the `location_anchor_design` passed
 /// to [`survival_nonrigid_pilot_eta`] — `[time_exit | marginal]` — so the
@@ -2180,6 +2228,126 @@ pub(crate) struct EvalCache {
 mod tests {
     use super::*;
     use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
+
+    /// Runs the non-rigid pilot on dense designs and checks the #3790
+    /// contract: every returned `eta1[i]` is `rigid_observed_eta` at the
+    /// returned coefficients (no per-row edit of the index), and the returned
+    /// point does not raise the pilot objective above the offset-only start.
+    /// Returns `(objective at start, objective at the returned pilot)`.
+    fn run_pilot_and_check_model_consistency_3790(
+        location: Array2<f64>,
+        slope_design: Array2<f64>,
+        z: &Array1<f64>,
+        q0: &Array1<f64>,
+        g0: f64,
+        event: &Array1<f64>,
+        probit_scale: f64,
+    ) -> (f64, f64) {
+        let n = z.len();
+        let zeros = Array1::<f64>::zeros(n);
+        let weights = Array1::<f64>::ones(n);
+        let location_design = DesignMatrix::from(location.clone());
+        let slope_dm = DesignMatrix::from(slope_design.clone());
+        let pilot = survival_nonrigid_pilot_eta(
+            n,
+            &location_design,
+            &slope_dm,
+            z,
+            q0,
+            &zeros,
+            &zeros,
+            g0,
+            &weights,
+            event,
+            probit_scale,
+        )
+        .expect("pilot");
+        let q_delta = location_design.apply(&pilot.location_beta);
+        let g_delta = slope_dm.apply(&pilot.slope_beta);
+        for i in 0..n {
+            let model_eta =
+                rigid_observed_eta(q0[i] + q_delta[i], g0 + g_delta[i], z[i], probit_scale);
+            assert_eq!(
+                pilot.eta1[i].to_bits(),
+                model_eta.to_bits(),
+                "row {i}: pilot eta1 {} is not the rigid index {} at the returned betas",
+                pilot.eta1[i],
+                model_eta,
+            );
+        }
+        let start_eta = survival_rigid_pilot_eta(n, z, q0, &zeros, &zeros, g0, probit_scale);
+        let f_start = survival_rigid_pilot_row_objective(&start_eta, &weights, event);
+        let f_pilot = survival_rigid_pilot_row_objective(&pilot.eta1, &weights, event);
+        assert!(
+            f_pilot <= f_start,
+            "pilot raised its own objective: start {f_start}, pilot {f_pilot}"
+        );
+        (f_start, f_pilot)
+    }
+
+    /// #3790: on this 8-row intercept/intercept pilot the full Newton step
+    /// δ = (0.797, 8.464) RAISES the pilot objective from 91.7425 to 2401.71
+    /// (independent scipy evaluation of the same f). The retired per-row cap
+    /// (max(4, 4·sd) = 20.98 here) clamped one row 24.5 index units away from
+    /// the model η at the β it shipped, and the clamped η still scored
+    /// f = 1318.74, worse than the start. The Armijo search on f accepts
+    /// t = 1/16 (β = (0.0498, 0.5290)) with f = 89.0475 — a genuine decrease,
+    /// at a point the rigid model actually reaches.
+    #[test]
+    fn nonrigid_pilot_line_search_lowers_objective_where_full_newton_step_overshoots_3790() {
+        let q0 = ndarray::array![-2.44, -0.74, -5.67, -3.31, 11.02, 4.16, -3.13, -5.35];
+        let z = ndarray::array![-0.04, 0.07, -1.49, -2.57, 2.84, 0.9, -0.75, -0.44];
+        let event = ndarray::array![0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0];
+        let n = q0.len();
+        let (f_start, f_pilot) = run_pilot_and_check_model_consistency_3790(
+            Array2::<f64>::ones((n, 1)),
+            Array2::<f64>::ones((n, 1)),
+            &z,
+            &q0,
+            -0.98,
+            &event,
+            0.5,
+        );
+        // Reference values from an independent scipy (log_ndtr) evaluation of
+        // the same objective; the 1e-9 relative band is the cross-library
+        // log-CDF agreement, far below the 2.7-unit decrease being asserted.
+        assert!(
+            ((f_start - 91.742_533_770_882_64) / f_start).abs() < 1e-9,
+            "start objective {f_start}"
+        );
+        assert!(
+            ((f_pilot - 89.047_498_313_127_49) / f_pilot).abs() < 1e-9,
+            "accepted pilot objective {f_pilot} is not the t = 1/16 Armijo point"
+        );
+    }
+
+    /// #3790: the model-consistency and descent contract on a wider pilot with
+    /// two-column location and slope designs and mixed event/censored rows.
+    #[test]
+    fn nonrigid_pilot_eta_is_the_rigid_index_at_the_returned_betas_3790() {
+        let n = 60;
+        let x = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.37).sin() * 2.0));
+        let u = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.91 + 0.3).cos()));
+        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 1.73 + 0.5).sin() * 1.5));
+        let q0 = Array1::from_iter((0..n).map(|i| 0.8 * x[i] - 0.5 + 0.3 * u[i]));
+        let event = Array1::from_iter((0..n).map(|i| if (i * 7) % 3 == 0 { 1.0 } else { 0.0 }));
+        let mut location = Array2::<f64>::ones((n, 2));
+        let mut slope_design = Array2::<f64>::ones((n, 2));
+        for i in 0..n {
+            location[[i, 1]] = x[i];
+            slope_design[[i, 1]] = u[i];
+        }
+        let (f_start, f_pilot) = run_pilot_and_check_model_consistency_3790(
+            location,
+            slope_design,
+            &z,
+            &q0,
+            0.3,
+            &event,
+            0.8,
+        );
+        assert!(f_pilot < f_start, "start {f_start}, pilot {f_pilot}");
+    }
 
     /// #1440 cutover oracle: the pilot W-metric chain factors are now the EXACT
     /// closed forms `∂η₁/∂q = c(g)` and `∂η₁/∂g = q·c'(g) + s'(g)·z`
