@@ -1,5 +1,5 @@
 //! Bug: a binding parametric coefficient inequality constraint
-//! (`nonnegative(x)` / `constrain(x, min=0)` / `linear(x, min=0)`) makes the
+//! (`nonnegative(x)` / `linear(x, min=0)`) makes the
 //! **whole fit abort** with a spurious KKT "stationarity" violation as soon as
 //! the model contains at least one *other* free term.
 //!

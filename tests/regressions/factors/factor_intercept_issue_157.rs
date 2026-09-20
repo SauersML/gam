@@ -39,14 +39,12 @@ fn factor_and_re_idioms_parse_to_random_effect() {
         random_effect_name("y ~ s(x) + s(group, bs=\"re\")"),
         "group"
     );
-    // Pre-existing aliases still work and produce the same lowering.
-    assert_eq!(random_effect_name("y ~ s(x) + re(group)"), "group");
     assert_eq!(random_effect_name("y ~ s(x) + group(group)"), "group");
 }
 
 #[test]
 fn factor_idiom_rejects_multivariable_call() {
-    // factor()/re()/group() are single-variable terms; multi-var must error
+    // factor()/group() are single-variable terms; multi-var must error
     // (and not silently fall through to factor-smooth, which is a different
     // construct).
     let err = parse_formula("y ~ factor(a, b)").expect_err("multi-var factor must error");

@@ -157,7 +157,7 @@ fn bare_tweedie_is_refused_instead_of_silently_fitting_a_default_power() {
     let ds = simulate_tweedie(P_TRUE, N, SEED);
 
     // ---- bare tweedie: refused, never fitted at a power nobody chose --------
-    for bare in ["tweedie", "tw"] {
+    for bare in ["tweedie"] {
         let cfg = FitConfig {
             family: Some(bare.to_string()),
             ..FitConfig::default()

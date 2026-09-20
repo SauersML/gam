@@ -195,7 +195,6 @@ Fields:
 | `n_samples` | `int` |
 | `n_warmup` | `int` |
 | `n_chains` | `int` |
-| `target_accept` | `float` |
 | `seed` | `int` |
 
 `n_warmup` is the warmup the run spent per chain (`0` for independent
@@ -392,7 +391,6 @@ from the coefficient count `p`:
 | Parameter | Rule |
 | --- | --- |
 | `n_samples` | `clamp(floor(100 * p * (1 + 2 * max(1, sqrt(p))) * 1.5), 500, 10_000)`. |
-| `target_accept` | `0.9`, not user-settable; `robust_target_accept` floors it by dimension and caps it. |
 | `seed` | `42` unless `seed=` is passed. |
 
 Every keyword on `Model.sample`, and the matching `gam sample` flag, overrides the corresponding default.

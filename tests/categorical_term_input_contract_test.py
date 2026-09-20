@@ -1,7 +1,7 @@
 """Input contracts for categorical columns (pyGAM audit F2, F3).
 
-Every categorical spelling (a bare ``+ g``, ``factor(g)``, ``group(g)``,
-``re(g)``) builds one coefficient per level under a ridge whose
+Every categorical spelling (a bare ``+ g``, ``factor(g)``, ``group(g)``)
+builds one coefficient per level under a ridge whose
 strength REML estimates, so the model can recover the null of no level effect.
 Two input contracts keep categorical columns out of the wrong terms:
 
@@ -42,7 +42,7 @@ def _g_block(model: Any) -> Any:
     return blocks[0]
 
 
-@pytest.mark.parametrize("formula", ["y ~ g", "y ~ factor(g)", "y ~ group(g)", "y ~ re(g)"])
+@pytest.mark.parametrize("formula", ["y ~ g", "y ~ factor(g)", "y ~ group(g)"])
 def test_every_categorical_spelling_is_a_reml_penalized_level_block(formula: str) -> None:
     model = gamfit.fit(_gaussian_frame(seed=1), formula)
     block = _g_block(model)
@@ -61,7 +61,7 @@ def test_every_categorical_spelling_is_a_reml_penalized_level_block(formula: str
         "y ~ s(g)",
         "y ~ linear(g)",
         "y ~ te(x, g)",
-        'y ~ s(g, bs="cc")',
+        'y ~ s(g, bs="cyclic")',
         "y ~ thinplate(x, g)",
         "y ~ matern(g)",
     ],
@@ -83,7 +83,7 @@ def test_categorical_column_in_a_numeric_axis_term_is_refused(formula: str) -> N
         "y ~ factor(g, foo=1)",
         "y ~ factor(g, double_penalty=false)",
         "y ~ group(g, bogus=3)",
-        "y ~ re(g, k=4)",
+        "y ~ group(g, k=4)",
     ],
 )
 def test_categorical_wrappers_reject_unknown_options(formula: str) -> None:
