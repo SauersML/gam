@@ -56,8 +56,10 @@ use super::chain::{
 use super::cohort::{EventHistoryError, SubjectNodes};
 use super::scalar::{add_real, div, exp, ln, recip, sqrt, square};
 use gam_math::nested_dual::JetField;
+use gam_math::roundoff::accumulation_growth;
 use ndarray::ArrayView2;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Everything one subject's marginal needs, in the caller's scalar type.
 pub(crate) struct SubjectInputs<'a, S> {
@@ -413,22 +415,37 @@ pub(crate) fn node_likelihood<S: JetField>(
                 .collect()
         });
         for i in 0..size {
-            if y != 0.0 {
-                let mut eta = base.clone();
-                for (k, a) in loadings_d.iter().enumerate() {
-                    eta = eta.add(&a.mul(grid.coordinate(i, k)));
+            // The tables hold exactly the products `a_k z_k` the linear
+            // predictor sums, in the same order, so a node with exposure reads
+            // `η` from them instead of forming every product a second time.
+            let eta = match &latent {
+                Some(tables) => {
+                    let mut eta = base.clone();
+                    for (k, table) in tables.iter().enumerate() {
+                        eta = eta.add(&table[grid.index(i, k)]);
+                    }
+                    Some(eta)
                 }
-                ell[i] = ell[i].add(&eta.scale(y));
+                None => None,
+            };
+            if y != 0.0 {
+                let term = match &eta {
+                    Some(eta) => eta.scale(y),
+                    None => {
+                        let mut eta = base.clone();
+                        for (k, a) in loadings_d.iter().enumerate() {
+                            eta = eta.add(&a.mul(grid.coordinate(i, k)));
+                        }
+                        eta.scale(y)
+                    }
+                };
+                ell[i] = ell[i].add(&term);
             }
             // A mark with no exposure at this node has no compensator and so
             // no curvature: its intensity is never formed, which is the work
             // the risk sets save.
-            match &latent {
-                Some(tables) => {
-                    let mut log_c = base.clone();
-                    for (k, table) in tables.iter().enumerate() {
-                        log_c = log_c.add(&table[grid.index(i, k)]);
-                    }
+            match eta {
+                Some(log_c) => {
                     let c = exp(&add_real(&log_c, exposure.ln()));
                     ell[i] = ell[i].sub(&c);
                     if derivatives {
@@ -436,7 +453,7 @@ pub(crate) fn node_likelihood<S: JetField>(
                         curvature.push(c);
                     }
                 }
-                _ => {
+                None => {
                     if derivatives {
                         score.push(zero.constant_like(y));
                         curvature.push(zero.clone());
@@ -545,7 +562,8 @@ pub(crate) fn condition<S: JetField>(
 /// One filtered node: its grid, the operators that reached it, the predicted
 /// and filtered densities on it, and the node's likelihood pieces.
 pub(crate) struct FilteredNode<S> {
-    pub grid: Grid<S>,
+    /// Shared, not copied: a static frailty's nodes all live on one grid.
+    pub grid: Arc<Grid<S>>,
     /// Transitions across the gap that led here; empty at the first node.
     pub transitions: Vec<AtomTransition<S>>,
     /// Forward operators from the previous grid; empty at the first node.
@@ -607,7 +625,7 @@ pub(crate) fn filter_start<S: JetField>(
     let (alpha, normaliser) =
         condition(&grid, &predicted, &likelihood.ell, likelihood.shift, label)?;
     Ok(FilteredNode {
-        grid,
+        grid: Arc::new(grid),
         transitions: Vec::new(),
         forward: OperatorFamily {
             per_axis: Vec::new(),
@@ -685,7 +703,7 @@ pub(crate) fn filter_step<S: JetField>(
         let likelihood = node_terms(previous_grid, derivatives);
         let (alpha, normaliser) = condition(previous_grid, previous_alpha, &likelihood.ell,
             likelihood.shift, label)?;
-        return Ok(FilteredNode { grid: previous_grid.clone(), transitions,
+        return Ok(FilteredNode { grid: Arc::new(previous_grid.clone()), transitions,
             forward: OperatorFamily { per_axis: Vec::new(), order: gh.order },
             predicted: previous_alpha.to_vec(), alpha, normaliser, likelihood });
     }
@@ -712,7 +730,7 @@ pub(crate) fn filter_step<S: JetField>(
     let (alpha, normaliser) =
         condition(&grid, &predicted, &likelihood.ell, likelihood.shift, label)?;
     Ok(FilteredNode {
-        grid,
+        grid: Arc::new(grid),
         transitions,
         forward,
         predicted,
@@ -1453,16 +1471,18 @@ fn filter_nodes<S: JetField>(
     let like = &inputs.eta0[0];
     if crate::static_state::is_static(inputs.rates) {
         // Every node shares the one whole-history grid of `static_state::filter`,
-        // so a node's scores live on the grid the carried vector already lives on.
-        let pass = crate::static_state::filter(inputs, None, &vec![true; marks])?;
-        return Ok((0..n_nodes).map(|n| {
-            let likelihood = subject_node_likelihood(inputs, counts_rows, exposure_rows,
-                &pass.grids[n], n, derivatives);
-            FilteredNode { grid: pass.grids[n].clone(), transitions: Vec::new(),
+        // so a node's scores live on the grid the carried vector already lives on,
+        // and the likelihood the pass conditioned on is the node's own.
+        let (pass, likelihoods) =
+            crate::static_state::conditioned(inputs, None, &vec![true; marks], derivatives)?;
+        let ForwardPass { grids, alpha, predicted, log_normalisers } = pass;
+        return Ok(grids.into_iter().zip(alpha).zip(predicted).zip(log_normalisers).zip(likelihoods)
+            .map(|((((grid, alpha), predicted), log_normaliser), likelihood)| FilteredNode {
+                grid, transitions: Vec::new(),
                 forward: OperatorFamily { per_axis: Vec::new(), order: gh.order },
-                predicted: pass.predicted[n].clone(), alpha: pass.alpha[n].clone(),
-                normaliser: exp(&add_real(&pass.log_normalisers[n], -likelihood.shift)), likelihood }
-        }).collect());
+                predicted, alpha,
+                normaliser: exp(&add_real(&log_normaliser, -likelihood.shift)), likelihood })
+            .collect());
     }
     let mut filtered: Vec<FilteredNode<S>> = Vec::with_capacity(n_nodes);
     let forward_power: u8 = if derivatives { 2 } else { 0 };
@@ -1844,7 +1864,7 @@ pub(crate) fn latent_state_moments(
 /// across the nodes (`super::static_state`): only its total and its final
 /// state are resolved, so chronological quantities come from [`spells`].
 pub(crate) struct ForwardPass<S> {
-    pub grids: Vec<Grid<S>>,
+    pub grids: Vec<Arc<Grid<S>>>,
     pub alpha: Vec<Vec<S>>,
     pub predicted: Vec<Vec<S>>,
     pub log_normalisers: Vec<S>,
@@ -1872,7 +1892,7 @@ pub(crate) fn forward_filter<S: JetField>(
         return crate::static_state::filter(inputs, initial, compensated);
     }
     let like = &inputs.eta0[0];
-    let mut grids: Vec<Grid<S>> = Vec::with_capacity(n_nodes);
+    let mut grids: Vec<Arc<Grid<S>>> = Vec::with_capacity(n_nodes);
     let mut alpha: Vec<Vec<S>> = Vec::with_capacity(n_nodes);
     let mut predicted: Vec<Vec<S>> = Vec::with_capacity(n_nodes);
     let mut log_normalisers: Vec<S> = Vec::with_capacity(n_nodes);
@@ -1951,6 +1971,9 @@ pub(crate) struct Spell {
     pub node: usize,
     /// `ln P(no event across the spell | the history before it)`.
     pub log_survival: f64,
+    /// The roundoff bound of [`Self::log_survival`] as it was formed, which
+    /// scales with the log integrals or normalisers it is assembled from.
+    pub log_survival_roundoff: f64,
     /// `E[λ_d(t) | the history before t]` for every mark when an event closes
     /// the spell at `t`; `None` for the open tail.
     pub intensities: Option<Vec<f64>>,
@@ -1983,11 +2006,17 @@ pub(crate) fn spells(
     }
     let pass = forward_filter(inputs, None, compensated)?;
     let mut spells = Vec::new();
-    let mut log_survival = 0.0_f64;
+    // A node's normaliser `ln c + shift` sums `size` positive terms (relative
+    // error `γ_{size+2}` with the weight and exponential), and the logarithm,
+    // the shift and the running sum each add `ε` of their magnitudes.
+    let (mut log_survival, mut log_survival_roundoff) = (0.0_f64, 0.0_f64);
     let mut open = false;
     for n in 0..n_nodes {
         if !nodes.is_event(n) {
-            log_survival += pass.log_normalisers[n];
+            let log_normaliser = pass.log_normalisers[n];
+            log_survival += log_normaliser;
+            log_survival_roundoff += accumulation_growth(pass.grids[n].size() + 2)
+                + f64::EPSILON * (2.0 * log_normaliser.abs() + log_survival.abs());
             open = true;
             continue;
         }
@@ -2005,15 +2034,17 @@ pub(crate) fn spells(
         spells.push(Spell {
             node: n,
             log_survival,
+            log_survival_roundoff,
             intensities: Some(intensities),
         });
-        log_survival = 0.0;
+        (log_survival, log_survival_roundoff) = (0.0, 0.0);
         open = false;
     }
     if open {
         spells.push(Spell {
             node: n_nodes - 1,
             log_survival,
+            log_survival_roundoff,
             intensities: None,
         });
     }

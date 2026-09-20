@@ -79,6 +79,10 @@ pub use gam_math::probability::signed_probit_logcdf_and_mills_ratio;
 /// `crate::probability::standard_normal_quantile` resolving for all existing callers.
 pub use gam_math::probability::standard_normal_quantile;
 
+/// The regularized incomplete gamma pair and its inverse live in `gam-math`,
+/// beside the chi-square tails built on them.
+use gam_math::probability::{inverse_regularized_lower_gamma, regularized_incomplete_gamma_pair};
+
 /// Quantile (inverse CDF) of a Gamma distribution parameterized by shape
 /// `k > 0` and scale `θ > 0` at probability `p ∈ (0, 1)`: the value `x` with
 /// `P(X ≤ x) = p` for `X ~ Gamma(shape = k, scale = θ)` (mean `kθ`, variance
@@ -782,96 +786,6 @@ pub fn tweedie_moment_matched_interval(
     }
 }
 
-/// Both regularized incomplete gamma tails at once, `(P(a, x), Q(a, x))`, each
-/// accurate to a relative ulp across the whole domain. `P(a, x) = γ(a, x) / Γ(a)`
-/// is the CDF of a unit-scale `Gamma(shape = a)` variate and `Q = 1 − P` is its
-/// survival function.
-///
-/// The pair is returned rather than `P` alone because the two are not
-/// interchangeable in `f64`: whichever of them is small carries information the
-/// other has already rounded away. Reconstructing the small one by subtracting
-/// the large one from 1 loses every digit it had — that is not a sharpening, it
-/// is the difference between an answer and none. Each branch below returns the
-/// tail it evaluates directly, and the complement is only ever formed where the
-/// subtraction is between unequal magnitudes.
-///
-/// This is the exact function [`inverse_regularized_lower_gamma`] inverts, so we
-/// own it rather than borrowing `statrs::gamma_lr`. That routine hard-clamps to
-/// `0.0` for every `x ≤ 1.11e-15` (its `almost_eq(x, 0)` guard, with accuracy
-/// `DEFAULT_F64_ACC`), which silently zeroes the residual `P(a, x) − p` in the
-/// small-shape lower tail: the Halley iterate is then driven *up* — away from a
-/// good sub-`1e-15` seed — until `x` crosses that clamp around `~1.6e-15`, where
-/// the returned point carries far more mass than `p` (#1018). The Numerical
-/// Recipes split — a power series for `x < a + 1`, the modified-Lentz continued
-/// fraction for the complement `Q = 1 − P` otherwise — keeps the leading
-/// `exp(a·ln x − x − ln Γ(a))` factor in logs, so the value stays finite and
-/// nonzero for arguments far below that clamp, and always evaluates the *smaller*
-/// tail directly (no catastrophic cancellation near either edge).
-fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
-    use statrs::function::gamma::ln_gamma;
-    // Callers (`inverse_regularized_lower_gamma`) validate `a > 0` upstream; a
-    // non-positive `a` would only mis-feed `ln_gamma`, never UB.
-    if x <= 0.0 {
-        return (0.0, 1.0);
-    }
-    let gln = ln_gamma(a);
-    if x < a + 1.0 {
-        // Power series: P(a,x) = exp(a·ln x − x − ln Γ(a)) · Σ_{n≥0} xⁿ / Π_{k=0}^{n}(a+k).
-        // The running term `del` is the ratio form, so no factorial overflows.
-        let mut ap = a;
-        let mut del = 1.0 / a;
-        let mut sum = del;
-        for _ in 0..1000 {
-            ap += 1.0;
-            del *= x / ap;
-            sum += del;
-            if del.abs() <= sum.abs() * f64::EPSILON {
-                break;
-            }
-        }
-        // The series branch is entered only for `x < a + 1`, where `P` is bounded
-        // by `P(a, a+1) < 3/4`, so the complement is a subtraction of unequal
-        // magnitudes and keeps every digit `P` has.
-        let p = (sum.ln() + a * x.ln() - x - gln).exp();
-        (p, 1.0 - p)
-    } else {
-        // Modified-Lentz continued fraction for Q(a,x) = 1 − P(a,x); P = 1 − Q.
-        // Evaluating the *upper* tail here keeps the directly-computed quantity
-        // small wherever P is near 1, so `1 − Q` loses no significant digits.
-        // Lentz's modified continued-fraction algorithm substitutes a tiny value
-        // for an exact zero in its recurrence (Numerical Recipes §6.2). It is a
-        // component of the algorithm, not a floor on a result: any value below
-        // the smallest normal quotient works and the converged fraction does not
-        // depend on it, so it is the arithmetic's own smallest normal, not a
-        // chosen magnitude (#2469).
-        const LENTZ_TINY: f64 = f64::MIN_POSITIVE;
-        let mut b = x + 1.0 - a;
-        let mut c = 1.0 / LENTZ_TINY;
-        let mut d = 1.0 / b;
-        let mut h = d;
-        for i in 1..1000 {
-            let an = -(i as f64) * (i as f64 - a);
-            b += 2.0;
-            d = an * d + b;
-            if d.abs() < LENTZ_TINY {
-                d = LENTZ_TINY;
-            }
-            c = b + an / c;
-            if c.abs() < LENTZ_TINY {
-                c = LENTZ_TINY;
-            }
-            d = 1.0 / d;
-            let del = d * c;
-            h *= del;
-            if (del - 1.0).abs() <= f64::EPSILON {
-                break;
-            }
-        }
-        let q = (a * x.ln() - x - gln + h.ln()).exp();
-        (1.0 - q, q)
-    }
-}
-
 /// Regularized lower incomplete gamma `P(a, x)` alone — see
 /// [`regularized_incomplete_gamma_pair`], which computes whichever tail is small
 /// directly and is what callers wanting `Q` must use.
@@ -879,147 +793,6 @@ fn regularized_lower_gamma(a: f64, x: f64) -> f64 {
     regularized_incomplete_gamma_pair(a, x).0
 }
 
-/// Inverse of the regularized lower incomplete gamma function: the `x ≥ 0` with
-/// `P(a, x) = p`, where `P(a, x) = γ(a, x) / Γ(a)` is the CDF of a unit-scale
-/// `Gamma(shape = a)` variate, `a > 0`, `p ∈ (0, 1)`.
-///
-/// Uses the standard rational/Wilson–Hilferty initial estimate, except in the
-/// extreme lower tail where the exact small-`x` seed
-/// `exp((ln p + ln Γ(a + 1)) / a)` follows from `P(a, x) ~ x^a / Γ(a + 1)`.
-/// For `a ≤ 1` it keeps the Numerical Recipes series/log initial estimate. The
-/// seed is refined by Halley's method on the CDF residual — third order, a Newton
-/// step scaled by the local curvature of `P`. That residual is taken against
-/// whichever tail is small — `P(a,x) − p` below the median, `(1 − p) − Q(a,x)`
-/// above it — so it never subtracts two quantities of size 1; see the note at the
-/// iteration itself. Both tails come from the crate's own
-/// [`regularized_incomplete_gamma_pair`] (NOT `statrs::gamma_lr`, which clamps the
-/// residual to `−p` for tiny `x`; see that fn's note); the density
-/// `f(x) = x^{a−1} e^{−x} / Γ(a)` is evaluated through the same overflow-safe
-/// log factorization Numerical Recipes uses (`invgammp`), so the iteration stays
-/// finite across a wide range of `a`. A positivity step-halving guard keeps the
-/// iterate inside the support.
-fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
-    use statrs::function::gamma::ln_gamma;
-
-    if !(a.is_finite() && a > 0.0) {
-        return f64::NAN;
-    }
-    if !p.is_finite() || p <= 0.0 {
-        return 0.0;
-    }
-    if p >= 1.0 {
-        return f64::INFINITY;
-    }
-
-    let gln = ln_gamma(a);
-    let a1 = a - 1.0;
-
-    // Initial estimate. For `a > 1` a Wilson–Hilferty transform of a normal
-    // quantile works away from the extreme lower tail; there, the small-`x`
-    // analytic seed is essentially exact. Both seeds feed the same Halley polish,
-    // which starts from whichever the CDF places closer to `p`, measured in the
-    // same tail the polish measures its residual in.
-    let mut x = if a > 1.0 {
-        let pp = if p < 0.5 { p } else { 1.0 - p };
-        let t = (-2.0 * pp.ln()).sqrt();
-        let mut z = (2.30753 + t * 0.27061) / (1.0 + t * (0.99229 + t * 0.04481)) - t;
-        if p < 0.5 {
-            z = -z;
-        }
-        let wh_inner = 1.0 - 1.0 / (9.0 * a) - z / (3.0 * a.sqrt());
-        let wh_seed = if wh_inner > 0.0 {
-            a * wh_inner.powi(3)
-        } else {
-            f64::NAN
-        };
-        let analytic_seed = ((p.ln() + ln_gamma(a + 1.0)) / a).exp();
-        if analytic_seed == 0.0 {
-            return 0.0;
-        }
-        if !(wh_seed.is_finite() && wh_seed > 0.0) {
-            analytic_seed
-        } else {
-            let residual = |seed: f64| {
-                let (p_at_seed, q_at_seed) = regularized_incomplete_gamma_pair(a, seed);
-                if p > 0.5 {
-                    ((1.0 - p) - q_at_seed).abs()
-                } else {
-                    (p_at_seed - p).abs()
-                }
-            };
-            if residual(analytic_seed) < residual(wh_seed) {
-                analytic_seed
-            } else {
-                wh_seed
-            }
-        }
-    } else {
-        let t = 1.0 - a * (0.253 + a * 0.12);
-        if p < t {
-            (p / t).powf(1.0 / a)
-        } else {
-            1.0 - (1.0 - (p - t) / (1.0 - t)).ln()
-        }
-    };
-
-    // Density factorization constants for `a > 1` (kept overflow-safe in logs).
-    let (lna1, afac) = if a > 1.0 {
-        let lna1 = a1.ln();
-        (lna1, (a1 * (lna1 - 1.0) - gln).exp())
-    } else {
-        (0.0, 0.0)
-    };
-
-    // Halley refinement of the seeded quantile. Halley's cubic convergence
-    // shrinks the step geometrically from the standard Wilson-Hilferty /
-    // asymptotic seed; once a step is no smaller than the one before it, or no
-    // longer moves the iterate, the quantile is at the resolution its residual's
-    // arithmetic has and no further step can improve it.
-    let mut previous_step = f64::INFINITY;
-    loop {
-        if x <= 0.0 {
-            return 0.0;
-        }
-        // Residual in whichever tail is small. `P(a,x) − p` subtracts two
-        // quantities of size 1 once `p > 1/2`, pinning the residual's absolute
-        // error at one ulp of 1 however close the iterate is; since the step is
-        // `err / dens` and `dens ≈ 1 − p` out there, the returned quantile carries
-        // a relative error of `ε / ((1 − p)·x)`, which diverges as `p → 1`
-        // (7.8e-4 at `1 − p = 1e-15`). Against the complement the same Newton step
-        // is `(1 − p) − Q(a,x)`: `1 − p` is exact for `p ≥ 1/2` by Sterbenz and `Q`
-        // is computed directly, so the residual carries *relative* accuracy. The
-        // branch point is the Sterbenz domain itself, not a tuned constant.
-        let (p_at_x, q_at_x) = regularized_incomplete_gamma_pair(a, x);
-        let err = if p > 0.5 {
-            (1.0 - p) - q_at_x
-        } else {
-            p_at_x - p
-        };
-        let dens = if a > 1.0 {
-            afac * (-(x - a1) + a1 * (x.ln() - lna1)).exp()
-        } else {
-            (-x + a1 * x.ln() - gln).exp()
-        };
-        if !(dens.is_finite() && dens > 0.0) {
-            break;
-        }
-        // Newton step `u = (P(a,x) − p) / f(x)`, then the Halley scaling by the
-        // local curvature `f'/f = (a−1)/x − 1`, capped (per NR) so the
-        // denominator never collapses below ½.
-        let u = err / dens;
-        let step = u / (1.0 - 0.5 * (u * (a1 / x - 1.0)).min(1.0));
-        if !(step.abs() < previous_step) || x - step == x {
-            break;
-        }
-        previous_step = step.abs();
-        x -= step;
-        if x <= 0.0 {
-            // Overshot the support floor: step back to half the prior iterate.
-            x = 0.5 * (x + step);
-        }
-    }
-    x
-}
 
 #[cfg(test)]
 mod tests {
@@ -1289,6 +1062,162 @@ mod tests {
             assert!(
                 rel <= 8.0 * f64::EPSILON * mu,
                 "P(Y<={k} | mu={mu}) = {got:e}, want {want:e}, relative {rel:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_gamma_is_accurate_from_small_to_huge_shape() {
+        // #4068: the series and continued fraction were capped at 1000 terms and
+        // returned the partial sum as converged. Near `x ≈ a` the series needs
+        // about `8.5·√a` terms, so for `a ≳ 1.4e4` the "converged" value was a
+        // truncation (P(1e6, 999500) came out 0.2419 against 0.3086).
+        //
+        // References: 60-digit mpmath sums, independent of every routine here —
+        // the power series for `P` when `x < a`, the Legendre continued fraction
+        // for `Q` otherwise, each run to its own tail bound, times
+        // `exp(a ln x − x − ln Γ(a))` at that precision. Each row is
+        // `(a, x, whether the small tail is P, that tail)`; the last four are the
+        // issue's own cases.
+        //
+        // Bar: the small tail carries the prefactor `e^{−a·h}`, `h = λ − 1 − ln λ`,
+        // whose relative error is `a·h` times the relative error of `h` — the
+        // conditioning of the function in `x` itself, since a one-ulp change of
+        // `x` moves `a·h` by `a·|λ − 1|/λ·ε`. So the error is measured in units
+        // of `(1 + a·h)·ε`; the old truncated sums were off by up to 22% here.
+        // Beyond that, the series and the continued fraction round once per
+        // term, and at small shapes near `x ≈ a` they take a few dozen terms:
+        // the bar is 32 units, against a measured worst of 19 (`a = x = 3`).
+        const UNIT_BAR: f64 = 32.0;
+        const ROWS: [(f64, f64, bool, f64); 66] = [
+            (0.7, 0.013999999999999999, true, 5.51313485464876e-2),
+            (0.7, 0.13999999999999999, true, 2.62568501634967e-1),
+            (0.7, 0.42, true, 5.0834813308743318e-1),
+            (0.7, 0.7, false, 3.4341093974049586e-1),
+            (0.7, 1.19, false, 1.9102554172690131e-1),
+            (0.7, 1.5366600265340755, false, 1.2825810179184002e-1),
+            (0.7, 2.4499999999999997, false, 4.6443606389297197e-2),
+            (0.7, 4.0466401061363015, false, 8.3388697938738817e-3),
+            (0.7, 4.199999999999999, false, 7.0868634681294926e-3),
+            (3.0, 0.06, true, 3.441824024472021e-5),
+            (3.0, 0.6000000000000001, true, 2.3115287752632959e-2),
+            (3.0, 1.2679491924311224, true, 1.3557137117993433e-1),
+            (3.0, 1.7999999999999998, true, 2.6937891406058745e-1),
+            (3.0, 3.0, false, 4.2319008112684352e-1),
+            (3.0, 4.732050807568877, false, 1.4911018549049089e-1),
+            (3.0, 5.1, false, 1.1647834313417626e-1),
+            (3.0, 9.92820323027551, false, 2.9371426399812767e-3),
+            (3.0, 10.5, false, 1.8346159379269044e-3),
+            (3.0, 18.0, false, 2.7566263337929857e-6),
+            (12.0, 0.24, true, 6.1101098698737629e-17),
+            (12.0, 2.4000000000000004, true, 8.4535131100734353e-6),
+            (12.0, 7.199999999999999, true, 6.2905833907867146e-2),
+            (12.0, 8.535898384862247, true, 1.5441621106288932e-1),
+            (12.0, 12.0, false, 4.615973330636182e-1),
+            (12.0, 15.464101615137753, false, 1.5586364364312884e-1),
+            (12.0, 20.4, false, 1.7518317615758892e-2),
+            (12.0, 25.856406460551018, false, 8.5271811759288256e-4),
+            (12.0, 42.0, false, 1.3852814835795081e-8),
+            (12.0, 72.0, false, 4.2762823157007119e-19),
+            (150.0, 3.0, true, 3.2894660604843632e-193),
+            (150.0, 30.0, true, 7.5592303464840563e-55),
+            (150.0, 90.0, true, 4.7953023275883495e-9),
+            (150.0, 101.01020514433644, true, 3.1572477177059796e-6),
+            (150.0, 137.7525512860841, true, 1.5836977907217069e-1),
+            (150.0, 150.0, false, 4.8914177025064032e-1),
+            (150.0, 162.2474487139159, false, 1.5840111742024859e-1),
+            (150.0, 198.98979485566355, false, 1.2664172915402692e-4),
+            (150.0, 255.0, false, 4.2105749324015774e-13),
+            (150.0, 525.0, false, 7.2920290967798446e-84),
+            (150.0, 900.0, false, 6.5280919022324705e-212),
+            (3000.0, 1800.0, true, 7.359801195156802e-147),
+            (3000.0, 2780.9109769979336, true, 2.1051974788722459e-5),
+            (3000.0, 2945.2277442494837, true, 1.5864163418646316e-1),
+            (3000.0, 3000.0, false, 4.9757211010594567e-1),
+            (3000.0, 3054.7722557505167, false, 1.5864198330967965e-1),
+            (3000.0, 3219.0890230020664, false, 4.5649067881116096e-5),
+            (3000.0, 5100.0, false, 2.2135555968387508e-223),
+            (100000.0, 98735.08893593265, true, 2.9605184180992645e-5),
+            (100000.0, 99683.77223398315, true, 1.5865484973789696e-1),
+            (100000.0, 100000.0, false, 4.9957947788963482e-1),
+            (100000.0, 100316.22776601683, false, 1.5865485155167504e-1),
+            (100000.0, 101264.91106406735, false, 3.3838116386882088e-5),
+            (1000000.0, 996000.0, true, 3.1007118211082967e-5),
+            (1000000.0, 999000.0, true, 1.5865521357430365e-1),
+            (1000000.0, 1000000.0, false, 4.9986701923912741e-1),
+            (1000000.0, 1000999.9999999999, false, 1.5865521363168786e-1),
+            (1000000.0, 1004000.0, false, 3.234544731347768e-5),
+            (100000000.0, 99960000.0, true, 3.1604377116199155e-5),
+            (100000000.0, 99990000.0, true, 1.5865525352814383e-1),
+            (100000000.0, 100000000.0, false, 4.9998670192398588e-1),
+            (100000000.0, 100010000.0, false, 1.5865525352820119e-1),
+            (100000000.0, 100040000.0, false, 3.1738207368808895e-5),
+            (100000.0, 99700.0, true, 1.7141731451450292e-1),
+            (1000000.0, 999500.0, true, 3.0862555689081532e-1),
+            (1000001.0, 1000000.0, true, 4.9973403851371635e-1),
+            (100000000.0, 100000001.5, false, 4.9992686058264875e-1),
+        ];
+        for (a, x, small_is_p, want) in ROWS {
+            let (p, q) = regularized_incomplete_gamma_pair(a, x);
+            let got = if small_is_p { p } else { q };
+            let lambda = x / a;
+            let ah = a * (lambda - 1.0 - lambda.ln()).abs();
+            let units = ((got - want) / want).abs() / ((1.0 + ah) * f64::EPSILON);
+            assert!(
+                units <= UNIT_BAR,
+                "a={a} x={x}: got {got:e}, want {want:e} ({units:.1} units of (1+a·h)ε)"
+            );
+            assert!(
+                (p + q - 1.0).abs() <= 2.0 * f64::EPSILON,
+                "a={a} x={x}: P + Q = {}",
+                p + q
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_gamma_at_its_mean_holds_past_the_integer_limit() {
+        // `Q(a, a) = ½ − 1/(3·√(2πa)) + O(a^{−3/2})`, and the next term is
+        // `(1/(540a))/√(2πa)`, below `1e−21` at these shapes. At `a = 1e16`,
+        // `a + 1 == a`: the old series/fraction split at `x < a + 1` and its
+        // capped sums are both gone here.
+        for a in [1e12_f64, 1e16] {
+            let want = 0.5 - 1.0 / (3.0 * (2.0 * std::f64::consts::PI * a).sqrt());
+            let (p, q) = regularized_incomplete_gamma_pair(a, a);
+            assert!(
+                ((q - want) / want).abs() <= 4.0 * f64::EPSILON,
+                "Q({a:e}, {a:e}) = {q:e}, want {want:e}"
+            );
+            assert!((p + q - 1.0).abs() <= 2.0 * f64::EPSILON, "P + Q = {}", p + q);
+        }
+    }
+
+    #[test]
+    fn count_and_gamma_quantiles_are_exact_at_large_means() {
+        // #4068: the capped sums moved these quantiles by thousands. The
+        // references are 60-digit mpmath inversions of the same laws
+        // (`P(Y ≤ k) = Q(k + 1, μ)` for the Poisson), independent of this file.
+        for (p, mu, want) in [
+            (0.975, 1e6, 1_001_960.0),
+            (0.025, 1e6, 998_041.0),
+            (0.975, 1e7, 10_006_198.0),
+            (0.025, 1e7, 9_993_803.0),
+        ] {
+            assert_eq!(poisson_quantile(p, mu), want, "poisson_quantile(p={p}, μ={mu:e})");
+        }
+        // The quantile's own conditioning is `ΔP/(x·f(x))`: a relative error
+        // `(1 + a·h)ε` in the tail moves `x` by far less than an ulp here, so the
+        // bar is the rounding of `x` itself.
+        for (p, a, want) in [
+            (0.025, 1e6, 998_040.983_340_293_9),
+            (0.025, 1e7, 9_993_802.996_884_267),
+            (0.975, 1e7, 10_006_198.897_421_6),
+        ] {
+            let got = gamma_quantile(p, a, 1.0);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= 4.0 * f64::EPSILON,
+                "gamma_quantile(p={p}, a={a:e}) = {got}, want {want} (relative {rel:e})"
             );
         }
     }
