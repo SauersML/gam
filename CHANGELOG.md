@@ -1,5 +1,12 @@
 ## Unreleased
 
+- **The cgroup-v2 memory probe no longer admits zero bytes when `memory.stat` reports more
+  `inactive_file` than `memory.current`** (#4380). The probe used to fail closed with
+  `inconsistent-counters`, which the resource governor reads as zero capacity, so every governed
+  allocation under that ceiling was refused. The v1 probe already admitted such a level at its headroom
+  with no reclaim credit, and both probes now share that rule inside the one constructor. The
+  `CgroupMemoryProbeFailureKind::InconsistentCounters` variant is removed.
+
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
   point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is

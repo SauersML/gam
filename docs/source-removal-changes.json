@@ -2665,5 +2665,14 @@
     ],
     "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
     "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "e7e4e23f5efbb5e01d7320389032d43a2e31fda3",
+    "items": [
+      "crates/gam-runtime/src/cgroup_memory.rs:fn:from_consistent_counters",
+      "crates/gam-runtime/src/cgroup_memory.rs:fn:inconsistent_cache_counter_fails_closed"
+    ],
+    "reason": "#4380: CgroupMemoryAvailability::from_consistent_counters returned None when inactive_file exceeded the charge counter. The v2 probe pre-checked that case and failed closed (InconsistentCounters, read by the governor as zero capacity), while the v1 probe clamped the reclaim credit to zero before calling it; both callers' ok_or_else branches were unreachable and the test-support replay needed an expect. The constructor is now the infallible from_counters, which owns the clamp for both probes, and the v2 fail-closed test inconsistent_cache_counter_fails_closed is replaced by v2_reclaim_credit_above_the_charge_counter_admits_the_headroom_without_credit.",
+    "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base e7e4e23f5efbb5e01d7320389032d43a2e31fda3 and head the change's commit list exactly these removals. Read-proof at the head: git grep finds no from_consistent_counters or InconsistentCounters in crates/ tests/ examples/ python/; every former caller (the v1 and v2 probes in crates/gam-runtime/src/cgroup_memory.rs and simulated_cgroup_memory_environment in crates/gam-runtime/src/test_support.rs) calls from_counters."
   }
 ]
