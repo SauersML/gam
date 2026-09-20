@@ -9,10 +9,7 @@ pub use normal_table::{
     NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, NORMAL_SCALED_TAIL_RELATIVE_ERROR, normal_cdf_and_pdf,
     normal_scaled_tail,
 };
-use statrs::function::{
-    beta::{beta_reg, inv_beta_reg, ln_beta},
-    gamma::gamma_ur,
-};
+use statrs::function::beta::{beta_reg, inv_beta_reg, ln_beta};
 
 const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
 const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
@@ -541,8 +538,11 @@ pub fn student_t_quantile(p: f64, degrees_of_freedom: f64) -> Result<f64, String
 
 /// Chi-squared survival probability `P(X_ν > statistic)`.
 ///
-/// Uses the regularized upper incomplete gamma directly instead of
-/// reconstructing a small tail as `1 − P(ν/2, statistic/2)`.
+/// It is the upper tail `Q(ν/2, statistic/2)` of this crate's own
+/// [`regularized_incomplete_gamma_pair`], the same pair
+/// [`chi_square_quantile`] inverts, so the p-value and the quantile agree at
+/// every `ν`. Where the small tail is `Q` the pair evaluates it directly rather
+/// than as `1 − P`.
 pub fn chi_square_sf(statistic: f64, degrees_of_freedom: f64) -> f64 {
     let half_df = 0.5 * degrees_of_freedom;
     if statistic.is_nan()
@@ -557,7 +557,7 @@ pub fn chi_square_sf(statistic: f64, degrees_of_freedom: f64) -> f64 {
     if statistic == f64::INFINITY {
         return 0.0;
     }
-    gamma_ur(half_df, 0.5 * statistic)
+    regularized_incomplete_gamma_pair(half_df, 0.5 * statistic).1
 }
 
 /// Quantile of `χ²_k` at lower-tail probability `p`: the `x` with
@@ -858,9 +858,10 @@ pub fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
                 break;
             }
         }
-        // The series branch is entered only for `x < a + 1`, where `P` is bounded
-        // by `P(a, a+1) < 3/4`, so the complement is a subtraction of unequal
-        // magnitudes and keeps every digit `P` has.
+        // The series branch is entered only for `x < a + 1`, where `Q ≥ Q(a, a+1)`.
+        // For `a ≥ 1` that is at least `Q(1, 2) = e^{-2}`, so the complement's
+        // relative error is at most `ε·P/Q < e²·ε`. For `a < 1`, `Q(a, a+1) → 0`
+        // as `a → 0` and `1 − P` keeps only absolute accuracy there (#4242).
         let p = (sum.ln() + ln_prefactor).exp();
         (p, 1.0 - p)
     } else {
@@ -2204,6 +2205,19 @@ mod tests {
         let (_, below) = regularized_incomplete_gamma_pair(1_001_960.0, 1e6);
         let (_, at) = regularized_incomplete_gamma_pair(1_001_961.0, 1e6);
         assert!(below < 0.975 && at >= 0.975, "CDF(1001959)={below}, CDF(1001960)={at}");
+    }
+
+    #[test]
+    fn chi_square_sf_at_huge_degrees_of_freedom_is_the_crate_gamma_tail() {
+        // χ²_ν survival at ν = 2e12, s = ν + 4e6 is Q(1e12, 1e12 + 2e6) =
+        // 0.022750185939118725 (50-digit reference). statrs `gamma_ur` returned
+        // 0.02279 here. Tolerance: the pair's 16ε(1 + aφ) with aφ ≈ aμ²/2 = 2.
+        let got = chi_square_sf(2.0e12 + 4.0e6, 2.0e12);
+        let reference = 0.022_750_185_939_118_725;
+        assert!(rel_err(got, reference) <= 16.0 * f64::EPSILON * 3.0, "got {got}");
+        // The survival and the quantile read the same pair.
+        let quantile = chi_square_quantile(1.0 - got, 2.0e12);
+        assert!(((quantile - (2.0e12 + 4.0e6)) / 2.0e12).abs() <= 4.0 * f64::EPSILON, "quantile {quantile}");
     }
 
     #[test]
