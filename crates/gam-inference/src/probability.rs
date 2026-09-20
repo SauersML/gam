@@ -10,6 +10,9 @@ pub use gam_math::probability::normal_pdf;
 /// `crate::probability::normal_cdf` resolving for all existing callers.
 pub use gam_math::probability::normal_cdf;
 
+/// Inverse-Gaussian CDF `IG(μ, λ)`. Implementation lives in `gam-math`.
+pub use gam_math::probability::inverse_gaussian_cdf;
+
 /// Two-sided standard-normal probability `P(|Z| ≥ |z|)`, evaluated directly
 /// without subtracting a CDF from one.
 pub use gam_math::probability::normal_two_sided_probability;
@@ -97,6 +100,15 @@ pub(crate) fn gamma_quantile(p: f64, shape: f64, scale: f64) -> f64 {
     scale * inverse_regularized_lower_gamma(p, shape)
 }
 
+/// The band of the point mass at zero, the one law on `[0, ∞)` whose mean is zero:
+/// what a predictive mean that underflows to zero, with no spread, describes. A
+/// non-negative response's moment-matched predictive takes it before asking for a
+/// positive mean, so such a row has the exact band `[0, 0]` rather than none
+/// (#3140).
+fn zero_point_mass(mu: f64, total_var: f64) -> Option<(f64, f64)> {
+    (mu == 0.0 && total_var == 0.0).then_some((0.0, 0.0))
+}
+
 /// Equal-tailed predictive interval for a strictly-positive, right-skewed
 /// response modelled as a Gamma whose first two moments match a point
 /// prediction: mean `mu` and total predictive variance `total_var`
@@ -123,6 +135,9 @@ pub fn gamma_moment_matched_interval(
     p_lo: f64,
     p_hi: f64,
 ) -> Option<(f64, f64)> {
+    if let Some(band) = zero_point_mass(mu, total_var) {
+        return Some(band);
+    }
     if !(mu.is_finite() && mu > 0.0 && total_var.is_finite() && total_var > 0.0) {
         return None;
     }
@@ -138,8 +153,9 @@ pub fn gamma_moment_matched_interval(
 }
 
 /// Equal-tailed predictive interval for a `(0, 1)`-bounded response modelled as a
-/// Beta whose first two moments match a point prediction: mean `mu ∈ (0, 1)` and
-/// total predictive variance `total_var` (estimation + observation noise).
+/// Beta whose first two moments match a point prediction: mean `mu ∈ [0, 1]`, its
+/// complement `complement = 1 − mu` carried separately (see below), and total
+/// predictive variance `total_var` (estimation + observation noise).
 /// Returns the pair of Beta quantiles at lower-tail probabilities `p_lo < p_hi` —
 /// the skew-correct replacement for a symmetric `mu ± z·σ` band, which for a
 /// skewed Beta lands *both* edges below the corresponding true quantile and so
@@ -152,30 +168,124 @@ pub fn gamma_moment_matched_interval(
 /// conditional `Beta(μφ₀, (1−μ)φ₀)`. With nonzero estimation variance it is the
 /// moment-matched Beta predictive — the minimal skew-correct widening.
 ///
-/// Returns `None` when the inputs are degenerate (mean outside `(0, 1)`,
-/// non-positive variance, non-finite), or when the requested variance reaches
-/// the Bernoulli ceiling `μ(1−μ)` (no Beta has that much spread for the given
-/// mean) — in which case the caller falls back to the symmetric edges.
+/// The Bernoulli ceiling `μ(1−μ)` and the shape `b` are read from `complement`,
+/// never from `1 − mu`: where the mean rounds to one, `1 − mu` is exactly zero
+/// while the complement is still a positive number, and the band lives on it
+/// (#3140). A predictive with no spread (`total_var = 0`) is the point mass at
+/// its mean, whose band is that point.
+///
+/// Returns `None` when the inputs are not the moments of a law on `[0, 1]`
+/// (negative or non-finite, or a variance at or past the Bernoulli ceiling
+/// `μ(1−μ)`, which no Beta reaches), or when the quantiles come out non-finite
+/// or mis-ordered.
 pub fn beta_moment_matched_interval(
     mu: f64,
+    complement: f64,
     total_var: f64,
     p_lo: f64,
     p_hi: f64,
 ) -> Option<(f64, f64)> {
-    if !(mu.is_finite() && mu > 0.0 && mu < 1.0 && total_var.is_finite() && total_var > 0.0) {
+    if !(mu.is_finite()
+        && mu >= 0.0
+        && complement.is_finite()
+        && complement >= 0.0
+        && total_var.is_finite()
+        && total_var >= 0.0)
+    {
         return None;
+    }
+    if total_var == 0.0 {
+        return Some((mu, mu));
     }
     // A Beta on (0,1) with mean μ can carry variance only up to the Bernoulli
     // limit μ(1−μ); at or beyond it no Beta exists, so the moment match fails.
-    let max_var = mu * (1.0 - mu);
+    let max_var = mu * complement;
     if total_var >= max_var {
         return None;
     }
     let precision = max_var / total_var - 1.0; // = a + b > 0
     let a = mu * precision;
-    let b = (1.0 - mu) * precision;
-    let q_lo = beta_quantile(p_lo, a, b);
-    let q_hi = beta_quantile(p_hi, a, b);
+    let b = complement * precision;
+    // A law whose mass sits nearer one is read through its mirror `1 − Y ~ Beta(b, a)`,
+    // whose mass sits near zero, where `beta_quantile`'s lower-tail series resolves a
+    // quantile to relative precision (#2528); one minus that quantile is then exact to
+    // the resolution of the support near one. Read directly, a shape `b` below the
+    // resolution of one is left to `inv_beta_reg`'s absolute tolerance.
+    let (q_lo, q_hi) = if complement < mu {
+        (
+            1.0 - beta_quantile(1.0 - p_lo, b, a),
+            1.0 - beta_quantile(1.0 - p_hi, b, a),
+        )
+    } else {
+        (beta_quantile(p_lo, a, b), beta_quantile(p_hi, a, b))
+    };
+    if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
+        Some((q_lo, q_hi))
+    } else {
+        None
+    }
+}
+
+/// Quantile of `IG(μ, λ)` at `p ∈ (0, 1)`: the CDF is continuous and strictly
+/// increasing on `(0, ∞)`, so a geometric bracket around the mean followed by
+/// geometric bisection converges to the adjacent-float pair that straddles `p`.
+fn inverse_gaussian_quantile(p: f64, mu: f64, lambda: f64) -> f64 {
+    if !(p > 0.0 && p < 1.0 && mu.is_finite() && mu > 0.0 && lambda.is_finite() && lambda > 0.0) {
+        return f64::NAN;
+    }
+    let mut lo = mu;
+    while inverse_gaussian_cdf(lo, mu, lambda) >= p {
+        lo *= 0.5;
+        if lo == 0.0 {
+            return 0.0;
+        }
+    }
+    let mut hi = mu;
+    while inverse_gaussian_cdf(hi, mu, lambda) < p {
+        hi *= 2.0;
+        if !hi.is_finite() {
+            return f64::INFINITY;
+        }
+    }
+    loop {
+        let mid = (lo * hi).sqrt();
+        if mid <= lo || mid >= hi {
+            return hi;
+        }
+        if inverse_gaussian_cdf(mid, mu, lambda) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+}
+
+/// Equal-tailed predictive interval for a strictly-positive response modelled
+/// as an inverse Gaussian whose first two moments match a point prediction:
+/// mean `mu` and total predictive variance `total_var` (estimation +
+/// observation noise). Moment matching fixes `λ = μ³/V`; when estimation
+/// uncertainty vanishes (`total_var → φμ³`) this is the exact conditional
+/// `IG(μ, 1/φ)`, and with nonzero estimation variance it widens inside the
+/// inverse-Gaussian family, keeping its right skew.
+///
+/// Returns `None` for degenerate inputs (non-positive or non-finite mean or
+/// variance) or a mis-ordered pair, in which case the caller keeps the
+/// symmetric edges.
+pub fn inverse_gaussian_moment_matched_interval(
+    mu: f64,
+    total_var: f64,
+    p_lo: f64,
+    p_hi: f64,
+) -> Option<(f64, f64)> {
+    if let Some(band) = zero_point_mass(mu, total_var) {
+        return Some(band);
+    }
+    if !(mu.is_finite() && mu > 0.0 && total_var.is_finite() && total_var > 0.0) {
+        return None;
+    }
+    let lambda = mu.powi(3) / total_var;
+    let q_lo = inverse_gaussian_quantile(p_lo, mu, lambda);
+    let q_hi = inverse_gaussian_quantile(p_hi, mu, lambda);
     if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
         Some((q_lo, q_hi))
     } else {
@@ -329,6 +439,9 @@ pub fn negative_binomial_moment_matched_interval(
     p_lo: f64,
     p_hi: f64,
 ) -> Option<(f64, f64)> {
+    if let Some(band) = zero_point_mass(mu, total_var) {
+        return Some(band);
+    }
     if !(mu.is_finite()
         && mu > 0.0
         && theta.is_finite()
@@ -447,6 +560,9 @@ pub fn poisson_moment_matched_interval(
     p_lo: f64,
     p_hi: f64,
 ) -> Option<(f64, f64)> {
+    if let Some(band) = zero_point_mass(mu, total_var) {
+        return Some(band);
+    }
     if !(mu.is_finite() && mu > 0.0 && total_var.is_finite() && total_var > 0.0) {
         return None;
     }
@@ -638,6 +754,9 @@ pub fn tweedie_moment_matched_interval(
     p_lo: f64,
     p_hi: f64,
 ) -> Option<(f64, f64)> {
+    if let Some(band) = zero_point_mass(mu, total_var) {
+        return Some(band);
+    }
     if !(mu.is_finite()
         && mu > 0.0
         && phi.is_finite()
@@ -905,6 +1024,39 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inverse_gaussian_quantile_inverts_the_cdf() {
+        // (p, μ, λ, scipy.stats.invgauss(μ/λ, scale=λ).ppf(p)).
+        let cases = [
+            (0.025, 1.0, 1.0, 0.149_804_321_724_041_93),
+            (0.975, 1.0, 1.0, 3.771_837_954_732_6),
+            (0.025, 2.0, 400.0, 1.737_184_562_740_362_1),
+            (0.975, 3.0, 0.5, 21.436_074_647_884_915),
+        ];
+        for (p, mu, lambda, reference) in cases {
+            let q = inverse_gaussian_quantile(p, mu, lambda);
+            assert!(
+                ((q - reference) / reference).abs() <= 1e-12,
+                "Q({p}; {mu}, {lambda}) = {q}, reference {reference}"
+            );
+        }
+        assert!(inverse_gaussian_quantile(0.0, 1.0, 1.0).is_nan());
+        assert!(inverse_gaussian_quantile(0.5, -1.0, 1.0).is_nan());
+    }
+
+    #[test]
+    fn inverse_gaussian_interval_is_the_conditional_law_at_zero_estimation_variance() {
+        // V = φμ³ is the conditional variance, so the moment-matched law is
+        // IG(μ, 1/φ) exactly: μ = 1, φ = 1 reproduces the λ = 1 quantiles.
+        let (lo, hi) = inverse_gaussian_moment_matched_interval(1.0, 1.0, 0.025, 0.975)
+            .expect("finite interval");
+        assert!((lo - 0.149_804_321_724_041_93).abs() <= 1e-12);
+        assert!((hi - 3.771_837_954_732_6).abs() <= 1e-12);
+        // Right skew: the upper edge sits further from the mean than the lower.
+        assert!(hi - 1.0 > 1.0 - lo);
+        assert!(inverse_gaussian_moment_matched_interval(1.0, 0.0, 0.025, 0.975).is_none());
+    }
 
     #[test]
     fn signed_log_sum_exp_propagates_positive_infinities() {
@@ -1326,7 +1478,7 @@ mod tests {
         let phi = 8.0_f64;
         let mu = 0.2_f64;
         let total_var = mu * (1.0 - mu) / (1.0 + phi); // SE(μ̂) = 0
-        let (lo, hi) = beta_moment_matched_interval(mu, total_var, 0.025, 0.975)
+        let (lo, hi) = beta_moment_matched_interval(mu, 1.0 - mu, total_var, 0.025, 0.975)
             .expect("non-degenerate moment-matched Beta interval");
         let analytic_lo = beta_quantile(0.025, mu * phi, (1.0 - mu) * phi);
         let analytic_hi = beta_quantile(0.975, mu * phi, (1.0 - mu) * phi);
@@ -1346,7 +1498,8 @@ mod tests {
         let total_var = mu * (1.0 - mu) / (1.0 + phi);
         let z = 1.959_963_984_540_054_f64;
         let (lo, hi) =
-            beta_moment_matched_interval(mu, total_var, normal_cdf(-z), normal_cdf(z)).unwrap();
+            beta_moment_matched_interval(mu, 1.0 - mu, total_var, normal_cdf(-z), normal_cdf(z))
+                .unwrap();
         assert!(
             0.0 < lo && lo < mu && mu < hi && hi < 1.0,
             "interval [{lo},{hi}] ∌ μ={mu}"
@@ -1366,17 +1519,23 @@ mod tests {
 
     #[test]
     fn beta_moment_matched_interval_rejects_degenerate_and_over_dispersed_inputs() {
-        // Mean outside (0,1), non-positive variance, non-finite => None.
-        assert!(beta_moment_matched_interval(0.0, 0.01, 0.025, 0.975).is_none());
-        assert!(beta_moment_matched_interval(1.0, 0.01, 0.025, 0.975).is_none());
-        assert!(beta_moment_matched_interval(-0.1, 0.01, 0.025, 0.975).is_none());
-        assert!(beta_moment_matched_interval(0.3, 0.0, 0.025, 0.975).is_none());
-        assert!(beta_moment_matched_interval(f64::NAN, 0.01, 0.025, 0.975).is_none());
+        // A spread at a mean on the boundary, a negative mean or variance, or a
+        // non-finite input is no law's moments => None.
+        assert!(beta_moment_matched_interval(0.0, 1.0, 0.01, 0.025, 0.975).is_none());
+        assert!(beta_moment_matched_interval(1.0, 0.0, 0.01, 0.025, 0.975).is_none());
+        assert!(beta_moment_matched_interval(-0.1, 1.1, 0.01, 0.025, 0.975).is_none());
+        assert!(beta_moment_matched_interval(0.3, 0.7, -0.01, 0.025, 0.975).is_none());
+        assert!(beta_moment_matched_interval(f64::NAN, 0.5, 0.01, 0.025, 0.975).is_none());
         // Variance at/over the Bernoulli ceiling μ(1−μ): no Beta matches => None.
-        assert!(beta_moment_matched_interval(0.5, 0.25, 0.025, 0.975).is_none());
-        assert!(beta_moment_matched_interval(0.5, 0.30, 0.025, 0.975).is_none());
+        assert!(beta_moment_matched_interval(0.5, 0.5, 0.25, 0.025, 0.975).is_none());
+        assert!(beta_moment_matched_interval(0.5, 0.5, 0.30, 0.025, 0.975).is_none());
+        // No spread: the point mass at the mean.
+        assert_eq!(
+            beta_moment_matched_interval(0.3, 0.7, 0.0, 0.025, 0.975),
+            Some((0.3, 0.3))
+        );
         // A well-conditioned case still returns Some.
-        assert!(beta_moment_matched_interval(0.4, 0.02, 0.025, 0.975).is_some());
+        assert!(beta_moment_matched_interval(0.4, 0.6, 0.02, 0.025, 0.975).is_some());
     }
 
     #[test]
@@ -1384,11 +1543,70 @@ mod tests {
         let phi = 8.0_f64;
         let mu = 0.3_f64;
         let obs_var = mu * (1.0 - mu) / (1.0 + phi);
-        let (lo0, hi0) = beta_moment_matched_interval(mu, obs_var, 0.025, 0.975).unwrap();
-        let (lo1, hi1) = beta_moment_matched_interval(mu, obs_var + 0.01, 0.025, 0.975).unwrap();
+        let (lo0, hi0) = beta_moment_matched_interval(mu, 1.0 - mu, obs_var, 0.025, 0.975).unwrap();
+        let (lo1, hi1) =
+            beta_moment_matched_interval(mu, 1.0 - mu, obs_var + 0.01, 0.025, 0.975).unwrap();
         assert!(
             lo1 < lo0 && hi1 > hi0,
             "estimation uncertainty must widen the band: [{lo0},{hi0}] -> [{lo1},{hi1}]"
+        );
+    }
+
+    /// #3140: a predictive mean that underflows to zero with no spread is the point
+    /// mass at zero, and a spread-free Beta predictive is the point mass at its mean,
+    /// so each moment match returns that point's exact band instead of none (the
+    /// caller used to fall back to a symmetric band and clamp it).
+    #[test]
+    fn a_spread_free_predictive_is_its_point_mass_3140() {
+        let zero = Some((0.0, 0.0));
+        assert_eq!(gamma_moment_matched_interval(0.0, 0.0, 0.025, 0.975), zero);
+        assert_eq!(
+            inverse_gaussian_moment_matched_interval(0.0, 0.0, 0.025, 0.975),
+            zero
+        );
+        assert_eq!(
+            poisson_moment_matched_interval(0.0, 0.0, 0.025, 0.975),
+            zero
+        );
+        assert_eq!(
+            negative_binomial_moment_matched_interval(0.0, 1.5, 0.0, 0.025, 0.975),
+            zero
+        );
+        assert_eq!(
+            tweedie_moment_matched_interval(0.0, 1.0, 1.5, 0.0, 0.025, 0.975),
+            zero
+        );
+        assert_eq!(
+            beta_moment_matched_interval(0.0, 1.0, 0.0, 0.025, 0.975),
+            zero
+        );
+        assert_eq!(
+            beta_moment_matched_interval(1.0, 0.0, 0.0, 0.025, 0.975),
+            Some((1.0, 1.0))
+        );
+        // A mean of zero that still carries spread is no law's moments on [0, ∞).
+        assert!(poisson_moment_matched_interval(0.0, 1e-3, 0.025, 0.975).is_none());
+    }
+
+    /// #3140: the Beta band reads its Bernoulli ceiling from the carried complement.
+    /// Near the upper edge `1 − mu` rounds to zero and no Beta has any spread there;
+    /// with the complement carried the band is the moment-matched Beta, inside `[0, 1]`.
+    #[test]
+    fn the_beta_band_lives_on_the_carried_complement_3140() {
+        let complement = 1.0e-20_f64;
+        let mu = 1.0 - complement;
+        assert_eq!(mu, 1.0, "fixture precondition: the mean rounds to one");
+        let phi = 8.0_f64;
+        let total_var = mu * complement / (1.0 + phi);
+        assert!(
+            beta_moment_matched_interval(mu, 1.0 - mu, total_var, 0.025, 0.975).is_none(),
+            "fixture precondition: the rounded complement leaves no Beta"
+        );
+        let (lo, hi) = beta_moment_matched_interval(mu, complement, total_var, 0.025, 0.975)
+            .expect("the carried complement admits the conditional Beta");
+        assert!(
+            (0.0..=1.0).contains(&lo) && (0.0..=1.0).contains(&hi) && lo <= hi,
+            "the band [{lo}, {hi}] lies in the support without a clamp"
         );
     }
 

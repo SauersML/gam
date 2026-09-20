@@ -107,7 +107,7 @@ def _fit(df: pd.DataFrame):
 def _predict_cif(model, pred_rows: pd.DataFrame):
     """Return (times, cif_by_cause) with cif_by_cause shape (n_causes, n_rows, n_times)."""
     pred = model.predict(pred_rows)
-    assert isinstance(pred, gamfit.CompetingRisksPrediction)
+    assert isinstance(pred, gamfit.results.CompetingRisksPrediction)
     times = np.asarray(pred.times, dtype=float)
     cif = np.asarray(pred.cif, dtype=float)
     overall = np.asarray(pred.overall_survival, dtype=float)

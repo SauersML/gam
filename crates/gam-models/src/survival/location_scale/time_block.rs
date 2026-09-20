@@ -203,37 +203,6 @@ pub(crate) fn lower_bound_constraints(
     LinearInequalityConstraints::from_per_coordinate_lower_bounds(lower_bounds)
 }
 
-pub(crate) fn append_linear_constraints(
-    first: Option<LinearInequalityConstraints>,
-    second: Option<LinearInequalityConstraints>,
-) -> Result<Option<LinearInequalityConstraints>, String> {
-    match (first, second) {
-        (None, None) => Ok(None),
-        (Some(constraints), None) | (None, Some(constraints)) => Ok(Some(constraints)),
-        (Some(lhs), Some(rhs)) => {
-            if lhs.a.ncols() != rhs.a.ncols() {
-                return Err(SurvivalLocationScaleError::DimensionMismatch {
-                    reason: format!(
-                        "time linear constraint width mismatch: left={}, right={}",
-                        lhs.a.ncols(),
-                        rhs.a.ncols()
-                    ),
-                }
-                .into());
-            }
-            let rows = lhs.a.nrows() + rhs.a.nrows();
-            let cols = lhs.a.ncols();
-            let mut a = Array2::<f64>::zeros((rows, cols));
-            let mut b = Array1::<f64>::zeros(rows);
-            a.slice_mut(s![..lhs.a.nrows(), ..]).assign(&lhs.a);
-            a.slice_mut(s![lhs.a.nrows().., ..]).assign(&rhs.a);
-            b.slice_mut(s![..lhs.b.len()]).assign(&lhs.b);
-            b.slice_mut(s![lhs.b.len()..]).assign(&rhs.b);
-            LinearInequalityConstraints::new(a, b).map(Some)
-        }
-    }
-}
-
 pub(crate) fn structural_time_coefficient_lower_bounds(
     design_value_entry: &DesignMatrix,
     design_value_exit: &DesignMatrix,
@@ -440,7 +409,7 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
         // float-scale entries from the upstream basis builder. We log
         // warn-level only in the surprising regime.
         if total_subtol_nonzeros > 0 {
-            log::warn!(
+            log::debug!(
                 "structural time coefficient bounds: no value-varying shape column on this candidate's time design ({} rows × {} cols, sub-tolerance derivative nonzero entries (0 < |v| ≤ {:.0e}): {}, max(|.|) of the columns carrying them: {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
                 nrows,
                 p,
@@ -515,7 +484,7 @@ pub(crate) fn structural_time_coefficient_lower_bounds_with_monotone_time_wiggle
 /// dim` and the `&beta + &corrections.row(i)` add panicked with
 /// `IncompatibleShape`). A length mismatch is a caller contract violation,
 /// so it is surfaced as a structured `Result::Err` that the marginal-slope /
-/// location-scale pipelines turn into a clean `GamError` instead of a panic
+/// location-scale pipelines turn into a clean `GamfitError` instead of a panic
 /// crossing the Rust/Python boundary.
 pub fn project_onto_linear_constraints(
     dim: usize,
@@ -760,8 +729,8 @@ pub(crate) fn validate_linear_constraints(
 }
 
 /// Orthonormal basis `z` (raw `p` × reduced `r`) of the penalty null space —
-/// the affine `{1, log t}` AFT baseline an I-spline 2nd-order difference penalty
-/// leaves unpenalized. The penalized (curvature) directions are exactly the
+/// the affine `{1, log t}` AFT baseline a rank-2-null-space I-spline time
+/// penalty leaves unpenalized. The penalized (curvature) directions are exactly the
 /// non-affine deviation the constant-scale data cannot identify, so the
 /// null-space columns are precisely the identifiable parametric subspace.
 ///
@@ -1030,8 +999,8 @@ pub(crate) fn unit_log_time_slope(
 
 /// Does the rank-1 reduced parametric-AFT regime apply (issue #892)?
 ///
-/// The real survival time penalty is a 1st-difference penalty, so its null space
-/// is DIMENSION 1: a single monotone log-t trend column `z` (p×1). When it does,
+/// The real survival time penalty (the I-spline value-space curvature Gram) has
+/// a null space of DIMENSION 1: a single monotone log-t trend column `z` (p×1). When it does,
 /// the time warp is REMOVED entirely (`h ≡ 0`) and the `log t` baseline is
 /// carried as a per-row σ-scaled LOCATION offset instead — `u = inv_sigma·(log t
 /// − η_t) = (log t − μ)/σ` — so the event Jacobian gains the `−log σ` term that
@@ -1198,7 +1167,8 @@ pub(crate) fn reduced_warp_logt_baseline_usable(
     design_exit: &Array2<f64>,
     log_time_exit: ndarray::ArrayView1<f64>,
 ) -> bool {
-    use gam_linalg::faer_ndarray::FaerCholesky;
+    use gam_linalg::faer_ndarray::FaerEigh;
+    use gam_linalg::roundoff::{accumulation_band, symmetric_spectrum_rounding_band};
     let n = design_exit.nrows();
     let r = z.ncols();
     if n == 0 || r == 0 || log_time_exit.len() != n {
@@ -1207,22 +1177,27 @@ pub(crate) fn reduced_warp_logt_baseline_usable(
     let g = design_exit.dot(z); // (n, r) warp images of the null directions
     let gtg = g.t().dot(&g); // (r, r)
     let gtl = g.t().dot(&log_time_exit); // (r,)
-    // Tiny Levenberg ridge so a rank-deficient G (some null directions producing
-    // a (near-)zero warp image) still yields a well-posed projection rather than
-    // a Cholesky failure that would spuriously reject the collapse.
-    let scale = gtg
-        .diag()
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-        .max(1.0);
-    let mut ridged = gtg;
-    for i in 0..r {
-        ridged[[i, i]] += 1e-10 * scale;
-    }
-    let Ok(chol) = ridged.cholesky(faer::Side::Lower) else {
+    // Minimum-norm least-squares coefficients `c = G⁺ log t`, read off the
+    // spectrum of GᵀG. A null direction whose warp image is not resolved from
+    // zero — its eigenvalue inside the eigensolver's band plus the band the
+    // length-`n` inner products left in each Gram entry, `γ_n·√(dᵢdⱼ)` — carries
+    // no information and drops out. That is the τ→0 limit a ridge `τ·I` only
+    // approximates, with no τ to choose (#3090).
+    let Ok((eigenvalues, eigenvectors)) = gtg.eigh(faer::Side::Lower) else {
         return false;
     };
-    let c = chol.solvevec(&gtl);
+    let spectrum: Vec<f64> = eigenvalues.iter().copied().collect();
+    let root_diagonal_sum: f64 = gtg.diag().iter().map(|d| d.abs().sqrt()).sum();
+    let band = symmetric_spectrum_rounding_band(&spectrum)
+        + accumulation_band(n, root_diagonal_sum * root_diagonal_sum);
+    let mut c = Array1::<f64>::zeros(r);
+    for (k, &lambda) in spectrum.iter().enumerate() {
+        if lambda <= band {
+            continue;
+        }
+        let q = eigenvectors.column(k);
+        c.scaled_add(q.dot(&gtl) / lambda, &q);
+    }
     if c.iter().any(|v| !v.is_finite()) {
         return false;
     }
@@ -1283,8 +1258,8 @@ pub(crate) fn prepare_identified_time_block(
         // and miscalibrates the absolute survival curve.
         //
         // RANK-1 case (the one that actually fires for real fits): the survival
-        // time penalty is a 1st-difference penalty, so its null space is
-        // DIMENSION 1 — a single monotone log-t trend column. Pin the warp SHAPE
+        // time penalty (the I-spline value-space curvature Gram) has a null space
+        // of DIMENSION 1 — a single monotone log-t trend column. Pin the warp SHAPE
         // to exactly `log t` (built straight from the event times, NOT the
         // I-spline's curved image of it) but keep its SCALE `θ` a single FREE
         // coefficient: `h(t) = θ · log t`. The standardized residual is
@@ -1320,7 +1295,7 @@ pub(crate) fn prepare_identified_time_block(
                 p,
             ));
         }
-        // RANK-2 case (2nd-difference penalty `{1, log t}`): kept for correctness
+        // RANK-2 case (a time penalty with null space `{1, log t}`): kept for correctness
         // where it occurs (golden unit test), though real fits use rank-1 above.
         if r == 2
             && z.nrows() == p
@@ -1513,14 +1488,18 @@ pub(crate) fn prepare_identified_time_block(
         "structural time block requires derivative offsets to encode the derivative guard and a non-negative derivative basis"
             .to_string()
     })?;
-    let coefficient_constraints = lower_bound_constraints(&coefficient_lower_bounds);
-    let derivative_constraints = time_derivative_guard_constraints(
-        &input.design_derivative_exit,
-        &input.derivative_offset_exit,
-        derivative_guard,
-    )?;
-    let linear_constraints =
-        append_linear_constraints(coefficient_constraints.clone(), derivative_constraints)?;
+    // The coordinate cone is this block's whole constraint set, declared once.
+    // Every training row's derivative guard `D_i β + o_i ≥ guard` already holds
+    // on it. The I-spline derivative design is non-negative entrywise (the
+    // builder zeroes round-off negatives and refuses the rest). Every column
+    // that carries it is bounded `β_k ≥ 0` above, and the offsets encode the
+    // guard, so on the cone `D_i β + o_i ≥ o_i ≥ guard`. Declaring those `n`
+    // rows as well wrote the same set with `p + n` rows (gam#3037). Where one
+    // bound (`o_i = guard` under the default linear baseline), the cone rows on
+    // `supp(D_i)` bound with it, so the active normals were dependent and LICQ
+    // failed at that vertex, and the constrained Laplace normalizer priced all
+    // `p + n` rows.
+    let linear_constraints = lower_bound_constraints(&coefficient_lower_bounds);
     let initial_beta = match (linear_constraints.as_ref(), input.initial_beta.as_ref()) {
         (Some(constraints), Some(beta0)) => {
             let mut clipped = beta0.clone();

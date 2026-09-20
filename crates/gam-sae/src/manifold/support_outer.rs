@@ -48,6 +48,7 @@
 use std::collections::BTreeMap;
 
 use gam_problem::{DeclaredHessianForm, Derivative, EstimationError, HessianValue, OuterEval};
+use gam_solve::estimate::outer_eval_capture::{RhoGradientParts, record_certificate_parts};
 use gam_solve::rho_optimizer::{
     OuterCapability, OuterCriterionCertificate, OuterEvalOrder, OuterObjective, OuterProblem,
     SeedOutcome,
@@ -266,6 +267,10 @@ struct SupportOuterEvaluation {
     /// Per-probe samples `[probe, group]` of the log-determinant half of `gradient`,
     /// present where the evaluation was asked to measure them on the rational route.
     probe_gradient_samples: Option<Array2<f64>>,
+    /// Each group's gradient split into the channels it is summed from, published
+    /// to the outer certificate so it charges each component its own rounding
+    /// and resolution (#2954).
+    gradient_parts: Vec<RhoGradientParts>,
 }
 
 #[derive(Clone)]
@@ -653,7 +658,7 @@ impl SaeSupportOuterObjective {
         // before #2576 it emitted nothing at all — six minutes of fourteen busy
         // cores between two log lines is what kept the cost invisible.
         if dense_reduced_schur_admitted {
-            log::info!(
+            log::debug!(
                 "support LAML evidence: border {}, row log|H_tt| = {:.6e}, dense exact log|S| = \
                  {:.6e} from one eigendecomposition, {:.1}s",
                 system.k,
@@ -663,7 +668,7 @@ impl SaeSupportOuterObjective {
             );
         } else {
             let metrics = bundle.evaluation_metrics();
-            log::info!(
+            log::debug!(
                 "support LAML evidence: border {}, row log|H_tt| = {:.6e}, surrogate log|S| = \
                  {:.6e}; {} total shifted-CG iterations, {} rational nodes, deflation rank {}, \
                  {:.1}s",
@@ -841,6 +846,7 @@ impl SaeSupportOuterObjective {
             )
             .map_err(outer_error)?;
         let mut gradient = Array1::<f64>::zeros(self.layout.group_keys.len());
+        let mut gradient_parts = Vec::with_capacity(gradient.len());
         for group in 0..gradient.len() {
             let derivative_matvec = |vector: ArrayView1<f64>| -> Array1<f64> {
                 self.schur_derivative_matvec(
@@ -885,10 +891,27 @@ impl SaeSupportOuterObjective {
                     }
                 }
             }
+            let rank = self.spectrum.rank_by_group[group];
             gradient[group] = 0.5
-                * (logdet_group_derivative - self.spectrum.rank_by_group[group] as f64
-                    + energy[group]
-                    - profile_response);
+                * (logdet_group_derivative - rank as f64 + energy[group] - profile_response);
+            // The same channels the REML engine publishes: the envelope penalty
+            // energy, the fixed-state `log|H|` derivative, the penalty
+            // pseudo-determinant's `rank`, and the profile response as the
+            // implicit correction folded in after them.
+            let lambda = rho[group].exp();
+            gradient_parts.push(RhoGradientParts {
+                index: group,
+                lambda,
+                block_quadratic: energy[group] / lambda,
+                rank,
+                dim: beta_dim,
+                fixed_beta: 0.5 * energy[group],
+                logdet_h: 0.5 * logdet_group_derivative,
+                frozen_logdet_h: 0.5 * logdet_group_derivative,
+                mode_response_logdet_h: 0.0,
+                logdet_s: -0.5 * rank as f64,
+                total: gradient[group],
+            });
         }
         if !cost.is_finite() || gradient.iter().any(|value| !value.is_finite()) {
             return Err(outer_error(
@@ -917,6 +940,7 @@ impl SaeSupportOuterObjective {
             logdet_nodes: logdet_derivative.evaluation_metrics().node_count,
             logdet_std_err: logdet_derivative.value_std_err(),
             probe_gradient_samples,
+            gradient_parts,
         })
     }
 
@@ -1023,6 +1047,7 @@ impl OuterObjective for SaeSupportOuterObjective {
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         let evaluation = self.evaluate_for_order(rho, OuterEvalOrder::ValueAndGradient)?;
+        record_certificate_parts(&evaluation.gradient_parts);
         Ok(OuterEval {
             cost: evaluation.cost,
             gradient: evaluation.gradient,
@@ -1040,6 +1065,7 @@ impl OuterObjective for SaeSupportOuterObjective {
         match order {
             OuterEvalOrder::Value => Ok(OuterEval::value_only(evaluation.cost, rho.len(), None)),
             OuterEvalOrder::ValueAndGradient | OuterEvalOrder::ValueGradientHessian => {
+                record_certificate_parts(&evaluation.gradient_parts);
                 Ok(OuterEval {
                     cost: evaluation.cost,
                     gradient: evaluation.gradient,
@@ -1121,16 +1147,13 @@ pub fn run_sae_support_outer(
     let spectrum = penalty_spectrum(&request.term, &layout).map_err(outer_error)?;
     let (rho_lower, rho_upper) =
         support_smoothing_domain(&request.term, &layout).map_err(outer_error)?;
-    // This Gaussian LAML criterion is a sum over response cells, not a
-    // unit-scale scalar.  Declare that natural scale to the shared outer
-    // engine so its projected-gradient stopping band has the same units as
-    // the score.  Without it BFGS used the bare absolute 1e-5 default even
-    // when the score-relative certificate at the same point was already
-    // decisive; on the small overcomplete Tier-2 witness that drove Strong
-    // Wolfe into sub-1e-8 rho probes whose predicted score change was below
-    // floating-point cancellation, with each probe paying for a full inner
-    // fixed point and rational evidence evaluation.
-    let objective_scale = request.target.len() as f64;
+    // #2954: the criterion's rows and the reduced Schur's border are the
+    // formation counts the certificate charges each gradient component's
+    // rounding at. Its resolution is each group's own O(rank) scale, which the
+    // parts `evaluate_uncached` publishes carry; the response-cell count scaled a
+    // band the gradient never had.
+    let n_cells = request.target.len();
+    let (_, beta_dim) = request.term.beta_layout().map_err(outer_error)?;
     let initial_term = request.term.clone();
     // The inner fixed point certifies to the resolution its own objective has, not to
     // a caller's number, so every driver of this engine gets the same derived value.
@@ -1162,7 +1185,7 @@ pub fn run_sae_support_outer(
         &rho_lower,
         &rho_upper,
         initial_rho,
-        objective_scale,
+        (n_cells, beta_dim),
         request.max_outer_iter,
     )?;
     let terminal = search.terminal;
@@ -1227,7 +1250,7 @@ fn run_support_outer_search(
     rho_lower: &Array1<f64>,
     rho_upper: &Array1<f64>,
     initial_rho: Array1<f64>,
-    objective_scale: f64,
+    (n_cells, beta_dim): (usize, usize),
     max_outer_iter: usize,
 ) -> Result<SupportOuterSearch, EstimationError> {
     let budget = max_outer_iter.max(1);
@@ -1240,7 +1263,7 @@ fn run_support_outer_search(
             .with_hessian(DeclaredHessianForm::Unavailable)
             .with_prefer_gradient_only(true)
             .with_disable_fixed_point(true)
-            .with_objective_scale(Some(objective_scale))
+            .with_problem_size(n_cells, beta_dim)
             .with_bounds(rho_lower.clone(), rho_upper.clone())
             .with_initial_rho(start)
             .with_max_iter(budget - iterations);
@@ -1318,7 +1341,7 @@ fn run_support_outer_search(
         let std_err_norm = unseen_std_err.dot(&unseen_std_err).sqrt();
         let seen_std_err_norm = seen_std_err.dot(&seen_std_err).sqrt();
         let band = certificate.stationarity.bound();
-        log::info!(
+        log::debug!(
             "support LAML certified point re-scored on {seen} unseen probes: |Pg| = \
              {gradient_norm:.6e}, standard error {std_err_norm:.6e}; certificate band \
              {band:.6e}, search-probe resolution {seen_std_err_norm:.6e} (plan {plans})"
@@ -1613,7 +1636,7 @@ pub fn fit_sae_support_sparse(
             outer.criterion.value(),
         );
     }
-    log::info!(
+    log::debug!(
         "support-sparse migration ledger: {} births, {} deaths, {} refusals, {} \
          principal-component reseeds",
         migration.n_births,
@@ -1671,7 +1694,7 @@ pub fn fit_sae_support_sparse_with_census(
         .unwrap_or(1);
     let linear_bulk_census = crate::tiered::linear_bulk_census(target, d_max, support_k);
     match &linear_bulk_census {
-        Ok(report) => log::info!(
+        Ok(report) => log::debug!(
             "support-sparse linear-bulk census: {} blocks of size {}, EV {:.6}, {} of {} \
              communities curve ({:.1} bits saved)",
             report.tier1.block_utilization.len(),
@@ -1681,7 +1704,7 @@ pub fn fit_sae_support_sparse_with_census(
             report.code_space.n_communities,
             report.code_space.dl_saved_bits,
         ),
-        Err(reason) => log::warn!("support-sparse linear-bulk census refused: {reason}"),
+        Err(reason) => log::debug!("support-sparse linear-bulk census refused: {reason}"),
     }
     Ok(SaeSupportSparseCensusedFit {
         fit,
@@ -2362,13 +2385,13 @@ mod tests {
             derived_tolerance(&mut objective);
             objective.random_state = seed;
             objective.in_core_budget_bytes = 0;
-            let scale = objective.target.len() as f64;
+            let size = (objective.target.len(), border);
             let search = match run_support_outer_search(
                 &mut objective,
                 &lower,
                 &upper,
                 initial.clone(),
-                scale,
+                size,
                 256,
             ) {
                 Ok(search) => search,

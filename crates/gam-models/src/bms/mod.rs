@@ -14,6 +14,7 @@ use crate::fit_orchestration::drivers::{
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint_typed,
     spatial_length_scale_term_indices,
 };
+use crate::inference::predict_io::FittedLatentScoreMap;
 use crate::marginal_slope_shared::{
     CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_optional_matrix,
     add_optional_vector, add_two_surface_psi_outer,
@@ -55,7 +56,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, s};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -195,6 +195,12 @@ pub struct BernoulliMarginalSlopeFitResult {
     /// prediction rebuilds `a(C)` from the (reproducible) marginal design and
     /// applies the identical map.
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
+    /// The latent score of each training row as the kernel consumed it: the raw
+    /// score through the fitted score map (the saved normalisation, then the
+    /// conditional calibration when one was minted). Under the conditional law
+    /// a saved model returns these same values at these rows through
+    /// `FittedModel::latent_conditional_residual` (gam#3016).
+    pub latent_score: Array1<f64>,
     /// The fitted residual repair geometry (gam#2924) when a residual block was
     /// supplied: column names, the pooled joint `(z, r)` covariance, the
     /// conditional model when the pairwise gate escalated, and the centring
@@ -808,7 +814,40 @@ pub enum LocalLawMixture {
     VanishingAtTruncation { floor: f64 },
 }
 
+/// How the flexible row algebra integrates a row over its latent law — the one
+/// property of a law that a row kernel has to implement (gam#3000). The CPU
+/// row lowering takes one branch per form, and a device kernel declares the
+/// forms it transcribes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LatentIntegral {
+    /// Closed-form moments of the standard normal density on each denested
+    /// cubic cell.
+    GaussianCellMoments,
+    /// A finite weighted sum over the law's grid nodes.
+    DiscreteGrid,
+}
+
+impl LatentIntegral {
+    /// The capability a kernel needs to compute a model of this form.
+    pub(crate) const fn capability(self) -> &'static str {
+        match self {
+            Self::GaussianCellMoments => "the Gaussian cell-moment latent integral",
+            Self::DiscreteGrid => "the discrete-grid latent integral of an empirical latent law",
+        }
+    }
+}
+
 impl LatentMeasureKind {
+    /// The form in which the row algebra integrates over this law.
+    pub(crate) fn integral(&self) -> LatentIntegral {
+        match self {
+            Self::StandardNormal => LatentIntegral::GaussianCellMoments,
+            Self::GlobalEmpirical { .. } | Self::LocalEmpirical { .. } => {
+                LatentIntegral::DiscreteGrid
+            }
+        }
+    }
+
     pub fn validate(&self, context: &str) -> Result<(), String> {
         match self {
             Self::StandardNormal => Ok(()),
@@ -1377,7 +1416,7 @@ impl LatentZRankIntCalibration {
         // Φ⁻¹(p); clip away from {0, 1} to keep the quantile finite.
         standard_normal_quantile(p).unwrap_or_else(|err| {
             let clipped = if p < 0.5 { -8.0 } else { 8.0 };
-            log::debug!(
+            log::trace!(
                 "standard_normal_quantile({p}) failed ({err}); clipping the latent score to {clipped}"
             );
             clipped
@@ -2464,12 +2503,14 @@ pub(crate) fn fit_conditional_latent_calibration(
         theta1_cov,
     };
 
-    // Sanity-check post-correction moments on the training sample.
-    let calibrated = calibration.apply(z.view(), a_block)?;
+    // Sanity-check post-correction moments on the training sample, whose
+    // calibrated score is the fitted score map's (gam#3016).
+    let calibrated = FittedLatentScoreMap::conditional_only(&calibration)
+        .calibrate(z.view(), Some(a_block))?;
     let post_mean = weighted_mean(
         calibrated
             .as_slice()
-            .expect("calibration.apply returns an owned standard-layout 1-D array"),
+            .expect("the fitted score map returns an owned standard-layout 1-D array"),
         weights.view(),
         total_weight,
     );
@@ -2612,7 +2653,7 @@ pub(crate) fn build_latent_measure_decision(
                         grid_size,
                         "estimated latent law",
                     )?;
-                    log::info!(
+                    log::debug!(
                         "[{context} latent-z] the conditional law of the score does not move on \
                          the marginal-index span ({}) and the score passes the standard-normal \
                          adequacy screen ({}); fitting the closed-form Gaussian law, to be \
@@ -2640,7 +2681,7 @@ pub(crate) fn build_latent_measure_decision(
                          evaluates only the closed form",
                         adequacy.ledger()
                     );
-                    log::warn!(
+                    log::debug!(
                         "[{context} latent-z] fitting the closed form uncertified: {missing} \
                          (gam#2926)"
                     );
@@ -2664,7 +2705,7 @@ pub(crate) fn build_latent_measure_decision(
                     grid_size,
                     "estimated latent law",
                 )?;
-                log::info!(
+                log::debug!(
                     "[{context} latent-z] the conditional law of the score does not move on the \
                      marginal-index span ({}) and the score fails the standard-normal adequacy \
                      check ({}); anchoring on its estimated law of {} nodes, the score on its own \
@@ -2688,7 +2729,7 @@ pub(crate) fn build_latent_measure_decision(
                      this configuration's row kernel evaluates only the closed form",
                     evidence.summary()
                 );
-                log::warn!(
+                log::debug!(
                     "[{context} latent-z] fitting the closed form uncertified: {missing} (gam#2926)"
                 );
                 return Ok(LatentMeasureDecision {
@@ -2713,8 +2754,10 @@ pub(crate) fn build_latent_measure_decision(
                 .to_string()
             })?;
             // The law moves, so it is chosen among nested arms by the moving-law
-            // certificate at the converged fit. The fit starts on the simplest arm
-            // that follows a moving mean and variance.
+            // certificate at the converged fit. The fit starts on the simplest
+            // admissible arm that follows a moving mean and variance: the
+            // location-scale Gaussian law only if its residual passes the adequacy
+            // screen.
             let a_block = conditioning.ok_or_else(|| {
                 format!(
                     "{context}: the conditional-law evidence moved without a marginal-index span \
@@ -2727,12 +2770,13 @@ pub(crate) fn build_latent_measure_decision(
                 a_block,
                 local,
                 grid_size,
+                policy,
                 evidence.clone(),
                 context,
             )
             .map_err(|error| error.to_string())?;
             let fitted = candidates.fitted_arm();
-            log::info!(
+            log::debug!(
                 "[{context} latent-z] the conditional law of the score moves on the \
                  marginal-index span ({}); fitting the {} law, to be certified against the \
                  other arms ({}) by their cross-fitted excess anchoring loss at the converged \
@@ -2790,7 +2834,7 @@ pub(crate) fn build_latent_measure_decision(
                 DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
                 "estimated latent law",
             )?;
-            log::warn!(
+            log::debug!(
                 "[{context} latent-z] the Gaussian latent law was declared, and the score fails \
                  the standard-normal adequacy screen (adequacy ledger, x = statistic / bound, \
                  x<=1 passed: {}); fitting the declared closed form, whose estimated excess \
@@ -2844,10 +2888,11 @@ pub(crate) fn build_latent_measure_decision(
                     // closed form: a two-point residual survives location-scale
                     // correction unchanged in shape, and only a declaration may
                     // make it Gaussian.
-                    let zeta = cal.apply(z.view(), a_block)?;
+                    let zeta = FittedLatentScoreMap::conditional_only(&cal)
+                        .calibrate(z.view(), Some(a_block))?;
                     let (kind, build) =
                         build_global_empirical_latent_measure(&zeta, weights, grid_size)?;
-                    log::info!(
+                    log::debug!(
                         "[{context} latent-z] declared conditional location-scale law: \
                          basis_ncols={} var_active={} post_mean={:.3e} post_sd={:.3e}; the \
                          residual is anchored on its empirical law (gam#2926)",
@@ -3288,7 +3333,6 @@ pub(crate) fn weighted_tail_mass(
 // Cross-module constants — declared here so all submodules can reach them
 // via `use super::*` without promoting implementation details to pub(crate).
 // ---------------------------------------------------------------------------
-pub(super) const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
 /// Upper bound (and large-`n` default) for rows-per-chunk in the parallel
 /// row-accumulation phases.
 ///
@@ -3602,6 +3646,8 @@ mod flex_verify_932_tests;
 // timing is eprintln-only per the SPEC ban on wall-clock correctness budgets.
 #[cfg(test)]
 mod flex_measure_932_tests;
+#[cfg(test)]
+mod third_trace_2998_tests;
 // gam#2768 unit gates on the shared latent-measure decision and the conditional
 // location-scale calibration it escalates to. Bare `#[cfg(test)] mod` with the
 // allowed `*_tests` name so the build.rs ban-scanner exempts it.
@@ -3615,6 +3661,10 @@ mod psi_axis_contractions_979_tests;
 // `#[cfg(test)] mod` with the allowed `*_tests` name.
 #[cfg(test)]
 mod multistart_member_2359_tests;
+// gam#3022: the rigid row kernel's per-row tensor tables. Bare
+// `#[cfg(test)] mod` with the allowed `*_tests` name.
+#[cfg(test)]
+mod rigid_row_tensors_3022_tests;
 pub(crate) mod row_primary_hessian;
 mod second_correction_traces;
 
@@ -3645,8 +3695,7 @@ pub(crate) use family::{
 pub(crate) use gradient_paths::MarginalSlopeCovarianceRef;
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub(crate) use gradient_paths::{
-    empirical_intercept_from_marginal, empirical_intercept_from_marginal_within,
-    empirical_intercept_tail_tolerance, signed_probit_neglog_derivatives_up_to_fourth,
+    empirical_intercept, signed_probit_neglog_derivatives_up_to_fourth,
     unary_derivatives_inverse_sqrt, unary_derivatives_log, unary_derivatives_log_normal_pdf,
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };

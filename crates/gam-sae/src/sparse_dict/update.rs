@@ -779,7 +779,7 @@ pub(super) fn run_seeded(
     // (log::warn survives the RUST_LOG=warn harnesses that drop log::info), so a
     // multi-hour host fit is never silent. Emitted at seed / initial-route /
     // per-epoch cadence only — never per row or per minibatch.
-    log::warn!(
+    log::debug!(
         "[SAE sparse_dict] seeded decoder N={n} P={p} K={k} s={s} \
          seed_s={:.1} (route + refresh follow)",
         fit_start.elapsed().as_secs_f64(),
@@ -851,7 +851,7 @@ fn run_from_decoder(
         config.score_mode,
         Some(&mut score_route_stats),
     )?;
-    log::warn!(
+    log::debug!(
         "[SAE sparse_dict] initial route done: minibatches={} device={} cpu={} \
          route_s={:.1} elapsed_s={:.1}",
         score_route_stats.minibatches,
@@ -1098,7 +1098,7 @@ fn run_from_decoder(
         // silent). A hang in the refresh or route is visible at round cadence,
         // and the CG certificate (giant component size, the a-priori κ bound,
         // any typed non-convergence) is on the same line.
-        log::warn!(
+        log::debug!(
             "[SAE epoch {}/{}] ev={:.6} improve={:.3e} ev_resid={:.3e} decoder_resid={:.3e} \
              routing_resid={:.3e} births={} revived={} live={}/{} \
              refresh_s={:.2} route_s={:.2} elapsed_s={:.1} \
@@ -1106,9 +1106,9 @@ fn run_from_decoder(
              precond_s={:.3} cg_solve_s={:.3} block_sweeps={} \
              precond_cost_ratio={:.3} recycling_admitted={} \
              mean_degree={:.1} giant_fraction={:.4} max_component={} \
-             max_component_nnz={} operator_build_s={:.3} \
-             cg_columns={} cg_iterations={} recycled_rank={} tile_columns={} \
-             device_cols={} \
+             max_component_nnz={} operator_build_s={:.3} dense_components={} \
+             cg_columns={} cg_iterations={} column_sweeps={} recycled_rank={} \
+             tile_columns={} device_cols={} \
              cg_nonconverged={} cg_kappa_bound={:?} cg_relative_residual={:.3e}",
             epochs_run,
             config.max_epochs,
@@ -1137,8 +1137,10 @@ fn run_from_decoder(
             decoder_solve_stats.max_component_size,
             decoder_solve_stats.cg_max_component_nnz,
             decoder_solve_stats.cg_operator_build_seconds,
+            decoder_solve_stats.dense_components,
             decoder_solve_stats.cg_columns,
             decoder_solve_stats.cg_iterations,
+            decoder_solve_stats.cg_column_sweeps,
             decoder_solve_stats.cg_recycled_rank,
             decoder_solve_stats.cg_min_tile_columns,
             decoder_solve_stats.device_refresh_columns,
@@ -1214,7 +1216,7 @@ fn run_from_decoder(
             let (candidate_loss, candidate_band) =
                 penalized_objective(x, candidate.view(), &candidate_codes, config.code_ridge);
             if candidate_loss + candidate_band < plain_loss - plain_band {
-                log::warn!(
+                log::debug!(
                     "[SAE epoch {epochs_run}] Aitken step adopted: penalized loss \
                      {plain_loss:.9e} -> {candidate_loss:.9e}"
                 );
@@ -1324,7 +1326,7 @@ fn continue_linear_fast_kernel(
     let p = x.ncols();
     let k = unified.n_atoms;
     let s = unified.active.min(k).max(1);
-    log::warn!(
+    log::debug!(
         "[SAE sparse_dict] continued prior decoder N={n} P={p} K={k} s={s} \
          (fresh route at rho={shared_rho:.6e} follows)"
     );
@@ -1653,7 +1655,7 @@ fn run_linear_reml_schedule_with_recycle(
         let log_change = (rho_new.ln() - rho.ln()).abs();
         // Per-iteration heartbeat on the warn channel (survives RUST_LOG=warn
         // harnesses), at outer-loop cadence only — never per row or minibatch.
-        log::warn!(
+        log::debug!(
             "[SAE reml-schedule iter {}] rho={:.6e} rho_new={:.6e} log_change={:.3e} \
              edof={:.2} rss={:.6e} penalty_energy={:.6e} tol={:.3e}",
             outer_iterations,
@@ -1863,7 +1865,7 @@ fn split_decoder_seed(
                 match super::single_atom::profiled_direction(residuals.view(), &local, direction) {
                     Ok(spread) => spread,
                     Err(reason) => {
-                        log::debug!("[SAE sparse_dict] atom {atom} is not split: {reason}");
+                        log::trace!("[SAE sparse_dict] atom {atom} is not split: {reason}");
                         return None;
                     }
                 };
@@ -2494,6 +2496,13 @@ pub(super) struct DecoderRecycleSpace {
     /// correction has to beat. The first refresh always supplies it: there is
     /// no history yet, so it necessarily runs at rank 0.
     jacobi_sweeps_per_column: Option<f64>,
+    /// Operator column-applications per decoder column that block CG actually
+    /// performed on the most recent refresh of this fit that ran CG
+    /// (`cg_column_sweeps / cg_columns`). It is the iteration-count input of
+    /// the dense-versus-CG cost route ([`decoder_component_route_is_dense`]);
+    /// `None` until a refresh has run CG, when the route uses the a-priori
+    /// Chebyshev/finite-termination bound instead.
+    cg_sweeps_per_column: Option<f64>,
     /// Whether the recycled correction is still admitted. See
     /// [`Self::score_refresh`].
     admitted: bool,
@@ -2507,7 +2516,17 @@ impl DecoderRecycleSpace {
             next_candidates: Vec::new(),
             next_capacity: 0,
             jacobi_sweeps_per_column: None,
+            cg_sweeps_per_column: None,
             admitted: true,
+        }
+    }
+
+    /// Record the CG work of the refresh that just finished as the route's
+    /// iteration prediction for the next one. A refresh that solved every
+    /// component densely carries no CG observation and leaves the previous one.
+    fn observe_cg_work(&mut self, column_sweeps: usize, columns: usize) {
+        if columns > 0 {
+            self.cg_sweeps_per_column = Some(column_sweeps as f64 / columns as f64);
         }
     }
 
@@ -2705,34 +2724,45 @@ fn decoder_solve_relative_tolerance() -> f64 {
     f64::EPSILON.sqrt()
 }
 
-/// Percolation-derived size ceiling for the exact dense-Cholesky path.
+/// Route one co-firing component to exact dense Cholesky or to matrix-free
+/// block CG by comparing the two solves' costs on THIS component.
 ///
-/// The co-firing graph is, at realistic scale, an Erdős–Rényi graph `G(K, p)`:
-/// each of the `N` rows lights `s` atoms, depositing `C(s,2)` co-firing edges,
-/// so the mean degree is `D = 2|E|/K ≈ N·s²/K`. Erdős–Rényi's theorem places the
-/// **giant-component birth exactly at mean degree `D = 1`**, and *at that
-/// critical point the largest component has size `Θ(K^{2/3})`*: strictly below
-/// criticality every component is smaller, and strictly above it anything of
-/// size `≫ K^{2/3}` has been swallowed by the single giant. `K^{2/3}` is thus
-/// the intrinsic size scale of the percolation transition — the frontier that
-/// separates the genuinely-small sub/critical debris (whose exact dense
-/// Cholesky costs at most `O((K^{2/3})³) = O(K²)`, i.e. never more than forming
-/// the ambient `K×K` normal equations themselves) from giant-scale blocks, where
-/// a per-component dense factorisation is fiction and matrix-free CG is the only
-/// honest solve. We therefore route components of size `≤ ⌈K^{2/3}⌉` to dense
-/// Cholesky and everything larger to CG. No tuned constant enters: the exponent
-/// `2/3` is the Erdős–Rényi critical-component exponent (`θ = 2/3`, a theorem,
-/// not a knob), and the threshold is that critical-window component scaling
-/// evaluated at the live `K` — it moves with the problem, so there is no magic
-/// block size to outgrow.
-pub(super) fn direct_solve_size_threshold(k: usize) -> usize {
-    if k == 0 {
-        return 0;
+/// For a component of `m` atoms with `nnz` stored couplings (both triangles)
+/// and `P` decoder columns:
+///
+/// - **Dense** factors `A_sub + ρI` once (`m³/3` flops) and back-solves all
+///   `P` columns from that factor (`2m²P`).
+/// - **Block CG** applies the restricted operator once per column per sweep,
+///   `2(m + nnz)` flops each, so `sweeps_per_column · P · 2(m + nnz)`. This
+///   counts operator applications only — the recurrence's vector updates, the
+///   inner products and any recycled correction come on top — so it is a LOWER
+///   bound on CG's work, and dense is chosen only when it beats CG's operator
+///   traffic alone.
+///
+/// The iteration count is the one unknown. `sweeps_per_column` is the work the
+/// previous refresh's CG actually performed per column (the operator drifts
+/// slowly between refreshes), or on a fit's first refresh the a-priori bound
+/// the CG solve itself would be budgeted by.
+///
+/// Dense is admissible only when its `m×m` factor fits the `K×P` envelope the
+/// refresh already holds as its right-hand side (`m² ≤ K·P`) — the same no-OOM
+/// scale contract that sizes the CG column tile. At the production shape
+/// (K ≈ 32 700, P = 2048) the giant component fails it, and CG is the only
+/// solve (#3124).
+pub(super) fn decoder_component_route_is_dense(
+    m: usize,
+    nnz: usize,
+    p: usize,
+    k_total: usize,
+    sweeps_per_column: f64,
+) -> bool {
+    if (m as u128) * (m as u128) > (k_total as u128) * (p as u128) {
+        return false;
     }
-    // ⌈K^{2/3}⌉: the critical-window largest-component scale. `ceil` keeps the
-    // smallest coupled blocks (a single co-firing edge, `K^{2/3} ≥ 1`) on the
-    // exact path where dense factorisation is unconditionally cheapest.
-    (k as f64).powf(2.0 / 3.0).ceil() as usize
+    let (m, p) = (m as f64, p as f64);
+    let dense_flops = m * m * m / 3.0 + 2.0 * m * m * p;
+    let cg_operator_flops = sweeps_per_column * p * 2.0 * (m + nnz as f64);
+    dense_flops <= cg_operator_flops
 }
 
 /// Solver/percolation certificate for one decoder MOD refresh.
@@ -2844,6 +2874,15 @@ pub struct DecoderSolveStats {
     /// top of that. This field is the exact number of `A·P` applications, which
     /// is what a traffic or flop model of the refresh has to be denominated in.
     pub cg_block_sweeps: usize,
+    /// Operator COLUMN applications the block recurrence performed: summed
+    /// over column tiles, the tile's maximum per-column iteration count times
+    /// its width. Every sweep applies the operator to all of a tile's columns,
+    /// converged or not, so this is the work the dense-versus-CG route prices
+    /// ([`decoder_component_route_is_dense`]).
+    pub cg_column_sweeps: usize,
+    /// Components solved exactly by dense Cholesky (the cost route chose dense
+    /// and the factorization succeeded).
+    pub dense_components: usize,
     /// Extra operator applications per sweep that the recycled correction adds,
     /// `2mr/(m+nnz)`, maximised over the CG-solved components of this refresh.
     ///
@@ -2882,6 +2921,8 @@ impl Default for DecoderSolveStats {
             cg_preconditioner_seconds: 0.0,
             cg_solve_seconds: 0.0,
             cg_block_sweeps: 0,
+            cg_column_sweeps: 0,
+            dense_components: 0,
             cg_preconditioner_cost_ratio: 0.0,
             cg_recycling_admitted: true,
         }
@@ -3020,7 +3061,7 @@ pub(super) fn solve_decoder_with_routability_gate_recycled(
             // debugger: `n < threshold` because the mean amplitude cannot yet
             // clear the `z_alpha * residual_scale` charge floor by the required
             // `margin` (see `routability_gate_decisions`).
-            log::debug!(
+            log::trace!(
                 "[SAE routability] atom {} deferred: firings={} mean_amplitude={:.4} \
                  z_alpha={:.4} margin={:.4} standard_error={:.4} threshold={:.4}",
                 decision.atom,
@@ -3209,11 +3250,6 @@ fn solve_decoder_recycled(
         ..DecoderSolveStats::default()
     };
 
-    // Exact dense Cholesky is confined to components below the percolation
-    // critical-component scale; everything larger is a giant-scale block solved
-    // matrix-free by CG (see `direct_solve_size_threshold`).
-    let direct_threshold = direct_solve_size_threshold(k);
-
     stats.graph_build_seconds = adjacency_seconds;
     // The BFS below is interleaved with the solves, so its cost is accumulated
     // per component rather than measured as one span.
@@ -3265,7 +3301,6 @@ fn solve_decoder_recycled(
             &comp,
             &neigh,
             p,
-            direct_threshold,
             gpu,
             &mut stats,
             recycle,
@@ -3278,14 +3313,15 @@ fn solve_decoder_recycled(
     // Percolation + conditioning certificate for this refresh. Surfacing the
     // giant-component fraction, mean degree, and the CG Lanczos κ̂ every epoch
     // makes the percolating-regime diagnosis (and any ill-conditioned block)
-    // readable without a debugger — the co-firing graph is one giant component
-    // at scale, so the exact-solve threshold `⌈K^{2/3}⌉` is expected to bind.
-    log::debug!(
+    // readable without a debugger. `dense_components` and `column_sweeps` are
+    // the two sides of the per-component cost route
+    // (`decoder_component_route_is_dense`).
+    log::trace!(
         "[SAE percolation] K={k} mean_degree={:.4} giant_fraction={:.4} \
          components={} max_component={} max_component_nnz={} operator_build_s={:.3} \
          graph_build_s={:.3} precond_s={:.3} cg_solve_s={:.3} block_sweeps={} \
          precond_cost_ratio={:.3} recycling_admitted={} \
-         direct_threshold={direct_threshold} \
+         dense_components={} column_sweeps={} \
          cg_columns={} cg_iterations={} recycled_rank={} tile_columns={} \
          cg_kappa_hat={:?} cg_kappa_bound={:?} \
          cg_nonconverged_columns={} cg_relative_residual={:.3e} cg_residual_stop={:.3e}",
@@ -3301,6 +3337,8 @@ fn solve_decoder_recycled(
         stats.cg_block_sweeps,
         stats.cg_preconditioner_cost_ratio,
         stats.cg_recycling_admitted,
+        stats.dense_components,
+        stats.cg_column_sweeps,
         stats.cg_columns,
         stats.cg_iterations,
         stats.cg_recycled_rank,
@@ -3311,6 +3349,7 @@ fn solve_decoder_recycled(
         stats.cg_relative_residual,
         stats.cg_residual_stop,
     );
+    recycle.observe_cg_work(stats.cg_column_sweeps, stats.cg_columns);
     recycle.score_refresh(
         stats.cg_block_sweeps,
         stats.cg_columns,
@@ -3475,10 +3514,10 @@ fn recycled_component_preconditioner(
     .map_err(|err| format!("decoder recycled coarse preconditioner failed: {err}"))
 }
 
-/// Solve one connected component's block: dense SPD Cholesky when the block is
-/// below the percolation critical-component scale (`direct_threshold`, see
-/// [`direct_solve_size_threshold`]), else matrix-free BLOCK CG over all `P`
-/// decoder columns at once. `comp` is the component's atom indices in
+/// Solve one connected component's block: dense SPD Cholesky when that is the
+/// cheaper exact solve for this component (see
+/// [`decoder_component_route_is_dense`]), else matrix-free BLOCK CG over all
+/// `P` decoder columns at once. `comp` is the component's atom indices in
 /// ascending order; `neigh` is the global sorted adjacency.
 ///
 /// # Why a block solve (#1017)
@@ -3501,7 +3540,6 @@ fn solve_component(
     comp: &[usize],
     neigh: &[Vec<(u32, f64)>],
     p: usize,
-    direct_threshold: usize,
     gpu: gam_gpu::GpuPolicy,
     stats: &mut DecoderSolveStats,
     recycle: &mut DecoderRecycleSpace,
@@ -3513,67 +3551,8 @@ fn solve_component(
         local.insert(a, i);
     }
 
-    if m <= direct_threshold {
-        // Assemble the dense block (A_sub + ρI) and the m×P right-hand side, then
-        // solve all P columns from one Cholesky factor.
-        let mut mat = Array2::<f64>::zeros((m, m));
-        let mut rhs = Array2::<f64>::zeros((m, p));
-        for (i, &a) in comp.iter().enumerate() {
-            mat[[i, i]] = eq.diag[a] + ridge;
-            for &(nb, val) in &neigh[a] {
-                if let Some(&j) = local.get(&(nb as usize)) {
-                    mat[[i, j]] = val;
-                }
-            }
-            for c in 0..p {
-                rhs[[i, c]] = eq.b[[a, c]];
-            }
-        }
-        if let Some(sol) = cholesky_solve_block(&mat, &rhs) {
-            for (i, &a) in comp.iter().enumerate() {
-                for c in 0..p {
-                    decoder[[a, c]] = sol[[i, c]] as f32;
-                }
-            }
-            return Ok(());
-        }
-        // Dense Cholesky is the small-component fast path, not the component's
-        // only solver. Returning `Ok(())` here used to leave the decoder block
-        // untouched while claiming that the refresh succeeded. Record the
-        // declined shortcut, then fall through to the matrix-free block-CG path
-        // below, which solves the same normal equations and carries its own
-        // convergence and residual certificate.
-        stats.dense_cholesky_declines += 1;
-    }
-
-    // Default coupled path: one matrix-free BLOCK CG over all live columns.
-    //
-    // CSR restricted to the component, in local (block-row) indices. A
-    // connected component is neighbor-closed, so every stored neighbor of a
-    // member is itself a member. The per-row entry order is the per-atom
-    // ascending-original-id order of `neigh` — and `local` is a monotone map
-    // (both `comp` and each adjacency list are ascending) — so the block
-    // operator's per-column summation order (diagonal first, then ascending
-    // neighbors) is EXACTLY the legacy per-column matvec's order.
-    let operator_build_start = Instant::now();
     let nnz: usize = comp.iter().map(|&a| neigh[a].len()).sum();
-    let mut row_ptr: Vec<u32> = Vec::with_capacity(m + 1);
-    let mut csr_cols: Vec<u32> = Vec::with_capacity(nnz);
-    let mut csr_vals: Vec<f64> = Vec::with_capacity(nnz);
-    row_ptr.push(0);
-    for &a in comp {
-        for &(nb, val) in &neigh[a] {
-            let j = *local
-                .get(&(nb as usize))
-                .expect("connected component must be neighbor-closed");
-            csr_cols.push(j as u32);
-            csr_vals.push(val);
-        }
-        row_ptr.push(csr_cols.len() as u32);
-    }
     let diag_ridge: Vec<f64> = comp.iter().map(|&a| eq.diag[a] + ridge).collect();
-    stats.cg_max_component_nnz = stats.cg_max_component_nnz.max(nnz);
-    stats.cg_operator_build_seconds += operator_build_start.elapsed().as_secs_f64();
     let residual_tolerance = decoder_solve_relative_tolerance();
 
     // A-priori spectral bounds of the symmetrically Jacobi-scaled operator
@@ -3605,7 +3584,6 @@ fn solve_component(
     // budget by, so the cap below falls back to the component dimension `m`.
     let lambda_min = lambda_min_bound.max(ridge_floor);
     let kappa_bound = (lambda_max_bound / lambda_min).max(1.0);
-    stats.record_kappa_bound(kappa_bound);
     let root = kappa_bound.sqrt();
     // ⌈½√κ·ln(2√κ/ε)⌉: CG's Chebyshev bound on the steps to reach relative 2-norm
     // residual ε. The √κ inside the log is the A-norm→2-norm
@@ -3625,6 +3603,77 @@ fn solve_component(
     } else {
         m.max(1)
     };
+
+    // The route's iteration input: the CG work the previous refresh actually
+    // performed per column, or on the first refresh the a-priori bound this
+    // solve would be budgeted by — the Chebyshev cap, or the Krylov dimension
+    // `m` at which CG terminates in exact arithmetic, whichever is smaller.
+    let predicted_sweeps_per_column = recycle
+        .cg_sweeps_per_column
+        .unwrap_or(jacobi_cap.min(m.max(1)) as f64);
+    let k_total = eq.diag.len();
+
+    if decoder_component_route_is_dense(m, nnz, p, k_total, predicted_sweeps_per_column) {
+        // Assemble the dense block (A_sub + ρI) and the m×P right-hand side, then
+        // solve all P columns from one Cholesky factor.
+        let mut mat = Array2::<f64>::zeros((m, m));
+        let mut rhs = Array2::<f64>::zeros((m, p));
+        for (i, &a) in comp.iter().enumerate() {
+            mat[[i, i]] = diag_ridge[i];
+            for &(nb, val) in &neigh[a] {
+                if let Some(&j) = local.get(&(nb as usize)) {
+                    mat[[i, j]] = val;
+                }
+            }
+            for c in 0..p {
+                rhs[[i, c]] = eq.b[[a, c]];
+            }
+        }
+        if let Some(sol) = cholesky_solve_block(&mat, &rhs) {
+            for (i, &a) in comp.iter().enumerate() {
+                for c in 0..p {
+                    decoder[[a, c]] = sol[[i, c]] as f32;
+                }
+            }
+            stats.dense_components += 1;
+            return Ok(());
+        }
+        // Dense Cholesky is the cheaper route here, not the component's
+        // only solver. Returning `Ok(())` here used to leave the decoder block
+        // untouched while claiming that the refresh succeeded. Record the
+        // declined shortcut, then fall through to the matrix-free block-CG path
+        // below, which solves the same normal equations and carries its own
+        // convergence and residual certificate.
+        stats.dense_cholesky_declines += 1;
+    }
+
+    // Default coupled path: one matrix-free BLOCK CG over all live columns.
+    //
+    // CSR restricted to the component, in local (block-row) indices. A
+    // connected component is neighbor-closed, so every stored neighbor of a
+    // member is itself a member. The per-row entry order is the per-atom
+    // ascending-original-id order of `neigh` — and `local` is a monotone map
+    // (both `comp` and each adjacency list are ascending) — so the block
+    // operator's per-column summation order (diagonal first, then ascending
+    // neighbors) is EXACTLY the legacy per-column matvec's order.
+    let operator_build_start = Instant::now();
+    let mut row_ptr: Vec<u32> = Vec::with_capacity(m + 1);
+    let mut csr_cols: Vec<u32> = Vec::with_capacity(nnz);
+    let mut csr_vals: Vec<f64> = Vec::with_capacity(nnz);
+    row_ptr.push(0);
+    for &a in comp {
+        for &(nb, val) in &neigh[a] {
+            let j = *local
+                .get(&(nb as usize))
+                .expect("connected component must be neighbor-closed");
+            csr_cols.push(j as u32);
+            csr_vals.push(val);
+        }
+        row_ptr.push(csr_cols.len() as u32);
+    }
+    stats.cg_max_component_nnz = stats.cg_max_component_nnz.max(nnz);
+    stats.cg_operator_build_seconds += operator_build_start.elapsed().as_secs_f64();
+    stats.record_kappa_bound(kappa_bound);
 
     // Split live columns from dead ones (an exactly zero right-hand side, whose
     // solution is zero). Dead columns are zeroed and never enter CG or the solve
@@ -3656,7 +3705,6 @@ fn solve_component(
         return Ok(());
     }
 
-    let k_total = eq.diag.len();
     // The correction is admitted only while it is still paying for itself on
     // this fit's own operator (see `DecoderRecycleSpace::score_refresh`).
     let rank_bound = if recycle.admitted() {
@@ -3762,11 +3810,13 @@ fn solve_component(
             cap,
         )?;
         stats.cg_solve_seconds += solve_start.elapsed().as_secs_f64();
-        stats.cg_block_sweeps += results
+        let tile_sweeps = results
             .iter()
             .map(|core| core.iterations)
             .max()
             .unwrap_or(0);
+        stats.cg_block_sweeps += tile_sweeps;
+        stats.cg_column_sweeps += tile_sweeps * t;
         if on_device {
             stats.device_refresh_columns += t;
         }
@@ -3828,7 +3878,7 @@ fn solve_component(
                 } else {
                     0.0
                 };
-                log::warn!(
+                log::debug!(
                     "[SAE CG] component size={m} did not converge: stop={:?} iters={} \
                      rel_residual={:.3e} residual_tolerance={:.3e} \
                      kappa_bound={:.3e} cap={cap}",
@@ -5073,26 +5123,89 @@ mod exact_solve_tests {
         );
     }
 
+    /// #3124 — the route is the cost comparison, not a size ceiling. The
+    /// K = 1024 rehearsal shape (one giant component, `nnz ≈ 354 810`,
+    /// P = 2048) prices dense at ≈ 4.65e9 flops, the operator work of ≈ 3.19
+    /// CG sweeps per column; CG measured 25-225 there, so dense must win both
+    /// a priori and from any of those observations, and lose only to a CG that
+    /// would need fewer sweeps than that. The production shape fails dense
+    /// admissibility (`m² > K·P`) whatever the sweep count.
     #[test]
-    fn direct_solve_threshold_tracks_percolation_scale_not_a_constant() {
-        use super::direct_solve_size_threshold;
-        // The exact-solve ceiling is the Erdős–Rényi critical-component scale
-        // ⌈K^{2/3}⌉ — it MUST move with K (no frozen magic block size), and it
-        // must sit strictly below K for any coupled dictionary so a single giant
-        // component is never dense-factorised.
-        assert_eq!(direct_solve_size_threshold(0), 0);
-        assert_eq!(direct_solve_size_threshold(1), 1);
-        for &k in &[8usize, 12, 64, 1024, 100_000] {
-            let tau = direct_solve_size_threshold(k);
-            let want = (k as f64).powf(2.0 / 3.0).ceil() as usize;
-            assert_eq!(tau, want, "threshold must equal ⌈K^{{2/3}}⌉ for K={k}");
-            assert!(
-                tau < k,
-                "a giant (size-K) component must exceed the dense threshold at K={k} (got {tau})"
-            );
+    fn decoder_route_prices_dense_against_cg_operator_work_3124() {
+        use super::decoder_component_route_is_dense as dense;
+        let (k, p, nnz) = (1024usize, 2048usize, 354_810usize);
+        assert!(dense(k, nnz, p, k, k as f64), "a-priori bound m");
+        for observed in [25.6, 106.0, 225.0] {
+            assert!(dense(k, nnz, p, k, observed), "observed {observed}/column");
         }
-        // It is genuinely a function of K, not a constant: the value grows with K.
-        assert!(direct_solve_size_threshold(100_000) > direct_solve_size_threshold(12));
+        let break_even = ((k as f64).powi(3) / 3.0 + 2.0 * (k * k * p) as f64)
+            / (p as f64 * 2.0 * (k + nnz) as f64);
+        assert!((break_even - 3.19).abs() < 0.01, "break-even {break_even}");
+        assert!(dense(k, nnz, p, k, break_even * (1.0 + 1e-12)));
+        assert!(!dense(k, nnz, p, k, break_even * (1.0 - 1e-12)));
+
+        let (k_prod, nnz_prod) = (32_672usize, 12_500_000usize);
+        assert!(
+            !dense(k_prod, nnz_prod, p, k_prod, 1.0e9),
+            "a production-scale giant block does not fit the K×P envelope"
+        );
+        // Admissibility is exactly `m² ≤ K·P`.
+        assert!(dense(64, 64 * 63, 64, 64, 1.0e9));
+        assert!(!dense(65, 65 * 64, 64, 65, 1.0e9));
+    }
+
+    /// #3124 — a component the cost route sends to dense is solved exactly with
+    /// no CG at all, and leaves the route's CG observation untouched; a
+    /// CG-routed refresh records its own column-sweeps per column as the next
+    /// refresh's prediction.
+    #[test]
+    fn cost_route_solves_dense_components_exactly_and_records_cg_work_3124() {
+        let k = 8usize;
+        let ridge = 1.0e-6f64;
+        let mut recycle = DecoderRecycleSpace::new(k);
+
+        // P = 4: m² = 64 > K·P = 32, so dense is inadmissible and CG runs.
+        let eq_cg = connected_tridiagonal_eq(k, 4);
+        let mut decoder = Array2::<f32>::zeros((k, 4));
+        let cg = solve_decoder_recycled(
+            &mut decoder,
+            &eq_cg,
+            ridge,
+            gam_gpu::GpuPolicy::Off,
+            &mut recycle,
+        )
+        .expect("CG refresh");
+        assert_eq!(cg.dense_components, 0);
+        assert_eq!(cg.cg_columns, 4);
+        assert!(cg.cg_column_sweeps >= cg.cg_block_sweeps);
+        let observed = cg.cg_column_sweeps as f64 / cg.cg_columns as f64;
+        assert_eq!(recycle.cg_sweeps_per_column, Some(observed));
+
+        // P = 16: admissible, and dense (≈ 2.2e3 flops) beats even the
+        // observed CG operator work.
+        let eq_dense = connected_tridiagonal_eq(k, 16);
+        assert!(super::decoder_component_route_is_dense(
+            k,
+            2 * (k - 1),
+            16,
+            k,
+            observed
+        ));
+        let mut decoder = Array2::<f32>::zeros((k, 16));
+        let dense = solve_decoder_recycled(
+            &mut decoder,
+            &eq_dense,
+            ridge,
+            gam_gpu::GpuPolicy::Off,
+            &mut recycle,
+        )
+        .expect("dense refresh");
+        assert_eq!(dense.dense_components, 1, "stats: {dense:?}");
+        assert_eq!(dense.cg_columns, 0, "stats: {dense:?}");
+        assert_eq!(dense.cg_column_sweeps, 0);
+        assert_eq!(recycle.cg_sweeps_per_column, Some(observed));
+        let rel = normal_eq_residual(&eq_dense, &decoder, ridge);
+        assert!(rel < 1.0e-6, "dense route must solve exactly, got {rel}");
     }
 
     #[test]
@@ -5284,9 +5397,11 @@ mod exact_solve_tests {
             firings: vec![1; k],
             amplitude_sum: vec![1.0; k],
         };
+        // With no CG history the route's prediction is min(Chebyshev cap, m)
+        // = m here (the singular block's κ bound is ~1e16).
         assert!(
-            k <= super::direct_solve_size_threshold(k),
-            "the pair must be small enough for the dense path"
+            super::decoder_component_route_is_dense(k, 2, p, k, k as f64),
+            "the pair must route to the dense path"
         );
         let mut decoder = Array2::<f32>::zeros((k, p));
         let stats = solve_decoder(&mut decoder, &eq, ridge, gam_gpu::GpuPolicy::Off)

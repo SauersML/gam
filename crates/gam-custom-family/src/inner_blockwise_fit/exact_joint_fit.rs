@@ -21,7 +21,7 @@ use super::*;
 /// the safe direction: this band can only fail to certify a stationary point,
 /// never certify a non-stationary one. It is not built from the penalty's
 /// entries — a band from `‖S‖` alone certified a residual of `0.15`.
-fn joint_stationarity_rounding_band(
+pub(super) fn joint_stationarity_rounding_band(
     s_lambdas: &[Array2<f64>],
     block_betas: &[&Array1<f64>],
     joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
@@ -43,7 +43,7 @@ fn joint_stationarity_rounding_band(
 /// Each local penalty product accumulates `p_k` terms; each full-width joint
 /// penalty accumulates `p` terms followed by strength scaling and summation
 /// across penalties. Both are charged on their absolute summand magnitudes.
-fn penalty_rounding_bands(
+pub(super) fn penalty_rounding_bands(
     s_lambdas: &[Array2<f64>],
     block_betas: &[&Array1<f64>],
     joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
@@ -88,7 +88,10 @@ fn penalty_rounding_bands(
 
 /// The data term of the stationarity rounding band per coefficient, where the
 /// workspace measures the row summands of its gradient: `γ_depth · Σ|products|ⱼ`
-/// (#2976). `None` when it measures none.
+/// (#2976), plus the error those summands inherit from their predictors where the
+/// workspace also measures that
+/// ([`ExactNewtonJointHessianWorkspace::joint_gradient_formation_bands`]). `None`
+/// when it measures no summands.
 fn measured_gradient_rounding_bands(
     workspace: Option<&Arc<dyn ExactNewtonJointHessianWorkspace>>,
     total_p: usize,
@@ -111,7 +114,26 @@ fn measured_gradient_rounding_bands(
         ));
     }
     let growth = gam_linalg::roundoff::accumulation_growth(accumulation.accumulation_depth);
-    Ok(Some(accumulation.absolute_sums.mapv(|sum| growth * sum)))
+    let mut bands = accumulation.absolute_sums.mapv(|sum| growth * sum);
+    // The terms' own error from the predictors they are evaluated at, which a
+    // high signal-to-noise residual term carries in excess of the sum's.
+    if let Some(formation) = workspace.joint_gradient_formation_bands()? {
+        if formation.len() != total_p {
+            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+                "joint Newton gradient formation bands have {} coordinates for {total_p} coefficients",
+                formation.len()
+            ) });
+        }
+        if !formation.iter().all(|value| value.is_finite() && *value >= 0.0) {
+            return Err(CustomFamilyError::trial_point(
+                "joint Newton gradient formation bands are not finite and non-negative at the \
+                 returned mode"
+                    .to_string(),
+            ));
+        }
+        bands += &formation;
+    }
+    Ok(Some(bands))
 }
 
 /// `data_bands` plus the penalty product's band per coefficient
@@ -198,9 +220,10 @@ pub(super) fn spectrum_decrement_resolution(
 /// meets the caller's target, a residual consistent with the arithmetic meets it,
 /// whatever the projection. The band enters per coordinate and never through a
 /// norm, which would let one coordinate settle on another's rounding. `bⱼ` is the
-/// data term `γ_depth · Σ|products|ⱼ` plus the penalty product's band
-/// ([`penalty_rounding_bands`]). It omits each row term's formation and the
-/// Jeffreys score's rounding, so it can only fail to settle a state.
+/// data term `γ_depth · Σ|products|ⱼ`, the error the row terms inherit from their
+/// predictors where the workspace measures it, and the penalty product's band
+/// ([`penalty_rounding_bands`]). It omits the rest of each row term's formation
+/// and the Jeffreys score's rounding, so it can only fail to settle a state.
 ///
 /// Only a returned-mode settlement reads it, where the Newton decrement is also at
 /// the objective's resolution; every residual-only exit keeps its residual. `None`
@@ -453,7 +476,7 @@ mod rounding_tests {
 fn clear_stall_evidence_collected_under_the_previous_model(
     best_residual_seen: &mut f64,
     cycles_since_residual_improved: &mut usize,
-    tr_clamped_during_stall: &mut bool,
+    tr_clamped_steps_during_stall: &mut usize,
     residual_descent_history: &mut std::collections::VecDeque<f64>,
     residual_rate_history: &mut std::collections::VecDeque<f64>,
     merit_window: &mut std::collections::VecDeque<f64>,
@@ -461,7 +484,7 @@ fn clear_stall_evidence_collected_under_the_previous_model(
 ) {
     *best_residual_seen = f64::INFINITY;
     *cycles_since_residual_improved = 0;
-    *tr_clamped_during_stall = false;
+    *tr_clamped_steps_during_stall = 0;
     residual_descent_history.clear();
     residual_rate_history.clear();
     merit_window.clear();
@@ -487,7 +510,7 @@ fn arm_jeffreys_completion_endgame(
     jeffreys_completion_endgame: &mut bool,
     best_residual_seen: &mut f64,
     cycles_since_residual_improved: &mut usize,
-    tr_clamped_during_stall: &mut bool,
+    tr_clamped_steps_during_stall: &mut usize,
     residual_descent_history: &mut std::collections::VecDeque<f64>,
     residual_rate_history: &mut std::collections::VecDeque<f64>,
     merit_window: &mut std::collections::VecDeque<f64>,
@@ -500,7 +523,7 @@ fn arm_jeffreys_completion_endgame(
     clear_stall_evidence_collected_under_the_previous_model(
         best_residual_seen,
         cycles_since_residual_improved,
-        tr_clamped_during_stall,
+        tr_clamped_steps_during_stall,
         residual_descent_history,
         residual_rate_history,
         merit_window,
@@ -520,7 +543,7 @@ mod jeffreys_endgame_arming_tests {
         let mut armed = false;
         let mut best_residual_seen = 1.499e1_f64;
         let mut cycles_since_residual_improved = 3_usize;
-        let mut tr_clamped_during_stall = true;
+        let mut tr_clamped_steps_during_stall = 3_usize;
         let mut residual_descent_history = std::collections::VecDeque::from(vec![1.499e1_f64, 1.904e1]);
         let mut residual_rate_history = std::collections::VecDeque::from(vec![1.499e1_f64]);
         let mut merit_window = std::collections::VecDeque::from(vec![5.603273e2_f64]);
@@ -530,7 +553,7 @@ mod jeffreys_endgame_arming_tests {
             &mut armed,
             &mut best_residual_seen,
             &mut cycles_since_residual_improved,
-            &mut tr_clamped_during_stall,
+            &mut tr_clamped_steps_during_stall,
             &mut residual_descent_history,
             &mut residual_rate_history,
             &mut merit_window,
@@ -539,7 +562,7 @@ mod jeffreys_endgame_arming_tests {
         assert!(armed);
         assert_eq!(best_residual_seen, f64::INFINITY);
         assert_eq!(cycles_since_residual_improved, 0);
-        assert!(!tr_clamped_during_stall);
+        assert_eq!(tr_clamped_steps_during_stall, 0);
         assert!(residual_descent_history.is_empty());
         assert!(residual_rate_history.is_empty());
         assert!(merit_window.is_empty());
@@ -547,13 +570,13 @@ mod jeffreys_endgame_arming_tests {
 
         best_residual_seen = 6.311e1;
         cycles_since_residual_improved = 29;
-        tr_clamped_during_stall = true;
+        tr_clamped_steps_during_stall = 3;
         merit_window.push_back(5.417023e2);
         arm_jeffreys_completion_endgame(
             &mut armed,
             &mut best_residual_seen,
             &mut cycles_since_residual_improved,
-            &mut tr_clamped_during_stall,
+            &mut tr_clamped_steps_during_stall,
             &mut residual_descent_history,
             &mut residual_rate_history,
             &mut merit_window,
@@ -562,7 +585,7 @@ mod jeffreys_endgame_arming_tests {
         assert!(armed);
         assert_eq!(best_residual_seen, 6.311e1);
         assert_eq!(cycles_since_residual_improved, 29);
-        assert!(tr_clamped_during_stall);
+        assert_eq!(tr_clamped_steps_during_stall, 3);
         assert_eq!(merit_window.len(), 1);
     }
 }
@@ -659,6 +682,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         options,
         mut states,
         s_lambdas,
+        penalty_roots,
         joint_bundle,
         mut lastobjective,
         mut converged,
@@ -869,16 +893,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
     // [`ObjectiveResolutionWitness`].
     let mut objective_resolution_witness = ObjectiveResolutionWitness::default();
     // The penalty's own ACCUMULATION, which is not its value (gam#2612's central
-    // observation, gam#2748's ceiling): `½β·(S_λβ)` with signed `S_ij` sums
-    // `½Σ|β_i S_ij β_j|` while returning something that can be many orders
-    // smaller. Each endpoint's magnitude comes from one explicit pass over its
-    // own `β` (gam#2959); this counts the summands that pass charges, every
-    // entry of each block `S_λ` and of each full-width penalty. `S_λ` is a
-    // function of ρ alone and ρ is fixed for this solve, so the count is too.
-    let penalty_entries = s_lambdas.iter().map(|s_lambda| s_lambda.len()).sum::<usize>()
-        + joint_bundle.map_or(0, |bundle| {
-            bundle.specs().iter().map(|spec| spec.matrix.len()).sum::<usize>()
-        });
+    // observation, gam#2748's ceiling). The penalty is formed on its structural
+    // roots (#2954, `BlockPenaltyRoots::value`), whose rounding is
+    // `γ_depth·magnitude` with a depth fixed by the roots' shapes: a function of
+    // ρ alone, and ρ is fixed for this solve, so the depth is too. Each
+    // endpoint's magnitude comes from its own `β`.
+    let penalty_entries = penalty_roots.accumulation_depth();
     let mut cycles_since_residual_improved: usize = 0;
     // Number of consecutive non-improving cycles after which the
     // conditioning-based self-vanishing Levenberg–Marquardt damping is
@@ -914,7 +934,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
     const RESIDUAL_DESCENT_WINDOW: usize = 3;
     let mut residual_descent_history: std::collections::VecDeque<f64> =
         std::collections::VecDeque::with_capacity(RESIDUAL_DESCENT_WINDOW);
-    let mut tr_clamped_during_stall: bool = false;
+    let mut tr_clamped_steps_during_stall: usize = 0;
     // Deterministic slow-geometric-rate stall guard (gam#979 survival
     // marginal-slope). The flat-residual guard below resets its no-improve
     // counter whenever the residual drops ≥10% versus the running best, and
@@ -1282,7 +1302,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     weakly_identified_decrement,
                     decrement_resolution,
                 } => {
-                    log::info!(
+                    log::debug!(
                         "[PIRLS/joint-Newton mode certificate] tentative constrained convergence revoked at cycle {cycle}: residual={tentative_residual:.3e}/{tentative_residual_target:.3e}, decrement={newton_decrement:.3e}, weak={weakly_identified_decrement:.3e} against resolution={:.3e}, weak resolution={:.3e}",
                         decrement_resolution.identified,
                         decrement_resolution.weakly_identified,
@@ -1292,7 +1312,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             &mut jeffreys_completion_endgame,
                             &mut best_residual_seen,
                             &mut cycles_since_residual_improved,
-                            &mut tr_clamped_during_stall,
+                            &mut tr_clamped_steps_during_stall,
                             &mut residual_descent_history,
                             &mut residual_rate_history,
                             &mut merit_window,
@@ -1353,16 +1373,11 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     cached_eval = eval;
                     cached_joint_workspace = workspace;
                     cached_joint_hessian_source = None;
-                    current_penalty = total_quadratic_penalty(
-                        &states,
-                        &s_lambdas,
-                        joint_bundle,
-                        Some(specs),
-                    );
+                    current_penalty = penalty_roots.value_of_states(&states).value;
                     lastobjective = -current_log_likelihood + current_penalty;
                     saddle_escapes_used += 1;
                     previous_escape_lambda_min = Some(lambda_min);
-                    log::info!(
+                    log::debug!(
                         "[PIRLS/joint-Newton saddle-escape] attempt={} lambda_min={:.6e} alpha={:.6e}",
                         saddle_escapes_used,
                         lambda_min,
@@ -1377,7 +1392,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     best_residual_seen = f64::INFINITY;
                     cycles_since_residual_improved = 0;
                     residual_descent_history.clear();
-                    tr_clamped_during_stall = false;
+                    tr_clamped_steps_during_stall = 0;
                     residual_rate_history.clear();
                     merit_window.clear();
                     prev_fully_rejected_cycle_signature = None;
@@ -1422,7 +1437,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         let hessian_scope_guard = gam_runtime::process_monitor::track_scope(format!(
             "joint Newton hessian_qp cycle={cycle} n={total_joint_n} p={total_p}"
         ));
-        log::info!(
+        log::debug!(
             "[joint-newton-tr] phase=hessian_qp cycle={} r={:.3e}",
             cycle,
             joint_trust_radius,
@@ -1518,7 +1533,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     returned_constrained_mode_pending = true;
                     continue 'joint_newton_cycles;
                 }
-                log::info!(
+                log::debug!(
                     "[PIRLS/joint-Newton convergence] cycle {cycle:>3} | mark declined: residual \
                      {marked_residual:.3e} above its target {marked_target:.3e}, which the \
                      settlement cannot accept (#2977)"
@@ -1526,7 +1541,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             }};
         }
         if cycle_log && cycle == 0 {
-            log::info!(
+            log::debug!(
                 "[STAGE] PIRLS/inner step=cycle0 block+joint constraints elapsed={:.3}s n={} p={}",
                 constraints_started.elapsed().as_secs_f64(),
                 total_joint_n,
@@ -1560,7 +1575,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     })?,
             };
             if cycle_log && cycle == 0 {
-                log::info!(
+                log::debug!(
                     "[STAGE] PIRLS/inner step=cycle0 hessian-workspace cached_hit={} elapsed={:.3}s n={} p={}",
                     cached_hit,
                     workspace_build_started.elapsed().as_secs_f64(),
@@ -1627,7 +1642,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else {
                 "operator"
             };
-            log::info!(
+            log::debug!(
                 "[STAGE] PIRLS/inner step=cycle{} hessian-source joint_workspace_requested={} source={} elapsed={:.3}s n={} p={}",
                 cycle,
                 joint_workspace_requested,
@@ -1711,7 +1726,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 joint_hessian_source_finite_check(&joint_hessian_source)?;
             }
             cycles_done = cycle + 1;
-            log::warn!(
+            log::debug!(
                 "[PIRLS/joint-Newton convergence] cycle {:>3} | non-finite-curvature guard (gam#1088): the joint Hessian source carries a non-finite entry, so the penalized Hessian H_pen = H + S(λ) and its spectrum (λ_max/λ_min/cond) are degenerate and the KKT certificate can never be issued; returning unconverged with finite β so the outer optimizer rejects this ρ evaluation instead of grinding to inner_max_cycles={}.",
                 cycle,
                 inner_max_cycles,
@@ -1756,17 +1771,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // and trial-value calls; the conditioning changes slowly across cycles
         // so re-estimating per cycle (one `O(p·k)` burst) is already cheap
         // against the work it guards.
-        let jeffreys_skippable_this_cycle: bool = if options.seed_screening {
-            // Seed screening only ranks seeds: skip the O(p · per-axis-Hdot)
-            // full Jeffreys gradient/curvature loop. The value-only Jeffreys
-            // term (folded into the objective baseline / trial penalties via
-            // `custom_family_joint_jeffreys_value`, gated independently on
-            // `joint_jeffreys_subspace.is_some()`) still bounds the screening
-            // score on separating directions; only the per-axis step curvature
-            // — the wrong cost class for ranking on a K-block coupled family —
-            // is dropped here (gam#729/#808).
-            true
-        } else if joint_jeffreys_subspace.is_some() {
+        let jeffreys_skippable_this_cycle: bool = if joint_jeffreys_subspace.is_some() {
             // EXPECTED-INFORMATION GUARD (gam#1020): the skippable
             // certificate probes the OBSERVED Hessian source; it only
             // transfers to the Jeffreys gate when the family's Jeffreys
@@ -1963,7 +1968,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .flat_map(|s| s.beta.iter())
                 .map(|v| v.abs())
                 .fold(0.0_f64, f64::max);
-            log::info!(
+            log::debug!(
                 "[979-PROBE] cyc={:>3} firth_armed={} skippable={} |gradPhi|inf={:.3e} kkt={:.3e} |beta|inf={:.3e} endgame={}",
                 cycle,
                 head_jeffreys_term.is_some(),
@@ -1977,7 +1982,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
 
         let solve_joint_constraints_dense = joint_constraints.is_some() || joint_hessian_is_dense;
         if cycle == 0 {
-            log::info!(
+            log::debug!(
                 "[JN-BRANCH-DIAG #1040] cycle=0 joint_constraints_is_some={} joint_pcg_attempt={:?} joint_hessian_is_dense={} solve_joint_constraints_dense={} -> branch={} total_p={} levenberg_on_ill_cond={}",
                 joint_constraints.is_some(),
                 joint_pcg_attempt,
@@ -2187,7 +2192,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             drop(spectrum_scope);
             let spectrum_elapsed = spectrum_started.elapsed();
             if spectrum_elapsed >= std::time::Duration::from_secs(1) {
-                log::warn!(
+                log::debug!(
                     "[gam#979 constrained-QP phase] cycle={cycle} phase=ambient-spectrum elapsed_s={:.3}",
                     spectrum_elapsed.as_secs_f64(),
                 );
@@ -2214,7 +2219,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 drop(reduced_face_scope);
                 let reduced_face_elapsed = reduced_face_started.elapsed();
                 if reduced_face_elapsed >= std::time::Duration::from_secs(1) {
-                    log::warn!(
+                    log::debug!(
                         "[gam#979 constrained-QP phase] cycle={cycle} phase=reduced-face elapsed_s={:.3} warm_rows={}",
                         reduced_face_elapsed.as_secs_f64(),
                         active_rows.len(),
@@ -2244,7 +2249,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 drop(convexification_scope);
                 let convexification_elapsed = convexification_started.elapsed();
                 if convexification_elapsed >= std::time::Duration::from_secs(1) {
-                    log::warn!(
+                    log::debug!(
                         "[gam#979 constrained-QP phase] cycle={cycle} phase=convexification elapsed_s={:.3}",
                         convexification_elapsed.as_secs_f64(),
                     );
@@ -2252,7 +2257,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 if cycle <= 2 {
                     let min_eval_raw = constrained_geometry.raw_min_eigenvalue;
                     let min_eval_refl = constrained_geometry.stabilized_min_eigenvalue;
-                    log::info!(
+                    log::debug!(
                         "[JN-REFLECT-DIAG #1040] cycle={cycle} CONSTRAINED_QP lambda_min_signed_raw={min_eval_raw:.3e} lambda_min_signed_reflected={min_eval_refl:.3e} nullity={} condition={:.3e} (reflection {})",
                         constrained_geometry.nullity,
                         constrained_geometry.condition,
@@ -2292,7 +2297,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             drop(metric_projection_scope);
             let metric_projection_elapsed = metric_projection_started.elapsed();
             if metric_projection_elapsed >= std::time::Duration::from_secs(1) {
-                log::warn!(
+                log::debug!(
                     "[gam#979 constrained-QP phase] cycle={cycle} phase=metric-projection elapsed_s={:.3}",
                     metric_projection_elapsed.as_secs_f64(),
                 );
@@ -2305,7 +2310,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // (near-separation). WARN reaches bounded workflow captures;
                     // cond/nullity/diagnosis come from `format_structured_log`
                     // at any refused exit.
-                    log::warn!(
+                    log::debug!(
                         "[gam#979 constrained-QP] cycle={} path={} warm_rows={} active_set_rows={} beta_inf={:.4e}",
                         cycle,
                         match reduced_face_kind {
@@ -2518,7 +2523,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             let mut delta = pcg_solution.map(|(solution, _)| solution);
             if pcg_requested {
                 // Which route produced this step, and how much of the attempt it used.
-                log::info!(
+                log::debug!(
                     "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} route={} cg_iterations={} attempt={:?} elapsed={:.3}s",
                     cycle,
                     total_joint_n,
@@ -2554,7 +2559,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 let m_dd_for_probe = if true_jeffreys_hessian_required
                     && !jeffreys_true_hessian_probe_logged
-                    && log::log_enabled!(log::Level::Info)
+                    && log::log_enabled!(log::Level::Debug)
                 {
                     let mut matrix = likelihood_hessian.clone();
                     add_joint_penalty_to_matrix(
@@ -2676,7 +2681,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &spectral_rhs,
                         &spectral_step.delta,
                     );
-                    log::info!(
+                    log::debug!(
                         "[979-TRUE-HESSIAN] cycle={cycle} completion_call={} \
                          eig(H_phi+completion)=[{component_min:.6e},{component_max:.6e}] \
                          eig(M_DD)=[{m_dd_min:.6e},{m_dd_max:.6e}] \
@@ -2741,7 +2746,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             if convex_step.reflected_negative_modes == 0
                                 && convex_step.delta.iter().all(|v| v.is_finite())
                             {
-                                log::info!(
+                                log::debug!(
                                     "[PIRLS/joint-Newton] cycle {cycle:>3} | gam#979 \
                                          Levenberg shift-to-PD seed: μ={mu:.3e}·D convexified \
                                          {} reflected mode(s) (λ_min={:.3e}) after {} stalled \
@@ -2758,7 +2763,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     }
                 }
                 if spectral_step.reflected_negative_modes > 0 {
-                    log::info!(
+                    log::debug!(
                         "[PIRLS/joint-Newton] cycle {cycle:>3} | indefinite inner \
                              Hessian: reflected {}/{} negative-curvature modes to |λ| \
                              (λ_min={:.3e}); proceeding with modified-Newton descent step \
@@ -2769,7 +2774,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     );
                 }
                 {
-                    log::info!(
+                    log::debug!(
                         "[979-DIAG] cycle {cycle:>3} spectral solve: nullity@{:.0e}={}/{} \
                          |P0 rhs|∞={:.3e} |P+ rhs|∞={:.3e} λ_min+={:.3e} λ_max={:.3e} reflected={}",
                         spectral_step.rank_tol,
@@ -2822,7 +2827,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         let hessian_and_qp_elapsed = hessian_started.elapsed();
         drop(hessian_scope_guard);
         let line_search_started = std::time::Instant::now();
-        log::info!(
+        log::debug!(
             "[joint-newton-tr] phase=line_search cycle={} r={:.3e} hessian_qp_elapsed={:.3}s",
             cycle,
             joint_trust_radius,
@@ -2854,13 +2859,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
         // What the incumbent's penalty accumulates, for the objective-resolution
         // ceiling (gam#2748, gam#2959).
-        let old_penalty_accumulation =
-            crate::blockwise_solve::total_quadratic_penalty_with_accumulation(
-                &old_beta,
-                &s_lambdas,
-                joint_bundle,
-            )
-            .1;
+        let old_penalty_accumulation = penalty_roots.value(&old_beta).magnitude;
         // Firth value Φ at the OLD (start-of-cycle) β, folded under the SAME
         // skippable gate the trial uses below — so `actual_reduction =
         // old_objective − trialobjective` compares two points on one objective
@@ -3004,7 +3003,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         };
         let residual_tol = (inner_tol * (1.0 + stationarity_scale)).max(stationarity_band);
         if stationarity_band > inner_tol * (1.0 + stationarity_scale) {
-            log::info!(
+            log::debug!(
                 "[PIRLS/joint-Newton] residual target raised to the residual's rounding band \
                  {stationarity_band:.3e} (caller's {:.3e}) at n={total_joint_n}",
                 inner_tol * (1.0 + stationarity_scale)
@@ -3100,7 +3099,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .iter()
                 .copied()
                 .fold(f64::NEG_INFINITY, f64::max);
-            log::info!(
+            log::debug!(
                 "[979-MODE-HESSIAN] eig(M_true_tangent_whitened)=[{returned_min:.6e},{returned_max:.6e}] numerical_floor={:.6e} tangent_dim={}",
                 returned_spectrum.numerical_floor,
                 total_p,
@@ -3169,7 +3168,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 decrement_resolution,
             );
             if has_resolvable_negative_curvature || !exact_first_order_certified {
-                log::info!(
+                log::debug!(
                     "[PIRLS/joint-Newton mode certificate] tentative convergence revoked: \
                      negative_curvature={has_resolvable_negative_curvature}, \
                      residual={current_stationarity_residual:.3e} (band-shrunk \
@@ -3187,7 +3186,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &mut jeffreys_completion_endgame,
                         &mut best_residual_seen,
                         &mut cycles_since_residual_improved,
-                        &mut tr_clamped_during_stall,
+                        &mut tr_clamped_steps_during_stall,
                         &mut residual_descent_history,
                         &mut residual_rate_history,
                         &mut merit_window,
@@ -3224,7 +3223,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 best_residual_seen = f64::INFINITY;
                 cycles_since_residual_improved = 0;
                 residual_descent_history.clear();
-                tr_clamped_during_stall = false;
+                tr_clamped_steps_during_stall = 0;
                 residual_rate_history.clear();
                 merit_window.clear();
                 prev_fully_rejected_cycle_signature = None;
@@ -3247,7 +3246,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     break;
                 }
             } else {
-                log::info!(
+                log::debug!(
                     "[PIRLS/joint-Newton mode certificate] certified: residual={current_stationarity_residual:.3e} (band-shrunk {settlement_residual:.3e})/{residual_tol:.3e}, decrement={returned_decrement:.3e}, weak={returned_weak_decrement:.3e}, null_score={returned_null_stationarity:.3e}, correction={step_inf:.3e}/{step_tol:.3e}"
                 );
                 certified_residual = settlement_residual;
@@ -3271,7 +3270,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             && step_inf <= step_tol
             && has_resolvable_negative_curvature
         {
-            log::info!(
+            log::debug!(
                 "[PIRLS/joint-Newton] cycle {cycle:>3} | first-order stationary strict saddle; refusing convergence and invoking the finite-radius negative-curvature hard case"
             );
         }
@@ -3816,7 +3815,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             let joint_feasibility_limit = match alpha_crush_outcome {
                 Ok(limit) => limit,
                 Err(alpha_crush_reason) => {
-                    log::info!(
+                    log::debug!(
                         "[PIRLS/joint-Newton feasibility] cycle {} attempt {} rejected at radius {:.6e} (qp_feasible_bypass={}): {}",
                         cycle,
                         trust_attempt,
@@ -3839,7 +3838,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .is_some_and(Option::is_some)
                     && joint_constraints.is_some();
                 if !face_is_projectable {
-                    log::info!(
+                    log::debug!(
                         "[PIRLS/joint-Newton feasibility] cycle {} attempt {} rejected at radius {:.6e}: \
                          block {:?} is blocked by an active face it does not represent as linear \
                          constraints, so no projection can restore the step",
@@ -3856,7 +3855,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     );
                     continue;
                 }
-                log::debug!(
+                log::trace!(
                     "[PIRLS/joint-Newton feasibility] cycle {} attempt {}: block {:?} is blocked by \
                      an active face; routing the step to the cone projection instead of scaling it \
                      to zero",
@@ -3920,7 +3919,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             // (gam#979). Without this an infeasible trial would
                             // reach the next cycle's `check_linear_feasibility`
                             // QP gate and hard-error.
-                            log::info!(
+                            log::debug!(
                                 "[PIRLS/joint-Newton feasibility] cycle {} attempt {} rejected at radius {:.6e}: cone projection found no feasible point",
                                 cycle,
                                 trust_attempt,
@@ -4018,7 +4017,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     if let Some(chord_gain) = chord_gain
                         && chord_gain > projected_gain.unwrap_or(f64::NEG_INFINITY)
                     {
-                        log::info!(
+                        log::debug!(
                             "[PIRLS/joint-Newton/TR cycle={} attempt={}] gam#2621 cone \
                              projection removed the trust step's descent: projected model gain \
                              {:?} vs feasible QP chord {:.3e} (chord α={:.3e}); taking the \
@@ -4263,12 +4262,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 states[b].beta.assign(&projected);
             }
             refresh_all_block_etas(family, specs, &mut states)?;
-            let mut trial_penalty = total_quadratic_penalty(
-                &states,
-                &s_lambdas,
-                joint_bundle,
-                Some(specs),
-            );
+            let mut trial_penalty = penalty_roots.value_of_states(&states).value;
             // Jeffreys objective contribution at the trial point keeps the
             // accept/reject objective consistent with the Jeffreys-modified
             // Newton step. `states` already holds the trial coefficients
@@ -4334,19 +4328,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // TWO decisions read it: the early exit below and the resolution
             // witness after the trial objective is known. The objective
             // magnitudes cover the likelihood accumulation; the penalty's is
-            // carried separately because it is precisely the term whose
-            // accumulation exceeds its value, and each endpoint is charged what
-            // its own `½βᵀS_λβ` summed; the log-determinant is not a sum at all
-            // and carries its own certified bound.
+            // carried separately, as each endpoint's own root-form accumulation
+            // (#2954, `BlockPenaltyRoots::value`); the log-determinant is not a sum
+            // at all and carries its own certified bound.
             let trial_betas: Vec<Array1<f64>> =
                 states.iter().map(|state| state.beta.clone()).collect();
-            let trial_penalty_accumulation =
-                crate::blockwise_solve::total_quadratic_penalty_with_accumulation(
-                    &trial_betas,
-                    &s_lambdas,
-                    joint_bundle,
-                )
-                .1;
+            let trial_penalty_accumulation = penalty_roots.value(&trial_betas).magnitude;
             // The trial's objective is not known yet, so the incumbent's stands in.
             let pre_trial_accumulation = ObjectiveAccumulation::between_endpoints(
                 total_joint_n,
@@ -4577,6 +4564,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 old_objective,
                 objective_tol,
                 measured_objective_resolution,
+                accumulation.roundoff_ceiling(),
                 current_stationarity_residual > residual_tol,
             );
             trust_ratio_witness.observe(step_norm, trust_update.rho, predicted_reduction);
@@ -4656,6 +4644,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             old_objective,
                             objective_tol,
                             measured_objective_resolution,
+                            accumulation.roundoff_ceiling(),
                             current_stationarity_residual > residual_tol,
                         );
                         if block_update.radius >= *block_radius
@@ -4711,7 +4700,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // `pred` there, so `prop_pred < pred` says the proposal and the
             // model it is judged on disagree about curvature along it; read
             // only when the line is printed.
-            let proposal_pred = if log::log_enabled!(log::Level::Info) {
+            let proposal_pred = if log::log_enabled!(log::Level::Debug) {
                 let mut proposal_hpen = Array1::<f64>::zeros(total_p);
                 let mut proposal_penalty_scratch = Array1::<f64>::zeros(total_p);
                 JointTrustRegionModel {
@@ -4752,14 +4741,14 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 Some(prev) => {
                     if tr_log_first == tr_log_last {
-                        log::info!(
+                        log::debug!(
                             "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
                             cycle,
                             tr_log_first,
                             prev,
                         );
                     } else {
-                        log::info!(
+                        log::debug!(
                             "[PIRLS/joint-Newton/TR cycle={} attempts={}..{} ×{}] {}",
                             cycle,
                             tr_log_first,
@@ -4781,14 +4770,14 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             if floor_reached {
                 if let Some(sig) = tr_log_sig.take() {
                     if tr_log_first == tr_log_last {
-                        log::info!(
+                        log::debug!(
                             "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
                             cycle,
                             tr_log_first,
                             sig,
                         );
                     } else {
-                        log::info!(
+                        log::debug!(
                             "[PIRLS/joint-Newton/TR cycle={} attempts={}..{} ×{}] {}",
                             cycle,
                             tr_log_first,
@@ -4816,14 +4805,14 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             if secondary_ok {
                 if let Some(sig) = tr_log_sig.take() {
                     if tr_log_first == tr_log_last {
-                        log::info!(
+                        log::debug!(
                             "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
                             cycle,
                             tr_log_first,
                             sig,
                         );
                     } else {
-                        log::info!(
+                        log::debug!(
                             "[PIRLS/joint-Newton/TR cycle={} attempts={}..{} ×{}] {}",
                             cycle,
                             tr_log_first,
@@ -4925,7 +4914,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         if let Some((claim, ceiling)) = objective_resolution_witness.refused()
             && claim > refused_resolution_before_this_ladder
         {
-            log::warn!(
+            log::debug!(
                 "[joint-newton objective-resolution gam#2748] cycle={cycle} REFUSED a \
                  resolution claim of {claim:.6e} against an arithmetic ceiling of \
                  {ceiling:.6e} (= gamma_m*sum|terms| over m={summands} summands): the ladder's \
@@ -4938,7 +4927,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             );
         }
         if objective_resolution_witness.measured() > resolution_before_this_ladder {
-            log::info!(
+            log::debug!(
                 "[joint-newton objective-resolution gam#2612] cycle={} MEASURED resolution={:.6e} \
                  (was {:.6e}); one evaluation of the inner objective carries this much rounding, \
                  so the {} shrink(s) this ladder took were decided on it and are undone: \
@@ -4960,14 +4949,14 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         }
         if let Some(sig) = tr_log_sig.take() {
             if tr_log_first == tr_log_last {
-                log::info!(
+                log::debug!(
                     "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
                     cycle,
                     tr_log_first,
                     sig,
                 );
             } else {
-                log::info!(
+                log::debug!(
                     "[PIRLS/joint-Newton/TR cycle={} attempts={}..{} ×{}] {}",
                     cycle,
                     tr_log_first,
@@ -4987,7 +4976,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // already collapsed via the attempt loop's shrink rules, so
             // the next cycle's Newton proposal will be evaluated under
             // a tighter L2 bound without any parallel adaptation here.
-            log::info!(
+            log::debug!(
                 "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} reject_feasibility={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
                 cycle,
                 hessian_and_qp_elapsed.as_secs_f64(),
@@ -5011,7 +5000,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // cycle spends its whole attempt budget and lands on the floor.
             if let Some(inconsistency) = trust_ratio_witness.model_inconsistency() {
                 trust_ratio_model_inconsistency = Some(inconsistency.clone());
-                log::info!(
+                log::debug!(
                     "[PIRLS/joint-Newton/model-consistency] cycle={} {}",
                     cycle,
                     inconsistency,
@@ -5187,7 +5176,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // decrement above tolerance is a genuinely reducible iterate.
                 // Both cases fall through to the refusal below, whose message
                 // carries `last_newton_math`; this line names the missing input.
-                log::debug!(
+                log::trace!(
                     "[PIRLS/joint-Newton convergence] cycle {cycle:>3} | #2485 stall-certificate \
                      spectrum={} decrement={stall_decrement:?} weak={stall_weak_decrement:?} \
                      null_score={stall_numerical_null_stationarity:?} \
@@ -5202,7 +5191,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &mut jeffreys_completion_endgame,
                         &mut best_residual_seen,
                         &mut cycles_since_residual_improved,
-                        &mut tr_clamped_during_stall,
+                        &mut tr_clamped_steps_during_stall,
                         &mut residual_descent_history,
                         &mut residual_rate_history,
                         &mut merit_window,
@@ -5222,7 +5211,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     resolution,
                     residual_tol,
                 ) {
-                    log::info!(
+                    log::debug!(
                         "[PIRLS/joint-Newton convergence] cycle {cycle:>3} | #2485 fully-rejected \
                          stall certified: radius={joint_trust_radius:.3e}, decrement={decrement:.3e}, \
                          weak={weak_decrement:.3e}, null_score={null_score:.3e}, \
@@ -5320,7 +5309,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .as_deref()
                     .map(|reason| format!(" MODEL-CONSISTENCY FAULT: {reason}."))
                     .unwrap_or_default();
-                log::warn!(
+                log::debug!(
                     "[PIRLS/joint-Newton convergence] cycle {:>3} | fully-rejected stall \
                      early-exit: every trust-region attempt rejected (by any of the model / \
                      likelihood / objective paths) — {} at joint trust radius {:.3e}.{} Reverted β \
@@ -5366,7 +5355,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         }
 
         let grad_reload_started = std::time::Instant::now();
-        log::info!(
+        log::debug!(
             "[joint-newton-tr] phase=gradient_reload cycle={} attempts={} r={:.3e}",
             cycle,
             line_search_attempts,
@@ -5399,7 +5388,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // four-phase split on every verbose cycle adds a redundant info
         // line. Rejected cycles still keep the detailed phase log since
         // the reject reason and per-phase split is the diagnostic.
-        log::debug!(
+        log::trace!(
             "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload={:.3}s total={:.3}s",
             cycle,
             hessian_and_qp_elapsed.as_secs_f64(),
@@ -5412,12 +5401,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         cached_joint_gradient = gradient;
         cached_eval = eval;
         cached_joint_workspace = workspace;
-        current_penalty = total_quadratic_penalty(
-            &states,
-            &s_lambdas,
-            joint_bundle,
-            Some(specs),
-        );
+        current_penalty = penalty_roots.value_of_states(&states).value;
         // `current_penalty` / `lastobjective` stay the pure quadratic-penalized
         // objective (NO Φ folded in) — the Firth value is applied per cycle at
         // each β (see `old_objective` above and `trialobjective` below). The
@@ -5538,12 +5522,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             best_residual_seen = f64::INFINITY;
             cycles_since_residual_improved = 0;
             residual_descent_history.clear();
-            tr_clamped_during_stall = false;
+            tr_clamped_steps_during_stall = 0;
             residual_rate_history.clear();
             merit_window.clear();
             geometric_tail_history.clear();
             last_kkt_refusal_report = None;
-            log::info!(
+            log::debug!(
                 "[PIRLS/joint-Newton active-face] cycle {} | accepted critical-cone transition; reset fixed-face convergence histories and require a fresh KKT certificate",
                 cycle,
             );
@@ -5657,7 +5641,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &mut jeffreys_completion_endgame,
                 &mut best_residual_seen,
                 &mut cycles_since_residual_improved,
-                &mut tr_clamped_during_stall,
+                &mut tr_clamped_steps_during_stall,
                 &mut residual_descent_history,
                 &mut residual_rate_history,
                 &mut merit_window,
@@ -5696,7 +5680,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         };
         // gam#1082 perf: a per-cycle #979 divergence-trace logging block
         // lived here and computed — EVERY inner cycle for the first 40
-        // cycles, purely to feed two `log::info!` lines — a FULL O((P·M)³)
+        // cycles, purely to feed two `log::debug!` lines — a FULL O((P·M)³)
         // eigendecomposition of the penalized-Hessian range, a
         // penalty-matrix min-eigenvalue, and per-penalty quadratic forms.
         // On any penalized family with a penalty null space (every
@@ -5768,7 +5752,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             })
             .collect::<Vec<_>>()
             .join(",");
-        log::info!(
+        log::debug!(
             "[PIRLS/joint-Newton convergence] cycle {:>3} | step_inf={:.3e} (tol={:.3e}) | accepted_step_inf={:.3e} | residual={:.3e} (tol={:.3e}) | relative_stationarity={:.3e} (scale={:.3e}, inner_tol={:.3e}) | per_block_resid=[{}] | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e} | per_block_beta_inf=[{}]",
             cycle,
             step_inf,
@@ -5791,7 +5775,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // above tol for `RESIDUAL_STALL_NO_IMPROVE_CYCLES` cycles), it
         // eigendecomposed the FULL P·M penalized Hessian (O((P·M)³)) plus an
         // O(p²) Rayleigh-quotient loop EVERY cycle thereafter, purely to feed
-        // one `log::info!`. The gate's whole point is "the solve is
+        // one `log::debug!`. The gate's whole point is "the solve is
         // grinding" — exactly the regime where it then fires on EVERY one of
         // the remaining (up to `inner_max_cycles`) cycles, turning a stall
         // into an O(p³)-per-cycle crawl (a dominant face of the #1082
@@ -5803,7 +5787,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // surfaces residual/step/per-block-residual for observability.
 
         if verbose_cycle || near_convergence {
-            log::info!(
+            log::debug!(
                 "[PIRLS/JN] cyc={:>3}/{} obj={:.6e} -loglik={:.6e} pen={:.3e} Δobj={:+.3e} |δ|∞={:.3e} accepted_|δ|∞={:.3e} resid={:.3e} (tol={:.3e}) rel_stat={:.3e} (scale={:.3e}) obj_tol={:.3e} step_tol={:.3e} |β|∞={:.3e} attempts={} t={:.3}s",
                 cycle,
                 inner_max_cycles,
@@ -5824,7 +5808,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 cycle_started.elapsed().as_secs_f64(),
             );
         } else {
-            log::info!(
+            log::debug!(
                 "[PIRLS/JN] cyc={:>3}/{} obj={:.6e} Δobj={:+.3e} |δ|∞={:.3e} resid={:.3e} attempts={} t={:.3}s",
                 cycle,
                 inner_max_cycles,
@@ -5852,7 +5836,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             || !lastobjective.is_finite()
             || !current_log_likelihood.is_finite()
         {
-            log::warn!(
+            log::debug!(
                 "[PIRLS/joint-Newton convergence] cycle {:>3} | divergence guard: non-finite inner state (residual={:.3e}, objective={:.3e}, -loglik={:.3e}); returning unconverged so the outer optimizer rejects this ρ evaluation instead of running to inner_max_cycles.",
                 cycle,
                 residual,
@@ -5996,7 +5980,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             && head_jeffreys_term.is_some()
             && head_jeffreys_completion.is_none()
         {
-            log::info!(
+            log::debug!(
                 "[PIRLS/joint-Newton model] cycle {cycle:>3} | the decrement certificate would \
                  fire on a step model that is not the objective's Hessian \
                  (residual={residual:.3e} against tol={residual_tol:.3e}, \
@@ -6007,7 +5991,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &mut jeffreys_completion_endgame,
                 &mut best_residual_seen,
                 &mut cycles_since_residual_improved,
-                &mut tr_clamped_during_stall,
+                &mut tr_clamped_steps_during_stall,
                 &mut residual_descent_history,
                 &mut residual_rate_history,
                 &mut merit_window,
@@ -6062,7 +6046,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .map(|spectrum| spectrum.null_residual_inf())
                 .unwrap_or(0.0);
             if excluded_null_residual > residual_tol {
-                log::warn!(
+                log::debug!(
                     "[PIRLS/joint-Newton convergence] cycle {cycle:>3} | Newton-decrement \
                      certificate fired with LARGE excluded near-null residual \
                      ={excluded_null_residual:.3e} (> tol={residual_tol:.3e}); the stopping \
@@ -6070,7 +6054,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                      penalty-null directions — flagged for joint-stationarity audit (#1082)."
                 );
             }
-            log::info!(
+            log::debug!(
                 "[PIRLS/joint-Newton convergence] cycle {} | decrement certificate: \
                  residual={:.3e}/{:.3e}, stalled_cycles={}, |Δobj|={:.3e}, \
                  decrement={:.3e}/{:.3e}, null_score={:.3e}/{:.3e}; \
@@ -6145,7 +6129,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
         }
         if objective_change <= objective_tol && residual <= residual_tol {
-            log::info!(
+            log::debug!(
                 "[PIRLS/joint-Newton convergence] cycle {:>3} | noise-floor KKT certificate: residual={:.3e} <= tol={:.3e}, |Δobjective|={:.3e} <= obj_tol={:.3e}",
                 cycle,
                 residual,
@@ -6262,7 +6246,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // the hard-case escape and re-certify curvature at the moved
                 // coefficient state.
                 if has_resolvable_negative_curvature {
-                    log::info!(
+                    log::debug!(
                         "[PIRLS/joint-Newton convergence] cycle {cycle:>3} |                              constrained-stationary plateau decision deferred: the exact                              pre-step spectrum has resolvable negative curvature, so the                              accepted hard-case escape must receive a fresh returned-mode                              curvature certificate next cycle"
                     );
                     continue;
@@ -6299,7 +6283,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     certificate_decision,
                     ConstrainedStationaryCertificate::Accept
                 ) {
-                    log::info!(
+                    log::debug!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained-stationary certificate: \
                          linear-solve neutralised {:.1}% of g (the remaining {:.1}% is a Lagrange multiplier \
                          of the active constraint set, not an unresolved gradient); \
@@ -6375,22 +6359,16 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // CTN order-0 power-9 fixture's fixed point at |Δobjective| = 3.382e-12
                 // against 2.445e-12 (gam#2959).
                 //
-                // The penalty half is what each endpoint's `½βᵀS_λβ` really summed,
-                // `½Σ|β_i S_ij β_j|` from one explicit pass, the same charge the trust
-                // loop's early exit and resolution witness read. The data half is
+                // The penalty half is each endpoint's root-form accumulation (#2954,
+                // `BlockPenaltyRoots::value`), the same charge the trust loop's early
+                // exit and resolution witness read. The data half is
                 // `|f_old| + |f_new|`: per-row log-likelihood terms can cancel, so it is
                 // at most `Σ|ℓ_i|` and the floor errs small, which only declines more.
                 // Where the floor is still loose, the step and exact-model arms carry
                 // the guarantee (`constrained_numerical_fixed_point_failures`).
                 let accepted_beta: Vec<Array1<f64>> =
                     states.iter().map(|state| state.beta.clone()).collect();
-                let accepted_penalty_accumulation =
-                    crate::blockwise_solve::total_quadratic_penalty_with_accumulation(
-                        &accepted_beta,
-                        &s_lambdas,
-                        joint_bundle,
-                    )
-                    .1;
+                let accepted_penalty_accumulation = penalty_roots.value(&accepted_beta).magnitude;
                 let objective_floor = ObjectiveAccumulation::between_endpoints(
                     total_joint_n,
                     penalty_entries,
@@ -6464,7 +6442,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .unwrap_or(None);
                     constrained_fixed_point_nullity = Some(hpen_nullity);
                     if hpen_nullity == Some(0) {
-                        log::info!(
+                        log::debug!(
                             "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained fixed-point certificate ({}): \
                              |Δobjective|={:.3e} ≤ objective_floor={:.3e} (objective change within its evaluations' rounding), accepted_step_inf={:.3e} (eps_floor={:.3e}, step_tol={:.3e}), \
                              scalar_relerr={:.3e}, linearized_rel={:.3e}; H_pen has no numerical null space so the \
@@ -6509,7 +6487,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // rather than refuse. The genuine plateau (flat/oscillating
                 // residual above tol) fails this test and refuses as before.
                 if residual_in_steady_geometric_descent(&residual_descent_history) {
-                    log::info!(
+                    log::debug!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | certificate declined but residual in steady geometric descent (history={:?}, residual={:.3e}, tol={:.3e}); continuing to convergence rather than refusing as a plateau",
                         cycle,
                         residual_descent_history,
@@ -6549,7 +6527,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 if residual_far_above_tol
                     && residual_descent_history.len() < RESIDUAL_DESCENT_WINDOW
                 {
-                    log::info!(
+                    log::debug!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained-stationary refusal DEFERRED: residual={:.3e} ≫ tol={:.3e} but only {} descent samples (< {} window) — too early to prove a multiplier/null plateau vs a high-curvature Firth-basin transient; continuing",
                         cycle,
                         residual,
@@ -6631,7 +6609,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .any(|maybe| maybe.as_ref().is_some_and(|rows| !rows.is_empty()));
                 let unconstrained_fit = !any_block_constrained && !any_active_set_rows;
                 if unconstrained_fit {
-                    log::info!(
+                    log::debug!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | unconstrained model-stationary certificate (gam#826/#808/#715): \
                          no active constraint (active_set_rows_total=0) so the residual={:.3e} cannot be a phantom multiplier; \
                          the iterate is a numerical fixed point (accepted_step_inf={:.3e}, |Δobjective|={:.3e}, scalar_relerr={:.3e}) \
@@ -6715,7 +6693,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         crate::joint_newton::constrained_fixed_point_verdict(&declining_conditions),
                     ..report
                 };
-                log::warn!(
+                log::debug!(
                     "{}",
                     report.format_structured_log(cert_residual_factor * residual_tol)
                 );
@@ -6781,11 +6759,11 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             if residual < RESIDUAL_STALL_IMPROVEMENT_FACTOR * best_residual_seen {
                 best_residual_seen = residual;
                 cycles_since_residual_improved = 0;
-                tr_clamped_during_stall = false;
+                tr_clamped_steps_during_stall = 0;
             } else {
                 cycles_since_residual_improved = cycles_since_residual_improved.saturating_add(1);
                 if last_accepted_hit_joint_trust_boundary {
-                    tr_clamped_during_stall = true;
+                    tr_clamped_steps_during_stall += 1;
                 }
             }
             // Trailing window of post-step residuals for the deterministic
@@ -6835,13 +6813,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             clear_stall_evidence_collected_under_the_previous_model(
                 &mut best_residual_seen,
                 &mut cycles_since_residual_improved,
-                &mut tr_clamped_during_stall,
+                &mut tr_clamped_steps_during_stall,
                 &mut residual_descent_history,
                 &mut residual_rate_history,
                 &mut merit_window,
                 &mut geometric_tail_history,
             );
-            log::info!(
+            log::debug!(
                 "[PIRLS/joint-Newton model] cycle {:>3} | the divided-difference Jeffreys \
                  surrogate cannot reach tol inside this solve's own remaining budget \
                  ({} cycle(s) of {inner_max_cycles}): residual={:.3e} (tol={:.3e}) at \
@@ -6934,7 +6912,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             });
         if cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
             && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
-            && tr_clamped_during_stall
+            && tr_clamped_steps_during_stall > 0
             && !residual_tol_reachable_within_cap
         {
             // gam#2612: a stall verdict taken on the divided-difference
@@ -6945,13 +6923,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 clear_stall_evidence_collected_under_the_previous_model(
                     &mut best_residual_seen,
                     &mut cycles_since_residual_improved,
-                    &mut tr_clamped_during_stall,
+                    &mut tr_clamped_steps_during_stall,
                     &mut residual_descent_history,
                     &mut residual_rate_history,
                     &mut merit_window,
                     &mut geometric_tail_history,
                 );
-                log::info!(
+                log::debug!(
                     "[PIRLS/joint-Newton model] cycle {:>3} | the residual-stall guard would \
                      concede on a step model that is not the objective's Hessian \
                      (jeffreys_completion_calls={}, residual={:.3e} against a completion band of \
@@ -6980,7 +6958,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     )
                 })
                 .unwrap_or_else(|| "last_newton_math=<none>".to_string());
-            log::warn!(
+            log::debug!(
                 "[PIRLS/joint-Newton convergence] cycle {:>3} | residual-stall early-exit: residual={:.3e} relative_stationarity={:.3e} (scale={:.3e}, inner_tol={:.3e}) best_seen={:.3e} no_improve_cycles={} accepted_step_inf={:.3e} trust_radius={:.3e} block_stationarity_inf={:?} {}; returning unconverged with finite β so the outer optimizer rejects this ρ evaluation before inner_max_cycles.",
                 cycle,
                 residual,
@@ -7058,6 +7036,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         residual_tol,
                         best_residual: best_residual_seen,
                         cycles_without_improvement: cycles_since_residual_improved,
+                        clipped_steps: tr_clamped_steps_during_stall,
                         accepted_step_inf,
                         trust_radius: joint_trust_radius,
                     },
@@ -7090,7 +7069,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 || (accepted_step_inf <= step_tol && objective_change <= objective_tol)
                 || superconverged_stationarity)
         {
-            log::info!(
+            log::debug!(
                 "[JN-EXIT] cycle={cycle} reason=strict_kkt residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
             );
             // This branch certifies on `residual ≤ residual_tol`; record it
@@ -7110,13 +7089,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
 
         // Flat-residual stall early-exit (gam#1040/#979/#370/#859).
         //
-        // The `tr_clamped_during_stall` residual-stall exit above only fires
+        // The `tr_clamped_steps_during_stall` residual-stall exit above only fires
         // when the accepted step kept hitting the trust-region boundary. A
         // distinct but equally terminal stall reaches neither it nor any
         // acceptance certificate: the KKT residual stops improving (no ≥10%
         // drop for the full `RESIDUAL_STALL_NO_IMPROVE_CYCLES` window) while
         // the accepted steps stay strictly INSIDE the trust region (so
-        // `tr_clamped_during_stall` never latches) and the objective keeps
+        // `tr_clamped_steps_during_stall` never counts one) and the objective keeps
         // drifting just above `objective_tol` (so the relative-objective
         // plateau exit's flat streak never completes). This is the measured
         // "[joint-newton-tr] cycles 1000+" wall on the binomial location-scale
@@ -7147,14 +7126,14 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             && (!merit_still_descending_over_window()
                 || cycles_since_residual_improved >= RESIDUAL_STALL_MERIT_VETO_MAX_CYCLES)
         {
-            log::warn!(
-                "[PIRLS/joint-Newton convergence] cycle {:>3} | flat-residual stall early-exit (gam#1040/#979): residual={:.3e} (tol={:.3e}) best_seen={:.3e} stalled {} cycles with steps inside the trust region (tr_clamped={}) and no acceptance certificate satisfied; the residual is neither trending toward KKT nor stationary on the identifiable subspace, so returning unconverged with finite β instead of grinding to inner_max_cycles={}.",
+            log::debug!(
+                "[PIRLS/joint-Newton convergence] cycle {:>3} | flat-residual stall early-exit (gam#1040/#979): residual={:.3e} (tol={:.3e}) best_seen={:.3e} stalled {} cycles with {} of them clipped by the trust region and no acceptance certificate satisfied; the residual is neither trending toward KKT nor stationary on the identifiable subspace, so returning unconverged with finite β instead of grinding to inner_max_cycles={}.",
                 cycle,
                 residual,
                 residual_tol,
                 best_residual_seen,
                 cycles_since_residual_improved,
-                tr_clamped_during_stall,
+                tr_clamped_steps_during_stall,
                 inner_max_cycles,
             );
             cycles_done = cycle + 1;
@@ -7254,13 +7233,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     clear_stall_evidence_collected_under_the_previous_model(
                         &mut best_residual_seen,
                         &mut cycles_since_residual_improved,
-                        &mut tr_clamped_during_stall,
+                        &mut tr_clamped_steps_during_stall,
                         &mut residual_descent_history,
                         &mut residual_rate_history,
                         &mut merit_window,
                         &mut geometric_tail_history,
                     );
-                    log::info!(
+                    log::debug!(
                         "[PIRLS/joint-Newton model] cycle {:>3} | the slow-geometric-rate \
                          projection would concede on a step model that is not the objective's \
                          Hessian (jeffreys_completion_calls={}, residual={:.3e} against a \
@@ -7277,7 +7256,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 let rate_per_cycle = (residual / oldest).powf(1.0 / (LINEAR_RATE_WINDOW as f64));
                 let contracting = rate_per_cycle < 1.0;
                 if contracting {
-                    log::warn!(
+                    log::debug!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | slow-geometric-rate stall early-exit (gam#979): residual={:.3e} (tol={:.3e}) contracting at ~{:.4}×/cycle over the last {} cycles — projected >{} more cycles to reach tol; returning unconverged with finite β instead of grinding to inner_max_cycles={}.",
                         cycle,
                         residual,
@@ -7288,7 +7267,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         inner_max_cycles,
                     );
                 } else {
-                    log::warn!(
+                    log::debug!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | non-contracting residual exit (#2902): residual={:.3e} (tol={:.3e}) did not contract over the last {} cycles (~{:.4}×/cycle); returning unconverged with finite β.",
                         cycle,
                         residual,
@@ -7409,7 +7388,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             certified_residual,
             certified_residual_tol,
         ) {
-            log::warn!(
+            log::debug!(
                 "[PIRLS/joint-Newton terminal] cycle {cycles_done}/{inner_max_cycles}: a converged \
                  exit is not backed by a certificate at its target (certified residual \
                  {certified_residual:.3e} against {certified_residual_tol:.3e}) — a \
@@ -7466,12 +7445,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             last_cycle_obj_change_below_tol,
             lastobjective,
         );
-        // A seed-screening solve that stops at its cap is expected (gam#2943).
-        if converged || options.seed_screening {
-            log::info!("{verdict}");
-        } else {
-            log::warn!("{verdict}");
-        }
+        log::debug!("{verdict}");
     }
 
     // If joint Newton converged, skip the blockwise loop entirely.
@@ -7485,12 +7459,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         let final_jeffreys_cache = jeffreys_triple_cache
             .as_ref()
             .filter(|(beta_key, _, _)| beta_cache_keys_match_bitwise(beta_key, &final_beta_key));
-        let penalty_value = total_quadratic_penalty(
-            &states,
-            &s_lambdas,
-            joint_bundle,
-            Some(specs),
-        );
+        let penalty_value = penalty_roots.value_of_states(&states).value;
         let active_constraints = {
             let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
             // The LAML logdet must project onto the tangent of the FULL
@@ -7734,16 +7703,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     )
                 })
                 .unwrap_or_else(|| "last_newton_math=<none>".to_string());
-            // A seed-screening solve stops at its deliberate cap: that is the
-            // expected end of a ranking probe, not a failure to report at warn
-            // (gam#2943).
-            let exhaustion_level = if options.seed_screening {
-                log::Level::Info
-            } else {
-                log::Level::Warn
-            };
-            log::log!(
-                exhaustion_level,
+            log::debug!(
                 "[PIRLS/joint-Newton] cycle={} budget-exhausted without KKT:objective_start={:.6e} objective_end={:.6e} objective_drop={:+.3e} beta_inf={:.3e} exit_unprojected_kkt_inf={:.3e} total_p={} total_n={} block_widths={:?} block_beta_inf={:?} block_grad_inf={:?} block_diag_hessian_default={} {}; rejecting this outer REML/LAML evaluation",
                 cycles_done,
                 initial_joint_objective,
@@ -7772,18 +7732,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // fit-able, so aborting the whole fit prevents the optimizer
                 // from ever leaving the valley.
                 let block_diag = exit_report.format_bubbled_error();
-                log::log!(
-                    exhaustion_level,
+                log::debug!(
                     "coupled exact-joint inner solve exhausted the joint Newton budget without KKT convergence after {cycles_done} cycle(s) — {block_diag}; returning a non-converged inner mode for outer-rho rejection"
                 );
             }
         }
-        let penalty_value = total_quadratic_penalty(
-            &states,
-            &s_lambdas,
-            joint_bundle,
-            Some(specs),
-        );
+        let penalty_value = penalty_roots.value_of_states(&states).value;
         let active_constraints = {
             let local_ranges = block_param_ranges(specs);
             let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
@@ -7871,15 +7825,10 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // current finite iterate with `converged=false` so the outer
         // optimizer can reject this rho and continue.
         let block_diag = exit_report.format_bubbled_error();
-        log::warn!(
+        log::debug!(
             "coupled exact-joint inner solve exited the joint Newton path before convergence — {block_diag}; returning a non-converged inner mode for outer-rho rejection"
         );
-        let penalty_value = total_quadratic_penalty(
-            &states,
-            &s_lambdas,
-            joint_bundle,
-            Some(specs),
-        );
+        let penalty_value = penalty_roots.value_of_states(&states).value;
         let active_constraints = {
             let local_ranges = block_param_ranges(specs);
             let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);

@@ -1,6 +1,6 @@
 # GPU Acceleration
 
-CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, `GpuRuntime::resolve(GpuPolicy::Auto)` lazily probes for a usable CUDA device and dispatches to it when present. Typed hardware absence (unsupported platform, no driver, or no device) selects CPU; a present-but-broken driver, missing runtime dependency, or initialization fault remains an error and never masquerades as absence. The policy decides whether a probe is permitted; the probe finds the hardware.
+CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, `GpuRuntime::resolve(GpuPolicy::Auto)` lazily probes for a usable CUDA device and dispatches to it when present. Typed absence (unsupported platform, no driver, no device, or a CUDA runtime library such as cuBLAS with no candidate on the host, which is where a CPU-only install lands on a driver-only GPU machine) selects CPU; a present-but-broken driver or runtime library, or an initialization fault, remains an error and never masquerades as absence. The policy decides whether a probe is permitted; the probe finds the hardware.
 
 The runtime policy is set through `crate::gpu::configure_global_policy`:
 
@@ -15,17 +15,27 @@ configure_global_policy(GpuPolicy::Auto);  // Auto (default) | Off | Required
 Python callers control this through a single `"gpu"` key in the `config` dict, whose value is one of `"auto"` (default), `"off"`, or `"required"`:
 
 ```python
-gamfit.fit(df, "y ~ s(x)", config={"gpu": "auto"})
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+
+gamfit.fit(df, "y ~ s(x)", config={"gpu": "auto"})   # CPU when no CUDA device is present
 ```
 
 Manifold-SAE fits own the policy per fit, including every nested arrow-Schur
 solve and evidence evaluation:
 
 ```python
+import numpy as np
+import gamfit
+
 rng = np.random.default_rng(0)
 angle = rng.uniform(0.0, 2.0 * np.pi, 200)
 X = np.column_stack([np.cos(angle), np.sin(angle)]) + 0.05 * rng.standard_normal((200, 2))
-gamfit.sae_manifold_fit(X, K=2, d_atom=1, gpu="off")
+gamfit.sae.sae_manifold_fit(X, K=2, d_atom=1, gpu="off")
 ```
 
 The fence's fit uses the default penalty-gated assignment, which takes the dense
@@ -49,12 +59,18 @@ import gamfit; CUDA probing happens lazily at runtime.
 `crates/gam-solve/src/gpu_kernels/arrow_schur.rs` owns the arrow-Schur latent-coordinate CUDA helpers. Dense Direct/SqrtBA solves use CUDA row-block Cholesky, Schur accumulation into the shared beta block, cuSOLVER for the reduced beta step, and row-local GPU back-substitution. Large matrix-free systems use the GPU Schur matvec hook instead of forming a dense shared beta factor.
 
 `crates/gam-models/src/bms/gpu/` owns the Bernoulli marginal-slope FLEX
-row-primary Hessian assembly. When
-`row_primary_hessian_decision(n, r).use_gpu` is true and the latent
-measure is standard-normal, the BMS row path packs per-row cell
-coefficient families, derivative moments, row scalars, and observed
-point terms into a structure-of-arrays bundle and launches the FLEX row
-kernel. The kernel runs one CUDA block per row, parallelises the per-cell
+row-primary Hessian assembly. The device row kernel declares what it
+computes, `BMS_FLEX_ROW_KERNEL_CAPABILITY`: the Gaussian cell-moment
+latent integral (the standard-normal law) with score-warp and
+link-deviation blocks of any width. A family's model is checked against
+that declaration before anything else, so an empirical latent law (global,
+local, or the conditional location-scale route that resolves to one) always
+takes the CPU row kernel under `gpu=auto`. Under `gpu=required` the fit is
+refused at entry, naming the missing capability. When
+`row_primary_hessian_decision(model, n).use_gpu` is true, the BMS row path
+packs per-row cell coefficient families, derivative moments, row scalars,
+and observed point terms into a structure-of-arrays bundle and launches
+the FLEX row kernel. The kernel runs one CUDA block per row, parallelises the per-cell
 moment contractions, finalises the implicit-function-theorem solve, and
 writes the symmetric row Hessian back to host-pinned storage.
 
@@ -78,9 +94,31 @@ evidence logdet also checks the same runtime switch before CPU
 eigendecomposition. Arrow-Schur selects dense CUDA helpers for dense
 Direct/SqrtBA solves and the GPU Schur matvec hook for large matrix-free
 PCG systems. The BMS marginal-slope FLEX row-Hessian path consults
-`row_primary_hessian_decision(n, r)`; any GPU error under `gpu=auto`
-returns to the existing CPU rayon row loop, while `gpu=required`
-propagates the error.
+`row_primary_hessian_decision(model, n)`, which selects the device kernel
+only for a model the kernel declares. Once the device kernel is selected,
+a GPU error propagates under every policy and is never retried on the CPU.
+The survival marginal-slope rigid row jet takes the same decision,
+`decide_row_kernel`: it declares the four-primary Gaussian frame, so a
+follow-up-varying slope or a declared latent law runs the CPU row program
+under `gpu=auto` and is refused at fit entry under `gpu=required`. Both
+decisions probe the device only when the answer depends on it; a model
+outside the declaration or `gpu=off` never creates a CUDA context.
+
+Under `gpu=auto`, the survival row jet and the Pólya-Gamma batch weigh
+their own two executors, measured on the workload in front of them
+(`crates/gam-gpu/src/row_kernel_race.rs`, gam#3024). They no longer borrow
+twice the `X'WX` Gram's measured crossover. The first `auto` call for a
+shape the process has not timed runs the CPU executor once and the device
+executor twice, timing the warm second call. The faster executor is
+recorded, and that call returns the CPU result. Later calls read the record:
+an exact point at the same row count, or each executor's `a + b·n` fitted
+through two or more timed row counts. A device whose per-row cost exceeds
+the CPU's is never selected at any size. The choice is a timing, so near a
+crossover two runs can pick different executors, and results can then
+differ at roundoff. `gpu="off"` and `gpu="required"` never race and are the
+deterministic choices. On a GPU host, the first admission of any size
+creates the CUDA context once per process. A host without libcuda resolves
+to absence before any cudarc call (#2972).
 
 ## Transfer And Precision Policy
 

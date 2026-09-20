@@ -358,6 +358,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
         linear_terms: vec![],
         smooth_terms: vec![],
         random_effect_terms: vec![],
+        level: Default::default(),
     });
 
     let model = FittedModel::from_payload(payload);
@@ -459,6 +460,7 @@ fn save_and_load_syncs_standard_sas_state_from_unified_fit_result() {
         linear_terms: vec![],
         smooth_terms: vec![],
         random_effect_terms: vec![],
+        level: Default::default(),
     });
 
     let model = FittedModel::from_payload(payload);
@@ -523,6 +525,7 @@ fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
         linear_terms: vec![],
         smooth_terms: vec![],
         random_effect_terms: vec![],
+        level: Default::default(),
     });
 
     let model = FittedModel::from_payload(payload);

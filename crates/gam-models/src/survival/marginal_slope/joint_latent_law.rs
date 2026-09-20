@@ -718,7 +718,7 @@ pub(crate) fn build_joint_latent_law(
         log_weights,
         ..runtime_shell
     };
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope latent-z] the row index is anchored on the joint law of K={k} \
          scores: {} nodes, {} transport (gam#2929)",
         runtime.node_count,
@@ -3203,6 +3203,7 @@ mod joint_latent_law_tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            flex_jet_arenas: new_flex_jet_arena_pool(),
         };
         let mut beta = Array1::<f64>::zeros(3 + 2 * k);
         beta[0] = 0.15;

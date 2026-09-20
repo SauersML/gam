@@ -88,6 +88,37 @@ pub fn fit_required_columns(
     Ok(required)
 }
 
+/// Expand the automatic `.` term of `formula` against `data`.
+///
+/// The columns `.` stands for are those no other part of the fit reads:
+/// [`fit_required_columns`] of the formula without `.`, under `config`, are
+/// reserved. The per-column rule is
+/// [`gam_terms::inference::automatic_formula::expand_automatic_formula`], the
+/// one implementation behind every front door. A formula without `.` comes
+/// back unchanged with no notes.
+pub fn expand_automatic_fit_formula(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<gam_terms::inference::automatic_formula::AutomaticFormula, WorkflowError> {
+    use gam_terms::inference::automatic_formula::{
+        AutomaticFormula, expand_automatic_formula, formula_has_automatic_term,
+        formula_without_automatic_term,
+    };
+    let invalid = |reason: String| WorkflowError::InvalidConfig { reason };
+    if !formula_has_automatic_term(formula)? {
+        return Ok(AutomaticFormula {
+            formula: formula.to_string(),
+            notes: Vec::new(),
+        });
+    }
+    let explicit = gam_terms::inference::formula_dsl::parse_formula(
+        &formula_without_automatic_term(formula)?,
+    )?;
+    let reserved = fit_required_columns(&explicit, config)?;
+    expand_automatic_formula(formula, data, &reserved).map_err(invalid)
+}
+
 pub(crate) fn resolve_continuous_column(
     data: &Dataset,
     col_map: &HashMap<String, usize>,
@@ -189,6 +220,27 @@ mod weight_row_index_tests {
              {neg_msg} vs {nan_msg}"
         );
     }
+
+    /// An all-zero weight vector leaves the likelihood without a data term, so
+    /// it is rejected at the column boundary; a single positive weight is a
+    /// valid (if tiny) fit and passes.
+    #[test]
+    fn all_zero_weights_are_rejected_at_the_column_boundary() {
+        let zeros = weight_dataset(&[0.0, 0.0, 0.0, 0.0]);
+        let reason = match resolve_fit_weight_column(&zeros, &zeros.column_map(), Some("w")) {
+            Err(WorkflowError::SchemaMismatch { reason }) => reason,
+            other => panic!("expected SchemaMismatch for all-zero weights, got {other:?}"),
+        };
+        assert!(
+            reason.contains("at least one non-zero weight"),
+            "all-zero rejection must say what is required: {reason}"
+        );
+
+        let one_positive = weight_dataset(&[0.0, 0.0, 2.5, 0.0]);
+        let weights = resolve_fit_weight_column(&one_positive, &one_positive.column_map(), Some("w"))
+            .expect("a single positive weight is a valid weight column");
+        assert_eq!(weights.to_vec(), vec![0.0, 0.0, 2.5, 0.0]);
+    }
 }
 
 pub fn resolve_offset_column(
@@ -222,6 +274,33 @@ pub fn resolve_weight_column(
                 ),
             });
         }
+    }
+    Ok(values)
+}
+
+/// Fit-time weight column: [`resolve_weight_column`] plus the requirement that
+/// the weights leave a data term to fit.
+pub fn resolve_fit_weight_column(
+    data: &Dataset,
+    col_map: &HashMap<String, usize>,
+    column_name: Option<&str>,
+) -> Result<Array1<f64>, WorkflowError> {
+    let values = resolve_weight_column(data, col_map, column_name)?;
+    let Some(column_name) = column_name else {
+        return Ok(values);
+    };
+    // Every row's likelihood contribution is scaled by its prior weight, so an
+    // all-zero weight vector leaves no data term at all: the fit would be the
+    // prior alone. Reject it here rather than let the REML outer search fail
+    // on an objective with no data in it.
+    if !values.iter().any(|value| *value > 0.0) {
+        return Err(WorkflowError::SchemaMismatch {
+            reason: format!(
+                "weights column '{column_name}' must contain at least one non-zero weight; \
+                 all {} weights are zero",
+                values.len()
+            ),
+        });
     }
     Ok(values)
 }

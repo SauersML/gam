@@ -42,7 +42,7 @@
 //!
 //! * **Formula → design integration** — `build_formula_design_for_multinomial`
 //!   parses the Wilkinson formula and assembles `X` and the per-term `S`
-//!   blocks; the `fit_multinomial_formula_pyfunc` FFI shim wires the Python
+//!   blocks; the `fit_table` FFI entry point wires the Python
 //!   `gamfit.fit(..., family='multinomial')` entry straight to this path.
 //!
 //! # Convergence
@@ -470,7 +470,7 @@ fn multinomial_formula_penalized_separation_evidence(
         crate::multinomial_reml::measured_penalty_nullspace(&reduced_penalty).map_err(|error| {
             format!("multinomial separation certificate could not measure ker(S_lambda): {error}")
         })?;
-    log::info!(
+    log::debug!(
         "multinomial separation certificate: {}/{} identifiable direction(s) are unreached by \
          any smoothing parameter (S_lambda v = 0)",
         unreached.ncols(),
@@ -498,7 +498,7 @@ fn multinomial_formula_penalized_separation_evidence(
     // estimand on the support of a smoothing device is the same category error
     // as choosing one on a cost cap.
     let (unreached_min, unreached_max) = plan.information_extrema();
-    log::info!(
+    log::debug!(
         "multinomial separation certificate: on the unreached subspace H+S_lambda lies in \
          [{unreached_min:e}, {unreached_max:e}], gate weight {:e}, under_identified={}, \
          singular={}",
@@ -619,7 +619,7 @@ fn multinomial_formula_penalized_separation_evidence(
                      subspace of H+S_lambda: {error}"
                 )
             })?;
-    log::info!(
+    log::debug!(
         "multinomial separation certificate: the armed term acts on {}/{} identifiable \
          direction(s) holding under one observation-equivalent of curvature in H+S_lambda at \
          the certified mode, of which {} are unreached by any smoothing parameter",
@@ -1706,7 +1706,7 @@ pub struct MultinomialSavedModel {
     /// truth-RMSE cost on interior data. A consumer scoring calibration, a
     /// reader comparing two fits, and the CLI summary all need to know which
     /// objective produced the numbers in front of them, and until #2612 the
-    /// decision existed only in a `log::info!` line the caller never sees.
+    /// decision existed only in a `log::debug!` line the caller never sees.
     ///
     /// The string is the certificate itself, not a flag: a verdict that carries
     /// the spectrum it was taken on can be checked, and one that carries only a
@@ -2988,7 +2988,7 @@ fn build_formula_design_for_multinomial(
     let y_col = resolve_role_col(&col_map, &parsed.response, "response")
         .map_err(|err| EstimationError::InvalidInput(format!("multinomial fit: {err}")))?;
     let y_kind = crate::fit_orchestration::response_column_kind(data, y_col);
-    let mut inference_notes: Vec<String> = Vec::new();
+    let mut inference_notes = crate::fit_orchestration::FitNotes::default();
     let spec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,
@@ -3514,32 +3514,6 @@ pub(crate) fn penalized_multinomial_formula_parts(
         // sample-count floor changes the statistical fit and is not a prior.
         rho_lower_bound: None,
         use_outer_hessian,
-        // #715 real-data arm ("canonical-gauge null direction rejects all REML
-        // seeds"): skip the multi-seed outer screening cascade and let the
-        // pinned `init_lambda` ρ flow straight to the outer optimizer.
-        //
-        // The multinomial family declares `levenberg_on_ill_conditioning() ->
-        // true`: near the simplex boundary (the near-separable penguins regime)
-        // the softmax Fisher weight `W = diag(p) − p pᵀ → 0`, so the joint
-        // information `H = JᵀWJ + S_λ` can become full-rank but
-        // ILL-CONDITIONED. The self-vanishing LM damping that keeps the inner
-        // joint-Newton from oscillating on those near-singular modes converges
-        // only GEOMETRICALLY. The default screening policy ranks candidate seeds
-        // with a 2-cycle inner cap (`outer_seed_config`); under geometric
-        // LM-damped descent two cycles never reach a finite, meaningful proxy
-        // objective, so EVERY capped seed can collapse to non-finite cost and
-        // the cascade escalates to ×4, ×16, then an UNCAPPED full inner solve
-        // PER SEED on the near-singular Hessian. That is the adapter-level face
-        // of "all REML startup seeds rejected" and the multi-minute timeout.
-        //
-        // The pinned seed is already principled here: `init_lambda` gives every
-        // (class, term) ρ a sensible moderate warm start, and the per-term
-        // effective-df-floor upper bounds (`effective_df_floor_rho_upper_bounds`,
-        // #715 arm (a)) keep any λ from collapsing the smooth onto its polynomial
-        // null space. So the outer ARC/BFGS optimizer performs the real REML ρ
-        // search from this seed; screening only adds the cascade cost and, on the
-        // near-separable arm, the rejection stall.
-        screen_initial_rho: false,
         // #1101: compute the joint Laplace posterior covariance `H⁻¹` (and the
         // influence matrix `F = H⁻¹ X'WX`) at the converged mode so the saved
         // model can surface delta-method per-class probability standard errors
@@ -3658,6 +3632,15 @@ fn multinomial_joint_penalty_operator(
 pub fn fit_penalized_multinomial_formula(
     request: &MultinomialFitRequest<'_>,
 ) -> Result<MultinomialSavedModel, EstimationError> {
+    if let std::borrow::Cow::Owned(kept) =
+        crate::fit_orchestration::drop_zero_weight_rows(request.data, request.config)
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?
+    {
+        return fit_penalized_multinomial_formula(&MultinomialFitRequest {
+            data: &kept,
+            ..*request
+        });
+    }
     let PenalizedMultinomialFormulaParts {
         family,
         blocks,
@@ -3791,7 +3774,7 @@ pub fn fit_penalized_multinomial_formula(
                         firth_family.with_joint_initial_log_lambdas(log_lambdas.to_vec());
                 }
             }
-            log::info!(
+            log::debug!(
                 "multinomial REML: arming the Jeffreys/Firth proper prior — separation evidence: \
              {evidence}"
             );
@@ -3870,7 +3853,7 @@ pub fn fit_penalized_multinomial_formula(
                 None => {
                     // Fit existence proves both optimization layers certified; no
                     // post-hoc convergence flag is needed.
-                    log::info!(
+                    log::debug!(
                         "multinomial REML: unbiased criterion accepted (no separation evidence; \
                          Jeffreys/Firth prior disarmed)"
                     );

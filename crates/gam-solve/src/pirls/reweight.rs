@@ -172,27 +172,34 @@ pub(super) fn exact_newton_decrement_sq(
 /// gets the relaxed `ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL`; a
 /// non-degenerate face is held to a strict band (`10 · kkt_tolerance`, the same
 /// near-stationary band `near_stationary_kkt` uses). Stationarity is checked
-/// scale-invariantly — absolute residual OR the relative ratio
-/// `stationarity / max(‖grad‖∞, 1)` within the band — exactly as the outer gate
-/// and the inner active-set solver do, so an O(n) gradient scale (issue #879)
-/// does not leave a converged optimum stranded above a fixed absolute band
-/// (issue #989). Returns `true` for an unconstrained fit (no constraint-KKT
-/// gate to honour) and when no constraint rows can be derived (no bound is
-/// finite).
+/// relative to `gradient_scale`, the natural scale of the operands that formed
+/// `gradient` ([`crate::active_set::exceeds_at_gradient_scale`]), exactly as the
+/// outer gate and the inner active-set solver do: an O(n) gradient scale (issue
+/// #879) does not leave a converged optimum stranded above a fixed absolute
+/// band (issue #989), and rescaling the objective does not move the verdict.
+/// Returns `true` for an unconstrained fit (no constraint-KKT gate to honour)
+/// and when no constraint rows can be derived (no bound is finite).
 pub(crate) fn constraint_kkt_admits_soft_accept(
     options: &WorkingModelPirlsOptions,
     beta: &Array1<f64>,
     gradient: &Array1<f64>,
+    gradient_scale: f64,
     kkt_tolerance: f64,
 ) -> bool {
     // Mirror the exported-diagnostic construction in the result assembly (and
     // the outer gate's input): prefer explicit linear constraints, else derive
     // the constraint rows from the coordinate lower bounds.
     let diag = match options.linear_constraints.as_ref() {
-        Some(lin) => Some(compute_constraint_kkt_diagnostics(beta, gradient, lin)),
+        Some(lin) => Some(compute_constraint_kkt_diagnostics(
+            beta,
+            gradient,
+            gradient_scale,
+            lin,
+        )),
         None => options.coefficient_lower_bounds.as_ref().and_then(|lb| {
-            linear_constraints_from_lower_bounds(lb)
-                .map(|lin| compute_constraint_kkt_diagnostics(beta, gradient, &lin))
+            linear_constraints_from_lower_bounds(lb).map(|lin| {
+                compute_constraint_kkt_diagnostics(beta, gradient, gradient_scale, &lin)
+            })
         }),
     };
     match diag {
@@ -203,16 +210,17 @@ pub(crate) fn constraint_kkt_admits_soft_accept(
             } else {
                 kkt_tolerance * 10.0
             };
-            // Scale-invariant stationarity, in lockstep with the outer gate
-            // (`enforce_constraint_kkt`) and the inner active-set solver: accept
-            // when EITHER the absolute residual OR the relative ratio
-            // `stationarity / max(‖grad‖∞, 1)` is within the band. An O(n)
-            // gradient scale (issue #879) leaves the absolute residual above any
-            // fixed band at a genuine optimum; gating only on it would refuse a
-            // converged soft-accept the outer gate now admits (issue #989).
-            let stationarity_rel = kkt.stationarity / kkt.gradient_scale.max(1.0);
+            // Stationarity relative to the gradient's operand scale, through the
+            // one predicate the outer gate (`enforce_constraint_kkt`) and the
+            // inner active-set solver judge with. An O(n) gradient scale (issue
+            // #879) leaves the absolute residual above any fixed band at a
+            // genuine optimum (issue #989); the ratio does not move with it.
             kkt.primal_feasibility <= crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-                && (kkt.stationarity <= stationarity_band || stationarity_rel <= stationarity_band)
+                && !crate::active_set::exceeds_at_gradient_scale(
+                    kkt.stationarity,
+                    stationarity_band,
+                    kkt.gradient_scale,
+                )
         }
     }
 }
@@ -332,6 +340,16 @@ fn exact_newton_decrement_sq_on_face(
     (decrement_sq.is_finite() && decrement_sq >= 0.0).then_some(decrement_sq)
 }
 
+/// Where a P-IRLS trial point left the link's feasibility set: the typed
+/// fields of the [`EstimationError::InverseLinkDomainViolation`] that rejected it.
+#[derive(Clone, Copy, Debug)]
+struct FeasibilityWitness {
+    link: &'static str,
+    eta: f64,
+    lower: f64,
+    upper: f64,
+}
+
 /// The exact-decrement half of the P-IRLS convergence certificate, measured on
 /// a fully evaluated state: the squared Newton decrement and the threshold it is
 /// certified against.
@@ -399,21 +417,16 @@ pub fn exact_newton_decrement_evidence(
 pub(crate) fn iterate_is_primal_feasible(
     options: &WorkingModelPirlsOptions,
     beta: &Array1<f64>,
-    gradient: &Array1<f64>,
 ) -> bool {
-    let diagnostics = match options.linear_constraints.as_ref() {
-        Some(lin) => Some(compute_constraint_kkt_diagnostics(beta, gradient, lin)),
+    let primal_feasibility = match options.linear_constraints.as_ref() {
+        Some(lin) => Some(crate::active_set::constraint_primal_feasibility(beta, lin)),
         None => options.coefficient_lower_bounds.as_ref().and_then(|lb| {
             linear_constraints_from_lower_bounds(lb)
-                .map(|lin| compute_constraint_kkt_diagnostics(beta, gradient, &lin))
+                .map(|lin| crate::active_set::constraint_primal_feasibility(beta, &lin))
         }),
     };
-    match diagnostics {
-        None => true,
-        Some(kkt) => {
-            kkt.primal_feasibility <= crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-        }
-    }
+    primal_feasibility
+        .is_none_or(|value| value <= crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL)
 }
 
 /// `iteration_callback` is optional: most callers want the fit and nothing else,
@@ -536,7 +549,7 @@ where
             self.consecutive_accepts = self.consecutive_accepts.saturating_add(1);
             self.consecutive_rejects = 0;
             if !self.engaged_logged {
-                log::info!("[PIRLS-AA1] engaged at iter={}", iter);
+                log::debug!("[PIRLS-AA1] engaged at iter={}", iter);
                 self.engaged_logged = true;
             }
         }
@@ -549,7 +562,7 @@ where
                 && self.consecutive_accepts < 1
             {
                 self.disabled = true;
-                log::info!(
+                log::debug!(
                     "[PIRLS-AA1] disabled at iter={} reason=consecutive_rejects",
                     iter
                 );
@@ -622,6 +635,43 @@ where
     // no branch in this file can re-derive either predicate locally.
     fn lm_can_retry(loop_lambda: f64) -> bool {
         crate::loop_guard::madsen_can_retry(loop_lambda)
+    }
+    /// The step this iteration proposed toward the likelihood maximum left the
+    /// link's feasibility set, and the witness of that rejection says where.
+    /// Returns the witness of a trial-point domain violation, or `None` for
+    /// every other candidate failure.
+    fn feasibility_witness(err: &EstimationError) -> Option<FeasibilityWitness> {
+        match *err {
+            EstimationError::InverseLinkDomainViolation {
+                link,
+                eta,
+                lower,
+                upper,
+            } => Some(FeasibilityWitness {
+                link,
+                eta,
+                lower,
+                upper,
+            }),
+            _ => None,
+        }
+    }
+    /// The inner maximum is on the feasibility boundary: in the iteration
+    /// that ended the solve, the step toward it left the feasible linear
+    /// predictor, and the gradient never vanished.
+    fn boundary_optimum_error(
+        witness: FeasibilityWitness,
+        iteration: usize,
+        gradient_norm: f64,
+    ) -> EstimationError {
+        EstimationError::LinkFeasibilityBoundaryOptimum {
+            link: witness.link,
+            eta: witness.eta,
+            lower: witness.lower,
+            upper: witness.upper,
+            iterations: iteration,
+            gradient_norm,
+        }
     }
     fn lm_nonconvergence_error(
         options: &WorkingModelPirlsOptions,
@@ -720,7 +770,7 @@ where
     // The active set is a property of the ITERATE, so it is asked per use rather
     // than once up front.
     if let Some(adaptive) = options.adaptive_kkt_tolerance {
-        log::info!(
+        log::debug!(
             "[ADAPTIVE-KKT] outer_g_norm={:.3e} effective_tol={:.3e} floor={:.3e} ceiling={:.3e}",
             adaptive.outer_grad_norm,
             kkt_tolerance,
@@ -764,14 +814,10 @@ where
         .unwrap_or(MADSEN_DAMPING_FLOOR);
     let lm_max_attempts = options.max_step_halving.max(1);
     // Convergence is decided by `WorkingState::certifies_kkt` /
-    // `WorkingState::near_stationary_kkt`, which combine a dimension-based
-    // bound  ‖g‖ < τ · √n · max(1, √p)  with a data-driven natural-scale
-    // bound  ‖g‖ / (1 + ‖score‖ + ‖S·β‖) < τ  and accept under either.
-    // Both certificates are scale-invariant under F → c·F (the additive 1
-    // is a NaN-safe floor; for non-trivial fits the natural scale dominates
-    // it within one PIRLS iteration). The absolute test ‖g‖ < τ that this
-    // replaces was systematically too tight at large-scale n because ‖g‖₂ grows
-    // as O(√n) for standardized columns.
+    // `WorkingState::near_stationary_kkt` on the dimensionless residual
+    // ‖g‖ / (‖score‖ + ‖S·β‖) < τ, or by the exact Newton decrement. Neither
+    // carries the gradient's units, so both read the same at every n and in
+    // every response unit.
 
     // ─── Observed vs expected information in PIRLS (see response.md Section 3) ───
     //
@@ -804,7 +850,7 @@ where
         // Start-of-iteration beacon: emits one line BEFORE the curvature-sensitive
         // inner work begins, so CI logs show *which* PIRLS iteration is in flight
         // if the process is killed during `update_with_curvature` or the LM solve.
-        log::debug!(
+        log::trace!(
             "[PIRLS] start iter {:>3} | lm_lambda {:.2e} | last_halving {} | last_dev_change {:.3e}",
             iter,
             lambda,
@@ -818,6 +864,10 @@ where
                 HessianCurvatureKind::Fisher
             };
         let mut used_fisher_fallback_this_iter = false;
+        // The latest trial point of THIS iteration that left the link's
+        // feasibility set. A rejection in an earlier iteration says nothing
+        // about where the final iterate sits.
+        let mut feasibility_witness_this_iter: Option<FeasibilityWitness> = None;
         let curvature_start = std::time::Instant::now();
         // The previous iter's LM accept path computed `accepted_state` via
         // `update_candidate(candidate_beta, state.hessian_curvature)` and
@@ -860,7 +910,7 @@ where
                     used_fisher_fallback_this_iter = true;
                     consecutive_fisher_fallbacks += 1;
                     if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
-                        log::info!(
+                        log::debug!(
                             "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=iter_start",
                             iter,
                             consecutive_fisher_fallbacks,
@@ -881,7 +931,7 @@ where
         // Fisher fallbacks for the bench runner's `pirls_fisher_frac`
         // diagnostic (commit 971e67ad), masking observed-Hessian PD
         // failures at large scale.
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS update_with_curvature iter={} curvature={:?} elapsed={:.3}s source={}",
             iter,
             state.hessian_curvature,
@@ -959,6 +1009,11 @@ where
         // takes. Distinct from the reject escalator by design; see the
         // loop_guard module docs.
         let mut lm_bound = IterationBound::new(lm_max_attempts);
+        // An AA(1) candidate is an extrapolation of the LM step, not the step
+        // whose predicted reduction the gain ratio is measured against, so its
+        // rejection says nothing about the damping. Once one is rejected this
+        // iteration, the retry evaluates the plain LM step at the same λ.
+        let mut aa_declined_this_iter = false;
         // Snapshot the LM trajectory's starting λ for the
         // `[PIRLS lm-trajectory]` log emitted at iter-end. This is what
         // the runtime-layer adaptive clamp (commit 43be42be) selected for
@@ -1015,6 +1070,7 @@ where
         loop {
             lm_bound.tick();
             lm_attempts_done += 1;
+            test_support::record_lm_attempt();
             let attempt_solve_start = std::time::Instant::now();
 
             // 1. Solve (H + λD²)δ = -g
@@ -1240,7 +1296,11 @@ where
             // (Arrow-Schur predicted reduction) needs the same generalisation.
             let predred_start = std::time::Instant::now();
             let lin = state.gradient.dot(direction);
-            let predicted_reduction = {
+            // `step_rayleigh_curvature` = δᵀHδ / δᵀD²δ: the bare model
+            // curvature along the step in the damping metric, which the
+            // rejection update uses to translate Moré's interpolated radius
+            // into a damping value (`RejectEscalator::escalate_from_rejected_trial`).
+            let (predicted_reduction, step_rayleigh_curvature) = {
                 let q_term = if let Some(sparse_reg) = cached_sparse_regularized.as_ref() {
                     sparse_symmetric_upper_matvec_public(sparse_reg, direction)
                 } else {
@@ -1255,10 +1315,12 @@ where
                 let model_curvature_correction =
                     model.objective_hessian_quadratic_correction(direction)?;
                 // Stored curvature plus the model-specific omitted block.
-                let quad = 0.5
-                    * (direction.dot(&q_term) - loop_lambda * d2_weighted_sq
-                        + model_curvature_correction);
-                -(lin + quad)
+                let bare_quadratic = direction.dot(&q_term) - loop_lambda * d2_weighted_sq
+                    + model_curvature_correction;
+                (
+                    -(lin + 0.5 * bare_quadratic),
+                    bare_quadratic / d2_weighted_sq,
+                )
             };
             lm_predred_total += predred_start.elapsed();
 
@@ -1284,7 +1346,7 @@ where
             // reject the accelerated candidate, fall back to the plain Fisher
             // candidate transparently — no change to the rest of the loop.
             let mut aa_attempt = false;
-            if force_fisher_for_rest && !aa_state.disabled {
+            if force_fisher_for_rest && !aa_state.disabled && !aa_declined_this_iter {
                 let beta_old_ref: &Array1<f64> = beta.as_ref();
                 if let Some(beta_accel) = aa_state.aa1_mix(beta_old_ref, &candidate_buf) {
                     candidate_buf.assign(beta_accel);
@@ -1367,7 +1429,27 @@ where
                                     if !is_lm_retriable_candidate_error(&err) {
                                         return Err(err);
                                     }
+                                    let witness = feasibility_witness(&err);
+                                    if witness.is_some() {
+                                        feasibility_witness_this_iter = witness;
+                                    }
                                     if lm_bound.exhausted_at(loop_lambda) {
+                                        // Every damped step, down to the
+                                        // steepest-descent limit, left the
+                                        // feasible set: the iterate is pressed
+                                        // against its boundary.
+                                        if let Some(witness) = witness {
+                                            return Err(boundary_optimum_error(
+                                                witness,
+                                                iter,
+                                                constrained_stationarity_norm(
+                                                    &state.gradient,
+                                                    beta.as_ref(),
+                                                    options.coefficient_lower_bounds.as_ref(),
+                                                    options.linear_constraints.as_ref(),
+                                                ),
+                                            ));
+                                        }
                                         return Err(lm_nonconvergence_error(
                                             options,
                                             iter,
@@ -1405,7 +1487,7 @@ where
                             -1.0
                         };
                         if rho > 100.0 && actual_reduction > noise_floor {
-                            log::info!(
+                            log::debug!(
                                 "[PIRLS gain-ratio audit] rho={:.6e} actual_reduction={:.6e} predicted_reduction={:.6e} linear_model_term={:.6e} direction_norm={:.6e} data_reduction={:.6e} penalty_reduction={:.6e} current_deviance={:.6e} candidate_deviance={:.6e} current_penalty={:.6e} candidate_penalty={:.6e}",
                                 rho,
                                 actual_reduction,
@@ -1422,10 +1504,12 @@ where
                             );
                         }
                         if !(rho > 0.0 && candidate_penalized.is_finite()) {
+                            candidate_buf = candidate_beta.into();
                             if aa_attempt {
                                 aa_state.note_reject(iter);
+                                aa_declined_this_iter = true;
+                                continue;
                             }
-                            candidate_buf = candidate_beta.into();
                             // Exhaustion guard, identical to the screening-reject
                             // branch below. The screening test admitted this trial
                             // (cheap forward eval looked like a descent) but the full
@@ -1461,7 +1545,7 @@ where
                                 kkt_tolerance,
                             );
                             if lm_rejection_soft {
-                                log::debug!(
+                                log::trace!(
                                     "[PIRLS] gain-rejection soft acceptance: near-stationary \
                                      plateau (‖g‖={projected_grad:.3e}, \
                                      predicted_reduction={predicted_reduction:.3e})"
@@ -1485,7 +1569,12 @@ where
                                 final_state = Some(state);
                                 break 'pirls_loop;
                             }
-                            madsen_escalator.escalate(&mut loop_lambda);
+                            madsen_escalator.escalate_from_rejected_trial(
+                                &mut loop_lambda,
+                                lin,
+                                actual_reduction,
+                                step_rayleigh_curvature,
+                            );
                             continue;
                         }
                         if preferred_curvature == HessianCurvatureKind::Observed
@@ -1638,14 +1727,13 @@ where
                         let exact_nd_pass = exact_decrement_sq
                             .is_some_and(|decrement_sq| decrement_sq <= exact_nd_threshold);
                         if should_check_exact_nd {
-                            log::info!(
-                                "[PIRLS exact-decrement] decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} relative_gradient={:.6e} dimension_scale={:.6e} natural_scale={:.6e} objective={:.6e} actual_reduction={:.6e} predicted_reduction={:.6e} linear_model_term={:.6e} direction_norm={:.6e} data_reduction={:.6e} penalty_reduction={:.6e}",
+                            log::debug!(
+                                "[PIRLS exact-decrement] decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} relative_gradient={:.6e} natural_scale={:.6e} objective={:.6e} actual_reduction={:.6e} predicted_reduction={:.6e} linear_model_term={:.6e} direction_norm={:.6e} data_reduction={:.6e} penalty_reduction={:.6e}",
                                 exact_decrement_sq.unwrap_or(f64::NAN),
                                 exact_nd_threshold,
                                 exact_nd_pass,
                                 convergence_grad_norm,
                                 final_state_ref.relative_gradient_norm(convergence_grad_norm),
-                                final_state_ref.kkt_dimension_scale(),
                                 final_state_ref.gradient_natural_scale,
                                 final_state_ref.penalized_objective(),
                                 actual_reduction,
@@ -1658,10 +1746,8 @@ where
                             );
                         }
 
-                        // Strict KKT: scale-invariant under EITHER the
-                        // dimension-based bound ‖g‖ < τ·√n·max(1,√p) OR the
-                        // data-driven natural-scale bound
-                        //     ‖g‖ / (1 + ‖score‖ + ‖S·β‖) < τ.
+                        // Strict KKT: the dimensionless residual
+                        //     ‖g‖ / (‖score‖ + ‖S·β‖) < τ.
                         // Newton decrement is an independent additional
                         // acceptance for ill-conditioned problems where ‖g‖
                         // is intrinsically large but H⁻¹g is already tiny.
@@ -1672,11 +1758,31 @@ where
                         // contracts and are required alongside it, never folded
                         // into the same max (#2705 group B — see
                         // `constrained_stationarity_norm`).
-                        if (final_state_ref.certifies_kkt(convergence_grad_norm, kkt_tolerance)
-                            || exact_nd_pass)
+                        let strict_kkt_pass =
+                            final_state_ref.certifies_kkt(convergence_grad_norm, kkt_tolerance);
+                        // The decrement collapses without the gradient doing so
+                        // when the curvature diverges, which a mean approaching
+                        // the edge of its domain does (Fisher weight 1/mu for
+                        // identity Poisson at mu -> 0, mu/(1-mu) for log binomial
+                        // at mu -> 1). If the step toward that edge was also
+                        // rejected as infeasible in this iteration, the iterate is
+                        // on the feasibility boundary, not at an interior mode the
+                        // decrement could certify.
+                        if exact_nd_pass
+                            && !strict_kkt_pass
+                            && let Some(witness) = feasibility_witness_this_iter
+                        {
+                            return Err(boundary_optimum_error(
+                                witness,
+                                iter,
+                                convergence_grad_norm,
+                            ));
+                        }
+                        if (strict_kkt_pass || exact_nd_pass)
                             && constraint_geometry_is_certified(
                                 beta.as_ref(),
                                 &final_state_ref.gradient,
+                                final_state_ref.gradient_natural_scale,
                                 options.linear_constraints.as_ref(),
                             )
                         {
@@ -1716,7 +1822,7 @@ where
                         if numerical_plateau
                             && exact_decrement_sq.is_some()
                         {
-                            log::debug!(
+                            log::trace!(
                                 "[PIRLS] objective resolution exhausted at iter {iter}; \
                                  handing exact-decrement state to undamped refinement \
                                  (decrement_sq={:.3e}, threshold={exact_nd_threshold:.3e})",
@@ -1758,6 +1864,7 @@ where
                                 options,
                                 beta.as_ref(),
                                 &final_state_ref.gradient,
+                                final_state_ref.gradient_natural_scale,
                                 kkt_tolerance,
                             );
 
@@ -1801,7 +1908,7 @@ where
                                 kkt_tolerance,
                             );
                         if plateau_streak.note(near_stationary_plateau) == LoopVerdict::Plateaued {
-                            log::debug!(
+                            log::trace!(
                                 "[PIRLS] iter {iter} early-exit on soft acceptance: \
                                  near-stationary plateau (‖g‖={convergence_grad_norm:.3e}, \
                                  Δdev={deviance_change:.3e})"
@@ -1815,6 +1922,8 @@ where
                         candidate_buf = candidate_beta.into();
                         if aa_attempt {
                             aa_state.note_reject(iter);
+                            aa_declined_this_iter = true;
+                            continue;
                         }
                         if state.hessian_curvature == HessianCurvatureKind::Observed
                             && !used_fisher_fallback_this_iter
@@ -1822,7 +1931,7 @@ where
                             used_fisher_fallback_this_iter = true;
                             consecutive_fisher_fallbacks += 1;
                             if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
-                                log::info!(
+                                log::debug!(
                                     "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=gain_rejection",
                                     iter,
                                     consecutive_fisher_fallbacks,
@@ -1839,7 +1948,7 @@ where
                             // (Observed assembly itself failed). Tagged
                             // with `gain_rejection` so the runner
                             // aggregator can count both reasons.
-                            log::info!(
+                            log::debug!(
                                 "[PIRLS] mid-iter Fisher fallback iter={} reason=gain_rejection",
                                 iter,
                             );
@@ -1888,7 +1997,7 @@ where
                             state.near_stationary_kkt(projected_grad, kkt_tolerance);
 
                         if lm_rejection_soft {
-                            log::debug!(
+                            log::trace!(
                                 "[PIRLS] LM-rejection soft acceptance: near-stationary plateau \
                                  (‖g‖={projected_grad:.3e}, \
                                  predicted_reduction={predicted_reduction:.3e})"
@@ -1925,7 +2034,7 @@ where
                                     .map(f64::abs)
                                     .fold(0.0_f64, f64::max);
                                 let relative_grad = state.relative_gradient_norm(projected_grad);
-                                log::debug!(
+                                log::trace!(
                                     "[PIRLS] LM step search exhausted at iter={}: \
                                      attempts={}/{} lambda={:.3e} (ceiling={}) \
                                      projected_grad={:.3e} (relative={:.3e}) \
@@ -1951,18 +2060,32 @@ where
                             final_state = Some(state);
                             break 'pirls_loop;
                         }
-                        madsen_escalator.escalate(&mut loop_lambda);
+                        madsen_escalator.escalate_from_rejected_trial(
+                            &mut loop_lambda,
+                            lin,
+                            screening_reduction,
+                            step_rayleigh_curvature,
+                        );
                     }
                 }
                 Err(err) => {
                     candidate_buf = candidate_beta.into();
+                    if aa_attempt && is_lm_retriable_candidate_error(&err) {
+                        aa_state.note_reject(iter);
+                        aa_declined_this_iter = true;
+                        continue;
+                    }
+                    let witness = feasibility_witness(&err);
+                    if witness.is_some() {
+                        feasibility_witness_this_iter = witness;
+                    }
                     if state.hessian_curvature == HessianCurvatureKind::Observed
                         && !used_fisher_fallback_this_iter
                     {
                         used_fisher_fallback_this_iter = true;
                         consecutive_fisher_fallbacks += 1;
                         if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
-                            log::info!(
+                            log::debug!(
                                 "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=candidate_err",
                                 iter,
                                 consecutive_fisher_fallbacks,
@@ -1977,7 +2100,7 @@ where
                         // mid-iter Observed-curvature unreliability,
                         // but candidate_err is a stronger signal
                         // (numerical breakdown, not just bad gain).
-                        log::info!(
+                        log::debug!(
                             "[PIRLS] mid-iter Fisher fallback iter={} reason=candidate_err",
                             iter,
                         );
@@ -2000,6 +2123,18 @@ where
                         return Err(err);
                     }
                     if lm_bound.exhausted_at(loop_lambda) {
+                        if let Some(witness) = witness {
+                            return Err(boundary_optimum_error(
+                                witness,
+                                iter,
+                                constrained_stationarity_norm(
+                                    &state.gradient,
+                                    beta.as_ref(),
+                                    options.coefficient_lower_bounds.as_ref(),
+                                    options.linear_constraints.as_ref(),
+                                ),
+                            ));
+                        }
                         return Err(lm_nonconvergence_error(
                             options,
                             iter,
@@ -2027,7 +2162,7 @@ where
         // exit early when the iteration is cheap (small change) AND
         // the residual is small.
         let iter_elapsed = iter_start.elapsed();
-        log::info!(
+        log::debug!(
             "[PIRLS iter-end] iter={:>3} elapsed={:.4}s lm_lambda={:.2e} g_norm={:.3e} last_dev_change={:.3e} last_halving={}",
             iter,
             iter_elapsed.as_secs_f64(),
@@ -2047,11 +2182,11 @@ where
         // dominates because of the O(p³) Cholesky in the LM solve.
         // Knowing which path is hot tells us where the next principled
         // optimization should land.
-        if log::log_enabled!(log::Level::Info) {
+        if log::log_enabled!(log::Level::Debug) {
             let timed_total =
                 curvature_total + lm_solve_total + lm_predred_total + lm_candidate_total;
             let other_total = iter_elapsed.saturating_sub(timed_total);
-            log::info!(
+            log::debug!(
                 "[PIRLS iter-breakdown] iter={:>3} attempts={} curvature={:.3}s solve={:.3}s predred={:.3}s candidate={:.3}s other={:.3}s",
                 iter,
                 lm_attempts_done,
@@ -2080,13 +2215,13 @@ where
         //                   the quadratic model was faithful; <0.5
         //                   means it overstated the predicted
         //                   reduction. NaN on rejection-exhausted.
-        if log::log_enabled!(log::Level::Info) {
+        if log::log_enabled!(log::Level::Debug) {
             let lambda_ratio_log10 = if lm_start_lambda > 0.0 && lambda > 0.0 {
                 (lambda / lm_start_lambda).log10()
             } else {
                 f64::NAN
             };
-            log::info!(
+            log::debug!(
                 "[PIRLS lm-trajectory] iter={:>3} start_lambda={:.3e} final_lambda={:.3e} \
                  log10_ratio={:.3} accept_rho={:.3} attempts={}",
                 iter,
@@ -2104,7 +2239,7 @@ where
         // 10× relaxed band). A convergence verdict keyed on wall-clock is
         // non-deterministic under CPU contention — the same fit converges to
         // a different β in a parallel sweep than it does run alone, which
-        // cascades into different outer seed screening and load-unstable
+        // cascades into different outer search paths and load-unstable
         // fire/collapse decisions downstream (gam#979). It also accepted
         // iterates up to 10× outside `convergence_tolerance`, an
         // unrequested weakening of the inner certificate. Convergence is
@@ -2118,7 +2253,7 @@ where
     // Newton convergence health: rate < 0.5 = healthy Newton; rate ≥ 0.7
     // = struggling (likely stuck near singular geometry or a
     // flat-warm-start that the predictor failed to refine).
-    if log::log_enabled!(log::Level::Info) {
+    if log::log_enabled!(log::Level::Debug) {
         let total_iters = iterations.max(1) as f64;
         let convergence_rate = match initial_gradient_norm {
             Some(g0) if g0 > 0.0 && lastgradient_norm.is_finite() => {
@@ -2127,7 +2262,7 @@ where
             }
             _ => f64::NAN,
         };
-        log::info!(
+        log::debug!(
             "[PIRLS solve-end] iters={} elapsed={:.4}s g_norm_initial={:.3e} g_norm_final={:.3e} convergence_rate={:.3e} status={:?}",
             iterations,
             inner_solve_start.elapsed().as_secs_f64(),
@@ -2213,7 +2348,7 @@ where
         const MAX_UNDAMPED_POLISH_STEPS: usize = 8;
         for polish_iter in 0..MAX_UNDAMPED_POLISH_STEPS {
             let Some(bare_h) = state.hessian.as_dense() else {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, the Hessian is not dense",
                     polish_iter + 1
                 );
@@ -2226,7 +2361,7 @@ where
                 options.linear_constraints.as_ref(),
             );
             if state.certifies_kkt(g_norm_before, kkt_tolerance) {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, strict KKT certified (‖g‖={g_norm_before:.3e})",
                     polish_iter + 1
                 );
@@ -2237,7 +2372,7 @@ where
             let bare_finite = state.gradient.iter().all(|v| v.is_finite())
                 && bare_h.iter().all(|v| v.is_finite());
             if !(g_norm_before > 0.0 && bare_finite) {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, residual {g_norm_before:.3e} is zero or \
                      the gradient/Hessian is not finite",
                     polish_iter + 1
@@ -2276,7 +2411,7 @@ where
                 Some(rows) => active_face_newton_direction(&curvature, &state.gradient, rows),
                 None => unconstrained_newton_direction(&curvature, &state.gradient),
             }) else {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, no Newton direction on a face with \
                      {active_row_count} binding row(s) (reduced curvature did not factorize)",
                     polish_iter + 1
@@ -2291,7 +2426,7 @@ where
             let step_norm_sq = direction.dot(&direction);
             let step_reasonable = step_finite && (step_norm_sq <= 0.25 * beta_norm_sq.max(1.0));
             if !step_reasonable {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, step not reasonable \
                      (‖step‖²={step_norm_sq:.3e}, bound {:.3e}, finite={step_finite})",
                     polish_iter + 1,
@@ -2301,7 +2436,7 @@ where
             }
             let polished: Array1<f64> = beta.as_ref() + &direction;
             if !polished.iter().all(|v| v.is_finite()) {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, polished iterate is not finite",
                     polish_iter + 1
                 );
@@ -2312,7 +2447,7 @@ where
                 match model.update_with_curvature(&polished_beta, state.hessian_curvature) {
                     Ok(polished_state) => polished_state,
                     Err(error) => {
-                        log::debug!(
+                        log::trace!(
                             "[PIRLS] undamped polish step {}: stop, re-evaluation failed: {error}",
                             polish_iter + 1
                         );
@@ -2328,12 +2463,8 @@ where
             // a Newton step and the strict-improvement guard below would be
             // certifying a different point than the one it measured (#2705
             // group B).
-            if !iterate_is_primal_feasible(
-                options,
-                polished_beta.as_ref(),
-                &polished_state.gradient,
-            ) {
-                log::debug!(
+            if !iterate_is_primal_feasible(options, polished_beta.as_ref()) {
+                log::trace!(
                     "[PIRLS] undamped Newton polish step {} would leave the feasible \
                      set; stopping the refinement at the last feasible iterate",
                     polish_iter + 1,
@@ -2380,7 +2511,7 @@ where
                 && objective_ok
                 && (residual_improved || resolvable_decrease))
             {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, no measured progress \
                      (‖g‖ {g_norm_before:.6e} -> {g_norm_after:.6e}, objective {obj_before:.15e} -> \
                      {obj_after:.15e}, Δ={:.3e}, ‖step‖={:.3e}, binding rows {active_row_count})",
@@ -2390,7 +2521,7 @@ where
                 );
                 break;
             }
-            log::debug!(
+            log::trace!(
                 "[PIRLS] undamped Newton polish (#1122) step {}: \
                  ‖g‖ {g_norm_before:.3e} → {g_norm_after:.3e}, ΔF={:.3e} \
                  (‖step‖={:.3e}, committed on {})",
@@ -2458,7 +2589,7 @@ where
     let final_exact_decrement_pass = final_exact_decrement_sq
         .is_some_and(|decrement_sq| decrement_sq <= final_decrement_threshold);
     if final_exact_decrement_sq.is_some() {
-        log::info!(
+        log::debug!(
             "[PIRLS final exact-decrement] decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} status_before={:?}",
             final_exact_decrement_sq.unwrap_or(f64::NAN),
             final_decrement_threshold,
@@ -2480,16 +2611,17 @@ where
         let geometry_certified = constraint_geometry_is_certified(
             beta.as_ref(),
             &state.gradient,
+            state.gradient_natural_scale,
             polish_inequalities.as_deref(),
         );
         if geometry_certified && state.certifies_kkt(final_projected_grad, kkt_tolerance) {
-            log::debug!(
+            log::trace!(
                 "[PIRLS] final-state certification: strict KKT \
                  (‖g‖={final_projected_grad:.3e})",
             );
             status = PirlsStatus::Converged;
         } else if geometry_certified && final_exact_decrement_pass {
-            log::debug!(
+            log::trace!(
                 "[PIRLS] final-state certification: exact decrement \
                  (‖g‖={final_projected_grad:.3e}, decrement_sq={:.3e})",
                 final_exact_decrement_sq.unwrap_or(f64::NAN),
@@ -2515,10 +2647,11 @@ where
                     options,
                     beta.as_ref(),
                     &state.gradient,
+                    state.gradient_natural_scale,
                     kkt_tolerance,
                 ))
         {
-            log::debug!(
+            log::trace!(
                 "[PIRLS] post-loop rescue on soft acceptance \
                  (‖g‖={final_projected_grad:.3e}, \
                  Δdev={last_deviance_change:.3e})"
@@ -2553,19 +2686,17 @@ where
     // enter this branch and pay only one cheap feasibility check.
     if let Some(lin) = options.linear_constraints.as_ref() {
         let primal_feasibility =
-            compute_constraint_kkt_diagnostics(beta.as_ref(), &state.gradient, lin)
-                .primal_feasibility;
+            crate::active_set::constraint_primal_feasibility(beta.as_ref(), lin);
         if primal_feasibility > crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
             let projected =
                 crate::active_set::project_point_strictly_into_feasible_cone(beta.as_ref(), lin)
                     .filter(|candidate| {
-                        compute_constraint_kkt_diagnostics(candidate, &state.gradient, lin)
-                            .primal_feasibility
+                        crate::active_set::constraint_primal_feasibility(candidate, lin)
                             <= crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
                     });
             match projected {
                 Some(feasible_beta) => {
-                    log::warn!(
+                    log::debug!(
                         "[PIRLS] constrained fit converged to an INFEASIBLE β \
                          (primal={primal_feasibility:.3e} > \
                          {tol:.3e}); projecting onto the feasible cone so the \
@@ -2643,7 +2774,7 @@ where
                                     options.coefficient_lower_bounds.as_ref(),
                                     options.linear_constraints.as_ref(),
                                 );
-                                log::warn!(
+                                log::debug!(
                                     "[PIRLS] post-convergence observed Hessian indefinite: \
                                  λ_min={min_eig:.3e}, pd_tol={pd_tolerance:.3e}, ‖g‖={g_norm:.3e}"
                                 );
@@ -2690,7 +2821,7 @@ where
                         options.coefficient_lower_bounds.as_ref(),
                         options.linear_constraints.as_ref(),
                     );
-                    log::warn!(
+                    log::debug!(
                         "[PIRLS] post-convergence observed Hessian assembly failed: {err}; \
                      exporting InvalidObservedCurvature with ‖g‖={g_norm:.3e}"
                     );
@@ -2712,11 +2843,23 @@ where
         constraint_kkt: options
             .linear_constraints
             .as_ref()
-            .map(|lin| compute_constraint_kkt_diagnostics(beta.as_ref(), &state.gradient, lin))
+            .map(|lin| {
+                compute_constraint_kkt_diagnostics(
+                    beta.as_ref(),
+                    &state.gradient,
+                    state.gradient_natural_scale,
+                    lin,
+                )
+            })
             .or_else(|| {
                 options.coefficient_lower_bounds.as_ref().and_then(|lb| {
                     linear_constraints_from_lower_bounds(lb).map(|lin| {
-                        compute_constraint_kkt_diagnostics(beta.as_ref(), &state.gradient, &lin)
+                        compute_constraint_kkt_diagnostics(
+                            beta.as_ref(),
+                            &state.gradient,
+                            state.gradient_natural_scale,
+                            &lin,
+                        )
                     })
                 })
             }),
@@ -2753,6 +2896,22 @@ pub(super) mod test_support {
         PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
             if let Some(ref mut buf) = *trace.borrow_mut() {
                 buf.push(value);
+            }
+        });
+    }
+
+    // Same pattern for the LM attempt count (one damped solve + trial
+    // evaluation per attempt), so tests can pin step-control cost in
+    // attempts rather than wall clock.
+    thread_local! {
+        pub(crate) static PIRLS_LM_ATTEMPT_COUNT: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(crate) fn record_lm_attempt() {
+        PIRLS_LM_ATTEMPT_COUNT.with(|count| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
             }
         });
     }

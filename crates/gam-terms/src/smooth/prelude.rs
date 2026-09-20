@@ -5,7 +5,8 @@ use crate::basis::{
     MaternBasisSpec, MeasureJetBasisSpec, PenaltyCandidate, PenaltySource,
     SpatialIdentifiability,
     SphericalSplineBasisSpec, ThinPlateBasisSpec,
-    apply_sum_to_zero_constraint, build_bspline_basis_1d, build_constant_curvature_basis,
+    apply_sum_to_zero_constraint, build_bspline_basis_1d, build_bspline_basis_1d_realizing,
+    build_constant_curvature_basis,
     build_duchon_basiswithworkspace, build_matern_basiswithworkspace,
     build_matern_collocation_operator_matrices, build_measure_jet_basis,
     build_spherical_spline_basis, build_thin_plate_basis, center_strategy_is_auto,
@@ -20,7 +21,7 @@ use penalty_priors::realize_coefficient_groups;
 
 use gam_problem::EstimationError;
 
-use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
+use gam_linalg::faer_ndarray::fast_ab;
 
 use gam_linalg::matrix::{
     BlockDesignOperator, DenseDesignOperator, DesignBlock, DesignMatrix, FiniteSignedWeightsView,

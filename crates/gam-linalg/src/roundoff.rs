@@ -79,8 +79,34 @@ pub fn symmetric_spectrum_rounding_band(eigenvalues: &[f64]) -> f64 {
 /// inside the band is not resolved from zero by the decomposition that produced
 /// it, and its sign carries no information.
 pub fn resolved_eigenvalue_count(eigenvalues: &[f64], assembly_band: f64) -> usize {
-    let band = symmetric_spectrum_rounding_band(eigenvalues) + assembly_band;
+    let band = resolved_eigenvalue_band(eigenvalues, assembly_band);
     eigenvalues.iter().filter(|&&value| value > band).count()
+}
+
+/// The threshold [`resolved_eigenvalue_count`] compares against:
+/// [`symmetric_spectrum_rounding_band`] plus `assembly_band`. Exposed for
+/// callers that act on each resolved eigenpair (a pseudo-inverse inverts
+/// exactly the eigenvalues above it) so the rank and the inversion read one
+/// predicate.
+pub fn resolved_eigenvalue_band(eigenvalues: &[f64], assembly_band: f64) -> f64 {
+    symmetric_spectrum_rounding_band(eigenvalues) + assembly_band
+}
+
+/// Spectral-norm bound on the rounding a weighted Gram `AᵀWA` picks up when it
+/// is formed as the inner products of `terms` rows, each product rounding
+/// `formation_roundings` times before the additions.
+///
+/// Entrywise the error is at most `γ_k·(|A|ᵀ|W||A|)`, `k = terms − 1 +
+/// formation_roundings` (Higham, *ASNA* 2nd ed., §3.1). That majorant is PSD,
+/// so its spectral norm — and by Perron–Frobenius monotonicity the error's —
+/// is bounded by its trace `Σᵢ |wᵢ|·‖aᵢ‖²`, which the caller passes as
+/// `weighted_row_norm_sum`.
+pub fn weighted_gram_assembly_band(
+    terms: usize,
+    formation_roundings: usize,
+    weighted_row_norm_sum: f64,
+) -> f64 {
+    accumulation_growth(terms.saturating_sub(1) + formation_roundings) * weighted_row_norm_sum
 }
 
 /// Forward-error band of a **compensated** summation (Kahan–Babuška–Neumaier)
@@ -98,6 +124,22 @@ pub fn resolved_eigenvalue_count(eigenvalues: &[f64], assembly_band: f64) -> usi
 /// costs three. Count the operations at the call site, where they are visible.
 pub fn compensated_band(formation_roundings: usize, absolute_sum: f64) -> f64 {
     (2.0 + formation_roundings as f64) * UNIT_ROUNDOFF * absolute_sum
+}
+
+/// The absolute summands behind a gradient summed from terms (#2976, #2822).
+///
+/// A gradient summed from rows carries the rounding of that sum, which scales with
+/// the summands' magnitudes and not with the assembled result: near a mode each
+/// row's term is `O(1)` while their sum is small. Coordinate `j` of the computed sum
+/// is within `accumulation_growth(accumulation_depth) · absolute_sums[j]` of the exact
+/// sum of the same computed terms.
+pub struct GradientAccumulation {
+    /// The sequential depth of the floating-point reduction that sums the terms:
+    /// the `m` of the `γ_m` that bands the sum.
+    pub accumulation_depth: usize,
+    /// `Σ |terms|` per coordinate: every product the reduction adds into that
+    /// coordinate, in absolute value.
+    pub absolute_sums: ndarray::Array1<f64>,
 }
 
 /// Backward-error band on the singular values of an `m × n` factor with largest

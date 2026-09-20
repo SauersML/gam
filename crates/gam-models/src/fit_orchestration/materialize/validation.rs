@@ -160,19 +160,71 @@ pub(super) fn effective_link_choice_for_materialize(
     parsed: &ParsedFormula,
     config: &FitConfig,
 ) -> Result<Option<LinkChoice>, WorkflowError> {
-    if let Some(linkspec) = parsed.linkspec.as_ref() {
-        if linkspec.mixture_rho.is_some()
+    if let Some(linkspec) = parsed.linkspec.as_ref()
+        && (linkspec.mixture_rho.is_some()
             || linkspec.sas_init.is_some()
-            || linkspec.beta_logistic_init.is_some()
-        {
-            return Err(WorkflowError::InvalidConfig {
-                reason: "link(...) initialization options are not supported by the materialized fit path; pass only link(type=...) in the formula"
-                    .to_string(),
-            });
-        }
-        return parse_link_choice(Some(&linkspec.link), false).map_err(WorkflowError::from);
+            || linkspec.beta_logistic_init.is_some())
+    {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "link(...) initialization options are not supported by the materialized fit path; pass only link(type=...) in the formula"
+                .to_string(),
+        });
     }
-    parse_link_choice(config.link.as_deref(), config.flexible_link).map_err(WorkflowError::from)
+    resolve_link_spellings(
+        parsed.linkspec.as_ref(),
+        config.link.as_deref(),
+        config.flexible_link,
+    )
+}
+
+/// Resolve a fit's link from every spelling the request carries: the formula's
+/// `link(...)`, the `link` argument and the `flexible_link` flag (gamfit's
+/// `link=` and `flexible_link=`). All of them are read. `flexible_link` flexes
+/// whichever base link is named (plain `flexible(probit)` when none is), a
+/// `flexible(...)` in either place makes the choice flexible, and a `link`
+/// argument whose base link differs from the formula's is refused by name
+/// rather than dropped. This is the rule `resolve_marginal_slope_link` applies
+/// to the probit-only marginal-slope families.
+pub(super) fn resolve_link_spellings(
+    linkspec: Option<&gam_terms::inference::formula_dsl::LinkFormulaSpec>,
+    link_argument: Option<&str>,
+    flexible_link: bool,
+) -> Result<Option<LinkChoice>, WorkflowError> {
+    let formula_choice = match linkspec {
+        Some(linkspec) => parse_link_choice(Some(&linkspec.link), flexible_link)?,
+        None => None,
+    };
+    let argument_choice = match (link_argument, &formula_choice) {
+        (None, Some(_)) => None,
+        (link, _) => parse_link_choice(link, flexible_link)?,
+    };
+    let (Some(formula), Some(argument), Some(linkspec), Some(link)) =
+        (&formula_choice, &argument_choice, linkspec, link_argument)
+    else {
+        return Ok(formula_choice.or(argument_choice));
+    };
+    if formula.link != argument.link || formula.mixture_components != argument.mixture_components
+    {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "the formula's link(type={}) and the link=\"{}\" argument name different \
+                 links; name the link once, either in the formula or as link=",
+                linkspec.link.trim(),
+                link.trim()
+            ),
+        });
+    }
+    let flexible = [formula, argument]
+        .into_iter()
+        .any(|choice| matches!(choice.mode, LinkMode::Flexible));
+    Ok(Some(LinkChoice {
+        mode: if flexible {
+            LinkMode::Flexible
+        } else {
+            LinkMode::Strict
+        },
+        ..formula.clone()
+    }))
 }
 
 /// Reject a `flexible(...)` link choice (the implicit link wiggle) when the
@@ -213,6 +265,51 @@ pub(super) fn reject_flexible_link_for_nonbinomial(
     Ok(())
 }
 
+/// Refuse a fit whose positive-weight rows cannot exceed the unpenalized
+/// dimension the formula already fixes, before the family is inferred or any
+/// basis is built.
+///
+/// REML/LAML estimate the smoothing parameters from the `n − M_p` residual
+/// contrasts the unpenalized directions cannot absorb, so an identified fit
+/// needs `n > M_p` (the full gate, once the penalties exist, is
+/// `reject_prefit_unidentifiable_unpenalized_space` in gam-solve). The formula
+/// alone already fixes part of `M_p`: the model intercept is one unpenalized
+/// direction unless the formula drops it. Parametric and smooth terms may or
+/// may not add more depending on their penalties, so they are left to that
+/// later gate. Checking this lower bound first makes a one-row fit report the
+/// row count rather than whatever the one row happens to trip next — an
+/// auto-inferred binomial family calling `y = [1]` degenerate, or a smooth
+/// calling its single covariate value constant.
+pub(super) fn reject_too_few_rows_for_formula(
+    parsed: &ParsedFormula,
+    weights: ArrayView1<'_, f64>,
+) -> Result<(), WorkflowError> {
+    let has_intercept = !parsed
+        .terms
+        .iter()
+        .any(|term| matches!(term, ParsedTerm::NoIntercept));
+    let unpenalized_lower_bound = usize::from(has_intercept);
+    let n_observations = weights.iter().filter(|&&weight| weight > 0.0).count();
+    if n_observations > unpenalized_lower_bound {
+        return Ok(());
+    }
+    let rows = if n_observations == 1 { "row" } else { "rows" };
+    let directions = if has_intercept {
+        "the intercept is an unpenalized coefficient direction (M_p >= 1)"
+    } else {
+        "a model needs at least one observation"
+    };
+    Err(WorkflowError::InvalidData {
+        column: parsed.response.clone(),
+        problem: format!(
+            "has {n_observations} positive-weight {rows}: too few rows to fit this model. \
+             REML estimates the smoothing parameters from the n - M_p residual contrasts the \
+             unpenalized directions cannot absorb, and {directions}, so the fit needs more than \
+             {unpenalized_lower_bound} positive-weight row(s). Add observations."
+        ),
+    })
+}
+
 /// Detect whether a response column is binary (0/1 only).
 pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     if y.is_empty() {
@@ -220,53 +317,6 @@ pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     }
     // Exact membership: a value near 0 or 1 is not an outcome.
     y.iter().all(|&v| v == 0.0 || v == 1.0)
-}
-
-/// Verify that the dataset has at least as many rows as the smooth terms in
-/// `spec` need for their bases to be well-posed.
-///
-/// Each [`SmoothBasisSpec`] owns its own `min_sample_rows` lower bound — the
-/// B-spline knot count, the *penalized* tensor-product floor (the sum of the
-/// per-marginal column counts, not their Kronecker product, because a `te()`
-/// is regularized and its effective dof is a small fraction of the column
-/// count), the PCA matrix width — so this helper is a thin sum-and-compare:
-/// the workflow has no per-basis-kind knowledge. Adding a new smooth kind
-/// extends the basis `match` in `min_sample_rows`, not this gate.
-///
-/// Catches the README-quickstart failure mode (#309) where `n=4` against
-/// `y ~ s(x)` would otherwise surface as an opaque `cached inner beta has
-/// length 8` message from the inner-state seeding hook.
-pub(super) fn check_smooth_capacity(
-    spec: &gam_terms::smooth::TermCollectionSpec,
-    n_rows: usize,
-    response_name: &str,
-) -> Result<(), WorkflowError> {
-    // Intercept + 1 dof for the smoothing-parameter optimizer.
-    let mut required: usize = 2;
-    let mut per_term: Vec<(String, usize)> = Vec::new();
-    for term in &spec.smooth_terms {
-        let need = term.basis.min_sample_rows();
-        required = required.saturating_add(need);
-        per_term.push((term.name.clone(), need));
-    }
-    if per_term.is_empty() || n_rows >= required {
-        return Ok(());
-    }
-    let breakdown = per_term
-        .iter()
-        .map(|(name, k)| format!("{name}≥{k}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(WorkflowError::InvalidConfig {
-        reason: format!(
-            "not enough observations to fit the requested formula: dataset has n={n_rows} \
-             rows but the smooth terms on response '{response_name}' need at least \
-             {required} rows total ({breakdown}, plus intercept + smoothing-parameter dof) \
-             before REML estimation is well-posed. \
-             Fix: add more training rows, replace `s(x)` with a linear term, or pass a \
-             smaller basis via `s(x, k=3)`."
-        ),
-    })
 }
 
 #[cfg(test)]

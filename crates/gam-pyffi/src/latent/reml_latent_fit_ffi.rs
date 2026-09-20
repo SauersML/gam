@@ -3,7 +3,7 @@
 /// In particular, a completed-but-nonstationary outer search is not an input
 /// error: it is a typed REML convergence failure whose full `OuterResult`
 /// remains the resume/evidence payload.  Keep that distinction instead of
-/// flattening `SaeFitError` through `Display` into `GamError`.
+/// flattening `SaeFitError` through `Display` into `GamfitError`.
 fn sae_fit_error_to_pyerr(py: Python<'_>, err: gam::terms::sae::manifold::SaeFitError) -> PyErr {
     use gam::terms::sae::manifold::SaeFitError;
 
@@ -791,10 +791,7 @@ fn glm_reml_fit_latent<'py>(
         .transpose()
         .map_err(py_value_error)?;
     if y_values.ncols() > 1
-        || matches!(
-            family_normalized.as_str(),
-            "multinomial" | "multinomial-logit" | "softmax" | "categorical-logit"
-        )
+        || gam::families::fit_orchestration::is_multinomial_family_name(&family_normalized)
     {
         // Per-row Fisher-block override is now threaded through the
         // multi-output canonical fitters (issue #349): the multinomial path
@@ -1454,37 +1451,6 @@ fn batched_gaussian_reml_fits_from_pydict(
         }));
     }
     Ok(fits)
-}
-
-fn set_degenerate_gaussian_reml_items<'py>(
-    py: Python<'py>,
-    out: &Bound<'py, PyDict>,
-    n_rows: usize,
-    n_outputs: usize,
-    n_coefficients: usize,
-) -> PyResult<()> {
-    out.set_item("status", "degenerate")?;
-    out.set_item("lambda", f64::NAN)?;
-    out.set_item("rho", f64::NAN)?;
-    out.set_item("reml_score", f64::NAN)?;
-    out.set_item("reml_grad_lambda", f64::NAN)?;
-    out.set_item("reml_hess_lambda", f64::NAN)?;
-    out.set_item("reml_grad_rho", f64::NAN)?;
-    out.set_item("reml_hess_rho", f64::NAN)?;
-    out.set_item("edf", 0.0)?;
-    out.set_item(
-        "coefficients",
-        Array2::<f64>::zeros((n_coefficients, n_outputs)).into_pyarray(py),
-    )?;
-    out.set_item(
-        "fitted",
-        Array2::<f64>::zeros((n_rows, n_outputs)).into_pyarray(py),
-    )?;
-    out.set_item(
-        "sigma2",
-        Array1::<f64>::from_elem(n_outputs, f64::NAN).into_pyarray(py),
-    )?;
-    Ok(())
 }
 
 struct BatchedGaussianRemlResult {
@@ -3310,16 +3276,17 @@ fn posterior_predict_result_to_py(
 #[pyfunction]
 fn posterior_predict_table(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     samples: PyReadonlyArray2<'_, f64>,
 ) -> PyResult<Py<PyDict>> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let samples = owned_row_major_f64(samples.as_array());
     let result = detach_py_result(py, "posterior_predict_table", move || {
-        posterior_predict_encoded_table_impl(&model_bytes, dataset, samples)
+        posterior_predict_encoded_table_impl(&model, dataset, samples)
     })?;
     posterior_predict_result_to_py(py, result)
 }
@@ -3327,17 +3294,18 @@ fn posterior_predict_table(
 #[pyfunction]
 fn posterior_predict_bands_table(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     samples: PyReadonlyArray2<'_, f64>,
     level: f64,
 ) -> PyResult<Py<PyDict>> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let samples = owned_row_major_f64(samples.as_array());
     let payload = detach_py_result(py, "posterior_predict_bands_table", move || {
-        posterior_predict_bands_encoded_table_impl(&model_bytes, dataset, samples, level)
+        posterior_predict_bands_encoded_table_impl(&model, dataset, samples, level)
     })?;
     posterior_bands_payload_to_py(py, payload)
 }
@@ -3435,8 +3403,9 @@ fn apply_inverse_link_with_optional_spec(
 }
 
 #[pyfunction]
-fn summary_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
-    detach_py_result(py, "summary_json", move || summary_json_impl(&model_bytes))
+fn summary_json(model: PyRef<'_, PyFittedModel>) -> PyResult<String> {
+    serde_json::to_string(model.summary_value()?)
+        .map_err(|err| py_value_error(format!("failed to serialize summary: {err}")))
 }
 
 /// #944 curvature-as-an-estimand report for every `curv(...)` constant-curvature
@@ -3451,24 +3420,27 @@ fn summary_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
 #[pyfunction]
 fn curvature_inference_json(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     level: Option<f64>,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     detach_py_result(py, "curvature_inference_json", move || {
-        curvature_inference_dataset_json_impl(&model_bytes, dataset, level.unwrap_or(0.95))
+        curvature_inference_dataset_json_impl(&model, dataset, level.unwrap_or(0.95))
     })
 }
 
 /// #1063 per-term LR significance report for every penalized smooth term:
 /// `statistic_lr`, `ref_df`, `bartlett_factor`,
 /// `bartlett_factor_conditional`, `rho_variation_shift`,
-/// `statistic_corrected`, `p_value_uncorrected`, `p_value_corrected`, and
+/// `statistic_corrected`, `p_value_uncorrected`, `p_value_corrected`,
 /// `correction_provenance` (`"lawley_lr_estimated_lambda"` |
-/// `"lawley_lr_fixed_lambda"` | `"none"`).
+/// `"lawley_lr_fixed_lambda"` | `"none"`), and exactly one of `p_value`,
+/// `p_value_upper_bound` or `unavailable_reason` (with `unavailable_message`).
+/// Every row carries every key.
 ///
 /// Unlike `summary_json` (Wood rank-truncated **Wald** χ²), this computes a
 /// genuine **likelihood-ratio** statistic by a constrained refit dropping each
@@ -3478,14 +3450,15 @@ fn curvature_inference_json(
 #[pyfunction]
 fn smooth_term_lr_inference_json(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     detach_py_result(py, "smooth_term_lr_inference_json", move || {
-        smooth_term_lr_inference_dataset_json_impl(&model_bytes, dataset)
+        smooth_term_lr_inference_dataset_json_impl(&model, dataset)
     })
 }
 
@@ -3501,14 +3474,15 @@ fn smooth_term_lr_inference_json(
 #[pyfunction]
 fn basis_adequacy_json(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     detach_py_result(py, "basis_adequacy_json", move || {
-        basis_adequacy_dataset_json_impl(&model_bytes, dataset)
+        basis_adequacy_dataset_json_impl(&model, dataset)
     })
 }
 
@@ -3541,15 +3515,16 @@ fn basis_adequacy_json(
 #[pyfunction]
 fn model_debiased_functional_json(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     target_spec_json: String,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     detach_py_result(py, "model_debiased_functional_json", move || {
-        model_debiased_functional_dataset_json_impl(&model_bytes, dataset, &target_spec_json)
+        model_debiased_functional_dataset_json_impl(&model, dataset, &target_spec_json)
     })
 }
 
@@ -3702,13 +3677,12 @@ fn weighted_affine_mean(
 }
 
 fn model_debiased_functional_dataset_json_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     dataset: EncodedDataset,
     target_spec_json: &str,
 ) -> Result<String, String> {
     use gam::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 
-    let model = load_model_impl(model_bytes)?;
     let formula = model.payload().formula.clone();
 
     // Only standard (non-survival, non-marginal-slope) models supported: they
@@ -4041,17 +4015,71 @@ fn resolve_average_derivative_column(
     }
 }
 
+/// The summary as a Python dict. The saved payload's row-major
+/// `covariance_flat` / `covariance_n` pair arrives as one `(n, n)` float64
+/// array under `"covariance"`; every other field converts as JSON.
 #[pyfunction]
-fn summary_payload_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
-    let payload = detach_py_result(py, "summary_payload_from_model", move || {
-        summary_payload_value_from_model_bytes(&model_bytes)
-    })?;
-    json_object_to_py_dict(py, payload)
+fn summary_payload_from_model(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<PyObject> {
+    let serde_json::Value::Object(items) = model.summary_value()? else {
+        return Err(py_value_error(
+            "model summary payload must be a JSON object".to_string(),
+        ));
+    };
+    let out = PyDict::new(py);
+    for (key, value) in items {
+        match key.as_str() {
+            "covariance_n" => {}
+            "covariance_flat" => {
+                let covariance = summary_covariance_matrix(items.get("covariance_n"), value)?;
+                match covariance {
+                    Some(covariance) => out.set_item("covariance", covariance.into_pyarray(py))?,
+                    None => out.set_item("covariance", py.None())?,
+                }
+            }
+            _ => out.set_item(key, json_value_to_py(py, value)?.bind(py))?,
+        }
+    }
+    Ok(out.unbind().into_any())
+}
+
+/// `covariance_flat` reshaped to its `covariance_n` side. JSON has no
+/// non-finite numbers, so serde writes a non-finite entry as `null`; it reads
+/// back as NaN.
+fn summary_covariance_matrix(
+    side: Option<&serde_json::Value>,
+    flat: &serde_json::Value,
+) -> PyResult<Option<Array2<f64>>> {
+    let Some(flat) = flat.as_array() else {
+        return Ok(None);
+    };
+    let side = side
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|side| usize::try_from(side).ok())
+        .ok_or_else(|| {
+            py_value_error("summary covariance_flat is present without covariance_n".to_string())
+        })?;
+    let entries = flat
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| match value {
+            serde_json::Value::Null => Ok(f64::NAN),
+            _ => value.as_f64().ok_or_else(|| {
+                py_value_error(format!("summary covariance_flat[{idx}] must be a JSON number"))
+            }),
+        })
+        .collect::<PyResult<Vec<f64>>>()?;
+    Array2::from_shape_vec((side, side), entries)
+        .map(Some)
+        .map_err(|err| {
+            py_value_error(format!(
+                "summary covariance_flat does not fill a {side}x{side} matrix: {err}"
+            ))
+        })
 }
 
 #[pyfunction]
-fn smoothing_parameters_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
-    let payload = summary_payload_from_model_bytes(&model_bytes)?;
+fn smoothing_parameters_from_model(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<PyObject> {
+    let payload = model.summary_value()?;
     let out = PyDict::new(py);
     let Some(lambdas) = payload.get("lambdas").and_then(serde_json::Value::as_array) else {
         return Ok(out.unbind().into_any());
@@ -4066,17 +4094,16 @@ fn smoothing_parameters_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyRe
 }
 
 #[pyfunction]
-fn model_group_metadata(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
-    let payload = summary_payload_from_model_bytes(&model_bytes)?;
-    match payload.get("group_metadata") {
-        Some(value @ serde_json::Value::Object(_)) => json_value_to_py(py, value.clone()),
+fn model_group_metadata(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<PyObject> {
+    match model.summary_value()?.get("group_metadata") {
+        Some(value @ serde_json::Value::Object(_)) => json_value_to_py(py, value),
         _ => Ok(py.None()),
     }
 }
 
 #[pyfunction]
-fn model_deployment_extensions(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
-    let payload = summary_payload_from_model_bytes(&model_bytes)?;
+fn model_deployment_extensions(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<PyObject> {
+    let payload = model.summary_value()?;
     let out = PyList::empty(py);
     let Some(extensions) = payload
         .get("deployment_extensions")
@@ -4086,30 +4113,29 @@ fn model_deployment_extensions(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult
     };
     for extension in extensions {
         if matches!(extension, serde_json::Value::Object(_)) {
-            let py_value = json_value_to_py(py, extension.clone())?;
+            let py_value = json_value_to_py(py, extension)?;
             out.append(py_value.bind(py))?;
         }
     }
     Ok(out.unbind().into_any())
 }
 
-#[pyfunction]
-fn model_conditional_aic(model_bytes: Vec<u8>) -> PyResult<f64> {
-    let payload = summary_payload_from_model_bytes(&model_bytes)?;
-    // Report the SAME Occam-penalised conditional-AIC ranking score that
-    // `gamfit.compare_models` ranks on (`-2·loglik + 2·edf`), not the raw
-    // REML/LAML criterion, so `Model.conditional_aic` ordering agrees with the
-    // winner `compare_models` declares. Lower is still better (issue #2079). It
-    // is a cost on the −2·log scale and no marginal likelihood (#2946 T12).
-    ranking_score_from_summary_payload(&payload)
+/// The saved-model summary as a JSON value, built from the typed model, with its
+/// rendered text under `"text"`: the one Rust renderer `gam summary` prints, so
+/// `str(model.summary())` is that same string.
+fn summary_payload_value(model: &FittedModel) -> Result<serde_json::Value, String> {
+    let summary = saved_model_summary(model)?;
+    let text = render_summary_text(&summary);
+    let mut value = serde_json::to_value(&summary)
+        .map_err(|err| format!("failed to serialize summary: {err}"))?;
+    let serde_json::Value::Object(fields) = &mut value else {
+        return Err("model summary payload must be a JSON object".to_string());
+    };
+    fields.insert("text".to_string(), serde_json::Value::String(text));
+    Ok(value)
 }
 
-fn summary_payload_value_from_model_bytes(model_bytes: &[u8]) -> Result<serde_json::Value, String> {
-    let summary_json = summary_json_impl(model_bytes)?;
-    serde_json::from_str(&summary_json).map_err(|err| format!("invalid model summary JSON: {err}"))
-}
-
-fn json_object_to_py_dict(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
+fn json_object_to_py_dict(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     let serde_json::Value::Object(items) = value else {
         return Err(py_value_error(
             "model summary payload must be a JSON object".to_string(),
@@ -4123,7 +4149,7 @@ fn json_object_to_py_dict(py: Python<'_>, value: serde_json::Value) -> PyResult<
     Ok(out.unbind().into_any())
 }
 
-fn json_value_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
+fn json_value_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     match value {
         serde_json::Value::Null => Ok(py.None()),
         serde_json::Value::Bool(value) => value.into_py_any(py),
@@ -4139,7 +4165,7 @@ fn json_value_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObje
                 .ok_or_else(|| py_value_error("JSON number is not representable".to_string()))?;
             value.into_py_any(py)
         }
-        serde_json::Value::String(value) => value.into_py_any(py),
+        serde_json::Value::String(value) => value.as_str().into_py_any(py),
         serde_json::Value::Array(values) => {
             let out = PyList::empty(py);
             for value in values {
@@ -4174,25 +4200,24 @@ fn summary_repr(payload: &Bound<'_, PyDict>) -> PyResult<String> {
             fields.push(format!("{key}={repr}"));
         }
     }
+    if let Some(estimator) = summary_estimator_text(payload)? {
+        fields.push(format!("estimator={}", estimator.repr()?.extract::<String>()?));
+    }
     Ok(format!("Summary({})", fields.join(", ")))
 }
 
-/// The summary's criterion row in gam-report's words, so the printed summary
-/// names a fit without null-space metadata apart from an exact fit the same way
-/// `gam fit` and the HTML report do (#2627).
-#[pyfunction]
-fn summary_criterion_row(payload: &Bound<'_, PyDict>) -> PyResult<String> {
-    let criterion = |key: &str| -> PyResult<Option<f64>> {
-        match payload.get_item(key)? {
-            Some(value) if !value.is_none() => Ok(Some(value.extract::<f64>()?)),
-            _ => Ok(None),
-        }
+/// `convergence.estimator.text`: the words `SummaryEstimator` renders for the
+/// objective the fit optimized. `None` for a route that certifies no optimizer.
+fn summary_estimator_text<'py>(
+    payload: &Bound<'py, PyDict>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let Some(convergence) = payload.get_item("convergence")? else {
+        return Ok(None);
     };
-    Ok(gam::report::criterion_row(
-        criterion("reml_score")?,
-        criterion("raw_reml_score")?,
-        summary_render::summary_format_float,
-    ))
+    if convergence.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(convergence.get_item("estimator")?.get_item("text")?))
 }
 
 #[pyfunction]
@@ -4201,7 +4226,7 @@ fn summary_html(payload: &Bound<'_, PyDict>) -> PyResult<String> {
     let mut rows = String::new();
     for (key, value) in payload.iter() {
         let key_text = key.str()?.extract::<String>()?;
-        if key_text == "coefficients" || key_text == "covariance_flat" {
+        if key_text == "coefficients" || key_text == "covariance" {
             continue;
         }
         rows.push_str("<tr>");
@@ -4222,36 +4247,40 @@ fn summary_html(payload: &Bound<'_, PyDict>) -> PyResult<String> {
 }
 
 #[pyfunction]
-fn coefficient_state_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
+fn coefficient_state_json(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     detach_py_result(py, "coefficient_state_json", move || {
-        coefficient_state_json_impl(&model_bytes)
+        coefficient_state_json_impl(&model)
     })
 }
 
 #[pyfunction]
-fn term_blocks_for_model(model_bytes: Vec<u8>) -> PyResult<Vec<(String, String, usize, usize)>> {
-    term_blocks_for_model_impl(&model_bytes).map_err(PyValueError::new_err)
+fn term_blocks_for_model(model: PyRef<'_, PyFittedModel>) -> PyResult<Vec<(String, String, usize, usize)>> {
+    let model = Arc::clone(&model.model);
+    term_blocks_for_model_impl(&model).map_err(PyValueError::new_err)
 }
 
 #[pyfunction]
 fn difference_smooth_json(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     request_json: String,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     detach_py_result(py, "difference_smooth_json", move || {
-        difference_smooth_json_impl(&model_bytes, &request_json)
+        difference_smooth_json_impl(&model, &request_json)
     })
 }
 
 #[pyfunction]
 fn difference_smooth_rows(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     request_json: String,
 ) -> PyResult<PyObject> {
+    let model = Arc::clone(&model.model);
     let rows = detach_py_result(py, "difference_smooth_rows", move || {
-        let raw = difference_smooth_json_impl(&model_bytes, &request_json)?;
+        let raw = difference_smooth_json_impl(&model, &request_json)?;
         serde_json::from_str::<Vec<serde_json::Map<String, serde_json::Value>>>(&raw)
             .map_err(|err| format!("failed to parse difference_smooth rows json: {err}"))
     })?;
@@ -4373,37 +4402,40 @@ fn cross_fit_shared_precision_groups_json(
 #[pyfunction]
 fn check_json(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     detach_py_result(py, "check_json", move || {
-        check_dataset_json_impl(&model_bytes, dataset)
+        check_dataset_json_impl(&model, dataset)
     })
 }
 
 #[pyfunction]
 fn check_payload_from_model(
     py: Python<'_>,
-    model_bytes: Vec<u8>,
+    model: PyRef<'_, PyFittedModel>,
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<PyObject> {
+    let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let payload = detach_py_result(py, "check_payload_from_model", move || {
-        let check_json = check_dataset_json_impl(&model_bytes, dataset)?;
+        let check_json = check_dataset_json_impl(&model, dataset)?;
         serde_json::from_str::<serde_json::Value>(&check_json)
             .map_err(|err| format!("invalid schema check JSON: {err}"))
     })?;
-    json_object_to_py_dict(py, payload)
+    json_object_to_py_dict(py, &payload)
 }
 
 #[pyfunction]
-fn report_html(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
-    detach_py_result(py, "report_html", move || report_html_impl(&model_bytes))
+fn report_html(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<String> {
+    let model = Arc::clone(&model.model);
+    detach_py_result(py, "report_html", move || report_html_impl(&model))
 }
 
 #[pyfunction]
@@ -4435,20 +4467,6 @@ fn diagnostics_from_predictions(
 fn auc_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
     gam::inference::diagnostics::auc_from_predictions(&observed, &predicted_mean)
         .map_err(py_value_error)
-}
-
-#[pyfunction]
-fn weighted_auc_from_predictions(
-    observed: Vec<f64>,
-    predicted_mean: Vec<f64>,
-    weights: Vec<f64>,
-) -> PyResult<f64> {
-    gam::inference::diagnostics::weighted_auc_from_predictions(
-        &observed,
-        &predicted_mean,
-        Some(&weights),
-    )
-    .map_err(py_value_error)
 }
 
 #[pyfunction]
@@ -4521,17 +4539,17 @@ fn gaussian_prediction_scores_from_predictions(
     Ok(out.unbind())
 }
 
-#[pyfunction]
+#[pyfunction(signature = (observed, predicted_mean, null_mean = None))]
 fn classification_metrics(
     py: Python<'_>,
     observed: Vec<f64>,
     predicted_mean: Vec<f64>,
-    train_prev: f64,
+    null_mean: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     let metrics = gam::inference::diagnostics::classification_metrics_from_predictions(
         &observed,
         &predicted_mean,
-        train_prev,
+        null_mean,
     )
     .map_err(py_value_error)?;
     let out = PyDict::new(py);

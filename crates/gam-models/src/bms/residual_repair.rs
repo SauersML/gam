@@ -63,6 +63,7 @@ use super::*;
 use gam_math::jet_scalar::{JetScalar, SymmetricQuadraticCoefficients};
 use gam_math::jet_tower::Tower4;
 use gam_math::nested_dual::JetField;
+use crate::latent_anchor::{AnchorGridOwned, AnchorTaylor, solve_anchor};
 use ndarray::Zip;
 
 /// Name of the residual block in the parameter-block list and in the
@@ -420,7 +421,7 @@ impl ResidualBlockRuntime {
                 .map_err(unavailable)?,
         };
         if let Some(model) = conditional.as_ref() {
-            log::info!(
+            log::debug!(
                 "[BMS residual repair] joint (z, r) covariance escalated to Σ(a): {} pair(s) fired \
                  the conditional gate",
                 model
@@ -582,12 +583,6 @@ fn sqrt1p_stack(f: f64) -> [f64; 5] {
     ]
 }
 
-/// Derivative stack of `x ↦ log Φ(x)` at `x`.
-#[inline]
-fn log_probit_stack(x: f64) -> [f64; 5] {
-    signed_probit_neglog_unary_stack(x, 1.0).map(|derivative| -derivative)
-}
-
 /// The anchored intercept of a finite mixture of Gaussian drives, with its
 /// derivatives through order four in `(q, B)`.
 ///
@@ -606,76 +601,25 @@ fn log_probit_stack(x: f64) -> [f64; 5] {
 /// — the probit anchor on a finite declared law, whose root is unique
 /// (`Descent.Portability.ProbitAnchor.exists_unique_anchor_probit`).
 ///
-/// The value is the log-space monotone root the rigid empirical kernel solves.
-/// The derivative channels come from frozen-Jacobian Newton on the tower,
-/// `ã ← ã − F(ã)/F′(ã*)` with `F(ã) = log Σ_k w_k Φ(ã + B·z_k) − log Φ(q)`: the
-/// error `e` of a step becomes `e·(1 − F′(ã)/F′(ã*)) + O(e²)`, and the factor has
-/// no constant term, so each step fixes one more Taylor order and four are
-/// exact through order four (its first order is `∂ã/∂B = −E[φ·z]/E[φ]`,
-/// `ProbitAnchor.anchor_deriv_eq_probit`). The value channel is held at the
-/// root, so every path that reads the same root agrees with it bit for bit.
+/// The value is the log-space root of the smaller tail the rigid empirical
+/// kernel solves ([`solve_anchor`]); the derivative channels are the anchor's
+/// Taylor table at that root ([`AnchorTaylor`]) composed with the seeded
+/// `(q, B)`, normalized by the grid density so a tail index whose every node
+/// density underflows keeps finite exact derivatives (gam#2978). Its first
+/// order is `∂ã/∂B = −E[φ·z]/E[φ]` (`ProbitAnchor.anchor_deriv_eq_probit`).
+/// The value channel is the root itself, so every path that reads the same
+/// root agrees with it bit for bit.
 pub(crate) fn mixture_anchor_tower(
-    marginal_mu: f64,
     q: f64,
     b: f64,
     grid: &EmpiricalZGrid,
 ) -> Result<Tower4<2>, String> {
-    let root =
-        empirical_intercept_from_marginal(marginal_mu, q, b, 1.0, &grid.nodes, &grid.weights, None)?;
-    let (_, slope_of_residual, _) = empirical_rigid_calibration_eval(
-        root,
-        marginal_mu.ln(),
-        b,
-        1.0,
-        &grid.nodes,
-        &grid.weights,
-    )?;
-    if !(slope_of_residual.is_finite() && slope_of_residual > 0.0) {
-        return Err(format!(
-            "residual repair mixture anchor: the calibration slope {slope_of_residual} at the root \
-             a={root} is not positive"
-        ));
-    }
-    let inverse_slope = slope_of_residual.recip();
+    let owned = AnchorGridOwned::from_grid(grid);
+    let root = solve_anchor(q, b, owned.view())?;
+    let taylor = AnchorTaylor::at(root, q, b, owned.view())?;
     let q_var = <Tower4<2> as JetScalar<2>>::variable(q, 0);
     let b_var = <Tower4<2> as JetScalar<2>>::variable(b, 1);
-    let log_target = q_var.compose_unary(log_probit_stack(q));
-    let log_weights: Vec<f64> = grid.weights.iter().map(|w| w.ln()).collect();
-    let mut intercept = <Tower4<2> as JetScalar<2>>::constant(root);
-    for _ in 0..4 {
-        let residual = log_mixture_probit(&intercept, &b_var, &grid.nodes, &log_weights)
-            .sub(&log_target);
-        intercept = intercept.sub(&residual.scale(inverse_slope).with_value(0.0));
-    }
-    Ok(intercept)
-}
-
-/// `log Σ_k w_k Φ(a + b·z_k)` on towers, by log-sum-exp about the largest term
-/// so every exponential is taken at a non-positive argument.
-fn log_mixture_probit(
-    a: &Tower4<2>,
-    b: &Tower4<2>,
-    nodes: &[f64],
-    log_weights: &[f64],
-) -> Tower4<2> {
-    let terms: Vec<Tower4<2>> = nodes
-        .iter()
-        .zip(log_weights.iter())
-        .map(|(&node, &log_weight)| {
-            let x = a.add(&b.scale(node));
-            x.compose_unary(log_probit_stack(x.value()))
-                .add_constant(log_weight)
-        })
-        .collect();
-    let largest = terms
-        .iter()
-        .map(|term| term.value())
-        .fold(f64::NEG_INFINITY, f64::max);
-    let mut mass = <Tower4<2> as JetScalar<2>>::constant(0.0);
-    for term in &terms {
-        mass = mass.add(&term.add_constant(-largest).exp());
-    }
-    mass.ln().add_constant(largest)
+    Ok(taylor.lift(&q_var, &b_var.with_value(0.0)))
 }
 
 /// Compose a bivariate tower `f(q, B)` with the jets `Q` and `B` through order
@@ -802,7 +746,7 @@ pub(super) fn residual_row_nll<const N: usize, S: JetScalar<N>>(
             }
             let tau = v.compose_unary(sqrt1p_stack((1.0 + v_value.max(0.0)).sqrt()));
             let b_scaled = m.mul(&tau.recip());
-            let tower = mixture_anchor_tower(marginal.mu, marginal.q, b_scaled.value(), grid)?;
+            let tower = mixture_anchor_tower(marginal.q, b_scaled.value(), grid)?;
             compose_bivariate_tower(&tower, &q, &b_scaled).multiply_add(&tau, &linear)
         }
     };
@@ -877,7 +821,7 @@ pub(crate) fn residual_row_index(
     }
     let tau = (1.0 + v.max(0.0)).sqrt();
     let b_scaled = m / tau;
-    let tower = mixture_anchor_tower(marginal.mu, marginal.q, b_scaled, grid)?;
+    let tower = mixture_anchor_tower(marginal.q, b_scaled, grid)?;
     let (intercept, intercept_q, intercept_b) = (tower.v, tower.g[0], tower.g[1]);
     let eta = tau * intercept + linear;
     let d_q = tau * intercept_q * marginal.q1;
@@ -1196,21 +1140,12 @@ mod residual_repair_kernel_tests {
         let grid = skewed_grid();
         let tower_at = |q: f64, b: f64| {
             let marginal = bernoulli_marginal_link_map(&link, q).unwrap();
-            mixture_anchor_tower(marginal.mu, marginal.q, b, &grid).unwrap()
+            mixture_anchor_tower(marginal.q, b, &grid).unwrap()
         };
         let (q, b) = (-0.7, 0.6);
         let base = tower_at(q, b);
         let marginal = bernoulli_marginal_link_map(&link, q).unwrap();
-        let root = empirical_intercept_from_marginal(
-            marginal.mu,
-            marginal.q,
-            b,
-            1.0,
-            &grid.nodes,
-            &grid.weights,
-            None,
-        )
-        .unwrap();
+        let root = empirical_intercept(marginal.q, b, 1.0, &grid.nodes, &grid.weights).unwrap();
         assert_eq!(base.v, root, "the value channel is the root itself");
         let h = 1.0e-4;
         let shifted = |axis: usize, sign: f64| {

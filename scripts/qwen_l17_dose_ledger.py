@@ -16,25 +16,37 @@ For each feature (weekday, month, color):
    output-Fisher factor from ``gamfit.torch.harvest``. The weights stay bfloat16
    and the harvest takes its math in float32. Rows and factors are cached as
    ``harvest_cache_{feature}_L{layer}_n{rows}.npz`` and re-used when present.
-2. **Chart.** ``gamfit.sae_manifold_fit`` fits one circle atom for
+2. **Chart.** ``gamfit.sae.sae_manifold_fit`` fits one circle atom for
    ``fit_iterations`` iterations in a train-only PCA chart of ``chart_dim``
    dimensions, with the projected shard installed.
 3. **Bases.** A seeded permutation draws ``bases`` base prompts from the
    evaluation templates. The first half is ``split=calibration``, the rest
    ``split=heldout``.
-4. **Dose floor.** Each base is re-run ``floor_repetitions`` times with its own
-   residual spliced back unchanged. The floor is ``floor_multiplier`` times the
-   largest ``KL(p_base || p_repeat)``, the smallest dose the forward resolves.
+4. **Controls.** Each base is re-run ``floor_repetitions`` times with its own
+   residual spliced back unchanged. On a deterministic model these measure exactly
+   0, which is no floor; their largest KL is kept only as control evidence that
+   raises a record's floor where the forward is stochastic.
 5. **Dose ladder.** A base's reference dose is the measured KL of the half-turn
    move along its chart (``ManifoldSAE.steer`` at the base's own gate). Each
-   fraction names the target ``fraction × reference``. A target at or under the
-   floor is recorded as ``below_floor`` and not requested.
-6. **Plans.** Every other target goes through ``ManifoldSAE.steer_to_target``
-   with a plan-aware probe. The probe writes the move in the model's dtype,
-   measures ``KL(p_base || p_patched)`` over the full vocabulary, and returns the
-   exact directional Fisher dose ``½ (Jδ)ᵀ F (Jδ)`` of the move it applied, by
-   one JVP. The returned plan, whose ``predicted_nats`` is that exact directional
-   value, is one ledger row. A typed refusal is recorded, never dropped.
+   fraction names the target ``fraction × reference``, and every target is
+   requested.
+6. **Plans.** Each target goes through ``ManifoldSAE.steer_to_target`` with a
+   plan-aware probe. The probe writes the move in the model's dtype, measures
+   ``KL(p_base || p_patched)`` over the full vocabulary with the calibration
+   contract's own evaluation (``gamfit.torch.interventions.kl_and_logit_extent``),
+   and returns the exact directional Fisher dose ``½ (Jδ)ᵀ F (Jδ)`` of the move it
+   applied, by one JVP. The returned plan, whose ``predicted_nats`` is that exact
+   directional value, is one ledger row. A typed refusal is recorded, never dropped.
+   Each row carries its own measurement floor from the Rust owner
+   (``kl_measurement_floor``): the band ``½·ulp_F(M)² + E₆₄`` of its logits'
+   format ``F``, largest ``|logit|`` ``M`` and largest change, raised by the control
+   evidence. The format is the head's own output dtype; this model's head computes
+   bfloat16 logits. A row whose KL does not exceed its floor is kept and scored as
+   unresolved, and a KL is never clamped.
+   Every patched forward also records each top-k router's expert sets, and the row
+   carries ``router_topk_changes``, the number of token rows whose set differs from
+   the base forward's: the scorer's small-dose expansion holds only before the
+   first such change along a chord.
 
 Each feature's result is cached as ``feature_{feature}.json``, so a run cut short
 resumes where it stopped. The ledger is written once every feature is done.
@@ -49,7 +61,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -75,13 +87,15 @@ TAU = MATRIX.TAU
 log = MATRIX.log
 
 
-# The frozen #2249 settings: DOSE_FLOOR_MULT=30, FLOOR_REPS=5, FRACS=0.01..0.6,
-# MAXTPL=6, NBASES=10, NITER=40 at layer 17, bfloat16 weights and float32 harvest
-# math. The historical ledger held 300 edits over three features and ten bases, so
-# FRACS is ten fractions, spaced geometrically across its stated range. The chart
-# dimension belongs to this restatement, and every ledger records it. The dose solve
-# takes no accuracy or probe budget: it lands each dose at the representation limit
-# of the displacement.
+# The frozen #2249 settings: FLOOR_REPS=5, FRACS=0.01..0.6, MAXTPL=6, NBASES=10,
+# NITER=40 at layer 17, bfloat16 weights and float32 harvest math. The historical
+# ledger held 300 edits over three features and ten bases, so FRACS is ten
+# fractions, spaced geometrically across its stated range. The chart dimension
+# belongs to this restatement, and every ledger records it. The dose solve takes no
+# accuracy or probe budget: it lands each dose at the representation limit of the
+# displacement. The historical DOSE_FLOOR_MULT=30 is not kept: 30 times the largest
+# repeated-forward KL is 0 on a deterministic model, and each record's floor is its
+# derived measurement band instead (#2263).
 FROZEN_PROTOCOL: dict[str, Any] = {
     "model": "Qwen/Qwen3.6-35B-A3B",
     "layer": 17,
@@ -91,7 +105,6 @@ FROZEN_PROTOCOL: dict[str, Any] = {
     "rank": 8,
     "seed": 0,
     "fractions": tuple(float(value) for value in np.geomspace(0.01, 0.6, 10)),
-    "floor_multiplier": 30,
     "floor_repetitions": 5,
     "max_templates": 6,
     "bases": 10,
@@ -167,25 +180,43 @@ def base_split(pool_size: int, bases: int, seed: int) -> list[tuple[int, str]]:
     ]
 
 
-def dose_floor(repeat_nats: list[float], multiplier: float) -> float:
-    """The smallest resolvable dose: ``multiplier`` times the largest repeat KL."""
+def control_evidence_nats(repeat_nats: list[float]) -> float:
+    """The largest repeated-forward KL: the control evidence that raises a floor.
+
+    A deterministic forward repeats exactly and measures 0, or a KL negative by
+    roundoff; neither raises a record's floor above its derived band. Only a
+    stochastic forward's repeats do.
+    """
     if not repeat_nats:
-        raise ValueError("the dose floor needs at least one repeated forward")
-    worst = max(repeat_nats)
-    if not (np.isfinite(worst) and worst >= 0.0):
-        raise ValueError(f"repeated-forward KL must be finite and non-negative; got {repeat_nats}")
-    return float(multiplier) * float(worst)
+        raise ValueError("the control evidence needs at least one repeated forward")
+    if not all(np.isfinite(value) for value in repeat_nats):
+        raise ValueError(f"repeated-forward KL must be finite; got {repeat_nats}")
+    return float(max(repeat_nats))
 
 
-def dose_ladder(
-    reference_nats: float, fractions: tuple[float, ...], floor_nats: float
-) -> list[tuple[int, float, bool]]:
-    """``(fraction index, target, above the floor)`` for every fraction of the reference."""
-    ladder = []
-    for index, fraction in enumerate(fractions):
-        target = float(fraction) * float(reference_nats)
-        ladder.append((index, target, target > floor_nats))
-    return ladder
+def dose_ladder(reference_nats: float, fractions: tuple[float, ...]) -> list[tuple[int, float]]:
+    """``(fraction index, target)`` for every fraction of the reference; all are requested."""
+    return [(index, float(fraction) * float(reference_nats)) for index, fraction in enumerate(fractions)]
+
+
+def router_topk_changes(base_calls: list[np.ndarray], patched_calls: list[np.ndarray]) -> int:
+    """Count the token rows whose top-k expert set differs between two forwards.
+
+    Each forward records one ``(tokens, k)`` index array per router call, in call
+    order. The logits are smooth in the activation only while every router keeps
+    its expert set, so a nonzero count puts the patched dose outside the region the
+    small-dose expansion describes. Order within a row is not part of the set.
+    """
+    if len(base_calls) != len(patched_calls):
+        raise ValueError(
+            f"the patched forward made {len(patched_calls)} router calls; the base made {len(base_calls)}"
+        )
+    changes = 0
+    for base, patched in zip(base_calls, patched_calls):
+        if base.shape != patched.shape:
+            raise ValueError(f"router call shapes differ: base {base.shape}, patched {patched.shape}")
+        changes += int(np.any(np.sort(base, axis=-1) != np.sort(patched, axis=-1), axis=-1).sum())
+    return changes
 
 
 def ledger_row(
@@ -197,8 +228,14 @@ def ledger_row(
     split: str,
     fraction_index: int,
     target_nats: float,
+    observation: dict[str, Any],
 ) -> dict[str, Any]:
-    """One scored intervention, copied from the public plan and never re-priced."""
+    """One scored intervention, copied from the public plan and never re-priced.
+
+    ``observation`` is what the probe recorded for the landed move beside the plan:
+    its router top-k changes, its logits' format and extents, and the measurement
+    floor the Rust owner derived from them.
+    """
     return {
         "intervention_id": f"{base_prompt_id}-f{fraction_index}",
         "feature": feature,
@@ -216,6 +253,13 @@ def ledger_row(
         "resident_metric_nats_kind": str(plan["resident_metric_nats_kind"]),
         "iterations": int(plan["iterations"]),
         "displacement": float(plan["displacement"]),
+        "router_topk_changes": int(observation["router_topk_changes"]),
+        "logit_format": str(observation["logit_format"]),
+        "logit_max_abs": float(observation["logit_max_abs"]),
+        "logit_max_abs_change": float(observation["logit_max_abs_change"]),
+        "measurement_evaluation_nats": float(observation["evaluation_band_nats"]),
+        "measurement_band_nats": float(observation["measurement_band_nats"]),
+        "measurement_floor_nats": float(observation["floor_nats"]),
     }
 
 
@@ -257,7 +301,14 @@ def snapshot_identity(snapshot: Path) -> tuple[str, str]:
 # Model interop
 # --------------------------------------------------------------------------- #
 def float32_readout(model: Any, layer: Any, position: int) -> Any:
-    """``build_readout`` from the gates 3/4 producer, with its logits taken in float32."""
+    """``build_readout`` from the gates 3/4 producer, with its logits cast to float32.
+
+    The cast does not make the logits float32-precise: this model's head computes
+    them in its own dtype (bfloat16 here; transformers does not upcast them outside
+    the loss), and a cast keeps the values that head rounded. ``logit_dtype`` records
+    the head's output dtype of the last forward, which is the format a measurement
+    band must use.
+    """
     import torch
 
     inner = MATRIX.build_readout(model, layer, position)
@@ -267,19 +318,59 @@ def float32_readout(model: Any, layer: Any, position: int) -> Any:
             super().__init__()
             self.inner = inner
             self.site = inner.site
+            self.logit_dtype: torch.dtype | None = None
 
         def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-            return self.inner(input_ids).to(torch.float32)
+            logits = self.inner(input_ids)
+            self.logit_dtype = logits.dtype
+            return logits.to(torch.float32)
 
     return Float32Readout()
 
 
+def router_modules(model: Any) -> list[Any]:
+    """The model's top-k expert routers; none for a dense model.
+
+    The frozen model's routers are ``Qwen3_5MoeTopKRouter``, whose forward returns
+    ``(logits, scores, indices)``. A config that declares experts with no router
+    found, or routers under a config with none, is refused rather than scored as
+    dense.
+    """
+    routers = [module for module in model.modules() if type(module).__name__.endswith("TopKRouter")]
+    config = getattr(model.config, "text_config", model.config)
+    experts = int(getattr(config, "num_experts", 0) or 0)
+    if bool(experts) != bool(routers):
+        raise RuntimeError(
+            f"the config declares {experts} experts but {len(routers)} top-k router modules were found"
+        )
+    return routers
+
+
+def record_router_topk(routers: list[Any], forward: Callable[[], Any]) -> tuple[Any, list[np.ndarray]]:
+    """Run ``forward`` and return its result with every router call's top-k indices."""
+    calls: list[np.ndarray] = []
+    handles = [
+        router.register_forward_hook(
+            lambda _module, _inputs, output: calls.append(output[2].detach().cpu().numpy())
+        )
+        for router in routers
+    ]
+    try:
+        result = forward()
+    finally:
+        for handle in handles:
+            handle.remove()
+    return result, calls
+
+
 def run_feature(
-    model: Any, tokenizer: Any, layer: Any, task: Any, atom: int, out_dir: Path
+    model: Any, tokenizer: Any, layer: Any, task: Any, atom: int, out_dir: Path, routers: list[Any]
 ) -> dict[str, Any]:
     import torch
     import gamfit
+    from gamfit._rust import kl_measurement_floor
     from gamfit.torch.harvest import HarvestShard, harvest_output_fisher_factors
+    from gamfit.torch.interventions import kl_and_logit_extent, logit_format_name
 
     protocol = FROZEN_PROTOCOL
     result_path = out_dir / f"feature_{task.name}.json"
@@ -343,7 +434,7 @@ def run_feature(
         provenance="output_fisher",
     )
     log(f"{task.name}: fitting one circle atom in a {x_fit_chart.shape[1]}-dim chart with the shard")
-    sae = gamfit.sae_manifold_fit(
+    sae = gamfit.sae.sae_manifold_fit(
         x_fit_chart,
         K=1,
         d_atom=1,
@@ -376,25 +467,30 @@ def run_feature(
 
     rows: list[dict[str, Any]] = []
     refusals: list[dict[str, Any]] = []
-    below_floor: list[dict[str, Any]] = []
     base_reports: list[dict[str, Any]] = []
     for b, base in enumerate(bases):
         item, readout, row, logits = base["item"], base["readout"], base["row"], base["logits"]
         base_prompt_id = f"{task.name}-e{item['template_index']}-l{item['label_index']}"
         repeat_nats = [
-            CALENDAR.full_vocab_kl(logits.cpu(), MATRIX.spliced_logits(readout, item["ids"], row).detach().cpu())
+            kl_and_logit_extent(
+                logits.cpu(), MATRIX.spliced_logits(readout, item["ids"], row).detach().cpu()
+            )[0]
             for _ in range(protocol["floor_repetitions"])
         ]
-        floor_nats = dose_floor(repeat_nats, protocol["floor_multiplier"])
+        control_nats = control_evidence_nats(repeat_nats)
+        _, base_routing = record_router_topk(
+            routers, lambda: MATRIX.spliced_logits(readout, item["ids"], row).detach()
+        )
+        observations: dict[tuple[float, ...], dict[str, Any]] = {}
         coord = float(base_coord[b])
         gate = float(base_gate[b])
         metric_row = MATRIX.nearest_fitted_row(fit_coord, coord, period)
         half_turn = sae.steer(0, metric_row, gate, np.asarray([coord]), np.asarray([coord + 0.5 * period]))
         half_move = torch.tensor(half_turn["delta"], dtype=torch.float64, device=device) @ lift64
-        reference_nats = CALENDAR.full_vocab_kl(
+        reference_nats = kl_and_logit_extent(
             logits.cpu(),
             MATRIX.spliced_logits(readout, item["ids"], row + half_move.to(row.dtype)).detach().cpu(),
-        )
+        )[0]
         base_reports.append(
             {
                 "base_prompt_id": base_prompt_id,
@@ -403,7 +499,7 @@ def run_feature(
                 "coordinate": coord,
                 "gate": gate,
                 "repeat_nats": repeat_nats,
-                "floor_nats": floor_nats,
+                "control_evidence_nats": control_nats,
                 "reference_nats": reference_nats,
             }
         )
@@ -414,23 +510,40 @@ def run_feature(
             base_logits: Any = logits,
             base_readout: Any = readout,
             input_ids: Any = item["ids"],
+            base_calls: list[np.ndarray] = base_routing,
+            control: float = control_nats,
+            by_delta: dict[tuple[float, ...], dict[str, Any]] = observations,
         ) -> dict[str, Any]:
             requested = torch.tensor(plan["delta"], dtype=torch.float64, device=device) @ lift64
             patched_row = base_row + requested.to(base_row.dtype)
             applied = patched_row - base_row
-            patched = MATRIX.spliced_logits(base_readout, input_ids, patched_row).detach()
+            patched, patched_calls = record_router_topk(
+                routers, lambda: MATRIX.spliced_logits(base_readout, input_ids, patched_row).detach()
+            )
+            logit_format = logit_format_name(base_readout.logit_dtype)
+            measured, logit_max_abs, logit_max_abs_change = kl_and_logit_extent(
+                base_logits.cpu(), patched.cpu()
+            )
+            effective_delta = (applied.to(torch.float64) @ lift64.T).cpu().tolist()
+            by_delta[tuple(effective_delta)] = {
+                "router_topk_changes": router_topk_changes(base_calls, patched_calls),
+                "logit_format": logit_format,
+                "logit_max_abs": logit_max_abs,
+                "logit_max_abs_change": logit_max_abs_change,
+                **kl_measurement_floor(
+                    logit_format, int(patched.shape[-1]), logit_max_abs, logit_max_abs_change, control
+                ),
+            }
             return {
-                "effective_delta": (applied.to(torch.float64) @ lift64.T).cpu().tolist(),
+                "effective_delta": effective_delta,
                 "exact_directional_nats": MATRIX.exact_directional_nats(
                     base_readout, input_ids, base_row, applied
                 ),
-                "measured_nats": CALENDAR.full_vocab_kl(base_logits.cpu(), patched.cpu()),
+                "measured_nats": measured,
                 "certified_attainable_upper_nats": None,
             }
 
-        for fraction_index, target_nats, above_floor in dose_ladder(
-            reference_nats, protocol["fractions"], floor_nats
-        ):
+        for fraction_index, target_nats in dose_ladder(reference_nats, protocol["fractions"]):
             record = {
                 "feature": task.name,
                 "base_prompt_id": base_prompt_id,
@@ -438,9 +551,6 @@ def run_feature(
                 "fraction_index": fraction_index,
                 "target_nats": target_nats,
             }
-            if not above_floor:
-                below_floor.append(record)
-                continue
             request = {
                 "atom_k": 0,
                 "metric_row": metric_row,
@@ -453,6 +563,12 @@ def run_feature(
             except ValueError as error:
                 refusals.append({**record, "refusal": str(error)})
                 continue
+            landed = tuple(float(value) for value in plan["effective_delta"])
+            if landed not in observations:
+                raise RuntimeError(
+                    f"{base_prompt_id} f{fraction_index}: the landed move was never probed, so its "
+                    "router top-k sets and measurement floor are unknown"
+                )
             rows.append(
                 ledger_row(
                     plan,
@@ -462,6 +578,7 @@ def run_feature(
                     split=base["split"],
                     fraction_index=fraction_index,
                     target_nats=target_nats,
+                    observation=observations[landed],
                 )
             )
 
@@ -478,10 +595,10 @@ def run_feature(
         "bases": base_reports,
         "rows": rows,
         "refusals": refusals,
-        "below_floor": below_floor,
     }
     result_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-    log(f"{task.name}: {len(rows)} rows, {len(refusals)} typed refusals, {len(below_floor)} targets under the floor")
+    unresolved = sum(row["measured_nats"] <= row["measurement_floor_nats"] for row in rows)
+    log(f"{task.name}: {len(rows)} rows, {len(refusals)} typed refusals, {unresolved} rows at or under their floor")
     return result
 
 
@@ -513,7 +630,11 @@ def main() -> int:
     layer = CALENDAR.resolve_layers(model)[protocol["layer"]]
     hook_module = next(name for name, module in model.named_modules() if module is layer)
     log(f"model {protocol['model']} revision {revision}; hook module {hook_module}")
-    features = [run_feature(model, tokenizer, layer, task, atom, args.out) for atom, task in enumerate(tasks)]
+    routers = router_modules(model)
+    log(f"{len(routers)} top-k router modules; each patched forward is compared with its base forward")
+    features = [
+        run_feature(model, tokenizer, layer, task, atom, args.out, routers) for atom, task in enumerate(tasks)
+    ]
     import gamfit
 
     ledger = assemble_ledger(
@@ -533,11 +654,11 @@ def main() -> int:
             "harvest_cache_sha256": {feature["feature"]: feature["harvest_cache_sha256"] for feature in features},
             "seed": protocol["seed"],
             "fractions": list(protocol["fractions"]),
-            "floor_multiplier": protocol["floor_multiplier"],
             "floor_repetitions": protocol["floor_repetitions"],
             "max_templates": protocol["max_templates"],
             "bases": protocol["bases"],
             "fit_iterations": protocol["fit_iterations"],
+            "router_modules": len(routers),
             "features": list(protocol["features"]),
             "rank": protocol["rank"],
             "chart_dim": protocol["chart_dim"],
@@ -553,7 +674,8 @@ def main() -> int:
     for feature in features:
         log(
             f"FEATURE {feature['feature']}: rows={len(feature['rows'])} "
-            f"refusals={len(feature['refusals'])} below_floor={len(feature['below_floor'])} "
+            f"refusals={len(feature['refusals'])} "
+            f"unresolved={sum(row['measured_nats'] <= row['measurement_floor_nats'] for row in feature['rows'])} "
             f"recovery_r2={feature['structure_recovery_r2']:.4f}"
         )
     return 0

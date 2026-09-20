@@ -1,0 +1,4 @@
+fit 8.0s
+predict(no interval, 5 pts) 0.0s
+predict(interval, 5 pts) 32.6s {'linear_predictor_plugin': array([-0.202,  0.017,  0.514,  0.949,  1.131]), 'mean_plugin': array([-0.202,  0.017,  0.514,  0.949,  1.131]), 'posterior_mean': array([-0.202,  0.017,  0.514,  0.949,  1.131]), 'posterior_mean_standard_error': array([0.096, 0.038, 0.045, 0.038, 0.074]), 'posterior_mean_lower': array([-0.436, -0.055,  0.425,  0.875,  1.01 ]), 'posterior_mean_upper': array([-0.064,  0.093,  0.601,  1.024,  1.3  ])}
+exit 0

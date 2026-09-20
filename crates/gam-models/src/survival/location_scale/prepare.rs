@@ -102,11 +102,6 @@ pub(crate) fn survival_blockwise_fit_options(
         cache_session: spec.cache_session.clone(),
         persistent_warm_start_store: spec.persistent_warm_start_store.clone(),
         cache_mirror_sessions: spec.cache_mirror_sessions.clone(),
-        // Constant-scale (parametric-AFT) fits pin the time-warp ρ seed at the
-        // identified affine-baseline limit; re-screening that already-correct
-        // seed across the flat unidentified time ridge only stalls. Genuinely
-        // flexible scale/spatial fits keep the default `true` and full screening.
-        screen_initial_rho: !survival_constant_scale(spec),
         ..BlockwiseFitOptions::default()
     }
 }
@@ -117,9 +112,17 @@ pub(crate) fn validate_survival_location_scale_spec(
     let n = spec.event_target.len();
     let monotone_time_wiggle_ncols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
     match &spec.inverse_link {
-        InverseLink::Standard(StandardLink::Log) => {
+        InverseLink::Standard(
+            link @ (StandardLink::Log
+                | StandardLink::Sqrt
+                | StandardLink::Inverse
+                | StandardLink::InverseSquared),
+        ) => {
             return Err(SurvivalLocationScaleError::InvalidConfiguration {
-                reason: "fit_survival_location_scale does not support Standard(Log)".to_string(),
+                reason: format!(
+                    "fit_survival_location_scale does not support the {} link",
+                    link.name()
+                ),
             });
         }
         InverseLink::Standard(StandardLink::Logit)

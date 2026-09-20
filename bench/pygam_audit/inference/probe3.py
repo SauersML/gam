@@ -1,0 +1,18 @@
+import numpy as np, gamfit, inspect, json, warnings
+warnings.simplefilter("ignore")
+rng=np.random.default_rng(0)
+n=300
+x=rng.uniform(0,1,n); z=rng.uniform(0,1,n)
+y=np.sin(2*np.pi*x)+rng.normal(0,0.5,n)
+df=dict(x=x,z=z,y=y)
+m=gamfit.fit(df,"y ~ s(x) + s(z)")
+d=m.diagnose(df)
+print(type(d)); print([a for a in dir(d) if not a.startswith('_')])
+try: print(d.to_dict().keys() if hasattr(d,'to_dict') else d)
+except Exception as e: print(e)
+print(d.metrics)
+m0=gamfit.fit(df,"y ~ s(x)")
+c=gamfit.compare_models([m,m0])
+print(c)
+print(m.summary().to_dict().keys())
+print(json.dumps({k:v for k,v in m.summary().to_dict().items() if k not in ('coefficients','covariance')},default=str)[:3000])

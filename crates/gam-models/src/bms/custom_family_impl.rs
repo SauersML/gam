@@ -551,22 +551,6 @@ impl crate::custom_family::JeffreysThirdInformationDerivative for BernoulliMargi
     }
 }
 
-impl crate::custom_family::JeffreysArming for BernoulliMarginalSlopeFamily {
-    fn with_jeffreys_armed(
-        &self,
-        evidence: Option<&gam_problem::jeffreys_arming::JeffreysArmingEvidence>,
-    ) -> Self {
-        Self {
-            jeffreys_armed: evidence.is_some(),
-            // Each member runs its own auto-subsample schedule from zero, as a
-            // freshly built family does at the start of a fit.
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            ..self.clone()
-        }
-    }
-}
-
 impl gam_model_api::families::custom_family::IndependentOuterSearch<BernoulliMarginalSlopeFamily>
     for BernoulliMarginalSlopeFamily
 {
@@ -595,6 +579,17 @@ impl gam_model_api::families::custom_family::IndependentOuterSearch<BernoulliMar
             search: Some(Arc::new(BmsSearchMember::new(lane))),
             ..self.clone()
         }
+    }
+
+    /// A start value is an upper bound on its basin's minimum, never a lower
+    /// bound, so no start comparison can skip a basin. On gnomon#2359's 200-row
+    /// calibration the fit's own start publishes a certified basin 1.49 nats above
+    /// the one ρ = −2 reaches. Two positive-definite certified minima are not
+    /// joined by any negative-curvature direction, so the saddle escape cannot
+    /// reach the second from the first; each of these starts gets its own full,
+    /// certified search and the lowest certified value wins.
+    fn additional_outer_start_levels(&self) -> Vec<f64> {
+        vec![0.0, f64::INFINITY, 2.0, 4.0, -2.0]
     }
 }
 
@@ -717,7 +712,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         // available we still fall through to the gradient-only route below.
         if !dense_available && !hvp_available {
             if log_exact_work(self.y.len()) {
-                log::info!(
+                log::debug!(
                     "[BMS outer-derivative-policy] n={} p={} flex={} order=First reason=no-outer-hessian dense_available={} outer_hvp_available={}",
                     self.y.len(),
                     specs.iter().map(|spec| spec.design.ncols()).sum::<usize>(),
@@ -746,7 +741,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             } else {
                 "direct-dense"
             };
-            log::info!(
+            log::debug!(
                 "[BMS outer-derivative-policy] n={} p={} flex={} order={:?} declared_hessian=analytic outer_hessian_requested={} outer_subsample={} inner_route={} inner_pcg_attempt={:?} dense_available={} outer_hvp_available={}",
                 self.y.len(),
                 p_total,
@@ -761,28 +756,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             );
         }
         order
-    }
-
-    fn outer_seed_config(&self, n_params: usize) -> gam_solve::seeding::SeedConfig {
-        let mut config = gam_solve::seeding::SeedConfig::default();
-        if n_params == 0 {
-            return config;
-        }
-        // Every one of the 6 generated seeds gets a full search (gnomon#2359),
-        // each on its own member in a parallel multistart
-        // (`IndependentOuterSearch`). A seed's start value is an upper bound on
-        // its basin's minimum, never a lower bound, so no start comparison can
-        // skip one: the single screened start this replaced (#979) published a
-        // certified basin 1.49 nats above the one the rho = -2 seed reaches on
-        // gnomon#2359's 200-row calibration.
-        config.max_seeds = 6;
-        config.seed_budget = config.max_seeds;
-        // Two cycles is below the observed KKT reachability floor for
-        // marginal-slope startup seeds: it rejects every candidate, then pays
-        // an immediate second screening pass at cap=8. Start at the first
-        // viable cap and let the existing cascade escalate only when needed.
-        config.screen_max_inner_iterations = 8;
-        config
     }
 
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
@@ -890,7 +863,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         let batched_started = std::time::Instant::now();
         let beta = Self::flatten_block_state_betas_for_specs(block_states, specs)?;
         if log_exact_work(self.y.len()) {
-            log::info!(
+            log::debug!(
                 "[BMS batched outer-gradient] start n={} p={} rho={} subsample_rows={} workspace={}",
                 self.y.len(),
                 total,
@@ -920,7 +893,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             })?
         };
         if log_exact_work(self.y.len()) {
-            log::info!(
+            log::debug!(
                 "[BMS batched outer-gradient] dense-hessian ready n={} p={} elapsed={:.3}s",
                 self.y.len(),
                 total,
@@ -988,7 +961,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             penalty_logdet_blocks.push(pld);
         }
         if log_exact_work(self.y.len()) {
-            log::info!(
+            log::debug!(
                 "[BMS batched outer-gradient] penalty assembly/logdet done n={} p={} rho={} elapsed={:.3}s",
                 self.y.len(),
                 total,
@@ -1002,7 +975,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             DenseSpectralOperator::from_symmetric_with_mode(&h, self.pseudo_logdet_mode())?;
         let factor = spectral.logdet_gradient_factor();
         if log_exact_work(self.y.len()) {
-            log::info!(
+            log::debug!(
                 "[BMS batched outer-gradient] spectral factor done n={} p={} rank={} elapsed={:.3}s",
                 self.y.len(),
                 total,
@@ -1214,7 +1187,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             }
         }
         if log_exact_work(self.y.len()) {
-            log::info!(
+            log::debug!(
                 "[BMS batched outer-gradient] direction solves done n={} p={} theta={} rho={} psi={} elapsed={:.3}s",
                 self.y.len(),
                 total,
@@ -1272,7 +1245,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         };
         trace_h_inv_hdot += &correction_traces;
         if log_exact_work(self.y.len()) {
-            log::info!(
+            log::debug!(
                 "[BMS batched outer-gradient] done n={} p={} theta={} rho={} psi={} trace_elapsed={:.3}s total_elapsed={:.3}s",
                 self.y.len(),
                 total,
@@ -2232,7 +2205,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
                 .map_or(family.y.len(), |subsample| subsample.len())
         ));
         if log_exact_work(family.y.len()) {
-            log::info!(
+            log::debug!(
                 "[BMS Hessian-workspace] build start n={} p={} subsample_rows={}",
                 family.y.len(),
                 block_slices(&family).total,
@@ -2252,7 +2225,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         // one ρ, or a line-search ρ that maps back to a seen β̂).
         let cache = family.build_or_reuse_shared_exact_cache(&block_states, &options, true)?;
         if log_exact_work(family.y.len()) {
-            log::info!(
+            log::debug!(
                 "[BMS Hessian-workspace] build done n={} p={} primary_hessian_cache={} elapsed={:.3}s",
                 family.y.len(),
                 cache.slices.total,
@@ -2411,7 +2384,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             // (outer-Hessian assembly, logdet factor) reach the fused dense
             // build through `hessian_dense_forced`.
             if log_exact_work(self.family.y.len()) {
-                log::info!(
+                log::debug!(
                     "[BMS inner] route=matrix-free-CG n={} p={} primary_hessian_cache_tiled={} reason=flex+row-primary-cache-not-pinned",
                     self.family.y.len(),
                     self.cache.slices.total,
@@ -2430,7 +2403,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
                 .map(|fused| Some(fused.hessian.clone()));
         }
         if log_exact_work(self.family.y.len()) {
-            log::info!(
+            log::debug!(
                 "[BMS inner] route=dense n={} p={} primary_hessian_cache={}",
                 self.family.y.len(),
                 self.cache.slices.total,
@@ -2542,7 +2515,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             )
             .map(Some);
         if log_exact_work(self.family.y.len()) && (call <= 3 || call.is_power_of_two()) {
-            log::info!(
+            log::debug!(
                 "[BMS Hessian-Hv] call={} n={} p={} primary_hessian_cache={} elapsed={:.3}s",
                 call,
                 self.family.y.len(),
@@ -2571,7 +2544,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
                 out,
             )?;
         if log_exact_work(self.family.y.len()) && (call <= 3 || call.is_power_of_two()) {
-            log::info!(
+            log::debug!(
                 "[BMS Hessian-Hv] call={} n={} p={} primary_hessian_cache={} elapsed={:.3}s (into)",
                 call,
                 self.family.y.len(),
@@ -2622,7 +2595,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
                 out,
             )?;
         if log_exact_work(self.family.y.len()) && (call <= 3 || call.is_power_of_two()) {
-            log::info!(
+            log::debug!(
                 "[BMS Hessian-Hv] call={} n={} p={} n_rhs={} primary_hessian_cache={} elapsed={:.3}s (mat)",
                 call,
                 self.family.y.len(),
@@ -3393,7 +3366,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         let started = std::time::Instant::now();
         if log_exact_work(self.y.len()) {
-            log::info!(
+            log::debug!(
                 "[BMS rho-correction-trace] sampled start n={} rows={} p={} rank={} dirs={}",
                 self.y.len(),
                 weighted_rows.len(),
@@ -3482,7 +3455,7 @@ impl BernoulliMarginalSlopeFamily {
         )?
         .unwrap_or_else(|| vec![0.0; n_dirs]);
         if log_exact_work(self.y.len()) {
-            log::info!(
+            log::debug!(
                 "[BMS rho-correction-trace] sampled done n={} rows={} p={} rank={} dirs={} elapsed={:.3}s",
                 self.y.len(),
                 weighted_rows.len(),
@@ -3526,7 +3499,7 @@ impl BernoulliMarginalSlopeFamily {
         let started = std::time::Instant::now();
         let progress_step = (n_chunks / 10).max(1);
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS rho-correction-trace] full start n={} chunks={} rows_per_chunk={} p={} rank={} dirs={}",
                 n,
                 n_chunks,
@@ -3705,7 +3678,7 @@ impl BernoulliMarginalSlopeFamily {
             if log_exact_work(n) {
                 let done = chunk_idx + 1;
                 if done == n_chunks || done % progress_step == 0 {
-                    log::info!(
+                    log::debug!(
                         "[BMS rho-correction-trace] full progress chunks={}/{} rows={}/{} elapsed={:.3}s",
                         done,
                         n_chunks,
@@ -3717,7 +3690,7 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS rho-correction-trace] full done n={} chunks={} p={} rank={} dirs={} elapsed={:.3}s",
                 n,
                 n_chunks,

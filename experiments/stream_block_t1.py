@@ -110,7 +110,7 @@ def stream_block_t1(args: argparse.Namespace) -> dict:
         f"G={args.n_blocks} b={args.block_size} top-k={args.block_topk} aux_k={args.aux_k}"
     )
 
-    stream = gamfit.block_sparse_dictionary_fit_begin(
+    stream = gamfit.sae.block_sparse_dictionary_fit_begin(
         seed_sample,
         args.n_blocks,
         block_size=args.block_size,

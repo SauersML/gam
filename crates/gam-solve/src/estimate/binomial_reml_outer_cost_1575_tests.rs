@@ -693,7 +693,7 @@ fn binomial_logit_outer_objective_is_a_function_of_rho_1575() {
 /// its IFT extrapolation, and the Levenberg-Marquardt damping hint seeded from
 /// the previous solve's `final_lm_lambda`. This probe runs the SAME trial rho
 /// twice — once through the ordinary stateful path, once through
-/// `execute_pirls_stateless_for_cubature`, which by construction threads none
+/// `execute_pirls_stateless_for_test`, which by construction threads none
 /// of that state — and prints both. If the stateless solve converges where the
 /// stateful one refuses, the trial point is fine and the carried state is the
 /// defect.
@@ -793,7 +793,7 @@ fn binomial_logit_inner_solve_refusal_is_carried_state_1575() {
         // Stateless FIRST, so the stateful arm sees exactly the carried state
         // the previous stateful call left behind (the stateless call writes
         // none of it) rather than a state this probe perturbed.
-        let stateless = describe(state.execute_pirls_stateless_for_cubature(&trial, None));
+        let stateless = describe(state.execute_pirls_stateless_for_test(&trial));
         if stateless.starts_with("REFUSED") {
             stateless_refusals += 1;
         }
@@ -820,7 +820,7 @@ fn binomial_logit_inner_solve_refusal_is_carried_state_1575() {
     eprintln!("{summary}");
 
     // The claim under test: a trial rho within 1e-1 of a point whose inner mode
-    // is certified to 3.3e-14 is a solvable inner problem. `execute_pirls_stateless_for_cubature`
+    // is certified to 3.3e-14 is a solvable inner problem. `execute_pirls_stateless_for_test`
     // is documented as bit-identical math to the ordinary non-screening branch
     // with every cross-call carry removed, so a refusal there WOULD mean the
     // point is genuinely hard and this probe would be the wrong lead.
@@ -1189,14 +1189,22 @@ fn a_fits_identified_rank_refuses_over_a_step_that_reaches_its_band_2901() {
         let design = gam_linalg::matrix::DesignMatrix::from(x);
         let coordinates = fit.lambdas.len();
         let outer_hessian = Array2::<f64>::eye(coordinates);
+        let rho = fit.lambdas.mapv(f64::ln);
+        let unbounded_below = Array1::<f64>::from_elem(coordinates, f64::NEG_INFINITY);
+        let unbounded_above = Array1::<f64>::from_elem(coordinates, f64::INFINITY);
         let (at_zero_step, zero_radius) = super::identified_hessian::certify_fitted_identified_rank(
             pirls,
             &spectrum,
             &fit.lambdas,
             &design,
-            &outer_hessian,
-            &Array1::<f64>::zeros(coordinates),
-            &[],
+            super::identified_hessian::OuterCertificatePoint {
+                hessian_rho: &outer_hessian,
+                gradient: &Array1::<f64>::zeros(coordinates),
+                railed: &[],
+                rho: &rho,
+                lower: &unbounded_below,
+                upper: &unbounded_above,
+            },
         )
         .expect("a zero step certifies the fitted rank");
         assert_eq!(zero_radius, 0.0);
@@ -1238,9 +1246,14 @@ fn a_fits_identified_rank_refuses_over_a_step_that_reaches_its_band_2901() {
             &spectrum,
             &fit.lambdas,
             &design,
-            &outer_hessian.mapv(|entry| entry / reaching_step),
-            &Array1::<f64>::ones(coordinates),
-            &[],
+            super::identified_hessian::OuterCertificatePoint {
+                hessian_rho: &outer_hessian.mapv(|entry| entry / reaching_step),
+                gradient: &Array1::<f64>::ones(coordinates),
+                railed: &[],
+                rho: &rho,
+                lower: &unbounded_below,
+                upper: &unbounded_above,
+            },
         )
         .expect_err("a step reaching the band refuses the fitted rank");
         assert!(

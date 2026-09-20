@@ -9,9 +9,9 @@ train/test split from --seed, so numbers are directly comparable across jobs.
 
 Arms:
   external_topk  — Gao-et-al. TopK SAE (torch, GPU), the "traditional SAE" bar.
-  gam_flat       — gamfit.sparse_dictionary_fit (our certified linear sparse-code
+  gam_flat       — gamfit.sae.sparse_dictionary_fit (our certified linear sparse-code
                    lane; the manifold engine rejects the flat config), held-out EV.
-  curved_topk    — gamfit.sae_manifold_fit(assignment='topk') (CPU Rust core).
+  curved_topk    — gamfit.sae.sae_manifold_fit(assignment='topk') (CPU Rust core).
   hybrid_rust    — native flat sparse coding plus a native curved TopK model on
                    the residual at a matched active-scalar budget.
 
@@ -39,11 +39,18 @@ import numpy as np
 # amortization_horizon that is separate from the bits estimation subsample, so
 # the horizon is part of the pair identity and v1 rows (whose dictionary bits
 # were computed with the confounded subsample N) are rejected on load.
-PAIR_SCHEMA = "gam.issue2283.eq4-pair.v2"
+# v3 (#2283): the measurement pairs the hybrid with gam_flat, the same trainer at
+# the external bar's K and top_k, and every bits row carries the grouped
+# jackknife over its scored rows, whose group count is part of the identity.
+PAIR_SCHEMA = "gam.issue2283.eq4-pair.v3"
 # The R2 operating point the #2283 acceptance is stated at. Every bits row is
 # scored at all four standard targets; this is the one the faithfulness audit
 # brackets, so the audit and the acceptance speak about the same number.
 ACCEPTANCE_R2_TARGET = 0.99
+# Where every sparse-dictionary route of a measurement runs: fail-closed on the
+# device, or deliberately on the host for a machine without one. Each is
+# certified whole by `_certify_sparse_routes`.
+SPARSE_SCORE_MODES = ("required", "off")
 FLAT_CHECKPOINT_SCHEMA = "gam.issue2283.flat-checkpoint.v1"
 FLAT_CHECKPOINT_ARRAYS = {
     "decoder",
@@ -165,8 +172,13 @@ def _append_jsonl(path: str, record: dict) -> None:
         fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def _assert_required_device_routes(route_stats: dict) -> dict:
-    """Return a canonical, internally consistent all-device route certificate."""
+def _certify_sparse_routes(route_stats: dict, score_mode: str) -> dict:
+    """Return a canonical, internally consistent certificate that every sparse
+    route ran where ``score_mode`` declares: wholly on the device for
+    ``"required"``, wholly on the host for ``"off"``. A measurement never mixes
+    the two, so a silent fallback cannot enter either arm of a pair."""
+    if score_mode not in SPARSE_SCORE_MODES:
+        raise RuntimeError(f"unknown sparse score mode {score_mode!r}")
     canonical = {}
     for phase, payload in route_stats.items():
         stats = dict(payload)
@@ -198,7 +210,7 @@ def _assert_required_device_routes(route_stats: dict) -> dict:
 
         # A device execution proves admission. When the aggregate admission
         # counter is absent, `device` is therefore the exact certified count on
-        # the only route that can pass this required-device gate. Any CPU route
+        # the only route that can pass the required-device gate. Any CPU route
         # still fails below, so missing telemetry can never launder a fallback.
         admitted = (
             counter("admitted_minibatches")
@@ -214,9 +226,14 @@ def _assert_required_device_routes(route_stats: dict) -> dict:
         stats["admitted_minibatches"] = admitted
         stats["device_minibatches"] = device
         stats["cpu_minibatches"] = cpu
-        if minibatches <= 0 or admitted != minibatches or device != minibatches or cpu != 0:
+        if score_mode == "required":
+            if minibatches <= 0 or admitted != minibatches or device != minibatches or cpu != 0:
+                raise RuntimeError(
+                    f"fail-closed sparse route {phase!r} was not wholly device-resident: {stats}"
+                )
+        elif minibatches <= 0 or device != 0 or cpu != minibatches:
             raise RuntimeError(
-                f"fail-closed sparse route {phase!r} was not wholly device-resident: {stats}"
+                f"host-declared sparse route {phase!r} was not wholly host-resident: {stats}"
             )
         canonical[phase] = stats
     return canonical
@@ -235,6 +252,7 @@ def _source_provenance(code_revision: str, wheel_sha256: str) -> dict:
     import gamfit
     import arm_featurizers
     import bits_eq4
+    import eq4_jackknife
     from gamfit import _description_length
     from gamfit._binding import rust_module
 
@@ -243,6 +261,7 @@ def _source_provenance(code_revision: str, wheel_sha256: str) -> dict:
         "driver": Path(__file__).resolve(),
         "arm_featurizers": Path(arm_featurizers.__file__).resolve(),
         "bits_eq4": Path(bits_eq4.__file__).resolve(),
+        "eq4_jackknife": Path(eq4_jackknife.__file__).resolve(),
         "description_length": Path(_description_length.__file__).resolve(),
         "rust_extension": rust_extension,
     }
@@ -266,6 +285,8 @@ def _pair_identity(
     bits_idx: np.ndarray,
     source_provenance: dict,
 ) -> dict:
+    import eq4_jackknife
+
     return {
         "schema": PAIR_SCHEMA,
         "run_id": args.run_id,
@@ -289,6 +310,7 @@ def _pair_identity(
             "bits_max_rows": args.bits_max_rows,
             "bits_rows": int(bits_idx.size),
             "amortization_horizon": args.amortization_horizon,
+            "jackknife_groups": eq4_jackknife.JACKKNIFE_GROUPS,
         },
     }
 
@@ -486,17 +508,18 @@ def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, minibatch, score_mode,
                  max_epochs, collect):
     import gamfit
 
-    fit = gamfit.sparse_dictionary_fit(
+    fit = gamfit.sae.sparse_dictionary_fit(
         x_tr, K, active=top_k, minibatch=minibatch, max_epochs=max_epochs,
         score_mode=score_mode)
     tr = fit.transform(x_te, score_mode=score_mode)
     recon = fit.reconstruct(tr.indices, tr.codes)
     collect["flat_fit"] = fit
-    collect["sparse_route_stats"] = _assert_required_device_routes(
+    collect["sparse_route_stats"] = _certify_sparse_routes(
         {
             "fit": fit.score_route_stats,
             "held_out": tr.score_route_stats,
-        }
+        },
+        score_mode,
     )
     collect["sparse_convergence"] = _convergence_payload(fit)
     return held_out_ev(x_te, recon, mean_tr), fit.explained_variance
@@ -508,7 +531,7 @@ def fit_curved_topk(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, seed):
     # The curved fit keeps its own inner budget. `--max-epochs` is the flat tier's
     # epoch cap; passed as `n_iter` it set every criterion evaluation's refine
     # ceilings to 16x and 64x that cap (#2283).
-    model = gamfit.sae_manifold_fit(
+    model = gamfit.sae.sae_manifold_fit(
         x_tr, K=K, d_atom=d_atom, atom_topology=topology,
         assignment="topk", top_k=top_k, random_state=seed)
     recon = np.asarray(model.reconstruct(x_te), dtype=np.float32)
@@ -554,7 +577,7 @@ def fit_hybrid_flat_checkpoint(
         flush=True,
     )
     t0 = time.perf_counter()
-    flat = gamfit.sparse_dictionary_fit(
+    flat = gamfit.sae.sparse_dictionary_fit(
         x_tr,
         flat_config["K_flat"],
         active=flat_config["active_flat"],
@@ -567,12 +590,13 @@ def fit_hybrid_flat_checkpoint(
     flat_recon_tr = flat.reconstruct(tr_tr.indices, tr_tr.codes)
     flat_recon_te = flat.reconstruct(tr_te.indices, tr_te.codes)
     ev_flat = held_out_ev(x_te, flat_recon_te, mean_tr)
-    route_stats = _assert_required_device_routes(
+    route_stats = _certify_sparse_routes(
         {
             "fit": flat.score_route_stats,
             "train": tr_tr.score_route_stats,
             "held_out": tr_te.score_route_stats,
-        }
+        },
+        flat_config["score_mode"],
     )
     convergence = _convergence_payload(flat)
     arrays = {
@@ -636,7 +660,7 @@ def fit_hybrid_curved_resume(
     r_tr = np.ascontiguousarray(x_tr - flat_recon_tr)
     r_te = np.ascontiguousarray(x_te - flat_recon_te)
     t1 = time.perf_counter()
-    curved = gamfit.sae_manifold_fit(
+    curved = gamfit.sae.sae_manifold_fit(
         r_tr, K=curved_K, d_atom=d, atom_topology=topology,
         assignment="topk", top_k=curved_k, random_state=seed)
     print(f"[hybrid_rust] curved tier fit {time.perf_counter()-t1:.0f}s", flush=True)
@@ -686,6 +710,7 @@ def score_bits_for_arm(
     # Local imports so a non-bits run never pays the sibling-module import.
     import bits_eq4
     import arm_featurizers as af
+    import eq4_jackknife
     import faithfulness_audit
 
     x_bits = np.ascontiguousarray(x_te[bits_idx])
@@ -721,20 +746,38 @@ def score_bits_for_arm(
     else:
         return None
 
+    t_score = time.perf_counter()
     dl = bits_eq4.description_length(
         fitted,
         x_bits.astype(np.float64),
         amortization_horizon=amortization_horizon,
     )
     out = {f"bits_{k}": v for k, v in dl.items()}
+    # Scoring costs are recorded beside the bits, so a run's links can be sized from
+    # measured costs: the jackknife alone is JACKKNIFE_GROUPS more scorings (#2283).
+    out["bits_score_s"] = round(time.perf_counter() - t_score, 1)
+    print(f"[#2283] {arm} Eq-4 scoring {out['bits_score_s']}s", flush=True)
     out["bits_scorer"] = bits_eq4.scorer_source()
     out["bits_rows"] = int(bits_idx.size)
     out["bits_amortization_horizon"] = int(amortization_horizon)
     out["bits_test_positions_sha256"] = _array_sha256(bits_idx)
     out["bits_row_ids_sha256"] = _array_sha256(test_row_ids[bits_idx])
+    # The same fitted featurizer scored once per deleted corpus block, so the
+    # comparator can bias-correct the plug-in and give its standard error (#2283).
+    t_jackknife = time.perf_counter()
+    out["bits_jackknife"] = eq4_jackknife.leave_one_block_out(
+        fitted,
+        x_bits.astype(np.float64),
+        test_row_ids[bits_idx],
+        lambda featurizer, rows: bits_eq4.description_length(
+            featurizer, rows, amortization_horizon=amortization_horizon
+        ),
+    )
+    out["bits_jackknife_s"] = round(time.perf_counter() - t_jackknife, 1)
+    print(f"[#2283] {arm} jackknife scorings {out['bits_jackknife_s']}s", flush=True)
     if fitted.extras is not None and "score_route_stats" in fitted.extras:
-        out["bits_score_route_stats"] = _assert_required_device_routes(
-            {"bits": fitted.extras["score_route_stats"]}
+        out["bits_score_route_stats"] = _certify_sparse_routes(
+            {"bits": fitted.extras["score_route_stats"]}, sparse_score_mode
         )["bits"]
     # gam#2233 self-certification: the Eq-4 dictionary term is
     # 0.5*dictionary_params/N*log2(N), ~95% of the score at K=32768, so the
@@ -753,6 +796,7 @@ def score_bits_for_arm(
     # full-linear-span pricing (#2283). A row that only wins under the ledger is
     # a different claim from one that wins under both, so the reader never has to
     # take the scorer's surrogate on trust.
+    t_audit = time.perf_counter()
     out["bits_faithfulness_audit"] = faithfulness_audit.audit_row(
         fitted,
         x_bits,
@@ -760,6 +804,8 @@ def score_bits_for_arm(
         span_widths=fitted.extras["atom_span_widths"],
         r2_target=ACCEPTANCE_R2_TARGET,
     )
+    out["bits_audit_s"] = round(time.perf_counter() - t_audit, 1)
+    print(f"[#2283] {arm} faithfulness audit {out['bits_audit_s']}s", flush=True)
     return out
 
 
@@ -789,9 +835,10 @@ def main() -> int:
     )
     ap.add_argument(
         "--sparse-score-mode",
-        choices=["required"],
+        choices=list(SPARSE_SCORE_MODES),
         default=None,
-        help="required fail-closed CUDA contract for every sparse-dictionary route",
+        help="where every sparse-dictionary route runs: required = fail-closed on the "
+             "CUDA device, off = wholly on the host (a machine with no device)",
     )
     ap.add_argument("--d-atom", type=int, default=2)
     ap.add_argument("--atom-topology", default="circle")
@@ -840,8 +887,8 @@ def main() -> int:
     if args.arm in {"gam_flat", "hybrid_rust"}:
         if args.sparse_minibatch is None or args.sparse_minibatch <= 0:
             ap.error(f"--arm {args.arm} requires a positive --sparse-minibatch")
-        if args.sparse_score_mode != "required":
-            ap.error(f"--arm {args.arm} requires --sparse-score-mode required")
+        if args.sparse_score_mode is None:
+            ap.error(f"--arm {args.arm} requires a declared --sparse-score-mode")
     if args.arm == "hybrid_rust":
         if args.hybrid_phase is None or args.flat_checkpoint is None:
             ap.error("--arm hybrid_rust requires --hybrid-phase and --flat-checkpoint")
@@ -853,8 +900,8 @@ def main() -> int:
             ap.error("curved-resume phase requires --bits")
     elif args.hybrid_phase is not None or args.flat_checkpoint is not None:
         ap.error("--hybrid-phase and --flat-checkpoint are only valid for hybrid_rust")
-    if args.arm == "external_topk" and not args.bits:
-        ap.error("--arm external_topk requires --bits for the #2283 paired measurement")
+    if args.arm in {"external_topk", "gam_flat"} and not args.bits:
+        ap.error(f"--arm {args.arm} requires --bits for the #2283 paired measurement")
     if args.bits_max_rows <= 0:
         ap.error("--bits-max-rows must be positive")
     if args.bits:

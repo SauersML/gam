@@ -32,7 +32,10 @@ def test_the_frozen_settings_are_the_historical_protocol() -> None:
     assert protocol["model"] == "Qwen/Qwen3.6-35B-A3B"
     assert protocol["layer"] == 17
     assert (protocol["model_dtype"], protocol["harvest_dtype"]) == ("bfloat16", "float32")
-    assert (protocol["floor_multiplier"], protocol["floor_repetitions"]) == (30, 5)
+    assert protocol["floor_repetitions"] == 5
+    # The historical DOSE_FLOOR_MULT=30 multiplied repeated-forward KLs that are exactly
+    # 0 on a deterministic model; each record is floored at its derived band instead.
+    assert "floor_multiplier" not in protocol
     assert (protocol["max_templates"], protocol["bases"], protocol["fit_iterations"]) == (6, 10, 40)
     fractions = np.asarray(protocol["fractions"])
     assert fractions.size == 10
@@ -72,17 +75,31 @@ def test_the_base_split_is_seeded_distinct_and_half_calibration() -> None:
         DRIVER.base_split(7, 10, 0)
 
 
-def test_only_targets_above_the_floor_are_requested() -> None:
-    floor = DRIVER.dose_floor([0.0, 2e-6, 1e-6], 30)
-    assert floor == pytest.approx(6e-5)
-    ladder = DRIVER.dose_ladder(1e-2, (0.001, 0.005, 0.01), floor)
-    assert [above for _, _, above in ladder] == [False, False, True]
-    assert [index for index, _, _ in ladder] == [0, 1, 2]
-    deterministic = DRIVER.dose_floor([0.0] * 5, 30)
-    assert deterministic == 0.0
-    assert all(above for _, _, above in DRIVER.dose_ladder(1e-2, (0.001, 0.6), deterministic))
+def test_every_ladder_target_is_requested_and_controls_only_raise_floors() -> None:
+    fractions = (0.001, 0.005, 0.01)
+    assert DRIVER.dose_ladder(1e-2, fractions) == [(k, 1e-2 * f) for k, f in enumerate(fractions)]
+    # Deterministic repeats measure 0, or a KL negative by roundoff: no evidence above
+    # the band. Stochastic repeats raise floors by their largest KL.
+    assert DRIVER.control_evidence_nats([0.0] * 5) == 0.0
+    assert DRIVER.control_evidence_nats([0.0, 2e-6, -1e-18]) == 2e-6
     with pytest.raises(ValueError):
-        DRIVER.dose_floor([], 30)
+        DRIVER.control_evidence_nats([])
+    with pytest.raises(ValueError):
+        DRIVER.control_evidence_nats([0.0, float("nan")])
+
+
+def test_router_topk_changes_count_token_rows_whose_expert_set_moved() -> None:
+    base = [np.asarray([[1, 2], [3, 4]]), np.asarray([[5, 6], [7, 8]])]
+    # Call 0: row 0 keeps {1, 2} in another order, row 1 trades expert 4 for 5.
+    # Call 1: both rows keep their sets. One row in total changed its set.
+    patched = [np.asarray([[2, 1], [3, 5]]), np.asarray([[5, 6], [8, 7]])]
+    assert DRIVER.router_topk_changes(base, patched) == 1
+    assert DRIVER.router_topk_changes(base, base) == 0
+    assert DRIVER.router_topk_changes([], []) == 0
+    with pytest.raises(ValueError, match="router calls"):
+        DRIVER.router_topk_changes(base, patched[:1])
+    with pytest.raises(ValueError, match="shapes differ"):
+        DRIVER.router_topk_changes(base, [patched[0][:1], patched[1]])
 
 
 def _plan(predicted: float, measured: float) -> dict[str, object]:
@@ -99,6 +116,18 @@ def _plan(predicted: float, measured: float) -> dict[str, object]:
     }
 
 
+def _observation(measured: float) -> dict[str, object]:
+    return {
+        "router_topk_changes": 0,
+        "logit_format": "bfloat16",
+        "logit_max_abs": 30.0,
+        "logit_max_abs_change": 0.25,
+        "evaluation_band_nats": 1e-12,
+        "measurement_band_nats": 0.25 * measured,
+        "floor_nats": 0.25 * measured,
+    }
+
+
 def test_the_assembled_ledger_is_what_the_scorer_accepts() -> None:
     rows = {
         feature: [
@@ -110,6 +139,7 @@ def test_the_assembled_ledger_is_what_the_scorer_accepts() -> None:
                 split=split,
                 fraction_index=k,
                 target_nats=0.01 * (k + 1),
+                observation=_observation(0.0101 * (k + 1)),
             )
             for b, split in enumerate(("calibration", "heldout"))
             for k in range(3)

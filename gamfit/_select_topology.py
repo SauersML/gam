@@ -5,7 +5,7 @@ Two public selectors are exposed:
 * :func:`select_topology` builds candidate formulas around an
   ``s(..., type=AUTO)`` smooth and ranks fitted models by evidence-like scores.
 * :class:`TopologyAutoSelector` is a multi-fit orchestrator for selecting the
-  topology of one :class:`gamfit.LatentCoord` block while preserving the rest
+  topology of one :class:`gamfit.smooth.LatentCoord` block while preserving the rest
   of the caller's fit configuration.
 """
 
@@ -18,7 +18,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
-from . import topology
 from ._api import fit
 from ._binding import rust_module
 from ._compare import _extract_reml_score_raw
@@ -79,13 +78,16 @@ class _TopologyRustModule(Protocol):
     ) -> list[float]: ...
 
 BasisSpec: TypeAlias = Smooth
-ScoreKind: TypeAlias = Literal["reml", "laml", "bic", "tk"]
+ScoreKind: TypeAlias = Literal["reml", "laml", "tk"]
 ScoreScale: TypeAlias = Literal["per_observation", "per_effective_dim", "raw"]
 TopologyName: TypeAlias = Literal[
     "euclidean", "circle", "sphere", "torus", "cylinder"
 ]
 TopologyScoreScale: TypeAlias = Literal["per_effective_dim", "per_observation"]
 TopologyAutoSelectorRank: TypeAlias = tuple[str, float, float, float, int, Any]
+
+_SCORE_KINDS: tuple[ScoreKind, ...] = ("reml", "laml", "tk")
+_SCORE_SCALES: tuple[ScoreScale, ...] = ("per_observation", "per_effective_dim", "raw")
 
 _DEFAULT_TOPOLOGY_NAMES: tuple[TopologyName, ...] = (
     "euclidean",
@@ -196,7 +198,7 @@ def select_topology(
         Euclidean patch, circle, sphere, torus, and cylinder constructors whose
         required dimension matches the predictor count.
     score:
-        ``"reml"``, ``"laml"``, ``"bic"``, or ``"tk"``. ``"tk"`` adds the
+        ``"reml"``, ``"laml"``, or ``"tk"``. ``"tk"`` adds the
         Tierney-Kadane null-space normalizer to the raw REML/evidence score.
     score_scale:
         ``"per_observation"``, ``"per_effective_dim"``, or ``"raw"``.
@@ -567,6 +569,9 @@ def _default_candidates(feature_dim: int) -> list[_Candidate]:
 
 
 def _default_topology_candidate(name: str, feature_dim: int) -> _Candidate:
+    # `gamfit.topology` re-exports this module, so it is bound at call time.
+    from . import topology
+
     if name == "euclidean":
         return _Candidate("euclidean", topology.EuclideanPatch(d=feature_dim, name="x"))
     if name == "circle":
@@ -686,7 +691,6 @@ def _fitted_candidate_outcome(
         "name": candidate.name,
         "raw_reml": _lifecycle_number(raw_reml),
         "laml": _optional_lifecycle_number(fields.get("laml")),
-        "deviance": _optional_lifecycle_number(fields.get("deviance")),
         "null_dim": _optional_lifecycle_number(fields.get("null_dim")),
         "null_space_logdet": _optional_lifecycle_number(fields.get("null_space_logdet")),
         "effective_dim": _lifecycle_number(fields["edf_total"]),
@@ -866,18 +870,20 @@ def _infer_candidate_name(topo: Smooth) -> str | None:
 
 
 def _normalize_score_kind(score: str) -> ScoreKind:
-    if score not in {"reml", "laml", "bic", "tk"}:
-        raise ValueError("score must be one of: 'reml', 'laml', 'bic', 'tk'")
-    return score
+    for kind in _SCORE_KINDS:
+        if score == kind:
+            return kind
+    raise ValueError("score must be one of: 'reml', 'laml', 'tk'")
 
 
 def _normalize_score_scale(score_scale: str) -> ScoreScale:
-    if score_scale not in {"per_observation", "per_effective_dim", "raw"}:
-        raise ValueError(
-            "score_scale must be one of: 'per_observation', "
-            "'per_effective_dim', 'raw'"
-        )
-    return score_scale
+    for scale in _SCORE_SCALES:
+        if score_scale == scale:
+            return scale
+    raise ValueError(
+        "score_scale must be one of: 'per_observation', "
+        "'per_effective_dim', 'raw'"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1056,7 +1062,7 @@ def _single_latent(
         name, latent = requested, latents[requested]
     if not isinstance(latent, LatentCoord):
         raise TypeError(
-            "TopologyAutoSelector latents entries must be gamfit.LatentCoord"
+            "TopologyAutoSelector latents entries must be gamfit.smooth.LatentCoord"
         )
     return str(name), latent
 
@@ -1133,10 +1139,10 @@ def _candidate_from_item(
             raise TypeError(f"candidate {idx} topology must be a gamfit Smooth")
         return _normalize_topology_name(str(name)), smooth
     if isinstance(item, Smooth):
-        name = _infer_candidate_name(item)
-        if name is None:
+        inferred = _infer_candidate_name(item)
+        if inferred is None:
             raise TypeError(f"candidate {idx} is not a supported topology Smooth")
-        return _normalize_topology_name(name), item
+        return _normalize_topology_name(inferred), item
     name = _normalize_topology_name(str(item))
     return name, _default_topology_candidate(name, latent_dim).topology
 

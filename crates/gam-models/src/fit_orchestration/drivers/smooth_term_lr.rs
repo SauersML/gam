@@ -17,8 +17,9 @@ pub enum SmoothLrCorrection {
     LawleyLrEstimatedLambda,
     /// A per-term likelihood-ratio statistic `W = 2(ℓ_full − ℓ_null)` that has
     /// been Bartlett-corrected with the fixed-λ Lawley factor `c = E[W|λ]/d`
-    /// (`W* = W/c`, referenced against `χ²_d`). This is used only when the
-    /// estimated-λ handoff is unavailable.
+    /// (`W* = W/c`, referenced against `χ²_d`). This is used when a λ̂-selection
+    /// replay already carries the estimation of `λ` in the reference law, and
+    /// when the estimated-λ handoff is unavailable.
     LawleyLrFixedLambda,
     /// No second-order correction was applied — either the family has no
     /// closed-form Lawley cumulant jets or the null refit did not converge — so
@@ -40,10 +41,10 @@ impl SmoothLrCorrection {
 /// Which lane supplied a [`SmoothLrReferenceDf`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SmoothLrReferenceSource {
-    /// The statistic's own null spectrum `w`, in full, scored by Imhof
-    /// inversion of its characteristic function. This is the exact lane: the
-    /// reference IS the null law, not a distribution fitted to some of its
-    /// moments.
+    /// The statistic's own null spectrum `w`, in full, scored by inverting its
+    /// moment generating function along a saddle-point contour. This is the
+    /// exact lane: the reference IS the null law, not a distribution fitted to
+    /// some of its moments.
     ///
     /// The spectrum is assembled from `[H⁻¹]_jj` and the term's own λ-weighted
     /// penalty block through the symmetric similarity
@@ -147,14 +148,17 @@ pub enum SmoothLrReferenceSource {
 /// # The Monte-Carlo error is removed where it would matter
 ///
 /// The replay is a simulation, so its tail is an estimate. The conditional tail
-/// is NOT — `gam_math::probability::signed_weighted_chi_square_sf_to_tolerance` evaluates it by
+/// is NOT — `gam_math::probability::signed_weighted_chi_square_sf` evaluates it by
 /// inversion. The two are strongly dependent (the same draws, differing only in
 /// whether `t` is selected or held at one), so the replay reports the
 /// DIFFERENCE and adds it to the exact conditional value:
 ///
 /// ```text
-/// p_selection = p_conditional + [ P̂(W_sel ≥ w) − P̂(W_cond ≥ w) ]
+/// p_selection = p_conditional(w) + [ P̂(W_sel ≥ w_sel) − P̂(W_cond ≥ w) ]
 /// ```
+///
+/// where `w_sel` is the observation under the replay's own selection (see
+/// [`Self::observed`]; `w_sel = w` when no score was supplied).
 ///
 /// a textbook control variate. The bracket is a difference of two indicators
 /// that agree on most draws, so its variance is a fraction of either term's, and
@@ -182,6 +186,40 @@ pub struct SmoothLrSelectionReplay {
     /// difference whose variance is what makes this a control variate rather
     /// than two independent estimates.
     conditional_sample: Vec<f64>,
+    /// The OBSERVED data scored the way every draw is: its whitened block
+    /// score run through the same selection, read at the selected `t` and at
+    /// `t = 1`. `None` when the caller supplied no score.
+    ///
+    /// # Why the observed statistic has to be scored by the replay's rule
+    ///
+    /// The sample above is `W(λ̂(u))` under the REPLAY's selection — the
+    /// certified global minimum of its criterion over the window. The observed
+    /// `W` is the statistic at the FIT's `λ̂`, which the outer REML search chose
+    /// on the real surface. Comparing the two is only a p-value when they are
+    /// the same functional of the data, and for a null term they are not: on a
+    /// flat surface the fit stops at an interior `λ̂` with `W ≈ 1e-5`, while the
+    /// replay's rule sends the same data to the wall with `W ≈ 1e-9`. Every
+    /// draw that rails then sits BELOW the observed value, and the p-value is
+    /// the non-railing fraction on almost every such replicate — a mass near
+    /// `0.5` on the Gaussian cells and a conservative one near `1` on the
+    /// binomial and Poisson ones.
+    ///
+    /// Scoring the observation by the replay's own rule makes the comparison
+    /// one functional against its own law. The quadratic model the replay runs
+    /// is `W_q(t; z) = Σ z²(1 − f(t)²)`, and the observed `W` is that model's
+    /// value at `t = 1` to first order, so the observed statistic under the
+    /// replay's selection is `W · W_q(t*; z)/W_q(1; z)`: the fit's own exact
+    /// `W`, carried to the replay's selected point by the quadratic model's own
+    /// ratio. At `t* = 1` the ratio is one and nothing moves.
+    observed: Option<ObservedSelection>,
+}
+
+/// `W_q` of the observed whitened score, at `t = 1` and at the replay's
+/// selected `t*` — see [`SmoothLrSelectionReplay::observed`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ObservedSelection {
+    conditional: f64,
+    selected: f64,
 }
 
 impl std::fmt::Debug for SmoothLrSelectionReplay {
@@ -191,6 +229,7 @@ impl std::fmt::Debug for SmoothLrSelectionReplay {
         f.debug_struct("SmoothLrSelectionReplay")
             .field("generalized", &self.generalized)
             .field("draws", &self.selection_sample.len())
+            .field("observed", &self.observed)
             .finish()
     }
 }
@@ -200,6 +239,7 @@ impl PartialEq for SmoothLrSelectionReplay {
         self.generalized == other.generalized
             && self.selection_sample == other.selection_sample
             && self.conditional_sample == other.conditional_sample
+            && self.observed == other.observed
     }
 }
 
@@ -907,6 +947,11 @@ pub enum SmoothLrSelectionDecline {
     /// inside the window, or an axis slice of it could not be priced, so that
     /// draw has no selection. Refused whole rather than sampled partial.
     SelectionUnresolved,
+    /// The observation's own block score was supplied but is not a finite
+    /// vector on the tested block, so the observed statistic cannot be scored
+    /// by the replay's selection rule — and a replay whose observation is
+    /// selected by a different rule than its draws is not a reference for it.
+    ObservedScoreUnusable,
 }
 
 impl SmoothLrSelectionDecline {
@@ -919,6 +964,7 @@ impl SmoothLrSelectionDecline {
             SmoothLrSelectionDecline::WindowClosed => "window_closed",
             SmoothLrSelectionDecline::GridRefused => "grid_refused",
             SmoothLrSelectionDecline::SelectionUnresolved => "selection_unresolved",
+            SmoothLrSelectionDecline::ObservedScoreUnusable => "observed_score_unusable",
         }
     }
 }
@@ -1608,11 +1654,17 @@ impl SmoothLrSelectionReplay {
     /// is empty (the fit is railed against both walls), in which case the
     /// conditional law IS the selection law and the caller should use it
     /// unmodified.
+    ///
+    /// `observed_score` is the tested block's score at the nested null fit, in
+    /// the units of the unscaled information the whitener was built from (see
+    /// [`ObservedSelection`]); its whitened image `Wᵀg` is the observation's
+    /// own draw.
     fn generate(
         whitener: &Array2<f64>,
         unit_penalties: &[Array2<f64>],
         log_lambda: &[f64],
         log_scale_windows: &[(f64, f64)],
+        observed_score: Option<&Array1<f64>>,
     ) -> SmoothLrSelection {
         if unit_penalties.is_empty() || unit_penalties.len() != log_lambda.len() {
             return SmoothLrSelection::Declined(
@@ -1626,42 +1678,75 @@ impl SmoothLrSelectionReplay {
         else {
             return SmoothLrSelection::Declined(SmoothLrSelectionDecline::GeometryRefused);
         };
+        let observed = match observed_score {
+            None => None,
+            Some(score) if score.len() == whitener.nrows() => {
+                let whitened = whitener.t().dot(score);
+                if whitened.iter().any(|value| !value.is_finite()) {
+                    return SmoothLrSelection::Declined(
+                        SmoothLrSelectionDecline::ObservedScoreUnusable,
+                    );
+                }
+                Some(whitened.to_vec())
+            }
+            Some(_) => {
+                return SmoothLrSelection::Declined(
+                    SmoothLrSelectionDecline::ObservedScoreUnusable,
+                );
+            }
+        };
         Self::from_geometry(
             &geometry,
             log_scale_windows,
             SMOOTH_LR_SELECTION_DRAWS,
             SMOOTH_LR_MULTISCALE_DRAWS,
+            observed.as_deref(),
         )
     }
 
     /// Dispatch: a term selecting `m ≥ 2` scales gets the `m`-dimensional
     /// replay; a single scale gets the common-scale lane.
+    ///
+    /// `observed` is the observation's whitened draw, scored by whichever lane
+    /// runs so that it is selected by exactly the rule its reference is.
     fn from_geometry(
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
         diagonal_draws: usize,
         multiscale_draws: usize,
+        observed: Option<&[f64]>,
     ) -> SmoothLrSelection {
         if log_scale_windows.len() != geometry.roots.len() {
             return SmoothLrSelection::Declined(
                 SmoothLrSelectionDecline::NoPenaltyComponents,
             );
         }
+        if observed.is_some_and(|draw| draw.len() != geometry.dimension) {
+            return SmoothLrSelection::Declined(SmoothLrSelectionDecline::ObservedScoreUnusable);
+        }
         if geometry.roots.len() >= 2 {
-            return match Self::generate_multiscale(geometry, log_scale_windows, multiscale_draws) {
+            return match Self::generate_multiscale(
+                geometry,
+                log_scale_windows,
+                multiscale_draws,
+                observed,
+            ) {
                 Ok(replay) => SmoothLrSelection::Replayed(replay),
                 // A closed multi-scale window is not the end of the story: the
                 // common-scale slice intersects the same windows and declines
                 // for ITSELF if there is genuinely nothing to move. Any other
                 // refusal is about the geometry, which the slice shares, so it
                 // stands rather than being retried.
-                Err(SmoothLrSelectionDecline::WindowClosed) => {
-                    Self::generate_common_scale(geometry, log_scale_windows, diagonal_draws)
-                }
+                Err(SmoothLrSelectionDecline::WindowClosed) => Self::generate_common_scale(
+                    geometry,
+                    log_scale_windows,
+                    diagonal_draws,
+                    observed,
+                ),
                 Err(reason) => SmoothLrSelection::Declined(reason),
             };
         }
-        Self::generate_common_scale(geometry, log_scale_windows, diagonal_draws)
+        Self::generate_common_scale(geometry, log_scale_windows, diagonal_draws, observed)
     }
 
     /// The COMMON-SCALE replay: every scale moved together, `t_i ≡ t`.
@@ -1686,6 +1771,7 @@ impl SmoothLrSelectionReplay {
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
         draws: usize,
+        observed: Option<&[f64]>,
     ) -> SmoothLrSelection {
         // Moving every scale together, the reachable set is the INTERSECTION of
         // the per-scale windows: a common shift has to keep every `ρ̂_i + ln t`
@@ -1718,6 +1804,22 @@ impl SmoothLrSelectionReplay {
             .map(|nu| nu.ln())
             .sum();
 
+        // `(W(t*), W(1))` for one draw's squared coordinates in the fitted
+        // eigenbasis. The observation goes through this same function.
+        let score = |squares: &[f64]| {
+            let criterion = DiagonalCriterion {
+                squares,
+                generalized: &generalized,
+                rank: geometry.rank,
+                occam: &[],
+                constant,
+            };
+            let selected = criterion.select(low, high).ok()?;
+            // The control variate's conditional arm is read AT the fitted scale,
+            // `ln t = 0`, on the same draw.
+            Some((criterion.statistic(selected), criterion.statistic(0.0)))
+        };
+
         let dimension = geometry.dimension;
         let mut squares = vec![0.0_f64; dimension];
         let mut stream = SelectionDrawStream::new(dimension, draws);
@@ -1725,25 +1827,39 @@ impl SmoothLrSelectionReplay {
         let mut conditional_sample = vec![0.0_f64; draws];
         for draw in 0..draws {
             stream.fill_chi_square_ones(&mut squares);
-            let criterion = DiagonalCriterion {
-                squares: &squares,
-                generalized: &generalized,
-                rank: geometry.rank,
-                occam: &[],
-                constant,
-            };
-            let Ok(selected) = criterion.select(low, high) else {
+            let Some((selected, held)) = score(&squares) else {
                 return SmoothLrSelection::Declined(SmoothLrSelectionDecline::SelectionUnresolved);
             };
-            selection_sample[draw] = criterion.statistic(selected);
-            // The control variate's conditional arm is read AT the fitted scale,
-            // `ln t = 0`, on the same draw.
-            conditional_sample[draw] = criterion.statistic(0.0);
+            selection_sample[draw] = selected;
+            conditional_sample[draw] = held;
         }
+        let observed = match observed {
+            None => None,
+            Some(draw) => {
+                // The draws are squared coordinates in the fitted eigenbasis;
+                // the observation is put in the same coordinates.
+                for (column, square) in squares.iter_mut().enumerate() {
+                    let projection: f64 = (0..dimension)
+                        .map(|row| draw[row] * fitted.basis[[row, column]])
+                        .sum();
+                    *square = projection * projection;
+                }
+                let Some((selected, conditional)) = score(&squares) else {
+                    return SmoothLrSelection::Declined(
+                        SmoothLrSelectionDecline::SelectionUnresolved,
+                    );
+                };
+                Some(ObservedSelection {
+                    conditional,
+                    selected,
+                })
+            }
+        };
         SmoothLrSelection::Replayed(Self {
             generalized: ascending(generalized),
             selection_sample,
             conditional_sample,
+            observed,
         })
     }
 
@@ -1798,6 +1914,7 @@ impl SmoothLrSelectionReplay {
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
         draws: usize,
+        observed: Option<&[f64]>,
     ) -> Result<Self, SmoothLrSelectionDecline> {
         let scales = geometry.roots.len();
         if scales < 2 {
@@ -1832,10 +1949,9 @@ impl SmoothLrSelectionReplay {
         let mut draw = vec![0.0_f64; dimension];
         let mut coordinates = vec![0.0_f64; geometry.rank];
         let mut selected = vec![0.0_f64; scales];
-        let mut selection_sample = vec![0.0_f64; draws];
-        let mut conditional_sample = vec![0.0_f64; draws];
-        for index in 0..draws {
-            stream.fill_normals(&mut draw);
+        // `(W(t*), W(1))` for one whitened draw. The observation goes through
+        // this same function.
+        let mut score = |draw: &[f64]| -> Result<(f64, f64), SmoothLrSelectionDecline> {
             let mut norm_squared = 0.0_f64;
             let mut conditional = 0.0_f64;
             for column in 0..dimension {
@@ -1846,7 +1962,6 @@ impl SmoothLrSelectionReplay {
                 }
                 conditional += projection * projection * fitted.weights[column];
             }
-            conditional_sample[index] = conditional;
             for column in 0..geometry.rank {
                 let mut projection = 0.0_f64;
                 for row in 0..dimension {
@@ -1858,12 +1973,29 @@ impl SmoothLrSelectionReplay {
             if !factor.refactor(geometry, &selected) {
                 return Err(SmoothLrSelectionDecline::SelectionUnresolved);
             }
-            selection_sample[index] = factor.score(&coordinates, norm_squared).1;
+            Ok((factor.score(&coordinates, norm_squared).1, conditional))
+        };
+        let mut selection_sample = vec![0.0_f64; draws];
+        let mut conditional_sample = vec![0.0_f64; draws];
+        for index in 0..draws {
+            stream.fill_normals(&mut draw);
+            (selection_sample[index], conditional_sample[index]) = score(&draw)?;
         }
+        let observed = match observed {
+            None => None,
+            Some(draw) => {
+                let (selected, conditional) = score(draw)?;
+                Some(ObservedSelection {
+                    conditional,
+                    selected,
+                })
+            }
+        };
         Ok(Self {
             generalized: ascending(fitted.eigenvalues),
             selection_sample,
             conditional_sample,
+            observed,
         })
     }
 
@@ -1919,15 +2051,41 @@ impl SmoothLrSelectionReplay {
             }
         }
     }
-    /// `(shift, standard_error)`: how much the selection moves the tail at
-    /// `statistic`, and the Monte-Carlo standard error of that shift.
+    /// The observation's statistic under the replay's own selection, given
+    /// its statistic `conditional` at the fitted `λ̂`: `conditional` carried by
+    /// the quadratic model's ratio `W_q(t*; z)/W_q(1; z)` of the observed
+    /// whitened score (see [`Self::observed`]). Unchanged when no observation
+    /// was scored, or when its `W_q(1; z)` is not a positive number to divide
+    /// by — a score of exactly zero, where every `t` gives the same `W_q = 0`
+    /// and the selection moves nothing.
+    fn observed_selection_threshold(&self, conditional: f64) -> f64 {
+        match self.observed {
+            Some(observed)
+                if observed.conditional.is_finite()
+                    && observed.conditional > 0.0
+                    && observed.selected.is_finite() =>
+            {
+                conditional * (observed.selected / observed.conditional)
+            }
+            _ => conditional,
+        }
+    }
+
+    /// `(shift, standard_error)` of `P̂(W_sel ≥ x_sel) − P̂(W_cond ≥ x)` on
+    /// shared draws, each arm asked about ITS OWN functional of the
+    /// observation: `x` is the observed statistic at the fitted `λ̂`, which the
+    /// exact conditional tail and its control variate are both read at, and
+    /// `x_sel` the same observation under the replay's selection.
     ///
-    /// The shift is `P̂(W_sel ≥ x) − P̂(W_cond ≥ x)` on shared draws. Its variance
-    /// is that of the paired indicator DIFFERENCE `d_i ∈ {−1, 0, +1}`, which is
-    /// zero on every draw whose selected `t` did not move it across `x` — that
-    /// is the control variate, and it is why the standard error is a fraction of
-    /// the naive `√(p(1−p)/N)`.
-    fn tail_shift(&self, statistic: f64) -> (f64, f64) {
+    /// `E[P̂(W_cond ≥ x)]` is the exact conditional tail at `x` for EVERY `x`,
+    /// so the sum `p_cond(x) + shift` is an unbiased estimate of
+    /// `P(W_sel ≥ x_sel)` whatever the two thresholds are; what their
+    /// agreement buys is only the variance, and that is measured, not assumed.
+    /// That variance is the paired indicator DIFFERENCE `d_i ∈ {−1, 0, +1}`'s,
+    /// zero on every draw whose selection did not carry it across the
+    /// thresholds — the control variate, and why the standard error is a
+    /// fraction of the naive `√(p(1−p)/N)`.
+    fn tail_shift_at(&self, conditional_threshold: f64, selection_threshold: f64) -> (f64, f64) {
         let draws = self.selection_sample.len();
         if draws == 0 {
             return (0.0, 0.0);
@@ -1939,7 +2097,8 @@ impl SmoothLrSelectionReplay {
             .iter()
             .zip(self.conditional_sample.iter())
         {
-            let difference = f64::from(selected >= statistic) - f64::from(held >= statistic);
+            let difference = f64::from(selected >= selection_threshold)
+                - f64::from(held >= conditional_threshold);
             sum += difference;
             sum_squares += difference * difference;
         }
@@ -2107,9 +2266,10 @@ fn split_mix64(state: u64) -> u64 {
 /// where a smooth term carrying real signal sits. Nothing about the statistic requires that
 /// trade: the weights are the parameters of an exactly invertible
 /// characteristic function, and
-/// `gam_math::probability::signed_weighted_chi_square_sf_to_tolerance`
-/// inverts it (Imhof) with a *returned* truncation bound of `1e-11` — eight
-/// orders below the smallest tail any of the numbers above resolves. So the
+/// `gam_math::probability::signed_weighted_chi_square_sf`
+/// inverts it with a *returned* error bound, relative to the tail itself, so
+/// the smallest tail any of the numbers above resolves is resolved to near
+/// full precision. So the
 /// reference is `P(Σ_j w_j χ²_1 > W)` itself, and the `(ν, g)` pair survives only
 /// as a two-number summary of the spectrum's shape, published for continuity and
 /// no longer consulted when the spectrum is known.
@@ -2210,15 +2370,6 @@ pub struct SmoothLrReferenceDf {
     /// about the fit, and a reader who does not have to look at which statement
     /// will not.
     pub selection: SmoothLrSelection,
-    /// The relative resolution of the statistic this reference will be asked
-    /// about — the fit's own outer convergence tolerance (`FitOptions::tol`).
-    ///
-    /// `W = 2(ℓ_full − ℓ_null)` is a difference of two SEPARATELY converged
-    /// optimizations, so it is not known better than that, and a p-value cannot
-    /// be more accurate than the statistic it is read from. See
-    /// [`Self::tail_probability_with_bound`] for what this is used for and why
-    /// it is not a numerical-accuracy knob.
-    pub statistic_resolution: f64,
     /// The ESTIMATED-SCALE channel, present exactly when the fit profiled its
     /// own Gaussian dispersion out of a residual sum of squares (#2672).
     ///
@@ -2265,7 +2416,7 @@ pub struct SmoothLrReferenceDf {
 ///
 /// a linear combination of independent chi-squares with a NEGATIVE weight,
 /// evaluated at zero — which is exactly
-/// [`gam_math::probability::signed_weighted_chi_square_sf_to_tolerance`]. There
+/// [`gam_math::probability::signed_weighted_chi_square_sf`]. There
 /// is no expansion, no `κ`-convention to pick, and no separate `F`-family
 /// approximation: `n` and `ν` appear where the log-likelihood actually put
 /// them.
@@ -2324,25 +2475,6 @@ pub struct SmoothLrProfiledScale {
     pub residual_unit_dimension: f64,
 }
 
-/// Accumulated-roundoff floor on the requested tail accuracy.
-///
-/// The Imhof value is assembled as `0.5 + I/π` over `N` panels, so its own
-/// arithmetic error is about `ε√N` — at the `10⁵`-panel scale this reference
-/// reaches, `1e-13`. Asking the quadrature for a bound below that buys panels,
-/// not digits.
-const SMOOTH_LR_TAIL_ROUNDOFF_FLOOR: f64 = 1e-13;
-
-/// Ceiling on the requested tail accuracy.
-///
-/// The derived request degenerates in one place: as `W → 0` the reference's
-/// density diverges for `ν < 2`, so "how far does the p-value move when `W`
-/// moves by its own resolution" becomes unbounded — while the p-value there is
-/// within `1e-3` of one and nothing depends on it. This rail is the statement
-/// that a probability is reported to at least three decimals whatever the
-/// derivation says; it binds nowhere else, because `density · ΔW` falls below it
-/// as soon as `W` leaves the origin.
-const SMOOTH_LR_TAIL_COARSEST: f64 = 1e-3;
-
 impl SmoothLrReferenceDf {
     /// The CONDITIONAL tail — the fixed-`λ` law alone, with the λ̂-selection
     /// replay held out. This is the tail `Self::tail_probability_with_bound`
@@ -2352,42 +2484,22 @@ impl SmoothLrReferenceDf {
         self.conditional_tail_with_bound(statistic).0
     }
 
-    /// `P(W > statistic)` under this reference, with the certified absolute
-    /// bound the quadrature achieved on it.
+    /// `P(W > statistic)` under this reference, with an absolute bound on its
+    /// error.
     ///
-    /// On the exact lane this is `P(Σ_j w_j χ²_1 > W)` by Imhof inversion; on the
-    /// two surrogate lanes it is the two-moment `P(χ²_ν > W/g)`. Both are
-    /// scale-equivariant in the same way, which is what lets the Bartlett
-    /// correction be applied as `W/c` on either.
+    /// On the exact lane this is `P(Σ_j w_j χ²_1 > W)` by inversion of its moment
+    /// generating function; on the two surrogate lanes it is the two-moment
+    /// `P(χ²_ν > W/g)`. Both are scale-equivariant in the same way, which is what
+    /// lets the Bartlett correction be applied as `W/c` on either.
     ///
     /// A non-finite statistic propagates as `NaN` rather than being scored: the
     /// LR statistic is `NaN` exactly when the null refit did not produce a finite
     /// log-likelihood, and there is no p-value for a test that was not run.
     ///
-    /// # How accurately the tail is resolved, and why that is derived
-    ///
-    /// Imhof's truncation point grows like `ε^{-2/(2+m)}` in the number `m` of
-    /// weights active at it. A shrunk penalized smooth has ONE weight of order
-    /// one over a tail of tiny ones, so `m = 1` across the whole useful range
-    /// and the cost is `ε^{-2/3}`: at `gam-math`'s default `ε = 1e-11` a single
-    /// p-value on a realistic spectrum measures **0.13 s to 3.3 s**. That is not
-    /// an accuracy anyone asked for — it is the library's default standing in
-    /// for a statement about what this particular answer is for.
-    ///
-    /// The statement is available. `W = 2(ℓ_full − ℓ_null)` is a difference of
-    /// two separately-converged optimizations, so it is known to about
-    /// `ΔW = tol · (W + E[W])` — the fit's own convergence tolerance on the
-    /// natural scale of the statistic. A p-value is a deterministic function of
-    /// `W`, so it is known to `|S(W) − S(W + ΔW)|` no matter how well the
-    /// integral is done. **That** is what the quadrature is asked for, and it is
-    /// evaluated through the two-moment summary — the distribution that used to
-    /// BE the reference, which costs nothing and is within a factor of 1.6 of
-    /// the exact tail everywhere it was measured, so it is an excellent scale
-    /// for a derivative it is not being asked to be the value of.
-    ///
-    /// Resolving finer than this is arithmetic on the fit's own noise; resolving
-    /// coarser would add some. The achieved bound is returned rather than
-    /// assumed, so a consumer can see the accuracy instead of inheriting it.
+    /// The bound is the inversion's own, derived from the arithmetic that
+    /// produced the value (see `gam_math::probability::signed_weighted_chi_square_sf`),
+    /// plus twice the selection replay's Monte-Carlo standard error when a
+    /// replay corrects it.
     pub fn tail_probability_with_bound(&self, statistic: f64) -> (f64, f64) {
         let (conditional, bound) = self.conditional_tail_with_bound(statistic);
         let Some(replay) = self.selection.replay() else {
@@ -2396,22 +2508,13 @@ impl SmoothLrReferenceDf {
         if !conditional.is_finite() {
             return (conditional, bound);
         }
-        let (shift, standard_error) = replay.tail_shift(self.selection_threshold(statistic));
+        let threshold = self.selection_threshold(statistic);
+        let (shift, standard_error) =
+            replay.tail_shift_at(threshold, replay.observed_selection_threshold(threshold));
         (
             (conditional + shift).clamp(0.0, 1.0),
             bound + 2.0 * standard_error,
         )
-    }
-
-    /// The Monte-Carlo standard error the selection replay contributes at this
-    /// statistic, or zero when nothing was replayed.
-    ///
-    /// This is a `O(draws)` pass over two samples, four orders cheaper than the
-    /// quadrature it is used to budget.
-    fn selection_standard_error(&self, statistic: f64) -> f64 {
-        self.selection.replay().map_or(0.0, |replay| {
-            replay.tail_shift(self.selection_threshold(statistic)).1
-        })
     }
 
     /// The threshold the λ̂-selection replay has to be asked about, which is not
@@ -2475,41 +2578,9 @@ impl SmoothLrReferenceDf {
             // a closed form: no truncation, so no bound to report.
             return (summary(statistic), 0.0);
         }
-        let derived = if self.statistic_resolution.is_finite() && self.statistic_resolution > 0.0 {
-            let delta = self.statistic_resolution * (statistic.abs() + self.mean.abs());
-            (summary(statistic) - summary(statistic + delta)).abs()
-        } else {
-            // A reference built without a fit behind it (a unit test, a
-            // hand-assembled spectrum) has no statistic resolution, so its
-            // statistic is exact and nothing coarsens the request: the clamp
-            // below lifts it to the quadrature's own roundoff floor.
-            0.0
-        };
-        // AND NO FINER THAN THE ANSWER'S OWN NOISE. The published accuracy of a
-        // replayed p-value is `quadrature + 2·se`, where `se` is the selection
-        // shift's Monte-Carlo standard error. Resolving the conditional half
-        // below `se` cannot improve that sum — it is arithmetic on a number the
-        // other term has already blurred — while Imhof's truncation point grows
-        // like `ε^{-2/3}`, so the request is what the cost is made of. Asking
-        // for exactly `se` caps the published bound at `3·se` against an
-        // irreducible `2·se`, i.e. within 1.5x of an infinitely accurate
-        // quadrature, and it is a DERIVED request rather than a budget: with no
-        // replay the floor is zero and the statistic's own resolution stands.
-        //
-        // Measured: with `FitOptions::tol = 1e-10` the derived request is ~1e-10
-        // — essentially `gam-math`'s strict default — and the module's own table
-        // puts that at 0.13-3.3 s PER P-VALUE. The driver evaluates three or
-        // four per term, and `null_simulation_size_is_calibrated_small_n` runs
-        // 960 of them: it did not finish in 4000 s at the commit this repair
-        // was measured against, against nextest's 600 s kill.
-        let tolerance = derived
-            .max(self.selection_standard_error(statistic))
-            .clamp(SMOOTH_LR_TAIL_ROUNDOFF_FLOOR, SMOOTH_LR_TAIL_COARSEST);
         let mut terms = self.null_law_terms();
         let Some(scale) = self.profiled_scale.as_ref() else {
-            return gam_math::probability::signed_weighted_chi_square_sf_to_tolerance(
-                &terms, statistic, tolerance,
-            );
+            return tail_with_bound(&terms, statistic);
         };
         // `W > w  ⟺  Q/V > expm1((w − B)/n)`, so the tail is the SIGNED
         // combination `Q − c·V` at zero. See [`SmoothLrProfiledScale`].
@@ -2535,8 +2606,197 @@ impl SmoothLrReferenceDf {
                 degrees_of_freedom: scale.residual_unit_dimension,
             });
         }
-        gam_math::probability::signed_weighted_chi_square_sf_to_tolerance(&terms, 0.0, tolerance)
+        tail_with_bound(&terms, 0.0)
     }
+
+    /// The typed p-value: a point value when its published accuracy resolves
+    /// it away from zero, and an explicit ceiling when it does not.
+    ///
+    /// `(value, accuracy)` is what [`Self::tail_probability_with_bound`] returned
+    /// at the statistic. When `value ≤ accuracy` the interval the reference
+    /// certifies, `[value − accuracy, value + accuracy]`, contains zero: the
+    /// digits of `value` are not the tail, and publishing them as a probability
+    /// would be publishing noise. What IS known there is the interval's top, so
+    /// that is what is reported.
+    ///
+    /// `None` when the value or its accuracy is not a number, which the driver
+    /// reports as [`SmoothLrUnavailable::TailNotComputable`].
+    pub fn typed_p_value(value: f64, accuracy: f64) -> Option<SmoothLrPValue> {
+        if !(value.is_finite() && accuracy.is_finite()) {
+            return None;
+        }
+        if value > accuracy {
+            return Some(SmoothLrPValue::Resolved(value));
+        }
+        // "p ≤ 0" is false for every continuous law; a ceiling that rounds to
+        // zero is lifted to the smallest positive double, the least
+        // representable true statement.
+        Some(SmoothLrPValue::UpperBound(
+            (value.max(0.0) + accuracy).clamp(f64::from_bits(1), 1.0),
+        ))
+    }
+}
+
+/// A smooth term's LR p-value as the reference can actually certify it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SmoothLrPValue {
+    /// A point value, resolved away from zero by the published accuracy
+    /// [`SmoothTermLrInference::p_value_bound`].
+    Resolved(f64),
+    /// `p ≤` this ceiling. The published accuracy does not separate the value
+    /// from zero, so a point value would be noise; see
+    /// [`SmoothLrReferenceDf::typed_p_value`].
+    UpperBound(f64),
+}
+
+/// Why a tested smooth term carries no LR p-value. Every smooth term the LR test
+/// applies to gets a row: a p-value ([`SmoothLrPValue`]) or one of these, never a
+/// silent gap and never an error for the whole call because one term's test
+/// could not run. (A shape-constrained term, which the test does not apply to,
+/// is named by [`smooth_term_lr_unavailable_forspec`].)
+#[derive(Clone, Debug, PartialEq)]
+pub enum SmoothLrUnavailable {
+    /// The term spans no coefficient columns in the fitted design, so there is
+    /// nothing to drop and no hypothesis to test.
+    EmptyCoefficientBlock,
+    /// The term's null law has no positive mean or no positive two-moment
+    /// shape/scale — the tested block carries no degree of freedom the data can
+    /// move, so no tail can be read from it.
+    DegenerateReference,
+    /// The full model could not be refitted from the supplied data, so no term
+    /// has an `ℓ_full` to be compared against.
+    FullRefitFailed(String),
+    /// The reduced model (this term's block fixed at zero, every other
+    /// smoothing parameter at the full fit's `λ̂`) did not reach a converged
+    /// optimum. A fit object is only ever the product of a converged
+    /// optimization, so there is no `ℓ_null` and no statistic.
+    NullFitNotConverged(String),
+    /// The reduced model is not the full model with this term's block
+    /// constrained to zero at the full fit's `λ̂` — a penalty spans the tested
+    /// block and a surviving one, a constraint needs the tested block, the
+    /// link shape was estimated jointly, or the fit uses the bounded-linear
+    /// route — so no nested likelihood ratio is defined for it here.
+    NullFitUnsupported(String),
+    /// The reduced model converged but its log-likelihood is not finite.
+    NullLogLikelihoodNotFinite,
+    /// The statistic was formed but the reference returned no finite tail or
+    /// accuracy for it.
+    TailNotComputable,
+}
+
+impl SmoothLrUnavailable {
+    /// Stable machine-readable label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::EmptyCoefficientBlock => "empty_coefficient_block",
+            Self::DegenerateReference => "degenerate_reference",
+            Self::FullRefitFailed(_) => "full_refit_failed",
+            Self::NullFitNotConverged(_) => "null_fit_not_converged",
+            Self::NullFitUnsupported(_) => "null_fit_unsupported",
+            Self::NullLogLikelihoodNotFinite => "null_log_likelihood_not_finite",
+            Self::TailNotComputable => "tail_not_computable",
+        }
+    }
+}
+
+impl std::fmt::Display for SmoothLrUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyCoefficientBlock => f.write_str("the term spans no coefficient columns"),
+            Self::DegenerateReference => {
+                f.write_str("the term's null law has no positive mean, shape or scale")
+            }
+            Self::FullRefitFailed(message) => write!(f, "full-model refit failed: {message}"),
+            Self::NullFitNotConverged(message) => {
+                write!(f, "the reduced model (term fixed at zero) did not converge: {message}")
+            }
+            Self::NullFitUnsupported(message) => {
+                write!(f, "no nested reduced model for this term: {message}")
+            }
+            Self::NullLogLikelihoodNotFinite => {
+                f.write_str("the reduced model's log-likelihood is not finite")
+            }
+            Self::TailNotComputable => {
+                f.write_str("the reference produced no finite tail at this statistic")
+            }
+        }
+    }
+}
+
+/// One smooth term's LR significance outcome: the report, or why there is none.
+#[derive(Clone, Debug)]
+pub struct SmoothTermLrReport {
+    /// Smooth-term name (matches the summary row).
+    pub name: String,
+    /// Smooth-term index within `resolvedspec.smooth_terms`.
+    pub term_idx: usize,
+    pub outcome: Result<SmoothTermLrInference, SmoothLrUnavailable>,
+}
+
+impl SmoothTermLrReport {
+    /// The report, when the test ran.
+    pub fn inference(&self) -> Option<&SmoothTermLrInference> {
+        self.outcome.as_ref().ok()
+    }
+}
+
+impl SmoothLrPValue {
+    /// The point value, when there is one.
+    pub fn value(self) -> Option<f64> {
+        match self {
+            Self::Resolved(value) => Some(value),
+            Self::UpperBound(_) => None,
+        }
+    }
+
+    /// The ceiling, when the tail was reported as one.
+    pub fn upper_bound(self) -> Option<f64> {
+        match self {
+            Self::UpperBound(bound) => Some(bound),
+            Self::Resolved(_) => None,
+        }
+    }
+}
+
+/// The weighted chi-square tail with its bound stated absolutely, the form the
+/// replay's shift is added to.
+fn tail_with_bound(terms: &[gam_math::probability::WeightedChiSquareTerm], statistic: f64) -> (f64, f64) {
+    let tail = gam_math::probability::signed_weighted_chi_square_sf(terms, statistic);
+    (tail.probability, tail.absolute_error())
+}
+
+/// A smooth term the per-term LR test does not report, with the typed reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SmoothTermLrUnavailable {
+    /// Smooth-term name (matches the summary row).
+    pub name: String,
+    /// Smooth-term index within `resolvedspec.smooth_terms`.
+    pub term_idx: usize,
+    /// Why no p-value exists for this term.
+    pub reason: gam_solve::estimate::SmoothPValueUnavailable,
+}
+
+/// The smooth terms of `resolvedspec` that [`smooth_term_lr_inference_forspec`]
+/// cannot test, each with its typed reason. A shape-constrained term's null
+/// `f = 0` is the apex of its constraint cone, so the LR statistic has no
+/// calibrated reference law (see [`gam_solve::estimate::SmoothPValueUnavailable`]).
+pub fn smooth_term_lr_unavailable_forspec(
+    resolvedspec: &TermCollectionSpec,
+) -> Vec<SmoothTermLrUnavailable> {
+    resolvedspec
+        .smooth_terms
+        .iter()
+        .enumerate()
+        .filter_map(|(term_idx, term)| {
+            gam_solve::estimate::smooth_pvalue_unavailable(&term.shape).map(|reason| {
+                SmoothTermLrUnavailable {
+                    name: term.name.clone(),
+                    term_idx,
+                    reason,
+                }
+            })
+        })
+        .collect()
 }
 
 /// The Bartlett-corrected per-term significance report for one penalized smooth
@@ -2606,17 +2866,19 @@ pub struct SmoothTermLrInference {
     /// to `p_value_corrected` when no selection was possible.
     pub p_value_conditional: f64,
     /// Certified absolute accuracy of the two published p-values — the larger of
-    /// the two truncation bounds the tail quadrature achieved (#2672).
+    /// the two bounds [`SmoothLrReferenceDf::tail_probability_with_bound`]
+    /// returned (#2672).
     ///
-    /// `0.0` on the closed-form lanes (a degraded reference, or a spectrum whose
-    /// weights are all equal) because there is no truncation to bound. On the
-    /// Imhof lane it is what the sweep reached against the accuracy
-    /// [`SmoothLrReferenceDf::tail_probability_with_bound`] derived from the
-    /// fit's own convergence tolerance, so a consumer reads the accuracy rather
-    /// than inheriting it. A value large enough to matter means the quadrature
-    /// hit its panel backstop, which is a statement about the spectrum's spread
-    /// and not a defect in the p-value's derivation.
+    /// `0.0` on the closed-form lane (a degraded reference without a profiled
+    /// scale), where the tail is a chi-square survival function. On the exact
+    /// lane it is the inversion's own derived error bound, so a consumer reads
+    /// the accuracy rather than inheriting it.
     pub p_value_bound: f64,
+    /// [`Self::p_value_corrected`] as the reference can certify it: the point
+    /// value when [`Self::p_value_bound`] resolves it away from zero, else an
+    /// explicit ceiling `p ≤ bound` — a strong effect's tail sits below the
+    /// quadrature's absolute accuracy, and its digits there are roundoff.
+    pub p_value: SmoothLrPValue,
 }
 
 /// The materiality threshold for [`SmoothTermLrInference::material`] (#939
@@ -2688,8 +2950,13 @@ fn fitted_rho_penalty_components(
 /// 1. Fit the full model and read `ℓ_full` and the per-term coefficient ranges /
 ///    EDF / influence block. The full design's column layout fixes the tested
 ///    block for the Lawley factor.
-/// 2. For each penalized smooth term, refit a null model with that term dropped
-///    from the spec; `W = max(2(ℓ_full − ℓ_null), 0)`.
+/// 2. For each penalized smooth term, fit the nested null model: the full
+///    design and likelihood with that term's coefficient block fixed at zero and
+///    every surviving smoothing parameter held at the full fit's `λ̂`
+///    ([`gam_solve::estimate::fit_nested_at_fitted_log_lambdas`]). Re-selecting
+///    `λ` for the reduced model would make `W` the difference of two REML
+///    optima, which at a null-railed term is the outer search's tolerance and
+///    not a likelihood ratio. `W = 2(ℓ_full − ℓ_null)`.
 /// 3. The reference d.f. `d` is the Wood truncation `tr(F)²/tr(F²)` on the
 ///    term's influence block (the same `ref_df` the summary Wald row reports),
 ///    floored at `max(edf, null_dim, 1)`: this LR test drops the whole term, so
@@ -2703,11 +2970,22 @@ fn fitted_rho_penalty_components(
 ///    `W` with [`gam_terms::inference::lawley::lawley_lr_bartlett_factor`]. The
 ///    null annihilates the tested block's penalty (`S_λ β₀ = 0` on that block),
 ///    so the penalized Lawley expansion applies verbatim.
-/// 5. Otherwise (no closed-form jets, or a null refit that did not converge) the
-///    uncorrected `χ²_d` stands with provenance `none` — never weakened.
+/// 5. Otherwise (no closed-form jets) the uncorrected `χ²_d` stands with
+///    provenance `none` — never weakened.
 ///
-/// Random-effect smooths and shape-constrained smooths are skipped (their tests
-/// are not a central-χ² LR), matching the summary table's policy.
+/// # Output
+///
+/// Exactly one [`SmoothTermLrReport`] per tested smooth term, in term order.
+/// Its outcome is either the inference — whose [`SmoothTermLrInference::p_value`]
+/// is a resolved value or an explicit ceiling — or the typed
+/// [`SmoothLrUnavailable`] reason the term has none: a reduced model whose fit
+/// did not converge, a degenerate reference, and so on. A failure of one term's
+/// refit is that term's reason and never the call's error; `Err` is reserved
+/// for inputs that break the driver's own invariants.
+///
+/// Shape-constrained smooths have no calibrated LR reference, and
+/// [`smooth_term_lr_unavailable_forspec`] names them with the typed reason,
+/// matching the summary table's policy, so they get no report here.
 pub fn smooth_term_lr_inference_forspec(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -2716,7 +2994,7 @@ pub fn smooth_term_lr_inference_forspec(
     resolvedspec: &TermCollectionSpec,
     family: LikelihoodSpec,
     options: &FitOptions,
-) -> Result<Vec<SmoothTermLrInference>, EstimationError> {
+) -> Result<Vec<SmoothTermLrReport>, EstimationError> {
     use gam_terms::inference::lawley::{
         LAWLEY_PAIR_MATRIX_MAX_ROWS, known_scale_expected_jets_with_dispersion,
         lawley_lr_bartlett_factor, lawley_lr_mean_shift_with_rho_variation,
@@ -2725,7 +3003,10 @@ pub fn smooth_term_lr_inference_forspec(
     let n = data.nrows();
     // Full fit: ℓ_full, the per-term coefficient ranges/EDF/influence, and the
     // full design whose column layout fixes each tested block for Lawley.
-    let full = fit_term_collection_forspec(
+    //
+    // A failure here is every term's reason, reported per term like any other:
+    // the call's contract is one row per smooth, each a p-value or a reason.
+    let full = match fit_term_collection_forspec(
         data,
         y,
         weights,
@@ -2733,7 +3014,22 @@ pub fn smooth_term_lr_inference_forspec(
         resolvedspec,
         family.clone(),
         options,
-    )?;
+    ) {
+        Ok(full) => full,
+        Err(error) => {
+            let message = error.to_string();
+            return Ok(resolvedspec
+                .smooth_terms
+                .iter()
+                .enumerate()
+                .map(|(term_idx, term)| SmoothTermLrReport {
+                    name: term.name.clone(),
+                    term_idx,
+                    outcome: Err(SmoothLrUnavailable::FullRefitFailed(message.clone())),
+                })
+                .collect());
+        }
+    };
     let ll_full = full.fit.log_likelihood;
     let p_total = full.design.design.ncols();
     let lambdas = full.fit.lambdas.as_slice().ok_or_else(|| {
@@ -2829,8 +3125,35 @@ pub fn smooth_term_lr_inference_forspec(
         },
     );
 
-    let mut out = Vec::<SmoothTermLrInference>::new();
+    // The nested null of every term is the full problem with one block fixed at
+    // zero, solved at the full fit's `ρ̂` on the offset the full fit was solved
+    // with. The bounded-linear route solves a different problem (a box on the
+    // bounded coefficients) that this nested fit does not reproduce.
+    let null_offset = full
+        .design
+        .compose_offset(offset, "smooth likelihood-ratio null model")
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    let bounded_linear = resolvedspec.has_bounded_linear_terms();
+    let nested_inputs = gam_solve::estimate::NestedFixedLambdaInputs {
+        design: &full.design.design,
+        y,
+        weights,
+        offset: null_offset.view(),
+        penalties: &full.design.penalties,
+        nullspace_dims: &full.design.nullspace_dims,
+        linear_constraints: full.design.linear_constraints.as_ref(),
+        fit: &full.fit,
+        tol: options.tol,
+        link_shape_estimated: options.optimize_sas || options.optimize_mixture,
+    };
+
+    let mut out = Vec::<SmoothTermLrReport>::new();
     for (term_idx, design_term) in full.design.smooth.terms.iter().enumerate() {
+        let report = |outcome| SmoothTermLrReport {
+            name: design_term.name.clone(),
+            term_idx,
+            outcome,
+        };
         let penalty_range = full
             .design
             .smooth_term_penalty_range(term_idx)
@@ -2838,15 +3161,16 @@ pub fn smooth_term_lr_inference_forspec(
         let (block_start, k) = penalty_range
             .map(|range| (range.start, range.len()))
             .unwrap_or((0, 0));
-        // Shape-constrained smooths get no central-χ² LR (cone-projected
-        // boundary test); the summary table skips them too.
-        if design_term.shape != ShapeConstraint::None {
+        // Shape-constrained smooths have no calibrated LR reference; they are
+        // reported by `smooth_term_lr_unavailable_forspec` instead.
+        if gam_solve::estimate::smooth_pvalue_unavailable(&design_term.shape).is_some() {
             continue;
         }
         // Shifted into the GLOBAL coefficient layout — see `smooth_start` above.
         let coeff_range = (smooth_start + design_term.coeff_range.start)
             ..(smooth_start + design_term.coeff_range.end);
         if coeff_range.start >= coeff_range.end || coeff_range.end > p_total {
+            out.push(report(Err(SmoothLrUnavailable::EmptyCoefficientBlock)));
             continue;
         }
         // Per-term EDF for the χ² reference df FALLBACK (used only when the
@@ -2954,6 +3278,45 @@ pub fn smooth_term_lr_inference_forspec(
                 (lo - rho, hi - rho)
             })
             .collect();
+        // Null model: this term's block fixed at zero, at the full fit's `ρ̂`.
+        // It is solved before the reference because the selection replay
+        // scores the OBSERVED data too: the tested block's score at the nested
+        // null, `g_j = X_jᵀ ∂ℓ/∂η`, is the draw the replay's own `z` stands in
+        // for (see `SmoothLrSelectionReplay::observed`). The reasons keep their
+        // precedence — a degenerate reference is reported before the null fit's.
+        let null_outcome = if bounded_linear {
+            None
+        } else {
+            Some(gam_solve::estimate::fit_nested_at_fitted_log_lambdas(
+                &nested_inputs,
+                coeff_range.clone(),
+            )?)
+        };
+        // The score is on the replay's unit-dispersion scale. Every family
+        // whose working weight already carries the dispersion reads it off the
+        // reporting likelihood directly; the profiled Gaussian's score is
+        // `X_jᵀ W (y − μ̂₀)` (unit `φ`), and dividing by `√(D_f / E[V])` puts
+        // it on the scale the selection threshold `expm1((W − B)/n)·E[V]` is
+        // expressed in — the same `D_f/E[V]` that threshold divides out.
+        let observed_score = match null_outcome.as_ref() {
+            Some(gam_solve::estimate::NestedFixedLambdaOutcome::Converged(null)) => {
+                let block_score = full_design_dense
+                    .slice(ndarray::s![.., coeff_range.start..coeff_range.end])
+                    .t()
+                    .dot(&null.eta_score);
+                let unit_scale = match profiled_residual.as_ref() {
+                    Some((residual_weights, residual_unit_dimension)) => {
+                        let expected_residual =
+                            residual_weights.iter().sum::<f64>() + residual_unit_dimension;
+                        full.fit.deviance / expected_residual
+                    }
+                    None => 1.0,
+                };
+                (unit_scale.is_finite() && unit_scale > 0.0)
+                    .then(|| block_score.mapv(|value| value / unit_scale.sqrt()))
+            }
+            _ => None,
+        };
         let reference = lr_null_reference(
             influence,
             hessian_inverse.as_ref(),
@@ -2961,10 +3324,10 @@ pub fn smooth_term_lr_inference_forspec(
             &coeff_range,
             edf,
             null_dim,
-            options.tol,
             &log_scale_windows,
             &term_penalties,
             &term_log_lambda,
+            observed_score.as_ref(),
         );
         let mut reference = reference;
         let ref_df = reference.mean;
@@ -2975,49 +3338,38 @@ pub fn smooth_term_lr_inference_forspec(
             && reference.scale.is_finite()
             && reference.scale > 0.0)
         {
+            out.push(report(Err(SmoothLrUnavailable::DegenerateReference)));
             continue;
         }
 
-        // Null model: drop this smooth term from the spec and refit. The term's
-        // name pins which spec entry to remove (design and spec share names).
-        let mut null_spec = resolvedspec.clone();
-        let Some(spec_pos) = null_spec
-            .smooth_terms
-            .iter()
-            .position(|t| t.name == design_term.name)
-        else {
+        let Some(null_outcome) = null_outcome else {
+            out.push(report(Err(SmoothLrUnavailable::NullFitUnsupported(
+                "the model has bounded linear terms, whose box-constrained fit the \
+                 nested fixed-lambda null does not reproduce"
+                    .to_string(),
+            ))));
             continue;
         };
-        null_spec.smooth_terms.remove(spec_pos);
-        let null_fit = fit_term_collection_forspec(
-            data,
-            y,
-            weights,
-            offset,
-            &null_spec,
-            family.clone(),
-            options,
-        );
-        let (statistic_lr, eta_null, null_residual_df) = match null_fit {
-            Ok(null) if null.fit.log_likelihood.is_finite() => {
-                let w = (2.0 * (ll_full - null.fit.log_likelihood)).max(0.0);
-                // η at the null fit: X_null β_null + affine_offset + offset
-                // (per-row linear predictor; design-layout independent — Lawley
-                // reads it on the full design rows). `compose_offset` folds the
-                // design's fixed affine channel (non-zero endpoint anchor,
-                // #2297) into the user offset.
-                let null_offset = null
-                    .design
-                    .compose_offset(offset, "smooth likelihood-ratio null model")
-                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-                let mut eta = null.design.design.dot(&null.fit.beta);
-                eta += &null_offset;
-                let residual_df =
-                    profiled_residual_degrees_of_freedom(&null.fit, profiled_observations);
-                (w, Some(eta), residual_df)
+        let null = match null_outcome {
+            gam_solve::estimate::NestedFixedLambdaOutcome::Converged(null) => null,
+            gam_solve::estimate::NestedFixedLambdaOutcome::NotConverged(message) => {
+                out.push(report(Err(SmoothLrUnavailable::NullFitNotConverged(message))));
+                continue;
             }
-            _ => (f64::NAN, None, None),
+            gam_solve::estimate::NestedFixedLambdaOutcome::Unsupported(message) => {
+                out.push(report(Err(SmoothLrUnavailable::NullFitUnsupported(message))));
+                continue;
+            }
         };
+        if !null.log_likelihood.is_finite() {
+            out.push(report(Err(SmoothLrUnavailable::NullLogLikelihoodNotFinite)));
+            continue;
+        }
+        let log_likelihood_ratio = 2.0 * (ll_full - null.log_likelihood);
+        // η at the null fit, offset included: Lawley reads it on the full
+        // design's rows.
+        let eta_null = Some(null.eta);
+        let null_residual_df = null.profiled_residual_df;
 
         // The estimated-scale channel needs BOTH fits' residual degrees of
         // freedom, so it is completed here rather than where the rest of the
@@ -3038,6 +3390,20 @@ pub fn smooth_term_lr_inference_forspec(
                 residual_unit_dimension: *residual_unit_dimension,
             });
         }
+        // The statistic's support is the reference's. A known-scale `W` is a
+        // non-negative combination of chi-squares, so a negative value is the
+        // two fits' optimizer noise and zero is the same event. A profiled `W`
+        // is `n·ln(1 + Q/V) + B`, whose support starts at `B`, and `B < 0`
+        // whenever the full fit spends any residual degree of freedom the null
+        // does not (`n·ln x < n(x − 1) ≤ ν_0(x − 1)` for `x = ν_f/ν_0 < 1`,
+        // since `ν_0 ≤ n`): a `W` in `(B, 0)` is an ordinary null draw, and moving
+        // it to zero scored it as `P(W > 0)` — an atom near 0.6 carrying the
+        // half of the null replicates whose term REML shrinks away.
+        let statistic_lr = if reference.profiled_scale.is_some() {
+            log_likelihood_ratio
+        } else {
+            log_likelihood_ratio.max(0.0)
+        };
         let ref_df_provenance = reference.clone();
 
         let (p_uncorrected, mut p_bound) = reference.tail_probability_with_bound(statistic_lr);
@@ -3081,7 +3447,18 @@ pub fn smooth_term_lr_inference_forspec(
                 {
                     let mut c_applied = c_cond;
                     correction = SmoothLrCorrection::LawleyLrFixedLambda;
-                    if let Some(cov) = rho_covariance
+                    // The ρ-variation mean shift is a first-order account of what
+                    // estimating `λ` does to `W`. A selection replay already puts
+                    // the whole of that into the law — it re-selects `λ` on every
+                    // draw — so adding the shift as well counts it twice. On a
+                    // term REML shrinks to its null the double count is not
+                    // small: an `O(1/n)` shift over `ref_df ~ 1e-5` is a factor
+                    // near 70, and it moved every such term's p-value to ~1.
+                    // With a replay, only the fixed-`λ` factor — the
+                    // non-Gaussian part of the conditional law, which the
+                    // replay's Gaussian quadratic form does not carry — applies.
+                    if reference.selection.replay().is_none()
+                        && let Some(cov) = rho_covariance
                         && let Ok(total_shift) = lawley_lr_mean_shift_with_rho_variation(
                             full_design_dense.view(),
                             &kappas,
@@ -3143,7 +3520,12 @@ pub fn smooth_term_lr_inference_forspec(
             SmoothLrCorrection::None => false,
         };
 
-        out.push(SmoothTermLrInference {
+        let Some(p_value) = SmoothLrReferenceDf::typed_p_value(p_corrected, p_bound) else {
+            out.push(report(Err(SmoothLrUnavailable::TailNotComputable)));
+            continue;
+        };
+
+        out.push(report(Ok(SmoothTermLrInference {
             name: design_term.name.clone(),
             term_idx,
             statistic_lr,
@@ -3159,7 +3541,8 @@ pub fn smooth_term_lr_inference_forspec(
             correction,
             p_value_conditional: p_conditional,
             p_value_bound: p_bound,
-        });
+            p_value,
+        })));
     }
     Ok(out)
 }
@@ -3312,10 +3695,10 @@ fn lr_null_reference(
     coeff_range: &Range<usize>,
     edf: f64,
     null_dim: usize,
-    statistic_resolution: f64,
     log_scale_windows: &[(f64, f64)],
     term_penalties: &[Array2<f64>],
     term_log_lambda: &[f64],
+    observed_score: Option<&Array1<f64>>,
 ) -> SmoothLrReferenceDf {
     let from_moments = |mean: f64, second_moment: f64, source| SmoothLrReferenceDf {
         weights: Vec::new(),
@@ -3330,7 +3713,6 @@ fn lr_null_reference(
         // The degraded lanes do not have the spectrum, so they cannot have the
         // geometry the replay is built from either.
         selection: SmoothLrSelection::Declined(SmoothLrSelectionDecline::GeometryRefused),
-        statistic_resolution,
         // Completed by the caller once the null refit has produced the second
         // residual degrees of freedom `B` needs (#2672).
         profiled_scale: None,
@@ -3381,8 +3763,8 @@ fn lr_null_reference(
                     term_penalties,
                     term_log_lambda,
                     log_scale_windows,
+                    observed_score,
                 ),
-                statistic_resolution,
                 profiled_scale: None,
             };
         }
@@ -3741,10 +4123,10 @@ mod lr_null_reference_tests {
             &(0..q),
             2.0,
             1,
-            0.0,
             WINDOW,
             &[],
             &[],
+            None,
         );
         assert_eq!(exact.source, SmoothLrReferenceSource::NullSpectrum);
         assert_eq!(exact.weights.len(), q);
@@ -3752,7 +4134,7 @@ mod lr_null_reference_tests {
         // No `H⁻¹` (or no penalty): the moments off `F`, and NO weights — which
         // is exactly the condition `tail_probability_with_bound` switches on.
         for degraded in [
-            lr_null_reference(Some(&influence), None, Some(&penalty), &(0..q), 2.0, 1, 0.0, WINDOW, &[], &[]),
+            lr_null_reference(Some(&influence), None, Some(&penalty), &(0..q), 2.0, 1, WINDOW, &[], &[], None),
             lr_null_reference(
                 Some(&influence),
                 Some(&hessian_inverse),
@@ -3760,10 +4142,10 @@ mod lr_null_reference_tests {
                 &(0..q),
                 2.0,
                 1,
-                0.0,
                 WINDOW,
                 &[],
                 &[],
+                None,
             ),
         ] {
             assert_eq!(degraded.source, SmoothLrReferenceSource::SpectralMomentMatch);
@@ -3772,18 +4154,18 @@ mod lr_null_reference_tests {
         }
 
         // Nothing at all: the unit-weight shape with its `max(edf, null_dim, 1)`.
-        let fallback = lr_null_reference(None, None, None, &(0..q), 2.5, 1, 0.0, WINDOW, &[], &[]);
+        let fallback = lr_null_reference(None, None, None, &(0..q), 2.5, 1, WINDOW, &[], &[], None);
         assert_eq!(fallback.source, SmoothLrReferenceSource::UnitWeightFallback);
         assert!(fallback.weights.is_empty());
         assert_eq!(fallback.chi_square_df, 2.5);
         assert_eq!(fallback.scale, 1.0);
         // The `max(edf, null_dim, 1)` shape is retained only on this lane.
         assert_eq!(
-            lr_null_reference(None, None, None, &(0..4), 0.01, 3, 0.0, WINDOW, &[], &[]).chi_square_df,
+            lr_null_reference(None, None, None, &(0..4), 0.01, 3, WINDOW, &[], &[], None).chi_square_df,
             3.0
         );
         assert_eq!(
-            lr_null_reference(None, None, None, &(0..4), 0.01, 0, 0.0, WINDOW, &[], &[]).chi_square_df,
+            lr_null_reference(None, None, None, &(0..4), 0.01, 0, WINDOW, &[], &[], None).chi_square_df,
             1.0
         );
     }
@@ -3814,7 +4196,6 @@ mod profiled_scale_reference_tests {
             null_dim: 0,
             source: SmoothLrReferenceSource::NullSpectrum,
             selection: SmoothLrSelection::Declined(SmoothLrSelectionDecline::GeometryRefused),
-            statistic_resolution: 0.0,
             profiled_scale,
         }
     }
@@ -3885,6 +4266,123 @@ mod profiled_scale_reference_tests {
         assert!(just_above < 1.0 && just_above > 0.999, "{just_above}");
     }
 
+    /// A profiled `W` between the offset and zero is an ordinary draw from the
+    /// reference: its tail is resolved, strictly between the tail at zero and
+    /// one, and falls as `W` rises. Scoring it as `W = 0` put an atom at the
+    /// tail at zero under half of the null replicates.
+    #[test]
+    fn a_statistic_between_the_offset_and_zero_is_scored_where_it_is() {
+        use super::SmoothLrPValue;
+        let subject = reference(
+            vec![1.0_f64, 0.5],
+            Some(SmoothLrProfiledScale {
+                observations: 30.0,
+                deterministic_offset: -0.61,
+                residual_weights: vec![0.25],
+                residual_unit_dimension: 24.0,
+            }),
+        );
+        let (at_zero, _) = subject.tail_probability_with_bound(0.0);
+        let mut previous = 1.0;
+        for &statistic in &[-0.5_f64, -0.3, -0.1, -1e-3] {
+            let (value, accuracy) = subject.tail_probability_with_bound(statistic);
+            assert!(value.is_finite() && accuracy.is_finite(), "W={statistic}: {value} ± {accuracy}");
+            assert!(value > at_zero && value < previous, "W={statistic}: {value} vs [{at_zero}, {previous}]");
+            assert_eq!(
+                SmoothLrReferenceDf::typed_p_value(value, accuracy),
+                Some(SmoothLrPValue::Resolved(value))
+            );
+            previous = value;
+        }
+    }
+
+    /// A huge effect is reported as a finite tiny p-value that is the tail.
+    ///
+    /// On the profiled reference the tail is `P(F_{q,ν} > c·ν/(g·q))` in closed
+    /// form (see the flat-spectrum test above), which `fisher_snedecor_sf`
+    /// evaluates in log space. The reference's inversion is accurate relative
+    /// to the tail, so a tail of `10⁻⁹⁰` is resolved as a point value within
+    /// its own published accuracy of the exact one — not rounded to zero, and
+    /// not floored at an absolute accuracy.
+    #[test]
+    fn a_huge_effect_is_a_finite_tiny_p_value_at_the_exact_tail() {
+        use super::SmoothLrPValue;
+        let (q, scale, nu) = (4usize, 0.37_f64, 26.0_f64);
+        let observations = nu + q as f64;
+        let subject = reference(
+            vec![scale; q],
+            Some(SmoothLrProfiledScale {
+                observations,
+                deterministic_offset: 0.0,
+                residual_weights: Vec::new(),
+                residual_unit_dimension: nu,
+            }),
+        );
+        for &statistic in &[90.0_f64, 150.0, 400.0] {
+            let (value, accuracy) = subject.tail_probability_with_bound(statistic);
+            let ratio = (statistic / observations).exp_m1();
+            let exact =
+                gam_math::probability::fisher_snedecor_sf(ratio * nu / (scale * q as f64), q as f64, nu);
+            assert!(exact > 0.0 && exact < 1e-16, "W={statistic}: {exact:.3e}");
+            assert_eq!(
+                SmoothLrReferenceDf::typed_p_value(value, accuracy),
+                Some(SmoothLrPValue::Resolved(value)),
+                "W={statistic}: {value:.3e} ± {accuracy:.3e}"
+            );
+            assert!(
+                (value - exact).abs() <= accuracy,
+                "W={statistic}: {value:.6e} ± {accuracy:.3e} against the exact tail {exact:.6e}"
+            );
+        }
+    }
+
+    /// A value its own accuracy does not separate from zero is published as the
+    /// top of the certified interval, never as a point value, and never as a
+    /// ceiling of zero.
+    #[test]
+    fn an_unresolved_tail_is_the_top_of_its_certified_interval() {
+        use super::SmoothLrPValue;
+        assert_eq!(
+            SmoothLrReferenceDf::typed_p_value(4e-17, 1e-13),
+            Some(SmoothLrPValue::UpperBound(1e-13 + 4e-17))
+        );
+        // A residue below zero is not part of the ceiling.
+        assert_eq!(
+            SmoothLrReferenceDf::typed_p_value(-3e-15, 1e-13),
+            Some(SmoothLrPValue::UpperBound(1e-13))
+        );
+        assert_eq!(
+            SmoothLrReferenceDf::typed_p_value(0.0, 0.0),
+            Some(SmoothLrPValue::UpperBound(f64::from_bits(1)))
+        );
+        assert_eq!(SmoothLrReferenceDf::typed_p_value(0.2, 1e-13), Some(SmoothLrPValue::Resolved(0.2)));
+        assert_eq!(SmoothLrReferenceDf::typed_p_value(f64::NAN, 0.0), None);
+        assert_eq!(SmoothLrReferenceDf::typed_p_value(0.2, f64::NAN), None);
+    }
+
+    /// On a flat known-scale spectrum the law is a chi-square with a closed-form
+    /// tail, so the inversion can be checked against it: even a tail of `10⁻⁴⁰`
+    /// is a resolved finite value within its own accuracy of the exact one — no
+    /// floor at `10⁻¹⁶`, no `1 − cdf` cancellation.
+    #[test]
+    fn a_closed_form_tail_resolves_arbitrarily_deep() {
+        use super::SmoothLrPValue;
+        let subject = reference(vec![1.0; 3], None);
+        for &statistic in &[80.0_f64, 200.0, 600.0] {
+            let (value, accuracy) = subject.tail_probability_with_bound(statistic);
+            let exact = gam_math::probability::chi_square_sf(statistic, 3.0);
+            assert!(exact > 0.0 && exact < 1e-16, "W={statistic}: {exact:.3e}");
+            assert_eq!(
+                SmoothLrReferenceDf::typed_p_value(value, accuracy),
+                Some(SmoothLrPValue::Resolved(value)),
+                "W={statistic}: {value:.3e} ± {accuracy:.3e}"
+            );
+            assert!(
+                (value - exact).abs() <= accuracy,
+                "W={statistic}: {value:.6e} ± {accuracy:.3e} against the exact tail {exact:.6e}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3892,7 +4390,7 @@ mod selection_replay_tests {
     use super::{
         AxisSlice, DiagonalCriterion, SMOOTH_LR_SELECTION_DRAWS, SelectionDrawStream,
         SelectionFactor, SelectionGeometry, SmoothLrSelection, SmoothLrSelectionDecline,
-        SmoothLrSelectionReplay, split_mix64,
+        SmoothLrReferenceDf, SmoothLrReferenceSource, SmoothLrSelectionReplay, split_mix64,
     };
     use ndarray::Array2;
 
@@ -4110,12 +4608,144 @@ mod selection_replay_tests {
     }
 
     fn replay_from(spectrum: &[f64], window: (f64, f64), draws: usize) -> SmoothLrSelectionReplay {
-        match SmoothLrSelectionReplay::from_geometry(&diagonal(spectrum), &[window], draws, draws) {
+        match SmoothLrSelectionReplay::from_geometry(&diagonal(spectrum), &[window], draws, draws, None) {
             SmoothLrSelection::Replayed(replay) => replay,
             SmoothLrSelection::Declined(reason) => {
                 panic!("expected a replay, declined: {}", reason.label())
             }
         }
+    }
+
+    /// `N(0, 1)` draws for the calibration study below, from a counter stream
+    /// the replay's own strata do not share (Box–Muller on SplitMix64 words).
+    fn observation(rep: u64, dimension: usize) -> Vec<f64> {
+        let unit = |counter: u64| {
+            ((split_mix64(0xC0FF_EE00_0000_0000 ^ counter) >> 11) as f64 + 0.5)
+                * (-53.0_f64).exp2()
+        };
+        (0..dimension as u64)
+            .map(|j| {
+                let base = 2 * (rep * dimension as u64 + j);
+                let (u, v) = (unit(base), unit(base + 1));
+                (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+            })
+            .collect()
+    }
+
+    /// Two-sided calibration of the selection-corrected tail, seeded.
+    ///
+    /// In the replay's own world the observation is a whitened score
+    /// `z ~ N(0, I)` and its statistic at the fitted scale is
+    /// `x = W_q(0; z) = Σ_j w_j z_j²`. The p-value the corrected reference
+    /// assigns it must be `U(0, 1)` over the WHOLE range — not merely sized at
+    /// one α — because a conservative p is as wrong as an anti-conservative one.
+    ///
+    /// Reading the selection arm at the observed `x` itself asks the wrong
+    /// question: `x` is the observation under the fitted `λ̂`, and the replay's
+    /// selected law is a law of the statistic under the replay's selection. On
+    /// the same observations that version fails this test (asserted below), so
+    /// the test pins the rescoring and not just the arithmetic.
+    ///
+    /// Two Monte-Carlo errors are in play and both are carried: the `R`
+    /// observations' (`√(α(1−α)/R)`) and the replay's own finite `N` draws
+    /// (`√(α(1−α)/N)`), which fix one empirical selected law for every
+    /// observation. The tolerances are three combined standard errors for the
+    /// sizes and the Kolmogorov `0.999` quantile `1.949·√(1/R + 1/N)` for `D`.
+    #[test]
+    fn the_rescored_selection_tail_is_uniform_on_both_sides() {
+        let generalized = spectrum();
+        let dimension = generalized.len();
+        let window = (-30.0_f64, 30.0);
+        let draws = SMOOTH_LR_SELECTION_DRAWS;
+        let weights: Vec<f64> = generalized
+            .iter()
+            .map(|&nu| {
+                let share = nu / (1.0 + nu);
+                1.0 - share * share
+            })
+            .collect();
+        let base = replay_from(&generalized, window, draws);
+        let replications = 600_u64;
+        let mut rescored = Vec::new();
+        let mut unscored = Vec::new();
+        for rep in 0..replications {
+            let z = observation(rep, dimension);
+            let statistic: f64 = z
+                .iter()
+                .zip(weights.iter())
+                .map(|(value, weight)| weight * value * value)
+                .sum();
+            let replay = match SmoothLrSelectionReplay::from_geometry(
+                &diagonal(&generalized),
+                &[window],
+                draws,
+                draws,
+                Some(&z),
+            ) {
+                SmoothLrSelection::Replayed(replay) => replay,
+                SmoothLrSelection::Declined(reason) => {
+                    panic!("rep {rep}: declined: {}", reason.label())
+                }
+            };
+            // The observation does not move the draws, and its conditional
+            // statistic is the one the fit reports.
+            assert_eq!(replay.selection_sample, base.selection_sample);
+            let observed = replay.observed.expect("an observed selection");
+            assert!(
+                (observed.conditional - statistic).abs() <= 1e-12 * statistic.max(1.0),
+                "rep {rep}: W_q(0; z) = {} but Σ w z² = {statistic}",
+                observed.conditional
+            );
+            let p_value = |selection| {
+                let mut reference = SmoothLrReferenceDf {
+                    weights: weights.clone(),
+                    mean: weights.iter().sum(),
+                    second_moment: weights.iter().map(|w| w * w).sum(),
+                    chi_square_df: 1.0,
+                    scale: 1.0,
+                    moment_residual: None,
+                    edf: 0.0,
+                    null_dim: 0,
+                    source: SmoothLrReferenceSource::NullSpectrum,
+                    selection,
+                    profiled_scale: None,
+                };
+                reference.chi_square_df = reference.mean * reference.mean / reference.second_moment;
+                reference.scale = reference.second_moment / reference.mean;
+                reference.tail_probability_with_bound(statistic).0
+            };
+            rescored.push(p_value(SmoothLrSelection::Replayed(replay.clone())));
+            let mut blind = replay;
+            blind.observed = None;
+            unscored.push(p_value(SmoothLrSelection::Replayed(blind)));
+        }
+        let r = replications as f64;
+        let n = draws as f64;
+        let kolmogorov = |sample: &[f64]| {
+            let mut sorted = sample.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| (p - i as f64 / r).max((i as f64 + 1.0) / r - p))
+                .fold(0.0_f64, f64::max)
+        };
+        let ks_limit = 1.949 * (1.0 / r + 1.0 / n).sqrt();
+        let d = kolmogorov(&rescored);
+        assert!(d <= ks_limit, "two-sided KS D = {d:.4} > {ks_limit:.4}");
+        for alpha in [0.10_f64, 0.05, 0.01] {
+            let size = rescored.iter().filter(|&&p| p <= alpha).count() as f64 / r;
+            let tolerance = 3.0 * (alpha * (1.0 - alpha) * (1.0 / r + 1.0 / n)).sqrt();
+            assert!(
+                (size - alpha).abs() <= tolerance,
+                "size at {alpha}: {size:.4}, outside {alpha} ± {tolerance:.4}"
+            );
+        }
+        let blind_d = kolmogorov(&unscored);
+        assert!(
+            blind_d > ks_limit,
+            "the unrescored tail must fail this test (D = {blind_d:.4})"
+        );
     }
 
     /// The replay is a p-value input, so it must not depend on a thread, a
@@ -4127,7 +4757,7 @@ mod selection_replay_tests {
         let second = replay_from(&spectrum(), (-8.0, 8.0), SMOOTH_LR_SELECTION_DRAWS);
         assert_eq!(first, second);
         for statistic in [0.05_f64, 0.5, 1.5, 4.0] {
-            assert_eq!(first.tail_shift(statistic), second.tail_shift(statistic));
+            assert_eq!(first.tail_shift_at(statistic, statistic), second.tail_shift_at(statistic, statistic));
         }
     }
 
@@ -4190,7 +4820,7 @@ mod selection_replay_tests {
         let mut any_move = false;
         for multiple in [0.25_f64, 1.0, 4.0, 16.0] {
             let statistic = multiple * conditional_mean;
-            let (shift, standard_error) = replay.tail_shift(statistic);
+            let (shift, standard_error) = replay.tail_shift_at(statistic, statistic);
             assert!(
                 shift.is_finite() && (-1.0..=1.0).contains(&shift) && standard_error >= 0.0,
                 "at W={statistic} the shift {shift} is not a probability difference"
@@ -4229,8 +4859,8 @@ mod selection_replay_tests {
             / coarse.conditional_sample.len() as f64;
         for multiple in [0.5_f64, 1.0, 2.0, 4.0, 8.0] {
             let statistic = multiple * conditional_mean;
-            let (coarse_shift, coarse_error) = coarse.tail_shift(statistic);
-            let (fine_shift, fine_error) = fine.tail_shift(statistic);
+            let (coarse_shift, coarse_error) = coarse.tail_shift_at(statistic, statistic);
+            let (fine_shift, fine_error) = fine.tail_shift_at(statistic, statistic);
             let allowance = 3.0 * (coarse_error + fine_error) + 1e-12;
             assert!(
                 (coarse_shift - fine_shift).abs() <= allowance,
@@ -4243,7 +4873,7 @@ mod selection_replay_tests {
         // error that does not fall with the budget is not a standard error.
         let statistic = 2.0 * conditional_mean;
         assert!(
-            fine.tail_shift(statistic).1 < coarse.tail_shift(statistic).1,
+            fine.tail_shift_at(statistic, statistic).1 < coarse.tail_shift_at(statistic, statistic).1,
             "the reported standard error did not fall when the draws quadrupled"
         );
     }
@@ -4274,6 +4904,7 @@ mod selection_replay_tests {
             &split_geometry,
             &[(-6.0, 6.0), (-6.0, 6.0)],
             2048,
+            None,
         )
         .expect("multiscale replay");
         // With `information = I` the generalized eigenvalues ARE the penalty's
@@ -4337,6 +4968,7 @@ mod selection_replay_tests {
                 &single,
                 &[(-6.0, 6.0)],
                 256,
+                None,
             )
             .is_err()
         );
@@ -4347,11 +4979,11 @@ mod selection_replay_tests {
         let crowded = SelectionGeometry::whiten(&information, &many, &[0.0; 5])
             .expect("crowded geometry");
         assert!(
-            SmoothLrSelectionReplay::generate_multiscale(&crowded, &windows, 256).is_ok(),
+            SmoothLrSelectionReplay::generate_multiscale(&crowded, &windows, 256, None).is_ok(),
             "a term with five scales is replayed over all five"
         );
         assert!(
-            SmoothLrSelectionReplay::from_geometry(&crowded, &windows, 256, 256)
+            SmoothLrSelectionReplay::from_geometry(&crowded, &windows, 256, 256, None)
                 .replay()
                 .is_some(),
             "a term with five scales still gets a replay"
@@ -4368,6 +5000,7 @@ mod selection_replay_tests {
                 &pair,
                 &[(1.0, 1.0), (2.0, 2.0)],
                 256,
+                None,
             ) == Err(SmoothLrSelectionDecline::WindowClosed)
         );
         // But ONE open axis is still a selection, and used to be discarded with
@@ -4377,6 +5010,7 @@ mod selection_replay_tests {
                 &pair,
                 &[(1.0, 1.0), (-6.0, 6.0)],
                 256,
+                None,
             )
             .is_ok(),
             "a scale whose own window is open must still be replayed when a \
@@ -4406,7 +5040,7 @@ mod selection_replay_tests {
         let geometry = diagonal(&spectrum());
         for window in [(4.0_f64, -4.0_f64), (f64::NAN, 1.0)] {
             assert_eq!(
-                SmoothLrSelectionReplay::from_geometry(&geometry, &[window], 256, 256).decline(),
+                SmoothLrSelectionReplay::from_geometry(&geometry, &[window], 256, 256, None).decline(),
                 Some(SmoothLrSelectionDecline::WindowClosed),
                 "a closed window must decline with a NAMED reason"
             );
@@ -4444,6 +5078,7 @@ mod selection_replay_tests {
                 &geometry,
                 &[(-36.0, 24.0), (-21.0, 39.0)],
                 512,
+                None,
             )
             .expect("multiscale replay")
         };
@@ -4451,7 +5086,7 @@ mod selection_replay_tests {
         let second = generate();
         assert_eq!(first, second);
         for statistic in [0.05_f64, 0.5, 1.5, 4.0] {
-            assert_eq!(first.tail_shift(statistic), second.tail_shift(statistic));
+            assert_eq!(first.tail_shift_at(statistic, statistic), second.tail_shift_at(statistic, statistic));
         }
     }
 
@@ -4840,6 +5475,7 @@ mod selection_replay_tests {
                 &[(-6.0, 6.0), (-6.0, 6.0)],
                 512,
                 512,
+                None,
             );
             let replay = replay.replay().unwrap_or_else(|| {
                 panic!(
@@ -4849,6 +5485,7 @@ mod selection_replay_tests {
                         &[(-6.0, 6.0), (-6.0, 6.0)],
                         512,
                         512,
+                        None,
                     )
                     .decline()
                 )
@@ -4961,7 +5598,7 @@ mod lr_null_spectrum_moment_tests {
         let f = ndarray::array![[0.5_f64, 40.0], [40.0, 0.5]];
         let [mean, _] = lr_null_spectral_moments(Some(&f), &(0..2)).unwrap();
         assert!(mean < 0.0, "the corrupted block's first moment is {mean}");
-        let reference = lr_null_reference(Some(&f), None, None, &(0..2), 1.0, 1, 0.0, WINDOW, &[], &[]);
+        let reference = lr_null_reference(Some(&f), None, None, &(0..2), 1.0, 1, WINDOW, &[], &[], None);
         assert_eq!(reference.source, SmoothLrReferenceSource::UnitWeightFallback);
         assert_eq!(reference.chi_square_df, 1.0);
         assert_eq!(reference.scale, 1.0);
@@ -4984,7 +5621,7 @@ mod lr_null_spectrum_moment_tests {
             [0.0, 0.0]
         );
         assert_eq!(
-            lr_null_reference(Some(&zero), None, None, &(0..2), 0.0, 0, 0.0, WINDOW, &[], &[]).source,
+            lr_null_reference(Some(&zero), None, None, &(0..2), 0.0, 0, WINDOW, &[], &[], None).source,
             SmoothLrReferenceSource::UnitWeightFallback
         );
     }

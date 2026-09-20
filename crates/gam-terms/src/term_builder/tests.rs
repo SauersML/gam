@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::basis::{OperatorPenaltySpec, PenaltySource};
+use crate::smooth::ShapeConstraint;
 use crate::inference::formula_dsl::parse_formula;
 use gam_data::{DataSchema, SchemaColumn};
 use ndarray::{Array1, Array2, array};
@@ -50,80 +51,62 @@ fn unique_count_column_uses_canonical_level_bits() {
     assert_eq!(unique_count_column(finite.view()), 3);
 }
 
-/// #1867 regression: on sparse 1-D data the generic conditioning cap in
-/// [`default_num_centers`] (`n / COND_N_DIVISOR`) starves a radial
-/// (matérn/duchon) basis BELOW the resolution the univariate B-spline
-/// `s(x)` is handed on the SAME data — 7 vs 11 basis functions at n=30 —
-/// so `matern(x)`/`duchon(x)` over-smooth oscillations that `s(x)`
-/// recovers. The spline-equivalent floor threaded into the radial default
-/// count must restore that resolution. Without the floor (the `0` argument,
-/// i.e. the pre-fix behaviour) the radial default stays starved.
+/// #1867: a 1-D radial smooth must not be dimensioned coarser than the
+/// univariate `s(x)` on the same data. The spline-equivalent floor is the
+/// rate-derived pilot `s(x)` starts from: the order-2 null space plus the
+/// penalized resolution rank `⌈n^{1/5}⌉`, held to the distinct values.
 #[test]
 fn radial_1d_default_not_starved_below_univariate_spline_resolution_1867() {
-    let n = 30usize;
-    let d = 1usize;
-    // Raw radial default, starved by the n/COND_N_DIVISOR conditioning cap.
-    let planned = default_num_centers(n, d);
-    assert!(
-        planned < 11,
-        "precondition: conditioning cap starves the raw radial default (got {planned})"
-    );
-    // A well-resolved 1-D column of `n` distinct values asks for the
-    // univariate spline basis dimension the competing `s(x)` gets.
-    let col: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
-    let univariate_floor =
-        heuristic_knots_for_column(col.view()).saturating_add(DEFAULT_BSPLINE_DEGREE + 1);
-    assert_eq!(univariate_floor, 11, "univariate spline resolution at n=30");
-
-    // BEFORE (no floor): radial defaults inherit the starved count.
-    assert_eq!(default_matern_center_count(n, d, planned, 0), planned);
-    assert!(default_duchon_center_count(n, d, planned, 2, 0) <= planned);
-
-    // AFTER (spline-equivalent floor): radial defaults are lifted to at
-    // least the univariate spline resolution, so they are not dimensioned
-    // coarser than `s(x)` on identical data.
-    assert!(
-        default_matern_center_count(n, d, planned, univariate_floor) >= univariate_floor,
-        "matern 1-D default must not be starved below the spline resolution"
-    );
-    assert!(
-        default_duchon_center_count(n, d, planned, 2, univariate_floor) >= univariate_floor,
-        "duchon 1-D default must not be starved below the spline resolution"
-    );
-
+    for n in [30usize, 1_000, 100_000] {
+        let col: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let univariate_floor = univariate_spline_basis_dim(col.view());
+        assert_eq!(
+            univariate_floor,
+            DEFAULT_PENALTY_ORDER + penalized_resolution_rank(n, 1, DEFAULT_PENALTY_ORDER),
+            "univariate spline pilot at n={n}"
+        );
+        // A radial plan starved below the floor is lifted to it.
+        let starved = 1usize;
+        assert!(default_matern_center_count(n, 1, starved, univariate_floor) >= univariate_floor);
+        assert!(default_duchon_center_count(n, 1, 2, univariate_floor) >= univariate_floor);
+        // Without the floor the Duchon default is the rate pilot itself
+        // (bounded below only by the null-space identifiability floor).
+        assert_eq!(
+            default_duchon_center_count(n, 1, 2, 0),
+            starting_num_centers(n, 1, 2).max(3)
+        );
+    }
     // The floor is scoped to 1-D: a multivariate smooth passes 0 and keeps
     // the generic n-scaling plan unchanged.
     assert_eq!(default_matern_center_count(200, 2, 40, 0), 40);
 }
 
 /// #1757 regression: an omitted `k=`/`centers=` on a 2-D Duchon smooth must
-/// remain a low-rank representer basis. The generic spatial planner grows
-/// with `n` (125 centers at n=500), which makes the Duchon center-Gram
-/// rotation and REML linear algebra scale as dense `O(k^3)` setup work
-/// before the data-fit iterations even start. The Duchon-specific default
-/// caps the implicit basis at the thin-plate/Duchon spline rank
-/// `10 * 3^(d - 1)` (30 in 2-D) while explicit `k=`/`centers=` still bypass
-/// this helper upstream.
+/// stay a low-rank representer basis rather than the generic spatial width,
+/// and that rank is the data-derived pilot — the affine null space plus the
+/// penalized resolution rank at `n` rows — not a fixed `10 * 3^(d - 1)`: it
+/// grows with `n` instead of saturating at 30 in 2-D.
 #[test]
 fn duchon_2d_default_is_low_rank_not_generic_spatial_width_1757() {
-    let n = 500usize;
     let d = 2usize;
     let polynomial_cols = d + 1;
-    let generic_plan = default_num_centers(n, d);
-    let duchon_default = default_duchon_center_count(n, d, generic_plan, polynomial_cols, 0);
-    let spline_rank = 10usize.saturating_mul(3usize.saturating_pow((d - 1) as u32));
-
+    let mut previous = 0usize;
+    for n in [500usize, 5_000, 50_000, 500_000] {
+        let generic_plan = default_num_centers(n, d);
+        let duchon_default = default_duchon_center_count(n, d, polynomial_cols, 0);
+        assert_eq!(
+            duchon_default,
+            starting_num_centers(n, d, polynomial_cols),
+            "2-D Duchon default at n={n} must be the rate-derived pilot"
+        );
+        assert!(duchon_default < generic_plan, "low rank vs the generic width at n={n}");
+        assert!(duchon_default > polynomial_cols, "affine null space plus a penalized span");
+        assert!(duchon_default >= previous, "the pilot never shrinks as n grows");
+        previous = duchon_default;
+    }
     assert!(
-        generic_plan > spline_rank,
-        "precondition: generic spatial plan should be wider than the Duchon low-rank spline rank"
-    );
-    assert_eq!(
-        duchon_default, spline_rank,
-        "2-D Duchon default must use the low-rank spline representer size, not the generic spatial width"
-    );
-    assert!(
-        duchon_default > polynomial_cols,
-        "the capped default must still contain the affine polynomial null space"
+        previous > 30,
+        "at n=5e5 the pilot exceeds the old fixed mgcv rank of 30 (got {previous})"
     );
 }
 
@@ -324,7 +307,6 @@ fn build_two_dimensional_spatial_basis(
         &options,
         ds,
         &mut notes,
-        1,
     )
     .unwrap_or_else(|error| {
         panic!("failed to build {selector} with count option {count_option:?}: {error}")
@@ -353,7 +335,6 @@ fn build_sphere_over_lat_lon(ds: &Dataset) -> Result<SmoothBasisSpec, String> {
         &options,
         ds,
         &mut notes,
-        1,
     )
 }
 
@@ -493,7 +474,6 @@ fn default_univariate_thinplate_basis_dim_is_modest() {
         &options,
         &ds,
         &mut notes,
-        1,
     )
     .expect("build default univariate tp smooth");
 
@@ -558,7 +538,6 @@ fn default_matern_2d_seeds_resolving_length_scale_not_overscaled_diameter() {
         &options,
         &ds,
         &mut notes,
-        1,
     )
     .expect("build default 2-D matern smooth");
 
@@ -653,18 +632,18 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
             &options,
             &ds,
             &mut notes,
-            1,
         )
         .expect("build Matérn provenance fixture")
     };
     let collection = |basis| TermCollectionSpec {
+        level: Default::default(),
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![SmoothTermSpec {
             frozen_parametric_residualization: None,
             name: "spatial".to_string(),
             basis,
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -751,7 +730,6 @@ fn matern_and_thinplate_accept_periodic_option() {
         &matern_opts,
         &ds,
         &mut notes,
-        1,
     )
     .expect("matern(x, periodic=true) must be accepted");
     match &matern_basis {
@@ -774,7 +752,6 @@ fn matern_and_thinplate_accept_periodic_option() {
         &tps_opts,
         &ds,
         &mut notes,
-        1,
     )
     .expect("thinplate(x, periodic=true) must be accepted");
     match &tps_basis {
@@ -817,7 +794,6 @@ fn scalar_periodic_false_builds_non_periodic_radial_smooth() {
             &opts,
             &ds,
             &mut notes,
-            1,
         )
         .unwrap_or_else(|e| panic!("s(x, bs={bs}, periodic=false) must be accepted: {e}"))
     };
@@ -871,13 +847,8 @@ fn inferred_tensor_basis_product(ds: &Dataset) -> usize {
             } => num_internal_knots + marginal.degree + 1,
             BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
             BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(num_internal_knots),
-                ..
+                num_internal_knots, ..
             } => num_internal_knots + marginal.degree + 1,
-            BSplineKnotSpec::Automatic {
-                num_internal_knots: None,
-                ..
-            } => panic!("test helper cannot infer automatic knot count"),
             BSplineKnotSpec::Provided(ref knots) => knots.len().saturating_sub(marginal.degree + 1),
             // cr basis dimension equals the knot count (no degree offset).
             BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
@@ -907,13 +878,8 @@ fn tensor_margin_basis_sizes(ds: &Dataset, formula: &str) -> Vec<usize> {
             } => num_internal_knots + marginal.degree + 1,
             BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
             BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(num_internal_knots),
-                ..
+                num_internal_knots, ..
             } => num_internal_knots + marginal.degree + 1,
-            BSplineKnotSpec::Automatic {
-                num_internal_knots: None,
-                ..
-            } => panic!("test helper cannot infer automatic knot count"),
             BSplineKnotSpec::Provided(ref knots) => knots.len().saturating_sub(marginal.degree + 1),
             // cr basis dimension equals the knot count (no degree offset).
             BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
@@ -996,6 +962,84 @@ fn tensor_k_accepts_square_bracket_per_margin_list() {
         tensor_margin_basis_sizes(&ds, "y ~ te(x, z, k=[5, 6])"),
         vec![5, 6],
         "square-bracket k lists should materialize the requested per-margin values"
+    );
+}
+
+#[test]
+fn tensor_margin_sizes_split_the_budget_and_respect_each_margin_support() {
+    // Two continuous margins split the budget as evenly as integers allow.
+    assert_eq!(tensor_margin_sizes(&[200, 200], 49), vec![7, 7]);
+    let split = tensor_margin_sizes(&[200, 200], 98);
+    assert_eq!(split.iter().product::<usize>(), 90);
+    assert!(split.iter().all(|&k| k == 9 || k == 10), "{split:?}");
+    // `te(season, hour)`: the 4-level margin cannot take its geometric share,
+    // so the headroom goes to `hour` until it too reaches its 24 values.
+    assert_eq!(tensor_margin_sizes(&[4, 24], 49), vec![4, 12]);
+    assert_eq!(tensor_margin_sizes(&[4, 24], 96), vec![4, 24]);
+    assert_eq!(tensor_margin_sizes(&[4, 24], 10_000), vec![4, 24]);
+}
+
+fn default_te_margin_dims(ds: &Dataset, formula: &str) -> Vec<usize> {
+    let parsed = parse_formula(formula).expect("parse tensor formula");
+    let mut notes = Vec::new();
+    let terms = build_termspec(&parsed.terms, ds, &ds.column_map(), &mut notes)
+        .expect("build tensor termspec");
+    let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
+        panic!("{formula} must lower to TensorBSpline");
+    };
+    spec.marginalspecs
+        .iter()
+        .map(|margin| match &margin.knotspec {
+            BSplineKnotSpec::NaturalCubicRegression { knots } => knots.len(),
+            other => panic!("default te margins are cr, got {other:?}"),
+        })
+        .collect()
+}
+
+/// The default `te` is a 2-D smooth and takes the same total basis dimension
+/// as any other 2-covariate default smooth on these rows, not a fixed per-margin
+/// table: at n = 3200 a `te(x, z)` of two continuous covariates resolves more
+/// than a fixed `7 x 7` could (the bump2d audit case).
+#[test]
+fn default_te_takes_the_engine_default_basis_dimension_for_its_rows() {
+    let n = 3200;
+    let ds = continuous_dataset(
+        &["y", "x", "z"],
+        (0..n)
+            .map(|i| {
+                let x = i as f64 / (n - 1) as f64;
+                let z = ((i * 7919) % n) as f64 / (n - 1) as f64;
+                vec![x.sin() + z.cos(), x, z]
+            })
+            .collect(),
+    );
+    let dims = default_te_margin_dims(&ds, "y ~ te(x, z)");
+    assert_eq!(
+        dims,
+        tensor_margin_sizes(&[n, n], default_num_centers(n, 2)),
+        "default te margins must split the engine's 2-D default budget"
+    );
+    assert!(dims.iter().product::<usize>() > 49, "{dims:?}");
+}
+
+/// A low-cardinality margin is capped at its distinct values and hands the
+/// remaining budget to the other margin: `te(season, hour)` resolves all 24
+/// hours instead of a 12-knot hour margin (the bike audit case).
+#[test]
+fn default_te_gives_a_low_cardinality_margins_share_to_the_other_margin() {
+    let ds = continuous_dataset(
+        &["y", "season", "hour"],
+        (0..960)
+            .map(|i| {
+                let season = (i % 4) as f64 + 1.0;
+                let hour = ((i / 4) % 24) as f64;
+                vec![season + hour, season, hour]
+            })
+            .collect(),
+    );
+    assert_eq!(
+        default_te_margin_dims(&ds, "y ~ te(season, hour)"),
+        vec![4, 24]
     );
 }
 
@@ -1183,7 +1227,7 @@ fn one_dimensional_bspline_accepts_boundary_periodic() {
         &spec.knotspec,
         BSplineKnotSpec::PeriodicUniform {
             data_range,
-            num_basis: 8
+            num_basis: 8, ..
         } if *data_range == (0.0, std::f64::consts::TAU)
     ));
 }
@@ -1292,9 +1336,9 @@ fn non_intercept_linear_effects_default_to_null_recovery_with_explicit_opt_out()
         );
     }
 
-    // `bounded()` is an exact interval transform and likewise defaults to
-    // no shrinkage ridge. It also structurally rejects combining the
-    // interval geometry with `double_penalty`.
+    // `bounded()` is an exact interval transform: it recovers the null through
+    // its default latent shrinkage prior, not the double-penalty ridge, and it
+    // structurally rejects combining the interval geometry with `double_penalty`.
     let bounded_parsed =
         parse_formula("y ~ bounded(z, min=-2, max=2)").expect("parse bounded defaults");
     let mut bounded_notes = Vec::new();
@@ -1409,7 +1453,7 @@ fn univariate_ps_small_k_degree_reduces_through_build(/* gam#1130 */) {
                 num_internal_knots, ..
             } => *num_internal_knots,
             BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(n),
+                num_internal_knots: n,
                 ..
             } => *n,
             other => panic!("`{formula}` unexpected knotspec: {other:?}"),
@@ -1497,10 +1541,12 @@ fn default_sphere_smooth_uses_spherical_farthest_point_centers() {
     let SmoothBasisSpec::Sphere { spec, .. } = &terms.smooth_terms[0].basis else {
         panic!("expected sphere term");
     };
-    assert!(matches!(
-        spec.center_strategy,
-        CenterStrategy::FarthestPoint { .. }
-    ));
+    // Nobody chose the count, so the farthest-point centers are an `Auto`
+    // pilot the formula workflow refines on the fit's REML evidence.
+    let CenterStrategy::Auto(inner) = &spec.center_strategy else {
+        panic!("default sphere centers must be an adaptive pilot: {:?}", spec.center_strategy);
+    };
+    assert!(matches!(**inner, CenterStrategy::FarthestPoint { .. }));
 }
 
 #[test]
@@ -1605,7 +1651,7 @@ fn one_dimensional_duchon_length_scale_opts_into_hybrid_mode() {
 }
 
 #[test]
-fn multidimensional_duchon_default_uses_low_rank_mgcv_sized_basis() {
+fn multidimensional_duchon_default_uses_rate_derived_pilot_basis() {
     let ds = continuous_dataset(
         &["y", "x1", "x2"],
         (0..500)
@@ -1632,10 +1678,17 @@ fn multidimensional_duchon_default_uses_low_rank_mgcv_sized_basis() {
     let CenterStrategy::Auto(inner) = &spec.center_strategy else {
         panic!("expected auto center strategy");
     };
-    assert!(matches!(
-        inner.as_ref(),
-        CenterStrategy::FarthestPoint { num_centers: 30 }
-    ));
+    let CenterStrategy::FarthestPoint { num_centers } = inner.as_ref() else {
+        panic!("expected farthest-point pilot centers, got {inner:?}");
+    };
+    // The pilot is the polynomial null space plus the penalized resolution
+    // rank at n=500 in 2-D — not a fixed per-dimension constant.
+    let polynomial_cols = match spec.nullspace_order {
+        DuchonNullspaceOrder::Zero => 1,
+        DuchonNullspaceOrder::Linear => 3,
+        DuchonNullspaceOrder::Degree(degree) => crate::basis::duchon_nullspace_dimension(2, degree),
+    };
+    assert_eq!(*num_centers, starting_num_centers(500, 2, polynomial_cols));
 }
 
 #[test]
@@ -1844,8 +1897,7 @@ fn factor_smooth_marginal_degree_reduces_for_small_k() {
                 num_internal_knots, ..
             } => num_internal_knots + spec.marginal.degree + 1,
             BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(num_internal_knots),
-                ..
+                num_internal_knots, ..
             } => num_internal_knots + spec.marginal.degree + 1,
             ref other => panic!("unexpected factor-smooth knotspec: {other:?}"),
         };
@@ -2417,6 +2469,51 @@ fn tensor_margin_leaves_cr_only_when_the_request_needs_a_bspline() {
     assert!(is_cr(&periodic[1]));
 }
 
+/// A shaped te() needs every margin to be a non-negative B-spline basis: the
+/// shaped margin for its control-point cone, the others because they weight
+/// the shaped fibres. Unset `bs=` therefore becomes all-ps, and an explicit
+/// cr margin is refused rather than fitted with an uncertified shape.
+#[test]
+fn shaped_tensor_defaults_every_margin_to_a_bspline_and_refuses_cr() {
+    let ds = continuous_dataset(
+        &["y", "x", "z"],
+        (0..200)
+            .map(|i| {
+                let x = (i % 20) as f64 / 19.0;
+                let z = (i / 20) as f64 / 9.0;
+                vec![x + z, x, z]
+            })
+            .collect(),
+    );
+    let col_map = ds.column_map();
+    let build = |formula: &str| {
+        let parsed = parse_formula(formula).expect("parse");
+        let mut notes = Vec::new();
+        build_termspec(&parsed.terms, &ds, &col_map, &mut notes).map_err(|e| e.to_string())
+    };
+    let terms = build("y ~ te(x, z, k=5, shape=[monotone_increasing, none])")
+        .expect("shaped te builds");
+    let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
+        panic!("expected a tensor spec");
+    };
+    assert!(
+        spec.marginalspecs.iter().all(|m| !matches!(
+            m.knotspec,
+            BSplineKnotSpec::NaturalCubicRegression { .. }
+        )),
+        "a shaped te() must not default any margin to cr"
+    );
+    crate::smooth::build_term_collection_design(ds.values.view(), &terms)
+        .expect("the all-ps shaped tensor realizes its cone");
+
+    let explicit_cr = build("y ~ te(x, z, k=5, bs=[ps, cr], shape=[monotone_increasing, none])")
+        .expect("the term spec itself is well formed");
+    let err = crate::smooth::build_term_collection_design(ds.values.view(), &explicit_cr)
+        .expect_err("a cr margin cannot weight shaped fibres")
+        .to_string();
+    assert!(err.contains("negative values"), "{err}");
+}
+
 /// #2781/#2782/#2783 guard: no whitelisted smooth option may be accepted
 /// and inert.
 ///
@@ -2509,6 +2606,9 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
             ) => &["[0.0, None]"],
             ("tensor", "periodic" | "cyclic") => &["[0]"],
             ("tensor", "boundary" | "bc") => &["['periodic', 'natural']"],
+            // Open-spline interval: wider than the fixture's [0, 1] columns.
+            ("tensor", "domain") => &["[[-0.5, 1.5], none]"],
+            (_, "domain") => &["[-0.5, 1.5]"],
             (_, "periodic" | "cyclic") => &["true"],
             (_, "period" | "periods") => &["0.7"],
             (_, "period_start" | "start") => &["0.05"],
@@ -2575,13 +2675,16 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
     // `zbig` spans a very different range from `x` on purpose, so an
     // anisotropy option such as `scale_dims=` has something to change on the
     // radial arms; on two identically-scaled axes it is a true no-op and the
-    // probe would prove nothing.
+    // probe would prove nothing. `x` is spread non-uniformly over [0, 1] so
+    // quantile and uniform knot placement differ at every knot count; on an
+    // equispaced covariate the rate-sized pilot's knots coincide under both
+    // placements and a `knot_placement=` probe would prove nothing either.
     let ds = continuous_dataset(
         &["y", "x", "z", "zbig", "lat", "lon", "g"],
         (0..240)
             .map(|i| {
                 let t = i as f64;
-                let x = (i % 24) as f64 / 23.0;
+                let x = ((i % 24) as f64 / 23.0).powi(2);
                 let z = (i / 24) as f64 / 9.0;
                 vec![
                     (t * 0.13).sin() + x + z,
@@ -3391,7 +3494,7 @@ fn tensor_smooth_low_cardinality_axis_falls_back_to_lower_degree_basis() {
             num_internal_knots, ..
         } => num_internal_knots + m.degree + 1,
         BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(n),
+            num_internal_knots: n,
             ..
         } => n + m.degree + 1,
         // The mgcv-default `cr` margin (#1074) reports its basis size as the
@@ -3441,7 +3544,7 @@ fn tensor_smooth_uniform_k_is_capped_to_a_low_cardinality_margins_distinct_value
             num_internal_knots, ..
         } => num_internal_knots + m.degree + 1,
         BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(n),
+            num_internal_knots: n,
             ..
         } => n + m.degree + 1,
         BSplineKnotSpec::NaturalCubicRegression { knots } => knots.len(),
@@ -3508,16 +3611,11 @@ fn tensor_all_tp_margins_with_per_margin_k_routes_to_bspline_tensor() {
                 num_internal_knots, ..
             } => num_internal_knots + m.degree + 1,
             BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(num_internal_knots),
-                ..
+                num_internal_knots, ..
             } => num_internal_knots + m.degree + 1,
             BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
             BSplineKnotSpec::Provided(ref knots) => knots.len().saturating_sub(m.degree + 1),
             BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
-            BSplineKnotSpec::Automatic {
-                num_internal_knots: None,
-                ..
-            } => panic!("test cannot infer automatic knot count"),
         })
         .collect::<Vec<_>>();
     assert_eq!(dims, vec![5, 5]);
@@ -3658,10 +3756,34 @@ fn inferred_tensor_basis_cap_uses_coordinate_support_not_duplicate_rows() {
     let unique_basis = inferred_tensor_basis_product(&unique);
     let repeated_basis = inferred_tensor_basis_product(&repeated);
 
-    assert_eq!(
-        unique_basis, repeated_basis,
-        "duplicating existing tensor coordinates must not inflate inferred basis width"
+    // Replicates sharpen the surface at the occupied locations, so the
+    // row-driven default may use more of the coordinate support, but never
+    // more than the 50 x 16 = 800 distinct locations the rows occupy.
+    assert!(
+        unique_basis <= repeated_basis,
+        "{unique_basis} > {repeated_basis}"
     );
+    assert!(
+        repeated_basis <= 800,
+        "duplicating existing tensor coordinates must not inflate the basis past its coordinate support: {repeated_basis}"
+    );
+
+    // On a coarse crossed grid the replicated default reaches that support
+    // exactly and stops there, however many replicates are added.
+    let grid_rows = |reps: usize| {
+        let mut rows = Vec::new();
+        for _ in 0..reps {
+            for i in 0..6 {
+                for j in 0..5 {
+                    let (theta, h) = (i as f64, j as f64);
+                    rows.push(vec![theta.sin() + h, theta, h]);
+                }
+            }
+        }
+        continuous_dataset(&["y", "theta", "h"], rows)
+    };
+    assert_eq!(inferred_tensor_basis_product(&grid_rows(40)), 30);
+    assert_eq!(inferred_tensor_basis_product(&grid_rows(400)), 30);
 }
 
 #[test]
@@ -3700,8 +3822,7 @@ fn inferred_three_dim_tensor_basis_stays_bounded_for_reml_selection() {
                     num_internal_knots, ..
                 } => num_internal_knots + m.degree + 1,
                 BSplineKnotSpec::Automatic {
-                    num_internal_knots: Some(num_internal_knots),
-                    ..
+                    num_internal_knots, ..
                 } => num_internal_knots + m.degree + 1,
                 // The mgcv-default `cr` margin (#1074) reports its basis size
                 // as the number of value-knots placed.
@@ -4036,7 +4157,6 @@ fn by_level_thin_plate_sizes_default_centers_from_the_smallest_level() {
             &options,
             &ds,
             &mut notes,
-            1,
         )
         .expect("thin-plate basis builds")
     };
@@ -4082,7 +4202,6 @@ fn by_level_thin_plate_sizes_default_centers_from_the_smallest_level() {
         &small_options,
         &ds_small,
         &mut notes,
-        1,
     )
     .expect("small-level thin-plate basis builds");
     assert_eq!(
@@ -4185,33 +4304,67 @@ fn parse_duchon_order_accepts_higher_polynomial_degrees_and_rejects_malformedval
 }
 
 #[test]
-fn heuristic_knots_for_column_uses_uniquevalue_rule() {
-    // Few unique values → `unique/4` clamped up to the 4-knot floor.
-    let col = array![0.0, 0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0];
-    assert_eq!(unique_count_column(col.view()), 6);
-    assert_eq!(heuristic_knots_for_column(col.view()), 4);
-    // Many unique values → clamped to the flat mgcv-like default cap of 8
-    // internal knots (cubic basis ≈ 12 functions), NOT grown with n. A larger
-    // column used to return 20 internal knots (a 24-function basis); that
-    // over-rich default over-parameterized weak-signal additive fits and the
-    // penalty could not shrink it away cleanly (gam#1680). The cap is flat in n:
-    // users opt *in* to a wigglier fit by raising `k` explicitly.
-    let bigger = Array1::from_iter((0..200).map(|v| v as f64));
-    assert_eq!(heuristic_knots_for_column(bigger.view()), 8);
-    // The 32-unique boundary is exactly where `unique/4` meets the cap, so
-    // columns at or below it keep their previous knot count unchanged.
-    let boundary = Array1::from_iter((0..32).map(|v| v as f64));
-    assert_eq!(heuristic_knots_for_column(boundary.view()), 8);
+fn pilot_internal_knots_follow_the_resolution_rate_not_a_fixed_cap() {
+    // The pilot open cubic basis is the order-2 null space plus the penalized
+    // resolution rank `⌈n^{1/5}⌉`: dims 5/6/9/12 at n = 1e2..1e5, with no
+    // fixed ceiling (the old rule clamped every column to 8 internal knots).
+    for (n, dim) in [(100usize, 5usize), (1_000, 6), (10_000, 9), (100_000, 12)] {
+        let col = Array1::from_iter((0..n).map(|v| v as f64));
+        assert_eq!(
+            pilot_internal_knots_for_column(col.view()) + DEFAULT_BSPLINE_DEGREE + 1,
+            dim,
+            "pilot s(x) dimension at n={n}"
+        );
+    }
+    let huge = 10usize.pow(9);
+    assert!(pilot_internal_knots(huge, DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER) > 8);
 }
 
+/// The default `s(x)` basis on a low-cardinality covariate is capped to the
+/// covariate's distinct values: the 4-knot heuristic floor handed a binary
+/// covariate eight cubic functions, six of them identified by the penalty
+/// alone. The heuristic knot count itself (the default policy) is unchanged;
+/// only the basis built from it is capped by the data's support, and an
+/// explicit `k=` is honoured as written.
 #[test]
-fn bug_term_builder_knots_floor_on_constant_column() {
-    let c = array![4.0, 4.0, 4.0, 4.0];
-    let k = heuristic_knots_for_column(c.view());
-    assert!(
-        k >= 4,
-        "Heuristic knot count should keep the documented minimum floor even on constant columns."
-    );
+fn default_bspline_basis_dimension_is_capped_by_unique_covariate_values() {
+    let dimension_of = |formula: &str, unique: usize| -> (usize, usize, usize) {
+        let ds = continuous_dataset(
+            &["y", "x"],
+            (0..60)
+                .map(|i| {
+                    let x = (i % unique) as f64;
+                    vec![x.sin(), x]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula(formula).expect("parse");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms =
+            build_termspec(&parsed.terms, &ds, &col_map, &mut notes).expect("default smooth builds");
+        let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected 1D B-spline");
+        };
+        let internal = match &spec.knotspec {
+            BSplineKnotSpec::Generate { num_internal_knots, .. } => *num_internal_knots,
+            BSplineKnotSpec::Automatic { num_internal_knots, .. } => *num_internal_knots,
+            other => panic!("unexpected default knot spec {other:?}"),
+        };
+        assert!(spec.penalty_order <= spec.degree);
+        (internal + spec.degree + 1, spec.degree, spec.penalty_order)
+    };
+    // (unique, expected basis dimension, expected degree)
+    for (unique, dimension, degree) in [(2, 2, 1), (3, 3, 2), (4, 4, 3), (5, 5, 3), (16, 5, 3)] {
+        let (got_dimension, got_degree, _) = dimension_of("y ~ s(x)", unique);
+        assert_eq!(
+            (got_dimension, got_degree),
+            (dimension, degree),
+            "default s(x) on {unique} unique values"
+        );
+    }
+    // An explicit basis dimension is the caller's contract, not a default.
+    assert_eq!(dimension_of("y ~ s(x, k=8)", 3).0, 8);
 }
 
 /// #1425 / #2469: the partition a fit prices and the partition identifiability
@@ -4353,7 +4506,8 @@ fn col_minmax_refuses_a_constant_column_and_keeps_a_tiny_real_range_2469() {
 /// they are already correct, and resolves the blocks a builder cutoff decides.
 /// - Unframed blocks across the basis families: `resolved_eigenvalue_count` equals
 ///   the builder's rank exactly, on a population whose gaps are clean.
-/// - Frame-declared blocks: the declared frame is the nullity, unchanged.
+/// - Frame-declared blocks: the measured null space lies inside the declared
+///   frame, and the owner resolves the builder's rank.
 /// - The Matérn operator mass penalty: at a short length scale the builder's
 ///   rank is full, and the collocation factor agrees. At a long one the factor
 ///   still resolves every mode, while the builder's dense Gram has lost some.
@@ -4399,11 +4553,49 @@ fn partition_owner_keeps_todays_ranks_where_they_are_correct_and_resolves_the_re
         for term in &design.smooth.terms {
             for penalty in &term.active_penalties {
                 match penalty.info.structural_null_frame.as_ref() {
-                    Some(frame) => assert_eq!(
-                        frame.ncols(),
-                        penalty.nullity,
-                        "{formula}: the declared frame is the nullity"
-                    ),
+                    Some(frame) => {
+                        // The frame is the SEMINORM's null space; the shipped
+                        // matrix may carry a deliberate conditioning ridge on
+                        // part of it (Duchon's `√ε` affine ridge, gam#1816),
+                        // which sits within a decade of the rank cutoff, so
+                        // whether a rank test reads it as null is a property
+                        // of the chart. What holds in every chart: the
+                        // measured null space lies inside the declared frame,
+                        // and the owner resolves exactly the builder's rank.
+                        assert!(
+                            penalty.nullity <= frame.ncols(),
+                            "{formula}: measured nullity {} exceeds the declared frame {}",
+                            penalty.nullity,
+                            frame.ncols()
+                        );
+                        let analysis = crate::basis::analyze_penalty_block(&penalty.matrix)
+                            .expect("penalty spectrum");
+                        if let Some(null) = penalty.null_eigenvectors.as_ref() {
+                            // Davis–Kahan: a computed null eigenvector tilts by
+                            // at most `p·ε·λmax / gap`, and every range
+                            // eigenvalue clears the rank cutoff, so the gap
+                            // is at least `rank_tol`.
+                            let lambda_max = analysis
+                                .eigenvalues
+                                .iter()
+                                .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+                            let tilt_bound = (frame.nrows() as f64) * f64::EPSILON * lambda_max
+                                / analysis.rank_tol;
+                            let outside = null - &frame.dot(&frame.t().dot(null));
+                            let leak = outside.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+                            assert!(
+                                leak <= tilt_bound,
+                                "{formula}: a measured null direction leaves the declared frame \
+                                 by {leak:.3e} (bound {tilt_bound:.3e})"
+                            );
+                        }
+                        assert_eq!(
+                            resolved_eigenvalue_count(&analysis.eigenvalues.to_vec(), 0.0),
+                            penalty.info.effective_rank,
+                            "{formula} {:?}: the owner must reproduce the builder's rank",
+                            penalty.info.source
+                        );
+                    }
                     None => {
                         let analysis = crate::basis::analyze_penalty_block(&penalty.matrix)
                             .expect("penalty spectrum");
@@ -4508,4 +4700,1139 @@ fn partition_owner_keeps_todays_ranks_where_they_are_correct_and_resolves_the_re
         3,
         "try_from_dense_psd's dim·1e-10·λmax cutoff truncates a resolved eigenvalue"
     );
+}
+
+fn smooth_option_dataset() -> Dataset {
+    continuous_dataset(
+        &["y", "x", "z"],
+        (0..40)
+            .map(|i| {
+                let x = i as f64 / 39.0;
+                let z = ((i * 7) % 40) as f64 / 39.0;
+                vec![(4.0 * x).sin() + z, x, z]
+            })
+            .collect(),
+    )
+}
+
+/// The error a formula produces anywhere between parsing and the term spec.
+fn formula_error(formula: &str, ds: &Dataset) -> String {
+    let parsed = match parse_formula(formula) {
+        Ok(parsed) => parsed,
+        Err(err) => return err.to_string(),
+    };
+    match build_termspec(&parsed.terms, ds, &ds.column_map(), &mut Vec::new()) {
+        Ok(spec) => panic!("`{formula}` must be rejected, but built {spec:?}"),
+        Err(err) => err.to_string(),
+    }
+}
+
+fn build_formula(formula: &str, ds: &Dataset) -> TermCollectionSpec {
+    let parsed = parse_formula(formula).unwrap_or_else(|err| panic!("parse `{formula}`: {err}"));
+    build_termspec(&parsed.terms, ds, &ds.column_map(), &mut Vec::new())
+        .unwrap_or_else(|err| panic!("build `{formula}`: {err}"))
+}
+
+fn bspline_spec(spec: &TermCollectionSpec, idx: usize) -> &BSplineBasisSpec {
+    match &spec.smooth_terms[idx].basis {
+        SmoothBasisSpec::BSpline1D { spec, .. } => spec,
+        other => panic!("expected a 1-D B-spline smooth, got {other:?}"),
+    }
+}
+
+/// Every numeric smooth option is read strictly: a value that is not what the
+/// option means is an error naming the term and the option, never a silently
+/// substituted default (the old readers turned `degree=cubic` into the cubic
+/// default and `penalty_order=two` into the second-order default).
+#[test]
+fn malformed_smooth_options_are_errors_that_name_the_term_and_option() {
+    let ds = smooth_option_dataset();
+    for (term, option) in [
+        ("s(x, degree=cubic)", "degree"),
+        ("s(x, degree=3.0)", "degree"),
+        ("s(x, degree=all)", "degree"),
+        ("s(x, degree=-1)", "degree"),
+        ("s(x, penalty_order=two)", "penalty_order"),
+        ("s(x, penalty_order=-1)", "penalty_order"),
+        ("s(x, penalty_order=[1,2])", "penalty_order"),
+        ("s(x, penalty_order=all)", "penalty_order"),
+        ("s(x, k=ten)", "k"),
+        ("s(x, double_penalty=maybe)", "double_penalty"),
+    ] {
+        let err = formula_error(&format!("y ~ {term}"), &ds);
+        assert!(
+            err.contains("in term s(x"),
+            "`{term}`: the error must name the term, got: {err}"
+        );
+        assert!(
+            err.contains(option),
+            "`{term}`: the error must name `{option}`, got: {err}"
+        );
+    }
+}
+
+/// A B-spline's roughness penalty is the integrated squared `m`-th derivative,
+/// defined only for `1 <= m <= degree`. Orders outside that range used to be
+/// clamped to the degree without a word; they are now errors that say why.
+#[test]
+fn penalty_order_outside_one_to_degree_is_an_error_not_a_clamp() {
+    let ds = smooth_option_dataset();
+
+    let err = formula_error("y ~ s(x, degree=0)", &ds);
+    assert!(
+        err.contains("degree=0") && err.contains("piecewise-constant"),
+        "degree=0 must be refused, got: {err}"
+    );
+    let err = formula_error("y ~ s(x, penalty_order=0)", &ds);
+    assert!(
+        err.contains("penalty_order=0"),
+        "penalty_order=0 must be refused, got: {err}"
+    );
+    let err = formula_error("y ~ s(x, penalty_order=4)", &ds);
+    assert!(
+        err.contains("in term s(x")
+            && err.contains("penalty_order=4 exceeds the spline degree 3"),
+        "an order above the degree must be refused, got: {err}"
+    );
+    let err = formula_error("y ~ s(x, degree=1, penalty_order=2)", &ds);
+    assert!(
+        err.contains("penalty_order=2 exceeds the spline degree 1"),
+        "an order above an explicit degree must be refused, got: {err}"
+    );
+    // k=3 holds at most a quadratic, so the cubic default is reduced; an order
+    // that only the requested degree could carry names that reduction.
+    let err = formula_error("y ~ s(x, k=3, penalty_order=3)", &ds);
+    assert!(
+        err.contains("degree=3 was reduced to 2") && err.contains("k=3"),
+        "the k-driven degree reduction must be named, got: {err}"
+    );
+    // An inferred basis on a three-valued covariate is capped to quadratic by
+    // the data support, not by any `k`; the error must say so.
+    let three_valued = continuous_dataset(
+        &["y", "x"],
+        (0..30)
+            .map(|i| {
+                let x = (i % 3) as f64;
+                vec![x * x + 0.01 * i as f64, x]
+            })
+            .collect(),
+    );
+    let err = formula_error("y ~ s(x, penalty_order=3)", &three_valued);
+    assert!(
+        err.contains("penalty_order=3 exceeds the spline degree 2")
+            && err.contains("only 3 unique values")
+            && !err.contains("k="),
+        "the support-driven degree reduction must be named, got: {err}"
+    );
+    let spec = build_formula("y ~ s(x)", &three_valued);
+    assert_eq!(bspline_spec(&spec, 0).penalty_order, 2);
+    let err = formula_error("y ~ te(x, z, penalty_order=[2, 4])", &ds);
+    assert!(
+        err.contains("tensor margin 1") && err.contains("penalty_order=4"),
+        "a tensor margin order above its degree must be refused, got: {err}"
+    );
+    let err = formula_error("y ~ cyclic(x, penalty_order=5)", &ds);
+    assert!(
+        err.contains("penalty_order=5"),
+        "a cyclic order above its degree must be refused, got: {err}"
+    );
+
+    // In range, the request is honoured exactly, and the default order follows
+    // a lower degree down rather than exceeding it.
+    assert_eq!(
+        bspline_spec(&build_formula("y ~ s(x, penalty_order=3)", &ds), 0).penalty_order,
+        3
+    );
+    let linear = build_formula("y ~ s(x, degree=1)", &ds);
+    assert_eq!(bspline_spec(&linear, 0).degree, 1);
+    assert_eq!(bspline_spec(&linear, 0).penalty_order, 1);
+}
+
+fn two_factor_dataset() -> Dataset {
+    let n = 36usize;
+    let rows = (0..n)
+        .map(|i| {
+            let x = i as f64 / (n - 1) as f64;
+            let f = (i % 3) as f64;
+            let g = ((i / 3) % 2) as f64;
+            vec![2.0 + x + f - g, x, f, g]
+        })
+        .collect::<Vec<_>>();
+    Dataset {
+        headers: vec!["y".into(), "x".into(), "f".into(), "g".into()],
+        values: Array2::from_shape_vec(
+            (n, 4),
+            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+        )
+        .expect("rectangular two-factor data"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "f".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["f0".into(), "f1".into(), "f2".into()],
+                },
+                SchemaColumn {
+                    name: "g".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["g0".into(), "g1".into()],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
+            ColumnKindTag::Categorical,
+        ],
+    }
+}
+
+/// The unpenalized part of a built design: the span of `X N`, with `N` the
+/// joint null space of every penalty. Returns its rank and the distance of the
+/// constant function from it. Rank one at zero distance is the default the
+/// intercept rule promises: the constant is the one direction no penalty
+/// shrinks, so a shift of `y` is absorbed at no cost while every other effect
+/// can still be shrunk to zero.
+fn unpenalized_span(ds: &Dataset, spec: &TermCollectionSpec) -> (usize, f64) {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let design = crate::smooth::build_term_collection_design(ds.values.view(), spec)
+        .expect("design builds");
+    let x = design.design.to_dense();
+    let p = x.ncols();
+    let mut penalty_sum = Array2::<f64>::zeros((p, p));
+    for penalty in &design.penalties {
+        let scale = penalty.local.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        if scale > 0.0 {
+            let range = penalty.col_range.clone();
+            let mut block = penalty_sum.slice_mut(ndarray::s![range.clone(), range]);
+            block.scaled_add(1.0 / scale, &penalty.local);
+        }
+    }
+    let (s_evals, s_evecs) = FaerEigh::eigh(&penalty_sum, faer::Side::Lower).expect("penalty eigh");
+    let s_max = s_evals.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+    let null_cols = (0..p)
+        .filter(|&j| s_evals[j].abs() <= 1e-10 * s_max)
+        .collect::<Vec<_>>();
+    let null_basis = s_evecs.select(ndarray::Axis(1), &null_cols);
+    let unpenalized = x.dot(&null_basis);
+    let ones = Array1::<f64>::ones(x.nrows());
+    let normal = unpenalized.t().dot(&unpenalized);
+    let (evals, evecs) = FaerEigh::eigh(&normal, faer::Side::Lower).expect("normal eigh");
+    let cutoff = evals.iter().fold(0.0_f64, |m, v| m.max(v.abs())) * 1e-10;
+    let rank = evals.iter().filter(|e| **e > cutoff).count();
+    let projected = evecs.t().dot(&unpenalized.t().dot(&ones));
+    let scaled = Array1::from_iter(
+        projected
+            .iter()
+            .zip(evals.iter())
+            .map(|(p, e)| if *e > cutoff { p / e } else { 0.0 }),
+    );
+    let fitted = unpenalized.dot(&evecs.dot(&scaled));
+    let residual = (&fitted - &ones).iter().map(|v| v * v).sum::<f64>().sqrt();
+    (rank, residual)
+}
+
+/// Removing the intercept from a formula in which `spanning` spans the
+/// constant keeps it: the spec is exactly the intercept formula's, and the
+/// constant is the design's only unpenalized direction.
+fn assert_keeps_only_the_constant_free(ds: &Dataset, formula: &str, with_intercept: &str) {
+    let spec = build_formula(formula, ds);
+    assert_eq!(spec.level, ModelLevel::Intercept, "`{formula}` keeps the intercept");
+    assert_eq!(
+        format!("{spec:?}"),
+        format!("{:?}", build_formula(with_intercept, ds)),
+        "`{formula}` builds exactly `{with_intercept}`"
+    );
+    let (rank, residual) = unpenalized_span(ds, &spec);
+    assert_eq!(rank, 1, "`{formula}`: only the constant is unpenalized");
+    assert!(residual < 1e-8, "`{formula}`: the constant is unpenalized ({residual})");
+}
+
+/// `0 + g` (and `- 1`, and every spelling of the fixed factor) spans the
+/// constant, so it keeps the intercept and is `g`: the full-level block keeps
+/// its ridge, which beside the free intercept shrinks only the level
+/// contrasts.
+#[test]
+fn no_intercept_factor_keeps_its_ridge_and_frees_only_the_constant() {
+    let ds = two_factor_dataset();
+    for formula in ["y ~ 0 + f", "y ~ f - 1", "y ~ 0 + factor(f)"] {
+        assert_keeps_only_the_constant_free(&ds, formula, "y ~ f");
+    }
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + f + g", "y ~ f + g");
+}
+
+/// A genuine random effect never spans the constant: its levels are mean-zero
+/// deviations. `0 + group(f) + s(x)` keeps the intercept through the smooth,
+/// and with nothing else spanning it the model has no constant at all.
+#[test]
+fn no_intercept_genuine_random_effect_does_not_span_the_constant() {
+    let ds = two_factor_dataset();
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + group(f) + s(x)", "y ~ group(f) + s(x)");
+
+    let spec = build_formula("y ~ 0 + x + group(f)", &ds);
+    assert_eq!(spec.level, ModelLevel::NoIntercept);
+    let design = crate::smooth::build_term_collection_design(ds.values.view(), &spec)
+        .expect("design builds");
+    assert!(design.intercept_range.is_empty(), "no all-ones column without a spanning term");
+}
+
+/// A pure-indicator interaction over the full level cross spans the constant:
+/// `0 + f:g` is `f:g`, one reference cell absorbed by the intercept and every
+/// other cell keeping its ridge.
+#[test]
+fn no_intercept_indicator_interaction_keeps_the_cell_ridge() {
+    let ds = two_factor_dataset();
+    let spec = build_formula("y ~ 0 + f:g", &ds);
+    let cells = spec
+        .linear_terms
+        .iter()
+        .filter(|t| !t.categorical_levels.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(cells.len(), 5, "one reference cell drops against the intercept");
+    assert!(cells.iter().all(|cell| cell.double_penalty), "every cell keeps its ridge");
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + f:g", "y ~ f:g");
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + f + f:g", "y ~ f + f:g");
+}
+
+/// A B-spline / tensor smooth spans the constant before its centring removes
+/// it, so `0 + s(x)` is `s(x)`: the centred smooth keeps its null-space ridge
+/// on the linear slope, and the constant is the intercept's alone.
+#[test]
+fn no_intercept_smooth_keeps_its_null_space_ridge() {
+    let ds = smooth_option_dataset();
+    for formula in ["y ~ 0 + s(x)", "y ~ s(x) - 1"] {
+        let spec = build_formula(formula, &ds);
+        let smooth = bspline_spec(&spec, 0);
+        assert!(matches!(
+            smooth.identifiability,
+            BSplineIdentifiability::WeightedSumToZero { .. }
+        ));
+        assert!(smooth.double_penalty, "`{formula}`: the slope keeps its null-space ridge");
+        assert_keeps_only_the_constant_free(&ds, formula, "y ~ s(x)");
+    }
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + s(x) + s(z)", "y ~ s(x) + s(z)");
+    assert_keeps_only_the_constant_free(
+        &ds,
+        "y ~ 0 + s(z) + s(x, identifiability=none)",
+        "y ~ s(z) + s(x, identifiability=none)",
+    );
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + te(x, z)", "y ~ te(x, z)");
+}
+
+/// A factor `by=` smooth's main effect is a fixed factor block, so it spans
+/// the constant and keeps the intercept.
+#[test]
+fn no_intercept_factor_by_main_effect_spans_the_constant() {
+    let ds = factor_dataset();
+    assert_keeps_only_the_constant_free(&ds, "y ~ 0 + s(x, by=g)", "y ~ s(x, by=g)");
+}
+
+/// A parametric no-intercept model has no constant anywhere: `0 + x` is the
+/// regression through the origin.
+#[test]
+fn no_intercept_parametric_model_passes_through_the_origin() {
+    let ds = smooth_option_dataset();
+    let spec = build_formula("y ~ 0 + x", &ds);
+    assert_eq!(spec.level, ModelLevel::NoIntercept);
+    let design = crate::smooth::build_term_collection_design(ds.values.view(), &spec)
+        .expect("design builds");
+    let dense = design.design.to_dense();
+    assert_eq!(dense.ncols(), 1, "only the slope column remains");
+    for (row, value) in dense.column(0).iter().enumerate() {
+        assert!((value - ds.values[[row, 1]]).abs() < 1e-12);
+    }
+}
+
+/// `smooth_option_dataset` restricted to `x ∈ [lo, hi]`.
+fn smooth_option_subrange(lo: f64, hi: f64) -> Dataset {
+    continuous_dataset(
+        &["y", "x", "z"],
+        (0..40)
+            .map(|i| {
+                let x = lo + (hi - lo) * i as f64 / 39.0;
+                let z = ((i * 7) % 40) as f64 / 39.0;
+                vec![(4.0 * x).sin() + z, x, z]
+            })
+            .collect(),
+    )
+}
+
+fn tensor_margins(spec: &TermCollectionSpec, idx: usize) -> &[BSplineBasisSpec] {
+    match &spec.smooth_terms[idx].basis {
+        SmoothBasisSpec::TensorBSpline { spec, .. } => &spec.marginalspecs,
+        other => panic!("expected a tensor smooth, got {other:?}"),
+    }
+}
+
+/// The span of a margin's knot set, whatever its representation.
+fn knot_span(spec: &BSplineBasisSpec) -> (f64, f64) {
+    match &spec.knotspec {
+        BSplineKnotSpec::Generate { data_range, .. } => *data_range,
+        BSplineKnotSpec::Provided(knots) | BSplineKnotSpec::NaturalCubicRegression { knots } => {
+            (knots[0], knots[knots.len() - 1])
+        }
+        other => panic!("knot span is not resolved at spec time for {other:?}"),
+    }
+}
+
+/// `domain=[a, b]` fixes the interval the basis is built on, so two samples of
+/// different extent inside it build the same smooth; without it the basis
+/// follows each sample's own range.
+#[test]
+fn domain_fixes_the_bspline_interval_independently_of_the_sample() {
+    let wide = smooth_option_subrange(0.0, 1.0);
+    let narrow = smooth_option_subrange(0.2, 0.8);
+    let formula = "y ~ s(x, k=8, domain=[-0.5, 1.5])";
+    let a = build_formula(formula, &wide);
+    let b = build_formula(formula, &narrow);
+    assert_eq!(knot_span(bspline_spec(&a, 0)), (-0.5, 1.5));
+    assert_eq!(
+        format!("{:?}", bspline_spec(&a, 0).knotspec),
+        format!("{:?}", bspline_spec(&b, 0).knotspec)
+    );
+    let a_default = build_formula("y ~ s(x, k=8)", &wide);
+    let b_default = build_formula("y ~ s(x, k=8)", &narrow);
+    assert_ne!(
+        knot_span(bspline_spec(&a_default, 0)),
+        knot_span(bspline_spec(&b_default, 0))
+    );
+    // The domain-built smooth assembles into a design like any other.
+    let design = crate::smooth::build_term_collection_design(narrow.values.view(), &b)
+        .expect("a domain wider than the data builds");
+    assert_eq!(design.design.nrows(), narrow.values.nrows());
+
+    // Numeric expressions are bounds too, and explicit interior knots are
+    // placed inside the domain rather than the data range.
+    let pi_domain = build_formula("y ~ s(x, domain=[0, pi])", &wide);
+    assert_eq!(knot_span(bspline_spec(&pi_domain, 0)).1, std::f64::consts::PI);
+    let explicit = build_formula("y ~ s(x, knots=[0.5, 1.2], domain=[0, 2])", &wide);
+    assert_eq!(knot_span(bspline_spec(&explicit, 0)), (0.0, 2.0));
+    // Quantile interior knots come from the data, boundary knots from the domain.
+    let quantile = build_formula("y ~ s(x, knot_placement=quantile, domain=[-1, 2])", &wide);
+    let BSplineKnotSpec::Provided(knots) = &bspline_spec(&quantile, 0).knotspec else {
+        panic!("quantile placement on a domain resolves to an explicit knot vector");
+    };
+    assert_eq!((knots[0], knots[knots.len() - 1]), (-1.0, 2.0));
+    assert!(knots.iter().filter(|&&t| t > -1.0 && t < 2.0).all(|&t| (0.0..=1.0).contains(&t)));
+    // A cubic regression spline keeps its quantile value-knots inside and moves
+    // its end knots to the domain.
+    let cr = build_formula("y ~ s(x, bs=cr, k=6, domain=[-1, 2])", &wide);
+    assert_eq!(knot_span(bspline_spec(&cr, 0)), (-1.0, 2.0));
+}
+
+/// A tensor smooth takes one domain interval per margin, `none` keeping a
+/// margin's data range, for both the default cr margins and B-spline margins.
+#[test]
+fn domain_applies_per_tensor_margin() {
+    let ds = smooth_option_dataset();
+    let cr = build_formula("y ~ te(x, z, domain=[[-1, 2], none])", &ds);
+    let margins = tensor_margins(&cr, 0);
+    assert_eq!(knot_span(&margins[0]), (-1.0, 2.0));
+    assert_eq!(knot_span(&margins[1]), (0.0, 1.0));
+    let ps = build_formula("y ~ te(x, z, bs=[ps, ps], domain=[[-1, 2], [0, 5]])", &ds);
+    let margins = tensor_margins(&ps, 0);
+    assert_eq!(knot_span(&margins[0]), (-1.0, 2.0));
+    assert_eq!(knot_span(&margins[1]), (0.0, 5.0));
+}
+
+/// A scalar `bs=` on `te()` names the basis of every margin, exactly like the
+/// per-margin vector; it never turns the tensor product into a 1-D smooth.
+#[test]
+fn scalar_bs_on_te_is_broadcast_to_every_margin() {
+    let ds = smooth_option_dataset();
+    for (formula, want_cr) in [
+        ("y ~ te(x, z, bs=ps)", false),
+        ("y ~ te(x, z, bs='cr')", true),
+        ("y ~ ti(x, z, bs=cr)", true),
+    ] {
+        let spec = build_formula(formula, &ds);
+        let margins = tensor_margins(&spec, 0);
+        assert_eq!(margins.len(), 2, "{formula}");
+        for margin in margins {
+            let is_cr = matches!(
+                margin.knotspec,
+                BSplineKnotSpec::NaturalCubicRegression { .. }
+            );
+            assert_eq!(is_cr, want_cr, "{formula}: {:?}", margin.knotspec);
+        }
+    }
+    let err = formula_error("y ~ te(x, z, bs=re)", &ds);
+    assert!(
+        err.contains("margin 0 basis 're' is not a supported penalized-spline margin"),
+        "{err}"
+    );
+}
+
+/// Data outside a declared domain, a malformed interval, and a domain on a
+/// periodic axis are errors that name the term and the option.
+#[test]
+fn domain_is_validated_against_the_data_and_its_own_shape() {
+    let ds = smooth_option_dataset();
+    let outside = formula_error("y ~ s(x, domain=[0.1, 1])", &ds);
+    assert!(outside.contains("in term s(x"), "{outside}");
+    assert!(outside.contains("domain=[0.1, 1] does not contain the data"), "{outside}");
+    assert!(outside.contains("column 'x' spans [0, 1]"), "{outside}");
+    for (term, needle) in [
+        ("s(x, domain=[0])", "must be an interval [lower, upper]"),
+        ("s(x, domain=[0, 1, 2])", "must be an interval [lower, upper]"),
+        ("s(x, domain=5)", "must be an interval [lower, upper]"),
+        ("s(x, domain=[2, -1])", "must satisfy lower < upper"),
+        ("s(x, domain=[low, 1])", "bound 'low' is not a number"),
+        ("te(x, z, domain=[0, 1])", "needs one [lower, upper] interval (or none) per margin"),
+        ("te(x, z, domain=[[0, 1]])", "needs one [lower, upper] interval (or none) per margin"),
+        ("te(x, z, domain=[[0, 1], [0.5, 1]])", "tensor margin 1"),
+        ("cyclic(x, period=1, domain=[0, 1])", "period="),
+        ("s(x, bs=cc, period=1, domain=[0, 1])", "period="),
+    ] {
+        let err = formula_error(&format!("y ~ {term}"), &ds);
+        assert!(err.contains("in term"), "`{term}`: {err}");
+        assert!(err.contains("domain"), "`{term}`: {err}");
+        assert!(err.contains(needle), "`{term}`: expected {needle:?} in {err}");
+    }
+}
+
+fn prediction_design_dataset(n: usize) -> Dataset {
+    let rows = (0..n)
+        .map(|i| {
+            let x = ((i * 37) % n) as f64 / (n - 1) as f64;
+            let z = ((i * 53) % n) as f64 / (n - 1) as f64;
+            let g = (i % 3) as f64;
+            vec![(4.0 * x).sin() + z * z + 0.3 * g, x, z, g]
+        })
+        .collect::<Vec<_>>();
+    let mut ds = continuous_dataset(&["y", "x", "z", "g"], rows);
+    ds.schema.columns[3].kind = ColumnKindTag::Categorical;
+    ds.schema.columns[3].levels = vec!["a".into(), "b".into(), "c".into()];
+    ds.column_kinds[3] = ColumnKindTag::Categorical;
+    ds
+}
+
+/// Prediction evaluates a fitted (frozen) spec on new rows, and reads only the
+/// design and its affine offset. The prediction builder must return exactly
+/// what the full build returns for those, while realizing no penalty for a
+/// frozen smooth: the full build re-ran every term's penalty normalization,
+/// PSD projection and collection-chart filtering on each prediction call.
+#[test]
+fn prediction_design_matches_full_build_without_realizing_penalties() {
+    let train = prediction_design_dataset(160);
+    let new_rows = Array2::from_shape_fn((37, 4), |(i, j)| match j {
+        0 => 0.0,
+        1 | 2 => ((i * (j + 11)) % 37) as f64 / 36.0,
+        _ => (i % 3) as f64,
+    });
+    for formula in [
+        "y ~ s(x) + s(z)",
+        "y ~ x + s(x)",
+        "y ~ s(x, double_penalty=true)",
+        "y ~ te(x, z)",
+        "y ~ s(x) + te(x, z)",
+        "y ~ s(x, z)",
+        "y ~ matern(x, z)",
+        "y ~ duchon(x, z)",
+        "y ~ g + s(x, by=g)",
+        "y ~ s(x, g, bs=\"fs\")",
+        "y ~ s(x) + s(g, x, bs=\"sz\")",
+    ] {
+        let spec = build_formula(formula, &train);
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+
+        let full = crate::smooth::build_term_collection_design(new_rows.view(), &frozen)
+            .unwrap_or_else(|err| panic!("`{formula}` full rebuild: {err}"));
+        let prediction =
+            crate::smooth::build_term_collection_prediction_design(new_rows.view(), &frozen)
+                .unwrap_or_else(|err| panic!("`{formula}` prediction design: {err}"));
+        assert_eq!(
+            prediction.design.to_dense(),
+            full.design.to_dense(),
+            "`{formula}`: the prediction design must equal the full rebuild's"
+        );
+        assert_eq!(
+            prediction.affine_offset, full.affine_offset,
+            "`{formula}`: the prediction offset must equal the full rebuild's"
+        );
+        assert_eq!(
+            prediction.linear_ranges, full.linear_ranges,
+            "`{formula}`: the prediction linear ranges must equal the full rebuild's"
+        );
+        let width = |ranges: &[(String, std::ops::Range<usize>)]| -> usize {
+            ranges.iter().map(|(_, range)| range.len()).sum()
+        };
+        let smooth_start = full.intercept_range.len()
+            + width(&full.linear_ranges)
+            + width(&full.random_effect_ranges);
+        let full_ranges: Vec<_> = full
+            .smooth
+            .terms
+            .iter()
+            .map(|term| {
+                let range = &term.coeff_range;
+                let columns = (smooth_start + range.start)..(smooth_start + range.end);
+                (term.name.clone(), columns)
+            })
+            .collect();
+        assert_eq!(
+            prediction.smooth_ranges, full_ranges,
+            "`{formula}`: the prediction smooth ranges must be the full rebuild's, placed after \
+             the intercept, linear and random-effect columns"
+        );
+        assert!(
+            !full.smooth.penalties.is_empty(),
+            "`{formula}`: the full rebuild realizes the smooth penalties"
+        );
+
+        for term in &frozen.smooth_terms {
+            // These kinds place their outer design from the inner penalties.
+            if matches!(
+                term.basis,
+                crate::smooth::SmoothBasisSpec::BySmooth { .. }
+                    | crate::smooth::SmoothBasisSpec::FactorSmooth { .. }
+                    | crate::smooth::SmoothBasisSpec::FactorSumToZero { .. }
+            ) {
+                continue;
+            }
+            let mut workspace = crate::basis::BasisWorkspace::default();
+            let local = crate::smooth::build_single_local_smooth_term_for(
+                new_rows.view(),
+                term,
+                &mut workspace,
+                crate::smooth::SmoothPenaltyDemand::DesignOnly,
+            )
+            .unwrap_or_else(|err| panic!("`{formula}` term {}: {err}", term.name));
+            assert!(
+                local.active_penalties.is_empty() && local.dropped_penalties.is_empty(),
+                "`{formula}`: frozen term {} must not realize penalties for a design-only build",
+                term.name
+            );
+        }
+    }
+}
+
+/// Partial dependence evaluates one term on a grid. Its columns must be the
+/// full prediction design's columns over the term's range, while the terms the
+/// block does not read are never built: realizing every term's basis on the
+/// grid made the cost scale with the model's width, not the term's.
+#[test]
+fn term_prediction_columns_match_the_full_prediction_design() {
+    let train = prediction_design_dataset(160);
+    let new_rows = Array2::from_shape_fn((37, 4), |(i, j)| match j {
+        0 => 0.0,
+        1 | 2 => ((i * (j + 11)) % 37) as f64 / 36.0,
+        _ => (i % 3) as f64,
+    });
+    for formula in [
+        "y ~ s(x) + s(z)",
+        "y ~ x + s(x)",
+        "y ~ x + s(x) + s(z)",
+        "y ~ s(x, double_penalty=true)",
+        "y ~ te(x, z)",
+        "y ~ s(x) + te(x, z)",
+        "y ~ s(x) + s(z) + ti(x, z)",
+        "y ~ s(x, z)",
+        "y ~ matern(x, z)",
+        "y ~ duchon(x, z)",
+        "y ~ g + s(x, by=g)",
+        "y ~ s(x, g, bs=\"fs\")",
+        "y ~ s(x) + s(g, x, bs=\"sz\")",
+    ] {
+        let spec = build_formula(formula, &train);
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let full = crate::smooth::build_term_collection_prediction_design(new_rows.view(), &frozen)
+            .unwrap_or_else(|err| panic!("`{formula}` prediction design: {err}"));
+        for (name, range) in full.linear_ranges.iter().chain(&full.smooth_ranges) {
+            let columns =
+                crate::smooth::build_term_prediction_columns(new_rows.view(), &frozen, name)
+                    .unwrap_or_else(|err| panic!("`{formula}` term {name}: {err}"));
+            assert_eq!(
+                columns,
+                full.design
+                    .extract_columns(&range.clone().collect::<Vec<_>>()),
+                "`{formula}`: term {name}'s columns must be the full design's over {range:?}"
+            );
+        }
+    }
+
+    // `s(x)` reads nothing of `s(z)`, so a grid whose `z` the full build
+    // rejects still evaluates it.
+    let spec = build_formula("y ~ s(x) + s(z)", &train);
+    let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+        .expect("training design");
+    let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted).expect("freeze");
+    let mut grid = new_rows.clone();
+    grid.column_mut(2).fill(f64::NAN);
+    assert!(
+        crate::smooth::build_term_collection_prediction_design(grid.view(), &frozen).is_err(),
+        "the full build must reject a non-finite `z`"
+    );
+    let reference = crate::smooth::build_term_prediction_columns(new_rows.view(), &frozen, "s(x)")
+        .expect("s(x) on finite rows");
+    let columns = crate::smooth::build_term_prediction_columns(grid.view(), &frozen, "s(x)")
+        .expect("s(x) must not build s(z)");
+    assert_eq!(columns, reference);
+}
+
+#[test]
+fn frozen_tensor_design_is_built_without_its_penalties() {
+    let train = prediction_design_dataset(160);
+    let new_rows = Array2::from_shape_fn((29, 4), |(i, j)| match j {
+        1 | 2 => ((i * (j + 5)) % 29) as f64 / 28.0,
+        _ => 0.0,
+    });
+    for formula in [
+        "y ~ te(x, z)",
+        "y ~ ti(x, z)",
+        "y ~ t2(x, z)",
+        "y ~ te(x, z, double_penalty=true)",
+    ] {
+        let spec = build_formula(formula, &train);
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let (feature_cols, tensor) = frozen
+            .smooth_terms
+            .iter()
+            .find_map(|term| match &term.basis {
+                crate::smooth::SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
+                    Some((feature_cols, spec))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("`{formula}` has no tensor term"));
+        let build = |realize_penalties: bool| {
+            crate::smooth::build_tensor_bspline_basis(
+                new_rows.view(),
+                feature_cols,
+                tensor,
+                realize_penalties,
+            )
+            .unwrap_or_else(|err| panic!("`{formula}` tensor build: {err}"))
+        };
+        let full = build(true);
+        let design_only = build(false);
+        assert!(
+            !full.active_penalties.is_empty(),
+            "`{formula}`: the full build realizes penalties"
+        );
+        assert!(
+            design_only.active_penalties.is_empty() && design_only.dropped_penalties.is_empty(),
+            "`{formula}`: a design-only tensor build must not assemble penalties"
+        );
+        assert_eq!(
+            design_only.design.to_dense(),
+            full.design.to_dense(),
+            "`{formula}`: the tensor design must not depend on its penalties"
+        );
+    }
+}
+
+#[test]
+fn frozen_bspline_1d_design_is_built_without_its_penalties() {
+    let train = prediction_design_dataset(160);
+    let new_rows = Array2::from_shape_fn((31, 4), |(i, j)| match j {
+        1 | 2 => ((i * (j + 7)) % 31) as f64 / 30.0,
+        _ => 0.0,
+    });
+    for formula in [
+        "y ~ s(x)",
+        "y ~ s(x, double_penalty=true)",
+        "y ~ s(x, bs=\"cr\")",
+        "y ~ s(x, bs=\"cr\", double_penalty=true)",
+        "y ~ s(x, bs=\"cc\")",
+        "y ~ s(x, shape=monotone_increasing)",
+    ] {
+        let spec = build_formula(formula, &train);
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let (feature_col, basis_spec) = frozen
+            .smooth_terms
+            .iter()
+            .find_map(|term| match &term.basis {
+                crate::smooth::SmoothBasisSpec::BSpline1D { feature_col, spec } => {
+                    Some((*feature_col, spec))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("`{formula}` has no 1-D spline term"));
+        let build = |realize_penalties: bool| {
+            crate::basis::build_bspline_basis_1d_realizing(
+                new_rows.column(feature_col),
+                basis_spec,
+                realize_penalties,
+            )
+            .unwrap_or_else(|err| panic!("`{formula}` 1-D spline build: {err}"))
+        };
+        let full = build(true);
+        let design_only = build(false);
+        assert!(
+            !full.active_penalties.is_empty(),
+            "`{formula}`: the full build realizes penalties"
+        );
+        assert!(
+            design_only.active_penalties.is_empty() && design_only.dropped_penalties.is_empty(),
+            "`{formula}`: a design-only 1-D spline build must not assemble penalties"
+        );
+        assert_eq!(
+            design_only.design.to_dense(),
+            full.design.to_dense(),
+            "`{formula}`: the 1-D spline design must not depend on its penalties"
+        );
+        assert_eq!(
+            design_only.affine_offset, full.affine_offset,
+            "`{formula}`: the 1-D spline offset must not depend on its penalties"
+        );
+    }
+}
+
+/// A continuous `x` with distinct values beside a categorical `g` whose level
+/// labels are `levels`; row `i` holds level `i % levels.len()`.
+fn categorical_coordinate_dataset(levels: &[&str]) -> Dataset {
+    let n = 120usize;
+    let rows = (0..n)
+        .map(|i| {
+            let x = i as f64 / (n as f64 - 1.0);
+            let g = (i % levels.len()) as f64;
+            vec![x + g, x, g]
+        })
+        .collect::<Vec<_>>();
+    Dataset {
+        headers: vec!["y".into(), "x".into(), "g".into()],
+        values: Array2::from_shape_vec(
+            (rows.len(), 3),
+            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+        )
+        .expect("rectangular categorical test data"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "g".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: levels.iter().map(|level| level.to_string()).collect(),
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
+        ],
+    }
+}
+
+fn try_build_formula(formula: &str, ds: &Dataset) -> Result<TermCollectionSpec, TermBuilderError> {
+    let parsed = parse_formula(formula).expect("formula parses");
+    build_termspec(&parsed.terms, ds, &ds.column_map(), &mut Vec::new())
+}
+
+/// pyGAM audit F4: a smooth, tensor or explicit linear term over a categorical
+/// column used to fit silently over the arbitrary level codes. It is refused
+/// at formula resolution as a formula error that names the column and the
+/// categorical alternatives.
+#[test]
+fn a_categorical_column_is_refused_as_a_numeric_coordinate() {
+    let ds = categorical_coordinate_dataset(&["a", "b", "c"]);
+    for (formula, term) in [
+        ("y ~ s(g)", "s(g)"),
+        ("y ~ s(x) + s(g)", "s(g)"),
+        ("y ~ te(x, g)", "te(x, g)"),
+        ("y ~ linear(g)", "linear(g)"),
+    ] {
+        let err = try_build_formula(formula, &ds).expect_err(formula);
+        let TermBuilderError::CategoricalCoordinate {
+            column,
+            level_count,
+            first_non_numeric,
+            ..
+        } = &err
+        else {
+            panic!("{formula}: expected CategoricalCoordinate, got {err:?}");
+        };
+        assert_eq!(column, "g", "{formula}");
+        assert_eq!(*level_count, 3, "{formula}");
+        assert_eq!(
+            first_non_numeric.as_ref(),
+            Some(&NonNumericCell {
+                value: "a".to_string(),
+                row: 1
+            }),
+            "{formula}"
+        );
+        assert_eq!(err.error_category(), ErrorCategory::Formula);
+        let message = err.to_string();
+        assert!(message.contains(term), "{formula}: {message}");
+        for alternative in ["factor(g)", "group(g)", "s(x, by=g)", "fs(x, g)", "bs=\"re\""] {
+            assert!(message.contains(alternative), "{formula}: {message}");
+        }
+    }
+}
+
+/// The categorical smooths stay valid: a factor `by=`, the factor slot of
+/// `fs`, and a random-effect smooth over the grouping column.
+#[test]
+fn a_categorical_column_is_accepted_where_a_smooth_takes_a_factor() {
+    let ds = categorical_coordinate_dataset(&["a", "b", "c"]);
+    for formula in [
+        "y ~ s(x, by=g)",
+        "y ~ fs(x, g)",
+        "y ~ s(g, bs=\"re\")",
+        "y ~ factor(g) + s(x)",
+    ] {
+        try_build_formula(formula, &ds).unwrap_or_else(|err| panic!("{formula}: {err}"));
+    }
+}
+
+/// A numeric column made categorical by one stray string reports that string
+/// and its 1-based row, and says how to keep the column numeric.
+#[test]
+fn a_stray_string_in_a_numeric_column_is_reported_with_its_row() {
+    // Rows cycle through the levels, so the first `oops` sits at row 3.
+    let ds = categorical_coordinate_dataset(&["1.5", "2.5", "oops"]);
+    let err = try_build_formula("y ~ s(g)", &ds).expect_err("s(g) on a categorical column");
+    let TermBuilderError::CategoricalCoordinate {
+        first_non_numeric, ..
+    } = &err
+    else {
+        panic!("expected CategoricalCoordinate, got {err:?}");
+    };
+    assert_eq!(
+        first_non_numeric.as_ref(),
+        Some(&NonNumericCell {
+            value: "oops".to_string(),
+            row: 3
+        })
+    );
+    let message = err.to_string();
+    assert!(message.contains("'oops' at row 3"), "{message}");
+    assert!(message.contains("meant to be numeric"), "{message}");
+}
+
+/// pyGAM audit F2: a categorical column in a term that reads its inputs as
+/// numeric axes must be a typed error pointing at `factor()`/`group()`,
+/// instead of fitting the level codes as positions on a line.
+#[test]
+fn categorical_column_in_a_numeric_axis_term_is_rejected() {
+    let ds = factor_dataset_l3();
+    let col_map = ds.column_map();
+    for formula in [
+        "y ~ s(g)",
+        "y ~ linear(g)",
+        "y ~ te(x, g)",
+        "y ~ s(g, bs=\"cc\")",
+        "y ~ thinplate(x, g)",
+        "y ~ matern(g)",
+    ] {
+        let parsed = parse_formula(formula).expect("parse numeric-axis formula");
+        let mut notes = Vec::new();
+        let err = build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
+            .expect_err(&format!("`{formula}` must reject the categorical column"));
+        assert!(
+            matches!(err, TermBuilderError::CategoricalCoordinate { .. }),
+            "`{formula}` must raise a typed CategoricalCoordinate, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'g' is categorical") && msg.contains("factor(g)") && msg.contains("group(g)"),
+            "`{formula}` must name the column and point at factor()/group(): {msg}"
+        );
+    }
+    // The factor-smooth family consumes the categorical as its grouping
+    // factor, and the categorical wrappers are its level effects, so none of
+    // these is a numeric axis.
+    for formula in [
+        "y ~ s(x, g, bs=\"fs\", k=5)",
+        "y ~ s(x, by=g, k=5)",
+        "y ~ x + g",
+        "y ~ x + factor(g)",
+        "y ~ x + group(g)",
+    ] {
+        let parsed = parse_formula(formula).expect("parse categorical formula");
+        let mut notes = Vec::new();
+        build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
+            .unwrap_or_else(|err| panic!("`{formula}` must still build, got: {err:?}"));
+    }
+}
+
+/// `s(b) + te(b, c)` puts the tensor in a collection gauge whose coefficient
+/// transform whitens the design Gram. The frozen spec rebuilds the tensor in
+/// the composite chart at predict time, and its null-function block ridges
+/// must find the chart's null as the preimage of `⊗ null(S_j)`: a spectral
+/// rank test on the whitened primary counted weakly penalized bending
+/// directions as null ("tensor null blocks span 4 of the chart's 27 null
+/// directions") and the fitted model could not predict.
+#[test]
+fn a_tensor_sharing_a_margin_with_a_smooth_rebuilds_from_its_frozen_spec() {
+    let n = 1000usize;
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut uniform = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let rows = (0..n)
+        .map(|_| {
+            let b = uniform();
+            let c = uniform();
+            vec![(3.0 * b).sin() + b * c, b, c]
+        })
+        .collect();
+    let ds = continuous_dataset(&["y", "b", "c"], rows);
+    for formula in ["y ~ s(b) + te(b, c)", "y ~ s(b) + te(b, c, k=[14,14])"] {
+        let spec = build_formula(formula, &ds);
+        let fitted = crate::smooth::build_term_collection_design(ds.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` fit-time design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let rebuilt = crate::smooth::build_term_collection_design(ds.values.view(), &frozen)
+            .unwrap_or_else(|err| panic!("`{formula}` rebuild from the frozen spec: {err}"));
+        let fitted_rows = fitted.design.to_dense();
+        let rebuilt_rows = rebuilt.design.to_dense();
+        assert_eq!(rebuilt_rows.dim(), fitted_rows.dim(), "`{formula}`");
+        let scale = fitted_rows.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        let drift = (&rebuilt_rows - &fitted_rows)
+            .iter()
+            .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(
+            drift <= 1e-9 * scale,
+            "`{formula}`: the rebuilt design drifts {drift:.3e} (scale {scale:.3e})"
+        );
+    }
+}
+
+/// Two-level factor frame whose group `a` covariate takes `rows_a` evenly
+/// spaced values over `unique_a` distinct points, and group `b` likewise.
+fn two_group_factor_dataset(
+    (rows_a, unique_a): (usize, usize),
+    (rows_b, unique_b): (usize, usize),
+) -> Dataset {
+    let group_rows = |rows: usize, unique: usize, g: f64| {
+        (0..rows)
+            .map(move |i| {
+                let x = (i % unique) as f64 / (unique - 1) as f64;
+                vec![x + g, x, g]
+            })
+            .collect::<Vec<_>>()
+    };
+    let rows: Vec<Vec<f64>> = group_rows(rows_a, unique_a, 0.0)
+        .into_iter()
+        .chain(group_rows(rows_b, unique_b, 1.0))
+        .collect();
+    Dataset {
+        headers: vec!["y".into(), "x".into(), "g".into()],
+        values: Array2::from_shape_vec(
+            (rows.len(), 3),
+            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+        )
+        .expect("rectangular two-group factor test data"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "g".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["a".into(), "b".into()],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
+        ],
+    }
+}
+
+fn factor_smooth_marginal_dim(spec: &FactorSmoothSpec) -> usize {
+    match spec.marginal.knotspec {
+        BSplineKnotSpec::Generate {
+            num_internal_knots, ..
+        }
+        | BSplineKnotSpec::Automatic {
+            num_internal_knots, ..
+        } => num_internal_knots + spec.marginal.degree + 1,
+        ref other => panic!("unexpected factor-smooth knotspec: {other:?}"),
+    }
+}
+
+/// #3264: the default `fs`/`sz` marginal is the univariate `s()` default on
+/// the least-informed group — the resolution-rate pilot of the smallest
+/// group's row count, held to the least per-group distinct-value support by
+/// the rank bound (a group with `u` distinct values identifies at most `u`
+/// marginal directions). The old rule subtracted two hand-set "residual
+/// points" from that support with a `degree + 2` floor, which both shrank a
+/// well-supported marginal below its pilot and, on a 4-value group, handed
+/// the marginal five functions the data could see only four of.
+#[test]
+fn factor_smooth_default_marginal_is_the_rank_bounded_group_pilot_3264() {
+    let degree = DEFAULT_BSPLINE_DEGREE;
+    let order = DEFAULT_PENALTY_ORDER.min(degree);
+    for formula in ["y ~ s(x, g, bs=fs)", "y ~ s(x, g, bs=sz)"] {
+        // Every group resolves its pilot: the marginal is the pilot of the
+        // smallest group's rows, whatever the pooled column would get.
+        let ds = two_group_factor_dataset((40, 40), (400, 400));
+        let spec = factor_smooth_spec_for(formula, &ds);
+        assert_eq!(
+            factor_smooth_marginal_dim(&spec),
+            pilot_internal_knots(40, degree, order) + degree + 1,
+            "{formula}: well-supported marginal is the smallest group's pilot"
+        );
+
+        // A group with exactly as many distinct values as the pilot keeps the
+        // full pilot (the old `u − 2` rule cut it to five functions).
+        let pilot_dim = pilot_internal_knots(1_000, degree, order) + degree + 1;
+        let ds = two_group_factor_dataset((1_000, pilot_dim), (1_000, 1_000));
+        let spec = factor_smooth_spec_for(formula, &ds);
+        assert_eq!(
+            factor_smooth_marginal_dim(&spec),
+            pilot_dim,
+            "{formula}: marginal at the support bound keeps the pilot"
+        );
+
+        // A group with four distinct values bounds the marginal at four.
+        let ds = two_group_factor_dataset((400, 4), (400, 400));
+        let spec = factor_smooth_spec_for(formula, &ds);
+        assert_eq!(
+            factor_smooth_marginal_dim(&spec),
+            4,
+            "{formula}: marginal is bounded by the least group support"
+        );
+        assert_eq!(spec.marginal.degree, degree);
+    }
 }

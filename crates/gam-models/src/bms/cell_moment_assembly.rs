@@ -15,23 +15,13 @@ use super::row_kernel::*;
 use super::*;
 
 use crate::fnv1a::Fnv1a;
-use crate::latent_anchor::{AnchorGridOwned, anchor_derivatives_in_slot, solve_anchor};
-use gam_math::jet_scalar::{
-    DynamicJetBatchWorkspace, DynamicOneSeedBatch, DynamicTwoSeedBatch,
-    FixedRuntimeJet, OneSeed, TwoSeed,
+use crate::latent_anchor::{
+    AnchorGridOwned, AnchorTaylor, anchor_derivatives_in_slot, anchor_taylor_in_slot, solve_anchor,
 };
-
-thread_local! {
-    /// Per-worker empirical FLEX third-order workspace. The largest batch is
-    /// retained across rows, so a warmed worker does not revisit the global
-    /// allocator for the runtime-sized jet tape.
-    static EMPIRICAL_BMS_THIRD_WORKSPACE: std::cell::RefCell<DynamicJetBatchWorkspace> =
-        std::cell::RefCell::new(DynamicJetBatchWorkspace::new(1));
-    /// Per-worker empirical FLEX fourth-order pair workspace. A caller may
-    /// evaluate several `(u,v)` contractions in one row-plan traversal.
-    static EMPIRICAL_BMS_FOURTH_WORKSPACE: std::cell::RefCell<DynamicJetBatchWorkspace> =
-        std::cell::RefCell::new(DynamicJetBatchWorkspace::new(1));
-}
+use gam_math::jet_scalar::{
+    DynamicOneSeedBatch, DynamicTwoSeedBatch, FixedRuntimeJet, OneSeed, TwoSeed,
+};
+use gam_math::jet_trace::DynamicTraceJet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum EmpiricalBmsThirdJetSchedule {
@@ -114,7 +104,7 @@ pub(super) struct SharedExactCacheStore {
 }
 
 impl SharedExactCacheStore {
-    const CAPACITY: usize = 2;
+    pub(super) const CAPACITY: usize = 2;
 
     pub(super) fn empty() -> Self {
         Self {
@@ -316,7 +306,7 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Objective-only fast path for the empirical-grid rigid kernel: returns
     /// `-w · log Φ(s · (intercept + s_f·g·z))` at the converged scalar
-    /// intercept (the calibration root from `empirical_intercept_from_marginal`).
+    /// intercept (the anchoring root from `latent_anchor::solve_anchor`).
     /// Shares the `intercept_warm_starts` cache with the closed-form
     /// gradient/Hessian path, so successive line-search trials at nearby
     /// intercepts converge in `O(1)` Newton iterations per row.
@@ -421,7 +411,6 @@ impl BernoulliMarginalSlopeFamily {
             slope,
             nodes,
             measure_weights,
-            2,
         )?;
         Ok(jet.into_channels())
     }
@@ -455,16 +444,13 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<[[[f64; 2]; 2]; 2], String> {
         // #932 (doc §11, §14.3): the uncontracted third tensor is the `.t3`
         // channel of the SAME single-source row jet, evaluated at `Tower3<2>`.
-        // Keep the previous four finite-precision lift passes for bit identity
-        // with the old `Tower4<2>` path, but do not build a fourth tensor for a
-        // consumer that never reads it.
+        // No fourth tensor is built for a consumer that never reads it.
         let jet = self.empirical_rigid_row_nll_jet::<gam_math::jet_tower::Tower3<2>>(
             row,
             marginal,
             slope,
             nodes,
             measure_weights,
-            4,
         )?;
         Ok(jet.t3)
     }
@@ -497,7 +483,7 @@ impl BernoulliMarginalSlopeFamily {
         // channel of the SAME single-source row jet at the packed `Tower4<2>`.
         // The former hand intercept-fourth chain (including the #833
         // `g_aa·a_ggg` term whose omission shifted the m/g block ~1.8%) is now
-        // generated mechanically by the filtered lift — that whole genus cannot
+        // generated mechanically by the anchor-table lift — that whole genus cannot
         // recur because there is no separate channel to drop.
         let jet = self.empirical_rigid_row_nll_jet::<gam_math::jet_tower::Tower4<2>>(
             row,
@@ -505,7 +491,6 @@ impl BernoulliMarginalSlopeFamily {
             slope,
             nodes,
             measure_weights,
-            4,
         )?;
         Ok(jet.t4)
     }
@@ -513,22 +498,13 @@ impl BernoulliMarginalSlopeFamily {
     /// Row negative-log-likelihood jet of the rigid empirical-grid kernel in the
     /// primaries `(m = marginal η, g = slope)`, evaluated in any [`JetScalar`]
     /// `S` (#932 — doc §11 "generic implicit-lift operator", §14.3 "BMS
-    /// empirical rigid"). The grid intercept `a(m, g)` solving the calibration
-    /// `Σ_k π_k Φ(a + s·g·x_k) = μ(m)` is lifted DIRECTLY in `S` by the filtered
-    /// Hensel operator
-    /// ([`gam_math::jet_scalar::filtered_implicit_solve_scalar`]) — no
-    /// dense extra-variable tower and no hand-written intercept-derivative
-    /// formulas — then the observed signed-probit NLL is composed on top.
-    /// Reading `(value, g, H)` off `Order2<2>` serves `primary_grad_hess`;
-    /// reading `.t3` / `.t4` off `Tower4<2>` serves `third_full` / `fourth_full`.
-    /// `lift_iters` is `S`'s nilpotency order (`Order2`: 2, `Tower4`: 4).
-    ///
-    /// The intercept value channel never moves under the lift (the constraint's
-    /// value channel is the certified root residual `= 0`), so each grid node's
-    /// normal-CDF derivative stack at the fixed base index `η_k0 = a0 + s·g·x_k`
-    /// is built ONCE — one transcendental pass — and folded into fifteen grid
-    /// moments; each lift grade then composes a degree-four polynomial in the
-    /// intercept and slope jets whose cost does not grow with the grid.
+    /// empirical rigid"). The grid intercept `a(q, s·g)` solving the anchoring
+    /// equation `Σ_k π_k Φ(a + s·g·x_k) = Φ(q)` is lifted DIRECTLY in `S` from
+    /// the anchor's Taylor table ([`AnchorTaylor`]) — no dense extra-variable
+    /// tower and no hand-written intercept-derivative formulas — then the
+    /// observed signed-probit NLL is composed on top. Reading `(value, g, H)`
+    /// off `Order2<2>` serves `primary_grad_hess`; reading `.t3` / `.t4` off
+    /// `Tower4<2>` serves `third_full` / `fourth_full`.
     fn empirical_rigid_intercept_jet<S: gam_math::jet_scalar::JetScalar<2>>(
         &self,
         row: usize,
@@ -536,95 +512,15 @@ impl BernoulliMarginalSlopeFamily {
         slope: f64,
         nodes: &[f64],
         measure_weights: &[f64],
-        lift_iters: usize,
     ) -> Result<S, String> {
-        let s = self.probit_frailty_scale();
-        let a0 =
-            self.empirical_rigid_intercept_for_row(row, marginal, slope, nodes, measure_weights)?;
-        let observed_slope = s * slope;
-
-        // One transcendental pass: per node the fixed normal-CDF derivative
-        // stack at η_k0 = a0 + s·slope·x_k, folded into the grid moments
-        //   M[j][i] = Σ_k π_k (s·x_k)^i Φ^{(j)}(η_k0),   i ≤ j ≤ 4.
-        // Node k's index jet is η_k0 + α + (s·x_k)·γ, with α and γ the
-        // derivative parts of the intercept and slope jets, so the grid sum
-        // composes to the polynomial
-        //   Σ_k π_k Φ(η_k) = Σ_{p+q ≤ 4} M[p+q][q] / (p!·q!) · α^p γ^q
-        // and every lift reads these fifteen moments instead of composing the
-        // grid again. The primal calibration Jacobian is F_a = M[1][0].
-        let mut moments = [[0.0f64; 5]; 5];
-        for (&node, &weight) in nodes.iter().zip(measure_weights.iter()) {
-            let eta0 = a0 + observed_slope * node;
-            let cdf_stack = unary_derivatives_normal_cdf(eta0);
-            let g_coef = s * node;
-            let mut coefficient = weight;
-            for q in 0..5 {
-                for j in q..5 {
-                    moments[j][q] += coefficient * cdf_stack[j];
-                }
-                coefficient *= g_coef;
-            }
-        }
-        let f_a = moments[1][0];
-        if !f_a.is_finite() || f_a <= 0.0 {
-            return Err(format!(
-                "empirical rigid jet: non-positive calibration Jacobian F_a={f_a} at row {row}"
-            ));
-        }
-        let inv_fa = 1.0 / f_a;
-
-        // Seeded primaries θ = (m slot 0, g slot 1) and the marginal target
-        // −μ(m) in S (its derivatives are exactly the production link map, so
-        // this is correct for any marginal link).
-        let m_jet = S::variable(marginal.eta, 0);
-        let g_jet = S::variable(slope, 1);
-        let neg_mu = m_jet
-            .compose_unary([
-                marginal.mu,
-                marginal.mu1,
-                marginal.mu2,
-                marginal.mu3,
-                marginal.mu4,
-            ])
-            .neg();
-
-        // Constraint F(a, θ) = −μ(m) + Σ_k π_k Φ(a + s·g·x_k), evaluated in S
-        // from the moments. The slope's powers γ^q do not move under the lift.
-        const INVERSE_FACTORIAL: [f64; 5] = [1.0, 1.0, 0.5, 1.0 / 6.0, 1.0 / 24.0];
-        let gamma = g_jet.with_value(0.0);
-        let mut gamma_powers = [S::constant(1.0); 5];
-        for q in 1..5 {
-            gamma_powers[q] = gamma_powers[q - 1].mul(&gamma);
-        }
-        let neg_mu_at_grid = neg_mu.add_constant(moments[0][0]);
-        let constraint = |a: &S| -> S {
-            let alpha = a.with_value(0.0);
-            let mut acc = neg_mu_at_grid;
-            let mut alpha_power = S::constant(1.0);
-            for p in 0..5 {
-                for q in 0..(5 - p) {
-                    if p + q == 0 {
-                        continue;
-                    }
-                    let coefficient =
-                        moments[p + q][q] * INVERSE_FACTORIAL[p] * INVERSE_FACTORIAL[q];
-                    let monomial = match (p, q) {
-                        (0, _) => gamma_powers[q],
-                        (_, 0) => alpha_power,
-                        _ => alpha_power.mul(&gamma_powers[q]),
-                    };
-                    acc = acc.add(&monomial.scale(coefficient));
-                }
-                if p < 4 {
-                    alpha_power = alpha_power.mul(&alpha);
-                }
-            }
-            acc
-        };
-        Ok(
-            gam_math::jet_scalar::filtered_implicit_solve_scalar::<2, S>(
-                a0, inv_fa, lift_iters, constraint,
-            ),
+        let observed_slope = S::variable(slope, 1).scale(self.probit_frailty_scale());
+        self.empirical_rigid_intercept_lift(
+            row,
+            marginal,
+            &S::variable(marginal.eta, 0),
+            &observed_slope,
+            nodes,
+            measure_weights,
         )
     }
 
@@ -635,24 +531,46 @@ impl BernoulliMarginalSlopeFamily {
         slope: f64,
         nodes: &[f64],
         measure_weights: &[f64],
-        lift_iters: usize,
     ) -> Result<S, String> {
-        let a_jet = self.empirical_rigid_intercept_jet::<S>(
+        let observed_slope = S::variable(slope, 1).scale(self.probit_frailty_scale());
+        self.empirical_rigid_row_nll_lift(
             row,
             marginal,
-            slope,
+            &S::variable(marginal.eta, 0),
+            &observed_slope,
             nodes,
             measure_weights,
-            lift_iters,
+        )
+    }
+
+    /// The empirical-grid rigid row NLL at the anchored intercept, from the
+    /// marginal-index jet `m` and the OBSERVED slope jet `s·g`. The kernel reads
+    /// the frailty scale only through the observed slope, so a caller whose
+    /// observed-slope jet also carries a frailty-scale seed receives the exact
+    /// σ derivatives of the finite-law objective (gam#3059).
+    fn empirical_rigid_row_nll_lift<S: gam_math::jet_scalar::JetScalar<2>>(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        m_jet: &S,
+        observed_slope: &S,
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> Result<S, String> {
+        let a_jet = self.empirical_rigid_intercept_lift(
+            row,
+            marginal,
+            m_jet,
+            observed_slope,
+            nodes,
+            measure_weights,
         )?;
-        let s = self.probit_frailty_scale();
-        let g_jet = S::variable(slope, 1);
 
         // Observed signed-probit NLL: η = a(m, g) + s·g·z, r = (2y−1)·η,
         // ℓ = −w·logΦ(r), through the SAME signed-probit scalar kernel the
         // standard-normal path uses.
         let z = self.z[row];
-        let eta = a_jet.add(&g_jet.scale(s * z));
+        let eta = a_jet.add(&observed_slope.scale(z));
         let sign = 2.0 * self.y[row] - 1.0;
         let signed = eta.scale(sign);
         let m_signed = gam_math::nested_dual::JetField::value(&signed);
@@ -669,6 +587,53 @@ impl BernoulliMarginalSlopeFamily {
         }
         Ok(signed.compose_unary(stack))
     }
+
+    /// The anchored intercept `a(q, s·g)` of the empirical-grid rigid kernel
+    /// lifted into `S`, from the marginal-index jet `m_jet` and the OBSERVED
+    /// slope jet `observed_slope = s·g`.
+    ///
+    /// The anchoring equation `Σ_k π_k Φ(a + (s·g)·x_k) = Φ(q)` is the latent
+    /// anchor's equation with `α = a` (the weights sum to one), so the row's
+    /// Taylor table at the root — solved and differentiated on the smaller
+    /// tail in log space and normalized by the grid density — composes with
+    /// the index jet `q(m)` and the observed-slope increment directly. No
+    /// probability is formed: at a tail index whose every node density
+    /// underflows, the table stays finite and the lift keeps the exact
+    /// gradient (gam#2978).
+    fn empirical_rigid_intercept_lift<S: gam_math::jet_scalar::JetScalar<2>>(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        m_jet: &S,
+        observed_slope: &S,
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> Result<S, String> {
+        let observed_slope_value = gam_math::nested_dual::JetField::value(observed_slope);
+        let taylor = match self
+            .intercept_warm_starts
+            .as_ref()
+            .and_then(|cache| cache.anchor_law.as_ref())
+        {
+            Some(law) => anchor_taylor_in_slot(
+                marginal.q,
+                observed_slope_value,
+                law.row_context(row, nodes)?,
+                row,
+                0,
+            )?,
+            None => {
+                let grid = AnchorGridOwned::new(nodes.to_vec(), measure_weights.to_vec());
+                let alpha = solve_anchor(marginal.q, observed_slope_value, grid.view())?;
+                AnchorTaylor::at(alpha, marginal.q, observed_slope_value, grid.view())?
+            }
+        };
+        let q_jet = m_jet.compose_unary([marginal.q, marginal.q1, marginal.q2, marginal.q3, marginal.q4]);
+        Ok(taylor.lift(&q_jet, &observed_slope.with_value(0.0)))
+    }
+}
+
+impl BernoulliMarginalSlopeFamily {
 
     /// Analytic fifth-order implicit differentiation. The known fourth-order
     /// intercept determines the fifth Bell remainder of every node. The only
@@ -691,7 +656,6 @@ impl BernoulliMarginalSlopeFamily {
             slope,
             nodes,
             measure_weights,
-            4,
         )?;
         let s = self.probit_frailty_scale();
         let mut fa = 0.0;
@@ -1162,64 +1126,6 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn empirical_fixed_third_trace_from_plan<const K: usize>(
-        plan: &BmsFlexRowProgram,
-        point: &[f64],
-        gram: &[f64],
-    ) -> Result<Array1<f64>, String> {
-        let point: &[f64; K] = point.try_into().map_err(|_| {
-            format!(
-                "fixed empirical BMS point length {} != specialization width {K}",
-                point.len()
-            )
-        })?;
-        if gram.len() != K * K {
-            return Err(format!(
-                "fixed empirical BMS trace gram length {} != {}",
-                gram.len(),
-                K * K
-            ));
-        }
-        let mut gradient = Array1::<f64>::zeros(K);
-        for direction_axis in 0..K {
-            let vars: [FixedRuntimeJet<OneSeed<K>, K>; K] = std::array::from_fn(|axis| {
-                FixedRuntimeJet::from_inner(OneSeed::seed_direction(
-                    point[axis],
-                    axis,
-                    f64::from(axis == direction_axis),
-                ))
-            });
-            let contracted = plan
-                .evaluate(&vars, 3, &())?
-                .into_inner()
-                .contracted_third();
-            gradient[direction_axis] = contracted
-                .iter()
-                .flatten()
-                .zip(gram)
-                .map(|(third, weight)| third * weight)
-                .sum();
-        }
-        Ok(gradient)
-    }
-
-    fn empirical_fixed_third_trace_dispatch(
-        plan: &BmsFlexRowProgram,
-        point: &[f64],
-        gram: &[f64],
-        r: usize,
-    ) -> Result<Array1<f64>, String> {
-        match r {
-            4 => Self::empirical_fixed_third_trace_from_plan::<4>(plan, point, gram),
-            8 => Self::empirical_fixed_third_trace_from_plan::<8>(plan, point, gram),
-            12 => Self::empirical_fixed_third_trace_from_plan::<12>(plan, point, gram),
-            18 => Self::empirical_fixed_third_trace_from_plan::<18>(plan, point, gram),
-            _ => Err(format!(
-                "unsupported fixed empirical BMS third-trace specialization width {r}"
-            )),
-        }
-    }
-
     pub(super) fn empirical_fixed_fourth_many_from_plan<const K: usize>(
         plan: &BmsFlexRowProgram,
         point: &[f64],
@@ -1381,9 +1287,10 @@ impl BernoulliMarginalSlopeFamily {
             EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan => {
                 Self::empirical_fixed_third_many_dispatch(&plan, &point, row_dirs, r)
             }
-            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => EMPIRICAL_BMS_THIRD_WORKSPACE
+            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => self
+                .jet_scratch
+                .batch
                 .with(|workspace| {
-                    let mut workspace = workspace.borrow_mut();
                     let mut contracted = Vec::with_capacity(row_dirs.len());
                     for directions in row_dirs.chunks(lanes) {
                         workspace.reset(directions.len());
@@ -1411,10 +1318,14 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    /// Trace-contract every Hessian index of the full third derivative from one
-    /// row plan. Direction `c` is seeded by basis vector `e_c`, then reduced
-    /// immediately to `sum_ab gram[ab] * d3[abc]`; no rank-three tensor is
-    /// materialized.
+    /// `g_c = Σ_ab gram[ab] · D³f[a,b,c]` from one row plan.
+    ///
+    /// D³f is symmetric in `(a, b)`, so only `S = (gram + gramᵀ)/2` enters,
+    /// and with `S = Σ_k λ_k v_k v_kᵀ`, `g = Σ_k λ_k D³f[v_k, v_k, ·]`. One
+    /// [`DynamicTraceJet`] pass carries every `D³f[v_k, v_k, ·]` at `O(r)`
+    /// floats per lane, where seeding one contraction lane per output axis
+    /// carries an `r × r` Hessian in each (gam#2998). No rank-three tensor is
+    /// materialized and no width has its own schedule.
     pub(super) fn empirical_flex_row_third_trace_gradient(
         &self,
         row: usize,
@@ -1438,6 +1349,20 @@ impl BernoulliMarginalSlopeFamily {
         if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
             return Err("non-finite empirical flexible row context in third trace gradient".into());
         }
+        let symmetric = Array2::from_shape_fn((r, r), |(a, b)| 0.5 * (gram[a * r + b] + gram[b * r + a]));
+        let (scales, directions) =
+            gam_linalg::faer_ndarray::FaerEigh::eigh(&symmetric, faer::Side::Lower).map_err(
+                |error| {
+                    format!(
+                        "bernoulli empirical flex third trace: gram eigendecomposition failed: {error}"
+                    )
+                },
+            )?;
+        let lanes: Vec<usize> = (0..r).filter(|&k| scales[k] != 0.0).collect();
+        let mut gradient = Array1::<f64>::zeros(r);
+        if lanes.is_empty() {
+            return Ok(gradient);
+        }
         let plan = self.compile_empirical_bms_row_program(
             row,
             primary,
@@ -1449,41 +1374,22 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        match empirical_bms_third_jet_schedule(r) {
-            EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan => {
-                Self::empirical_fixed_third_trace_dispatch(&plan, &point, gram, r)
+        self.jet_scratch.trace.with(|workspace| {
+            workspace.reset(lanes.len());
+            let vars = workspace.alloc_slice_fill_with(r, |axis| {
+                DynamicTraceJet::seed_directions(point[axis], axis, r, &workspace, |lane| {
+                    directions[[axis, lanes[lane]]]
+                })
+            });
+            let jet = plan.evaluate(vars, 3, &workspace)?;
+            for (lane, &k) in lanes.iter().enumerate() {
+                let scale = scales[k];
+                for (out, &third) in gradient.iter_mut().zip(jet.second_directional_gradient(lane)) {
+                    *out += scale * third;
+                }
             }
-            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => EMPIRICAL_BMS_THIRD_WORKSPACE
-                .with(|workspace| {
-                    let mut workspace = workspace.borrow_mut();
-                    let mut gradient = Array1::<f64>::zeros(r);
-                    for axis_start in (0..r).step_by(lanes) {
-                        let active_lanes = (r - axis_start).min(lanes);
-                        workspace.reset(active_lanes);
-                        let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                            DynamicOneSeedBatch::seed_directions(
-                                point[axis],
-                                axis,
-                                r,
-                                &workspace,
-                                |lane| {
-                                    if axis_start + lane == axis { 1.0 } else { 0.0 }
-                                },
-                            )
-                        });
-                        let jet = plan.evaluate(vars, 3, &workspace)?;
-                        for lane in 0..active_lanes {
-                            gradient[axis_start + lane] = jet
-                                .contracted_third(lane)
-                                .iter()
-                                .zip(gram)
-                                .map(|(third, weight)| third * weight)
-                                .sum();
-                        }
-                    }
-                    Ok(gradient)
-                }),
-        }
+            Ok(gradient)
+        })
     }
 
     pub(super) fn empirical_flex_row_fourth_contracted(
@@ -1647,6 +1553,7 @@ impl BernoulliMarginalSlopeFamily {
                     direction_pairs,
                     primary,
                     lanes,
+                    &self.jet_scratch.batch,
                 )
             }
         }
@@ -1660,11 +1567,11 @@ impl BernoulliMarginalSlopeFamily {
         direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
         primary: &PrimarySlices,
         lanes: usize,
+        scratch: &super::hessian_paths::JetScratchPool,
     ) -> Result<Vec<Array2<f64>>, String> {
         let r = primary.total;
         let is_zero = |direction: &Array1<f64>| direction.iter().all(|value| *value == 0.0);
-        EMPIRICAL_BMS_FOURTH_WORKSPACE.with(|workspace| {
-            let mut workspace = workspace.borrow_mut();
+        scratch.with(|workspace| {
             let mut contracted = Vec::with_capacity(direction_pairs.len());
             for pairs in direction_pairs.chunks(lanes) {
                 workspace.reset(pairs.len());
@@ -1913,13 +1820,15 @@ impl BernoulliMarginalSlopeFamily {
     /// 32 ψ-axes pays the heavy empirical jet at most once per row.
     ///
     /// Readers are row passes that already run in parallel over rows, so a row
-    /// is built serially by the reader that owns it: no reader starts a nested
-    /// full-`n` build. That was the old contract, and `RayonSafeOnce` lets
-    /// every concurrent first caller run its own initializer, so each worker
-    /// that entered a row fold before the first publish rebuilt the whole
-    /// table: up to one full-`n` jet pass per pool thread, the extra work
-    /// growing with the thread count. A failed row's `Err` is stored in that
-    /// row's slot and propagates identically to every reader of the row.
+    /// is built serially by its first reader, and concurrent readers of the
+    /// same row wait for it ([`RigidRowTensors`]): no reader starts a nested
+    /// full-`n` build and no row is built twice. A whole-table lazy build was
+    /// the old contract, and `RayonSafeOnce` lets every concurrent first caller
+    /// run its own initializer, so each worker that entered a row fold before
+    /// the first publish rebuilt the whole table: up to one full-`n` jet pass
+    /// per pool thread, the extra work growing with the thread count. A failed
+    /// row's `Err` is stored in that row's slot and propagates identically to
+    /// every reader of the row.
     pub(super) fn rigid_third_full_cached<'a>(
         &self,
         block_states: &[ParameterBlockState],
@@ -1935,8 +1844,9 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// One row of a per-row rigid full-derivative tensor table: allocate the
-    /// table's row slots on first touch, then build and store this row's
-    /// tensor on the row's first read.
+    /// table on first touch, then build and store this row's tensor on the
+    /// row's first read. The table holder is a `RayonSafeOnce`, so a racing
+    /// allocation only discards an unbuilt table.
     ///
     /// The standard-normal arm of `row_fn` is a compile-time row-program
     /// lowering that emits exactly the requested tensor order; empirical-grid
@@ -1946,7 +1856,7 @@ impl BernoulliMarginalSlopeFamily {
     /// the third-order cache.
     fn rigid_full_tensor_for_row<'a, T, R>(
         &self,
-        table: &'a gam_runtime::resource::RayonSafeOnce<Vec<RigidRowTensorSlot<T>>>,
+        table: &'a gam_runtime::resource::RayonSafeOnce<RigidRowTensors<T>>,
         block_states: &[ParameterBlockState],
         row: usize,
         row_fn: R,
@@ -1954,18 +1864,12 @@ impl BernoulliMarginalSlopeFamily {
     where
         R: FnOnce(BernoulliMarginalLinkMap, f64) -> Result<T, String>,
     {
-        let slots = table.get_or_compute(|| {
-            (0..self.y.len())
-                .map(|_| RigidRowTensorSlot::new())
-                .collect::<Vec<_>>()
-        });
-        slots[row]
-            .get_or_compute(|| {
+        table
+            .get_or_compute(|| RigidRowTensors::new(self.y.len()))
+            .row(row, || {
                 let marginal = self.marginal_link_map(block_states[0].eta[row])?;
                 row_fn(marginal, block_states[1].eta[row])
             })
-            .as_ref()
-            .map_err(|err| err.clone())
     }
 
     /// Look up the per-row rigid uncontracted fourth-derivative tensor.
@@ -2366,9 +2270,14 @@ impl BernoulliMarginalSlopeFamily {
         Ok(crate::survival::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln()))
     }
 
-    /// Evaluate the canonical rigid standard-normal row program with the slope
-    /// already lifted through a jet-valued frailty scale. `probit_scale = 1`
-    /// prevents a second scale application inside the single row expression.
+    /// Evaluate the row's rigid kernel on its own latent law with the slope
+    /// already lifted through a jet-valued frailty scale: the observed slope
+    /// `s·g` carries the frailty-scale seed, and both kernels read the scale only
+    /// through it. The standard-normal program runs at `probit_scale = 1`, which
+    /// prevents a second scale application inside the single row expression; an
+    /// empirical grid lifts its anchored intercept at the same observed slope
+    /// (gam#3059), so a learned σ is differentiated on the finite law the fit
+    /// anchors on.
     fn row_neglog_canonical_scale_jet<S: gam_math::jet_scalar::JetScalar<2>>(
         &self,
         row: usize,
@@ -2377,15 +2286,27 @@ impl BernoulliMarginalSlopeFamily {
         scale: &S,
     ) -> Result<S, String> {
         let marginal = self.marginal_link_map(block_states[0].eta[row])?;
-        let observed_primaries = [primaries[0], primaries[1].mul(scale)];
-        rigid_standard_normal_row_nll_generic(
-            &observed_primaries,
-            marginal,
-            self.z[row],
-            self.y[row],
-            self.weights[row],
-            1.0,
-        )
+        let observed_slope = primaries[1].mul(scale);
+        match self.training_row_grid(row)? {
+            None => rigid_standard_normal_row_nll_generic(
+                &[primaries[0], observed_slope],
+                marginal,
+                self.z[row],
+                self.y[row],
+                self.weights[row],
+                1.0,
+            ),
+            Some(grid) => {
+                self.empirical_rigid_row_nll_lift(
+                    row,
+                    marginal,
+                    &primaries[0],
+                    &observed_slope,
+                    &grid.nodes,
+                    &grid.weights,
+                )
+            }
+        }
     }
 
     pub(super) fn row_sigma_primary_terms(
@@ -2920,8 +2841,7 @@ impl BernoulliMarginalSlopeFamily {
         // ~0.1% hit rate at large scale while pinning multiple GiB of resident
         // moment entries and serialising every row behind its mutex (insert +
         // eviction churn). Intra-β reuse of a single row's moments is already
-        // served by the per-row `degree9_cells` cache and the
-        // `RowCellMomentsBundle`; the cross-row layer buys nothing here. Skip it
+        // served by the `RowCellMomentsBundle`; the cross-row layer buys nothing here. Skip it
         // and evaluate uncached — bit-identical to a cold LRU miss, which still
         // honours the affine tail-cell memo inside `evaluate_cell_moments`.
         if self.flex_active() {
@@ -3399,7 +3319,7 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
         }
-        log::info!(
+        log::debug!(
             "[bernoulli intercept warm-start] preseeded={} (cold), kept_warm={} (carried over from previous PIRLS)",
             preseeded,
             kept_warm,
@@ -3511,7 +3431,7 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
         }
-        log::info!(
+        log::debug!(
             "[bernoulli intercept warm-start rows={}] preseeded={} (cold), kept_warm={} (carried over from previous PIRLS)",
             rows.len(),
             preseeded,
@@ -3611,7 +3531,7 @@ mod empirical_rigid_jet_oracle_tests {
     //!
     //!   * re-solves the calibration intercept root with its OWN self-contained
     //!     Newton iteration (sharing no code with
-    //!     `empirical_intercept_from_marginal` / the production IFT chain), and
+    //!     `latent_anchor::solve_anchor` / the production anchor table), and
     //!   * builds the scalar row NLL `ℓ(m, g) = −w·logΦ(sign·(a(m,g) + s·g·z))`
     //!     from `normal_logcdf`,
     //!
@@ -3626,7 +3546,7 @@ mod empirical_rigid_jet_oracle_tests {
 
     /// Independent calibration-intercept root solve: the unique `a` with
     /// `Σ_k π_k Φ(a + s·g·x_k) = μ`. Plain damped Newton from a bracketed seed;
-    /// shares no code with `empirical_intercept_from_marginal`.
+    /// shares no code with `latent_anchor::solve_anchor`.
     // Witness-exact standard-normal primitives (`libm::erfc`, no piecewise
     // rational approximation). The high-order FD witness divides by h⁴, so it
     // amplifies any *smooth* approximation error in the CDF/logCDF by ~1/h⁴:
@@ -3784,6 +3704,7 @@ mod empirical_rigid_jet_oracle_tests {
             policy: policy.clone(),
             cell_moment_lru: new_cell_moment_lru_cache(&policy),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
+            jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
@@ -3799,6 +3720,167 @@ mod empirical_rigid_jet_oracle_tests {
         let total: f64 = raw.iter().sum();
         let weights: Vec<f64> = raw.iter().map(|w| w / total).collect();
         EmpiricalZGrid::new(nodes, weights, "empirical rigid jet oracle").expect("valid grid")
+    }
+
+    /// gam#3059: the log-sigma derivatives of the row's (objective, primary
+    /// gradient, primary Hessian) on a finite law are those of the anchored
+    /// finite-law kernel itself — central differences in `t = log σ` of the
+    /// production grid channels, at a re-anchored intercept for every `σ`.
+    #[test]
+    fn empirical_rigid_log_sigma_terms_match_the_finite_law_difference_3059() {
+        let sigma = 0.6_f64;
+        let family = empirical_family(
+            vec![1.0, 0.0],
+            vec![0.9, -0.4],
+            vec![1.0, 0.8],
+            Some(sigma),
+            test_grid(),
+        );
+        let states = [
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: Array1::from_vec(vec![0.3, -0.5]),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: Array1::from_vec(vec![0.7, 1.1]),
+            },
+        ];
+        let grid = test_grid();
+        let channels = |row: usize, t: f64| {
+            let mut shifted = family.clone();
+            shifted.gaussian_frailty_sd = Some(sigma * t.exp());
+            let marginal = shifted
+                .marginal_link_map(states[0].eta[row])
+                .expect("marginal link map");
+            let (value, grad, hess) = shifted
+                .empirical_rigid_primary_grad_hess_closed_form(
+                    row,
+                    marginal,
+                    states[1].eta[row],
+                    &grid.nodes,
+                    &grid.weights,
+                )
+                .expect("finite-law channels");
+            [
+                value, grad[0], grad[1], hess[0][0], hess[0][1], hess[1][0], hess[1][1],
+            ]
+        };
+        let h = 1e-3;
+        for row in 0..2 {
+            let (d_value, d_grad, d_hess) = family
+                .row_sigma_primary_terms(row, &states, false)
+                .expect("first log-sigma terms");
+            let (dd_value, dd_grad, dd_hess) = family
+                .row_sigma_primary_terms(row, &states, true)
+                .expect("second log-sigma terms");
+            let jet_first = [
+                d_value,
+                d_grad[0],
+                d_grad[1],
+                d_hess[[0, 0]],
+                d_hess[[0, 1]],
+                d_hess[[1, 0]],
+                d_hess[[1, 1]],
+            ];
+            let jet_second = [
+                dd_value,
+                dd_grad[0],
+                dd_grad[1],
+                dd_hess[[0, 0]],
+                dd_hess[[0, 1]],
+                dd_hess[[1, 0]],
+                dd_hess[[1, 1]],
+            ];
+            let (plus, centre, minus) = (channels(row, h), channels(row, 0.0), channels(row, -h));
+            for k in 0..7 {
+                let fd_first = (plus[k] - minus[k]) / (2.0 * h);
+                let fd_second = (plus[k] - 2.0 * centre[k] + minus[k]) / (h * h);
+                assert!(
+                    (jet_first[k] - fd_first).abs() <= 1e-6 * (1.0 + fd_first.abs()),
+                    "row {row} channel {k}: d/dlogσ jet {} vs finite-law difference {fd_first}",
+                    jet_first[k]
+                );
+                assert!(
+                    (jet_second[k] - fd_second).abs() <= 1e-4 * (1.0 + fd_second.abs()),
+                    "row {row} channel {k}: d²/dlogσ² jet {} vs finite-law difference {fd_second}",
+                    jet_second[k]
+                );
+            }
+        }
+    }
+
+    /// gam#2978: the marginal pull of a row never vanishes in either tail. At the
+    /// indices the refusing seeds stalled at (`η = 32.84, −7.66, −12.31`) the
+    /// retired probability clamp pinned `q` and zeroed `q1`, so `∂NLL/∂η` read
+    /// exactly zero (`0e0` against a ridge pull `w·c·|m| = 9.407e0` at
+    /// `η = −7.66, y = 1`) and the outer search saw a false stationary point. On
+    /// both the standard-normal and the finite-law route the gradient must be
+    /// nonzero, pull toward the observed outcome, and be the derivative of the
+    /// row objective the same kernel reports: against the closed form
+    /// `−w·σ·φ(q)/Φ(σq)` at `g = 0`, where both routes anchor `a = q`, and
+    /// against a central difference of the reported value at `g ≠ 0`.
+    #[test]
+    fn marginal_pull_is_exact_and_nonzero_in_both_probit_tails_2978() {
+        let w = 1.3_f64;
+        let z = 0.9_f64;
+        for &route_is_empirical in &[false, true] {
+            for &y in &[1.0_f64, 0.0] {
+                let mut family =
+                    empirical_family(vec![y], vec![z], vec![w], None, test_grid());
+                if !route_is_empirical {
+                    family.latent_measure = LatentMeasureKind::StandardNormal;
+                }
+                let sign = 2.0 * y - 1.0;
+                for &m in &[32.84_f64, 12.31, 7.66, -7.66, -12.31, -32.84] {
+                    let kernel = |m: f64, g: f64| {
+                        let marginal = family.marginal_link_map(m).expect("exact link map");
+                        family
+                            .rigid_row_kernel_eval(0, marginal, g)
+                            .unwrap_or_else(|e| panic!("m={m}, g={g}, y={y}: {e}"))
+                    };
+                    // g = 0: the anchored intercept is q itself on either route.
+                    let (_, grad, _) = kernel(m, 0.0);
+                    let log_ratio = -0.5 * m * m
+                        - 0.5 * (2.0 * std::f64::consts::PI).ln()
+                        - crate::probability::normal_logcdf(sign * m);
+                    let closed_form = -w * sign * log_ratio.exp();
+                    let pull = -sign * grad[0];
+                    assert!(
+                        pull > 0.0 && pull.is_finite(),
+                        "empirical={route_is_empirical} m={m} y={y}: pull −sign·∂NLL/∂η = \
+                         {pull:e} must be positive"
+                    );
+                    assert!(
+                        (grad[0] - closed_form).abs() <= 1e-9 * closed_form.abs(),
+                        "empirical={route_is_empirical} m={m} y={y} g=0: ∂NLL/∂η = {:e} vs \
+                         closed form {closed_form:e}",
+                        grad[0]
+                    );
+                    // g ≠ 0: the gradient is the derivative of the reported value.
+                    // A row whose objective itself is below the smallest double
+                    // (`m = 32.84, y = 1` puts the Gaussian row index near 40.7,
+                    // `−log Φ(40.7) ≈ 1e-362`) carries no representable pull; every
+                    // row the kernel resolves must pull toward its outcome.
+                    let g = 0.7;
+                    let (value, grad, _) = kernel(m, g);
+                    let h = 1e-5;
+                    let fd = (kernel(m + h, g).0 - kernel(m - h, g).0) / (2.0 * h);
+                    assert!(
+                        value == 0.0 || -sign * grad[0] > 0.0,
+                        "empirical={route_is_empirical} m={m} y={y} g={g}: ∂NLL/∂η = {:e} \
+                         pulls away from the outcome",
+                        grad[0]
+                    );
+                    assert!(
+                        (grad[0] - fd).abs() <= 1e-5 * fd.abs(),
+                        "empirical={route_is_empirical} m={m} y={y} g={g}: ∂NLL/∂η = {:e} vs \
+                         central difference {fd:e}",
+                        grad[0]
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -4451,6 +4533,7 @@ mod empirical_flex_jet_oracle_tests {
             policy: policy.clone(),
             cell_moment_lru: new_cell_moment_lru_cache(&policy),
             cell_moment_cache_stats: new_cell_moment_cache_stats(),
+            jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
@@ -4866,18 +4949,21 @@ mod empirical_flex_jet_oracle_tests {
     // single-source contract this gate is meant to enforce.
 
     fn runtime_for_primary_dimension(total_dimension: usize) -> DeviationRuntime {
+        // A clamped cubic vector with `k` internal knots keeps `k + 1` directions
+        // after the smoothness drop, so every width from one up is reachable. A
+        // simple-ended vector needs eight knots, and so three ramps, before it has
+        // any direction at all (gam#3011).
         let wanted = total_dimension - 2;
-        for n_knots in 5..=40 {
-            let knots = Array1::from_iter(
-                (0..n_knots).map(|i| -2.45_f64 + 5.0_f64 * (i as f64) / ((n_knots - 1) as f64)),
-            );
-            if let Ok(runtime) = DeviationRuntime::try_new(knots, 0.0, 3)
-                && runtime.basis_dim() == wanted
-            {
-                return runtime;
-            }
-        }
-        panic!("no deviation runtime realizes total primary dimension {total_dimension}");
+        let seed = Array1::from_vec(vec![-2.45_f64, 2.55]);
+        let knots = gam_terms::basis::initializewiggle_knots_from_seed(seed.view(), 3, wanted - 1)
+            .expect("clamped deviation knots");
+        let runtime = DeviationRuntime::try_new(knots, 0.0, 3).expect("deviation runtime");
+        assert_eq!(
+            runtime.basis_dim(),
+            wanted,
+            "a clamped runtime realizes total primary dimension {total_dimension}"
+        );
+        runtime
     }
 
     fn make_dimension_fixture(is_score_warp: bool, total_dimension: usize) -> FlexFixture {
@@ -4928,7 +5014,6 @@ mod empirical_flex_jet_oracle_tests {
                 intercept,
                 m_a: f_a,
                 intercept_fast_path: false,
-                degree9_cells: None,
             },
         )
     }

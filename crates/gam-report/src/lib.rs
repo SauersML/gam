@@ -102,7 +102,6 @@ pub struct SmoothingForensicsRow {
     pub edf_assembly: Option<f64>,
     pub double_penalty_range: Option<f64>,
     pub double_penalty_null_space: Option<f64>,
-    pub seed_screening: Vec<String>,
 }
 
 /// First-order optimality evidence carried into a rendered report.
@@ -877,15 +876,10 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
             .smoothing_forensics
             .iter()
             .map(|row| {
-                let seeds = if row.seed_screening.is_empty() {
-                    "—".to_string()
-                } else {
-                    esc(&row.seed_screening.join("; "))
-                };
                 format!(
                     "<tr><td>{}</td><td class=\"mono\">{}</td><td class=\"mono\">{}</td>\
                      <td class=\"num\">{}</td><td class=\"num\">{}</td>\
-                     <td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td></tr>",
+                     <td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
                     esc(&row.term),
                     esc(&fmt_path(&row.lambda_path)),
                     esc(&fmt_path(&row.sigma2_path)),
@@ -893,7 +887,6 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
                     fmt_opt(row.edf_assembly),
                     fmt_opt(row.double_penalty_range),
                     fmt_opt(row.double_penalty_null_space),
-                    seeds,
                 )
             })
             .collect::<Vec<_>>()
@@ -901,9 +894,9 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
         format!(
             "<section class=\"card\" id=\"sec-smoothing-forensics\">\n\
              <h2>Smoothing Forensics</h2>\n\
-             <p class=\"muted\">Diagnostic-only state for over-smoothing investigations: λ and σ² paths, criterion-vs-assembly EDF, double-penalty split, and seed-screening verdicts.</p>\n\
+             <p class=\"muted\">Diagnostic-only state for over-smoothing investigations: λ and σ² paths, criterion-vs-assembly EDF, and double-penalty split.</p>\n\
              <div class=\"table-wrap\"><table>\n\
-             <thead><tr><th>Term</th><th>λ path</th><th>σ² path</th><th>EDF criterion</th><th>EDF assembly</th><th>Range penalty</th><th>Null-space penalty</th><th>Seed screening</th></tr></thead>\n\
+             <thead><tr><th>Term</th><th>λ path</th><th>σ² path</th><th>EDF criterion</th><th>EDF assembly</th><th>Range penalty</th><th>Null-space penalty</th></tr></thead>\n\
              <tbody>{rows}</tbody>\n</table></div>\n</section>"
         )
     };
@@ -1344,6 +1337,71 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
+/// `value` to six significant digits in C's `%g` form: fixed notation for
+/// decimal exponents in `[-4, 6)`, scientific otherwise, trailing zeros trimmed.
+/// The number format of every printed model summary.
+pub fn format_significant(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value == f64::INFINITY {
+        return "inf".to_string();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-inf".to_string();
+    }
+    if value == 0.0 {
+        return "0".to_string();
+    }
+
+    let exponent = value.abs().log10().floor() as i32;
+    let mut out = if !(-4..6).contains(&exponent) {
+        let raw = format!("{:.5e}", value);
+        normalize_exponent(&raw)
+    } else {
+        let places = (6 - exponent - 1).max(0) as usize;
+        trim_float(format!("{:.*}", places, value))
+    };
+    if out == "-0" {
+        out = "0".to_string();
+    }
+    out
+}
+
+fn normalize_exponent(raw: &str) -> String {
+    let Some((mantissa, exponent)) = raw.split_once('e') else {
+        return raw.to_string();
+    };
+    let mantissa = trim_float(mantissa.to_string());
+    let (sign, digits) = if let Some(rest) = exponent.strip_prefix('-') {
+        ('-', rest)
+    } else if let Some(rest) = exponent.strip_prefix('+') {
+        ('+', rest)
+    } else {
+        ('+', exponent)
+    };
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let padded = if digits.len() == 1 {
+        format!("0{digits}")
+    } else {
+        digits.to_string()
+    };
+    format!("{mantissa}e{sign}{padded}")
+}
+
+fn trim_float(mut value: String) -> String {
+    if value.contains('.') {
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+    }
+    value
+}
+
 /// The words for a fit with no REML/LAML criterion at all: an exactly
 /// interpolating Gaussian fit, whose profiled restricted likelihood is unbounded.
 const NO_CRITERION_WORDS: &str = "none (exact fit: criterion unbounded)";
@@ -1754,12 +1812,10 @@ mod tests {
             edf_assembly: Some(3.1),
             double_penalty_range: Some(2.0),
             double_penalty_null_space: Some(1.0),
-            seed_screening: vec!["accepted".to_string()],
         }];
         let html = render_html(&input).unwrap();
         assert!(html.contains("Smoothing Forensics"));
         assert!(html.contains("0.1000 → 0.2000"));
-        assert!(html.contains("accepted"));
     }
 
     #[test]

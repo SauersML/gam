@@ -6,9 +6,9 @@ across-level average at ``predict``, and ``Model.check(...)`` reported
 Root cause: ``factor(g)`` shared the ``group()``/``re()`` parse arm in
 ``formula_dsl`` and was lowered as a *lenient* random effect
 (``lenient_unseen: true``), so an unseen level at predict collapsed onto the
-factor's sum-to-zero centering point instead of raising. ``factor()`` is a fixed
-categorical factor (R ``factor()`` / patsy ``C()`` convention), not a
-random-effect alias: like a bare ``+ g`` categorical main effect (#2102), an
+factor's sum-to-zero centering point instead of raising. ``factor()`` names the
+categorical level effect of a column seen in training, not a held-out-group
+random effect: like a bare ``+ g`` categorical main effect (#2102), an
 unseen level is a schema mismatch that must raise. The unseen policy is now
 carried on ``ParsedTerm::RandomEffect`` and set by the wrapper the user wrote —
 ``factor()`` strict, ``group()``/``re()``/``s(bs="re")`` lenient — so seen-level
@@ -40,11 +40,11 @@ def _make(seed: int = 2) -> pd.DataFrame:
 def test_factor_wrapper_predict_raises_on_unseen_level() -> None:
     """``predict`` on an out-of-vocabulary level of a fixed ``factor(g)`` must
     raise — NOT silently return the centering point. The strict categorical
-    encode raises the same ``GamError`` (``unseen level '…' in categorical
+    encode raises the same ``GamfitError`` (``unseen level '…' in categorical
     column '…'``) that the bare ``+ g`` path has raised since #2102, so the two
     fixed-factor spellings are now consistent."""
     m = gamfit.fit(_make(), "y ~ factor(g)")
-    with pytest.raises(gamfit.GamError) as exc:
+    with pytest.raises(gamfit.errors.GamfitError) as exc:
         m.predict(pd.DataFrame({"g": ["z"]}))
     assert "unseen level" in str(exc.value)
     assert "g" in str(exc.value)
@@ -59,7 +59,7 @@ def test_factor_wrapper_matches_bare_categorical_on_unseen_level() -> None:
     unseen = pd.DataFrame({"g": ["z"]})
     for formula in ("y ~ g", "y ~ factor(g)"):
         m = gamfit.fit(df, formula)
-        with pytest.raises(gamfit.GamError):
+        with pytest.raises(gamfit.errors.GamfitError):
             m.predict(unseen)
         assert m.check(unseen).ok is False, f"{formula} must flag the unseen level"
 
@@ -109,7 +109,7 @@ def test_numeric_coded_factor_predict_and_check_flag_unseen_code() -> None:
     m = gamfit.fit(pd.DataFrame({"year": year, "y": y}), "y ~ factor(year)")
 
     unseen = pd.DataFrame({"year": [1999.0]})
-    with pytest.raises(gamfit.GamError):
+    with pytest.raises(gamfit.errors.GamfitError):
         m.predict(unseen)
     assert m.check(unseen).ok is False, "check() must flag an unseen numeric factor code"
 

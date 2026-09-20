@@ -195,7 +195,7 @@ fn zz_measure_inner_step_acceptance_trace_2267() {
             // below already gates the macros, but `log::log_enabled!` and any
             // logger that consults us directly must get the same answer, or the
             // trace this probe reads would silently disagree with the filter.
-            metadata.level() <= log::Level::Debug
+            metadata.level() <= log::Level::Trace
         }
         fn log(&self, record: &log::Record<'_>) {
             eprintln!("[{}] {}", record.level(), record.args());
@@ -204,7 +204,7 @@ fn zz_measure_inner_step_acceptance_trace_2267() {
     }
     static FORWARDING_TEST_LOGGER: ForwardingTestLogger = ForwardingTestLogger;
     if log::set_logger(&FORWARDING_TEST_LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Debug);
+        log::set_max_level(log::LevelFilter::Trace);
     }
 
     let (mut term, z, rho) = p16_circle_rung();

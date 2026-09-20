@@ -357,7 +357,7 @@ fn zz_2691_euclidean_line_refusal_sweep() {
     }
 }
 
-/// The FULL production entry, the way `gamfit.sae_manifold_fit` reaches it:
+/// The FULL production entry, the way `gamfit.sae.sae_manifold_fit` reaches it:
 /// minimal seed → fit seed → `run_sae_manifold_fit` with
 /// `run_outer_rho_search: true`. This is the only structural difference from
 /// [`fit_and_measure_chart`], which drives the inner joint fit alone at a FIXED
@@ -616,7 +616,7 @@ fn zz_2691_ard_precision_ladder_collapses_the_chart() {
 /// certified fit whose coordinate is a constant.
 ///
 /// The fixture is the ARD ladder's terminal rung driven through the REAL entry
-/// (`run_sae_manifold_fit`, the same function `gamfit.sae_manifold_fit` calls),
+/// (`run_sae_manifold_fit`, the same function `gamfit.sae.sae_manifold_fit` calls),
 /// at a FIXED ρ so the collapse is placed by construction rather than waited
 /// for: `α = 1e9` on the periodic chart axis. At the parent commit this call
 /// returns `Ok` with `coord_std = 5.000e-1`, one distinct chart point over 70
@@ -1093,15 +1093,21 @@ fn zz_2691_bounded_sigma_witness_returns_an_answer_at_every_sigma() {
             .with_max_iter(8)
             .run(&mut objective, "SAE #2691 bounded σ witness");
         let secs = start.elapsed().as_secs_f64();
+        // A budget-bounded search that does not certify stationarity mints no
+        // fit; it refuses with its best iterate as the checkpoint. That iterate
+        // IS the terminal ρ this witness reads — where the search put the ARD
+        // coordinate when its iterations ran out. Any other error returns no
+        // iterate at all, which is exactly the "no answer at this σ" the test
+        // name forbids.
         let (terminal, converged) = match &result {
             Ok(outcome) => (outcome.rho[ard_index], outcome.converged()),
-            Err(error) => {
-                eprintln!(
-                    "[2691-sigma] {sigma:.3}\t{face:.4}\t{seed:.4}\t-\t-\t-\t{secs:.1}\tREFUSED: {}",
-                    format!("{error}").replace('\n', " ")
-                );
-                continue;
+            Err(EstimationError::RemlDidNotConverge { rho_checkpoint, reason, .. }) => {
+                eprintln!("[2691-sigma] {sigma:.3}\tcheckpoint after: {reason}");
+                (rho_checkpoint[ard_index], false)
             }
+            Err(error) => panic!(
+                "#2691: the bounded σ witness returned no terminal ρ at σ={sigma}: {error}"
+            ),
         };
         let moved = (terminal - seed).abs() > 1.0e-9;
         any_moved |= moved;

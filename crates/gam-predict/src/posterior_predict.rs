@@ -789,6 +789,9 @@ fn gaussian_location_scale_draws(
         .link_wiggle;
     let wiggle_range = block_range(fit, BlockRole::LinkWiggle);
     validate_runtime_width(link_wiggle.as_ref(), wiggle_range.as_ref(), model_class)?;
+    let sigma_floor =
+        gam_models::inference::model::gaussian_location_scale_saved_sigma_floor(model.payload())
+            .map_err(|error| inconsistent_state_error(model_class, error.to_string()))?;
     let mut predictor = GaussianLocationScalePredictor {
         beta_mu: fit
             .beta
@@ -798,7 +801,7 @@ fn gaussian_location_scale_draws(
             .beta
             .slice(s![scale_range.start..scale_range.end])
             .to_owned(),
-        sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+        sigma_floor,
         response_scale: model.gaussian_response_scale.unwrap_or(1.0),
         covariance: None,
         link_wiggle: link_wiggle.take(),

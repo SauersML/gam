@@ -98,19 +98,10 @@ pub struct ExactNewtonJointGradientEvaluation {
     pub gradient: Array1<f64>,
 }
 
-/// The absolute row summands behind a workspace's joint gradient (#2976).
-///
-/// A gradient summed from rows carries the rounding of that sum, which scales with
-/// the summands' magnitudes and not with the assembled result: near a mode each
-/// row's term is `O(1)` while their sum is small.
-pub struct GradientAccumulation {
-    /// The sequential depth of the floating-point reduction that sums the terms:
-    /// the `m` of the `γ_m` that bands the sum.
-    pub accumulation_depth: usize,
-    /// `Σ |terms|` per coordinate in flattened coefficient-block order: every
-    /// product the reduction adds into that coordinate, in absolute value.
-    pub absolute_sums: Array1<f64>,
-}
+/// The absolute row summands behind a workspace's joint gradient (#2976), in flattened
+/// coefficient-block order. The type is the roundoff owner's, so a gradient assembled
+/// outside a custom family carries the same record (#2822).
+pub use gam_linalg::roundoff::GradientAccumulation;
 
 /// Batched per-θ_j contributions to the analytic outer gradient.
 ///
@@ -370,6 +361,13 @@ pub trait IndependentOuterSearch<F> {
     /// A member for one search: its per-fit state fresh, as a newly built family
     /// has it, and its memory choices read from `lane`.
     fn outer_search_member(&self, lane: Arc<gam_runtime::resource::SearchLaneBudget>) -> F;
+
+    /// The starts searched beside the fit's own derived start, each a common
+    /// log-smoothing level `ℓ` for every coordinate (`+∞` names the upper face of
+    /// the search box). The runner projects each into the search box and drops
+    /// duplicates. Empty means the family's surface has no second certified basin
+    /// on record, and the fit runs one search.
+    fn additional_outer_start_levels(&self) -> Vec<f64>;
 }
 
 /// User-defined family contract for multi-block generalized models.
@@ -537,6 +535,44 @@ pub trait CustomFamily {
         false
     }
 
+    /// Why a converged coefficient mode is not a mode of its trial point's
+    /// posterior, when the family can prove it is not (gam#3003).
+    ///
+    /// Convergence certifies stationarity. It cannot see a boundary the
+    /// coefficient space approaches without reaching, along which the objective
+    /// `−ℓ + ½βᵀS_λβ` falls below the mode's value: the posterior's infimum then
+    /// lies at infinity, and the mode's Laplace criterion describes nothing. A
+    /// family that has derived such a limit in closed form states it here, and
+    /// the joint criterion refuses the trial point exactly as it refuses an
+    /// unconverged one.
+    ///
+    /// `states` are the mode's coefficient states, `log_likelihood` and
+    /// `penalty_value` the two terms of the objective it minimised, and
+    /// `s_lambdas` each block's `S_λ` at the trial point. The default refuses
+    /// nothing.
+    fn coefficient_mode_refusal(
+        &self,
+        specs: &[ParameterBlockSpec],
+        states: &[ParameterBlockState],
+        log_likelihood: f64,
+        penalty_value: f64,
+        s_lambdas: &[Array2<f64>],
+    ) -> Result<Option<String>, String> {
+        // "Nothing refutes this mode" is a statement about one coefficient point
+        // of one objective, so its parts must describe the same blocks.
+        assert_states_match_specs(states, specs, "coefficient mode refusal");
+        assert_eq!(
+            s_lambdas.len(),
+            specs.len(),
+            "coefficient mode refusal: one S_λ per block"
+        );
+        assert!(
+            log_likelihood.is_finite() && penalty_value.is_finite(),
+            "coefficient mode refusal: a converged mode has a finite objective"
+        );
+        Ok(None)
+    }
+
     /// Whether the outer REML/LAML logdet term `½ log|H + Sλ|` and its analytic
     /// trace gradient `½ tr((H+Sλ)⁺ ∂Sλ)` are evaluated over the FULL
     /// identifiable subspace `range(H + Sλ)` (mgcv's generalized determinant,
@@ -602,22 +638,6 @@ pub trait CustomFamily {
         OuterDerivativePolicy {
             capability: self.exact_outer_derivative_order(specs, options),
         }
-    }
-
-    /// Family-specific outer seeding policy.
-    ///
-    /// The default preserves the generic custom-family behavior. Families with
-    /// a strong warm start can override this to keep seed screening from
-    /// dominating the fit.
-    fn outer_seed_config(&self, n_params: usize) -> gam_problem::SeedConfig {
-        if n_params == 0 {
-            return gam_problem::SeedConfig::default();
-        }
-        let mut config = gam_problem::SeedConfig::default();
-        config.max_seeds = if n_params <= 4 { 6 } else { 4 };
-        config.seed_budget = 1;
-        config.screen_max_inner_iterations = 2;
-        config
     }
 
     /// The family's members for a parallel multistart, when it has them

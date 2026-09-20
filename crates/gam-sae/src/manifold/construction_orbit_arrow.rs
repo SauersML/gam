@@ -348,6 +348,40 @@ impl ArrowJointBlocks {
         (rows + 2.0 * squares(&self.cross) + squares(&self.border)).sqrt()
     }
 
+    /// `self −= other`, block by block; both must hold the same layout.
+    pub(crate) fn subtract(&mut self, other: &Self) -> Result<(), String> {
+        if self.row_offsets != other.row_offsets || self.k != other.k {
+            return Err("ArrowJointBlocks::subtract: the operators hold different layouts".to_string());
+        }
+        for (mine, theirs) in self.rows.iter_mut().zip(other.rows.iter()) {
+            *mine -= theirs;
+        }
+        self.cross -= &other.cross;
+        self.border -= &other.border;
+        Ok(())
+    }
+
+    /// `⟨W, self⟩` over the arrow's positions, the coordinate–border block counted on both
+    /// sides; every position off the arrow is zero in `self`.
+    pub(crate) fn contract<W: JointWeight + ?Sized>(&self, weight: &W) -> Result<f64, String> {
+        let total_t = self.total_t;
+        let mut total = 0.0_f64;
+        for (row, block) in self.rows.iter().enumerate() {
+            let (start, end) = self.row_range(row);
+            total += (&weight.row_block(start, end - start) * block).sum();
+        }
+        for i in 0..total_t {
+            for c in 0..self.k {
+                total += 2.0 * weight.entry(i, total_t + c) * self.cross[[i, c]];
+            }
+        }
+        let border = weight.border_block(total_t).ok_or_else(|| {
+            "ArrowJointBlocks::contract: the weight holds no border at this layout".to_string()
+        })?;
+        total += (&border * &self.border).sum();
+        Ok(total)
+    }
+
     /// The operator applied to a joint vector.
     fn apply(&self, x: ArrayView1<'_, f64>) -> Array1<f64> {
         let total_t = self.total_t;
@@ -1245,7 +1279,7 @@ impl SaeManifoldTerm {
         let certificate = match verdict {
             ArrowOrbitPencilVerdict::Certified(certificate) => certificate,
             ArrowOrbitPencilVerdict::Refused(refusal) => {
-                log::info!("[SAE-ARROW-ORBIT] atom={atom} orbits={orbits} dim={dim} refused: {refusal}");
+                log::debug!("[SAE-ARROW-ORBIT] atom={atom} orbits={orbits} dim={dim} refused: {refusal}");
                 return Err(refuse(refusal));
             }
         };
@@ -1334,7 +1368,7 @@ impl SaeManifoldTerm {
             let integral = geometry.orbit_generators[index]
                 .integrand(coupling_forms[0], coupling_forms[1], coupling_forms[2])
                 .integrate()?;
-            log::info!(
+            log::debug!(
                 "[SAE-ARROW-ORBIT] atom={} priced: nodes={} log I={:.6e} log det N={:.6e} \
                  coupling=[{:.3e}, {:.3e}, {:.3e}]",
                 geometry.orbit_generators[index].atom,
@@ -1356,7 +1390,7 @@ impl SaeManifoldTerm {
         }
         geometry.log_det_correction =
             -log_gram_det - 2.0 * log_integrals + orbits as f64 * std::f64::consts::TAU.ln();
-        log::info!(
+        log::debug!(
             "[SAE-ARROW-ORBIT] certified: τ_cert={:.6e} δ={:.3e} λ_min(Φ)≥{:.3e} ½log|A_s|={:.6e} \
              correction={:.6e} orbit curvatures {:?} against edges {:?}",
             geometry.certificate.threshold,
@@ -1563,6 +1597,14 @@ impl SaeManifoldTerm {
         for (flat, contraction) in operator_traces.contractions {
             logdet_trace[flat] = 0.5 * contraction;
         }
+        // #2231 — the crosscoder block weights reach `A` through the scaled target.
+        self.add_crosscoder_block_logdet_traces(
+            rho,
+            target,
+            cache,
+            &differential.operator_weight,
+            &mut logdet_trace,
+        )?;
         let mut gamma = self.logdet_theta_adjoint_dense(
             rho,
             cache,

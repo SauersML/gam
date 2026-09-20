@@ -817,6 +817,7 @@ mod tests {
                 flavour,
                 group_frozen_levels: Some(vec![0.0_f64.to_bits(), 1.0_f64.to_bits()]),
                 frozen_global_orthogonality: None,
+                adaptive: false,
             },
         }
     }
@@ -857,6 +858,7 @@ mod tests {
                     knotspec: BSplineKnotSpec::PeriodicUniform {
                         data_range: (0.0, 1.0),
                         num_basis: 8,
+                        adaptive: false,
                     },
                     boundary: OneDimensionalBoundary::Cyclic {
                         start: 0.0,
@@ -1132,6 +1134,7 @@ mod tests {
             knotspec: BSplineKnotSpec::PeriodicUniform {
                 data_range: (-0.4 * scale, 1.6 * scale),
                 num_basis: 9,
+                adaptive: false,
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
@@ -1227,7 +1230,7 @@ mod tests {
                 identifiability: TensorBSplineIdentifiability::None,
                 penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
             };
-            build_tensor_bspline_basis(scaled.view(), &[0, 1], &spec)
+            build_tensor_bspline_basis(scaled.view(), &[0, 1], &spec, true)
                 .expect("rescaled tensor basis")
         };
         let reference = build_tensor(1.0, 1.0);
@@ -1250,6 +1253,7 @@ mod tests {
                 flavour,
                 group_frozen_levels: Some(levels.clone()),
                 frozen_global_orthogonality: None,
+                adaptive: false,
             },
         };
         match family {
@@ -1316,7 +1320,7 @@ mod tests {
                 frozen_parametric_residualization: None,
                 name: "scale-contract-wrapper".to_string(),
                 basis,
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             &mut BasisWorkspace::new(),
@@ -1692,9 +1696,10 @@ mod tests {
                 frozen_parametric_residualization: None,
                 name: "matern".to_string(),
                 basis: zoo_basis(BasisScaleFamily::Matern),
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
 
         let error = frozen

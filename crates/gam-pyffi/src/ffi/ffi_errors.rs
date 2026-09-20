@@ -1,52 +1,156 @@
 //! Typed engine-error → Python-exception boundary.
 //!
-//! This module owns the canonical gamfit exception class hierarchy (defined
-//! via `pyo3::create_exception!`) and every typed engine→Python adaptor that
-//! converts a `gam` error enum into the matching exception subclass without a
-//! message-regex classifier (issue #343). Concentrating both the class
-//! identities and the variant-dispatch converters here keeps the error
-//! contract in one place: `gamfit/_exceptions.py` re-exports the classes under
-//! their public `gamfit.*` names, and every FFI submodule reaches the
-//! converters/classes through the crate-root re-export.
+//! This module owns the gamfit exception classes and every adaptor that turns a
+//! typed engine error into one of them. The class is chosen from the error's
+//! type, never from its message (issue #343). `gamfit/_exceptions.py`
+//! re-exports the classes under their public `gamfit.errors.*` names, so the class a
+//! user catches is the type object this module constructs.
 //!
-//! The classes live here (not in any fit/predict module) so the Rust
-//! extension owns the canonical type identity; `gamfit/_exceptions.py`
-//! re-exports them so the public names remain `gamfit.GamError`,
-//! `gamfit.FormulaError`, etc.
+//! The hierarchy has one base and one class per [`ErrorCategory`], the
+//! category every front end classifies an engine error by; the CLI turns the
+//! same category into its exit code:
 //!
-//! Inheritance: every gamfit exception is a subclass of `GamError`, and
-//! `GamError` itself is a subclass of Python's built-in `ValueError`.
-//! That preserves the historical contract that `except ValueError`
-//! catches every engine-side failure (the Rust extension previously
-//! raised bare `PyValueError` for everything), while `except GamError`
-//! becomes the documented broad catch — see issue #330.
+//! ```text
+//! GamfitError(Exception)
+//! ├── FormulaError(GamfitError, ValueError)            ErrorCategory::Formula
+//! ├── DataError(GamfitError, ValueError)               ErrorCategory::Data
+//! ├── ConvergenceError(GamfitError, RuntimeError)      ErrorCategory::Convergence
+//! ├── NotFittedError(GamfitError, ValueError, AttributeError)
+//! │                                                    ErrorCategory::NotFitted
+//! └── InternalError(GamfitError, RuntimeError)         ErrorCategory::Internal
+//! ```
 //!
-//! Adding a new engine error variant: extend `estimation_error_to_pyerr`
-//! (or the per-enum analogue) with the new variant; do NOT add new
-//! patterns to a message-regex classifier.
+//! Every other class subclasses exactly one category class and names a
+//! specific engine variant under it. A bad request or bad data is a
+//! `ValueError`; a solve that did not finish and an engine defect are
+//! `RuntimeError`s, since the arguments were valid. `NotFittedError` carries
+//! the bases of scikit-learn's `NotFittedError`, so scikit-learn's unfitted
+//! checks accept it without `import gamfit` importing scikit-learn.
+//!
+//! Adding an engine error variant: give it an [`ErrorCategory`] in Rust, then
+//! extend the dispatcher for its enum with a class under that category's class.
 
 use crate::ffi_prelude::*;
 
+use gam::ErrorCategory;
 use pyo3::create_exception;
+use pyo3::exceptions::{PyAttributeError, PyRuntimeError};
+use pyo3::types::PyTuple;
+
+/// Create an exception type with several bases. `create_exception!` takes one
+/// base, and each category class must also be a Python built-in exception.
+fn new_exception_type(
+    py: Python<'_>,
+    name: &std::ffi::CStr,
+    doc: &std::ffi::CStr,
+    bases: &[Bound<'_, PyType>],
+) -> Py<PyType> {
+    let created = PyTuple::new(py, bases).and_then(|bases| {
+        // SAFETY: `name` and `doc` are NUL-terminated and outlive the call,
+        // `bases` is a live tuple of type objects, and a null dict asks for a
+        // fresh one. The call returns a new reference or null with an error set.
+        let raw = unsafe {
+            pyo3::ffi::PyErr_NewExceptionWithDoc(
+                name.as_ptr(),
+                doc.as_ptr(),
+                bases.as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: `raw` is the new reference returned above, or null.
+        let created = unsafe { Bound::from_owned_ptr_or_err(py, raw) }?;
+        Ok(created.cast_into::<PyType>()?.unbind())
+    });
+    // The same contract `create_exception!` applies: the interpreter cannot
+    // fail to build a class from exception bases with compatible layouts.
+    created.expect("Failed to initialize new exception type.")
+}
+
+/// `create_exception!` for a class whose bases are listed: the category
+/// classes, which subclass both `GamfitError` and a Python built-in.
+macro_rules! create_category_exception {
+    ($name:ident, [$($base:ty),+ $(,)?], $doc:expr) => {
+        #[repr(transparent)]
+        #[doc = $doc]
+        pub struct $name(pyo3::PyAny);
+
+        pyo3::impl_exception_boilerplate!($name);
+        pyo3::pyobject_native_type_named!($name);
+
+        // SAFETY: `type_object_raw` returns an exception type object that the
+        // static below creates once and keeps alive for the interpreter's life.
+        unsafe impl pyo3::type_object::PyTypeInfo for $name {
+            const NAME: &'static str = stringify!($name);
+            const MODULE: Option<&'static str> = Some("_rust");
+
+            fn type_object_raw(py: Python<'_>) -> *mut pyo3::ffi::PyTypeObject {
+                static TYPE_OBJECT: pyo3::sync::PyOnceLock<Py<PyType>> =
+                    pyo3::sync::PyOnceLock::new();
+                TYPE_OBJECT
+                    .get_or_init(py, || {
+                        new_exception_type(
+                            py,
+                            pyo3::ffi::c_str!(concat!("_rust.", stringify!($name))),
+                            pyo3::ffi::c_str!($doc),
+                            &[$(py.get_type::<$base>()),+],
+                        )
+                    })
+                    .as_ptr()
+                    .cast()
+            }
+        }
+    };
+}
 
 create_exception!(
     _rust,
-    GamError,
-    PyValueError,
-    "Base class for Python-facing gamfit engine errors.\n\
-     \n\
-     All gamfit-specific exceptions raised by the Rust extension inherit\n\
-     from `GamError`, which itself inherits from `ValueError` to preserve\n\
-     the historical `except ValueError` contract."
+    GamfitError,
+    pyo3::exceptions::PyException,
+    "Base class of every gamfit error. Catch a category subclass to branch on \
+     the kind of failure: `FormulaError`, `DataError`, `ConvergenceError`, \
+     `NotFittedError` or `InternalError`."
 );
 
-create_exception!(
-    _rust,
+create_category_exception!(
     FormulaError,
-    GamError,
-    "The Wilkinson-style formula could not be parsed or references columns \
-     missing from the input table."
+    [GamfitError, PyValueError],
+    "The request cannot be fit as written: the formula does not parse, names a \
+     column the data lacks, uses a column in a role its type does not allow \
+     (a smooth over a categorical column), or selects an option or combination \
+     the engine does not support."
 );
+
+create_category_exception!(
+    DataError,
+    [GamfitError, PyValueError],
+    "The data cannot support the requested model: a value does not parse or is \
+     out of range, a column is degenerate, prediction data does not match the \
+     training schema, or the design is separated or rank-deficient."
+);
+
+create_category_exception!(
+    ConvergenceError,
+    [GamfitError, PyRuntimeError],
+    "A valid problem whose solve did not finish: an optimizer ended without its \
+     convergence certificate, a factorization or root solve failed, or a \
+     quadrature missed its tolerance."
+);
+
+create_category_exception!(
+    NotFittedError,
+    [GamfitError, PyValueError, PyAttributeError],
+    "A method that needs a fitted model was called before `fit`. Its bases \
+     after `GamfitError` are those of scikit-learn's `NotFittedError`."
+);
+
+create_category_exception!(
+    InternalError,
+    [GamfitError, PyRuntimeError],
+    "The engine broke its own contract: an invariant check failed or Rust \
+     panicked. A defect in gamfit, not in the input; please report it."
+);
+
+// FormulaError subclasses.
 
 create_exception!(
     _rust,
@@ -61,123 +165,125 @@ create_exception!(
      `column` is the missing name as written, `available` is every header \
      present in the input, `similar` is a cheap shortlist of close matches, \
      and `tsv_hint` is True when the file is almost certainly a TSV mis-\
-     extensioned as CSV (sole header contains literal tab characters). \
-     Subclass of `FormulaError` so `except gamfit.FormulaError` still \
-     catches it."
+     extensioned as CSV (sole header contains literal tab characters)."
 );
 
 create_exception!(
     _rust,
+    InvalidSpecificationError,
+    FormulaError,
+    "Invalid specification supplied to the engine."
+);
+
+create_exception!(
+    _rust,
+    InvalidConfigurationError,
+    InvalidSpecificationError,
+    "Fit configuration is internally inconsistent or selects an \
+     unsupported combination (conflicting family/link, unsupported \
+     link placement, frailty for an incompatible family, duplicate or \
+     out-of-range hyperpriors)."
+);
+
+create_exception!(
+    _rust,
+    BasisError,
+    FormulaError,
+    "A basis could not be built from the requested specification."
+);
+
+create_exception!(
+    _rust,
+    MissingDependencyError,
+    FormulaError,
+    "A required input column, frailty parameter, baseline target, or \
+     cause count is missing for the requested fit mode."
+);
+
+// DataError subclasses.
+
+create_exception!(
+    _rust,
     SchemaMismatchError,
-    GamError,
+    DataError,
     "Prediction input does not match the training schema."
 );
 
 create_exception!(
     _rust,
     PredictionError,
-    GamError,
+    DataError,
     "Prediction failed for a reason that is not a pure schema mismatch."
 );
 
-// EstimationError variant subclasses.
-//
-// Each subclass corresponds to exactly one variant of
-// `gam::solver::estimate::EstimationError`. Catching the specific subclass lets
-// callers branch on the exact failure mode (e.g. retry with looser
-// tolerances on `RemlConvergenceError`, suggest more data on
-// `ModelOverparameterizedError`, which `PrefitRankDeficientDesignDetected` raises).
-
 create_exception!(
     _rust,
-    BasisError,
-    GamError,
-    "Underlying basis function generation failed."
+    PredictInputError,
+    PredictionError,
+    "A cell of the prediction data cannot be predicted from: a non-finite \
+     covariate, a missing categorical label or an unseen fixed-factor level."
 );
 
 create_exception!(
     _rust,
-    LinearSystemSolveError,
-    GamError,
-    "A linear system solve failed; the penalized Hessian may be singular."
+    PerfectSeparationError,
+    DataError,
+    "Perfect or quasi-perfect separation detected during model fitting."
 );
 
 create_exception!(
     _rust,
-    EigendecompositionError,
-    GamError,
-    "Eigendecomposition failed."
+    ModelOverparameterizedError,
+    DataError,
+    "Model is over-parameterized: its unpenalized coefficient directions \
+     (intercept, unpenalized terms, penalty null spaces) are not fewer than the \
+     observations, or the design is rank deficient."
 );
 
 create_exception!(
     _rust,
-    PenaltySpectrumError,
-    GamError,
-    "Penalty spectrum check failed (non-finite or indefinite eigenvalue)."
+    IllConditionedError,
+    DataError,
+    "Model is ill-conditioned (large condition number)."
 );
 
 create_exception!(
     _rust,
-    ParameterConstraintError,
-    GamError,
-    "Parameter constraint violation."
+    InvalidInputError,
+    DataError,
+    "Invalid input to the engine (shape/dtype/range violation)."
 );
-
-// Fit-failure categories (#2937). Every failure of a fit's solve used to reach
-// Python as `IntegrationError`; each now raises the class of its category,
-// selected from the typed engine error (`FailureCategory`), never from text.
 
 create_exception!(
     _rust,
-    FitError,
-    GamError,
-    "A model fit's solve failed. Subclasses name the failure's category; an \
-     instance of `FitError` itself is a failure that reached the boundary as \
-     prose, with no category to claim. Instances carry `variant` (str, the typed \
-     engine variant, e.g. `EstimationError::StartupSeedsRefused`), `category` \
-     (str), `causes` (list[str], the message chain, outermost first) and \
-     `fields` (dict, the typed evidence the variant exposes by field name; empty \
-     when it exposes none)."
+    GeometryError,
+    DataError,
+    "Riemannian-geometry / manifold-primitive operation failed \
+     (dimension mismatch, invalid point, singular tangent space)."
+);
+
+// Fit-failure categories (#2937). A failure of a fit's solve raises the class
+// of its `FailureCategory`, under the class of that category's `ErrorCategory`.
+// Instances carry `variant` (str, the typed engine variant, e.g.
+// `EstimationError::StartupSeedsRefused`), `category` (str, the failure
+// category), `causes` (list[str], the message chain, outermost first) and
+// `fields` (dict, the typed evidence the variant exposes by field name; empty
+// when it exposes none).
+
+create_exception!(
+    _rust,
+    FitInputError,
+    DataError,
+    "The fit's solve refused the data or the problem's size (separation, rank \
+     deficiency, a value outside the family's support)."
 );
 
 create_exception!(
     _rust,
     FitConvergenceError,
-    FitError,
+    ConvergenceError,
     "An outer smoothing search or an inner coefficient solve ended without its \
      convergence certificate."
-);
-
-create_exception!(
-    _rust,
-    FitSeedError,
-    FitError,
-    "Outer startup validation refused every candidate seed, so no outer solver \
-     started."
-);
-
-create_exception!(
-    _rust,
-    FitInvariantError,
-    FitError,
-    "A fit result or intermediate state violated the engine's own consistency \
-     contract. An engine defect, not a property of the data; please report it."
-);
-
-create_exception!(
-    _rust,
-    FitInputError,
-    FitError,
-    "The fit's solve refused the configuration, the data or the problem's size \
-     (separation, rank deficiency, an unsupported option)."
-);
-
-create_exception!(
-    _rust,
-    FitNumericalError,
-    FitError,
-    "A numerical step of the fit failed: a factorization, an eigendecomposition, \
-     a root solve, or a row quantity that float64 cannot represent."
 );
 
 create_exception!(
@@ -185,20 +291,6 @@ create_exception!(
     PirlsConvergenceError,
     FitConvergenceError,
     "The P-IRLS inner loop did not converge within its iteration budget."
-);
-
-create_exception!(
-    _rust,
-    PerfectSeparationError,
-    GamError,
-    "Perfect or quasi-perfect separation detected during model fitting."
-);
-
-create_exception!(
-    _rust,
-    HessianNotPositiveDefiniteError,
-    GamError,
-    "Hessian matrix is not positive definite at the converged iterate."
 );
 
 create_exception!(
@@ -221,381 +313,120 @@ create_exception!(
 
 create_exception!(
     _rust,
+    FitSeedError,
+    ConvergenceError,
+    "Outer startup validation refused every candidate seed, so no outer solver \
+     started."
+);
+
+create_exception!(
+    _rust,
+    FitNumericalError,
+    ConvergenceError,
+    "A numerical step of the fit failed: a factorization, an eigendecomposition, \
+     a root solve, or a row quantity that float64 cannot represent."
+);
+
+create_exception!(
+    _rust,
+    LinearSystemSolveError,
+    FitNumericalError,
+    "A linear system solve failed; the penalized Hessian may be singular."
+);
+
+create_exception!(
+    _rust,
+    EigendecompositionError,
+    FitNumericalError,
+    "Eigendecomposition failed."
+);
+
+create_exception!(
+    _rust,
+    PenaltySpectrumError,
+    FitNumericalError,
+    "Penalty spectrum check failed (non-finite or indefinite eigenvalue)."
+);
+
+create_exception!(
+    _rust,
+    ParameterConstraintError,
+    FitNumericalError,
+    "Parameter constraint violation."
+);
+
+create_exception!(
+    _rust,
+    HessianNotPositiveDefiniteError,
+    FitNumericalError,
+    "Hessian matrix is not positive definite at the converged iterate."
+);
+
+create_exception!(
+    _rust,
+    MonotoneRootError,
+    FitNumericalError,
+    "Monotone-root solve failed."
+);
+
+create_exception!(
+    _rust,
+    IntegrationError,
+    ConvergenceError,
+    "A quadrature or numerical integration did not reach its tolerance."
+);
+
+create_exception!(
+    _rust,
+    CalibratorError,
+    ConvergenceError,
+    "Calibrator training failed."
+);
+
+create_exception!(
+    _rust,
     DictionaryConvergenceError,
-    GamError,
+    ConvergenceError,
     "A dictionary optimizer failed to reach its certified fixed point. Instances \
      carry the solver's structured residual evidence; no partial fit is returned."
+);
+
+// InternalError subclasses.
+
+create_exception!(
+    _rust,
+    FitInvariantError,
+    InternalError,
+    "A fit result or intermediate state violated the engine's own consistency \
+     contract. An engine defect, not a property of the data; please report it."
 );
 
 create_exception!(
     _rust,
     GradientUnavailableError,
-    GamError,
+    InternalError,
     "The unified evaluator returned no gradient in the requested mode."
 );
 
 create_exception!(
     _rust,
     LayoutError,
-    GamError,
+    InternalError,
     "An internal error occurred during model layout or coefficient mapping."
 );
 
-create_exception!(
-    _rust,
-    ModelOverparameterizedError,
-    GamError,
-    "Model is over-parameterized: more coefficients than samples."
-);
-
-create_exception!(
-    _rust,
-    IllConditionedError,
-    GamError,
-    "Model is ill-conditioned (large condition number)."
-);
-
-create_exception!(
-    _rust,
-    InvalidInputError,
-    GamError,
-    "Invalid input to the engine (shape/dtype/range violation)."
-);
-
-create_exception!(
-    _rust,
-    MonotoneRootError,
-    GamError,
-    "Monotone-root solve failed."
-);
-
-create_exception!(
-    _rust,
-    CalibratorError,
-    GamError,
-    "Calibrator training failed."
-);
-
-create_exception!(
-    _rust,
-    InvalidSpecificationError,
-    GamError,
-    "Invalid specification supplied to the engine."
-);
-
-// -------------------------------------------------------------------------
-// Remaining engine error enum subclasses (issue #343 follow-up).
-//
-// Each `pub enum *Error` in `src/` gets a corresponding subclass below, so
-// every engine error path is variant-typed at the FFI boundary and no
-// longer flows through the message-regex classifier. Inheritance is
-// chosen by semantic relationship: builder-layer errors that arise from
-// formula authoring (e.g. `TermBuilderError`) inherit from
-// `FormulaError`; prediction-time input errors inherit from
-// `PredictionError`; everything else inherits from `GamError`.
-// -------------------------------------------------------------------------
-
-create_exception!(
-    _rust,
-    GeometryError,
-    GamError,
-    "Riemannian-geometry / manifold-primitive operation failed \
-     (dimension mismatch, invalid point, singular tangent space)."
-);
-
-create_exception!(
-    _rust,
-    MatrixMaterializationError,
-    GamError,
-    "Lazy design-matrix materialization failed (size cap exceeded, \
-     forbidden by policy, or row-block evaluation failure)."
-);
-
-create_exception!(
-    _rust,
-    GpuError,
-    GamError,
-    "GPU offload path failed (driver unavailable, kernel launch error, \
-     calibration failure, or feature not yet implemented on this device)."
-);
-
-create_exception!(
-    _rust,
-    LinearAlgebraError,
-    GamError,
-    "Dense linear-algebra primitive failed (factorization, SVD, or \
-     eigendecomposition reported non-convergence or non-finite input)."
-);
-
-create_exception!(
-    _rust,
-    MatrixError,
-    GamError,
-    "Matrix-level invariant violated (dimension mismatch, refused \
-     densification, or related shape contract failure)."
-);
-
-create_exception!(
-    _rust,
-    CacheStoreError,
-    GamError,
-    "Persistent on-disk model cache I/O or serialization failure."
-);
-
-create_exception!(
-    _rust,
-    SmoothError,
-    GamError,
-    "Smooth-term construction failed (invalid configuration for the \
-     requested basis or penalty)."
-);
-
-create_exception!(
-    _rust,
-    ArrowSchurError,
-    GamError,
-    "Arrow-Schur block solver failed (per-row factor failure, ill-\
-     conditioning, PCG non-convergence, or adaptive-correction failure)."
-);
-
-create_exception!(
-    _rust,
-    OuterStrategyError,
-    GamError,
-    "Outer smoothing-strategy contract violated (operator-shape \
-     mismatch, non-finite Hessian, or rho-block shape error)."
-);
-
-create_exception!(
-    _rust,
-    TermBuilderError,
-    FormulaError,
-    "A formula term could not be built from the input data \
-     (missing column, incompatible options, degenerate data, etc.). \
-     Subclass of `FormulaError` so existing `except FormulaError` \
-     handlers still catch it."
-);
-
-create_exception!(
-    _rust,
-    CorrectedCovarianceError,
-    GamError,
-    "Corrected posterior covariance construction failed \
-     (shape mismatch, eigendecomposition failure, or indefinite outer \
-     Hessian)."
-);
-
-create_exception!(
-    _rust,
-    PredictInputError,
-    PredictionError,
-    "Prediction input is invalid or incompatible with the fitted model \
-     (shape mismatch, missing metadata, or malformed payload). \
-     Subclass of `PredictionError`."
-);
-
-create_exception!(
-    _rust,
-    HmcError,
-    GamError,
-    "Hamiltonian Monte Carlo sampler failed (non-finite state, invalid \
-     configuration, unsupported family / link, or sampling divergence)."
-);
-
-create_exception!(
-    _rust,
-    AloError,
-    GamError,
-    "Approximate leave-one-out computation failed (invalid input, \
-     degenerate design, or influence-matrix factorization failure)."
-);
-
-create_exception!(
-    _rust,
-    SurvivalError,
-    GamError,
-    "Survival kernel invariant violated (dimension mismatch, non-finite \
-     input, invalid time grid, non-monotone cumulative hazard, etc.)."
-);
-
-create_exception!(
-    _rust,
-    CubicCellKernelError,
-    GamError,
-    "Cubic-cell-moment kernel rejected an input (degenerate interval, \
-     invalid cell shape, insufficient moments, or out-of-domain \
-     bivariate-normal evaluation)."
-);
-
-create_exception!(
-    _rust,
-    SurvivalConstructionError,
-    GamError,
-    "Survival model construction failed (invalid config, missing column, \
-     dimension mismatch, data validation, or unsupported distribution)."
-);
-
-create_exception!(
-    _rust,
-    TransformationNormalError,
-    GamError,
-    "Transformation-normal family rejected the design / response \
-     (degenerate design, non-finite input, or monotonicity violation)."
-);
-
-create_exception!(
-    _rust,
-    CustomFamilyError,
-    GamError,
-    "Custom family contract violated (invalid input, optimization \
-     failure, numerical failure, or identifiability violation)."
-);
-
-create_exception!(
-    _rust,
-    GamlssError,
-    GamError,
-    "GAMLSS location-scale family rejected the input (dimension \
-     mismatch, non-finite, unsupported configuration, or constraint \
-     violation)."
-);
-
-create_exception!(
-    _rust,
-    SurvivalMarginalSlopeError,
-    GamError,
-    "Survival marginal-slope family failed (invalid input, \
-     monotonicity violation, integration failure, or unsupported \
-     configuration)."
-);
-
-create_exception!(
-    _rust,
-    LatentSurvivalError,
-    GamError,
-    "Latent-survival family rejected the dataset (invalid frailty, \
-     invalid dataset, block mismatch, or numerical failure)."
-);
-
-create_exception!(
-    _rust,
-    SurvivalPredictError,
-    PredictionError,
-    "Survival prediction failed (invalid input, missing fit metadata, \
-     incompatible schema, or numerical failure). Subclass of \
-     `PredictionError`."
-);
-
-create_exception!(
-    _rust,
-    DeviationRuntimeError,
-    GamError,
-    "Marginal-slope deviation runtime rejected the input (invalid \
-     input, dimension mismatch, or numerical failure)."
-);
-
-create_exception!(
-    _rust,
-    DataError,
-    GamError,
-    "Input dataset failed schema / encoding validation (parse error, \
-     empty input, invalid value, missing column)."
-);
-
-create_exception!(
-    _rust,
-    FittedModelError,
-    GamError,
-    "Saved fitted-model payload is incompatible (schema mismatch, \
-     corrupt payload, missing field, or incompatible config)."
-);
-
-create_exception!(
-    _rust,
-    LognormalKernelError,
-    GamError,
-    "Lognormal kernel configuration is invalid."
-);
-
-create_exception!(
-    _rust,
-    ScaleDesignError,
-    GamError,
-    "Scale-design construction failed (invalid weights, dimension \
-     mismatch, non-finite input, degenerate design, or SVD failure)."
-);
-
-create_exception!(
-    _rust,
-    IdentifiabilityCompilerError,
-    GamError,
-    "Identifiability compiler rejected the block layout (dimension \
-     mismatch, fully aliased block, or linear-algebra failure)."
-);
-
-create_exception!(
-    _rust,
-    JointPenaltyError,
-    GamError,
-    "Joint penalty matrix rejected (not square, not symmetric, \
-     non-finite entry, or nullspace too large)."
-);
-
-create_exception!(
-    _rust,
-    SurvivalLocationScaleError,
-    GamError,
-    "Survival location-scale family rejected the input (dimension \
-     mismatch, invalid configuration, constraint violation, or \
-     numerical failure)."
-);
-
-create_exception!(
-    _rust,
-    MapUniquenessError,
-    GamError,
-    "MAP-uniqueness identifiability audit detected duplicate or \
-     overlapping posterior modes."
-);
-
-create_exception!(
-    _rust,
-    UnsupportedLinkError,
-    InvalidSpecificationError,
-    "An inverse-link / link transform was requested that the engine \
-     does not support for the chosen family. Subclass of \
-     `InvalidSpecificationError`."
-);
-
-create_exception!(
-    _rust,
-    InvalidConfigurationError,
-    InvalidSpecificationError,
-    "Fit configuration is internally inconsistent or selects an \
-     unsupported combination (conflicting family/link, unsupported \
-     link placement, frailty for an incompatible family, duplicate or \
-     out-of-range hyperpriors). Subclass of `InvalidSpecificationError`."
-);
-
-create_exception!(
-    _rust,
-    MissingDependencyError,
-    GamError,
-    "A required input column, frailty parameter, baseline target, or \
-     cause count is missing for the requested fit mode."
-);
-
-create_exception!(
-    _rust,
-    IntegrationError,
-    FitError,
-    "A quadrature or numerical integration did not reach its tolerance. \
-     Every fit failure used to raise this class; since gam#2937 other failures \
-     raise their own `FitError` subclass."
-);
-
-// -------------------------------------------------------------------------
-// (Removed) Legacy message-regex classifier — issue #343.
+/// The class of an [`ErrorCategory`]: the one place a category becomes a
+/// Python class. A dispatcher raises it when no more specific class under it
+/// names the variant.
+pub(crate) fn category_error(category: ErrorCategory, message: String) -> PyErr {
+    match category {
+        ErrorCategory::Formula => FormulaError::new_err(message),
+        ErrorCategory::Data => DataError::new_err(message),
+        ErrorCategory::Convergence => ConvergenceError::new_err(message),
+        ErrorCategory::NotFitted => NotFittedError::new_err(message),
+        ErrorCategory::Internal => InternalError::new_err(message),
+    }
+}
 
 /// Variant-dispatch: convert a typed engine error into the matching
 /// Python exception subclass. This is the single chokepoint where
@@ -704,17 +535,15 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
                 estimation_error_to_pyerr_with_message(source, message)
             } else {
                 // An opt client may attach a typed error that is not an engine
-                // `EstimationError`. It is still an evaluator-construction
-                // failure, not evidence that REML merely exhausted its
-                // convergence budget, and nothing about it says integration.
-                // Preserve the complete boundary message under the `FitError`
-                // base without guessing a category from that source's prose.
-                FitError::new_err(message)
+                // `EstimationError`; it names no variant class, so the class of
+                // its category carries the complete boundary message.
+                category_error(err.error_category(), message)
             }
         }
         EstimationError::GradientUnavailable { .. } => GradientUnavailableError::new_err(message),
         EstimationError::LayoutError(_) => LayoutError::new_err(message),
-        EstimationError::PrefitRankDeficientDesignDetected { .. } => {
+        EstimationError::PrefitRankDeficientDesignDetected { .. }
+        | EstimationError::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
             ModelOverparameterizedError::new_err(message)
         }
         EstimationError::PrefitNearDegenerateDesignDetected { .. } => {
@@ -725,9 +554,17 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
             InvalidInputError::new_err(message)
         }
         EstimationError::FitResultInvariantViolated(_) => FitInvariantError::new_err(message),
+        // Row quantities float64 cannot represent at the current coefficients:
+        // numerical failures of the solve, not properties of the input.
         EstimationError::InverseLinkDomainViolation { .. }
         | EstimationError::PirlsRowGeometryUnrepresentable { .. }
-        | EstimationError::LogStrengthDomainViolation { .. } => InvalidInputError::new_err(message),
+        | EstimationError::LogStrengthDomainViolation { .. } => FitNumericalError::new_err(message),
+        // The data put the likelihood maximum on the edge of the link's
+        // feasible set (an all-zero group under identity-Poisson, say), like a
+        // separation: a property of the input, raised as its category's class.
+        EstimationError::LinkFeasibilityBoundaryOptimum { .. } => {
+            category_error(err.error_category(), message)
+        }
         EstimationError::MonotoneRoot(_) => MonotoneRootError::new_err(message),
         EstimationError::CalibratorTrainingFailed(_) => CalibratorError::new_err(message),
         EstimationError::InvalidSpecification(_) => InvalidSpecificationError::new_err(message),
@@ -736,14 +573,17 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         // prediction request is what declines, not the fit (#1082).
         EstimationError::PredictiveIntervalsDeclined { .. } => PredictionError::new_err(message),
         // A fit that ended holding an uncertified inner solve (gam#2943). Only
-        // that variant carries terminal inner-mode evidence. It precedes the
-        // catch-all below, whose class is not a `FitError`.
+        // that variant carries terminal inner-mode evidence.
         EstimationError::CustomFamily(family_error)
             if family_error.terminal_inner_mode_evidence().is_some() =>
         {
             InnerModeConvergenceError::new_err(message)
         }
-        EstimationError::CustomFamily(_) => CustomFamilyError::new_err(message),
+        EstimationError::CustomFamily(family_error) => failure_class(
+            family_error.failure_category(),
+            family_error.error_category(),
+            message,
+        ),
         // Invalid stabilization metadata is a model/solver specification
         // defect, not a data problem.
         EstimationError::InvalidStabilization(_) => InvalidSpecificationError::new_err(message),
@@ -759,16 +599,55 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
     }
 }
 
+/// The class for a boundary that rejects its caller's arguments with a
+/// `String` rather than a typed error: a request the engine refuses is a
+/// `FormulaError` (a `ValueError`), the category of user input.
 pub(crate) fn py_value_error(message: String) -> PyErr {
-    // Engine errors funneled here are gamfit-specific failures, so they must
-    // carry GamError identity (a ValueError subclass) — preserving the
-    // historical `except ValueError` contract while making `except
-    // gamfit.GamError` reliable for engine errors (issue #330).
-    GamError::new_err(message)
+    FormulaError::new_err(message)
 }
 
+/// A table gam-data refuses to encode, on every ingestion path whichever
+/// transport the table crossed the boundary in. The class follows the error's
+/// category like every other engine error: a requested column the table lacks
+/// is a `ColumnNotFoundError`, an unsupported value or a malformed layout a
+/// `DataError`.
+pub(crate) fn data_error_to_pyerr(error: gam::data::DataError) -> PyErr {
+    Python::attach(|py| workflow_error_to_pyerr(py, error.into()))
+}
+
+/// A saved model this binary refuses to read raises the class of its category
+/// (`FittedModelError::error_category`), with the `variant:` / `category:`
+/// lines and attributes a fit failure carries (#2937, gam#3008). Load used to
+/// flatten the typed refusal to prose, so a payload the engine cannot read was
+/// raised as a formula error with no variant.
+pub(crate) fn saved_model_error_to_pyerr(
+    py: Python<'_>,
+    err: gam::inference::model::FittedModelError,
+) -> PyErr {
+    let variant = err.variant_name();
+    let category = err.error_category();
+    let exc = category_error(
+        category,
+        format!("{err}\nvariant: {variant}\ncategory: {}", category.label()),
+    );
+    let bound = exc.value(py);
+    // As for a fit failure: the class is the contract, the attributes are
+    // enrichment, so one that cannot be set is reported as unraisable.
+    let attach_result: PyResult<()> = (|| {
+        bound.setattr("variant", variant)?;
+        bound.setattr("category", category.label())?;
+        Ok(())
+    })();
+    if let Err(attach_err) = attach_result {
+        attach_err.write_unraisable(py, Some(&bound));
+    }
+    exc
+}
+
+/// A Rust panic caught at the boundary is an engine defect whatever the input,
+/// so it reaches Python as `InternalError`, never as an abort.
 fn py_panic_error(context: &'static str, payload: Box<dyn std::any::Any + Send>) -> PyErr {
-    py_value_error(format!(
+    InternalError::new_err(format!(
         "{context} panicked inside Rust boundary: {}",
         gam_runtime::panic_payload_message(payload)
     ))
@@ -813,16 +692,21 @@ where
 /// (the caller's frame is missing a column the fitted model requires) or an
 /// ordinary failure. The prediction FFI historically flattened every failure
 /// to a bare `String`, so a missing-required-column rejection surfaced as the
-/// generic `GamError` instead of the documented `SchemaMismatchError`
+/// generic base class instead of the documented `SchemaMismatchError`
 /// (issue #343's typed-error contract). Keeping the two cases distinct lets
 /// [`detach_predict_result`] pick the right Python class without string
 /// sniffing, while any non-schema `?` inside the predict impl still converts
 /// straight through `From<String>`.
 pub(crate) enum PredictError {
-    /// The frame does not carry a column the model needs → `SchemaMismatchError`.
+    /// The frame does not carry a column the model needs, or a column's kind
+    /// disagrees with the saved schema → `SchemaMismatchError`.
     SchemaMismatch(String),
-    /// Any other predict failure → `GamError` (a `ValueError` subclass), the
-    /// same class the bare-`String` path produced before.
+    /// A cell of the frame cannot be predicted from — a non-finite covariate,
+    /// a missing categorical label or an unseen fixed-factor level →
+    /// `PredictInputError`, carrying the typed error's advice.
+    Input(gam::data::DataError),
+    /// Any other predict failure → `PredictionError`, a `DataError`: the
+    /// prediction data is what the fitted model could not evaluate.
     Other(String),
 }
 
@@ -836,13 +720,15 @@ impl From<PredictError> for String {
     fn from(err: PredictError) -> Self {
         match err {
             PredictError::SchemaMismatch(message) | PredictError::Other(message) => message,
+            PredictError::Input(error) => error.to_string(),
         }
     }
 }
 
 /// Predict-path twin of [`detach_py_result`]: releases the GIL, runs the
 /// closure, and maps a [`PredictError`] onto the *typed* Python exception —
-/// `SchemaMismatch` → `SchemaMismatchError`, everything else → `GamError`.
+/// `SchemaMismatch` → `SchemaMismatchError`, `Input` → `PredictInputError`,
+/// everything else → `PredictionError`.
 /// Panics are still surfaced as the context-tagged panic error.
 pub(crate) fn detach_predict_result<T, F>(
     py: Python<'_>,
@@ -858,7 +744,10 @@ where
         Ok(Err(PredictError::SchemaMismatch(message))) => {
             Err(SchemaMismatchError::new_err(message))
         }
-        Ok(Err(PredictError::Other(message))) => Err(py_value_error(message)),
+        Ok(Err(PredictError::Input(error))) => Err(PredictInputError::new_err(
+            message_with_advice(&error, error.advice()),
+        )),
+        Ok(Err(PredictError::Other(message))) => Err(PredictionError::new_err(message)),
         Err(payload) => Err(py_panic_error(context, payload)),
     }
 }
@@ -888,7 +777,7 @@ where
 /// `estimation_error_to_pyerr`. This is the principled engine→Python
 /// adaptor: no `err.to_string()` flattening, no message-regex
 /// reclassification on the Python side. Each `EstimationError` variant
-/// surfaces as a specific `gamfit.GamError` subclass (see issue #343).
+/// surfaces as a specific `gamfit.errors.GamfitError` subclass (see issue #343).
 pub(crate) fn detach_estimation_result<T, F>(
     py: Python<'_>,
     context: &'static str,
@@ -907,7 +796,7 @@ where
 
 /// Variant-dispatch the engine's top-level `WorkflowError` into the matching
 /// Python exception class. The key entry is `WorkflowError::ColumnNotFound`,
-/// which surfaces as `gamfit.ColumnNotFoundError` with the structured
+/// which surfaces as `gamfit.errors.ColumnNotFoundError` with the structured
 /// fields attached as Python attributes (`column`, `role`, `available`,
 /// `similar`, `tsv_hint`) — issue #305 / #343. Other variants degrade to
 /// the most appropriate existing gamfit exception type; new variants can
@@ -964,14 +853,10 @@ pub(crate) fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyE
             }
             exc
         }
-        // Variant-typed dispatch (issue #343). The four flavours that
-        // previously flattened to bare `py_value_error(reason)` now each
-        // carry a distinct typed subclass, so callers can branch on
+        // Variant-typed dispatch (issue #343): each flavour carries a distinct
+        // subclass of its category's class, so callers branch on
         // `except InvalidConfigurationError` / `SchemaMismatchError` /
-        // `MissingDependencyError` / `IntegrationError` without parsing
-        // the prose. All four still inherit from `GamError` (and
-        // therefore `ValueError`), so legacy `except ValueError` /
-        // `except GamError` handlers keep catching them.
+        // `MissingDependencyError` without parsing the prose.
         WorkflowError::InvalidConfig { reason } => InvalidConfigurationError::new_err(reason),
         WorkflowError::SchemaMismatch { .. } => {
             let advice = err.advice();
@@ -984,6 +869,7 @@ pub(crate) fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyE
                 message: failure.to_string(),
                 variant: failure.variant_name(),
                 category: failure.category(),
+                error_category: failure.error_category(),
                 causes: failure.causes(),
                 estimation_error: failure.estimation_error(),
                 terminal_inner_mode: failure.terminal_inner_mode_evidence(),
@@ -1007,6 +893,7 @@ pub(crate) fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyE
                     message: err.to_string(),
                     variant: err.variant_name(),
                     category: err.failure_category(),
+                    error_category: err.error_category(),
                     causes: vec![err.to_string()],
                     estimation_error: refit.and_then(|failure| failure.estimation_error()),
                     terminal_inner_mode: refit
@@ -1014,9 +901,19 @@ pub(crate) fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyE
                 },
             )
         }
+        // Term construction and the data layer name no finer class than their
+        // category; the typed source decides which (a categorical column
+        // used as a smooth coordinate is a `FormulaError`).
+        WorkflowError::TermBuilder { .. } | WorkflowError::Data(_) => {
+            let advice = err.advice();
+            category_error(err.error_category(), message_with_advice(&err, advice))
+        }
         WorkflowError::FormulaDsl { .. } => FormulaError::new_err(err.to_string()),
         WorkflowError::MarginalSlopeLink { .. } => InvalidConfigurationError::new_err(err.to_string()),
         WorkflowError::TransformationNormalConflict { .. } => {
+            InvalidConfigurationError::new_err(err.to_string())
+        }
+        WorkflowError::WarmStartRefused { .. } => {
             InvalidConfigurationError::new_err(err.to_string())
         }
     }
@@ -1027,6 +924,7 @@ struct FitFailureReport<'a> {
     message: String,
     variant: &'static str,
     category: gam::FailureCategory,
+    error_category: ErrorCategory,
     causes: Vec<String>,
     estimation_error: Option<&'a EstimationError>,
     /// The terminal inner solve's facts, when the fit ended without a
@@ -1035,8 +933,8 @@ struct FitFailureReport<'a> {
 }
 
 /// The exception class of a fit failure's category. `Unclassified` raises the
-/// `FitError` base: that failure reached the boundary as prose, so no subclass
-/// can be claimed for it.
+/// `ConvergenceError` base: that failure reached the boundary as prose, so no
+/// subclass can be claimed for it, only that the fit did not finish.
 fn fit_category_error(category: gam::FailureCategory, message: String) -> PyErr {
     use gam::FailureCategory as Category;
     match category {
@@ -1046,7 +944,20 @@ fn fit_category_error(category: gam::FailureCategory, message: String) -> PyErr 
         Category::Input => FitInputError::new_err(message),
         Category::Numerical => FitNumericalError::new_err(message),
         Category::Integration => IntegrationError::new_err(message),
-        Category::Unclassified => FitError::new_err(message),
+        Category::Unclassified => ConvergenceError::new_err(message),
+    }
+}
+
+/// The class of a failure that names no variant class: its fit-category class
+/// when that class lies under the failure's [`ErrorCategory`], otherwise the
+/// category class itself. The two disagree only where a finer rule overrides
+/// the fit category (a configuration the family does not implement is a
+/// `Formula` failure although its fit category is `Input`).
+fn failure_class(failure: gam::FailureCategory, category: ErrorCategory, message: String) -> PyErr {
+    if failure.error_category() == category {
+        fit_category_error(failure, message)
+    } else {
+        category_error(category, message)
     }
 }
 
@@ -1054,17 +965,18 @@ fn fit_category_error(category: gam::FailureCategory, message: String) -> PyErr 
 ///
 /// The message is the failure's complete rendered chain, unchanged, followed by
 /// the typed variant and category, and by the `help:` line when the engine
-/// error declares one. When the failure ends in an `EstimationError` whose own
-/// class already names a fit category (`RemlConvergenceError` is a
-/// `FitConvergenceError`), that more specific class is raised, so a fit and a
-/// direct estimation entry point raise the same class for the same variant.
-/// The variant, category and message chain are also set as attributes, so a
-/// caller branches on them without parsing the message.
+/// error declares one. When the failure ends in an `EstimationError`, that
+/// variant's own class is raised (`RemlConvergenceError`, `InvalidInputError`,
+/// ...), so a fit and a direct estimation entry point raise the same class for
+/// the same variant; it lies under the failure's [`ErrorCategory`] class by
+/// construction. The variant, category and message chain are also set as
+/// attributes, so a caller branches on them without parsing the message.
 fn fit_failure_to_pyerr(py: Python<'_>, report: FitFailureReport<'_>) -> PyErr {
     let FitFailureReport {
         message,
         variant,
         category,
+        error_category,
         causes,
         estimation_error,
         terminal_inner_mode,
@@ -1083,10 +995,9 @@ fn fit_failure_to_pyerr(py: Python<'_>, report: FitFailureReport<'_>) -> PyErr {
     let specific = match terminal_inner_mode {
         Some(_) => Some(InnerModeConvergenceError::new_err(message.clone())),
         None => estimation_error
-            .map(|source| estimation_error_to_pyerr_with_message(source, message.clone()))
-            .filter(|candidate| candidate.is_instance_of::<FitError>(py)),
+            .map(|source| estimation_error_to_pyerr_with_message(source, message.clone())),
     };
-    let exc = specific.unwrap_or_else(|| fit_category_error(category, message));
+    let exc = specific.unwrap_or_else(|| failure_class(category, error_category, message));
     let bound = exc.value(py);
     // As for `ColumnNotFoundError`: the class is the contract, the attributes
     // are enrichment, so an attribute that cannot be set is reported as
@@ -1094,6 +1005,7 @@ fn fit_failure_to_pyerr(py: Python<'_>, report: FitFailureReport<'_>) -> PyErr {
     let attach_result: PyResult<()> = (|| {
         bound.setattr("variant", variant)?;
         bound.setattr("category", category.label())?;
+        bound.setattr("error_category", error_category.label())?;
         bound.setattr("causes", causes)?;
         // The typed evidence a variant exposes, by field name, each also set as
         // a plain attribute. Only a fit that ended without a certified inner
@@ -1137,10 +1049,10 @@ where
 }
 
 /// Variant-dispatch the engine's `GeometryError` into the typed Python
-/// `gamfit.GeometryError`. All three variants — `DimensionMismatch`,
+/// `gamfit.errors.GeometryError`. All three variants — `DimensionMismatch`,
 /// `InvalidPoint`, `Singular` — share the same Python class because the
 /// distinction matters only in the message text; the typed class makes
-/// `except gamfit.GeometryError` actionable without parsing the prose.
+/// `except gamfit.errors.GeometryError` actionable without parsing the prose.
 pub(crate) fn geometry_error_to_pyerr(err: EngineGeometryError) -> PyErr {
     GeometryError::new_err(err.to_string())
 }
@@ -1171,12 +1083,12 @@ where
 // Engine error → typed `PyErr` adaptors (issue #343).
 //
 // One trivial converter per typed engine→Python boundary actually used.
-// Each helper preserves the typed-class identity so `except gamfit.SurvivalError`
-// (etc.) is actionable without the user parsing the prose. A call site that does
-// `.map_err(|e| e.to_string())?` against a `Result<_, EngineError>` in a
-// `PyResult<_>` function should swap to `.map_err(<engine>_error_to_pyerr)?` —
-// the message text is identical, only the Python class type widens from
-// `ValueError` to the typed subclass. The orphan rule prevents a blanket
+// Each helper picks the class from the error's type, so `except
+// gamfit.errors.BasisError` (etc.) is actionable without the user parsing the prose.
+// A call site that does `.map_err(|e| e.to_string())?` against a
+// `Result<_, EngineError>` in a `PyResult<_>` function should swap to
+// `.map_err(<engine>_error_to_pyerr)?`: the message text is identical, only the
+// Python class narrows to the typed subclass. The orphan rule prevents a blanket
 // `impl From<E> for PyErr`, so each converter is emitted explicitly via the
 // `error_to_pyerr!` macro below.
 // -------------------------------------------------------------------------
@@ -1198,17 +1110,21 @@ macro_rules! error_to_pyerr {
 }
 
 error_to_pyerr!(
-    survival_error_to_pyerr,
-    gam::families::survival::SurvivalError,
-    SurvivalError
-);
-error_to_pyerr!(
     basis_error_to_pyerr,
     gam::terms::basis::BasisError,
-    GamError
+    BasisError
 );
-error_to_pyerr!(shape_error_to_pyerr, ndarray::ShapeError, GamError);
-error_to_pyerr!(serde_json_error_to_pyerr, serde_json::Error, GamError);
+// Arrays whose shapes do not fit together: the caller's arrays, or ones sized
+// from the caller's `n_obs` / `latent_dim`.
+error_to_pyerr!(shape_error_to_pyerr, ndarray::ShapeError, DataError);
+// A JSON payload the caller handed in (a saved model, a spec) that does not parse.
+error_to_pyerr!(serde_json_error_to_pyerr, serde_json::Error, FormulaError);
+
+/// A survival fit's refusal takes the class of its fit category.
+pub(crate) fn survival_error_to_pyerr(err: gam::families::survival::SurvivalError) -> PyErr {
+    let failure = err.failure_category();
+    failure_class(failure, failure.error_category(), err.to_string())
+}
 
 #[cfg(test)]
 mod fit_failure_dispatch_tests {
@@ -1267,7 +1183,7 @@ mod fit_failure_dispatch_tests {
             assert!(integration.is_instance_of::<IntegrationError>(py));
 
             let prose = raise(FitFailure::unclassified("a helper's prose"));
-            assert!(prose.is_instance_of::<FitError>(py));
+            assert!(prose.is_instance_of::<ConvergenceError>(py));
             for subclass_check in [
                 prose.is_instance_of::<FitConvergenceError>(py),
                 prose.is_instance_of::<FitSeedError>(py),
@@ -1279,9 +1195,15 @@ mod fit_failure_dispatch_tests {
                 assert!(!subclass_check, "prose must not claim a category");
             }
 
+            for err in [&seeds, &reml, &laws, &numerical, &prose] {
+                assert!(err.is_instance_of::<ConvergenceError>(py));
+                assert!(err.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py));
+            }
+            assert!(input.is_instance_of::<DataError>(py));
+            assert!(input.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert!(invariant.is_instance_of::<InternalError>(py));
             for err in [&seeds, &reml, &laws, &invariant, &input, &numerical, &prose] {
-                assert!(err.is_instance_of::<FitError>(py));
-                assert!(err.is_instance_of::<GamError>(py));
+                assert!(err.is_instance_of::<GamfitError>(py));
                 assert!(
                     !err.is_instance_of::<IntegrationError>(py),
                     "only a genuine integration failure is an IntegrationError"
@@ -1339,6 +1261,49 @@ mod fit_failure_dispatch_tests {
             assert!(
                 !trace.is_instance_of::<IntegrationError>(py),
                 "only a genuine integration failure is an IntegrationError"
+            );
+        });
+    }
+
+    /// Every class the boundary raises lies under the class of the error's
+    /// own `ErrorCategory`, so `except gamfit.errors.DataError` catches exactly the
+    /// failures the CLI reports with the data exit code.
+    #[test]
+    fn every_raised_class_lies_under_its_error_category_class() {
+        fn category_class(py: Python<'_>, category: ErrorCategory) -> Bound<'_, PyType> {
+            match category {
+                ErrorCategory::Formula => py.get_type::<FormulaError>(),
+                ErrorCategory::Data => py.get_type::<DataError>(),
+                ErrorCategory::Convergence => py.get_type::<ConvergenceError>(),
+                ErrorCategory::NotFitted => py.get_type::<NotFittedError>(),
+                ErrorCategory::Internal => py.get_type::<InternalError>(),
+            }
+        }
+        Python::attach(|py| {
+            let estimation: [fn() -> EstimationError; 7] = [
+                || EstimationError::InvalidSpecification("bad".to_string()),
+                || EstimationError::InvalidInput("bad".to_string()),
+                || EstimationError::PredictionError,
+                || EstimationError::RemlOptimizationFailed("stalled".to_string()),
+                || EstimationError::StartupSeedsRefused("none".to_string()),
+                || EstimationError::CalibratorTrainingFailed("prose".to_string()),
+                || EstimationError::FitResultInvariantViolated("broken".to_string()),
+            ];
+            for make in estimation {
+                let class = category_class(py, make().error_category());
+                let direct = estimation_error_to_pyerr(make());
+                assert!(direct.value(py).is_instance(&class).unwrap(), "{}", make());
+                let fit = raise(FitFailure::from(make()));
+                assert!(fit.value(py).is_instance(&class).unwrap(), "{} via a fit", make());
+            }
+            for category in ErrorCategory::ALL {
+                let err = category_error(category, "msg".to_string());
+                assert!(err.value(py).is_instance(&category_class(py, category)).unwrap());
+                assert!(err.is_instance_of::<GamfitError>(py));
+            }
+            assert!(
+                category_error(ErrorCategory::NotFitted, String::new())
+                    .is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
             );
         });
     }
@@ -1464,6 +1429,54 @@ mod fit_failure_dispatch_tests {
                 .cast::<pyo3::types::PyDict>()
                 .expect("fields is a dict");
             assert!(trial_fields.is_empty(), "only the fit-ending variant exposes evidence");
+        });
+    }
+}
+
+#[cfg(test)]
+mod saved_model_error_dispatch_tests {
+    use super::*;
+
+    /// gam#3008: a payload load refuses raises the class of its category, a
+    /// `DataError`, naming its variant and category in the message and as
+    /// attributes, not an untyped refusal that cannot be told from any other.
+    #[test]
+    fn a_refused_saved_model_raises_its_category_with_its_variant_3008() {
+        Python::attach(|py| {
+            let refused = crate::load_model_impl(b"{\"not\": \"a saved model\"}")
+                .err()
+                .expect("bytes that are not a saved model must be refused");
+            let err = saved_model_error_to_pyerr(py, refused);
+            assert!(err.is_instance_of::<DataError>(py));
+            assert!(err.is_instance_of::<GamfitError>(py));
+            assert!(
+                !err.is_instance_of::<FormulaError>(py),
+                "a payload refusal is not a request error"
+            );
+            let value = err.value(py);
+            let variant: String =
+                value.getattr("variant").and_then(|v| v.extract()).expect("variant");
+            let category: String =
+                value.getattr("category").and_then(|v| v.extract()).expect("category");
+            assert_eq!(variant, "FittedModelError::PayloadCorrupt");
+            assert_eq!(category, "data");
+            let message = value.str().expect("message").to_string();
+            assert!(
+                message.contains("failed to parse model json")
+                    && message.contains("variant: FittedModelError::PayloadCorrupt")
+                    && message.contains("category: data"),
+                "the message must carry the refusal, its variant and its category: {message}"
+            );
+
+            let mismatch = saved_model_error_to_pyerr(
+                py,
+                gam::inference::model::FittedModelError::SchemaMismatch {
+                    reason: "fixture: saved covariance has the wrong shape".to_string(),
+                },
+            );
+            let variant: String =
+                mismatch.value(py).getattr("variant").and_then(|v| v.extract()).expect("variant");
+            assert_eq!(variant, "FittedModelError::SchemaMismatch");
         });
     }
 }

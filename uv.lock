@@ -314,7 +314,6 @@ wheels = [
 
 [[package]]
 name = "gamfit"
-version = "0.1.268"
 source = { editable = "." }
 dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -401,8 +400,8 @@ requires-dist = [
     { name = "pandas", marker = "extra == 'pandas'", specifier = ">=2.0" },
     { name = "pyarrow", marker = "extra == 'all'", specifier = ">=14" },
     { name = "pyarrow", marker = "extra == 'pandas'", specifier = ">=14" },
-    { name = "scikit-learn", marker = "extra == 'all'", specifier = ">=1.4" },
-    { name = "scikit-learn", marker = "extra == 'sklearn'", specifier = ">=1.4" },
+    { name = "scikit-learn", marker = "extra == 'all'", specifier = ">=1.6" },
+    { name = "scikit-learn", marker = "extra == 'sklearn'", specifier = ">=1.6" },
 ]
 provides-extras = ["cuda", "pandas", "plot", "sklearn", "all"]
 
@@ -412,7 +411,7 @@ test = [
     { name = "pandas", specifier = ">=2.0" },
     { name = "pyarrow", specifier = ">=14" },
     { name = "pytest", specifier = ">=8" },
-    { name = "scikit-learn", specifier = ">=1.4" },
+    { name = "scikit-learn", specifier = ">=1.6" },
 ]
 type = [
     { name = "matplotlib", specifier = ">=3.8" },
@@ -422,7 +421,7 @@ type = [
     { name = "polars", specifier = ">=1" },
     { name = "pyarrow", specifier = ">=14" },
     { name = "pytest", specifier = ">=8" },
-    { name = "scikit-learn", specifier = ">=1.4" },
+    { name = "scikit-learn", specifier = ">=1.6" },
     { name = "scikit-learn-stubs" },
     { name = "scipy-stubs" },
     { name = "types-requests" },

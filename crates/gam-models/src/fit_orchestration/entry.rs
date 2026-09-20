@@ -2,6 +2,8 @@ use super::*;
 use gam_linalg::matrix::LinearOperator;
 use gam_problem::FailureCategory;
 use gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root;
+use crate::inference::model_payload_builders::standard_fit_comparable_reml_score;
+use gam_terms::smooth::AdaptiveResolution;
 
 /// Request-specific inputs to the canonical standard-fit `FitOptions`.
 ///
@@ -58,14 +60,11 @@ pub fn canonical_standard_fit_options(
         // works for every family (the `COV_MAX_P` diagonal fallback caps cost).
         compute_inference: true,
         // Formula/CLI fits are the interactive/default path: keep coefficient
-        // covariance and the smoothing correction, and emit the CHEAP Tier-0
-        // live-rho posterior adequacy diagnostic (a handful of outer-criterion
-        // evaluations), which the optimizer surfaces regardless of this flag
-        // whenever it is cheaply available (#1810). This flag only suppresses the
-        // EXPENSIVE escalation tiers (Tier-1 quadrature / Tier-2 NUTS over rho),
-        // which could otherwise launch NUTS and turn ordinary fits into sampler
-        // benchmarks. Lower-level callers that explicitly need the escalation opt
-        // in elsewhere (`skip_rho_posterior_inference: false`).
+        // covariance and the analytic first-order smoothing correction, which
+        // the returned fit needs. The rho-posterior adequacy diagnostic (Tier-0
+        // PSIS over dozens of refits, and its Tier-1/Tier-2 escalations) is not
+        // needed to build that fit, so it runs only for lower-level callers that
+        // request it (`skip_rho_posterior_inference: false`).
         skip_rho_posterior_inference: true,
         // The count for the loops that still take one: the negative-binomial
         // alternation, the expectile LAWS iterations, the bounded-effect
@@ -129,6 +128,23 @@ fn residual_cascade_failure(error: gam_solve::residual_cascade::ResidualCascadeE
     raised_fit_failure(category, error.to_string())
 }
 
+/// The REML fit of a standard request whose exact Gaussian boundary
+/// (`try_deterministic_gaussian_standard_fit`) has already been refused. That
+/// certificate builds its own dense design and normal equations, so a caller
+/// that already ran it hands the request here rather than back through
+/// [`fit_model`], which would build and refuse it a second time.
+///
+/// `realized_design` is the design that certificate realized, when it built one;
+/// the REML fit starts from it instead of realizing the same design again.
+fn fit_standard_past_exact_gaussian_boundary(
+    request: StandardFitRequest<'_>,
+    realized_design: Option<TermCollectionDesign>,
+) -> Result<FitResult, WorkflowError> {
+    fit_standard_model_on_design(request, realized_design)
+        .map(FitResult::Standard)
+        .map_err(|failure| WorkflowError::from(failure.ending_the_fit()))
+}
+
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
     let request = request;
     // Every arm hands back the helper's `FitFailure` whole. This boundary used
@@ -140,12 +156,11 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
         |failure: FitFailure| -> WorkflowError { WorkflowError::from(failure.ending_the_fit()) };
     match request {
         FitRequest::Standard(request) => {
-            if let Some(fitted) = try_deterministic_gaussian_standard_fit(&request)? {
-                Ok(FitResult::Standard(fitted))
-            } else {
-                fit_standard_model(request)
-                    .map(FitResult::Standard)
-                    .map_err(wrap_solver_err)
+            match try_deterministic_gaussian_standard_fit(&request)? {
+                GaussianStandardRoute::Exact(fitted) => Ok(FitResult::Standard(fitted)),
+                GaussianStandardRoute::Iterative(design) => {
+                    fit_standard_past_exact_gaussian_boundary(request, design)
+                }
             }
         }
         FitRequest::GaussianLocationScale(request) => fit_gaussian_location_scale_model(request)
@@ -203,59 +218,70 @@ pub(crate) fn resolved_resource_policy(
 }
 
 /// Parse, materialize, and fit a model in one call.
-/// Resolve the expectile asymmetry `τ` requested by `config`, if any.
+/// Resolve the expectile levels requested by `config`, if any.
 ///
-/// Returns `Ok(Some(τ))` when `config.family` is `"expectile"` (optionally with
-/// an inline asymmetry, `"expectile(0.9)"`), `Ok(None)` for every other family,
-/// and `Err` when an expectile request carries an out-of-range `τ`. The inline
-/// form takes precedence over the explicit [`FitConfig::expectile_tau`] field
-/// only when both are present and disagree is rejected as a contradiction; when
-/// neither pins `τ`, the median expectile `τ = 0.5` (the ordinary mean fit) is
-/// the default.
-pub(crate) fn expectile_tau_for_config(config: &FitConfig) -> Result<Option<f64>, WorkflowError> {
-    let Some(raw) = config.family.as_deref() else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if !(lower == "expectile" || lower.starts_with("expectile(")) {
-        return Ok(None);
+/// Thin typed-error wrapper over [`FitConfig::resolved_expectile_levels`],
+/// the one rule [`FitConfig::resolve`] also enforces: `Some(levels)` for the
+/// expectile family, `None` for every other family, and `Err` for a malformed
+/// expectile request or an `expectile_tau` given with a non-expectile family.
+pub fn expectile_levels_for_config(
+    config: &FitConfig,
+) -> Result<Option<Vec<f64>>, WorkflowError> {
+    config
+        .resolved_expectile_levels()
+        .map_err(|reason| WorkflowError::InvalidConfig { reason })
+}
+
+/// Prior-weighted empirical `τ`-expectile of `z` in closed form.
+///
+/// The expectile is the unique root `c` of the strictly decreasing, piecewise
+/// linear estimating function
+/// `g(c) = τ·Σ_{zᵢ>c} pᵢ(zᵢ − c) − (1 − τ)·Σ_{zᵢ≤c} pᵢ(c − zᵢ)`.
+/// Sorting `z` and carrying the prefix sums `A = Σ p`, `B = Σ p·z` over the
+/// rows below the root's segment, `g` is linear on that segment and vanishes
+/// exactly at `c = [τ(Z − B) + (1 − τ)B] / [τ(P − A) + (1 − τ)A]` with totals
+/// `P`, `Z`. The segment is the first one whose right sorted endpoint has
+/// `g ≤ 0`; no iteration or tolerance is involved.
+fn weighted_empirical_expectile(z: &[f64], p: &[f64], tau: f64) -> Result<f64, String> {
+    if z.len() != p.len() || z.is_empty() {
+        return Err(format!(
+            "weighted expectile needs matching non-empty inputs; got {} values and {} weights",
+            z.len(),
+            p.len()
+        ));
     }
-    let invalid = |reason: String| WorkflowError::InvalidConfig { reason };
-    // Optional inline asymmetry: `expectile(0.9)`.
-    let inline_tau = if let Some(rest) = lower.strip_prefix("expectile(") {
-        let inner = rest.strip_suffix(')').ok_or_else(|| {
-            invalid(format!(
-                "expectile family asymmetry must be written as `expectile(τ)`; got `{trimmed}`"
-            ))
-        })?;
-        let value: f64 = inner.trim().parse().map_err(|_| {
-            invalid(format!(
-                "expectile asymmetry `{}` is not a finite number",
-                inner.trim()
-            ))
-        })?;
-        Some(value)
-    } else {
-        None
+    if z.iter().any(|v| !v.is_finite()) || p.iter().any(|w| !w.is_finite() || *w < 0.0) {
+        return Err(
+            "weighted expectile needs finite values and finite non-negative weights".to_string(),
+        );
+    }
+    let mut order: Vec<usize> = (0..z.len()).collect();
+    order.sort_by(|&a, &b| z[a].total_cmp(&z[b]));
+    let total_p: f64 = p.iter().sum();
+    let total_z: f64 = z.iter().zip(p).map(|(v, w)| v * w).sum();
+    if !(total_p > 0.0) {
+        return Err("weighted expectile needs a positive total weight".to_string());
+    }
+    let root = |below_p: f64, below_z: f64| {
+        (tau * (total_z - below_z) + (1.0 - tau) * below_z)
+            / (tau * (total_p - below_p) + (1.0 - tau) * below_p)
     };
-    let tau = match (inline_tau, config.expectile_tau) {
-        (Some(a), Some(b)) if (a - b).abs() > 0.0 => {
-            return Err(invalid(format!(
-                "expectile asymmetry given both inline (`expectile({a})`) and via expectile_tau \
-                 ({b}); supply exactly one"
-            )));
+    let (mut below_p, mut below_z) = (0.0_f64, 0.0_f64);
+    for &i in &order {
+        let at = z[i];
+        let (upto_p, upto_z) = (below_p + p[i], below_z + p[i] * z[i]);
+        let g = tau * ((total_z - upto_z) - at * (total_p - upto_p))
+            - (1.0 - tau) * (at * upto_p - upto_z);
+        if g <= 0.0 {
+            // The root lies on the segment ending at `at`, whose lower set is
+            // the rows strictly before this one.
+            return Ok(root(below_p, below_z).min(at));
         }
-        (Some(a), _) => a,
-        (None, Some(b)) => b,
-        (None, None) => 0.5,
-    };
-    if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
-        return Err(invalid(format!(
-            "expectile asymmetry τ must be finite and strictly in (0, 1); got {tau}"
-        )));
+        below_p = upto_p;
+        below_z = upto_z;
     }
-    Ok(Some(tau))
+    // Unreachable for positive total weight: g at the largest value is ≤ 0.
+    Ok(root(below_p, below_z))
 }
 
 /// Per-row asymmetric LAWS weight `wᵢ(τ) = τ` if `yᵢ > μᵢ` else `1 − τ`, scaled
@@ -391,7 +417,7 @@ fn expectile_kkt_residual(
 
 #[cfg(test)]
 mod expectile_convergence_tests {
-    use super::{ExpectileSignCycle, expectile_kkt_residual};
+    use super::{ExpectileSignCycle, expectile_kkt_residual, weighted_empirical_expectile};
     use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
     use ndarray::array;
 
@@ -455,6 +481,70 @@ mod expectile_convergence_tests {
         .expect("scaled KKT audit");
         assert!((base_kkt - scaled_kkt).abs() <= f64::EPSILON.sqrt());
     }
+
+    /// `g(c)` from the doc comment of `weighted_empirical_expectile`.
+    fn expectile_estimating_function(z: &[f64], p: &[f64], tau: f64, c: f64) -> f64 {
+        z.iter()
+            .zip(p)
+            .map(|(&v, &w)| {
+                if v > c {
+                    tau * w * (v - c)
+                } else {
+                    -(1.0 - tau) * w * (c - v)
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn weighted_expectile_is_the_exact_root_of_the_estimating_function() {
+        let z = [0.3, -1.7, 2.4, 0.3, -0.2, 5.1, -3.3];
+        let p = [1.0, 0.5, 2.0, 0.0, 1.5, 0.25, 1.0];
+        for tau in [0.02, 0.1, 0.3, 0.5, 0.7, 0.9, 0.98] {
+            let c = weighted_empirical_expectile(&z, &p, tau).expect("expectile");
+            let scale: f64 = z.iter().zip(&p).map(|(v, w)| w * v.abs()).sum();
+            let g = expectile_estimating_function(&z, &p, tau, c);
+            assert!(g.abs() <= 1.0e-13 * scale, "tau={tau}: g(c)={g:e}");
+        }
+    }
+
+    #[test]
+    fn weighted_expectile_at_one_half_is_the_weighted_mean() {
+        let z = [4.0, -2.0, 1.0, 7.5];
+        let p = [1.0, 3.0, 0.5, 2.0];
+        let mean = z.iter().zip(&p).map(|(v, w)| v * w).sum::<f64>() / p.iter().sum::<f64>();
+        let c = weighted_empirical_expectile(&z, &p, 0.5).expect("expectile");
+        assert!((c - mean).abs() <= 1.0e-14 * mean.abs().max(1.0));
+    }
+
+    #[test]
+    fn weighted_expectile_is_strictly_increasing_in_the_level() {
+        let z = [0.9, -0.4, 1.3, -2.2, 0.1, 3.0];
+        let p = [1.0; 6];
+        let levels = [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99];
+        let values: Vec<f64> = levels
+            .iter()
+            .map(|&tau| weighted_empirical_expectile(&z, &p, tau).expect("expectile"))
+            .collect();
+        assert!(
+            values.windows(2).all(|pair| pair[0] < pair[1]),
+            "expectiles not strictly increasing: {values:?}"
+        );
+        assert!(values[0] > -2.2 && values[values.len() - 1] < 3.0);
+    }
+
+    #[test]
+    fn weighted_expectile_ignores_zero_weight_rows_and_rejects_bad_input() {
+        let with_dead = weighted_empirical_expectile(&[1.0, 100.0, 3.0], &[1.0, 0.0, 1.0], 0.8)
+            .expect("expectile");
+        let without = weighted_empirical_expectile(&[1.0, 3.0], &[1.0, 1.0], 0.8).expect("expectile");
+        assert!((with_dead - without).abs() <= 1.0e-15);
+        assert!(weighted_empirical_expectile(&[], &[], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0], &[1.0, 1.0], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0, 2.0], &[0.0, 0.0], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0, f64::NAN], &[1.0, 1.0], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0, 2.0], &[1.0, -1.0], 0.5).is_err());
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -468,18 +558,51 @@ enum DeterministicPenaltyFace {
 }
 
 struct ExactGaussianBoundary {
+    /// The design the certificate was proved on.
+    design: TermCollectionDesign,
     beta: Array1<f64>,
     penalty_faces: Vec<DeterministicPenaltyFace>,
 }
 
-/// `Ok(None)` means the shortcut does not apply and the iterative REML solver
+/// What the exact Gaussian boundary certificate found.
+enum ExactGaussianVerdict {
+    /// The request is not a candidate; no design was realized.
+    Ineligible,
+    /// The realized design does not reproduce the response exactly.
+    Interior(TermCollectionDesign),
+    Boundary(ExactGaussianBoundary),
+}
+
+/// Who fits a Gaussian identity standard request.
+enum GaussianStandardRoute {
+    /// The deterministic zero-residual boundary fit.
+    Exact(StandardFitResult),
+    /// The iterative REML solver, handed the design the boundary check
+    /// realized from this request's `spec`, `data` and `resource_policy`, when
+    /// it realized one.
+    Iterative(Option<TermCollectionDesign>),
+}
+
+/// The design every standard fit of `request` realizes, built with the fit's
+/// own resource policy so that the REML fit can start from it.
+fn realize_standard_design(
+    request: &StandardFitRequest<'_>,
+) -> Result<TermCollectionDesign, gam_terms::basis::BasisError> {
+    gam_terms::smooth::build_term_collection_design_with_policy(
+        request.data.view(),
+        &request.spec,
+        &request.options.resource_policy,
+    )
+}
+
+/// `Iterative` means the shortcut does not apply and the iterative REML solver
 /// owns the fit; it is returned when the exact boundary face's free directions
 /// are not identified by the data (see the tangent-precision factorization
 /// below). Every `Err` is a malformed request, not a declined shortcut.
 fn deterministic_gaussian_standard_fit(
     request: &StandardFitRequest<'_>,
     exact_boundary: Option<ExactGaussianBoundary>,
-) -> Result<Option<StandardFitResult>, WorkflowError> {
+) -> Result<GaussianStandardRoute, WorkflowError> {
     if !request.family.is_gaussian_identity() || request.y.is_empty() {
         return Err(WorkflowError::InvalidConfig {
             reason:
@@ -505,28 +628,35 @@ fn deterministic_gaussian_standard_fit(
             reason: "deterministic Gaussian shortcut requires positive total weight".to_string(),
         });
     }
-    let design =
-        build_term_collection_design(request.data.view(), &request.spec).map_err(|err| {
-            WorkflowError::InvalidConfig {
-                reason: format!("deterministic Gaussian shortcut could not rebuild design: {err}"),
-            }
-        })?;
+    let (design, exact_boundary) = match exact_boundary {
+        Some(ExactGaussianBoundary {
+            design,
+            beta,
+            penalty_faces,
+        }) => (design, Some((beta, penalty_faces))),
+        None => (
+            realize_standard_design(request).map_err(|err| WorkflowError::InvalidConfig {
+                reason: format!("deterministic Gaussian shortcut could not build its design: {err}"),
+            })?,
+            None,
+        ),
+    };
     let p = design.design.ncols();
     let n_penalties = design.penalties.len();
     let (beta, penalty_faces) = match exact_boundary {
-        Some(boundary) => {
-            if boundary.beta.len() != p || boundary.penalty_faces.len() != n_penalties {
+        Some((beta, penalty_faces)) => {
+            if beta.len() != p || penalty_faces.len() != n_penalties {
                 return Err(raised_fit_failure(
                     FailureCategory::Invariant,
                     format!(
-                        "deterministic Gaussian boundary shape changed while rebuilding: \
+                        "deterministic Gaussian boundary does not match its design: \
                          coefficients {} vs {p}, penalty faces {} vs {n_penalties}",
-                        boundary.beta.len(),
-                        boundary.penalty_faces.len(),
+                        beta.len(),
+                        penalty_faces.len(),
                     ),
                 ));
             }
-            (boundary.beta, boundary.penalty_faces)
+            (beta, penalty_faces)
         }
         None => {
             // Dispatch proved every represented `y - offset` value is
@@ -822,7 +952,8 @@ fn deterministic_gaussian_standard_fit(
             // the data pin every direction the face leaves free. When they do
             // not -- `free_dim > n` makes `A` singular by construction, since
             // `rank(X Z) <= n`, and a double-penalized smooth deliberately
-            // admits `p > n` (`bspline_basis_min_rows`) -- the unpenalized
+            // admits `p > n` (only `n > M_p` is required, see
+            // `reject_prefit_unidentifiable_unpenalized_space`) -- the unpenalized
             // interpolant the boundary was built from is not the optimum at
             // all: with a penalty on those directions the criterion's
             // `log|X'WX + S_λ| - log|S_λ|₊` terms move the optimum off the
@@ -833,7 +964,7 @@ fn deterministic_gaussian_standard_fit(
             // n-vs-rank decision, fit the model (the n=30 wine-shaped fold of
             // #1089 is exactly this shape).
             let Ok(chol) = equilibrated.cholesky(faer::Side::Lower) else {
-                return Ok(None);
+                return Ok(GaussianStandardRoute::Iterative(Some(design)));
             };
             let solve_free = |rhs: &Array2<f64>| {
                 let mut scaled_rhs = rhs.clone();
@@ -1013,6 +1144,7 @@ fn deterministic_gaussian_standard_fit(
         // Exact fit ⇒ residual variance is exactly zero.
         dispersion: gam_solve::estimate::Dispersion::ZERO_ESTIMATE,
         factorized_standard_errors: None,
+        smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence,
         weighted_gram: Some(xtwx),
@@ -1091,13 +1223,12 @@ fn deterministic_gaussian_standard_fit(
                 reason: format!("deterministic Gaussian shortcut could not freeze design: {err}"),
             }
         })?;
-    Ok(Some(StandardFitResult {
+    Ok(GaussianStandardRoute::Exact(StandardFitResult {
         fit,
         design,
         resolvedspec,
         basis_adequacy: Vec::new(),
-        adaptive_spatial_terms: adaptive_spatial_term_mask(&request.spec),
-        adaptive_spatial_center_counts: adaptive_spatial_center_counts(&request.spec),
+        adaptive_bases: adaptive_bases(&request.spec),
         kappa_timing: None,
         saved_link_state: gam_solve::estimate::FittedLinkState::Standard(None),
         wiggle_knots: None,
@@ -1154,57 +1285,28 @@ fn exact_gaussian_coefficients(
     subspace: Option<(&Array2<f64>, f64)>,
 ) -> Option<Array1<f64>> {
     let p = x.ncols();
-    let (reduced_x, basis, rotation_radius) = match subspace {
-        Some((z, radius)) => (gam_linalg::faer_ndarray::fast_ab(x, z), Some(z), radius),
-        None => (x.clone(), None, 0.0),
+    let (reduced_x_storage, basis, rotation_radius) = match subspace {
+        Some((z, radius)) => (
+            std::borrow::Cow::Owned(gam_linalg::faer_ndarray::fast_ab(x, z)),
+            Some(z),
+            radius,
+        ),
+        None => (std::borrow::Cow::Borrowed(x), None, 0.0),
     };
+    let reduced_x: &Array2<f64> = &reduced_x_storage;
     if !rotation_radius.is_finite() {
         return None;
     }
     if adjusted_response.len() != reduced_x.nrows() || weights.len() != reduced_x.nrows() {
         return None;
     }
-    let beta = if reduced_x.ncols() == 0 {
+    let reduced_p = reduced_x.ncols();
+    let beta = if reduced_p == 0 {
         Array1::<f64>::zeros(p)
     } else {
-        // A zero-residual coefficient defines a deterministic Gaussian law
-        // only when it is unique on the positive-weight support.  A certified
-        // solve residual alone cannot establish that: when n < p an
-        // underdetermined design can interpolate arbitrary responses while
-        // still admitting infinitely many coefficient vectors.  Certify the
-        // injectivity promised by `exact_gaussian_boundary` directly on the
-        // reduced design's positive-weight support before forming its Gram
-        // matrix. Positive row scaling cannot change exact rank, so omitting it
-        // here also makes the structural certificate invariant to a uniform
-        // rescaling of all positive likelihood weights.
-        let reduced_p = reduced_x.ncols();
-        let positive_rows: Vec<usize> = weights
-            .iter()
-            .enumerate()
-            .filter_map(|(row, &weight)| (weight > 0.0).then_some(row))
-            .collect();
-        if positive_rows.len() < reduced_p {
-            return None;
-        }
-        let positive_weight_reduced_x = Array2::from_shape_fn(
-            (positive_rows.len(), reduced_p),
-            |(weighted_row, column)| {
-                let row = positive_rows[weighted_row];
-                reduced_x[[row, column]]
-            },
-        );
-        let rank = gam_linalg::faer_ndarray::rrqr_with_permutation(
-            &positive_weight_reduced_x,
-            gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
-        )
-        .ok()?
-        .rank;
-        if rank != reduced_p {
-            return None;
-        }
-        let gram = gam_linalg::faer_ndarray::fast_xt_diag_x(&reduced_x, weights);
+        let gram = gam_linalg::faer_ndarray::fast_xt_diag_x(reduced_x, weights);
         let rhs_matrix = gam_linalg::faer_ndarray::fast_xt_diag_y(
-            &reduced_x,
+            reduced_x,
             weights,
             &adjusted_response.view().insert_axis(ndarray::Axis(1)),
         );
@@ -1265,6 +1367,43 @@ fn exact_gaussian_coefficients(
             return None;
         }
     }
+    // A zero-residual coefficient defines a deterministic Gaussian law only
+    // when it is unique on the positive-weight support. A certified solve
+    // residual alone cannot establish that: when n < p an underdetermined
+    // design can interpolate arbitrary responses while still admitting
+    // infinitely many coefficient vectors. Certify the injectivity promised by
+    // `exact_gaussian_boundary` directly on the reduced design's positive-weight
+    // support. Positive row scaling cannot change exact rank, so omitting it
+    // here also makes the structural certificate invariant to a uniform
+    // rescaling of all positive likelihood weights. Every certificate here is
+    // a conjunct, so the rank-revealing QR runs last: a noisy response is
+    // refused by the residual bound above without paying for it.
+    if reduced_p > 0 {
+        let positive_rows: Vec<usize> = weights
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &weight)| (weight > 0.0).then_some(row))
+            .collect();
+        if positive_rows.len() < reduced_p {
+            return None;
+        }
+        let positive_weight_reduced_x = Array2::from_shape_fn(
+            (positive_rows.len(), reduced_p),
+            |(weighted_row, column)| {
+                let row = positive_rows[weighted_row];
+                reduced_x[[row, column]]
+            },
+        );
+        let rank = gam_linalg::faer_ndarray::rrqr_with_permutation(
+            &positive_weight_reduced_x,
+            gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
+        )
+        .ok()?
+        .rank;
+        if rank != reduced_p {
+            return None;
+        }
+    }
     Some(beta)
 }
 
@@ -1299,6 +1438,72 @@ mod exact_gaussian_boundary_tests {
     }
 }
 
+#[cfg(test)]
+mod exact_gaussian_boundary_design_reuse_tests {
+    use super::*;
+    use csv::StringRecord;
+    use gam_data::encode_recordswith_inferred_schema;
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+
+    fn noisy_surface() -> Dataset {
+        let mut rng = StdRng::seed_from_u64(3261);
+        let headers: Vec<String> = ["x0", "x1", "y"].iter().map(|h| h.to_string()).collect();
+        let rows = (0..240)
+            .map(|_| {
+                let x0: f64 = rng.random();
+                let x1: f64 = rng.random();
+                let noise: f64 = rng.random::<f64>() - 0.5;
+                let y = (3.0 * x0).sin() * (2.0 * x1).cos() + 0.2 * noise;
+                StringRecord::from(vec![x0.to_string(), x1.to_string(), y.to_string()])
+            })
+            .collect();
+        encode_recordswith_inferred_schema(headers, rows).expect("encode")
+    }
+
+    fn standard_request<'a>(data: &'a Dataset) -> StandardFitRequest<'a> {
+        let config = FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        };
+        match materialize("y ~ te(x0, x1)", data, &config)
+            .expect("materialize")
+            .request
+        {
+            FitRequest::Standard(request) => request,
+            _ => panic!("a Gaussian te() formula materializes a standard request"),
+        }
+    }
+
+    /// The boundary certificate refuses a noisy response after realizing the
+    /// full design; the REML fit must start from that design, and doing so
+    /// must be the same fit as realizing it again.
+    #[test]
+    fn refused_boundary_hands_the_fit_its_realized_design() {
+        let data = noisy_surface();
+        let request = standard_request(&data);
+        let GaussianStandardRoute::Iterative(Some(design)) =
+            try_deterministic_gaussian_standard_fit(&request).expect("boundary check")
+        else {
+            panic!("a noisy te() response is refused with its realized design");
+        };
+        let rebuilt = realize_standard_design(&request).expect("rebuild");
+        assert_eq!(design.design.to_dense(), rebuilt.design.to_dense());
+        assert_eq!(design.affine_offset, rebuilt.affine_offset);
+        assert_eq!(design.penalties.len(), rebuilt.penalties.len());
+        for (handed, fresh) in design.penalties.iter().zip(&rebuilt.penalties) {
+            assert_eq!(handed.col_range, fresh.col_range);
+            assert_eq!(handed.local, fresh.local);
+        }
+
+        let on_design = fit_standard_model_on_design(request, Some(design)).expect("reused fit");
+        let fresh = fit_standard_model(standard_request(&data)).expect("fresh fit");
+        assert_eq!(on_design.fit.log_lambdas, fresh.fit.log_lambdas);
+        assert_eq!(on_design.fit.beta, fresh.fit.beta);
+        assert_eq!(on_design.design.design.to_dense(), fresh.design.design.to_dense());
+    }
+}
+
 /// Certify that a Gaussian design represents its adjusted response exactly and
 /// identify the asymptotic face of every smoothing precision.
 ///
@@ -1316,7 +1521,7 @@ mod exact_gaussian_boundary_tests {
 /// Thus a merely small residual cannot enter this route.
 fn exact_gaussian_boundary(
     request: &StandardFitRequest<'_>,
-) -> Result<Option<ExactGaussianBoundary>, WorkflowError> {
+) -> Result<ExactGaussianVerdict, WorkflowError> {
     if !request.family.is_gaussian_identity()
         || request.y.is_empty()
         || !request.spec.random_effect_terms.is_empty()
@@ -1334,16 +1539,11 @@ fn exact_gaussian_boundary(
         || request.y.len() != request.offset.len()
         || request.y.len() != request.weights.len()
     {
-        return Ok(None);
+        return Ok(ExactGaussianVerdict::Ineligible);
     }
-    let design =
-        build_term_collection_design(request.data.view(), &request.spec).map_err(|err| {
-            WorkflowError::InvalidConfig {
-                reason: format!(
-                    "deterministic Gaussian candidate could not build its design: {err}"
-                ),
-            }
-        })?;
+    let design = realize_standard_design(request).map_err(|err| WorkflowError::InvalidConfig {
+        reason: format!("deterministic Gaussian candidate could not build its design: {err}"),
+    })?;
     if design.design.ncols() == 0
         || design.coefficient_lower_bounds.is_some()
         || design.linear_constraints.is_some()
@@ -1352,7 +1552,7 @@ fn exact_gaussian_boundary(
             .iter()
             .any(|block| !matches!(&block.prior_mean, gam_problem::CoefficientPriorMean::Zero))
     {
-        return Ok(None);
+        return Ok(ExactGaussianVerdict::Interior(design));
     }
     let adjusted_response = request.y.as_ref() - request.offset.as_ref() - &design.affine_offset;
     if adjusted_response.iter().any(|value| !value.is_finite())
@@ -1361,13 +1561,13 @@ fn exact_gaussian_boundary(
             .iter()
             .any(|weight| !weight.is_finite() || *weight < 0.0)
     {
-        return Ok(None);
+        return Ok(ExactGaussianVerdict::Interior(design));
     }
     let x = design.design.to_dense();
     let Some(beta) =
         exact_gaussian_coefficients(&x, &adjusted_response, request.weights.as_ref(), None)
     else {
-        return Ok(None);
+        return Ok(ExactGaussianVerdict::Interior(design));
     };
 
     let p = x.ncols();
@@ -1476,14 +1676,15 @@ fn exact_gaussian_boundary(
             request.weights.as_ref(),
             Some((&joint_null_basis, joint_rotation_radius)),
         ) else {
-            return Ok(None);
+            return Ok(ExactGaussianVerdict::Interior(design));
         };
         tangent_beta
     } else {
         beta
     };
 
-    Ok(Some(ExactGaussianBoundary {
+    Ok(ExactGaussianVerdict::Boundary(ExactGaussianBoundary {
+        design,
         beta,
         penalty_faces,
     }))
@@ -1551,14 +1752,55 @@ fn embedded_penalty_null_basis(
 
 fn try_deterministic_gaussian_standard_fit(
     request: &StandardFitRequest<'_>,
-) -> Result<Option<StandardFitResult>, WorkflowError> {
+) -> Result<GaussianStandardRoute, WorkflowError> {
     if gaussian_response_is_constant(request) {
         return deterministic_gaussian_standard_fit(request, None);
     }
-    let Some(boundary) = exact_gaussian_boundary(request)? else {
-        return Ok(None);
+    match exact_gaussian_boundary(request)? {
+        ExactGaussianVerdict::Ineligible => Ok(GaussianStandardRoute::Iterative(None)),
+        ExactGaussianVerdict::Interior(design) => Ok(GaussianStandardRoute::Iterative(Some(design))),
+        ExactGaussianVerdict::Boundary(boundary) => {
+            deterministic_gaussian_standard_fit(request, Some(boundary))
+        }
+    }
+}
+
+/// The training table with every zero-weight row removed.
+///
+/// A prior weight of zero removes the row from the likelihood, and it must
+/// remove it from everything else the fit derives from the rows as well —
+/// knots, covariate ranges, identifiability constraints, standardization,
+/// factor levels, column kinds — so that weight zero is exactly row deletion.
+/// Every fitting entry point runs its data through this one seam. The table
+/// is borrowed unchanged when no weight column is configured or no weight is
+/// exactly zero; rows with a missing or negative weight are kept so the weight
+/// validator still reports them.
+pub fn drop_zero_weight_rows<'a>(
+    data: &'a Dataset,
+    config: &FitConfig,
+) -> Result<std::borrow::Cow<'a, Dataset>, WorkflowError> {
+    use std::borrow::Cow;
+    let Some(name) = config.weight_column.as_deref().map(str::trim) else {
+        return Ok(Cow::Borrowed(data));
     };
-    deterministic_gaussian_standard_fit(request, Some(boundary))
+    let Some(column) = data.headers.iter().position(|header| header == name) else {
+        return Ok(Cow::Borrowed(data));
+    };
+    let weights = data.values.column(column);
+    let keep: Vec<usize> = (0..weights.len()).filter(|&row| weights[row] != 0.0).collect();
+    if keep.len() == weights.len() {
+        return Ok(Cow::Borrowed(data));
+    }
+    if keep.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!("weight column '{name}' is zero on every row; there is nothing to fit"),
+        });
+    }
+    data.select_rows(&keep)
+        .map(Cow::Owned)
+        .map_err(|error| WorkflowError::InvalidConfig {
+            reason: error.to_string(),
+        })
 }
 
 pub fn fit_from_formula(
@@ -1573,7 +1815,7 @@ pub fn fit_from_formula(
 /// authoritative materialization pass.
 pub struct FormulaFitResult {
     pub result: FitResult,
-    pub inference_notes: Vec<String>,
+    pub inference_notes: FitNotes,
     /// Scalar terms the training rows could not identify, removed before the fit.
     pub unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,
 }
@@ -1581,7 +1823,28 @@ pub struct FormulaFitResult {
 /// Resolve, materialize, and fit a formula without making front ends repeat any
 /// model construction. Unlike `fit_from_formula`, this service also returns the
 /// materializer's user-facing advisories for CLI/Python presentation.
+///
+/// An automatic `.` term is expanded against `data` first; its notes (the
+/// first of which spells out the fitted formula) lead the returned notes.
 pub fn fit_from_formula_with_notes(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<FormulaFitResult, WorkflowError> {
+    let data = &*drop_zero_weight_rows(data, config)?;
+    let automatic = expand_automatic_fit_formula(formula, data, config)?;
+    if automatic.notes.is_empty() {
+        return fit_expanded_formula_with_notes(formula, data, config);
+    }
+    let mut outcome = fit_expanded_formula_with_notes(&automatic.formula, data, config)?;
+    // The expansion is an advisory: the fitted formula is not the literal one.
+    let mut advisories = automatic.notes;
+    advisories.append(&mut outcome.inference_notes.advisories);
+    outcome.inference_notes.advisories = advisories;
+    Ok(outcome)
+}
+
+fn fit_expanded_formula_with_notes(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
@@ -1589,7 +1852,10 @@ pub fn fit_from_formula_with_notes(
     if config.ctn_stage1.is_some() || config.frozen_ctn.is_some() {
         let payload = crate::inference::model_payload_builders::fit_formula_to_payload(
             formula.to_string(), data, config)?;
-        return Ok(FormulaFitResult { inference_notes: payload.inference_notes.clone(),
+        return Ok(FormulaFitResult { inference_notes: FitNotes {
+                                        advisories: payload.inference_notes.clone(),
+                                        informational: payload.informational_notes.clone(),
+                                    },
                                     unidentified_scalar_terms: payload.unidentified_scalar_terms.clone(),
                                     result: FitResult::Ctn(Box::new(payload)) });
     }
@@ -1601,7 +1867,7 @@ pub fn fit_from_formula_with_notes(
     // `materialize()` callers receive the ordinary fully provisioned basis;
     // activating the structural start without an owner would strand them in an
     // under-resolved function space.
-    config.spatial_center_counts = Some(Vec::new());
+    config.adaptive_resolution = Some(Vec::new());
     let current = fit_from_formula_once_with_notes(formula, data, &config)?;
     finish_adaptive_spatial_fit(formula, data, config, current)
 }
@@ -1620,13 +1886,13 @@ pub(crate) fn fit_materialized_standard_with_notes(
     data: &Dataset,
     config: &FitConfig,
     request: StandardFitRequest<'_>,
-    inference_notes: Vec<String>,
+    inference_notes: FitNotes,
 ) -> Result<FormulaFitResult, WorkflowError> {
     let mut config = config
         .clone()
         .resolve()
         .map_err(|reason| WorkflowError::InvalidConfig { reason })?;
-    config.spatial_center_counts = Some(Vec::new());
+    config.adaptive_resolution = Some(Vec::new());
     let current = fit_materialized_once_with_notes(MaterializedModel {
         request: FitRequest::Standard(request),
         inference_notes,
@@ -1636,138 +1902,296 @@ pub(crate) fn fit_materialized_standard_with_notes(
     finish_adaptive_spatial_fit(formula, data, config, current)
 }
 
+/// Grow every formula-default smooth basis until the converged fit's own
+/// evidence stops paying for more resolution (#1689, #3078).
+///
+/// Each round reads two signals per adaptive term from the converged fit: EDF
+/// saturation (λ at its floor, the penalized capacity used up) and the #2774
+/// lack-of-fit score test (residual structure the basis cannot represent while
+/// λ still binds). A term with either signal proposes one level of nested
+/// refinement, bounded by what its covariate support can identify and by the
+/// design rank. The refit is accepted only when it raises the marginal
+/// likelihood: the null-space-normalized REML/LAML score is the model evidence
+/// of the penalized basis, so a larger basis that merely lets the prior absorb
+/// noise is rejected and the smaller fit stands.
 fn finish_adaptive_spatial_fit(
     formula: &str,
     data: &Dataset,
     mut config: FitConfig,
     mut current: FormulaFitResult,
 ) -> Result<FormulaFitResult, WorkflowError> {
+    // Saturation, and the evidence margin below, are read at the same
+    // outer-optimization tolerance that certified the formula fit.
+    // `canonical_standard_fit_options` is the single policy source for that
+    // tolerance, so the decision cannot drift between the CLI and library
+    // entry points.
+    let resolution_tol =
+        canonical_standard_fit_options(&config, StandardFitOptionsInputs::default()).tol;
     loop {
         let Some(current_standard) = standard_result(&current) else {
             return Ok(current);
         };
-        // Saturation is assessed at the same outer-optimization tolerance that
-        // certified this formula fit. `canonical_standard_fit_options` is the
-        // single policy source for that tolerance, so the expansion decision
-        // cannot drift between the CLI and library entry points.
-        let standard_options =
-            canonical_standard_fit_options(&config, StandardFitOptionsInputs::default());
-        let resolution_tol = standard_options.tol;
-        let candidates =
-            adaptive_spatial_candidates(current_standard, data.values.nrows(), resolution_tol)?;
-        if candidates.is_empty() {
+        let refinements = adaptive_refinements(current_standard, data, resolution_tol)?;
+        if refinements.is_empty() {
             return Ok(current);
         }
+        let Some(current_score) = standard_fit_comparable_reml_score(current_standard)
+            .map_err(|reason| raised_fit_failure(FailureCategory::Invariant, reason))?
+        else {
+            // A fit without a marginal likelihood carries no evidence to
+            // compare a refinement against.
+            return Ok(current);
+        };
+        let term_count = current_standard.adaptive_bases.len();
 
-        // Grow one under-resolved term at a time in stable formula order. The
-        // next loop iteration re-fits and re-measures every term, so
-        // interactions between smooths are handled from a converged joint
-        // optimum instead of applying several decisions made against stale
-        // evidence.
-        let term_count = candidates.term_count;
-        let candidate = candidates
-            .terms
-            .into_iter()
-            .next()
-            .expect("non-empty adaptive candidate set");
-        // Expansion is mandatory once a certified fit is under-resolved, so the
-        // old design/covariance can be released before constructing the larger
-        // one. Keeping both complete fits alive would make adaptive resolution
-        // itself an avoidable peak-memory multiplier.
-        drop(current);
-        let mut candidate_config = config.clone();
-        let center_counts = candidate_config
-            .spatial_center_counts
-            .get_or_insert_with(Vec::new);
-        if center_counts.len() < term_count {
-            center_counts.resize(term_count, None);
+        // Every signalling term is refined jointly, so smooths that share
+        // structure grow from one converged optimum. When the joint refit does
+        // not pay, one term's spurious screen may be masking another's real
+        // gain; each refinement is then tried alone, in formula order.
+        let mut attempts = vec![refinements.iter().collect::<Vec<_>>()];
+        if refinements.len() > 1 {
+            attempts.extend(refinements.iter().map(|refinement| vec![refinement]));
         }
-        center_counts[candidate.term_index] = Some(candidate.proposed_centers);
-        let candidate_outcome = fit_from_formula_once_with_notes(formula, data, &candidate_config)
-            .map_err(|error| WorkflowError::SpatialUnderresolved {
-                term: candidate.term_name.clone(),
-                current_centers: candidate.current_centers,
-                attempted_centers: candidate.proposed_centers,
-                reason: error.to_string(),
-                refit_failure: Some(Box::new(error)),
-            })?;
-        if standard_result(&candidate_outcome).is_none() {
-            return Err(WorkflowError::SpatialUnderresolved {
-                term: candidate.term_name.clone(),
-                current_centers: candidate.current_centers,
-                attempted_centers: candidate.proposed_centers,
-                reason: "the certification refit changed estimator representation".to_string(),
-                refit_failure: None,
-            });
+        let mut accepted = None;
+        for attempt in attempts {
+            let candidate_config = config_with_refinements(&config, term_count, &attempt);
+            let candidate = fit_from_formula_once_with_notes(formula, data, &candidate_config)
+                .map_err(|error| refinement_failure(&attempt, error.to_string(), Some(error)))?;
+            let Some(candidate_standard) = standard_result(&candidate) else {
+                return Err(refinement_failure(
+                    &attempt,
+                    "the refinement refit changed estimator representation".to_string(),
+                    None,
+                ));
+            };
+            let candidate_score = standard_fit_comparable_reml_score(candidate_standard)
+                .map_err(|reason| raised_fit_failure(FailureCategory::Invariant, reason))?;
+            if candidate_score
+                .is_some_and(|score| evidence_improves(current_score, score, resolution_tol))
+            {
+                accepted = Some((candidate_config, candidate));
+                break;
+            }
         }
-
-        // The current fit was under-resolved; once the larger fit is certified
-        // it is the estimator state to resume from. Comparing raw REML/LAML
-        // values across different center charts is not a valid rejection gate
-        // (and a strict `<` accepts numerical noise), so resolution growth is
-        // controlled solely by the next converged fit's own saturation and
-        // lack-of-fit evidence.
-        config = candidate_config;
-        current = candidate_outcome;
+        match accepted {
+            Some((candidate_config, candidate)) => {
+                config = candidate_config;
+                current = candidate;
+            }
+            None => return Ok(current),
+        }
     }
 }
 
-struct AdaptiveSpatialCandidates {
+/// Whether a refit's comparable REML/LAML score (lower is better) beats the
+/// current one by more than the outer optimizer's own convergence tolerance,
+/// so optimizer noise is never read as evidence.
+fn evidence_improves(current: f64, candidate: f64, tol: f64) -> bool {
+    candidate < current - tol * (1.0 + current.abs())
+}
+
+fn config_with_refinements(
+    config: &FitConfig,
     term_count: usize,
-    terms: Vec<AdaptiveSpatialCandidate>,
+    refinements: &[&AdaptiveRefinement],
+) -> FitConfig {
+    let mut candidate = config.clone();
+    let plan = candidate.adaptive_resolution.get_or_insert_with(Vec::new);
+    if plan.len() < term_count {
+        plan.resize(term_count, None);
+    }
+    for refinement in refinements {
+        plan[refinement.term_index] = Some(refinement.proposed.clone());
+    }
+    candidate
 }
 
-impl AdaptiveSpatialCandidates {
-    fn is_empty(&self) -> bool {
-        self.terms.is_empty()
+fn refinement_failure(
+    refinements: &[&AdaptiveRefinement],
+    reason: String,
+    refit_failure: Option<WorkflowError>,
+) -> WorkflowError {
+    let join = |part: &dyn Fn(&AdaptiveRefinement) -> String| {
+        refinements
+            .iter()
+            .map(|refinement| part(refinement))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    WorkflowError::SpatialUnderresolved {
+        term: join(&|refinement| refinement.term_name.clone()),
+        current_resolution: join(&|refinement| refinement.current.to_string()),
+        attempted_resolution: join(&|refinement| refinement.proposed.to_string()),
+        reason,
+        refit_failure: refit_failure.map(Box::new),
     }
 }
 
-struct AdaptiveSpatialCandidate {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdaptiveRefinement {
     term_index: usize,
     term_name: String,
-    current_centers: usize,
-    proposed_centers: usize,
+    current: AdaptiveResolution,
+    proposed: AdaptiveResolution,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AdaptiveCenterDecision {
-    Certified,
-    Expand(usize),
-    Exhausted,
-}
-
-/// Decide one adaptive spatial term's resolution from its converged fit.
-///
-/// Two pieces of evidence say the realized basis is too small. EDF saturation
-/// fires once λ has been driven to its floor and the penalized capacity is used
-/// up. The #2774 lack-of-fit score test (`lacks_fit`) fires while λ still binds,
-/// where saturation is blind: REML trades basis size against λ, so a basis that
-/// is far too small can sit below its algebraic ceiling while the residuals keep
-/// structure it cannot represent. Either one grows the basis.
-///
-/// Only saturation at the validated ceiling is exhaustion. A lack-of-fit verdict
-/// at the ceiling leaves the fit certified with its fit-time advisory, since
-/// growing past the validated default is not this loop's to do.
-fn adaptive_center_decision(
-    current_centers: usize,
-    ceiling_centers: usize,
+/// A refinement one term's evidence asks for, before the design rank is shared
+/// out between the terms asking.
+#[derive(Clone, Debug)]
+struct RefinementRequest {
+    refinement: AdaptiveRefinement,
+    saturated: bool,
     edf: f64,
-    realized_width: usize,
-    nullspace_dim: usize,
-    resolution_tol: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AdaptiveTermDecision {
+    Certified,
+    Refine(AdaptiveResolution),
+}
+
+/// Decide one adaptive term's next resolution from its converged fit.
+///
+/// Without saturation or lack of fit the basis is certified. Otherwise the
+/// proposal is one level of nested refinement bounded by the covariate
+/// support. A basis already at its support bound spans every function the
+/// observed covariate values can identify, so there is nothing larger to
+/// resolve and it is certified as well.
+fn adaptive_term_decision(
+    current: &AdaptiveResolution,
+    refined: &AdaptiveResolution,
+    support: &AdaptiveResolution,
+    saturated: bool,
     lacks_fit: bool,
-) -> AdaptiveCenterDecision {
-    let saturated =
-        gam_terms::basis::basis_is_saturated(edf, realized_width, nullspace_dim, resolution_tol);
+) -> AdaptiveTermDecision {
     if !saturated && !lacks_fit {
-        return AdaptiveCenterDecision::Certified;
+        return AdaptiveTermDecision::Certified;
     }
-    match gam_terms::basis::expanded_num_centers(current_centers, ceiling_centers) {
-        Some(proposed) => AdaptiveCenterDecision::Expand(proposed),
-        None if saturated => AdaptiveCenterDecision::Exhausted,
-        None => AdaptiveCenterDecision::Certified,
+    let proposed = refined.clamped(support, current);
+    if proposed.exceeds(current) {
+        AdaptiveTermDecision::Refine(proposed)
+    } else {
+        AdaptiveTermDecision::Certified
     }
+}
+
+/// Whether a lack-of-fit row's enrichment explains more deviance than its
+/// parameters cost. The score statistic is the local approximation of the
+/// deviance the `rank` enrichment directions would remove, and each added
+/// parameter costs two units of deviance in expected predictive loss (AIC).
+/// This is a screen for which terms to refit, not a verdict: the refit's REML
+/// evidence decides.
+fn enrichment_pays_for_itself(row: &crate::fit_orchestration::drivers::BasisAdequacyRow) -> bool {
+    match (row.statistic, row.enrichment_rank) {
+        (Some(statistic), Some(rank)) if rank > 0 => statistic > 2.0 * rank as f64,
+        _ => false,
+    }
+}
+
+/// The smallest nested refinement of `current` that adds at least
+/// `directions` coefficients, within `support`, and never less than one level.
+///
+/// The lack-of-fit screen finds its evidence in a `directions`-dimensional
+/// alternative, so a smaller refinement can miss that structure entirely: a
+/// harmonic basis is orthogonal across degrees, so a degree-8 signal is
+/// invisible to every span below degree 8 and a one-level step shows no
+/// evidence gain. The refit's REML evidence still decides whether the larger
+/// basis is kept.
+fn refinement_spanning(
+    basis: &gam_terms::smooth::SmoothBasisSpec,
+    values: ndarray::ArrayView2<'_, f64>,
+    current: &AdaptiveResolution,
+    support: &AdaptiveResolution,
+    directions: usize,
+) -> AdaptiveResolution {
+    let width =
+        |resolution: &AdaptiveResolution| {
+            gam_terms::smooth::adaptive_resolution_width(basis, values, resolution)
+        };
+    let base = width(current);
+    let mut target = gam_terms::smooth::refined_adaptive_resolution(current);
+    while width(&target).saturating_sub(base) < directions {
+        let next = gam_terms::smooth::refined_adaptive_resolution(&target)
+            .clamped(support, current);
+        if !next.exceeds(&target) {
+            break;
+        }
+        target = next;
+    }
+    target
+}
+
+/// Share the design's residual rank between the requested refinements in
+/// formula order, so the refit keeps at least one residual degree of freedom
+/// (a `p >= n` design is not identified by the data, and the REML surface is
+/// flat along directions the data never see).
+///
+/// `width(term_index, resolution)` is the raw coefficient width a term realizes
+/// at `resolution`. A request that does not fit whole is shortened to the
+/// furthest point on its monotone refinement path that does. A saturated term
+/// that cannot take even one step with the round's whole residual rank is
+/// under-resolved with no identifiable refinement left: that is a typed error,
+/// never a silent certification. A term that only lost the rank to an earlier
+/// one is reconsidered in the next round.
+fn fit_refinements_to_rank(
+    requests: Vec<RefinementRequest>,
+    spare_rank: usize,
+    width: impl Fn(usize, &AdaptiveResolution) -> usize,
+) -> Result<Vec<AdaptiveRefinement>, WorkflowError> {
+    let mut remaining = spare_rank;
+    let mut accepted = Vec::new();
+    for request in requests {
+        let RefinementRequest {
+            refinement,
+            saturated,
+            edf,
+        } = request;
+        let base = width(refinement.term_index, &refinement.current);
+        let cost = |step: usize| {
+            width(
+                refinement.term_index,
+                &refinement.current.toward(&refinement.proposed, step),
+            )
+            .saturating_sub(base)
+        };
+        let steps = refinement.current.steps_to(&refinement.proposed);
+        // `width` is monotone along the path, so the furthest affordable
+        // step is found by bisection.
+        let (mut lo, mut hi) = (0, steps);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if cost(mid) <= remaining {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if lo == 0 {
+            if saturated && steps > 0 && cost(1) > spare_rank {
+                let attempted = refinement.current.toward(&refinement.proposed, 1);
+                return Err(WorkflowError::SpatialUnderresolved {
+                    term: refinement.term_name,
+                    current_resolution: refinement.current.to_string(),
+                    attempted_resolution: attempted.to_string(),
+                    reason: format!(
+                        "term EDF {edf:.6} saturates its realized basis, and the smallest \
+                         refinement adds {} coefficients to a design with {spare_rank} residual \
+                         degrees of freedom",
+                        cost(1)
+                    ),
+                    refit_failure: None,
+                });
+            }
+            continue;
+        }
+        remaining -= cost(lo);
+        let proposed = refinement.current.toward(&refinement.proposed, lo);
+        accepted.push(AdaptiveRefinement {
+            proposed,
+            ..refinement
+        });
+    }
+    Ok(accepted)
 }
 
 fn standard_result(outcome: &FormulaFitResult) -> Option<&StandardFitResult> {
@@ -1777,172 +2201,280 @@ fn standard_result(outcome: &FormulaFitResult) -> Option<&StandardFitResult> {
     }
 }
 
-fn adaptive_spatial_candidates(
+/// The refinements the converged `result` asks for, already fitted to the
+/// design rank.
+fn adaptive_refinements(
     result: &StandardFitResult,
-    n_rows: usize,
+    data: &Dataset,
     resolution_tol: f64,
-) -> Result<AdaptiveSpatialCandidates, WorkflowError> {
+) -> Result<Vec<AdaptiveRefinement>, WorkflowError> {
     let term_count = result.resolvedspec.smooth_terms.len();
-    if result.adaptive_spatial_terms.len() != term_count
-        || result.adaptive_spatial_center_counts.len() != term_count
-        || result.design.smooth.terms.len() != term_count
+    if result.adaptive_bases.len() != term_count || result.design.smooth.terms.len() != term_count
     {
         return Err(raised_fit_failure(
             FailureCategory::Invariant,
             format!(
-                "adaptive spatial provenance mismatch: resolved terms={term_count}, mask={}, \
-                 requested counts={}, realized terms={}",
-                result.adaptive_spatial_terms.len(),
-                result.adaptive_spatial_center_counts.len(),
+                "adaptive resolution provenance mismatch: resolved terms={term_count}, \
+                 adaptive bases={}, realized terms={}",
+                result.adaptive_bases.len(),
                 result.design.smooth.terms.len(),
             ),
         ));
     }
-
+    let values = data.values.view();
     let smooth_offset = result
         .design
         .design
         .ncols()
         .saturating_sub(result.design.smooth.total_smooth_cols());
-    // The #2774 lack-of-fit verdict this fit already carries, read at the same
-    // family-wise level as its fit-time note.
-    let lacking_fit: Vec<usize> =
-        crate::fit_orchestration::drivers::basis_adequacy_rows_lacking_fit(&result.basis_adequacy)
-            .map(|row| row.term_idx)
-            .collect();
-    let mut candidates = Vec::new();
-    for term_index in 0..term_count {
+    let mut requests = Vec::new();
+    for (term_index, basis) in result.adaptive_bases.iter().enumerate() {
+        let Some(basis) = basis else {
+            continue;
+        };
+        let term_name = &result.resolvedspec.smooth_terms[term_index].name;
+        let invariant = |what: &str| {
+            raised_fit_failure(
+                FailureCategory::Invariant,
+                format!("adaptive smooth term '{term_name}' {what}"),
+            )
+        };
+        let current = gam_terms::smooth::adaptive_resolution_of(basis)
+            .ok_or_else(|| invariant("lost its adaptive provenance"))?;
+        let support = gam_terms::smooth::adaptive_resolution_support(basis, values)
+            .ok_or_else(|| invariant("references covariates the data does not carry"))?;
         let realized = &result.design.smooth.terms[term_index];
-        if result.adaptive_spatial_terms[term_index]
-            && let Some(current_centers) = result.adaptive_spatial_center_counts[term_index]
+        let penalty_range = result
+            .design
+            .smooth_term_penalty_range(term_index)
+            .map_err(|reason| raised_fit_failure(FailureCategory::Invariant, reason))?
+            .ok_or_else(|| invariant("emitted no penalty block"))?;
+        let global_range =
+            (smooth_offset + realized.coeff_range.start)..(smooth_offset + realized.coeff_range.end);
+        let edf = result
+            .fit
+            .per_term_edf(global_range, penalty_range.start, penalty_range.len());
+        let saturated = gam_terms::basis::basis_is_saturated(
+            edf,
+            realized.coeff_range.len(),
+            realized.wald_unpenalized_dim(),
+            resolution_tol,
+        );
+        // The widest alternative in which the screen found structure that pays
+        // for itself: the refinement must add at least that many directions.
+        let lack_of_fit_directions = result
+            .basis_adequacy
+            .iter()
+            .filter(|row| row.term_idx == term_index && enrichment_pays_for_itself(row))
+            .filter_map(|row| row.enrichment_rank)
+            .max();
+        let lacks_fit = lack_of_fit_directions.is_some();
+        let refined = refinement_spanning(
+            basis,
+            values,
+            &current,
+            &support,
+            lack_of_fit_directions.unwrap_or(0),
+        );
+        if let AdaptiveTermDecision::Refine(proposed) =
+            adaptive_term_decision(&current, &refined, &support, saturated, lacks_fit)
         {
-            let penalty_range = result
-                .design
-                .smooth_term_penalty_range(term_index)
-                .map_err(|reason| raised_fit_failure(FailureCategory::Invariant, reason))?
-                .ok_or_else(|| {
-                    raised_fit_failure(
-                        FailureCategory::Invariant,
-                        format!(
-                            "adaptive spatial term '{}' emitted no penalty block",
-                            result.resolvedspec.smooth_terms[term_index].name,
-                        ),
-                    )
-                })?;
-            let spatial_dimension = result.resolvedspec.smooth_terms[term_index]
-                .basis
-                .structural_feature_cols()
-                .len();
-            if spatial_dimension == 0 {
-                return Err(raised_fit_failure(
-                    FailureCategory::Invariant,
-                    format!(
-                        "adaptive spatial term '{}' has no structural feature columns",
-                        result.resolvedspec.smooth_terms[term_index].name,
-                    ),
-                ));
-            }
-            // Tiny samples can force the materializer's exact polynomial floor
-            // above the generic `n / 4` conditioning ceiling. The realized
-            // request is already the smallest admissible basis in that case, so
-            // it is also the ceiling; never report a nonsensical attempted
-            // center count below the basis that just converged.
-            let ceiling_centers = gam_terms::basis::default_num_centers(n_rows, spatial_dimension)
-                .max(current_centers);
-            let global_range = (smooth_offset + realized.coeff_range.start)
-                ..(smooth_offset + realized.coeff_range.end);
-            let edf =
-                result
-                    .fit
-                    .per_term_edf(global_range, penalty_range.start, penalty_range.len());
-            let nullspace_dim = realized.wald_unpenalized_dim();
-            match adaptive_center_decision(
-                current_centers,
-                ceiling_centers,
+            requests.push(RefinementRequest {
+                refinement: AdaptiveRefinement {
+                    term_index,
+                    term_name: term_name.clone(),
+                    current,
+                    proposed,
+                },
+                saturated,
                 edf,
-                realized.coeff_range.len(),
-                nullspace_dim,
-                resolution_tol,
-                lacking_fit.contains(&term_index),
-            ) {
-                AdaptiveCenterDecision::Certified => {}
-                AdaptiveCenterDecision::Expand(proposed_centers) => {
-                    candidates.push(AdaptiveSpatialCandidate {
-                        term_index,
-                        term_name: result.resolvedspec.smooth_terms[term_index].name.clone(),
-                        current_centers,
-                        proposed_centers,
-                    });
-                }
-                AdaptiveCenterDecision::Exhausted => {
-                    return Err(WorkflowError::SpatialUnderresolved {
-                        term: result.resolvedspec.smooth_terms[term_index].name.clone(),
-                        current_centers,
-                        attempted_centers: ceiling_centers,
-                        reason: format!(
-                            "term EDF {edf:.6} remains at its realized basis ceiling with all \
-                             {ceiling_centers} validated default centers already requested"
-                        ),
-                        refit_failure: None,
-                    });
-                }
-            }
+            });
         }
     }
-    Ok(AdaptiveSpatialCandidates {
-        term_count,
-        terms: candidates,
+    let spare_rank = values
+        .nrows()
+        .saturating_sub(1)
+        .saturating_sub(result.design.design.ncols());
+    fit_refinements_to_rank(requests, spare_rank, |term_index, resolution| {
+        result.adaptive_bases[term_index]
+            .as_ref()
+            .map_or(0, |basis| {
+                gam_terms::smooth::adaptive_resolution_width(basis, values, resolution)
+            })
     })
 }
 
 #[cfg(test)]
 mod adaptive_spatial_resolution_tests {
-    use super::{AdaptiveCenterDecision, adaptive_center_decision};
+    use super::{
+        AdaptiveRefinement, AdaptiveResolution, AdaptiveTermDecision, RefinementRequest,
+        adaptive_term_decision, evidence_improves, fit_refinements_to_rank,
+    };
+    use crate::fit_orchestration::error::WorkflowError;
+
+    fn request(
+        term_index: usize,
+        current: AdaptiveResolution,
+        proposed: AdaptiveResolution,
+        saturated: bool,
+    ) -> RefinementRequest {
+        RefinementRequest {
+            refinement: AdaptiveRefinement {
+                term_index,
+                term_name: format!("s{term_index}"),
+                current,
+                proposed,
+            },
+            saturated,
+            edf: 0.0,
+        }
+    }
+
+    fn knots_width(resolution: &AdaptiveResolution) -> usize {
+        match resolution {
+            AdaptiveResolution::InternalKnots(k) => k + 4,
+            AdaptiveResolution::Centers(c) | AdaptiveResolution::PeriodicBasis(c) => *c,
+            AdaptiveResolution::HarmonicDegree(l) => (l + 1).pow(2),
+        }
+    }
 
     #[test]
-    fn unsaturated_basis_is_certified_without_a_probe_refit() {
+    fn unsignalled_basis_is_certified_without_a_refit() {
+        use AdaptiveResolution::Centers;
         assert_eq!(
-            adaptive_center_decision(8, 100, 5.0, 10, 2, 1.0e-6, false),
-            AdaptiveCenterDecision::Certified
+            adaptive_term_decision(&Centers(8), &Centers(16), &Centers(500), false, false),
+            AdaptiveTermDecision::Certified
         );
     }
 
     #[test]
-    fn saturated_basis_expands_geometrically_and_respects_validated_ceiling() {
+    fn either_signal_refines_by_one_nested_level() {
+        use AdaptiveResolution::InternalKnots;
+        for (saturated, lacks_fit) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                adaptive_term_decision(
+                    &InternalKnots(8),
+                    &InternalKnots(17),
+                    &InternalKnots(996),
+                    saturated,
+                    lacks_fit
+                ),
+                AdaptiveTermDecision::Refine(InternalKnots(17))
+            );
+        }
+    }
+
+    #[test]
+    fn refinement_is_bounded_by_covariate_support_not_a_constant() {
+        use AdaptiveResolution::{Centers, InternalKnots};
+        // Far beyond any fixed default: only the data's distinct rows bound it.
         assert_eq!(
-            adaptive_center_decision(8, 100, 10.0, 10, 2, 1.0e-6, false),
-            AdaptiveCenterDecision::Expand(16)
+            adaptive_term_decision(&Centers(4096), &Centers(8192), &Centers(6000), true, false),
+            AdaptiveTermDecision::Refine(Centers(6000))
         );
         assert_eq!(
-            adaptive_center_decision(64, 100, 10.0, 10, 2, 1.0e-6, false),
-            AdaptiveCenterDecision::Expand(100)
+            adaptive_term_decision(
+                &InternalKnots(8),
+                &InternalKnots(17),
+                &InternalKnots(12),
+                false,
+                true
+            ),
+            AdaptiveTermDecision::Refine(InternalKnots(12))
         );
     }
 
     #[test]
-    fn saturated_basis_at_validated_ceiling_is_typed_exhaustion() {
+    fn basis_at_its_support_bound_is_certified() {
+        use AdaptiveResolution::PeriodicBasis;
         assert_eq!(
-            adaptive_center_decision(100, 100, 10.0, 10, 2, 1.0e-6, false),
-            AdaptiveCenterDecision::Exhausted
+            adaptive_term_decision(
+                &PeriodicBasis(12),
+                &PeriodicBasis(24),
+                &PeriodicBasis(12),
+                true,
+                true
+            ),
+            AdaptiveTermDecision::Certified
         );
     }
 
     #[test]
-    fn unsaturated_basis_lacking_fit_expands_1561() {
-        // The 2-D default-rank Duchon pilot at n=1500: 30 centers, penalized
-        // EDF 24.7 of 27, below the saturation ceiling while λ still binds.
-        assert_eq!(
-            adaptive_center_decision(30, 187, 27.7, 30, 3, 1.0e-6, true),
-            AdaptiveCenterDecision::Expand(60)
-        );
+    fn refinements_share_the_residual_rank_in_formula_order() {
+        use AdaptiveResolution::InternalKnots;
+        let accepted = fit_refinements_to_rank(
+            vec![
+                request(0, InternalKnots(8), InternalKnots(17), true),
+                request(1, InternalKnots(8), InternalKnots(17), true),
+                request(2, InternalKnots(8), InternalKnots(17), false),
+            ],
+            12,
+            |_, resolution: &AdaptiveResolution| knots_width(resolution),
+        )
+        .expect("rank remains for the first two terms");
+        // The first term takes its whole 9-knot refinement, the second the 3
+        // knots left, and the third waits for the next round.
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(accepted[0].proposed, InternalKnots(17));
+        assert_eq!(accepted[1].proposed, InternalKnots(11));
     }
 
     #[test]
-    fn lack_of_fit_at_validated_ceiling_stays_certified_1561() {
-        assert_eq!(
-            adaptive_center_decision(187, 187, 27.7, 190, 3, 1.0e-6, true),
-            AdaptiveCenterDecision::Certified
-        );
+    fn harmonic_refinement_is_shortened_along_its_monotone_path() {
+        use AdaptiveResolution::HarmonicDegree;
+        let accepted = fit_refinements_to_rank(
+            vec![request(0, HarmonicDegree(3), HarmonicDegree(8), true)],
+            30,
+            |_, resolution: &AdaptiveResolution| knots_width(resolution),
+        )
+        .expect("a partial harmonic refinement fits");
+        // Degree 5 adds 20 columns to degree 3's 16; degree 6 would add 33.
+        assert_eq!(accepted[0].proposed, HarmonicDegree(5));
+    }
+
+    #[test]
+    fn saturated_term_without_identifiable_rank_is_typed_underresolution() {
+        use AdaptiveResolution::InternalKnots;
+        let error = fit_refinements_to_rank(
+            vec![request(0, InternalKnots(8), InternalKnots(17), true)],
+            0,
+            |_, resolution: &AdaptiveResolution| knots_width(resolution),
+        )
+        .expect_err("a saturated basis with no residual rank is under-resolved");
+        match error {
+            WorkflowError::SpatialUnderresolved {
+                term,
+                current_resolution,
+                attempted_resolution,
+                refit_failure,
+                ..
+            } => {
+                assert_eq!(term, "s0");
+                assert_eq!(current_resolution, "8 internal knots");
+                assert_eq!(attempted_resolution, "9 internal knots");
+                assert!(refit_failure.is_none());
+            }
+            other => panic!("expected SpatialUnderresolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lack_of_fit_without_rank_waits_instead_of_failing() {
+        use AdaptiveResolution::Centers;
+        let accepted = fit_refinements_to_rank(
+            vec![request(0, Centers(30), Centers(60), false)],
+            0,
+            |_, resolution: &AdaptiveResolution| knots_width(resolution),
+        )
+        .expect("an unsaturated term is not under-resolved");
+        assert!(accepted.is_empty());
+    }
+
+    #[test]
+    fn evidence_margin_is_the_outer_tolerance() {
+        assert!(evidence_improves(1000.0, 999.0, 1.0e-6));
+        assert!(!evidence_improves(1000.0, 1000.0 - 1.0e-4, 1.0e-6));
+        assert!(!evidence_improves(1000.0, 1000.5, 1.0e-6));
     }
 }
 
@@ -1964,8 +2496,8 @@ fn fit_from_formula_once_with_notes(
     // `family = "expectile"`. Every other family falls through unchanged.
     if let Some(result) = fit_expectile_if_requested(formula, data, &config)? {
         return Ok(FormulaFitResult {
-            result: FitResult::Standard(result),
-            inference_notes: Vec::new(),
+            result: result.into_fit_result(),
+            inference_notes: FitNotes::default(),
             unidentified_scalar_terms: Vec::new(),
         });
     }
@@ -1985,8 +2517,22 @@ fn fit_materialized_once_with_notes(
     // Cloning the handle is `O(1)` by construction — a `Copy` view or an `Arc`
     // bump, aliasing the same storage — and its lifetime is the caller's
     // dataset, not `mat`, so it outlives the move.
+    //
+    // The response side travels with it: the conditional reference for a
+    // canonical binomial/Poisson fit conditions on `Xᵀ(w∘y)`, so it needs the
+    // response and prior weights the fit consumed (both `Arc` handles, so this
+    // is a refcount bump too).
     let standard_covariate_frame = match &mat.request {
-        FitRequest::Standard(request) => Some(request.data.clone()),
+        FitRequest::Standard(request) => Some(BasisAdequacyInputs {
+            frame: request.data.clone(),
+            y: request.y.clone(),
+            prior_weights: request.weights.clone(),
+            canonical_family: crate::fit_orchestration::drivers::basis_adequacy_canonical_family(
+                &request.family,
+                request.wiggle.is_some(),
+                request.latent_coord.is_some(),
+            ),
+        }),
         _ => None,
     };
     // Exact O(n) spline-scan fast path (#1030): when the materialized request
@@ -1998,14 +2544,18 @@ fn fit_materialized_once_with_notes(
     // through to the dense `fit_model` path unchanged. Mirrors the CLI
     // (main.rs run_fit) and FFI consumers, which build the persistence payload
     // from this same `SplineScanFit`.
+    let mut realized_design = None;
     if let FitRequest::Standard(request) = &mat.request {
-        if let Some(result) = try_deterministic_gaussian_standard_fit(request)? {
-            return Ok(attach_basis_adequacy(
-                FitResult::Standard(result),
-                standard_covariate_frame,
-                inference_notes,
-                unidentified_scalar_terms,
-            ));
+        match try_deterministic_gaussian_standard_fit(request)? {
+            GaussianStandardRoute::Exact(result) => {
+                return Ok(attach_basis_adequacy(
+                    FitResult::Standard(result),
+                    standard_covariate_frame,
+                    inference_notes,
+                    unidentified_scalar_terms,
+                ));
+            }
+            GaussianStandardRoute::Iterative(design) => realized_design = design,
         }
         if let Some(inputs) = spline_scan_fast_path(request) {
             let scan = gam_solve::spline_scan::fit_spline_scan(
@@ -2050,14 +2600,31 @@ fn fit_materialized_once_with_notes(
         }
     }
     // `fit_model` already returns `WorkflowError` end-to-end; propagate it
-    // directly instead of stringifying then re-wrapping.
-    let result = fit_model(mat.request)?;
+    // directly instead of stringifying then re-wrapping. A standard request
+    // was refused by the exact Gaussian boundary above, so it skips that
+    // certificate's second design build inside `fit_model` and fits on the
+    // design the certificate realized.
+    let result = match mat.request {
+        FitRequest::Standard(request) => {
+            fit_standard_past_exact_gaussian_boundary(request, realized_design)?
+        }
+        request => fit_model(request)?,
+    };
     Ok(attach_basis_adequacy(
         result,
         standard_covariate_frame,
         inference_notes,
         unidentified_scalar_terms,
     ))
+}
+
+/// What [`attach_basis_adequacy`] needs from the standard request, kept across
+/// the `fit_model` move.
+struct BasisAdequacyInputs<'a> {
+    frame: StandardFitData<'a>,
+    y: std::sync::Arc<ndarray::Array1<f64>>,
+    prior_weights: std::sync::Arc<ndarray::Array1<f64>>,
+    canonical_family: Option<gam_terms::inference::basis_adequacy::CanonicalExponentialFamily>,
 }
 
 /// Measure each smooth's basis adequacy (#2774) and fold the verdict into the
@@ -2075,8 +2642,8 @@ fn fit_materialized_once_with_notes(
 /// what this finds — the only thing that changes is what the caller is told.
 fn attach_basis_adequacy(
     result: FitResult,
-    covariate_frame: Option<StandardFitData<'_>>,
-    mut inference_notes: Vec<String>,
+    covariate_frame: Option<BasisAdequacyInputs<'_>>,
+    mut inference_notes: FitNotes,
     unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,
 ) -> FormulaFitResult {
     let FitResult::Standard(mut standard) = result else {
@@ -2086,14 +2653,26 @@ fn attach_basis_adequacy(
             unidentified_scalar_terms,
         };
     };
-    if let Some(data) = covariate_frame {
+    // The random-effect test needs only the design and the converged fit, so
+    // it runs whether or not the covariate frame is available.
+    standard.fit.artifacts.random_effect_tests =
+        crate::fit_orchestration::drivers::random_effect_test_records(
+            &standard.design,
+            &standard.fit,
+        );
+    if let Some(inputs) = covariate_frame {
         standard.basis_adequacy = crate::fit_orchestration::drivers::basis_adequacy_report(
-            data.view(),
+            inputs.frame.view(),
             &standard.design,
             &standard.resolvedspec,
             &standard.fit,
+            &crate::fit_orchestration::drivers::BasisAdequacyResponse {
+                y: inputs.y.view(),
+                prior_weights: inputs.prior_weights.view(),
+                canonical_family: inputs.canonical_family,
+            },
         );
-        inference_notes.extend(crate::fit_orchestration::drivers::basis_adequacy_notes(
+        inference_notes.advisories.extend(crate::fit_orchestration::drivers::basis_adequacy_notes(
             &standard.basis_adequacy,
         ));
     }
@@ -2126,11 +2705,267 @@ pub(crate) fn fit_expectile_if_requested(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
-) -> Result<Option<StandardFitResult>, WorkflowError> {
-    match expectile_tau_for_config(config)? {
-        Some(tau) => Ok(Some(fit_expectile_laws(formula, data, config, tau)?)),
-        None => Ok(None),
+) -> Result<Option<ExpectileFit>, WorkflowError> {
+    let Some(levels) = expectile_levels_for_config(config)? else {
+        return Ok(None);
+    };
+    match levels.as_slice() {
+        [tau] => Ok(Some(ExpectileFit::Single(fit_expectile_laws(
+            formula, data, config, *tau,
+        )?))),
+        _ => Ok(Some(ExpectileFit::Joint(fit_expectile_location_scale(
+            formula, data, config, levels,
+        )?))),
     }
+}
+
+/// The two shapes an expectile request resolves to.
+pub(crate) enum ExpectileFit {
+    /// One level: the LAWS fit of that level alone.
+    Single(StandardFitResult),
+    /// Several levels: one joint non-crossing location-scale fit.
+    Joint(ExpectileLocationScaleFitResult),
+}
+
+impl ExpectileFit {
+    pub(crate) fn into_fit_result(self) -> FitResult {
+        match self {
+            Self::Single(result) => FitResult::Standard(result),
+            Self::Joint(result) => FitResult::ExpectileLocationScale(result),
+        }
+    }
+}
+
+/// The log-σ formula of a joint expectile fit: the caller's `noise_formula`, or
+/// else the mean formula's right-hand side, so `σ(x)` is as flexible as `μ(x)`.
+pub(crate) fn expectile_noise_formula(
+    formula: &str,
+    config: &FitConfig,
+) -> Result<String, WorkflowError> {
+    match config.noise_formula.as_deref() {
+        Some(noise) => Ok(noise.to_string()),
+        None => formula
+            .split_once('~')
+            .map(|(_, rhs)| rhs.trim().to_string())
+            .ok_or_else(|| WorkflowError::InvalidConfig {
+                reason: format!("expectile formula `{formula}` has no `~`"),
+            }),
+    }
+}
+
+/// Joint non-crossing multi-level expectile fit.
+///
+/// Fitting each level on its own lets the curves cross: nothing ties the
+/// separately penalized surfaces together, and under heteroscedasticity their
+/// slopes differ, so they meet as soon as the data (or an extrapolation) is far
+/// enough from the centre. The joint model is the location-scale expectile
+///
+/// ```text
+///   e_τ(x) = μ(x) + c_τ·σ(x),     y = μ(x) + σ(x)·ε,  ε ⟂ x,
+/// ```
+///
+/// under which every conditional expectile of `y | x` has exactly this form,
+/// with `c_τ` the `τ`-expectile of `ε`. `μ` and `σ` are the Gaussian
+/// location-scale GAM (`noise_formula`, defaulting to the mean formula's
+/// right-hand side), so both surfaces carry their own function penalties and
+/// REML/LAML-selected smoothing and come only from a certified fit. `c_τ` is the
+/// prior-weighted empirical `τ`-expectile of the standardized residuals
+/// `(yᵢ − μᵢ)/E[σᵢ]`, solved in closed form.
+///
+/// The expectile of a fixed sample is strictly increasing in `τ`, and
+/// `σ(x) > 0` everywhere (the link has a positive floor), so for `τ₁ < τ₂`
+/// `e_τ₂(x) − e_τ₁(x) = (c_τ₂ − c_τ₁)·σ(x) > 0` at *every* `x`, extrapolation
+/// included. Ordering is a property of the construction, never a post-hoc sort.
+///
+/// `σ` enters as its posterior mean `E[σ] = f + exp(m + v/2)` under the log-σ
+/// block's conditional Gaussian posterior `N(m, v)` — the same functional the
+/// predictor evaluates — and `μ` is identity-linked, so its plug-in is its
+/// posterior mean.
+fn fit_expectile_location_scale(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+    levels: Vec<f64>,
+) -> Result<ExpectileLocationScaleFitResult, WorkflowError> {
+    if config.frailty.is_active() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "expectile regression does not support frailty; use a survival/frailty-aware family instead"
+                .to_string(),
+        });
+    }
+    let noise_formula = expectile_noise_formula(formula, config)?;
+    let location_scale_config = FitConfig {
+        family: Some("gaussian".to_string()),
+        link: Some("identity".to_string()),
+        expectile_tau: None,
+        frailty: FrailtySpec::None,
+        noise_formula: Some(noise_formula),
+        ..config.clone()
+    };
+    let mat = materialize(formula, data, &location_scale_config)?;
+    let FitRequest::GaussianLocationScale(request) = mat.request else {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "joint expectile regression is only defined for a Gaussian location-scale \
+                     response (non-survival, non-latent)"
+                .to_string(),
+        });
+    };
+    if request.wiggle.is_some() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "expectile regression does not support flexible-link wiggle".to_string(),
+        });
+    }
+    let y = request.spec.y.clone();
+    let prior_weights = request.spec.weights.clone();
+    let mean_offset = request.spec.mean_offset.clone();
+    let log_sigma_offset = request.spec.log_sigma_offset.clone();
+    let FitResult::GaussianLocationScale(location_scale) =
+        fit_model(FitRequest::GaussianLocationScale(request))?
+    else {
+        return Err(raised_fit_failure(
+            FailureCategory::Invariant,
+            "joint expectile: the Gaussian location-scale request returned another fit kind"
+                .to_string(),
+        ));
+    };
+
+    let standardized_expectiles = joint_expectile_standardized_expectiles(
+        &location_scale,
+        y.view(),
+        prior_weights.view(),
+        mean_offset.view(),
+        log_sigma_offset.view(),
+        &levels,
+    )?;
+    Ok(ExpectileLocationScaleFitResult {
+        location_scale,
+        levels,
+        standardized_expectiles,
+    })
+}
+
+/// The level constants `c_τ` of a joint expectile fit: the prior-weighted
+/// empirical `τ`-expectiles of the standardized residuals `(yᵢ − μᵢ)/E[σᵢ]`,
+/// with `E[σᵢ] = f + exp(mᵢ + vᵢ/2)` under the log-σ block's conditional
+/// Gaussian posterior `N(mᵢ, vᵢ)`.
+///
+/// `vᵢ` comes from the Scale block of the fit's joint conditional covariance
+/// (coefficient layout `[mean | scale]`). That covariance is part of the
+/// estimand, so a fit without it is refused with a typed error instead of
+/// being standardized by the plug-in σ.
+fn joint_expectile_standardized_expectiles(
+    location_scale: &GaussianLocationScaleFitResult,
+    y: ArrayView1<'_, f64>,
+    prior_weights: ArrayView1<'_, f64>,
+    mean_offset: ArrayView1<'_, f64>,
+    log_sigma_offset: ArrayView1<'_, f64>,
+    levels: &[f64],
+) -> Result<Vec<f64>, WorkflowError> {
+    use gam_linalg::matrix::DenseDesignOperator;
+    use gam_problem::BlockRole;
+
+    let invariant = |reason: String| {
+        raised_fit_failure(
+            FailureCategory::Invariant,
+            format!("joint expectile: {reason}"),
+        )
+    };
+    let fit = &location_scale.fit;
+    let beta_mu = crate::inference::model::gaussian_location_scale_mean_beta(&fit.fit)
+        .ok_or_else(|| invariant("fit has no location block".to_string()))?;
+    let beta_sigma = fit
+        .fit
+        .block_by_role(BlockRole::Scale)
+        .map(|block| block.beta.clone())
+        .ok_or_else(|| invariant("fit has no scale block".to_string()))?;
+    let mu = fit
+        .mean_design
+        .apply(beta_mu.view())
+        .map_err(|error| invariant(format!("could not evaluate the mean design: {error}")))?
+        + &mean_offset;
+    let eta_sigma = fit
+        .noise_design
+        .apply(beta_sigma.view())
+        .map_err(|error| invariant(format!("could not evaluate the log-σ design: {error}")))?
+        + &log_sigma_offset;
+    let n = y.len();
+    if mu.len() != n || eta_sigma.len() != n || prior_weights.len() != n {
+        return Err(invariant(format!(
+            "row counts disagree: y={n}, μ={}, η_σ={}, weights={}",
+            mu.len(),
+            eta_sigma.len(),
+            prior_weights.len()
+        )));
+    }
+    // Posterior variance of η_σ per row from the Scale block of the joint
+    // conditional covariance (coefficient layout `[mean | scale]`). `c_τ`
+    // integrates σ over this posterior, so a fit without it has no `c_τ`:
+    // a typed constrained-posterior decline is refused with its reason, and a
+    // missing covariance with no decline breaks the location-scale fit contract.
+    // Neither is ever read as zero posterior variance (the plug-in σ).
+    let p_mu = beta_mu.len();
+    let p_sigma = beta_sigma.len();
+    fit.fit
+        .require_posterior_mean("joint expectile c_τ")
+        .map_err(|error| {
+            raised_fit_failure(FailureCategory::Input, format!("joint expectile: {error}"))
+        })?;
+    let covariance = fit.fit.beta_covariance().ok_or_else(|| {
+        invariant(
+            "c_τ integrates σ over the log-σ posterior, but the location-scale fit carries \
+             neither its joint posterior covariance nor a typed posterior-moment decline"
+                .to_string(),
+        )
+    })?;
+    if covariance.nrows() < p_mu + p_sigma || covariance.ncols() < p_mu + p_sigma {
+        return Err(invariant(format!(
+            "covariance is {}x{}, smaller than the {} location-scale coefficients",
+            covariance.nrows(),
+            covariance.ncols(),
+            p_mu + p_sigma
+        )));
+    }
+    let scale_block = covariance
+        .slice(ndarray::s![p_mu..p_mu + p_sigma, p_mu..p_mu + p_sigma])
+        .to_owned();
+    let log_sigma_variance = fit
+        .noise_design
+        .design
+        .quadratic_form_diag(&scale_block)
+        .map_err(|error| invariant(format!("log-σ posterior variance: {error}")))?;
+    let sigma_floor = location_scale.response_scale * location_scale.sigma_floor;
+    let standardized: Vec<f64> = (0..n)
+        .map(|i| {
+            let sigma = gam_model_kernels::sigma_link::logb_sigma_posterior_mean_with_floor_scalar(
+                sigma_floor,
+                eta_sigma[i],
+                log_sigma_variance[i],
+            );
+            (y[i] - mu[i]) / sigma
+        })
+        .collect();
+    let prior_weights = prior_weights.to_vec();
+    let standardized_expectiles = levels
+        .iter()
+        .map(|&tau| weighted_empirical_expectile(&standardized, &prior_weights, tau))
+        .collect::<Result<Vec<f64>, String>>()
+        .map_err(|reason| {
+            raised_fit_failure(FailureCategory::Input, format!("joint expectile: {reason}"))
+        })?;
+    if standardized_expectiles
+        .windows(2)
+        .any(|pair| !(pair[0] < pair[1]))
+    {
+        return Err(raised_fit_failure(
+            FailureCategory::Input,
+            format!(
+                "joint expectile: the standardized residual expectiles {standardized_expectiles:?} \
+                 at levels {levels:?} are not strictly increasing — the standardized residuals \
+                 carry no spread to order the levels by"
+            ),
+        ));
+    }
+    Ok(standardized_expectiles)
 }
 
 /// Least Asymmetrically Weighted Squares (LAWS) driver for expectile GAMs.
@@ -2149,9 +2984,9 @@ pub(crate) fn fit_expectile_if_requested(
 /// the current asymmetric weights. The returned fit is an ordinary
 /// [`FitResult::Standard`] whose coefficients ARE the penalized τ-expectile —
 /// every downstream consumer (predict, posterior bands, persistence) works
-/// unchanged. The reported scale is the asymmetric working variance, so
-/// expectile standard errors are the sandwich-free Gaussian-form bands of the
-/// converged weighted problem (a deliberate first-rung choice; see #1100).
+/// unchanged. Its published coefficient covariance is the penalized
+/// Newey–Powell sandwich of [`publish_expectile_sandwich_covariance`], never
+/// the Gaussian working-model `φ̂·H⁻¹` of the last inner solve.
 fn fit_expectile_laws(
     formula: &str,
     data: &Dataset,
@@ -2335,6 +3170,14 @@ fn fit_expectile_laws(
         })?;
         let kkt_bound = options.tol;
         if kkt <= kkt_bound {
+            let mut result = result;
+            publish_expectile_sandwich_covariance(
+                &mut result.fit,
+                &result.design.design,
+                residual.view(),
+                weights.view(),
+                tau,
+            )?;
             return Ok(result);
         }
         last_kkt = (kkt, kkt_bound);
@@ -2369,6 +3212,141 @@ fn fit_expectile_laws(
             last_kkt.0, last_kkt.1,
         ),
     ))
+}
+
+/// Replace the working-model covariance of a certified LAWS fixed point with
+/// the penalized Newey–Powell sandwich.
+///
+/// The expectile is an M-estimator, not a likelihood fit: `β̂` solves
+/// `ψ(β) = Xᵀ(w ∘ r) − S_λβ = 0` with `wᵢ = baseᵢ·|τ − 1[rᵢ < 0]|`, whose
+/// Jacobian is `−H`, `H = XᵀWX + S_λ` — the unscaled penalized Hessian the
+/// last inner solve already factored. The inner fit publishes
+/// `Vb = φ̂·H⁻¹`, which is correct only if `Var(wᵢrᵢ) = φ̂·wᵢ`, i.e. only if
+/// the asymmetric weights were inverse variances. They are not: they are the
+/// loss asymmetry, and under heteroscedastic noise the working model
+/// under-covers wherever the noise is large (τ = 0.05/0.95 bands covered
+/// 0.81/0.73 at nominal 0.95).
+///
+/// Newey & Powell (1987, Thm 3) give the unpenalized law
+/// `√n(β̂ − β) → N(0, A⁻¹BA⁻¹)`, `A = E[w xxᵀ]`, `B = E[w²r² xxᵀ]`, with no
+/// dispersion factor anywhere: the scale lives in `r` itself. The penalized
+/// analogue keeps the smoothing prior `β ~ N(0, φ̂·S_λ⁻)` that makes `Vb`
+/// Bayesian (Wahba 1983; Nychka 1988), so the published covariance is the
+/// prior-inclusive sandwich
+///
+///   `V = H⁻¹ (c·Xᵀ diag(w²r²) X + φ̂·S_λ) H⁻¹`,   `c = n₊ / (n₊ − edf)`,
+///
+/// the Bayesian ("penalty as prior") form of the Huber–White sandwich.
+/// Three limits pin every constant:
+///
+/// * `S_λ → 0` recovers the Newey–Powell `A⁻¹BA⁻¹` exactly (up to `c`).
+/// * Under the working model, `E[c·w²r²] = φ̂·w` row by row, so `V → Vb`: the
+///   sandwich changes nothing where the Gaussian form was already right.
+/// * `c` is the HC1 degrees-of-freedom correction, the same `n₊ − edf` the
+///   inner fit's `φ̂ = Σwr² / (n₊ − edf)` divides by (mgcv `gam.scale`), so the
+///   meat and the prior term are debiased on one scale; `n₊` counts the rows
+///   with positive weight, exactly as `φ̂` does.
+///
+/// `φ̂` enters only through the prior term, where it is the posterior
+/// variance's own scale; it never multiplies the meat.
+///
+/// Because `φ̂·S_λ = φ̂·H − φ̂·XᵀWX`, the sandwich is an exact rank-`n`
+/// correction of the published `Vb` that needs neither `S_λ` nor `H`:
+///
+///   `V = Vb + Vb Xᵀ diag(d) X Vb`,   `dᵢ = c·wᵢ²rᵢ²/φ̂² − wᵢ/φ̂`.
+///
+/// It holds verbatim for a constraint-projected `Vb = φ̂·Z(ZᵀHZ)⁻¹Zᵀ`, so the
+/// identifiability and active-constraint gauge the fit already chose carries
+/// over. The correction is added to the conditional AND smoothing-corrected
+/// stores through the one seam that keeps them consistent, so the
+/// smoothing-parameter uncertainty term `Vp − Vb` survives and every consumer
+/// — predict bands, posterior draws, summary SEs, the CLI, Python — reads the
+/// same matrix. A fit on the zero-dispersion boundary (`φ̂ = 0`, every
+/// residual zero) has a zero meat and nothing to correct.
+///
+/// A fit with no dense `Vb` (the memory governor refused it and published only
+/// a factorized diagonal, or inference was off) cannot carry the sandwich, so
+/// its covariance is declined with a typed reason instead of leaving the
+/// working-model diagonal or Hessian to be read under the expectile's name.
+fn publish_expectile_sandwich_covariance(
+    fit: &mut gam_solve::estimate::UnifiedFitResult,
+    design: &gam_linalg::matrix::DesignMatrix,
+    residual: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    tau: f64,
+) -> Result<(), WorkflowError> {
+    let invariant = |reason: String| {
+        raised_fit_failure(
+            FailureCategory::Invariant,
+            format!("expectile sandwich covariance (tau={tau}): {reason}"),
+        )
+    };
+    let Some(vb) = fit.covariance_conditional.clone() else {
+        // The declination is also what stops every Hessian reconstruction
+        // (summary, predict, sampling) from rebuilding the working-model `Vb`.
+        let declined = gam_solve::estimate::CovarianceDeclined::
+            ExpectileSandwichRequiresDenseCovariance {
+                coefficients: fit.beta.len(),
+            };
+        log::debug!("[expectile] {}", declined.explain());
+        fit.covariance_corrected = None;
+        if let Some(inference) = fit.inference.as_mut() {
+            inference.factorized_standard_errors = None;
+            inference.smoothing_correction_factorized = None;
+        }
+        fit.artifacts.covariance_declined = Some(declined);
+        return Ok(());
+    };
+    let n = design.nrows();
+    if residual.len() != n || weights.len() != n {
+        return Err(invariant(format!(
+            "design rows={n}, residual={}, weights={}",
+            residual.len(),
+            weights.len()
+        )));
+    }
+    let phi = fit
+        .coefficient_covariance_scale()
+        .map_err(|error| invariant(error.to_string()))?;
+    if !(phi.is_finite() && phi >= 0.0) {
+        return Err(invariant(format!(
+            "coefficient covariance scale must be finite and non-negative, got {phi:?}"
+        )));
+    }
+    if phi == 0.0 {
+        return Ok(());
+    }
+    let edf = fit.edf_total().ok_or_else(|| {
+        invariant("a fit that publishes a covariance must carry its effective degrees of freedom".to_string())
+    })?;
+    let n_positive = weights.iter().filter(|&&w| w > 0.0).count() as f64;
+    let residual_df = n_positive - edf;
+    if !(residual_df.is_finite() && residual_df > 0.0) {
+        return Err(invariant(format!(
+            "residual degrees of freedom n₊ − edf = {n_positive} − {edf} must be positive"
+        )));
+    }
+    let hc1 = n_positive / residual_df;
+    let row_correction = Array1::from_shape_fn(n, |i| {
+        let score = weights[i] * residual[i];
+        hc1 * score * score / (phi * phi) - weights[i] / phi
+    });
+    let certified = gam_linalg::matrix::FiniteSignedWeightsView::try_from_array(&row_correction)
+        .map_err(invariant)?;
+    let middle = gam_linalg::matrix::xt_diag_x_signed(design, certified)
+        .map_err(invariant)?
+        .to_dense();
+    if middle.dim() != vb.dim() {
+        return Err(invariant(format!(
+            "design Gram is {:?} but the published covariance is {:?}",
+            middle.dim(),
+            vb.dim()
+        )));
+    }
+    let mut correction = vb.dot(&middle).dot(&vb);
+    gam_linalg::matrix::symmetrize_in_place(&mut correction);
+    fit.add_coefficient_covariance_correction(&correction)
+        .map_err(|error| invariant(error.to_string()))
 }
 /// Detection seam for the exact O(n) cubic-smoothing-spline fast path.
 ///
@@ -2449,7 +3427,7 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
         return None;
     }
     let term = &spec.smooth_terms[0];
-    if !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None)
+    if !term.shape.is_none()
         || term.joint_null_rotation.is_some()
     {
         return None;
@@ -2624,7 +3602,7 @@ pub fn residual_cascade_fast_path(
         return None;
     }
     let term = &spec.smooth_terms[0];
-    if !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None)
+    if !term.shape.is_none()
         || term.joint_null_rotation.is_some()
     {
         return None;
@@ -3134,4 +4112,93 @@ pub fn fit_spline_scan_from_formula(
     gam_solve::spline_scan::fit_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
         .map(Some)
         .map_err(spline_scan_failure)
+}
+
+#[cfg(test)]
+mod joint_expectile_scale_posterior_tests {
+    use super::*;
+
+    const LEVELS: [f64; 3] = [0.1, 0.5, 0.9];
+
+    /// Heteroscedastic `y = sin(3x) + (0.3 + 0.6x)·ε`, `ε ~ N(0, 1)` from a
+    /// fixed LCG with Box–Muller, so the fixture is reproducible.
+    fn heteroscedastic_dataset(n: usize) -> Dataset {
+        let mut state: u64 = 0x3056_2026_0919_0001;
+        let mut unif = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let rows = (0..n)
+            .map(|i| {
+                let x = i as f64 / (n as f64 - 1.0);
+                let u1 = 1.0 - unif();
+                let u2 = unif();
+                let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                let y = (3.0 * x).sin() + (0.3 + 0.6 * x) * z;
+                csv::StringRecord::from(vec![x.to_string(), y.to_string()])
+            })
+            .collect();
+        let headers = ["x", "y"].into_iter().map(String::from).collect();
+        gam_data::encode_recordswith_inferred_schema(headers, rows).expect("encode fixture")
+    }
+
+    /// `c_τ` standardizes each residual by the posterior mean of σ, which needs
+    /// the Scale block of the joint covariance. The fitted `c_τ` is exactly the
+    /// covariance-integrated value, and the same fit with its covariance
+    /// removed is refused with a typed error — never standardized by the
+    /// plug-in σ as if the log-σ posterior variance were zero (#3056).
+    #[test]
+    fn joint_expectile_c_tau_requires_the_scale_block_posterior() {
+        let n = 200;
+        let data = heteroscedastic_dataset(n);
+        let config = FitConfig {
+            family: Some("expectile".to_string()),
+            expectile_tau: Some(LEVELS.to_vec()),
+            ..FitConfig::default()
+        };
+        let mut result = fit_expectile_location_scale("y ~ s(x)", &data, &config, LEVELS.to_vec())
+            .expect("joint expectile fit");
+        let y_index = data
+            .headers
+            .iter()
+            .position(|h| h == "y")
+            .expect("response column");
+        let y = data.values.column(y_index).to_owned();
+        let ones = Array1::<f64>::ones(n);
+        let zeros = Array1::<f64>::zeros(n);
+        let c_tau = |location_scale: &GaussianLocationScaleFitResult| {
+            joint_expectile_standardized_expectiles(
+                location_scale,
+                y.view(),
+                ones.view(),
+                zeros.view(),
+                zeros.view(),
+                &LEVELS,
+            )
+        };
+
+        assert!(
+            result.location_scale.fit.fit.beta_covariance().is_some(),
+            "a joint expectile fit carries its joint posterior covariance"
+        );
+        let integrated = c_tau(&result.location_scale).expect("c_τ with covariance");
+        assert_eq!(integrated, result.standardized_expectiles);
+
+        result.location_scale.fit.fit.covariance_conditional = None;
+        match c_tau(&result.location_scale) {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("joint posterior covariance"),
+                    "refusal must name the missing covariance: {message}"
+                );
+            }
+            Ok(plug_in) => panic!(
+                "c_τ without the scale-block covariance must be refused, got the plug-in \
+                 {plug_in:?} (integrated {integrated:?})"
+            ),
+        }
+    }
 }

@@ -862,6 +862,9 @@ pub(crate) struct EvidenceRootCounters {
     negative_curvature_no_steps: std::sync::atomic::AtomicUsize,
     unfactorable_no_steps: std::sync::atomic::AtomicUsize,
     uncertified_refinements: std::sync::atomic::AtomicUsize,
+    exact_refused_acceptances: std::sync::atomic::AtomicUsize,
+    rounding_floor_stops: std::sync::atomic::AtomicUsize,
+    band_refused_commits: std::sync::atomic::AtomicUsize,
 }
 
 /// A snapshot of [`EvidenceRootTelemetry`].
@@ -881,6 +884,14 @@ pub(crate) struct EvidenceRootCounts {
     /// A refinement moved the state and recurred, but the refined root did not certify, so
     /// the accepted state was priced.
     pub(crate) uncertified_refinements: usize,
+    /// #2933 F08 — a state admitted on the majorizer Newton decrement whose exact verdict
+    /// refused it, so it was not priced and the solve continued.
+    pub(crate) exact_refused_acceptances: usize,
+    /// #2822 — the gate sat inside its formation band, so no root step was solved for.
+    pub(crate) rounding_floor_stops: usize,
+    /// #2822 — a trial the strict contraction would have committed, refused because the two
+    /// gates' formation bands overlap.
+    pub(crate) band_refused_commits: usize,
 }
 
 impl EvidenceRootTelemetry {
@@ -896,6 +907,9 @@ impl EvidenceRootTelemetry {
                 .load(Ordering::Relaxed),
             unfactorable_no_steps: self.0.unfactorable_no_steps.load(Ordering::Relaxed),
             uncertified_refinements: self.0.uncertified_refinements.load(Ordering::Relaxed),
+            exact_refused_acceptances: self.0.exact_refused_acceptances.load(Ordering::Relaxed),
+            rounding_floor_stops: self.0.rounding_floor_stops.load(Ordering::Relaxed),
+            band_refused_commits: self.0.band_refused_commits.load(Ordering::Relaxed),
         }
     }
 }
@@ -2532,7 +2546,7 @@ impl SaeManifoldTerm {
             Ok(solve) => solve,
             Err(err) => {
                 counters.solve_failures.fetch_add(1, Ordering::Relaxed);
-                log::info!("[SAE-ROOT] no root step: dense exact-A pseudoinverse: {err}");
+                log::debug!("[SAE-ROOT] no root step: dense exact-A pseudoinverse: {err}");
                 return None;
             }
         };
@@ -2540,7 +2554,7 @@ impl SaeManifoldTerm {
         // step toward the saddle along it. The root this phase refines is a mode.
         if let Some(negative) = solve.negative_curvature {
             counters.negative_curvature_no_steps.fetch_add(1, Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[SAE-ROOT] no root step: the pencil resolves {} negative curvature direction(s) \
                  (min μ={:.6e} below −{:.6e})",
                 negative.directions,
@@ -2557,7 +2571,7 @@ impl SaeManifoldTerm {
         if let Some(nearest) = nearest_edge {
             if solve.retained_rank == 0 {
                 counters.band_skips.fetch_add(1, Ordering::Relaxed);
-                log::info!(
+                log::debug!(
                     "[SAE-ROOT] no root step: pencil band holds a direction (|μ|={:.6e}, \
                      band={:.6e}); all {} directions are in the band",
                     nearest.magnitude,
@@ -2567,7 +2581,7 @@ impl SaeManifoldTerm {
                 return None;
             }
             counters.band_holds.fetch_add(1, Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[SAE-ROOT] pencil band holds {} direction(s) (nearest its edge |μ|={:.6e}, \
                  band={:.6e}); stepping on the resolvable complement of rank {}",
                 solve.band.len(),
@@ -4590,6 +4604,25 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        // #2231/#2822/#3270 — the output-scale coordinates (crosscoder blocks, the global
+        // dispersion) reach `½log|A|` through the scaled target.
+        // The dense and arrow-orbit routes contract their operator weight in
+        // `dense_exact_a_logdet_channels` / `arrow_orbit_logdet_channels`; this route contracts
+        // the bundle's selected inverse row by row.
+        if let Some((probes, sinv)) = logdet_derivative_bundle {
+            let traces = self
+                .crosscoder_block_logdet_traces_from_probes(
+                    rho,
+                    target,
+                    evidence_cache,
+                    probes,
+                    sinv,
+                    evidence_operator,
+                )
+                .map_err(OuterGradientError::internal)?;
+            Self::write_crosscoder_block_logdet_traces(rho, traces, &mut logdet_trace)
+                .map_err(OuterGradientError::internal)?;
+        }
 
         // The scalar criterion adds the realised-rank charge to `½ log|H|`.
         // Its direct rho differential belongs alongside the explicit
@@ -4754,9 +4787,11 @@ impl SaeManifoldTerm {
                 },
             )
         })?;
-        let block_tail_start = n_params - rho.log_lambda_block.len();
+        // The block weights sit before the curvature tail, so their range is
+        // derived forwards from the flat layout, not as an offset from the end.
+        let block_range = rho.block_flat_range();
         for coord in 0..n_params {
-            let rhs = if coord >= block_tail_start && !rho.log_lambda_block.is_empty() {
+            let rhs = if block_range.contains(&coord) {
                 let &(p_x, ref block_dims) =
                     self.crosscoder_pricing_spans.as_ref().ok_or_else(|| {
                         OuterGradientError::internal(
@@ -4765,7 +4800,7 @@ impl SaeManifoldTerm {
                                 .to_string(),
                         )
                     })?;
-                let block = coord - block_tail_start;
+                let block = coord - block_range.start;
                 let start = p_x + block_dims[..block].iter().sum::<usize>();
                 self.crosscoder_block_ift_rhs(cache, target, start..start + block_dims[block])
                     .map_err(OuterGradientError::internal)?
@@ -4881,7 +4916,7 @@ impl SaeManifoldTerm {
                 min_retained_over_floor = min_retained_over_floor.min(magnitude / edge);
             }
         }
-        log::info!(
+        log::debug!(
             "[SAE-EXACT-DENSE] priced: dim={} retained={retained} in_band={in_band} \
              substituted={substituted} resolution_limited={resolution_limited} negative={} \
              ½log|A|={:.6e} ½log|Φ|={:.6e} min retained μ/floor={:.3e} \
@@ -4901,7 +4936,7 @@ impl SaeManifoldTerm {
         } else {
             let values = Self::price_compact_orbits(&geometry.orbit_generators, &geometry.block)?;
             for (generator, value) in geometry.orbit_generators.iter().zip(values.orbits.iter()) {
-                log::info!(
+                log::debug!(
                     "[SAE-EXACT-ORBIT] atom={} priced: nodes={} log I={:.6e} log det N={:.6e} \
                      coupling=[{:.3e}, {:.3e}, {:.3e}] correction={:.6e}",
                     generator.atom,
@@ -4936,7 +4971,7 @@ impl SaeManifoldTerm {
                         }
                     }
                 }
-                log::info!(
+                log::debug!(
                     "[SAE-EXACT-ORBIT] {} separated orbits: largest cross/diagonal complement form {largest:.3e}",
                     values.orbits.len()
                 );
@@ -4997,7 +5032,7 @@ impl SaeManifoldTerm {
         let mut eigenvectors = metric.lower_transpose_solve(rotation.view())?;
         drop(rotation);
         EXACT_A_PENCIL_DECOMPOSITIONS.with(|count| count.set(count.get() + 1));
-        log::info!(
+        log::debug!(
             "[SAE-EXACT-DENSE] pencil eigendecomposition DONE: dim={dimension}, {:.3} s, \
              decomposition {} on this thread",
             eigh_started.elapsed().as_secs_f64(),
@@ -5075,7 +5110,7 @@ impl SaeManifoldTerm {
             // Report when the working coordinates, rather than the pencil, determine the
             // shared spectral rank.
             let widest = block.resolution.iter().copied().fold(0.0_f64, f64::max);
-            log::warn!(
+            log::debug!(
                 "[SAE-EXACT-DENSE] numerical resolution limit: {crossings} of {dimension} \
                  pencil directions clear √ε but not their own numerical resolution (widest \
                  {widest:.6e}); value and adjoint discard these directions",
@@ -5210,7 +5245,7 @@ impl SaeManifoldTerm {
             );
             let floor = sae_exact_a_band_edge(kappa, resolution, 0.0);
             if kappa < -floor {
-                log::warn!(
+                log::debug!(
                     "SAE exact-A basin refusal: block={label}, mode={i}, curvature={kappa:e}, floor={floor:e}"
                 );
                 let Some(directions) = refused_directions.as_mut() else {
@@ -5448,7 +5483,7 @@ impl SaeManifoldTerm {
         for pricing in self.separated_compact_orbit_pricing(rho, target, cache)? {
             match pricing {
                 CompactOrbitPricing::ExactCircle(generator) => {
-                    log::info!(
+                    log::debug!(
                         "[SAE-EXACT-ORBIT] atom={} exact circle orbit: period={:e} eta={:e} \
                          closure residual={:.3e} band={:.3e} prior rows={}",
                         generator.atom,
@@ -5462,7 +5497,7 @@ impl SaeManifoldTerm {
                 }
                 CompactOrbitPricing::Laplace { atom, reason } => {
                     if reason != CompactOrbitLaplaceReason::NotAPeriodicChart {
-                        log::info!("[SAE-EXACT-ORBIT] atom={atom} keeps Laplace pricing: {reason:?}");
+                        log::debug!("[SAE-EXACT-ORBIT] atom={atom} keeps Laplace pricing: {reason:?}");
                     }
                 }
             }
@@ -5585,7 +5620,7 @@ impl SaeManifoldTerm {
             .map(|row| offsets[row + 1] - offsets[row])
             .max()
             .unwrap_or(0);
-        log::info!(
+        log::debug!(
             "[SAE-EXACT-DENSE] materializing the exact stationarity Hessian: dim={dim} \
              (coords={total_t} + border={k}) from {} arrow probes ({slots} coordinate \
              slots + {k} border columns), {:.1} MiB per dim x dim f64 block",
@@ -5723,7 +5758,7 @@ impl SaeManifoldTerm {
             }
         };
         let build_elapsed = build_started.elapsed();
-        log::info!(
+        log::debug!(
             "[SAE-EXACT-DENSE] operator BUILT: dim={dim}, {} arrow probes on {pool_threads} pool \
              threads + symmetrization in {:.3} s ({:.3} ms wall per probe), with the \
              decoder-prior majorizer gap border from the same {k} border probes; the \
@@ -5875,6 +5910,344 @@ impl SaeManifoldTerm {
         Ok((delta_trace, delta_gamma_t))
     }
 
+    /// #2231 — `½⟨W, ∂A/∂log λ_ℓ⟩` for each crosscoder output block (or the global dispersion's
+    /// log precision, #2822), `W` the route's weight on `dA`; empty when no crosscoder pricing is installed. Block `ℓ` moves the scaled target
+    /// along `D_ℓ = ½·Z̃_ℓ` on its own columns. At a fixed state the exact Hessian reads the
+    /// target only through its residual-curvature legs, which are linear in the residual, so
+    /// `∂A/∂log λ_ℓ = A(t + D_ℓ) − A(t)` exactly: two probes of the same operator, differenced
+    /// before they are contracted.
+    pub(crate) fn crosscoder_block_logdet_traces<W: JointWeight + ?Sized>(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        weight: &W,
+    ) -> Result<Vec<f64>, String> {
+        let Some((p_x, block_dims)) = self.crosscoder_pricing_spans.as_ref() else {
+            return Ok(Vec::new());
+        };
+        self.crosscoder_block_traces_refuse_sphere_rows(cache)?;
+        enum Probed {
+            Dense(Array2<f64>),
+            Arrow(ArrowJointBlocks),
+        }
+        let probe = |at: ArrayView2<'_, f64>| -> Result<Probed, String> {
+            if weight.dense().is_some() {
+                let (a, _) = self.materialize_exact_hessian_dense_with_gap_border(rho, at, cache)?;
+                Ok(Probed::Dense(a))
+            } else {
+                let mut blocks = ArrowJointBlocks::zeros(&cache.row_offsets, cache.k);
+                self.probe_exact_hessian_arrow(rho, at, cache, &mut blocks)?;
+                Ok(Probed::Arrow(blocks))
+            }
+        };
+        let base = probe(target)?;
+        let mut shifted = target.to_owned();
+        let mut traces = Vec::with_capacity(block_dims.len());
+        let mut start = *p_x;
+        for &p_l in block_dims {
+            shifted.assign(&target);
+            shifted
+                .slice_mut(s![.., start..start + p_l])
+                .mapv_inplace(|value| 1.5 * value);
+            let contraction = match (probe(shifted.view())?, &base) {
+                (Probed::Dense(mut moved), Probed::Dense(base)) => {
+                    moved -= base;
+                    let dense = weight.dense().ok_or_else(|| {
+                        "crosscoder_block_logdet_traces: the dense weight vanished".to_string()
+                    })?;
+                    (dense * &moved).sum()
+                }
+                (Probed::Arrow(mut moved), Probed::Arrow(base)) => {
+                    moved.subtract(base)?;
+                    moved.contract(weight)?
+                }
+                _ => {
+                    return Err(
+                        "crosscoder_block_logdet_traces: the two probes took different layouts"
+                            .to_string(),
+                    );
+                }
+            };
+            traces.push(0.5 * contraction);
+            start += p_l;
+        }
+        Ok(traces)
+    }
+
+    /// Write [`Self::crosscoder_block_logdet_traces`] into the block coordinates of a
+    /// flat log-determinant trace.
+    pub(crate) fn add_crosscoder_block_logdet_traces<W: JointWeight + ?Sized>(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        weight: &W,
+        logdet_trace: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let traces = self.crosscoder_block_logdet_traces(rho, target, cache, weight)?;
+        Self::write_crosscoder_block_logdet_traces(rho, traces, logdet_trace)
+    }
+
+    /// Write one trace per crosscoder output block into the block coordinates of a flat
+    /// log-determinant trace; `traces` is empty exactly when no crosscoder pricing is installed.
+    fn write_crosscoder_block_logdet_traces(
+        rho: &SaeManifoldRho,
+        traces: Vec<f64>,
+        logdet_trace: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let range = rho.block_flat_range();
+        if traces.is_empty() {
+            return if range.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "crosscoder block log-determinant traces: rho carries {} block coordinates \
+                     but no crosscoder pricing spans are installed",
+                    range.len()
+                ))
+            };
+        }
+        if traces.len() != range.len() {
+            return Err(format!(
+                "crosscoder block log-determinant traces: {} traces for the {} block \
+                 coordinates of rho",
+                traces.len(),
+                range.len()
+            ));
+        }
+        for (coord, trace) in range.zip(traces) {
+            logdet_trace[coord] += trace;
+        }
+        Ok(())
+    }
+
+    /// #2822/#3270 — the output-scale traces (a crosscoder block's or the global dispersion's)
+    /// read `∂A/∂log λ_ℓ` through the residual-curvature legs of `ΔC` alone. An embedded-sphere
+    /// row's `B` also carries `−c_g·P_g` with `c_g = ⟨g_raw, x_g⟩`, which reads the residual, so
+    /// on such a row `B`, `Φ(B)` and `A` all move with the target and no trace prices that leg;
+    /// every route refuses it rather than return a trace short by that leg.
+    fn crosscoder_block_traces_refuse_sphere_rows(
+        &self,
+        cache: &ArrowFactorCache,
+    ) -> Result<(), String> {
+        if self.sphere_tangent_blocks(&cache.row_dims)?.is_empty() {
+            Ok(())
+        } else {
+            Err(
+                "output-scale log-determinant traces: an embedded-sphere row's B carries -c_g P_g \
+                 with c_g = <g_raw, x_g>, which moves with the target; that leg of \
+                 d log|A| / d log(lambda) is not priced, so output-scale coordinates are refused \
+                 on sphere rows"
+                    .to_string(),
+            )
+        }
+    }
+
+    /// #3270 — [`Self::crosscoder_block_logdet_traces`] on the streaming exact-A route: one
+    /// `½⟨W, ∂A/∂log λ_ℓ⟩` per output-scale coordinate (a crosscoder block, or the global
+    /// dispersion over every column), contracted row by row against the probe bundle's
+    /// selected inverse, so no `N`-sized operator is held.
+    ///
+    /// Block `ℓ` moves the scaled target along `½·Z̃_ℓ` on its own columns, so the row error
+    /// `√w·(f − Z̃)` moves along `δe = −½·√w·Z̃_ℓ`. At a fixed state the exact Hessian reads the
+    /// target only through the residual-curvature legs of `ΔC`, which are linear in the error:
+    /// `∂A_tt[a, b] = ⟨δe, ∂²f_ab⟩` and `∂A_tβ[a, β] = ⟨δe, ∂²f_aβ⟩` on the row, and
+    /// `∂A_ββ = 0` because `f` is linear in `β`. The error is whitened exactly as
+    /// [`Self::crosscoder_block_ift_rhs`] whitens it against the same row jets.
+    ///
+    /// The weight is the one every from-probes channel of this route contracts
+    /// ([`Self::logdet_theta_adjoint_from_probes`]): the row blocks
+    /// `(H⁻¹)_tt = A_i⁻¹ + G_i S⁻¹ G_iᵀ` and `(H⁻¹)_tβ = −G_i S⁻¹` from
+    /// [`row_selected_inverse_from_probes`], plus the reduced-Schur clamp-basin weights, the
+    /// Daleckii–Krein correction on a deflated row, and the row clamp-basin response. The clamp
+    /// does not read the target, so its explicit leg does not enter.
+    pub(crate) fn crosscoder_block_logdet_traces_from_probes(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        probes: &[Array1<f64>],
+        sinv_probes: &[Array1<f64>],
+        operator: EvidenceOperator,
+    ) -> Result<Vec<f64>, String> {
+        let Some((p_x, block_dims)) = self.crosscoder_pricing_spans.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if !operator.is_exact_a() {
+            return Err(format!(
+                "crosscoder_block_logdet_traces_from_probes: the traces differentiate ½log|A|, \
+                 but the bundle names {operator:?}"
+            ));
+        }
+        self.crosscoder_block_traces_refuse_sphere_rows(cache)?;
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if target.nrows() != n || target.ncols() != p {
+            return Err(format!(
+                "crosscoder_block_logdet_traces_from_probes: target shape ({}, {}) != ({n}, {p})",
+                target.nrows(),
+                target.ncols()
+            ));
+        }
+        if p_x + block_dims.iter().sum::<usize>() != p {
+            return Err(format!(
+                "crosscoder_block_logdet_traces_from_probes: anchor width {p_x} plus block widths \
+                 {block_dims:?} do not tile the {p} target columns"
+            ));
+        }
+        let k_border = cache.k;
+        if k_border > 0 {
+            if probes.is_empty() || sinv_probes.len() != probes.len() {
+                return Err(format!(
+                    "crosscoder_block_logdet_traces_from_probes: need matching non-empty \
+                     probe/solve bundles, got {} probes and {} solves",
+                    probes.len(),
+                    sinv_probes.len()
+                ));
+            }
+            for (label, set) in [("probe", probes), ("solve", sinv_probes)] {
+                for (j, v) in set.iter().enumerate() {
+                    if v.len() != k_border {
+                        return Err(format!(
+                            "crosscoder_block_logdet_traces_from_probes: {label} {j} has length \
+                             {} != border dim {k_border}",
+                            v.len()
+                        ));
+                    }
+                }
+            }
+        }
+        // #2915 — the clamp-basin prices, built as `logdet_theta_adjoint_from_probes` builds
+        // them on this operator.
+        let clamp = self.materialize_ard_concave_clamp_diagonal_for_rows(rho, &cache.row_dims)?;
+        let border_remainder = if cache.beta_schur_conditioning.is_some() {
+            self.decoder_prior_border_remainder_op(cache.k, 1.0)?
+        } else {
+            None
+        };
+        let beta_basin = match Self::beta_schur_clamp_basin_operands(
+            cache,
+            clamp.view(),
+            border_remainder.as_ref().map(|op| op as &dyn BetaPenaltyOp),
+        )? {
+            Some(operands) => Some((
+                Self::beta_schur_basin_row_weights(cache, clamp.view(), &operands),
+                Self::beta_schur_basin_border_weights(cache, clamp.view(), &operands)?.0,
+            )),
+            None => None,
+        };
+        let second_jets = self.atom_second_jets()?;
+        let border = self.border_channels_for_cache(cache)?;
+        let whiten = self.whiten_logdet_row_jets();
+        let metric = if whiten {
+            Some(self.row_metric.as_ref().ok_or_else(|| {
+                "crosscoder_block_logdet_traces_from_probes: whitening metric absent".to_string()
+            })?)
+        } else {
+            None
+        };
+        let mut spans = Vec::with_capacity(block_dims.len());
+        let mut start = *p_x;
+        for &width in block_dims {
+            spans.push(start..start + width);
+            start += width;
+        }
+        let mut traces = vec![0.0_f64; block_dims.len()];
+        let mut jet_window: std::collections::VecDeque<SaeRowJets> =
+            std::collections::VecDeque::new();
+        let mut jet_window_next = 0usize;
+        for row in 0..n {
+            let q = cache.row_dims[row];
+            let base = cache.row_offsets[row];
+            if jet_window.is_empty() {
+                jet_window_next = self.refill_jet_window(
+                    jet_window_next,
+                    cache,
+                    &second_jets,
+                    &border,
+                    &mut jet_window,
+                )?;
+            }
+            let mut jets = jet_window.pop_front().ok_or_else(|| {
+                "crosscoder_block_logdet_traces_from_probes: empty jet window".to_string()
+            })?;
+            if whiten {
+                self.apply_whiten_to_logdet_row_jets(row, &mut jets)?;
+            }
+            let (mut inv_vv, mut inv_vbeta) = row_selected_inverse_from_probes(
+                cache,
+                row,
+                probes,
+                sinv_probes,
+                true,
+                "crosscoder_block_logdet_traces_from_probes",
+            )?;
+            if let Some((row_weights, border_weights)) = beta_basin.as_ref() {
+                inv_vv += &row_weights[row].0;
+                inv_vbeta += &border_weights[row];
+            }
+            let dirs = cache
+                .deflated_row_directions
+                .get(row)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let spectrum = cache
+                .deflation_row_spectra
+                .get(row)
+                .and_then(Option::as_ref);
+            let deflation_live = Self::row_deflation_is_live(dirs, spectrum);
+            let price =
+                Self::clamp_basin_price_weights(&inv_vv, clamp.slice(s![base..base + q]), spectrum);
+            let sqrt_w = self
+                .row_loss_weights
+                .as_deref()
+                .map_or(1.0, |w| w[row].sqrt());
+            for (block, span) in spans.iter().enumerate() {
+                let mut error_step: Vec<f64> = (0..p)
+                    .map(|col| {
+                        if span.contains(&col) {
+                            -0.5 * sqrt_w * target[[row, col]]
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                if let Some(metric) = metric {
+                    Self::whiten_logdet_metric_vec(metric, row, p, &mut error_step)?;
+                }
+                let mut d_tt = Array2::<f64>::zeros((q, q));
+                for a in 0..q {
+                    for b in 0..q {
+                        d_tt[[a, b]] = sae_dot(jets.second(a, b), &error_step);
+                    }
+                }
+                let mut contraction = 0.0_f64;
+                for a in 0..q {
+                    for b in 0..q {
+                        contraction += inv_vv[[b, a]] * d_tt[[a, b]];
+                    }
+                }
+                if deflation_live {
+                    contraction -=
+                        Self::deflation_block_correction(&inv_vv, &d_tt, dirs, spectrum);
+                }
+                if let Some((_, response)) = price.as_ref() {
+                    contraction += (response * &d_tt).sum();
+                }
+                for a in 0..q {
+                    for (beta_pos, channel) in border.iter().enumerate() {
+                        contraction += 2.0
+                            * inv_vbeta[[a, channel.index]]
+                            * sae_dot(jets.beta_deriv(a, beta_pos), &error_step);
+                    }
+                }
+                traces[block] += 0.5 * contraction;
+            }
+        }
+        Ok(traces)
+    }
+
     pub(crate) fn dense_exact_a_logdet_channels(
         &self,
         target: ArrayView2<'_, f64>,
@@ -5943,6 +6316,8 @@ impl SaeManifoldTerm {
         }
         // One per-coordinate map at a time: the metric channel below builds its own.
         drop(da_by_flat);
+        // #2231 — the crosscoder block weights reach `A` through the scaled target.
+        self.add_crosscoder_block_logdet_traces(rho, target, cache, a_pinv, &mut logdet_trace)?;
         // Ordered-Beta–Bernoulli sparse coordinate: its ∂A/∂ρ_sparse is the exact
         // integrated-marginal logit Hessian (cross-row), absent from the operator
         // map above (softmax-only). Add its ½log|A| trace directly.
@@ -7202,7 +7577,7 @@ mod test_support {
                     .iter()
                     .enumerate()
                 {
-                    // A clone drops the three frozen gates, and
+                    // A clone of an undeclared term carries no gate, and
                     // `barrier_coactivation_pairs` then recomputes the barrier
                     // coactivation from the moved logits, so the border gap would
                     // move with theta. Production holds the gates fixed across a step.
@@ -8219,7 +8594,7 @@ mod column_loop_oracle_tests {
             // hundred and finishes in ~1.6 s, while a 508-row K=8 dense-softmax rung
             // is ~5.3e3 and one step measured >=25 min at 4.7 GiB peak RSS. One line,
             // once per materialization, states the size of the bill before it is paid.
-            log::info!(
+            log::debug!(
                 "[SAE-EXACT-DENSE] materializing the exact stationarity Hessian: dim={dim} \
                  (coords={total_t} + border={k}), {:.1} MiB per dim x dim f64 block, \
                  {:.1} MiB resident across {} live blocks, \
@@ -8279,7 +8654,7 @@ mod column_loop_oracle_tests {
                 }
             }
             let build_elapsed = build_started.elapsed();
-            log::info!(
+            log::debug!(
                 "[SAE-EXACT-DENSE] operator BUILT: dim={dim}, {dim} Hessian-vector applies \
                  + symmetrization in {:.3} s ({:.3} ms per apply); \
                  the O(dim^3) symmetric eigendecomposition has NOT started yet",

@@ -45,11 +45,9 @@ use crate::location_scale_engine::build_location_scale_exact_joint_setup;
 
 use crate::parameter_block::ParameterBlockInput;
 
-use crate::scale_design::{build_scale_deviation_operator, build_scale_deviation_transform_design};
-
 use crate::sigma_link::{
-    LOGB_SIGMA_FLOOR, SigmaJet1, exp_sigma_derivs_up_to_fourth_scalar,
-    exp_sigma_derivs_up_to_third, exp_sigma_from_eta_scalar, exp_sigma_jet1_scalar,
+    SigmaJet1, exp_sigma_derivs_up_to_fourth_scalar, exp_sigma_derivs_up_to_third,
+    exp_sigma_from_eta_scalar, exp_sigma_jet1_scalar, gaussian_resolution_sigma_floor,
     logb_sigma_from_eta_scalar, logb_sigma_jet1_scalar, safe_exp,
 };
 
@@ -106,7 +104,6 @@ use std::collections::{HashMap, hash_map::DefaultHasher};
 
 use std::hash::{Hash, Hasher};
 
-use std::sync::atomic::AtomicUsize;
 
 use std::sync::{Arc, Mutex};
 

@@ -21,7 +21,7 @@ def main() -> None:
     )
     y = np.sin(theta) + 0.1 * rng.normal(size=n)
 
-    penalty = gamfit.MechanismSparsityPenalty(
+    penalty = gamfit.penalties.MechanismSparsityPenalty(
         [[0, 1], [2, 3]],
         weight=0.2,
         n_eff=n,
@@ -31,7 +31,7 @@ def main() -> None:
         {"y": y},
         "y ~ s(t, type='duchon', centers=24)",
         latents={
-            "t": gamfit.LatentCoord(n=n, d=2, init=aux[:, :2], aux_prior={"u": aux}),
+            "t": gamfit.smooth.LatentCoord(n=n, d=2, init=aux[:, :2], aux_prior={"u": aux}),
         },
         penalties=[penalty],
     )

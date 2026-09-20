@@ -20,7 +20,7 @@ finite coefficient standard errors and labels their provenance
 that even reports ``covariance_source='conditional'`` in its own output. But
 every DEFAULT uncertainty surface refuses with the same string:
 
-    predict(interval=0.95)                    GamError: ... does not contain smoothing-corrected covariance
+    predict(interval=0.95)                    GamfitError: ... does not contain smoothing-corrected covariance
     predict(interval=0.95, observation_interval=True)   same
     predict(interval="conformal", calibration=...)      same
     diagnose(data)                                      same
@@ -46,6 +46,12 @@ Expected: a certified fit reports uncertainty through its default surfaces. The
 conditional covariance it already publishes through ``summary()`` (and returns
 on request through ``predict``) is available; the correction that is missing is
 an enhancement, exactly as the solver comment says.
+
+Resolution: the correction was never missing in principle. A railed coordinate
+carries zero ρ-variance exactly (``∂β̂/∂ρ_k = 0`` on the rail face), so the
+correction now judges the ρ-Hessian off the railed axes, as the outer
+certificate does, and a fit whose every smoothing parameter is railed
+publishes the exact zero correction instead of none.
 """
 
 from __future__ import annotations
@@ -87,9 +93,26 @@ def railed() -> tuple[Any, dict[str, Any]]:
     # assertions below would be testing nothing.
     assert summary.convergence["certified"] is True
     assert summary.convergence["outer"]["lambdas_railed"] == [0]
-    assert summary.covariance_kind == "conditional"
+    # The only smoothing parameter sits on its rail, where ∂β̂/∂ρ = 0 exactly:
+    # the correction is published, and it is the exact zero, not an absence.
+    assert summary.covariance_kind == "smoothing-corrected"
     assert all(np.isfinite(c["std_error"]) for c in summary.coefficients)
     return model, data
+
+
+def test_railed_coordinate_adds_no_smoothing_variance(railed: tuple[Any, dict[str, Any]]) -> None:
+    model, _ = railed
+    corrected = model.predict(_levels(), interval=0.95, return_type="dict")
+    conditional = model.predict(
+        _levels(), interval=0.95, covariance_mode="conditional", return_type="dict"
+    )
+    assert corrected.covariance_source == "smoothing-corrected"
+    np.testing.assert_allclose(
+        np.asarray(corrected.posterior_mean_standard_error, dtype=float),
+        np.asarray(conditional.posterior_mean_standard_error, dtype=float),
+        rtol=1e-12,
+        atol=0.0,
+    )
 
 
 def _levels() -> dict[str, Any]:

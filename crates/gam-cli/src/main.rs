@@ -3,7 +3,7 @@
 // Crate-root shared imports, re-exported so each `src/main/` submodule
 // inherits them via `use super::*;`. Real submodules below replace the
 // former textually-pasted source fragments.
-pub(crate) use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+pub(crate) use clap::{Args, Parser, Subcommand, ValueEnum};
 
 pub(crate) use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8_FULL};
 
@@ -11,7 +11,7 @@ pub(crate) use csv::WriterBuilder;
 
 pub(crate) use gam::estimate::{
     BlockRole, ContinuousSmoothnessOrderStatus, ModelSummary,
-    ParametricTermSummary, UnifiedFitResult, smooth_term_summary_rows,
+    ParametricTermSummary, SummaryBlockOffset, UnifiedFitResult, smooth_term_summary_rows,
 };
 
 pub(crate) use gam::families::survival::latent::fixed_latent_hazard_frailty;
@@ -52,7 +52,7 @@ pub(crate) use gam_predict::linalg::{PredictionCovarianceBackend, rowwise_local_
 pub(crate) use gam::matrix::{DesignMatrix, SymmetricMatrix};
 
 pub(crate) use gam_predict::{
-    FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod, PosteriorMeanOptions,
+    FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod,
     PredictInput, PredictUncertaintyOptions, PredictableModel, predict_gam,
     predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
@@ -60,7 +60,7 @@ pub(crate) use gam_predict::{
 pub(crate) use gam::report;
 
 pub(crate) use gam::probability::{
-    normal_cdf, normal_two_sided_probability, standard_normal_quantile,
+    inverse_gaussian_cdf, normal_two_sided_probability, standard_normal_quantile,
     student_t_two_sided_probability,
 };
 
@@ -91,7 +91,6 @@ pub(crate) use gam::families::survival::location_scale::{
 };
 
 pub(crate) use gam::families::survival::predict::{
-    build_saved_survival_marginal_slope_predictor,
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
     resolve_saved_survival_time_columns, resolve_survival_inverse_link_from_saved,
     resolve_termspec_for_prediction, saved_baseline_timewiggle_components,
@@ -110,7 +109,8 @@ pub(crate) use gam::types::{
 pub(crate) use gam::families::fit_orchestration::{
     FitConfig, FitResult,
     PreparedSurvivalTimeStack, WorkflowError,
-    fit_from_formula_with_notes, fit_required_columns, formula_columns, is_binary_response,
+    drop_zero_weight_rows, fit_from_formula_with_notes, fit_required_columns, formula_columns,
+    is_binary_response,
     prepare_survival_time_stack, resolve_offset_column, resolve_weight_column,
 };
 
@@ -165,8 +165,12 @@ mod prediction_csv;
 mod run_crosscoder;
 #[path = "main/run_parameter_decomposition.rs"]
 mod run_parameter_decomposition;
+#[path = "main/run_compare.rs"]
+mod run_compare;
 #[path = "main/run_diagnose.rs"]
 mod run_diagnose;
+#[path = "main/run_summary.rs"]
+mod run_summary;
 #[path = "main/run_fit.rs"]
 mod run_fit;
 #[path = "main/run_joint_events.rs"]
@@ -190,7 +194,9 @@ pub(crate) use multinomial_cli::*;
 pub(crate) use prediction_csv::*;
 pub(crate) use run_crosscoder::*;
 pub(crate) use run_parameter_decomposition::*;
+pub(crate) use run_compare::*;
 pub(crate) use run_diagnose::*;
+pub(crate) use run_summary::*;
 pub(crate) use run_fit::*;
 pub(crate) use run_joint_events::*;
 pub(crate) use run_predict::*;
@@ -225,7 +231,8 @@ fn main() {
     // Drive the whole command on a dedicated wide-stack thread (see
     // `CLI_WORKER_STACK_SIZE`). `run` returns the same `CliResult` it would on
     // the main thread; a `join` error means `run` itself panicked, which the
-    // default panic hook has already reported, so we flush and exit non-zero.
+    // default panic hook has already reported. A panic is never the user's
+    // fault, so it exits with the internal-error code.
     let worker = std::thread::Builder::new()
         .name("gam-cli".to_string())
         .stack_size(CLI_WORKER_STACK_SIZE)
@@ -236,7 +243,7 @@ fn main() {
         Err(_) => {
             drop(std::io::Write::flush(&mut std::io::stdout()));
             drop(std::io::Write::flush(&mut std::io::stderr()));
-            HARD_EXIT(1);
+            HARD_EXIT(gam::ErrorCategory::Internal.exit_code());
         }
     };
     if let Err(e) = result {
@@ -246,7 +253,7 @@ fn main() {
         }
         drop(std::io::Write::flush(&mut std::io::stdout()));
         drop(std::io::Write::flush(&mut std::io::stderr()));
-        HARD_EXIT(1);
+        HARD_EXIT(e.error_category().exit_code());
     }
     // Every output artifact has been written and flushed by `run()`. Skip the
     // natural drop chain and exit explicitly: on Linux the cudarc + cuBLAS +
@@ -265,13 +272,8 @@ fn run() -> CliResult<()> {
     // Parse first so `--help` / `--version` exit cleanly without spawning the
     // runtime-threads INFO line clap can't suppress.
     let cli = Cli::parse();
-    // Honor an explicit `--log-level`; otherwise the logger installs at its
-    // quiet `Warn` default (#1688). Clap has already validated an explicit
-    // level, so initialization cannot reinterpret or guess at the request.
-    match cli.log_level {
-        Some(level) => gam::progress_log::init_logging_at(level),
-        None => gam::progress_log::init_logging(),
-    }
+    // Solver diagnostics reach stderr only when asked for with `-v`/`-vv`.
+    gam::progress_log::init_logging_at(log_level_for_verbosity(cli.verbose));
     // #2738 — a SETTING and a CAPACITY are not enough; report the policy too.
     //
     // This line used to print `rayon_current_num_threads` beside
@@ -287,23 +289,27 @@ fn run() -> CliResult<()> {
     // so the two cannot drift: a field dropped from the log is a field dropped
     // from the data, and `parallelism_snapshot_2738_tests` fails.
     let threads = gam::faer_ndarray::ParallelismSnapshot::capture();
-    log::info!("[STAGE] runtime threads | {threads}");
+    log::debug!("[STAGE] runtime threads | {threads}");
     if let Some(disagreement) = threads.inconsistency() {
         // Not fatal — the run is still the run — but a perf number taken under a
         // configuration that disagrees with itself is un-denominated, and that
         // has to be said at the top of the log rather than inferred later.
-        log::warn!("[STAGE] runtime threads | INCONSISTENT: {disagreement}");
+        log::debug!("[STAGE] runtime threads | INCONSISTENT: {disagreement}");
     }
     match cli.command {
         Command::Fit(args) => run_fit(args).map_err(CliError::from),
         Command::Crosscoder(args) => run_crosscoder(args),
         Command::ParameterDecomposition(args) => run_parameter_decomposition_cli(args),
         Command::Report(args) => run_report(args).map_err(CliError::from),
-        Command::Predict(args) => run_predict(args).map_err(CliError::from),
+        Command::Summary(args) => run_summary(args).map_err(CliError::from),
+        Command::Predict(args) => run_predict(args),
         Command::TransformationScore(args) => {
             run_transformation_score(args).map_err(CliError::from)
         }
+        Command::LatentResidual(args) => run_latent_residual(args),
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),
+        Command::Residuals(args) => run_residuals(args).map_err(CliError::from),
+        Command::Compare(args) => run_compare(args).map_err(CliError::from),
         Command::Sample(args) => run_sample(args).map_err(CliError::from),
         Command::Generate(args) => run_generate(args).map_err(CliError::from),
         Command::JointEvents(args) => run_joint_events(args).map_err(CliError::from),

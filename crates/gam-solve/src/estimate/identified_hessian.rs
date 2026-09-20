@@ -312,25 +312,36 @@ pub(crate) struct HessianSpectrumBounds {
 
 impl HessianSpectrumBounds {
     /// The bounds for the penalized `hessian`, which carries the engine's
-    /// `penalty` `S̃`, over a step of at most `step[k]` in coordinate `k`, for the
-    /// curvature weights' `motion` over that step. `penalties` yields one
-    /// `(range, block)` per coordinate, in coordinate order: `block` is
-    /// `λ_k S̃_k` on `hessian`'s rows and columns `range`, zero elsewhere.
-    pub(crate) fn over_step(
+    /// `penalty` `S̃`, over a step that moves coordinate `k` down by at most
+    /// `down[k]` and up by at most `up[k]`, so `λ_k S̃_k` ranges over
+    /// `[e^{−down_k}, e^{up_k}]·λ_k S̃_k`, for the curvature weights' `motion`
+    /// over that step. `penalties` yields one `(range, block)` per coordinate,
+    /// in coordinate order: `block` is `λ_k S̃_k` on `hessian`'s rows and
+    /// columns `range`, zero elsewhere.
+    pub(crate) fn over_reach(
         hessian: &Array2<f64>,
         penalty: &Array2<f64>,
         penalties: impl IntoIterator<Item = (std::ops::Range<usize>, Array2<f64>)>,
-        step: ArrayView1<'_, f64>,
+        down: ArrayView1<'_, f64>,
+        up: ArrayView1<'_, f64>,
         motion: HessianSpectrumMotion,
     ) -> Result<Self, EstimationError> {
         let dimension = hessian.nrows();
+        let nonnegative = |reach: &ArrayView1<'_, f64>| {
+            reach
+                .iter()
+                .all(|&radius| radius.is_finite() && radius >= 0.0)
+        };
         if hessian.ncols() != dimension
             || penalty.dim() != (dimension, dimension)
-            || step.iter().any(|&radius| !(radius.is_finite() && radius >= 0.0))
+            || down.len() != up.len()
+            || !nonnegative(&down)
+            || !nonnegative(&up)
         {
             return Err(EstimationError::InvalidInput(format!(
                 "Hessian spectrum bounds need a square Hessian, a penalty of its shape and \
-                 finite nonnegative steps: {}x{} Hessian, {}x{} penalty, steps {step}",
+                 finite nonnegative reaches of one length: {}x{} Hessian, {}x{} penalty, \
+                 reach down {down}, reach up {up}",
                 hessian.nrows(),
                 hessian.ncols(),
                 penalty.nrows(),
@@ -344,10 +355,10 @@ impl HessianSpectrumBounds {
         let mut upper_unbounded = false;
         let mut coordinates = 0usize;
         for (range, block) in penalties {
-            let Some(&radius) = step.get(coordinates) else {
+            let (Some(&fall), Some(&rise)) = (down.get(coordinates), up.get(coordinates)) else {
                 return Err(EstimationError::InvalidInput(format!(
                     "Hessian spectrum bounds: more penalties than the {} step coordinates",
-                    step.len()
+                    down.len()
                 )));
             };
             if range.end > dimension || block.dim() != (range.len(), range.len()) {
@@ -365,8 +376,8 @@ impl HessianSpectrumBounds {
                 .scaled_add(1.0, &block);
             shrunk
                 .slice_mut(s![range.clone(), range.clone()])
-                .scaled_add((-radius).exp(), &block);
-            let growth = radius.exp();
+                .scaled_add((-fall).exp(), &block);
+            let growth = rise.exp();
             if growth.is_finite() {
                 grown
                     .slice_mut(s![range.clone(), range])
@@ -376,10 +387,10 @@ impl HessianSpectrumBounds {
             }
             coordinates += 1;
         }
-        if coordinates != step.len() {
+        if coordinates != down.len() {
             return Err(EstimationError::InvalidInput(format!(
                 "Hessian spectrum bounds: {coordinates} penalties for {} step coordinates",
-                step.len()
+                down.len()
             )));
         }
         let difference = penalty - &total;
@@ -668,13 +679,26 @@ impl FittedHessianSpectrum {
     }
 }
 
+/// The outer certificate at ρ̂, as the identified-rank certificate reads it:
+/// its curvature `hessian_rho` and `gradient`, the coordinates it certified on
+/// a rail, ρ̂ itself, and the resolvability domain `[lower, upper]` the outer
+/// search ran in.
+pub(crate) struct OuterCertificatePoint<'a> {
+    pub(crate) hessian_rho: &'a Array2<f64>,
+    pub(crate) gradient: &'a Array1<f64>,
+    pub(crate) railed: &'a [usize],
+    pub(crate) rho: &'a Array1<f64>,
+    pub(crate) lower: &'a Array1<f64>,
+    pub(crate) upper: &'a Array1<f64>,
+}
+
 /// Certify at finalization that the fitted Hessian's identified rank is constant
 /// over the outer certificate's own Newton step (#2901 V22), and return that
 /// certificate with the step's largest coordinate.
 ///
 /// `spectrum` is PIRLS's dense penalized Hessian's, in its transformed basis;
-/// `hessian_rho` and `gradient` are the outer certificate's curvature and
-/// gradient at ρ̂, and `railed` lists the coordinates it certified on a rail. The
+/// `outer` carries the outer certificate's curvature and gradient at ρ̂ and the
+/// coordinates it certified on a rail. The
 /// curvature weights move through `β̂`: `ΔW_i = c_i·x_iᵀΔβ` with
 /// `Δβ = Σ_k δρ_k·∂β̂/∂ρ_k` and `∂β̂/∂ρ_k = −H⁺λ_kS_kβ̂` over the identified
 /// subspace the criterion priced, so row `i` moves by at most
@@ -683,17 +707,51 @@ impl FittedHessianSpectrum {
 /// bounds are taken at this certified state, the one the criterion priced. Both
 /// channels read the same penalties: the engine's projections `S̃_k = Π S_k Π`
 /// that sum to the `S̃` in `H` ([`HessianSpectrumBounds`]).
+///
+/// The stationary point the certificate vouches for is the outer search's, and
+/// that search runs inside its resolvability domain `[lo, hi]`. So coordinate
+/// `k` reaches down by `min(t_k, ρ̂_k − lo_k)` and up by `min(t_k, hi_k − ρ̂_k)`
+/// for the Newton displacement `t_k`: a flat coordinate just inside the λ→∞
+/// face has a long Newton step toward that face, and the step ends on the face,
+/// not beyond it.
 pub(crate) fn certify_fitted_identified_rank(
     pirls: &crate::pirls::PirlsResult,
     spectrum: &FittedHessianSpectrum,
     lambdas: &Array1<f64>,
     design: &gam_linalg::matrix::DesignMatrix,
-    hessian_rho: &Array2<f64>,
-    gradient: &Array1<f64>,
-    railed: &[usize],
+    outer: OuterCertificatePoint<'_>,
 ) -> Result<(IdentifiedRankCertificate, f64), EstimationError> {
+    let OuterCertificatePoint {
+        hessian_rho,
+        gradient,
+        railed,
+        rho,
+        lower,
+        upper,
+    } = outer;
+    if rho.len() != gradient.len() || lower.len() != rho.len() || upper.len() != rho.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "identified-rank certificate: {} gradient coordinates at a {}-coordinate rho in a \
+             [{}, {}]-coordinate domain",
+            gradient.len(),
+            rho.len(),
+            lower.len(),
+            upper.len()
+        )));
+    }
     let displacement = certificate_newton_displacement(hessian_rho, gradient, railed)?;
-    let step_radius = displacement.iter().fold(0.0_f64, |acc, value| acc.max(*value));
+    let down: Array1<f64> = ndarray::Zip::from(&displacement)
+        .and(rho)
+        .and(lower)
+        .map_collect(|&step, &at, &floor| step.min((at - floor).max(0.0)));
+    let up: Array1<f64> = ndarray::Zip::from(&displacement)
+        .and(rho)
+        .and(upper)
+        .map_collect(|&step, &at, &ceiling| step.min((ceiling - at).max(0.0)));
+    let reach: Array1<f64> = ndarray::Zip::from(&down)
+        .and(&up)
+        .map_collect(|&fall, &rise| fall.max(rise));
+    let step_radius = reach.iter().fold(0.0_f64, |acc, value| acc.max(*value));
     let penalties = pirls.reparam_result.applied_penalties().map_err(|error| {
         EstimationError::LayoutError(format!(
             "projecting the rank certificate's penalty blocks onto the reparameterization's \
@@ -714,7 +772,7 @@ pub(crate) fn certify_fitted_identified_rank(
         for ((penalty, &lambda), &step) in penalties
             .iter()
             .zip(lambdas.iter())
-            .zip(displacement.iter())
+            .zip(reach.iter())
         {
             if step == 0.0 {
                 continue;
@@ -765,7 +823,7 @@ pub(crate) fn certify_fitted_identified_rank(
             Ok(qs.t().dot(&gram).dot(qs))
         },
     )?;
-    let bounds = HessianSpectrumBounds::over_step(
+    let bounds = HessianSpectrumBounds::over_reach(
         &spectrum.hessian,
         &pirls.reparam_result.s_transformed,
         penalties.iter().zip(lambdas.iter()).map(|(penalty, &lambda)| {
@@ -774,7 +832,8 @@ pub(crate) fn certify_fitted_identified_rank(
                 penalty.root.t().dot(&penalty.root) * lambda,
             )
         }),
-        displacement.view(),
+        down.view(),
+        up.view(),
         motion,
     )?;
     certify_identified_rank_locally_constant(eigenvalues, rank, penalty_rank, &bounds)
@@ -853,12 +912,13 @@ mod tests {
             Array2::<f64>::zeros((hessian.len(), hessian.len())),
             |sum, entry| sum + diagonal(entry.0),
         );
-        HessianSpectrumBounds::over_step(
+        HessianSpectrumBounds::over_reach(
             &diagonal(hessian),
             &engine,
             penalties
                 .iter()
                 .map(|entry| (0..hessian.len(), diagonal(entry.0))),
+            steps.view(),
             steps.view(),
             still_weights(),
         )
@@ -1005,6 +1065,42 @@ mod tests {
         );
     }
 
+    /// A flat coordinate just inside the λ→∞ face of its
+    /// resolvability domain carries a long Newton step toward that face, and the
+    /// step ends on the face. On `y ~ s(x0) + … + s(x19)` (binomial, n = 10000) the
+    /// displacement was 11 at ρ = 23.5 with the face at 25.4; its penalty sets
+    /// `‖H‖₂`, so growing it by `e^{11}` lifted the band past the data direction's
+    /// σ_r = 63.6 and refused a rank that cannot move inside the domain. Growing it
+    /// by the `e^{1.9}` that reaches the face certifies; the same step shrinking the
+    /// penalty by `e^{−11}` leaves the data direction where it is.
+    #[test]
+    fn a_step_toward_the_domain_face_is_clipped_at_the_face() {
+        let spectrum = [2.0e15 + 1.0, 63.6];
+        let hessian = diagonal(&spectrum);
+        let engine = diagonal(&[2.0e15, 0.0]);
+        let bounds_for = |down: f64, up: f64| {
+            HessianSpectrumBounds::over_reach(
+                &hessian,
+                &engine,
+                [(0..2, engine.clone())],
+                array![down].view(),
+                array![up].view(),
+                still_weights(),
+            )
+            .unwrap()
+        };
+        let refusal = certify_at_identified_rank(&spectrum, 1, &bounds_for(11.0, 11.0)).unwrap_err();
+        assert!(
+            matches!(
+                refusal,
+                EstimationError::IdentifiedRankNotLocallyConstant { rank: 2, .. }
+            ),
+            "{refusal}"
+        );
+        let certificate = certify_at_identified_rank(&spectrum, 1, &bounds_for(11.0, 1.9)).unwrap();
+        assert_eq!(certificate.rank, 2);
+    }
+
     /// #2901 V22: a rotated penalty root can leak onto the structural null
     /// coordinates, where the engine's penalty is exactly zero. With null
     /// coordinate 1, root `r = (1, 1e-4)` and `λ = 1e8`, the raw block `λ·rᵀr`
@@ -1024,13 +1120,14 @@ mod tests {
             .project_out_null_directions(array![[0.0], [1.0]].view())
             .unwrap();
         let bounds_for = |penalty: &gam_terms::construction::CanonicalPenalty| {
-            HessianSpectrumBounds::over_step(
+            HessianSpectrumBounds::over_reach(
                 &hessian,
                 &engine,
                 [(
                     penalty.col_range.clone(),
                     penalty.root.t().dot(&penalty.root) * 1.0e8,
                 )],
+                array![1.0].view(),
                 array![1.0].view(),
                 still_weights(),
             )
@@ -1060,10 +1157,11 @@ mod tests {
     fn an_engine_penalty_the_blocks_do_not_reproduce_is_charged_its_residual_2901() {
         let spectrum = [1.0, 0.3];
         let bounds_for = |engine: &[f64]| {
-            HessianSpectrumBounds::over_step(
+            HessianSpectrumBounds::over_reach(
                 &diagonal(&spectrum),
                 &diagonal(engine),
                 [(0..2, diagonal(&[0.0, 0.2]))],
+                array![0.0].view(),
                 array![0.0].view(),
                 still_weights(),
             )
@@ -1218,10 +1316,11 @@ mod tests {
         let second = rotation.dot(&diagonal(&[0.0, 3.0, 1.0])).dot(&rotation.t());
         let hessian = &data + &first + &second;
         let steps = array![1.3, 0.4];
-        let bounds = HessianSpectrumBounds::over_step(
+        let bounds = HessianSpectrumBounds::over_reach(
             &hessian,
             &(&first + &second),
             [(0..3, first.clone()), (0..3, second.clone())],
+            steps.view(),
             steps.view(),
             still_weights(),
         )
@@ -1298,10 +1397,11 @@ mod tests {
                     Ok(Array2::from_diag(mass))
                 })
                 .unwrap();
-            HessianSpectrumBounds::over_step(
+            HessianSpectrumBounds::over_reach(
                 &diagonal(&spectrum),
                 &diagonal(&[0.0, 0.5]),
                 [penalty.clone()],
+                array![0.0].view(),
                 array![0.0].view(),
                 motion,
             )

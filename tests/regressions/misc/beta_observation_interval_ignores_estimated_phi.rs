@@ -126,7 +126,6 @@ fn beta_observation_interval_uses_estimated_phi_not_seed() {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         },
     )

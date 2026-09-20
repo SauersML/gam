@@ -27,28 +27,40 @@ pub struct ConformalRows<'a> {
     pub noise_offset: &'a Array1<f64>,
 }
 
-/// Exact full-conformal prediction columns at the fitted smoothing parameters.
+/// Rows the exact full-conformal set predicts at, or is built on (then they must
+/// also carry the response column): the data in the model schema and its column
+/// map.
+pub struct DesignRows<'a> {
+    pub data: ArrayView2<'a, f64>,
+    pub col_map: &'a HashMap<String, usize>,
+}
+
+/// Full-conformal prediction columns for a Gaussian-identity fit.
 ///
-/// Reads the `ExactFullConformalSubstrate` precomputed at fit time (only
-/// available for Gaussian-identity, unit-weight, offset-free models without a
-/// link wiggle), rebuilds the test design from the saved `resolved_termspec`,
-/// and calls `substrate.interval(x_*, alpha)` per test row — one Cholesky each,
-/// zero refits. The set is exact *given the frozen penalty*; because the fitted
-/// λ̂ was selected from all training responses, the frozen-λ score construction
-/// is not permutation symmetric in the n+1 augmented points, so the
-/// distribution-free finite-sample coverage theorem applies only where the
-/// per-row frozen-ρ certificate accepts (`frozen_rho_certified` = 1.0, on the
-/// REML branch through the augmented optimum); a 0.0 row is the frozen-λ
-/// approximation with no finite-sample guarantee. The exact set is a union of
-/// intervals; `posterior_mean_lower` / `posterior_mean_upper` are its outer
-/// envelope (a superset).
+/// Reads the frozen penalty `Sλ` and its smoothing-parameter count persisted at
+/// fit time (only for Gaussian-identity, unit-weight, offset-free models without
+/// a link wiggle), rebuilds the design of the `labeled` rows and of the `test`
+/// rows from the saved `resolved_termspec`, and calls
+/// `substrate.interval(x_*, alpha)` per test row. The saved model persists no
+/// training rows, so the caller supplies the labeled rows the set is built on.
+///
+/// Each row's set is that of the fitting map which re-selects the smoothing
+/// strength by REML on the augmented rows, so the finite-sample coverage
+/// theorem holds for it. The `conformal_certificate` column says what each row
+/// carries: `0` exact_frozen (no strength to re-select), `1` honest_refit, and a
+/// negative code for a typed refusal (`-1` multi_penalty, `-2`
+/// unknown_penalty_structure, `-3` augmented_gram_singular, `-4` reml_undefined,
+/// `-5` refit_outside_tube, `-6` refit_failed), where the row gets the frozen-ρ
+/// set with no finite-sample guarantee. The set is a union of intervals;
+/// `posterior_mean_lower` / `posterior_mean_upper` are its outer envelope (a
+/// superset).
 ///
 /// `alpha = 1 − conformal_level`: the full-conformal set `C_α` has marginal
 /// coverage `≥ 1 − α`, with no factor of two.
 pub fn full_conformal_prediction_columns(
     model: &FittedModel,
-    data: ArrayView2<'_, f64>,
-    col_map: &HashMap<String, usize>,
+    test: &DesignRows<'_>,
+    labeled: &DesignRows<'_>,
     conformal_level: f64,
 ) -> Result<BTreeMap<String, Vec<f64>>, String> {
     if !(conformal_level > 0.0 && conformal_level < 1.0) {
@@ -64,17 +76,16 @@ pub fn full_conformal_prediction_columns(
         return Err(
             "exact full-conformal intervals require a penalised-spline (B-spline) model; \
              this model was fit by the exact O(n) state-space scan. Refit with \
-             double_penalty=true to obtain the standard model that carries the substrate."
+             double_penalty=true to obtain the standard model that carries the frozen penalty."
                 .to_string(),
         );
     }
-    let substrate = model.full_conformal.as_ref().ok_or_else(|| {
+    let penalty = model.full_conformal.as_ref().ok_or_else(|| {
         "exact full-conformal intervals require a Gaussian-identity GLM trained without \
-         prior weights, offsets, or a link wiggle, AND a fit that precomputed the \
-         substrate. This model carries none (non-Gaussian family, weighted data, offset, \
-         link wiggle, an older serialised payload, or precompute_conformal=false at fit \
-         time). Calibrate split-conformal intervals on a held-out labeled fold for other \
-         families."
+         prior weights, offsets, or a link wiggle. This model carries no frozen \
+         full-conformal penalty (non-Gaussian family, weighted data, offset, or link \
+         wiggle). Calibrate split-conformal intervals on a held-out labeled fold for \
+         other families."
             .to_string()
     })?;
     if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
@@ -82,24 +93,40 @@ pub fn full_conformal_prediction_columns(
             "exact full-conformal prediction supports only standard GAM models".to_string(),
         );
     }
-    let spec = resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        model.training_headers.as_ref(),
-        col_map,
-        "resolved_termspec",
-    )?;
-    let design = build_term_collection_design(data, &spec)
-        .map_err(|err| format!("full conformal: failed to build test design: {err}"))?;
-    let x_test = design
-        .design
-        .try_to_dense_by_chunks("full conformal test design")?;
+    let dense_design = |rows: &DesignRows<'_>, what: &str| {
+        let spec = resolve_termspec_for_prediction(
+            &model.resolved_termspec,
+            model.training_headers.as_ref(),
+            rows.col_map,
+            "resolved_termspec",
+        )?;
+        let design = build_term_collection_design(rows.data, &spec)
+            .map_err(|err| format!("full conformal: failed to build {what} design: {err}"))?;
+        design
+            .design
+            .try_to_dense_by_chunks(&format!("full conformal {what} design"))
+    };
+    let response_name = formula_response_column(&model.payload().formula).ok_or_else(|| {
+        "full conformal: could not resolve the response column from the saved formula"
+            .to_string()
+    })?;
+    let response_col = *labeled.col_map.get(&response_name).ok_or_else(|| {
+        format!(
+            "exact full-conformal training data must contain the response column \
+             '{response_name}' (the set is built on labeled rows)"
+        )
+    })?;
+    let y_labeled = labeled.data.column(response_col).to_owned();
+    let x_labeled = dense_design(labeled, "training")?;
+    let substrate = penalty.with_labeled_rows(x_labeled, y_labeled)?;
+    let x_test = dense_design(test, "test")?;
     let n_test = x_test.nrows();
-    if x_test.ncols() != substrate.p() {
+    if x_test.ncols() != penalty.p() {
         return Err(format!(
-            "full conformal: test design has {} columns but the stored substrate has p={}; \
+            "full conformal: test design has {} columns but the stored penalty has p={}; \
              the model may need to be refit",
             x_test.ncols(),
-            substrate.p()
+            penalty.p()
         ));
     }
     let alpha = 1.0 - conformal_level;
@@ -114,7 +141,7 @@ pub fn full_conformal_prediction_columns(
     let mut mean_vec = Vec::with_capacity(n_test);
     let mut lower_vec = Vec::with_capacity(n_test);
     let mut upper_vec = Vec::with_capacity(n_test);
-    let mut certified_vec = Vec::with_capacity(n_test);
+    let mut certificate_vec = Vec::with_capacity(n_test);
     for i in 0..n_test {
         let x_star = x_test.row(i).to_owned();
         let iv = substrate
@@ -126,7 +153,7 @@ pub fn full_conformal_prediction_columns(
         mean_vec.push(x_star.dot(&fit.beta));
         lower_vec.push(iv.lo);
         upper_vec.push(iv.hi);
-        certified_vec.push(if iv.frozen_rho_certified { 1.0 } else { 0.0 });
+        certificate_vec.push(f64::from(iv.certificate.code()));
     }
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
     columns.insert("linear_predictor_plugin".to_string(), mean_vec.clone());
@@ -134,7 +161,7 @@ pub fn full_conformal_prediction_columns(
     columns.insert("posterior_mean".to_string(), mean_vec);
     columns.insert("posterior_mean_lower".to_string(), lower_vec);
     columns.insert("posterior_mean_upper".to_string(), upper_vec);
-    columns.insert("frozen_rho_certified".to_string(), certified_vec);
+    columns.insert("conformal_certificate".to_string(), certificate_vec);
     Ok(columns)
 }
 

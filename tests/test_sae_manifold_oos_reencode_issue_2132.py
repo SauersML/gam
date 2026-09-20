@@ -65,7 +65,7 @@ def _planted_two_circles(n: int = 220, p: int = 6, seed: int = 0) -> np.ndarray:
 
 
 def _fit(x: np.ndarray) -> Any:
-    return gamfit.sae_manifold_fit(
+    return gamfit.sae.sae_manifold_fit(
         X=x, K=2, assignment="topk", top_k=1, n_iter=6, random_state=0
     )
 
@@ -119,7 +119,7 @@ def test_selected_rho_survives_save_load_roundtrip(tmp_path: Any) -> None:
     fit = _fit(x)
     path = tmp_path / "sae_2132.json"
     fit.save(path)
-    loaded = gamfit.ManifoldSAE.load(path)
+    loaded = gamfit.sae.ManifoldSAE.load(path)
     assert loaded.selected_log_lambda_sparse == fit.selected_log_lambda_sparse
     np.testing.assert_allclose(
         np.asarray(loaded.selected_log_lambda_smooth, dtype=float),

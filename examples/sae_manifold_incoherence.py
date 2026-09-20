@@ -20,8 +20,8 @@ def _decoder_overlap(decoder_a: np.ndarray, decoder_b: np.ndarray) -> float:
     return float(numerator / max(denominator, np.finfo(float).eps))
 
 
-def _fit(x: np.ndarray, weight: float, seed: int) -> gamfit.ManifoldSAE:
-    return gamfit.sae_manifold_fit(
+def _fit(x: np.ndarray, weight: float, seed: int) -> gamfit.sae.ManifoldSAE:
+    return gamfit.sae.sae_manifold_fit(
         x,
         K=2,
         d_atom=1,

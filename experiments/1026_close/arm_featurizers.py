@@ -95,11 +95,17 @@ def _flat_block_from_sparse(
     gate = _dense_magnitude_gate(sparse_indices, sparse_codes, k)
 
     def atom_contribution(g: int):
-        dec_g = decoder[g]
+        # The rows are formed in float64, where the product of a float32 code and a
+        # float32 decoder entry is exact (48 of 53 significand bits), so they are
+        # exactly proportional and the scorer's rank-one certificate holds. Formed in
+        # float32, every entry carried its own rounding: the off-axis energy, about
+        # 1e-15 of the total, exceeded the certificate's float64 floor, and every flat
+        # atom paid a full SVD (#2283).
+        dec_g = decoder[g].astype(np.float64)
 
         def selected_rows(take, g=g, dec_g=dec_g):
             row_indices = sparse_indices[take]
-            row_codes = sparse_codes[take]
+            row_codes = sparse_codes[take].astype(np.float64)
             signed_code = np.where(row_indices == g, row_codes, 0.0).sum(axis=1)
             return np.outer(signed_code, dec_g)
 
@@ -127,7 +133,7 @@ def build_external_topk(x_bits, *, W_enc, W_dec, b_dec, top_k) -> FittedFeaturiz
 
 
 def build_gam_flat(x_bits, *, fit, score_mode: str) -> FittedFeaturizer:
-    """FittedFeaturizer for gamfit.sparse_dictionary_fit on x_bits."""
+    """FittedFeaturizer for gamfit.sae.sparse_dictionary_fit on x_bits."""
     tr = fit.transform(x_bits, score_mode=score_mode)
     recon = fit.reconstruct(tr.indices, tr.codes)
     gate, contrib, code_dims, dparams = _flat_block_from_sparse(

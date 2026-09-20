@@ -61,7 +61,6 @@ use gam_terms::smooth::penalty_priors::realize_keyed_penalty_block_gamma_priors;
 
 use gam_terms::smooth::shape_constraints::{
     linear_constraints_from_lower_bounds_global, merge_linear_constraints_global,
-    shape_lower_bounds_local,
 };
 
 // Every `pub` item that `gam_terms::smooth` exposes (the `term_specs.rs`
@@ -73,7 +72,6 @@ use gam_terms::smooth::*;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
 use std::ops::Range;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 // Fit-result carriers relocated out of `gam_terms::smooth::term_specs` with the
@@ -163,6 +161,9 @@ include!("smooth_term_lr.rs");
 // as the LR test above: a self-contained inference subsystem over the driver's
 // fit, kept out of the driver file for the same reason.
 include!("basis_adequacy.rs");
+// The per-term random-effect variance-component test. Reads the same retained
+// IRLS row state as the basis-adequacy report above.
+include!("random_effect_test.rs");
 
 #[cfg(test)]
 mod test_support {

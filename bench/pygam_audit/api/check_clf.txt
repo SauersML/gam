@@ -1,0 +1,37 @@
+clf formula='s(x0)+s(x1)' total=55 time=105s
+Counter({'failed': 34, 'passed': 20, 'skipped': 1})
+  failed   check_fit_score_takes_y: ValueError: GAMClassifier requires exactly two observed classes; got 3: array([0, 1, 2])
+  failed   check_estimators_overwrite_params: ValueError: GAMClassifier requires exactly two observed classes; got 3: array([0, 1, 2])
+  failed   check_dont_overwrite_parameters: ValueError: GAMClassifier requires exactly two observed classes; got 3: array([0, 1, 2])
+  failed   check_estimators_fit_returns_self: ValueError: GAMClassifier requires exactly two observed classes; got 3: array([0, 1, 2])
+  failed   check_readonly_memmap_input: ValueError: GAMClassifier requires exactly two observed classes; got 3: array([0, 1, 2])
+  failed   check_estimators_unfitted: AssertionError: Estimator should raise a NotFittedError when calling `predict` before fit. Either call `check_is_fitted(self)` at the beginning of `predict` or set `tags.requires_fit=False` on estimator tags to disable this check. - `check_is_fitted`: https://scikit-learn.org/dev/modules/generated/sklearn.utils.val
+  failed   check_n_features_in_after_fitting: ValueError: GAMClassifier requires exactly two observed classes; got 3: array([0, 1, 2])
+  failed   check_positive_only_tag_during_fit: AssertionError: Estimator 'GAMClassifier' raised ValueError unexpectedly. This happens when passing negative input values as X. If negative values are not supported for this estimator instance, then the tags.input_tags.positive_only tag needs to be set to True.
+  failed   check_estimators_dtypes: IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change this outcome: smoothing cubature has no positive-width proposal in the resolved domain
+  failed   check_complex_data: TypeError: float() argument must be a string or a real number, not 'complex'
+  failed   check_dtype_object: ValueError: GAMClassifier requires exactly two observed classes; got 4: array([0, 1, 2, 3])
+  failed   check_estimators_empty_data_messages: AssertionError: The error message should contain one of the following patterns: 0 feature\(s\) \(shape=\(\d*, 0\)\) while a minimum of \d* is required. Got column 'x0' not found in data. Available columns: [y]
+  failed   check_estimators_nan_inf: IntegrationError: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=3.326e-1 |Pg|=3.326e-1 bound=4.563e-4 (rung=curvature-resolvability derived_standard=true) hessian_psd=yes curvature_source=terminal-analytic railed=[] → NOT STATIONARY (|Pg|=3.326e-1 > bound=4.
+  failed   check_estimator_sparse_tag: AssertionError: Estimator GAMClassifier raised an exception. The estimator failed when fitted on sparse data in accordance with its tag self.input_tags.sparse=False but didn't raise the appropriate error: error message should state explicitly that sparse input is not supported if this is not the case, e.g. by using
+  failed   check_estimator_sparse_array: AssertionError: Estimator GAMClassifier doesn't seem to fail gracefully on sparse data: error message should state explicitly that sparse input is not supported if this is not the case, e.g. by using check_array(X, accept_sparse=False).
+  failed   check_estimator_sparse_matrix: AssertionError: Estimator GAMClassifier doesn't seem to fail gracefully on sparse data: error message should state explicitly that sparse input is not supported if this is not the case, e.g. by using check_array(X, accept_sparse=False).
+  failed   check_estimators_pickle: TypeError: cannot pickle 'builtins._FittedModel' object
+  failed   check_estimators_pickle: TypeError: cannot pickle 'builtins._FittedModel' object
+  skipped  check_array_api_input: SkipTest: SCIPY_ARRAY_API is not set: not checking array_api input
+  failed   check_f_contiguous_array_estimator: ValueError: GAMClassifier requires exactly two observed classes; got 3: array([0, 1, 2])
+  failed   check_classifier_data_not_an_array: TypeError: unsupported table input; use pandas, pyarrow, numpy, a mapping, a list of records, or a 2D row sequence
+  failed   check_classifiers_classes: ValueError: GAMClassifier requires exactly two observed classes; got 3: array(['one', 'three', 'two'], dtype='<U5')
+  failed   check_classifiers_train: AssertionError: The classifier GAMClassifier does not raise an error when the number of features in predict is different from the number of features in fit.
+  failed   check_classifiers_train: AssertionError: The classifier GAMClassifier does not raise an error when the number of features in predict is different from the number of features in fit.
+  failed   check_classifiers_train: IntegrationError: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=1.506e-4 |Pg|=1.506e-4 bound=2.980e-6 (rung=solver-band derived_standard=false) hessian_psd=NO (cleared=false λ_min(H)=-6.226376e-7 λ_min(H+diag|g|)=-4.939321e-7 max_k|g_k|=1.493407e-4 measured_
+  failed   check_classifiers_regression_target: AssertionError: When a classifier is passed a continuous target, it should raise a ValueError with a message containing 'Unknown label type: ' or a message indicating that a continuous target is passed and the message should include the word 'continuous'
+  failed   check_supervised_y_2d: ValueError: GAMClassifier requires exactly two observed classes; got 3: array([0, 1, 2])
+  failed   check_methods_sample_order_invariance: ValueError: GAMClassifier requires exactly two observed classes; got 3: array([0, 1, 2])
+  failed   check_methods_subset_invariance: ValueError: GAMClassifier requires exactly two observed classes; got 3: array([0, 1, 2])
+  failed   check_fit2d_1sample: AssertionError: The error message should contain one of the following patterns: 1 sample n_samples = 1 n_samples=1 one sample 1 class one class Got GAMClassifier requires exactly two observed classes; got 1: array([1])
+  failed   check_fit2d_1feature: AssertionError: The error message should contain one of the following patterns: 1 feature\(s\) n_features = 1 n_features=1 Got column 'x1' not found in data. Available columns: [x0, y]
+  failed   check_dict_unchanged: ValueError: GAMClassifier requires exactly two observed classes; got 3: array([0, 1, 2])
+  failed   check_fit_idempotent: IntegrationError: smoothing cubature proposal has no positive width; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change this outcome: smoothing cubature proposal has no positive width
+  failed   check_fit2d_predict1d: ValueError: GAMClassifier requires exactly two observed classes; got 3: array([0, 1, 2])
+  failed   check_requires_y_none: ValueError: Your estimator raised a ValueError, but with the incorrect or incomplete error message to be considered a graceful fail. The expected message in the ValueError should contain one of these literal strings: ('requires y to be passed, but the target y is None', 'Expected array-like (array or non-string

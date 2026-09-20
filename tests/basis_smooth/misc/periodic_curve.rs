@@ -84,6 +84,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
                 knotspec: BSplineKnotSpec::PeriodicUniform {
                     data_range: (0.0, 1.0),
                     num_basis: 10,
+                    adaptive: false,
                 },
                 double_penalty: true,
                 identifiability: BSplineIdentifiability::None,
@@ -91,13 +92,14 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
                 boundary_conditions: Default::default(),
             },
         },
-        shape: gam::terms::smooth::ShapeConstraint::None,
+        shape: gam::terms::smooth::ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
     let mut spec = TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![term],
+        level: Default::default(),
     };
     let design = build_term_collection_design(data.view(), &spec).unwrap();
     assert_eq!(design.smooth.terms.len(), 1);
@@ -192,6 +194,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
             knotspec: BSplineKnotSpec::PeriodicUniform {
                 data_range: (0.0, 1.0),
                 num_basis: 10,
+                adaptive: false,
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
@@ -269,6 +272,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
             BSplineKnotSpec::PeriodicUniform {
                 data_range,
                 num_basis,
+                ..
             } => {
                 assert_eq!(num_basis, 9);
                 assert_eq!(data_range, (0.0, 1.0));

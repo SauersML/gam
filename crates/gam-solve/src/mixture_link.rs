@@ -75,6 +75,105 @@ pub(crate) fn log_link_solver_exp(eta: f64) -> Result<f64, EstimationError> {
     Ok(eta.exp())
 }
 
+/// Exact 6-jet `(mu, mu', …, mu^(5))` of the reciprocal-power inverse links
+/// `mu = eta^(-a)`: `a = 1` is the inverse link `g(mu) = 1/mu` (canonical for
+/// Gamma), `a = 1/2` the inverse-squared link `g(mu) = 1/mu²` (canonical for
+/// the inverse Gaussian).
+///
+/// Both links map only `eta > 0` onto the mean space `mu > 0`; `eta <= 0` has
+/// no mean at all (and `eta → 0⁺` sends `mu → ∞`). Such an `eta` is refused
+/// through the same typed [`EstimationError::InverseLinkDomainViolation`] the
+/// log link uses, which the PIRLS LM step search treats as an infeasible trial
+/// step and damps: the inner solver stays in the domain by step-halving to
+/// feasibility, never by projecting `eta`.
+///
+/// `d_k = c_k · eta^(-a-k)` with `c_0 = 1`, `c_{k+1} = c_k · (-a - k)`.
+pub(crate) fn reciprocal_power_link_jet6(
+    link: &'static str,
+    exponent: f64,
+    eta: f64,
+) -> Result<[f64; 6], EstimationError> {
+    if !(eta > 0.0 && eta.is_finite()) {
+        return Err(EstimationError::InverseLinkDomainViolation {
+            link,
+            eta,
+            lower: 0.0,
+            upper: f64::MAX,
+        });
+    }
+    let mut out = [0.0; 6];
+    let mut coef = 1.0;
+    for (k, slot) in out.iter_mut().enumerate() {
+        *slot = coef * eta.powf(-exponent - k as f64);
+        coef *= -exponent - k as f64;
+    }
+    Ok(out)
+}
+
+/// Canonical names of the reciprocal links, from the one link vocabulary.
+pub(crate) const INVERSE_LINK_NAME: &str = StandardLink::Inverse.name();
+pub(crate) const INVERSE_SQUARED_LINK_NAME: &str = StandardLink::InverseSquared.name();
+pub(crate) const SQRT_LINK_NAME: &str = StandardLink::Sqrt.name();
+
+/// The inverse-link stack `[h, h′, …, h⁽⁵⁾]` of the square-root link
+/// `g(μ) = √μ`, whose inverse `μ = η²` is a bijection only on the branch
+/// `η > 0`; every other `η` is refused through the typed domain error (the
+/// recoverable step-rejection channel), never folded back onto the branch.
+pub(crate) fn sqrt_link_jet6(eta: f64) -> Result<[f64; 6], EstimationError> {
+    if !(eta > 0.0 && eta.is_finite()) {
+        return Err(EstimationError::InverseLinkDomainViolation {
+            link: SQRT_LINK_NAME,
+            eta,
+            lower: 0.0,
+            upper: f64::MAX,
+        });
+    }
+    Ok([eta * eta, 2.0 * eta, 2.0, 0.0, 0.0, 0.0])
+}
+
+/// The inverse-link stack `[h, h′, …, h⁽⁵⁾]` at `η` for the links of the
+/// power/log ladder (identity, log, sqrt, `1/μ`, `1/μ²`), `None` for the
+/// probability links. Each link's own domain is enforced through
+/// [`EstimationError::InverseLinkDomainViolation`].
+pub(crate) fn standard_ladder_link_jet6(
+    link: StandardLink,
+    eta: f64,
+) -> Option<Result<[f64; 6], EstimationError>> {
+    match link {
+        StandardLink::Identity => Some(
+            finite_inverse_link_eta(StandardLink::Identity.name(), eta)
+                .map(|eta| [eta, 1.0, 0.0, 0.0, 0.0, 0.0]),
+        ),
+        StandardLink::Log => Some(log_link_solver_exp(eta).map(|e| [e; 6])),
+        StandardLink::Sqrt => Some(sqrt_link_jet6(eta)),
+        StandardLink::Inverse | StandardLink::InverseSquared => {
+            standard_reciprocal_power_jet6(link, eta)
+        }
+        StandardLink::Logit
+        | StandardLink::Probit
+        | StandardLink::CLogLog
+        | StandardLink::LogLog
+        | StandardLink::Cauchit => None,
+    }
+}
+
+/// [`reciprocal_power_link_jet6`] for the standard link, `None` for every link
+/// that is not a reciprocal power.
+pub(crate) fn standard_reciprocal_power_jet6(
+    link: StandardLink,
+    eta: f64,
+) -> Option<Result<[f64; 6], EstimationError>> {
+    match link {
+        StandardLink::Inverse => Some(reciprocal_power_link_jet6(INVERSE_LINK_NAME, 1.0, eta)),
+        StandardLink::InverseSquared => Some(reciprocal_power_link_jet6(
+            INVERSE_SQUARED_LINK_NAME,
+            0.5,
+            eta,
+        )),
+        _ => None,
+    }
+}
+
 #[inline]
 fn finite_inverse_link_eta(link: &'static str, eta: f64) -> Result<f64, EstimationError> {
     if !eta.is_finite() {
@@ -136,7 +235,7 @@ fn asinh_jet5(eta: f64) -> AsinhJet5 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct InverseLinkJet {
     pub mu: f64,
     pub d1: f64,
@@ -463,7 +562,11 @@ pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64
         StandardLink::CLogLog => component_fisher_weight_jet5(LinkComponent::CLogLog, eta),
         StandardLink::LogLog => component_fisher_weight_jet5(LinkComponent::LogLog, eta),
         StandardLink::Cauchit => component_fisher_weight_jet5(LinkComponent::Cauchit, eta),
-        StandardLink::Identity | StandardLink::Log => (0.0, 0.0, 0.0, 0.0, 0.0),
+        StandardLink::Identity
+        | StandardLink::Log
+        | StandardLink::Sqrt
+        | StandardLink::Inverse
+        | StandardLink::InverseSquared => (0.0, 0.0, 0.0, 0.0, 0.0),
     }
 }
 
@@ -1356,6 +1459,20 @@ impl InverseLinkKernel for LinkFunction {
                     d3: e,
                 })
             }
+            LinkFunction::Sqrt => {
+                let [mu, d1, d2, d3, _, _] = sqrt_link_jet6(eta)?;
+                Ok(InverseLinkJet { mu, d1, d2, d3 })
+            }
+            LinkFunction::Inverse => {
+                let [mu, d1, d2, d3, _, _] =
+                    reciprocal_power_link_jet6(INVERSE_LINK_NAME, 1.0, eta)?;
+                Ok(InverseLinkJet { mu, d1, d2, d3 })
+            }
+            LinkFunction::InverseSquared => {
+                let [mu, d1, d2, d3, _, _] =
+                    reciprocal_power_link_jet6(INVERSE_SQUARED_LINK_NAME, 0.5, eta)?;
+                Ok(InverseLinkJet { mu, d1, d2, d3 })
+            }
             LinkFunction::Sas => Err(EstimationError::InvalidInput(
                 "LinkFunction::Sas inverse-link requires explicit SAS link state".to_string(),
             )),
@@ -1429,6 +1546,11 @@ impl InverseLinkKernel for InverseLink {
             InverseLink::Standard(StandardLink::Cauchit) => CauchitLinkKernel.jet(eta),
             InverseLink::Standard(StandardLink::Identity) => LinkFunction::Identity.jet(eta),
             InverseLink::Standard(StandardLink::Log) => LinkFunction::Log.jet(eta),
+            InverseLink::Standard(StandardLink::Sqrt) => LinkFunction::Sqrt.jet(eta),
+            InverseLink::Standard(StandardLink::Inverse) => LinkFunction::Inverse.jet(eta),
+            InverseLink::Standard(StandardLink::InverseSquared) => {
+                LinkFunction::InverseSquared.jet(eta)
+            }
             InverseLink::LatentCLogLog(state) => latent_cloglog_point_jet(state, eta),
             InverseLink::Sas(state) => state.jet(eta),
             InverseLink::BetaLogistic(state) => BetaLogisticKernel {
@@ -1512,7 +1634,7 @@ pub fn inverse_link_mu_d1_for_inverse_link(
 /// Each link with a cancellation-free closed form for `1 - mu` uses it; links
 /// without one fall back to `1.0 - mu` (unchanged behaviour). The complement is
 /// clamped into `[0, 1]` only against round-off just past the boundary.
-pub(crate) fn inverse_link_complement_for_inverse_link(
+pub fn inverse_link_complement_for_inverse_link(
     link: &InverseLink,
     eta: f64,
     mu: f64,
@@ -1576,10 +1698,17 @@ fn standard_link_complement(link: StandardLink, eta: f64, mu: f64) -> f64 {
             }
         }
         StandardLink::Cauchit => cauchit_mean(-eta),
-        // Logit carries its own tail complement on the canonical path; identity
-        // and log are not Bernoulli-variance links. The naive complement is
-        // exact enough for these here.
-        StandardLink::Logit | StandardLink::Identity | StandardLink::Log => 1.0 - mu,
+        // Relative-risk Bernoulli link: mu = exp(eta)  =>  1 - mu = -expm1(eta),
+        // which keeps the complement's leading digits as eta -> 0⁻.
+        StandardLink::Log => -eta.exp_m1(),
+        // Logit carries its own tail complement on the canonical path; the
+        // remaining links are not Bernoulli-variance links. The naive
+        // complement is exact enough for these here.
+        StandardLink::Logit
+        | StandardLink::Identity
+        | StandardLink::Sqrt
+        | StandardLink::Inverse
+        | StandardLink::InverseSquared => 1.0 - mu,
     }
 }
 
@@ -1737,6 +1866,18 @@ fn link_function_mu_d1(link: LinkFunction, eta: f64) -> Result<(f64, f64), Estim
         LinkFunction::CLogLog => Ok(component_inverse_link_mu_d1(LinkComponent::CLogLog, eta)),
         LinkFunction::LogLog => Ok(component_inverse_link_mu_d1(LinkComponent::LogLog, eta)),
         LinkFunction::Cauchit => Ok(component_inverse_link_mu_d1(LinkComponent::Cauchit, eta)),
+        LinkFunction::Sqrt => {
+            let jet = sqrt_link_jet6(eta)?;
+            Ok((jet[0], jet[1]))
+        }
+        LinkFunction::Inverse => {
+            let jet = reciprocal_power_link_jet6(INVERSE_LINK_NAME, 1.0, eta)?;
+            Ok((jet[0], jet[1]))
+        }
+        LinkFunction::InverseSquared => {
+            let jet = reciprocal_power_link_jet6(INVERSE_SQUARED_LINK_NAME, 0.5, eta)?;
+            Ok((jet[0], jet[1]))
+        }
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "LinkFunction::Sas inverse-link requires explicit SAS link state".to_string(),
         )),
@@ -1911,7 +2052,16 @@ fn inverse_link_pdf_derivative_for_inverse_link(
 ) -> Result<f64, EstimationError> {
     match link {
         InverseLink::Standard(StandardLink::Identity) => Ok(0.0),
+        InverseLink::Standard(StandardLink::Sqrt) => sqrt_link_jet6(eta).map(|_| 0.0),
         InverseLink::Standard(StandardLink::Log) => log_link_solver_exp(eta),
+        InverseLink::Standard(link @ (StandardLink::Inverse | StandardLink::InverseSquared)) => {
+            let jet = standard_reciprocal_power_jet6(*link, eta)
+                .expect("reciprocal-power arm matched a reciprocal-power link")?;
+            Ok(match order {
+                PdfDerivativeOrder::Third => jet[4],
+                PdfDerivativeOrder::Fourth => jet[5],
+            })
+        }
         InverseLink::Standard(StandardLink::Probit) => Ok(order.probit(eta)),
         InverseLink::Standard(StandardLink::Logit) => {
             Ok(order.component(LinkComponent::Logit, eta))

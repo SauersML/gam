@@ -193,9 +193,10 @@ fn build_non_periodic_design(n: usize) -> (DesignMatrix, Array2<f64>) {
                     penalty_decomposition: Default::default(),
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let design =
         build_term_collection_design(data.view(), &spec).expect("non-periodic te(x, h) build");
@@ -260,6 +261,7 @@ fn build_cylinder_design(n: usize) -> (DesignMatrix, Array2<f64>) {
         knotspec: BSplineKnotSpec::PeriodicUniform {
             data_range: (0.0, TAU),
             num_basis: 9,
+            adaptive: false,
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
@@ -298,9 +300,10 @@ fn build_cylinder_design(n: usize) -> (DesignMatrix, Array2<f64>) {
                     penalty_decomposition: Default::default(),
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let design =
         build_term_collection_design(data.view(), &spec).expect("cylinder te(theta, h) build");

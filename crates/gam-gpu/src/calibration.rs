@@ -29,9 +29,6 @@ const _: () = assert!(
 );
 const _: () = assert!(POTRF_DIMS[0] == GpuDispatchPolicy::MIN_CALIBRATABLE_POTRF_P);
 const _: () = assert!(XTWX_DIMS[0].0 == GpuDispatchPolicy::MIN_CALIBRATABLE_ROW_KERNEL_N);
-const _: () = assert!(
-    XTWX_DIMS[0].0 * 2 == GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N
-);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedCalibration {
@@ -66,7 +63,7 @@ struct Measurement {
 pub(crate) fn calibrated_policy_for_device(device: &GpuDeviceInfo) -> GpuDispatchPolicy {
     let fingerprint = device_fingerprint(device);
     if let Some(cached) = load_cached_policy(fingerprint) {
-        log::info!(
+        log::debug!(
             "[GPU] loaded calibrated dispatch policy for {} ({fingerprint})",
             device.name
         );
@@ -80,7 +77,7 @@ pub(crate) fn calibrated_policy_for_device(device: &GpuDeviceInfo) -> GpuDispatc
             policy
         }
         Err(err) => {
-            log::warn!(
+            log::debug!(
                 "[GPU] dispatch calibration unavailable for {}: {}; using default policy",
                 device.name,
                 err
@@ -114,14 +111,13 @@ fn calibrate_device(
     if let Some(rows) = crossover_rows(&measurements, "xtwx", policy.xtwx_n_min) {
         policy.xtwx_n_min = rows;
         policy.row_kernel_min_n = rows;
-        policy.fused_kernel_min_n = rows.saturating_mul(2);
     }
     if let Some(p) = crossover_rows(&measurements, "potrf", policy.potrf_min_p) {
         policy.potrf_min_p = p;
         policy.prefer_gpu_factorization_min_p = p;
     }
 
-    log::info!(
+    log::debug!(
         "[GPU] calibrated dispatch policy for {} ({fingerprint}) from {} measurements",
         device.name,
         measurements.len()
@@ -336,7 +332,7 @@ fn store_cached_policy(fingerprint: Fingerprint, record: &CachedCalibration) {
     let path = cache_path(fingerprint);
     if let Some(parent) = path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
-            log::warn!("[GPU] unable to create calibration cache dir: {err}");
+            log::debug!("[GPU] unable to create calibration cache dir: {err}");
             return;
         }
     }
@@ -344,12 +340,12 @@ fn store_cached_policy(fingerprint: Fingerprint, record: &CachedCalibration) {
     let bytes = match serde_json::to_vec_pretty(record) {
         Ok(bytes) => bytes,
         Err(err) => {
-            log::warn!("[GPU] unable to serialize calibration cache: {err}");
+            log::debug!("[GPU] unable to serialize calibration cache: {err}");
             return;
         }
     };
     if let Err(err) = fs::write(&tmp, bytes).and_then(|_| fs::rename(&tmp, &path)) {
-        log::warn!("[GPU] unable to write calibration cache: {err}");
+        log::debug!("[GPU] unable to write calibration cache: {err}");
     }
 }
 

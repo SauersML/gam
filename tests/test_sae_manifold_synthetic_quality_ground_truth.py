@@ -128,11 +128,9 @@ def test_oos_fixed_decoder_recovers_one_hot_oracle_assignments() -> None:
         alpha=1.0,
         tau=0.25,
         assignment_kind="softmax",
-        max_iter=4,
-        learning_rate=1.0,
         log_lambda_sparse=float(np.log(0.01)),
         log_lambda_smooth=[float(np.log(0.01)), float(np.log(0.01))],
-        log_ard=[[], []],
+        log_ard=[[float(np.log(0.01))], [float(np.log(0.01))]],
     )
     assignments = np.asarray(payload["assignments_z"], dtype=float)
     fitted = np.asarray(payload["fitted"], dtype=float)
@@ -158,7 +156,7 @@ def test_fit_learns_disjoint_periodic_atoms_without_inactive_leakage() -> None:
     permutation.
     """
     x, truth, _t = _planted_one_hot_periodic(n=48, seed=4, noise=0.01)
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=x,
         K=2,
         atom_basis="periodic",
@@ -183,7 +181,7 @@ def test_fit_oos_quality_matches_training_on_planted_oracle_distribution() -> No
     """Fit on one draw, score OOS on another draw from the same oracle."""
     x_train, _truth_train, _ = _planted_one_hot_periodic(n=48, seed=10, noise=0.01)
     x_test, truth_test, _ = _planted_one_hot_periodic(n=16, seed=11, noise=0.01)
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=x_train,
         K=2,
         atom_basis="periodic",
@@ -234,7 +232,7 @@ def test_isometry_on_circle_recovers_planted_geometry_normalized_reference() -> 
     z = _planted_circle(noise=0.02, seed=0)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        fit = gamfit.sae_manifold_fit(
+        fit = gamfit.sae.sae_manifold_fit(
             X=z,
             K=1,
             d_atom=1,

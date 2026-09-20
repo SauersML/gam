@@ -8,7 +8,22 @@ from dataclasses import asdict, dataclass, field, fields
 from functools import lru_cache
 from importlib import util
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable, cast
+
+if TYPE_CHECKING:
+    from typing import TypedDict
+
+    class _CudaDiagnosticsFields(TypedDict, total=False):
+        """Keyword form of :class:`CudaDiagnostics`; every field is optional."""
+
+        platform: str
+        mapped: dict[str, list[str]]
+        conflicts: dict[str, list[str]]
+        packaged_nvidia_roots: list[str]
+        packaged_cuda_library_dirs: list[str]
+        packaged_complete_stacks: list[list[str]]
+        system_driver_libraries: list[str]
+        system_complete_stacks: list[list[str]]
 
 _CUDA_LIBRARY_GROUPS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
     ("cuda_runtime", (("libcudart.so.13", "libcudart.so.12", "libcudart.so"),)),
@@ -97,7 +112,13 @@ class CudaDiagnostics:
 
     @classmethod
     def from_mapping(cls, info: Mapping[str, object]) -> "CudaDiagnostics":
-        kwargs = {f.name: info[f.name] for f in fields(cls) if f.name in info}
+        # ``info`` is the public ``dict[str, object]`` diagnostics surface
+        # (possibly a partial dict handed back by a caller); its values follow
+        # this dataclass's schema, which the TypedDict restates key by key.
+        kwargs = cast(
+            "_CudaDiagnosticsFields",
+            {f.name: info[f.name] for f in fields(cls) if f.name in info},
+        )
         return cls(**kwargs)
 
 
@@ -232,12 +253,15 @@ def assert_no_cuda_library_conflicts(context: str) -> None:
     cause discoverable; if it doesn't (the typical case), gamfit just works.
     """
 
-    diag = CudaDiagnostics.from_mapping(cuda_diagnostics())
-    if not diag.conflicts:
+    # A conflict is read off ``/proc/self/maps`` alone. The rest of the
+    # diagnostics snapshot (packaged and system stacks on disk) is only
+    # rendered into the warning, so it is built only when there is one.
+    mapped = _mapped_cuda_libraries()
+    conflicts = {family: paths for family, paths in mapped.items() if len(paths) > 1}
+    if not conflicts:
         return
     key = "|".join(
-        f"{name}:{','.join(sorted(paths))}"
-        for name, paths in sorted(diag.conflicts.items())
+        f"{name}:{','.join(sorted(paths))}" for name, paths in sorted(conflicts.items())
     )
     if key in _CUDA_CONFLICT_WARNED:
         return

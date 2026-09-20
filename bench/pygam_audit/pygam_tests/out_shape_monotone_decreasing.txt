@@ -1,0 +1,4 @@
+monotone_decreasing fit wall 1.4s cpu 0.1s True
+monotone_decreasing predict wall 211.8s cpu 19.0s
+monotone_decreasing pdep 0.2s plugin 3.85e-04 post_mean 3.85e-04 lower 3.66e-04 upper 4.00e-04 pdep 3.85e-04 cov_src conditional
+monotone_decreasing sample 0.1s draws (80, 60) frac_violating 0.0

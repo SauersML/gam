@@ -554,8 +554,6 @@ fn held_out_ev(
             log_lambda_smooth: rho.log_lambda_smooth.clone(),
             log_ard: rho.log_ard.iter().map(|block| block.to_vec()).collect(),
         },
-        max_iter: INNER_MAX_ITER,
-        learning_rate: LEARNING_RATE,
         ridge_ext_coord: RIDGE_EXT_COORD,
         initial_logits: None,
         initial_coords: None,

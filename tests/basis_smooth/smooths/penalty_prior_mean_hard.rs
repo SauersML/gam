@@ -139,7 +139,7 @@ fn shifted_quadratic_at_beta_equals_mean_is_exact_zero() {
         let cp = CanonicalPenalty::from_dense_root_with_mean(root, dim, mean.clone());
 
         // Reference path: pure root-of-zero computation.
-        let q_ref = reference_shifted_quadratic(&cp.root, &mean, &mean, 1.0);
+        let q_ref = reference_shifted_quadratic(&cp.root.to_owned(), &mean, &mean, 1.0);
         assert_eq!(
             q_ref.to_bits(),
             0.0_f64.to_bits(),

@@ -686,7 +686,7 @@ mod device {
         // single unattributed block with no telemetry for the whole high-`K` route.
         // Synchronise on a cadence derived from the tile count so the async backlog
         // is bounded and each fault is attributed to its tile window; the heartbeat
-        // is `log::debug!` so an ordinary (info-level) per-minibatch run is not
+        // is `log::trace!` so an ordinary (info-level) per-minibatch run is not
         // flooded, while `RUST_LOG=debug` exposes intra-route progress.
         let tile_count = k.div_ceil(tile_cols);
         let checkpoint_stride = tile_count
@@ -763,7 +763,7 @@ mod device {
                         "sparse_dict tiled route progress checkpoint (tiles {checkpoint_lo}..{tiles_done} of {tile_count}, atoms 0..{start} of {k}): {err}"
                     )
                 })?;
-                log::debug!(
+                log::trace!(
                     "[SAE score route] tiles {tiles_done}/{tile_count} atoms {start}/{k} \
                      elapsed {:.2}s",
                     route_started.elapsed().as_secs_f64(),

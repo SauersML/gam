@@ -68,7 +68,7 @@ mod adaptive_bounded_duchon_tests {
                     boundary: OneDimensionalBoundary::Open,
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         };
         let spec = TermCollectionSpec {
@@ -98,26 +98,14 @@ mod adaptive_bounded_duchon_tests {
                     frozen_function_mass: None,
                 },
             ],
-            // Likewise, both random effects own non-empty coefficient ranges
-            // but only the first emits a ridge.
-            random_effect_terms: vec![
-                RandomEffectTermSpec {
-                    name: "penalized_group".to_string(),
-                    feature_col: 2,
-                    drop_first_level: false,
-                    penalized: true,
-                    frozen_levels: Some(vec![0, 1]),
-                    lenient_unseen: true,
-                },
-                RandomEffectTermSpec {
-                    name: "unpenalized_group".to_string(),
-                    feature_col: 3,
-                    drop_first_level: false,
-                    penalized: false,
-                    frozen_levels: Some(vec![0, 1, 2, 3]),
-                    lenient_unseen: true,
-                },
-            ],
+            // The random effect owns exactly one ridge between the linear
+            // ridges and the smooths. Column 3 is unused.
+            random_effect_terms: vec![RandomEffectTermSpec {
+                name: "penalized_group".to_string(),
+                feature_col: 2,
+                frozen_levels: Some(vec![0, 1]),
+                lenient_unseen: true,
+            }],
             // Distinct feature ownership is essential here. Two copies of the
             // same smooth are deliberately collapsed by global hierarchical
             // identifiability, in which case the second term correctly owns no
@@ -125,6 +113,7 @@ mod adaptive_bounded_duchon_tests {
             // Each surviving smooth emits BOTH its primary roughness and its
             // function-space null ridge, so every repeated axis has width two.
             smooth_terms: vec![smooth("first_smooth", 4), smooth("second_smooth", 5)],
+            level: Default::default(),
         };
         let design = build_term_collection_design(data.view(), &spec).expect("mixed design");
 
@@ -265,9 +254,10 @@ mod adaptive_bounded_duchon_tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
 
         let base_design = build_term_collection_design(data.view(), &spec).expect("base design");
@@ -332,8 +322,6 @@ mod adaptive_bounded_duchon_tests {
             random_effect_terms: vec![RandomEffectTermSpec {
                 name: "grp".to_string(),
                 feature_col: 1,
-                drop_first_level: false,
-                penalized: true,
                 frozen_levels: None,
                 lenient_unseen: true,
             }],
@@ -355,9 +343,10 @@ mod adaptive_bounded_duchon_tests {
                         boundary_conditions: gam_terms::basis::BSplineBoundaryConditions::default(),
                     },
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
         let fit_opts = FitOptions {
             max_iter: 40,
@@ -424,7 +413,7 @@ mod adaptive_bounded_duchon_tests {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         };
 
@@ -432,11 +421,13 @@ mod adaptive_bounded_duchon_tests {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![duchon_term("mean_duchon", 0.8)],
+            level: Default::default(),
         };
         let noisespec = TermCollectionSpec {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![duchon_term("noise_duchon", 1.1)],
+            level: Default::default(),
         };
 
         let solved = run_two_block_exact_joint_optimize(
@@ -496,7 +487,7 @@ mod adaptive_bounded_duchon_tests {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         };
 
@@ -504,11 +495,13 @@ mod adaptive_bounded_duchon_tests {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![pure_duchon_term("mean_pure_duchon")],
+            level: Default::default(),
         };
         let noisespec = TermCollectionSpec {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![pure_duchon_term("noise_pure_duchon")],
+            level: Default::default(),
         };
 
         let (boot_designs, frozen_specs) = build_term_collection_designs_and_freeze_joint(
@@ -653,6 +646,7 @@ mod adaptive_bounded_duchon_tests {
             ],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         };
 
         let fitted = fit_term_collectionwith_spatial_length_scale_optimization(
@@ -731,6 +725,7 @@ mod adaptive_bounded_duchon_tests {
             ],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         };
 
         let fitted = fit_term_collection_forspec(
@@ -830,6 +825,7 @@ mod adaptive_bounded_duchon_tests {
             }],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         let constraints = design.linear_constraints.expect("constraints");
@@ -890,6 +886,7 @@ mod adaptive_bounded_duchon_tests {
             ],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         assert_eq!(design.penalties.len(), 2);
@@ -1009,6 +1006,7 @@ mod adaptive_bounded_duchon_tests {
                 min: 0.0,
                 max: 1.0,
                 prior: BoundedCoefficientPriorSpec::Uniform,
+                latent_center: 0.0,
             }],
         };
         let state = vec![ParameterBlockState {
@@ -1104,6 +1102,7 @@ mod adaptive_bounded_duchon_tests {
                     min: -1.0,
                     max: 2.0,
                     prior,
+                    latent_center: 0.0,
                 }],
             };
             let at = |beta: Array1<f64>| {
@@ -1174,6 +1173,7 @@ mod adaptive_bounded_duchon_tests {
                         min: -1.0,
                         max: 2.0,
                         prior,
+                        latent_center: 0.0,
                     }],
                 }
             };

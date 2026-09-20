@@ -6,9 +6,12 @@
 //! `gam::inference::*` namespace; the root crate keeps the old paths valid via
 //! re-exports.
 
+pub mod automatic_formula;
 pub mod basis_adequacy;
 pub mod formula_dsl;
 pub mod higher_order;
 pub mod lawley;
+pub mod random_effect_test;
+pub mod smooth_score_test;
 pub mod smooth_test;
 pub mod structure_evidence;

@@ -3,7 +3,7 @@
 The latent Duchon design used by ``gaussian_reml_fit_latent`` worked for
 ``latent_dim`` 1-3 but raised for ``latent_dim >= 4``::
 
-    GamError: failed to evaluate N-D Duchon basis for LatentCoord:
+    GamfitError: failed to evaluate N-D Duchon basis for LatentCoord:
               Invalid input: Duchon pointwise kernel ...
 
 Root cause: the latent Duchon design hard-coded the spectral power ``s = 0``
@@ -69,7 +69,7 @@ def test_latent_duchon_constructs_for_high_dim(k: int) -> None:
     # This is a basis-construction regression, so hold the latent coordinate
     # fixed instead of coupling it to the separate latent-optimizer convergence
     # contract.
-    res = gamfit.gaussian_reml_fit_latent(
+    res = gamfit.reml.gaussian_reml_fit_latent(
         t_true.reshape(-1),
         y,
         n,
@@ -80,7 +80,7 @@ def test_latent_duchon_constructs_for_high_dim(k: int) -> None:
         basis_kind="duchon",
     )
 
-    # Construction succeeded (no GamError) and produced a usable decoder.
+    # Construction succeeded (no GamfitError) and produced a usable decoder.
     assert "fitted" in res
     fitted = np.asarray(res["fitted"], dtype=float)
     assert fitted.shape == y.shape

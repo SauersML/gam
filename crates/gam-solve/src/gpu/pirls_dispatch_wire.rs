@@ -15,45 +15,27 @@
 //! no-op stub.
 
 use gam_gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
-use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use crate::gpu_kernels::pirls_row::{PirlsRowFamily, PirlsRowRoute};
+use gam_problem::LikelihoodSpec;
 
 /// Result of mapping the engine-level `(ResponseFamily, InverseLink)` pair
 /// to the six built-in JIT-cached families the Stage 3.3 PIRLS loop can
 /// evaluate without going through a Level-B raw-body NVRTC compile.
 ///
-/// `None` means the fit must stay on the CPU LM loop: either the response /
-/// link combination is one of the engine's custom variants (Sas, Mixture,
-/// LatentCLogLog, BetaLogistic, Tweedie, NegativeBinomial, Beta,
-/// RoystonParmar) for which Stage 3.3 has no built-in row kernel, or the
-/// response is supported but the link does not match a built-in pairing
-/// (e.g. Poisson with Identity link).
+/// `None` means the fit must stay on the CPU LM loop, as decided by
+/// [`PirlsRowRoute::for_spec`]: a generic variance × link cell (composed on
+/// the CPU by the exact EDM row kernel), or a custom / blended likelihood
+/// (Sas, Mixture, LatentCLogLog, BetaLogistic, Tweedie, NegativeBinomial,
+/// Beta, RoystonParmar) with no built-in device row kernel.
 pub(crate) fn pirls_loop_family_for(spec: &LikelihoodSpec) -> Option<PirlsLoopFamilyKind> {
-    let link = match &spec.link {
-        InverseLink::Standard(lf) => *lf,
-        // Custom / blended inverse links have no Stage 3.3 row kernel; they
-        // require Stage 6 Level B JIT, which the CPU LM loop calls through
-        // different machinery.
-        _ => return None,
-    };
-    match (&spec.response, link) {
-        (ResponseFamily::Binomial, StandardLink::Logit) => {
-            Some(PirlsLoopFamilyKind::BernoulliLogit)
-        }
-        (ResponseFamily::Binomial, StandardLink::Probit) => {
-            Some(PirlsLoopFamilyKind::BernoulliProbit)
-        }
-        (ResponseFamily::Binomial, StandardLink::CLogLog) => {
-            Some(PirlsLoopFamilyKind::BernoulliCLogLog)
-        }
-        (ResponseFamily::Poisson, StandardLink::Log) => Some(PirlsLoopFamilyKind::PoissonLog),
-        (ResponseFamily::Gaussian, StandardLink::Identity) => {
-            Some(PirlsLoopFamilyKind::GaussianIdentity)
-        }
-        (ResponseFamily::Gamma, StandardLink::Log) => Some(PirlsLoopFamilyKind::GammaLog),
-        // Every other pairing is either not in the JIT-cache set or is a
-        // canonical-pair the row kernels do not currently support.
-        _ => None,
-    }
+    Some(match PirlsRowRoute::for_spec(spec).device_family()? {
+        PirlsRowFamily::BernoulliLogit => PirlsLoopFamilyKind::BernoulliLogit,
+        PirlsRowFamily::BernoulliProbit => PirlsLoopFamilyKind::BernoulliProbit,
+        PirlsRowFamily::BernoulliCLogLog => PirlsLoopFamilyKind::BernoulliCLogLog,
+        PirlsRowFamily::PoissonLog => PirlsLoopFamilyKind::PoissonLog,
+        PirlsRowFamily::GaussianIdentity => PirlsLoopFamilyKind::GaussianIdentity,
+        PirlsRowFamily::GammaLog => PirlsLoopFamilyKind::GammaLog,
+    })
 }
 
 /// Curvature surface the GPU loop should use given the family mapping and the
@@ -445,6 +427,7 @@ mod linux_impl {
                 let (sc, sd, sdmu, sd2, sd3) = computeworkingweight_derivatives_from_eta(
                     input.likelihood,
                     input.inverse_link,
+                    input.y,
                     &final_eta,
                     input.priorweights,
                 )?;
@@ -555,6 +538,7 @@ mod linux_impl {
             Some(compute_constraint_kkt_diagnostics(
                 &beta,
                 &gradient_total,
+                gradient_natural_scale,
                 lin,
             ))
         } else {
@@ -952,7 +936,12 @@ mod linux_impl {
         };
 
         let constraint_kkt_val = if let Some(lin) = input.linear_constraints.as_ref() {
-            Some(compute_constraint_kkt_diagnostics(&beta, &gradient, lin))
+            Some(compute_constraint_kkt_diagnostics(
+                &beta,
+                &gradient,
+                score_norm + s_beta_norm,
+                lin,
+            ))
         } else {
             None
         };
@@ -996,6 +985,7 @@ mod linux_impl {
                 let (c, d, dmu, d2mu, d3mu) = computeworkingweight_derivatives_from_eta(
                     input.likelihood,
                     input.inverse_link,
+                    input.y,
                     &eta_owned,
                     input.priorweights,
                 )
@@ -1071,13 +1061,14 @@ mod linux_impl {
 pub(crate) use linux_impl::{GpuGaussianPlsInput, GpuPirlsDispatchInput};
 #[cfg(target_os = "linux")]
 pub(crate) use linux_impl::{
-    try_gpu_gaussian_pls_dispatch, try_gpu_pirls_loop_admit, try_gpu_pirls_loop_dispatch,
+    try_gpu_gaussian_pls_admit, try_gpu_gaussian_pls_dispatch, try_gpu_pirls_loop_admit,
+    try_gpu_pirls_loop_dispatch,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_problem::{LikelihoodSpec, MixtureLinkState};
+    use gam_problem::{InverseLink, LikelihoodSpec, MixtureLinkState, ResponseFamily, StandardLink};
     use ndarray::Array1;
 
     fn dummy_mixture_state() -> MixtureLinkState {
@@ -1163,6 +1154,38 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[test]
+    fn every_generic_variance_link_cell_routes_to_the_cpu_edm_kernel() {
+        let mut generic_cells = 0;
+        for response in [
+            ResponseFamily::Gaussian,
+            ResponseFamily::Poisson,
+            ResponseFamily::Gamma,
+            ResponseFamily::InverseGaussian,
+            ResponseFamily::Binomial,
+        ] {
+            for link in gam_problem::LinkFunction::ALL {
+                let Ok(standard) = StandardLink::try_from(link) else {
+                    continue;
+                };
+                let spec = LikelihoodSpec::new(response.clone(), InverseLink::Standard(standard));
+                let route = PirlsRowRoute::for_spec(&spec);
+                match gam_problem::GenericEdmCell::classify(&spec.response, &spec.link) {
+                    Some(cell) => {
+                        generic_cells += 1;
+                        assert_eq!(route, PirlsRowRoute::CpuGenericEdm(cell), "for {spec:?}");
+                        assert_eq!(pirls_loop_family_for(&spec), None, "for {spec:?}");
+                    }
+                    None => assert!(
+                        !matches!(route, PirlsRowRoute::CpuGenericEdm(_)),
+                        "{spec:?} is not a generic cell"
+                    ),
+                }
+            }
+        }
+        assert_eq!(generic_cells, 14);
     }
 
     #[test]

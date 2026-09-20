@@ -68,18 +68,17 @@ def test_default_uncertainty_uses_and_reports_smoothing_corrected_covariance(tmp
         "covariance despite reporting smoothing-corrected provenance"
     )
 
-    # The published corrected covariance is the sigma-point cubature estimand
-    # E_rho[phi H(rho)^-1] + Cov_rho[beta_hat(rho)] over the smoothing posterior
-    # (`UnifiedFitResult::beta_covariance_corrected`). Its difference from the
-    # conditional covariance at rho_hat can take either sign, so no pointwise
-    # ordering against `conditional_se` holds. Only the first-order method,
-    # V_beta + J V_rho J^T, guarantees one. Pin the method the fit publishes, so a
-    # change of method reopens that question instead of passing silently (#2627).
+    # The published corrected covariance is the first-order estimand
+    # V_beta + J V_rho J^T (`UnifiedFitResult::beta_covariance_corrected`); the
+    # added term is positive semidefinite, so every corrected SE is at least the
+    # conditional one. Pin the method the fit publishes, so a change of method
+    # reopens that question instead of passing silently (#2627).
+    assert np.all(default_se >= conditional_se - 1e-10 * np.maximum(1.0, conditional_se))
     path = tmp_path / "model.gam"
     model.save(path)
     saved = json.loads(path.read_text())
     method = saved["payload"]["fit_result"]["inference"]["smoothing_correction_method"]
-    assert set(method) == {"SigmaPointCubature"}, method
+    assert set(method) == {"FirstOrderIdentifiedSubspace"}, method
 
 
 def test_default_uncertainty_publishes_conditional_when_no_correction_exists() -> None:
@@ -111,10 +110,11 @@ def test_default_uncertainty_publishes_conditional_when_no_correction_exists() -
     # refuses rather than delivering the conditional band under a corrected
     # label. The producing seam is
     # `crates/gam-pyffi/src/manifold/geometry_ffi.rs`,
-    # `.map_err(|err| format!("prediction failed: {err}"))`.
-    with pytest.raises(gamfit.GamError) as raised:
+    # `.map_err(|err| format!("prediction failed: {err}"))`, which the predict
+    # boundary raises as `PredictionError`, a `DataError`.
+    with pytest.raises(gamfit.errors.DataError) as raised:
         model.predict(grid, interval=0.9, covariance_mode="smoothing", return_type="dict")
-    assert type(raised.value) is gamfit.GamError
+    assert type(raised.value) is gamfit.errors.PredictionError
     assert str(raised.value) == (
         "prediction failed: Invalid input: fit result does not "
         "contain smoothing-corrected covariance"
@@ -223,7 +223,7 @@ def test_spline_scan_interval_refuses_corrected_and_labels_conditional() -> None
     # An EXPLICIT smoothing-corrected request refuses: no corrected object
     # exists for the profiled-lambda scan, and substituting the conditional
     # band under a corrected requirement would under-report uncertainty.
-    with pytest.raises(gamfit.GamError) as refusal:
+    with pytest.raises(gamfit.errors.GamfitError) as refusal:
         model.predict(
             grid, interval=0.9, covariance_mode="smoothing", return_type="dict"
         )

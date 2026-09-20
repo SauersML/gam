@@ -27,6 +27,129 @@ pub struct SmoothTermSummary {
     /// published raw, so `edf` may lie outside `[0, dim]` and is not clamped. `None`
     /// when every block of the term is certified, or the fit recorded no bounds.
     pub edf_rank_bound: Option<String>,
+    /// Why `pvalue` is absent, when the term or the fit leaves no valid
+    /// reference law. `None` whenever `pvalue` is present.
+    pub pvalue_unavailable: Option<SmoothPValueUnavailable>,
+}
+
+/// Why a smooth term reports no significance p-value.
+///
+/// A reason, not a status: each variant names the property of the term, or the
+/// missing piece of the fit, that leaves no valid reference distribution, so an
+/// absent p-value is never confusable with a term that was never tested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmoothPValueUnavailable {
+    /// The term is shape-constrained (`shape=` monotone, convex, concave).
+    ///
+    /// Its coefficients live in a cone `δ ≥ 0`, and the null `f ≡ 0` is the
+    /// cone's apex, so every coordinate of the null sits on the boundary.
+    /// A `χ²` or spectral reference assumes the estimate can fall on either
+    /// side of the null, which it cannot. The boundary-aware references do not
+    /// apply either:
+    ///
+    /// - The chi-bar-square law (Silvapulle & Sen 2005; Meyer 2003) is the
+    ///   null law of the cone-*projected* estimate, whose face is the active
+    ///   set. The term's estimate is the truncated posterior mean, which lies
+    ///   strictly inside the cone and has no active set.
+    /// - Conditioning on the active set is unavailable for the same reason.
+    /// - Both laws hold for a fixed, unpenalized cone. Here the penalty and its
+    ///   REML-selected λ shrink every face together, and the mixture weights
+    ///   move with them.
+    ShapeConstrained,
+    /// The term has coefficient directions that none of its penalties shrink.
+    ///
+    /// The score test treats the smooth as the variance components
+    /// `β_j ~ N(0, Σ_l τ_l·S_l⁺)`, one per penalty, and tests `τ = 0`. A direction outside every
+    /// penalty's range is a fixed effect of the term, which `τ = 0` does not
+    /// remove, so "no effect" is not the variance-component null and the
+    /// score's reference law does not describe it.
+    UnpenalizedDirection,
+    /// The fit carries no exact penalized Hessian `H` and weighted Gram
+    /// `X'WX` in one coefficient layout (its inference block was not kept), or
+    /// they are not one finite fit. The score and its covariance are read off
+    /// exactly those two, and a Gram reconstructed without the fitted weights
+    /// would give a reference law for a different statistic.
+    FitCurvatureUnavailable,
+    /// The fit's coefficient covariance scale (the dispersion `φ` the score
+    /// is standardized by) cannot be resolved from its likelihood metadata.
+    DispersionUnavailable,
+    /// The term is not identified apart from the rest of the model: the other
+    /// coefficients' penalized Hessian is not positive definite, or the term's
+    /// score has no variance left once they are fitted.
+    NotIdentified,
+    /// The fit's likelihood curvature `H − S(λ)` is indefinite on the term's
+    /// score once the other coefficients are fitted. A custom family's
+    /// penalized Hessian is its observed information, which need not be
+    /// positive semidefinite at a penalized mode; the score then has no
+    /// covariance to refer it to.
+    IndefiniteCurvature,
+    /// The scale is estimated, but the fit has no positive residual degrees of
+    /// freedom for the denominator of the reference law.
+    ResidualDfUnavailable,
+    /// A random-effect term whose variance-component score test
+    /// (`gam_terms::inference::random_effect_test`) could not be computed, with
+    /// the test's own reason.
+    RandomEffect(gam_terms::inference::random_effect_test::RandomEffectTestUnavailable),
+    /// A random-effect term the fit carries no test record for: a model saved
+    /// before the test existed, or a fit route that does not compute it.
+    RandomEffectTestNotRecorded,
+}
+
+impl SmoothPValueUnavailable {
+    /// Serialized label carried into the model payload and the Python surface.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ShapeConstrained => "shape_constrained",
+            Self::UnpenalizedDirection => "unpenalized_direction",
+            Self::FitCurvatureUnavailable => "fit_curvature_unavailable",
+            Self::DispersionUnavailable => "dispersion_unavailable",
+            Self::NotIdentified => "not_identified",
+            Self::IndefiniteCurvature => "indefinite_curvature",
+            Self::ResidualDfUnavailable => "residual_df_unavailable",
+            Self::RandomEffect(reason) => reason.label(),
+            Self::RandomEffectTestNotRecorded => "random_effect_test_not_recorded",
+        }
+    }
+
+    /// One-line explanation printed beside the summary table.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::ShapeConstrained => {
+                "shape-constrained: the null f = 0 is the apex of the constraint cone, so no \
+                 chi-square, spectral or chi-bar-square reference is valid for the truncated \
+                 posterior mean; no p-value is reported"
+            }
+            Self::UnpenalizedDirection => {
+                "unpenalized direction: some coefficient direction of the term is shrunk by no \
+                 penalty, so f = 0 is not the variance-component null tau = 0; no p-value is \
+                 reported"
+            }
+            Self::FitCurvatureUnavailable => {
+                "fit curvature unavailable: the fit kept no exact penalized Hessian and weighted \
+                 Gram, which the score test is read off; no p-value is reported"
+            }
+            Self::DispersionUnavailable => {
+                "dispersion unavailable: the fit's coefficient covariance scale cannot be \
+                 resolved from its likelihood metadata; no p-value is reported"
+            }
+            Self::NotIdentified => {
+                "not identified: the term's score has no variance once the other terms are \
+                 fitted; no p-value is reported"
+            }
+            Self::IndefiniteCurvature => {
+                "indefinite curvature: the fit's likelihood curvature leaves the term's score an \
+                 indefinite covariance, so the score has no variance law; no p-value is reported"
+            }
+            Self::ResidualDfUnavailable => {
+                "residual df unavailable: the scale is estimated but the fit has no positive \
+                 residual degrees of freedom; no p-value is reported"
+            }
+            Self::RandomEffect(reason) => reason.explanation(),
+            Self::RandomEffectTestNotRecorded => {
+                "the fit carries no variance-component test for this random effect"
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -475,6 +598,11 @@ impl fmt::Display for ModelSummary {
                 namew = smoothnamew
             )?;
         }
+        for term in &self.smooth_terms {
+            if let Some(reason) = term.pvalue_unavailable {
+                writeln!(f, "  {}: {}", term.name, reason.explanation())?;
+            }
+        }
         // #2901: a term spending an uncertified penalty block publishes its EDF
         // unclamped, and says so here rather than in a number that looks clamped.
         for term in &self.smooth_terms {
@@ -570,6 +698,7 @@ mod edf_rank_bound_label_tests {
             continuous_order: None,
             basis_note: None,
             edf_rank_bound: label.map(str::to_string),
+            pvalue_unavailable: None,
         };
         let summary = ModelSummary {
             family: "gaussian".to_string(),
@@ -592,5 +721,81 @@ mod edf_rank_bound_label_tests {
             "{text}"
         );
         assert!(!text.contains("s(x1): rank bound"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod pvalue_unavailable_tests {
+    use super::*;
+    use crate::estimate::smooth_pvalue_unavailable;
+    use gam_terms::smooth::{ShapeConstraint, ShapeSet, ShapeSpec};
+
+    /// Every shape request (atom, conjunction, per-margin tensor) withholds
+    /// the p-value with the typed reason, and only the unconstrained smooth is
+    /// testable.
+    #[test]
+    fn every_shape_constraint_withholds_the_smooth_pvalue() {
+        assert_eq!(smooth_pvalue_unavailable(&ShapeSpec::None), None);
+        let mut conjunction = ShapeSet::single(ShapeConstraint::MonotoneIncreasing);
+        conjunction
+            .insert(ShapeConstraint::Concave)
+            .expect("increasing and concave are compatible");
+        let per_margin = ShapeSpec::PerMargin(vec![
+            ShapeSet::single(ShapeConstraint::MonotoneIncreasing),
+            ShapeSet::default(),
+        ]);
+        for shape in [
+            ShapeConstraint::MonotoneIncreasing.into(),
+            ShapeConstraint::MonotoneDecreasing.into(),
+            ShapeConstraint::Convex.into(),
+            ShapeConstraint::Concave.into(),
+            ShapeSpec::Joint(conjunction),
+            per_margin,
+        ] {
+            assert_eq!(
+                smooth_pvalue_unavailable(&shape),
+                Some(SmoothPValueUnavailable::ShapeConstrained),
+                "{shape:?}"
+            );
+        }
+        assert_eq!(
+            SmoothPValueUnavailable::ShapeConstrained.label(),
+            "shape_constrained"
+        );
+    }
+
+    /// The printed summary names the reason beside the table, so a blank
+    /// p-value column is never read as "not significant".
+    #[test]
+    fn the_summary_names_a_withheld_shape_pvalue() {
+        let row = |name: &str, reason: Option<SmoothPValueUnavailable>| SmoothTermSummary {
+            name: name.to_string(),
+            edf: 2.5,
+            ref_df: 3.0,
+            chi_sq: None,
+            pvalue: None,
+            continuous_order: None,
+            basis_note: None,
+            edf_rank_bound: None,
+            pvalue_unavailable: reason,
+        };
+        let summary = ModelSummary {
+            family: "gaussian".to_string(),
+            deviance_explained: None,
+            reml_score: None,
+            raw_reml_score: None,
+            parametric_terms: Vec::new(),
+            smooth_terms: vec![
+                row("s(x1)", None),
+                row("s(x2)", Some(SmoothPValueUnavailable::ShapeConstrained)),
+            ],
+            coefficient_se_source: None,
+        };
+        let text = summary.to_string();
+        assert!(
+            text.contains("s(x2): shape-constrained: the null f = 0 is the apex"),
+            "{text}"
+        );
+        assert!(!text.contains("s(x1): shape-constrained"), "{text}");
     }
 }

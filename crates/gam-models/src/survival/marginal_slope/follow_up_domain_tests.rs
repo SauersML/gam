@@ -136,6 +136,7 @@ fn family(frame_is_follow_up_varying: bool) -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -747,7 +748,12 @@ fn jeffreys_candidate_value(lambda: f64, floor: f64, cap: f64) -> f64 {
     } else if lambda >= 0.0 {
         lambda / floor + floor.ln() - 1.0
     } else {
-        floor.ln() - 1.0 + lambda / (floor - lambda)
+        // G(t) = ∫₀ᵗ ds/(1 + s⁴), the bottom saturation's antiderivative (gam#2982).
+        let t = lambda / floor;
+        let root2 = std::f64::consts::SQRT_2;
+        let g = ((t * t + root2 * t + 1.0) / (t * t - root2 * t + 1.0)).ln() / (4.0 * root2)
+            + ((root2 * t + 1.0).atan() + (root2 * t - 1.0).atan()) / (2.0 * root2);
+        floor.ln() - 1.0 + g
     }
 }
 
@@ -760,7 +766,7 @@ fn jeffreys_candidate_slope(lambda: f64, floor: f64, cap: f64) -> f64 {
     } else if lambda >= 0.0 {
         1.0 / floor
     } else {
-        floor / ((floor - lambda) * (floor - lambda))
+        1.0 / (floor * (1.0 + (lambda / floor).powi(4)))
     }
 }
 
