@@ -696,7 +696,9 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     // The band prices its SEs off the covariance the fit publishes, as
     // `summary()` and `partial_dependence` do (#2779); a fit whose correction
-    // is typed unavailable reports the conditional band under that label.
+    // is typed unavailable reports the conditional band under that label. The
+    // band's critical value reads the same fit-owned reference law as
+    // `predict()` intervals: Student-t on n - edf for an estimated dispersion.
     let selected_covariance = gam::inference::effects::select_published_covariance(&fit)
         .map_err(|error| error.to_string())?;
     let payload = model.payload();
@@ -719,11 +721,13 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
             beta: fit.beta.view(),
             covariance: selected_covariance.matrix,
             covariance_source: selected_covariance.source,
+            reference: gam::inference::interval_reference::IntervalReference::of_fit(&fit)
+                .map_err(|error| error.to_string())?,
         },
         request,
         |headers, rows| {
             let dataset = dataset_with_model_schema(&model, headers, rows)?;
-            standard_mean_design(&model, dataset)
+            gam_predict::partial_effect::standard_mean_design(&model, dataset)
         },
     )?;
     serde_json::to_string(&rows)
@@ -1079,13 +1083,9 @@ struct SmoothTermLrRow {
     /// quadrature's truncation bound plus twice the selection replay's own
     /// Monte-Carlo standard error. `0.0` on the closed-form lanes.
     p_value_bound: Option<f64>,
-    /// Lawley LR Bartlett factor `c = 1 + Δε/d` (1.0 when uncorrected).
+    /// Lawley LR Bartlett factor `c = 1 + Δε/d`, the fixed-λ scale of the
+    /// reference (1.0 when uncorrected).
     bartlett_factor: Option<f64>,
-    /// Fixed-λ conditional Lawley factor when the applied factor also includes
-    /// estimated-λ rho variation.
-    bartlett_factor_conditional: Option<f64>,
-    /// Mean-shift increment from ρ̂ sampling variation, when present.
-    rho_variation_shift: Option<f64>,
     /// Bartlett-corrected statistic `W* = W / c`.
     statistic_corrected: Option<f64>,
     /// Uncorrected p-value `P(χ²_d > W)`.
@@ -1097,9 +1097,8 @@ struct SmoothTermLrRow {
     /// `n` is too small for first-order inference on this term. `false` when no
     /// correction was applied.
     material: Option<bool>,
-    /// `"lawley_lr_estimated_lambda"` when the full estimated-λ Bartlett
-    /// correction was applied, `"lawley_lr_fixed_lambda"` for the conditional
-    /// fixed-λ factor, else `"none"`.
+    /// `"lawley_lr_fixed_lambda"` when the Lawley factor was applied, else
+    /// `"none"`.
     correction_provenance: Option<&'static str>,
 }
 
@@ -1330,8 +1329,6 @@ fn smooth_term_lr_inference_dataset_json_impl(
                 p_value_conditional: Some(r.p_value_conditional),
                 p_value_bound: Some(r.p_value_bound),
                 bartlett_factor: Some(r.bartlett_factor),
-                bartlett_factor_conditional: r.bartlett_factor_conditional,
-                rho_variation_shift: r.rho_variation_shift,
                 statistic_corrected: Some(r.statistic_corrected),
                 p_value_uncorrected: Some(r.p_value_uncorrected),
                 p_value_corrected: Some(r.p_value_corrected),
@@ -5123,8 +5120,11 @@ impl ManifoldSaeCore {
 
     #[staticmethod]
     fn load(py: Python<'_>, path: std::path::PathBuf) -> PyResult<Py<ManifoldSaeCore>> {
-        let payload_json = std::fs::read_to_string(path)
-            .map_err(|error| py_value_error(format!("ManifoldSAE.load: {error}")))?;
+        // The one saved-model reader every surface shares (gam#3054): a
+        // filesystem refusal raises the `OSError` subclass its kind names, with
+        // the path in its message.
+        let payload_json = gam_model_api::saved_model::read_saved_model_file(&path)
+            .map_err(crate::saved_document_error_to_pyerr)?;
         Self::from_json(py, &payload_json)
     }
 
@@ -5143,8 +5143,12 @@ impl ManifoldSaeCore {
 
     fn save(&self, path: std::path::PathBuf) -> PyResult<()> {
         let payload = self.inner.to_json().map_err(py_value_error)?;
-        std::fs::write(path, payload)
-            .map_err(|error| py_value_error(format!("ManifoldSAE.save: {error}")))
+        // The one saved-model writer every surface shares (gam#3054): atomic,
+        // so a failed save leaves the previous file whole, and durable on Unix
+        // before it returns. A filesystem refusal raises the `OSError` subclass
+        // its kind names, with the path in its message.
+        gam_model_api::saved_model::write_saved_model(&path, payload.as_bytes())
+            .map_err(crate::saved_document_error_to_pyerr)
     }
 
     fn __repr__(&self) -> PyResult<String> {

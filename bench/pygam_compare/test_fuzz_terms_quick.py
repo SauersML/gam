@@ -54,3 +54,23 @@ def test_fuzz_terms_quick_plan_has_no_failures(tmp_path: Path) -> None:
         if failure_cause(r) is not None
     ]
     assert not failures, "\n".join(failures)
+
+
+def test_failure_cause_groups_by_recorded_exception_head() -> None:
+    # The worker keeps only the traceback's last 2000 characters, so a long
+    # engine message loses its exception line; triage must group by the head
+    # the worker recorded, not by whatever line the tail happens to start on.
+    message = "Outer optimization did not certify: |Pg|=1.5e-6 " + "x" * 3000
+    tail = f"{message}\nvariant: EstimationError::RemlDidNotConverge\ncategory: convergence\n"
+    rec = {
+        "status": "ok",
+        "errors": {"fit": tail[-2000:]},
+        "error_types": {"fit": "RemlConvergenceError"},
+        "error_heads": {"fit": message},
+    }
+    cause = failure_cause(rec)
+    assert cause is not None
+    assert cause.startswith(
+        "fit:RemlConvergenceError: [EstimationError::RemlDidNotConverge] "
+        "Outer optimization did not certify: |Pg|=#"
+    ), cause
