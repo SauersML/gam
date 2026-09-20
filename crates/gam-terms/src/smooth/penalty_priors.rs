@@ -14,7 +14,7 @@ use super::{PenaltyBlockInfo, TermCollectionDesign};
 use crate::PenaltySpec;
 use crate::basis::BasisError;
 use gam_spec::CoefficientGroupPrior;
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -45,8 +45,6 @@ pub struct CoefficientGroupSpec {
     pub selectors: Vec<CoefficientSelector>,
     pub parent: Option<String>,
     pub prior: Option<CoefficientGroupPrior>,
-    #[serde(skip, default)]
-    pub prior_mean: gam_problem::CoefficientPriorMean,
 }
 
 /// The penalties / null-space dims / rho-prior realized from a coefficient
@@ -458,27 +456,19 @@ pub fn realize_coefficient_groups(
             .iter()
             .flat_map(|component| component.iter().copied())
             .collect::<BTreeSet<_>>();
-        let local_mean = group
-            .prior_mean
-            .evaluate(
-                active_cols.len(),
-                &format!("coefficient group '{}'", group.name),
-            )
-            .map_err(|err| BasisError::InvalidInput(err.to_string()))?;
-        let mut prior_mean = Array1::<f64>::zeros(p);
         // Hierarchical Gamma precision update.
         //
         // For a leaf group,
         //
         //   p(beta_g | lambda_g) p(lambda_g)
         //     ∝ lambda_g^{|g|/2}
-        //       exp[-lambda_g (beta_g - mu_g)' S_g (beta_g - mu_g) / 2]
+        //       exp[-lambda_g beta_g' S_g beta_g / 2]
         //       lambda_g^{a_g-1} exp[-b_g lambda_g],
         //
         // so fixed-beta MAP gives
         //
         //   lambda_g* = (a_g + |g|/2 - 1)
-        //               / (b_g + (beta_g - mu_g)' S_g (beta_g - mu_g) / 2).
+        //               / (b_g + beta_g' S_g beta_g / 2).
         //
         // Interior nodes use the same identity with beta_g formed by
         // concatenating child beta vectors.  Equivalently, |g| and the
@@ -491,13 +481,7 @@ pub fn realize_coefficient_groups(
                 penalty[[col, col]] += 1.0;
             }
         }
-        for (mean_idx, &col) in active_cols.iter().enumerate() {
-            prior_mean[col] = local_mean[mean_idx];
-        }
-        penalty_specs.push(PenaltySpec::DenseWithMean {
-            matrix: penalty,
-            prior_mean: gam_problem::CoefficientPriorMean::constant(prior_mean),
-        });
+        penalty_specs.push(PenaltySpec::Dense(penalty));
         nullspace_dims.push(p.saturating_sub(active_cols.len()));
         group_column_indices.push((group.name.clone(), cols.iter().copied().collect()));
     }
