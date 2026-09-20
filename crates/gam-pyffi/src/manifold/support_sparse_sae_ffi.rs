@@ -629,9 +629,12 @@ impl SupportSparseManifoldSaeCore {
         let text = serde_json::to_string(&payload).map_err(|error| {
             py_value_error(format!("ManifoldSAESupport.save: serialization failed: {error}"))
         })?;
-        std::fs::write(path, text).map_err(|error| {
-            py_value_error(format!("ManifoldSAESupport.save: writing {path:?} failed: {error}"))
-        })
+        // The one saved-model writer every surface shares (gam#3054): atomic,
+        // so a failed save leaves the previous file whole, and durable on Unix
+        // before it returns. A filesystem refusal raises the `OSError` subclass
+        // its kind names, with the path in its message.
+        gam_model_api::saved_model::write_saved_model(std::path::Path::new(path), text.as_bytes())
+            .map_err(crate::saved_document_error_to_pyerr)
     }
 
     fn __repr__(&self) -> String {

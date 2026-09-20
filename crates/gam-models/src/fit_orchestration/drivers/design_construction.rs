@@ -3558,6 +3558,7 @@ fn fit_bounded_term_collection_with_design(
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             };
             let covariance_conditional = beta_covariance;
             // Sealed `UnifiedFitResult`: existence certifies inner+outer
