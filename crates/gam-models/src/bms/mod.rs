@@ -189,11 +189,10 @@ pub struct BernoulliMarginalSlopeFitResult {
     /// Conditional location-scale calibration of the latent score (#905),
     /// `Some(_)` only under the declared `conditional-location-scale` law when
     /// its `E[z|C]`/`Var(z|C)` Rao test fired: the training z was then replaced
-    /// in place by `ζ = (z − m(C))/√v(C)` (via
-    /// [`LatentZConditionalCalibration::apply`]) before any downstream consumer
-    /// saw it, and the residual is anchored on its empirical law. Persisted so
-    /// prediction rebuilds `a(C)` from the (reproducible) marginal design and
-    /// applies the identical map.
+    /// in place by `ζ = (z − m(C))/√v(C)` (through the fitted latent score map,
+    /// gam#3016) before any downstream consumer saw it, and the residual is
+    /// anchored on its empirical law. Persisted so prediction rebuilds `a(C)` from
+    /// the (reproducible) marginal design and applies the identical map.
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
     /// The latent score of each training row as the kernel consumed it: the raw
     /// score through the fitted score map (the saved normalisation, then the
@@ -1810,8 +1809,11 @@ impl LatentZConditionalCalibration {
 
     /// Apply `ζ = (z − m(C))/√v(C)` to a batch. `a_block` is the marginal
     /// design (`n × basis_ncols`); `z` is the (normalized) latent score. Used
-    /// at both training and predict time, so the map is identical.
-    pub fn apply(
+    /// at both training and predict time, so the map is identical. Crate-private:
+    /// every reader goes through the fitted latent score map
+    /// (`FittedLatentScoreMap`, gam#3016), outside the crate through
+    /// `FittedModel::fitted_latent_score`.
+    pub(crate) fn apply(
         &self,
         z: ArrayView1<'_, f64>,
         a_block: ArrayView2<'_, f64>,
