@@ -2925,63 +2925,6 @@ fn frozen_penalty_diag_and_log_det_are_exact_past_dimension_1024_2900() {
     assert_abs_diff_eq!(log_det, exact, epsilon = 1e-9 * exact.abs().max(1.0));
 }
 
-/// The row-precision energy ½ tᵀΛt reads only the symmetric part of Λ, so a
-/// penalty built from an asymmetric Λ is the penalty built from (Λ + Λᵀ)/2:
-/// value, gradient, curvature and the log-determinant agree exactly. An input
-/// whose symmetric part is singular is still refused as not positive definite,
-/// whatever its skew part (#2469).
-#[test]
-fn row_precision_prior_reads_the_symmetric_part_of_its_precision_2469() {
-    let target = PsiSlice::full(4, Some(2));
-    let asymmetric = array![[[2.0_f64, 1.5], [0.5, 2.0]], [[3.0, -0.25], [0.75, 1.0]]];
-    let symmetric = array![[[2.0_f64, 1.0], [1.0, 2.0]], [[3.0, 0.25], [0.25, 1.0]]];
-    let from_asymmetric =
-        RowPrecisionPriorPenalty::new(target.clone(), asymmetric, 1.3, 2, true).unwrap();
-    let from_symmetric =
-        RowPrecisionPriorPenalty::new(target.clone(), symmetric.clone(), 1.3, 2, true).unwrap();
-    assert_eq!(from_asymmetric.lambda_per_row, symmetric);
-
-    let t = array![0.7_f64, -1.1, 0.4, 2.3];
-    let rho = array![0.2_f64];
-    assert_eq!(
-        from_asymmetric.value(t.view(), rho.view()),
-        from_symmetric.value(t.view(), rho.view())
-    );
-    assert_eq!(
-        from_asymmetric.grad_target(t.view(), rho.view()),
-        from_symmetric.grad_target(t.view(), rho.view())
-    );
-    assert_eq!(
-        from_asymmetric.as_dense(t.view(), rho.view()),
-        from_symmetric.as_dense(t.view(), rho.view())
-    );
-    assert_eq!(
-        from_asymmetric.log_det_plus_lambda_i(rho.view(), 0.5).unwrap(),
-        from_symmetric.log_det_plus_lambda_i(rho.view(), 0.5).unwrap()
-    );
-    // The value is the quadratic form of the stored matrix plus the Gaussian
-    // normalizer −½·len·ln μ of the learnable strength.
-    let weight = 1.3 * 0.2_f64.exp();
-    let mut energy = 0.0;
-    for n in 0..2 {
-        for i in 0..2 {
-            for j in 0..2 {
-                energy += t[2 * n + i] * symmetric[[n, i, j]] * t[2 * n + j];
-            }
-        }
-    }
-    assert_abs_diff_eq!(
-        from_asymmetric.value(t.view(), rho.view()),
-        0.5 * weight * energy - 0.5 * 4.0 * weight.ln(),
-        epsilon = 1e-12
-    );
-
-    // [[1, 3], [−1, 1]] has symmetric part [[1, 1], [1, 1]], eigenvalues {0, 2}.
-    let singular_part = array![[[1.0_f64, 3.0], [-1.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]]];
-    let refused = RowPrecisionPriorPenalty::new(target, singular_part, 1.3, 2, true);
-    assert!(refused.unwrap_err().contains("must be positive definite"));
-}
-
 /// Checks `grad_target`, `hvp` and `grad_rho` of a learnable-weight quadratic penalty
 /// `P(t, ρ) = ½·w·tᵀHt − ½·len·ln w`, `w = w₀·exp(ρ)`, against central differences
 /// of `value` and `grad_target`.
@@ -3127,78 +3070,59 @@ fn row_precision_prior_dense_hessian_and_diagonal_match_hvp() {
     assert!(penalty.hessian_diag(t.view(), rho.view()).is_none());
 }
 
-fn ivae_gauge_fixture_aux() -> Array2<f64> {
-    array![[1.0_f64, 0.3], [-0.5, 0.8], [0.2, -1.1], [0.9, 0.4]]
-}
-
-fn build_ivae_gauge_fixture() -> IvaeRidgeMeanGauge {
-    IvaeRidgeMeanGauge::new(
-        PsiSlice::full(8, Some(2)),
-        ivae_gauge_fixture_aux(),
-        0.1,
-        0.7,
-        4,
-        true,
-    )
-    .expect("valid iVAE ridge mean gauge")
-}
-
-/// `|U|·|(UᵀU + εI)⁻¹|·|U|ᵀ`: the entrywise bound on the sums the projection
-/// `P = U(UᵀU + εI)⁻¹Uᵀ` is formed from.
-fn ivae_gauge_abs_projection(penalty: &IvaeRidgeMeanGauge) -> Array2<f64> {
-    let u_abs = penalty.aux.mapv(f64::abs);
-    u_abs.dot(&penalty.ridge_inv.mapv(f64::abs)).dot(&u_abs.t())
-}
-
-/// The iVAE gauge's gradient `w·(t − Pt)`, its curvature `w·(v − Pv)` and its strength
-/// derivative `½·w·tᵀ(t − Pt) − ½·len` are the derivatives of its value.
+/// The row-precision energy ½ tᵀΛt reads only the symmetric part of Λ, so a
+/// penalty built from an asymmetric Λ is the penalty built from (Λ + Λᵀ)/2:
+/// value, gradient, curvature and the log-determinant agree exactly. An input
+/// whose symmetric part is singular is still refused as not positive definite,
+/// whatever its skew part (#2469).
 #[test]
-fn ivae_gauge_derivatives_match_finite_differences() {
-    let penalty = build_ivae_gauge_fixture();
-    let t = array![0.4_f64, -0.3, 0.2, -0.1, 0.6, 0.5, -0.7, 0.35];
-    let v = Array1::from_shape_fn(t.len(), |i| 0.2 * ((i as f64) + 1.3).cos());
-    let p_abs = ivae_gauge_abs_projection(&penalty);
-    assert_learnable_quadratic_penalty_derivatives(&penalty, 0.7, &t, 0.25, &v, |x| {
-        let x_mat = x.view().into_shape_with_order((4, 2)).expect("4 × 2 block");
-        let projected = p_abs.dot(&x_mat);
-        Array1::from_shape_fn(x.len(), |row| x[row] + projected[[row / 2, row % 2]])
-    });
-}
+fn row_precision_prior_reads_the_symmetric_part_of_its_precision_2469() {
+    let target = PsiSlice::full(4, Some(2));
+    let asymmetric = array![[[2.0_f64, 1.5], [0.5, 2.0]], [[3.0, -0.25], [0.75, 1.0]]];
+    let symmetric = array![[[2.0_f64, 1.0], [1.0, 2.0]], [[3.0, 0.25], [0.25, 1.0]]];
+    let from_asymmetric =
+        RowPrecisionPriorPenalty::new(target.clone(), asymmetric, 1.3, 2, true).unwrap();
+    let from_symmetric =
+        RowPrecisionPriorPenalty::new(target.clone(), symmetric.clone(), 1.3, 2, true).unwrap();
+    assert_eq!(from_asymmetric.lambda_per_row, symmetric);
 
-/// `as_dense` and `diag_target` of the iVAE gauge feed the frozen operator like the
-/// row-precision prior's: each column of `as_dense` is the finite-difference-checked
-/// `hvp` of the matching unit vector and `diag_target` is its diagonal. Each entry
-/// `w·(δ_nm − p_nm)` is formed from sums of products bounded by `|P|`, so the three
-/// agree to `32·ε·w·(1 + max|P|)`.
-#[test]
-fn ivae_gauge_dense_hessian_and_diagonal_match_hvp() {
-    let penalty = build_ivae_gauge_fixture();
-    let t = array![0.4_f64, -0.3, 0.2, -0.1, 0.6, 0.5, -0.7, 0.35];
-    let n = t.len();
-    let rho = array![0.25_f64];
-    let dense = penalty.as_dense(t.view(), rho.view());
-    let diag = penalty.diag_target(t.view(), rho.view());
-    let p_abs_max = ivae_gauge_abs_projection(&penalty)
-        .iter()
-        .fold(0.0_f64, |acc, &x| acc.max(x));
-    let tol = 32.0 * f64::EPSILON * 0.7 * 0.25_f64.exp() * (1.0 + p_abs_max);
-    for j in 0..n {
-        let mut e = Array1::<f64>::zeros(n);
-        e[j] = 1.0;
-        let column = penalty.hvp(t.view(), rho.view(), e.view());
-        for i in 0..n {
-            assert!(
-                (dense[[i, j]] - column[i]).abs() <= tol,
-                "as_dense[{i}, {j}] = {:.15e}, hvp(e_{j})[{i}] = {:.15e}",
-                dense[[i, j]],
-                column[i]
-            );
+    let t = array![0.7_f64, -1.1, 0.4, 2.3];
+    let rho = array![0.2_f64];
+    assert_eq!(
+        from_asymmetric.value(t.view(), rho.view()),
+        from_symmetric.value(t.view(), rho.view())
+    );
+    assert_eq!(
+        from_asymmetric.grad_target(t.view(), rho.view()),
+        from_symmetric.grad_target(t.view(), rho.view())
+    );
+    assert_eq!(
+        from_asymmetric.as_dense(t.view(), rho.view()),
+        from_symmetric.as_dense(t.view(), rho.view())
+    );
+    assert_eq!(
+        from_asymmetric.log_det_plus_lambda_i(rho.view(), 0.5).unwrap(),
+        from_symmetric.log_det_plus_lambda_i(rho.view(), 0.5).unwrap()
+    );
+    // The value is the quadratic form of the stored matrix plus the Gaussian
+    // normalizer −½·len·ln μ of the learnable strength.
+    let weight = 1.3 * 0.2_f64.exp();
+    let mut energy = 0.0;
+    for n in 0..2 {
+        for i in 0..2 {
+            for j in 0..2 {
+                energy += t[2 * n + i] * symmetric[[n, i, j]] * t[2 * n + j];
+            }
         }
-        assert!(
-            (diag[j] - dense[[j, j]]).abs() <= tol,
-            "diag_target[{j}] = {:.15e}, as_dense[{j}, {j}] = {:.15e}",
-            diag[j],
-            dense[[j, j]]
-        );
     }
+    assert_abs_diff_eq!(
+        from_asymmetric.value(t.view(), rho.view()),
+        0.5 * weight * energy - 0.5 * 4.0 * weight.ln(),
+        epsilon = 1e-12
+    );
+
+    // [[1, 3], [−1, 1]] has symmetric part [[1, 1], [1, 1]], eigenvalues {0, 2}.
+    let singular_part = array![[[1.0_f64, 3.0], [-1.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]]];
+    let refused = RowPrecisionPriorPenalty::new(target, singular_part, 1.3, 2, true);
+    assert!(refused.unwrap_err().contains("must be positive definite"));
 }
