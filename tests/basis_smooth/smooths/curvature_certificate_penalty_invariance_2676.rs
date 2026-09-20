@@ -183,7 +183,6 @@ fn fit_at_with(
             ResponseFamily::Binomial,
             InverseLink::Standard(StandardLink::Logit),
         ),
-        estimate_tweedie_p: false,
         options: FitOptions {
             // Inference on, so the smoothing-correction inverse
             // (`invert_identified_rho_hessian`, this issue's path 2) runs
