@@ -2984,6 +2984,21 @@ fn build_formula_design_for_multinomial(
             "multinomial fit: failed to parse formula {formula:?}: {err}"
         ))
     })?;
+    // The softmax link is fixed and has no deviation to fit, so every link
+    // spelling and a `linkwiggle(...)` are refused here, for every frontend,
+    // rather than parsed and never read (gam#3298).
+    crate::fit_orchestration::refuse_link_spellings(
+        parsed.linkspec.as_ref(),
+        config,
+        "the multinomial family (its softmax link is fixed)",
+    )
+    .map_err(|err| EstimationError::InvalidInput(String::from(err)))?;
+    if parsed.linkwiggle.is_some() {
+        crate::bail_invalid_estim!(
+            "linkwiggle(...) is not supported for the multinomial family: its softmax link is \
+             fixed and has no deviation to fit"
+        );
+    }
     let col_map = data.column_map();
     let y_col = resolve_role_col(&col_map, &parsed.response, "response")
         .map_err(|err| EstimationError::InvalidInput(format!("multinomial fit: {err}")))?;

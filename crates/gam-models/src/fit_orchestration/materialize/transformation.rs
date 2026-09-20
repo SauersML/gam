@@ -6,12 +6,11 @@ pub(crate) fn materialize_transformation_normal<'a>(
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
-    if parsed.linkspec.is_some() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "link(...) is not supported for the transformation-normal family".to_string(),
-        }
-        .into());
-    }
+    refuse_link_spellings(
+        parsed.linkspec.as_ref(),
+        config,
+        "the transformation-normal family",
+    )?;
     if parsed.linkwiggle.is_some() {
         return Err(WorkflowError::InvalidConfig {
             reason: "linkwiggle(...) is not supported for the transformation-normal family"

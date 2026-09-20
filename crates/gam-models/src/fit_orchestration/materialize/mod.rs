@@ -36,7 +36,7 @@ pub(crate) use terms::{
 };
 pub(crate) use transformation::materialize_transformation_normal;
 pub(crate) use validation::{
-    reject_marginal_slope_controls_for_transformation_normal,
+    refuse_link_spellings, reject_marginal_slope_controls_for_transformation_normal,
     reject_survival_only_config_for_nonsurvival, reject_survival_only_terms_for_nonsurvival,
     requests_bernoulli_marginal_slope,
 };

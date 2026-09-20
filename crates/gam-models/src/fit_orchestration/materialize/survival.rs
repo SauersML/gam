@@ -249,22 +249,21 @@ pub(crate) fn materialize_survival<'a>(
         }
         .into());
     }
-    if parsed.linkspec.is_some()
-        && matches!(
-            survival_mode,
-            SurvivalLikelihoodMode::Transformation
-                | SurvivalLikelihoodMode::Weibull
-                | SurvivalLikelihoodMode::Latent
-                | SurvivalLikelihoodMode::LatentBinary
-        )
-    {
-        return Err(WorkflowError::InvalidConfig {
-            reason: format!(
-                "link(...) is not implemented for survival_likelihood='{}'",
+    if matches!(
+        survival_mode,
+        SurvivalLikelihoodMode::Transformation
+            | SurvivalLikelihoodMode::Weibull
+            | SurvivalLikelihoodMode::Latent
+            | SurvivalLikelihoodMode::LatentBinary
+    ) {
+        refuse_link_spellings(
+            parsed.linkspec.as_ref(),
+            config,
+            &format!(
+                "survival_likelihood='{}'",
                 config.resolved_survival_likelihood()
             ),
-        }
-        .into());
+        )?;
     }
     // Hoist the survival marginal-slope z-column exclusion check above the
     // time-basis / termspec construction below.  Those downstream steps fail
@@ -465,14 +464,30 @@ pub(crate) fn materialize_survival<'a>(
         },
     )?;
     // `loglog` and `cauchit` are single-component mixtures, not link choices a
-    // link deviation can flex.
-    let link_choice = if link_name.is_some_and(|name| {
-        let name = name.trim();
-        name.eq_ignore_ascii_case("loglog") || name.eq_ignore_ascii_case("cauchit")
-    }) {
-        None
-    } else {
-        parse_link_choice(link_name, config.flexible_link)?
+    // link deviation can flex, so a request to flex one, by `flexible_link` or
+    // by `flexible(...)`, is refused here rather than dropped or refused only
+    // after the location-scale fit has run (gam#3298).
+    let link_choice = parse_link_choice(link_name, config.flexible_link)?;
+    let link_choice = match link_choice {
+        Some(choice)
+            if choice.mixture_components.is_none()
+                && matches!(choice.link, LinkFunction::LogLog | LinkFunction::Cauchit) =>
+        {
+            if matches!(choice.mode, gam_terms::inference::formula_dsl::LinkMode::Flexible) {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "a survival {} link is a single-component mixture, not a link a link \
+                         deviation can flex, so flexible(...) and flexible_link=True are refused \
+                         for it; use the plain {} link",
+                        choice.link.name(),
+                        choice.link.name()
+                    ),
+                }
+                .into());
+            }
+            None
+        }
+        choice => choice,
     };
     // Only the location-scale and marginal-slope likelihoods fit the anchored link
     // deviation a `flexible(...)` link asks for, the one `linkwiggle(...)` gives them;
