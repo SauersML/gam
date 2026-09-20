@@ -20,7 +20,7 @@ pytest.importorskip("gamfit._rust")
 from gamfit._binding import rust_module
 
 
-@pytest.mark.parametrize("degree", [1, 2, 3])
+@pytest.mark.parametrize("degree", [2, 3, 4])
 def test_periodic_n_basis_is_the_uniform_lattice(degree: int) -> None:
     n_basis = degree + 5
     t = np.linspace(0.0, 1.0, 29).reshape(-1, 1)
@@ -39,7 +39,7 @@ def test_periodic_n_basis_is_the_uniform_lattice(degree: int) -> None:
     np.testing.assert_allclose(np.asarray(phi)[0], np.asarray(phi)[-1], atol=1e-12)
 
 
-@pytest.mark.parametrize("degree", [1, 2, 3])
+@pytest.mark.parametrize("degree", [2, 3, 4])
 def test_open_n_basis_is_the_clamped_uniform_vector(degree: int) -> None:
     n_basis = degree + 5
     interior = n_basis - (degree + 1)
