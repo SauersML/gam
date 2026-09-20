@@ -2591,6 +2591,11 @@ fn block_cross_residual_gram(
     col_offsets: &[usize],
     block_idx: usize,
 ) -> Result<Array2<f64>, EstimationError> {
+    if gram_struct.iter().any(|value| !value.is_finite()) {
+        return Err(EstimationError::LayoutError(
+            "cross-residual Gram requires finite joint Gram entries".to_string(),
+        ));
+    }
     let p_total = gram_struct.ncols();
     let b_start = col_offsets[block_idx];
     let b_end = col_offsets[block_idx + 1];
@@ -2626,6 +2631,15 @@ fn block_cross_residual_gram(
     let (evals, evecs) = g_aa
         .eigh(Side::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
+    if evals
+        .iter()
+        .chain(evecs.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(EstimationError::LayoutError(
+            "cross-residual Gram eigendecomposition produced non-finite entries".to_string(),
+        ));
+    }
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
     let tol = lambda_max * 64.0 * (n_a.max(1) as f64) * f64::EPSILON;
     // M = U · diag(1/λ_kept) · Uᵀ · G_Ab
@@ -2648,6 +2662,11 @@ fn block_cross_residual_gram(
             r[[i, j]] = avg;
             r[[j, i]] = avg;
         }
+    }
+    if r.iter().any(|value| !value.is_finite()) {
+        return Err(EstimationError::LayoutError(
+            "cross-residual Gram produced non-finite entries".to_string(),
+        ));
     }
     Ok(r)
 }
@@ -3611,7 +3630,10 @@ mod tests {
             let known_rank = rrqr_with_permutation(&design, default_rrqr_rank_alpha())
                 .unwrap()
                 .rank;
-            assert_eq!(known_rank, 3, "scale {scale:e}: fixture design must be full rank");
+            assert_eq!(
+                known_rank, 3,
+                "scale {scale:e}: fixture design must be full rank"
+            );
             if scale == 1e6 {
                 // The regime this pins: the weak direction's Gram eigenvalue sits
                 // BETWEEN the singular-value cutoff squared (so J is full rank)
@@ -3644,7 +3666,10 @@ mod tests {
             let aliased_rank = rrqr_with_permutation(&aliased, default_rrqr_rank_alpha())
                 .unwrap()
                 .rank;
-            assert_eq!(aliased_rank, 2, "scale {scale:e}: aliased design must lose one rank");
+            assert_eq!(
+                aliased_rank, 2,
+                "scale {scale:e}: aliased design must lose one rank"
+            );
             let aliased_specs = [spec_from_dense("time_transform", aliased.clone())];
             let error =
                 check_map_uniqueness(&aliased, &[], &unpenalized, &aliased_specs, &col_offsets)
@@ -4504,4 +4529,17 @@ mod tests {
 
     // ── Competing-risks cross-channel redundancy regression (gam#1590) ──────
 
+    #[test]
+    fn cross_residual_gram_never_substitutes_a_bare_block_for_invalid_joint_geometry() {
+        // X_a=(1,1), X_b=(1,2): ||X_b||² - (X_aᵀX_b)²/||X_a||² = 1/2.
+        let gram = ndarray::array![[2.0, 3.0], [3.0, 5.0]];
+        let residual = block_cross_residual_gram(&gram, &[0, 1, 2], 1).unwrap();
+        assert_eq!(residual[[0, 0]], 0.5);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut invalid_gram = gram.clone();
+            invalid_gram[[0, 0]] = invalid;
+            assert!(block_cross_residual_gram(&invalid_gram, &[0, 1, 2], 1).is_err());
+            assert!(block_cross_residual_gram(&invalid_gram, &[0, 2], 0).is_err());
+        }
+    }
 }

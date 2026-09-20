@@ -35,7 +35,6 @@ use ndarray::{Array1, Array2, ArrayView2, ArrayViewD};
 use serde::{Deserialize, Serialize};
 
 use super::apply::{ApplyError, FactorView, FactoredEdit, apply_anchored_linear, native_linear};
-use super::field::CotangentTerm;
 use super::occurrence::{OccurrenceError, ParameterEditRecord};
 use crate::inference::intervention_shard::{ExperimentUnit, InterventionChange, ParameterEditScope};
 
@@ -754,29 +753,6 @@ pub struct ExecutedExperiment {
     pub readouts: Vec<Array2<f64>>,
     /// Their forward-error status.
     pub roundoff: ForwardRoundoff,
-}
-
-/// A forward executor of the teacher under typed parameter edits.
-///
-/// The Rust lift implements it natively, and the Python surface wraps an external
-/// framework object as the same trait. An executor returns executed rows only:
-/// divergences, cotangent contractions and bounds are computed in Rust from them.
-pub trait ParameterExecutor {
-    /// Executes every experiment. A batch of one is the scalar case.
-    fn forward(
-        &self,
-        experiments: &[ParameterExperiment],
-    ) -> Result<Vec<ExecutedExperiment>, ExecutorError>;
-
-    /// Pulls each experiment's readout cotangents (one block per readout, in the
-    /// readout's shape) back to the cotangent term of every use site its edits reach,
-    /// in that use's orientation. `occurrence::edit_cotangent` sums the terms through
-    /// each use's tie.
-    fn vjp(
-        &self,
-        experiments: &[ParameterExperiment],
-        cotangents: &[Vec<Array2<f64>>],
-    ) -> Result<Vec<Vec<(UseSiteId, CotangentTerm)>>, ExecutorError>;
 }
 
 impl ParameterExperiment {

@@ -680,43 +680,58 @@ pub(crate) fn unified_joint_efs_eval(
     }
 }
 
-/// Same-ρ assembled-operator reuse for the custom-family outer driver.
+/// Same-matrix assembled-operator reuse for the custom-family outer driver.
 ///
 /// The outer Hessian operator the cost-side `hop.logdet()` and the gradient
-/// traces consume is `H(β̂, ρ) + S_λ(ρ) + H_Φ(β̂, ρ)`. Its expensive part is the
-/// dense spectral factorization (`g_factor` / `projected_factor_cache`), built
-/// lazily inside `BlockCoupledOperator` the first time
-/// a logdet/trace method is touched (≈14–19 s at biobank scale). BFGS issues a
-/// `Value` eval immediately followed by a `ValueAndGradient` eval at the SAME ρ
-/// (and the line search re-probes ρ), so the released path rebuilt + refactorized
-/// that operator 2–4× per fit at identical ρ.
+/// traces consume is `BlockCoupledOperator::from_joint_hessian_with_mode(J, mode)`
+/// for the assembled, symmetrized `J = H_unpen + S_λ + S_joint + scale·H_Φ`. Its
+/// expensive part is the dense factorization and the spectral caches built
+/// lazily inside `BlockCoupledOperator` the first time a logdet/trace method is
+/// touched. BFGS issues a `Value` eval immediately followed by a
+/// `ValueAndGradient` eval at the SAME ρ (and the line search re-probes ρ), so
+/// without reuse the same operator is refactorized 2–4× per fit.
 ///
-/// The operator is a deterministic function of `(β̂, ρ)` for a fixed
-/// family/data plus the scalar assembly knobs (ridges, curvature scale, logdet
-/// flags, pseudo-logdet mode, Jeffreys curvature). We therefore cache the
-/// assembled `Arc<dyn HessianFactorization>` keyed by a content fingerprint of ALL of
-/// those inputs and reuse it on a bit-identical hit. Because the reuse condition
-/// is exact byte-equality of the build inputs, the reused operator — and so the
-/// LAML cost and its analytic gradient — is bit-identical to a fresh build.
-/// On a miss we build + store, evicting the older of the (at most) two retained
-/// entries, which bounds memory to the last two distinct ρ assemblies.
+/// The key is the builder's complete input: the assembled matrix `J` itself and
+/// the pseudo-logdet mode, compared by exact element equality (`±0.0` compare
+/// equal, and `J` is finite because materialization refuses non-finite
+/// curvature). A hit therefore hands back the operator a fresh build of the same
+/// arguments would produce, for every source kind and for every fit sharing this
+/// process-global cache: two fits whose `(ρ, β̂)` or Hessian diagonal coincide
+/// but whose curvature differs have different `J` and never share an operator
+/// (gam#3641). The key does not assume anything about which family, data or ψ
+/// produced `J`.
+///
+/// A hit still pays the materialization of `J` (`Θ(n·p²)` for an operator
+/// source); it skips the `O(p³)` factorization and the lazily built spectral
+/// caches. Memory is bounded to the last two distinct assemblies, each held
+/// once as `J` next to its operator.
 struct AssembledOperatorCache {
-    /// `(fingerprint, operator)` for at most the last two distinct assemblies.
-    entries: Vec<(u64, Arc<dyn HessianFactorization>)>,
+    /// At most the last two distinct assemblies.
+    entries: Vec<AssembledOperatorEntry>,
+}
+
+struct AssembledOperatorEntry {
+    mode: PseudoLogdetMode,
+    matrix: Array2<f64>,
+    operator: Arc<dyn HessianFactorization>,
 }
 
 impl AssembledOperatorCache {
     const CAPACITY: usize = 2;
 
-    fn get(&self, fingerprint: u64) -> Option<Arc<dyn HessianFactorization>> {
+    fn get(
+        &self,
+        matrix: &Array2<f64>,
+        mode: PseudoLogdetMode,
+    ) -> Option<Arc<dyn HessianFactorization>> {
         self.entries
             .iter()
-            .find(|(key, _)| *key == fingerprint)
-            .map(|(_, op)| Arc::clone(op))
+            .find(|entry| entry.mode == mode && entry.matrix == *matrix)
+            .map(|entry| Arc::clone(&entry.operator))
     }
 
-    fn insert(&mut self, fingerprint: u64, op: Arc<dyn HessianFactorization>) {
-        if self.entries.iter().any(|(key, _)| *key == fingerprint) {
+    fn insert(&mut self, entry: AssembledOperatorEntry) {
+        if self.get(&entry.matrix, entry.mode).is_some() {
             return;
         }
         if self.entries.len() >= Self::CAPACITY {
@@ -724,7 +739,7 @@ impl AssembledOperatorCache {
             // the immediate Value→ValueAndGradient pair at one ρ always hits.
             self.entries.remove(0);
         }
-        self.entries.push((fingerprint, op));
+        self.entries.push(entry);
     }
 }
 
@@ -737,115 +752,35 @@ fn assembled_operator_cache() -> &'static Mutex<AssembledOperatorCache> {
     })
 }
 
-/// Fold a finite `f64`'s canonical bit pattern into a hasher (±0.0 → +0.0,
-/// mirroring `solver::reml::rho_key::sanitized_rhokey`). Non-finite values poison
-/// the fingerprint with a distinguished sentinel so a NaN/∞ assembly never
-/// aliases a finite one (it will simply never hit, which is the safe outcome).
-fn hash_f64<H: std::hash::Hasher>(value: f64, hasher: &mut H) {
-    use std::hash::Hash;
-    let bits = if value == 0.0 {
-        0.0f64.to_bits()
-    } else if value.is_finite() {
-        value.to_bits()
-    } else {
-        // Distinct sentinel for any non-finite component.
-        0xFFFF_FFFF_FFFF_FFFFu64
-    };
-    bits.hash(hasher);
-}
-
-/// Content fingerprint of every input that determines the assembled outer
-/// Hessian operator. Reuse is gated on exact equality of this fingerprint, so a
-/// hit means a bit-identical operator. `None` (here: never) would disable
-/// caching; we always produce a fingerprint and let mismatches simply miss.
-fn assembled_operator_fingerprint(
-    rho: &Array1<f64>,
-    beta_flat: &Array1<f64>,
-    h_joint_unpen: &JointHessianSource,
-    scaled_s_lambdas: &[Array2<f64>],
-    scaled_joint_penalty: Option<&Array2<f64>>,
-    robust_jeffreys_hphi_for_operator: Option<&Array2<f64>>,
-    ranges: &[(usize, usize)],
-    total: usize,
-    rho_curvature_scale: f64,
-    pseudo_logdet_mode: PseudoLogdetMode,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // Structural discriminants.
-    total.hash(&mut hasher);
-    ranges.hash(&mut hasher);
-    (pseudo_logdet_mode == PseudoLogdetMode::Smooth).hash(&mut hasher);
-    hash_f64(rho_curvature_scale, &mut hasher);
-    // ρ and β̂ together pin the family/data state at this evaluation: for a fixed
-    // family/data the operator is `H(β̂, ρ) + S_λ(ρ) + H_Φ(β̂, ρ)`, so identical
-    // (ρ, β̂) ⇒ identical operator, and distinct fits at the same ρ differ in β̂.
-    rho.len().hash(&mut hasher);
-    for &v in rho {
-        hash_f64(v, &mut hasher);
+/// The outer Hessian operator for the assembled, symmetrized joint matrix `J`:
+/// the cached operator when an earlier evaluation built one from exactly this
+/// `(J, mode)`, a fresh `BlockCoupledOperator` otherwise. See
+/// [`AssembledOperatorCache`].
+pub(crate) fn assembled_joint_operator(
+    matrix: Array2<f64>,
+    mode: PseudoLogdetMode,
+) -> Result<Arc<dyn HessianFactorization>, CustomFamilyError> {
+    if let Some(cached) = assembled_operator_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&matrix, mode))
+    {
+        log::trace!("[OUTER hessian-route] reusing cached assembled operator (same matrix)");
+        return Ok(cached);
     }
-    beta_flat.len().hash(&mut hasher);
-    for &v in beta_flat {
-        hash_f64(v, &mut hasher);
+    let operator: Arc<dyn HessianFactorization> = Arc::new(
+        BlockCoupledOperator::from_joint_hessian_with_mode(&matrix, mode).map_err(|e| {
+            CustomFamilyError::trial_point(format!("BlockCoupledOperator from joint Hessian: {e}"))
+        })?,
+    );
+    if let Ok(mut cache) = assembled_operator_cache().lock() {
+        cache.insert(AssembledOperatorEntry {
+            mode,
+            matrix,
+            operator: Arc::clone(&operator),
+        });
     }
-    // Scaled penalty blocks (O(Σ p_b²); cheap vs the O(total³) factorization).
-    scaled_s_lambdas.len().hash(&mut hasher);
-    for matrix in scaled_s_lambdas {
-        matrix.dim().hash(&mut hasher);
-        for &v in matrix.iter() {
-            hash_f64(v, &mut hasher);
-        }
-    }
-    // Jeffreys curvature: presence + content.
-    match robust_jeffreys_hphi_for_operator {
-        Some(hphi) => {
-            1u8.hash(&mut hasher);
-            hphi.dim().hash(&mut hasher);
-            for &v in hphi.iter() {
-                hash_f64(v, &mut hasher);
-            }
-        }
-        None => 0u8.hash(&mut hasher),
-    }
-    // gam#1587/#561: the full-width joint penalty `Σ_t λ_t (M⊗S_t)` is part of
-    // the assembled operator `H + S_λ`, but its λ live in the OUTER ρ
-    // coordinates, NOT in the physical `rho` hashed above (which is empty when
-    // the family rides entirely on joint penalties, e.g. multinomial). Without
-    // hashing the joint penalty's content, two outer evaluations at different
-    // joint λ but a coincident β̂ collide on the same fingerprint and the second
-    // reuses the first's STALE operator — the silent gam#1395 logdet divergence.
-    // Hash presence + content so the cache key tracks the joint λ exactly.
-    match scaled_joint_penalty {
-        Some(joint) => {
-            1u8.hash(&mut hasher);
-            joint.dim().hash(&mut hasher);
-            for &v in joint.iter() {
-                hash_f64(v, &mut hasher);
-            }
-        }
-        None => 0u8.hash(&mut hasher),
-    }
-    // Dense joint Hessian content is part of the operator only on the dense
-    // path; the operator (matrix-free) path's curvature is pinned by (ρ, β̂)
-    // through the family workspace and is fingerprinted above. Including the
-    // dense source closes the only remaining content channel.
-    match h_joint_unpen {
-        JointHessianSource::Dense(matrix) => {
-            2u8.hash(&mut hasher);
-            matrix.dim().hash(&mut hasher);
-            for &v in matrix.iter() {
-                hash_f64(v, &mut hasher);
-            }
-        }
-        JointHessianSource::Operator { diagonal, .. } => {
-            3u8.hash(&mut hasher);
-            diagonal.len().hash(&mut hasher);
-            for &v in diagonal.iter() {
-                hash_f64(v, &mut hasher);
-            }
-        }
-    }
-    hasher.finish()
+    Ok(operator)
 }
 
 /// Shared implementation for the joint exact-Newton and surrogate outer paths.
@@ -1265,83 +1200,40 @@ pub(crate) fn joint_outer_evaluate(
     // the Φ-augmented inner objective) — differ only in that argument.
     //
     // Reuse the assembled operator (and its lazily-built spectral factorization)
-    // when an immediately-prior eval at the SAME ρ/β̂/curvature assembled the
-    // bit-identical operator (the BFGS Value→ValueAndGradient pair and repeated
-    // line-search probes). The fingerprint pins every operator input INCLUDING
-    // `J`, so the two objects never collide in the cache and a hit is
-    // bit-identical to a fresh build. See `AssembledOperatorCache`.
+    // when an earlier eval assembled exactly this matrix (the BFGS
+    // Value→ValueAndGradient pair and repeated line-search probes). The cache is
+    // keyed on the assembled matrix itself, which includes `J`, so the two
+    // objects never collide and a hit is the operator a fresh build would
+    // return. See `AssembledOperatorCache`.
     let assemble_operator = |jeffreys_for_operator: Option<&Array2<f64>>| -> Result<
         Arc<dyn HessianFactorization>,
         CustomFamilyError,
     > {
-        let operator_fingerprint = assembled_operator_fingerprint(
-            rho,
-            beta_flat,
+        let mut j_for_traces = materialize_joint_hessian_source(
             &h_joint_unpen,
-            &scaled_s_lambdas,
-            scaled_joint_penalty.as_ref(),
-            jeffreys_for_operator,
-            ranges,
             total,
-            rho_curvature_scale,
-            pseudo_logdet_mode,
-        );
-        let cached_operator = assembled_operator_cache()
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(operator_fingerprint));
-
-        let assembled: Arc<dyn HessianFactorization> = if let Some(cached) = cached_operator {
-            log::trace!(
-                "[OUTER hessian-route] reusing cached same-ρ assembled operator (fingerprint hit)"
-            );
-            cached
-        } else {
-            let built: Arc<dyn HessianFactorization> = {
-                let mut j_for_traces = materialize_joint_hessian_source(
-                    &h_joint_unpen,
-                    total,
-                    "joint exact-newton Hessian materialization",
-                )?;
-                add_joint_penalty_to_matrix(
-                    &mut j_for_traces,
-                    ranges,
-                    &scaled_s_lambdas,
-                    0.0,
-                    None,
-                );
-                if let Some(joint) = scaled_joint_penalty.as_ref() {
-                    j_for_traces += joint;
-                }
-                if let Some(hphi) = jeffreys_for_operator {
-                    j_for_traces.scaled_add(rho_curvature_scale, hphi);
-                }
-                // gam#1395/#1854: `BlockCoupledOperator::from_joint_hessian_with_mode`
-                // eigendecomposes via `eigh(Side::Lower)`, which reads ONLY the lower
-                // triangle and assumes the input is already symmetric. The assembled
-                // `H_unpen + S_λ + scale·H_Φ` is symmetric in exact arithmetic, but
-                // reduction-order f.p. noise desyncs mirror entries — and on the
-                // multinomial Firth/Jeffreys path the divided-difference `H_Φ` (plus
-                // its second-order completion) carries an `O(1e10)` curvature scale in
-                // the near-separation regime, so that asymmetry is large enough that
-                // reading the raw lower triangle yields a materially different spectrum
-                // (and logdet) than the symmetrized matrix. Symmetrize so the operator
-                // realizes the penalized joint Hessian its logdet is meant to price.
-                symmetrize_dense_in_place(&mut j_for_traces);
-                Arc::new(
-                    BlockCoupledOperator::from_joint_hessian_with_mode(
-                        &j_for_traces,
-                        pseudo_logdet_mode,
-                    )
-                    .map_err(|e| CustomFamilyError::trial_point(format!("BlockCoupledOperator from joint Hessian: {e}")))?,
-                )
-            };
-            if let Ok(mut cache) = assembled_operator_cache().lock() {
-                cache.insert(operator_fingerprint, Arc::clone(&built));
-            }
-            built
-        };
-        Ok(assembled)
+            "joint exact-newton Hessian materialization",
+        )?;
+        add_joint_penalty_to_matrix(&mut j_for_traces, ranges, &scaled_s_lambdas, 0.0, None);
+        if let Some(joint) = scaled_joint_penalty.as_ref() {
+            j_for_traces += joint;
+        }
+        if let Some(hphi) = jeffreys_for_operator {
+            j_for_traces.scaled_add(rho_curvature_scale, hphi);
+        }
+        // gam#1395/#1854: `BlockCoupledOperator::from_joint_hessian_with_mode`
+        // eigendecomposes via `eigh(Side::Lower)`, which reads ONLY the lower
+        // triangle and assumes the input is already symmetric. The assembled
+        // `H_unpen + S_λ + scale·H_Φ` is symmetric in exact arithmetic, but
+        // reduction-order f.p. noise desyncs mirror entries — and on the
+        // multinomial Firth/Jeffreys path the divided-difference `H_Φ` (plus
+        // its second-order completion) carries an `O(1e10)` curvature scale in
+        // the near-separation regime, so that asymmetry is large enough that
+        // reading the raw lower triangle yields a materially different spectrum
+        // (and logdet) than the symmetrized matrix. Symmetrize so the operator
+        // realizes the penalized joint Hessian its logdet is meant to price.
+        symmetrize_dense_in_place(&mut j_for_traces);
+        assembled_joint_operator(j_for_traces, pseudo_logdet_mode)
     };
 
     let hessian_op = assemble_operator(robust_jeffreys_hphi_for_operator.as_ref())?;
@@ -1966,8 +1858,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                                     )
                                 })?;
                         let wwork = certify_finite_working_weights(working_weights)?;
-                        let x_dense = x_dyn.to_dense();
-                        let n = x_dense.nrows();
+                        let n = x_dyn.nrows();
 
                         let mut d_eta = x_dyn.matrixvectormultiply(direction);
                         let geom = family.block_geometry_directional_derivative(
@@ -1976,25 +1867,12 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                             spec,
                             direction,
                         )?;
-                        let mut correction_mat = Array2::<f64>::zeros((p, p));
-
+                        let mut d_design = None;
                         if let Some(geom_dir) = geom {
                             d_eta += &geom_dir.d_offset;
                             if let Some(dx) = geom_dir.d_design {
                                 d_eta += &fast_av(&dx, &beta_flat);
-                                let mut wx = x_dense.clone();
-                                let mut wdx = dx.clone();
-                                ndarray::Zip::from(wx.rows_mut())
-                                    .and(wdx.rows_mut())
-                                    .and(wwork.view())
-                                    .par_for_each(|mut wxr, mut wdxr, &wi| {
-                                        if wi != 1.0 {
-                                            wxr.mapv_inplace(|v| v * wi);
-                                            wdxr.mapv_inplace(|v| v * wi);
-                                        }
-                                    });
-                                correction_mat += &fast_atb(&dx, &wx);
-                                correction_mat += &fast_atb(&x_dense, &wdx);
+                                d_design = Some(dx);
                             }
                         }
 
@@ -2016,12 +1894,11 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                                 n
                             ) });
                         }
-                        let mut scaled_x = x_dense.clone();
-                        ndarray::Zip::from(scaled_x.rows_mut())
-                            .and(&dw)
-                            .par_for_each(|mut sr, &dwi| sr.mapv_inplace(|v| v * dwi));
-                        correction_mat += &fast_atb(&x_dense, &scaled_x);
-
+                        let correction_mat = diagonal_block_hessian_drift(
+                            x_dyn,
+                            &dw,
+                            d_design.as_ref().map(|dx| (dx, wwork)),
+                        )?;
                         Ok(Some(DriftDerivResult::Dense(correction_mat)))
                     }
                 }
@@ -2067,8 +1944,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                                 "missing dynamic design for block {block_idx} diagonal fixed-point second correction"
                             )
                         })?;
-                        let x_dense = x_dyn.to_dense();
-                        let n = x_dense.nrows();
+                        let n = x_dyn.nrows();
                         let reject_second_order_geometry =
                             |label: &str,
                              geom: Option<BlockGeometryDirectionalDerivative>|
@@ -2123,11 +1999,9 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                                 n
                             ) });
                         }
-                        let mut scaled_x = x_dense.clone();
-                        ndarray::Zip::from(scaled_x.rows_mut())
-                            .and(&d2w)
-                            .par_for_each(|mut sr, &d2wi| sr.mapv_inplace(|value| value * d2wi));
-                        Ok(Some(DriftDerivResult::Dense(fast_atb(&x_dense, &scaled_x))))
+                        Ok(Some(DriftDerivResult::Dense(diagonal_block_hessian_drift(
+                            x_dyn, &d2w, None,
+                        )?)))
                     }
                 }
             };
@@ -2838,5 +2712,97 @@ mod first_order_trace_skip_tests {
                 .expect("still available once the list is exhausted"),
             want
         );
+    }
+}
+
+#[cfg(test)]
+mod assembled_operator_cache_tests {
+    use super::{
+        AssembledOperatorCache, AssembledOperatorEntry, BlockCoupledOperator, HessianFactorization,
+        PseudoLogdetMode, assembled_joint_operator,
+    };
+    use ndarray::array;
+    use std::sync::Arc;
+
+    /// gam#3641: the process-global cache is shared by every fit, so the key has
+    /// to be the operator's whole build input. Two assemblies with the same
+    /// diagonal (the old Operator-source key, together with coincident ρ and β̂)
+    /// but different off-diagonal curvature must each be priced by their own
+    /// matrix: `log|[[2,0],[0,2]]| = ln 4` and `log|[[2,1],[1,2]]| = ln 3`.
+    #[test]
+    fn same_diagonal_different_curvature_never_shares_an_operator_3641() {
+        let uncoupled = array![[2.0, 0.0], [0.0, 2.0]];
+        let coupled = array![[2.0, 1.0], [1.0, 2.0]];
+        for mode in [
+            PseudoLogdetMode::Smooth,
+            PseudoLogdetMode::HardPseudo,
+            PseudoLogdetMode::PositiveDefinite,
+        ] {
+            let first = assembled_joint_operator(uncoupled.clone(), mode).expect("uncoupled");
+            let second = assembled_joint_operator(coupled.clone(), mode).expect("coupled");
+            let again = assembled_joint_operator(uncoupled.clone(), mode).expect("uncoupled again");
+            let fresh = |matrix| {
+                BlockCoupledOperator::from_joint_hessian_with_mode(matrix, mode)
+                    .expect("fresh build")
+                    .logdet()
+            };
+            assert_eq!(first.logdet(), fresh(&uncoupled), "{mode:?}");
+            assert_eq!(second.logdet(), fresh(&coupled), "{mode:?}");
+            assert_eq!(again.logdet(), fresh(&uncoupled), "{mode:?}");
+            assert!((first.logdet() - 4f64.ln()).abs() <= 1e-14, "{mode:?}");
+            assert!((second.logdet() - 3f64.ln()).abs() <= 1e-14, "{mode:?}");
+        }
+    }
+
+    /// The key is the exact `(matrix, mode)` pair: equal matrices under one mode
+    /// hit, a different mode or a single differing entry misses. The previous
+    /// fingerprint folded the mode to `mode == Smooth`, so `HardPseudo` and
+    /// `PositiveDefinite` assemblies of one matrix aliased.
+    #[test]
+    fn the_cache_key_is_the_exact_matrix_and_mode_3641() {
+        let matrix = array![[3.0, 0.5], [0.5, 1.0]];
+        let operator: Arc<dyn HessianFactorization> = Arc::new(
+            BlockCoupledOperator::from_joint_hessian_with_mode(
+                &matrix,
+                PseudoLogdetMode::HardPseudo,
+            )
+            .expect("build"),
+        );
+        let mut cache = AssembledOperatorCache {
+            entries: Vec::with_capacity(AssembledOperatorCache::CAPACITY),
+        };
+        cache.insert(AssembledOperatorEntry {
+            mode: PseudoLogdetMode::HardPseudo,
+            matrix: matrix.clone(),
+            operator: Arc::clone(&operator),
+        });
+        let hit = cache
+            .get(&matrix, PseudoLogdetMode::HardPseudo)
+            .expect("same matrix and mode must hit");
+        assert!(Arc::ptr_eq(&hit, &operator));
+        assert!(cache.get(&matrix, PseudoLogdetMode::PositiveDefinite).is_none());
+        assert!(cache.get(&matrix, PseudoLogdetMode::Smooth).is_none());
+        let mut perturbed = matrix.clone();
+        perturbed[[1, 0]] = f64::from_bits(perturbed[[1, 0]].to_bits() + 1);
+        assert!(cache.get(&perturbed, PseudoLogdetMode::HardPseudo).is_none());
+        let mut signed_zero = array![[3.0, 0.0], [0.0, 1.0]];
+        let zero_operator: Arc<dyn HessianFactorization> = Arc::new(
+            BlockCoupledOperator::from_joint_hessian_with_mode(
+                &signed_zero,
+                PseudoLogdetMode::HardPseudo,
+            )
+            .expect("build"),
+        );
+        cache.insert(AssembledOperatorEntry {
+            mode: PseudoLogdetMode::HardPseudo,
+            matrix: signed_zero.clone(),
+            operator: Arc::clone(&zero_operator),
+        });
+        signed_zero[[0, 1]] = -0.0;
+        let zero_hit = cache
+            .get(&signed_zero, PseudoLogdetMode::HardPseudo)
+            .expect("-0.0 and +0.0 are the same entry");
+        assert!(Arc::ptr_eq(&zero_hit, &zero_operator));
+        assert_eq!(cache.entries.len(), AssembledOperatorCache::CAPACITY);
     }
 }
