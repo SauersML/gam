@@ -1,26 +1,5 @@
 use super::*;
 
-/// Declares what a specific model path can provide to the outer optimizer.
-///
-/// Each call site that optimizes smoothing parameters constructs one of these
-/// to describe its analytic derivative coverage. The [`plan`] function then
-/// selects the optimizer and Hessian strategy.
-///
-/// HISTORY: this crossover used to be 8 — a "performance choice" that routed
-/// every small-dimensional problem WITH an analytic gradient to BFGS on the
-/// theory that a dense quasi-Newton is cheaper below the cutoff. On the
-/// criteria that actually fail (the SAE manifold Laplace evidence: 2–7 ρ
-/// coordinates, piecewise-smooth basin-envelope value, inner-solve truncation
-/// noise), BFGS is not cheaper — its Strong-Wolfe line search is the consumer
-/// of the entire probe-lane / wall / escape / rescue apparatus, and every cost
-/// probe is a full inner re-convergence. EFS is the declared canonical REML
-/// method, needs only the traces `tr(H⁻¹S_k)` (no line search, no Wolfe, no
-/// value/gradient-lane agreement), and already drives every large fit. The
-/// crossover is therefore 0: a fixed-point-capable objective routes to
-/// EFS/HybridEfs at EVERY dimension, and BFGS remains the fallback for
-/// objectives with no fixed-point hook (or after `disable_fixed_point`).
-pub(crate) const SMALL_OUTER_BFGS_MAX_PARAMS: usize = 0;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OuterThetaLayout {
     pub n_params: usize,
@@ -169,6 +148,11 @@ impl OuterThetaLayout {
     }
 }
 
+/// Declares what a specific model path can provide to the outer optimizer.
+///
+/// Each call site that optimizes smoothing parameters constructs one of these
+/// to describe its analytic derivative coverage. The [`plan`] function then
+/// selects the optimizer and Hessian strategy.
 #[derive(Clone, Debug)]
 pub struct OuterCapability {
     pub gradient: Derivative,
@@ -264,25 +248,29 @@ impl OuterCapability {
         self.psi_dim > 0
     }
 
+    /// A fixed-point-capable, all-penalty-like objective routes to EFS at
+    /// every dimension; no coordinate count decides it.
+    ///
+    /// HISTORY: a former ≤8-coordinate crossover routed every small problem
+    /// WITH an analytic gradient to BFGS on the theory that a dense
+    /// quasi-Newton is cheaper below the cutoff. On the criteria that actually
+    /// fail (the SAE manifold Laplace evidence: 2–7 ρ coordinates,
+    /// piecewise-smooth basin-envelope value, inner-solve truncation noise),
+    /// BFGS is not cheaper — its Strong-Wolfe line search is the consumer of
+    /// the entire probe-lane / wall / escape / rescue apparatus, and every cost
+    /// probe is a full inner re-convergence. EFS is the declared canonical
+    /// REML method, needs only the traces `tr(H⁻¹S_k)` (no line search, no
+    /// Wolfe, no value/gradient-lane agreement), and already drives every
+    /// large fit. BFGS remains the plan for objectives with no fixed-point
+    /// hook (or after `disable_fixed_point`).
     fn efs_plan_eligible(&self) -> bool {
-        self.fixed_point_available
-            && !self.disable_fixed_point
-            && self.all_penalty_like()
-            // A fixed-point-capable objective routes to EFS at every dimension
-            // (see `SMALL_OUTER_BFGS_MAX_PARAMS`): the former ≤8-coordinate
-            // BFGS crossover sent exactly the failing small fits into the
-            // fragile Wolfe/probe lane while large fits got the robust
-            // trace-based fixed point.
-            && (self.gradient == Derivative::Unavailable
-                || self.n_params > SMALL_OUTER_BFGS_MAX_PARAMS)
+        self.fixed_point_available && !self.disable_fixed_point && self.all_penalty_like()
     }
 
+    /// ψ-carrying fixed-point objectives route to HybridEfs at every
+    /// dimension, for the same reason as `efs_plan_eligible`.
     fn hybrid_efs_plan_eligible(&self) -> bool {
-        self.fixed_point_available
-            && !self.disable_fixed_point
-            && self.has_psi_coords()
-            && (self.gradient == Derivative::Unavailable
-                || self.n_params > SMALL_OUTER_BFGS_MAX_PARAMS)
+        self.fixed_point_available && !self.disable_fixed_point && self.has_psi_coords()
     }
 
     fn declared_hessian_for_planning(&self) -> Derivative {
