@@ -6,7 +6,7 @@
 //! fit. Python bindings only marshal arrays and call these entries.
 
 use super::*;
-use gam_terms::basis::duchon_nullspace_dimension;
+use gam_terms::basis::{default_num_centers, duchon_nullspace_dimension};
 
 /// Per-atom basis spec used by [`sae_build_padded_basis_stacks`] to assemble the
 /// padded `(K, N, M_max)` design plus jacobian, smoothness penalty stack, and
@@ -147,8 +147,8 @@ pub fn sae_build_padded_basis_stacks(
 /// (`resolve_auto_primary_atoms`), interpreted per the atom's resolved basis
 /// kind: the thin-plate center count for a #2240 Duchon-sheet winner (clamped to
 /// the identifiability floor and to `n_obs`), or the per-axis harmonic order for
-/// a #2243 torus winner (clamped to the dense guard). `None` entries keep the
-/// fixed economy budget below.
+/// a #2243 torus winner (clamped to the dense guard). `None` entries take the
+/// data-derived default resolution of their kind.
 pub(crate) fn sae_build_atom_plans(
     z: ArrayView2<'_, f64>,
     atom_basis: &[String],
@@ -305,22 +305,24 @@ pub(crate) fn sae_build_atom_plans(
                 // exceed the polynomial nullspace dimension of its resolved
                 // order. The identifiability floor `nullspace + d + 1` clears that
                 // dimension, so a positive-rank kernel block survives, and it is
-                // the same floor the discovery race prices a Duchon sheet at. It is
-                // bounded above by `n_obs` and the dense cap. The Euclidean patch
-                // ignores centers, so this lower bound is harmless there.
+                // the same floor the discovery race prices a Duchon sheet at. The
+                // Euclidean patch ignores centers, so this lower bound is harmless
+                // there.
                 let duchon_m = sae_duchon_atom_m(d);
                 let poly_nullspace_dim = duchon_nullspace_dimension(d, duchon_m.saturating_sub(1));
-                let center_floor = poly_nullspace_dim + d + 1;
-                let center_ceiling = center_floor.max(32);
-                let lo = center_floor.min(n_obs);
-                let hi = center_ceiling.min(n_obs);
+                let lo = (poly_nullspace_dim + d + 1).min(n_obs);
                 // #2240 — a Duchon-sheet discovery winner carries its
                 // evidence-selected center count; honor it (clamped to the
-                // identifiability floor and the row count) instead of the
-                // fixed economy ceiling.
+                // identifiability floor and the row count). Any other Duchon atom
+                // takes the production radial-smooth budget for `d` coordinates
+                // on `n_obs` rows (#3826). An atom's resolution is fixed once
+                // planned (no adequacy loop grows it), so the budget is the ample
+                // one whose unsupported directions the atom's REML λ shrinks, not
+                // the refinable pilot: under-provisioning caps reconstruction,
+                // over-provisioning does not.
                 let n_centers = match resolution_overrides[atom_idx] {
                     Some(selected) => selected.min(n_obs).max(lo),
-                    None => n_obs.min(hi).max(lo),
+                    None => default_num_centers(n_obs, d).max(lo),
                 };
                 let idx = sae_pick_duchon_center_indices(
                     n_obs,
@@ -640,6 +642,51 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Center count of a planned Duchon atom with no discovery override.
+    fn planned_duchon_centers(n_obs: usize, d: usize) -> usize {
+        let golden = 0.618_033_988_749_894_9_f64;
+        let z = Array2::<f64>::zeros((n_obs, 1));
+        let mut seed_coords = Array3::<f64>::zeros((1, n_obs, d));
+        for row in 0..n_obs {
+            for axis in 0..d {
+                seed_coords[[0, row, axis]] = ((row + 1) as f64 * (golden + axis as f64)).fract();
+            }
+        }
+        let plans =
+            sae_build_atom_plans(z.view(), &["duchon".to_string()], &[d], seed_coords.view(), 5, &[None])
+                .expect("duchon plan");
+        match plans[0].geometry.resolution() {
+            SaeBasisResolution::DuchonCoordinates { centers } => {
+                assert_eq!(centers.ncols(), d);
+                centers.nrows()
+            }
+            other => panic!("duchon atom planned a non-Duchon resolution: {other:?}"),
+        }
+    }
+
+    /// #3826 — an un-overridden Duchon atom's center budget grows with its rows
+    /// at the production radial-smooth rate instead of stopping at a fixed
+    /// ceiling, and never drops below the identifiability floor.
+    #[test]
+    fn default_duchon_atom_budget_is_row_derived_3826() {
+        for d in [1usize, 2] {
+            let floor = duchon_nullspace_dimension(d, sae_duchon_atom_m(d) - 1) + d + 1;
+            let small = planned_duchon_centers(12, d);
+            assert_eq!(small, floor.min(12), "d={d}: tiny atoms sit on the identifiability floor");
+            let mut previous = small;
+            for n_obs in [400usize, 1_600, 6_400] {
+                let centers = planned_duchon_centers(n_obs, d);
+                assert_eq!(centers, default_num_centers(n_obs, d).max(floor), "d={d} n={n_obs}");
+                assert!(centers >= previous, "d={d} n={n_obs}: budget must not shrink with rows");
+                previous = centers;
+            }
+            assert!(
+                previous > 32,
+                "d={d}: a 6400-row atom must not be held at the retired 32-center ceiling, got {previous}"
+            );
         }
     }
 }

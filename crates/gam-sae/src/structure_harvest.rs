@@ -6553,7 +6553,7 @@ fn select_torus_resolution(
 ///   its own candidate) installs as `duchon` and carries its evidence-selected
 ///   center count in the returned per-atom override vector, so the seed
 ///   builder grows the thin-plate resolution REML picked rather than its
-///   fixed economy budget;
+///   default budget;
 /// * a circle winner carries the harmonic resolution the fit-entry evidence
 ///   race selected (#2243), installed as the periodic atom's `d_atom` (the seed
 ///   builder's harmonic-count knob) so discovery grows resolution rather than
