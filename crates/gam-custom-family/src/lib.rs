@@ -138,6 +138,10 @@ pub(crate) use joint_newton::whitened_spectrum;
 // in gam-solve). Its three entry points are re-imported into the prelude above
 // via `crate::custom_family_persistent_warm_start::{...}`.
 mod custom_family_persistent_warm_start;
+// The one design-matrix hash of the persistent warm-start key, for families
+// whose `persistent_warm_start_fingerprint` covers designs held outside the
+// block specs (gam#3002).
+pub use crate::custom_family_persistent_warm_start::hash_cf_design_matrix;
 
 mod assembly;
 mod block_spec;

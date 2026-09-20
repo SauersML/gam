@@ -215,8 +215,11 @@ impl FitConfig {
                 );
             }
         }
+        // The materializer's own predicate, so every spelling it fits as
+        // transformation-normal also carries its config.
         if self.transformation_normal_config.is_some()
-            && !(self.transformation_normal || self.family.as_deref() == Some("transformation-normal"))
+            && !(self.transformation_normal
+                || family_requests_transformation_normal(self.family.as_deref()))
         {
             return Err("transformation_normal_config requires a transformation-normal fit".to_string());
         }
@@ -445,6 +448,40 @@ mod tests {
         assert_eq!(inline.resolved_expectile_levels(), Ok(Some(vec![0.25, 0.75])));
         let median = config(Some("expectile"), None).resolve().unwrap();
         assert_eq!(median.resolved_expectile_levels(), Ok(Some(vec![0.5])));
+    }
+
+    /// `transformation_normal_config` is legal on exactly the requests the
+    /// materializer fits as transformation-normal; family names are
+    /// case-insensitive.
+    #[test]
+    fn transformation_normal_config_follows_the_materializer_family_predicate() {
+        let request = |family: Option<&str>, flag: bool| FitConfig {
+            family: family.map(str::to_string),
+            transformation_normal: flag,
+            transformation_normal_config: Some(TransformationNormalConfig::default()),
+            ..FitConfig::default()
+        };
+        for family in [
+            "transformation-normal",
+            "Transformation-Normal",
+            " TRANSFORMATION-NORMAL ",
+        ] {
+            assert!(
+                family_requests_transformation_normal(Some(family)),
+                "{family}: the materializer fits this spelling as transformation-normal"
+            );
+            request(Some(family), false)
+                .resolve()
+                .unwrap_or_else(|error| panic!("{family}: {error}"));
+        }
+        request(None, true).resolve().expect("the flag spelling");
+        for family in [None, Some("gaussian"), Some("transformation")] {
+            let error = request(family, false).resolve().unwrap_err();
+            assert_eq!(
+                error, "transformation_normal_config requires a transformation-normal fit",
+                "{family:?}"
+            );
+        }
     }
 
     #[test]

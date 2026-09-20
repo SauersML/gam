@@ -6,8 +6,8 @@
 //!
 //! # Log-sum-exp and log-softmax
 //!
-//! `lse(z) = log Σ_i e^{z_i}` is [`signed_log_sum_exp`] with every sign positive: one common max-shift and a compensated
-//! sum, so gam-math keeps one owner of the reduction. `log softmax(z)_i = z_i − lse(z)`.
+//! `lse(z) = log Σ_i e^{z_i}` is [`positive_log_sum_exp`], the signed log-sum-exp with every sign positive: one
+//! common max-shift and a compensated sum, so gam-math keeps one owner of the reduction. `log softmax(z)_i = z_i − lse(z)`.
 //!
 //! # KL from logits
 //!
@@ -75,7 +75,7 @@
 
 use std::fmt;
 
-use crate::probability::signed_log_sum_exp;
+use crate::probability::positive_log_sum_exp;
 use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use crate::special::softplus;
 
@@ -140,11 +140,6 @@ fn validate(name: &'static str, logits: &[f64]) -> Result<(), CategoricalError> 
         return Err(CategoricalError::NoSupport { name });
     }
     Ok(())
-}
-
-/// `log Σ_i e^{x_i}` over terms that may be `−∞`; an empty or all-`−∞` sum is `−∞`.
-fn positive_log_sum_exp(log_terms: &[f64]) -> f64 {
-    signed_log_sum_exp(log_terms, &vec![1.0; log_terms.len()]).0
 }
 
 /// A first-order bound on `|lse(x) − normalizer|` read off the normalization defect (see the module documentation), and
@@ -231,7 +226,7 @@ fn log_excess_exponential(d: f64) -> (f64, f64) {
     }
 }
 
-/// `lse(z) = log Σ_i e^{z_i}`, through [`signed_log_sum_exp`]'s max-shifted compensated sum.
+/// `lse(z) = log Σ_i e^{z_i}`, through [`positive_log_sum_exp`]'s max-shifted compensated sum.
 pub fn log_sum_exp(logits: &[f64]) -> Result<f64, CategoricalError> {
     validate("logits", logits)?;
     Ok(positive_log_sum_exp(logits))
