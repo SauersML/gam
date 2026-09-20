@@ -5,9 +5,11 @@
 //! (basis builds are already past 150× via parallel + algorithmic
 //! changes).
 //!
-//! These tests print timings via eprintln and are intentionally
-//! ungated — they always pass even if the perf is slow — so the
-//! numbers are visible in CI logs without breaking the build.
+//! Wall-clock timings are printed via eprintln and are not gated (shared CI
+//! runners make a latency budget meaningless). What IS gated is that every
+//! timed fit succeeds and returns a standard fit: a timing of a fit that
+//! errored measures nothing, so `time_fit` panics with the fit's own error
+//! instead of reporting `p=0` and passing.
 
 use csv::StringRecord;
 use gam::basis::{BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec};
@@ -85,18 +87,28 @@ fn sphere_data(n: usize) -> gam::data::EncodedDataset {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "sphere", e))
 }
 
-fn time_fit(formula: &str, data: &gam::data::EncodedDataset, cfg: &FitConfig) -> (f64, usize) {
+/// Time one fit. The fit must succeed and be a standard fit; its error is
+/// the test failure otherwise. Returns `(ms, p, standard_deviation)`.
+fn time_fit(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    cfg: &FitConfig,
+) -> (f64, usize, f64) {
     let t = Instant::now();
     let res = fit_from_formula(formula, data, cfg);
     let ms = t.elapsed().as_secs_f64() * 1e3;
-    let p = res
-        .ok()
-        .map(|r| match r {
-            FitResult::Standard(f) => f.fit.beta.len(),
-            _ => 0,
-        })
-        .unwrap_or(0);
-    (ms, p)
+    let fit = match res {
+        Ok(FitResult::Standard(fit)) => fit,
+        Ok(_) => panic!("`{formula}` must produce a standard fit"),
+        Err(error) => panic!("`{formula}` must fit (after {ms:.0} ms): {error}"),
+    };
+    let p = fit.fit.beta.len();
+    assert!(p > 0, "`{formula}` returned a fit with no coefficients");
+    assert!(
+        fit.fit.beta.iter().all(|b| b.is_finite()),
+        "`{formula}` returned non-finite coefficients"
+    );
+    (ms, p, fit.fit.standard_deviation)
 }
 
 #[test]
@@ -107,7 +119,7 @@ fn large_scale_perf_cylinder_n1m() {
         ..FitConfig::default()
     };
     let data = cylinder_data(1_000_000);
-    let (ms, p) = time_fit(
+    let (ms, p, _) = time_fit(
         "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])",
         &data,
         &cfg,
@@ -123,7 +135,7 @@ fn large_scale_perf_periodic_1d_n1m() {
         ..FitConfig::default()
     };
     let data = periodic_1d_data(1_000_000);
-    let (ms, p) = time_fit(
+    let (ms, p, _) = time_fit(
         "y ~ cyclic(theta, period_start=0, period_end=6.283185307179586)",
         &data,
         &cfg,
@@ -139,7 +151,7 @@ fn large_scale_perf_bc_1d_n1m() {
         ..FitConfig::default()
     };
     let data = bc_1d_data(1_000_000);
-    let (ms, p) = time_fit("y ~ s(x, bc=anchored)", &data, &cfg);
+    let (ms, p, _) = time_fit("y ~ s(x, bc=anchored)", &data, &cfg);
     eprintln!("[large-scale-fit] bc_anchored 1D N=1M p={p}: {ms:.0} ms");
 }
 
@@ -154,7 +166,7 @@ fn large_scale_perf_sphere_wahba_n100k() {
         ..FitConfig::default()
     };
     let data = sphere_data(100_000);
-    let (ms, p) = time_fit("y ~ sphere(lat, lon, k=24)", &data, &cfg);
+    let (ms, p, _) = time_fit("y ~ sphere(lat, lon, k=24)", &data, &cfg);
     eprintln!("[large-scale-fit] sphere_wahba N=100K K=24 p={p}: {ms:.0} ms");
 }
 
@@ -166,7 +178,7 @@ fn large_scale_perf_sphere_harmonic_n1m() {
         ..FitConfig::default()
     };
     let data = sphere_data(1_000_000);
-    let (ms, p) = time_fit(
+    let (ms, p, _) = time_fit(
         "y ~ sphere(lat, lon, method=harmonic, max_degree=4)",
         &data,
         &cfg,
@@ -177,19 +189,15 @@ fn large_scale_perf_sphere_harmonic_n1m() {
 // ----- accuracy & robustness: NOISY data, multiple families -----
 
 fn noisy_cylinder_data(n: usize, noise_sd: f64, seed: u64) -> gam::data::EncodedDataset {
-    let mut s = seed;
-    let mut rand_normal = move || -> f64 {
-        // Box-Muller from LCG
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let u1 = ((s >> 33) as f64 / u32::MAX as f64).max(1e-30);
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let u2 = (s >> 33) as f64 / u32::MAX as f64;
-        (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
-    };
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand_distr::{Distribution, Normal};
+    // Genuine N(0, 1) draws. (The former hand-rolled Box-Muller divided a
+    // 31-bit LCG word by `u32::MAX`, so its uniforms lived on [0, 0.5) and the
+    // "unit normal" had standard deviation ~1.30, not 1.)
+    let mut rng = StdRng::seed_from_u64(seed);
+    let unit = Normal::new(0.0, 1.0).expect("unit normal");
+    let mut rand_normal = move || -> f64 { unit.sample(&mut rng) };
     let headers = vec!["theta".into(), "h".into(), "y".into()];
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
@@ -206,7 +214,18 @@ fn noisy_cylinder_data(n: usize, noise_sd: f64, seed: u64) -> gam::data::Encoded
 
 #[test]
 fn large_scale_perf_cylinder_noisy_n100k_accuracy() {
-    // Fit on noisy data, check that |residuals| has expected scale.
+    // Fit on noisy data and check that the estimated residual scale recovers
+    // the injected noise scale.
+    //
+    // The truth (a cyclic cos/sin in theta plus a linear h) lies in the
+    // te(theta, h) span up to cubic-spline approximation error ~1e-3, whose
+    // square is negligible next to sigma^2 = 1e-2. With A the influence matrix
+    // and nu = n - edf, the fitted sigma_hat^2 = RSS/nu (or RSS/n when no
+    // inference is computed) has
+    //   * relative bias (tr A^2 - edf)/nu or -(2 edf - tr A^2)/n, both within
+    //     [-2 edf/n, 0], i.e. at most edf/n <= p/n on sigma_hat itself;
+    //   * sampling SD sqrt(2/nu) on sigma_hat^2, i.e. 1/sqrt(2 nu) on sigma_hat.
+    // The gate is |sigma_hat/sigma - 1| <= p/n + 4/sqrt(2 (n - p)), using edf <= p.
     init_parallelism();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -215,12 +234,24 @@ fn large_scale_perf_cylinder_noisy_n100k_accuracy() {
     let n = 100_000;
     let true_sd = 0.1;
     let data = noisy_cylinder_data(n, true_sd, 42);
-    let (ms, p) = time_fit(
+    let (ms, p, sigma_hat) = time_fit(
         "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])",
         &data,
         &cfg,
     );
-    eprintln!("[large-scale-fit] cylinder_noisy N={n} p={p}: {ms:.0} ms (target ≤ 200 ms)");
+    let n_f = n as f64;
+    let p_f = p as f64;
+    let band = p_f / n_f + 4.0 / (2.0 * (n_f - p_f)).sqrt();
+    let rel = sigma_hat / true_sd - 1.0;
+    eprintln!(
+        "[large-scale-fit] cylinder_noisy N={n} p={p}: {ms:.0} ms; sigma_hat={sigma_hat:.6} \
+         true_sd={true_sd} rel_err={rel:+.5} band=±{band:.5}"
+    );
+    assert!(
+        rel.abs() <= band,
+        "estimated residual scale {sigma_hat:.6} misses the injected noise sd {true_sd} by \
+         {rel:+.5} (relative), outside the derived ±{band:.5} (bias p/n + 4 sampling SDs)"
+    );
 }
 
 #[test]
@@ -261,7 +292,7 @@ fn large_scale_perf_mixed_three_smooths_n100k() {
         .collect();
     let data = encode_recordswith_inferred_schema(headers, rows)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "mixed", e));
-    let (ms, p) = time_fit(
+    let (ms, p, _) = time_fit(
         "y ~ cyclic(theta, period_start=0, period_end=6.283185307179586) + s(x, bc=anchored) + sphere(lat, lon, method=harmonic, max_degree=3)",
         &data,
         &cfg,
@@ -294,7 +325,7 @@ fn large_scale_perf_binomial_cylinder_n100k() {
         family: Some("binomial".to_string()),
         ..FitConfig::default()
     };
-    let (ms, p) = time_fit(
+    let (ms, p, _) = time_fit(
         "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])",
         &data,
         &cfg,

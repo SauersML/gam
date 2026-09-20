@@ -112,13 +112,13 @@ fn cylinder_fit_scaling_curve() {
         let t = Instant::now();
         let res = fit_from_formula(formula, &data, &cfg);
         let ms = t.elapsed().as_secs_f64() * 1e3;
-        let p = res
-            .ok()
-            .map(|r| match r {
-                FitResult::Standard(f) => f.fit.beta.len(),
-                _ => 0,
-            })
-            .unwrap_or(0);
+        // A timing of a fit that errored measures nothing: the fit must
+        // succeed and be standard at every N, or the curve is not a curve.
+        let p = match res {
+            Ok(FitResult::Standard(f)) => f.fit.beta.len(),
+            Ok(_) => panic!("cylinder te N={n}: expected a standard fit"),
+            Err(e) => panic!("cylinder te N={n}: fit failed after {ms:.0} ms: {e}"),
+        };
         eprintln!("[scale] cylinder te N={n} p={p}: {ms:.3} ms");
     }
 }
