@@ -1,80 +1,5 @@
 use super::*;
 
-/// Rebuild `Vb` from a saved fit that persisted only the penalized Hessian.
-///
-/// The two CLI entry points below both need this fallback, and both used to
-/// hand-roll it as `from_factorized_hessian_scaled(H, 1.0)` — which is `φ = 1` and *no*
-/// constrained correction. That is not `Vb` for either of the two reasons the
-/// library's own fallback (`gam-predict`'s `conditional_prediction_backend`)
-/// handles:
-///
-/// * the module invariant is `Vb = φ·H⁻¹`, and `φ` is the profiled residual
-///   variance `σ̂²` for the scale-free profiled Gaussian (`1.0` for every family
-///   whose IRLS weight already carries the dispersion, #679); and
-/// * a fit that accepted inequality constraints has a **truncated** Laplace
-///   posterior, whose covariance is `Σ − GΔGᵀ`, not the ambient `Σ`. Where a
-///   constraint is active the ambient covariance is simply the wrong object:
-///   it describes spread along directions the feasible set does not have
-///   (#2385).
-///
-/// The two are one fix rather than two, because the correction's `lift` and
-/// `removed_normal_variance` already live on the φ-scaled covariance metric
-/// (see `PredictionCovarianceBackend::Factorized`). Subtracting a φ-scaled
-/// `GΔGᵀ` from an unscaled `H⁻¹` would be dimensionally inconsistent, so the
-/// correction cannot be routed here without also honoring `φ`.
-///
-/// Consequence of routing both through the library's constructor: a fit with no
-/// engine-level family (custom / GAMLSS) has no scalar coefficient-covariance
-/// scale and is now refused here, exactly as the library path already refuses
-/// it, instead of silently returning an unscaled `H⁻¹` labelled `Vb`.
-fn factorized_covariance_fallback(fit: &UnifiedFitResult) -> Option<Result<PredictionCovarianceBackend<'_>, String>> {
-    if let Err(error) = fit.require_posterior_mean("coefficient covariance summary") {
-        return Some(Err(error.to_string()));
-    }
-    // An expectile fit's Hessian rebuilds the Gaussian working-model `Vb`, the
-    // covariance its declined sandwich replaces; its identity-link point never
-    // needs it, so the only thing this reconstruction could feed is a band
-    // the fit declared inadmissible.
-    if let Some(
-        declined @ gam::estimate::CovarianceDeclined::ExpectileSandwichRequiresDenseCovariance {
-            ..
-        },
-    ) = fit.artifacts.covariance_declined.as_ref()
-    {
-        return Some(Err(declined.explain()));
-    }
-    let hessian = fit.penalized_hessian()?;
-    let scale = match fit.coefficient_covariance_scale() {
-        Ok(scale) => scale,
-        Err(error) => {
-            return Some(Err(format!(
-                "saved model persisted only a penalized Hessian, so the reported covariance must be \
-                 reconstructed as Vb = phi*H^-1, but this fit has no scalar coefficient-covariance \
-                 scale: {error}"
-            )));
-        }
-    };
-    let constrained_correction = match fit
-        .geometry
-        .as_ref()
-        .and_then(|geometry| geometry.constrained_posterior.as_ref())
-    {
-        Some(posterior) => match posterior.correction() {
-            Ok(correction) => correction,
-            Err(reason) => return Some(Err(reason)),
-        },
-        None => None,
-    };
-    Some(
-        PredictionCovarianceBackend::from_factorized_hessian_scaled_with_correction(
-            SymmetricMatrix::Dense(hessian.clone()),
-            scale,
-            constrained_correction,
-        )
-        .map_err(|e| format!("failed to factor saved penalized Hessian for prediction: {e}")),
-    )
-}
-
 /// The covariance definition a `gam predict` invocation uses: the explicit
 /// `--covariance-mode` when given, else the definition the saved fit
 /// publishes — the same resolution the Python bindings apply to
@@ -93,80 +18,17 @@ pub(crate) fn resolved_covariance_mode(
     })
 }
 
-/// The refusal for an explicit corrected request on a fit that selected
-/// smoothing parameters but carries no correction. Refitting with the same
-/// binary publishes the same absence (a Jeffreys family without its third
-/// information derivative declares no exact outer Hessian, so no correction is
-/// minted), so the message names the modes that exist instead of a refit (#2677).
-const SMOOTHING_CORRECTED_ABSENT: &str = "saved model does not contain smoothing-corrected covariance: its fit selected smoothing parameters but published no rho-uncertainty correction; request --covariance-mode conditional, or omit --covariance-mode to use the covariance the fit publishes";
-
-pub(crate) fn covariance_from_model(
-    model: &SavedModel,
-    mode: InferenceCovarianceMode,
-) -> Result<Array2<f64>, String> {
-    let fit = model
-        .fit_result
-        .as_ref()
-        .ok_or_else(|| "model is missing canonical fit_result payload; refit".to_string())?;
-    fit.require_posterior_mean("saved-model covariance summary")
-        .map_err(|error| error.to_string())?;
-    if mode == InferenceCovarianceMode::SmoothingCorrected {
-        if let Some(cov) = fit.beta_covariance_corrected() {
-            return Ok(cov.clone());
-        }
-        // A fit whose inference stayed factorized carries `Vp = Vb + B·Bᵀ` as the
-        // correction's factor beside its Hessian (#3283).
-        if let Some(backend) = gam_predict::smoothing_corrected_factorized_backend(
-            fit,
-            fit.beta.len(),
-            "saved-model covariance summary",
-        )
-        .map_err(|error| error.to_string())?
-        {
-            let dim = backend.nrows();
-            return backend.apply_columns(&Array2::<f64>::eye(dim)).map_err(|e| {
-                format!("failed to recover the smoothing-corrected covariance from its factors: {e}")
-            });
-        }
-        // With NO smoothing coordinates the correction J·V_rho·Jᵀ is the unique
-        // zero-dimensional zero matrix, so Vp = Vb EXACTLY. This is an identity
-        // of the definition, not a fallback to a weaker uncertainty object, and
-        // the library predict path already applies it (`gam-predict`'s
-        // `select_uncertainty_backend`, the `!fit.has_smoothing_coordinate()` branch).
-        // The CLI never did, so every SAVED fit with an empty lambda vector —
-        // a fully parametric survival fit is the common case — refused the
-        // DEFAULT `gam predict` invocation (`--mode posterior-mean
-        // --covariance-mode corrected`) with "refit before requesting", an
-        // instruction no refit could satisfy because there is no correction to
-        // compute. A fit that DOES carry smoothing coordinates keeps the hard
-        // refusal: there the correction is a real, absent term.
-        if fit.has_smoothing_coordinate() {
-            return Err(match fit.smoothing_correction_absence() {
-                Some(absence) => format!("{SMOOTHING_CORRECTED_ABSENT}; the fit recorded why: {absence}"),
-                None => SMOOTHING_CORRECTED_ABSENT.to_string(),
-            });
-        }
-    }
-    if let Some(cov) = fit.beta_covariance() {
-        return Ok(cov.clone());
-    }
-    if let Some(backend) = factorized_covariance_fallback(fit) {
-        let backend = backend?;
-        let dim = backend.nrows();
-        let mut eye = Array2::<f64>::zeros((dim, dim));
-        for j in 0..dim {
-            eye[[j, j]] = 1.0;
-        }
-        return backend.apply_columns(&eye).map_err(|e| {
-            format!("failed to recover covariance from saved penalized Hessian: {e}")
-        });
-    }
-    Err(
-        "nonlinear posterior-mean prediction requires covariance or a saved penalized Hessian; refit"
-            .to_string(),
-    )
-}
-
+/// The coefficient-covariance backend a saved-model prediction applies under
+/// `mode`, selected by the library's own
+/// [`UncertaintyCovarianceSource::select_uncertainty_backend`] — the selection
+/// every library and Python predict path already uses — so `gam predict` reads
+/// one definition instead of a hand-rolled copy of it: the dense `Vb`/`Vp`,
+/// the factorized `Vp = Vb + B·Bᵀ` (#3283), `Vp = Vb` exactly when the fit has
+/// no smoothing coordinates, and otherwise `Vb = φ·H⁻¹` from the saved
+/// penalized Hessian, lifted through the coefficient gauge (#1561) and
+/// truncated by an active constraint set (#2385). A fit that withheld its
+/// covariance (#2718, #2985) or declined its posterior moments is refused with
+/// its own reason, in both modes.
 pub(crate) fn prediction_backend_from_model<'a>(
     model: &'a SavedModel,
     mode: InferenceCovarianceMode,
@@ -175,48 +37,39 @@ pub(crate) fn prediction_backend_from_model<'a>(
         .fit_result
         .as_ref()
         .ok_or_else(|| "model is missing canonical fit_result payload; refit".to_string())?;
-    if mode == InferenceCovarianceMode::SmoothingCorrected {
-        if let Some(covariance) = fit.beta_covariance_corrected() {
-            return Ok(PredictionCovarianceBackend::from_dense(covariance.view()));
-        }
-        // The factorized branch's `Vp = Vb + B·Bᵀ` (#3283).
-        if let Some(backend) = gam_predict::smoothing_corrected_factorized_backend(
-            fit,
-            fit.beta.len(),
-            "saved-model prediction",
-        )
-        .map_err(|error| error.to_string())?
-        {
-            return Ok(backend);
-        }
-        // Same zero-smoothing-coordinate identity as `covariance_from_model`
-        // above: Vp = Vb when there is no rho to integrate over. Falling
-        // through to the conditional sources is the CORRECTED answer here, not
-        // a substitution of a narrower band.
-        if fit.has_smoothing_coordinate() {
-            return Err(match fit.smoothing_correction_absence() {
-                Some(absence) => format!("{SMOOTHING_CORRECTED_ABSENT}; the fit recorded why: {absence}"),
-                None => SMOOTHING_CORRECTED_ABSENT.to_string(),
-            });
-        }
-    }
-    if let Some(covariance) = fit.beta_covariance() {
-        return Ok(PredictionCovarianceBackend::from_dense(covariance.view()));
-    }
-    if let Some(backend) = factorized_covariance_fallback(fit) {
-        // Surface the factorization error directly rather than swallowing it
-        // and reporting the generic "model is missing either ..." message.
-        // When the saved Hessian exists but cannot be factored (indefinite,
-        // numerically degenerate, etc.) the user needs to see *why*, not a
-        // confused "refit" instruction that doesn't match the real fault.
-        return backend;
-    }
-    Err(
-        "nonlinear posterior-mean prediction requires either covariance or a saved penalized Hessian; refit"
-            .to_string(),
-    )
+    fit.select_uncertainty_backend(fit.beta.len(), mode, "saved-model prediction")
+        .map(|(backend, _)| backend)
+        .map_err(|error| {
+            // Refitting with the same binary publishes the same absent
+            // correction, so the refusal names the modes that exist (#2677).
+            let correction_absent = mode == InferenceCovarianceMode::SmoothingCorrected
+                && fit.has_smoothing_coordinate()
+                && fit.beta_covariance_corrected().is_none()
+                && fit.smoothing_correction_factorized().is_none();
+            if correction_absent {
+                format!(
+                    "{error}; request --covariance-mode conditional, or omit --covariance-mode \
+                     to use the covariance the fit publishes"
+                )
+            } else {
+                error.to_string()
+            }
+        })
 }
 
+/// The dense coefficient covariance [`prediction_backend_from_model`] applies,
+/// for the consumers that take the matrix itself.
+pub(crate) fn covariance_from_model(
+    model: &SavedModel,
+    mode: InferenceCovarianceMode,
+) -> Result<Array2<f64>, String> {
+    let backend = prediction_backend_from_model(model, mode)?;
+    backend
+        .apply_columns(&Array2::<f64>::eye(backend.nrows()))
+        .map_err(|e| {
+            format!("failed to recover the coefficient covariance from its saved source: {e}")
+        })
+}
 
 /// Render the covariance-provenance suffix for `gam predict` from
 /// RESULT-OWNED sources (#2296): what the evaluator actually consumed for the

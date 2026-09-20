@@ -2546,5 +2546,14 @@
     ],
     "reason": "The cold SAE routing seed added a fixed 1e-3, random_state-keyed logit perturbation on top of the data-driven residual seed. Its own comment said it does not change which atom wins, so its only effect was to make the start depend on random_state. Both jitter constants are deleted: RANDOM_STATE_LOGIT_JITTER in minimal_seed.rs and SAE_RANDOM_STATE_LOGIT_JITTER in seed_routing.rs.",
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3352 (fix-3090-seed-logit-jitter, part of #3090) merged as 93285a585bf63554ef43831f1a7f4a4758115f98 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 93285a585bf63554ef43831f1a7f4a4758115f98's own tree with --base d058855331e8384f91083846d36df994f5187d9b --head 93285a585bf63554ef43831f1a7f4a4758115f98 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 2 items. Read-proof: git grep -w -c <name> 93285a585bf63554ef43831f1a7f4a4758115f98 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "6f2b3d221808fe901975935e854ed71355a7f9e3",
+    "items": [
+      "crates/gam-cli/src/main/model_summary.rs:const:SMOOTHING_CORRECTED_ABSENT",
+      "crates/gam-cli/src/main/model_summary.rs:fn:factorized_covariance_fallback"
+    ],
+    "reason": "#3749: gam predict selected its coefficient covariance through a hand-rolled copy of gam-predict's selected_uncertainty_backend that had drifted (no coefficient-gauge lift, only the expectile covariance decline refused, no dimension checks). prediction_backend_from_model and covariance_from_model now call UncertaintyCovarianceSource::select_uncertainty_backend, so the copy's private helper factorized_covariance_fallback and its refusal text SMOOTHING_CORRECTED_ABSENT have no caller; the #2677 guidance that constant carried is kept as CLI context on the library's absent-correction refusal.",
+    "evidence": "scripts/source_removal_guard.py with --base 6f2b3d221808fe901975935e854ed71355a7f9e3 and head the change's commit lists exactly these two removals. Read-proof at the head: git grep -w finds no occurrence of factorized_covariance_fallback or SMOOTHING_CORRECTED_ABSENT anywhere in the repository; both were private to crates/gam-cli/src/main/model_summary.rs, whose only consumers were the two functions rewritten here."
   }
 ]

@@ -1,5 +1,17 @@
 ## Unreleased
 
+- **`gam predict` selects its coefficient covariance through the library** (gam#3749).
+  The CLI kept its own copy of `gam-predict`'s covariance-source selection, and the copy
+  had drifted. It factored a saved penalized Hessian without the coefficient-gauge lift
+  (#1561), so a gauged fit got a covariance on its active coordinates. It honoured only
+  the expectile covariance decline, so a fit that withheld its covariance (#2718, #2985)
+  still produced bands. It also skipped the dimension checks. `gam predict` now calls
+  `UncertaintyCovarianceSource::select_uncertainty_backend`, the same selection the
+  library and Python use. In that selection, a fit whose constrained posterior moments
+  were declined is refused in both modes, including when a dense `Vp` was persisted. A
+  saved Hessian whose precision cannot be built reports why, instead of saying that no
+  covariance exists.
+
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
   `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and
