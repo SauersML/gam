@@ -402,6 +402,7 @@ mod tests {
             railed_facts: Vec::new(),
             newton_polish: None,
             curvature_floor: None,
+            criterion_error: None,
         };
         UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
             blocks: vec![gam::estimate::FittedBlock {
@@ -512,6 +513,7 @@ mod tests {
             railed_facts: Vec::new(),
             newton_polish: None,
             curvature_floor: None,
+            criterion_error: None,
         };
         let result = UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
             blocks: vec![gam::estimate::FittedBlock {
@@ -711,6 +713,7 @@ fn saved_fit_summary_fixture() -> SavedFitSummary {
             railed_facts: Vec::new(),
             newton_polish: None,
             curvature_floor: None,
+            criterion_error: None,
         }),
     }
 }
@@ -3855,6 +3858,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
                 railed_facts: Vec::new(),
                 newton_polish: None,
                 curvature_floor: None,
+                criterion_error: None,
             }),
             ..Default::default()
         },
@@ -3934,6 +3938,7 @@ fn core_saved_fit_result_json_roundtripswith_finite_summary() {
                 railed_facts: Vec::new(),
                 newton_polish: None,
                 curvature_floor: None,
+                criterion_error: None,
             }),
         },
     ).expect("saved fit reconstruction");
