@@ -191,24 +191,36 @@ class Model:
             band at ``conformal_level`` coverage in ``posterior_mean_lower`` /
             ``posterior_mean_upper`` — the same routes as ``gam predict
             --conformal``. Exactly one of ``training_data`` or ``calibration``
-            is required. With ``training_data`` it is the full-conformal set of
-            the fit that re-selects the smoothing strength by REML on the
-            training rows plus the candidate test row (#942 Layer 3): every
-            labeled row is used for both fitting and calibration, and the test
-            row is treated exactly like a training row, so the finite-sample
-            ``conformal_level`` coverage theorem holds. It costs one Cholesky
-            per test point plus a cold REML refit at each finite endpoint. It
-            needs a Gaussian-identity model fitted without prior weights,
-            offsets, or a link wiggle. The saved model carries only the
-            ``p x p`` frozen penalty and its smoothing-parameter count, never
-            per-row training data, so the labeled rows are passed again here.
-            The per-row ``conformal_certificate`` output column is 0
-            (exact_frozen: nothing to re-select) or 1 (honest_refit) where the
-            guarantee holds; a negative code is a typed refusal (several
-            smoothing parameters, a payload without the count, a degenerate
-            criterion) where the row carries the frozen-smoothing set with no
-            finite-sample guarantee. The bounds report the outer envelope of
-            the (possibly multi-interval) set. With ``calibration`` it is the
+            is required. With ``training_data`` it is the full-conformal set
+            built on the labeled rows plus the candidate test row: every
+            labeled row is used for both fitting and calibration. A
+            Gaussian-identity model gets the set of the fit that re-selects the
+            smoothing strength by REML on the augmented rows (#942 Layer 3), so
+            the finite-sample ``conformal_level`` coverage theorem holds; it
+            costs one Cholesky per test point plus a cold REML refit at each
+            finite endpoint. Bernoulli-logit (the set is a subset of
+            ``{0, 1}``), Poisson-log and negative-binomial-log (candidates
+            enumerated up to a data-derived tail beyond which none can conform;
+            NB theta frozen at its fitted value) and Gamma-log (Pearson score,
+            so the set is a band in ``y / mu``) refit the augmented penalized
+            likelihood per candidate at the frozen penalty. Discrete ties are
+            broken by a seeded uniform so the set is exact rather than
+            conservative. Offsets are honoured. A model fitted with prior
+            weights raises ``InvalidConfigurationError``: the candidate point
+            has no weight, so use ``calibration=`` (split conformal) instead.
+            The saved model carries only the ``p x p`` frozen penalty and its
+            smoothing-parameter count, never per-row training data, so the
+            labeled rows are passed again here. The per-row
+            ``conformal_certificate`` output column is 0 (exact_frozen: nothing
+            to re-select) or 1 (honest_refit) where the guarantee holds; a
+            negative code is a typed refusal where the row carries the
+            frozen-penalty set with no finite-sample guarantee for the
+            selection step (several smoothing parameters, a payload without the
+            count, a degenerate criterion, or ``-7`` glm_frozen_penalty for a
+            non-Gaussian fit that selected a smoothing parameter or NB theta).
+            The set is a union of ``conformal_set_components`` intervals and
+            the bounds report its outer envelope (NaN for an empty randomized
+            set). With ``calibration`` it is the
             split-conformal band ``mu_hat(x) +/- q_hat * s(x)`` calibrated on
             that held-out fold, with finite-sample marginal coverage
             ``>= conformal_level`` regardless of model misspecification, for
