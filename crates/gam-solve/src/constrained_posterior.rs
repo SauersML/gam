@@ -158,8 +158,8 @@ mod boundary_mode;
 pub use boundary_mode::{BoundaryModeApproximation, BoundaryModeCertificate, BoundaryModeRefusal};
 mod cone_normalizer;
 pub use cone_normalizer::{
-    ConeCoordinateMotion, ConeFirstOrder, ConeNormalizer, ConeNormalizerRefusal, ConePairMotion,
-    OrthantLogMass,
+    ConeCoordinateMotion, ConeDriftWeight, ConeFirstOrder, ConeNormalizer, ConeNormalizerRefusal,
+    ConePairMotion, OrthantLogMass,
 };
 mod cone_laplace;
 pub use cone_laplace::{

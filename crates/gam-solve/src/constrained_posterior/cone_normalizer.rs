@@ -865,20 +865,65 @@ pub struct ConeCoordinateMotion {
     pub inverse_rotation_on_generator: Array2<f64>,
 }
 
-/// One coordinate pair's second-order motion: `v_kl`, `g̈_kl`, and `M̈_kl` applied to `y` and to
-/// each column of `N`.
+/// One coordinate pair's second-order motion: `v_kl`, `g̈_kl`, and the pair drift `M̈_kl` through
+/// the only contraction [`ConeNormalizer::second_order`] reads it in, `tr(Q·M̈_kl)` with `Q` the
+/// normalizer's [`ConeDriftWeight`] (gam#3347).
 #[derive(Clone, Debug)]
 pub struct ConePairMotion {
     pub mode_response: Array1<f64>,
     pub gradient_rate: Array1<f64>,
-    pub precision_rate_on_y: Array1<f64>,
-    pub precision_rate_on_basis: Array2<f64>,
+    /// `tr(Q·M̈_kl)`, `Q` from [`ConeNormalizer::drift_weight`].
+    pub precision_rate_trace: f64,
     /// What the inverse identities in [`ConeNormalizer::second_order`] omit where `M⁻¹` is the
     /// criterion's kept-spectrum pseudo-inverse: `(D²M⁺[Ṁ_k, Ṁ_l] − M⁺Ṁ_kM⁺Ṁ_lM⁺ − M⁺Ṁ_lM⁺Ṁ_kM⁺)`
     /// plus the rotation of the pair drift `D M⁺[M̈] + M⁺M̈M⁺`, applied to `g` and to each column
     /// of the basis generator `C`. Zero where `M⁻¹` is an inverse (gam#2952).
     pub inverse_rotation_on_gradient: Array1<f64>,
     pub inverse_rotation_on_generator: Array2<f64>,
+}
+
+/// The weight `Q` through which [`ConeNormalizer::second_order`] reads a pair's precision drift:
+/// the pair value is `tr(Q·M̈) + (terms free of M̈)`, with
+///
+/// ```text
+/// Q = ½ y yᵀ − sym(y (N Bᵀγ)ᵀ) + N Γ Nᵀ = Z S Zᵀ,   Z = [y  N],   S = [[½, −½cᵀ], [−½c, Γ]],   c = Bᵀγ,
+/// ```
+///
+/// since `M̈` enters `C̈` only as `+½ yᵀM̈y` (through `ÿ`), `−γᵀB NᵀM̈y` (through `m̈₀`) and
+/// `+tr(Γ NᵀM̈N)` (through `K̈`). `Q` is held as signed factors from the eigenpairs `S = VΛVᵀ`:
+/// the columns `√|λ_a| Z v_a` split by the sign of `λ_a`, so `Q = F₊F₊ᵀ − F₋F₋ᵀ` exactly and
+/// `tr(Q·E) = tr(F₊ᵀEF₊) − tr(F₋ᵀEF₋)` for any symmetric `E`. A caller can then contract a drift
+/// it never forms, such as a family's fourth-derivative correction, through a trace kernel
+/// instead of applying it to `y` and every column of `N` (gam#3347).
+#[derive(Clone, Debug)]
+pub struct ConeDriftWeight {
+    positive: Array2<f64>,
+    negative: Array2<f64>,
+}
+
+impl ConeDriftWeight {
+    /// `F₊`, `p × a`.
+    pub fn positive(&self) -> &Array2<f64> {
+        &self.positive
+    }
+
+    /// `F₋`, `p × b`.
+    pub fn negative(&self) -> &Array2<f64> {
+        &self.negative
+    }
+
+    /// `tr(Q·E)` for a symmetric `E` given by its action.
+    pub fn trace(&self, apply: &dyn Fn(&Array1<f64>) -> Array1<f64>) -> f64 {
+        let side = |factor: &Array2<f64>| -> f64 {
+            (0..factor.ncols())
+                .map(|index| {
+                    let column = factor.column(index).to_owned();
+                    column.dot(&apply(&column))
+                })
+                .sum()
+        };
+        side(&self.positive) - side(&self.negative)
+    }
 }
 
 /// A coordinate's first derivative of `C`, with the rates its pairs reuse.
@@ -1096,6 +1141,45 @@ impl ConeNormalizer {
         &self.basis
     }
 
+    /// The weight `Q` a pair's precision drift is read through, as signed factors
+    /// ([`ConeDriftWeight`]).
+    pub fn drift_weight(&self) -> Result<ConeDriftWeight, ConeNormalizerRefusal> {
+        use gam_linalg::faer_ndarray::FaerEigh;
+        let (p, r) = self.basis.dim();
+        let loaded = self.orthant.loadings.t().dot(&self.orthant.mean_gradient());
+        let covariance_gradient = self.orthant.covariance_gradient();
+        let mut weight = Array2::<f64>::zeros((r + 1, r + 1));
+        weight[[0, 0]] = 0.5;
+        weight.slice_mut(s![1.., 1..]).assign(&covariance_gradient);
+        for a in 0..r {
+            weight[[0, a + 1]] = -0.5 * loaded[a];
+            weight[[a + 1, 0]] = -0.5 * loaded[a];
+        }
+        let (values, vectors) = weight
+            .eigh(faer::Side::Lower)
+            .map_err(|error| ConeNormalizerRefusal::Singular { reason: format!("drift weight spectrum: {error:?}") })?;
+        let mut span = Array2::<f64>::zeros((p, r + 1));
+        span.column_mut(0).assign(&self.y);
+        span.slice_mut(s![.., 1..]).assign(&self.basis);
+        let directions = span.dot(&vectors);
+        let side = |keep: &dyn Fn(f64) -> bool| {
+            let chosen: Vec<usize> = (0..values.len()).filter(|&a| keep(values[a])).collect();
+            let mut factor = Array2::<f64>::zeros((p, chosen.len()));
+            for (index, &a) in chosen.iter().enumerate() {
+                factor.column_mut(index).assign(&directions.column(a).mapv(|value| value * values[a].abs().sqrt()));
+            }
+            factor
+        };
+        let weight = ConeDriftWeight {
+            positive: side(&|value: f64| value > 0.0),
+            negative: side(&|value: f64| value < 0.0),
+        };
+        if weight.positive.iter().chain(weight.negative.iter()).any(|value| !value.is_finite()) {
+            return Err(ConeNormalizerRefusal::NonFinite { what: "drift weight" });
+        }
+        Ok(weight)
+    }
+
     /// First derivative along one coordinate, with the rates its pairs reuse. `solve` applies the
     /// same `M⁻¹` [`Self::evaluate`] read.
     pub fn first_order(
@@ -1127,7 +1211,9 @@ impl ConeNormalizer {
     ///
     /// `M ÿ = g̈ − Ṁ_l ẏ_k − Ṁ_k ẏ_l − M̈ y`, read only through `yᵀ(·)` and `A M⁻¹(·) = BNᵀ(·)`,
     /// so `Ṁ_l ẏ_k` enters as `(Ṁ_l y)ᵀẏ_k` and `(Ṁ_l N)ᵀẏ_k`;
-    /// `K̈ = Nᵀ(Ṁ_k M⁻¹ Ṁ_l + Ṁ_l M⁻¹ Ṁ_k − M̈)N`.
+    /// `K̈ = Nᵀ(Ṁ_k M⁻¹ Ṁ_l + Ṁ_l M⁻¹ Ṁ_k − M̈)N`. Every `M̈` term is linear in it and sums to
+    /// `tr(Q·M̈)` ([`ConeDriftWeight`]), which the pair supplies as `precision_rate_trace`; what
+    /// is formed below is the rest.
     pub fn second_order(
         &self,
         motion_k: &ConeCoordinateMotion,
@@ -1138,8 +1224,7 @@ impl ConeNormalizer {
     ) -> Result<f64, ConeNormalizerRefusal> {
         let y_moved = pair.gradient_rate.dot(&self.y)
             - motion_l.precision_rate_on_y.dot(&first_k.y_rate)
-            - motion_k.precision_rate_on_y.dot(&first_l.y_rate)
-            - pair.precision_rate_on_y.dot(&self.y);
+            - motion_k.precision_rate_on_y.dot(&first_l.y_rate);
         // Where `M⁻¹` is a kept-spectrum pseudo-inverse, `ÿ` and `Ẅ` also carry what the identities
         // above omit: the pair's second rotation, and each coordinate's first rotation against the
         // other's rates (`ẏ` already carries the first rotation, which the identities read back
@@ -1165,21 +1250,19 @@ impl ConeNormalizer {
         let basis_moved = self.basis.t().dot(&pair.gradient_rate)
             - motion_l.precision_rate_on_basis.t().dot(&first_k.y_rate)
             - motion_k.precision_rate_on_basis.t().dot(&first_l.y_rate)
-            - self.basis.t().dot(&pair.precision_rate_on_y)
             + basis_turned;
         let normal_moved = self.orthant.loadings.dot(&basis_moved);
         let m0_second = self.rows.dot(&pair.mode_response) - normal_moved;
         let cross = motion_k.precision_rate_on_basis.t().dot(&first_l.solved_rate_on_basis);
         let k_second = symmetrized(
-            &(&cross + &cross.t() - self.basis.t().dot(&pair.precision_rate_on_basis)
-                + self.generator.t().dot(&pair.inverse_rotation_on_generator)),
+            &(&cross + &cross.t() + self.generator.t().dot(&pair.inverse_rotation_on_generator)),
         );
         let (d_gamma, d_big_gamma) = self.orthant.gradient_motion(&first_l.m0_rate, &first_l.k_rate)?;
         let second_log_mass = d_gamma.dot(&first_k.m0_rate)
             + frobenius(&d_big_gamma, &first_k.k_rate)
             + self.orthant.mean_gradient().dot(&m0_second)
             + frobenius(&self.orthant.covariance_gradient(), &k_second);
-        Ok(-0.5 * second_gy - second_log_mass)
+        Ok(-0.5 * second_gy - second_log_mass + pair.precision_rate_trace)
     }
 }
 
@@ -1739,8 +1822,10 @@ mod tests {
             let pair_with = |turn_on_gradient: Array1<f64>, turn_on_generator: Array2<f64>| ConePairMotion {
                 mode_response: Array1::zeros(3),
                 gradient_rate: Array1::zeros(3),
-                precision_rate_on_y: second_precision.dot(normalizer_one.solved_gradient()),
-                precision_rate_on_basis: second_precision.dot(normalizer_one.covariance_basis()),
+                precision_rate_trace: normalizer_one
+                    .drift_weight()
+                    .expect("drift weight")
+                    .trace(&|v: &Array1<f64>| second_precision.dot(v)),
                 inverse_rotation_on_gradient: turn_on_gradient,
                 inverse_rotation_on_generator: turn_on_generator,
             };
@@ -1837,11 +1922,32 @@ mod tests {
             "dC {} against central difference {fd} (bar {bar})",
             first.derivative
         );
+        // gam#3347: the factored weight is the three places the pair value reads `M̈`, pinned on
+        // this path's drift. `tr(Q·E) = tr(S·ZᵀEZ)`; the eigensolver reconstructs `S` to a normwise
+        // backward error of `(r+1)³` rounded operations and each entry of `ZᵀEZ` takes `2p`, so
+        // the two agree to that band on `‖S‖_F ‖ZᵀEZ‖_F`, which bounds either side.
+        let drift = m2 * 2.0;
+        let (y, basis) = (normalizer.solved_gradient(), normalizer.covariance_basis());
+        let loaded = normalizer.orthant.loadings.t().dot(&normalizer.orthant.mean_gradient());
+        let covariance_gradient = normalizer.orthant.covariance_gradient();
+        let explicit = 0.5 * y.dot(&drift.dot(y)) - loaded.dot(&basis.t().dot(&drift.dot(y)))
+            + frobenius(&covariance_gradient, &basis.t().dot(&drift.dot(basis)));
+        let factored = normalizer.drift_weight().expect("drift weight").trace(&|v: &Array1<f64>| drift.dot(v));
+        let (p, r) = basis.dim();
+        let mut span = Array2::<f64>::zeros((p, r + 1));
+        span.column_mut(0).assign(y);
+        span.slice_mut(s![.., 1..]).assign(basis);
+        let projected = span.t().dot(&drift.dot(&span));
+        let weight_norm = (0.25 + 0.5 * loaded.dot(&loaded) + frobenius(&covariance_gradient, &covariance_gradient)).sqrt();
+        let weight_band = band((r + 1).pow(3) + 2 * p, weight_norm * frobenius(&projected, &projected).sqrt());
+        assert!(
+            (factored - explicit).abs() <= weight_band,
+            "tr(Q·E) {factored} from the signed factors against {explicit} read term by term (band {weight_band:e})"
+        );
         let pair = ConePairMotion {
             mode_response: b2 * 2.0,
             gradient_rate: g2 * 2.0,
-            precision_rate_on_y: (m2 * 2.0).dot(normalizer.solved_gradient()),
-            precision_rate_on_basis: (m2 * 2.0).dot(normalizer.covariance_basis()),
+            precision_rate_trace: normalizer.drift_weight().expect("drift weight").trace(&|v: &Array1<f64>| (m2 * 2.0).dot(v)),
             inverse_rotation_on_gradient: Array1::zeros(b2.len()),
             inverse_rotation_on_generator: Array2::zeros(normalizer.covariance_generator().raw_dim()),
         };
