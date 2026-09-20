@@ -2973,7 +2973,10 @@ impl SaeManifoldTerm {
     ///   curvature it is `material_floor / slope`.
     ///
     /// 1. Armijo backtracking from the far end finds the LONGEST step with
-    ///    sufficient decrease. A direction with tiny curvature and a live gradient
+    ///    sufficient decrease, judged against the rounding bands of `base` and of
+    ///    each trial (#3243, [`BandedPenalizedObjective::armijo_accepts`]): the
+    ///    trial must be resolvably below `base` and pass Armijo relaxed by the two
+    ///    bands. A direction with tiny curvature and a live gradient
     ///    needs a long step (#2762), and this is the globalization that starts
     ///    long. Its trial count is the number of contractions between the two
     ///    endpoints.
@@ -3002,12 +3005,13 @@ impl SaeManifoldTerm {
         registry: Option<&AnalyticPenaltyRegistry>,
         direction: ArrayView1<'_, f64>,
         dense_len: usize,
-        base_objective: f64,
+        base: BandedPenalizedObjective,
         slope: f64,
         negative_curvature: f64,
         material_floor: f64,
         snapshot: &SaeManifoldMutableState,
     ) -> Result<ObjectiveLineMinimum, String> {
+        let base_objective = base.value;
         let mut line = ObjectiveLineMinimum {
             alpha: 0.0,
             value: base_objective,
@@ -3039,48 +3043,51 @@ impl SaeManifoldTerm {
         {
             return Ok(line);
         }
-        let trial_at =
-            |term: &mut Self, alpha: f64, line: &mut ObjectiveLineMinimum| -> Result<f64, String> {
-                let value = match term.apply_newton_step(
-                    direction.slice(s![..dense_len]),
-                    direction.slice(s![dense_len..]),
-                    alpha,
-                ) {
-                    Ok(()) => {
-                        line.objective_evaluations += 1;
-                        match term.penalized_objective_total(target, rho, registry, 1.0) {
-                            Ok(value) if value.is_finite() => Some(value),
-                            Ok(value) => {
-                                line.record_failure(format!(
-                                    "non-finite objective {value} at α={alpha:.3e}"
-                                ));
-                                None
-                            }
-                            Err(err) => {
-                                line.record_failure(format!("objective at α={alpha:.3e}: {err}"));
-                                None
-                            }
+        let trial_at = |term: &mut Self,
+                        alpha: f64,
+                        line: &mut ObjectiveLineMinimum|
+         -> Result<BandedPenalizedObjective, String> {
+            let value = match term.apply_newton_step(
+                direction.slice(s![..dense_len]),
+                direction.slice(s![dense_len..]),
+                alpha,
+            ) {
+                Ok(()) => {
+                    line.objective_evaluations += 1;
+                    match term.penalized_objective_banded(target, rho, registry, 1.0) {
+                        Ok(value) if value.value.is_finite() => Some(value),
+                        Ok(value) => {
+                            line.record_failure(format!(
+                                "non-finite objective {} at α={alpha:.3e}",
+                                value.value
+                            ));
+                            None
+                        }
+                        Err(err) => {
+                            line.record_failure(format!("objective at α={alpha:.3e}: {err}"));
+                            None
                         }
                     }
-                    Err(err) => {
-                        line.record_failure(format!("step at α={alpha:.3e}: {err}"));
-                        None
-                    }
-                };
-                term.restore_mutable_state(snapshot).map_err(|err| {
-                    format!(
-                        "SaeManifoldTerm::minimize_objective_along: restoring the pre-trial \
-                         state after the trial at α={alpha:.6e} failed: {err}"
-                    )
-                })?;
-                Ok(match value {
-                    Some(value) => {
-                        line.finite_trials += 1;
-                        value
-                    }
-                    None => f64::INFINITY,
-                })
+                }
+                Err(err) => {
+                    line.record_failure(format!("step at α={alpha:.3e}: {err}"));
+                    None
+                }
             };
+            term.restore_mutable_state(snapshot).map_err(|err| {
+                format!(
+                    "SaeManifoldTerm::minimize_objective_along: restoring the pre-trial \
+                     state after the trial at α={alpha:.6e} failed: {err}"
+                )
+            })?;
+            Ok(match value {
+                Some(value) => {
+                    line.finite_trials += 1;
+                    value
+                }
+                None => BandedPenalizedObjective::UNUSABLE,
+            })
+        };
 
         // (1) Longest sufficient-decrease step from the trust radius.
         let contraction = BacktrackConfig::default().contraction;
@@ -3090,7 +3097,11 @@ impl SaeManifoldTerm {
             shortest *= contraction;
             max_steps += 1;
         }
-        let cushion = opt::armijo_roundoff_cushion(base_objective);
+        // Each trial is judged against the rounding bands of the two evaluations
+        // it compares (#3243, `BandedPenalizedObjective::armijo_accepts`). The
+        // trial's band rides beside its value, since the search hands `accept`
+        // the value alone.
+        let trial_band = std::cell::Cell::new(0.0_f64);
         let accepted = backtracking_line_search::<_, String>(
             BacktrackConfig {
                 initial_step: far_alpha,
@@ -3098,13 +3109,21 @@ impl SaeManifoldTerm {
                 ..BacktrackConfig::default()
             },
             |alpha| {
-                trial_at(self, alpha, &mut line)
-                    .map(|value| value.is_finite().then_some((value, ())))
+                trial_at(self, alpha, &mut line).map(|trial| {
+                    trial_band.set(trial.band);
+                    trial.value.is_finite().then_some((trial.value, ()))
+                })
             },
             |alpha, value| {
                 let sufficient = SAE_MANIFOLD_ARMIJO_C1 * alpha * slope
                     + SAE_MANIFOLD_ARMIJO_C1 * 0.5 * negative_curvature * alpha * alpha;
-                value <= base_objective - sufficient + cushion
+                base.armijo_accepts(
+                    &BandedPenalizedObjective {
+                        value,
+                        band: trial_band.get(),
+                    },
+                    sufficient,
+                )
             },
         )?;
         let Some(accepted) = accepted else {
@@ -3125,7 +3144,7 @@ impl SaeManifoldTerm {
                 if !(alpha_q.is_finite() && alpha_q >= near_alpha && alpha_q < best_alpha) {
                     break;
                 }
-                let value = trial_at(self, alpha_q, &mut line)?;
+                let value = trial_at(self, alpha_q, &mut line)?.value;
                 if !(best_value - value > material_floor) {
                     break;
                 }
@@ -3365,7 +3384,8 @@ impl SaeManifoldTerm {
             )?;
             let step_coord_len = arrow_row_offsets[n];
 
-            let base_objective = self.penalized_objective_total(target, rho, registry, 1.0)?;
+            let base = self.penalized_objective_banded(target, rho, registry, 1.0)?;
+            let base_objective = base.value;
             if outcome.entry_objective.is_none() {
                 outcome.entry_objective = Some(base_objective);
             }
@@ -3385,7 +3405,7 @@ impl SaeManifoldTerm {
                 registry,
                 step_direction.view(),
                 step_coord_len,
-                base_objective,
+                base,
                 slope,
                 0.0,
                 material_floor,
@@ -4060,7 +4080,7 @@ impl SaeManifoldTerm {
             // at (near-)equal EV, breaks the tie on coordinate uniformity: EV
             // provably does not certify the coordinate, so a reseed that ties on EV
             // but reads a more uniform angle is the better basin.
-            let candidate_uniformity = self.coordinate_uniformity_aggregate();
+            let candidate_uniformity = self.coordinate_uniformity_aggregate()?;
             let prefer = match self.best_cocollapse_incumbent.as_ref() {
                 None => ev.is_finite(),
                 Some((best_ev, best_uniformity, _)) => prefer_candidate_basin(
@@ -4115,7 +4135,7 @@ impl SaeManifoldTerm {
                     // #2081 — restore the incumbent when it is the better basin under
                     // the same EV-then-uniformity ordering used to bank it: strictly
                     // higher EV, or (near-)equal EV with a more uniform coordinate.
-                    let current_uniformity = self.coordinate_uniformity_aggregate();
+                    let current_uniformity = self.coordinate_uniformity_aggregate()?;
                     if prefer_candidate_basin(
                         best_ev,
                         best_uniformity,
@@ -4236,7 +4256,7 @@ impl SaeManifoldTerm {
                 let incumbent_uniformity = *incumbent_uniformity;
                 let reseeded_ev =
                     self.dictionary_reconstruction_ev_maybe(target, rho, target_col_stats)?;
-                let reseeded_uniformity = self.coordinate_uniformity_aggregate();
+                let reseeded_uniformity = self.coordinate_uniformity_aggregate()?;
                 !prefer_candidate_basin(
                     reseeded_ev,
                     reseeded_uniformity,
@@ -5972,8 +5992,9 @@ impl SaeManifoldTerm {
             // The baseline is read after assembly, from the exact represented
             // state whose gradient and Hessian produced `sys`.
             let pre_step_loss = self.loss(target, rho)?;
-            let pre_step_total =
-                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+            let pre_step =
+                self.penalized_objective_banded(target, rho, analytic_penalties, 1.0)?;
+            let pre_step_total = pre_step.value;
             if !pre_step_total.is_finite() {
                 return Err(format!(
                     "SaeManifoldTerm::run_fixed_decoder_arrow_schur: non-finite objective \
@@ -5993,17 +6014,9 @@ impl SaeManifoldTerm {
                      decrement {directional_decrease} at iteration {iteration}"
                 ));
             }
-            // The penalized objective is the loss components plus the extra
-            // penalty terms. Its longest accumulation is the data fit over the
-            // `n·p` residual cells, then the five summands are added, so its
-            // computed value cannot resolve a change below `γ_k·Σ|summands|`.
-            let summand_scale = pre_step_loss.data_fit.abs()
-                + pre_step_loss.assignment_sparsity.abs()
-                + pre_step_loss.smoothness.abs()
-                + pre_step_loss.ard.abs()
-                + (pre_step_total - pre_step_loss.total()).abs();
-            let objective_resolution =
-                gam_linalg::roundoff::accumulation_band(target.len() + 4, summand_scale);
+            // The computed penalized objective cannot resolve a change below its
+            // own rounding band (`BandedPenalizedObjective`).
+            let objective_resolution = pre_step.band;
             if directional_decrease <= decrease.rounding_band.max(objective_resolution) {
                 return Ok(pre_step_loss);
             }
@@ -6885,7 +6898,7 @@ impl SaeManifoldTerm {
         // EV so the keep-best can break (near-)equal-objective ties on coordinate
         // fidelity.
         let mut best_reconstruction_uniformity = if initial_reconstruction_is_structurally_healthy {
-            self.coordinate_uniformity_aggregate()
+            self.coordinate_uniformity_aggregate()?
         } else {
             None
         };
@@ -7565,18 +7578,30 @@ impl SaeManifoldTerm {
                 // oscillating — the fixed-floor version un-damped on every clean
                 // step and re-overshot, so it only reduced the crawl. Predicted
                 // decrease along the accepted step α·Δ is α·d − ½α²·ΔᵀHΔ, with
-                // d = directional_decrease (= −gᵀΔ > 0) and, for the LM step
-                // (H+λI)Δ = −g, ΔᵀHΔ = d − λ‖Δ‖² (λ the β-block ridge). Standard
-                // 0.25/0.75 trust-region thresholds; factor 4 the standard
-                // aggressive LM step (Marquardt / Nocedal–Wright Alg. 4.1, inverted
-                // for the ridge↔radius reciprocal). Floored at the caller's ridges.
+                // d = directional_decrease (= −gᵀΔ > 0) and ΔᵀHΔ the assembled
+                // arrow curvature applied to the step actually taken. It is
+                // measured, not recovered from the LM identity
+                // ΔᵀHΔ = d − λ‖Δ‖²: that identity holds only for the raw solve
+                // (H+λI)Δ = −g, and the Δ here has had its per-row sub-floor null
+                // directions projected out and may have been clipped to the trust
+                // radius (a clip by s turns ΔᵀHΔ into s²·ΔᵀHΔ, not s·d − λs²‖Δ‖²);
+                // the solve also carries separate coordinate/decoder ridges plus
+                // any proximal ridge its escalation added. Standard 0.25/0.75
+                // trust-region thresholds; factor 4 the standard aggressive LM
+                // step (Marquardt / Nocedal–Wright Alg. 4.1, inverted for the
+                // ridge↔radius reciprocal). Floored at the caller's ridges.
                 let alpha = step.step;
                 let actual = pre_step_total - step.value;
-                let d_th_d = (directional_decrease
-                    - globalization.lm_ridge_b * step_norm_sq)
-                    .max(0.0);
-                let predicted =
-                    (alpha * directional_decrease - 0.5 * alpha * alpha * d_th_d).max(0.0);
+                let (h_delta_t, h_delta_beta) = gam_solve::arrow_schur::arrow_operator_apply(
+                    &sys,
+                    0.0,
+                    0.0,
+                    delta_ext_coord.view(),
+                    delta_beta.view(),
+                );
+                let step_curvature =
+                    delta_ext_coord.dot(&h_delta_t) + delta_beta.dot(&h_delta_beta);
+                let predicted = alpha * directional_decrease - 0.5 * alpha * alpha * step_curvature;
                 let gain_ratio = if predicted > 0.0 {
                     actual / predicted
                 } else {
@@ -8002,7 +8027,7 @@ impl SaeManifoldTerm {
                 let collapse = self.structural_coherence_collapse_detected()?;
                 tail_marks.push(("ev_coherence", iteration_started.elapsed().as_secs_f64()));
                 if collapse.is_none() {
-                    let candidate_uniformity = self.coordinate_uniformity_aggregate();
+                    let candidate_uniformity = self.coordinate_uniformity_aggregate()?;
                     tail_marks.push(("ev_uniformity", iteration_started.elapsed().as_secs_f64()));
                     let candidate_obj = boundary_obj;
                     if prefer_candidate_state(
@@ -8056,12 +8081,17 @@ impl SaeManifoldTerm {
             // EV-keyed veto restored the same ρ-independent incumbent after
             // every probe and flattened the outer objective into the
             // #2230/#2134 restore-churn grind).
+            // A final objective that is infinite, or fails to evaluate (priced
+            // as +inf), is the worst degradation there is. It must restore:
+            // finiteness is checked first because an infinite final objective
+            // makes the tolerance infinite too, and `inf <= inf` would keep
+            // the blown state.
             let final_obj = self
                 .penalized_objective_total(target, rho, analytic_penalties, 1.0)
                 .unwrap_or(f64::INFINITY);
             let obj_scale = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
                 * (1.0 + final_obj.abs().max(best_reconstruction_obj.abs()));
-            if !(final_obj <= best_reconstruction_obj + obj_scale) {
+            if !(final_obj.is_finite() && final_obj <= best_reconstruction_obj + obj_scale) {
                 let final_ev = self
                     .dictionary_reconstruction_ev(target, rho)
                     .unwrap_or(f64::NAN);
@@ -8180,12 +8210,15 @@ impl SaeManifoldTerm {
         // re-entry never improves on its own entry objective, so the bank
         // equals the entry state and the comparison is a no-op there.
         if let Some(bank) = warranty_state.as_ref() {
+            // The bank's objective is finite by construction. A final objective
+            // that is infinite or unevaluable (priced as +inf) is degraded past
+            // it and restores; it must not widen the tolerance to +inf.
             let final_obj = self
                 .penalized_objective_total(target, rho, analytic_penalties, 1.0)
                 .unwrap_or(f64::INFINITY);
             let warranty_tol = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
                 * (1.0 + final_obj.abs().max(warranty_obj.abs()));
-            if !(final_obj <= warranty_obj + warranty_tol) {
+            if !(final_obj.is_finite() && final_obj <= warranty_obj + warranty_tol) {
                 log::debug!(
                     "[#2228] exit warranty: final penalized objective {final_obj:.6e} degraded \
                      past the best accepted boundary {warranty_obj:.6e}; restoring the banked \

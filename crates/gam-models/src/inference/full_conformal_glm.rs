@@ -109,7 +109,7 @@ use ndarray::{Array1, Array2, Axis};
 use rand::{RngExt, SeedableRng};
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv, fast_av, fast_xt_diag_x};
-use gam_linalg::utils::{stable_logistic as sigmoid, stable_softplus as softplus};
+use gam_math::special::{logistic as sigmoid, softplus};
 use gam_problem::types::LikelihoodSpec;
 use gam_spec::FamilySpecKind;
 use opt::{BacktrackConfig, backtracking_line_search};

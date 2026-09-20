@@ -71,17 +71,26 @@ impl DispersionLocationScalePredictor {
     }
 
     /// The family's conditional response variance `Var(Y | μ, precision)`.
-    /// `None` for a response that is not a dispersion location-scale family
-    /// (a classification error upstream; callers choose their own degrade).
-    fn conditional_response_variance(response: &ResponseFamily, mu: f64, prec: f64) -> Option<f64> {
+    /// A response that is not a dispersion location-scale family has no such
+    /// law here (a classification error upstream) and is refused.
+    fn conditional_response_variance(
+        response: &ResponseFamily,
+        mu: f64,
+        prec: f64,
+    ) -> Result<f64, EstimationError> {
         let var = match response {
             ResponseFamily::NegativeBinomial { .. } => mu + mu * mu / prec,
             ResponseFamily::Gamma => mu * mu / prec,
             ResponseFamily::Beta { .. } => mu * (1.0 - mu) / (1.0 + prec),
             ResponseFamily::Tweedie { p } => mu.powf(*p) / prec,
-            _ => return None,
+            _ => {
+                return Err(EstimationError::InvalidInput(format!(
+                    "dispersion location-scale response variance: {response:?} is not a \
+                     dispersion location-scale family"
+                )));
+            }
         };
-        Some(var.max(0.0))
+        Ok(var.max(0.0))
     }
 
     /// `E[Var(Y | μ(η_μ), precision(η_d))]` under the joint per-row posterior
@@ -146,12 +155,7 @@ impl DispersionLocationScalePredictor {
                 |t, d| {
                     let mu = strategy.inverse_link(t)?;
                     let prec = d.exp().max(f64::MIN_POSITIVE);
-                    Self::conditional_response_variance(response, mu, prec).ok_or_else(|| {
-                        EstimationError::InvalidInput(format!(
-                            "dispersion location-scale observation noise: {response:?} is not a \
-                             dispersion location-scale family"
-                        ))
-                    })
+                    Self::conditional_response_variance(response, mu, prec)
                 },
             )?
             .max(0.0);
@@ -177,15 +181,12 @@ impl DispersionLocationScalePredictor {
             )));
         }
         let response = &self.likelihood.response;
-        let variance = Array1::from_shape_fn(mean.len(), |i| {
-            // The dispersion location-scale class only routes the four
-            // overdispersion mean families; any other response is a
-            // classification error upstream. Report a Gaussian-style scalar
-            // variance (`1/precision`) rather than panic so a corrupt model
-            // degrades gracefully instead of aborting prediction.
-            Self::conditional_response_variance(response, mean[i], precision[i])
-                .unwrap_or(1.0 / precision[i])
-        });
+        // The dispersion location-scale class only routes the four
+        // overdispersion mean families; any other response is a classification
+        // error upstream and is refused, exactly as the observation band does.
+        let variance = (0..mean.len())
+            .map(|i| Self::conditional_response_variance(response, mean[i], precision[i]))
+            .collect::<Result<Array1<f64>, _>>()?;
         Ok(variance.mapv(f64::sqrt))
     }
 
@@ -458,13 +459,6 @@ impl PredictableModel for DispersionLocationScalePredictor {
         predict_posterior_mean_generic(self, input, fit, options)
     }
 
-    fn n_blocks(&self) -> usize {
-        2
-    }
-
-    fn block_roles(&self) -> Vec<BlockRole> {
-        vec![BlockRole::Location, BlockRole::Scale]
-    }
 }
 
 impl PerRowDispersionChannel for DispersionLocationScalePredictor {
@@ -628,6 +622,23 @@ mod tests {
             "NB dispersion: got {:.6e}, expected theta={:.6e}",
             disp[0],
             theta
+        );
+    }
+
+    /// A response outside the four dispersion location-scale families has no
+    /// mean–variance law here: the noise scale refuses it instead of reporting
+    /// an invented `1/precision` variance.
+    #[test]
+    fn noise_sd_refuses_a_non_dispersion_family() {
+        let pred = make_pred(ResponseFamily::Gaussian, StandardLink::Identity);
+        let input = make_input(2.0_f64.ln());
+        let err = pred
+            .noise_sd(&input)
+            .expect_err("a Gaussian response has no dispersion location-scale law");
+        assert!(
+            err.to_string()
+                .contains("is not a dispersion location-scale family"),
+            "unexpected error: {err}"
         );
     }
 

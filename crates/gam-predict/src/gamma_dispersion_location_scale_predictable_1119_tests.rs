@@ -251,6 +251,7 @@ fn gamma_dispersion_location_scale_assembles_covariance_and_is_predictable() {
         covariance_mode: InferenceCovarianceMode::Conditional,
         include_observation_interval: true,
         extrapolation_variance: None,
+        observation_prior_weights: None,
     };
     let pred = predictor
         .predict_posterior_mean(&input, &fit.fit, &pm_options)
@@ -460,6 +461,7 @@ fn gamma_dispersion_posterior_mean_observation_band_is_per_row_not_scalar() {
         covariance_mode: InferenceCovarianceMode::Conditional,
         include_observation_interval: true,
         extrapolation_variance: None,
+        observation_prior_weights: None,
     };
     let pm = predictor
         .predict_posterior_mean(&input, &fit.fit, &pm_options)
@@ -741,6 +743,7 @@ fn assert_orthogonal_dispersion_family_predictable(
         covariance_mode: InferenceCovarianceMode::Conditional,
         include_observation_interval: true,
         extrapolation_variance: None,
+        observation_prior_weights: None,
     };
     let pred = predictor
         .predict_posterior_mean(&input, &fit.fit, &pm_options)

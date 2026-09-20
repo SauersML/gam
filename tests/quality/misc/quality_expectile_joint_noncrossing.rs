@@ -126,6 +126,7 @@ fn predict(
                 covariance_mode: InferenceCovarianceMode::Conditional,
                 include_observation_interval: false,
                 extrapolation_variance: None,
+                observation_prior_weights: None,
             },
         )
         .expect("posterior-mean prediction")

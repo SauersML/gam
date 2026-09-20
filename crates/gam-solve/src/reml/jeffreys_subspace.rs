@@ -634,31 +634,32 @@ fn spectral_gate_weight(lambda_min: f64, lambda_max: f64) -> f64 {
     if !lambda_min.is_finite() {
         return 1.0;
     }
-    // `ramp_down(x, under, clear)`: the still-active weight, `1` for `x ≤ under`,
-    // `0` for `x ≥ clear`, C¹ cubic smoothstep `1 − (3t² − 2t³)` between.
-    #[inline]
-    fn ramp_down(x: f64, under: f64, clear: f64) -> f64 {
-        if x <= under {
-            return 1.0;
-        }
-        if x >= clear {
-            return 0.0;
-        }
-        let t = (x - under) / (clear - under);
-        1.0 - t * t * (3.0 - 2.0 * t)
-    }
-    let w_abs = ramp_down(
+    let ((w_abs, ..), (w_rel, ..)) = conditioning_sub_weight_derivatives(lambda_min, lambda_max);
+    w_abs.max(w_rel)
+}
+
+/// The absolute and relative sub-weights `(w_abs, w_rel)` of the spectral gate, each
+/// with its first three derivatives in its own argument (`λ_min` for `w_abs`,
+/// `r = log₁₀(λ_min/λ_max)` for `w_rel`), from the one ramp
+/// [`conditioning_ramp_down_derivatives`]. The gate value, its partials and the
+/// max-branch stratum check all read the sub-weights here, so they select the same
+/// active branch from the same numbers.
+#[inline]
+fn conditioning_sub_weight_derivatives(
+    lambda_min: f64,
+    lambda_max: f64,
+) -> ((f64, f64, f64, f64), (f64, f64, f64, f64)) {
+    let absolute = conditioning_ramp_down_derivatives(
         lambda_min,
         CONDITIONING_GATE_ABSOLUTE,
         CONDITIONING_GATE_ABSOLUTE_CLEAR,
     );
-    let log10_ratio = conditioning_log10_ratio(lambda_min, lambda_max);
-    let w_rel = ramp_down(
-        log10_ratio,
+    let relative = conditioning_ramp_down_derivatives(
+        conditioning_log10_ratio(lambda_min, lambda_max),
         CONDITIONING_GATE_RELATIVE.log10(),
         CONDITIONING_GATE_RELATIVE_CLEAR.log10(),
     );
-    w_abs.max(w_rel)
+    (absolute, relative)
 }
 
 /// Partial derivatives `(∂G/∂λ_min, ∂G/∂λ_max)` of the conditioning gate weight
@@ -678,33 +679,8 @@ fn spectral_gate_weight_grad(lambda_min: f64, lambda_max: f64) -> (f64, f64) {
         // Matches `spectral_gate_weight`'s constant-`1.0` early returns.
         return (0.0, 0.0);
     }
-    // `ramp_down`'s value and derivative: `d/dx [1 − (3t² − 2t³)] = −6 t (1−t) / (clear − under)`
-    // on the open band (`under < x < clear`), `0` at/outside both knots (C¹).
-    #[inline]
-    fn ramp_down_value_and_deriv(x: f64, under: f64, clear: f64) -> (f64, f64) {
-        if x <= under {
-            return (1.0, 0.0);
-        }
-        if x >= clear {
-            return (0.0, 0.0);
-        }
-        let span = clear - under;
-        let t = (x - under) / span;
-        let value = 1.0 - t * t * (3.0 - 2.0 * t);
-        let deriv = -6.0 * t * (1.0 - t) / span;
-        (value, deriv)
-    }
-    let (w_abs, dw_abs_dlmin) = ramp_down_value_and_deriv(
-        lambda_min,
-        CONDITIONING_GATE_ABSOLUTE,
-        CONDITIONING_GATE_ABSOLUTE_CLEAR,
-    );
-    let log10_ratio = conditioning_log10_ratio(lambda_min, lambda_max);
-    let (w_rel, dw_rel_dlogratio) = ramp_down_value_and_deriv(
-        log10_ratio,
-        CONDITIONING_GATE_RELATIVE.log10(),
-        CONDITIONING_GATE_RELATIVE_CLEAR.log10(),
-    );
+    let ((w_abs, dw_abs_dlmin, ..), (w_rel, dw_rel_dlogratio, ..)) =
+        conditioning_sub_weight_derivatives(lambda_min, lambda_max);
     // `G = w_abs.max(w_rel)`: only the active branch varies the max. A tie is a
     // measure-zero kink the smooth band stays away from; resolve it to `w_abs`
     // (consistent, and the dominant branch in the small-`n` absolute regime).
@@ -737,34 +713,9 @@ fn spectral_gate_weight_hess(lambda_min: f64, lambda_max: f64) -> (f64, f64, f64
     if lambda_max <= 0.0 || !lambda_min.is_finite() {
         return (0.0, 0.0, 0.0);
     }
-    // `ramp_down`'s value, first, and second derivative. On the open band
-    // (`under < x < clear`): `d/dx = −6 t (1−t)/span`, `d²/dx² = −6 (1−2t)/span²`.
-    // Both derivatives are `0` at/outside the knots (the value is C¹; the second
-    // derivative jumps at the knots but is evaluated only in the smooth interior).
-    #[inline]
-    fn ramp_down_value_d1_d2(x: f64, under: f64, clear: f64) -> (f64, f64, f64) {
-        if x <= under || x >= clear {
-            let v = if x <= under { 1.0 } else { 0.0 };
-            return (v, 0.0, 0.0);
-        }
-        let span = clear - under;
-        let t = (x - under) / span;
-        let value = 1.0 - t * t * (3.0 - 2.0 * t);
-        let d1 = -6.0 * t * (1.0 - t) / span;
-        let d2 = -6.0 * (1.0 - 2.0 * t) / (span * span);
-        (value, d1, d2)
-    }
-    let (w_abs, _dw_abs, d2w_abs) = ramp_down_value_d1_d2(
-        lambda_min,
-        CONDITIONING_GATE_ABSOLUTE,
-        CONDITIONING_GATE_ABSOLUTE_CLEAR,
-    );
-    let log10_ratio = conditioning_log10_ratio(lambda_min, lambda_max);
-    let (w_rel, dw_rel_dr, d2w_rel_dr2) = ramp_down_value_d1_d2(
-        log10_ratio,
-        CONDITIONING_GATE_RELATIVE.log10(),
-        CONDITIONING_GATE_RELATIVE_CLEAR.log10(),
-    );
+    // The ramp's second derivative jumps at the knots and reads `0` at and outside them.
+    let ((w_abs, _, d2w_abs, _), (w_rel, dw_rel_dr, d2w_rel_dr2, _)) =
+        conditioning_sub_weight_derivatives(lambda_min, lambda_max);
     // Same active-branch selection as `conditioning_gate_weight_grad` (resolve the
     // measure-zero tie to `w_abs`), so gradient and Hessian agree on which sub-weight
     // is differentiated.
@@ -801,17 +752,8 @@ fn spectral_gate_weight_third(
     if lambda_max <= 0.0 || !lambda_min.is_finite() {
         return (0.0, 0.0, 0.0, 0.0);
     }
-    let (w_abs, _, _, d3w_abs) = conditioning_ramp_down_derivatives(
-        lambda_min,
-        CONDITIONING_GATE_ABSOLUTE,
-        CONDITIONING_GATE_ABSOLUTE_CLEAR,
-    );
-    let log10_ratio = conditioning_log10_ratio(lambda_min, lambda_max);
-    let (w_rel, d1w, d2w, d3w) = conditioning_ramp_down_derivatives(
-        log10_ratio,
-        CONDITIONING_GATE_RELATIVE.log10(),
-        CONDITIONING_GATE_RELATIVE_CLEAR.log10(),
-    );
+    let ((w_abs, _, _, d3w_abs), (w_rel, d1w, d2w, d3w)) =
+        conditioning_sub_weight_derivatives(lambda_min, lambda_max);
     if w_abs >= w_rel {
         (d3w_abs, 0.0, 0.0, 0.0)
     } else {
@@ -846,17 +788,8 @@ fn spectral_gate_weight_fourth(
     if lambda_max <= 0.0 || !lambda_min.is_finite() {
         return (0.0, 0.0, 0.0, 0.0, 0.0);
     }
-    let (w_abs, _, _, _) = conditioning_ramp_down_derivatives(
-        lambda_min,
-        CONDITIONING_GATE_ABSOLUTE,
-        CONDITIONING_GATE_ABSOLUTE_CLEAR,
-    );
-    let log10_ratio = conditioning_log10_ratio(lambda_min, lambda_max);
-    let (w_rel, d1w, d2w, d3w) = conditioning_ramp_down_derivatives(
-        log10_ratio,
-        CONDITIONING_GATE_RELATIVE.log10(),
-        CONDITIONING_GATE_RELATIVE_CLEAR.log10(),
-    );
+    let ((w_abs, ..), (w_rel, d1w, d2w, d3w)) =
+        conditioning_sub_weight_derivatives(lambda_min, lambda_max);
     if w_abs >= w_rel {
         (0.0, 0.0, 0.0, 0.0, 0.0)
     } else {
@@ -2508,27 +2441,8 @@ impl JointJeffreysPlan {
                     ));
                 }
             }
-            let ramp_down = |value: f64, under: f64, clear: f64| -> f64 {
-                if value <= under {
-                    1.0
-                } else if value >= clear {
-                    0.0
-                } else {
-                    let t = (value - under) / (clear - under);
-                    1.0 - t * t * (3.0 - 2.0 * t)
-                }
-            };
-            let weight_absolute = ramp_down(
-                self.lambda_min,
-                CONDITIONING_GATE_ABSOLUTE,
-                CONDITIONING_GATE_ABSOLUTE_CLEAR,
-            );
-            let log10_ratio = conditioning_log10_ratio(self.lambda_min, self.lambda_max);
-            let weight_relative = ramp_down(
-                log10_ratio,
-                CONDITIONING_GATE_RELATIVE.log10(),
-                CONDITIONING_GATE_RELATIVE_CLEAR.log10(),
-            );
+            let ((weight_absolute, ..), (weight_relative, ..)) =
+                conditioning_sub_weight_derivatives(self.lambda_min, self.lambda_max);
             if weight_absolute > 0.0
                 && weight_absolute < 1.0
                 && (weight_absolute - weight_relative).abs() <= 64.0 * f64::EPSILON
