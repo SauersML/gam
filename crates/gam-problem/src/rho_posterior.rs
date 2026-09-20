@@ -59,6 +59,16 @@ pub const ESCALATE_K_HAT: f64 = 0.7;
 pub const PLUG_IN_ADEQUATE_K_HAT: f64 = 0.5;
 
 impl RhoProposalAdequacy {
+    /// The grade of a weight vector's upper tail. A flat tail has no tail to
+    /// be heavy: its weights are bounded by the threshold they all equal, so it
+    /// grades plug-in adequate without a shape (#3202).
+    pub fn from_tail_shape(shape: WeightTailShape) -> Self {
+        match shape {
+            WeightTailShape::Pareto(k_hat) => Self::from_k_hat(k_hat),
+            WeightTailShape::Flat => RhoProposalAdequacy::PlugInAdequate,
+        }
+    }
+
     pub fn from_k_hat(k_hat: f64) -> Self {
         if !k_hat.is_finite() || k_hat > ESCALATE_K_HAT {
             RhoProposalAdequacy::Escalate
@@ -70,18 +80,73 @@ impl RhoProposalAdequacy {
     }
 }
 
+/// Upper-tail shape of a vector of importance weights (#3202).
+///
+/// The weights' largest `tail_count(M)` values either carry a tail the
+/// generalized Pareto can be fitted to, or all equal the largest weight below
+/// them. The second case is not a tail with a shape of `−∞`: it has no tail at
+/// all, and it arises exactly when the proposal is the target (every weight is
+/// the same number). It is its own variant because the grade must read it as
+/// adequate while `from_k_hat` reads a non-finite shape as `Escalate`, and a
+/// non-finite float has no JSON form.
+///
+/// On the wire a fitted shape is its number, as written before the flat case
+/// was typed, and the flat case is the string `"Flat"`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(from = "WeightTailShapeWire", into = "WeightTailShapeWire")]
+pub enum WeightTailShape {
+    /// The fitted generalized-Pareto shape `k̂` of the upper tail.
+    Pareto(f64),
+    /// Every tail weight equals the threshold weight bit for bit.
+    Flat,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum WeightTailShapeWire {
+    Pareto(f64),
+    Absent(AbsentTail),
+}
+
+#[derive(Serialize, Deserialize)]
+enum AbsentTail {
+    Flat,
+}
+
+impl From<WeightTailShapeWire> for WeightTailShape {
+    fn from(wire: WeightTailShapeWire) -> Self {
+        match wire {
+            WeightTailShapeWire::Pareto(k_hat) => WeightTailShape::Pareto(k_hat),
+            WeightTailShapeWire::Absent(AbsentTail::Flat) => WeightTailShape::Flat,
+        }
+    }
+}
+
+impl From<WeightTailShape> for WeightTailShapeWire {
+    fn from(shape: WeightTailShape) -> Self {
+        match shape {
+            WeightTailShape::Pareto(k_hat) => WeightTailShapeWire::Pareto(k_hat),
+            WeightTailShape::Flat => WeightTailShapeWire::Absent(AbsentTail::Flat),
+        }
+    }
+}
+
 /// The Tier-0 `ρ`-uncertainty adequacy diagnostic for a fit: the PSIS tail
 /// shape of the Laplace proposal's importance weights and the grade read off it.
 ///
-/// Every field persists with the fit, so `k_hat` and `effective_sample_size`
-/// are finite by construction: the producer refuses a non-finite tail shape
-/// ([`RhoPosteriorRefusal::TailShapeNotFinite`]) and weights that do not
-/// normalize ([`RhoPosteriorRefusal::SmoothedWeightsNotNormalizable`]).
+/// Every field persists with the fit, so a fitted `k̂` and
+/// `effective_sample_size` are finite by construction: the producer refuses a
+/// non-finite tail shape ([`RhoPosteriorRefusal::TailShapeNotFinite`]) and
+/// weights that do not normalize
+/// ([`RhoPosteriorRefusal::SmoothedWeightsNotNormalizable`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RhoPosteriorAdequacy {
-    /// Pareto tail-shape of the importance weights — the reliability diagnostic.
-    pub k_hat: f64,
-    /// The adequacy grade read off `k_hat`. `certificate` is its legacy key:
+    /// Upper-tail shape of the importance weights — the reliability
+    /// diagnostic. Its key is `k_hat`, the name it had while only a fitted
+    /// shape could be written.
+    #[serde(rename = "k_hat")]
+    pub tail_shape: WeightTailShape,
+    /// The adequacy grade read off `tail_shape`. `certificate` is its legacy key:
     /// accepted when reading a payload written before #2946 T2, never written.
     #[serde(alias = "certificate")]
     pub adequacy: RhoProposalAdequacy,
@@ -386,6 +451,29 @@ mod tests {
         assert_eq!(RhoProposalAdequacy::from_k_hat(10.0), RhoProposalAdequacy::Escalate);
     }
 
+    /// #3202: a flat tail is no tail, so it grades adequate, and it is written
+    /// as its own token, not as a non-finite shape that JSON cannot carry and
+    /// `from_k_hat` would read as `Escalate`.
+    #[test]
+    fn flat_tail_grades_plug_in_adequate_and_writes_its_own_token_3202() {
+        assert_eq!(
+            RhoProposalAdequacy::from_tail_shape(WeightTailShape::Flat),
+            RhoProposalAdequacy::PlugInAdequate
+        );
+        assert_eq!(
+            RhoProposalAdequacy::from_tail_shape(WeightTailShape::Pareto(0.9)),
+            RhoProposalAdequacy::Escalate
+        );
+        assert_eq!(
+            serde_json::to_string(&WeightTailShape::Flat).expect("shape serializes"),
+            r#""Flat""#
+        );
+        assert_eq!(
+            serde_json::to_string(&WeightTailShape::Pareto(0.25)).expect("shape serializes"),
+            "0.25"
+        );
+    }
+
     #[test]
     fn from_k_hat_nan_is_escalate() {
         assert_eq!(
@@ -425,10 +513,16 @@ mod tests {
                 detail: "Cholesky(NonPositivePivot { index: 0 })".to_string(),
             }),
             RhoPosteriorOutcome::Assessed(RhoPosteriorAdequacy {
-                k_hat: 0.25,
+                tail_shape: WeightTailShape::Pareto(0.25),
                 adequacy: RhoProposalAdequacy::PlugInAdequate,
                 n_samples: 64,
                 effective_sample_size: 61.5,
+            }),
+            RhoPosteriorOutcome::Assessed(RhoPosteriorAdequacy {
+                tail_shape: WeightTailShape::Flat,
+                adequacy: RhoProposalAdequacy::PlugInAdequate,
+                n_samples: 64,
+                effective_sample_size: 64.0,
             }),
         ];
         for outcome in outcomes {
@@ -448,7 +542,7 @@ mod tests {
     #[test]
     fn assessed_outcome_writes_adequacy_tokens_not_certificate_words_2946() {
         let json = serde_json::to_string(&RhoPosteriorOutcome::Assessed(RhoPosteriorAdequacy {
-            k_hat: 0.25,
+            tail_shape: WeightTailShape::Pareto(0.25),
             adequacy: RhoProposalAdequacy::PlugInAdequate,
             n_samples: 64,
             effective_sample_size: 61.5,
@@ -479,7 +573,7 @@ mod tests {
         assert_eq!(
             read,
             RhoPosteriorOutcome::Assessed(RhoPosteriorAdequacy {
-                k_hat: 0.25,
+                tail_shape: WeightTailShape::Pareto(0.25),
                 adequacy: RhoProposalAdequacy::PlugInAdequate,
                 n_samples: 64,
                 effective_sample_size: 61.5,
