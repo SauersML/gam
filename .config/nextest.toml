@@ -173,17 +173,6 @@ slow-timeout = { period = "600s", terminate-after = 4 }
 filter = 'test(/bms_residual_repair_2924::residual_block_anchors_on_a_declared_skewed_score_law/)'
 slow-timeout = { period = "600s", terminate-after = 4 }
 
-# The gam#3452 generated-regressor acceptance arms each fit the Bernoulli
-# marginal-slope family 400 times at n = 2,000 with the conditional calibration
-# and its corrected covariance, the heavy-tailed arm on the global-empirical
-# grid. The 400 replicates run on the pool; on 4 cores an arm takes 590 s,
-# past the default 600 s bound with no headroom. The two-sided variance band
-# needs all 400, and terminate-after = 4 still kills a genuine hang far inside
-# the job backstop.
-[[profile.default.overrides]]
-filter = 'test(/quality_bms_empirical_grid_generated_regressor_3452::/)'
-slow-timeout = { period = "600s", terminate-after = 4 }
-
 # The gam#2926 survival moving-law acceptance probes each fit the survival default on a
 # moving conditional law and certify it (10 held-out laws per arm), and the shape-moving
 # probe re-solves on the local law and fits the declared location-scale law beside it.

@@ -273,7 +273,7 @@ impl EmpiricalZGridBuild {
     /// pushed through the raw-node adjoint `(1/sd)·Mᵀ·V`, and centered under the
     /// empirical law so the rows sum to zero.
     ///
-    /// Evaluated in `O(n·p + m·p)`: with `r_c = (Mᵀ V)_{c·}/(sd·π_c)` and `t` in
+    /// Evaluated in `O(n·log(m) + n·p + m·p)`: with `r_c = (Mᵀ V)_{c·}/(sd·π_c)` and `t` in
     /// fill-order bin `k`, `Σ_c clamp_c(t)·r_c = Σ_{c<k} Q_c r_c + t·r_k +
     /// Σ_{c>k} Q_{c−1} r_c` — a prefix sum, one term, and a suffix sum. The first
     /// bin's missing lower edge and the last bin's missing upper edge only ever

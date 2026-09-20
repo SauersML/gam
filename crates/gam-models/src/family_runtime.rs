@@ -254,15 +254,38 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         match (&self.spec.response, &self.spec.link) {
             (ResponseFamily::StudentT { .. }, _) => Ok(eta),
             (
-                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
+                ResponseFamily::Gaussian
+                | ResponseFamily::Gamma
+                | ResponseFamily::InverseGaussian
+                | ResponseFamily::Poisson
+                | ResponseFamily::Tweedie { .. }
+                | ResponseFamily::NegativeBinomial { .. },
                 InverseLink::Standard(StandardLink::Log),
-            ) => Ok((eta + 0.5 * se_eta * se_eta).exp()),
+            ) => {
+                // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)
+                // (log-normal MGF). When the exponent exceeds the f64 range the
+                // posterior mean genuinely overflows; `exp` then returns +inf,
+                // which IS the correctly rounded value of the integral. Earlier
+                // revisions substituted the plug-in `exp(η)` (or f64::MAX) here
+                // to keep the FFI finite, silently turning an unbounded
+                // posterior mean into an innocuous value (η = 0, se = 40 →
+                // exponent 800 reported as 1). Honesty over convenience:
+                // return the exact, possibly infinite, mean and let callers
+                // decide how to present it.
+                Ok((eta + 0.5 * se_eta * se_eta).exp())
+            }
             (
-                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
+                ResponseFamily::Gaussian
+                | ResponseFamily::Gamma
+                | ResponseFamily::InverseGaussian
+                | ResponseFamily::Poisson
+                | ResponseFamily::Tweedie { .. }
+                | ResponseFamily::NegativeBinomial { .. },
                 _,
             ) => {
-                // Identity is the plug-in; the reciprocal links are the
-                // principal-value / positive-part means of the shared dispatcher.
+                // Identity is the plug-in, sqrt is `eta² + se²`, and the
+                // reciprocal links are the principal-value / positive-part
+                // means of the shared dispatcher.
                 integrated_inverse_link_mean_and_derivative(
                     quadctx,
                     self.link_function(),
@@ -310,21 +333,6 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 )
                 .map(|v| v.mean)
             }
-            (ResponseFamily::Poisson, _)
-            | (ResponseFamily::Tweedie { .. }, _)
-            | (ResponseFamily::NegativeBinomial { .. }, _) => {
-                // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)
-                // (log-normal MGF). When the exponent exceeds the f64 range the
-                // posterior mean genuinely overflows; `exp` then returns +inf,
-                // which IS the correctly rounded value of the integral. Earlier
-                // revisions substituted the plug-in `exp(η)` (or f64::MAX) here
-                // to keep the FFI finite, silently turning an unbounded
-                // posterior mean into an innocuous value (η = 0, se = 40 →
-                // exponent 800 reported as 1). Honesty over convenience:
-                // return the exact, possibly infinite, mean and let callers
-                // decide how to present it.
-                Ok((eta + 0.5 * se_eta * se_eta).exp())
-            }
             (ResponseFamily::Beta { .. }, _) => {
                 logit_posterior_meanwith_deriv(eta, se_eta).map(|(mean, _)| mean)
             }
@@ -341,25 +349,44 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         match (&self.spec.response, &self.spec.link) {
             (ResponseFamily::StudentT { .. }, _) => Ok((eta, se_eta * se_eta)),
             (
-                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ) => Ok((eta, se_eta * se_eta)),
-            (
-                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
-                InverseLink::Standard(StandardLink::Log),
-            ) => Ok(lognormal_meanvariance(eta, se_eta)),
-            (
-                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
-                InverseLink::Standard(link @ (StandardLink::Inverse | StandardLink::InverseSquared)),
-            ) => reciprocal_link_posterior_meanvariance(link.as_link_function(), eta, se_eta),
-            (
-                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
-                other,
-            ) => Err(EstimationError::InvalidInput(format!(
-                "{} likelihood has no posterior variance for link {:?}",
-                self.spec.response.name(),
-                other
-            ))),
+                ResponseFamily::Gaussian
+                | ResponseFamily::Gamma
+                | ResponseFamily::InverseGaussian
+                | ResponseFamily::Poisson
+                | ResponseFamily::Tweedie { .. }
+                | ResponseFamily::NegativeBinomial { .. },
+                link,
+            ) => match link {
+                InverseLink::Standard(StandardLink::Identity) => Ok((eta, se_eta * se_eta)),
+                InverseLink::Standard(StandardLink::Log) => Ok(lognormal_meanvariance(eta, se_eta)),
+                InverseLink::Standard(StandardLink::Sqrt) => {
+                    // μ = η² with η ~ N(m, s²): E[η²] = m² + s² and
+                    // Var[η²] = E[η⁴] − E[η²]² = (m⁴ + 6m²s² + 3s⁴) − (m² + s²)²
+                    // = 2s²(2m² + s²), exactly. The mean comes from the shared
+                    // dispatcher, which also refuses a predictor outside `η > 0`.
+                    let mean = integrated_inverse_link_mean_and_derivative(
+                        quadctx,
+                        LinkFunction::Sqrt,
+                        eta,
+                        se_eta,
+                    )?
+                    .mean;
+                    let s2 = se_eta * se_eta;
+                    Ok((mean, 2.0 * s2 * (2.0 * eta * eta + s2)))
+                }
+                InverseLink::Standard(
+                    reciprocal @ (StandardLink::Inverse | StandardLink::InverseSquared),
+                ) => reciprocal_link_posterior_meanvariance(
+                    reciprocal.as_link_function(),
+                    eta,
+                    se_eta,
+                ),
+                other => Err(EstimationError::InvalidInput(format!(
+                    "{} likelihood has no posterior variance for link {:?}",
+                    self.spec.response.name(),
+                    other
+                ))),
+            },
             (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
                 logit_posterior_meanvariance(eta, se_eta)
             }
@@ -434,11 +461,6 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 });
                 Ok((m1, (m2 - m1 * m1).max(0.0)))
             }
-            (ResponseFamily::Poisson, _)
-            | (ResponseFamily::Tweedie { .. }, _)
-            | (ResponseFamily::NegativeBinomial { .. }, _) => {
-                Ok(lognormal_meanvariance(eta, se_eta))
-            }
             (ResponseFamily::Beta { .. }, _) => {
                 logit_posterior_meanvariance(eta, se_eta)
             }
@@ -472,13 +494,21 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
                 Ok(survival_posterior_mean(quadctx, eta, se_eta))
             }
-            // The latent-cloglog kernel reports its mean but not the survival
-            // output the exact complement needs (mixture_link.rs,
-            // `inverse_link_complement_for_inverse_link`), so its complement is the
-            // mean's, as the working response already takes it.
-            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => self
-                .posterior_mean(quadctx, eta, se_eta)
-                .map(|mean| 1.0 - mean),
+            // The latent-cloglog mean is `1 − S(eta, √(se² + σ_L²))` with the
+            // lognormal-Laplace survival `S(m, σ) = E[exp(−exp η)]`, `η ~ N(m, σ²)`
+            // (`posterior_mean` forms it as `−expm1(ln S)`), so the complement is
+            // `S` itself, on the same survival surface.
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
+                let state = self.require_latent_cloglog_state()?;
+                let total_sigma = se_eta.hypot(state.latent_sd);
+                if !eta.is_finite() || !total_sigma.is_finite() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "latent cloglog posterior complement requires finite eta and \
+                         sigma, got eta={eta}, sigma={total_sigma}"
+                    )));
+                }
+                Ok(survival_posterior_mean(quadctx, eta, total_sigma))
+            }
             (ResponseFamily::Binomial, link) => {
                 let spec = &self.spec;
                 Ok(normal_expectation_1d_adaptive(quadctx, eta, se_eta, |x| {
@@ -580,6 +610,157 @@ mod log_link_public_jet_tests {
         assert!(over.mu.is_infinite() && over.mu > 0.0, "exp(710) -> +inf");
         let under = strategy.inverse_link_jet(-746.0).expect("jet");
         assert_eq!(under.mu, 0.0, "exp(-746) -> 0.0");
+    }
+
+    /// The latent-cloglog posterior complement is the survival `S(eta, σ)`,
+    /// `σ = √(se² + σ_L²)`, not `1 − mean`: at `(eta, σ) = (8, 0.5)` the mean
+    /// rounds to one while `ln S = −70.97988851759840` (the #2714 high-precision
+    /// reference row, which `ln S` meets to `1e-13` relative).
+    #[test]
+    fn latent_cloglog_posterior_complement_keeps_the_survival_tail() {
+        let state = gam_problem::LatentCLogLogState::new(0.4).expect("latent SD");
+        let strategy = strategy_for_spec(&LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::LatentCLogLog(state),
+        ));
+        let quadctx = QuadratureContext::new();
+        let (eta, se_eta) = (8.0, 0.3);
+        let mean = strategy
+            .posterior_mean(&quadctx, eta, se_eta)
+            .expect("posterior mean");
+        assert_eq!(mean, 1.0, "the mean saturates, so 1 - mean carries nothing");
+        let complement = strategy
+            .posterior_complement_mean(&quadctx, eta, se_eta)
+            .expect("posterior complement");
+        assert!(
+            complement > 0.0,
+            "the complement must keep the representable survival tail, got {complement:e}"
+        );
+        let reference_log_survival = -7.097_988_851_759_84e1;
+        let relative =
+            (complement.ln() - reference_log_survival).abs() / reference_log_survival.abs();
+        assert!(
+            relative <= 1.0e-12,
+            "ln complement = {:.17e}, reference {reference_log_survival:.17e} \
+             (relative {relative:.3e})",
+            complement.ln()
+        );
+
+        // Where the mean does not saturate, the complement and the mean share
+        // one `ln S`, so they add to one up to the rounding of each.
+        let (eta, se_eta) = (0.35, 0.3);
+        let mean = strategy
+            .posterior_mean(&quadctx, eta, se_eta)
+            .expect("posterior mean");
+        let complement = strategy
+            .posterior_complement_mean(&quadctx, eta, se_eta)
+            .expect("posterior complement");
+        assert!(
+            (mean + complement - 1.0).abs() <= 4.0 * f64::EPSILON,
+            "mean {mean:.17e} + complement {complement:.17e} must be one"
+        );
+
+        assert!(
+            strategy
+                .posterior_complement_mean(&quadctx, f64::NAN, se_eta)
+                .is_err(),
+            "a non-finite eta is refused, as the mean refuses it"
+        );
+    }
+
+    fn standard_strategy(response: ResponseFamily, link: StandardLink) -> ResolvedFamilyStrategy {
+        strategy_for_spec(&LikelihoodSpec::new(response, InverseLink::Standard(link)))
+    }
+
+    /// A count family's posterior response moments are those of ITS inverse
+    /// link: identity-, sqrt- and inverse-link Poisson/Tweedie/NB fits are
+    /// generic EDM cells, and none of their means is the log-normal
+    /// `exp(eta + se²/2)` the log link implies.
+    #[test]
+    fn count_family_posterior_moments_follow_the_link() {
+        let quadctx = QuadratureContext::new();
+        let (eta, se) = (5.0_f64, 0.3_f64);
+        for response in [
+            ResponseFamily::Poisson,
+            ResponseFamily::Tweedie { p: 1.5 },
+            ResponseFamily::NegativeBinomial {
+                theta: 2.0,
+                theta_fixed: true,
+            },
+        ] {
+            let identity = standard_strategy(response.clone(), StandardLink::Identity);
+            assert_eq!(identity.posterior_mean(&quadctx, eta, se).unwrap(), eta);
+            assert_eq!(
+                identity.posterior_meanvariance(&quadctx, eta, se).unwrap(),
+                (eta, se * se)
+            );
+
+            let sqrt = standard_strategy(response.clone(), StandardLink::Sqrt);
+            let (m1, m2) = normal_expectation_1d_adaptive_pair(&quadctx, eta, se, |x| {
+                let mu = x * x;
+                (mu, mu * mu)
+            });
+            let mean = sqrt.posterior_mean(&quadctx, eta, se).unwrap();
+            let (mv_mean, variance) = sqrt.posterior_meanvariance(&quadctx, eta, se).unwrap();
+            assert!((mean - (eta * eta + se * se)).abs() <= 1e-14 * mean);
+            assert_eq!(mv_mean, mean);
+            assert!(
+                (mean - m1).abs() <= 1e-12 * m1,
+                "sqrt mean {mean} vs quadrature {m1}"
+            );
+            let quadrature_variance = m2 - m1 * m1;
+            assert!(
+                (variance - quadrature_variance).abs() <= 1e-9 * quadrature_variance,
+                "sqrt variance {variance} vs quadrature {quadrature_variance}"
+            );
+            assert!(sqrt.posterior_mean(&quadctx, -1.0, se).is_err());
+
+            for link in [StandardLink::Inverse, StandardLink::InverseSquared] {
+                let strategy = standard_strategy(response.clone(), link);
+                let expected =
+                    reciprocal_link_posterior_meanvariance(link.as_link_function(), eta, se)
+                        .unwrap();
+                assert_eq!(
+                    strategy.posterior_meanvariance(&quadctx, eta, se).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    strategy.posterior_mean(&quadctx, eta, se).unwrap(),
+                    expected.0
+                );
+            }
+
+            let log = standard_strategy(response, StandardLink::Log);
+            assert_eq!(
+                log.posterior_mean(&quadctx, eta, se).unwrap(),
+                (eta + 0.5 * se * se).exp()
+            );
+            assert_eq!(
+                log.posterior_meanvariance(&quadctx, eta, se).unwrap(),
+                lognormal_meanvariance(eta, se)
+            );
+        }
+    }
+
+    /// Sqrt-link Gaussian/Gamma/inverse-Gaussian fits have a posterior mean,
+    /// so they have the posterior variance `2se²(2eta² + se²)` of `η²` too.
+    #[test]
+    fn sqrt_link_continuous_families_report_posterior_variance() {
+        let quadctx = QuadratureContext::new();
+        let (eta, se) = (2.0_f64, 0.25_f64);
+        for response in [
+            ResponseFamily::Gaussian,
+            ResponseFamily::Gamma,
+            ResponseFamily::InverseGaussian,
+        ] {
+            let strategy = standard_strategy(response, StandardLink::Sqrt);
+            let (mean, variance) = strategy.posterior_meanvariance(&quadctx, eta, se).unwrap();
+            let s2 = se * se;
+            assert_eq!(mean, strategy.posterior_mean(&quadctx, eta, se).unwrap());
+            assert!((mean - (eta * eta + s2)).abs() <= 1e-14 * mean);
+            assert_eq!(variance, 2.0 * s2 * (2.0 * eta * eta + s2));
+            assert!(strategy.posterior_meanvariance(&quadctx, 0.0, se).is_err());
+        }
     }
 
 }

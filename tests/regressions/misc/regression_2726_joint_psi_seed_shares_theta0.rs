@@ -178,7 +178,6 @@ fn run_fit(max_outer_iter: usize) -> Result<(), String> {
         coefficient_groups: Vec::new(),
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
-        estimate_tweedie_p: false,
     }));
     match outcome {
         Ok(FitResult::Standard(_)) => Ok(()),

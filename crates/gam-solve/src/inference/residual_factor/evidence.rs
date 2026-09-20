@@ -401,8 +401,7 @@ impl<'a> EvidenceProblem<'a> {
             let logits: Vec<f64> = (0..slots)
                 .map(|b| if b + 1 < slots { theta[base + b] } else { 0.0 })
                 .collect();
-            let top = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let log_sum = top + logits.iter().map(|&l| (l - top).exp()).sum::<f64>().ln();
+            let log_sum = gam_math::probability::positive_log_sum_exp(&logits);
             let log_w: Vec<f64> = logits.iter().map(|&l| l - log_sum).collect();
             (log_w.iter().map(|&l| l.exp()).collect(), log_w)
         } else {

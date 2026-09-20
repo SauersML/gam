@@ -105,14 +105,20 @@ fn grid_sampling_influence_is_centered_and_zero_on_zero_weight_rows_3452() {
         );
         for (i, &value) in column.iter().enumerate() {
             if weights[i] == 0.0 {
-                assert_eq!(value, 0.0, "gam#3452: zero-weight row {i} carries influence {value}");
+                assert_eq!(
+                    value, 0.0,
+                    "gam#3452: zero-weight row {i} carries influence {value}"
+                );
             }
         }
     }
     // Every row the grid saw moves it: a zero influence would be the pre-fix
     // state, where the grid's sampling error was absent from the correction.
     let norm = influence.iter().map(|x| x * x).sum::<f64>();
-    assert!(norm > 0.0, "gam#3452: the grid's sampling influence came out identically zero");
+    assert!(
+        norm > 0.0,
+        "gam#3452: the grid's sampling influence came out identically zero"
+    );
 }
 
 #[test]
@@ -151,17 +157,15 @@ fn monte_carlo(law: Law, n: usize, replicates: usize, seed: u64) -> (f64, f64) {
     let mut predicted = 0.0;
     for _ in 0..replicates {
         let (zeta, weights) = sample(law, n, &mut state);
-        let build =
-            build_empirical_z_grid_with_alpha(zeta.view(), weights.view(), GRID_SIZE, "mc")
-                .expect("grid builds");
+        let build = build_empirical_z_grid_with_alpha(zeta.view(), weights.view(), GRID_SIZE, "mc")
+            .expect("grid builds");
         assert_eq!(build.grid.nodes.len(), GRID_SIZE);
         values.push(functional(&build.grid.nodes, &v));
         let influence = build.node_sampling_influence(v.view()).expect("influence");
         predicted += influence.iter().map(|x| x * x).sum::<f64>();
     }
     let mean = values.iter().sum::<f64>() / replicates as f64;
-    let variance =
-        values.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / (replicates - 1) as f64;
+    let variance = values.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / (replicates - 1) as f64;
     (variance, predicted / replicates as f64)
 }
 
@@ -177,7 +181,10 @@ fn grid_sampling_influence_reproduces_the_grids_monte_carlo_variance_3452() {
     // tail at 2.5·10⁻⁴, standard-normal quantile 3.4808.
     const Z_TAIL: f64 = 3.480_756;
     const REPLICATES: usize = 2_000;
-    for (law, seed) in [(Law::Gaussian, 0x3452_0000_0000_00A1), (Law::ScaleMixture, 0x3452_0000_0000_00A2)] {
+    for (law, seed) in [
+        (Law::Gaussian, 0x3452_0000_0000_00A1),
+        (Law::ScaleMixture, 0x3452_0000_0000_00A2),
+    ] {
         let (empirical, predicted) = monte_carlo(law, 2_000, REPLICATES, seed);
         let k = (REPLICATES - 1) as f64;
         let low = predicted * chi2_over_df(k, -Z_TAIL);
@@ -192,5 +199,125 @@ fn grid_sampling_influence_reproduces_the_grids_monte_carlo_variance_3452() {
             "gam#3452 ({law:?}): the grid's Monte Carlo variance {empirical:.4e} is outside the \
              two-sided χ² band [{low:.4e}, {high:.4e}] around the influence's {predicted:.4e}"
         );
+    }
+}
+
+#[test]
+fn grid_sampling_influence_matches_individual_weight_perturbations_3452() {
+    let n = 51;
+    let m = 7;
+    let z = Array1::from_shape_fn(n, |i| (i as f64 * 0.73).sin() + i as f64 * 0.037);
+    let w = Array1::from_shape_fn(n, |i| {
+        if i % 11 == 4 {
+            0.0
+        } else {
+            0.4 + (i as f64 * 1.17).cos().abs()
+        }
+    });
+    let v = Array2::from_shape_fn((m, 3), |(b, j)| ((b + 2 * j) as f64 * 0.63).cos());
+    let build = build_empirical_z_grid_with_alpha(z.view(), w.view(), m, "weight derivative")
+        .expect("grid");
+    assert_eq!(build.grid.nodes.len(), m);
+    let influence = build.node_sampling_influence(v.view()).expect("influence");
+    // Multiplying every weight preserves the empirical law and its influence.
+    let scaled =
+        build_empirical_z_grid_with_alpha(z.view(), w.mapv(|x| 13.7 * x).view(), m, "scaled")
+            .expect("scaled grid")
+            .node_sampling_influence(v.view())
+            .expect("scaled influence");
+    for (a, b) in influence.iter().zip(scaled.iter()) {
+        assert!((a - b).abs() < 2.0e-12);
+    }
+    // Perturb one weight through the actual builder, including moving quantile
+    // boundaries, normalization, and the zero-weight filtering path.
+    for i in 0..n {
+        for eps in [2.0_f64.powi(-15), 2.0_f64.powi(-17)] {
+            let mut plus = w.clone();
+            let mut minus = w.clone();
+            plus[i] *= 1.0 + eps;
+            minus[i] *= 1.0 - eps;
+            let hi =
+                build_empirical_z_grid_with_alpha(z.view(), plus.view(), m, "plus").expect("plus");
+            let lo = build_empirical_z_grid_with_alpha(z.view(), minus.view(), m, "minus")
+                .expect("minus");
+            for j in 0..3 {
+                let fd = (0..m)
+                    .map(|b| v[[b, j]] * (hi.grid.nodes[b] - lo.grid.nodes[b]))
+                    .sum::<f64>()
+                    / (2.0 * eps);
+                assert!(
+                    (fd - influence[[i, j]]).abs() < 2.0e-8 * (1.0 + fd.abs()),
+                    "row {i}, output {j}, step {eps}: builder derivative {fd:e}, influence {:e}",
+                    influence[[i, j]]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn joint_row_influence_retains_the_canceling_cross_covariance_3452() {
+    let n = 43;
+    let a = Array2::from_shape_fn((n, 1), |(i, _)| (i as f64 * 0.47).sin());
+    let z = Array1::from_shape_fn(n, |i| {
+        0.3 + 0.7 * a[[i, 0]] + (i as f64 * 1.37).cos() * (1.0 + 0.2 * a[[i, 0]])
+    });
+    let w = Array1::from_shape_fn(n, |i| {
+        if i % 13 == 4 {
+            0.0
+        } else {
+            0.7 + (i % 5) as f64 * 0.13
+        }
+    });
+    let sensitivity = Array2::from_shape_fn((n, 2), |(i, j)| {
+        ((i + 3 * j) as f64 * 0.31).cos() / n as f64
+    });
+    let vb = ndarray::array![[1.0, 0.2], [0.2, 2.0]];
+    for fit_variance in [false, true] {
+        let calibration = super::fit_conditional_latent_calibration(&z, &w, a.view(), fit_variance)
+            .expect("conditional fit");
+        let jacobian = calibration.build_zeta_theta1_jacobian(z.view(), a.view());
+        let g = sensitivity.t().dot(&jacobian);
+        let psi = calibration
+            .theta1_row_influence(z.view(), a.view(), w.view())
+            .expect("rows");
+        let calibration_rows = psi.dot(&g.t());
+        assert!(calibration_rows.iter().map(|v| v * v).sum::<f64>() > 1.0e-8);
+        // Equal and opposite influences from the same observations cancel.
+        // Adding the two separate covariance matrices would instead double it.
+        let measure = calibration_rows.mapv(|value| -value);
+        let correction = calibration
+            .generated_regressor_correction_with_measure_influence(
+                sensitivity.view(),
+                z.view(),
+                a.view(),
+                w.view(),
+                vb.view(),
+                measure.view(),
+            )
+            .expect("joint correction");
+        assert!(
+            correction.iter().all(|value| value.abs() < 1.0e-24),
+            "{correction:?}"
+        );
+        // The zero-measure route agrees with the already calibrated first-stage
+        // covariance and does not drop it while adding the empirical-law term.
+        let zero = Array2::zeros((n, 2));
+        let rows_only = calibration
+            .generated_regressor_correction_with_measure_influence(
+                sensitivity.view(),
+                z.view(),
+                a.view(),
+                w.view(),
+                vb.view(),
+                zero.view(),
+            )
+            .expect("rows only");
+        let covariance_only = calibration
+            .generated_regressor_correction(sensitivity.view(), z.view(), a.view(), vb.view())
+            .expect("covariance only");
+        for (left, right) in rows_only.iter().zip(covariance_only.iter()) {
+            assert!((left - right).abs() <= 1.0e-12 * right.abs().max(1.0e-20));
+        }
     }
 }

@@ -3815,27 +3815,10 @@ mod stacked_first_stage_sandwich_2484_tests {
     };
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2, array};
 
-    /// The joint first-stage covariance `V₁ = J⁻¹ Ω J⁻ᵀ` of `θ₁ = (β_m, β_v)`, the
-    /// sandwich of the stacked system [`stacked_first_stage_inverse_bread`]
-    /// documents, with the robust (HC0) meat
-    ///
-    /// ```text
-    /// Ω = Σ_i w_i² [A_i û_i ; B_i r_i][·]ᵀ = SᵀS,   S_i = [w_i û_i A_iᵀ | w_i r_i B_iᵀ].
-    /// ```
-    ///
-    /// Both off-diagonal channels, `M_vm` in the bread and `Ω_mv ∝ E[û³]` in the
-    /// meat, vanish for a Gaussian residual and neither vanishes on the branch this
-    /// covariance serves (gam#2484). The mean block is the standalone HC0 sandwich
-    /// `M⁺ Ω_mm M⁺` exactly, because `J⁻¹` is block lower-triangular. `V₁` is a
-    /// congruence of the PSD Gram `Ω`, so it is PSD, and so is the
-    /// generated-regressor term built from it. `var_residuals` are the `r_i`.
-    ///
-    /// Formed as `ΨᵀΨ` from the row influence
-    /// [`stacked_first_stage_row_influence`], which is `J⁻¹ Ω J⁻ᵀ` exactly. The fit
-    /// builds `θ₁`'s covariance from that influence directly
-    /// ([`LatentZConditionalCalibration::theta1_row_influence`]); this closed form of
-    /// the same number is what the tests pin the formula against.
-    fn stacked_first_stage_sandwich_cov(
+    /// Compare the live row-influence covariance with an independently assembled
+    /// stacked score meat and block inverse bread. The oracle deliberately does
+    /// not call the production inverse-bread or row-influence helpers.
+    fn assert_row_influence_matches_sandwich(
         mean_basis: ArrayView2<'_, f64>,
         var_basis: ArrayView2<'_, f64>,
         weights: ArrayView1<'_, f64>,
@@ -3853,7 +3836,49 @@ mod stacked_first_stage_sandwich_2484_tests {
             mean_normal,
             var_normal,
         )?;
-        first_stage_covariance_from_row_influence(&psi)
+        let actual = first_stage_covariance_from_row_influence(&psi)?;
+        let n = mean_basis.nrows();
+        let p = mean_basis.ncols();
+        let q = var_basis.ncols();
+        let m_inv = preconditioned_normal_pseudoinverse(mean_normal, n)?;
+        let v_inv = preconditioned_normal_pseudoinverse(var_normal, n)?;
+        let mut cross = Array2::<f64>::zeros((q, p));
+        let mut meat = Array2::<f64>::zeros((p + q, p + q));
+        for i in 0..n {
+            let mut score = vec![0.0; p + q];
+            for j in 0..p {
+                score[j] = weights[i] * mean_residuals[i] * mean_basis[[i, j]];
+            }
+            for j in 0..q {
+                score[p + j] = weights[i] * var_residuals[i] * var_basis[[i, j]];
+                for k in 0..p {
+                    cross[[j, k]] -= 2.0 * weights[i] * mean_residuals[i]
+                        * var_basis[[i, j]] * mean_basis[[i, k]];
+                }
+            }
+            for j in 0..p + q {
+                for k in 0..p + q {
+                    meat[[j, k]] += score[j] * score[k];
+                }
+            }
+        }
+        let lower = v_inv.dot(&cross).dot(&m_inv);
+        let mut inverse_bread = Array2::<f64>::zeros((p + q, p + q));
+        for j in 0..p {
+            for k in 0..p { inverse_bread[[j, k]] = m_inv[[j, k]]; }
+        }
+        for j in 0..q {
+            for k in 0..p { inverse_bread[[p + j, k]] = lower[[j, k]]; }
+            for k in 0..q { inverse_bread[[p + j, p + k]] = v_inv[[j, k]]; }
+        }
+        let expected = inverse_bread.dot(&meat).dot(&inverse_bread.t());
+        let scale = expected.iter().fold(0.0_f64, |v, x| v.max(x.abs()));
+        let allowance = 64.0 * (n + p + q) as f64 * f64::EPSILON * scale;
+        for (a, e) in actual.iter().zip(expected.iter()) {
+            assert!((a - e).abs() <= allowance,
+                "row influence covariance {a:e} differs from independent sandwich {e:e}");
+        }
+        Ok(actual)
     }
 
     /// The standalone HC0 sandwich `M⁺ (Σ w² e² A Aᵀ) M⁺` of one weighted-ridge
@@ -3914,7 +3939,7 @@ mod stacked_first_stage_sandwich_2484_tests {
         let var_residuals: Vec<f64> = mean_residuals.iter().map(|&u| u * u - 0.5).collect();
         let m = system(&basis, &weights);
 
-        let joint = stacked_first_stage_sandwich_cov(
+        let joint = assert_row_influence_matches_sandwich(
             basis.view(),
             basis.view(),
             weights.view(),
@@ -3977,7 +4002,7 @@ mod stacked_first_stage_sandwich_2484_tests {
         let var_residuals: Vec<f64> = mean_residuals.iter().map(|&u| u * u - 0.5).collect();
         let m = system(&basis, &weights);
 
-        let joint = stacked_first_stage_sandwich_cov(
+        let joint = assert_row_influence_matches_sandwich(
             basis.view(),
             basis.view(),
             weights.view(),
@@ -4032,6 +4057,8 @@ mod empirical_intercept_solve_tests;
 mod empirical_measure_2484_tests;
 #[cfg(test)]
 mod empirical_grid_sampling_3452_tests;
+#[cfg(test)]
+mod empirical_grid_fit_3452_tests;
 #[cfg(test)]
 mod anchor_law_2926_tests;
 #[cfg(test)]
