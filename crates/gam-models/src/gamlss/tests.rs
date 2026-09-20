@@ -2933,7 +2933,9 @@ pub(crate) fn gaussian_location_scale_termswith_matern_spatial_blocks_fit_finite
     // Production-sized outer budget: with genuine interior signal the REML
     // optimum is a real stationary point, so give the outer enough iterations to
     // reach and certify it (this is not budget-inflation to chase a saturated
-    // rail — the honest optimum here is interior).
+    // rail — the honest optimum here is interior). The explicit length scales
+    // seed joint κ coordinates (#3020), so the joint κ+ρ search gets the
+    // production budget too, not the four-step smoke budget.
     let options = BlockwiseFitOptions {
         inner_max_cycles: 48,
         inner_tol: 1e-4,
@@ -2945,7 +2947,7 @@ pub(crate) fn gaussian_location_scale_termswith_matern_spatial_blocks_fit_finite
         data.view(),
         spec,
         &options,
-        &spatial_kappa_options(),
+        &SpatialLengthScaleOptimizationOptions::default(),
     )
     .expect("gaussian location-scale spatial fit");
     assert!(fit.fit.penalized_objective().is_some_and(f64::is_finite));
