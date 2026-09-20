@@ -217,11 +217,7 @@ impl std::fmt::Display for PooledPilotRefusal {
                 threshold,
                 positive_above_threshold,
             }) => {
-                let side = if *positive_above_threshold {
-                    "above"
-                } else {
-                    "below"
-                };
+                let side = if *positive_above_threshold { "above" } else { "below" };
                 write!(
                     f,
                     "pooled bernoulli-marginal-slope pilot: the latent score z separates the \
@@ -375,12 +371,13 @@ pub(super) fn pooled_probit_baseline(
     // A `z` whose spread sits inside its mean's rounding band `γ_{n+1}·max|z|` has no
     // slope to regress on.
     let z_magnitude = z.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    let mut beta1 =
-        if z_var.sqrt() > gam_linalg::roundoff::accumulation_growth(z.len() + 1) * z_magnitude {
-            yz_cov / z_var
-        } else {
-            0.0
-        };
+    let mut beta1 = if z_var.sqrt()
+        > gam_linalg::roundoff::accumulation_growth(z.len() + 1) * z_magnitude
+    {
+        yz_cov / z_var
+    } else {
+        0.0
+    };
 
     // `γ_{n+k}` for a sum over the `n` rows of terms formed by `k` rounded
     // operations after the log-CDF jet.
@@ -477,7 +474,9 @@ pub(super) fn pooled_probit_baseline(
             g0_abs += g_eta.abs();
             g1 += g_eta * zi;
             g1_abs += (g_eta * zi).abs();
-            let omega = wi * normal_logcdf_derivatives(eta)[1] * normal_logcdf_derivatives(-eta)[1];
+            let omega = wi
+                * normal_logcdf_derivatives(eta)[1]
+                * normal_logcdf_derivatives(-eta)[1];
             i00 += omega;
             i01 += omega * zi;
             i01_abs += (omega * zi).abs();
@@ -567,11 +566,9 @@ pub(super) fn pooled_probit_baseline(
             (along * v0, along * v1)
         };
         if !(step0.is_finite() && step1.is_finite()) {
-            return Err(
-                "pooled bernoulli-marginal-slope pilot Newton step is not finite"
-                    .to_string()
-                    .into(),
-            );
+            return Err("pooled bernoulli-marginal-slope pilot Newton step is not finite"
+                .to_string()
+                .into());
         }
         Ok((step0, step1, e.g0 * step0 + e.g1 * step1))
     };
@@ -716,8 +713,9 @@ mod pooled_probit_prevalence_tests {
     #[test]
     fn a_separated_score_refuses_unarmed_and_has_a_finite_jeffreys_mode_3217() {
         let mut state = 0x3217_u64;
-        let mut next_unit =
-            || (gam_linalg::utils::splitmix64(&mut state) >> 11) as f64 / (1u64 << 53) as f64;
+        let mut next_unit = || {
+            (gam_linalg::utils::splitmix64(&mut state) >> 11) as f64 / (1u64 << 53) as f64
+        };
         let z = Array1::from_iter((0..400).map(|_| {
             let u1 = next_unit().max(f64::MIN_POSITIVE);
             let u2 = next_unit();
@@ -753,11 +751,7 @@ mod pooled_probit_prevalence_tests {
                 let q = gam_math::probability::normal_cdf(-eta);
                 nll -= if yi > 0.5 { p.ln() } else { q.ln() };
                 let density = (-0.5 * eta * eta).exp() / (std::f64::consts::TAU).sqrt();
-                let omega = if density > 0.0 {
-                    density * density / (p * q)
-                } else {
-                    0.0
-                };
+                let omega = if density > 0.0 { density * density / (p * q) } else { 0.0 };
                 i00 += omega;
                 i01 += omega * zi;
                 i11 += omega * zi * zi;
@@ -768,10 +762,7 @@ mod pooled_probit_prevalence_tests {
         assert!(information > 0.0, "slope {slope}, intercept {intercept}");
         for (d0, d1) in [(1e-3, 0.0), (-1e-3, 0.0), (0.0, 1e-3), (0.0, -1e-3)] {
             let moved = objective(beta0 + d0, slope * (1.0 + d1)).0;
-            assert!(
-                moved > at_mode,
-                "F({d0}, {d1}) = {moved} <= F(mode) = {at_mode}"
-            );
+            assert!(moved > at_mode, "F({d0}, {d1}) = {moved} <= F(mode) = {at_mode}");
         }
     }
 }
@@ -980,9 +971,8 @@ pub(super) fn joint_setup(
 ) -> Result<ExactJointHyperSetup, gam_terms::basis::BasisError> {
     let marginal_terms = spatial_length_scale_term_indices(marginalspec);
     let slope_terms = spatial_length_scale_term_indices(slopespec);
-    let marginal_kappa =
-        SpatialLogKappaCoords::from_length_scales_aniso(marginalspec, &marginal_terms)
-            .reseed_from_data(data, marginalspec, &marginal_terms)?;
+    let marginal_kappa = SpatialLogKappaCoords::from_length_scales_aniso(marginalspec, &marginal_terms)
+        .reseed_from_data(data, marginalspec, &marginal_terms)?;
     let slope_kappa = SpatialLogKappaCoords::from_length_scales_aniso(slopespec, &slope_terms)
         .reseed_from_data(data, slopespec, &slope_terms)?;
     let mut values = marginal_kappa.as_array().to_vec();
@@ -999,12 +989,8 @@ pub(super) fn joint_setup(
         &marginal_terms,
         &marginal_dims,
     )?;
-    let slope_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
-        data,
-        slopespec,
-        &slope_terms,
-        &slope_dims,
-    )?;
+    let slope_lower =
+        SpatialLogKappaCoords::lower_bounds_aniso_from_data(data, slopespec, &slope_terms, &slope_dims)?;
     let mut lower_vals = marginal_lower.as_array().to_vec();
     lower_vals.extend(slope_lower.as_array().iter());
     let log_kappa_lower =
@@ -1015,12 +1001,8 @@ pub(super) fn joint_setup(
         &marginal_terms,
         &marginal_dims,
     )?;
-    let slope_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
-        data,
-        slopespec,
-        &slope_terms,
-        &slope_dims,
-    )?;
+    let slope_upper =
+        SpatialLogKappaCoords::upper_bounds_aniso_from_data(data, slopespec, &slope_terms, &slope_dims)?;
     let mut upper_vals = marginal_upper.as_array().to_vec();
     upper_vals.extend(slope_upper.as_array().iter());
     let log_kappa_upper = SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), dims);
@@ -1380,11 +1362,13 @@ impl MarginalSlopeCovariance {
         // an EXACT zero therefore refuses honest collinear scores whenever
         // roundoff happens to fall on the negative side — a host- and
         // BLAS-dependent refusal of a valid covariance, not a geometry defect.
-        // Decide against the eigensolver's own band instead, in the established
-        // dimension-scaled form `128·k·ε·max|λ̂|` that
-        // `gam_linalg::utils::rank_certified_psd_pseudoinverse` already uses for
-        // exactly this question. Material indefiniteness outside the band is
-        // still an error.
+        // Decide against the eigensolver's own band instead, in the
+        // dimension-scaled form `128·k·ε·max|λ̂|`. The coefficient is not the
+        // owner band `gam_linalg::roundoff::symmetric_spectrum_rounding_band`
+        // (`k·ε·max|λ̂|`), which `rank_certified_psd_pseudoinverse` now reads;
+        // it is kept here only because `conditional_score_covariance` floors its
+        // innovation at the same number (#4000). Material
+        // indefiniteness outside the band is still an error.
         let spectral_magnitude = eigenvalues
             .iter()
             .fold(0.0_f64, |magnitude, &value| magnitude.max(value.abs()));
@@ -3046,13 +3030,11 @@ mod jet_tower_oracle_tests {
                 .expect("jet kernel");
                 let mut corrupted = marginal;
                 corrupted.q1 *= 1.0 + 1e-12;
-                let (cv, cg, ch) = hand_rigid_vgh(corrupted, g[r], z[r], y[r], w[r], probit_scale)
-                    .expect("corrupted hand rigid row");
+                let (cv, cg, ch) =
+                    hand_rigid_vgh(corrupted, g[r], z[r], y[r], w[r], probit_scale)
+                        .expect("corrupted hand rigid row");
                 assert!(
-                    jv.is_finite()
-                        && cv.is_finite()
-                        && jh[0][0].is_finite()
-                        && ch[0][0].is_finite(),
+                    jv.is_finite() && cv.is_finite() && jh[0][0].is_finite() && ch[0][0].is_finite(),
                     "corruption control row {r}: non-finite channel"
                 );
                 let trip = (jg[0] - cg[0]).abs() / band(jg[0], cg[0]);
