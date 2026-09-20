@@ -14,6 +14,7 @@ use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
 use gam_problem::OrderedRhoBounds;
+use gam_terms::inference::smooth_score_test::WorkingResidual;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -3164,14 +3165,10 @@ where
     //
     // The identity check is BITWISE on ρ, not a re-judged gradient norm: the
     // retained certificate is the analytic stationarity authority minted at
-    // `outer_result.rho` by the full certification machinery (noise-floor
-    // widenings, flatness probes, asymptote rails). In the deep-smoothing
-    // regime the analytic gradient is a noise instrument (|Pg| redraws across
-    // evaluations of the SAME point — the reproducibility floor exists because
-    // of it), so re-drawing it once here and comparing against the certified
-    // band refuses honest noise-band certificates with coin-flip probability
-    // while adding nothing to point-identity (which bit equality decides
-    // exactly). The evaluation itself is kept: it installs the inner state at
+    // `outer_result.rho` by the full certification machinery (derived bands,
+    // flatness probes, asymptote rails). Re-judging a second gradient here
+    // would add nothing to point-identity, which bit equality decides exactly.
+    // The evaluation itself is kept: it installs the inner state at
     // the shipped point and supplies the shipped value/gradient fields.
     let (final_value, finalgrad, finalgrad_norm) = if final_rho.is_empty() {
         (outer_result.final_value, Array1::zeros(0), 0.0)
@@ -4209,6 +4206,19 @@ where
                 ))
             })?;
     }
+    // The working residual in its Pearson form: at the accepted step the score
+    // is `u = W_F(z − η)` with `W_F` the score-side Fisher weight, and the norm
+    // is `Σ u²/W_F`, each row of null mean `φ` (not `Σ u²/W_H` in the observed
+    // curvature `finalweights`, which is biased for a non-canonical link;
+    // gam#3832). The identity-link weighted RSS is that sum, formed from the
+    // response directly and snapped with the dispersion it sets.
+    let working_residual = if cfg.likelihood.spec.is_gaussian_identity() {
+        Some(WorkingResidual { weighted_norm: weighted_rss, rows: n as usize })
+    } else {
+        let scores = &pirls_res.solveweights
+            * &(&pirls_res.solveworking_response - &pirls_res.final_eta);
+        WorkingResidual::of(pirls_res.solveweights.view(), scores.view())
+    };
     let inference = opts.compute_inference.then(|| FitInference {
         edf_by_block,
         penalty_block_trace,
@@ -4228,6 +4238,7 @@ where
         coefficient_influence,
         weighted_gram,
         identified_subspace,
+        working_residual,
     });
 
     let pirls_status = pirls_res.status;
