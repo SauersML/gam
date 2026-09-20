@@ -262,6 +262,16 @@ fn audit_converged_identifiability<F: CustomFamily + ?Sized>(
                 verdict.drift.recovered.join(", "),
             );
         }
+        if verdict.recovered_under_identity_gauge() {
+            log::debug!(
+                "[AUDIT-DRIFT] converged identifiability accepted a recovery on the identity \
+                 gauge: the fit ran every raw column, and convergence identifies rank {} where \
+                 the pilot identified {}; recovered=[{}]",
+                verdict.drift.current_rank,
+                verdict.drift.pilot_rank,
+                verdict.drift.recovered.join(", "),
+            );
+        }
         (verdict.drift, refuses, Some(pilot_gauge_rank))
     } else {
         let drift = gam_identifiability::audit::maybe_log_audit_drift(
