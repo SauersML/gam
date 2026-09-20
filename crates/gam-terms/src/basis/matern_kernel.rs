@@ -2567,9 +2567,12 @@ pub(crate) fn closed_form_anisotropic_pair_block_with_origin(
 /// must be used in place of [`closed_form_anisotropic_pair_block`] for
 /// `length_scale = None` (pure-Duchon) penalty assembly.
 ///
-/// Self-pairs (R=0) are ε-regularized using a small fraction of the median
-/// off-diagonal lag, since the radial form is singular at R=0 and the pure
-/// Riesz Schoenberg fallback also doesn't converge for κ=0.
+/// Self-pairs (R=0) take the exact `R → 0⁺` limit
+/// [`closed_form_penalty::pure_duchon_self_pair_value`] (integer or fractional
+/// `s`): `0` whenever the UV clause `4(m+s) > d + 2q` of
+/// [`duchon_closed_form_operator_penalty_converges`] holds. Outside that regime
+/// the self-pair diverges and no closed-form block exists, so calling this
+/// without the convergence gate is a contract violation and panics.
 pub fn closed_form_anisotropic_pair_block_pure(
     centers: ArrayView2<'_, f64>,
     q: usize,
@@ -2589,25 +2592,20 @@ pub fn closed_form_anisotropic_pair_block_pure(
     };
     let j_prefactor = eta_centered.iter().sum::<f64>().exp();
 
-    // Median off-diagonal anisotropic distance is needed only when the
-    // exact pure-Duchon finite self-pair is unavailable. The integer-only
-    // self-pair helper is consulted only when `s` is whole-valued;
-    // fractional `s` always falls through to the analytic radial chain
-    // below, which now accepts `f64` via the threaded
-    // `radial_derivatives_of_isotropic_duchon` cascade.
-    let s_int = if s.fract() == 0.0 && s >= 0.0 {
-        Some(s as usize)
-    } else {
-        None
-    };
-    let pure_diag_exact = s_int
-        .and_then(|si| closed_form_penalty::pure_duchon_self_pair_value(q, d, m, si, &eta_centered))
-        .is_some();
-    let r_eps = if pure_diag_exact {
-        0.0
-    } else {
-        pure_duchon_diagonal_epsilon(centers, &eta_centered)
-    };
+    // The exact self-pair limit `g_q(0)`, shared by every diagonal entry.
+    let self_pair = j_prefactor
+        * closed_form_penalty::pure_duchon_self_pair_value(q, d, m, s, &eta_centered)
+            .unwrap_or_else(|| {
+                // SAFETY: outside the UV clause `4(m+s) > d + 2q` the self-pair diverges
+                // and no closed-form block exists; callers gate on
+                // `duchon_closed_form_operator_penalty_converges`, so reaching this is a
+                // broken contract, and no finite value may stand in for the limit.
+                panic!(
+                    "closed_form_anisotropic_pair_block_pure: q={q} d={d} m={m} s={s} violates \
+                     the UV clause 4(m+s) > d + 2q, so the self-pair diverges; callers must gate \
+                     on duchon_closed_form_operator_penalty_converges"
+                )
+            });
     let powers = closed_form_penalty::AnisoMetricPowers::new(&eta_centered);
 
     // Parallelize by independent lower-triangular rows and evaluate each
@@ -2625,26 +2623,7 @@ pub fn closed_form_anisotropic_pair_block_pure(
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
             let value = if i == j {
-                // Self-pair (R = 0). Prefer the exact finite-part limit
-                // when available (integer s only); otherwise use the same
-                // ε-regularized convention via the analytic radial chain
-                // (which now accepts fractional s end-to-end).
-                let closed_self = s_int.and_then(|si| {
-                    closed_form_penalty::pure_duchon_self_pair_value(q, d, m, si, eta_slice)
-                });
-                if let Some(closed) = closed_self {
-                    j_prefactor * closed
-                } else {
-                    let mut r_eps_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
-                    r_eps_buf.resize(d, 0.0);
-                    if d > 0 {
-                        r_eps_buf[0] = r_eps * eta_slice[0].exp();
-                    }
-                    j_prefactor
-                        * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
-                            q, m, s, 0.0, eta_slice, &powers, &r_eps_buf,
-                        )
-                }
+                self_pair
             } else {
                 j_prefactor
                     * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
@@ -3106,8 +3085,8 @@ pub(crate) const CLOSED_FORM_OPERATOR_THRESHOLD: usize = 1500;
 /// [`closed_form_anisotropic_pair_block_pure`] to evaluate the closed-form
 /// penalty via analytic radial derivatives of the pure-Riesz kernel, which
 /// is finite for R > 0 in any (m, s, d, q) regime where
-/// `radial_derivatives_of_isotropic_duchon` is defined. Self-pair (R=0)
-/// regularization is handled inside the pair-block routine.
+/// `radial_derivatives_of_isotropic_duchon` is defined. The self-pair (R=0)
+/// takes its exact limit inside the pair-block routine.
 pub(crate) fn closed_form_operator_penalty_in_total_basis_pure(
     centers: ArrayView2<'_, f64>,
     q: usize,
@@ -3119,12 +3098,8 @@ pub(crate) fn closed_form_operator_penalty_in_total_basis_pure(
     outer_identifiability: Option<&Array2<f64>>,
 ) -> Array2<f64> {
     // The whole scale-free Duchon chain — pair block, anisotropic radial,
-    // uniform-metric branch, isotropic radial derivatives, Riesz kernel —
-    // is now `f64`-threaded for `kappa = 0`. The integer-only self-pair /
-    // partial-fraction helpers are still consulted opportunistically
-    // (`s_int` gating inside the pair block) when `s` happens to be
-    // whole-valued, but fractional `s` falls through cleanly to the
-    // ε-regularized analytic radial chain.
+    // uniform-metric branch, isotropic radial derivatives, Riesz kernel, and
+    // the exact self-pair limit — is `f64`-threaded for `kappa = 0`.
     assert!(
         s_order.is_finite() && s_order >= 0.0,
         "closed_form_operator_penalty_in_total_basis_pure: s_order must be finite and ≥ 0, got {s_order}"

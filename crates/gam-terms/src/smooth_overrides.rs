@@ -323,7 +323,7 @@ fn apply_one_override(
 ) -> Result<(), String> {
     // Push the descriptor's optional `name` into the term name for downstream
     // diagnostics (purely cosmetic — the term identity is its feature_cols).
-    if let Some(name) = descriptor.get("name").and_then(|v| v.as_str())
+    if let Some(name) = descriptor_str(descriptor, "name", symbol)?
         && !name.is_empty()
     {
         term.name = name.to_string();
@@ -544,11 +544,7 @@ fn apply_duchon(
     // (`deny_unknown_fields`, locked by
     // `test_duchon_basis_spec_rejects_removed_double_penalty_field`). Python
     // only emits the key when `True`, so reject it loudly rather than drop it.
-    if descriptor
-        .get("double_penalty")
-        .and_then(JsonValue::as_bool)
-        == Some(true)
-    {
+    if descriptor_bool(descriptor, "double_penalty", symbol)? == Some(true) {
         return Err(format!(
             "smooths[{symbol:?}]: double_penalty is not supported on Duchon smooths; the \
              Duchon function-norm penalty already spans the polynomial null space"
@@ -570,7 +566,7 @@ fn apply_thinplate(
         descriptor,
         symbol,
     )?;
-    if let Some(ls) = descriptor.get("length_scale").and_then(JsonValue::as_f64) {
+    if let Some(ls) = descriptor_f64(descriptor, "length_scale", symbol)? {
         if !ls.is_finite() || ls <= 0.0 {
             return Err(format!(
                 "smooths[{symbol:?}].length_scale must be a positive finite value, got {ls}"
@@ -584,10 +580,7 @@ fn apply_thinplate(
             spec.periodic = Some(parsed);
         }
     }
-    if let Some(dp) = descriptor
-        .get("double_penalty")
-        .and_then(JsonValue::as_bool)
-    {
+    if let Some(dp) = descriptor_bool(descriptor, "double_penalty", symbol)? {
         spec.double_penalty = dp;
     }
     Ok(())
@@ -606,10 +599,10 @@ fn apply_matern(
         descriptor,
         symbol,
     )?;
-    if let Some(nu) = descriptor.get("nu").and_then(JsonValue::as_f64) {
+    if let Some(nu) = descriptor_f64(descriptor, "nu", symbol)? {
         spec.nu = parse_matern_nu(nu, symbol)?;
     }
-    if let Some(ls) = descriptor.get("length_scale").and_then(JsonValue::as_f64) {
+    if let Some(ls) = descriptor_f64(descriptor, "length_scale", symbol)? {
         if !ls.is_finite() || ls <= 0.0 {
             return Err(format!(
                 "smooths[{symbol:?}].length_scale must be a positive finite value, got {ls}"
@@ -620,10 +613,7 @@ fn apply_matern(
     if let Some(anis) = descriptor.get("aniso_log_scales") {
         spec.aniso_log_scales = Some(parse_f64_vec(anis, "aniso_log_scales", symbol)?);
     }
-    if let Some(dp) = descriptor
-        .get("double_penalty")
-        .and_then(JsonValue::as_bool)
-    {
+    if let Some(dp) = descriptor_bool(descriptor, "double_penalty", symbol)? {
         spec.double_penalty = dp;
     }
     Ok(())
@@ -644,7 +634,7 @@ fn apply_sphere(
             ));
         }
         spec.center_strategy = CenterStrategy::UserProvided(centers);
-    } else if let Some(n) = descriptor.get("n_centers").and_then(JsonValue::as_u64) {
+    } else if let Some(n) = descriptor_u64(descriptor, "n_centers", symbol)? {
         let n = n as usize;
         if n < 2 {
             return Err(format!(
@@ -653,13 +643,13 @@ fn apply_sphere(
         }
         spec.center_strategy = CenterStrategy::FarthestPoint { num_centers: n };
     }
-    if let Some(po) = descriptor.get("penalty_order").and_then(JsonValue::as_u64) {
+    if let Some(po) = descriptor_u64(descriptor, "penalty_order", symbol)? {
         spec.penalty_order = po as usize;
     }
-    if let Some(rad) = descriptor.get("radians").and_then(JsonValue::as_bool) {
+    if let Some(rad) = descriptor_bool(descriptor, "radians", symbol)? {
         spec.radians = rad;
     }
-    if let Some(kernel) = descriptor.get("kernel").and_then(JsonValue::as_str) {
+    if let Some(kernel) = descriptor_str(descriptor, "kernel", symbol)? {
         let k = kernel.to_ascii_lowercase();
         match k.as_str() {
             "harmonic" => spec.method = SphereMethod::Harmonic,
@@ -672,10 +662,7 @@ fn apply_sphere(
             }
         }
     }
-    if let Some(double_penalty) = descriptor
-        .get("double_penalty")
-        .and_then(JsonValue::as_bool)
-    {
+    if let Some(double_penalty) = descriptor_bool(descriptor, "double_penalty", symbol)? {
         spec.double_penalty = double_penalty;
     }
     Ok(())
@@ -694,7 +681,7 @@ fn apply_constant_curvature(
             ));
         }
         spec.center_strategy = CenterStrategy::UserProvided(centers);
-    } else if let Some(n) = descriptor.get("n_centers").and_then(JsonValue::as_u64) {
+    } else if let Some(n) = descriptor_u64(descriptor, "n_centers", symbol)? {
         let n = n as usize;
         if n < 2 {
             return Err(format!(
@@ -703,13 +690,13 @@ fn apply_constant_curvature(
         }
         spec.center_strategy = CenterStrategy::FarthestPoint { num_centers: n };
     }
-    if let Some(kappa) = descriptor.get("kappa").and_then(JsonValue::as_f64) {
+    if let Some(kappa) = descriptor_f64(descriptor, "kappa", symbol)? {
         if !kappa.is_finite() {
             return Err(format!("smooths[{symbol:?}].kappa must be finite"));
         }
         spec.kappa = kappa;
     }
-    if let Some(ls) = descriptor.get("length_scale").and_then(JsonValue::as_f64) {
+    if let Some(ls) = descriptor_f64(descriptor, "length_scale", symbol)? {
         if !(ls.is_finite() && ls > 0.0) {
             return Err(format!(
                 "smooths[{symbol:?}].length_scale must be a positive finite number"
@@ -717,10 +704,7 @@ fn apply_constant_curvature(
         }
         spec.length_scale = ls;
     }
-    if let Some(double_penalty) = descriptor
-        .get("double_penalty")
-        .and_then(JsonValue::as_bool)
-    {
+    if let Some(double_penalty) = descriptor_bool(descriptor, "double_penalty", symbol)? {
         spec.double_penalty = double_penalty;
     }
     Ok(())
@@ -739,7 +723,7 @@ fn apply_measure_jet(
             ));
         }
         spec.center_strategy = CenterStrategy::UserProvided(centers);
-    } else if let Some(n) = descriptor.get("n_centers").and_then(JsonValue::as_u64) {
+    } else if let Some(n) = descriptor_u64(descriptor, "n_centers", symbol)? {
         let n = n as usize;
         if n < 3 {
             return Err(format!(
@@ -748,7 +732,7 @@ fn apply_measure_jet(
         }
         spec.center_strategy = CenterStrategy::FarthestPoint { num_centers: n };
     }
-    if let Some(s) = descriptor.get("s").and_then(JsonValue::as_f64) {
+    if let Some(s) = descriptor_f64(descriptor, "s", symbol)? {
         if !(s.is_finite() && s > 0.0 && s < 2.0) {
             return Err(format!(
                 "smooths[{symbol:?}].s must lie in (0, 2) for the measure-jet affine-jet energy"
@@ -756,16 +740,16 @@ fn apply_measure_jet(
         }
         spec.order_s = s;
     }
-    if let Some(alpha) = descriptor.get("alpha").and_then(JsonValue::as_f64) {
+    if let Some(alpha) = descriptor_f64(descriptor, "alpha", symbol)? {
         if !alpha.is_finite() {
             return Err(format!("smooths[{symbol:?}].alpha must be finite"));
         }
         spec.alpha = alpha;
     }
-    if let Some(n) = descriptor.get("scales").and_then(JsonValue::as_u64) {
+    if let Some(n) = descriptor_u64(descriptor, "scales", symbol)? {
         spec.num_scales = n as usize;
     }
-    if let Some(ls) = descriptor.get("length_scale").and_then(JsonValue::as_f64) {
+    if let Some(ls) = descriptor_f64(descriptor, "length_scale", symbol)? {
         if !(ls.is_finite() && ls > 0.0) {
             return Err(format!(
                 "smooths[{symbol:?}].length_scale must be a positive finite number"
@@ -773,23 +757,17 @@ fn apply_measure_jet(
         }
         spec.length_scale = ls;
     }
-    if let Some(double_penalty) = descriptor
-        .get("double_penalty")
-        .and_then(JsonValue::as_bool)
-    {
+    if let Some(double_penalty) = descriptor_bool(descriptor, "double_penalty", symbol)? {
         spec.double_penalty = double_penalty;
     }
     // Multiscale (per-scale spectral split + ψ dials + ridge) is an explicit
     // opt-in (#1116); default single-scale at any center count.
-    if let Some(multiscale) = descriptor.get("multiscale").and_then(JsonValue::as_bool) {
+    if let Some(multiscale) = descriptor_bool(descriptor, "multiscale", symbol)? {
         spec.multiscale = multiscale;
     }
     // REML-learning the representer length-scale ℓ is explicit opt-in; the
     // default keeps the realized auto/user scale fixed.
-    if let Some(learn) = descriptor
-        .get("learn_length_scale")
-        .and_then(JsonValue::as_bool)
-    {
+    if let Some(learn) = descriptor_bool(descriptor, "learn_length_scale", symbol)? {
         spec.learn_length_scale = learn;
     }
     Ok(())
@@ -805,22 +783,19 @@ fn apply_bspline_1d(
     // count is interpreted; converting against the formula's default degree
     // and swapping the degree afterwards built a basis whose width matched
     // neither reading of the request.
-    if let Some(d) = descriptor.get("degree").and_then(JsonValue::as_u64) {
+    if let Some(d) = descriptor_u64(descriptor, "degree", symbol)? {
         spec.degree = d as usize;
     }
-    if let Some(po) = descriptor.get("penalty_order").and_then(JsonValue::as_u64) {
+    if let Some(po) = descriptor_u64(descriptor, "penalty_order", symbol)? {
         spec.penalty_order = po as usize;
     }
-    if let Some(dp) = descriptor
-        .get("double_penalty")
-        .and_then(JsonValue::as_bool)
-    {
+    if let Some(dp) = descriptor_bool(descriptor, "double_penalty", symbol)? {
         spec.double_penalty = dp;
     }
     if let Some(knots_val) = descriptor.get("knots") {
         let knots = parse_f64_vec(knots_val, "knots", symbol)?;
         spec.knotspec = BSplineKnotSpec::Provided(Array1::from(knots));
-    } else if let Some(n) = descriptor.get("n_knots").and_then(JsonValue::as_u64) {
+    } else if let Some(n) = descriptor_u64(descriptor, "n_knots", symbol)? {
         // `BSpline(knots=K)` means K INTERIOR knots — the one meaning the
         // integer has everywhere else it is read: the public evaluator
         // (`gamfit.basis.bspline_basis`, `BSpline.evaluate`) and the formula DSL's
@@ -872,7 +847,7 @@ fn apply_bspline_1d(
     // a knot/boundary pair bit-identical to the formula DSL `cyclic()`
     // build (see `term_builder.rs` periodic arm). Python emits the key only
     // when `True`.
-    if descriptor.get("periodic").and_then(JsonValue::as_bool) == Some(true) {
+    if descriptor_bool(descriptor, "periodic", symbol)? == Some(true) {
         let (start, end, num_basis) = match &spec.knotspec {
             BSplineKnotSpec::Generate {
                 data_range,
@@ -944,10 +919,7 @@ fn apply_tensor_bspline(
             apply_bspline_1d(&mut spec.marginalspecs[axis], marginal_obj, symbol)?;
         }
     }
-    if let Some(dp) = descriptor
-        .get("double_penalty")
-        .and_then(JsonValue::as_bool)
-    {
+    if let Some(dp) = descriptor_bool(descriptor, "double_penalty", symbol)? {
         spec.double_penalty = dp;
     }
     Ok(())
@@ -983,7 +955,7 @@ fn apply_pca(
                 parsed.nrows(),
             ));
         }
-        if let Some(k) = descriptor.get("K").and_then(JsonValue::as_u64) {
+        if let Some(k) = descriptor_u64(descriptor, "K", symbol)? {
             if k as usize != parsed.ncols() {
                 return Err(format!(
                     "smooths[{symbol:?}].K ({k}) must equal the number of basis columns ({})",
@@ -994,7 +966,7 @@ fn apply_pca(
         *basis_matrix = parsed;
         // An explicit dense basis overrides any lazy memmap path.
         *pca_basis_path = None;
-    } else if let Some(k) = descriptor.get("K").and_then(JsonValue::as_u64) {
+    } else if let Some(k) = descriptor_u64(descriptor, "K", symbol)? {
         if k as usize != basis_matrix.ncols() {
             return Err(format!(
                 "smooths[{symbol:?}].K ({k}) must equal the number of basis columns ({}) on \
@@ -1011,7 +983,7 @@ fn apply_pca(
         *pca_basis_path = Some(PathBuf::from(path));
     }
 
-    if let Some(c) = descriptor.get("centered").and_then(JsonValue::as_bool) {
+    if let Some(c) = descriptor_bool(descriptor, "centered", symbol)? {
         *centered = c;
     }
 
@@ -1021,7 +993,7 @@ fn apply_pca(
         ));
     }
 
-    if let Some(cs) = descriptor.get("chunk_size").and_then(JsonValue::as_u64) {
+    if let Some(cs) = descriptor_u64(descriptor, "chunk_size", symbol)? {
         *chunk_size = (cs as usize).max(1);
     }
 
@@ -1041,22 +1013,10 @@ fn apply_periodic_spline_curve_reject(
     // Python always emits these with their build defaults; only a value that
     // differs from the formula-DSL default could change the built term, and
     // that change cannot be re-applied post-build.
-    let touched = descriptor
-        .get("n_knots")
-        .and_then(JsonValue::as_u64)
-        .is_some_and(|v| v != 20)
-        || descriptor
-            .get("degree")
-            .and_then(JsonValue::as_u64)
-            .is_some_and(|v| v != 3)
-        || descriptor
-            .get("output_dim")
-            .and_then(JsonValue::as_u64)
-            .is_some_and(|v| v != 1)
-        || descriptor
-            .get("penalty_order")
-            .and_then(JsonValue::as_u64)
-            .is_some_and(|v| v != 2);
+    let touched = descriptor_u64(descriptor, "n_knots", symbol)?.is_some_and(|v| v != 20)
+        || descriptor_u64(descriptor, "degree", symbol)?.is_some_and(|v| v != 3)
+        || descriptor_u64(descriptor, "output_dim", symbol)?.is_some_and(|v| v != 1)
+        || descriptor_u64(descriptor, "penalty_order", symbol)?.is_some_and(|v| v != 2);
     if touched {
         return Err(format!(
             "smooths[{symbol:?}]: PeriodicSplineCurve tunables (n_knots / degree / output_dim / \
@@ -1077,10 +1037,7 @@ fn apply_categorical_reject(
     symbol: &str,
 ) -> Result<(), String> {
     let touched = descriptor.contains_key("levels")
-        || descriptor
-            .get("n_levels")
-            .and_then(JsonValue::as_u64)
-            .is_some_and(|v| v != 0);
+        || descriptor_u64(descriptor, "n_levels", symbol)?.is_some_and(|v| v != 0);
     if touched {
         return Err(format!(
             "smooths[{symbol:?}]: Categorical tunables (levels / n_levels) are consumed during \
@@ -1095,6 +1052,72 @@ fn apply_categorical_reject(
 // --------------------------------------------------------------------------
 // Common parsers
 // --------------------------------------------------------------------------
+
+// Typed scalar accessors. An absent key is `None` (keep the formula-built
+// value); a present key whose value has the wrong JSON type — a negative or
+// fractional count, a string where a number belongs, a number where a flag
+// belongs — is a configuration error, never a silent fallback to the formula
+// default.
+
+fn descriptor_u64(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    symbol: &str,
+) -> Result<Option<u64>, String> {
+    descriptor
+        .get(key)
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                format!("smooths[{symbol:?}].{key} must be a non-negative integer, got {value}")
+            })
+        })
+        .transpose()
+}
+
+fn descriptor_f64(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    symbol: &str,
+) -> Result<Option<f64>, String> {
+    descriptor
+        .get(key)
+        .map(|value| {
+            value
+                .as_f64()
+                .ok_or_else(|| format!("smooths[{symbol:?}].{key} must be a number, got {value}"))
+        })
+        .transpose()
+}
+
+fn descriptor_bool(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    symbol: &str,
+) -> Result<Option<bool>, String> {
+    descriptor
+        .get(key)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| format!("smooths[{symbol:?}].{key} must be a boolean, got {value}"))
+        })
+        .transpose()
+}
+
+fn descriptor_str<'a>(
+    descriptor: &'a serde_json::Map<String, JsonValue>,
+    key: &str,
+    symbol: &str,
+) -> Result<Option<&'a str>, String> {
+    descriptor
+        .get(key)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| format!("smooths[{symbol:?}].{key} must be a string, got {value}"))
+        })
+        .transpose()
+}
 
 fn explicit_duchon_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
     duchon_center_strategy(num_centers, d, false)
@@ -1130,7 +1153,7 @@ fn apply_center_strategy(
         *target = CenterStrategy::UserProvided(centers);
         return Ok(());
     }
-    if let Some(n) = descriptor.get("n_centers").and_then(JsonValue::as_u64) {
+    if let Some(n) = descriptor_u64(descriptor, "n_centers", symbol)? {
         let n = usize::try_from(n)
             .ok()
             .filter(|n| *n > 0)
@@ -1782,6 +1805,74 @@ mod tests {
         )
         .expect_err("non-default tunable must be rejected");
         assert!(err.contains("build-time-only"), "got: {err}");
+    }
+
+    /// A present key with the wrong JSON type used to be read through
+    /// `.and_then(JsonValue::as_u64)` and friends, so a negative count, a
+    /// fractional count or a mistyped flag was dropped and the formula default
+    /// fitted instead. Every such value must now be a configuration error.
+    #[test]
+    fn mistyped_descriptor_values_are_rejected_not_dropped() {
+        let mut bspline = open_bspline_spec();
+        let err = apply_bspline_1d(&mut bspline, &obj(json!({"degree": -1})), "x")
+            .expect_err("negative degree must be rejected");
+        assert!(
+            err.contains("degree must be a non-negative integer"),
+            "got: {err}"
+        );
+        assert_eq!(bspline.degree, 3, "a rejected value must not be applied");
+
+        let mut bspline = open_bspline_spec();
+        let err = apply_bspline_1d(&mut bspline, &obj(json!({"n_knots": 4.5})), "x")
+            .expect_err("fractional knot count must be rejected");
+        assert!(
+            err.contains("n_knots must be a non-negative integer"),
+            "got: {err}"
+        );
+
+        let mut bspline = open_bspline_spec();
+        let err = apply_bspline_1d(&mut bspline, &obj(json!({"double_penalty": "yes"})), "x")
+            .expect_err("string flag must be rejected");
+        assert!(
+            err.contains("double_penalty must be a boolean"),
+            "got: {err}"
+        );
+
+        let mut tps = thinplate_spec();
+        let err = apply_thinplate(&mut tps, 2, &obj(json!({"n_centers": -5})), "x")
+            .expect_err("negative n_centers must be rejected like n_centers = 0");
+        assert!(
+            err.contains("n_centers must be a non-negative integer"),
+            "got: {err}"
+        );
+
+        let mut tps = thinplate_spec();
+        let err = apply_thinplate(&mut tps, 2, &obj(json!({"length_scale": "2"})), "x")
+            .expect_err("string length_scale must be rejected");
+        assert!(err.contains("length_scale must be a number"), "got: {err}");
+
+        let mut mat = matern_spec();
+        let err = apply_matern(&mut mat, 2, &obj(json!({"nu": "2.5"})), "x")
+            .expect_err("string nu must be rejected");
+        assert!(err.contains("nu must be a number"), "got: {err}");
+
+        let err = apply_periodic_spline_curve_reject(&obj(json!({"n_knots": -3})), "t")
+            .expect_err("a mistyped tunable must not pass as untouched");
+        assert!(
+            err.contains("n_knots must be a non-negative integer"),
+            "got: {err}"
+        );
+
+        // Well-typed values still apply.
+        let mut bspline = open_bspline_spec();
+        apply_bspline_1d(
+            &mut bspline,
+            &obj(json!({"degree": 2, "penalty_order": 1, "double_penalty": true})),
+            "x",
+        )
+        .expect("well-typed values must apply");
+        assert_eq!((bspline.degree, bspline.penalty_order), (2, 1));
+        assert!(bspline.double_penalty);
     }
 
     #[test]

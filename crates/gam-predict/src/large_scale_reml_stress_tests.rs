@@ -30,10 +30,9 @@
 use gam_models::fit_orchestration::drivers::{
     fit_term_collection_forspec, fit_term_collectionwith_spatial_length_scale_optimization,
 };
-use crate::interval_policy::IntervalReference;
 use crate::{
-    InferenceCovarianceMode, PosteriorMeanOptions, PredictInput, PredictPosteriorMeanResult,
-    PredictableModel, StandardPredictor,
+    InferenceCovarianceMode, IntervalReference, PosteriorMeanOptions, PredictInput,
+    PredictPosteriorMeanResult, PredictableModel, StandardPredictor,
 };
 use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use faer::Side;
