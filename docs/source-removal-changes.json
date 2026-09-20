@@ -3094,5 +3094,14 @@
     ],
     "reason": "#4390: a single live compute-library cache owns complete Result<Library,GpuError> entries, preserving opened handles and typed failure causes after mutex poison. The production preload helper preserves the platform loader diagnostic. The duplicated libcuda version walk and split KEEP_ALIVE static are replaced by their shared live owners.",
     "evidence": "MSI complete gam-gpu unit binary compiles with warnings denied in 2.83 seconds. 43 focused CPU-side tests pass: 22 driver/cache/loader, 11 device-query and policy, 3 calibration, 7 device-pool. New controls exercise actual loader failure, success/error cache entries after poison, loader panic/retry, all eight attribute failures, name/memory failures, and exact successful values. GPU hardware execution is not claimed."
+  },
+  {
+    "base": "71b7a9df8d253931e91a3d6a28afe5e85c21e609",
+    "items": [
+      "tests/manifolds/manifolds/sphere_m4_lambda_diagnostic.rs:fn:make_dataset",
+      "tests/manifolds/manifolds/sphere_m4_lambda_diagnostic.rs:fn:sphere_m_sweep_lambda_diagnostic"
+    ],
+    "reason": "#4134: remove an assertion-free four-fit diagnostic that swallowed fit errors and printed a hard-coded convergence certificate. The same seed-7/n400 hypothesis remains covered by registered Wahba/Sobolev/pseudo-spline fit-quality assertions.",
+    "evidence": "Read-only source audit verified the removed diagnostic has no quality assertion, both retained test modules remain registered, their fixture seed/size agree, and the m4 quality test requires RMSE <= 0.10 while the kernel sweeps collect fit errors as failures. No production code changes; no numerical fit rerun is claimed."
   }
 ]
