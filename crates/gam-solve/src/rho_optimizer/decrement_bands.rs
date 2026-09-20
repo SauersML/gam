@@ -314,7 +314,7 @@ impl ObjectiveBand {
 /// band, `max(τ_stat − band_f, band_f)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DecrementTolerance {
-    /// `τ_stat = 1/(2n)` ([`OuterProblemSize::statistical_resolution`]).
+    /// `τ_stat = 1/(2·n_eff)` ([`OuterProblemSize::statistical_resolution`]).
     ///
     /// [`OuterProblemSize::statistical_resolution`]: super::run::OuterProblemSize::statistical_resolution
     pub(crate) tau_stat: f64,

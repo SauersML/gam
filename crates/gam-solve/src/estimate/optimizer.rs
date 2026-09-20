@@ -1237,6 +1237,45 @@ fn student_t_outer_point(reference_scale: f64, log_relative_sigma: f64, log_nu: 
     (reference_scale * log_relative_sigma.exp(), log_nu.exp())
 }
 
+/// The Fisher-information count `n_eff` the outer criterion is summed over.
+/// It sets the criterion's statistical resolution `τ_stat = 1/(2·n_eff)` (#3192).
+///
+/// Take a likelihood whose prior weights enter as `Σ wᵢ ℓᵢ` with no scale
+/// absorbing them. A row of weight `c` is then exactly `c` rows of weight one:
+/// the inner mode, `H = XᵀWX + S_λ` and the LAML criterion `V` are the same
+/// under both encodings (#893). The resolution must be the same too, and that
+/// forces `n_eff = Σ wᵢ`. The rows are the wrong count: a binomial with trials
+/// as weights would certify at a `τ_stat` `mean(w)` times looser than the same
+/// data in Bernoulli rows.
+///
+/// The count holds with an estimated nuisance too. The Gamma shape, the
+/// Tweedie, Beta and generic dispersions and the NB `θ` are each normalized by
+/// `Σ wᵢ`, so each one is itself unchanged by replication.
+///
+/// Only the profiled Gaussian scale `φ̂ = D_p/(n − M_p)` absorbs a global
+/// rescale `w → c·w`, leaving `V` fixed up to a constant (#877). There the count
+/// must be invariant under that rescale, and `Σ wᵢ` is not, so it is the rows.
+///
+/// The match is exhaustive on purpose: a new scale variant has to decide
+/// whether it absorbs the weights.
+fn outer_information_count(
+    scale: gam_problem::ResolvedLikelihoodScale,
+    prior_weights: ndarray::ArrayView1<'_, f64>,
+) -> f64 {
+    use gam_problem::ResolvedLikelihoodScale as Scale;
+    match scale {
+        Scale::ProfiledGaussian => prior_weights.len() as f64,
+        Scale::FixedGaussian { .. }
+        | Scale::Unit
+        | Scale::Gamma { .. }
+        | Scale::Tweedie { .. }
+        | Scale::BetaPrecision { .. }
+        | Scale::NegativeBinomial { .. }
+        | Scale::Dispersion { .. }
+        | Scale::Unspecified => prior_weights.sum(),
+    }
+}
+
 pub(crate) fn optimize_external_designwith_heuristic_log_lambdas_andwarm_start<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
@@ -1600,6 +1639,10 @@ where
                 .with_tolerance(reml_tol)
                 .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
                 .with_problem_size(n_obs, x_o.ncols())
+                .with_information_count(outer_information_count(
+                    resolved_likelihood_scale,
+                    w_o.view(),
+                ))
                 .with_bounds(rho_model_domain.0.clone(), rho_model_domain.1.clone())
                 // #2954: which of those faces are the terms' limit models, so a
                 // mint may rail a coordinate there and nowhere else.
@@ -1902,6 +1945,10 @@ where
                 // link/scale coupling and stall with a nonstationary shape.
                 .with_prefer_gradient_only(false)
                 .with_problem_size(n_obs, x_o.ncols())
+                .with_information_count(outer_information_count(
+                    resolved_likelihood_scale,
+                    w_o.view(),
+                ))
                 .with_psi_dim(mixture_dim + sas_dim + student_t_dim)
                 .with_barrier(
                     crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
@@ -4776,5 +4823,38 @@ mod negative_binomial_joint_certificate_tests {
             );
         }
         assert_eq!(gradient[3], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod outer_information_count_3192_tests {
+    use super::outer_information_count;
+    use gam_problem::ResolvedLikelihoodScale as Scale;
+    use ndarray::array;
+
+    /// #3192: a binomial with trials as prior weights is the same data as its
+    /// Bernoulli rows, and its criterion is identical under both encodings
+    /// (#893), so it declares the information count `Σ trials`: exactly the
+    /// row count of the replicated encoding. The profiled Gaussian scale
+    /// absorbs a global weight rescale, so it declares its rows, unchanged
+    /// by `w → c·w`.
+    #[test]
+    fn replication_weights_count_their_sum_and_a_profiled_scale_counts_rows() {
+        let trials = array![3.0, 1.0, 5.0, 2.0];
+        let replicated_rows = array![1.0; 11];
+        assert_eq!(outer_information_count(Scale::Unit, trials.view()), 11.0);
+        assert_eq!(
+            outer_information_count(Scale::Unit, trials.view()),
+            outer_information_count(Scale::Unit, replicated_rows.view()),
+        );
+        assert_eq!(
+            outer_information_count(Scale::ProfiledGaussian, trials.view()),
+            4.0
+        );
+        let rescaled = trials.mapv(|w| 10.0 * w);
+        assert_eq!(
+            outer_information_count(Scale::ProfiledGaussian, rescaled.view()),
+            outer_information_count(Scale::ProfiledGaussian, trials.view()),
+        );
     }
 }

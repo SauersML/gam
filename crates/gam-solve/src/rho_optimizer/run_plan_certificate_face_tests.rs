@@ -318,6 +318,7 @@ fn certify_flat_valley_point_2596(
             problem_size: crate::rho_optimizer::OuterProblemSize {
                 n_obs: Some(N_OBS_2596),
                 p_coefficients: Some(1),
+                information_count: None,
             },
             ..OuterConfig::default()
         },

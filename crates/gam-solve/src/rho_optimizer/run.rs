@@ -137,19 +137,30 @@ impl Drop for FullFidelityInnerCapGuard<'_> {
 }
 
 /// Declared size of the problem behind an outer objective: the number of
-/// observations and of inner coefficients. The decrement-band certificate
-/// charges its floating-point formation error against these counts
-/// (`outer_decrement_bands`); a route that declares no size takes no band
-/// verdict.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// observation rows and inner coefficients, and the criterion's information
+/// count. The decrement-band certificate charges its floating-point formation
+/// error against the row and coefficient counts (`outer_decrement_bands`), and
+/// a route that declares no size takes no band verdict. The statistical
+/// resolution reads the information count
+/// ([`OuterProblemSize::statistical_resolution`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct OuterProblemSize {
+    /// Observation rows: the count the criterion's sums run over, and so the
+    /// count its rounding grows with (`accumulation_growth(n + p²)`).
     pub(crate) n_obs: Option<usize>,
     pub(crate) p_coefficients: Option<usize>,
+    /// The Fisher-information count `n_eff` the criterion is summed over, when
+    /// it is not the row count: `Σ wᵢ` for a likelihood whose prior weights
+    /// are replication weights ([`OuterProblem::with_information_count`];
+    /// #3192). `None` means the information count is the row count `n_obs`.
+    pub(crate) information_count: Option<f64>,
 }
 
 impl OuterProblemSize {
-    /// The criterion's statistical resolution `τ_stat = η²/2 = 1/(2n)`, in the
-    /// criterion's own absolute units, over the declared `n` observations.
+    /// The criterion's statistical resolution `τ_stat = η²/2 = 1/(2·n_eff)`,
+    /// in the criterion's own absolute units, over the declared information
+    /// count `n_eff`: `information_count`, or the `n_obs` rows where the route
+    /// declares none.
     ///
     /// A point whose remaining decrease `G` to the exact optimum satisfies
     /// `½(θ − θ̂)ᵀH(θ − θ̂) ≤ G` has every linear functional `Lᵀθ` within
@@ -165,15 +176,31 @@ impl OuterProblemSize {
     /// that. It is invariant to the units of `y` and to any additive constant
     /// in `V` (a Poisson `Σ log y!`), which `rel·(1 + |V|)` was not.
     ///
-    /// `η² = 1/n` is the first-order choice. For Gaussian REML, whose criterion
-    /// carries no Laplace error, `1/edf` or `1/(n − p)` could be argued instead;
-    /// the choice moves `τ_stat` by a constant factor only (#3192).
+    /// `η² = 1/n_eff` is the first-order choice. For Gaussian REML, whose
+    /// criterion carries no Laplace error, `1/edf` or `1/(n − p)` could be
+    /// argued instead. That choice moves `τ_stat` by a constant factor only
+    /// (#3192).
     ///
-    /// `None` when the route declares no observation count.
+    /// `n` is the count of *information*, not of rows, because the criterion
+    /// fixes it. For a likelihood whose prior weights are replication weights,
+    /// a row of weight `c` is exactly `c` rows of weight one, and `V` is
+    /// identical under both encodings. The resolution must then be identical
+    /// too, which forces `n_eff = Σ wᵢ`. That covers every family whose
+    /// weighted log-likelihood `Σ wᵢ ℓᵢ` has no scale absorbing `w`. Under
+    /// the row count, a binomial fit with trials as weights certified at a
+    /// `τ_stat` `mean(w)` times looser than the same data in Bernoulli rows.
+    /// Where a profiled scale absorbs the weights (Gaussian REML: `φ̂ =
+    /// D_p/(n − M_p)` makes `V` invariant under `w → c·w` up to a constant),
+    /// the resolution must be invariant under that rescale, and `Σ wᵢ` is
+    /// not, so the count is the rows there.
+    ///
+    /// `None` when the route declares no observation count, or declares an
+    /// information count that is not finite and positive.
     pub(crate) fn statistical_resolution(&self) -> Option<f64> {
-        self.n_obs
-            .filter(|&n| n > 0)
-            .map(|n| 0.5 / n as f64)
+        match self.information_count {
+            Some(n_eff) => (n_eff.is_finite() && n_eff > 0.0).then(|| 0.5 / n_eff),
+            None => self.n_obs.filter(|&n| n > 0).map(|n| 0.5 / n as f64),
+        }
     }
 }
 
@@ -804,10 +831,19 @@ impl OuterProblem {
     }
 
     pub fn with_problem_size(mut self, n_obs: usize, p_coefficients: usize) -> Self {
-        self.problem_size = OuterProblemSize {
-            n_obs: Some(n_obs),
-            p_coefficients: Some(p_coefficients),
-        };
+        self.problem_size.n_obs = Some(n_obs);
+        self.problem_size.p_coefficients = Some(p_coefficients);
+        self
+    }
+
+    /// Declare the criterion's Fisher-information count `n_eff` where it is
+    /// not the row count `with_problem_size` declares. For a likelihood whose
+    /// prior weights are replication weights it is `Σ wᵢ`. The statistical
+    /// resolution `τ_stat = 1/(2·n_eff)` reads it
+    /// (`OuterProblemSize::statistical_resolution`; #3192), and the rounding
+    /// bands keep charging the rows the sums run over.
+    pub fn with_information_count(mut self, information_count: f64) -> Self {
+        self.problem_size.information_count = Some(information_count);
         self
     }
 
@@ -1939,6 +1975,7 @@ pub fn audit_stationary_point(
         problem_size: OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(p_coefficients),
+            information_count: None,
         },
         ..OuterConfig::default()
     };
@@ -7730,7 +7767,7 @@ pub(crate) fn fixed_point_step_resolution(config: &OuterConfig, n_params: usize)
 }
 
 /// The criterion's resolution in its own absolute units: the statistical
-/// resolution `τ_stat = 1/(2n)` over the declared observations
+/// resolution `τ_stat = 1/(2·n_eff)` over the declared information count
 /// ([`OuterProblemSize::statistical_resolution`], C3).
 ///
 /// Every judgement of "the criterion cannot tell these apart" reads this one
