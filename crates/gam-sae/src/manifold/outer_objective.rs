@@ -3035,42 +3035,13 @@ impl SaeManifoldOuterObjective {
         // `ln(1 − 2·g/(α·E))` (historically `n_eff/E` on a Euclidean axis, #F1 — no
         // `φ̂`). The complete gradient also carries the exact von-Mises normalizer on
         // a periodic axis, so one step form serves both geometries.
-        // #1026 shared-ARD: in `Shared` mode several atoms alias ONE outer
-        // coordinate, so the energy pools across the owning atoms and one step is
-        // written. Walking a raw per-atom cursor there indexes past the flat length
-        // and splits one shared strength across phantom slots. An axis no atom owns
-        // keeps its default uncovered certificate.
-        match rho.ard_sharing() {
-            ArdSharing::PerAtom => {
-                for (k, axis_logard) in rho.log_ard.iter().enumerate() {
-                    for (j, &logard_kj) in axis_logard.iter().enumerate() {
-                        record_precision_step(
-                            rho.ard_flat_index(k, j),
-                            logard_kj.exp() * (sumsq[k][j] + traces[k][j]),
-                            format!("atom {k} ARD axis {j}"),
-                        );
-                    }
-                }
-            }
-            ArdSharing::Shared => {
-                for axis in 0..rho.max_ard_axes() {
-                    let mut energy = 0.0_f64;
-                    let mut owned = false;
-                    for (k, axis_logard) in rho.log_ard.iter().enumerate() {
-                        if axis < axis_logard.len() {
-                            // Broadcast table: every owner carries the same precision.
-                            energy += axis_logard[axis].exp() * (sumsq[k][axis] + traces[k][axis]);
-                            owned = true;
-                        }
-                    }
-                    if owned {
-                        record_precision_step(
-                            rho.ard_flat_index(0, axis),
-                            energy,
-                            format!("shared ARD axis {axis}"),
-                        );
-                    }
-                }
+        for (k, axis_logard) in rho.log_ard.iter().enumerate() {
+            for (j, &logard_kj) in axis_logard.iter().enumerate() {
+                record_precision_step(
+                    rho.ard_flat_index(k, j),
+                    logard_kj.exp() * (sumsq[k][j] + traces[k][j]),
+                    format!("atom {k} ARD axis {j}"),
+                );
             }
         }
 
@@ -3383,9 +3354,8 @@ fn observed_ard_curvature_range(
 /// axis, because native Gaussian ARD curvature has unit coefficient before
 /// `alpha`. Either way the domain is `[ln(√ε·γ_min), ln(γ_max/√ε)]`: past either
 /// face every direction's share of the ρ-gradient is under its own round-off, so
-/// a railed strength is a structural result. A coordinate several atoms alias
-/// (`ArdSharing::Shared`) takes the union of their eigenvalues, and a coordinate
-/// with no curved direction declares no face here. These faces replace the outer
+/// a railed strength is a structural result. A coordinate with no curved
+/// direction declares no face here. These faces replace the outer
 /// engine's ±30 fallback, which capped every declared face (SPEC rule 20,
 /// #2902 row 8).
 fn resolvability_domain_faces(
