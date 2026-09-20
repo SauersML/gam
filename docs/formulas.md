@@ -572,7 +572,7 @@ Radial-basis surface smooth with thin-plate kernel.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `centers` (`k`, `basis_dim`) | auto | Number of radial centres. |
-| `length_scale` | `1.0` | Global length-scale init. |
+| `length_scale` | `1.0` | Input scale of the kernel. Fixed geometry: under a learned `λ` a thin-plate kernel scale is not identifiable, so it is not searched. |
 | `double_penalty` | `true` | Ridge + main penalty. |
 | `by`, `identifiability` | — | `identifiability` takes `none` or `orthogonal_to_parametric`; see [univariate smooths](#univariate-smooths). |
 
@@ -588,7 +588,7 @@ Radial basis with Matérn covariance kernel.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `centers` (`k`, `basis_dim`) | auto | Number of centres. |
-| `length_scale` | `1.0` | Global length-scale init. |
+| `length_scale` | data seed | Starting value of the global scale; REML estimates κ = 1/length_scale (see [kernel scales](#kernel-scales)). |
 | `nu` | `5/2` | Smoothness, one of `1/2`, `3/2`, `5/2`, `7/2`, `9/2`. |
 | `include_intercept` | `false` | Append a constant column. |
 | `double_penalty` | `true` | Ridge + main penalty. |
@@ -623,7 +623,7 @@ zero (recover the null by default; opt into overfitting). Scale-free unless
 | `order` (alias `nullspace_order`) | `1` (Linear, affine null space) | Polynomial nullspace order `p`. Polynomial block has `C(d + p, d)` columns (`p=0` → constant only, `p=1` (Linear) → `d+1` columns, `p=2` → `(d+1)(d+2)/2`). Honoured whether or not `power` is also given. |
 | `power` (alias `p`) | cubic default `s = (d−1)/2` | Riesz fractional smoothness `s`. The default gives `φ(r)=r³` in every dimension; an explicit value (e.g. `power=0` → `r²·log r` thin-plate in even `d`) is honored verbatim. |
 | `centers` (`k`, `basis_dim`) | auto | Number of centres. |
-| `length_scale` | none (scale-free) | Optional global scale. Without it, the kernel is pure polyharmonic; with it, the kernel is the hybrid Duchon-Matérn (κ = 1/length_scale). |
+| `length_scale` | none (scale-free) | Optional global scale. Without it, the kernel is pure polyharmonic; with it, the kernel is the hybrid Duchon-Matérn (κ = 1/length_scale), and the value is the starting point of REML's κ search (see [kernel scales](#kernel-scales)). |
 | `scale_dims` | `false` | Per-axis **relevance** (ARD by shrinkage): one gradient penalty `Σ(∂f/∂x_a)²` per input axis, each its own REML `λ_a`. REML flattens the surface along axes that don't earn their keep — automatic variable relevance via plain penalties. The kernel metric is held fixed at its knot-geometry init (not separately optimized). |
 | `periodic`, `period`, `period_start`, `period_end` | — | 1-D cyclic Duchon (see below). |
 
@@ -638,6 +638,24 @@ derivation, so a periodic axis must name its period (`period=[…, None]`), and
 `duchon()` rejects `double_penalty` — the Hilbert-scale penalty (curvature +
 trend + mass + tension) is built in, each block with its own REML smoothing
 parameter, and REML deselects unhelpful ones.
+
+### Kernel scales {#kernel-scales}
+
+A Matérn or hybrid-Duchon `length_scale=` is where REML **starts** the kernel
+scale, never a pin: κ = 1/`length_scale` is an outer coordinate searched
+jointly with the smoothing parameters, and which scales are searched is a
+property of the term, decided once for every family (single-surface GAMs,
+location-scale, survival, GAMLSS and Bernoulli marginal-slope alike, #3020).
+Omitting it only changes the seed to a data-derived one. Thin-plate has no
+κ coordinate at all (above). `mjs(...)` and `curv(...)` ranges follow the
+mgcv-`sp=` convention instead (an explicit value pins, `learn_length_scale=`
+overrides; [specialized smooths](#specialized-smooths-mjs-curv-pca)).
+
+Two fits hold a scale at its seed rather than searching it: a Bernoulli
+marginal-slope fit with `residual_columns` (the residual row kernel carries
+only smoothing-parameter derivatives, #2924; see
+[marginal-slope.md](marginal-slope.md)), and the measure-jet range on the
+coupled marginal-slope families (below).
 
 ### Sphere (`sphere`, `sos`, `spherical`, `s2`) {#intrinsic-s2-sphere-smooth}
 

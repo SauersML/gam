@@ -175,8 +175,8 @@ fn measure_jet_reml_selects_the_representer_range_by_default_2761() {
     );
     assert!(
         !learns("mjs(x1, x2, centers=8, length_scale=0.3)"),
-        "a typed length_scale= is a request, not a seed, and must pin ℓ — the same \
-             short-circuit an explicitly-scaled Matérn gets"
+        "a typed length_scale= pins ℓ under the sp= convention unless \
+             learn_length_scale=true asks REML to start from it"
     );
     assert!(
         !learns("mjs(x1, x2, centers=8, learn_length_scale=false)"),
@@ -604,11 +604,12 @@ fn default_matern_2d_seeds_resolving_length_scale_not_overscaled_diameter() {
     );
 }
 
-/// gam#979: the BMS entry point asks `all_spatial_terms_kappa_fixed` before
-/// any design build. Omitted Matérn scales must therefore be distinguishable
-/// from explicit scales both before and after Auto seed resolution.
+/// gam#979 / #3020: an omitted Matérn scale stays distinguishable from an
+/// explicit one before and after Auto seed resolution (so re-planning never
+/// overwrites a user value), while κ enrollment ignores provenance: every
+/// family searches κ, from the data seed or from the explicit `length_scale=`.
 #[test]
-fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
+fn matern_length_scale_provenance_is_kept_and_kappa_is_always_enrolled() {
     let ds = continuous_dataset(
         &["y", "x1", "x2"],
         vec![
@@ -660,8 +661,8 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
         }
     ));
     assert!(
-        !crate::smooth::all_spatial_terms_kappa_fixed(&auto),
-        "BMS pre-design query must enroll omitted Matérn κ"
+        crate::smooth::spatial_term_supports_hyper_optimization(&auto, 0),
+        "the pre-design enrollment query must enroll omitted Matérn κ"
     );
     crate::smooth::auto_init_length_scale_in_place(ds.values.view(), &mut auto.smooth_terms[0]);
     assert!(matches!(
@@ -677,7 +678,7 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
         } if value.is_finite() && *value > 0.0
     ));
     assert!(
-        !crate::smooth::all_spatial_terms_kappa_fixed(&auto),
+        crate::smooth::spatial_term_supports_hyper_optimization(&auto, 0),
         "resolved Auto Matérn κ must remain optimizer-owned"
     );
 
@@ -694,8 +695,8 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
             } if *value == explicit.parse::<f64>().unwrap()
         ));
         assert!(
-            crate::smooth::all_spatial_terms_kappa_fixed(&fixed),
-            "explicit Matérn length_scale={explicit} must lock κ before design build"
+            crate::smooth::spatial_term_supports_hyper_optimization(&fixed, 0),
+            "explicit Matérn length_scale={explicit} seeds the κ search; it does not pin κ"
         );
     }
 }

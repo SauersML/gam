@@ -315,8 +315,8 @@ pub struct MeasureJetBasisSpec {
     ///
     /// `false` freezes ℓ at the auto (or explicit) value with no outer
     /// enrollment. The term builder selects that automatically when the user
-    /// pins `length_scale=` — an explicit range is a request, not a seed —
-    /// mirroring the Matérn `all_spatial_terms_kappa_fixed` short-circuit.
+    /// pins `length_scale=` (the `sp=` convention); `learn_length_scale=true`
+    /// turns an explicit range into the seed of the REML search instead.
     #[serde(default = "measure_jet_learn_length_scale_default")]
     pub learn_length_scale: bool,
     /// Explicit opt-in for multiscale mode: the per-scale spectral penalty

@@ -3660,10 +3660,11 @@ pub(crate) fn build_smooth_basis(
             // with the design's own span floor sitting AT the fitted value).
             // REML therefore selects it by default.
             //
-            // An explicit `length_scale=` is a request, not a seed, so it pins ℓ
-            // — the same short-circuit `all_spatial_terms_kappa_fixed` gives an
-            // explicitly-scaled Matérn. `learn_length_scale=` overrides either
-            // way.
+            // The measure-jet range follows the `sp=` convention of the other
+            // explicitly-owned knobs: an explicit `length_scale=` pins ℓ unless
+            // `learn_length_scale=true` asks REML to start from it. (A Matérn
+            // or Duchon `length_scale=` has no such switch and is always the
+            // seed of its κ search, #3020.)
             let learn_length_scale =
                 option_bool(options, "learn_length_scale")?.unwrap_or(length_scale == 0.0);
             Ok(SmoothBasisSpec::MeasureJet {

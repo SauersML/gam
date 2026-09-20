@@ -3530,47 +3530,6 @@ pub fn set_single_term_constant_curvature_kappa(
     }
 }
 
-/// Returns `true` when a spatial term has NO outer optimization axes — i.e.
-/// the user provided an explicit `length_scale` and the term does not enroll
-/// REML-side per-axis ψ contrasts, so both the scalar κ and any fixed geometry
-/// anisotropy are anchored.
-///
-/// This is the per-term predicate that distinguishes "fixed kernel scale"
-/// from "optimize the kernel scale" within the family entry points that
-/// want to honor an explicit user-supplied scale (e.g. Bernoulli
-/// marginal-slope, where the joint-spatial outer solver otherwise spends
-/// ~80 iters stalled on the user's chosen ρ at high gradient).
-pub fn spatial_term_has_locked_kappa(spec: &TermCollectionSpec, term_idx: usize) -> bool {
-    let explicitly_fixed = spec
-        .smooth_terms
-        .get(term_idx)
-        .is_some_and(|term| match &term.basis {
-            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale.is_fixed(),
-            SmoothBasisSpec::ThinPlate { .. } => true,
-            SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale.is_some(),
-            _ => false,
-        });
-    explicitly_fixed && !spatial_term_uses_per_axis_psi(spec, term_idx)
-}
-
-/// Returns `true` when every spatial term in `spec` has a locked kernel scale
-/// (explicit `length_scale=X` without anisotropy) and therefore contributes no
-/// outer ψ/κ optimization axis. Empty term collections also return `true` —
-/// there are no kappas to optimize.
-///
-/// Used by family entry points that want to honor a user-supplied scalar length
-/// scale exactly: when all spatial terms are locked the n-block joint-spatial
-/// outer solver has nothing to optimize, and routing through it merely spends
-/// ~80 outer iters chasing a stalled ARC at the user's chosen ρ. Skipping
-/// straight to the rho-only path avoids that waste and respects the user's
-/// explicit kernel-scale input.
-pub fn all_spatial_terms_kappa_fixed(spec: &TermCollectionSpec) -> bool {
-    spec.smooth_terms.iter().enumerate().all(|(idx, _)| {
-        !spatial_term_supports_hyper_optimization(spec, idx)
-            || spatial_term_has_locked_kappa(spec, idx)
-    })
-}
-
 pub(crate) fn spatial_identifiability_policy(
     termspec: &SmoothTermSpec,
 ) -> Option<&SpatialIdentifiability> {

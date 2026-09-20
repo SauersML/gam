@@ -924,7 +924,9 @@ pub(crate) use sphere_spectral::{pseudo_s2_truncated_coefficients, sobolev_s2_tr
 /// numeric seed.  This is deliberately not represented by a magic floating
 /// point value: callers can distinguish an omitted `length_scale` from an
 /// explicit value before and after center planning, and subsequent κ updates
-/// preserve that provenance.
+/// preserve that provenance.  Provenance decides only where the seed comes
+/// from: in either case κ is an outer REML coordinate in every family (#3020),
+/// so an explicit `length_scale=` is the start of that search, not a pin.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum MaternLengthScale {
     Auto { resolved: Option<f64> },
@@ -938,10 +940,6 @@ impl MaternLengthScale {
 
     pub const fn fixed(value: f64) -> Self {
         Self::Fixed(value)
-    }
-
-    pub(crate) const fn is_fixed(self) -> bool {
-        matches!(self, Self::Fixed(_))
     }
 
     pub const fn resolved(self) -> Option<f64> {
