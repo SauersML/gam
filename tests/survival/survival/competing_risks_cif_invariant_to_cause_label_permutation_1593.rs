@@ -159,7 +159,7 @@ fn fit_and_cause_cumulative_hazards(
         survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("Surv(time, event) ~ s(x, bs='tp')", &data, &cfg)
+    let result = fit_from_formula("Surv(time, event) ~ s(x, bs='tps')", &data, &cfg)
         .expect("unified competing-risks Weibull fit");
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!("expected a SurvivalTransformation fit for the unified competing-risks model");

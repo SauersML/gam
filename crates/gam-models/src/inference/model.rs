@@ -153,20 +153,30 @@ use std::path::Path;
 // count and its conformal rows are refused by name (`UnknownPenaltyStructure`); a v32 binary
 // refuses a v33 payload by version instead of publishing its frozen-λ set for a fit whose
 // selection it cannot see.
-// v34 carries the constant variance stage in the latent-Z calibration's first-stage
+// v34 records the closed-form certificate's null law (gam#2926):
+// `ClosedFormAnchorResidual::{null_p_value, null_p_value_relative_error, null_modes}`,
+// whose decision is now the null tail against its design rate instead of the sign of
+// `D̂`. All three carry serde defaults, so a v33 or older payload loads with none
+// recorded, its decision as it was made; a v33 binary refuses a v34 payload by version.
+// v35 carries the constant variance stage in the latent-Z calibration's first-stage
 // covariance (`theta1_cov`, gam#3030): a fit whose variance stage does not fire now
-// records the `(p+2)²` joint covariance, with the variance row and column, where v33
-// recorded `(p+1)²`. A v33 payload still loads and predicts; its generated-regressor
+// records the `(p+2)²` joint covariance, with the variance row and column, where v34
+// recorded `(p+1)²`. A v34 payload still loads and predicts; its generated-regressor
 // correction refuses the narrower covariance by name, so no interval is published
 // without the stage.
-pub const MODEL_PAYLOAD_VERSION: u32 = 34;
+pub const MODEL_PAYLOAD_VERSION: u32 = 35;
 
 /// The schema before the constant variance stage in the first-stage covariance
 /// (gam#3030), whose only difference is that covariance's width.
-const CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION: u32 = 33;
+const CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION: u32 = 34;
+
+/// The schema before the closed-form certificate's null law (gam#2926), whose only
+/// difference from [`CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION`] is those fields'
+/// absence.
+const CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION: u32 = 33;
 
 /// The schema before the full-conformal penalty count (gam#3296), whose only difference
-/// from [`CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION`] is that field's absence.
+/// from [`CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION`] is that field's absence.
 const CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION: u32 = 32;
 
 /// The schema before the moving-law arms' adequacy screens (gam#2926), whose only
@@ -209,7 +219,8 @@ const LOCATION_ONLY_SCALE_PAYLOAD_VERSION: u32 = 25;
 pub(crate) const OUTER_WARM_START_ABSENT_PAYLOAD_VERSION: u32 = 24;
 
 /// The schema before the residual repair block's covariance declination (gam#2985),
-/// whose only difference is that variant's absence.
+/// whose only difference from [`OUTER_WARM_START_ABSENT_PAYLOAD_VERSION`] is that
+/// variant's absence.
 const RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION: u32 = 23;
 
 /// The schema before the latent-law record (gam#2926), whose only difference from
@@ -238,9 +249,10 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 17] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 18] = [
     MODEL_PAYLOAD_VERSION,
     CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
+    CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
     CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
     MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
     SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
@@ -5304,7 +5316,7 @@ impl FittedModel {
     ///
     /// This is the whitelist the predict/`check` encode paths pass to
     /// `UnseenCategoryPolicy::encode_unknown_for_columns`. It intentionally
-    /// covers ONLY genuine random effects (`group(g)`/`re(g)`/`s(g, bs="re")`).
+    /// covers ONLY genuine random effects (`group(g)`/`s(g, bs="re")`).
     /// A FIXED categorical factor — a bare `+ g` OR an explicit `factor(g)` —
     /// is auto-promoted to a penalized random block internally but is still a
     /// fixed parametric factor: an unseen level of it must reach the strict
@@ -7049,6 +7061,7 @@ mod tests {
                 jeffreys_arming_evidence: None,
                 improper_penalty_null_posterior: None,
                 outer_warm_start: None,
+                null_deviance: None,
                 coefficient_mode_selection:
                     gam_solve::model_types::CoefficientModeSelection::NotRecorded,
                 random_effect_tests: Vec::new(),
@@ -7543,9 +7556,9 @@ mod tests {
     /// `y ~ factor(g)` — must reach the strict schema encode and raise a
     /// `SchemaMismatch` on an unseen level; it must NOT be silently mapped to
     /// the factor's centering point (the across-level average). Only a genuine
-    /// random effect (`group(g)`/`re(g)`/`s(g, bs="re")`) is eligible for the
+    /// random effect (`group(g)`/`s(g, bs="re")`) is eligible for the
     /// lenient held-out-group policy, and it must stay lenient. `factor(g)`
-    /// shared the `group()`/`re()` parse arm and so wrongly inherited the
+    /// shared the `group()` parse arm and so wrongly inherited the
     /// lenient policy (#2137); it is now lowered as the fixed factor it is.
     ///
     /// This drives the real predict/`check` encode contract: it derives the
@@ -7661,8 +7674,8 @@ mod tests {
         );
 
         // Genuine random effects stay lenient (held-out group → population mean):
-        // group(g), its re(g) alias, and the mgcv s(g, bs="re") spelling.
-        for formula in ["y ~ group(g)", "y ~ re(g)", "y ~ s(g, bs=\"re\")"] {
+        // group(g) and the s(g, bs="re") basis.
+        for formula in ["y ~ group(g)", "y ~ s(g, bs=\"re\")"] {
             let grouped = model_for(formula);
             assert!(
                 grouped.random_effect_group_columns().contains("g"),
@@ -7943,6 +7956,7 @@ mod tests {
         for version in [
             MODEL_PAYLOAD_VERSION,
             CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
+            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
             CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
             MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
             SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
@@ -7966,8 +7980,12 @@ mod tests {
         }
         assert_eq!(CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
         assert_eq!(
-            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
+            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
             CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
+            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION - 1
         );
         assert_eq!(
             MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,

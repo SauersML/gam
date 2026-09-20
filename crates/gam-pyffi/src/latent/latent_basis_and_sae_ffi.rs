@@ -174,6 +174,10 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
         "cache_coefficient_basis",
         Array2::<f64>::zeros((0, 0)).into_pyarray(py),
     )?;
+    out.set_item(
+        "cache_data_null_basis",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
     out.set_item("cache_xtwx_fingerprint", 0_u64)?;
     out.set_item("cache_penalty_fingerprint", 0_u64)?;
     out.set_item("cache_logdet_xtwx", f64::NAN)?;
@@ -266,29 +270,6 @@ fn latent_multi_output_fit_to_pydict<'py>(
             "multinomial-logit requires at least two response columns".to_string(),
         ));
     }
-    if multinomial {
-        // The softmax cross-entropy −Σ_c y_c log p_c has residual gradient
-        // y_a − p_a and Fisher block p_a δ_ab − p_a p_b only when each row is a
-        // point on the probability simplex (Σ_c y_c = 1; nonnegativity is
-        // already enforced by the per-entry [0,1] loop above). A row with mass
-        // s ≠ 1 has true gradient y_a − s p_a, so accepting it would fit with a
-        // curvature that disagrees with the objective. Reject before solving.
-        // (Binomial-multi treats the K columns as independent Bernoulli draws,
-        // for which the per-entry [0,1] constraint alone is correct.)
-        for n in 0..n_obs {
-            let mut row_sum = 0.0_f64;
-            for a in 0..n_outputs {
-                row_sum += y[[n, a]];
-            }
-            if (row_sum - 1.0).abs() > 1.0e-9 {
-                return Err(py_value_error(format!(
-                    "multinomial-logit response rows must sum to 1 (one-hot for hard \
-                     labels, or a label-smoothed probability vector); row {n} sums to \
-                     {row_sum}"
-                )));
-            }
-        }
-    }
     if !(multinomial || binomial_multi) {
         return Err(py_value_error(format!(
             "multi-output GLM latent supports binomial-logit and multinomial-logit; got {family_name:?}"
@@ -318,8 +299,8 @@ fn latent_multi_output_fit_to_pydict<'py>(
     // `(N, K, K)`; validate finiteness + non-negative diagonal here, then adapt
     // to each branch's curvature gauge:
     //   - multinomial: the fitter consumes the active `(N, K-1, K-1)` leading
-    //     sub-block (the reference class K-1 is dropped); require each per-row
-    //     active block to be symmetric.
+    //     sub-block (the reference class K-1 is dropped) through its symmetric
+    //     part, the only part the block's quadratic form reads.
     //   - binomial-multi: the K columns are fit independently, so off-diagonal
     //     cross terms cannot be represented — require them to be zero — and the
     //     full `(N, K, K)` array is forwarded for its diagonal.
@@ -332,16 +313,6 @@ fn latent_multi_output_fit_to_pydict<'py>(
                     for a in 0..active_outputs {
                         for b in 0..active_outputs {
                             active[[n, a, b]] = fw[[n, a, b]];
-                        }
-                    }
-                    for a in 0..active_outputs {
-                        for b in (a + 1)..active_outputs {
-                            if (fw[[n, a, b]] - fw[[n, b, a]]).abs() > 1.0e-9 {
-                                return Err(py_value_error(format!(
-                                    "fisher_w active block[{n}] must be symmetric for the \
-                                     multinomial path; entries [{a},{b}] and [{b},{a}] differ"
-                                )));
-                            }
                         }
                     }
                 }
@@ -456,6 +427,10 @@ fn latent_multi_output_fit_to_pydict<'py>(
     )?;
     out.set_item(
         "cache_coefficient_basis",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_data_null_basis",
         Array2::<f64>::zeros((0, 0)).into_pyarray(py),
     )?;
     out.set_item("cache_xtwx_fingerprint", 0_u64)?;
@@ -1160,7 +1135,6 @@ fn sae_manifold_fit_inner<'py>(
     top_k: Option<usize>,
     threshold_gate_threshold: f64,
     seed_refine_routing: bool,
-    seed_refine_random_state: u64,
     // WP-D output-Fisher shard (#980). Magic-by-default: the *presence* of
     // `fisher_u` activates `RowMetric::OutputFisher` — there is no flag. `fisher_u`
     // is `(n_obs, p_out, rank)` row-major (`U[n, i, k]`), exactly the harvest
@@ -1267,7 +1241,6 @@ fn sae_manifold_fit_inner<'py>(
         top_k,
         threshold: threshold_gate_threshold,
         seed_refine_routing,
-        seed_refine_random_state,
         fit_config: gam::terms::sae::manifold::SaeFitConfig {
             separation_barrier_strength_override,
             gpu_policy,

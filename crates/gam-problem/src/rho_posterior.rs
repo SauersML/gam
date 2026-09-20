@@ -188,7 +188,8 @@ pub enum RhoPosteriorRefusal {
     TailFitUnavailable,
     /// The Pareto tail fit returned a non-finite shape, which grades nothing.
     TailShapeNotFinite,
-    /// The smoothed importance weights do not sum to a positive finite total.
+    /// The smoothed importance weights have no positive finite largest weight
+    /// to normalize by.
     SmoothedWeightsNotNormalizable,
 }
 
@@ -221,7 +222,7 @@ impl fmt::Display for RhoPosteriorRefusal {
             }
             Self::TailShapeNotFinite => f.write_str("the Pareto tail shape is not finite"),
             Self::SmoothedWeightsNotNormalizable => {
-                f.write_str("smoothed importance weights do not sum to a positive finite total")
+                f.write_str("smoothed importance weights have no positive finite largest weight")
             }
         }
     }
@@ -343,18 +344,20 @@ pub struct RhoPosteriorSamples {
 }
 
 /// The auto-selected escalation outcome when the Tier-0 grade reads
-/// [`RhoProposalAdequacy::Escalate`] (#938): Tier 1 (deterministic quadrature) for
-/// `K ≤ 4`, Tier 2 (NUTS over `ρ`) for `K ≤ 16`, and an HONEST report that
-/// escalation is unavailable beyond that — never a silently-degraded answer.
+/// [`RhoProposalAdequacy::Escalate`] (#938): Tier 1 (deterministic quadrature)
+/// when its node grid costs no more criterion evaluations than the fewest a
+/// converged Tier-2 NUTS run needs, Tier 2 (NUTS over `ρ`) otherwise, and an
+/// HONEST report when the chosen tier cannot run — never a silently-degraded
+/// answer.
 #[derive(Debug, Clone)]
 pub enum RhoPosteriorEscalation {
-    /// Tier 1: deterministic Gauss-Hermite mixture (`K ≤ 4`).
+    /// Tier 1: deterministic Gauss-Hermite mixture (the cheaper tier).
     Quadrature(RhoPosteriorMixture),
-    /// Tier 2: NUTS draws with the exact profiled gradient (`5 ≤ K ≤ 16`).
+    /// Tier 2: NUTS draws with the exact profiled gradient (the cheaper tier).
     Nuts(RhoPosteriorSamples),
-    /// Escalation could not run (dimension beyond the NUTS cap, or the chosen
-    /// tier failed); intervals remain plug-in + first-order corrected, and the
-    /// fit reports WHY.
+    /// Escalation could not run (no `ρ` to escalate over, or the chosen tier
+    /// failed); intervals remain plug-in + first-order corrected, and the fit
+    /// reports WHY.
     Unavailable { n_params: usize, reason: String },
 }
 
@@ -397,18 +400,18 @@ pub trait RhoPosteriorEscalator: Send + Sync {
         support: &(Array1<f64>, Array1<f64>),
         held: &[usize],
         criterion: &dyn Fn(&Array1<f64>) -> Result<f64, String>,
-        n_samples: Option<usize>,
     ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal>;
 
     /// Auto-selected escalation (Tier-1 quadrature / Tier-2 NUTS / honest
-    /// `Unavailable`). `criterion` returns the exact profiled criterion value,
-    /// `criterion_and_grad` the value plus the exact LAML `ρ`-gradient; either
-    /// failing at a node or a sampler position makes the tier `Unavailable`
-    /// with that reason.
+    /// `Unavailable`). `criterion` returns the negative log of the sampled
+    /// density, `criterion_and_grad` the value plus its exact `ρ`-gradient;
+    /// either failing at a node or a sampler position makes the tier
+    /// `Unavailable` with that reason. `mode` and `hessian` are that density's
+    /// own Laplace geometry (#3293): the tiers centre and whiten by them.
     fn escalate_rho_posterior(
         &self,
-        rho_hat: &Array1<f64>,
-        outer_hessian: &Array2<f64>,
+        mode: &Array1<f64>,
+        hessian: &Array2<f64>,
         criterion: &mut dyn FnMut(&Array1<f64>) -> Result<f64, String>,
         criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String>
                   + Send),

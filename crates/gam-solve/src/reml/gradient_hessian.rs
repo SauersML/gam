@@ -3490,13 +3490,13 @@ impl<'a> RemlState<'a> {
     /// priors also need the log-precision Jacobian. Every distribution consumer
     /// adds the same correction to the fitting criterion.
     ///
-    /// Returned as `(cost, gradient)` only: the ρ-posterior samplers consume a
-    /// log-density and its gradient, and no consumer of this correction needs
-    /// its curvature.
+    /// The samplers consume the cost and gradient; the curvature (diagonal,
+    /// since every term is per-coordinate) is what places them on the sampled
+    /// density's own Laplace geometry (#3293).
     pub(crate) fn rho_prior_distribution_correction(
         &self,
         rho: &Array1<f64>,
-    ) -> Result<(f64, Array1<f64>), EstimationError> {
+    ) -> Result<crate::rho_prior_eval::DistributionCorrection, EstimationError> {
         // The SAME weight anchoring the criterion's own prior evaluation uses
         // (#877), so the correction is taken at the coordinate the terms it
         // corrects were evaluated at.
@@ -7303,7 +7303,7 @@ impl<'a> RemlState<'a> {
             )?;
             self.frozen_dispersion_phi
                 .store(phi.to_bits(), Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[OUTER] dispersion λ-search φ frozen at {phi:.6e} (measured at the \
                  converged η); outer REML criterion now stationary in ρ"
             );
@@ -7684,14 +7684,14 @@ mod stateless_pirls_tests {
                 .collect::<Vec<_>>()
                 .join(",");
             match result {
-                Ok((ref res, ref wm)) => log::info!(
+                Ok((ref res, ref wm)) => log::debug!(
                     "[STAGE] stateless pirls solve rho=[{rho_text}] iters={} status={:?} max_eta={:.1} elapsed={:.3}s",
                     wm.iterations,
                     res.status,
                     res.max_abs_eta,
                     pirls_elapsed.as_secs_f64(),
                 ),
-                Err(ref error) => log::info!(
+                Err(ref error) => log::debug!(
                     "[STAGE] stateless pirls solve rho=[{rho_text}] FAILED in {:.3}s: {error}",
                     pirls_elapsed.as_secs_f64(),
                 ),

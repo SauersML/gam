@@ -246,6 +246,167 @@ impl ProbitFrailtyScaleJet {
     }
 }
 
+// ─── Frailty identification ──────────────────────────────────────────────────
+
+/// Whether a marginal-slope fit's likelihood identifies a Gaussian-shift frailty σ
+/// (gam#2938, gam#3059); see [`frailty_identification`].
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum FrailtyIdentification {
+    /// The slope's fixed offset lies in the span of every slope surface it feeds,
+    /// within `band`, so any change of σ is absorbed by the slope and the
+    /// likelihood does not identify σ. `distance` is the largest relative distance
+    /// of the offset from a surface's span.
+    NotIdentified { distance: f64, band: f64 },
+    /// The offset lies outside surface `surface`'s span by more than `band`, so it
+    /// pins the scale of the observed slope and identifies σ.
+    IdentifiedByOffset {
+        surface: usize,
+        distance: f64,
+        band: f64,
+    },
+    /// Surface `surface`'s column space is not separated from rounding at its rank
+    /// boundary, so whether the offset leaves it cannot be decided.
+    Undecided { surface: usize },
+}
+
+/// The resolved rank of a column-equilibrated `rows × cols` design from its
+/// singular values in descending order, with the error bar of the computed
+/// projector onto its column space; `None` where the rank boundary is not
+/// separated from the decomposition's backward error.
+///
+/// The rank counts the singular values above
+/// [`gam_linalg::roundoff::factor_singular_band`], and the projector's error is
+/// [`gam_linalg::decision::projector_error_bar`] at the gap between the last kept
+/// and the first dropped singular value, with that band as the backward error.
+pub(crate) fn resolved_span_error_bar(
+    singular_values: &[f64],
+    rows: usize,
+    cols: usize,
+) -> Option<(usize, f64)> {
+    let sigma_max = singular_values.first().copied().unwrap_or(0.0);
+    let backward_error = gam_linalg::roundoff::factor_singular_band(rows, cols, sigma_max);
+    let rank = singular_values
+        .iter()
+        .take_while(|&&sigma| sigma > backward_error)
+        .count();
+    let dropped = singular_values.get(rank).copied().unwrap_or(0.0);
+    let kept = singular_values.get(rank.checked_sub(1)?).copied()?;
+    let bar = gam_linalg::decision::projector_error_bar(kept - dropped, backward_error);
+    bar.is_finite().then_some((rank, bar))
+}
+
+/// Decide whether the slope's fixed offset identifies a Gaussian-shift frailty σ
+/// (gam#2938, gam#3059).
+///
+/// Every marginal-slope row program reads σ only as the observed slope `s(σ)·g`:
+/// the Gaussian-decoupling identity `E_U Φ(η + U) = Φ(s(σ)·η)`,
+/// `s(σ) = 1/√(1+σ²)`, rescales the slope while the marginal index enters
+/// unscaled. On a slope surface `g = o + Xβ`, with `o` the fixed offset (the
+/// caller's offset, the design's affine offset and the pilot's constant), a move
+/// `σ ↦ σ′` is undone by any `β′` with `o + Xβ′ = c·(o + Xβ)`, `c = s(σ)/s(σ′)`,
+/// and one exists exactly when `o` lies in the span of `X`; the slope penalty
+/// follows under `λ ↦ λ/c²`. So σ is identified exactly when `o` leaves the span of
+/// some surface it feeds (`surfaces`, one design per surface the offset is added
+/// to).
+///
+/// Each surface's span is taken on its column-equilibrated design, so the decision
+/// does not depend on its columns' units, through its thin SVD
+/// ([`resolved_span_error_bar`]). With `õ = o/‖o‖` and `U_r` the resolved left
+/// singular vectors, the distance `d = ‖õ − U_r U_rᵀ õ‖` is compared with a band
+/// that adds the projector's error bar to the rounding of forming `d`:
+/// `(√r + 1)·γ_n + √r·γ_r + 2u`. A distance within the band cannot certify that `o`
+/// leaves the span, so σ is not identified there.
+pub(crate) fn frailty_identification(
+    surfaces: &[ndarray::ArrayView2<'_, f64>],
+    offset: ndarray::ArrayView1<'_, f64>,
+) -> Result<FrailtyIdentification, String> {
+    use gam_linalg::faer_ndarray::FaerSvd;
+    use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
+
+    let rows = offset.len();
+    if surfaces.is_empty() {
+        return Err("frailty identification: no slope surface was given".to_string());
+    }
+    if offset.iter().any(|value| !value.is_finite()) {
+        return Err("frailty identification: the slope offset is not finite".to_string());
+    }
+    let norm = offset.dot(&offset).sqrt();
+    if norm == 0.0 {
+        return Ok(FrailtyIdentification::NotIdentified {
+            distance: 0.0,
+            band: 0.0,
+        });
+    }
+    let unit = offset.mapv(|value| value / norm);
+    let mut widest: Option<(f64, f64)> = None;
+    for (surface, design) in surfaces.iter().enumerate() {
+        if design.nrows() != rows {
+            return Err(format!(
+                "frailty identification: slope surface {surface} has {} rows for an offset of \
+                 {rows}",
+                design.nrows()
+            ));
+        }
+        // Equilibrate: each column to unit norm. A zero column spans nothing.
+        let columns: Vec<ndarray::Array1<f64>> = design
+            .columns()
+            .into_iter()
+            .filter_map(|column| {
+                let length = column.dot(&column).sqrt();
+                (length > 0.0).then(|| column.mapv(|value| value / length))
+            })
+            .collect();
+        if columns.is_empty() {
+            return Ok(FrailtyIdentification::IdentifiedByOffset {
+                surface,
+                distance: 1.0,
+                band: 0.0,
+            });
+        }
+        let cols = columns.len();
+        let mut equilibrated = ndarray::Array2::<f64>::zeros((rows, cols));
+        for (index, column) in columns.iter().enumerate() {
+            equilibrated.column_mut(index).assign(column);
+        }
+        let (left, sigma, _) = equilibrated
+            .svd(true, false)
+            .map_err(|error| format!("frailty identification: surface {surface} SVD: {error}"))?;
+        let left = left.ok_or_else(|| {
+            format!("frailty identification: surface {surface} SVD returned no left vectors")
+        })?;
+        let mut order: Vec<usize> = (0..sigma.len()).collect();
+        order.sort_by(|&i, &j| sigma[j].total_cmp(&sigma[i]));
+        let descending: Vec<f64> = order.iter().map(|&i| sigma[i]).collect();
+        let Some((rank, projector)) = resolved_span_error_bar(&descending, rows, cols) else {
+            return Ok(FrailtyIdentification::Undecided { surface });
+        };
+        let mut projected = ndarray::Array1::<f64>::zeros(rows);
+        for &index in &order[..rank] {
+            let direction = left.column(index);
+            projected.scaled_add(direction.dot(&unit), &direction);
+        }
+        let residual = &unit - &projected;
+        let distance = residual.dot(&residual).sqrt();
+        let root_rank = (rank as f64).sqrt();
+        let band = projector
+            + (root_rank + 1.0) * accumulation_growth(rows)
+            + root_rank * accumulation_growth(rank)
+            + 2.0 * UNIT_ROUNDOFF;
+        if distance > band {
+            return Ok(FrailtyIdentification::IdentifiedByOffset {
+                surface,
+                distance,
+                band,
+            });
+        }
+        if widest.is_none_or(|(farthest, _)| distance > farthest) {
+            widest = Some((distance, band));
+        }
+    }
+    let (distance, band) = widest.unwrap_or((0.0, 0.0));
+    Ok(FrailtyIdentification::NotIdentified { distance, band })
+}
+
 #[inline]
 fn worst_mode(
     a: IntegratedExpectationMode,
@@ -1514,6 +1675,127 @@ impl LatentSurvivalRowJet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `n` points of a covariate on `[-1, 1]` and the slope designs built from it.
+    fn covariate(n: usize) -> ndarray::Array1<f64> {
+        ndarray::Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * (i as f64 + 0.5) / n as f64))
+    }
+
+    fn design(columns: &[ndarray::Array1<f64>]) -> ndarray::Array2<f64> {
+        let mut design = ndarray::Array2::<f64>::zeros((columns[0].len(), columns.len()));
+        for (index, column) in columns.iter().enumerate() {
+            design.column_mut(index).assign(column);
+        }
+        design
+    }
+
+    fn identify(
+        surfaces: &[&ndarray::Array2<f64>],
+        offset: &ndarray::Array1<f64>,
+    ) -> FrailtyIdentification {
+        let views: Vec<_> = surfaces.iter().map(|surface| surface.view()).collect();
+        frailty_identification(&views, offset.view()).expect("a decision")
+    }
+
+    /// gam#2938, gam#3059: the slope's fixed offset identifies a Gaussian-shift frailty
+    /// only from outside the slope design's span. Inside it — a constant beside an
+    /// intercept, or any combination of the design's columns — a change of σ is absorbed by
+    /// the slope; outside it — a curvature the design lacks, or a constant without an
+    /// intercept — the offset pins the observed slope's scale.
+    #[test]
+    fn a_slope_offset_identifies_a_frailty_only_from_outside_the_slope_designs_span_2938() {
+        let x = covariate(200);
+        let ones = ndarray::Array1::<f64>::ones(x.len());
+        let linear = design(&[ones.clone(), x.clone()]);
+        let not_identified = |offset: &ndarray::Array1<f64>, what: &str| {
+            let verdict = identify(&[&linear], offset);
+            assert!(
+                matches!(verdict, FrailtyIdentification::NotIdentified { .. }),
+                "{what} lies in span(1, x): {verdict:?}"
+            );
+        };
+        not_identified(&ndarray::Array1::zeros(x.len()), "a zero offset");
+        not_identified(&ones.mapv(|_| 0.37), "a constant offset beside an intercept");
+        not_identified(&x.mapv(|v| 0.5 * v - 0.2), "an offset linear in x");
+        let curved = x.mapv(|v| v * v);
+        let verdict = identify(&[&linear], &curved);
+        assert!(
+            matches!(verdict, FrailtyIdentification::IdentifiedByOffset { surface: 0, .. }),
+            "x² leaves span(1, x): {verdict:?}"
+        );
+        let no_intercept = design(&[x.clone()]);
+        let verdict = identify(&[&no_intercept], &ones.mapv(|_| 0.37));
+        assert!(
+            matches!(verdict, FrailtyIdentification::IdentifiedByOffset { .. }),
+            "a constant leaves span(x) without an intercept: {verdict:?}"
+        );
+    }
+
+    /// A rank-deficient design's span is its resolved column space, not the span of a
+    /// factor's full column count, and the decision does not move with the columns' units.
+    #[test]
+    fn frailty_identification_reads_the_resolved_span_of_a_rank_deficient_design_2938() {
+        let x = covariate(150);
+        let ones = ndarray::Array1::<f64>::ones(x.len());
+        let aliased = design(&[ones.clone(), x.clone(), x.mapv(|v| 2.0 * v + 1.0)]);
+        let verdict = identify(&[&aliased], &x.mapv(|v| 3.0 * v - 1.0));
+        assert!(
+            matches!(verdict, FrailtyIdentification::NotIdentified { .. }),
+            "3x − 1 lies in the rank-2 span: {verdict:?}"
+        );
+        let verdict = identify(&[&aliased], &x.mapv(|v| v * v));
+        assert!(
+            matches!(verdict, FrailtyIdentification::IdentifiedByOffset { .. }),
+            "x² leaves the rank-2 span however many columns carry it: {verdict:?}"
+        );
+        let rescaled = design(&[ones.mapv(|v| 1e-9 * v), x.mapv(|v| 1e8 * v)]);
+        let verdict = identify(&[&rescaled], &x.mapv(|v| 0.5 * v - 0.2));
+        assert!(
+            matches!(verdict, FrailtyIdentification::NotIdentified { .. }),
+            "the span does not depend on the columns' units: {verdict:?}"
+        );
+    }
+
+    /// With one slope surface per score the offset feeds every surface, so it identifies
+    /// σ as soon as it leaves any one of their spans, and the verdict names that surface.
+    #[test]
+    fn a_per_score_offset_identifies_a_frailty_where_it_leaves_any_surface_2938() {
+        let x = covariate(120);
+        let ones = ndarray::Array1::<f64>::ones(x.len());
+        let quadratic = design(&[ones.clone(), x.clone(), x.mapv(|v| v * v)]);
+        let linear = design(&[ones.clone(), x.clone()]);
+        let offset = x.mapv(|v| v * v - 0.1);
+        let verdict = identify(&[&quadratic, &quadratic], &offset);
+        assert!(
+            matches!(verdict, FrailtyIdentification::NotIdentified { .. }),
+            "x² − 0.1 lies in both quadratic surfaces: {verdict:?}"
+        );
+        let verdict = identify(&[&quadratic, &linear], &offset);
+        assert!(
+            matches!(verdict, FrailtyIdentification::IdentifiedByOffset { surface: 1, .. }),
+            "x² − 0.1 leaves the linear second surface: {verdict:?}"
+        );
+    }
+
+    /// The rank boundary decides the span only where the kept and dropped singular values
+    /// are separated beyond the decomposition's backward error.
+    #[test]
+    fn an_unseparated_rank_boundary_leaves_the_frailty_undecided_2938() {
+        let (rows, cols) = (1000, 3);
+        let band = gam_linalg::roundoff::factor_singular_band(rows, cols, 1.5);
+        let decided = resolved_span_error_bar(&[1.5, 0.8, 0.0], rows, cols);
+        assert!(
+            matches!(decided, Some((2, bar)) if bar < 1e-10),
+            "a wide gap decides the rank-2 span: {decided:?}"
+        );
+        let unseparated = resolved_span_error_bar(&[1.5, 1.6 * band, 0.8 * band], rows, cols);
+        assert_eq!(
+            unseparated, None,
+            "kept {} and dropped {} singular values within the band {band} of each other",
+            1.6 * band,
+            0.8 * band
+        );
+    }
 
     /// A learned frailty scale's optimizer domain is derived from the gradient
     /// resolution around its seed (SPEC rule 20), and a fixed scale owns no

@@ -1149,7 +1149,10 @@ fn deterministic_gaussian_standard_fit(
         smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence,
-        weighted_gram: Some(xtwx),
+        // `X'WX` is stored beside `H` in the gauge's active frame (gam#3346).
+        // Every penalty vanishes on the tangent face, so there the Gram
+        // `Z'X'WX Z` is the penalized Hessian itself.
+        weighted_gram: Some(penalized_hessian.clone()),
         identified_subspace: None,
     };
     let geometry = Some(gam_solve::estimate::FitGeometry {
@@ -3378,7 +3381,7 @@ fn publish_expectile_sandwich_covariance(
 ///   through the scan would silently drop that penalty and select λ from the
 ///   bending penalty alone, which is exactly the EDF inflation #1266 reports.
 ///   Those fits fall through to the dense two-rho path, which owns both penalties
-///   jointly. Natural cubic regression (`bs="cr"`/`"cs"`) terms also fall
+///   jointly. Natural cubic regression (`bs="cr"`) terms also fall
 ///   through: their knot-value parameterization is a finite-rank regression
 ///   spline, not the scan's full smoothing-spline state-space posterior;
 /// - the offset is identically zero and every weight is finite and positive;
@@ -3476,7 +3479,7 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
             gam_terms::basis::BSplineKnotSpec::PeriodicUniform { .. }
                 | gam_terms::basis::BSplineKnotSpec::NaturalCubicRegression { .. }
         )
-        // mgcv `bs="cr"`/`"cs"` materialise a `NaturalCubicRegression` value-knot
+        // `bs="cr"` materialises a `NaturalCubicRegression` value-knot
         // spec: a Lancaster–Salkauskas cubic-regression basis whose columns
         // index `f(x*_i)` at `k` quantile knots — a genuinely DIFFERENT finite
         // basis (and hence a different penalized posterior) from the free
