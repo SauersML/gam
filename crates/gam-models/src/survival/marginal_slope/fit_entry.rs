@@ -339,6 +339,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         .map_err(|e| FitFailure::from(e).context("failed to rebuild frozen probe SMGS joint designs"))?;
     let marginal_design = joint_designs.remove(0);
     let marginalspec_boot = joint_specs.remove(0);
+    // gam#2938: a learned frailty is identified only where the slope's fixed offset
+    // leaves a slope surface's span, decided below once that offset is complete; the
+    // surfaces' covariate designs are kept for it.
+    let slope_surface_designs: Option<Vec<Array2<f64>>> =
+        learned_sigma_initial.is_some().then(|| {
+            joint_designs
+                .iter()
+                .map(|surface| surface.design.to_dense())
+                .collect()
+        });
     let (slope_design, slopespec_boot, slope_topology) =
         combine_slope_surface_designs(joint_designs, &joint_specs).map_err(FitFailure::invariant)?;
     // gam#2765 / gam#2767: if the request asked for a follow-up-varying slope,
@@ -365,27 +375,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let slope_surface_specs: Option<Vec<TermCollectionSpec>> =
         slope_topology.is_per_score().then(|| joint_specs.clone());
     if slope_topology.is_per_score() {
-        // A Gaussian-shift frailty reaches a per-score row only through the
-        // probit scale s(σ) = 1/√(1+σ²) on every slope, so the likelihood reads
-        // σ and the slopes only through s·g: σ is not identified, and along the
-        // orbit that keeps s·g fixed only ½·log|H| moves, with no minimiser in σ
-        // (measured ∂V/∂log σ = −2σ²/(1+σ²), no data term; gam#2938). The
-        // design-ψ terms are formed on the shared-slope row program, so a
-        // spatial marginal term refuses rather than differentiate a likelihood
-        // other than the one it fits. Both are checked here, before the pilot.
-        if learned_sigma_initial.is_some() {
-            return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
-                reason: format!(
-                    "a learned Gaussian frailty on a per-score slope over K={} scores is \
-                     refused: σ reaches every per-score row only through the probit scale \
-                     1/√(1+σ²) on the slopes, so the likelihood depends on σ and the slopes \
-                     only through their product and σ is not identified (the Laplace \
-                     evidence has no minimiser in σ; gam#2938)",
-                    spec.z.ncols()
-                ),
-            }
-            .into());
-        }
+        // The design-ψ terms are formed on the shared-slope row program, so a
+        // per-score slope refuses a spatial marginal term rather than
+        // differentiate a likelihood other than the one it fits, before the
+        // pilot solve. A learned frailty is checked once the slope offset is
+        // composed, below.
         if !spatial_length_scale_term_indices(&marginalspec_boot).is_empty() {
             return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
                 reason: format!(
@@ -680,6 +674,51 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         baseline_started.elapsed().as_secs_f64(),
     );
     let common_slope_offset = &spec.slope_offset + baseline_slope;
+    if let Some(surfaces) = slope_surface_designs.as_ref() {
+        // gam#2938: the offset every slope surface carries is now complete. Where it
+        // lies in each surface's span nothing in the likelihood identifies σ, so the
+        // fit is refused before the pilot solve. On a follow-up-varying slope the
+        // time margin is a partition of unity, so a covariate design's span sits
+        // inside its channels' span at every follow-up time.
+        use crate::survival::lognormal_kernel::{FrailtyIdentification, frailty_identification};
+        let views: Vec<_> = surfaces.iter().map(|surface| surface.view()).collect();
+        match frailty_identification(&views, common_slope_offset.view())
+            .map_err(FitFailure::invariant)?
+        {
+            FrailtyIdentification::NotIdentified { .. } => {
+                return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+                    reason: LEARNED_FRAILTY_NOT_IDENTIFIED.to_string(),
+                }
+                .into());
+            }
+            FrailtyIdentification::Undecided { surface } => {
+                return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+                    reason: format!(
+                        "a learned Gaussian-shift frailty σ is refused: slope surface {surface}'s \
+                         column space is not separated from rounding at its rank boundary, so \
+                         whether the slope offset identifies σ cannot be decided (gam#2938)"
+                    ),
+                }
+                .into());
+            }
+            // Where the offset identifies σ, the log σ terms are formed on the
+            // shared-slope row program, so a per-score slope refuses rather than
+            // differentiate a likelihood other than the one it fits.
+            FrailtyIdentification::IdentifiedByOffset { .. } if slope_topology.is_per_score() => {
+                return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+                    reason: format!(
+                        "a learned Gaussian frailty on a per-score slope over K={} scores, \
+                         identified only by the slope's fixed offset, is refused: its log-σ \
+                         derivatives are formed on the shared-slope row program, not on the \
+                         per-score likelihood this fit optimises (gam#2938)",
+                        spec.z.ncols()
+                    ),
+                }
+                .into());
+            }
+            FrailtyIdentification::IdentifiedByOffset { .. } => {}
+        }
+    }
     if slope_topology.is_per_score() && slope_topology.score_count() != spec.z.ncols() {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
