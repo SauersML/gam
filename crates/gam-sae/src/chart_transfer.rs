@@ -174,10 +174,21 @@ pub fn so2_polar_angle(operator: ArrayView2<'_, f64>) -> Result<f64, String> {
 /// Density-weighted circular mean and standard error of the per-token SO(2)
 /// polar angles of a stack of 2×2 operators.
 ///
-/// Returns `(mean_angle, se)`. The mean direction comes from the weighted
-/// resultant `(C, S) = Σ wᵢ (cos θᵢ, sin θᵢ)`; the SE is the circular standard
-/// deviation `√(−2 ln R̄)` (with `R̄` the mean resultant length) divided by
-/// `√n_eff`, where `n_eff` is Kish's effective sample size under the weights.
+/// Returns `(mean_angle, se)`. The mean direction is `θ̂ = atan2(S, C)` of the
+/// weighted resultant `(C, S) = Σ wᵢ (cos θᵢ, sin θᵢ)`, with length
+/// `R = √(C² + S²) = Σ wᵢ cos(θᵢ − θ̂)`. Perturbing the tokens moves `θ̂` by
+/// `Σ wᵢ sin(θᵢ − θ̂) / R` to first order, so the delta-method (sandwich) SE is
+///
+/// ```text
+///     se = √(Σ wᵢ² sin²(θᵢ − θ̂)) / R
+/// ```
+///
+/// With equal weights this is the textbook `√((1 − R̄₂) / (2 n R̄²))`, where
+/// `R̄₂` is the second central trigonometric moment. It is not the circular SD
+/// `√(−2 ln R̄)` over `√n`. That ratio matches only in the concentrated limit,
+/// and it understates the SE as the angles spread. It also needs no Kish
+/// effective-n shortcut, which assumes the weights are unrelated to the
+/// angles. With `R = 0` there is no mean direction, and the SE is infinite.
 /// Any token whose operator is a reflection/collapse propagates the
 /// [`so2_polar_angle`] error — a mixed rotation/reflection population has no
 /// honest mean angle.
@@ -197,10 +208,10 @@ pub fn rotation_angle_band(
             w.len()
         ));
     }
+    let mut angles = Vec::with_capacity(n);
     let mut c = 0.0_f64;
     let mut s_sum = 0.0_f64;
     let mut weight_sum = 0.0_f64;
-    let mut weight_sq_sum = 0.0_f64;
     for i in 0..n {
         let w = weights.as_ref().map_or(1.0, |ws| ws[i]);
         if !w.is_finite() || w < 0.0 {
@@ -213,26 +224,25 @@ pub fn rotation_angle_band(
         c += w * angle.cos();
         s_sum += w * angle.sin();
         weight_sum += w;
-        weight_sq_sum += w * w;
+        angles.push((w, angle));
     }
     if weight_sum <= 0.0 {
         return Err("at least one token must have positive weight".to_string());
     }
     let mean_angle = s_sum.atan2(c);
-    // The mean resultant length is a probability-weighted average of unit vectors,
-    // so it lies in [0, 1] exactly; a value above 1 is pure floating-point drift
-    // (a point mass rounds `√(cos²+sin²)` to 1 ± ε). Clamp to the physical range so
-    // the `−2·ln R̄` circular-SD below cannot see a spurious `R̄ > 1`.
-    let resultant = ((c * c + s_sum * s_sum).sqrt() / weight_sum).min(1.0);
-    let effective_n = weight_sum * weight_sum / weight_sq_sum;
-    // Degenerate resultant (angles spread over the whole circle): the circular
-    // std diverges; report it honestly as infinite rather than clamping.
-    let circular_sd = if resultant > 0.0 {
-        (-2.0 * resultant.ln()).max(0.0).sqrt()
-    } else {
-        f64::INFINITY
-    };
-    Ok((mean_angle, circular_sd / effective_n.sqrt()))
+    let resultant = (c * c + s_sum * s_sum).sqrt();
+    // A zero resultant has no mean direction, so its SE is infinite.
+    if !(resultant > 0.0) {
+        return Ok((mean_angle, f64::INFINITY));
+    }
+    let score_variance = angles
+        .iter()
+        .map(|&(w, angle)| {
+            let deviation = (angle - mean_angle).sin();
+            w * w * deviation * deviation
+        })
+        .sum::<f64>();
+    Ok((mean_angle, score_variance.sqrt() / resultant))
 }
 
 fn solve_spd_1_or_2(
@@ -371,14 +381,61 @@ mod tests {
         let (mean_one, se_one) =
             rotation_angle_band(ops.view(), Some(array![1.0, 0.0].view())).unwrap();
         assert!((mean_one - (std::f64::consts::PI - 0.1)).abs() < 1.0e-9);
-        // A point mass has zero circular dispersion, but the SD estimator
-        // `√(−2·ln R̄)` is ill-conditioned as `R̄ → 1`: a point mass leaves `R̄`
-        // one machine-epsilon below 1, which the `√` amplifies to O(√ε) ≈ 1e-8.
-        // That IS "collapsed to the angle"; asserting below the estimator's fp
-        // floor (1e-9) is unmeetable.
+        // A point mass has zero dispersion. Its only deviation from the mean is
+        // the atan2 round-off in `sin(θ − θ̂)`, which is O(ε).
         assert!(
-            se_one.abs() < 1.0e-7,
+            se_one.abs() < 1.0e-12,
             "point-mass band should collapse; got {se_one}"
+        );
+    }
+
+    fn rotation(angle: f64) -> ndarray::Array2<f64> {
+        array![[angle.cos(), -angle.sin()], [angle.sin(), angle.cos()]]
+    }
+
+    /// Two equal-weight rotations at `±δ` have `θ̂ = 0` and `R = 2 cos δ`.
+    /// The sandwich numerator is `√(2 sin² δ)`, so the SE is `tan δ / √2`.
+    /// The old circular-SD form, `√(−2 ln cos δ) / √2`, is 1.01 at `δ = 1.2`,
+    /// against the true 1.82.
+    #[test]
+    fn rotation_angle_se_is_the_mean_direction_delta_method_se() {
+        let delta = 1.2_f64;
+        let mut ops = Array3::<f64>::zeros((2, 2, 2));
+        ops.slice_mut(s![0, .., ..]).assign(&rotation(delta));
+        ops.slice_mut(s![1, .., ..]).assign(&rotation(-delta));
+        let (mean, se) = rotation_angle_band(ops.view(), None).unwrap();
+        assert!(mean.abs() < 1.0e-12, "symmetric pair has mean 0, got {mean}");
+        let expected = delta.tan() / 2.0_f64.sqrt();
+        assert!(
+            (se - expected).abs() < 1.0e-12,
+            "mean-direction SE must be tan(δ)/√2 = {expected}, got {se}"
+        );
+    }
+
+    /// Weighted tokens use the sandwich form directly:
+    /// `√(Σ wᵢ² sin²(θᵢ − θ̂)) / |Σ wᵢ e^{iθᵢ}|`.
+    #[test]
+    fn rotation_angle_se_uses_the_weighted_sandwich() {
+        let angles = [0.3_f64, -0.9, 1.4];
+        let weights = array![1.0_f64, 2.5, 0.5];
+        let mut ops = Array3::<f64>::zeros((3, 2, 2));
+        for (i, &angle) in angles.iter().enumerate() {
+            ops.slice_mut(s![i, .., ..]).assign(&rotation(angle));
+        }
+        let (mean, se) = rotation_angle_band(ops.view(), Some(weights.view())).unwrap();
+        let c: f64 = angles.iter().zip(weights.iter()).map(|(a, w)| w * a.cos()).sum();
+        let s_sum: f64 = angles.iter().zip(weights.iter()).map(|(a, w)| w * a.sin()).sum();
+        let theta = s_sum.atan2(c);
+        let numerator: f64 = angles
+            .iter()
+            .zip(weights.iter())
+            .map(|(a, w)| (w * (a - theta).sin()).powi(2))
+            .sum();
+        let expected = numerator.sqrt() / (c * c + s_sum * s_sum).sqrt();
+        assert!((mean - theta).abs() < 1.0e-12);
+        assert!(
+            (se - expected).abs() < 1.0e-12,
+            "weighted SE {se} must equal the sandwich {expected}"
         );
     }
 
