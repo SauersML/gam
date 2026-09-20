@@ -2546,5 +2546,15 @@
     ],
     "reason": "The cold SAE routing seed added a fixed 1e-3, random_state-keyed logit perturbation on top of the data-driven residual seed. Its own comment said it does not change which atom wins, so its only effect was to make the start depend on random_state. Both jitter constants are deleted: RANDOM_STATE_LOGIT_JITTER in minimal_seed.rs and SAE_RANDOM_STATE_LOGIT_JITTER in seed_routing.rs.",
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3352 (fix-3090-seed-logit-jitter, part of #3090) merged as 93285a585bf63554ef43831f1a7f4a4758115f98 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 93285a585bf63554ef43831f1a7f4a4758115f98's own tree with --base d058855331e8384f91083846d36df994f5187d9b --head 93285a585bf63554ef43831f1a7f4a4758115f98 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 2 items. Read-proof: git grep -w -c <name> 93285a585bf63554ef43831f1a7f4a4758115f98 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "5994ad54c4c39f086905591da98990d8a21a87dd",
+    "items": [
+      "crates/gam-sae/src/manifold/gauge.rs:const:C",
+      "crates/gam-sae/src/manifold/gauge.rs:const:G",
+      "crates/gam-sae/src/manifold/gauge.rs:fn:ln_gamma"
+    ],
+    "reason": "#3795: gauge.rs's private Lanczos ln_gamma (and its G/C coefficient constants) duplicated the workspace's one ln Gamma; beta_loglik_avg now calls statrs::function::gamma::ln_gamma, as atom_codes.rs in the same crate already does.",
+    "evidence": "https://github.com/SauersML/gam/issues/3795"
   }
 ]
