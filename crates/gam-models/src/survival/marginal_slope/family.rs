@@ -290,6 +290,14 @@ impl SurvivalMarginalSlopeFamily {
         self.rigid_third_information_available() && self.family_hyper.log_sigma_axis.is_none()
     }
 
+    /// Whether the ζ composition of `timewiggle_third` serves every ψ-mixed third information
+    /// derivative an armed Jeffreys objective's exact outer Hessian reads under a time wiggle.
+    /// Design axes (gam#2893) and baseline-chart axes (gam#3061) have ζ closed forms; a learned
+    /// log σ has none.
+    pub(crate) fn timewiggle_psi_jeffreys_third_served(&self) -> bool {
+        self.timewiggle_zeta_available() && self.family_hyper.log_sigma_axis.is_none()
+    }
+
     /// Memoize the dense form of each operator-backed covariate design the
     /// rigid row kernel reads one row at a time (gnomon#2337).
     ///

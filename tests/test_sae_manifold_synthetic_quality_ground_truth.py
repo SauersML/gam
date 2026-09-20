@@ -130,7 +130,7 @@ def test_oos_fixed_decoder_recovers_one_hot_oracle_assignments() -> None:
         assignment_kind="softmax",
         log_lambda_sparse=float(np.log(0.01)),
         log_lambda_smooth=[float(np.log(0.01)), float(np.log(0.01))],
-        log_ard=[[], []],
+        log_ard=[[float(np.log(0.01))], [float(np.log(0.01))]],
     )
     assignments = np.asarray(payload["assignments_z"], dtype=float)
     fitted = np.asarray(payload["fitted"], dtype=float)
