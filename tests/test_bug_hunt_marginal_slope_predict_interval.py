@@ -17,9 +17,13 @@ This module pins the fix with two oracles, both on a fitted model (no fakes):
    for: `std_error` is the diagonal of `X Vp Xᵀ` on the η scale.
 
 2. **Coverage oracle** — on a fixture with a *known* generative probability
-   `p_true(x)` per row, the nominal-95% band covers `p_true` at approximately the
-   nominal rate (and the 50% band is meaningfully tighter than the 95% band, so
-   the width responds honestly to the level).
+   `p_true(x)` per row, the across-the-function coverage of `p_true` (the
+   quantity a Bayesian band holds at nominal; Nychka 1988, Marra & Wood 2012)
+   sits at the nominal level at both 95% and 50%, measured over independent
+   replicate responses and gated on both sides by the replicates' own Monte
+   Carlo error. The 50% level is what exposes an over-covering band: a
+   covariance inflated by any factor pushes 50% coverage far above 0.5, where
+   it cannot hide under a ceiling the way 95% hides under 1.0.
 """
 
 from __future__ import annotations
@@ -90,9 +94,8 @@ def _make_fixture(n: int = 600, seed: int = 20240613):
     return data, p_true
 
 
-def _fit_model():
-    data, p_true = _make_fixture()
-    model = gamfit.fit(
+def _fit(data):
+    return gamfit.fit(
         data,
         "disease ~ s(bmi)",
         family="bernoulli-marginal-slope",
@@ -100,7 +103,53 @@ def _fit_model():
         z_column="z",
         slope_formula="1",
     )
-    return model, data, p_true
+
+
+def _fit_model():
+    data, p_true = _make_fixture()
+    return _fit(data), data, p_true
+
+
+# Replicate responses for the coverage oracle. One fit's per-row coverage
+# indicators are all driven by the same few-dimensional estimation error, so a
+# single-realization coverage fraction has no error bar; the replicate mean
+# does, and the gate below reads it from the replicates themselves.
+_REPLICATES = 64
+# Two-sided Monte Carlo gate |mean(c_r) - level| <= _MC_SIGMAS * sd(c_r)/sqrt(R).
+# At 4 standard errors an honest band trips one of the file's four gates (two
+# tests x two levels) with probability below 4 * 2 * Phi(-4) ~= 2.5e-4.
+_MC_SIGMAS = 4.0
+_LEVELS = (0.95, 0.50)
+
+
+def _replicate_fits():
+    """Refit on `_REPLICATES` independent responses drawn from the fixture's
+    known `p_true`, holding the covariates (`z`, `bmi`) fixed."""
+    data, p_true = _make_fixture()
+    for r in range(_REPLICATES):
+        rng = np.random.default_rng([20240613, r])
+        y = (rng.random(p_true.size) < p_true).astype(int)
+        replicate = {**data, "disease": y.tolist()}
+        yield _fit(replicate), replicate, p_true
+
+
+def _covered_fraction(p_true, lo, hi) -> float:
+    lo = np.asarray(lo, dtype=float)
+    hi = np.asarray(hi, dtype=float)
+    return float(((p_true >= lo - 1e-9) & (p_true <= hi + 1e-9)).mean())
+
+
+def _assert_nominal_coverage(coverage: dict[float, list[float]], band: str) -> None:
+    for level in _LEVELS:
+        c = np.asarray(coverage[level], dtype=float)
+        mc_se = float(c.std(ddof=1)) / math.sqrt(c.size)
+        gap = abs(float(c.mean()) - level)
+        assert gap <= _MC_SIGMAS * mc_se, (
+            f"{band}: nominal-{level:.0%} band covers p_true at "
+            f"{c.mean():.4f} across {c.size} replicates (|gap| {gap:.4f} > "
+            f"{_MC_SIGMAS:g} x MC s.e. {mc_se:.4f}); per-replicate range "
+            f"[{c.min():.3f}, {c.max():.3f}]"
+        )
 
 
 def test_marginal_slope_predict_emits_interval_columns():
@@ -174,32 +223,18 @@ def test_marginal_slope_interval_matches_transform_eta_construction():
     np.testing.assert_allclose(hw95 / hw50, np.full(hw95.shape, z95 / z50), rtol=1e-6, atol=0.0)
 
 def test_marginal_slope_interval_covers_truth_at_nominal_rate():
-    """Coverage oracle: the 95% band covers the known generative probability at
-    approximately the nominal rate, and the 50% band is materially tighter than
-    the 95% band (the width responds to the requested level)."""
-    model, data, p_true = _fit_model()
-
-    out95 = model.predict(data, interval=0.95, return_type="dict")
-    lo95 = np.asarray(out95["mean_lower"], dtype=float)
-    hi95 = np.asarray(out95["mean_upper"], dtype=float)
-    covered = (p_true >= lo95 - 1e-9) & (p_true <= hi95 + 1e-9)
-    coverage = float(covered.mean())
-    # The band quantifies *coefficient* (epistemic) uncertainty in the smooth +
-    # slope, so on a well-specified DGP it should cover the true probability
-    # surface at roughly the nominal rate. Allow a generous tolerance band
-    # around 0.95 for finite-sample + smoothing-bias slack while still failing
-    # a no-op (which would give zero-width bands and ~0 coverage).
-    assert 0.80 <= coverage <= 1.0, f"95% band coverage of p_true was {coverage:.3f}"
-
-    out50 = model.predict(data, interval=0.50, return_type="dict")
-    lo50 = np.asarray(out50["mean_lower"], dtype=float)
-    hi50 = np.asarray(out50["mean_upper"], dtype=float)
-    width95 = float(np.median(hi95 - lo95))
-    width50 = float(np.median(hi50 - lo50))
-    assert width50 < width95, (
-        f"50% band (median width {width50:.4f}) is not tighter than the 95% "
-        f"band (median width {width95:.4f}); the level is being ignored"
-    )
+    """Coverage oracle for `predict(interval=)`: across replicate responses the
+    band covers the known generative probability at the nominal rate at both
+    95% and 50%, within the replicates' Monte Carlo error on either side, so
+    neither an under- nor an over-covering band passes."""
+    coverage: dict[float, list[float]] = {level: [] for level in _LEVELS}
+    for model, data, p_true in _replicate_fits():
+        for level in _LEVELS:
+            out = model.predict(data, interval=level, return_type="dict")
+            coverage[level].append(
+                _covered_fraction(p_true, out["mean_lower"], out["mean_upper"])
+            )
+    _assert_nominal_coverage(coverage, "predict(interval=)")
 
 
 def test_marginal_slope_sample_predict_returns_posterior_bands():
@@ -210,9 +245,9 @@ def test_marginal_slope_sample_predict_returns_posterior_bands():
     The Laplace draws already existed (sample() works and is instant); this pins
     that they are now propagated through the marginal-slope kernel to a per-row
     η matrix and collapsed to probability-scale credible bands. The bands are
-    ordered, clipped to [0, 1], non-degenerate, and the 50% band is tighter than
-    the 95% band, so the posterior predictive responds to the level."""
-    model, data, p_true = _fit_model()
+    ordered, clipped to [0, 1] and non-degenerate; their coverage is pinned by
+    `test_marginal_slope_posterior_band_covers_truth_at_nominal_rate`."""
+    model, data, _ = _fit_model()
 
     posterior = model.sample(data, samples=300, seed=7)
     bands95 = posterior.predict(data, level=0.95)
@@ -230,20 +265,23 @@ def test_marginal_slope_sample_predict_returns_posterior_bands():
     assert np.all(lo95 <= mean + 1e-9) and np.all(hi95 >= mean - 1e-9)
     assert np.median(hi95 - lo95) > 1e-3
 
-    # Coverage of the known generative probability at roughly the nominal rate.
-    covered = (p_true >= lo95 - 1e-9) & (p_true <= hi95 + 1e-9)
-    coverage = float(covered.mean())
-    assert 0.80 <= coverage <= 1.0, (
-        f"95% posterior-predictive band coverage of p_true was {coverage:.3f}"
-    )
 
-    # The band responds to the requested level.
-    bands50 = posterior.predict(data, level=0.50)
-    lo50 = np.asarray(bands50["posterior_mean_lower"], dtype=float)
-    hi50 = np.asarray(bands50["posterior_mean_upper"], dtype=float)
-    assert float(np.median(hi50 - lo50)) < float(np.median(hi95 - lo95)), (
-        "50% posterior-predictive band is not tighter than the 95% band"
-    )
+def test_marginal_slope_posterior_band_covers_truth_at_nominal_rate():
+    """Coverage oracle for `sample().predict(level=)`: the posterior draw band
+    covers the known generative probability at the nominal rate at both 95%
+    and 50% across replicate responses, gated on both sides by the replicates'
+    Monte Carlo error."""
+    coverage: dict[float, list[float]] = {level: [] for level in _LEVELS}
+    for r, (model, data, p_true) in enumerate(_replicate_fits()):
+        posterior = model.sample(data, samples=300, seed=7 + r)
+        for level in _LEVELS:
+            bands = posterior.predict(data, level=level)
+            coverage[level].append(
+                _covered_fraction(
+                    p_true, bands["posterior_mean_lower"], bands["posterior_mean_upper"]
+                )
+            )
+    _assert_nominal_coverage(coverage, "sample().predict(level=)")
 
 
 def test_marginal_slope_posterior_predict_draws_matrix_shape():
