@@ -2532,9 +2532,11 @@ pub(crate) fn run_outer_with_plan(
     //
     // The incumbent is the lowest checkpoint the attempt kept. Its stored value is
     // where a search stopped, so it is re-evaluated at its own ρ before it can
-    // outrank anything. The gap is judged at the criterion's own rounding
-    // envelope, [`outer_value_agreement_bound`], because two values of one
-    // criterion closer than that cannot be ranked. Beyond it the winner loses.
+    // outrank anything. The gap is judged at the resolution the winner was
+    // certified at, [`super::run::outer_dominance_band`]: the certificate admits a
+    // remaining decrease up to the criterion's statistical resolution, plus the
+    // rounding of the two values, so a state lower by less than that is consistent
+    // with the certificate and ranks nothing (#4024). Beyond it the winner loses.
     // The search continues once from the incumbent, with the same one-shot reseed
     // the saddle-escape retry uses. If that does not certify, the
     // attempt returns the typed [`PlanRunOutcome::DominatedPlateau`], and the
@@ -2548,7 +2550,7 @@ pub(crate) fn run_outer_with_plan(
     if let (Some(certified), Some(incumbent)) = (best.as_ref(), best_checkpoint.as_ref()) {
         let winner_value = certified.result().final_value;
         let cached_band =
-            crate::rho_optimizer::outer_value_agreement_bound(winner_value, incumbent.final_value);
+            super::run::outer_dominance_band(config, winner_value, incumbent.final_value);
         if winner_value.is_finite()
             && incumbent.final_value.is_finite()
             && winner_value - incumbent.final_value > cached_band
@@ -2560,11 +2562,11 @@ pub(crate) fn run_outer_with_plan(
                 Ok(value) => value,
                 // The stored checkpoint cannot be re-evaluated at its own ρ. Its stored
                 // value is the criterion's evaluation there and beats the winner beyond
-                // the envelope, so the winner is declined on it (#2953).
+                // the dominance band, so the winner is declined on it (#2953).
                 Err(error) if error.is_trial_point_infeasible() => {
                     log::debug!(
                         "[OUTER] {context}: certified winner rho={:?} cost={:.6e} sits above a stored \
-                         checkpoint rho={:?} cost={:.6e} by more than the criterion's rounding envelope \
+                         checkpoint rho={:?} cost={:.6e} by more than the dominance band \
                          {:.3e}, and re-evaluating that checkpoint was refused ({error}); the winner is \
                          declined on the stored value, and no search continues from the checkpoint \
                          (#2953)",
@@ -2580,8 +2582,7 @@ pub(crate) fn run_outer_with_plan(
                 Err(error) => return Err(error),
             };
             obj.reset();
-            let band =
-                crate::rho_optimizer::outer_value_agreement_bound(winner_value, incumbent_value);
+            let band = super::run::outer_dominance_band(config, winner_value, incumbent_value);
             if incumbent_value.is_finite() && winner_value - incumbent_value > band {
                 dominance = Some((incumbent_value, band));
             }
@@ -2605,8 +2606,8 @@ pub(crate) fn run_outer_with_plan(
             None => {
                 log::debug!(
                     "[OUTER] {context}: certified winner rho={:?} cost={:.6e} is dominated by an \
-                     evaluated state rho={:?} cost={:.6e} (gap {:.3e} > the criterion's rounding \
-                     envelope {:.3e}); it is not published, and the search continues from that \
+                     evaluated state rho={:?} cost={:.6e} (gap {:.3e} > the dominance band \
+                     {:.3e}); it is not published, and the search continues from that \
                      state (#2596, #2627)",
                     plateau.rho.to_vec(),
                     plateau.final_value,

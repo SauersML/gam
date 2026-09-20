@@ -1205,7 +1205,7 @@ pub(crate) enum PlanRunOutcome {
 }
 
 /// A certified candidate that an evaluated but uncertified state of the same
-/// attempt beats by more than the criterion's rounding envelope (#2596, #2627).
+/// attempt beats by more than the dominance band (#2596, #2627, #4024).
 ///
 /// A certificate says the candidate is stationary, not that it is the best point
 /// the search measured. On a face of the declared domain the criterion is flat
@@ -1222,8 +1222,8 @@ pub(crate) struct DominatedPlateau {
     pub(crate) incumbent: OuterResult,
     /// The plateau's value minus the incumbent's value, at the decline.
     pub(crate) gap: f64,
-    /// `outer_value_agreement_bound(plateau, incumbent)`, the resolution the gap
-    /// was judged against.
+    /// `outer_dominance_band(config, plateau, incumbent)`, the resolution the gap
+    /// was judged against (#4024).
     pub(crate) band: f64,
     /// How the search from the incumbent ended (#2953).
     pub(crate) continuation: DominanceContinuationStop,
@@ -1278,7 +1278,8 @@ pub struct DominatedPlateauRecord {
     /// `plateau_value` minus the value of the state that beat it: re-evaluated, or
     /// stored when the objective refused the re-evaluation.
     pub gap: f64,
-    /// The criterion's rounding envelope the gap was judged against.
+    /// The dominance band the gap was judged against: the criterion's statistical
+    /// resolution plus its rounding envelope ([`outer_dominance_band`], #4024).
     pub band: f64,
     /// How the search from that state ended.
     pub continuation: DominanceContinuationStop,
@@ -7183,7 +7184,7 @@ pub(crate) fn run_outer_uncertified(
                 log::debug!(
                     "[OUTER] {context}: attempt {} (plan={the_plan}) declined a certified \
                      winner at cost {:.6e}, dominated by an evaluated state at cost {:.6e} \
-                     (gap {:.3e} > rounding envelope {:.3e}); that state is the resume \
+                     (gap {:.3e} > dominance band {:.3e}); that state is the resume \
                      checkpoint (#2596, #2627)",
                     attempt_idx + 1,
                     dominated.plateau.final_value,
@@ -7584,6 +7585,33 @@ pub(crate) fn outer_criterion_resolution(config: &OuterConfig) -> f64 {
         .statistical_resolution()
         .filter(|tau| tau.is_finite() && *tau > 0.0)
         .unwrap_or(0.0)
+}
+
+/// The least gap by which an evaluated state resolvably beats a certified
+/// optimum of the same criterion: `τ_stat + √ε·max(|V_w|, |V_i|, 1)` (#4024).
+///
+/// The certificate that minted the winner `V_w` admits a remaining decrease of
+/// at most `τ_stat` ([`outer_criterion_resolution`]) to the minimum of the basin
+/// it certifies: its Newton-decrement verdict and curvature-resolvability rung
+/// both accept `½·gᵀH⁻¹g ≤ τ_stat`, so under the quadratic model every state of
+/// that basin scores at least `V_w − τ_stat`. The two values are separately
+/// rounded, which adds [`outer_value_agreement_bound`]. An incumbent `V_i` inside
+/// that sum is consistent with the certificate, whatever basin it came from: a
+/// decrease below `τ_stat` moves no reported quantity by more than the sampling
+/// error the inference already carries, the standard every other "the criterion
+/// cannot tell these apart" judgement reads. Only a gap beyond it contradicts the
+/// certificate, which is the case the dominance decline exists for (a domain face
+/// certified at 110.94 over an evaluated 4.19, #2596).
+///
+/// Judging the gap at the rounding envelope alone held the decline to a standard
+/// `τ_stat/(√ε·|V|)` times stricter than the certificate it overrules (about
+/// `10³` at `n = 400`), so two stops of one flat valley declined each other:
+/// the certified one lost to an uncertified one a hair further down, and the
+/// continuation from there had to certify beneath a checkpoint already inside the
+/// certificate's own tolerance (#4024). With no declared observation count
+/// `τ_stat = 0` and the band is the rounding envelope.
+pub(crate) fn outer_dominance_band(config: &OuterConfig, winner: f64, incumbent: f64) -> f64 {
+    outer_criterion_resolution(config) + outer_value_agreement_bound(winner, incumbent)
 }
 
 /// The largest step the negative-curvature adjudication takes along its eigenvector: one
