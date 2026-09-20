@@ -7676,18 +7676,20 @@ fn atom_ambient_image(atom: &SaeManifoldAtom) -> Array2<f64> {
 ///
 /// The start vector is the highest-norm centered active row, which lies in
 /// `range C`, so the Krylov space it generates has dimension at most
-/// `rank C ≤ min(p, active)`. That budget is exact, not a guess. A solve that
-/// does not certify within it returns `None`, and the caller frames no atom
-/// instead of adjudicating a plane built on an unconverged direction.
+/// `rank C ≤ min(p, active)`. That budget is exact, not a guess. `Ok(None)` is
+/// an image with no centered signal (`C = 0`), which frames nothing. A solve
+/// that does not certify within the exact budget is an error the harvest
+/// propagates, never a silently skipped atom and never a plane adjudicated on
+/// an unconverged direction.
 fn certified_top_dir(
     img: ArrayView2<'_, f64>,
     center: &Array1<f64>,
     active: &[usize],
-) -> Option<Array1<f64>> {
+) -> Result<Option<Array1<f64>>, String> {
     let p = img.ncols();
     let m = active.len();
     if p == 0 || m == 0 {
-        return None;
+        return Ok(None);
     }
     let apply_c = |x: &[f64], out: &mut [f64]| {
         out.fill(0.0);
@@ -7720,8 +7722,13 @@ fn certified_top_dir(
             }
         }
     }
-    if !(best_norm > 0.0 && trace.is_finite()) {
-        return None;
+    if !trace.is_finite() {
+        return Err(format!(
+            "linear-atom frame: the centered image trace is not finite ({trace})"
+        ));
+    }
+    if !(best_norm > 0.0) {
+        return Ok(None);
     }
     // Normalize the operator by the seed's Rayleigh quotient `ρ₀ ≤ λ₁`, so the
     // solver's `max(|λ|, 1)` residual scale is `λ₁/ρ₀ ≥ 1`: the certificate is
@@ -7729,8 +7736,13 @@ fn certified_top_dir(
     let mut c_seed = vec![0.0_f64; p];
     apply_c(&seed, &mut c_seed);
     let rho0 = seed.iter().zip(&c_seed).map(|(s, c)| s * c).sum::<f64>() / best_norm;
+    // `seed ∈ range C` and `seed ≠ 0`, so `ρ₀ ≥ ‖seed‖² > 0` in exact
+    // arithmetic; a non-positive or non-finite quotient is a failed evaluation.
     if !(rho0 > 0.0 && rho0.is_finite()) {
-        return None;
+        return Err(format!(
+            "linear-atom frame: the seed Rayleigh quotient is not a positive finite \
+             number ({rho0})"
+        ));
     }
     // One scaled matvec commits `p + 2` roundings per row projection (centering,
     // product, sum), `m + 2` per output accumulation, and one in `/ρ₀`, against
@@ -7756,23 +7768,27 @@ fn certified_top_dir(
             Ok(())
         },
     )
-    .ok()?;
+    .map_err(|error| format!("linear-atom frame direction did not certify: {error}"))?;
     let mut v = pairs.eigenvectors.column(0).to_owned();
     let vnorm = v.dot(&v).sqrt();
     if !(vnorm > 0.0 && vnorm.is_finite()) {
-        return None;
+        return Err(format!(
+            "linear-atom frame: the certified Ritz vector has norm {vnorm}"
+        ));
     }
     // The eigenvector's sign is a gauge; orient it along the seed row so the
     // direction is deterministic.
     let orientation = v.iter().zip(&seed).map(|(a, b)| a * b).sum::<f64>();
     let sign = if orientation < 0.0 { -1.0 } else { 1.0 };
     v.mapv_inplace(|x| sign * x / vnorm);
-    Some(v)
+    Ok(Some(v))
 }
 
 /// Assemble the fitted linear atoms' `(atom index, unit direction, active mask,
 /// ambient image)` — the raw material coalescing and candidate generation read.
-fn linear_atom_frames(term: &SaeManifoldTerm) -> Vec<(usize, Array1<f64>, Vec<bool>, Array2<f64>)> {
+fn linear_atom_frames(
+    term: &SaeManifoldTerm,
+) -> Result<Vec<(usize, Array1<f64>, Vec<bool>, Array2<f64>)>, String> {
     let assignments = term.assignment.assignments();
     let n = assignments.nrows();
     let k = assignments.ncols();
@@ -7803,12 +7819,12 @@ fn linear_atom_frames(term: &SaeManifoldTerm) -> Vec<(usize, Array1<f64>, Vec<bo
             }
         }
         center.mapv_inplace(|x| x / active_idx.len() as f64);
-        let Some(dir) = certified_top_dir(img.view(), &center, &active_idx) else {
+        let Some(dir) = certified_top_dir(img.view(), &center, &active_idx)? else {
             continue;
         };
         out.push((a, dir, active_mask, img));
     }
-    out
+    Ok(out)
 }
 
 /// Mine flat-pair → circle promotion candidates from the fitted dictionary
@@ -7836,7 +7852,7 @@ fn curl_candidates(
         },
         SaeReferenceMetricPlan::UnitCircle,
     )?;
-    let frames = linear_atom_frames(term);
+    let frames = linear_atom_frames(term)?;
     if frames.len() < 2 {
         return Ok(Vec::new());
     }
