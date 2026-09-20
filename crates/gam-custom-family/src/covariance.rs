@@ -372,51 +372,34 @@ pub(crate) fn synchronized_states_from_flat_beta<
 /// component before taking the inf-norm. Axis-aligned lower bounds are just a
 /// special case; coupled derivative-guard rows must use the same KKT geometry.
 ///
-/// `known_active_rows`, when provided, is the QP solver's authoritative active
-/// face. Trust-region damping and finite
-/// precision can leave the committed β with row slacks slightly above the slack
-/// tolerance even though the QP identified the row as binding; slack-based
-/// detection alone then misses the row and leaves its Lagrange-multiplier mass
-/// in the projected residual. Conversely, unioning the authoritative face with
-/// every slack-tight row destroys the factored-cone contract: one zero CTN
-/// coefficient row makes all `n` observation rows tight although the QP needs
-/// only a small working face, so the residual checker materializes thousands of
-/// redundant rows and sends them through an `O(m²)` NNLS iteration bound. Slack
-/// discovery is therefore used only when the caller has no QP face provenance.
-/// The non-negative-multiplier projection still rejects every supplied row with
-/// the wrong multiplier sign.
+/// The active face is the tangent face at `beta` itself: a row is a
+/// multiplier candidate exactly when its scaled slack is within
+/// `ACTIVE_SET_WORKING_FACE_TOL` (the point-local rule of
+/// `gam_solve::active_set::project_stationarity_residual_on_constraint_set`).
+/// A slack row carries no multiplier: at `a_iᵀβ > b_i` a residual along
+/// `a_i` is descent the constraint does not block, so it stays in the
+/// certificate (#3513). There is one face rule for every caller, whatever
+/// QP provenance it has.
 pub(crate) fn projected_stationarity_inf_norm(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
     constraints: Option<&ConstraintSet>,
-    known_active_rows: Option<&[usize]>,
 ) -> f64 {
     assert_eq!(residual.len(), beta.len());
     let raw_inf = residual.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     let Some(constraints) = constraints else {
         return raw_inf;
     };
-    projected_linear_constraint_stationarity_inf_norm(
-        residual,
-        beta,
-        constraints,
-        known_active_rows,
-    )
-    .unwrap_or(raw_inf)
+    projected_linear_constraint_stationarity_inf_norm(residual, beta, constraints)
+        .unwrap_or(raw_inf)
 }
 
 pub(crate) fn projected_linear_constraint_stationarity_inf_norm(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
     constraints: &ConstraintSet,
-    known_active_rows: Option<&[usize]>,
 ) -> Option<f64> {
-    let projected = projected_linear_constraint_stationarity_vector(
-        residual,
-        beta,
-        constraints,
-        known_active_rows,
-    )?;
+    let projected = projected_linear_constraint_stationarity_vector(residual, beta, constraints)?;
     let primal_violation = linear_constraint_primal_violation(beta, constraints)?;
     Some(
         projected
@@ -452,98 +435,24 @@ pub(crate) fn linear_constraint_primal_violation(
     Some(primal_violation)
 }
 
+/// Stationarity residual with the tangent-face normal-cone component at
+/// `beta` removed; see [`projected_stationarity_inf_norm`] for the face rule.
 pub fn projected_linear_constraint_stationarity_vector(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
     constraints: &ConstraintSet,
-    known_active_rows: Option<&[usize]>,
 ) -> Option<Array1<f64>> {
     let p = beta.len();
     if residual.len() != p || constraints.ncols() != p {
         return None;
     }
-    if let Some(hint) = known_active_rows {
-        // QP provenance selects the strict point-local tangent-face contract.
-        // The operator-native Moreau solve discovers its complete multiplier
-        // support deterministically; the historical warm row ids no longer
-        // alter generator selection or the projected stationarity vector.
-        return gam_solve::active_set::project_stationarity_residual_on_constraint_set(
-            residual,
-            beta,
-            constraints,
-            hint,
-        )
-        .map(|(projected, _active)| projected);
-    }
-    let n_rows = constraints.nrows();
-    let values = constraints.values(beta.view()).ok()?;
-    // With no QP provenance, discover candidates from slack. Using a boolean
-    // membership table preserves canonical row order.
-    let mut in_active = vec![false; n_rows];
-    for row in 0..n_rows {
-        let bound = constraints.bound(row).ok()?;
-        if bound == f64::NEG_INFINITY {
-            continue;
-        }
-        if !bound.is_finite() {
-            return None;
-        }
-        let value = values[row];
-        let slack = value - bound;
-        if !slack.is_finite() {
-            return None;
-        }
-        // Active-row inclusion band for the stationarity-residual cone projection.
-        // A constraint binding at the constrained optimum carries a Lagrange
-        // multiplier whose mass IS the stationarity residual (`r = A_activeᵀ λ`,
-        // λ >= 0); to project it out, every genuinely tight row must be a candidate.
-        // The constrained QP only reports rows it drove tight during a
-        // non-degenerate step, so monotone derivative-guard rows tight at the
-        // optimum but never explicitly stepped sit just above the old `1e-6·scale`
-        // band, get excluded, and leave the multiplier unresolved — tripping the
-        // `active_set_incomplete` refusal on an exactly constrained-stationary
-        // iterate (gam#797 survival time block). Widen the band so every near-tight
-        // row is a CANDIDATE; over-inclusion is safe because the downstream NNLS
-        // (`project_stationarity_residual_on_constraint_cone`) assigns λ = 0 to any
-        // candidate carrying no multiplier mass, so a non-binding row cannot
-        // spuriously shrink the residual.
-        let scale = value.abs().max(bound.abs()).max(1.0);
-        let beta_inf = beta
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0_f64, f64::max)
-            .max(1.0);
-        // ℓ¹ row norm bounded below by the Euclidean norm the carrier exposes;
-        // for the factored cone the Euclidean norm is exact and the ℓ¹ norm is
-        // within √p of it, so the slack band keeps its magnitude semantics.
-        let row_norm1 = constraints.row_norm(row).ok()?.max(1.0);
-        // A row that is mathematically binding can appear a small positive
-        // distance inside the feasible cone after repeated dense/spectral
-        // Newton projections on a flat baseline-hazard valley: the objective is
-        // insensitive along that direction, so round-off in the derivative-basis
-        // coordinates dominates the true slack.  The active-set QP reports only
-        // rows it explicitly pivoted on, so the KKT residual projection must also
-        // recover these numerically-pinned rows from primal slack.  Use a
-        // coefficient-space slack band, scaled by the row norm and coefficient
-        // magnitude, not just by `Aβ` (which is exactly zero for monotone
-        // derivative constraints with `b=0`).  Over-inclusion is safe because the
-        // downstream nonnegative cone projection assigns λ=0 to rows that do not
-        // carry multiplier mass; under-inclusion leaves a genuine multiplier in
-        // the residual and falsely reports `active_set_incomplete` (#1793/#1040).
-        let coordinate_slack_tol = 5e-3 * row_norm1 * beta_inf + 1e-8;
-        let active_tol = (1e-3 * scale + 1e-8).max(coordinate_slack_tol);
-        if slack <= active_tol {
-            in_active[row] = true;
-        }
-    }
-    let active_rows: Vec<usize> = (0..n_rows).filter(|&row| in_active[row]).collect();
-    if active_rows.is_empty() {
-        return Some(residual.clone());
-    }
-
-    let gathered = constraints.gather_rows(&active_rows).ok()?;
-    project_stationarity_residual_on_constraint_cone(residual, &gathered.a)
-        .map(|(projected, _)| projected)
+    gam_solve::active_set::project_stationarity_residual_on_constraint_set(
+        residual,
+        beta,
+        constraints,
+        &[],
+    )
+    .map(|(projected, _active)| projected)
 }
 
 pub(crate) fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>(
@@ -552,7 +461,6 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>
     eval: &FamilyEvaluation,
     states: &[ParameterBlockState],
     s_lambdas: &[Array2<f64>],
-    block_active_sets: Option<&[Option<Vec<usize>>]>,
 ) -> Result<Option<f64>, CustomFamilyError> {
     if eval.blockworking_sets.len() != states.len() || states.len() != s_lambdas.len() {
         return Err(CustomFamilyError::DimensionMismatch {
@@ -563,15 +471,6 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>
         return Err(CustomFamilyError::DimensionMismatch {
             reason: "exact-newton joint stationarity check: spec/state count mismatch".to_string(),
         });
-    }
-    if let Some(sets) = block_active_sets
-        && sets.len() != states.len()
-    {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton joint stationarity check: active-set count mismatch, got {}, expected {}",
-            sets.len(),
-            states.len()
-        ) });
     }
 
     let block_constraints = collect_block_linear_constraints(family, states, specs)?;
@@ -607,14 +506,10 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>
             _ => return Ok(None),
         };
         let residual = s_lambdas[b].dot(&states[b].beta) - gradient;
-        let block_active_hint = block_active_sets
-            .and_then(|sets| sets.get(b))
-            .and_then(|opt| opt.as_deref());
         let block_inf = projected_stationarity_inf_norm(
             &residual,
             &states[b].beta,
             block_constraints[b].as_ref(),
-            block_active_hint,
         );
         inf_norm = inf_norm.max(block_inf);
     }
@@ -739,7 +634,6 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
     specs: &[ParameterBlockSpec],
     s_lambdas: &[Array2<f64>],
     block_constraints: &[Option<ConstraintSet>],
-    block_active_sets: Option<&[Option<Vec<usize>>]>,
     // gam#979: per-coordinate simple lower bounds (`f64::NEG_INFINITY` where
     // unbounded, length = total joint p), from `extract_simple_lower_bounds` on
     // the joint constraints. Used to project out the KKT multipliers of ACTIVE
@@ -780,15 +674,6 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
             states.len()
         ) });
     }
-    if let Some(sets) = block_active_sets
-        && sets.len() != states.len()
-    {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton joint stationarity check from gradient: active-set count mismatch, got {}, expected {}",
-            sets.len(),
-            states.len()
-        ) });
-    }
     let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     if gradient.len() != total_p {
         return Err(CustomFamilyError::DimensionMismatch { reason: format!(
@@ -811,16 +696,9 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
     // multipliers at active lower bounds are not convergence defects, so we
     // measure only the free-set residual. See `projected_stationarity_inf_norm`
     // for the tolerance choice and its parallel with `projected_gradient_norm`
-    // in `pirls.rs`.
-    //
-    // The optional `block_active_sets` arrives from the joint-Newton inner
-    // loop's `cached_active_sets` and carries the QP solver's authoritative
-    // active rows per block. Threading it through is what makes the
-    // stationarity test correctly fire at the constrained optimum: a damped
-    // constrained step may commit β with row slacks slightly above the slack
-    // tolerance even though the QP identified the rows as binding, and
-    // slack-based detection alone then misses the rows and leaves the
-    // Lagrange-multiplier mass in the residual.
+    // in `pirls.rs`. The linear-constraint face is the tangent face at the
+    // committed β, never a QP working set: a row the QP reported but the
+    // committed β leaves slack carries no multiplier there (#3513).
     let mut inf_norm = 0.0_f64;
     let mut offset = 0usize;
     for b in 0..states.len() {
@@ -859,14 +737,10 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
                 residual[j] = beta_j - (beta_j - residual[j]).max(lower);
             }
         }
-        let block_active_hint = block_active_sets
-            .and_then(|sets| sets.get(b))
-            .and_then(|opt| opt.as_deref());
         let block_inf = projected_stationarity_inf_norm(
             &residual,
             &states[b].beta,
             block_constraints[b].as_ref(),
-            block_active_hint,
         );
         inf_norm = inf_norm.max(block_inf);
         offset += width;
@@ -947,7 +821,6 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
     specs: &[ParameterBlockSpec],
     s_lambdas: &[Array2<f64>],
     block_constraints: &[Option<ConstraintSet>],
-    block_active_sets: Option<&[Option<Vec<usize>>]>,
     // gam#1587/#561: `Σ_t λ_t (M⊗S_t) · β` — the full-width joint penalty's
     // contribution to the penalized stationarity condition, in stacked
     // (class-major) coordinates over the whole `total_p` vector. Families whose
@@ -970,15 +843,6 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
             reason: "exact-newton projected stationarity vector from gradient: block dimension mismatch"
                 .to_string(),
         });
-    }
-    if let Some(sets) = block_active_sets
-        && sets.len() != states.len()
-    {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton projected stationarity vector from gradient: active-set count mismatch, got {}, expected {}",
-            sets.len(),
-            states.len()
-        ) });
     }
     let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     if gradient.len() != total_p {
@@ -1009,14 +873,10 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
             block += &js.slice(ndarray::s![start..end]);
         }
         if let Some(constraints) = block_constraints[b].as_ref() {
-            let block_active_hint = block_active_sets
-                .and_then(|sets| sets.get(b))
-                .and_then(|opt| opt.as_deref());
             match projected_linear_constraint_stationarity_vector(
                 &block,
                 &states[b].beta,
                 constraints,
-                block_active_hint,
             ) {
                 Some(projected) => block = projected,
                 None => {
@@ -1042,8 +902,8 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
 
 /// Build the free-space-projected KKT residual for the IFT correction.
 ///
-/// The active set passed via `block_active_sets` is consumed by the inner
-/// projection so the returned vector lies in `range(I − P_normal_cone)`. The
+/// The tangent-face normal cone at each block's β is projected out, so the
+/// returned vector lies in `range(I − P_normal_cone)`. The
 /// [`gam_solve::model_types::ProjectedKktResidual`] return type makes
 /// that invariant visible at every call site — callers cannot forget to
 /// project, and `reml/unified.rs` cannot accidentally accept an unprojected
@@ -1053,7 +913,6 @@ pub(crate) fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
     s_lambdas: &[Array2<f64>],
-    block_active_sets: Option<&[Option<Vec<usize>>]>,
     joint_penalty_score: Option<&Array1<f64>>,
 ) -> Result<Option<ProjectedKktResidual>, CustomFamilyError> {
     let eval = family.evaluate(states)?;
@@ -1067,7 +926,6 @@ pub(crate) fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
         states,
         s_lambdas,
         &block_constraints,
-        block_active_sets,
         joint_penalty_score,
     )
 }
@@ -1079,7 +937,6 @@ pub(crate) fn exact_newton_joint_kkt_residual_for_ift_from_cached_gradient<
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
     s_lambdas: &[Array2<f64>],
-    block_active_sets: Option<&[Option<Vec<usize>>]>,
     cached_gradient: Option<&Array1<f64>>,
     joint_penalty_score: Option<&Array1<f64>>,
 ) -> Result<Option<ProjectedKktResidual>, CustomFamilyError> {
@@ -1091,7 +948,6 @@ pub(crate) fn exact_newton_joint_kkt_residual_for_ift_from_cached_gradient<
             states,
             s_lambdas,
             &block_constraints,
-            block_active_sets,
             joint_penalty_score,
         );
     }
@@ -1100,7 +956,6 @@ pub(crate) fn exact_newton_joint_kkt_residual_for_ift_from_cached_gradient<
         specs,
         states,
         s_lambdas,
-        block_active_sets,
         joint_penalty_score,
     )
 }
@@ -1111,7 +966,6 @@ pub(crate) fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
     states: &[ParameterBlockState],
     s_lambdas: &[Array2<f64>],
     block_constraints: &[Option<ConstraintSet>],
-    block_active_sets: Option<&[Option<Vec<usize>>]>,
     joint_penalty_score: Option<&Array1<f64>>,
 ) -> Result<Option<ProjectedKktResidual>, CustomFamilyError> {
     let residual = exact_newton_joint_projected_stationarity_vector_from_gradient(
@@ -1120,7 +974,6 @@ pub(crate) fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
         specs,
         s_lambdas,
         block_constraints,
-        block_active_sets,
         joint_penalty_score,
     )?;
     if residual.iter().all(|v| v.is_finite()) {

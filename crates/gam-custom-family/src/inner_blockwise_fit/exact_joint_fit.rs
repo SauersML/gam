@@ -237,7 +237,6 @@ fn returned_mode_band_shrunk_residual(
     s_lambdas: &[Array2<f64>],
     joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
     block_constraints: &[Option<ConstraintSet>],
-    block_active_sets: &[Option<Vec<usize>>],
     joint_lower_bounds: Option<&Array1<f64>>,
 ) -> Result<Option<f64>, CustomFamilyError> {
     let total_p = kkt_gradient.len();
@@ -265,7 +264,6 @@ fn returned_mode_band_shrunk_residual(
         specs,
         s_lambdas,
         block_constraints,
-        Some(block_active_sets),
         joint_lower_bounds,
         joint_score.as_ref(),
     )
@@ -1508,7 +1506,6 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &s_lambdas,
                         joint_bundle,
                         &block_constraints,
-                        &cached_active_sets,
                         joint_lower_bounds.as_ref(),
                     )?
                     .unwrap_or(marked_residual)
@@ -1946,7 +1943,6 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             specs,
             &s_lambdas,
             &block_constraints,
-            Some(cached_active_sets.as_slice()),
             joint_lower_bounds.as_ref(),
             joint_penalty_stationarity_score(options, specs, &states).as_ref(),
         )?;
@@ -3207,7 +3203,6 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &s_lambdas,
                     joint_bundle,
                     &block_constraints,
-                    &cached_active_sets,
                     joint_lower_bounds.as_ref(),
                 )?
                 .unwrap_or(current_stationarity_residual)
@@ -5592,7 +5587,6 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             specs,
             &s_lambdas,
             &block_constraints,
-            Some(cached_active_sets.as_slice()),
             joint_lower_bounds.as_ref(),
             joint_penalty_stationarity_score(options, specs, &states).as_ref(),
         )?;
@@ -5713,7 +5707,6 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 specs,
                 &s_lambdas,
                 &block_constraints,
-                Some(cached_active_sets.as_slice()),
                 joint_penalty_stationarity_score(options, specs, &states).as_ref(),
             )?;
         let block_stationarity_norms = {
@@ -7586,7 +7579,6 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             specs,
             &states,
             &s_lambdas,
-            Some(cached_active_sets.as_slice()),
             ift_gradient,
             joint_penalty_score.as_ref(),
         )?;

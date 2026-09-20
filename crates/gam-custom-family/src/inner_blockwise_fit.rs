@@ -4837,7 +4837,6 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 &cached_eval,
                 &states,
                 &s_lambdas,
-                None,
             )?
         } else {
             None
@@ -5068,7 +5067,6 @@ fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'stat
                     &states,
                     &s_lambdas,
                     &block_constraints,
-                    Some(cached_active_sets.as_slice()),
                     joint_penalty_stationarity_score(options, specs, &states).as_ref(),
                 )?
                 .map(|r| r.with_metadata(last_residual_tol, free_rank_at_cert))

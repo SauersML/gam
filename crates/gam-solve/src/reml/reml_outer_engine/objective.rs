@@ -2143,7 +2143,7 @@ pub(crate) fn reml_laml_evaluate(
                  which is numerically unreliable on near-singular H). \
                  If kkt_residual.is_some()=false under fixed dispersion, the convergent inner \
                  path forgot to populate `BlockwiseInnerResult::kkt_residual` (call \
-                 `exact_newton_joint_kkt_residual_for_ift(..., Some(active_sets))` on return) \
+                 `exact_newton_joint_kkt_residual_for_ift` on return) \
                  and this evaluation is a contract error. If kkt_residual.is_some()=true and \
                  the warning still fires, the projected-residual correction was insufficient: \
                  the post-correction gradient is still inconsistent and must not be handed to \

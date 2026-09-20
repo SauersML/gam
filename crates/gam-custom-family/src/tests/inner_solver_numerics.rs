@@ -4320,7 +4320,7 @@ pub(crate) fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
     // Test (i): no constraints → plain inf-norm.
     let beta = array![1.0, 2.0, -0.5];
     let residual = array![0.3, -0.1, 0.2];
-    let inf_nocon = projected_stationarity_inf_norm(&residual, &beta, None, None);
+    let inf_nocon = projected_stationarity_inf_norm(&residual, &beta, None);
     assert_relative_eq!(inf_nocon, 0.3_f64, epsilon = 1e-12);
 
     // Test (ii): β_j at its lower bound with residual_j > 0 is a KKT
@@ -4342,13 +4342,12 @@ pub(crate) fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
         b: array![0.0],
     });
     let inf_projected =
-        projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&single), None);
+        projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&single));
     assert_relative_eq!(inf_projected, 0.1_f64, epsilon = 1e-12);
     let vec_projected = projected_linear_constraint_stationarity_vector(
         &residual_active,
         &beta_active,
         &single,
-        None,
     )
     .expect("active lower-bound projection should succeed");
     assert_relative_eq!(vec_projected[0], 0.0_f64, epsilon = 1e-10);
@@ -4367,7 +4366,6 @@ pub(crate) fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
         &residual_active,
         &beta_active,
         Some(&constraints_lb0),
-        None,
     );
     assert_relative_eq!(inf_with_two_row, 0.1_f64, epsilon = 1e-12);
 
@@ -4386,7 +4384,6 @@ pub(crate) fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
         &residual_wrong_sign,
         &beta_wrong_sign,
         Some(&single1),
-        None,
     );
     assert_relative_eq!(inf_wrong_sign, 0.2_f64, epsilon = 1e-12);
 
@@ -4395,34 +4392,33 @@ pub(crate) fn projected_stationarity_inf_norm_respects_kkt_multipliers() {
     let beta_interior = array![1.5];
     let residual_interior = array![0.4];
     let inf_interior =
-        projected_stationarity_inf_norm(&residual_interior, &beta_interior, Some(&single1), None);
+        projected_stationarity_inf_norm(&residual_interior, &beta_interior, Some(&single1));
     assert_relative_eq!(inf_interior, 0.4_f64, epsilon = 1e-12);
 
-    // #1793/#1040: monotone derivative rows have `b = 0`, so a numerically
-    // pinned baseline-hazard row can sit a few 1e-3 inside the feasible cone
-    // after repeated basis projections even though the residual is entirely a
-    // valid KKT multiplier.  The projection must treat that row as an active
-    // candidate and let the nonnegative cone solve remove the multiplier.
-    let beta_nearly_pinned = array![0.004];
+    // #3513: the certificate's face is the tangent face at β itself. A row
+    // whose slack is resolvably positive is inactive, so KKT complementary
+    // slackness gives it a zero multiplier and the full residual is genuine
+    // non-stationarity. At β = 0.004 under β ≥ 0 with r = 2 the point is not
+    // a constrained optimum (moving β toward 0 lowers the objective), and the
+    // certificate must say so; only a row on the face may absorb r.
+    let beta_off_face = array![0.004];
     let residual_multiplier = array![2.0];
-    let near_pinned = projected_stationarity_inf_norm(
+    let off_face =
+        projected_stationarity_inf_norm(&residual_multiplier, &beta_off_face, Some(&single1));
+    assert_relative_eq!(off_face, 2.0_f64, epsilon = 1e-12);
+    let vec_off_face = projected_linear_constraint_stationarity_vector(
         &residual_multiplier,
-        &beta_nearly_pinned,
-        Some(&single1),
-        None,
-    );
-    assert_relative_eq!(near_pinned, 0.0_f64, epsilon = 1e-10);
+        &beta_off_face,
+        &single1,
+    )
+    .expect("off-face projection should succeed");
+    assert_relative_eq!(vec_off_face[0], 2.0_f64, epsilon = 1e-12);
 
-    // But a row clearly in the interior remains visible, so the wider
-    // near-active band cannot erase ordinary interior non-stationarity.
-    let beta_clearly_interior = array![0.02];
-    let interior_residual = projected_stationarity_inf_norm(
-        &residual_multiplier,
-        &beta_clearly_interior,
-        Some(&single1),
-        None,
-    );
-    assert_relative_eq!(interior_residual, 2.0_f64, epsilon = 1e-12);
+    // The same residual at β on the face is a valid multiplier and scores 0.
+    let beta_on_face = array![0.0];
+    let on_face =
+        projected_stationarity_inf_norm(&residual_multiplier, &beta_on_face, Some(&single1));
+    assert_relative_eq!(on_face, 0.0_f64, epsilon = 1e-10);
 }
 
 /// Pins the constrained-stationary certificate semantics.
@@ -4669,14 +4665,12 @@ pub(crate) fn projected_stationarity_inf_norm_projects_coupled_linear_kkt_multip
         &residual_valid_multiplier,
         &beta_active,
         Some(&constraints),
-        None,
     );
     assert_relative_eq!(inf_valid, 0.0_f64, epsilon = 1e-10);
     let vec_valid = projected_linear_constraint_stationarity_vector(
         &residual_valid_multiplier,
         &beta_active,
         &constraints,
-        None,
     )
     .expect("coupled active projection should succeed");
     assert_relative_eq!(vec_valid[0], 0.0_f64, epsilon = 1e-10);
@@ -4687,7 +4681,6 @@ pub(crate) fn projected_stationarity_inf_norm_projects_coupled_linear_kkt_multip
         &residual_wrong_sign,
         &beta_active,
         Some(&constraints),
-        None,
     );
     assert_relative_eq!(inf_wrong, 3.0_f64, epsilon = 1e-12);
 
@@ -4696,21 +4689,17 @@ pub(crate) fn projected_stationarity_inf_norm_projects_coupled_linear_kkt_multip
         &residual_valid_multiplier,
         &beta_interior,
         Some(&constraints),
-        None,
     );
     assert_relative_eq!(inf_interior, 3.0_f64, epsilon = 1e-12);
 }
 
 #[test]
-pub(crate) fn projected_stationarity_uses_the_qp_face_without_expanding_tight_rows() {
-    // A cone vertex can make every observation inequality tight while the QP's
-    // face names one (or zero) of the 4,096 duplicate rows. The QP face is a
-    // WARM SEED, not the complete normal cone: the projection certifies
-    // against ONE cone geometry (the tangent cone at beta) regardless of which
-    // redundant rows the QP happened to report. Treating a sparse/empty seed
-    // as an authoritative "no projection" verdict reports resolvable
-    // multiplier mass as residual — the #979 eternal-plateau class — so the
-    // resolvable +2 component must project out under EVERY seed.
+pub(crate) fn projected_stationarity_uses_the_tangent_face_without_expanding_tight_rows() {
+    // A cone vertex can make every observation inequality tight: here 4,096
+    // duplicate rows are all on the face at beta. The certificate reads ONE
+    // cone geometry, the tangent face at beta itself (#3513), so the resolvable
+    // +2 multiplier mass projects out through the duplicates while the free
+    // coordinate's -3 stays as residual.
     let mut a = Array2::<f64>::zeros((4096, 2));
     a.column_mut(0).fill(1.0);
     let constraints = ConstraintSet::Dense(
@@ -4720,17 +4709,10 @@ pub(crate) fn projected_stationarity_uses_the_qp_face_without_expanding_tight_ro
     let beta = array![0.0_f64, 0.0];
     let residual = array![2.0_f64, -3.0];
 
-    let projected =
-        projected_linear_constraint_stationarity_vector(&residual, &beta, &constraints, Some(&[0]))
-            .expect("seeded face projection");
+    let projected = projected_linear_constraint_stationarity_vector(&residual, &beta, &constraints)
+        .expect("tangent-face projection");
     assert_relative_eq!(projected[0], 0.0_f64, epsilon = 1e-10);
     assert_relative_eq!(projected[1], -3.0_f64, epsilon = 1e-10);
-
-    let empty_seed =
-        projected_linear_constraint_stationarity_vector(&residual, &beta, &constraints, Some(&[]))
-            .expect("empty-seed projection against the same cone geometry");
-    assert_relative_eq!(empty_seed[0], 0.0_f64, epsilon = 1e-10);
-    assert_relative_eq!(empty_seed[1], -3.0_f64, epsilon = 1e-10);
 }
 
 #[test]
@@ -4793,7 +4775,6 @@ pub(crate) fn joint_stationarity_from_gradient_projects_coupled_linear_constrain
         &[Some(constraints.clone())],
         None,
         None,
-        None,
     )
     .expect("stationarity projection should succeed");
     assert_relative_eq!(projected, 0.0_f64, epsilon = 1e-10);
@@ -4803,7 +4784,6 @@ pub(crate) fn joint_stationarity_from_gradient_projects_coupled_linear_constrain
         &[state.clone()],
         &s_lambdas,
         &[Some(constraints.clone())],
-        None,
         None,
     )
     .expect("KKT residual assembly should succeed")
@@ -4820,7 +4800,6 @@ pub(crate) fn joint_stationarity_from_gradient_projects_coupled_linear_constrain
         &[spec],
         &s_lambdas,
         &[Some(constraints)],
-        None,
         None,
         None,
     )
@@ -4875,7 +4854,6 @@ pub(crate) fn stationarity_projects_valid_lower_bound_multiplier_but_keeps_wrong
         std::slice::from_ref(&spec),
         &s_lambdas,
         &[None],
-        None,
         Some(&lower_bounds),
         None,
     )
@@ -4891,7 +4869,6 @@ pub(crate) fn stationarity_projects_valid_lower_bound_multiplier_but_keeps_wrong
         std::slice::from_ref(&spec),
         &s_lambdas,
         &[None],
-        None,
         None,
         None,
     )
@@ -4930,7 +4907,6 @@ pub(crate) fn kkt_residual_uses_cached_joint_gradient_without_re_evaluating_fami
         std::slice::from_ref(&spec),
         std::slice::from_ref(&state),
         std::slice::from_ref(&s_lambda),
-        None,
         Some(&cached_gradient),
         None,
     )
@@ -4980,7 +4956,6 @@ pub(crate) fn projected_stationarity_vector_uses_penalized_residual_not_raw_scor
         std::slice::from_ref(&spec),
         std::slice::from_ref(&s_lambda),
         &[None],
-        None,
         None,
     )
     .expect("projected stationarity residual should assemble");
