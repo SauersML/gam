@@ -170,7 +170,7 @@ class _ColumnarCoefficientRecords(Sequence[Mapping[str, Any]]):
 
 @dataclass(frozen=True, slots=True)
 class Summary:
-    """Frozen, typed view of a fitted-model summary.
+    r"""Frozen, typed view of a fitted-model summary.
 
     Each attribute mirrors a field of the Rust ``SummaryPayload`` struct.
     Subscript access (``summary["formula"]``) is supported for callers that
