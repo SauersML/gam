@@ -2732,5 +2732,13 @@
     ],
     "reason": "#3604: posterior_eta_bands had no Python caller (retired in docs/public-api-2829-disposition.tsv); its hand-copied band reducer never validated draws. draw_bands_from_matrices is the single reducer; matrix_bands calls quantile_from_sorted directly.",
     "evidence": "git grep finds no caller of posterior_eta_bands, posterior_eta_bands_impl, eta_bands_from_matrix_link, LinkSelector or posterior_quantile_from_sorted after the deletion."
+  },
+  {
+    "base": "0b9dc2c6b850eff58b11003192136420ef7233e7",
+    "items": [
+      "crates/gam-models/src/test_support.rs:const:PI_QUARTER_INV"
+    ],
+    "reason": "#4522: gauss_hermite_probabilists was a line-for-line Numerical Recipes gauher transcription (asymptotic seeds, orthonormal recurrence, 200-step Newton); it is now a split of gam_math::quadrature::standard_normal_gauss_hermite_rule, the workspace's one standard-normal Gauss-Hermite rule. PI_QUARTER_INV (pi^-1/4, the recurrence seed) was a local constant of the deleted transcription.",
+    "evidence": "At this base, source_removal_guard.py with the landing commit as head reports exactly this identity. git grep -w PI_QUARTER_INV finds none under crates, src or tests in the head tree."
   }
 ]
