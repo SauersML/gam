@@ -1,5 +1,11 @@
 ## Unreleased
 
+- **CLI: `residuals`, `diagnose`, `sample`, `generate` and `report` keep a data refusal's exit code and `help:` line** (#4312).
+  These commands flattened the typed error from the model-schema data loader into a bare message, so a
+  non-finite cell or an unseen level exited with the invocation (formula) code and printed no remedy.
+  They now exit with the data code and print the same `help:` line `gam predict` and `gam fit` print.
+  `diagnose`'s spline-scan and residual-cascade refusals no longer name the removed `--alo` flag.
+
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
   point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is

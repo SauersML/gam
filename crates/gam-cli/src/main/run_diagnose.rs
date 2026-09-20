@@ -40,13 +40,13 @@ fn print_multicoordinate_alo(alo: &gam_predict::SavedModelAloDiagnostics) {
     cli_out!("{table}");
 }
 
-pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
+pub(crate) fn run_diagnose(args: DiagnoseArgs) -> CliResult<()> {
     // `diagnose` currently has exactly one diagnostic, ALO, so it is always
     // run.  Do not expose a boolean that cannot alter this behavior: the old
     // `--alo` flag was a silent no-op.
 
     reject_multinomial_model(&args.model, "diagnose")?;
-    let model = SavedModel::load_from_path(&args.model)?;
+    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
     let parsed = parse_formula(&model.formula)?;
     // A spline-scan model (a Standard fit routed through the exact O(n)
     // smoother) keeps no dense design/Gram, and ALO leverage is defined off
@@ -54,11 +54,9 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // from the per-knot posterior. Surface a precise error rather than the
     // cryptic missing-resolved_termspec one (#1046).
     if model.spline_scan.is_some() {
-        return Err(
-            "diagnose --alo cannot replay this spline-scan model because its \
+        return Err("diagnose cannot replay this spline-scan model because its \
              saved state has no coefficient-space penalized Hessian"
-                .to_string(),
-        );
+            .into());
     }
     // A residual-cascade model (#1032) is the multi-resolution analogue: the
     // scattered low-d smooth is routed through the multilevel Wendland
@@ -68,9 +66,9 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // the downstream missing-resolved_termspec one.
     if model.residual_cascade.is_some() {
         return Err(
-            "diagnose --alo cannot replay this residual-cascade model because \
+            "diagnose cannot replay this residual-cascade model because \
              its saved state has no coefficient-space penalized Hessian"
-                .to_string(),
+                .into(),
         );
     }
     let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;

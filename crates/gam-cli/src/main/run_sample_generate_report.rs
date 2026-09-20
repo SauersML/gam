@@ -77,10 +77,10 @@ fn saved_alo_report_data(
     })
 }
 
-pub(crate) fn run_sample(args: SampleArgs) -> Result<(), String> {
+pub(crate) fn run_sample(args: SampleArgs) -> CliResult<()> {
     validate_positive_optional_usize("--samples", args.samples)?;
     reject_multinomial_model(&args.model, "sample")?;
-    let model = SavedModel::load_from_path(&args.model)?;
+    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
     let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
     require_dataset_rows("sample", &args.data, ds.values.nrows())?;
     let col_map = ds.column_map();
@@ -223,12 +223,9 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
-    if args.n_draws == 0 {
-        return Err("--n-draws must be > 0".to_string());
-    }
+pub(crate) fn run_generate(args: GenerateArgs) -> CliResult<()> {
     reject_multinomial_model(&args.model, "generate")?;
-    let model = SavedModel::load_from_path(&args.model)?;
+    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
 
     let ds = load_datasetwith_model_schema(&args.data, &model)?;
     require_dataset_rows("generate", &args.data, ds.values.nrows())?;
@@ -385,9 +382,9 @@ pub(crate) fn run_summary(args: SummaryArgs) -> Result<(), String> {
         .map_err(|error| format!("failed to write the summary: {error}"))
 }
 
-pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
+pub(crate) fn run_report(args: ReportArgs) -> CliResult<()> {
     reject_multinomial_model(&args.model, "report")?;
-    let model = SavedModel::load_from_path(&args.model)?;
+    let model = SavedModel::load_from_path(&args.model).map_err(|error| error.to_string())?;
     // The report card of the saved model has one owner, which gamfit's
     // `Model.report()` renders too. This command adds only what the data it is
     // given can show.
@@ -528,7 +525,8 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                     training_headers,
                     &col_map,
                     "resolved_termspec",
-                )?;
+                )
+                .map_err(|error| error.to_string())?;
                 let design = build_term_collection_design(ds.values.view(), &spec)
                     .map_err(|e| format!("failed to build design for report diagnostics: {e}"))?;
 
@@ -611,7 +609,8 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                             design.penalties.len(),
                             &fit,
                             "report measure-jet spectrum",
-                        )?;
+                        )
+                        .map_err(|error| error.to_string())?;
                     }
                     let mut penalty_cursor = design.leading_penalty_blocks_before_smooth();
                     for term in &design.smooth.terms {

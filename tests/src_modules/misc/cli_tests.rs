@@ -1328,6 +1328,7 @@ fn cli_sample_bounded_model_reaches_sampler_config_validation() {
     })
     .expect_err("invalid draw count should fail inside sampler validation");
 
+    let err = err.to_string();
     assert!(
         err.contains("NUTS n_samples"),
         "bounded sample dispatch should reach sampler validation, got {err}"
