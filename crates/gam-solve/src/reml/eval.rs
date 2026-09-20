@@ -205,12 +205,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
-        let decision = self.selecthessian_strategy_policy(&bundle);
-        let hessian = match decision.strategy {
-            super::inner_strategy::HessianEvalStrategyKind::SpectralExact => {
-                self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
-            }
-        };
+        let hessian = self.compute_lamlhessian_exact_from_bundle(rho, &bundle);
         // Read after the evaluation: a first evaluation is what latches the
         // #784 block, and with it whether `Δ_b` has a closed-form ρ-Hessian.
         if let Some(reason) = self.block_correction_hessian_refusal() {
@@ -499,18 +494,6 @@ impl<'a> RemlState<'a> {
         match &outcome {
             SmoothingCorrectionOutcome::FirstOrder { method, .. } => {
                 log::debug!("[smoothing-correction] branch=first-order method={method:?}");
-            }
-            SmoothingCorrectionOutcome::Unavailable {
-                reason: SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { error },
-                ..
-            } => {
-                // Structural, not numerical: no analytic outer Hessian exists
-                // for this fit, so the counter of numerical failures does not
-                // move.
-                log::debug!(
-                    "[smoothing-correction] branch=unavailable reason=outer-hessian-not-analytic \
-                     ({error})"
-                );
             }
             SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
                 SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
