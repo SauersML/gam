@@ -12,7 +12,7 @@
 use super::*;
 use gam_solve::arrow_schur::{
     ArrowFactorSlab, ArrowHtbetaCache, ArrowPcgDiagnostics, ArrowSolverMode, ArrowUndampedFactors,
-    BetaSchurSpectralConditioning,
+    BetaSchurSpectralConditioning, arrow_factor_max_pivot, arrow_factor_min_pivot,
 };
 use ndarray::array;
 
@@ -904,9 +904,8 @@ pub(crate) fn outer_gradient_solver_rejects_near_singular_cache_without_matching
     // deflate the flat subspace, the flatness is genuinely OUTSIDE the gauge orbit
     // — a distinct, more specific diagnosis the solver surfaces as
     // `OuterGradientError::NonIdentifiable` (rather than echoing the raw
-    // pivot-ratio `IllConditioned` trip). Both classes are FD-eligible, so the
-    // recovery behaviour is unchanged; only the diagnostic is sharper. This is the
-    // exact "without a matching gauge" path the test name describes.
+    // pivot-ratio trip). This is the exact "without a matching gauge" path the
+    // test name describes.
     let err = match obj
         .term
         .outer_gradient_arrow_solver(&cache, &obj.current_rho.lambda_smooth_vec().unwrap())
@@ -1096,16 +1095,12 @@ pub(crate) fn outer_gradient_solver_deflates_rank_deficient_decoder_beta_null() 
 /// the diagnostic must remain machine-distinguishable.
 #[test]
 pub(crate) fn outer_gradient_internal_invariant_is_typed_1436() {
-    let ill_conditioned = OuterGradientError::IllConditioned {
-        reason: "near-singular joint Hessian".to_string(),
-    };
     let non_identifiable = OuterGradientError::NonIdentifiable {
         reason: "gauge-degenerate direction".to_string(),
     };
     let internal = OuterGradientError::InternalInvariant {
         reason: "shape mismatch".to_string(),
     };
-    assert!(ill_conditioned.to_string().contains("ill-conditioned"));
     assert!(non_identifiable.to_string().contains("non-identifiable"));
     assert!(
         internal.to_string().contains("internal invariant"),
@@ -1120,21 +1115,14 @@ pub(crate) fn outer_gradient_internal_invariant_is_typed_1436() {
 /// invariant violations still invalidate the whole optimization.
 #[test]
 pub(crate) fn outer_gradient_failure_preserves_rho_locality_2653() {
-    for error in [
-        OuterGradientError::IllConditioned {
-            reason: "finite projected solve lost residual reduction".to_string(),
-        },
-        OuterGradientError::NonIdentifiable {
-            reason: "gauge-deflated operator remains singular".to_string(),
-        },
-    ] {
-        let error = EstimationError::from(error);
-        assert!(
-            matches!(error, EstimationError::TrialPointRefused { .. })
-                && error.is_trial_point_infeasible(),
-            "conditioning at one rho must reject only that trial: {error}"
-        );
-    }
+    let error = EstimationError::from(OuterGradientError::NonIdentifiable {
+        reason: "gauge-deflated operator remains singular".to_string(),
+    });
+    assert!(
+        matches!(error, EstimationError::TrialPointRefused { .. })
+            && error.is_trial_point_infeasible(),
+        "conditioning at one rho must reject only that trial: {error}"
+    );
 
     let invariant = EstimationError::from(OuterGradientError::InternalInvariant {
         reason: "gradient length differs from rho layout".to_string(),

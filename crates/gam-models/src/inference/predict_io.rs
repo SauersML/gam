@@ -1281,6 +1281,7 @@ impl BernoulliMarginalSlopePredictor {
         let scale = self.probit_frailty_scale();
         let summands = cells.len() * crate::cubic_cell_kernel::TERMINAL_GL_ORDER;
         let mut tail = 0.0;
+        let mut tail_rounding = 0.0;
         let mut density = 0.0;
         let mut density_slope = 0.0;
         for partition_cell in cells {
@@ -1317,6 +1318,7 @@ impl BernoulliMarginalSlopePredictor {
             )
             .map_err(EstimationError::InvalidInput)?;
             tail += state.value;
+            tail_rounding += state.value_rounding;
             density += crate::cubic_cell_kernel::cell_first_derivative_from_moments(
                 &dc_da,
                 &state.moments,
@@ -1336,6 +1338,7 @@ impl BernoulliMarginalSlopePredictor {
             density,
             density_slope: Some(density_slope),
             summands,
+            tail_rounding,
         })
     }
 
@@ -1450,6 +1453,7 @@ impl BernoulliMarginalSlopePredictor {
             density,
             density_slope: Some(density_slope),
             summands: grid.nodes.len(),
+            tail_rounding: 0.0,
         })
     }
 

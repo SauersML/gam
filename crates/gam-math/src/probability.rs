@@ -1,17 +1,16 @@
-use libm::{erf, erfc};
 use crate::double_double::SMALLEST_SUBNORMAL;
-use crate::roundoff::{UNIT_ROUNDOFF, inflated};
+use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth, inflated};
+use libm::{erf, erfc};
 
 mod normal_table;
 mod weighted_chi_square;
-pub use weighted_chi_square::{TailProbability, WeightedChiSquareTerm, signed_weighted_chi_square_sf};
 pub use normal_table::{
-    NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, NORMAL_SCALED_TAIL_RELATIVE_ERROR, normal_cdf_and_pdf,
-    normal_scaled_tail,
+    NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, NORMAL_SCALED_TAIL_RELATIVE_ERROR,
+    normal_cdf_and_pdf, normal_scaled_tail,
 };
-use statrs::function::{
-    beta::{beta_reg, inv_beta_reg, ln_beta},
-    gamma::gamma_ur,
+use statrs::function::beta::{beta_reg, inv_beta_reg, ln_beta};
+pub use weighted_chi_square::{
+    TailProbability, WeightedChiSquareTerm, signed_weighted_chi_square_sf,
 };
 
 const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
@@ -22,7 +21,9 @@ const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
 /// `I_x(a, b) = p`, where `I` is the regularized incomplete beta.
 ///
 /// `p <= 0` maps to the support floor and `p >= 1` to the support ceiling. A
-/// non-finite or non-positive shape, or a NaN probability, yields `NaN`.
+/// non-finite or non-positive shape, or a NaN probability, yields `NaN`. So
+/// does a lower-tail quantile whose log-space Newton ends at a point the
+/// residual certificate of [`lower_tail_beta_quantile`] does not accept.
 pub fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
     if p.is_nan() || !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
         return f64::NAN;
@@ -33,9 +34,36 @@ pub fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
     if p >= 1.0 {
         return 1.0;
     }
+    // Exact unit-shape families avoid both inversion and a cancellation-prone
+    // normalization, including arbitrarily skewed representable shapes.
+    if a == 1.0 {
+        return -((-p).ln_1p() / b).exp_m1();
+    }
+    if b == 1.0 {
+        return (p.ln() / a).exp();
+    }
     match lower_tail_beta_quantile(p, a, b) {
         Some(x) => x,
         None => inv_beta_reg(a, b, p),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LogBeta {
+    value: f64,
+    error: f64,
+}
+
+/// ln(a B(a,b)) = [ln Γ(1+a)-ln Γ(1)] - [ln Γ(b+a)-ln Γ(b)].
+/// Both differences are evaluated at their own scale, never as subtraction
+/// of separately rounded log-gammas. Normalizing S to H=a*S also removes
+/// the subsequent cancellation against ln(a) in a small-shape residual.
+fn lower_tail_log_beta(a: f64, b: f64) -> LogBeta {
+    let (first, first_error) = crate::jet_tower::ln_gamma_shift_gap_with_error(1.0, a);
+    let (second, second_error) = crate::jet_tower::ln_gamma_shift_gap_with_error(b, a);
+    LogBeta {
+        value: first - second,
+        error: first_error + second_error + accumulation_growth(1) * (first.abs() + second.abs()),
     }
 }
 
@@ -53,17 +81,17 @@ pub fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
 /// The lower tail has a convergent ascending series,
 ///
 /// ```text
-/// I_x(a,b) = x^a / B(a,b) · S(x),   S(x) = Σ_{k≥0} c_k x^k,
-/// c_k = (1−b)_k / (k!·(a+k)),       c_0 = 1/a
+/// I_x(a,b) = x^a / (a B(a,b)) · H(x),   H(x) = Σ_{k≥0} c_k x^k,
+/// c_k = a (1−b)_k / (k!·(a+k)),         c_0 = 1
 /// ```
 ///
 /// whose leading term inverts in closed form to
-/// `x₀ = exp([ln p + ln a + ln B(a,b)] / a)`. Refining it in `y = ln x` rather
+/// `x₀ = exp([ln p + ln(a B(a,b))] / a)`. Refining it in `y = ln x` rather
 /// than in `x` is what removes the floor: the answer's own variable becomes the
 /// iteration variable, so an absolute step tolerance in `y` is a RELATIVE
 /// tolerance in `x` and there is nothing to stall against. The iteration is
 /// also better conditioned than the one it replaces —
-/// `G(y) = ln I_{e^y}(a,b) − ln p` has `G′(y) = a + x·S′(x)/S(x) → a`, a
+/// `G(y) = ln I_{e^y}(a,b) − ln p` has `G′(y) = a + x·H′(x)/H(x) → a`, a
 /// constant, where the `x`-space derivative `∂I/∂x` spans hundreds of orders
 /// over the same range.
 ///
@@ -73,6 +101,17 @@ pub fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
 /// spurious positive floor a
 /// caller cannot distinguish from a resolved bound.
 ///
+/// The step test `|Δy| ≤ ε·max(|y|, 1)` only decides when to stop iterating;
+/// it is not what makes the answer an answer. For small `a` the rounding noise
+/// of `G` divided by `G′ ≈ a` sits above that threshold, and the iterate
+/// oscillates at noise level until [`BETA_NEWTON_MAX_STEPS`] runs out. The
+/// returned root is therefore certified at the point it is returned: `G` is
+/// re-evaluated there and must lie within its own rounding band
+/// ([`lower_tail_residual`]). A point outside the band is reported as
+/// `Some(NaN)`, whichever way the loop ended. It is not returned as a quantile,
+/// and `None` is not used for it either, since `None` would hand the case to
+/// `inv_beta_reg`, whose floor on this branch is the defect above.
+///
 /// The branch condition is `x·max(1, b) ≤ ½`, which is derived rather than
 /// tuned. The term ratio is `|x·(k+1−b)/(k+1)|·(a+k)/(a+k+1)`, and
 /// `|k+1−b| ≤ (k+1)·max(1, b)` for every `k ≥ 0`, so the condition bounds every
@@ -81,14 +120,22 @@ pub fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
 /// reason, that `crates/gam-terms/src/basis/polylog.rs` uses for its own
 /// ascending series.
 fn lower_tail_beta_quantile(p: f64, a: f64, b: f64) -> Option<f64> {
-    let ln_b = ln_beta(a, b);
-    if !ln_b.is_finite() {
-        return None;
+    let normalization = lower_tail_log_beta(a, b);
+    let ln_b = normalization.value;
+    if !ln_b.is_finite() || !normalization.error.is_finite() {
+        return Some(f64::NAN);
     }
     // Leading-order inverse: `I_x ≈ x^a / (a·B(a,b))` as `x → 0`.
-    let mut y = (p.ln() + a.ln() + ln_b) / a;
+    let mut y = (p.ln() + ln_b) / a;
+    if y == f64::NEG_INFINITY {
+        // A finite log-CDF residual at the rounding boundary can certify a
+        // true zero even when dividing the log-space seed by a overflows.
+        let rounding_boundary = libm::log(SMALLEST_SUBNORMAL) - std::f64::consts::LN_2;
+        let certificate = lower_tail_residual(rounding_boundary, a, b, normalization, p.ln());
+        return Some(if certificate.is_some_and(|r| r.g > r.band) { 0.0 } else { f64::NAN });
+    }
     if !y.is_finite() {
-        return None;
+        return Some(f64::NAN);
     }
     // Reject before iterating if the seed is outside the series branch. The
     // seed overestimates `x` for `b < 1` and underestimates it for `b > 1`, by
@@ -100,59 +147,156 @@ fn lower_tail_beta_quantile(p: f64, a: f64, b: f64) -> Option<f64> {
     }
     let ln_p = p.ln();
     for _ in 0..BETA_NEWTON_MAX_STEPS {
-        let x = y.exp();
-        if x * b.max(1.0) > 0.5 {
+        if y.exp() * b.max(1.0) > 0.5 {
             return None;
         }
-        let (sum, derivative_sum) = beta_ascending_series(x, a, b)?;
-        if !(sum.is_finite() && sum > 0.0 && derivative_sum.is_finite()) {
-            return None;
-        }
-        // `G(y) = a·y − ln B(a,b) + ln S(e^y) − ln p`.
-        let g = a * y - ln_b + sum.ln() - ln_p;
-        let g_prime = a + x * derivative_sum / sum;
-        if !(g.is_finite() && g_prime.is_finite() && g_prime > 0.0) {
-            return None;
-        }
-        let step = g / g_prime;
+        let Some(residual) = lower_tail_residual(y, a, b, normalization, ln_p) else {
+            return Some(f64::NAN);
+        };
+        let step = residual.g / residual.g_prime;
         if !step.is_finite() {
-            return None;
+            return Some(f64::NAN);
         }
         y -= step;
-        // Absolute in `y` is relative in `x`, which is the whole point.
+        // Absolute in `y` is relative in `x`. This only stops the iteration;
+        // the certificate below judges the point it stops at.
         if step.abs() <= f64::EPSILON * y.abs().max(1.0) {
             break;
         }
     }
     let x = y.exp();
-    if x.is_finite() && (0.0..=1.0).contains(&x) {
+    if !(x.is_finite() && (0.0..=1.0).contains(&x)) {
+        return Some(f64::NAN);
+    }
+    if x * b.max(1.0) > 0.5 {
+        return None;
+    }
+    // An underflowed quantile (`exp(y) = 0`, the correctly rounded answer) is
+    // certified the same way: `G` is formed from `y`, which stays finite, and
+    // the series at `x = 0` is the exact `H = 1`.
+    let Some(certificate) = lower_tail_residual(y, a, b, normalization, ln_p) else {
+        return Some(f64::NAN);
+    };
+    if certificate.g.abs() <= certificate.band {
         Some(x)
     } else {
-        None
+        Some(f64::NAN)
     }
 }
 
-/// `(S(x), S′(x))` for `S(x) = Σ_{k≥0} (1−b)_k · x^k / (k!·(a+k))`.
+/// `G(y) = a·y − ln(a B(a,b)) + ln H(e^y) − ln p`, its derivative and the rounding
+/// band inside which a computed `G` does not resolve from zero. Returns `None`
+/// off the series branch or when a piece does not form.
 ///
-/// Accumulated by the ratio `t_{k+1} = t_k·(k+1−b)/(k+1)` on the Pochhammer
-/// factor, so no factorial or gamma is formed. `None` if the guard term count
+/// The band, with `γ_n` from [`accumulation_growth`]:
+/// - The four summands `a·y`, `ln(a B)`, `ln H` and `ln p` meet in three
+///   additions. The product and logarithms contribute their rounding, so
+///   the final assembly allowance is
+///   `γ₄·(|a·y| + |ln(a B)| + |ln H| + |ln p|)`.
+/// - `ln H` inherits the geometric truncation remainder and arithmetic error
+///   of `H`, transformed to logarithmic units by
+///   [`AscendingSeries::log_error_bound`].
+/// - The normalization carries its own Stirling remainder and arithmetic
+///   allowance from [`lower_tail_log_beta`]; it is not a single rounded log.
+/// The check certifies convergence within these floating-point allowances,
+/// not correctly rounded quantiles for arbitrary conditioning.
+fn lower_tail_residual(
+    y: f64,
+    a: f64,
+    b: f64,
+    normalization: LogBeta,
+    ln_p: f64,
+) -> Option<LowerTailResidual> {
+    let x = y.exp();
+    if x * b.max(1.0) > 0.5 {
+        return None;
+    }
+    let series = beta_ascending_series(x, a, b)?;
+    if !(series.sum.is_finite() && series.sum > 0.0 && series.weighted_derivative_sum.is_finite()) {
+        return None;
+    }
+    let ln_b = normalization.value;
+    let ln_s = series.sum.ln();
+    let a_y = a * y;
+    let g = a_y - ln_b + ln_s - ln_p;
+    let g_prime = a + series.weighted_derivative_sum / series.sum;
+    let band = accumulation_growth(4) * (a_y.abs() + ln_b.abs() + ln_s.abs() + ln_p.abs())
+        + series.log_error_bound()
+        + normalization.error
+        + accumulation_growth(2) * (series.weighted_derivative_sum / series.sum).abs();
+    if !(g.is_finite() && g_prime.is_finite() && g_prime > 0.0 && band.is_finite()) {
+        return None;
+    }
+    Some(LowerTailResidual { g, g_prime, band })
+}
+
+struct LowerTailResidual {
+    g: f64,
+    g_prime: f64,
+    band: f64,
+}
+
+/// The normalized ascending series `H(x)=a*S(x)`, x times its derivative,
+/// and what its rounding needs:
+/// the sum of the magnitudes of its terms and the number of terms taken.
+struct AscendingSeries {
+    sum: f64,
+    weighted_derivative_sum: f64,
+    magnitude: f64,
+    terms: usize,
+    remainder_bound: f64,
+}
+
+impl AscendingSeries {
+    /// The complete-term recurrence has at most seven roundings per term,
+    /// followed by its addition. Charge `γ_{8·terms+4}·Σ|t_k|`,
+    /// the geometric remainder and an absolute
+    /// subnormal rounding allowance. The logarithm's worst deviation for a
+    /// relative perturbation r < 1 is -ln(1-r), not just r.
+    fn log_error_bound(&self) -> f64 {
+        let operations = self.terms.saturating_mul(8).saturating_add(4);
+        let relative = (accumulation_growth(operations) * self.magnitude
+            + self.remainder_bound
+            + operations as f64 * SMALLEST_SUBNORMAL)
+            / self.sum;
+        if relative < 1.0 {
+            -(-relative).ln_1p()
+        } else {
+            f64::INFINITY
+        }
+    }
+}
+
+/// `H(x)`, `x*H′(x)`, `Σ|t_k|` and the term count for
+/// `H(x) = Σ_{k≥0} a (1−b)_k · x^k / (k!·(a+k))`.
+///
+/// Accumulated by the complete-term ratio, including x and the denominator
+/// ratio. No independently overflowing Pochhammer factor or vanishing power is formed. `None` if the guard term count
 /// is exhausted, which the caller's branch condition makes unreachable.
-fn beta_ascending_series(x: f64, a: f64, b: f64) -> Option<(f64, f64)> {
-    let mut pochhammer_over_factorial = 1.0_f64;
-    let mut power = 1.0_f64;
-    let mut sum = 1.0 / a;
-    let mut derivative_sum = 0.0_f64;
+fn beta_ascending_series(x: f64, a: f64, b: f64) -> Option<AscendingSeries> {
+    let mut term = 1.0;
+    let mut sum = term;
+    let mut weighted_derivative_sum = 0.0_f64;
+    let mut magnitude = sum;
     for k in 1..=BETA_SERIES_MAX_TERMS {
         let kf = k as f64;
-        pochhammer_over_factorial *= (kf - b) / kf;
-        let coefficient = pochhammer_over_factorial / (a + kf);
-        // `power` holds `x^{k-1}` here, which is what `S′` wants.
-        derivative_sum += kf * coefficient * power;
-        power *= x;
-        let term = coefficient * power;
+        // Carry the full term: (1-b)_k and x^k can separately overflow and
+        // underflow even though their product has ratio at most one half.
+        term *= ((kf - b) * x / kf) * ((a + (kf - 1.0)) / (a + kf));
+        // Carry x*S', which Newton needs, instead of an overflowing S'.
+        weighted_derivative_sum += kf * term;
         sum += term;
+        magnitude += term.abs();
         if term.abs() <= f64::EPSILON * sum.abs() {
-            return Some((sum, derivative_sum));
+            return Some(AscendingSeries {
+                sum,
+                weighted_derivative_sum,
+                magnitude,
+                terms: k,
+                // Subsequent term ratios are at most r <= 1/2, hence the
+                // omitted absolute tail is at most |t_k| r/(1-r).
+                remainder_bound: term.abs() * (x * b.max(1.0)) / (1.0 - x * b.max(1.0)),
+            });
         }
     }
     None
@@ -238,10 +382,10 @@ fn ln_regularized_beta_series(log_x: f64, a: f64, b: f64) -> Option<f64> {
         return None;
     }
     let x = log_x.exp();
-    let Some((sum, _)) = beta_ascending_series(x, a, b) else {
+    let Some(AscendingSeries { sum, .. }) = beta_ascending_series(x, a, b) else {
         return Some(f64::NAN);
     };
-    let log_beta = ln_beta(a, b);
+    let log_beta = lower_tail_log_beta(a, b).value;
     if !(sum.is_finite() && sum > 0.0 && log_beta.is_finite()) {
         return Some(f64::NAN);
     }
@@ -265,9 +409,12 @@ fn log_reciprocal_one_plus_exp(log_ratio: f64) -> f64 {
 /// guard, not the expected count.
 const BETA_SERIES_MAX_TERMS: usize = 128;
 
-/// Guard step count for the log-space Newton. From a seed whose relative error
-/// is `O(x)` the iteration is quadratic, so it converges in two or three steps
-/// over the whole branch; this is the non-convergence guard.
+/// Step count for the log-space Newton. From a seed whose relative error is
+/// `O(x)` the iteration is quadratic, so it reaches `G`'s rounding band in two
+/// to four steps over the whole branch. The step test that ends the loop can
+/// fail to fire once the iterate sits in that band, so this count can end the
+/// loop too. It is not a certificate. [`lower_tail_beta_quantile`] certifies
+/// the point it returns, whichever way the loop ended.
 const BETA_NEWTON_MAX_STEPS: usize = 32;
 
 /// The part of `x·x` that `f64` cannot hold: `x² = x*x + square_residual(x)`,
@@ -541,8 +688,12 @@ pub fn student_t_quantile(p: f64, degrees_of_freedom: f64) -> Result<f64, String
 
 /// Chi-squared survival probability `P(X_ν > statistic)`.
 ///
-/// Uses the regularized upper incomplete gamma directly instead of
-/// reconstructing a small tail as `1 − P(ν/2, statistic/2)`.
+/// This is `Q(ν/2, statistic/2)`, read directly from
+/// [`regularized_incomplete_gamma_pair`] rather than reconstructed as
+/// `1 − P`. It is the same pair [`chi_square_quantile`] inverts, so the
+/// p-value and the critical value agree at every `ν`. statrs' `gamma_ur` does
+/// not: at `ν = 2e12`, `statistic = ν + 4e6` it returns 0.02279 against the
+/// exact 0.0227501859391187.
 pub fn chi_square_sf(statistic: f64, degrees_of_freedom: f64) -> f64 {
     let half_df = 0.5 * degrees_of_freedom;
     if statistic.is_nan()
@@ -557,7 +708,7 @@ pub fn chi_square_sf(statistic: f64, degrees_of_freedom: f64) -> f64 {
     if statistic == f64::INFINITY {
         return 0.0;
     }
-    gamma_ur(half_df, 0.5 * statistic)
+    regularized_incomplete_gamma_pair(half_df, 0.5 * statistic).1
 }
 
 /// Quantile of `χ²_k` at lower-tail probability `p`: the `x` with
@@ -600,6 +751,8 @@ pub fn chi_square_quantile(p: f64, degrees_of_freedom: f64) -> f64 {
 ///   Each runs to its own stopping test — no term cap, whose silent truncation
 ///   used to hand back a partial sum as a converged value — and returns NaN if
 ///   that test can never be met, which the band code already reads as "no band".
+///   Below the split with `a < 1`, `Q` is summed directly
+///   ([`small_shape_upper_gamma_below_split`]) rather than formed as `1 − P`.
 ///
 /// All three share the prefactor `x^a e^{−x} / Γ(a)` in the form
 /// `e^{−a·h} √(a/2π) / Γ*(a)`, `h = λ − 1 − ln λ`, `λ = x / a`
@@ -621,6 +774,18 @@ pub fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
     }
     let prefactor = incomplete_gamma_prefactor(a, x);
     if x < a + 1.0 {
+        // The series below gives `P`, and `1 − P` keeps absolute accuracy ε, so
+        // its relative error is ε·P/Q. For `a ≥ 1` this branch has
+        // `Q ≥ Q(1, 2) = e^{-2}`, so the loss is below a factor `e² − 1`. For
+        // `a < 1`, however, `Q(a, x) ≈ a·E₁(x)` goes to 0 with `a`, so there `Q`
+        // is summed directly and, where it is the smaller tail, `P` is its
+        // complement (#4242).
+        if a < 1.0 {
+            let q = small_shape_upper_gamma_below_split(a, x);
+            if q <= 0.5 {
+                return (1.0 - q, q);
+            }
+        }
         // Power series: P(a,x) = x^a e^{−x}/Γ(a) · Σ_{n≥0} xⁿ / Π_{k=0}^{n}(a+k).
         // The running term `del` is the ratio form, so no factorial overflows.
         // The terms after `del` are bounded by the geometric series of ratio
@@ -645,64 +810,121 @@ pub fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
             del *= x / ap;
             sum += del;
         }
-        // The series branch is entered only for `x < a + 1`, where `P` is bounded
-        // by `P(a, a+1) < 3/4`, so the complement is a subtraction of unequal
-        // magnitudes and keeps every digit `P` has.
+        // Here `Q ≥ e^{-2}` (`a ≥ 1`) or `Q > ½`, so `1 − P` loses at most a
+        // factor `e² − 1` of relative accuracy.
         let p = prefactor * sum;
         (p, 1.0 - p)
     } else {
-        // Modified-Lentz continued fraction for Q(a,x) = 1 − P(a,x); P = 1 − Q.
         // Evaluating the *upper* tail here keeps the directly-computed quantity
         // small wherever P is near 1, so `1 − Q` loses no significant digits.
-        // Lentz's modified continued-fraction algorithm substitutes a tiny value
-        // for an exact zero in its recurrence (Numerical Recipes §6.2). It is a
-        // component of the algorithm, not a floor on a result: any value below
-        // the smallest normal quotient works and the converged fraction does not
-        // depend on it, so it is the arithmetic's own smallest normal, not a
-        // chosen magnitude (#2469).
-        const LENTZ_TINY: f64 = f64::MIN_POSITIVE;
-        // Each factor `del = d·c` is a product of two quotients, each a
-        // correctly rounded division of a correctly rounded sum: four roundings,
-        // so `|del − 1| ≤ 4ε` is as close to 1 as a computed factor can be
-        // certified. The fraction has converged once a factor reaches `ε` (the
-        // Numerical Recipes test) or, inside that rounding band, stops getting
-        // closer to 1 — further factors are rounding noise, not convergence.
-        const FACTOR_ROUNDING: f64 = 4.0 * f64::EPSILON;
-        let mut b = x + 1.0 - a;
-        let mut c = 1.0 / LENTZ_TINY;
-        let mut d = 1.0 / b;
-        let mut h = d;
-        let mut previous_distance = f64::INFINITY;
-        let mut i = 1.0_f64;
-        loop {
-            let an = -i * (i - a);
-            b += 2.0;
-            d = an * d + b;
-            if d.abs() < LENTZ_TINY {
-                d = LENTZ_TINY;
-            }
-            c = b + an / c;
-            if c.abs() < LENTZ_TINY {
-                c = LENTZ_TINY;
-            }
-            d = 1.0 / d;
-            let del = d * c;
-            h *= del;
-            let distance = (del - 1.0).abs();
-            if !distance.is_finite() || !h.is_finite() {
-                return (f64::NAN, f64::NAN);
-            }
-            if distance <= f64::EPSILON
-                || (distance <= FACTOR_ROUNDING && distance >= previous_distance)
-            {
-                break;
-            }
-            previous_distance = distance;
-            i += 1.0;
-        }
-        let q = prefactor * h;
+        let q = prefactor * upper_gamma_continued_fraction(a, x);
         (1.0 - q, q)
     }
+}
+
+/// The modified-Lentz continued fraction `h(a, x)` with
+/// `Q(a, x) = x^a·e^{−x}/Γ(a) · h(a, x)`, for `x ≥ a + 1`, where it converges
+/// rapidly (Numerical Recipes §6.2). NaN where the recurrence leaves the
+/// floating range.
+fn upper_gamma_continued_fraction(a: f64, x: f64) -> f64 {
+    // Lentz's modified continued-fraction algorithm substitutes a tiny value
+    // for an exact zero in its recurrence (Numerical Recipes §6.2). It is a
+    // component of the algorithm, not a floor on a result: any value below
+    // the smallest normal quotient works and the converged fraction does not
+    // depend on it, so it is the arithmetic's own smallest normal, not a
+    // chosen magnitude (#2469).
+    const LENTZ_TINY: f64 = f64::MIN_POSITIVE;
+    // Each factor `del = d·c` is a product of two quotients, each a
+    // correctly rounded division of a correctly rounded sum: four roundings,
+    // so `|del − 1| ≤ 4ε` is as close to 1 as a computed factor can be
+    // certified. The fraction has converged once a factor reaches `ε` (the
+    // Numerical Recipes test) or, inside that rounding band, stops getting
+    // closer to 1 — further factors are rounding noise, not convergence.
+    const FACTOR_ROUNDING: f64 = 4.0 * f64::EPSILON;
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / LENTZ_TINY;
+    let mut d = 1.0 / b;
+    let mut h = d;
+    let mut previous_distance = f64::INFINITY;
+    let mut i = 1.0_f64;
+    loop {
+        let an = -i * (i - a);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < LENTZ_TINY {
+            d = LENTZ_TINY;
+        }
+        c = b + an / c;
+        if c.abs() < LENTZ_TINY {
+            c = LENTZ_TINY;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        let distance = (del - 1.0).abs();
+        if !distance.is_finite() || !h.is_finite() {
+            return f64::NAN;
+        }
+        if distance <= f64::EPSILON
+            || (distance <= FACTOR_ROUNDING && distance >= previous_distance)
+        {
+            break;
+        }
+        previous_distance = distance;
+        i += 1.0;
+    }
+    h
+}
+
+/// `Q(a, x)` for `0 < a < 1`, `0 < x < s = a + 1`, summed without the
+/// complement `1 − P`.
+///
+/// `Γ(a, x) = Γ(a, s) + ∫_x^s t^{a−1}e^{−t} dt`, and both parts are positive,
+/// so `Q(a, x) = Q(a, s) + (1/Γ(a))·∫_x^s t^{a−1}e^{−t} dt`. `Q(a, s)` comes
+/// from the continued fraction at its own convergence boundary. Expanding
+/// `e^{−t}` gives
+///
+/// `∫_x^s t^{a−1}e^{−t} dt = Σ_{n≥0} (−1)^n c_n`, where
+/// `c_n = s^{a+n}(1 − r^{a+n}) / ((a+n)·n!)` and `r = x/s < 1`.
+///
+/// Each `1 − r^{a+n} = −expm1((a+n)·ln r)` lies in `(0, 1)`, so no term
+/// overflows or cancels. For `m > 0`, `(1 − r^{m+1})/(1 − r^m) ≤ 1 + 1/m`
+/// (`1 − r^m − m·r^m(1−r)` falls to 0 at `r = 1`). So `c_{n+1}/c_n ≤ s/(n+1) < 1`
+/// for every `n ≥ 1`, because `s < 2`. The alternating tail past term `n − 1` is
+/// then bounded by `c_n`, and the sum stops once `c_n` is below one rounding of
+/// the positive total. `1/Γ(a) = a/Γ(1 + a)` uses `ln Γ(1 + a)`, whose argument
+/// lies in `[1, 2)`, so the scale costs only the absolute error of that
+/// logarithm and not the `ln(1/a)` magnitude of `ln Γ(a)`.
+fn small_shape_upper_gamma_below_split(a: f64, x: f64) -> f64 {
+    use statrs::function::gamma::ln_gamma;
+    let s = a + 1.0;
+    let ln_r = (x / s).ln();
+    // `s^a / Γ(1 + a)`: the `n = 0` term is `c_0 / Γ(a)` = this times `1 − r^a`.
+    let leading = (a * s.ln() - ln_gamma(s)).exp();
+    // `Q(a, s)` through the same `a/Γ(1 + a)` scaling ([`incomplete_gamma_prefactor`]).
+    let mut total = incomplete_gamma_prefactor(a, s) * upper_gamma_continued_fraction(a, s)
+        + leading * (-(a * ln_r).exp_m1());
+    // `s^{a+n} / (n!·Γ(a))`, carried as a ratio so neither factor overflows.
+    let mut scaled_power = leading * a;
+    let mut n = 1.0_f64;
+    loop {
+        scaled_power *= s / n;
+        let m = a + n;
+        let term = scaled_power * (-(m * ln_r).exp_m1()) / m;
+        // Negated so that a NaN (from an unvalidated `a ≤ 0`) ends the sum and
+        // propagates, rather than never satisfying the comparison.
+        if !(term > total * f64::EPSILON) {
+            break;
+        }
+        // `(−1)^n`: odd `n` subtracts.
+        if n % 2.0 == 1.0 {
+            total -= term;
+        } else {
+            total += term;
+        }
+        n += 1.0;
+    }
+    total
 }
 
 /// Taylor degree, in `ζ`, of the function `f(ζ) = ζ / (μ(ζ) − 1)` the Temme
@@ -876,19 +1098,26 @@ fn gamma_exponent(a: f64, x: f64) -> f64 {
 /// `ln Γ*(a)`, `Γ*(a) = Γ(a) / (√(2π) a^{a−½} e^{−a})`. Stirling's series from
 /// [`temme_table`] where its terms reach `ε` before the table ends (the series
 /// is asymptotic: its terms fall until `k ≈ 2πa`, and the first omitted term
-/// bounds the error); otherwise `a` is small enough that `ln Γ(a)` and
-/// `(a − ½) ln a − a` are of the size of `ln Γ*(a)` itself and the difference
-/// loses nothing.
+/// bounds the error); it is declined as soon as a term stops falling, since
+/// from there it only diverges (for `a ≲ 1e-13` the terms overflow, and an
+/// infinite term would pass the `ε` test). Otherwise `a` is small enough that
+/// `ln Γ(a)` and `(a − ½) ln a − a` are of the size of `ln Γ*(a)` itself and the
+/// difference loses nothing.
 fn ln_gamma_star(a: f64) -> f64 {
     let stirling = &temme_table().stirling;
     let mut sum = 0.0;
     let mut scale = 1.0;
+    let mut previous_term = f64::INFINITY;
     for &gamma_k in stirling {
         let term = gamma_k * scale;
+        if term.abs() >= previous_term {
+            break;
+        }
         sum += term;
         if term.abs() <= f64::EPSILON * sum.abs() {
             return sum.ln();
         }
+        previous_term = term.abs();
         scale /= a;
     }
     statrs::function::gamma::ln_gamma(a) - (a - 0.5) * a.ln() + a
@@ -899,7 +1128,17 @@ fn ln_gamma_star(a: f64) -> f64 {
 /// `h = λ − 1 − ln λ`. The exponent `a·h` ([`gamma_exponent`]) is never formed
 /// as `a·ln x − x − ln Γ(a)`, which cancels to it from terms of size `a·ln a`;
 /// its rounding is `h`'s own, which is the conditioning of `e^{−a·h}` itself.
+///
+/// For `a < 1` there is no `a·ln a` to cancel, but `ln Γ(a) ≈ ln(1/a)` is: both
+/// the textbook exponent and the `Γ*` form carry it, and an exponent of that
+/// size costs `ln(1/a)` ulp of the prefactor (≈ 690 at `a = 1e-300`), although
+/// the prefactor's condition number in `a` is about 1. There
+/// `1/Γ(a) = a/Γ(1 + a)` moves the `ln(1/a)` out of the exponent into an exact
+/// scaling: `a·exp(a·ln x − x − ln Γ(1 + a))`, with `ln Γ(1 + a) ∈ (−0.13, 0]`.
 fn incomplete_gamma_prefactor(a: f64, x: f64) -> f64 {
+    if a < 1.0 {
+        return a * (a * x.ln() - x - statrs::function::gamma::ln_gamma(1.0 + a)).exp();
+    }
     let exponent = -gamma_exponent(a, x) + 0.5 * (a / (2.0 * std::f64::consts::PI)).ln()
         - ln_gamma_star(a);
     exponent.exp()
@@ -1349,18 +1588,39 @@ pub fn exact_binary64_sum_sign(
 /// is `(+∞, +1)`; only with negative sign, `(+∞, −1)` (a log-magnitude of
 /// `+∞` with sign `−1` encodes the value `−∞`); with both signs the sum is
 /// the indeterminate `+∞ − ∞`, returned as `(NaN, 0.0)`.  A `−∞`
-/// log-magnitude is `exp(−∞) = 0` and is correctly dropped.
+/// log-magnitude is `exp(−∞) = 0` and is correctly dropped. A `NaN` sign, or a
+/// `NaN` log-magnitude carried by a nonzero sign, is an undefined term and makes
+/// the whole sum undefined: `(NaN, 0.0)`.
 pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
+    signed_log_sum_exp_by(log_mags, |idx| signs[idx])
+}
+
+/// `log Σ_i e^{x_i}`: [`signed_log_sum_exp`] with every sign `+1`. A `−∞` term
+/// contributes `e^{−∞} = 0`, so an empty or all-`−∞` sum is `−∞`; a `+∞` term
+/// makes the sum `+∞`; a `NaN` term makes it `NaN`. Callers that must refuse
+/// those inputs use [`crate::categorical::log_sum_exp`], which validates first.
+pub fn positive_log_sum_exp(log_terms: &[f64]) -> f64 {
+    signed_log_sum_exp_by(log_terms, |_| 1.0).0
+}
+
+/// The reduction behind [`signed_log_sum_exp`] and [`positive_log_sum_exp`],
+/// with the sign of term `idx` read from `sign(idx)`.
+fn signed_log_sum_exp_by(log_mags: &[f64], sign: impl Fn(usize) -> f64) -> (f64, f64) {
     // Infinite-magnitude terms dominate any finite contribution, so resolve
     // them before the finite log-sum-exp reduction below. `−∞` log-magnitudes
-    // are `exp(−∞) = 0` and need no special handling.
+    // are `exp(−∞) = 0` and need no special handling. An undefined term makes
+    // the sum undefined; `f64::max` below would otherwise skip it silently.
     let mut has_pos_inf = false;
     let mut has_neg_inf = false;
     for (idx, &lm) in log_mags.iter().enumerate() {
+        let term_sign = sign(idx);
+        if term_sign.is_nan() || (lm.is_nan() && term_sign != 0.0) {
+            return (f64::NAN, 0.0);
+        }
         if lm == f64::INFINITY {
-            if signs[idx] > 0.0 {
+            if term_sign > 0.0 {
                 has_pos_inf = true;
-            } else if signs[idx] < 0.0 {
+            } else if term_sign < 0.0 {
                 has_neg_inf = true;
             }
         }
@@ -1378,9 +1638,9 @@ pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
     let mut pos_max = f64::NEG_INFINITY;
     let mut neg_max = f64::NEG_INFINITY;
     for (idx, &lm) in log_mags.iter().enumerate() {
-        if signs[idx] > 0.0 {
+        if sign(idx) > 0.0 {
             pos_max = pos_max.max(lm);
-        } else if signs[idx] < 0.0 {
+        } else if sign(idx) < 0.0 {
             neg_max = neg_max.max(lm);
         }
     }
@@ -1401,11 +1661,11 @@ pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
     let mut absolute_scaled_sum = 0.0_f64;
     let mut finite_term_count = 0usize;
     for (idx, &lm) in log_mags.iter().enumerate() {
-        if !lm.is_finite() || !(signs[idx] > 0.0 || signs[idx] < 0.0) {
+        if !lm.is_finite() || !(sign(idx) > 0.0 || sign(idx) < 0.0) {
             continue;
         }
         let magnitude = (lm - common_max).exp();
-        let term = if signs[idx] > 0.0 {
+        let term = if sign(idx) > 0.0 {
             magnitude
         } else {
             -magnitude
@@ -1444,13 +1704,13 @@ pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
         if !lm.is_finite() {
             continue;
         }
-        if signs[idx] > 0.0 {
+        if sign(idx) > 0.0 {
             let term = (lm - pos_max).exp();
             let combined = pos_sum + term;
             let shifted = combined - pos_sum;
             pos_tail += (pos_sum - (combined - shifted)) + (term - shifted);
             pos_sum = combined;
-        } else if signs[idx] < 0.0 {
+        } else if sign(idx) < 0.0 {
             let term = (lm - neg_max).exp();
             let combined = neg_sum + term;
             let shifted = combined - neg_sum;
@@ -2230,6 +2490,85 @@ mod tests {
         assert!(chi_square_quantile(0.5, 0.0).is_nan());
     }
 
+    #[test]
+    fn chi_square_sf_at_huge_degrees_of_freedom_is_the_crate_gamma_tail() {
+        // The χ² survival at ν = 2e12, s = ν + 4e6 is Q(1e12, 1e12 + 2e6) =
+        // 0.022750185939118725 (a 50-digit mpmath reference). statrs `gamma_ur`
+        // returned 0.02279 here. The bar is the pair's own: 32 units of
+        // (1 + a·h)ε (gam-inference `incomplete_gamma_is_accurate_from_small_to_huge_shape`),
+        // with a·h ≈ a·μ²/2 = 2 at μ = x/a − 1 = 2e-6.
+        let (a, x) = (1.0e12_f64, 1.0e12 + 2.0e6);
+        let lambda = x / a;
+        let ah = a * (lambda - 1.0 - lambda.ln());
+        let got = chi_square_sf(2.0 * x, 2.0 * a);
+        let reference = 0.022_750_185_939_118_725;
+        let bar = 32.0 * (1.0 + ah) * f64::EPSILON;
+        assert!(rel_err(got, reference) <= bar, "got {got:e}, bar {bar:e}");
+        // Round trip through the quantile, which inverts the same pair. The
+        // inverse's target `1 − (1 − got)` differs from `got` by at most 2⁻⁵⁴
+        // (one rounding of `1 − got`), and together with the bar above that
+        // moves the gamma argument by (2⁻⁵⁴ + bar·Q)/density ≈ 1e-8, with a
+        // density of ≈ φ(2)/√a = 5.4e-8. That is far below one ulp of x
+        // (1.2e-4), so the inverse is fixed to the Halley loop's stationarity,
+        // which is a few ulp.
+        let quantile = chi_square_quantile(1.0 - got, 2.0 * a);
+        assert!(
+            ((quantile - 2.0 * x) / (2.0 * x)).abs() <= 4.0 * f64::EPSILON,
+            "quantile {quantile}"
+        );
+    }
+
+    /// #4242: below the split `x < a + 1` with shape `a < 1`, `Q(a, x)` keeps
+    /// relative accuracy as `a → 0`, where the complement `1 − P` it replaces
+    /// has relative error ≈ ε·P/Q (1.9e5ε at `a = 1e-4`). The references are
+    /// 50-digit `mpmath.gammainc(a, x, inf, regularized=True)` values at the
+    /// exact binary `a` and `x`. The bar, 64ε, covers the continued fraction's
+    /// own error at the split, ≈52ε worst for `a < 1` against mpmath, which the
+    /// sum inherits through `Q(a, a + 1)` and does not add to. The two smallest shapes
+    /// are where `ln Γ*(a)`'s Stirling series overflowed and the pair came back
+    /// NaN or `P = 0`.
+    #[test]
+    fn small_shape_upper_gamma_keeps_relative_accuracy_4242() {
+        let bar = 64.0 * f64::EPSILON;
+        let cases: [(f64, f64, f64); 10] = [
+            (1e-2, 0.909, 2.585_880_246_514_324_190_4e-3),
+            (1e-3, 0.99099, 2.229_549_549_437_722_252_1e-4),
+            (1e-4, 0.9901, 2.230_849_540_126_837_447_8e-5),
+            (1e-8, 0.5, 5.597_735_977_099_587_104_9e-9),
+            (1e-12, 0.7, 3.737_688_432_337_938_572_5e-13),
+            (
+                1.220_517_092_297_636_4e-14,
+                0.535_882_004_306_695_7,
+                6.328_065_217_785_509_233_1e-15,
+            ),
+            (
+                4.469_568_170_114_96e-293,
+                0.874_332_377_373_819_6,
+                1.216_172_647_707_404_266_1e-293,
+            ),
+            (0.5, 1.2, 0.121_335_250_358_482_153_42),
+            (0.9, 1e-3, 0.997_926_400_133_915_959_51),
+            (0.3, 1e-20, 0.999_998_885_757_491_452_7),
+        ];
+        for (a, x, expected) in cases {
+            let (p, q) = regularized_incomplete_gamma_pair(a, x);
+            let rel = (q - expected).abs() / expected;
+            assert!(
+                rel <= bar,
+                "Q({a}, {x}) = {q:e}, expected {expected:e}: rel {rel:e}"
+            );
+            assert!(
+                (0.0..=1.0).contains(&p),
+                "P({a}, {x}) = {p:e} is not a probability"
+            );
+            assert!(
+                (p + q - 1.0).abs() <= f64::EPSILON,
+                "P + Q = {} at a = {a}",
+                p + q
+            );
+        }
+    }
+
     const TOL: f64 = 1e-12;
 
     #[test]
@@ -2604,7 +2943,7 @@ mod tests {
     /// Shapes are the ones `gam_inference::probability` derives from a mean and
     /// a variance (`precision = mu(1-mu)/total_var - 1`), so every row is the
     /// lower endpoint of a 95% predictive interval a caller can actually ask
-    /// for. References are an 80-digit bisection in `ln x` on
+    /// for. References are a 100-digit, 420-step bisection in `ln x` at exact binary64 inputs on
     /// `I_x(a,b) = p`; the `Beta(0.1, 0.1)` row is additionally checkable in
     /// closed form, since `I_x -> x^a/(a B(a,b))` gives
     /// `x = (p a B(a,b))^(1/a)` there.
@@ -2617,26 +2956,26 @@ mod tests {
     /// returns is the solver's own resolution limit rather than a quantile.
     fn beta_quantile_resolves_the_lower_tail_below_the_solver_floor() {
         const CASES: [(f64, f64, f64, f64); 8] = [
-            (0.04, 3.96, 0.025, 1.4749755854885786e-41),
-            (0.01, 0.99, 0.025, 6.326229749489128e-161),
+            (0.04, 3.96, 0.025, 1.4749755854883186e-41),
+            (0.01, 0.99, 0.025, 6.326229749488541e-161),
             (
                 0.046666666666666666,
                 2.2866666666666666,
                 0.025,
-                1.488779171021457e-35,
+                1.488779171021281e-35,
             ),
-            (0.05, 0.95, 0.025, 9.875267916846768e-33),
-            (0.1, 0.9, 0.025, 1.12479965068234e-16),
-            (0.3, 0.7, 0.025, 7.6005358168401896e-6),
-            (0.5, 0.5, 0.025, 1.5413331334360133e-3),
-            (0.1, 0.1, 1.0e-4, 8.869280655550463e-38),
+            (0.05, 0.95, 0.025, 9.875267916846412e-33),
+            (0.1, 0.9, 0.025, 1.1247996506823232e-16),
+            (0.3, 0.7, 0.025, 7.6005358168401705e-6),
+            (0.5, 0.5, 0.025, 1.541333133436012e-3),
+            (0.1, 0.1, 1.0e-4, 8.86928065555026e-38),
         ];
         let mut worst = 0.0_f64;
         for (a, b, p, want) in CASES {
             let got = beta_quantile(p, a, b);
             let relative = ((got - want) / want).abs();
             assert!(
-                relative <= 16.0 * f64::EPSILON,
+                relative <= 8.0 * f64::EPSILON * (1.0 + want.ln().abs()),
                 "beta_quantile({p}, {a}, {b}) = {got:e}, want {want:e}, relative {relative:e}"
             );
             worst = worst.max(relative);
@@ -2661,6 +3000,205 @@ mod tests {
             ((upper - UPPER) / UPPER).abs() <= 1.0e-11,
             "upper tail moved: {upper:e}, want {UPPER:e}"
         );
+    }
+
+    #[test]
+    /// The lower-tail quantile is judged by the residual of `G` at the point it
+    /// returns, not by how its Newton loop ended. For small `a` the step test
+    /// `|Δy| ≤ ε·max(|y|, 1)` sits below `G`'s own rounding noise over `a`,
+    /// and the loop can end on its step count with the iterate oscillating in
+    /// the band. Over this grid, which includes such shapes, every returned
+    /// quantile is inside the band. A point moved off it by a resolvable
+    /// amount is not, so the band is not vacuous.
+    fn beta_lower_tail_quantile_is_certified_by_its_residual_band() {
+        let mut certified = 0_usize;
+        for a in [1.0e-3, 0.01, 0.02, 0.04, 0.08, 0.1, 0.2, 0.5, 1.0, 2.0] {
+            for b in [0.3, 0.9, 1.5, 3.96, 10.0, 100.0, 1000.0] {
+                for p in [1.0e-10, 1.0e-4, 1.0e-3, 0.025, 0.1, 0.5, 0.9, 0.975] {
+                    let Some(x) = lower_tail_beta_quantile(p, a, b) else {
+                        continue;
+                    };
+                    assert!(
+                        x.is_finite(),
+                        "Beta({a}, {b}) at p={p}: the lower-tail Newton ended outside its residual band"
+                    );
+                    if x > 0.0 {
+                        let normalization = lower_tail_log_beta(a, b);
+                        let off_root = x.ln() + 1.0e-6;
+                        if let Some(residual) =
+                            lower_tail_residual(off_root, a, b, normalization, p.ln())
+                        {
+                            assert!(
+                                residual.g.abs() > residual.band,
+                                "Beta({a}, {b}) at p={p}: a 1e-6 displacement in ln x is not resolved"
+                            );
+                        }
+                    }
+                    certified += 1;
+                }
+            }
+        }
+        assert!(
+            certified > 100,
+            "the grid barely reaches the series branch: {certified}"
+        );
+    }
+
+    #[test]
+    fn beta_series_domain_dispatch_does_not_hide_numerical_refusal() {
+        assert!(
+            lower_tail_beta_quantile(0.9, 2.0, 2.0).is_none(),
+            "an ordinary off-series quantile belongs to the general evaluator"
+        );
+        // The log normalization itself is beyond the floating range.
+        let refused = lower_tail_beta_quantile(0.25, f64::MAX, f64::MAX)
+            .expect("a numerical failure must not dispatch to the general solver");
+        assert!(refused.is_nan());
+    }
+
+    #[test]
+    fn beta_ascending_series_log_band_covers_closed_form_remainder() {
+        // For a=1,b=1/2, S(x)=2/(1+sqrt(1-x)); this does not use a beta CDF.
+        for x in [0.25_f64, 0.49, 0.5] {
+            let series = beta_ascending_series(x, 1.0, 0.5).unwrap();
+            let exact = 2.0 / (1.0 + (1.0 - x).sqrt());
+            let observed_log_error = (series.sum / exact).ln().abs();
+            assert!(
+                observed_log_error <= series.log_error_bound() + accumulation_growth(4),
+                "x={x}: {observed_log_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn beta_true_underflow_is_zero_even_when_log_seed_overflows() {
+        for a in [f64::from_bits(1), 1.0e-310, 1.0e-308] {
+            assert_eq!(beta_quantile(0.025, a, 2.0), 0.0, "a={a}");
+        }
+    }
+
+    #[test]
+    fn beta_normalization_matches_independent_extreme_shape_references() {
+        // mpmath 400 digits, exact binary64 input shapes. These are ln B;
+        // production carries ln(a B), so add ln(a) once to the oracle.
+        for (a, b, log_beta) in [
+            (0.5_f64, 1.0e6, -6.33539021105743696498747),
+            (0.5, 1.0e12, -13.2431456150394490170362),
+            (0.5, 1.0e100, -114.556889706777584121779),
+            (0.5, f64::MAX, -354.31899150376729827904),
+            (2.0, 1.0e100, -460.517018598809136835404),
+            (0.001, 1.0e100, 6.67692037608444908847276),
+            (1.0e12, 2.0e12, -1909542504897.13229482198),
+        ] {
+            let got = lower_tail_log_beta(a, b);
+            let expected = log_beta + a.ln();
+            let error = (got.value - expected).abs();
+            assert!(
+                error <= got.error + accumulation_growth(2) * expected.abs(),
+                "a={a}, b={b}, value={}, error={error}, allowance={}",
+                got.value,
+                got.error
+            );
+            assert!(
+                error <= 64.0 * f64::EPSILON * (1.0 + expected.abs()),
+                "a={a}, b={b}, value={}, expected={expected}",
+                got.value
+            );
+        }
+    }
+
+    #[test]
+    fn beta_nonunit_extreme_skew_quantiles_match_independent_references() {
+        // Beta(2,b): solve 1-(1-x)^b(1+b*x)=p at 400 digits, 180 bisections
+        // in b*x. Neither the normalizer nor the beta series is used by it.
+        for (b, p, expected) in [
+            (1.0e6, 0.001, 4.540199403782722e-8),
+            (1.0e6, 0.025, 2.422091281067833e-7),
+            (1.0e6, 0.05, 3.553612698772142e-7),
+            (1.0e12, 0.001, 4.5402017769465826e-14),
+            (1.0e12, 0.025, 2.4220927854381447e-13),
+            (1.0e12, 0.05, 3.5536151069842124e-13),
+            (1.0e100, 0.001, 4.540201776948956e-102),
+            (1.0e100, 0.025, 2.422092785439649e-101),
+            (1.0e100, 0.05, 3.5536151069866206e-101),
+        ] {
+            let got = beta_quantile(p, 2.0, b);
+            assert!(
+                rel_err(got, expected) <= 1.0e-12,
+                "Beta(2,{b}), p={p}: {got:e} vs {expected:e}"
+            );
+        }
+        // b*Beta(1/2,b) tends to Gamma(1/2,1); the omitted O(1/b)
+        // correction here is far below binary64. Gamma's inverse is erf^-1(p)^2.
+        for b in [1.0e100, f64::MAX] {
+            for (p, scaled) in [
+                (0.001, 7.85398574631245e-7),
+                (0.025, 4.91034558587628e-4),
+                (0.1, 7.895387046715613e-3),
+                (0.25, 5.076552213381077e-2),
+            ] {
+                let expected = scaled / b;
+                let got = beta_quantile(p, 0.5, b);
+                assert!(
+                    (got - expected).abs() <= 1.0e-12 * expected + 16.0 * SMALLEST_SUBNORMAL,
+                    "Beta(0.5,{b}), p={p}: {got:e} vs {expected:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn beta_quantiles_match_closed_form_unit_shape_families() {
+        for p in [1.0e-12_f64, 1.0e-6, 0.025, 0.1, 0.25, 0.5] {
+            for a in [0.01_f64, 0.04, 0.1, 0.5, 1.0, 2.0, 1.0e6, 1.0e12, 1.0e100] {
+                // I_x(a,1)=x^a, independently of the ascending-series solver.
+                let expected = (p.ln() / a).exp();
+                let got = beta_quantile(p, a, 1.0);
+                if expected == 0.0 {
+                    assert_eq!(got, 0.0);
+                } else {
+                    assert!(
+                        rel_err(got, expected) <= 5.0e-13,
+                        "Beta({a},1), p={p}: {got} vs {expected}"
+                    );
+                }
+            }
+            for b in [
+                0.5_f64,
+                1.0,
+                2.0,
+                4.0,
+                10.0,
+                1.0e6,
+                1.0e12,
+                1.0e100,
+                f64::MAX,
+            ] {
+                // I_x(1,b)=1-(1-x)^b; expm1/log1p keep the tiny result.
+                let expected = -((-p).ln_1p() / b).exp_m1();
+                let got = beta_quantile(p, 1.0, b);
+                assert!(
+                    rel_err(got, expected) <= 5.0e-13,
+                    "Beta(1,{b}), p={p}: {got} vs {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chi_square_survival_matches_exact_even_degree_tails() {
+        for statistic in [0.0_f64, 1.0e-12, 0.5, 2.0, 10.0, 100.0, 1000.0] {
+            let half = statistic / 2.0;
+            let exponential = (-half).exp();
+            for (degrees, expected) in [(2.0, exponential), (4.0, exponential * (1.0 + half))] {
+                let got = chi_square_sf(statistic, degrees);
+                let band = crate::roundoff::accumulation_growth(16) * (1.0 + half);
+                assert!(
+                    rel_err(got, expected) <= band,
+                    "chi-square({degrees}), x={statistic}: {got:e} vs {expected:e}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3226,6 +3764,41 @@ mod tests {
         let (lm, sg) = signed_log_sum_exp(&[f64::INFINITY, f64::INFINITY], &[1.0, -1.0]);
         assert!(lm.is_nan());
         assert_eq!(sg, 0.0);
+    }
+
+    #[test]
+    fn slse_undefined_term_makes_the_sum_undefined() {
+        // `f64::max` skips a NaN, so a NaN log-magnitude used to vanish from the
+        // sum and leave a finite, wrong answer.
+        for (log_mags, signs) in [
+            ([f64::NAN, 1.0], [1.0, 1.0]),
+            ([1.0, f64::NAN], [1.0, -1.0]),
+            ([f64::NAN, f64::INFINITY], [1.0, 1.0]),
+            ([1.0, 2.0], [f64::NAN, 1.0]),
+        ] {
+            let (lm, sg) = signed_log_sum_exp(&log_mags, &signs);
+            assert!(lm.is_nan(), "{log_mags:?} {signs:?} gave {lm}");
+            assert_eq!(sg, 0.0);
+        }
+        // A zero sign removes the term whatever its magnitude.
+        let (lm, sg) = signed_log_sum_exp(&[f64::NAN, 2.0], &[0.0, 1.0]);
+        assert_eq!((lm, sg), (2.0, 1.0));
+    }
+
+    #[test]
+    fn positive_log_sum_exp_edge_cases() {
+        assert_eq!(positive_log_sum_exp(&[]), f64::NEG_INFINITY);
+        assert_eq!(
+            positive_log_sum_exp(&[f64::NEG_INFINITY, f64::NEG_INFINITY]),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(positive_log_sum_exp(&[0.0, f64::INFINITY]), f64::INFINITY);
+        assert!(positive_log_sum_exp(&[0.0, f64::NAN]).is_nan());
+        let ln2 = std::f64::consts::LN_2;
+        assert!((positive_log_sum_exp(&[0.0, 0.0]) - ln2).abs() <= 2.0 * f64::EPSILON);
+        // Max-shifted: terms far beyond `exp`'s range stay finite.
+        let big = positive_log_sum_exp(&[1000.0, 1000.0, f64::NEG_INFINITY]);
+        assert!((big - (1000.0 + ln2)).abs() <= 1000.0 * f64::EPSILON);
     }
 
     // ── normal_logcdf ─────────────────────────────────────────────────────────

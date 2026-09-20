@@ -6,6 +6,7 @@ pub(crate) fn materialize_transformation_normal<'a>(
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
+    reject_unrealized_precision_priors(config, "transformation-normal models", false)?;
     if parsed.linkspec.is_some() {
         return Err(WorkflowError::InvalidConfig {
             reason: "link(...) is not supported for the transformation-normal family".to_string(),

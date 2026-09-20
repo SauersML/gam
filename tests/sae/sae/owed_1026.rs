@@ -36,7 +36,7 @@ use gam::solver::arrow_schur::{
 };
 use gam::terms::latent::LatentManifold;
 use gam::terms::{
-    sae::manifold::ArdSharing, sae::manifold::AssignmentMode,
+    sae::manifold::AssignmentMode,
     sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment,
     sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator,
     sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
@@ -600,173 +600,58 @@ fn matrix_free_pcg_curvature_floor_is_noop_on_healthy_system_1026() {
     }
 }
 
-/// #1026 — shared-hyperparameter ARD at large K. The outer quasi-Laplace optimizer
-/// searches over the flat `to_flat()` coordinate vector, so its dimension is
-/// what makes a large-K fit tractable or not.
-///
-/// Per-atom ARD (the small/moderate-K default) gives one independent outer
-/// coordinate per atom per axis, so the flat vector is `1 + K + Σ_k d_k`: the
-/// sparse log-strength, the K per-atom smoothness log-strengths (one per atom
-/// since #1556), and the per-atom per-axis ARD precisions. At K = 32_768 1-D
-/// atoms the ARD block alone is 32_768 coordinates — intractable for a generic
-/// outer optimizer. The shared mode collapses that ARD block to one strength per
-/// intrinsic axis (`max_d`), broadcast to every atom, so the flat vector shrinks
-/// to `1 + K + max_d`: the per-axis ARD count is a CONSTANT `max_d` regardless of
-/// K, removing the `Σ_k d_k` blow-up the per-atom mode carries. (The K per-atom
-/// smoothness coordinates remain in both modes — `ard_sharing` governs the ARD
-/// block only.)
-///
-/// This gate pins both regimes: per-atom keeps the `1 + K + Σ d_k` count (so
-/// existing fits are unchanged), and shared collapses the ARD block to a
-/// per-axis `max_d` (`1 + K + max_d`). It also checks the broadcast round-trip:
-/// `from_flat` rebuilds the full per-atom precision table the inner solve
-/// consumes, with every atom sharing the per-axis strength.
+/// #3824 — the ARD prior family does not depend on the atom count. Every
+/// `(atom, axis)` precision is its own outer coordinate at every K, so the flat
+/// vector is `1 + K + Σ_k d_k` (the sparse log-strength, the K per-atom
+/// smoothness log-strengths of #1556, and the per-atom per-axis ARD precisions)
+/// on both sides of any K. The former fit-seed switch to one shared strength per
+/// axis at K >= 256 changed the REML/LAML criterion itself; this pins the one
+/// parameterization across the old threshold and checks the heterogeneous-`d_k`
+/// round-trip through `from_flat`.
 #[test]
-fn shared_ard_collapses_outer_param_count_at_large_k() {
-    // d=1 atoms (the worst case: one ARD axis per atom).
+fn ard_outer_coordinates_are_per_atom_at_every_k_3824() {
     let d_per_atom = 1usize;
-    for &k in &[2usize, 32usize, 1000usize, 32_768usize] {
+    for &k in &[2usize, 255usize, 256usize, 1000usize] {
         let log_ard: Vec<ndarray::Array1<f64>> = (0..k)
             .map(|_| ndarray::Array1::<f64>::zeros(d_per_atom))
             .collect();
-
-        let per_atom = SaeManifoldRho::new(-0.5, -0.5, log_ard.clone());
-        assert_eq!(per_atom.ard_sharing, ArdSharing::PerAtom);
-        // Per-atom: 1 + K + Σ_k d_k = 1 + K + K (d=1) — the sparse coord, the K
-        // per-atom smoothness coords (#1556), and one ARD precision per atom.
+        let rho = SaeManifoldRho::new(-0.5, -0.5, log_ard);
         assert_eq!(
-            per_atom
-                .to_flat(&gate_assignment(k))
+            rho.to_flat(&gate_assignment(k))
                 .expect("a threshold-gate layout carries the sparse coordinate")
                 .len(),
             1 + k + k * d_per_atom,
-            "per-atom ARD must keep 1 + K + Σ d_k outer coords (K={k})"
-        );
-
-        let shared = SaeManifoldRho::new_shared_ard(-0.5, -0.5, log_ard.clone());
-        assert_eq!(shared.ard_sharing, ArdSharing::Shared);
-        // Shared: the ARD block collapses to a per-axis max_d, so the flat
-        // vector is 1 + K + max_d (= 1 + K + d here) — the Σ_k d_k ARD blow-up
-        // is gone; only the K per-atom smoothness coords scale with K (#1556).
-        assert_eq!(
-            shared
-                .to_flat(&gate_assignment(k))
-                .expect("a threshold-gate layout carries the sparse coordinate")
-                .len(),
-            1 + k + d_per_atom,
-            "shared ARD must collapse the ARD block to a per-axis max_d (got K={k})"
+            "ARD must keep 1 + K + Σ d_k outer coords (K={k})"
         );
     }
 
-    // Round-trip: shared flat broadcasts back to a full per-atom table, every
-    // atom carrying the shared per-axis strength, preserving heterogeneous d_k.
     let log_ard = vec![
         ndarray::Array1::<f64>::zeros(2), // a 2-axis atom
         ndarray::Array1::<f64>::zeros(1), // a 1-axis atom
         ndarray::Array1::<f64>::zeros(2), // another 2-axis atom
     ];
-    let shared = SaeManifoldRho::new_shared_ard(0.0, 0.0, log_ard);
-    let flat = shared.to_flat(&gate_assignment(3)).expect("a threshold-gate layout carries the sparse coordinate");
-    // K = 3 atoms, max_d = 2 → 1 + K + max_d = 1 + 3 + 2 = 6 outer coords. The
-    // shared ARD block (the two per-axis strengths) occupies indices
-    // 1 + K .. 1 + K + max_d = 4..6.
-    assert_eq!(flat.len(), 6);
-
-    // Drive the two shared per-axis strengths to distinct values and broadcast.
+    let rho = SaeManifoldRho::new(0.0, 0.0, log_ard);
+    let flat = rho
+        .to_flat(&gate_assignment(3))
+        .expect("a threshold-gate layout carries the sparse coordinate");
+    // 1 + K + Σ d_k = 1 + 3 + 5; the ARD block occupies 4..9 in atom order.
+    assert_eq!(flat.len(), 9);
     let mut moved = flat.clone();
-    moved[4] = 1.5; // axis-0 shared log-precision
-    moved[5] = -2.5; // axis-1 shared log-precision
-    let rebuilt = shared.from_flat(moved.view()).unwrap();
-    assert_eq!(rebuilt.ard_sharing, ArdSharing::Shared);
-    // Every atom that owns axis 0 sees 1.5; every atom owning axis 1 sees -2.5;
-    // the 1-axis atom keeps its single axis.
-    assert_eq!(rebuilt.log_ard.len(), 3);
-    assert_eq!(rebuilt.log_ard[0].as_slice().unwrap(), &[1.5, -2.5]);
-    assert_eq!(rebuilt.log_ard[1].as_slice().unwrap(), &[1.5]);
-    assert_eq!(rebuilt.log_ard[2].as_slice().unwrap(), &[1.5, -2.5]);
-
-    // to_flat is the exact inverse of the broadcast (read-back is exact when the
-    // table is uniform across owners, which the broadcast guarantees).
-    let reflat = rebuilt.to_flat(&gate_assignment(3)).expect("a threshold-gate layout carries the sparse coordinate");
-    for (a, b) in moved.iter().zip(reflat.iter()) {
-        assert!(
-            (a - b).abs() <= 1e-12,
-            "shared ARD round-trip must be exact: {a} vs {b}"
-        );
+    for (offset, value) in [1.5, -2.5, 0.75, -1.0, 2.0].into_iter().enumerate() {
+        moved[4 + offset] = value;
     }
-}
-
-/// BEHAVIORAL half of the #1026 shared-ARD collapse: the count-collapse above is
-/// only useful if the SHARED parameterization is still a VALID convergent outer
-/// coordinate — a smaller flat vector is worthless if the inner joint fit no
-/// longer converges under it. This drives the real production inner solve
-/// (`penalized_quasi_laplace_criterion_with_cache`, the same entry the outer optimizer steps on)
-/// at a `new_shared_ard` ρ and asserts:
-///   1. the shared flat coordinate is strictly SHORTER than the per-atom one
-///      (1 + K + max_d  <  1 + K + Σ_k d_k for K>1, since the ARD block
-///      collapses from Σ_k d_k to max_d) — the ARD-block collapse, and
-///   2. the inner fit converges to a finite custom quasi-Laplace criterion, i.e. the
-///      shared `from_flat` broadcast feeds the inner solve a well-posed per-atom
-///      precision table that the joint Newton can actually reach a minimum on.
-/// A regression that broke the broadcast (or made the shared coordinate
-/// non-convergent) would either shorten nothing or return a non-finite criterion
-/// here. Built at small K (CPU-feasible) because the shared coordinate's validity
-/// is K-independent — that independence is the whole point of the collapse.
-#[test]
-fn shared_ard_is_a_convergent_outer_coordinate_1026() {
-    // Two distinct, non-collinear decoders so the inner data-fit is well posed
-    // and the joint fit has a genuine (non-degenerate) minimum to converge to.
-    let mut dec0 = Array2::<f64>::zeros((M, P));
-    dec0[[0, 0]] = 0.5;
-    dec0[[1, 1]] = 1.0;
-    dec0[[2, 2]] = 1.0;
-    let mut dec1 = Array2::<f64>::zeros((M, P));
-    dec1[[0, 1]] = 0.5;
-    dec1[[1, 2]] = 1.0;
-    dec1[[2, 0]] = 1.0;
-    let mut term = build_two_atom_term(dec0, dec1);
-    let n = term.n_obs();
-    let target =
-        Array2::from_shape_fn((n, P), |(i, c)| 0.1 * ((i as f64) * 0.3 + (c as f64)).sin());
-
-    // d=1 circle atoms ⇒ max_d = 1. Per-atom flat = 1 + K + Σ_k d_k = 1 + 2 + 2
-    // = 5; shared flat = 1 + K + max_d = 1 + 2 + 1 = 4. The ARD-block collapse
-    // is real even at K=2; it widens as K→∞.
-    let log_ard = vec![Array1::<f64>::from_elem(1, (1.0e-1_f64).ln()); 2];
-    let per_atom = SaeManifoldRho::new((1.0e-2_f64).ln(), (1.0e-2_f64).ln(), log_ard.clone())
-        .for_assignment(&term.assignment);
-    let shared = SaeManifoldRho::new_shared_ard((1.0e-2_f64).ln(), (1.0e-2_f64).ln(), log_ard)
-        .for_assignment(&term.assignment);
-    let per_atom_len = per_atom.to_flat(&term.assignment).expect("the rho is bound to the term's assignment").len();
-    let shared_len = shared.to_flat(&term.assignment).expect("the rho is bound to the term's assignment").len();
-    assert_eq!(shared.ard_sharing, ArdSharing::Shared);
-    assert!(
-        shared_len < per_atom_len,
-        "shared ARD outer coordinate ({}) must be strictly shorter than per-atom ({})",
-        shared_len,
-        per_atom_len
-    );
-
-    // Inner-solve knobs mirroring the production outer objective's defaults.
-    let (cost, _loss, _cache) = term
-        .penalized_quasi_laplace_criterion_with_cache(
-            target.view(),
-            &shared,
-            None,
-            64,
-            1.0,
-            1.0e-8,
-            1.0e-8,
-        )
-        .expect("inner joint fit must converge at the shared-ARD ρ");
-    assert!(
-        cost.is_finite(),
-        "shared-ARD inner fit must reach a finite quasi-Laplace criterion; got {cost}"
-    );
+    let rebuilt = rho.from_flat(moved.view()).unwrap();
+    assert_eq!(rebuilt.log_ard[0].as_slice().unwrap(), &[1.5, -2.5]);
+    assert_eq!(rebuilt.log_ard[1].as_slice().unwrap(), &[0.75]);
+    assert_eq!(rebuilt.log_ard[2].as_slice().unwrap(), &[-1.0, 2.0]);
+    let reflat = rebuilt
+        .to_flat(&gate_assignment(3))
+        .expect("a threshold-gate layout carries the sparse coordinate");
+    assert_eq!(moved, reflat, "per-atom ARD round-trip must be exact");
 }
 
 /// A one-row threshold-gate assignment of `k` atoms. Its layout carries the sparse coordinate,
-/// so the flat counts below are `1 + K + ...` whatever the ARD sharing.
+/// so the flat counts above are `1 + K + ...`.
 fn gate_assignment(k: usize) -> SaeAssignment {
     SaeAssignment::from_blocks_with_mode_and_manifolds(
         Array2::<f64>::zeros((1, k)),
