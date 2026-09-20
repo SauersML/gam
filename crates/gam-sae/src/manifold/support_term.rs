@@ -7054,10 +7054,22 @@ impl SaeSupportSparseTerm {
                 prior_cursor += 1;
             }
         }
-        let raw_gradient_max = rhs_vector
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f64, f64::max);
+        // The certified measure is each slot's feasible-direction gradient `P g`, the
+        // same one the solve-level certificate reads (#4006); `rhs = -g`.
+        let mut raw_gradient_max = 0.0_f64;
+        for (slot, &atom) in support.iter().enumerate() {
+            let gradient = rhs_vector
+                .slice(ndarray::s![offsets[slot].clone()])
+                .mapv(|value| -value);
+            let (_, projected) = self.slot_feasible_gradient(
+                atom as usize,
+                &coords_row[offsets[slot].clone()],
+                &gradient,
+            )?;
+            raw_gradient_max = projected
+                .iter()
+                .fold(raw_gradient_max, |max, value| max.max(value.abs()));
+        }
         // A row already satisfying the caller's KKT request is a certified
         // fixed point of this coordinate block. The row gradient scales
         // with the row's own residual energy, so the skip threshold is
@@ -7240,6 +7252,7 @@ impl SaeSupportSparseTerm {
             for (slot, &atom) in support.iter().enumerate() {
                 let atom = atom as usize;
                 let periods = self.atom_ard_axis_periods(atom);
+                let mut slot_gradient = Array1::<f64>::zeros(dims[slot].1);
                 for axis in 0..dims[slot].1 {
                     let jacobian_row = trial[slot].jacobian.row(axis);
                     let prior_gradient = ArdAxisPrior::eval(
@@ -7248,8 +7261,7 @@ impl SaeSupportSparseTerm {
                         periods[axis],
                     )
                     .grad;
-                    let gradient = -jacobian_row.dot(&*trial_residual) + prior_gradient;
-                    trial_gradient_max = trial_gradient_max.max(gradient.abs());
+                    slot_gradient[axis] = -jacobian_row.dot(&*trial_residual) + prior_gradient;
                     let terms = jacobian_row
                         .iter()
                         .zip(trial_residual.iter())
@@ -7258,6 +7270,15 @@ impl SaeSupportSparseTerm {
                         + prior_gradient.abs();
                     trial_gradient_band = trial_gradient_band.max(gradient_gamma * terms);
                 }
+                // Compared with `raw_gradient_max`, so measured the same way (#4006).
+                let (_, projected) = self.slot_feasible_gradient(
+                    atom,
+                    &coords_row[offsets[slot].clone()],
+                    &slot_gradient,
+                )?;
+                trial_gradient_max = projected
+                    .iter()
+                    .fold(trial_gradient_max, |max, value| max.max(value.abs()));
             }
             // A step is taken only on a resolved change: the row objective falls by more than
             // its rounding band, or it ties inside that band while the gradient falls by more
@@ -7306,6 +7327,28 @@ impl SaeSupportSparseTerm {
             }
         }
         Ok(max_change)
+    }
+
+    /// One support slot's coordinate first-order optimality measure `P g` and its
+    /// projector `P`: the ambient coordinate gradient `gradient` of an `atom` block
+    /// at `point`, restricted to the block's linearized feasible update space.
+    ///
+    /// On a sphere or at an interval endpoint the ambient gradient keeps the
+    /// constraint's normal (multiplier) component, which stays non-zero at a
+    /// constrained stationary point whose residual does not vanish. Certifying it
+    /// refused a Riemannian stationary sphere row forever (#4006: ambient
+    /// `|g| = 1.40e-3`, tangent `6.0e-16`). A flat chart has `P = I`.
+    fn slot_feasible_gradient(
+        &self,
+        atom: usize,
+        point: &[f64],
+        gradient: &Array1<f64>,
+    ) -> Result<(Array2<f64>, Array1<f64>), String> {
+        let projector =
+            self.assignment
+                .atom_gradient_tangent_projector(atom, point, gradient.view())?;
+        let projected = projector.dot(gradient);
+        Ok((projector, projected))
     }
 
     /// Raw (undamped) KKT residual of the exact objective.
@@ -7410,25 +7453,44 @@ impl SaeSupportSparseTerm {
                     self.fill_active(row, slot, scratch)
                         .map_err(SaeSupportStationarityError::Evaluation)?;
                     let periods = self.atom_ard_axis_periods(atom);
-                    for axis in 0..scratch.jacobian.nrows() {
+                    let point = self.assignment.coords_for_slot(row, slot);
+                    let dim = scratch.jacobian.nrows();
+                    let mut ambient_gradient = Array1::<f64>::zeros(dim);
+                    let mut prior_curvature = Array1::<f64>::zeros(dim);
+                    for axis in 0..dim {
                         let mut gradient = 0.0;
-                        // #2517 — the Gauss-Newton curvature of this coordinate,
-                        // in the same pass: `Σ_out J²` plus the ARD prior's own
-                        // curvature. Same discipline as the decoder block, so
-                        // both are certified in parameter space.
-                        let mut curvature = 0.0;
                         for output in 0..self.output_dim {
-                            let jacobian = scratch.jacobian[[axis, output]];
-                            gradient -= jacobian * residual[[row, output]];
-                            curvature += jacobian * jacobian;
+                            gradient -= scratch.jacobian[[axis, output]] * residual[[row, output]];
                         }
                         let prior = ArdAxisPrior::eval(
                             ard_precisions[atom][axis],
-                            self.assignment.coords_for_slot(row, slot)[axis],
+                            point[axis],
                             periods[axis],
                         );
-                        gradient += prior.grad;
-                        curvature += prior.psd_majorizer_hess();
+                        ambient_gradient[axis] = gradient + prior.grad;
+                        prior_curvature[axis] = prior.psd_majorizer_hess();
+                    }
+                    let (projector, projected_gradient) = self
+                        .slot_feasible_gradient(atom, point, &ambient_gradient)
+                        .map_err(SaeSupportStationarityError::Evaluation)?;
+                    let projected_jacobian = projector.dot(&scratch.jacobian);
+                    for axis in 0..dim {
+                        let gradient = projected_gradient[axis];
+                        // #2517 — the Gauss-Newton curvature of this coordinate,
+                        // in the same pass: `Σ_out J²` plus the ARD prior's own
+                        // curvature. Same discipline as the decoder block, so
+                        // both are certified in parameter space. Measured along
+                        // the feasible direction (#4006), it is the diagonal of
+                        // `P (J Jᵀ + H_prior) P`; a flat chart has `P = I`.
+                        let mut curvature = 0.0;
+                        for output in 0..self.output_dim {
+                            let jacobian = projected_jacobian[[axis, output]];
+                            curvature += jacobian * jacobian;
+                        }
+                        for other in 0..dim {
+                            let weight = projector[[axis, other]];
+                            curvature += weight * weight * prior_curvature[other];
+                        }
                         sq += gradient * gradient;
                         max = max.max(gradient.abs());
                         accumulate_parameter_scaled_gradient(
@@ -7494,6 +7556,8 @@ impl SaeSupportSparseTerm {
                     let atom = self.assignment.support_indices(row)[slot] as usize;
                     self.fill_active(row, slot, scratch)?;
                     let periods = self.atom_ard_axis_periods(atom);
+                    let point = self.assignment.coords_for_slot(row, slot);
+                    let mut ambient_gradient = Array1::<f64>::zeros(scratch.jacobian.nrows());
                     for axis in 0..scratch.jacobian.nrows() {
                         let likelihood_gradient = scratch
                             .jacobian
@@ -7502,13 +7566,17 @@ impl SaeSupportSparseTerm {
                             .zip(residual.row(row).iter())
                             .map(|(jet, error)| -jet * error)
                             .sum::<f64>();
-                        let gradient = likelihood_gradient
+                        ambient_gradient[axis] = likelihood_gradient
                             + ArdAxisPrior::eval(
                                 ard_precisions[atom][axis],
-                                self.assignment.coords_for_slot(row, slot)[axis],
+                                point[axis],
                                 periods[axis],
                             )
                             .grad;
+                    }
+                    let (_, projected_gradient) =
+                        self.slot_feasible_gradient(atom, point, &ambient_gradient)?;
+                    for &gradient in projected_gradient.iter() {
                         sq += gradient * gradient;
                         max = max.max(gradient.abs());
                     }

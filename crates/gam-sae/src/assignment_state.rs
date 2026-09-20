@@ -39,7 +39,7 @@
 
 use gam_problem::LatentRetractionRegistry;
 use gam_terms::latent::LatentManifold;
-use ndarray::Array1;
+use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::assignment::AssignmentMode;
 
@@ -264,6 +264,43 @@ impl SaeAssignmentState {
     /// Per-atom intrinsic dimension, with no `d_max` padding.
     pub fn atom_coord_dim(&self, atom: usize) -> usize {
         self.atom_coord_meta[atom].latent_dim
+    }
+
+    /// The linearized feasible update space of one `atom` coordinate block at
+    /// `point` for the objective gradient `gradient`, as the symmetric projector
+    /// matrix `P` of [`LatentManifold::project_matrix_columns_to_gradient_tangent`]:
+    /// `I - uuᵀ` on a sphere, the identity on flat and periodic charts, and on an
+    /// interval endpoint a zero exactly where descent `-gradient` leaves the
+    /// interval.
+    ///
+    /// `P·gradient` is the block's first-order optimality measure. The ambient
+    /// gradient keeps the constraint's normal (multiplier) component, which does not
+    /// vanish at a constrained stationary point whose residual is non-zero (#4006).
+    pub fn atom_gradient_tangent_projector(
+        &self,
+        atom: usize,
+        point: &[f64],
+        gradient: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let meta = self.atom_coord_meta.get(atom).ok_or_else(|| {
+            format!(
+                "SaeAssignmentState::atom_gradient_tangent_projector: atom {atom} out of range K={}",
+                self.k_atoms
+            )
+        })?;
+        if point.len() != meta.latent_dim || gradient.len() != meta.latent_dim {
+            return Err(format!(
+                "SaeAssignmentState::atom_gradient_tangent_projector: atom {atom} point width {} and gradient width {} != latent dim {}",
+                point.len(),
+                gradient.len(),
+                meta.latent_dim
+            ));
+        }
+        Ok(meta.manifold.project_matrix_columns_to_gradient_tangent(
+            ArrayView1::from(point),
+            gradient,
+            Array2::<f64>::eye(meta.latent_dim).view(),
+        ))
     }
 
     /// Whether [`Self::retract_row_coords`] moves this atom's coordinates by the step

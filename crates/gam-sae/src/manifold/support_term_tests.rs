@@ -2167,3 +2167,131 @@ fn a_symmetry_the_certificate_is_not_given_is_refused_2576() {
         }
     }
 }
+
+/// #4006: a support-sparse sphere row certifies its coordinate block by the
+/// feasible-direction gradient `P g`, not the ambient one. Twelve planted rows on S²
+/// start 0.15 rad in latitude and 0.2 rad in longitude off a zero-residual fit; one
+/// row settles at a Riemannian stationary point that keeps a residual, where the
+/// ambient gradient is the constraint's normal multiplier. The frozen-decoder solve
+/// must certify it rather than refuse it as a stall, and both certificates must read
+/// the same tangent measure.
+#[test]
+fn sphere_rows_certify_the_tangent_coordinate_gradient_4006() {
+    let n = 12usize;
+    let p = 4usize;
+    let sphere = crate::basis::AmbientSphereHarmonicEvaluator::new(2).expect("degree two");
+    let width = sphere.basis_size();
+    let evaluator: Arc<dyn SaeBasisSecondJet> = Arc::new(sphere);
+    let unit = |lat: f64, lon: f64| vec![lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()];
+    let rows = |lat_offset: f64, lon_offset: f64| -> Vec<Vec<f64>> {
+        (0..n)
+            .map(|row| {
+                let t = (row as f64 + 0.5) / n as f64;
+                unit(-1.1 + 2.2 * t + lat_offset, 0.4 + 5.3 * t + lon_offset)
+            })
+            .collect()
+    };
+    let planted = rows(0.0, 0.0);
+    let start = rows(0.15, -0.2);
+    let decoder = Array2::<f64>::from_shape_fn((width, p), |(basis, out)| {
+        0.3 + 0.9 * ((3 * basis + 5 * out) as f64 * 0.7 + 0.2).sin()
+    });
+    let planted_coords = Array2::from_shape_fn((n, 3), |(row, axis)| planted[row][axis]);
+    let (planted_phi, _) = evaluator
+        .evaluate(planted_coords.view())
+        .expect("unit coordinates evaluate");
+    let target = planted_phi.dot(&decoder);
+    let atoms = vec![atom(
+        "sphere",
+        SaeAtomBasisKind::Sphere,
+        3,
+        Arc::clone(&evaluator),
+        &start[0],
+        decoder.clone(),
+    )];
+    let state = SaeAssignmentState::from_topk_support_heterogeneous(
+        n,
+        1,
+        1,
+        vec![SaeAssignmentAtomSpec {
+            latent_dim: 3,
+            manifold: SaeAtomBasisKind::Sphere.latent_manifold(3),
+            retraction: gam_problem::LatentRetractionRegistry::all_euclidean(),
+        }],
+        vec![vec![0]; n],
+        vec![vec![1.0]; n],
+        start,
+    )
+    .expect("state");
+    let mut term = SaeSupportSparseTerm::new(atoms, state).expect("term");
+    let ard = vec![vec![0.0_f64; 3]];
+    let tolerance = term.fixed_point_tolerance();
+    let report = term
+        .solve_coordinates_fixed_decoder(target.view(), &ard, tolerance, 0.25)
+        .expect("a Riemannian stationary sphere row certifies");
+    assert!(report.recurred, "the solve returns only a recurred state");
+
+    let residual = term.raw_residual(target.view()).expect("residual");
+    let kkt_scale = report.objective.abs().max(1.0);
+    assert!(
+        report.coordinate_max_abs <= tolerance * kkt_scale,
+        "tangent coordinate KKT {:.3e} > {:.3e}",
+        report.coordinate_max_abs,
+        tolerance * kkt_scale
+    );
+    let stationarity = term
+        .raw_stationarity_with_residual(&residual, &[0.0], &ard)
+        .expect("stationarity");
+    assert!(
+        stationarity.coordinate_max_abs <= tolerance * kkt_scale,
+        "the joint certificate reads the same tangent measure: {:.3e}",
+        stationarity.coordinate_max_abs
+    );
+    assert!(stationarity.coordinate_scaled_max_abs.is_finite());
+
+    // The fixture must exercise the constrained case: some certified row keeps a
+    // residual whose ambient gradient is its normal multiplier, far above tolerance.
+    let solved = Array2::from_shape_fn((n, 3), |(row, axis)| term.assignment.coords_row(row)[axis]);
+    let (_, jet) = evaluator
+        .evaluate(solved.view())
+        .expect("unit coordinates evaluate");
+    let mut ambient_max = 0.0_f64;
+    for row in 0..n {
+        let coords = term.assignment.coords_row(row);
+        let radius = coords.iter().map(|value| value * value).sum::<f64>().sqrt();
+        assert!(
+            (radius - 1.0).abs() <= 8.0 * f64::EPSILON,
+            "row {row} left the sphere: |u| = {radius:.17e}"
+        );
+        let mut gradient = [0.0_f64; 3];
+        for (axis, component) in gradient.iter_mut().enumerate() {
+            for out in 0..p {
+                let jacobian = (0..width)
+                    .map(|basis| jet[[row, basis, axis]] * decoder[[basis, out]])
+                    .sum::<f64>();
+                *component -= jacobian * residual[[row, out]];
+            }
+        }
+        let normal = gradient
+            .iter()
+            .zip(coords.iter())
+            .map(|(g, u)| g * u)
+            .sum::<f64>();
+        let tangent = gradient
+            .iter()
+            .zip(coords.iter())
+            .map(|(g, u)| (g - normal * u).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            tangent <= tolerance * kkt_scale,
+            "row {row}: tangent gradient {tangent:.3e} above tolerance"
+        );
+        ambient_max = gradient
+            .iter()
+            .fold(ambient_max, |max, value| max.max(value.abs()));
+    }
+    assert!(
+        ambient_max > 1.0e3 * tolerance * kkt_scale,
+        "no row reaches a constrained stationary point with a residual (ambient KKT {ambient_max:.3e})"
+    );
+}
