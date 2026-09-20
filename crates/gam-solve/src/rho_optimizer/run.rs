@@ -4221,7 +4221,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // a candidate it refused was discarded rather than deferred.
     //
     // Measured (#2596, lognormal location-scale AFT with a double-penalty
-    // `s(z, bs="tp", k=10)`): the BFGS converged to the correct interior optimum
+    // `s(z, bs="tps", k=10)`): the BFGS converged to the correct interior optimum
     // ρ = (0.378, −4.975) at cost 4.1926 with |Pg| = 7.29e-5 against a solver
     // band of 5.19e-5 — refused by a factor of 1.4. Both interior seeds were
     // refused, the multi-start fell through to the seed lattice's
@@ -8372,7 +8372,7 @@ pub(crate) fn run_fixed_point_outer_solver(
             &mut seed_result,
             CertificationFidelity::Screening,
         ) {
-            log::info!(
+            log::debug!(
                 "[OUTER] {context}: {label} seed is already stationary at cost={:.6e}; \
                  no fixed-point step taken",
                 seed_result.final_value,

@@ -24,7 +24,7 @@
 //   0.2163      -246.4           0.0110
 //   0.8030      -256.3           0.0084     <- GLOBAL minimum, 21.7 deeper
 //   1.0438      -198.5           0.0538     <- past the diameter: block collapses
-//   s(x, bs="tp")  -247.4        0.0123
+//   s(x, bs="tps")  -247.4        0.0123
 // ```
 //
 // The free search lands at `V = -234.6`: it never leaves the first basin. The

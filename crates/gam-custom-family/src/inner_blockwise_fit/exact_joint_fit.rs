@@ -1129,6 +1129,10 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
     // per-block + spectrum breakdown without re-materializing H_pen.
     let mut last_kkt_refusal_report: Option<KktRefusalReport> = None;
     let mut prev_kkt_norm: Option<f64> = None;
+    // The spectrum of the last dense step, which prices the CG route of the steps
+    // after it (gam#3285). None before the first dense step and after a CG step
+    // missed its bound, so those steps go dense and measure it again.
+    let mut joint_pcg_condition: Option<JointPcgConditionRecord> = None;
     // The projected stationarity residual and its target at the state a tentative
     // convergence mark was made on, recorded by the mark itself (#2627).
     let mut tentative_mark_kkt: Option<(f64, f64)> = None;
@@ -1417,8 +1421,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // bernoulli marginal-slope FLEX large-scale failure mode) becomes a
         // logged timeline at the end of the cycle. Phases:
         //   * hessian: joint Hessian source build (matrix-free workspace
-        //     OR dense fallback assembly)
-        //   * pcg:     matrix-free QP solve via solve_spd_pcg_with_info_into
+        //     OR dense assembly)
+        //   * pcg:     matrix-free QP solve via solve_spd_pcg_bounded_into
         //              (already logs its own diagnostics; we accumulate
         //              here for the end-of-cycle summary)
         //   * line_search: backtracking step-size search (up to 8 attempts)
@@ -1983,10 +1987,10 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // the constrained-QP and matrix-free PCG paths, which keep their
         // existing globalization untouched.
         let mut joint_spectrum: Option<whitened_spectrum::WhitenedHessianSpectrum> = None;
-        // DENSE-FALLBACK OPERATOR MATERIALIZATION REUSE (gam#1040). On the
+        // DENSE-ROUTE OPERATOR MATERIALIZATION REUSE (gam#1040). On the
         // DENSE_SPECTRAL path the inner Hessian `source` can be a matrix-free
         // `Operator` (BMS flex, large n, p below the matrix-free joint-dim
-        // threshold so PCG is not requested): the dense-fallback below then
+        // threshold so PCG is not requested): the dense route below then
         // calls `materialize_joint_hessian_source` to form the unpenalized
         // dense `H` ONCE for the spectral `decompose`. Without capturing it,
         // the per-cycle Cauchy leg and the up-to-`JOINT_TRUST_MAX_ATTEMPTS`
@@ -2361,40 +2365,62 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     _ => None,
                 };
             let pcg_started = std::time::Instant::now();
-            // CG spends at most what the dense route costs (gam#2900). A `Budgeted`
-            // attempt that has not converged within its products hands the step to
-            // the dense route below. `Only` (no dense route fits the memory cap)
-            // keeps the historical cap and refuses. One product per iteration, plus
-            // a residual refresh every 32 iterations.
-            let pcg_max_products = match joint_pcg_attempt {
-                gam_linalg::pcg::PcgAttempt::Only => JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
-                gam_linalg::pcg::PcgAttempt::Budgeted { products } => products,
-            };
-            let pcg_requested = !joint_hessian_is_dense
+            // One route per step, decided before any solve (gam#3285). CG is
+            // eligible only for the plain penalized system `H + S`: a dense
+            // source, a pending returned-mode curvature or a Jeffreys-augmented
+            // system goes dense. `Only` (no dense route fits the memory cap) runs
+            // CG under the historical cap and refuses a miss. `Budgeted` takes CG
+            // only when the Chebyshev bound at the last dense step's spectrum says
+            // it costs fewer products than the dense route; a cold start has no
+            // spectrum and goes dense. A CG step that misses its bound is an
+            // inexact Newton step for the trust region below, never a reason to
+            // solve the same system again densely.
+            let pcg_eligible = !joint_hessian_is_dense
                 && !returned_mode_curvature_pending
                 && !true_jeffreys_hessian_required
-                && inner_jeffreys_term.is_none()
-                && pcg_max_products > 0;
+                && inner_jeffreys_term.is_none();
+            let pcg_preconditioner = pcg_eligible.then(|| match &joint_hessian_source {
+                JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
+                    &h_joint.diag().to_owned(),
+                    &ranges,
+                    &s_lambdas,
+                    joint_solver_diagonal_ridge,
+                    joint_bundle,
+                ),
+                JointHessianSource::Operator { diagonal, .. } => joint_penalty_preconditioner_diag(
+                    diagonal,
+                    &ranges,
+                    &s_lambdas,
+                    joint_solver_diagonal_ridge,
+                    joint_bundle,
+                ),
+            });
+            let pcg_route =
+                pcg_preconditioner
+                    .as_ref()
+                    .and_then(|preconditioner| match joint_pcg_attempt {
+                        gam_linalg::pcg::PcgAttempt::Only => Some(None),
+                        gam_linalg::pcg::PcgAttempt::Budgeted { products } => joint_pcg_condition
+                            .as_ref()
+                            .and_then(|record| {
+                                record.cg_route(
+                                    preconditioner,
+                                    joint_solver_diagonal_ridge,
+                                    pcg_rel_tol,
+                                    products,
+                                )
+                            })
+                            .map(Some),
+                    });
             let mut spectral_nullity_for_step = 0usize;
-            let pcg_solution = if pcg_requested {
-                let preconditioner_diag = match &joint_hessian_source {
-                    JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
-                        &h_joint.diag().to_owned(),
-                        &ranges,
-                        &s_lambdas,
-                        joint_solver_diagonal_ridge,
-                        joint_bundle,
-                    ),
-                    JointHessianSource::Operator { diagonal, .. } => {
-                        joint_penalty_preconditioner_diag(
-                            diagonal,
-                            &ranges,
-                            &s_lambdas,
-                            joint_solver_diagonal_ridge,
-                            joint_bundle,
-                        )
-                    }
-                };
+            let mut delta = None;
+            if let (Some(preconditioner_diag), Some(route)) =
+                (pcg_preconditioner.as_ref(), pcg_route)
+            {
+                let max_iter = route
+                    .map_or(JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1), |route| {
+                        route.iterations
+                    });
                 // Pre-allocate the penalty workspace ONCE outside the
                 // PCG closure so each CG iter (called hundreds-to-
                 // thousands of times per outer iter at large scale)
@@ -2403,9 +2429,9 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // borrow of captures) and we need interior mutability
                 // to write into the workspace.
                 let penalty_workspace = RefCell::new(Array1::<f64>::zeros(total_p));
-                match &joint_hessian_source {
+                let solved = match &joint_hessian_source {
                     JointHessianSource::Dense(h_joint) => {
-                        gam_linalg::utils::solve_spd_pcg_with_info_into(
+                        gam_linalg::utils::solve_spd_pcg_bounded_into(
                             |v, out| {
                                 // h_joint * v -> out (faer-backed, no alloc)
                                 gam_linalg::faer_ndarray::fast_av_view_into(
@@ -2425,20 +2451,10 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 *out += &*pen;
                             },
                             &rhs,
-                            &preconditioner_diag,
+                            preconditioner_diag,
                             pcg_rel_tol,
-                            pcg_max_products,
+                            max_iter,
                         )
-                        .map(|(solution, info)| {
-                            log_joint_pcg_diagnostics(
-                                cycle,
-                                total_p,
-                                total_joint_n,
-                                &preconditioner_diag,
-                                &info,
-                            );
-                            (solution, info.iterations)
-                        })
                     }
                     JointHessianSource::Operator { apply_into, .. } => {
                         let apply_h_into = Arc::clone(apply_into);
@@ -2447,7 +2463,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         // a step for it. The first failure is kept and refuses the
                         // trial point once the solve returns.
                         let matvec_failure = std::cell::RefCell::new(None::<String>);
-                        let solved = gam_linalg::utils::solve_spd_pcg_with_info_into(
+                        let solved = gam_linalg::utils::solve_spd_pcg_bounded_into(
                             |v, out| {
                                 if let Err(error) = apply_h_into(v, out) {
                                     matvec_failure
@@ -2467,20 +2483,10 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 *out += &*pen;
                             },
                             &rhs,
-                            &preconditioner_diag,
+                            preconditioner_diag,
                             pcg_rel_tol,
-                            pcg_max_products,
-                        )
-                        .map(|(solution, info)| {
-                            log_joint_pcg_diagnostics(
-                                cycle,
-                                total_p,
-                                total_joint_n,
-                                &preconditioner_diag,
-                                &info,
-                            );
-                            (solution, info.iterations)
-                        });
+                            max_iter,
+                        );
                         if let Some(error) = matvec_failure.into_inner() {
                             return Err(CustomFamilyError::trial_point(format!(
                                 "exact joint Newton at cycle {cycle}: the joint Hessian operator \
@@ -2490,38 +2496,78 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         }
                         solved
                     }
+                };
+                let Some((mut solution, info, stop)) = solved else {
+                    return Err(CustomFamilyError::trial_point(format!(
+                        "exact joint Newton at cycle {cycle}: the preconditioned CG solve of the \
+                         penalized Newton system returned no finite iterate at this iterate"
+                    )));
+                };
+                log_joint_pcg_diagnostics(
+                    cycle,
+                    total_p,
+                    total_joint_n,
+                    preconditioner_diag,
+                    &info,
+                );
+                if stop != gam_linalg::pcg::PcgStop::Converged {
+                    if route.is_none() {
+                        return Err(CustomFamilyError::trial_point(format!(
+                            "exact joint Newton at cycle {cycle}: the preconditioned CG solve of \
+                             the penalized Newton system stopped with {stop:?} after {} \
+                             iterations (relative residual {:.3e}, target {pcg_rel_tol:.3e}), and \
+                             the dense Hessian exceeds the materialization cap",
+                            info.iterations, info.relative_residual_norm,
+                        )));
+                    }
+                    // The recorded spectrum no longer bounds this Hessian, so the
+                    // next step goes dense and measures it again.
+                    joint_pcg_condition = None;
+                    if solution.iter().all(|v| *v == 0.0) {
+                        // Breakdown on the first direction leaves the zero start.
+                        // That direction, `M⁻¹ rhs`, is the step CG would have taken
+                        // first; the trust region judges it against the true model.
+                        solution = &rhs / preconditioner_diag;
+                    }
                 }
-            } else {
-                None
-            };
-            let pcg_iterations = pcg_solution.as_ref().map(|(_, iterations)| *iterations);
-            let mut delta = pcg_solution.map(|(solution, _)| solution);
-            if pcg_requested {
-                // Which route produced this step, and how much of the attempt it used.
                 log::debug!(
-                    "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} route={} cg_iterations={} attempt={:?} elapsed={:.3}s",
+                    "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} route=pcg attempt={:?} \
+                     bound_iterations={} bound_condition={} stop={:?} cg_iterations={} \
+                     relative_residual={:.3e} target={:.3e} elapsed={:.3}s",
                     cycle,
                     total_joint_n,
                     total_p,
-                    if delta.is_some() { "pcg" } else { "dense" },
-                    pcg_iterations.map_or_else(|| "none".to_string(), |used| used.to_string()),
                     joint_pcg_attempt,
+                    max_iter,
+                    route.map_or_else(
+                        || "none".to_string(),
+                        |route| format!("{:.3e}", route.condition)
+                    ),
+                    stop,
+                    info.iterations,
+                    info.relative_residual_norm,
+                    pcg_rel_tol,
                     pcg_started.elapsed().as_secs_f64()
                 );
+                delta = Some(solution);
             }
             if delta.is_none() {
-                if pcg_requested && joint_pcg_attempt == gam_linalg::pcg::PcgAttempt::Only {
-                    return Err(CustomFamilyError::trial_point(format!(
-                        "exact joint Newton at cycle {cycle}: the preconditioned CG solve of the \
-                         penalized Newton system returned no solution at this iterate, and the \
-                         dense Hessian exceeds the materialization cap"
-                    )));
-                }
                 let likelihood_hessian = materialize_joint_hessian_source(
                     &joint_hessian_source,
                     total_p,
-                    "joint Newton inner dense fallback Hessian materialization",
+                    "joint Newton inner dense Hessian materialization",
                 )?;
+                if pcg_eligible {
+                    log::debug!(
+                        "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} route=dense attempt={:?} \
+                         recorded_spectrum={}",
+                        cycle,
+                        total_joint_n,
+                        total_p,
+                        joint_pcg_attempt,
+                        joint_pcg_condition.is_some(),
+                    );
+                }
                 // Capture the unpenalized dense `H` for the rest of this
                 // cycle (gam#1040): the Cauchy leg and trust-region
                 // predicted-reduction matvecs below can then reuse it as a
@@ -2588,7 +2634,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // already carries `+∇Φ` from the single shared computation
                 // above, and we REUSE that same `H_Φ` here rather than
                 // recomputing the (O(p) directional-derivative) term — the
-                // dense fallback and the matrix-free PCG step now solve the
+                // dense route and the matrix-free PCG step now solve the
                 // SAME Jeffreys-augmented Newton system.
                 let spectral_rhs = rhs.clone();
                 // ENDGAME EXACTNESS (gam#979). Outside the endgame the
@@ -2616,6 +2662,14 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &joint_trust_metric_diag,
                     KKT_REFUSAL_RANK_TOL,
                 )?;
+                // The spectrum of the plain `H + S` prices the next step's CG
+                // route; a Jeffreys-augmented matrix is not the system CG solves.
+                joint_pcg_condition =
+                    if inner_jeffreys_term.is_none() && !true_jeffreys_hessian_required {
+                        JointPcgConditionRecord::from_spectrum(&spectrum)
+                    } else {
+                        None
+                    };
                 // A positive-definite M_true owns the exact Newton step and
                 // therefore the quadratic endgame. An indefinite M_true is
                 // not reflected into a fake local minimum: start directly
@@ -2811,7 +2865,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         let delta = &candidate_beta - &beta_joint;
         // Effective Hessian source for the remaining per-cycle matvecs
         // (Cauchy leg + trust-region predicted reduction). When the dense
-        // fallback above materialized a matrix-free `Operator` to dense, route
+        // route above materialized a matrix-free `Operator` to dense, route
         // those matvecs through that `Dense` snapshot so each is an `O(p²)`
         // GEMV rather than an `O(n·p)` operator row-sweep repeated up to
         // `JOINT_TRUST_MAX_ATTEMPTS` times (gam#1040). Byte-identical action

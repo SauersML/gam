@@ -152,10 +152,10 @@ fn covariate_constant_slope_survival_fit_passes_seed_validation_2930() {
     fit_and_report("smooth", "Surv(time, event) ~ s(x, k=5)", &data, &config);
 }
 
-/// gam#2945: a learned Gaussian frailty σ moves the priced completion, whose explicit σ derivative
-/// is not derived, so such a fit has neither an exact outer gradient nor a curvature certificate. It
-/// is refused once, by name, before the smoothing search: not on every value+gradient evaluation,
-/// and not after the search at the curvature guard.
+/// gam#2945, gam#2938: a learned Gaussian frailty σ on this fixture is refused once, by name, before
+/// the smoothing search. Its slope carries an intercept and a constant offset, so the likelihood
+/// reads σ only as the observed slope `s(σ)·g` and does not identify it: the inner objective was
+/// flat in σ to seven figures while the criterion fell (gam#2938, job 1230170).
 #[test]
 fn covariate_constant_slope_learned_sigma_is_refused_by_name_2945() {
     use gam_models::survival::lognormal_kernel::{FrailtyScale, FrailtySpec};
@@ -173,11 +173,13 @@ fn covariate_constant_slope_learned_sigma_is_refused_by_name_2945() {
         ..constant_slope_config()
     };
     let message = match fit_from_formula("Surv(time, event) ~ x", &data, &config) {
-        Ok(_) => panic!("a learned frailty σ with the armed Jeffreys completion must be refused"),
+        Ok(_) => panic!("a learned frailty σ the likelihood does not identify must be refused"),
         Err(error) => error.to_string(),
     };
     assert!(
-        message.contains("a learned Gaussian frailty σ with the armed Jeffreys completion is refused"),
+        message.contains(
+            "a learned Gaussian-shift frailty σ is refused: σ is not identified by the likelihood"
+        ),
         "the refusal must name its reason, got: {message}"
     );
 }

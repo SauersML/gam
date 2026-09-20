@@ -12,7 +12,7 @@ too (EDF = 2.000, zero residual wiggle).
 But ``bs="ps"`` (and the default ``s(x)``, which routes to ps) plateaus at
 EDF ~= 4.9-5.0 with a comparatively *small* selected lambda (~4e4 vs ~6.5e7 for
 cr), introducing spurious curvature on a dead-straight signal and measurably
-worse predictive accuracy than the cr basis on the identical data. ``bs="tp"``
+worse predictive accuracy than the cr basis on the identical data. ``bs="tps"``
 is worse still (EDF ~= 8). The cr basis reaching EDF = 2.000 on the same data
 proves that "collapse to the line" is the correct, achievable answer, so ps/tp
 are genuinely under-smoothing.

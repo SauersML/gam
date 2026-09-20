@@ -657,6 +657,41 @@ fn prefit_binomial_separation_supported_link(link: &InverseLink) -> bool {
     )
 }
 
+/// Choose between the flat-prior and the Jeffreys-prior binomial estimator
+/// before any solve (#3129).
+///
+/// A separated design has no finite maximum likelihood, and the certificates
+/// of [`reject_prefit_binomial_separation`] decide that from the realized
+/// design alone. On a Firth-capable binomial family a certificate arms the
+/// Jeffreys prior `|I(β)|^½`, which bounds the coefficients along the
+/// separating direction, and the returned evidence is the reason the fit
+/// records for it. So the estimator is a function of the data and the design,
+/// never of whether a flat-prior solve happened to certify.
+///
+/// The certificate stays a refusal only where the prior cannot be armed: an
+/// optimized SAS or mixture link appends link-parameter outer coordinates
+/// that the Firth outer derivative does not define (#2654).
+pub(crate) fn arm_jeffreys_on_prefit_binomial_separation(
+    cfg: &mut RemlConfig,
+    opts: &ExternalOptimOptions,
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x_fit: &DesignMatrix,
+    penalties: &[CanonicalPenalty],
+) -> Result<Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence>, EstimationError> {
+    let Err(refusal) = reject_prefit_binomial_separation(cfg, y, w, x_fit, penalties) else {
+        return Ok(None);
+    };
+    let Some(evidence) = refusal.separation_arming_evidence() else {
+        return Err(refusal);
+    };
+    if !opts.family.supports_firth() || opts.optimize_sas || opts.optimize_mixture {
+        return Err(refusal);
+    }
+    cfg.firth_bias_reduction = true;
+    Ok(Some(evidence))
+}
+
 pub(crate) fn reject_prefit_binomial_separation(
     cfg: &RemlConfig,
     y: ArrayView1<'_, f64>,

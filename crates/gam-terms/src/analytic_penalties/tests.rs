@@ -2596,3 +2596,60 @@ fn frozen_penalty_diag_and_log_det_are_exact_past_dimension_1024_2900() {
     let log_det = op.log_det_plus_lambda_i(lambda).expect("frozen log det");
     assert_abs_diff_eq!(log_det, exact, epsilon = 1e-9 * exact.abs().max(1.0));
 }
+
+/// The row-precision energy ½ tᵀΛt reads only the symmetric part of Λ, so a
+/// penalty built from an asymmetric Λ is the penalty built from (Λ + Λᵀ)/2:
+/// value, gradient, curvature and the log-determinant agree exactly. An input
+/// whose symmetric part is singular is still refused as not positive definite,
+/// whatever its skew part (#2469).
+#[test]
+fn row_precision_prior_reads_the_symmetric_part_of_its_precision_2469() {
+    let target = PsiSlice::full(4, Some(2));
+    let asymmetric = array![[[2.0_f64, 1.5], [0.5, 2.0]], [[3.0, -0.25], [0.75, 1.0]]];
+    let symmetric = array![[[2.0_f64, 1.0], [1.0, 2.0]], [[3.0, 0.25], [0.25, 1.0]]];
+    let from_asymmetric =
+        RowPrecisionPriorPenalty::new(target.clone(), asymmetric, 1.3, 2, true).unwrap();
+    let from_symmetric =
+        RowPrecisionPriorPenalty::new(target.clone(), symmetric.clone(), 1.3, 2, true).unwrap();
+    assert_eq!(from_asymmetric.lambda_per_row, symmetric);
+
+    let t = array![0.7_f64, -1.1, 0.4, 2.3];
+    let rho = array![0.2_f64];
+    assert_eq!(
+        from_asymmetric.value(t.view(), rho.view()),
+        from_symmetric.value(t.view(), rho.view())
+    );
+    assert_eq!(
+        from_asymmetric.grad_target(t.view(), rho.view()),
+        from_symmetric.grad_target(t.view(), rho.view())
+    );
+    assert_eq!(
+        from_asymmetric.as_dense(t.view(), rho.view()),
+        from_symmetric.as_dense(t.view(), rho.view())
+    );
+    assert_eq!(
+        from_asymmetric.log_det_plus_lambda_i(rho.view(), 0.5).unwrap(),
+        from_symmetric.log_det_plus_lambda_i(rho.view(), 0.5).unwrap()
+    );
+    // The value is the quadratic form of the stored matrix plus the Gaussian
+    // normalizer −½·len·ln μ of the learnable strength.
+    let weight = 1.3 * 0.2_f64.exp();
+    let mut energy = 0.0;
+    for n in 0..2 {
+        for i in 0..2 {
+            for j in 0..2 {
+                energy += t[2 * n + i] * symmetric[[n, i, j]] * t[2 * n + j];
+            }
+        }
+    }
+    assert_abs_diff_eq!(
+        from_asymmetric.value(t.view(), rho.view()),
+        0.5 * weight * energy - 0.5 * 4.0 * weight.ln(),
+        epsilon = 1e-12
+    );
+
+    // [[1, 3], [−1, 1]] has symmetric part [[1, 1], [1, 1]], eigenvalues {0, 2}.
+    let singular_part = array![[[1.0_f64, 3.0], [-1.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]]];
+    let refused = RowPrecisionPriorPenalty::new(target, singular_part, 1.3, 2, true);
+    assert!(refused.unwrap_err().contains("must be positive definite"));
+}

@@ -127,11 +127,11 @@ def test_negbin_dispersion_location_scale_is_predictable() -> None:
     y = rng.poisson(lam).astype(float)
     df = pd.DataFrame({"y": y, "x": x})
 
-    m = gamfit.fit(df, "y ~ s(x)", family="nb", noise_formula="s(x)")
+    m = gamfit.fit(df, "y ~ s(x)", family="negative-binomial", noise_formula="s(x)")
     x_grid = np.linspace(-1.5, 1.5, 40)
     true_mean = np.exp(0.5 + 0.6 * x_grid)
     _assert_joint_covariance_and_predictable(
-        m, x_grid=x_grid, true_mean=true_mean, family="nb"
+        m, x_grid=x_grid, true_mean=true_mean, family="negative-binomial"
     )
 
 
