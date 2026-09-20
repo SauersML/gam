@@ -2738,14 +2738,6 @@ fn certify_four_spends_order_four_once_and_prices_the_curvature_against_the_crit
     );
 }
 
-// The historical bridge-side `rejects_oversized_bfgs_cost_probe_before_objective`
-// test exercised a mechanism (returning `BFGS_LINE_SEARCH_REJECT_COST`
-// from `eval_cost` on overreach) that has been retired in favor of
-// `opt::Bfgs::with_axis_step_caps` — the line-search direction is now
-// shortened up front by opt itself, so the bridge never sees an
-// oversized probe in the first place. The equivalent invariant now
-// lives in opt's `with_axis_step_caps` test surface.
-
 #[test]
 fn first_order_bridge_keeps_true_gradient_on_repeated_flat_cost() {
     let eval_calls = Arc::new(AtomicUsize::new(0));

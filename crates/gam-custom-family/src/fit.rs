@@ -2655,7 +2655,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         family.outer_hyper_hessian_hvp_available(specs),
         family.outer_hyper_hessian_dense_available(specs),
     );
-    let bfgs_step_cap = Some(FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP);
     // EFS / HybridEfs structural property (`H^{-1/2} B_k H^{-1/2} ≽ 0` plus a
     // parameter-independent nullspace, Wood-Fasiolo) fails for multi-block
     // families whose joint likelihood Hessian depends on β.
@@ -2893,7 +2892,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_disable_fixed_point(multi_block_beta_dependent || prices_cone_normalizer)
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)
-        .with_bfgs_step_cap(bfgs_step_cap)
         .with_initial_rho(rho0.clone())
         .with_problem_size(n_obs, p_total.max(1))
         // Per-coordinate ρ domain (#2812): the interval on which each term's

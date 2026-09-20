@@ -1653,7 +1653,6 @@ pub(crate) fn run_outer_with_plan(
                     // the device input below carries it as a raw `usize`, so we
                     // only need the wrapper for its bail-on-invalid behaviour.
                     outer_max_iterations(config.max_iter)?;
-                    let axis_caps_dev = bfgs_axis_step_caps(config, layout);
                     let seed_eval_dev = match eval_seed_restoring_rays(
                             obj,
                             config,
@@ -1700,7 +1699,6 @@ pub(crate) fn run_outer_with_plan(
                         // the terminal certificate judges the point it stops at
                         // regardless (#2817).
                         cost_stall_projected_grad_tol: grad_tol_dev.abs,
-                        axis_step_caps: axis_caps_dev,
                         admission,
                         seed_objective: seed_eval_dev.cost,
                         seed_gradient: seed_eval_dev.gradient.clone(),
@@ -2085,9 +2083,6 @@ pub(crate) fn run_outer_with_plan(
                             if scale.is_finite() && scale > 0.0 {
                                 optimizer = optimizer.with_initial_metric(InitialMetric::Scalar(scale));
                             }
-                        }
-                        if let Some(caps) = bfgs_axis_step_caps(config, layout) {
-                            optimizer = optimizer.with_axis_step_caps(caps);
                         }
                         // The observer is installed UNCONDITIONALLY on this route
                         // (#2613). It used to be gated on `outer_inner_cap`, the

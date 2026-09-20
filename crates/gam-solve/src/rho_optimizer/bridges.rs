@@ -1773,12 +1773,8 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         // evaluation before doing anything else: a stalled verdict must halt
         // this call rather than pay another inner solve first (#2613).
         self.drain_accepted_steps()?;
-        // Per-axis line-search step caps now live natively in opt::Bfgs
-        // (`with_axis_step_caps`), which shortens the BFGS direction before
-        // line search instead of poisoning the Wolfe bracket with a
-        // sentinel cost. This entry point can therefore stay honest: any
-        // call that lands here is a real line-search probe, not a too-far
-        // attempt the bridge needs to swat away.
+        // Every call that lands here is a real line-search probe: no step
+        // budget shortens or refuses a probe, on this side or in opt.
         //
         // Uncap the inner solve for the line-search cost probe (see the field
         // doc on `outer_inner_cap`): the deciding cost MUST be the true
