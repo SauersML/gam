@@ -8357,7 +8357,7 @@ pub(crate) fn run_fixed_point_outer_solver(
     // test, never stationarity (see the certificate after the walk), so a seed
     // that is already stationary is walked anyway: a smoothing parameter on its
     // rail keeps proposing an outward EFS step, and nothing short of the
-    // unprogressing-walk window ends it. On the ISLR `Default` logistic fit the
+    // unprogressing-walk stop ends it. On the ISLR `Default` logistic fit the
     // #784 corrected continuation starts from the certified Laplace optimum, which
     // is stationary under the correction too (the BFGS continuation later
     // certified it at zero iterations, |g| = 5.9e-6), yet the walk spent ~60
