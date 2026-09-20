@@ -9,6 +9,10 @@
   invalidated the row on every hit. A hit now requires both the meta and the key-dir
   mtimes to match, and the row is re-recorded after the touch. `touch_lookup_hit` is
   removed.
+- **`process_monitor` reads every `/proc/self` field through one parser** (#4073).
+  `parse_status_kb`, `parse_status_count` and `parse_io_bytes` were three copies of
+  "the integer after the key"; they are replaced by `parse_proc_value`, which takes the
+  first whitespace-separated token after the key for `status` and `io` lines alike.
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
   `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and

@@ -2592,11 +2592,30 @@
     "evidence": "scripts/source_removal_guard.py --base 3c2b08bc13124f15576fef1513960f97053c1647 --head d91b01836688765aadbbed2aff2ef0f78d7e9d41 (the landing session's merge of main into claude/pygam-partial-effects) lists exactly these 11 guarded removals and fails without this entry. Read-proof, git grep -w -c over *.rs at that head: DEFAULT_SIMULATIONS 0, model_partial_dependence 0, model_partial_dependence_impl 0, PartialDependenceOutput 0; standard_mean_design is in gam-predict/src/partial_effect.rs (2), geometry_ffi.rs (1, the variance-share caller) and manifold_and_posterior_ffi.rs (1, the difference-smooth caller); standard_mean_termspec (3), standard_mean_prediction_design (2) and NONZERO_ANCHOR_DESIGN_ERROR (3) are all in gam-predict/src/partial_effect.rs; SimultaneousBandOptions::at_level appears 5 times in gam-inference/src/effects.rs, and main's whole-curve coverage test is ported to it. The renamed tests are each declared once in gam-inference/src/partial_dependence.rs."
   },
   {
-    "base": "15e7666340914de4903aad94a79f0cb642e99410",
+    "base": "41fbd6c3376037036ca93f1c5274575fef526dc0",
     "items": [
+      "crates/gam-models/src/fit_orchestration/materialize/terms.rs:fn:spatial_center_strategy_mut",
+      "crates/gam-terms/src/term_builder.rs:fn:cyclic_basis_dim_for_column",
+      "crates/gam-terms/src/term_builder.rs:fn:pilot_internal_knots_for_column",
+      "crates/gam-terms/src/term_builder/tests.rs:fn:multidimensional_duchon_default_uses_rate_derived_pilot_basis"
+    ],
+    "reason": "#3149 R0: formula defaults are built at their provisioned size on every route, and only the bases the standard workflow's resolution loop grows start at their penalized-resolution pilot, through the one rule gam_terms::smooth::starting_resolution. materialize/terms.rs spatial_center_strategy_mut served only the d>1 radial start special case that starting_resolution now owns; term_builder cyclic_basis_dim_for_column was the position basis's pilot cyclic default, now provisioned_cyclic_basis_dim; the test multidimensional_duchon_default_uses_rate_derived_pilot_basis is restated as multidimensional_duchon_default_is_provisioned_and_the_loop_starts_it_at_its_pilot (same fixture, both sizes asserted); term_builder pilot_internal_knots_for_column lost its last production caller (the position basis now takes the provisioned default, and the pilot floor sizes from the rows it is identified on, #3179), so its tests call pilot_internal_knots directly.",
+    "evidence": "Gate direct-dy6-w2a-r0v5-gt.log, TIPCHECK at tip 988f269d7e (tip tree 9598a61a74): cargo check --workspace --all-targets RC 0 with SCANNER_ERRORS=0, gam-pyffi check RC 0, gam-terms 114 of 114; its source_removal_guard and public_api_census flagged exactly these items and nothing else. Read-proof: git grep -w for spatial_center_strategy_mut, cyclic_basis_dim_for_column and pilot_internal_knots_for_column at 988f269d7e finds only their definitions, the callers this landing rewrites, and a doc comment in basis/types.rs that this landing also rewrites."
+  },
+  {
+    "base": "fe064470faaceabe62fc9ae9c3daa9c2679d2d74",
+    "items": [
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes_wrong_key_returns_none",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_count",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_count_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb_wrong_key_returns_none",
       "crates/gam-runtime/src/warm_start/store.rs:fn:touch_lookup_hit"
     ],
-    "reason": "#3882, #3885: the warm-start lookup fast path now re-reads and touches the cached meta itself and re-records the post-touch meta and key-directory stamps through remember_lookup, the one helper the slow path also uses, so the private wrapper touch_lookup_hit (read_meta + touch_lookup_meta, discarding the touched meta the row now needs) has no caller.",
-    "evidence": "scripts/source_removal_guard.py with --base 15e7666340914de4903aad94a79f0cb642e99410 and head the change's commit lists exactly this removal. Read-proof at the head: git grep -w touch_lookup_hit finds no occurrence in the repository; it was a private method of WarmStartStore in crates/gam-runtime/src/warm_start/store.rs whose only call site was the lookup_with fast path rewritten here."
+    "reason": "#3882/#3885: the warm-start lookup fast path now re-reads and touches the cached meta itself and re-records the post-touch meta and key-directory stamps through remember_lookup, the one helper the slow path also uses, so the private wrapper touch_lookup_hit (read_meta + touch_lookup_meta, discarding the touched meta the row now needs) has no caller. #4073: process_monitor's three private /proc/self field parsers parse_status_kb, parse_status_count and parse_io_bytes were one rule (the integer after the key) written three times; they collapse into parse_proc_value, and the five unit tests that pinned the copies separately (parse_status_kb_valid_line, parse_status_kb_wrong_key_returns_none, parse_status_count_valid_line, parse_io_bytes_valid_line, parse_io_bytes_wrong_key_returns_none) are replaced by parse_proc_value_reads_the_number_before_a_unit, parse_proc_value_reads_a_bare_counter and parse_proc_value_wrong_key_returns_none, which cover the same lines plus an unanchored-key case.",
+    "evidence": "scripts/source_removal_guard.py with --base fe064470faaceabe62fc9ae9c3daa9c2679d2d74 and head the change's commit lists exactly these removals. Read-proof at the head: git grep -w touch_lookup_hit finds no occurrence in the repository (it was a private method of WarmStartStore in crates/gam-runtime/src/warm_start/store.rs whose only call site was the lookup_with fast path rewritten here); git grep -w for parse_status_count and parse_io_bytes finds no occurrence, and parse_status_kb survives only as crates/gam-sae/examples/scale_k.rs's own unrelated local helper. All removed process_monitor functions were private and cfg(target_os = \"linux\"), called only from read_linux in the same file."
   }
 ]
