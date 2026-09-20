@@ -32,8 +32,8 @@
 //! `Var(θ̂) = σ² ‖∇θ‖² = σ²/a²`, where the gradient is evaluated at the TRUE point
 //! `z = a·u(t₀)` (so `‖z‖ = a`), not at the noisy observation. The `σ²` here is the
 //! variance of the noise component TANGENTIAL to the circle (the component that
-//! moves the phase); under isotropy it equals the radial variance, so the same `σ̂`
-//! estimated from radial scatter also serves the phase. Hence
+//! moves the phase); under isotropy it equals the per-component variance, so the
+//! `σ̂` estimated from the squared radii (below) also serves the phase. Hence
 //!
 //! ```text
 //!   SD(t̂) = SD(θ̂)/(2π) = σ / (2π a).
@@ -50,33 +50,46 @@
 //!
 //! # Estimating σ (it is not a knob)
 //!
-//! `σ` is estimated per block from the firings' codes, never supplied. For an
-//! isotropic-noise circle of unknown per-firing amplitude, the phase is a pure
-//! rotation and the radius carries `signal + radial-noise`: with
-//! `z = r·e(θ) + ε`, the observed radius is `‖z‖ ≈ r + (ε·e)` where the radial
-//! projection `ε·e ~ N(0, σ²)`. The radial component of an isotropic Gaussian is
-//! one-dimensional with variance `σ²` **regardless of the ambient block size**,
-//! so the scatter of `‖z‖` about the block's mean radius estimates the
-//! per-component `σ²` directly:
+//! `σ` is estimated per block from the firings' codes, never supplied. Under the
+//! circle model `z_i = a·e(θ_i) + ε_i`, `ε_i ~ N(0, σ² I_b)`, with `e(θ_i)` a unit
+//! vector of the `b`-dimensional block, the squared radius
+//! `q_i = ‖z_i‖² = a² + 2a (e·ε_i) + ‖ε_i‖²` has the exact moments
 //!
 //! ```text
-//!   r̄  = mean_i ‖z_i‖,
-//!   σ̂² = (1/(n−1)) Σ_i (‖z_i‖ − r̄)²      (one dof spent on r̄).
+//!   E[q] = a² + bσ²,      Var[q] = 4a²σ² + 2bσ⁴
 //! ```
 //!
+//! (the cross term `Cov(e·ε, ‖ε‖²)` is an odd Gaussian moment and vanishes).
+//! Eliminating `a²` leaves `Var[q] = 4 E[q] σ² − 2b σ⁴`, a quadratic in `σ²` whose
+//! smaller root is the only one with `a² ≥ 0`. With the sample mean `m` and the
+//! unbiased sample variance `v` of the `q_i`:
+//!
+//! ```text
+//!   σ̂² = v / (2 (m + √(m² − b v/2)))     if m² > b v/2,
+//!   σ̂² = m / b                             otherwise (a² = 0: pure noise),
+//! ```
+//!
+//! the first line being `(m − √(m² − b v/2))/b` written without the cancellation.
+//! The two branches meet at `m² = b v/2`. The estimator is consistent at every
+//! SNR. The scatter of `‖z‖` about its mean, which is how σ used to be read, is
+//! not: it equals `σ` only once `a ≫ σ`. At `a = 0` the `b = 2` radius is Rayleigh
+//! with SD `σ·√(2 − π/2) ≈ 0.655σ`, so that estimate ran a third low. The
+//! bias-corrected amplitude `â = √(‖z‖² − 2σ̂²)` then stayed positive on most
+//! pure-noise firings, and their phase SEs came out finite and too small.
+//!
 //! **Assumption + one-sided guarantee.** This assumes isotropic within-block
-//! noise, so radial scatter estimates the per-component `σ`. If the amplitude
-//! genuinely varies across firings (the subspace is a *cone*/*cylinder* rather
-//! than a fixed-radius circle), the radial scatter absorbs that amplitude
-//! spread and **over**estimates `σ`; the reported SE is then conservative. This
-//! is a one-sided guarantee: the SE never silently understates phase
-//! uncertainty from amplitude heterogeneity.
+//! noise and a common signal norm `a`. If the amplitude genuinely varies across
+//! firings (the subspace is a *cone*/*cylinder* rather than a fixed-radius
+//! circle), `Var[q]` gains `Var(a²) ≥ 0`. The smaller root increases with `v`, so
+//! σ̂ then **over**estimates `σ` and the reported SE is conservative. This is a
+//! one-sided guarantee: the SE never silently understates phase uncertainty from
+//! amplitude heterogeneity.
 //!
 //! The phase SE is a propagation of the TANGENTIAL noise scale. With per-firing
 //! free phases the tangential residual is absorbed by the phase estimate and is
 //! not separately identifiable from a single circle's marginal, so we identify it
-//! with the radial-scatter `σ̂` under the isotropy assumption above — the one axis
-//! on which the phase SE is conditional. What the earlier `σ̂/(2π‖z‖)` form got
+//! with the isotropic `σ̂` under the assumption above — the one axis on which the
+//! phase SE is conditional. What the earlier `σ̂/(2π‖z‖)` form got
 //! wrong was orthogonal to this: it evaluated the delta method at the noise-inflated
 //! observed radius instead of the true amplitude, an anti-conservative error at low
 //! SNR that the bias-corrected `â` (below) removes.
@@ -160,7 +173,7 @@ pub struct FiringCoordinate {
 /// per-firing coordinates.
 #[derive(Clone, Debug)]
 pub struct BlockCoordinateReport {
-    /// Estimated isotropic per-component noise `σ̂` (radial scatter of `‖z‖`).
+    /// Estimated isotropic per-component noise `σ̂` ([`isotropic_noise_sigma`]).
     pub sigma_hat: f64,
     /// Mean firing radius `r̄ = mean ‖z‖`.
     pub mean_radius: f64,
@@ -255,26 +268,43 @@ fn collect_route_firings(
     Ok(out)
 }
 
-/// Mean radius `r̄` and unbiased radial-scatter noise `σ̂` from the firing codes.
-fn radius_and_sigma(firings: &[(usize, Vec<f64>)]) -> (f64, f64) {
+/// Isotropic per-component noise scale `σ̂` of `dim`-dimensional block codes that
+/// share one signal norm, from the first two moments of their squared radii
+/// `q_i = ‖z_i‖²` (see "Estimating σ" in the module docs). Fewer than two
+/// firings leave the variance unidentified, and the scale is reported as 0.
+pub(crate) fn isotropic_noise_sigma(squared_norms: &[f64], dim: usize) -> f64 {
+    let n = squared_norms.len();
+    if n < 2 || dim == 0 {
+        return 0.0;
+    }
+    let mean = squared_norms.iter().sum::<f64>() / n as f64;
+    let var = squared_norms
+        .iter()
+        .map(|&q| (q - mean) * (q - mean))
+        .sum::<f64>()
+        / (n - 1) as f64;
+    let discriminant = mean * mean - dim as f64 * var / 2.0;
+    let sigma_sq = if discriminant > 0.0 {
+        var / (2.0 * (mean + discriminant.sqrt()))
+    } else {
+        mean / dim as f64
+    };
+    sigma_sq.max(0.0).sqrt()
+}
+
+/// Mean radius `r̄` and isotropic noise `σ̂` ([`isotropic_noise_sigma`]) of the
+/// firing codes.
+fn radius_and_sigma(firings: &[(usize, Vec<f64>)], dim: usize) -> (f64, f64) {
     let n = firings.len();
     if n == 0 {
         return (0.0, 0.0);
     }
-    let mut norms = Vec::with_capacity(n);
-    let mut sum = 0.0f64;
-    for (_, z) in firings {
-        let nrm = z.iter().map(|v| v * v).sum::<f64>().sqrt();
-        sum += nrm;
-        norms.push(nrm);
-    }
-    let mean = sum / n as f64;
-    if n < 2 {
-        return (mean, 0.0);
-    }
-    let ss: f64 = norms.iter().map(|&r| (r - mean) * (r - mean)).sum();
-    let sigma = (ss / (n - 1) as f64).sqrt();
-    (mean, sigma)
+    let squared_norms: Vec<f64> = firings
+        .iter()
+        .map(|(_, z)| z.iter().map(|v| v * v).sum::<f64>())
+        .collect();
+    let mean = squared_norms.iter().map(|q| q.sqrt()).sum::<f64>() / n as f64;
+    (mean, isotropic_noise_sigma(&squared_norms, dim))
 }
 
 /// Assemble the phase SE for a `b = 2` firing, clamping to the uniform ceiling in
@@ -284,10 +314,11 @@ fn radius_and_sigma(firings: &[(usize, Vec<f64>)]) -> (f64, f64) {
 /// the squared circle radius — and must be evaluated at the TRUE amplitude `a`, not
 /// the noise-inflated observed radius `‖z‖`. Under the isotropic-noise circle model
 /// `σ_t = σ` (the tangential and radial components of an isotropic Gaussian share
-/// one scale, so the radial-scatter `σ̂` also estimates the phase-relevant
-/// tangential noise), while `E[‖z‖²] = a² + 2σ²`, so the bias-corrected amplitude is
-/// `â = √max(‖z‖² − 2σ², 0)`. Plugging the observed `‖z‖` in place of `â` — as a
-/// naive `σ̂/(2π‖z‖)` does — divides by a radius the noise itself inflated, so it
+/// one scale, so the isotropic `σ̂` of [`isotropic_noise_sigma`] also estimates the
+/// phase-relevant tangential noise), while `E[‖z‖²] = a² + 2σ²`, so the
+/// bias-corrected amplitude is `â = √max(‖z‖² − 2σ², 0)`. Plugging the observed
+/// `‖z‖` in place of `â` — as a naive `σ̂/(2π‖z‖)` does — divides by a radius the
+/// noise itself inflated, so it
 /// UNDERSTATES the phase SE in the weak-signal regime (at true `a = 0` the observed
 /// radius is Rayleigh-distributed and strictly positive, yielding a small finite SE
 /// for a phase that is in fact uniform). Evaluating at `â` makes the SE degrade
@@ -312,9 +343,9 @@ fn phase_se_b2(sigma: f64, norm: f64) -> (f64, bool) {
 /// Per-firing circle-phase coordinate standard error `σ/(2π·â)` at the
 /// bias-corrected amplitude `â = √max(‖z‖² − 2σ², 0)`, clamped at the uniform-phase
 /// ceiling `√(1/12)` — the bare SE (no clamp flag) [`phase_se_b2`] exposes for the
-/// matched-description-length report column. `σ` is the block's radial-scatter noise
-/// scale, `norm = ‖z‖` the firing radius. A firing at or below the noise floor
-/// returns the uniform ceiling (never NaN).
+/// matched-description-length report column. `σ` is the block's isotropic noise
+/// scale ([`isotropic_noise_sigma`]), `norm = ‖z‖` the firing radius. A firing at
+/// or below the noise floor returns the uniform ceiling (never NaN).
 pub(crate) fn phase_coordinate_se(sigma: f64, norm: f64) -> f64 {
     phase_se_b2(sigma, norm).0
 }
@@ -508,7 +539,7 @@ pub fn block_route_firing_coordinates(
         ));
     }
     let firings = collect_route_firings(blocks, codes, n_blocks, block, b)?;
-    let (mean_radius, sigma_hat) = radius_and_sigma(&firings);
+    let (mean_radius, sigma_hat) = radius_and_sigma(&firings, b);
 
     let mut coords = Vec::with_capacity(firings.len());
     for (row, z) in &firings {
@@ -867,7 +898,7 @@ pub fn harmonic_route_firing_coordinates(
     let omega_sq_sum: f64 = (1..=h_count).map(|h| TAU * h as f64).map(|w| w * w).sum();
 
     let firings = collect_route_firings(blocks, codes, n_blocks, block, b)?;
-    let (mean_radius, sigma_hat) = radius_and_sigma(&firings);
+    let (mean_radius, sigma_hat) = radius_and_sigma(&firings, b);
     let ceiling = uniform_phase_sd();
 
     let mut coords = Vec::with_capacity(firings.len());
@@ -982,4 +1013,90 @@ mod tests {
         assert_eq!(count_separated_positive_modes(&rho, separation_limit(4)), 1);
     }
 
+    /// Deterministic pseudo-uniform in `(0, 1)` from a counter (no RNG dependency).
+    fn unif(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    }
+
+    /// Standard normal by Box–Muller from two counter uniforms.
+    fn normal(state: &mut u64) -> f64 {
+        let u1 = unif(state);
+        let u2 = unif(state);
+        (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
+    }
+
+    /// `n` single-block routes with codes `a·u(t_i) + N(0, σ² I_b)`, the signal on
+    /// the first harmonic pair and `t_i` uniform.
+    fn noisy_circle_route(
+        n: usize,
+        b: usize,
+        amplitude: f64,
+        sigma: f64,
+        seed: u64,
+    ) -> (ndarray::Array2<u32>, ndarray::Array3<f32>) {
+        let mut state = seed;
+        let blocks = ndarray::Array2::<u32>::zeros((n, 1));
+        let mut codes = ndarray::Array3::<f32>::zeros((n, 1, b));
+        for i in 0..n {
+            let t = unif(&mut state);
+            for r in 0..b {
+                let signal = match r {
+                    0 => amplitude * (TAU * t).cos(),
+                    1 => amplitude * (TAU * t).sin(),
+                    _ => 0.0,
+                };
+                codes[[i, 0, r]] = (signal + sigma * normal(&mut state)) as f32;
+            }
+        }
+        (blocks, codes)
+    }
+
+    #[test]
+    fn noise_scale_is_calibrated_from_pure_noise_to_high_snr() {
+        // The scatter of ‖z‖ about its mean reads a Rayleigh radius at a = 0 and gave
+        // σ̂ ≈ 0.65σ there (0.78σ at a = σ, 0.70σ for a pure-noise b = 4 block). The
+        // squared-radius moment estimator is consistent at every SNR.
+        let sigma = 0.5;
+        for (seed, amplitude) in [(11u64, 0.0), (12, 0.5), (13, 2.0)] {
+            let (blocks, codes) = noisy_circle_route(20_000, 2, amplitude, sigma, seed);
+            let report = block_route_firing_coordinates(blocks.view(), codes.view(), 1, 0)
+                .expect("circle readout");
+            let ratio = report.sigma_hat / sigma;
+            assert!(
+                (ratio - 1.0).abs() < 0.1,
+                "b = 2, a = {amplitude}: σ̂/σ = {ratio}"
+            );
+        }
+        for (seed, amplitude) in [(21u64, 0.0), (22, 2.0)] {
+            let (blocks, codes) = noisy_circle_route(4_000, 4, amplitude, sigma, seed);
+            let report = harmonic_route_firing_coordinates(blocks.view(), codes.view(), 1, 0)
+                .expect("harmonic readout");
+            let ratio = report.sigma_hat / sigma;
+            assert!(
+                (ratio - 1.0).abs() < 0.1,
+                "b = 4, a = {amplitude}: σ̂/σ = {ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn pure_noise_phases_clamp_at_the_calibrated_rate() {
+        // At a = 0, ‖z‖²/σ² ~ χ²₂ and the SE clamps once ‖z‖² ≤ σ²(2 + 12/(2π)²), so a
+        // calibrated σ̂ clamps a fraction 1 − exp(−(1 + 6/(2π)²)) ≈ 0.684 of the
+        // firings. The radial-scatter σ̂ clamped about 0.39 and gave the rest a finite
+        // SE for a phase that is uniform.
+        let (blocks, codes) = noisy_circle_route(20_000, 2, 0.0, 0.5, 31);
+        let report = block_route_firing_coordinates(blocks.view(), codes.view(), 1, 0)
+            .expect("circle readout");
+        let clamped = report.firings.iter().filter(|f| f.t_se_clamped).count();
+        let fraction = clamped as f64 / report.firings.len() as f64;
+        let expected = 1.0 - (-(1.0 + 6.0 / (TAU * TAU))).exp();
+        assert!(
+            (fraction - expected).abs() < 0.05,
+            "clamped fraction {fraction}, calibrated {expected}"
+        );
+    }
 }

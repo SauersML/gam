@@ -733,8 +733,8 @@ fn part_c_two_instance(csv: &Path) -> Result<Value, String> {
 }
 
 fn estimate_sigma(per_weekday: &[(usize, Vec<f64>)]) -> f64 {
-    // Radial scatter of the mean-code norms about their mean (matches
-    // coordinate.rs radius_and_sigma convention), a conservative noise proxy.
+    // Radial scatter of the mean-code norms about their mean, a noise proxy for
+    // this example's per-weekday codes.
     let norms: Vec<f64> = per_weekday
         .iter()
         .map(|(_, z)| z.iter().map(|v| v * v).sum::<f64>().sqrt())

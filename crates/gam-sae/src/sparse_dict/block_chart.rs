@@ -554,8 +554,9 @@ pub fn block_sparse_dictionary_seed_manifest(
 /// Matched description length (bits) of the flat/linear block vs the curved circle
 /// chart for one block, from its per-firing coordinates.
 ///
-/// Per firing, the radial-scatter noise `σ̂` (unbiased SD of the firing radii `‖z‖`)
-/// sets each coordinate's standard error, but the two arms transmit DIFFERENT kinds
+/// Per firing, the block's isotropic noise `σ̂`
+/// ([`super::coordinate::isotropic_noise_sigma`] of the firing codes) sets each
+/// coordinate's standard error, but the two arms transmit DIFFERENT kinds
 /// of coordinate and are coded at their OWN resolution (the S5 fix). The circle
 /// chart transmits one PHASE `t = θ/(2π)`, whose arc position ranges over the
 /// circumference `2π·â` at the bias-corrected amplitude `â = √max(‖z‖² − 2σ̂², 0)`,
@@ -583,24 +584,14 @@ fn matched_dl_for_block(
     crate::description_length::MatchedDl,
 ) {
     use crate::description_length::{matched_dl, se_resolution_bits};
-    // Per-firing radii ‖z‖ and their unbiased radial-scatter noise σ̂.
-    let n_fire = firing_coords.nrows();
-    let mut norms: Vec<f64> = Vec::with_capacity(n_fire);
-    for row in firing_coords.rows() {
-        norms.push(
-            row.iter()
-                .map(|&v| (v as f64) * (v as f64))
-                .sum::<f64>()
-                .sqrt(),
-        );
-    }
-    let sigma_hat = if n_fire >= 2 {
-        let mean = norms.iter().sum::<f64>() / n_fire as f64;
-        let ss: f64 = norms.iter().map(|&r| (r - mean) * (r - mean)).sum();
-        (ss / (n_fire - 1) as f64).sqrt()
-    } else {
-        0.0
-    };
+    // Per-firing radii ‖z‖ and the block's isotropic noise σ̂.
+    let squared_norms: Vec<f64> = firing_coords
+        .rows()
+        .into_iter()
+        .map(|row| row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>())
+        .collect();
+    let norms: Vec<f64> = squared_norms.iter().map(|q| q.sqrt()).collect();
+    let sigma_hat = super::coordinate::isotropic_noise_sigma(&squared_norms, firing_coords.ncols());
     // PER-ARM per-scalar resolution. Both arms derive from the SAME σ̂ and radii,
     // but transmit different coordinates: the chart a phase over the circumference
     // `2π·â` at the bias-corrected amplitude `â = √max(‖z‖²−2σ̂²,0)`
