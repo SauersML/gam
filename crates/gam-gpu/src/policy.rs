@@ -175,10 +175,11 @@ impl GpuDispatchPolicy {
     /// InexactPCG hot loop for matrix-free SAE β-blocks) to the device.
     ///
     /// The dense gates key on one big reduction's or factorization's flops, and
-    /// the SAE LLM shape `(n≈2000) × (k≈2048) × (d≈8)` trips neither: it is thousands of small dense ops. But a CG solve
-    /// stages the row frames once and reuses them for `cg_iters` applies, so its
-    /// cost profile is one staging plus `cg_iters·n·(4·d·k + d²)` batched
-    /// arithmetic, the profile of one dense launch of that many flops. The
+    /// the SAE LLM shape `(n≈2000) × (k≈2048) × (d≈8)` trips neither: it is
+    /// thousands of small dense ops. But a CG solve stages the row frames once
+    /// and reuses them for `cg_iters` applies, so its cost profile is one
+    /// staging plus `cg_iters·n·(4·d·k + d²)` batched arithmetic,
+    /// the profile of one dense launch of that many flops. The
     /// admission floor is therefore this policy's dense launch crossover
     /// (`dense_reduction_flops_min`), which device calibration measures per device
     /// (`calibration::calibrate_device`). The host matvec (gather/scatter plus

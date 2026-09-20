@@ -1,5 +1,18 @@
 ## Unreleased
 
+- **GPU fp32-factor refinement returns a solution only when its residual certifies**
+  (gam#3547, gam#3548). The device Cholesky solve factors in fp32 and refines with fp64
+  residuals. If the fixed budget of corrections ran out before the residual reached its
+  attainable rounding band `γ_{p+1}(‖A‖_F‖x‖+‖b‖)`, it used to return that uncertified `x`
+  as a success. It now factors in fp64 instead. `gam::gpu::solver::cholesky_solve_only_gpu`
+  is the one device solve entry point. `cholesky_solve_gpu`, which also returned a
+  log-determinant that no caller read, is deleted, and so is
+  `cholesky_logdet_from_col_major`. `GpuMixedPrecisionPolicy` is deleted, since only its
+  `Refinement` variant was ever reachable. `GpuDispatchPolicy` loses seven fields that no
+  dispatch decision read: `xtwx_n_min`, `xtwx_use_fused_below_p`, `syevd_min_p`,
+  `sparse_min_nnz`, `keep_design_resident_min_bytes`, `prefer_gpu_factorization_min_p`
+  and `mixed_precision`.
+
 - **A learned Gaussian-shift frailty in survival marginal-slope is refused as not identified.**
   The likelihood reads σ only through the observed slope `s(σ)·g`, `s = 1/√(1+σ²)`, so with
   the default slope (an intercept in every slope surface and a constant or no offset) any σ
