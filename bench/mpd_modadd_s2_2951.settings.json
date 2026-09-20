@@ -1,0 +1,14 @@
+{
+  "stage": "plane_edits",
+  "models": [
+    {"label": "trained", "file": "addition_s0.pt", "step": null, "shuffle_mlp_seed": null},
+    {"label": "c1_init", "file": "addition_s0.pt", "step": 0, "shuffle_mlp_seed": null},
+    {"label": "c4_step2000", "file": "addition_s0.pt", "step": 2000, "shuffle_mlp_seed": null},
+    {"label": "c3_shuffled_mlp", "file": "addition_s0.pt", "step": null, "shuffle_mlp_seed": 0},
+    {"label": "c2_random_labels", "file": "random_s0.pt", "step": null, "shuffle_mlp_seed": null}
+  ],
+  "fit_shift": 1,
+  "fraction_bits": 24,
+  "null_edit_models": ["trained"],
+  "random_basis_seed": 0
+}

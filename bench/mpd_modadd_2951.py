@@ -8,9 +8,11 @@ Stage S0 is torch only.
   file; the step-0 checkpoint is control C1, the random init of the same run.
 * ``s0`` runs the executor controls and the benchmark oracle on stored checkpoints and writes
   one JSON receipt.
-* ``execute`` is the torch driver of the Schur cross-check receipt
-  (``crates/gam-sae/examples/mpd_modadd_schur_2951.rs``): it writes each declared checkpoint's
-  W_E and its least-squares shift operator T1 as ``<f8`` arrays, plus ``export.json``.
+* ``execute`` is the torch driver of the Rust receipts; the settings' stage picks the export.
+  Stage ``schur_cross_check`` (``crates/gam-sae/examples/mpd_modadd_schur_2951.rs``) writes each
+  declared checkpoint's W_E and its least-squares shift operator T1 as ``<f8`` arrays. Stage
+  ``plane_edits`` (``crates/gam-sae/examples/mpd_modadd_s2_2951.rs``) writes every parameter of
+  each declared model, its split and its float64 logits. Both write ``export.json``.
 
 W_E is one tensor with three use sites (pos0 ``a``, pos1 ``b``, pos2 ``=``). ``forward`` runs
 each occurrence as its own lookup, so a use-specific edit and a global edit are different
@@ -417,11 +419,64 @@ def export_shift_operators(settings, args):
     print(f"[execute] wrote {len(exports)} checkpoints to {args.out_dir}", flush=True)
 
 
+S2_WEIGHTS = ("W_E", "W_pos", "W_Q", "W_K", "W_V", "W_O", "W_in", "b_in", "W_out", "b_out", "W_U")
+
+
+def export_models(settings, args):
+    """Stage ``plane_edits``: every parameter of each declared model, its split and its float64 logits.
+
+    A model is a checkpoint of a run, or (control C3) that checkpoint with the MLP's input rows
+    permuted independently of its output columns. The weights go out in their trained ``<f4``, the
+    attention weights in torch ``Linear`` layout (``W_Q`` as ``n_heads·d_head × d_model``), and the
+    ``p² × p`` logits of the float64 torch forward over every pair are the executor cross-check
+    for ``crates/gam-sae/examples/mpd_modadd_s2_2951.rs``.
+    """
+    os.makedirs(args.out_dir, exist_ok=True)
+    exports = []
+    for entry in settings["models"]:
+        run = torch.load(os.path.join(args.harvest, entry["file"]), map_location="cpu", weights_only=True)
+        config = run["config"]
+        step = entry["step"] if entry["step"] is not None else max(run["checkpoints"])
+        state = {name: t.clone() for name, t in run["checkpoints"][step].items()}
+        shuffle = entry["shuffle_mlp_seed"]
+        if shuffle is not None:
+            generator = torch.Generator().manual_seed(shuffle)
+            rows_perm = torch.randperm(config["d_mlp"], generator=generator)
+            cols_perm = torch.randperm(config["d_mlp"], generator=generator)
+            state["W_in"], state["b_in"] = state["W_in"][rows_perm], state["b_in"][rows_perm]
+            state["W_out"] = state["W_out"][:, cols_perm]
+        model = build_model(config)
+        model.load_state_dict(state)
+        tokens = all_pairs(config["p"])
+        with torch.inference_mode():
+            logits = model.double()(tokens)
+        label = entry["label"]
+        for name in S2_WEIGHTS:
+            tensor = state[name]
+            if name in ("W_Q", "W_K", "W_V"):
+                tensor = tensor.reshape(-1, tensor.shape[-1])
+            np.save(os.path.join(args.out_dir, f"{name}.{label}.npy"), tensor.contiguous().numpy())
+        np.save(os.path.join(args.out_dir, f"logits64.{label}.npy"), logits.numpy())
+        hit = logits.argmax(-1) == run["labels"]
+        exports.append({
+            "label": label, "file": entry["file"], "step": step, "shuffle_mlp_seed": shuffle,
+            "config": config, "train_idx": run["train_idx"].tolist(), "test_idx": run["test_idx"].tolist(),
+            "train_acc": hit[run["train_idx"]].double().mean().item(),
+            "test_acc": hit[run["test_idx"]].double().mean().item(),
+        })
+        print(f"[execute] {label} step={step} train_acc={exports[-1]['train_acc']:.4f} "
+              f"test_acc={exports[-1]['test_acc']:.4f}", flush=True)
+    with open(os.path.join(args.out_dir, "export.json.partial"), "w") as handle:
+        json.dump({"stage": "execute", "exports": exports}, handle)
+    os.replace(os.path.join(args.out_dir, "export.json.partial"), os.path.join(args.out_dir, "export.json"))
+    print(f"[execute] wrote {len(exports)} models to {args.out_dir}", flush=True)
+
+
 def execute(args):
     """The receipt driver: ``receipt.sh`` always runs ``execute``, and the settings' stage picks the export."""
     with open(args.settings) as handle:
         settings = json.load(handle)
-    stages = {"schur_cross_check": export_shift_operators}
+    stages = {"schur_cross_check": export_shift_operators, "plane_edits": export_models}
     if settings["stage"] not in stages:
         raise SystemExit(f"[execute] no stage {settings['stage']!r}; declared stages: {sorted(stages)}")
     stages[settings["stage"]](settings, args)
