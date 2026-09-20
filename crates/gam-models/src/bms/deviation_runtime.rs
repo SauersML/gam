@@ -26,13 +26,15 @@ fn validate_breakpoints(breakpoints: &[f64], label: &str) -> Result<(), String> 
 
 /// Deduplicate an ordered BMS knot sequence into strictly increasing
 /// breakpoints.
+///
+/// A repeated knot is a stored copy of the same value, and the B-spline basis
+/// opens a span between any two knots that differ at all. So a knot is merged
+/// only when it equals its predecessor exactly; a tolerance would merge a real
+/// span the basis still has.
 fn breakpoints_from_knots(knots: &[f64], label: &str) -> Result<Vec<f64>, String> {
     let mut breakpoints = Vec::new();
     for &knot in knots {
-        if breakpoints
-            .last()
-            .is_none_or(|prev: &f64| (knot - *prev).abs() > 1e-12)
-        {
+        if breakpoints.last().is_none_or(|prev: &f64| knot != *prev) {
             breakpoints.push(knot);
         }
     }
@@ -1464,60 +1466,6 @@ impl DeviationRuntime {
         self.right_boundary_value_row.dot(&beta)
     }
 
-    /// Conservative L1 sup-norm bound for the deviation value basis.
-    ///
-    /// For every evaluation point `x`, this returns a finite `K` such that
-    /// `|B(x)·β| <= K * ||β||_∞`.  Each basis column is a cubic on each
-    /// finite span and constant in the two tails, so the supremum is attained
-    /// at a span endpoint, an interior root of the derivative, or a tail
-    /// value.  Summing per-column suprema gives a conservative row-wise L1
-    /// bound that is independent of `x`.
-    pub(crate) fn value_basis_l1_sup_norm(&self) -> f64 {
-        let mut total = 0.0;
-        for basis_idx in 0..self.basis_dim {
-            let mut col_sup = self.span_c0[[0, basis_idx]]
-                .abs()
-                .max(self.right_boundary_value_row[basis_idx].abs());
-            for span_idx in 0..self.span_count() {
-                let left = self.endpoint_points[span_idx];
-                let right = self.endpoint_points[span_idx + 1];
-                let width = right - left;
-                if !width.is_finite() || width <= 0.0 {
-                    continue;
-                }
-                let c0 = self.span_c0[[span_idx, basis_idx]];
-                let c1 = self.span_c1[[span_idx, basis_idx]];
-                let c2 = self.span_c2[[span_idx, basis_idx]];
-                let c3 = self.span_c3[[span_idx, basis_idx]];
-                let eval_abs = |t: f64| (c0 + c1 * t + c2 * t * t + c3 * t * t * t).abs();
-                col_sup = col_sup.max(eval_abs(0.0)).max(eval_abs(width));
-                let a = 3.0 * c3;
-                let b = 2.0 * c2;
-                let c = c1;
-                if a.abs() <= f64::EPSILON {
-                    if b.abs() > f64::EPSILON {
-                        let t = -c / b;
-                        if t > 0.0 && t < width {
-                            col_sup = col_sup.max(eval_abs(t));
-                        }
-                    }
-                } else {
-                    let disc = b * b - 4.0 * a * c;
-                    if disc >= 0.0 {
-                        let sqrt_disc = disc.sqrt();
-                        for t in [(-b - sqrt_disc) / (2.0 * a), (-b + sqrt_disc) / (2.0 * a)] {
-                            if t > 0.0 && t < width {
-                                col_sup = col_sup.max(eval_abs(t));
-                            }
-                        }
-                    }
-                }
-            }
-            total += col_sup;
-        }
-        total
-    }
-
     // ── monotonicity enforcement ──
 
     pub(super) fn support_interval(&self) -> Result<(f64, f64), String> {
@@ -1641,5 +1589,20 @@ impl DeviationRuntime {
             }
             .into())
         }
+    }
+}
+
+#[cfg(test)]
+mod breakpoint_tests {
+    use super::breakpoints_from_knots;
+
+    #[test]
+    fn breakpoints_merge_only_exactly_repeated_knots_2469() {
+        // 0.25 + 2⁻⁵⁰ is a distinct knot the basis opens a span at, closer to
+        // 0.25 than any fixed tolerance would allow; exact repeats collapse.
+        let near = 0.25 + 2.0_f64.powi(-50);
+        let knots = [0.0, 0.0, 0.25, 0.25, near, 1.0, 1.0];
+        let breakpoints = breakpoints_from_knots(&knots, "test").unwrap();
+        assert_eq!(breakpoints, vec![0.0, 0.25, near, 1.0]);
     }
 }

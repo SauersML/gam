@@ -29,7 +29,6 @@ pub struct GpuDispatchPolicy {
     pub sparse_min_nnz: usize,
     pub keep_design_resident_min_bytes: usize,
     pub prefer_gpu_factorization_min_p: usize,
-    pub row_kernel_min_n: usize,
     pub mixed_precision: GpuMixedPrecisionPolicy,
 }
 
@@ -55,7 +54,6 @@ impl Default for GpuDispatchPolicy {
             sparse_min_nnz: 1_000_000,
             keep_design_resident_min_bytes: 32 * 1024 * 1024,
             prefer_gpu_factorization_min_p: 512,
-            row_kernel_min_n: 50_000,
             mixed_precision: GpuMixedPrecisionPolicy::Refinement,
         }
     }
@@ -83,14 +81,6 @@ impl GpuDispatchPolicy {
     /// pinned by a compile-time assert there). A single (batch ≤ 1) POTRF with
     /// `p` below this is inadmissible under every reachable policy.
     pub(crate) const MIN_CALIBRATABLE_POTRF_P: usize = 64;
-
-    /// The smallest `row_kernel_min_n` / `xtwx_n_min` ANY production dispatch
-    /// policy can carry: the smallest XtWX calibration row count
-    /// (`calibration::XTWX_DIMS[0].0`, pinned by a compile-time assert there).
-    /// A row-kernel workload with fewer rows is inadmissible under every
-    /// reachable policy, so per-fit GPU-eligibility deciders may refuse it
-    /// BEFORE probing the device.
-    pub const MIN_CALIBRATABLE_ROW_KERNEL_N: usize = 2_048;
 
     /// Minimum problem dimension for the fp32+refinement path.
     ///
@@ -218,7 +208,7 @@ impl GpuDispatchPolicy {
     /// Work-based admission for offloading the **reduced-Schur PCG matvec** (the
     /// InexactPCG hot loop for matrix-free SAE β-blocks) to the device.
     ///
-    /// The dense gates key on row count (`xtwx_n_min`, `row_kernel_min_n`) or on
+    /// The dense gates key on row count (`xtwx_n_min`) or on
     /// one big factorization's flops, and the SAE LLM shape `(n≈2000) × (k≈2048)
     /// × (d≈8)` trips neither: it is thousands of small dense ops. But a CG solve
     /// stages the row frames once and reuses them for `cg_iters` applies, so its

@@ -87,7 +87,7 @@ fn wps_corrected_edf_is_not_below_conditional_edf() {
     assert!(
         fit.penalized_hessian().is_some()
             && fit.coefficient_influence().is_some()
-            && fit.weighted_gram().is_some()
+            && matches!(fit.saved_frame_weighted_gram(), Ok(Some(_)))
             && fit.smoothing_correction().is_some(),
         "fit is missing the H / F / X'WX / smoothing-correction inputs required \
          for the WPS regression"

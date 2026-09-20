@@ -477,13 +477,11 @@ class ResponseGeometryModel:
     def save(self, path: Any) -> None:
         """Serialise the fitted response-geometry model to ``path``.
 
-        Mirrors :meth:`Model.save`; the resulting file round-trips through
-        :func:`gamfit.load`, which reconstructs a
+        Mirrors :meth:`Model.save`, atomic and durable alike; the resulting
+        file round-trips through :func:`gamfit.load`, which reconstructs a
         :class:`ResponseGeometryModel`.
         """
-        from pathlib import Path
-
-        Path(path).write_bytes(self.dumps())
+        rust_module().write_saved_model_file(path, self.dumps())
 
 
 def fit_response_geometry(

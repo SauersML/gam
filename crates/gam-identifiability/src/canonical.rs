@@ -1277,13 +1277,18 @@ fn canonicalize_for_identifiability_inner(
             design: reduced_design,
             offset: spec.offset.clone(),
             penalties: reduced_penalties,
-            // Pulled-back penalties may carry an enlarged structural
-            // nullspace (a column dropped from a smooth's pure-span
-            // basis adds that direction to the penalty kernel).
-            // Falling back to eigenvalue-based rank detection in the
-            // pseudo-logdet path is the safe choice when the
-            // selection-T pullback changes the kernel structurally.
-            nullspace_dims: Vec::new(),
+            // With no dropped column `T` is the identity, so each declared
+            // nullity is a structural fact about the reduced penalty too
+            // (gam#3023). A selection `S_KK` has nullity
+            // `nullity(S) − rank(N_D)` for a null basis `N` restricted to
+            // the dropped rows, which a dimension alone does not determine:
+            // until blocks declare null bases, those ranks come from the
+            // spectrum.
+            nullspace_dims: if dropped_sorted.is_empty() {
+                spec.nullspace_dims.clone()
+            } else {
+                Vec::new()
+            },
             initial_log_lambdas: spec.initial_log_lambdas.clone(),
             initial_beta: reduced_initial_beta,
             gauge_priority: spec.gauge_priority,
@@ -1998,7 +2003,16 @@ fn try_orthogonalize_blocks(
             design: reduced_design,
             offset: spec.offset.clone(),
             penalties: reduced_penalties,
-            nullspace_dims: Vec::new(),
+            // A square `V_b` has orthonormal columns, so it is orthogonal and
+            // `V_bᵀ S V_b` is a congruence: every declared nullity carries
+            // exactly (gam#3023). A narrowed `V_b` leaves
+            // `dim(ker S ∩ range V_b)`, which needs a declared null basis, not
+            // a dimension; until then that rank comes from the spectrum.
+            nullspace_dims: if v_b.ncols() == p_b {
+                spec.nullspace_dims.clone()
+            } else {
+                Vec::new()
+            },
             initial_log_lambdas: spec.initial_log_lambdas.clone(),
             initial_beta: reduced_initial_beta,
             gauge_priority: spec.gauge_priority,
@@ -2541,6 +2555,65 @@ mod tests {
             canon.reduced_specs[0].design.ncols(),
             specs[0].design.ncols(),
             "the higher-priority mean block keeps its columns",
+        );
+    }
+
+    /// A declared penalty nullity survives an orthogonal pullback and only that
+    /// (gam#3023). The mean block keeps its width, so `V_b` is square and
+    /// orthonormal, and `V_bᵀ S V_b` is a congruence with the same nullity. The
+    /// narrowed warp block's nullity is `dim(ker S ∩ range V_b)`, which its
+    /// declared dimension does not determine, so it is not carried.
+    #[test]
+    fn declared_nullity_carries_through_an_orthogonal_pullback_only_3023() {
+        use gam_problem::test_support::spec_from_dense_with_priority;
+        let n = 240;
+        let t = linspace(n);
+        let mut mean = Array2::<f64>::zeros((n, 3));
+        let mut warp = Array2::<f64>::zeros((n, 4));
+        for i in 0..n {
+            mean[[i, 0]] = 1.0;
+            mean[[i, 1]] = t[i];
+            mean[[i, 2]] = (2.0 * t[i]).sin();
+            warp[[i, 0]] = t[i];
+            warp[[i, 1]] = t[i] * t[i];
+            warp[[i, 2]] = t[i] * t[i] * t[i];
+            warp[[i, 3]] = (3.0 * t[i]).cos();
+        }
+        let penalized = |name: &str, design: Array2<f64>, priority: u8| {
+            let p = design.ncols();
+            let mut spec = spec_from_dense_with_priority(name, design, priority);
+            // Nullity 1: the first coefficient is unpenalized.
+            let mut penalty = Array2::<f64>::eye(p);
+            penalty[[0, 0]] = 0.0;
+            spec.penalties = vec![PenaltyMatrix::Dense(penalty)];
+            spec.initial_log_lambdas = Array1::zeros(1);
+            spec.nullspace_dims = vec![1];
+            spec
+        };
+        let specs = [penalized("eta", mean, 100), penalized("wiggle", warp, 80)];
+        let canon = canonicalize_for_identifiability_with_operating_scalars(
+            &specs,
+            &[CoefficientCoordinate::Spanning; 2],
+            None,
+        )
+        .expect("a rank-deficient overlap must canonicalise");
+        let (eta, wiggle) = (&canon.reduced_specs[0], &canon.reduced_specs[1]);
+        assert_eq!(eta.design.ncols(), 3, "the anchor keeps its width");
+        assert_eq!(wiggle.design.ncols(), 3, "the warp sheds one direction");
+        assert_eq!(eta.nullspace_dims, vec![1]);
+        assert!(
+            wiggle.nullspace_dims.is_empty(),
+            "a narrowed pullback must not carry a dimension-only declaration"
+        );
+        // The carried declaration is the reduced penalty's resolved nullity.
+        use gam_linalg::faer_ndarray::FaerEigh;
+        let reduced = eta.penalties[0].as_dense_cow().into_owned();
+        let (values, _) = FaerEigh::eigh(&reduced, faer::Side::Lower)
+            .expect("reduced penalty spectrum");
+        assert_eq!(
+            gam_linalg::roundoff::resolved_eigenvalue_count(&values.to_vec(), 0.0),
+            2,
+            "{values:?}"
         );
     }
 

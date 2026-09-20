@@ -12,14 +12,14 @@
 //! fix (8a8c96d83) was NOT to delete the binding but to *wire it back* so a
 //! `cc`/`cp`/`cyclic` tensor margin with no explicit `period=` once again wraps
 //! on the covariate's observed `[min, max]` span (the #1752 behaviour), mirroring
-//! the 1-D `s(x, bs='cc')` cyclic fallback.
+//! the 1-D `s(x, bs='cyclic')` cyclic fallback.
 //!
 //! The repro test the issue cited (`bug_hunt_periodic_radial_refactor_dead_
 //! binding_breaks_build.rs`) never reached `main`, so this file restores
 //! regression coverage and pins the *behaviour* the binding drives — from two
 //! independent angles so a future refactor cannot silently regress either:
 //!
-//!   1. **Tensor cyclic margin, no `period=`** — `te(x, z, bs=c('cc','cc'))`.
+//!   1. **Tensor cyclic margin, no `period=`** — `te(x, z, bs=c('cyclic','cyclic'))`.
 //!      This is the exact code path `margin_is_cc` guards
 //!      (`term_builder.rs`, `None if margin_is_cc => …`). If a refactor reverts
 //!      to "periodic tensor margins *require* an explicit period" (the tempting
@@ -66,7 +66,7 @@ fn encode_xzy(rows: &[(f64, f64, f64)]) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, records).expect("encode dataset")
 }
 
-/// Angle 1 — `te(x, z, bs=c('cc','cc'))` with NO `period=`: the cyclic margins
+/// Angle 1 — `te(x, z, bs=c('cyclic','cyclic'))` with NO `period=`: the cyclic margins
 /// must wrap on their own observed data range (mgcv `bs="cc"` semantics), not
 /// hard-error demanding an explicit period. This is the `margin_is_cc` path.
 #[test]
@@ -74,7 +74,7 @@ fn tensor_cc_margins_without_period_wrap_on_data_range() {
     init_parallelism();
 
     // Half-open `[0, 1)` grids on BOTH axes, so each margin's data span is the
-    // natural wrap period (`bs='cc'` derives period = max - min).
+    // natural wrap period (`bs='cyclic'` derives period = max - min).
     let n_x = 24usize;
     let n_z = 8usize;
     let mut training = Vec::with_capacity(n_x * n_z);
@@ -92,8 +92,8 @@ fn tensor_cc_margins_without_period_wrap_on_data_range() {
     // (periodic margins require an explicit period) this `fit_from_formula`
     // returns Err and the `.expect` below fails — catching the exact regression
     // from a behavioural angle the compiler alone would miss.
-    let result = fit_from_formula("y ~ te(x, z, bs=c('cc','cc'))", &data, &gaussian_cfg())
-        .expect("te(x,z,bs=c('cc','cc')) with no period must fit by wrapping on the data range");
+    let result = fit_from_formula("y ~ te(x, z, bs=c('cyclic','cyclic'))", &data, &gaussian_cfg())
+        .expect("te(x,z,bs=c('cyclic','cyclic')) with no period must fit by wrapping on the data range");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian cyclic tensor smooth");
     };

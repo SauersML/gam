@@ -37,7 +37,7 @@
 //! cause-specific hazard model with a parametric Weibull baseline and a
 //! flexible thin-plate covariate smooth:
 //!
-//!     Surv(N_Days, event_k) ~ s(Age, bs='tp'),   survival_likelihood = weibull
+//!     Surv(N_Days, event_k) ~ s(Age, bs='tps'),   survival_likelihood = weibull
 //!
 //! This is a proportional-hazards cause-specific model:
 //!     H_k(t | x) = (t / scale_k)^shape_k * exp(eta_k(x)),
@@ -203,7 +203,7 @@ fn cause_cumulative_hazard(
         survival_likelihood: Some("weibull".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("Surv(N_Days, event) ~ s(Age, bs='tp')", &data, &cfg)
+    let result = fit_from_formula("Surv(N_Days, event) ~ s(Age, bs='tps')", &data, &cfg)
         .unwrap_or_else(|e| panic!("gam Weibull cause-specific fit for {cause_label} failed: {e}"));
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!(

@@ -288,8 +288,12 @@ fn penalty_is_constrained_kernel_gram() {
 // ---------------------------------------------------------------------------
 
 fn termspec_for(formula: &str) -> gam::terms::smooth::TermCollectionSpec {
+    termspec_result(formula).unwrap_or_else(|e| panic!("{formula}: {e}"))
+}
+
+fn termspec_result(formula: &str) -> Result<gam::terms::smooth::TermCollectionSpec, String> {
     use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-    let parsed = parse_formula(formula).expect("formula parses");
+    let parsed = parse_formula(formula).map_err(|e| e.to_string())?;
     let values = array![
         [1.0, 0.05, -0.10],
         [2.0, -0.42, 0.31],
@@ -323,7 +327,7 @@ fn termspec_for(formula: &str) -> gam::terms::smooth::TermCollectionSpec {
         &col_map,
         &mut notes,
     )
-    .expect("term spec")
+    .map_err(|e| e.to_string())
 }
 
 #[test]
@@ -355,14 +359,8 @@ fn curv_formula_builds_constant_curvature_term() {
 }
 
 #[test]
-fn curvature_aliases_all_dispatch_to_constant_curvature() {
-    for formula in [
-        "y ~ curvature(x1, x2)",
-        "y ~ constant_curvature(x1, x2)",
-        "y ~ mkappa(x1, x2)",
-        "y ~ s(x1, x2, bs=\"curv\")",
-        "y ~ s(x1, x2, type=\"curvature\")",
-    ] {
+fn curv_is_the_one_spelling_and_removed_spellings_name_it() {
+    for formula in ["y ~ curv(x1, x2)", "y ~ s(x1, x2, bs=\"curv\")"] {
         let spec = termspec_for(formula);
         assert!(
             matches!(
@@ -372,6 +370,16 @@ fn curvature_aliases_all_dispatch_to_constant_curvature() {
             "{formula} did not build a kappa=0 ConstantCurvature term: {:?}",
             spec.smooth_terms[0].basis
         );
+    }
+    for (formula, expected) in [
+        ("y ~ curvature(x1, x2)", "unknown term function `curvature`; use `curv()`"),
+        ("y ~ constant_curvature(x1, x2)", "unknown term function `constant_curvature`; use `curv()`"),
+        ("y ~ mkappa(x1, x2)", "unknown term function `mkappa`; use `curv()`"),
+        ("y ~ s(x1, x2, bs=\"curvature\")", "unknown smooth type `curvature`; use `curv`"),
+        ("y ~ s(x1, x2, bs=\"mkappa\")", "unknown smooth type `mkappa`; use `curv`"),
+    ] {
+        let err = termspec_result(formula).expect_err(formula);
+        assert!(err.contains(expected), "{formula}: expected `{expected}`, got `{err}`");
     }
 }
 

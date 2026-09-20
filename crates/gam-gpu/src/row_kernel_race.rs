@@ -182,6 +182,143 @@ pub fn race_row_kernel<T, E>(
     Ok(out)
 }
 
+/// One call of a row kernel that `auto` admitted to its race and that runs as
+/// a sequence of tiles: the executor recorded for `shape` when a race of its
+/// law has since settled it (an earlier tile of the same pass), otherwise a
+/// race of this tile. `device` returns the device executor's value, which is
+/// used when the device is the recorded faster.
+pub fn run_measured_row_kernel<T, E>(
+    shape: RowKernelShape,
+    cpu: impl FnOnce() -> Result<T, E>,
+    mut device: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    match measured_executor(&shape) {
+        Some(MeasuredExecutor::Cpu) => cpu(),
+        Some(MeasuredExecutor::Device) => device(),
+        None => race_row_kernel(shape, cpu, || device().map(|_| ())),
+    }
+}
+
+/// The race of a row kernel whose executors each build state once and then
+/// apply against it many times: the SAE residual-curvature HVP, whose CPU
+/// executor keeps per-state contractions that each CG apply reads, and the BMS
+/// FLEX row-primary Hessian, whose device executor keeps the row Hessians and
+/// designs resident for every inner CG HVP. Timing one apply would leave out
+/// the builds each choice pays and the reuse it buys, so the race times the
+/// whole state: both builds, then both executors on every apply against them.
+/// The device executor's build and its first apply each also run once
+/// untimed, which pays compilation, allocation and first touch as
+/// [`race_row_kernel`]'s cold call does. Every apply returns the CPU
+/// executor's value, and the totals are recorded when the state is dropped,
+/// so the next state of this shape reads them. A state with no apply, or one
+/// an executor faulted in, records nothing.
+pub struct ReusedStateRace {
+    shape: RowKernelShape,
+    ledger: Mutex<ReusedStateLedger>,
+}
+
+struct ReusedStateLedger {
+    cpu_seconds: f64,
+    device_seconds: f64,
+    applies: usize,
+    faulted: bool,
+}
+
+impl ReusedStateRace {
+    /// Build both executors' states for `shape`, timed. An executor that keeps
+    /// nothing builds `()`.
+    pub fn build<C, D, E>(
+        shape: RowKernelShape,
+        cpu_state: impl FnOnce() -> Result<C, E>,
+        mut device_state: impl FnMut() -> Result<D, E>,
+    ) -> Result<(Self, C, D), E> {
+        let started = Instant::now();
+        let cpu = cpu_state()?;
+        let cpu_seconds = started.elapsed().as_secs_f64();
+        drop(device_state()?);
+        let started = Instant::now();
+        let device = device_state()?;
+        let race = Self {
+            shape,
+            ledger: Mutex::new(ReusedStateLedger {
+                cpu_seconds,
+                device_seconds: started.elapsed().as_secs_f64(),
+                applies: 0,
+                faulted: false,
+            }),
+        };
+        Ok((race, cpu, device))
+    }
+
+    /// One apply against the state: both executors, timed; the CPU value.
+    pub fn apply<T, E>(
+        &self,
+        cpu: impl FnOnce() -> Result<T, E>,
+        mut device: impl FnMut() -> Result<(), E>,
+    ) -> Result<T, E> {
+        let cold = self.lock().applies == 0;
+        let timed = (|| {
+            let started = Instant::now();
+            let out = cpu()?;
+            let cpu_seconds = started.elapsed().as_secs_f64();
+            if cold {
+                device()?;
+            }
+            let started = Instant::now();
+            device()?;
+            Ok((out, cpu_seconds, started.elapsed().as_secs_f64()))
+        })();
+        let mut ledger = self.lock();
+        match timed {
+            Ok((out, cpu_seconds, device_seconds)) => {
+                ledger.cpu_seconds += cpu_seconds;
+                ledger.device_seconds += device_seconds;
+                ledger.applies += 1;
+                Ok(out)
+            }
+            Err(error) => {
+                ledger.faulted = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReusedStateLedger> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Drop for ReusedStateRace {
+    fn drop(&mut self) {
+        let ledger = self
+            .ledger
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ledger.faulted || ledger.applies == 0 {
+            return;
+        }
+        record(&self.shape, ledger.cpu_seconds, ledger.device_seconds);
+        log::debug!(
+            "[GPU row-kernel race] kernel={} rows={} widths={:?} threads={} applies={} \
+             cpu_build_and_applies={:.6}s device_build_and_applies={:.6}s selects={}",
+            self.shape.kernel.as_str(),
+            self.shape.rows,
+            self.shape.widths,
+            self.shape.threads,
+            ledger.applies,
+            ledger.cpu_seconds,
+            ledger.device_seconds,
+            if ledger.device_seconds < ledger.cpu_seconds {
+                "device"
+            } else {
+                "cpu"
+            },
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +432,106 @@ mod tests {
             || Err("device fault".to_string()),
         );
         assert_eq!(fault, Err("device fault".to_string()));
+    }
+
+    /// A tiled pass races its first tile and reads the record on every later
+    /// tile of the same shape.
+    #[test]
+    fn a_tiled_pass_races_once_per_shape_3024() {
+        let shape = RowKernelShape {
+            kernel: GpuKernel::FinalInference,
+            rows: 3_048,
+            widths: [30, 48, 0, 0],
+            threads: 1,
+        };
+        let mut device_runs = 0;
+        for _ in 0..3 {
+            let value = run_measured_row_kernel(
+                shape,
+                || Ok::<_, String>(2.0),
+                || {
+                    device_runs += 1;
+                    Ok(2.0)
+                },
+            )
+            .expect("both executors succeed");
+            assert_eq!(value, 2.0);
+        }
+        let first_tile = 2;
+        assert!(
+            device_runs == first_tile || device_runs == first_tile + 2,
+            "the first tile races (two device calls), each later one runs the \
+             recorded executor once; got {device_runs} device calls"
+        );
+        assert!(measured_executor(&shape).is_some());
+    }
+
+    /// A reused-state race times both builds plus every apply on each
+    /// executor, runs the device's build and first apply once cold, records
+    /// only when its state drops, returns the CPU value, and records nothing
+    /// for a state an executor faulted in or that was never applied.
+    #[test]
+    fn a_reused_state_race_records_its_whole_state_on_drop_3024() {
+        let shape = RowKernelShape {
+            kernel: GpuKernel::FinalInference,
+            rows: 3_348,
+            widths: [33, 48, 0, 0],
+            threads: 1,
+        };
+        let mut device_builds = 0;
+        let (race, kept, resident) = ReusedStateRace::build(
+            shape,
+            || Ok::<_, String>(4.0),
+            || {
+                device_builds += 1;
+                Ok(device_builds)
+            },
+        )
+        .expect("both builds succeed");
+        assert_eq!(
+            (device_builds, resident),
+            (2, 2),
+            "the device builds once cold, then keeps its timed build"
+        );
+        let mut device_runs = 0;
+        for _ in 0..3 {
+            let value = race
+                .apply(
+                    || Ok::<_, String>(kept * 2.0),
+                    || {
+                        device_runs += 1;
+                        Ok(())
+                    },
+                )
+                .expect("both executors succeed");
+            assert_eq!(value, 8.0);
+        }
+        assert_eq!(device_runs, 4, "one untimed cold call, then one per apply");
+        assert_eq!(
+            measured_executor(&shape),
+            None,
+            "nothing is recorded while the state lives"
+        );
+        drop(race);
+        assert!(measured_executor(&shape).is_some());
+
+        let unapplied = RowKernelShape {
+            rows: 3_349,
+            ..shape
+        };
+        drop(ReusedStateRace::build(unapplied, || Ok::<_, String>(()), || Ok(())).expect("built"));
+        assert_eq!(measured_executor(&unapplied), None);
+        let faulted = RowKernelShape {
+            widths: [33, 49, 0, 0],
+            ..shape
+        };
+        let (race, (), ()) =
+            ReusedStateRace::build(faulted, || Ok::<_, String>(()), || Ok(())).expect("built");
+        assert_eq!(
+            race.apply(|| Ok(1.0), || Err("device fault".to_string())),
+            Err("device fault".to_string())
+        );
+        drop(race);
+        assert_eq!(measured_executor(&faulted), None);
     }
 }

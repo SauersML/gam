@@ -72,7 +72,7 @@ fn main() {
     let cfg = FitConfig {
         survival_likelihood: Some("marginal-slope".to_string()),
         z_column: Some("ejection_fraction".to_string()),
-        slope_formula: Some("s(age, bs='tp', k=4)".to_string()),
+        slope_formula: Some("s(age, bs='tps', k=4)".to_string()),
         baseline_target: "linear".to_string(),
         gpu_policy: gam::gpu::GpuPolicy::Off,
         ..FitConfig::default()

@@ -140,7 +140,7 @@ fn survival_location_scale_constant_scale_fit_terminates_1389() {
     // completes in seconds; a generous 300s wall guards against the hang
     // recurring without flaking on normal scheduler/CI jitter.
     let started = Instant::now();
-    let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tp", k=5)"#, &ds, &cfg)
+    let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tps", k=5)"#, &ds, &cfg)
         .expect("constant-scale survival location-scale AFT fit");
     let elapsed = started.elapsed();
     assert!(
