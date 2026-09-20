@@ -122,10 +122,10 @@ fn sampled_marginal_splice_outer_gradient_matches_finite_difference_2623() {
     // FIXTURE CELL, CHOSEN BY MEASUREMENT (2026-09-04). The gate arms only where
     // the #784 splice engages, and the cell this test shipped with —
     // `fixture(240, 6, 3.0)` at `rho = [-1.0, -0.95]` — stopped engaging once the
-    // admission became a latched property of the MODEL (the `m` largest-|γ_r|
-    // positive-curvature directions at each ρ) instead of a per-ρ threshold
-    // crossing. The gate then failed on its own arming assertion, i.e. it was a
-    // dark instrument: it graded nothing and said so.
+    // admission became a latched property of the MODEL (the directions at the
+    // spectral positions the admission integrated, taken at each ρ) instead of a
+    // per-ρ threshold crossing. The gate then failed on its own arming
+    // assertion, i.e. it was a dark instrument: it graded nothing and said so.
     //
     // A 144-cell sweep over `n ∈ {120, 240, 480} × k ∈ {4, 6, 8} × amp ∈
     // {3, 6, 12, 24} × ρ ∈ {-1, 1, 3, 5}` on this same builder found five cells

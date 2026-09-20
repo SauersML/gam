@@ -7,34 +7,7 @@ pub(super) enum GeometryBackendKind {
     SparseExactSpd,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum HessianEvalStrategyKind {
-    SpectralExact,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct HessianStrategyDecision {
-    pub(super) strategy: HessianEvalStrategyKind,
-}
-
 impl<'a> RemlState<'a> {
-    pub(super) fn selecthessian_strategy_policy(
-        &self,
-        bundle: &EvalShared,
-    ) -> HessianStrategyDecision {
-        // When the sparse-exact backend produced the PIRLS result, prefer
-        // the sparse Hessian path for consistency (avoids dense→sparse
-        // round-trip that loses sparsity structure).
-        if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
-            return HessianStrategyDecision {
-                strategy: HessianEvalStrategyKind::SpectralExact,
-            };
-        }
-        HessianStrategyDecision {
-            strategy: HessianEvalStrategyKind::SpectralExact,
-        }
-    }
-
     /// Upper-triangle density of the penalized Hessian above which the sparse
     /// exact-SPD backend loses its advantage and we fall back to dense: once
     /// >10% of entries are nonzero, sparse factorization fill-in and bookkeeping

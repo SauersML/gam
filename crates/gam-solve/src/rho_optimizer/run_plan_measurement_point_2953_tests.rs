@@ -1,12 +1,13 @@
-//! #2953: an outer result's gradient is a measurement at a point, and the
-//! gradient-reproducibility floor widens only when that point is the one being
-//! certified.
+//! #2953: an outer result's gradient is a measurement at a point.
 //!
 //! The incident: a one-iteration search inside a Gaussian well stopped at one ρ,
 //! the dominance continuation from it stopped at a second, and the incumbent took
-//! the second ρ and value while keeping the first gradient. The floor then read
-//! the two gradients as a same-ρ redraw and widened the bound past the slope it
-//! was judging.
+//! the second ρ and value while keeping the first gradient.
+//!
+//! #3531: a second measurement at the same ρ is not a noise sample either. The
+//! solver's recorded measurement comes from a capped inner solve, so its gradient
+//! is off at first order in the inner truncation while its value is off only at
+//! second order, and the certificate judges `|Pg|` on its own evaluation alone.
 
 use super::*;
 use ndarray::array;
@@ -161,29 +162,18 @@ fn the_dominance_incumbent_does_not_certify_on_the_slope_between_two_points_2953
                 message.contains("NOT STATIONARY"),
                 "the refusal must be the ordinary non-stationarity one: {message}",
             );
-            assert!(
-                !message.contains(StationarityBoundSource::GradientReproducibility.label()),
-                "a deterministic criterion has no gradient noise for the floor to measure: \
-                 {message}",
-            );
         }
     }
 }
 
-/// A flat criterion whose certificate-time gradient is `CERT_GRADIENT`, certified
-/// at `POINT` with a run-recorded measurement of gradient `RECORDED_GRADIENT`
-/// taken at `recorded_rho`. When the two measurements share a point their spread
-/// is 2.5, so the floor's bound is exactly 5.0 against |Pg| = 3.
-fn certify_flat_point_with_recorded_measurement(
-    recorded_rho: f64,
-) -> Result<OuterCriterionCertificate, EstimationError> {
-    let (mut obj, config, mut result) = flat_point_with_recorded_measurement(recorded_rho);
-    certify_outer_optimality(&mut obj, &config, "reproducibility floor #2953", &mut result)
-}
-
-fn flat_point_with_recorded_measurement(
-    recorded_rho: f64,
-) -> (impl OuterObjective, OuterConfig, OuterResult) {
+/// A flat criterion whose certificate-time gradient is `CERT_GRADIENT` = 3,
+/// certified at its own ρ while the result carries the solver's measurement at
+/// that same ρ with a different gradient and the same value, as a capped inner
+/// solve returns: first-order error in the gradient, none visible in the value.
+/// The two gradients differ by 2.5, so the retired floor bounded `|Pg|` by 5.0
+/// and minted the point.
+#[test]
+fn a_same_rho_gradient_disagreement_does_not_widen_the_stationarity_bound_3531() {
     const POINT: f64 = 0.5;
     const FLAT_VALUE: f64 = 1.0;
     const CERT_GRADIENT: f64 = 3.0;
@@ -192,7 +182,7 @@ fn flat_point_with_recorded_measurement(
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable);
     let config = problem.config();
-    let obj = problem.build_objective(
+    let mut obj = problem.build_objective(
         (),
         |_: &mut (), _: &Array1<f64>| Ok(FLAT_VALUE),
         |_: &mut (), _: &Array1<f64>| {
@@ -217,86 +207,31 @@ fn flat_point_with_recorded_measurement(
         },
     );
     result.final_measurement = Some(OuterFirstOrderMeasurement::new(
-        array![recorded_rho],
+        array![POINT],
         FLAT_VALUE,
         array![RECORDED_GRADIENT],
     ));
-    (obj, config, result)
-}
-
-/// The run plan screens a candidate and then mints the winner, both on one
-/// result at one ρ. Each pass re-measures from a reset, so the mint's evaluation
-/// replays the screening's bit for bit; the solver's own measurement, the one
-/// that differs, is the one screening displaced. Before the mint weighed it, the
-/// mint saw a spread of exactly zero and refused the point screening certified
-/// (inverse-Gaussian `y ~ s(x0)`, n = 100: |Pg| = 5.307e-10, screening bound
-/// 9.943e-10 from the floor, mint bound 1.500e-10).
-#[test]
-fn the_mint_keeps_the_solver_measurement_screening_displaced() {
-    let (mut obj, config, mut result) = flat_point_with_recorded_measurement(0.5);
-    let screened = certify_outer_optimality_with_fidelity(
-        &mut obj,
-        &config,
-        "screening before the mint",
-        &mut result,
-        CertificationFidelity::Screening,
-    )
-    .expect("screening holds the solver's measurement and the reset one at one rho");
-    assert_eq!(
-        screened.stationarity.rung().label,
-        StationarityBoundSource::GradientReproducibility.label(),
-        "{}",
-        screened.summary(),
-    );
-    let minted = certify_outer_optimality(&mut obj, &config, "mint after screening", &mut result)
-        .expect("the mint holds the same two measurements screening certified on");
-    assert!(minted.certifies(), "{}", minted.summary());
-    assert_eq!(
-        minted.stationarity.rung().label,
-        StationarityBoundSource::GradientReproducibility.label(),
-        "{}",
-        minted.summary(),
-    );
-    assert_eq!(
-        minted.stationarity.bound().to_bits(),
-        screened.stationarity.bound().to_bits(),
-        "the mint must judge by the bound screening derived at the same rho: screening {}, \
-         mint {}",
-        screened.summary(),
-        minted.summary(),
-    );
-}
-
-#[test]
-fn the_reproducibility_floor_widens_only_on_a_measurement_at_the_certified_rho_2953() {
-    let same_point = certify_flat_point_with_recorded_measurement(0.5)
-        .expect("two measurements at the certified rho whose gradients disagree widen the bound");
-    assert!(same_point.certifies(), "{}", same_point.summary());
-    assert_eq!(
-        same_point.stationarity.rung().label,
-        StationarityBoundSource::GradientReproducibility.label(),
-        "{}",
-        same_point.summary(),
-    );
-    assert_eq!(
-        same_point.stationarity.bound().to_bits(),
-        5.0_f64.to_bits(),
-        "the widened bound is twice the spread between the two measurements: {}",
-        same_point.summary(),
-    );
-
-    // One ulp away is a different point, so the spread is not a redraw.
-    let neighbour = f64::from_bits(0.5_f64.to_bits() + 1);
-    let refusal = certify_flat_point_with_recorded_measurement(neighbour)
-        .expect_err("a measurement taken at another rho is not a redraw of this one");
-    let message = refusal.to_string();
-    assert!(
-        message.contains("NOT STATIONARY"),
-        "the refusal must be the ordinary non-stationarity one: {message}",
-    );
-    assert!(
-        !message.contains(StationarityBoundSource::GradientReproducibility.label()),
-        "the floor must not decide a point its recorded measurement was not taken at: \
-         {message}",
-    );
+    for fidelity in [CertificationFidelity::Screening, CertificationFidelity::Mint] {
+        match certify_outer_optimality_with_fidelity(
+            &mut obj,
+            &config,
+            "same-rho gradient disagreement #3531",
+            &mut result,
+            fidelity,
+        ) {
+            Ok(certificate) => panic!(
+                "{fidelity:?}: |Pg| = {CERT_GRADIENT} on a flat criterion was certified on the \
+                 spread between two measurements: {}",
+                certificate.summary(),
+            ),
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("NOT STATIONARY"),
+                    "{fidelity:?}: the refusal must be the ordinary non-stationarity one: \
+                     {message}",
+                );
+            }
+        }
+    }
 }

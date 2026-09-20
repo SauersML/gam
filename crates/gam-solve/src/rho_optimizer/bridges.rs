@@ -138,8 +138,6 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
 
 pub(crate) const VALUE_PROBE_CACHE_CAPACITY: usize = 256;
 
-pub(crate) const VALUE_PROBE_REJECT_COST_FLOOR: f64 = 1.0e11;
-
 /// Sentinel embedded in the fatal [`ObjectiveEvalError`] message the bridge
 /// returns when [`CostStallGuard`] halts BFGS on a cost stall. `opt::Bfgs`
 /// preserves the message verbatim in [`BfgsError::ObjectiveFailed`]; the
@@ -1572,9 +1570,14 @@ pub(crate) fn value_probe_outcome_label(outcome: &CachedValueProbeOutcome) -> &'
     }
 }
 
+/// Whether a memoized value probe is a refused trial, kept across value+gradient
+/// evaluations so a re-queried refusal does not pay another inner solve. A
+/// finite cost is never a refusal: refusals arrive as typed
+/// [`ObjectiveEvalError`]s, and `finite_cost_or_error` turns a non-finite cost
+/// into one before it is cached (#3543).
 pub(crate) fn value_probe_reject_outcome(outcome: &CachedValueProbeOutcome) -> bool {
     match outcome {
-        CachedValueProbeOutcome::Cost(cost) => *cost >= VALUE_PROBE_REJECT_COST_FLOOR,
+        CachedValueProbeOutcome::Cost(_) => false,
         CachedValueProbeOutcome::Recoverable(_) | CachedValueProbeOutcome::Fatal(_) => true,
     }
 }
@@ -1725,12 +1728,8 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         // evaluation before doing anything else: a stalled verdict must halt
         // this call rather than pay another inner solve first (#2613).
         self.drain_accepted_steps()?;
-        // Per-axis line-search step caps now live natively in opt::Bfgs
-        // (`with_axis_step_caps`), which shortens the BFGS direction before
-        // line search instead of poisoning the Wolfe bracket with a
-        // sentinel cost. This entry point can therefore stay honest: any
-        // call that lands here is a real line-search probe, not a too-far
-        // attempt the bridge needs to swat away.
+        // Every call that lands here is a real line-search probe: no step
+        // budget shortens or refuses a probe, on this side or in opt.
         //
         // Uncap the inner solve for the line-search cost probe (see the field
         // doc on `outer_inner_cap`): the deciding cost MUST be the true
