@@ -35,8 +35,8 @@
 //! A clean 2-block model (no aliasing) with full-rank penalties on both
 //! blocks passes canonicalize without triggering any failure.
 
-use gam::families::custom_family::ParameterBlockSpec;
-use gam::identifiability::audit::{MapUniquenessError, check_map_uniqueness};
+use gam::families::custom_family::{CustomFamilyError, ParameterBlockSpec};
+use gam::identifiability::audit::check_map_uniqueness;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::{Array1, Array2};
 
@@ -114,7 +114,7 @@ fn map_uniqueness_check_passes_with_covering_penalty() {
     s[[2, 2]] = 1.0; // S_B[0,0]
     let (specs, col_offsets) = build_two_block_specs();
 
-    let result: Result<(), MapUniquenessError> =
+    let result: Result<(), CustomFamilyError> =
         check_map_uniqueness(&j, &[], &s, &specs, &col_offsets);
 
     assert!(
@@ -138,11 +138,11 @@ fn map_uniqueness_check_fails_when_s_zero_on_null_direction() {
     s[[0, 0]] = 1.0; // S_A[0,0] — penalises v_shared; null direction has n[0]=0
     let (specs, col_offsets) = build_two_block_specs();
 
-    let result: Result<(), MapUniquenessError> =
+    let result: Result<(), CustomFamilyError> =
         check_map_uniqueness(&j, &[], &s, &specs, &col_offsets);
 
     match result {
-        Err(err) => {
+        Err(CustomFamilyError::MapUniquenessFailure { error: err }) => {
             assert!(
                 err.dominant_block == "block_a" || err.dominant_block == "block_b",
                 "dominant block must be block_a or block_b; got '{}'",
@@ -158,6 +158,12 @@ fn map_uniqueness_check_fails_when_s_zero_on_null_direction() {
                 err.message.contains(&err.dominant_block),
                 "error message must contain the dominant block name; message: '{}'",
                 err.message,
+            );
+        }
+        Err(other) => {
+            panic!(
+                "MAP uniqueness check must refuse as a MAP-uniqueness failure when S = 0 on \
+                 the null direction; got {other:?}"
             );
         }
         Ok(()) => {
