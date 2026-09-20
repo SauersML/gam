@@ -4743,8 +4743,8 @@ type RpRowEvaluation = (f64, f64, f64, f64);
 /// is a sum of `p + 2` terms, so its forward error is at most
 /// `δ = γ_{p+2} · (Σ_j |x_j β_j| + |eta_time_offset| + |primary_offset|)`
 /// (Higham, Lemma 3.1 / inner-product bound). `exp` is faithfully rounded, a
-/// relative error below `ε`, so
-/// `|Ĥ − H| ≤ Ĥ · (expm1(δ) + ε) / (1 − ε)`.
+/// relative error below `ε = 2u`, so with `γ_2 = ε / (1 − ε)`
+/// `|Ĥ − H| ≤ Ĥ · (expm1(δ) + ε) / (1 − ε) = Ĥ · (expm1(δ) · (1 + γ_2) + γ_2)`.
 /// The competing-risks Aalen-Johansen assembly uses it to tell a rounding-level
 /// decrease of `H` between two evaluations from a real one (#3529).
 fn evaluate_rp_row_with_beta(
@@ -4861,7 +4861,8 @@ fn evaluate_rp_row_with_beta(
         + eta_time_offset_row.abs()
         + primary_offset_row.abs();
     let eta_band = gam_linalg::roundoff::accumulation_growth(p + 2) * eta_magnitude;
-    let cum_band = cum * (eta_band.exp_m1() + f64::EPSILON) / (1.0 - f64::EPSILON);
+    let exp_growth = gam_linalg::roundoff::accumulation_growth(2);
+    let cum_band = cum * (eta_band.exp_m1() * (1.0 + exp_growth) + exp_growth);
     Ok((eta, cum, haz, cum_band))
 }
 
