@@ -14,7 +14,7 @@
 //! - `N(z) = ∫₀^∞ w e^{−zw − w²/2} dw = 1 − z·R(z)`, with `R` Mills' ratio.
 //!
 //! When `ρ ≤ 0` and `α₁, α₂ ≥ 0` every factor is positive. So nothing cancels, and the value keeps its relative digits
-//! however small it is. That is the certified region. The core's `Φ(h)Φ(k) + T` cancels there instead.
+//! however small it is. That is the certified region. A Drezner-Wesolowsky sum `Φ(h)Φ(k) + T` cancels there instead.
 //!
 //! # Map
 //!
@@ -54,7 +54,8 @@ use crate::roundoff::UNIT_ROUNDOFF;
 use crate::score_opt::{ClosedInterval, certified_ln_1p};
 use std::f64::consts::PI;
 
-/// The truncation target relative to the lower bound on `I`: `2ε`, the rounding scale the core order targets.
+/// The truncation target relative to the lower bound on `I`: `2ε`, the rounding scale of a Gauss-Legendre sum whose
+/// weights sum to 2.
 const TRUNCATION_TARGET: f64 = 2.0 * f64::EPSILON;
 
 /// A log-radius admissible for every law in the certified region, so every call can certify at it.
@@ -793,10 +794,8 @@ fn bounded(enclosure: ClosedInterval) -> Option<BoundedProbability> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bivariate_normal::{
-        BIVARIATE_NORMAL_CDF_ERROR_BOUND, bivariate_normal_cdf_with_complement,
-        bivariate_normal_cdf_with_complement_bounded,
-    };
+    use crate::bivariate_normal::bivariate_normal_cdf_with_complement;
+    use crate::probability::{NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, normal_cdf_and_pdf};
 
     /// `(h, k, ρ, c, Φ₂)` at exact binary64 laws inside the certified region: fr-kernel's 14 cells with their
     /// `c = (1 − ρ)(1 + ρ)` as formed in binary64, a sweep over `φ₀ ∈ {π/4, 0.2, 0.02}`, `|α| ∈ {0.1, 1, 10, 40}` and
@@ -895,12 +894,12 @@ mod tests {
     const APEX_RELATIVE_BOUND: f64 = 1.0e-12;
 
     fn bounded_at(h: f64, k: f64, rho: f64, complement: f64) -> BoundedProbability {
-        bivariate_normal_cdf_with_complement_bounded(h, k, rho, complement).unwrap()
+        bivariate_normal_cdf_with_complement(h, k, rho, complement).unwrap()
     }
 
     #[test]
     fn certified_bound_and_apex_tree_cover_the_references() {
-        let mut below_the_absolute_bound = false;
+        let mut below_absolute_resolution = false;
         for &(h, k, rho, complement, reference) in REFERENCES {
             let certified = relative_orthant(h, k, rho, complement).unwrap();
             let apex = bounded_at(h, k, rho, complement);
@@ -921,11 +920,12 @@ mod tests {
                 apex.rounding,
                 apex.value
             );
-            below_the_absolute_bound |= reference <= BIVARIATE_NORMAL_CDF_ERROR_BOUND;
+            below_absolute_resolution |= reference <= UNIT_ROUNDOFF;
         }
+        // An absolute bound on a probability is at least the unit roundoff, the rounding of a value near one.
         assert!(
-            below_the_absolute_bound,
-            "some reference must lie below the core's absolute bound, where only a relative bound resolves it"
+            below_absolute_resolution,
+            "some reference must lie below the unit roundoff, where only a relative bound resolves it"
         );
     }
 
@@ -983,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn outside_the_certified_region_the_oracle_declines_and_the_apex_tree_meets_the_core() {
+    fn outside_the_certified_region_the_oracle_declines_and_the_apex_tree_keeps_the_complementary_identity() {
         let mut cells: Vec<(f64, f64, f64, f64)> = SUBNORMAL_DENSITY.to_vec();
         cells.extend([
             // ρ > 0.
@@ -1001,17 +1001,28 @@ mod tests {
         ]);
         for &(h, k, rho, complement) in &cells {
             assert!(relative_orthant(h, k, rho, complement).is_none(), "({h}, {k}, {rho}, {complement})");
+            // `Φ₂(h, k; ρ) + Φ₂(h, −k; −ρ) = Φ(h)`. A constraint active in one orthant is inactive in the other, so the
+            // two take different branches of the tree. The sum adds its rounding, and `Φ(h)` its own.
             let apex = bounded_at(h, k, rho, complement);
-            let plain = bivariate_normal_cdf_with_complement(h, k, rho, complement).unwrap();
+            let mirror = bounded_at(h, -k, -rho, complement);
+            let total = apex.value + mirror.value;
+            let marginal = normal_cdf_and_pdf(h).0;
+            let allowance = apex.rounding
+                + mirror.rounding
+                + UNIT_ROUNDOFF * total
+                + NORMAL_CDF_RELATIVE_ERROR * marginal
+                + NORMAL_CDF_UNDERFLOW_FLOOR;
             assert!(
-                (apex.value - plain).abs() <= apex.rounding + BIVARIATE_NORMAL_CDF_ERROR_BOUND,
-                "({h}, {k}, {rho}, {complement}) apex={:e}±{:e} core={plain:e}",
+                (total - marginal).abs() <= allowance,
+                "({h}, {k}, {rho}, {complement}) apex={:e}±{:e} mirror={:e}±{:e} Φ(h)={marginal:e}",
                 apex.value,
-                apex.rounding
+                apex.rounding,
+                mirror.value,
+                mirror.rounding
             );
         }
-        assert!(bivariate_normal_cdf_with_complement_bounded(0.0, 0.0, -0.5, -1.0e-3).is_err());
-        assert!(bivariate_normal_cdf_with_complement_bounded(f64::NAN, 0.0, -0.5, 0.75).is_err());
+        assert!(bivariate_normal_cdf_with_complement(0.0, 0.0, -0.5, -1.0e-3).is_err());
+        assert!(bivariate_normal_cdf_with_complement(f64::NAN, 0.0, -0.5, 0.75).is_err());
     }
 
     #[test]

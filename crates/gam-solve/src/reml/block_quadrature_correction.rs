@@ -200,6 +200,15 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<bool, EstimationError> {
+        // A family the correction never applies to has its decision without an
+        // evaluation: the verdict below would only reach the same decline, after
+        // a reset that discards the certified optimum's inner solve and a fresh
+        // one to replace it.
+        if let Some(reason) = self.block_correction_family_decline() {
+            log::trace!("[#784] block-local correction declined at the optimum: {reason}");
+            *self.block_correction_decision_guard() = BlockCorrectionDecision::DeclinedAtOptimum;
+            return Ok(false);
+        }
         *self.block_correction_decision_guard() = BlockCorrectionDecision::DecidingAtOptimum;
         // Every cached evaluation priced the Laplace criterion, and the decision
         // is taken at the terminal inner mode, not a capped screening one.
@@ -212,6 +221,45 @@ impl<'a> RemlState<'a> {
             *decision = BlockCorrectionDecision::DeclinedAtOptimum;
         }
         Ok(*decision == BlockCorrectionDecision::AdmittedAtOptimum)
+    }
+
+    /// Why the correction never applies to this fit's likelihood, if it never
+    /// does. Each reason reads only the configured family, so it holds at every
+    /// ρ of the fit.
+    fn block_correction_family_decline(&self) -> Option<&'static str> {
+        if reml_is_gaussian_identity(&self.config.likelihood) {
+            return Some("Laplace is exact for the Gaussian-identity model");
+        }
+        // The exact score channel relies on the exponential-family unit-
+        // deviance identity dD/dμ = −2w(y−μ)/V(μ), which does not hold for
+        // the Beta pseudo-family parameterization. Decline rather than splice
+        // a gradient that is not the derivative of the spliced value.
+        if matches!(
+            reml_spec(&self.config.likelihood).response,
+            ResponseFamily::Beta { .. }
+        ) {
+            return Some(
+                "the Beta family has no exponential-family score identity for the exact \
+                 gradient channels",
+            );
+        }
+        // Firth/Jeffreys fits: the integrand `Gam784BlockTarget::excess` is the
+        // remainder of the PLAIN penalized likelihood about its mode, but under
+        // Firth β̂ is the mode of the Jeffreys-penalized objective. The plain
+        // remainder then keeps a linear term (∇Φ(β̂) ≠ 0), omits the Jeffreys
+        // change Φ(β̂+δ)−Φ(β̂), and subtracts only XᵀWX while the draws are
+        // scaled by `h_total`, which carries −H_Φ. On separated data that
+        // mis-targeted Δ_b is orders of magnitude above 1/n_eff and drags the
+        // criterion off the certified Laplace surface, so the outer search it
+        // is spliced into cannot certify. Decline — value and gradient
+        // together — until the Jeffreys term is integrated.
+        if reml_robust_jeffreys_link(&self.config).is_some() {
+            return Some(
+                "Firth/Jeffreys bias reduction is active and the block target integrates \
+                 the plain penalized likelihood, not the Jeffreys-penalized one",
+            );
+        }
+        None
     }
 
     fn block_local_quadrature_correction_compute(
@@ -245,8 +293,8 @@ impl<'a> RemlState<'a> {
             return Ok(zero());
         }
 
-        // Laplace is exact for the Gaussian-identity model: nothing to correct.
-        if reml_is_gaussian_identity(&self.config.likelihood) {
+        if let Some(reason) = self.block_correction_family_decline() {
+            log::trace!("[#784] block-local fallback declined: {reason}");
             return Ok(zero());
         }
         // The mode and trace channels need one λ per canonical penalty.
@@ -278,10 +326,10 @@ impl<'a> RemlState<'a> {
 
         // ── Unconditional declines, BEFORE any evidence is bought ────────────
         //
-        // The two predicates below decline the whole correction, and neither
-        // consults a single number the diagnostic produces: one reads the
-        // hyper-layout, the other the configured response family. Both are
-        // therefore constant across the entire fit.
+        // The predicate below and the family declines above decline the whole
+        // correction, and none consults a single number the diagnostic
+        // produces: this one reads the hyper-layout, the others the configured
+        // response family. All are therefore constant across the entire fit.
         //
         // They used to sit AFTER `directional_cubic_diagnostic` — an `O(p³)`
         // dense factorization plus `O(n·p)` cubic contractions — so every
@@ -290,7 +338,7 @@ impl<'a> RemlState<'a> {
         // as though it had been decided on evidence (gam#2584). Evidence is
         // worth buying only when the verdict can depend on it.
         //
-        // Hoisting them is exactly value-preserving: neither predicate reads
+        // Hoisting them is exactly value-preserving: no predicate reads
         // `sampler`, `max_abs`, `directional` or `verdict`, and every path they
         // guard returns the same `zero()` it returned before.
 
@@ -309,39 +357,6 @@ impl<'a> RemlState<'a> {
                  {n_ext} external (ψ) coordinate(s) present and the ψ-exact gradient \
                  channels are not implemented; splicing a ψ-truncated gradient would \
                  desync objective and gradient (#901)"
-            );
-            return Ok(zero());
-        }
-        // The exact score channel relies on the exponential-family unit-
-        // deviance identity dD/dμ = −2w(y−μ)/V(μ), which does not hold for
-        // the Beta pseudo-family parameterization. Decline rather than splice
-        // a gradient that is not the derivative of the spliced value.
-        if matches!(
-            reml_spec(&self.config.likelihood).response,
-            ResponseFamily::Beta { .. }
-        ) {
-            log::trace!(
-                "[#784] block-local fallback declined before the skewness diagnostic: \
-                 Beta family has no exponential-family score identity for the exact \
-                 gradient channels"
-            );
-            return Ok(zero());
-        }
-        // Firth/Jeffreys fits: the integrand `Gam784BlockTarget::excess` is the
-        // remainder of the PLAIN penalized likelihood about its mode, but under
-        // Firth β̂ is the mode of the Jeffreys-penalized objective. The plain
-        // remainder then keeps a linear term (∇Φ(β̂) ≠ 0), omits the Jeffreys
-        // change Φ(β̂+δ)−Φ(β̂), and subtracts only XᵀWX while the draws are
-        // scaled by `h_total`, which carries −H_Φ. On separated data that
-        // mis-targeted Δ_b is orders of magnitude above 1/n_eff and drags the
-        // criterion off the certified Laplace surface, so the outer search it
-        // is spliced into cannot certify. Decline — value and gradient
-        // together — until the Jeffreys term is integrated.
-        if reml_robust_jeffreys_link(&self.config).is_some() {
-            log::debug!(
-                "[#784] block-local fallback declined before the skewness diagnostic: \
-                 Firth/Jeffreys bias reduction is active and the block target \
-                 integrates the plain penalized likelihood, not the Jeffreys-penalized one"
             );
             return Ok(zero());
         }

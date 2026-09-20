@@ -1976,11 +1976,11 @@ impl Default for FitOptions {
 /// `Normal { mean: 0, sd: 3 }`, so the shipped criterion was `REML + Σρ²/18` —
 /// MAP in ρ, with an underived `sd = 3.0` — for as long as nobody re-read the
 /// `Default` impl. The damage was not only statistical: a prior whose gradient
-/// survives into the λ→∞ tail makes `ĉ = −e^ρ ∂V/∂ρ` divergent, and all three
-/// rail-reasoning paths (`try_certify_asymptote_rail`, `try_tail_snap_to_rail`,
+/// survives into the λ→∞ tail makes `ĉ = −e^ρ ∂V/∂ρ` divergent, and the
+/// measured rail-reasoning paths (`try_certify_asymptote_rail`,
 /// `detect_wrong_rail_pullback`) decide by testing that `ĉ` is CONSTANT. One
-/// `Default` disabled the face certificate, the tail snap, and the repair path
-/// for a coordinate stuck on the wrong bound.
+/// `Default` disabled the face certificate and the repair path for a
+/// coordinate stuck on the wrong bound.
 #[cfg(test)]
 mod tests_certification_refusal_2550 {
     use super::{

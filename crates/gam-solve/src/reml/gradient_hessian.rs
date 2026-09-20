@@ -5849,19 +5849,32 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn reset_outer_seed_state(&self) {
-        self.cache_manager.invalidate_eval_bundle();
-        // Drop cross-call PIRLS LRU entries: cached β may have been computed under a coarsened inner cap, so reusing them on retry skips real work and bit-replays the prior attempt.
-        self.cache_manager
-            .pirls_cache
-            .write()
-            .expect("PIRLS result cache lock poisoned")
-            .clear();
-        // The outer is restarting from a fresh seed — the previous
-        // trajectory's warm-start signals are calibrated to a different
-        // ρ-path and would mislead both predictors and the adaptive cap
-        // policies. Wipe in lockstep so the first solve at the new
-        // seed starts fully cold.
-        self.clear_warm_start_predictor_state();
+        if self.inner_mode_is_seed_independent() {
+            // Every inner solve, and every outer evaluation built on one, is a
+            // function of its key alone, so what the state already holds is what
+            // a cold restart would rebuild, bit for bit: the bundle, the PIRLS
+            // LRU, the outer-eval LRU and the warm start that publishes each
+            // evaluation's `inner_beta_hint` all survive. Their keys carry the
+            // inner cap, which still separates a capped screening solve from a
+            // terminal one. Only the previous-evaluation mirror is trajectory
+            // state, and it goes.
+            self.cache_manager.forget_previous_outer_eval();
+        } else {
+            self.cache_manager.invalidate_eval_bundle();
+            // Drop cross-call PIRLS LRU entries: cached β may have been computed under a coarsened inner cap, so reusing them on retry skips real work and bit-replays the prior attempt.
+            self.cache_manager
+                .pirls_cache
+                .write()
+                .expect("PIRLS result cache lock poisoned")
+                .clear();
+            // The outer is restarting from a fresh seed — the previous
+            // trajectory's warm-start signals are calibrated to a different
+            // ρ-path and would mislead the predictors. Wipe them so the first
+            // solve at the new seed starts fully cold.
+            self.clear_warm_start_predictor_state();
+        }
+        // The previous trajectory's adaptive signals would mislead the adaptive
+        // cap policies of the next one.
         self.clear_warm_start_adaptive_signals();
         // Inner-PIRLS iteration caps are cross-trajectory state: the
         // previous outer's first-order bridge writes `outer_inner_cap`
@@ -5871,6 +5884,14 @@ impl<'a> RemlState<'a> {
         // next outer is responsible for re-establishing any cap it wants
         // via its own bridge; zeroing here is the safe baseline.
         self.outer_inner_cap.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether the inner mode at a key is a function of that key and the frozen
+    /// state alone. An eligible Gaussian-identity fit has no inner iteration: its
+    /// mode is one direct penalized least-squares solve, which no warm start,
+    /// adaptive signal or cap reaches.
+    fn inner_mode_is_seed_independent(&self) -> bool {
+        self.gaussian_fixed_cache_eligible()
     }
 
     // Accessor methods for private fields

@@ -17,6 +17,7 @@ use crate::fit::{
     continuation_refinement_decision,
 };
 use crate::penalty_labels::penalty_label_layout_with_joint;
+use crate::test_support::outerobjectivegradienthessian_labeled;
 
 /// A one-coefficient family with two known, unequal modes.
 ///
@@ -1181,16 +1182,14 @@ fn a_mode_at_its_root_to_rounding_certifies_and_continues_2973() {
         &specs,
         &options,
         &layout,
-        &gam_problem::RhoPrior::Flat,
         &start.warm_start,
         &array![to],
-        EvalMode::ValueAndGradient,
     ) {
         Ok(continuation) => continuation,
         Err(refusal) => panic!("the quadratic's single branch continues to λ = 2e9: {refusal}"),
     };
     assert!(
-        continuation.eval.inner_converged,
+        continuation.inner.converged,
         "the continued mode certifies"
     );
     let at_target = newton_region_contraction(
@@ -1199,7 +1198,7 @@ fn a_mode_at_its_root_to_rounding_certifies_and_continues_2973() {
         &options,
         &layout,
         &array![to],
-        &continuation.eval.warm_start,
+        &constrained_warm_start_from_inner(&array![to], &continuation.inner),
     )
     .expect("the Newton-region test runs at the continued mode");
     assert!(
@@ -1249,15 +1248,13 @@ fn the_shallow_branch_is_followed_to_its_fold_and_declines_past_it_2973() {
             &specs,
             &options,
             &layout,
-            &gam_problem::RhoPrior::Flat,
             &start.warm_start,
             &array![target],
-            EvalMode::ValueAndGradient,
         ) {
             Ok(continuation) => {
-                let beta = continuation.eval.warm_start.block_beta[0][0];
+                let beta = continuation.inner.block_states[0].beta[0];
                 assert!(
-                    continuation.eval.inner_converged,
+                    continuation.inner.converged,
                     "the continued evaluation at rho={target} converges"
                 );
                 assert!(
@@ -1281,12 +1278,12 @@ fn the_shallow_branch_is_followed_to_its_fold_and_declines_past_it_2973() {
             &specs,
             &options,
             &layout,
-            &gam_problem::RhoPrior::Flat,
             &start.warm_start,
             &array![from],
-            EvalMode::ValueAndGradient,
         ) {
-            Ok(continuation) => continuation.eval.warm_start,
+            Ok(continuation) => {
+                constrained_warm_start_from_inner(&array![from], &continuation.inner)
+            }
             Err(refusal) => panic!("the shallow branch exists at rho={from}: {refusal}"),
         };
         // The closed-form IFT tangent of the tilted double well: stationarity is
@@ -1347,15 +1344,13 @@ fn the_shallow_branch_is_followed_to_its_fold_and_declines_past_it_2973() {
         &specs,
         &options,
         &layout,
-        &gam_problem::RhoPrior::Flat,
         &start.warm_start,
         &array![1.2],
-        EvalMode::ValueAndGradient,
     ) {
         Ok(continuation) => panic!(
             "past the fold at rho={rho_fold} the shallow branch does not exist, so the \
              continuation must decline; it published beta={}",
-            continuation.eval.warm_start.block_beta[0][0]
+            continuation.inner.block_states[0].beta[0]
         ),
         Err(refusal) => {
             eprintln!("[2973 fold] {refusal}");
@@ -1473,7 +1468,10 @@ fn a_walk_that_tries_to_cross_the_fold_publishes_one_branch_per_theta_2973() {
             &options,
             &layout,
             &point,
-            state.warm_start_for(&point),
+            ModeStarts {
+                incumbent: state.warm_start_for(&point),
+                fixed: &[],
+            },
             &gam_problem::RhoPrior::Flat,
             EvalMode::ValueAndGradient,
         );
@@ -1539,13 +1537,11 @@ fn the_deep_branch_continues_across_every_rho_2973() {
         &specs,
         &options,
         &layout,
-        &gam_problem::RhoPrior::Flat,
         &start.warm_start,
         &array![18.0],
-        EvalMode::ValueAndGradient,
     ) {
         Ok(continuation) => {
-            let beta = continuation.eval.warm_start.block_beta[0][0];
+            let beta = continuation.inner.block_states[0].beta[0];
             assert!(
                 is_deep_mode_2973(18.0, beta),
                 "the deep branch continues to rho=18; got beta={beta}"
@@ -1553,4 +1549,225 @@ fn the_deep_branch_continues_across_every_rho_2973() {
         }
         Err(refusal) => panic!("the deep branch has no fold, so it must continue: {refusal}"),
     }
+}
+
+/// The tilted double well's penalized objective `f(β; ρ) = (β² − 1)² + cβ + ½e^ρβ²`.
+fn double_well_penalized_objective_3173(rho: f64, beta: f64) -> f64 {
+    let well = beta * beta - 1.0;
+    well * well + TILT * beta + 0.5 * rho.exp() * beta * beta
+}
+
+/// A start in the deep well, as a fit's fixed seed: coefficients only, at another θ.
+fn deep_well_seed_3173() -> crate::assembly::ConstrainedWarmStart {
+    crate::assembly::ConstrainedWarmStart {
+        rho: array![0.0],
+        block_beta: vec![array![-2.0]],
+        active_sets: vec![None],
+        cached_inner: None,
+    }
+}
+
+/// A penalized objective of `value` summed from one likelihood row and one penalty entry, with
+/// nothing else accumulated: its comparison rounds by `γ₂·(|a| + |b|)`.
+fn penalized_3173(value: f64) -> PenalizedObjective {
+    PenalizedObjective {
+        value,
+        likelihood_rows: 1,
+        penalty_entries: 1,
+        penalty_accumulation: 0.0,
+        jeffreys_roundoff: 0.0,
+    }
+}
+
+/// #3173: the selection's index is the lowest penalized objective among the certified starts,
+/// taken in order. A later start replaces the current choice only when it is below by more than
+/// the comparison rounds by, so an exact tie and a tie within rounding both keep the earlier start
+/// (the incumbent, listed first).
+#[test]
+fn the_lowest_penalized_start_wins_and_a_tie_keeps_the_earlier_3173() {
+    let at = |values: &[Option<f64>]| {
+        let penalized: Vec<Option<PenalizedObjective>> = values
+            .iter()
+            .map(|value| value.map(penalized_3173))
+            .collect();
+        lowest_penalized_index(&penalized)
+    };
+    assert_eq!(at(&[Some(2.0), None, Some(1.0)]), Some(2));
+    assert_eq!(at(&[Some(1.0), Some(0.5)]), Some(1));
+    assert_eq!(
+        at(&[Some(1.0), Some(1.0)]),
+        Some(0),
+        "an exact tie keeps the earlier start"
+    );
+    // One ulp below 1 lies inside `γ₂·(|a| + |b|) ≈ 4.4e-16`, the comparison's rounding.
+    assert_eq!(
+        at(&[Some(1.0), Some(1.0 - f64::EPSILON / 2.0)]),
+        Some(0),
+        "a difference within the comparison's rounding keeps the earlier start"
+    );
+    assert_eq!(at(&[None, None]), None);
+}
+
+/// #3173: an evaluation publishes the certified mode with the lowest penalized objective among
+/// its starts.
+///
+/// At ρ = 0.5 both wells are minima, and the closed form orders them: the deep minimum's `f` is
+/// below the shallow one's. From the shallow incumbent alone the evaluation publishes the shallow
+/// mode, as the warm start chose it. With the deep well among the fit's fixed starts it publishes
+/// the deep mode, and it publishes the deep mode from the deep incumbent too, at one criterion
+/// value to its own roundoff, so `V(0.5)` does not depend on which mode the walk carried there.
+#[test]
+fn the_published_mode_is_the_lowest_penalized_mode_among_the_starts_3173() {
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let specs = [double_well_spec(2.0)];
+    let options = double_well_options();
+    let penalty_counts: Vec<usize> = specs.iter().map(|spec| spec.penalties.len()).collect();
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("single-penalty label layout");
+    let rho = array![0.5];
+    let evaluate = |starts: ModeStarts<'_>| {
+        evaluate_on_branch(
+            &family,
+            &specs,
+            &options,
+            &layout,
+            &rho,
+            starts,
+            &gam_problem::RhoPrior::Flat,
+            EvalMode::ValueAndGradient,
+        )
+        .expect("an evaluation at rho=0.5 certifies a mode")
+    };
+    let shallow = evaluate(ModeStarts {
+        incumbent: None,
+        fixed: &[],
+    });
+    let shallow_beta = shallow.warm_start.block_beta[0][0];
+    assert!(
+        is_shallow_mode_2973(0.5, shallow_beta),
+        "the caller's seed at +2 reaches the shallow well; got {shallow_beta}"
+    );
+    let fixed = [Some(deep_well_seed_3173())];
+    let from_shallow = evaluate(ModeStarts {
+        incumbent: Some(&shallow.warm_start),
+        fixed: &fixed,
+    });
+    let published = from_shallow.warm_start.block_beta[0][0];
+    assert!(
+        is_deep_mode_2973(0.5, published),
+        "the deep well's mode is the lower of the two, so it is published; got {published}"
+    );
+    assert!(
+        double_well_penalized_objective_3173(0.5, published)
+            < double_well_penalized_objective_3173(0.5, shallow_beta),
+        "the closed form orders the deep minimum below the shallow one"
+    );
+    let from_deep = evaluate(ModeStarts {
+        incumbent: Some(&from_shallow.warm_start),
+        fixed: &fixed,
+    });
+    assert!(
+        is_deep_mode_2973(0.5, from_deep.warm_start.block_beta[0][0]),
+        "from the deep incumbent the deep mode is published too"
+    );
+    let bound = gam_solve::rho_optimizer::outer_value_agreement_bound(
+        from_shallow.objective,
+        from_deep.objective,
+    );
+    assert!(
+        (from_shallow.objective - from_deep.objective).abs() <= bound,
+        "V(0.5) is one value whichever mode the walk carried: {:.17e} against {:.17e} (roundoff \
+         bound {bound:.3e})",
+        from_shallow.objective,
+        from_deep.objective,
+    );
+}
+
+/// #3173: a branch that ends at its fold hands over to the lowest-f certified rival.
+///
+/// Past the shallow well's fold at `ρ_fold = ln(4 − 3c^{2/3}) ≈ 0.97666` only the deep minimum
+/// exists. From the shallow incumbent at ρ = 0.5 alone, the evaluation at ρ = 1.2 is refused, the
+/// #2973 fold refusal. With the deep well among the fit's fixed starts, the shallow branch ends at
+/// its fold and the deep minimum is published instead.
+#[test]
+fn a_branch_that_ends_at_its_fold_hands_over_to_the_lowest_rival_3173() {
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let specs = [double_well_spec(2.0)];
+    let options = double_well_options();
+    let penalty_counts: Vec<usize> = specs.iter().map(|spec| spec.penalties.len()).collect();
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("single-penalty label layout");
+    let start = outerobjectivegradienthessian_labeled(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &array![0.5],
+        None,
+        &gam_problem::RhoPrior::Flat,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("the derivative-bearing evaluation at the shallow start");
+    assert!(
+        is_shallow_mode_2973(0.5, start.warm_start.block_beta[0][0]),
+        "a seed at +2 starts in the shallow well"
+    );
+    let evaluate = |fixed: &[Option<crate::assembly::ConstrainedWarmStart>]| {
+        evaluate_on_branch(
+            &family,
+            &specs,
+            &options,
+            &layout,
+            &array![1.2],
+            ModeStarts {
+                incumbent: Some(&start.warm_start),
+                fixed,
+            },
+            &gam_problem::RhoPrior::Flat,
+            EvalMode::ValueAndGradient,
+        )
+    };
+    match evaluate(&[]) {
+        Ok(eval) => panic!(
+            "with no rival the shallow branch's fold refuses the trial; it published beta={}",
+            eval.warm_start.block_beta[0][0]
+        ),
+        Err(refusal) => assert!(
+            refusal.is_trial_point_infeasible(),
+            "a branch that ends with no rival is a rejected trial: {refusal}"
+        ),
+    }
+    let handed = evaluate(&[Some(deep_well_seed_3173())])
+        .expect("the deep well's mode certifies past the shallow fold");
+    let beta = handed.warm_start.block_beta[0][0];
+    assert!(
+        is_deep_mode_2973(1.2, beta),
+        "past the fold the lowest certified rival, the deep minimum, is published; got {beta}"
+    );
+}
+
+/// #3173: an outer evaluation's starts are the incumbent's and the fit's fixed starts, except at
+/// a θ where the rule already published a mode (here a value probe's): the fixed starts would
+/// reproduce that selection there, so they are left out, and only there.
+#[test]
+fn the_fixed_starts_are_left_out_only_where_the_rule_already_published_3173() {
+    let mut state =
+        CustomOuterState::new(None).with_fixed_starts(vec![Some(deep_well_seed_3173())]);
+    let theta = array![0.5];
+    assert_eq!(state.mode_starts_for(&theta).fixed.len(), 1);
+    let seed = crate::warm_start::SeedIdentity::of(state.seed_for(&theta));
+    let published = crate::assembly::ConstrainedWarmStart {
+        rho: theta.clone(),
+        ..deep_well_seed_3173()
+    };
+    state.record_value_probe(&theta, seed, published);
+    assert!(
+        state.mode_starts_for(&theta).fixed.is_empty(),
+        "the value probe's published mode at this θ was selected against the same fixed starts"
+    );
+    assert_eq!(
+        state.mode_starts_for(&array![0.6]).fixed.len(),
+        1,
+        "at any other θ the fixed starts are solved again"
+    );
 }

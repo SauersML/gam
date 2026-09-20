@@ -9,8 +9,10 @@ import os
 import pathlib
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
+import unittest.mock
 import zipfile
 
 
@@ -33,10 +35,18 @@ GIT_ENV = {
 
 
 def pyproject(version: str, note: str = "") -> str:
+    """The repository's layout: a dynamic [project] version and the release line under [tool.gamfit]."""
     return (
-        f'[project]\nname = "gamfit"\nversion = "{version}"\ndescription = "d"\n'
-        f'requires-python = ">=3.10"\n\n[tool.maturin]\nmodule-name = "gamfit._rust"\n# {note}\n'
+        '[build-system]\nrequires = ["maturin>=1.7,<2"]\nbuild-backend = "gamfit_version"\n'
+        'backend-path = ["scripts"]\n\n[project]\nname = "gamfit"\ndynamic = ["version"]\n'
+        f'description = "d"\nrequires-python = ">=3.10"\n\n[tool.gamfit]\nversion = "{version}"\n\n'
+        f'[tool.maturin]\nmodule-name = "gamfit._rust"\n# {note}\n'
     )
+
+
+def static_pyproject(version: str) -> str:
+    """The layout before gam#3157's backend: the release line as the static [project] version."""
+    return f'[project]\nname = "gamfit"\nversion = "{version}"\ndescription = "d"\n'
 
 
 class Repo:
@@ -126,8 +136,17 @@ class DeriveTests(unittest.TestCase):
         loose = pathlib.Path(self.scratch.name) / "loose"
         loose.mkdir()
         (loose / "pyproject.toml").write_text(pyproject("2.3.5"))
-        with self.assertRaisesRegex(gamfit_version.VersionError, "not a gam git checkout"):
+        with self.assertRaisesRegex(gamfit_version.VersionError, "neither a gam git checkout"):
             gamfit_version.derive(loose)
+
+    def test_moving_the_release_line_out_of_project_does_not_set_it(self):
+        # The layout change that made [project] version dynamic keeps the value, so it releases nothing.
+        repo = Repo(pathlib.Path(self.scratch.name) / "static")
+        release = repo.commit({"pyproject.toml": static_pyproject("2.3.5"), "engine.rs": "a\n"}, "release: 2.3.5")
+        self.assertEqual(repo.version(), "2.3.5")
+        moved = repo.commit({"pyproject.toml": pyproject("2.3.5")}, "derive the version in the backend")
+        self.assertEqual(gamfit_version.release_commits(repo.path, "2.3.5"), [release])
+        self.assertEqual(repo.version(), f"2.3.6.dev1+g{moved}")
 
     def test_only_the_commit_that_sets_the_release_line_can_be_published_as_it(self):
         self.assertEqual(gamfit_version.release(self.repo.path), "2.3.5")
@@ -154,11 +173,26 @@ class ReleaseLineTests(unittest.TestCase):
         self.assertIsNone(gamfit_version.declared_version(b'[project]\nname = "gamfit"\n'))
 
     def test_the_repository_release_line_is_the_one_gam_pyffi_carries(self):
-        # build.rs holds crates/gam-pyffi/Cargo.toml's first version line to pyproject.toml's.
+        # build.rs holds crates/gam-pyffi/Cargo.toml's first version line to pyproject.toml's, and maturin
+        # gives the dynamic [project] version from that Cargo.toml.
         project = gamfit_version.declared_version((ROOT / "pyproject.toml").read_bytes())
         pyffi = gamfit_version.declared_version((ROOT / "crates/gam-pyffi/Cargo.toml").read_bytes())
         self.assertIsNotNone(project)
         self.assertEqual(project, pyffi)
+
+    def test_the_repository_builds_through_this_backend_and_ships_it_in_the_sdist(self):
+        import tomllib
+
+        config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(config["build-system"]["build-backend"], SCRIPT.stem)
+        self.assertEqual([ROOT / path for path in config["build-system"]["backend-path"]], [SCRIPT.parent])
+        # PEP 621: a backend that computes the version must not also declare it statically.
+        self.assertNotIn("version", config["project"])
+        self.assertIn("version", config["project"]["dynamic"])
+        self.assertEqual(config["tool"]["gamfit"]["version"], gamfit_version.declared_version(
+            (ROOT / "pyproject.toml").read_bytes()))
+        shipped = [entry for entry in config["tool"]["maturin"]["include"] if entry.get("format") == "sdist"]
+        self.assertIn(SCRIPT.relative_to(ROOT).as_posix(), [entry["path"] for entry in shipped])
 
 
 def record_hash(data: bytes) -> str:
@@ -334,6 +368,165 @@ class StampInstalledTests(unittest.TestCase):
         done = self.stamp_installed(target)
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("the tree changed during the build", done.stderr)
+
+
+class FakeMaturin:
+    """maturin's PEP 517 hooks as the backend sees them: artifacts named by the unstamped version.
+
+    maturin takes that version from gam-pyffi's Cargo.toml, which build.rs holds to the release line, so
+    the fake reads the release line of the tree it builds (the working directory, as under PEP 517).
+    ``during_build`` runs inside a build hook, to change the tree while maturin works.
+    """
+
+    def __init__(self):
+        self.during_build = None
+        self.metadata_directories = []
+
+    @staticmethod
+    def version() -> str:
+        return gamfit_version.declared_version(pathlib.Path("pyproject.toml").read_bytes())
+
+    def get_requires_for_build_wheel(self, config_settings=None):
+        return []
+
+    get_requires_for_build_editable = get_requires_for_build_sdist = get_requires_for_build_wheel
+
+    def prepare_metadata_for_build_wheel(self, metadata_directory, config_settings=None):
+        name = f"gamfit-{self.version()}.dist-info"
+        (pathlib.Path(metadata_directory) / name).mkdir()
+        (pathlib.Path(metadata_directory) / name / "METADATA").write_text(
+            f"Metadata-Version: 2.4\nName: gamfit\nVersion: {self.version()}\n\nbody\n"
+        )
+        return name
+
+    prepare_metadata_for_build_editable = prepare_metadata_for_build_wheel
+
+    def build_wheel(self, wheel_directory, config_settings=None, metadata_directory=None):
+        self.metadata_directories.append(metadata_directory)
+        if self.during_build is not None:
+            self.during_build()
+        return build_wheel(pathlib.Path(wheel_directory), self.version(), "").name
+
+    build_editable = build_wheel
+
+    def build_sdist(self, sdist_directory, config_settings=None):
+        root = f"gamfit-{self.version()}"
+        members = {
+            "PKG-INFO": f"Metadata-Version: 2.4\nName: gamfit\nVersion: {self.version()}\n\nbody\n".encode(),
+            "pyproject.toml": pathlib.Path("pyproject.toml").read_bytes(),
+            "engine.rs": pathlib.Path("engine.rs").read_bytes(),
+        }
+        sdist = pathlib.Path(sdist_directory) / f"{root}.tar.gz"
+        with tarfile.open(sdist, "w:gz") as out:
+            for name, data in members.items():
+                info = tarfile.TarInfo(f"{root}/{name}")
+                info.size = len(data)
+                out.addfile(info, io.BytesIO(data))
+        return sdist.name
+
+
+class BackendTests(unittest.TestCase):
+    """The PEP 517 hooks on a git checkout and on sdists cut at a release and at a later commit."""
+
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.scratch.name)
+        self.repo = Repo(self.dir / "gam")
+        self.repo.commit({"pyproject.toml": pyproject("2.3.4"), "engine.rs": "a\n"}, "release: 2.3.4")
+        self.release = self.repo.commit({"pyproject.toml": pyproject("2.3.5")}, "release: 2.3.5")
+        self.maturin = FakeMaturin()
+        patcher = unittest.mock.patch.dict(sys.modules, {"maturin": self.maturin})
+        patcher.start()
+        # Cleanups run last-in first-out: leave the scratch directory before deleting it.
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.scratch.cleanup)
+        self.addCleanup(os.chdir, os.getcwd())
+
+    def out(self, name: str) -> pathlib.Path:
+        path = self.dir / name
+        path.mkdir()
+        return path
+
+    def wheel_version(self, wheel: pathlib.Path) -> str:
+        with zipfile.ZipFile(wheel) as archive:
+            [metadata] = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+            lines = archive.read(metadata).decode().split("\n")
+        [version] = [line[len("Version: "):] for line in lines if line.startswith("Version: ")]
+        self.assertEqual(metadata, f"gamfit-{version}.dist-info/METADATA")
+        self.assertEqual(wheel.name, f"gamfit-{version}-py3-none-any.whl")
+        return version
+
+    def sdist(self) -> tuple[pathlib.Path, pathlib.Path]:
+        """Build an sdist of the checkout and unpack it outside any git repository."""
+        os.chdir(self.repo.path)
+        sdist = self.out("sdist") / gamfit_version.build_sdist(str(self.dir / "sdist"))
+        unpacked = self.out("unpacked")
+        with tarfile.open(sdist) as archive:
+            archive.extractall(unpacked, filter="data")
+        [tree] = list(unpacked.iterdir())
+        return sdist, tree
+
+    def test_a_checkout_prepares_and_builds_its_derived_version(self):
+        engine = self.repo.commit({"engine.rs": "b\n"}, "engine change")
+        expected = f"2.3.6.dev1+g{engine}"
+        os.chdir(self.repo.path)
+        metadata = self.out("metadata")
+        name = gamfit_version.prepare_metadata_for_build_wheel(str(metadata))
+        self.assertEqual(name, f"gamfit-{expected}.dist-info")
+        self.assertIn(f"\nVersion: {expected}\n", (metadata / name / "METADATA").read_text())
+        wheel = self.out("wheel") / gamfit_version.build_wheel(str(self.dir / "wheel"), None, str(metadata / name))
+        self.assertEqual(self.wheel_version(wheel), expected)
+        editable = self.out("editable") / gamfit_version.build_editable(str(self.dir / "editable"))
+        self.assertEqual(self.wheel_version(editable), expected)
+        # maturin never sees the stamped metadata directory, whose name it did not write.
+        self.assertEqual(self.maturin.metadata_directories, [None, None])
+
+    def test_an_sdist_cut_at_the_release_commit_builds_the_release(self):
+        sdist, tree = self.sdist()
+        self.assertEqual(sdist.name, "gamfit-2.3.5.tar.gz")
+        self.assertEqual(tree.name, "gamfit-2.3.5")
+        os.chdir(tree)
+        self.assertEqual(gamfit_version.derive(tree), ("2.3.5", None, None))
+        wheel = self.out("wheel") / gamfit_version.build_wheel(str(self.dir / "wheel"))
+        self.assertEqual(self.wheel_version(wheel), "2.3.5")
+
+    def test_an_sdist_cut_at_a_later_commit_carries_its_development_version(self):
+        engine = self.repo.commit({"engine.rs": "b\n"}, "engine change")
+        expected = f"2.3.6.dev1+g{engine}"
+        sdist, tree = self.sdist()
+        self.assertEqual(sdist.name, f"gamfit-{expected}.tar.gz")
+        self.assertEqual(tree.name, f"gamfit-{expected}")
+        self.assertIn(f"\nVersion: {expected}\n", (tree / "PKG-INFO").read_text())
+        # Positive control: the sdist's own pyproject.toml still names the release line.
+        self.assertEqual(gamfit_version.declared_version((tree / "pyproject.toml").read_bytes()), "2.3.5")
+        os.chdir(tree)
+        metadata = self.out("metadata")
+        name = gamfit_version.prepare_metadata_for_build_wheel(str(metadata))
+        self.assertEqual(name, f"gamfit-{expected}.dist-info")
+        wheel = self.out("wheel") / gamfit_version.build_wheel(str(self.dir / "wheel"), None, str(metadata / name))
+        self.assertEqual(self.wheel_version(wheel), expected)
+
+    def test_an_sdist_whose_pkg_info_names_another_version_is_refused(self):
+        sdist, tree = self.sdist()
+        pkg_info = tree / "PKG-INFO"
+        pkg_info.write_text(pkg_info.read_text().replace("Version: 2.3.5", "Version: 9.9.9"))
+        os.chdir(tree)
+        with self.assertRaisesRegex(gamfit_version.VersionError, "neither the release line"):
+            gamfit_version.build_wheel(str(self.out("wheel")))
+
+    def test_a_tree_that_moves_between_preparing_and_building_is_refused(self):
+        os.chdir(self.repo.path)
+        metadata = self.out("metadata")
+        name = gamfit_version.prepare_metadata_for_build_wheel(str(metadata))
+        self.repo.commit({"engine.rs": "b\n"}, "engine change")
+        with self.assertRaisesRegex(gamfit_version.VersionError, "between preparing the metadata and building"):
+            gamfit_version.build_wheel(str(self.out("wheel")), None, str(metadata / name))
+
+    def test_a_tree_that_moves_during_the_build_is_refused(self):
+        os.chdir(self.repo.path)
+        self.maturin.during_build = lambda: (self.repo.path / "engine.rs").write_text("edited\n")
+        with self.assertRaisesRegex(gamfit_version.VersionError, "changed during the build"):
+            gamfit_version.build_wheel(str(self.out("wheel")))
 
 
 if __name__ == "__main__":
