@@ -121,20 +121,6 @@ impl SupportMeasure {
     }
 }
 
-/// #976 Layer-1 guard: cap on one accepted iteration's assignment-logit
-/// update, in units of the gate temperature τ (the gate's natural length
-/// scale — every assignment mode reads logits through `σ(·/τ)` /
-/// `softmax(·/τ)`). A 4τ move spans the gate's whole soft range, so healthy
-/// convergence is never throttled, but no single inner iteration can carry a
-/// gate from contention to numerically-zero support: a collapse takes
-/// multiple accepted iterations, which guarantees the per-iteration
-/// active-mass guard observes the decay before it completes. The clamp is
-/// applied where the step is realised; when it binds, the realised objective
-/// is evaluated on the clamped state, so the Armijo comparison stays
-/// value-consistent (the unclamped quadratic model is merely conservative,
-/// and step halvings shrink the trial below the cap).
-pub(crate) const SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS: f64 = 4.0;
-
 /// #976 Layer-1 guard: re-seed budget per atom per joint fit. One second
 /// chance from a fresh basin; a second breach means the collapse is (locally)
 /// the objective's verdict at the current hyperparameters, which is recorded

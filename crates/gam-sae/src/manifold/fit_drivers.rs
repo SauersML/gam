@@ -5551,10 +5551,8 @@ impl SaeManifoldTerm {
                     layout.expand_row(row, &compact_row, &mut full_delta[row * q..(row + 1) * q]);
                 }
             }
-            // Apply logits from expanded buffer, clamped to the #976 gate-scale
-            // step cap, then canonicalize each softmax row in the same worker.
-            let logit_step_cap =
-                SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * self.assignment.mode.temperature();
+            // Apply logits from expanded buffer, then canonicalize each softmax
+            // row in the same worker.
             if parallel_rows {
                 use rayon::prelude::*;
                 self.assignment
@@ -5565,8 +5563,7 @@ impl SaeManifoldTerm {
                     .for_each(|(row, mut logits)| {
                         let row_base = row * q;
                         for atom_idx in 0..assignment_dim {
-                            logits[atom_idx] += (step_size * full_delta[row_base + atom_idx])
-                                .clamp(-logit_step_cap, logit_step_cap);
+                            logits[atom_idx] += step_size * full_delta[row_base + atom_idx];
                         }
                         if softmax {
                             canonicalize_softmax_logit_row(
@@ -5579,8 +5576,7 @@ impl SaeManifoldTerm {
                     let row_base = row * q;
                     let mut logits = self.assignment.logits.row_mut(row);
                     for atom_idx in 0..assignment_dim {
-                        logits[atom_idx] += (step_size * full_delta[row_base + atom_idx])
-                            .clamp(-logit_step_cap, logit_step_cap);
+                        logits[atom_idx] += step_size * full_delta[row_base + atom_idx];
                     }
                     if softmax {
                         canonicalize_softmax_logit_row(
@@ -5610,9 +5606,6 @@ impl SaeManifoldTerm {
                 ));
             }
             let coord_offsets = self.assignment.coord_offsets();
-            // #976 gate-scale step cap, as in the compact branch above.
-            let logit_step_cap =
-                SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * self.assignment.mode.temperature();
             if parallel_rows {
                 use rayon::prelude::*;
                 self.assignment
@@ -5623,8 +5616,7 @@ impl SaeManifoldTerm {
                     .for_each(|(row, mut logits)| {
                         let row_base = row * q;
                         for atom_idx in 0..assignment_dim {
-                            logits[atom_idx] += (step_size * delta_ext_coord[row_base + atom_idx])
-                                .clamp(-logit_step_cap, logit_step_cap);
+                            logits[atom_idx] += step_size * delta_ext_coord[row_base + atom_idx];
                         }
                         if softmax {
                             canonicalize_softmax_logit_row(
@@ -5637,8 +5629,7 @@ impl SaeManifoldTerm {
                     let row_base = row * q;
                     let mut logits = self.assignment.logits.row_mut(row);
                     for atom_idx in 0..assignment_dim {
-                        logits[atom_idx] += (step_size * delta_ext_coord[row_base + atom_idx])
-                            .clamp(-logit_step_cap, logit_step_cap);
+                        logits[atom_idx] += step_size * delta_ext_coord[row_base + atom_idx];
                     }
                     if softmax {
                         canonicalize_softmax_logit_row(

@@ -2302,12 +2302,13 @@ pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
     });
 }
 
-/// #976 Layer-1 guard 2: a single Newton application cannot move a gate
-/// logit by more than the gate-scale cap, however large the solver's raw
-/// delta. Softmax canonicalization shifts whole rows, so the invariant is
+/// A Newton application realises exactly `step_size · Δ` on every gate logit,
+/// however large the raw delta: the step is globalised by the Armijo line
+/// search on the realised objective, not by a hand box on the logit move
+/// (SPEC 18-22). Softmax canonicalization shifts whole rows, so the step is
 /// checked on the within-row logit DIFFERENCE, which the shift preserves.
 #[test]
-pub(crate) fn assignment_logit_step_cap_bounds_single_iteration_gate_motion() {
+pub(crate) fn assignment_logit_newton_step_is_realised_unboxed() {
     let (mut term, _target, _rho) = small_two_atom_periodic_term();
     let n = term.assignment.n_obs();
     let q = term.assignment.row_block_dim();
@@ -2315,17 +2316,19 @@ pub(crate) fn assignment_logit_step_cap_bounds_single_iteration_gate_motion() {
 
     let mut delta = Array1::<f64>::zeros(n * q);
     // Softmax K=2 has one free logit per row at offset 0 of the row block.
-    delta[0] = 1.0e6;
+    let raw = 1.0e3 * term.assignment.mode.temperature();
+    delta[0] = raw;
     let delta_beta = Array1::<f64>::zeros(term.beta_dim());
-    term.apply_newton_step(delta.view(), delta_beta.view(), 1.0)
+    let step_size = 0.5;
+    term.apply_newton_step(delta.view(), delta_beta.view(), step_size)
         .expect("step applies");
 
-    let cap = SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * term.assignment.mode.temperature();
     let diff_after = term.assignment.logits[[0, 0]] - term.assignment.logits[[0, 1]];
+    let realised = diff_after - diff_before;
+    let expected = step_size * raw;
     assert!(
-        ((diff_after - diff_before) - cap).abs() < 1.0e-9,
-        "a 1e6 raw logit delta must realise exactly the {cap}-cap, moved {}",
-        diff_after - diff_before
+        (realised - expected).abs() <= 8.0 * f64::EPSILON * (expected.abs() + diff_before.abs()),
+        "the logit must move by step_size·Δ = {expected}, moved {realised}"
     );
 }
 
