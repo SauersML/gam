@@ -157,7 +157,9 @@ impl BlockEffectiveJacobian for ScaledTwoChannelJacobian {
         if let Some(point) = point {
             for column in 0..p {
                 let scale = point.column_scales[self.block][column];
-                output.column_mut(column).mapv_inplace(|value| value * scale);
+                output
+                    .column_mut(column)
+                    .mapv_inplace(|value| value * scale);
             }
         }
         Ok(output)
@@ -178,10 +180,10 @@ fn legendre_columns(n: usize, count: usize) -> Array2<f64> {
             legendre[[row, 1]] = x[row];
         }
         for degree in 2..count {
-            legendre[[row, degree]] = ((2 * degree - 1) as f64 * x[row]
-                * legendre[[row, degree - 1]]
-                - (degree - 1) as f64 * legendre[[row, degree - 2]])
-                / degree as f64;
+            legendre[[row, degree]] =
+                ((2 * degree - 1) as f64 * x[row] * legendre[[row, degree - 1]]
+                    - (degree - 1) as f64 * legendre[[row, degree - 2]])
+                    / degree as f64;
         }
     }
     legendre
@@ -192,7 +194,9 @@ fn segment_indicator_columns(n: usize, lengths: &[usize]) -> Array2<f64> {
     let mut columns = Array2::zeros((n, lengths.len()));
     let mut start = 0;
     for (column, &length) in lengths.iter().enumerate() {
-        columns.slice_mut(s![start..start + length, column]).fill(1.0);
+        columns
+            .slice_mut(s![start..start + length, column])
+            .fill(1.0);
         start += length;
     }
     columns
@@ -266,8 +270,18 @@ fn converged_drift_ranks_penalty_covered_aliases_with_the_pilot_audit_2627() {
     let specs = two_channel_specs(
         &legendre_columns(n, 8),
         &[
-            vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)], vec![(0, 1.0), (1, 1.0)]],
-            vec![vec![(3, 1.0)], vec![(4, 1.0)], vec![(5, 1.0)], vec![(3, 1.0), (4, 1.0)]],
+            vec![
+                vec![(0, 1.0)],
+                vec![(1, 1.0)],
+                vec![(2, 1.0)],
+                vec![(0, 1.0), (1, 1.0)],
+            ],
+            vec![
+                vec![(3, 1.0)],
+                vec![(4, 1.0)],
+                vec![(5, 1.0)],
+                vec![(3, 1.0), (4, 1.0)],
+            ],
         ],
         &[],
         true,
@@ -338,7 +352,12 @@ fn converged_drift_refuses_a_direction_lost_at_convergence_2627() {
     let specs = two_channel_specs(
         &legendre_columns(n, 8),
         &[
-            vec![vec![(0, 1.0)], vec![(1, 1.0)], vec![(2, 1.0)], vec![(3, 1.0)]],
+            vec![
+                vec![(0, 1.0)],
+                vec![(1, 1.0)],
+                vec![(2, 1.0)],
+                vec![(3, 1.0)],
+            ],
             vec![vec![(4, 1.0)], vec![(5, 1.0)]],
         ],
         &[],
@@ -500,7 +519,11 @@ fn converged_verdict_accepts_a_representative_swap_and_refuses_a_gauge_loss_2627
         "B absorbs the pilot alias b = e0"
     );
     assert!(!canonical.audit.fatal, "the penalty covers the alias");
-    assert_eq!(canonical.reduced_specs[1].design.ncols(), 1, "the reducing gauge removes b");
+    assert_eq!(
+        canonical.reduced_specs[1].design.ncols(),
+        1,
+        "the reducing gauge removes b"
+    );
     let current =
         channel_aware_audit_at_operating_scalars(&swap_specs, Some(Arc::clone(&converged)))
             .expect("channel-aware converged audit runs");
@@ -522,14 +545,9 @@ fn converged_verdict_accepts_a_representative_swap_and_refuses_a_gauge_loss_2627
         label_drift.newly_dropped.len(),
         label_drift.recovered.len()
     );
-    let swap = converged_channel_aware_verdict(
-        &swap_specs,
-        &canonical,
-        Arc::clone(&converged),
-        change,
-        0,
-    )
-    .expect("channel-aware converged verdict runs");
+    let swap =
+        converged_channel_aware_verdict(&swap_specs, &canonical, Arc::clone(&converged), change, 0)
+            .expect("channel-aware converged verdict runs");
     assert!(
         swap.pilot_gauge_reaudit.is_some(),
         "a reducing gauge is re-audited at convergence"
@@ -628,9 +646,14 @@ fn converged_verdict_accepts_a_recovery_the_identity_gauge_ran_3304() {
         (reduced_width, verdict)
     };
 
-    let (structural_width, structural) =
-        verdict_under(&[CoefficientCoordinate::Spanning, CoefficientCoordinate::Structural]);
-    assert_eq!(structural_width, 2, "a Structural block keeps its raw width");
+    let (structural_width, structural) = verdict_under(&[
+        CoefficientCoordinate::Spanning,
+        CoefficientCoordinate::Structural,
+    ]);
+    assert_eq!(
+        structural_width, 2,
+        "a Structural block keeps its raw width"
+    );
     assert!(
         !structural.refuses()
             && structural.recovered_under_identity_gauge()
@@ -643,7 +666,10 @@ fn converged_verdict_accepts_a_recovery_the_identity_gauge_ran_3304() {
     );
 
     let (spanning_width, spanning) = verdict_under(&[CoefficientCoordinate::Spanning; 2]);
-    assert_eq!(spanning_width, 1, "the reducing gauge removes the dead column");
+    assert_eq!(
+        spanning_width, 1,
+        "the reducing gauge removes the dead column"
+    );
     assert!(
         spanning.refuses() && !spanning.recovered_under_identity_gauge(),
         "positive control: the gauge removed a direction convergence identifies, so the \
@@ -766,7 +792,11 @@ fn penalty_covered_competing_risks_redundancy_canonicalises_cleanly_1590() {
         // gam#3023: an identity pullback carries the declared nullity; a
         // column selection leaves it to the spectrum.
         let expected_nullity: Vec<usize> = if width == 4 { vec![0] } else { Vec::new() };
-        assert_eq!(spec.nullspace_dims, expected_nullity, "block '{}'", spec.name);
+        assert_eq!(
+            spec.nullspace_dims, expected_nullity,
+            "block '{}'",
+            spec.name
+        );
     }
     assert_eq!(
         rank(&reduced_joint),
@@ -776,4 +806,92 @@ fn penalty_covered_competing_risks_redundancy_canonicalises_cleanly_1590() {
     eprintln!(
         "#1590 multi-channel canonicalization: raw_width=8 raw_rank=6 retained_width={reduced_width} retained_rank=6"
     );
+}
+
+/// Streaming and full materialization must use the same family operating point.
+struct OperatingPointOnlyTwoChannelJacobian {
+    full: Array2<f64>,
+    n: usize,
+    refuse_full: bool,
+}
+
+impl BlockEffectiveJacobian for OperatingPointOnlyTwoChannelJacobian {
+    fn effective_jacobian_rows(
+        &self,
+        state: &FamilyLinearizationState<'_>,
+        rows: Range<usize>,
+    ) -> Result<Array2<f64>, String> {
+        if state.family_scalars.is_none() || !state.beta.is_empty() {
+            return Err(
+                "fixture Jacobian requires the supplied operating point and empty beta".into(),
+            );
+        }
+        if self.refuse_full && rows.end == usize::MAX {
+            return Err("fixture full materialization refused".into());
+        }
+        let end = rows.end.min(self.n);
+        if rows.start > end {
+            return Err("fixture row range is reversed or out of bounds".into());
+        }
+        let width = end - rows.start;
+        let mut output = Array2::zeros((2 * width, self.full.ncols()));
+        for channel in 0..2 {
+            output
+                .slice_mut(s![channel * width..(channel + 1) * width, ..])
+                .assign(&self.full.slice(s![
+                    channel * self.n + rows.start..channel * self.n + end,
+                    ..
+                ]));
+        }
+        Ok(output)
+    }
+
+    fn n_outputs(&self) -> usize {
+        2
+    }
+}
+
+#[test]
+fn map_uniqueness_preserves_operating_point_and_propagates_real_refusal() {
+    let n = 64;
+    let basis = legendre_columns(n, 4);
+    for refuse_full in [false, true] {
+        let specs: Vec<_> = (0..2)
+            .map(|block| {
+                let full = Array2::from_shape_fn((2 * n, 2), |(row, column)| {
+                    basis[[row % n, 2 * block + column]]
+                });
+                let mut spec = spec_from_dense(
+                    &format!("surface_{}", block + 1),
+                    full.slice(s![..n, ..]).to_owned(),
+                );
+                spec.jacobian_callback = Some(Arc::new(OperatingPointOnlyTwoChannelJacobian {
+                    full,
+                    n,
+                    refuse_full,
+                }));
+                spec
+            })
+            .collect();
+        let result = canonicalize_for_identifiability_with_operating_scalars(
+            &specs,
+            &[CoefficientCoordinate::Spanning; 2],
+            Some(operating_point(vec![vec![1.0; 2], vec![1.0; 2]], false)),
+        );
+        if refuse_full {
+            let err = result.expect_err("a genuine materialization refusal must propagate");
+            let text = format!("{err:?}");
+            assert!(
+                text.contains("could not evaluate the effective Jacobian of block 'surface_1'")
+                    && text.contains("fixture full materialization refused"),
+                "the refusal must name its block and original reason: {text}"
+            );
+        } else {
+            let canonical =
+                result.expect("MAP and joint audit must see the supplied operating point");
+            assert!(canonical.used_channel_aware_audit);
+            assert_eq!(canonical.reduced_specs[0].design.ncols(), 2);
+            assert_eq!(canonical.reduced_specs[1].design.ncols(), 2);
+        }
+    }
 }

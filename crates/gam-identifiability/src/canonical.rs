@@ -1469,15 +1469,36 @@ fn canonicalize_for_identifiability_inner(
                 col_off += p_b;
                 continue;
             }
-            let zeros = vec![0.0f64; p_b];
+            // Match the streaming joint audit's linearization exactly.
             let state = FamilyLinearizationState {
-                beta: &zeros,
-                family_scalars: None,
+                beta: &[],
+                family_scalars: operating_scalars.clone(),
                 channel_hessian: None,
                 probit_frailty_scale: 1.0,
             };
             match spec.effective_jacobian_at("canonicalize_rank_check", &state) {
                 Ok(j_b) => {
+                    let outputs = spec
+                        .jacobian_callback
+                        .as_ref()
+                        .map_or(1, |callback| callback.n_outputs());
+                    let expected_rows = outputs.checked_mul(n_rows).ok_or_else(|| {
+                        CustomFamilyError::DimensionMismatch {
+                            reason: format!(
+                                "MAP uniqueness check: Jacobian row count overflows for block '{}'",
+                                spec.name
+                            ),
+                        }
+                    })?;
+                    if outputs == 0 || j_b.dim() != (expected_rows, p_b) || expected_rows > r_map {
+                        return Err(CustomFamilyError::DimensionMismatch {
+                            reason: format!(
+                                "MAP uniqueness check: effective Jacobian for block '{}' has shape {:?}, expected ({expected_rows}, {p_b}) within {r_map} rows",
+                                spec.name,
+                                j_b.dim()
+                            ),
+                        });
+                    }
                     // j_b is channel-major (k_b·n_rows, p_b): row `r·n_rows + i`
                     // carries observation `i`'s channel-`r` row Jacobian. A
                     // single-channel plain block (k_b == 1) packs at its native
@@ -1504,28 +1525,15 @@ fn canonicalize_for_identifiability_inner(
                         }
                     }
                 }
-                Err(_) => {
-                    // Fall back: embed the flat design at its native rows. A
-                    // design that will not densify is refused: leaving its
-                    // columns zero would lower rank(J_pre) and rank(J_can)
-                    // together, so the post-T and MAP-uniqueness certificates
-                    // below would be taken on a design the fit never sees.
-                    let flat = spec
-                        .design
-                        .try_to_dense_arc("canonicalize_rank_check")
-                        .map_err(|reason| CustomFamilyError::DimensionMismatch {
-                            reason: format!(
-                                "canonicalize_for_identifiability_with_operating_scalars: the \
-                                 post-T rank certificate could not materialise the design for \
-                                 block '{}': {reason}",
-                                spec.name,
-                            ),
-                        })?;
-                    for i in 0..n_rows.min(flat.nrows()).min(r_map) {
-                        for j in 0..p_b.min(flat.ncols()) {
-                            j_pre[[i, col_off + j]] = flat[[i, j]];
-                        }
-                    }
+                Err(reason) => {
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "canonicalize_for_identifiability_with_operating_scalars: the MAP-uniqueness \
+                             check could not evaluate the effective Jacobian of block '{}', so its \
+                             column span cannot be seen: {reason}",
+                            spec.name,
+                        ),
+                    });
                 }
             }
             col_off += p_b;
