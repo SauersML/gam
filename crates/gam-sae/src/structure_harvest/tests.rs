@@ -2699,9 +2699,20 @@ fn curl_rejects_gaussian_fill_plane() {
 /// per-row turns; the fundamental decoder places the ring in the `(e0, e1)`
 /// plane at radius `R`.
 fn single_circle_term(phase_turns: &Array1<f64>) -> (SaeManifoldTerm, SaeManifoldRho) {
-    let n = phase_turns.len();
-    let p = 4usize;
     let radius = 3.0_f64;
+    let mut decoder = Array2::<f64>::zeros((3, 4));
+    decoder[[2, 0]] = radius; // cos₁ · e0
+    decoder[[1, 1]] = radius; // sin₁ · e1
+    single_periodic_term(phase_turns, decoder)
+}
+
+/// A single-Periodic-atom term (degree-3 harmonic basis `[1, sin₁, cos₁]`) with
+/// the given per-row phase turns and `3×p` decoder, gated fully on every row.
+fn single_periodic_term(
+    phase_turns: &Array1<f64>,
+    decoder: Array2<f64>,
+) -> (SaeManifoldTerm, SaeManifoldRho) {
+    let n = phase_turns.len();
     let evaluator = Arc::new(
         PeriodicHarmonicEvaluator::new(3)
             .expect("a degree-3 periodic harmonic basis is a valid evaluator spec"),
@@ -2710,9 +2721,6 @@ fn single_circle_term(phase_turns: &Array1<f64>) -> (SaeManifoldTerm, SaeManifol
     let (phi, jet) = evaluator
         .evaluate(coords.view())
         .expect("the fixture coords are finite and lie inside the evaluator chart");
-    let mut decoder = Array2::<f64>::zeros((3, p));
-    decoder[[2, 0]] = radius; // cos₁ · e0
-    decoder[[1, 1]] = radius; // sin₁ · e1
     let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle".to_string(),
         SaeAtomBasisKind::Periodic,
@@ -2740,24 +2748,106 @@ fn single_circle_term(phase_turns: &Array1<f64>) -> (SaeManifoldTerm, SaeManifol
 
 /// A circle whose angular mass has collapsed to a diameter (phases at 0 and
 /// ½ turn only) is flagged for flattening; a healthy full-coverage ring is
-/// not.
+/// not. The residuals are zero, so the parsed rows are the atom's own image.
 #[test]
 fn flatten_flags_diameter_and_spares_healthy_ring() {
     let n = 400usize;
+    let zero = Array2::<f64>::zeros((n, 4));
     // Diameter: phases alternate 0 / ½ turn → angles {0, π}.
     let diameter_phases = Array1::from_shape_fn(n, |r| if r % 2 == 0 { 0.0 } else { 0.5 });
     let (diam_term, _) = single_circle_term(&diameter_phases);
-    let flagged = flatten_candidates(&diam_term);
+    let flagged = flatten_candidates(&diam_term, zero.view()).unwrap();
     assert_eq!(flagged, vec![0], "a diameter-collapsed circle must flatten");
 
     // Healthy ring: full angular coverage.
     let ring_phases = Array1::from_shape_fn(n, |r| r as f64 / n as f64);
     let (ring_term, _) = single_circle_term(&ring_phases);
-    let flagged = flatten_candidates(&ring_term);
+    let flagged = flatten_candidates(&ring_term, zero.view()).unwrap();
     assert!(
         flagged.is_empty(),
         "a healthy full-coverage ring must NOT be flattened"
     );
+}
+
+/// #3506 — a periodic decoder that traces a SEGMENT (only `cos₁` loaded) under
+/// uniformly spread phases is a line. The old audit paired the image radius
+/// `|R cos φ|` with the phase angle `φ`, which reads `κ = 3/2` and `R₂ = 0` —
+/// a covered "ring" sitting exactly on its magic `κ > 1.5` cut, so it was
+/// never flattened. The geometric angle of the image point in its principal
+/// plane is `0` or `π`, so the audit now reads a diameter and demotes to rank 1.
+#[test]
+fn flatten_demotes_line_collapsed_decoder_under_uniform_phases_3506() {
+    let n = 400usize;
+    let mut decoder = Array2::<f64>::zeros((3, 4));
+    decoder[[2, 0]] = 3.0; // cos₁ · e0 only: the image is the segment [−3, 3]·e0
+    let phases = Array1::from_shape_fn(n, |r| r as f64 / n as f64);
+    let (term, _) = single_periodic_term(&phases, decoder);
+    let zero = Array2::<f64>::zeros((n, 4));
+    let audit = flatten_audit(&term, zero.view()).unwrap();
+    assert_eq!(audit.len(), 1, "the one periodic atom is audited");
+    let FlattenAudit::Judged(verdict) = &audit[0].1 else {
+        panic!("a non-constant image with a parse must be judged, got {:?}", audit[0].1);
+    };
+    assert!(
+        verdict.image.diameter,
+        "the segment image must read as a diameter (R₂ = {:.4})",
+        verdict.image.resultant2
+    );
+    assert!(verdict.recommend_flatten, "a line-collapsed circle must flatten");
+    assert_eq!(verdict.residual_rank, 1, "a segment demotes to rank 1");
+    assert_eq!(flatten_candidates(&term, zero.view()).unwrap(), vec![0]);
+}
+
+/// #3506 — the Gaussian-fill branch reads the DATA the circle parses, not its
+/// image: a healthy ring decoder whose rows actually parse an isotropic Gaussian
+/// blob in the ring's plane (leave-atom-out target `y = R + a·g` Gaussian) is
+/// not a recognizable ring, so it demotes to a rank-2 flat plane. The image of a
+/// 1-D periodic curve can never read `κ ≈ 2`, so the old image-only audit
+/// could not fire this branch at all.
+#[test]
+fn flatten_demotes_gaussian_parse_of_ring_decoder_to_rank2_3506() {
+    let n = 400usize;
+    let phases = Array1::from_shape_fn(n, |r| r as f64 / n as f64);
+    let (term, _) = single_circle_term(&phases);
+    let fitted = term.try_fitted().unwrap();
+    let mut s = 0x3506_u64;
+    let mut lcg = || -> f64 {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((s >> 11) as f64) / ((1u64 << 53) as f64)
+    };
+    // Residual = Gaussian blob − the atom's own contribution, so the parsed
+    // leave-atom-out rows are exactly the blob.
+    let mut residuals = -&fitted;
+    for r in 0..n {
+        let u1 = lcg().max(1e-12);
+        let u2 = lcg();
+        let rad = 3.0 * (-2.0 * u1.ln()).sqrt();
+        residuals[[r, 0]] += rad * (std::f64::consts::TAU * u2).cos();
+        residuals[[r, 1]] += rad * (std::f64::consts::TAU * u2).sin();
+    }
+    let audit = flatten_audit(&term, residuals.view()).unwrap();
+    let FlattenAudit::Judged(verdict) = &audit[0].1 else {
+        panic!("the ring atom must be judged, got {:?}", audit[0].1);
+    };
+    assert!(
+        verdict.image.recognized,
+        "the decoder itself is a healthy ring (κ = {:.3})",
+        verdict.image.kappa
+    );
+    assert!(
+        !verdict.parse.recognized,
+        "a Gaussian parse must not read as a ring (κ = {:.3}, z = {:.2})",
+        verdict.parse.kappa,
+        verdict.parse.z_below_gaussian
+    );
+    assert!(verdict.recommend_flatten, "a Gaussian-fill circle must flatten");
+    assert_eq!(verdict.residual_rank, 2, "Gaussian fill demotes to rank 2");
+
+    // The same ring parsing its own image is left alone.
+    let zero = Array2::<f64>::zeros((n, 4));
+    assert!(flatten_candidates(&term, zero.view()).unwrap().is_empty());
 }
 
 /// KILLER DEMO — end-to-end through the round driver: with curl ON the
@@ -2862,15 +2952,15 @@ fn curl_killer_demo_planted_circle_wins_race() {
     );
 
     let n = 400usize;
-    let radii = Array1::<f64>::from_elem(n, 3.0);
-    let angles = Array1::<f64>::from_shape_fn(n, |r| {
-        if r % 2 == 0 {
-            0.0
-        } else {
-            std::f64::consts::PI
-        }
-    });
-    let flatten = crate::manifold::flatten_verdict(radii.view(), angles.view()).unwrap();
+    let alpha = Array1::<f64>::from_shape_fn(n, |r| if r % 2 == 0 { 3.0 } else { -3.0 });
+    let beta = Array1::<f64>::zeros(n);
+    let flatten = crate::manifold::flatten_verdict(
+        alpha.view(),
+        beta.view(),
+        alpha.view(),
+        beta.view(),
+    )
+    .unwrap();
     assert!(flatten.recommend_flatten, "diameter must flatten");
     assert_eq!(flatten.residual_rank, 1, "diameter must flatten to rank 1");
 }
