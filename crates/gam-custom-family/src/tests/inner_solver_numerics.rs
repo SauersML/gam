@@ -3895,20 +3895,23 @@ pub(crate) fn exact_newton_dh_closure_rejects_non_finite_directional_derivative(
 /// every one of those folds would report a finite minimum for a poisoned
 /// Hessian.
 #[test]
-pub(crate) fn eigh_refuses_nan_hessian_so_min_eigenvalue_folds_never_see_nan() {
-    let mut mat = Array2::<f64>::eye(3);
-    mat[[1, 0]] = f64::NAN;
-    mat[[0, 1]] = f64::NAN;
-
+pub(crate) fn eigh_refuses_nonfinite_hessian_before_min_eigenvalue_folds() {
     use gam_linalg::faer_ndarray::{FaerEigh, FaerLinalgError};
-    let error = FaerEigh::eigh(&mat, faer::Side::Lower).expect_err(
-        "eigh must refuse a NaN block Hessian; the production min-eigenvalue folds use \
-         f64::min, which would silently drop NaN eigenvalues",
-    );
-    assert!(
-        matches!(error, FaerLinalgError::SelfAdjointEigenNonFiniteInput { .. }),
-        "eigh must refuse NaN input as non-finite, got: {error}"
-    );
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for (row,col) in [(0,0), (0,1), (1,0)] {
+            let mut matrix = Array2::<f64>::eye(3);
+            matrix[[row,col]] = bad;
+            for side in [faer::Side::Lower, faer::Side::Upper] {
+                let error = FaerEigh::eigh(&matrix, side)
+                    .expect_err("the eigenvalue consumer must never see nonfinite input eigenvalues");
+                assert!(matches!(error, FaerLinalgError::SelfAdjointEigenNonFiniteInput { .. }),
+                    "bad={bad}, position=({row},{col}): {error}");
+            }
+        }
+    }
+    let (values, _) = FaerEigh::eigh(&Array2::<f64>::eye(3), faer::Side::Lower)
+        .expect("the same finite control must remain accepted");
+    assert!(values.iter().all(|&value| value == 1.0));
 }
 
 #[test]

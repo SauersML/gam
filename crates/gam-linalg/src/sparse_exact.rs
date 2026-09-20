@@ -99,7 +99,7 @@ pub(crate) fn dense_to_sparse_symmetric_upper(
             let mut count = 0usize;
             let row_end = (col + 1).min(row_limit);
             for row in 0..row_end {
-                if matrix[[row, col]].abs() > tol {
+                if is_stored_entry(matrix[[row, col]], tol) {
                     count += 1;
                 }
             }
@@ -122,6 +122,16 @@ pub(crate) fn dense_to_sparse_symmetric_upper(
     );
     let symbolic = SymbolicSparseColMat::<usize>::new_checked(nrows, ncols, col_ptr, None, row_idx);
     Ok(SparseColMat::<usize, f64>::new(symbolic, values))
+}
+
+/// Whether a dense entry is carried into the sparse pattern: everything except
+/// a finite value of magnitude at most `tol`. Written as the negation so that a
+/// `NaN` entry (for which every comparison is false) is kept and reaches the
+/// factorization's finiteness check, instead of being deleted as if it were a
+/// structural zero.
+#[inline]
+fn is_stored_entry(value: f64, tol: f64) -> bool {
+    !(value.abs() <= tol)
 }
 
 fn prefix_sum_counts(counts: &[usize]) -> Vec<usize> {
@@ -152,7 +162,7 @@ fn fill_dense_symmetric_upper_columns(
             let mut write = col_ptr[col] - base;
             for row in 0..row_end {
                 let value = matrix[[row, col]];
-                if value.abs() > tol {
+                if is_stored_entry(value, tol) {
                     row_idx[write] = row;
                     values[write] = value;
                     write += 1;
@@ -457,6 +467,18 @@ fn canonicalize_sparse_symmetric_upper(
             }
         };
 
+        // `absolute` sums `|vᵢ|` over every stored contribution, so it is finite
+        // exactly when every contribution is finite and their magnitudes do not
+        // overflow. The drop test below cannot be trusted with anything else:
+        // `NaN > band` and `∞ > ∞` are both false, so a non-finite entry would
+        // be deleted from the matrix and the factor, solve and inertia would be
+        // reported for a different matrix.
+        if !(value.is_finite() && absolute.is_finite()) {
+            bail_invalid_linalg!(
+                "sparse symmetric matrix entry ({row}, {col}) is not finite: canonical value \
+                 {value:?} from contributions of total magnitude {absolute:?}"
+            );
+        }
         if value.abs() > crate::roundoff::accumulation_band(roundings, absolute) {
             triplets.push(Triplet::new(row, col, value));
         }
@@ -868,7 +890,9 @@ fn factorize_simplicial_canonical_upper(
     let mut logdet = 0.0f64;
     for j in 0..n {
         let diag = l_values[l_col_ptr[j]];
-        if diag <= 0.0 {
+        // Negated so a `NaN` pivot is refused rather than summed into the
+        // log-determinant.
+        if !(diag.is_finite() && diag > 0.0) {
             return Err(LinalgError::HessianNotPositiveDefinite {
                 min_eigenvalue: f64::NAN,
             });
@@ -1501,6 +1525,100 @@ mod tests {
         let solution = solve_sparse_spd(&factor, &array![0.0, 1.0]).unwrap();
         assert!(solution[0] < 0.0, "tiny coupling must not be dropped");
         approx_eq(solution[0], -tiny / (1.0 - tiny * tiny), 1.0e-27);
+    }
+
+    /// A non-finite stored entry is an error in every entrypoint that
+    /// canonicalizes, not a structural zero. Before the canonicalization checked
+    /// finiteness, its drop test `|v| > band` was false for `NaN` and for `∞`
+    /// (whose band is itself `∞`), so `[[4, x], [x, 5]]` with `x` non-finite
+    /// was factorized, and its inertia and fill counted, as `diag(4, 5)`.
+    #[test]
+    fn non_finite_sparse_entries_are_rejected_not_dropped() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            // Full storage (both triangles) and upper-only storage of the same
+            // off-diagonal, plus a non-finite diagonal.
+            let full: SparseColMat<usize, f64> = SparseColMat::try_new_from_triplets(
+                2,
+                2,
+                &[
+                    Triplet::new(0, 0, 4.0),
+                    Triplet::new(0, 1, bad),
+                    Triplet::new(1, 0, bad),
+                    Triplet::new(1, 1, 5.0),
+                ],
+            )
+            .expect("full storage");
+            let upper: SparseColMat<usize, f64> = SparseColMat::try_new_from_triplets(
+                2,
+                2,
+                &[
+                    Triplet::new(0, 0, 4.0),
+                    Triplet::new(0, 1, bad),
+                    Triplet::new(1, 1, 5.0),
+                ],
+            )
+            .expect("upper storage");
+            let diagonal: SparseColMat<usize, f64> = SparseColMat::try_new_from_triplets(
+                2,
+                2,
+                &[Triplet::new(0, 0, bad), Triplet::new(1, 1, 5.0)],
+            )
+            .expect("diagonal storage");
+            for (label, h) in [("full", &full), ("upper", &upper), ("diagonal", &diagonal)] {
+                assert!(
+                    canonicalize_sparse_symmetric_upper(h).is_err(),
+                    "{label} {bad:?}: canonicalization kept going"
+                );
+                assert!(
+                    factorize_sparse_spd(h).is_err(),
+                    "{label} {bad:?}: factorized as a different matrix"
+                );
+                assert!(
+                    sparse_symmetric_inertia(h).is_err(),
+                    "{label} {bad:?}: inertia reported for a different matrix"
+                );
+                assert!(
+                    sparse_spd_factor_nnz(h).is_err(),
+                    "{label} {bad:?}: fill counted for a different pattern"
+                );
+            }
+        }
+    }
+
+    /// Mirrored finite entries that cancel exactly are still dropped as the
+    /// zero they are; the finiteness check does not change the drop test.
+    #[test]
+    fn cancelling_finite_mirror_pair_is_still_dropped() {
+        let h: SparseColMat<usize, f64> = SparseColMat::try_new_from_triplets(
+            2,
+            2,
+            &[
+                Triplet::new(0, 0, 4.0),
+                Triplet::new(0, 1, 1.0e-3),
+                Triplet::new(1, 0, -1.0e-3),
+                Triplet::new(1, 1, 5.0),
+            ],
+        )
+        .expect("mirror pair");
+        let upper = canonicalize_sparse_symmetric_upper(&h).expect("finite input");
+        assert_eq!(upper.compute_nnz(), 2);
+    }
+
+    /// The dense→sparse conversion keeps a `NaN` entry instead of reading it as
+    /// a structural zero (`NaN.abs() > tol` is false), so the factorization
+    /// sees it and refuses. Finite entries at or below `tol` are still dropped.
+    #[test]
+    fn dense_to_sparse_keeps_nan_entries() {
+        let m = array![[4.0, f64::NAN, 0.0], [f64::NAN, 5.0, 1.0e-20], [0.0, 1.0e-20, 6.0]];
+        let s = dense_to_sparse_symmetric_upper(&m, 1.0e-12).unwrap();
+        // Three diagonals plus the NaN; the zero and the sub-tolerance entry go.
+        assert_eq!(s.compute_nnz(), 4);
+        let (symbolic, values) = s.parts();
+        let col1 = symbolic.col_ptr()[1]..symbolic.col_ptr()[2];
+        assert_eq!(&symbolic.row_idx()[col1.clone()], &[0, 1]);
+        assert!(values[col1.start].is_nan());
+        assert!(factorize_sparse_spd(&s).is_err());
+        assert!(sparse_symmetric_inertia(&s).is_err());
     }
 
     #[test]

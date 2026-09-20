@@ -2266,22 +2266,16 @@ impl<'a> RemlState<'a> {
         let is_gaussian_identity = self.config.likelihood.spec.is_gaussian_identity();
         let firth_jeffreys_link = super::outer_eval::reml_robust_jeffreys_link(&self.config);
         let firth_op_original = if let Some(jeffreys_link) = firth_jeffreys_link {
-            if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
-                Some(cached.as_ref().clone())
-            } else {
-                let x_dense_arc = self
-                    .x()
-                    .try_to_dense_arc(
-                        "sparse exact tau coords require dense design for Firth operator",
-                    )
-                    .map_err(EstimationError::InvalidInput)?;
-                Some(Self::build_firth_dense_operator_for_link(
-                    &jeffreys_link,
-                    x_dense_arc.as_ref(),
-                    &pirls_result.final_eta.to_owned(),
-                    self.weights,
-                )?)
-            }
+            let x_dense_arc = self
+                .x()
+                .try_to_dense_arc("sparse exact tau coords require dense design for Firth operator")
+                .map_err(EstimationError::InvalidInput)?;
+            Some(Self::build_firth_dense_operator_for_link(
+                &jeffreys_link,
+                x_dense_arc.as_ref(),
+                &pirls_result.final_eta.to_owned(),
+                self.weights,
+            )?)
         } else {
             None
         };
@@ -2480,23 +2474,20 @@ impl<'a> RemlState<'a> {
 
         let firth_jeffreys_link = super::outer_eval::reml_robust_jeffreys_link(&self.config);
         let firth_op = if let Some(jeffreys_link) = firth_jeffreys_link {
-            let op = if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
-                cached.as_ref().clone()
-            } else {
-                let x_dense_arc = self
-                    .x()
-                    .try_to_dense_arc(
-                        "build_tau_fixed_drift_deriv_original_basis requires dense design for Firth operator",
-                    )
-                    .map_err(EstimationError::InvalidInput)?;
+            let x_dense_arc = self
+                .x()
+                .try_to_dense_arc(
+                    "build_tau_fixed_drift_deriv_original_basis requires dense design for Firth operator",
+                )
+                .map_err(EstimationError::InvalidInput)?;
+            Some(std::sync::Arc::new(
                 Self::build_firth_dense_operator_for_link(
                     &jeffreys_link,
                     x_dense_arc.as_ref(),
                     &pirls_result.final_eta.to_owned(),
                     self.weights,
-                )?
-            };
-            Some(std::sync::Arc::new(op))
+                )?,
+            ))
         } else {
             None
         };
@@ -2645,25 +2636,20 @@ impl<'a> RemlState<'a> {
         let (firth_op_arc, x_tau_dense_list, x_tau_tau_dense) = if let Some(jeffreys_link) =
             firth_jeffreys_link
         {
-            let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> =
-                if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
-                    Some(std::sync::Arc::new(cached.as_ref().clone()))
-                } else {
-                    let x_dense_arc = self
-                    .x()
-                    .try_to_dense_arc(
-                        "original-basis tau pair callbacks require dense design for Firth operator",
-                    )
-                    .map_err(EstimationError::InvalidInput)?;
-                    Some(std::sync::Arc::new(
-                        Self::build_firth_dense_operator_for_link(
-                            &jeffreys_link,
-                            x_dense_arc.as_ref(),
-                            &pirls_result.final_eta.to_owned(),
-                            self.weights,
-                        )?,
-                    ))
-                };
+            let x_dense_arc = self
+                .x()
+                .try_to_dense_arc(
+                    "original-basis tau pair callbacks require dense design for Firth operator",
+                )
+                .map_err(EstimationError::InvalidInput)?;
+            let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> = Some(
+                std::sync::Arc::new(Self::build_firth_dense_operator_for_link(
+                    &jeffreys_link,
+                    x_dense_arc.as_ref(),
+                    &pirls_result.final_eta.to_owned(),
+                    self.weights,
+                )?),
+            );
             let dense_list: Vec<Option<Array2<f64>>> = x_tau_terms
                 .iter()
                 .map(|t| match t {

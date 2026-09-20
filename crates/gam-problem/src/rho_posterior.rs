@@ -173,6 +173,11 @@ pub enum RhoPosteriorRefusal {
     CriterionUnavailableAtRhoHat { detail: String },
     /// The criterion at `ρ̂` is not finite.
     CriterionNotFiniteAtRhoHat,
+    /// A sequential interval of the Laplace proposal restricted to the support
+    /// of `π(ρ|y)` has a mass whose two log-probabilities round to the same
+    /// value, so the draw's density on free coordinate `coordinate` is not
+    /// representable. No criterion was evaluated off `ρ̂` (#3010).
+    DegenerateProposalInterval { coordinate: usize },
     /// The criterion could not be evaluated at proposal draw `draw`, and why.
     /// Every draw carries mass, so one the criterion cannot value refuses the
     /// diagnostic rather than being dropped from it.
@@ -201,6 +206,11 @@ impl fmt::Display for RhoPosteriorRefusal {
                 write!(f, "criterion is unavailable at rho_hat: {detail}")
             }
             Self::CriterionNotFiniteAtRhoHat => f.write_str("criterion at rho_hat is not finite"),
+            Self::DegenerateProposalInterval { coordinate } => write!(
+                f,
+                "the Laplace proposal restricted to the support of pi(rho|y) has an interval \
+                 of unrepresentable mass on rho coordinate {coordinate}"
+            ),
             Self::CriterionUnavailableAtDraw { draw, detail } => {
                 write!(f, "criterion is unavailable at proposal draw {draw}: {detail}")
             }
@@ -224,8 +234,10 @@ pub enum RhoPosteriorNotComputed {
     /// Only the REML evaluator's post-fit seam forms the diagnostic, and this
     /// fit was assembled on a route that does not pass through it.
     NotFormedOnThisRoute,
-    /// The fit was run without inference (`FitOptions::compute_inference` is
-    /// false), and the seam runs only inside the inference pass.
+    /// The fit did not request `ρ`-posterior inference: it was run without
+    /// inference (`FitOptions::compute_inference` is false), or with
+    /// `skip_rho_posterior_inference` set, and the seam runs only on request
+    /// (#3010).
     InferenceNotRequested,
     /// No adequacy producer is registered (a build that never links the
     /// sampler tier).
@@ -241,7 +253,7 @@ impl fmt::Display for RhoPosteriorNotComputed {
                 f.write_str("this fit's route does not pass through the adequacy seam")
             }
             Self::InferenceNotRequested => {
-                f.write_str("the fit was run without inference, where the adequacy seam runs")
+                f.write_str("the fit did not request rho-posterior inference")
             }
             Self::EscalatorUnregistered => f.write_str("no rho-posterior producer is registered"),
             Self::OuterHessianUnavailable { reason } => {
@@ -258,7 +270,8 @@ impl fmt::Display for RhoPosteriorNotComputed {
 /// a log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RhoPosteriorOutcome {
-    /// No smoothing coordinate: there is nothing to grade.
+    /// No free smoothing coordinate: `ρ` is empty, or every coordinate is
+    /// held on a face of its domain (#3010). There is nothing to grade.
     NotApplicable,
     /// The diagnostic was never attempted, and why.
     NotComputed(RhoPosteriorNotComputed),
@@ -370,13 +383,22 @@ pub enum RhoPosteriorEscalation {
 pub trait RhoPosteriorEscalator: Send + Sync {
     /// Tier-0 PSIS `ρ`-adequacy diagnostic. `criterion` evaluates the outer criterion
     /// `−log π(ρ|y)` at any `ρ`, or says why it cannot; a draw it cannot value
-    /// refuses the diagnostic, since dropping it would drop its mass. Returns
-    /// `Ok(None)` when there is nothing to grade (`K = 0`) and the typed
-    /// [`RhoPosteriorRefusal`] when the diagnostic cannot be formed.
+    /// refuses the diagnostic, since dropping it would drop its mass. `support`
+    /// is the `(lower, upper)` box on which the criterion has a value: finite
+    /// only at a literal face, past which it has none, and infinite at a
+    /// saturated face, past which it continues. The diagnostic's target is
+    /// `π(ρ|y)` restricted to it. `held` names the coordinates the outer
+    /// certificate railed or found on a face; they stay at `ρ̂`, and the rest
+    /// are drawn from the Laplace approximation conditioned on them and
+    /// truncated to `support` (#3010). Returns `Ok(None)` when there is nothing
+    /// to grade (no free coordinate) and the typed [`RhoPosteriorRefusal`] when
+    /// the diagnostic cannot be formed.
     fn rho_posterior_adequacy(
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
+        support: &(Array1<f64>, Array1<f64>),
+        held: &[usize],
         criterion: &dyn Fn(&Array1<f64>) -> Result<f64, String>,
     ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal>;
 
