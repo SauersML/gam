@@ -3223,11 +3223,6 @@ fn claim_band_config(band: f64) -> OuterConfig {
 /// that (#3018). It is the improvement floor the fixtures used to hand the guard.
 const GUARD_REL_RESOLUTION: f64 = 1.0e-6;
 
-/// The criterion resolution `τ` these fixtures hand the guard, the resolution a
-/// value carries when its evaluation publishes no band: absolute, as every route
-/// derives it (`outer_criterion_resolution`).
-const GUARD_TAU: f64 = 1.0e-6;
-
 /// A step whose model predicted no decrease: with no resolvable measured
 /// decrease either, it is a stalled step (#3018). A refused trial proposed by
 /// such a step stalls too, since it could not have shown resolved progress.
@@ -3259,7 +3254,7 @@ fn guard_sample(
 #[test]
 fn finite_cost_stall_refuses_to_certify_strict_saddle_incumbent_2357() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
 
     // Best-so-far: low cost, gradient inside the certification band, but a
     // certified strict saddle (the #2357 eval#5 analogue at ρ₂≈5.4).
@@ -3328,7 +3323,7 @@ fn finite_cost_stall_refuses_to_certify_strict_saddle_incumbent_2357() {
 #[test]
 fn rejected_trials_that_move_do_not_prove_a_replay_at_a_strict_saddle() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     let incumbent = array![-2.6, 4.8];
     guard.observe_second_order_seed(
         &incumbent,
@@ -3441,7 +3436,7 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     // Threshold the projected residual (0 here) must clear; any positive value
     // certifies the at-bound stall as converged.
-    let guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
@@ -3511,7 +3506,7 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
@@ -3592,7 +3587,7 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
@@ -3680,7 +3675,7 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
@@ -3791,7 +3786,7 @@ fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
@@ -3924,7 +3919,7 @@ fn bfgs_bridge_value_probe_carries_the_refusal_reason_where_plus_inf_names_nothi
 #[test]
 fn arc_cost_stall_guard_uses_cached_initial_sample_as_feasible_best() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     let seed = array![0.0, 0.0];
     guard.observe_seed(&seed, 10.0, GUARD_REL_RESOLUTION * (1.0 + f64::abs(10.0)), 5.0e-4);
 
@@ -3965,7 +3960,7 @@ fn arc_cost_stall_guard_uses_cached_initial_sample_as_feasible_best() {
 #[test]
 fn arc_infeasible_stall_refuses_cached_strict_saddle_2316() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit);
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit);
     let seed = array![0.0, 0.0];
     guard.observe_second_order_seed(&seed, 10.0, GUARD_REL_RESOLUTION * 11.0, 5.0e-2, Some(false));
 
@@ -4024,7 +4019,7 @@ fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     guard.observe_seed(&seed, 10.0, GUARD_REL_RESOLUTION * (1.0 + f64::abs(10.0)), 5.0e-4);
     let lo = array![-10.0];
     let hi = array![10.0];
@@ -4083,7 +4078,7 @@ fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
 #[test]
 fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     let stale_seed = array![0.0, 0.0];
     guard.observe_seed(&stale_seed, 1.0, GUARD_REL_RESOLUTION * (1.0 + f64::abs(1.0)), 2.0);
 
@@ -4126,7 +4121,7 @@ fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
 #[test]
 fn constrained_stationary_probe_keeps_better_incumbent() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     // A good interior fit (the prepass seed): low cost on a flat valley floor,
     // with a residual outer gradient above the claim band, so it is not certified
     // stationary but it is the incumbent every later publish must keep.
@@ -4195,7 +4190,7 @@ fn constrained_stationary_probe_keeps_better_incumbent() {
 #[test]
 fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     let seed = array![0.0, 0.0];
     // Best iterate has a HUGE residual gradient (the #1426 |g|≈11 signature),
     // orders of magnitude above the claim band — the inner solve did not converge.
@@ -4277,7 +4272,7 @@ fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
 #[test]
 fn cost_stall_productive_descent_replenishes_escape_budget_2253() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     let seed = array![0.0, 0.0];
     let stuck_grad = 10.9;
     guard.observe_seed(&seed, 10.0, GUARD_REL_RESOLUTION * (1.0 + f64::abs(10.0)), stuck_grad);
@@ -4368,7 +4363,7 @@ fn cost_stall_productive_descent_replenishes_escape_budget_2253() {
 #[test]
 fn a_stall_modestly_above_the_band_escapes_then_halts_on_the_replay_cut_2817() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     let seed = array![0.0, 0.0];
     let score = -1.0e3;
     // Just above the band the certificate applies (1e-3 here, at every value).
@@ -4419,7 +4414,7 @@ fn a_stall_modestly_above_the_band_escapes_then_halts_on_the_replay_cut_2817() {
 #[test]
 fn cost_stall_above_score_relative_band_keeps_descending() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-3), exit.clone());
     let seed = array![3.0, -3.0];
     let score = -6.0e2;
     // Far above the band the certificate applies, and below the fixed 5.0 ceiling
@@ -4455,7 +4450,7 @@ fn cost_stall_above_score_relative_band_keeps_descending() {
 #[test]
 fn a_stall_inside_its_probe_noise_floor_is_not_claimed_2241() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-9), exit.clone());
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-9), exit.clone());
     let residual_grad = 0.5;
     let score = 10.0;
     assert!(
@@ -4498,7 +4493,7 @@ fn collapsed_probe_radius_leaves_the_claim_band_unchanged_2456() {
     let verdict_at_radius = |radius: f64| {
         let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
         let mut guard =
-            CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-9), exit.clone());
+            CostStallGuard::new(&claim_band_config(1.0e-9), exit.clone());
         guard.observe_seed(&array![0.0, 0.0], score, GUARD_REL_RESOLUTION * (1.0 + f64::abs(score)), residual_grad);
         // σ̂ = median{8e-4, 4e-4, 6e-4} = 6e-4 over a probed radius Δ = radius.
         guard.observe(guard_sample(&array![radius, 0.0], score + 8.0e-4, residual_grad, None), NO_MODEL_DECREASE);
@@ -4654,7 +4649,7 @@ fn criterion_flat_halt_is_refused_by_the_ladder_not_rescued_by_a_constant_2458()
 #[test]
 fn probe_noise_floor_capped_never_certifies_steep_point_2241() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-9), exit.clone());
+    let mut guard = CostStallGuard::new(&claim_band_config(1.0e-9), exit.clone());
     let steep_grad = 2.0;
     guard.observe_seed(&array![0.0, 0.0], 10.0, GUARD_REL_RESOLUTION * (1.0 + f64::abs(10.0)), steep_grad);
     // Degenerate 1e-9 probe steps with O(1e-3) value scatter: raw σ̂/Δ ≈ 1e6,

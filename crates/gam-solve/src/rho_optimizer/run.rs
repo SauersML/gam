@@ -7561,9 +7561,8 @@ pub(crate) fn fixed_point_step_resolution(config: &OuterConfig, n_params: usize)
 /// resolution `τ_stat = 1/(2n)` over the declared observations
 /// ([`OuterProblemSize::statistical_resolution`], C3).
 ///
-/// Every judgement of "the criterion cannot tell these apart" reads this one
-/// number: the cost-stall guard's no-improvement test where the evaluations
-/// carry no objective band, the ARC online stop and the matrix-free model
+/// Every judgement of "the decrease left is below what the criterion can tell
+/// apart" reads this one number: the ARC online stop and the matrix-free model
 /// decrement, the curvature-resolvability and gradient-reproducibility rungs,
 /// the asymptote-rail and large-step flatness certificates, and the
 /// negative-curvature adjudication's falsifiable range. A decrease below
@@ -7571,6 +7570,12 @@ pub(crate) fn fixed_point_step_resolution(config: &OuterConfig, n_params: usize)
 /// error the inference built on the optimum already carries; it does not move
 /// with the units of `y` or with an additive constant in `V`, which the
 /// `rel·(1 + |V|)` floor it replaces did, and it shrinks as `n` grows (#2954).
+///
+/// It is a decrease-left tolerance, not the evaluation error of one value, so
+/// no test of whether one computed value is below another charges it: the
+/// cost-stall guard charges each value its objective band or its own rounding
+/// ([`super::bridges::sample_resolution`], #3287), as the fixed-point walk does
+/// (#3176).
 ///
 /// `0.0` when the route declares no observation count: such a criterion has no
 /// statistical resolution, so nothing is waived as unresolvable — a tolerance

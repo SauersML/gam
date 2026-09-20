@@ -17,8 +17,9 @@
 // One stalled step reaches a verdict (#3018): a step stalls when neither its
 // measured decrease nor its model's predicted decrease is resolvable against the
 // two values' resolutions. These scripted objectives publish no evidence, so each
-// value's resolution is the criterion's resolution [`RESOLUTION_2817`] the guard
-// is built with.
+// value's resolution is its own rounding `γ₁|V|` (#3287). The criterion's
+// resolution [`RESOLUTION_2817`] is the curvature rung's: the decrease it allows
+// to be left, and the most a step may buy for the rung to decide.
 
 use super::*;
 use ndarray::array;
@@ -30,7 +31,7 @@ use opt::OperatorObjective;
 /// threshold.
 const COST_2817: f64 = 1.0e3;
 
-/// The criterion resolution these fixtures hand the bridge and its guard: the
+/// The criterion resolution these fixtures hand the bridge's curvature rung: the
 /// statistical resolution `τ_stat = 1/(2n)` of an `n = 5000` fit, `1e-4`,
 /// written out so a fixture states the threshold it brackets instead of
 /// importing it and asserting a tautology.
@@ -187,11 +188,7 @@ fn drive_arc_oracle_publishing_2817(
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let guard = CostStallGuard::new(
-        RESOLUTION_2817,
-        &claim_band_config_2817(CLAIM_BAND_2817),
-        exit.clone(),
-    );
+    let guard = CostStallGuard::new(&claim_band_config_2817(CLAIM_BAND_2817), exit.clone());
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
@@ -311,19 +308,21 @@ fn a_flatlined_arc_stall_is_adjudicated_by_the_certificates_own_test_2817() {
     );
 }
 
-/// The wall the escape's adjudication exists for (#2817). A flat valley whose
-/// incumbent keeps creeping by less than the criterion's resolution, while its
-/// residual keeps contracting, is licensed at every stall by that contraction.
-/// So a stall above the band that escapes WITHOUT adjudication runs until the
-/// iteration count ends it: the 200-iteration wall measured on the gaussian
-/// n=50 000 fit. Every stall above the band escapes, and the escape is
-/// adjudicated by the certificate's own decrement test, so this one stops at its
-/// first stall, at a point the certificate accepts.
+/// The wall the adjudication exists for (#2817). A flat valley whose incumbent
+/// keeps creeping by less than the criterion's resolution, while its residual
+/// keeps contracting, is never stopped by the guard: each creep is resolved
+/// against the two values' rounding, so the guard reads it as descent (#3287),
+/// and a stall would be licensed by the contraction anyway. WITHOUT adjudication
+/// it runs until the iteration count ends it: the 200-iteration wall measured on
+/// the gaussian n=50 000 fit. The certificate's own decrement test decides once
+/// a step bought no more than the criterion's resolution, so this one stops at
+/// its first accepted step, at a point the certificate accepts.
 #[test]
 fn a_creeping_flat_valley_stops_at_its_first_window_by_adjudication_2817() {
     const WALL_2817: usize = 200;
-    // Each evaluation improves by 1e-9, far under the resolution `1e-4`, so
-    // every step stalls while the incumbent still moves.
+    // Each evaluation improves by 1e-9: ten thousand times the values' rounding
+    // `γ₁·|V| ≈ 1.1e-13`, so no step stalls, and far under the resolution
+    // `1e-4`, so every step opens the curvature rung.
     const CREEP_2817: f64 = 1.0e-9;
     // The residual contracts by 1e-4 of itself per evaluation, so each stall's
     // incumbent carries a smaller gradient than the last one did.
@@ -354,7 +353,7 @@ fn a_creeping_flat_valley_stops_at_its_first_window_by_adjudication_2817() {
     assert_eq!(
         outcomes.len(),
         FIRST_STALL_2817,
-        "the stop must come at the first stalled step: {} evaluation(s)",
+        "the stop must come at the first accepted step: {} evaluation(s)",
         outcomes.len()
     );
     assert!(
@@ -366,7 +365,8 @@ fn a_creeping_flat_valley_stops_at_its_first_window_by_adjudication_2817() {
 /// NEGATIVE CONTROL ON THE GATE, and it is the SAME fixture as the one above
 /// with one thing changed. Same point, same curvature, same gradient, same
 /// decrement — and a criterion still buying a whole unit of decrease per step
-/// instead of standing still. Nothing is adjudicated, because nothing stalled.
+/// instead of standing still. Nothing is adjudicated, because every step bought
+/// ten thousand times the criterion's resolution.
 ///
 /// This is what keeps the rung from becoming a first-choice stop: a search
 /// making real progress is left alone even when its local decrement is already
@@ -1168,17 +1168,26 @@ fn a_stall_that_bought_resolved_descent_between_windows_keeps_moving_2817() {
 /// projected gradient halved. The search is buying stationarity, so the second
 /// stall is licensed.
 ///
-/// Each step improves by `1e-6`, below the resolution `1e-4`, so every step
-/// stalls while the incumbent still moves and carries the gradient of the point
-/// that set it.
+/// Each step improves by one unit in the last place of `V`, below the pair of
+/// the two values' rounding `2γ₁·|V|` the guard resolves against (#3287), so
+/// every step stalls while the incumbent still moves and carries the gradient of
+/// the point that set it.
 #[test]
 fn a_stall_whose_residual_contracted_between_windows_keeps_moving_2817() {
     let schedule: Vec<(f64, Array1<f64>)> = (0..SECOND_STALL_2817)
         .map(|index| {
             let gradient = if index < 2 { 1.0 } else { 0.5 };
-            (COST_2817 - 1.0e-6 * index as f64, array![gradient])
+            let cost = f64::from_bits(COST_2817.to_bits() - index as u64);
+            (cost, array![gradient])
         })
         .collect();
+    let last_place = COST_2817 - f64::from_bits(COST_2817.to_bits() - 1);
+    assert!(
+        last_place < 2.0 * value_rounding(COST_2817),
+        "the fixture's step {last_place:.3e} must be unresolved against the pair of \
+         roundings {:.3e}",
+        2.0 * value_rounding(COST_2817)
+    );
     let (outcomes, _) = drive_arc_oracle_2817(
         array![0.5],
         schedule,
@@ -1230,7 +1239,6 @@ fn drive_operator_oracle_2817(
     );
     let stop: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let guard = CostStallGuard::new(
-        RESOLUTION_2817,
         &claim_band_config_2817(CLAIM_BAND_2817),
         Arc::new(Mutex::new(None)),
     );
@@ -1398,6 +1406,14 @@ const EXACT_INNER_MODE_3018: crate::estimate::outer_eval_capture::InnerResidualC
         source: crate::estimate::outer_eval_capture::InnerResidualSource::InnerGradient,
     };
 
+/// An inner mode solved only to an energy of `1e-6`, a thousand times the crawl's
+/// step below: a band that resolves none of its steps.
+const INEXACT_INNER_MODE_3018: crate::estimate::outer_eval_capture::InnerResidualCharge =
+    crate::estimate::outer_eval_capture::InnerResidualCharge {
+        energy: 1.0e-6,
+        source: crate::estimate::outer_eval_capture::InnerResidualSource::InnerGradient,
+    };
+
 /// A crawl buying `1e-9` per step at `|g| = 1`: a ten-thousandth of the
 /// criterion's resolution `RESOLUTION_2817 = 1e-4`, and ten thousand times the rounding band `γ₁·|V| ≈ 1.1e-13` the evaluation carries.
 /// The residual sits far above the band and its decrement `0.5` far above the
@@ -1409,13 +1425,13 @@ fn crawl_3018(count: usize) -> Vec<(f64, Array1<f64>)> {
 }
 
 /// Drive the ARC bridge over `schedule` at one point, `opt` accepting every
-/// trial, on a route that declares its problem size. With `publishes_band`, each
-/// evaluation publishes an exact inner mode, so its value's resolution is its
-/// rounding band ([`sample_resolution`]); without it, the evaluation publishes
-/// nothing and the resolution is the criterion's, [`RESOLUTION_2817`].
+/// trial, on a route that declares its problem size. With `inner_mode`, each
+/// evaluation publishes that inner residual, so its value's resolution is the
+/// band it forms ([`sample_resolution`]); without it, the evaluation publishes
+/// nothing and the resolution is the value's own rounding `γ₁|V|` (#3287).
 fn drive_arc_crawl_3018(
     schedule: Vec<(f64, Array1<f64>)>,
-    publishes_band: bool,
+    inner_mode: Option<crate::estimate::outer_eval_capture::InnerResidualCharge>,
 ) -> (Vec<Result<f64, String>>, Option<CostStallExit>) {
     let point = array![0.5];
     let table = Arc::new(schedule.clone());
@@ -1435,10 +1451,8 @@ fn drive_arc_crawl_3018(
         move |_: &mut (), _: &Array1<f64>, order: OuterEvalOrder| {
             let idx = calls.fetch_add(1, Ordering::Relaxed);
             let (cost, gradient) = table[idx.min(table.len() - 1)].clone();
-            if publishes_band {
-                crate::estimate::outer_eval_capture::record_certificate_inner_residual(
-                    EXACT_INNER_MODE_3018,
-                );
+            if let Some(charge) = inner_mode {
+                crate::estimate::outer_eval_capture::record_certificate_inner_residual(charge);
             }
             Ok(OuterEval {
                 cost,
@@ -1461,7 +1475,7 @@ fn drive_arc_crawl_3018(
         ..claim_band_config_2817(CLAIM_BAND_2817)
     };
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let guard = CostStallGuard::new(RESOLUTION_2817, &config, exit.clone());
+    let guard = CostStallGuard::new(&config, exit.clone());
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
@@ -1503,15 +1517,16 @@ fn drive_arc_crawl_3018(
 /// unprogressing at its second window while every step bought a certified
 /// decrease.
 ///
-/// Where the evaluation publishes its band, `1e-9` per step is ten thousand
-/// resolutions and the run never stalls. The CONTROL is the same crawl on an
-/// evaluation that publishes nothing, whose resolution is the criterion's
-/// `RESOLUTION_2817 = 1e-4`: there `1e-9` resolves nothing, the second stall bought
-/// nothing, and the run stops. The two arms differ only in the band, which is
-/// what makes the band the thing that decides.
+/// Where the evaluation publishes an exact inner mode, `1e-9` per step is
+/// thousands of bands and the run never stalls. The CONTROL is the same crawl on
+/// an evaluation whose inner mode carries an energy of `1e-6`: there `1e-9`
+/// resolves nothing, the second stall bought nothing, and the run stops. The two
+/// arms differ only in the band, which is what makes the band the thing that
+/// decides.
 #[test]
 fn a_crawl_the_evaluations_band_resolves_is_never_stalled_3018() {
-    let (resolved, published) = drive_arc_crawl_3018(crawl_3018(4 * SECOND_STALL_2817), true);
+    let (resolved, published) =
+        drive_arc_crawl_3018(crawl_3018(4 * SECOND_STALL_2817), Some(EXACT_INNER_MODE_3018));
     assert!(
         resolved.iter().all(|outcome| outcome.is_ok()),
         "every step of the crawl buys a decrease its band resolves, so none may stall: \
@@ -1522,18 +1537,54 @@ fn a_crawl_the_evaluations_band_resolves_is_never_stalled_3018() {
         "a running crawl publishes only its best-so-far snapshot, never a convergence"
     );
 
-    let (asserted, stopped) = drive_arc_crawl_3018(crawl_3018(4 * SECOND_STALL_2817), false);
+    let (unresolved, stopped) =
+        drive_arc_crawl_3018(crawl_3018(4 * SECOND_STALL_2817), Some(INEXACT_INNER_MODE_3018));
     assert_eq!(
-        asserted.len(),
+        unresolved.len(),
         SECOND_STALL_2817,
-        "under the asserted resolution the same crawl stalls twice and stops: {asserted:?}"
+        "inside a band of 1e-6 the same crawl stalls twice and stops: {unresolved:?}"
     );
     assert_eq!(
-        asserted.last().expect("ran").clone().err().as_deref(),
+        unresolved.last().expect("ran").clone().err().as_deref(),
         Some(ARC_UNPROGRESSING_STALL_SENTINEL),
-        "the control stops on the unprogressing sentinel: {asserted:?}"
+        "the control stops on the unprogressing sentinel: {unresolved:?}"
     );
     assert!(stopped.is_some_and(|exit| !exit.converged));
+}
+
+/// gam#3287: an evaluation that publishes no band carries the error its value's
+/// own arithmetic gives it, `γ₁|V| ≈ 1.1e-13` at `|V| = 1e3`, not the criterion's
+/// resolution. Charging `τ` to every unbanded value read a search still
+/// descending as stalled: on p6d50k the BFGS route stopped at `V = 15646.60`,
+/// `|Pg| = 2.46e-3`, where the criterion later reached `15643.01`.
+///
+/// The crawl buys `1e-9` per step, a ten-thousandth of `τ = 1e-4` and thousands
+/// of roundings, at a residual whose decrement `0.5` the certificate refuses.
+/// With no evidence published it is resolved descent at every step, exactly as
+/// with an exact inner mode: nothing stalls, and the run is never stopped. It
+/// used to stall twice and stop on the unprogressing sentinel.
+#[test]
+fn an_unbanded_crawl_below_tau_but_above_rounding_keeps_descending_3287() {
+    assert!(
+        1.0e-9 > 2.0 * value_rounding(COST_2817) && 1.0e-9 < RESOLUTION_2817,
+        "the crawl step must sit between the pair of roundings {:.3e} and τ = {:.3e}",
+        2.0 * value_rounding(COST_2817),
+        RESOLUTION_2817,
+    );
+    let (outcomes, published) = drive_arc_crawl_3018(crawl_3018(4 * SECOND_STALL_2817), None);
+    assert_eq!(
+        outcomes.len(),
+        4 * SECOND_STALL_2817,
+        "an unbanded crawl the arithmetic resolves must run every evaluation: {outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().all(|outcome| outcome.is_ok()),
+        "an unbanded crawl the arithmetic resolves is never stalled: {outcomes:?}"
+    );
+    assert!(
+        published.is_some_and(|exit| !exit.converged),
+        "a running crawl publishes only its best-so-far snapshot, never a convergence"
+    );
 }
 
 // ─── an unprogressing fixed-point walk stops ─────────────────────────────────

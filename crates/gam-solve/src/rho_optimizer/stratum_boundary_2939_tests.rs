@@ -320,7 +320,7 @@ fn refused_wall_2939(guard: &CostStallGuard, refused: &Array1<f64>) -> (f64, f64
 fn pinned_guard() -> (CostStallGuard, Arc<Mutex<Option<CostStallExit>>>, Array1<f64>) {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let config = stratum_problem().config();
-    let mut guard = CostStallGuard::new(1.0e-6, &config, exit.clone());
+    let mut guard = CostStallGuard::new(&config, exit.clone());
     let incumbent = array![1.99965, 0.4549];
     let fixture = StratumFixture {
         cutoff: 0.05,

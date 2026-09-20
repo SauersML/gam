@@ -1043,11 +1043,8 @@ pub(crate) fn run_outer_with_plan(
                     // descent ended only when its iteration count ran out. The
                     // same progress certificate the dense route uses ends it
                     // instead (#2817), on the same stall rule (#3018).
-                    let mut cost_stall_guard = CostStallGuard::new(
-                        super::run::outer_criterion_resolution(config),
-                        config,
-                        Arc::new(Mutex::new(None)),
-                    );
+                    let mut cost_stall_guard =
+                        CostStallGuard::new(config, Arc::new(Mutex::new(None)));
                     let seed_resolution =
                         cost_stall_guard.value_resolution(seed_eval.cost, &seed_evidence);
                     cost_stall_guard.observe_seed(
@@ -1290,7 +1287,7 @@ pub(crate) fn run_outer_with_plan(
                     // KKT-stationary even though its raw ∂V/∂ρ never vanishes).
                     let cost_stall_exit: Arc<Mutex<Option<CostStallExit>>> =
                         Arc::new(Mutex::new(None));
-                    let cost_stall_resolution = super::run::outer_criterion_resolution(config);
+                    let criterion_resolution = super::run::outer_criterion_resolution(config);
 
                     // Build the exact seed Hessian before enrolling the seed in
                     // the stall guard. The guard must know whether its incumbent
@@ -1314,7 +1311,7 @@ pub(crate) fn run_outer_with_plan(
                     // bridge's later verdicts use (#1082), so the seed is not a
                     // strict saddle by a standard the iterates never face.
                     let seed_curvature_resolution =
-                        super::run::criterion_curvature_resolution(cost_stall_resolution);
+                        super::run::criterion_curvature_resolution(criterion_resolution);
                     let seed_hessian_psd = seed_hessian.as_ref().and_then(|dense| {
                         reduced_hessian_psd_at_point(
                             &seed,
@@ -1326,7 +1323,7 @@ pub(crate) fn run_outer_with_plan(
                     });
 
                     let mut cost_stall_guard =
-                        CostStallGuard::new(cost_stall_resolution, config, cost_stall_exit.clone());
+                        CostStallGuard::new(config, cost_stall_exit.clone());
                     let seed_resolution =
                         cost_stall_guard.value_resolution(seed_eval.cost, &seed_evidence);
                     cost_stall_guard.observe_second_order_seed(
@@ -1376,7 +1373,7 @@ pub(crate) fn run_outer_with_plan(
                         // already does this through opt's own decrement rung
                         // (`with_model_decrement_tolerance` above); this is the
                         // dense route's half of the same repair.
-                        curvature_stationary_resolution: Some(cost_stall_resolution),
+                        curvature_stationary_resolution: Some(criterion_resolution),
                         accepted_trials: AcceptedTrialGate::new(Arc::clone(&accepted_steps)),
                         // #2954 — and on the rung it judges on. Where the route
                         // declares its size the certificate decides on the
@@ -1938,11 +1935,8 @@ pub(crate) fn run_outer_with_plan(
                         // (`CostStallGuard::stationarity_band`, #2817).
                         let seed_grad_norm =
                             stratum_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-                        let mut cost_stall_guard = CostStallGuard::new(
-                            super::run::outer_criterion_resolution(config),
-                            config,
-                            cost_stall_exit.clone(),
-                        );
+                        let mut cost_stall_guard =
+                            CostStallGuard::new(config, cost_stall_exit.clone());
                         let seed_resolution =
                             cost_stall_guard.value_resolution(stratum_eval.cost, &stratum_evidence);
                         cost_stall_guard.observe_seed(
