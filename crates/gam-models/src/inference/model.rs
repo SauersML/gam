@@ -158,10 +158,21 @@ use std::path::Path;
 // whose decision is now the null tail against its design rate instead of the sign of
 // `D̂`. All three carry serde defaults, so a v33 or older payload loads with none
 // recorded, its decision as it was made; a v33 binary refuses a v34 payload by version.
-pub const MODEL_PAYLOAD_VERSION: u32 = 34;
+// v35 carries the constant variance stage in the latent-Z calibration's first-stage
+// covariance (`theta1_cov`, gam#3030): a fit whose variance stage does not fire now
+// records the `(p+2)²` joint covariance, with the variance row and column, where v34
+// recorded `(p+1)²`. A v34 payload still loads and predicts; its generated-regressor
+// correction refuses the narrower covariance by name, so no interval is published
+// without the stage.
+pub const MODEL_PAYLOAD_VERSION: u32 = 35;
+
+/// The schema before the constant variance stage in the first-stage covariance
+/// (gam#3030), whose only difference is that covariance's width.
+const CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION: u32 = 34;
 
 /// The schema before the closed-form certificate's null law (gam#2926), whose only
-/// difference is those fields' absence.
+/// difference from [`CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION`] is those fields'
+/// absence.
 const CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION: u32 = 33;
 
 /// The schema before the full-conformal penalty count (gam#3296), whose only difference
@@ -238,8 +249,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 17] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 18] = [
     MODEL_PAYLOAD_VERSION,
+    CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
     CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
     CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
     MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
@@ -7943,6 +7955,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
             CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
             CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
             MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
@@ -7965,7 +7978,11 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
-        assert_eq!(CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(
+            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
+            CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION - 1
+        );
         assert_eq!(
             CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
             CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION - 1
