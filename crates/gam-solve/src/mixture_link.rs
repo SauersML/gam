@@ -2,7 +2,7 @@ use crate::estimate::EstimationError;
 use crate::quadrature::{latent_cloglog_d6, latent_cloglog_jet5};
 use gam_math::{
     probability::{normal_cdf, normal_pdf},
-    special::trigamma,
+    special::{digamma, trigamma},
 };
 use gam_math::special::stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg;
 use gam_problem::{
@@ -11,7 +11,6 @@ use gam_problem::{
 };
 use ndarray::{Array1, Array2};
 use statrs::function::beta::{beta_reg, ln_beta};
-use statrs::function::gamma::digamma;
 use std::ops::Neg;
 use std::sync::OnceLock;
 

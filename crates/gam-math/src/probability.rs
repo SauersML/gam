@@ -560,6 +560,247 @@ pub fn chi_square_sf(statistic: f64, degrees_of_freedom: f64) -> f64 {
     gamma_ur(half_df, 0.5 * statistic)
 }
 
+/// Quantile of `χ²_k` at lower-tail probability `p`: the `x` with
+/// `P(χ²_k ≤ x) = p`. `χ²_k` is `Gamma(shape = k/2, scale = 2)`, so this is
+/// `2·P⁻¹(k/2, p)` through [`inverse_regularized_lower_gamma`]: `p ≤ 0` maps to
+/// the support floor `0` and `p ≥ 1` to `+∞`, and a non-finite or non-positive
+/// `k` yields `NaN`.
+pub fn chi_square_quantile(p: f64, degrees_of_freedom: f64) -> f64 {
+    2.0 * inverse_regularized_lower_gamma(p, 0.5 * degrees_of_freedom)
+}
+
+/// Both regularized incomplete gamma tails at once, `(P(a, x), Q(a, x))`, each
+/// accurate to a relative ulp across the whole domain. `P(a, x) = γ(a, x) / Γ(a)`
+/// is the CDF of a unit-scale `Gamma(shape = a)` variate and `Q = 1 − P` is its
+/// survival function.
+///
+/// The pair is returned rather than `P` alone because the two are not
+/// interchangeable in `f64`: whichever of them is small carries information the
+/// other has already rounded away. Reconstructing the small one by subtracting
+/// the large one from 1 loses every digit it had — that is not a sharpening, it
+/// is the difference between an answer and none. Each branch below returns the
+/// tail it evaluates directly, and the complement is only ever formed where the
+/// subtraction is between unequal magnitudes.
+///
+/// This is the exact function [`inverse_regularized_lower_gamma`] inverts, so we
+/// own it rather than borrowing `statrs::gamma_lr`. That routine hard-clamps to
+/// `0.0` for every `x ≤ 1.11e-15` (its `almost_eq(x, 0)` guard, with accuracy
+/// `DEFAULT_F64_ACC`), which silently zeroes the residual `P(a, x) − p` in the
+/// small-shape lower tail: the Halley iterate is then driven *up* — away from a
+/// good sub-`1e-15` seed — until `x` crosses that clamp around `~1.6e-15`, where
+/// the returned point carries far more mass than `p` (#1018). The Numerical
+/// Recipes split — a power series for `x < a + 1`, the modified-Lentz continued
+/// fraction for the complement `Q = 1 − P` otherwise — keeps the leading
+/// `exp(a·ln x − x − ln Γ(a))` factor in logs, so the value stays finite and
+/// nonzero for arguments far below that clamp, and always evaluates the *smaller*
+/// tail directly (no catastrophic cancellation near either edge).
+pub fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
+    use statrs::function::gamma::ln_gamma;
+    // Callers (`inverse_regularized_lower_gamma`) validate `a > 0` upstream; a
+    // non-positive `a` would only mis-feed `ln_gamma`, never UB.
+    if x <= 0.0 {
+        return (0.0, 1.0);
+    }
+    let gln = ln_gamma(a);
+    if x < a + 1.0 {
+        // Power series: P(a,x) = exp(a·ln x − x − ln Γ(a)) · Σ_{n≥0} xⁿ / Π_{k=0}^{n}(a+k).
+        // The running term `del` is the ratio form, so no factorial overflows.
+        let mut ap = a;
+        let mut del = 1.0 / a;
+        let mut sum = del;
+        for _ in 0..1000 {
+            ap += 1.0;
+            del *= x / ap;
+            sum += del;
+            if del.abs() <= sum.abs() * f64::EPSILON {
+                break;
+            }
+        }
+        // The series branch is entered only for `x < a + 1`, where `P` is bounded
+        // by `P(a, a+1) < 3/4`, so the complement is a subtraction of unequal
+        // magnitudes and keeps every digit `P` has.
+        let p = (sum.ln() + a * x.ln() - x - gln).exp();
+        (p, 1.0 - p)
+    } else {
+        // Modified-Lentz continued fraction for Q(a,x) = 1 − P(a,x); P = 1 − Q.
+        // Evaluating the *upper* tail here keeps the directly-computed quantity
+        // small wherever P is near 1, so `1 − Q` loses no significant digits.
+        // Lentz's modified continued-fraction algorithm substitutes a tiny value
+        // for an exact zero in its recurrence (Numerical Recipes §6.2). It is a
+        // component of the algorithm, not a floor on a result: any value below
+        // the smallest normal quotient works and the converged fraction does not
+        // depend on it, so it is the arithmetic's own smallest normal, not a
+        // chosen magnitude (#2469).
+        const LENTZ_TINY: f64 = f64::MIN_POSITIVE;
+        let mut b = x + 1.0 - a;
+        let mut c = 1.0 / LENTZ_TINY;
+        let mut d = 1.0 / b;
+        let mut h = d;
+        for i in 1..1000 {
+            let an = -(i as f64) * (i as f64 - a);
+            b += 2.0;
+            d = an * d + b;
+            if d.abs() < LENTZ_TINY {
+                d = LENTZ_TINY;
+            }
+            c = b + an / c;
+            if c.abs() < LENTZ_TINY {
+                c = LENTZ_TINY;
+            }
+            d = 1.0 / d;
+            let del = d * c;
+            h *= del;
+            if (del - 1.0).abs() <= f64::EPSILON {
+                break;
+            }
+        }
+        let q = (a * x.ln() - x - gln + h.ln()).exp();
+        (1.0 - q, q)
+    }
+}
+
+/// Inverse of the regularized lower incomplete gamma function: the `x ≥ 0` with
+/// `P(a, x) = p`, where `P(a, x) = γ(a, x) / Γ(a)` is the CDF of a unit-scale
+/// `Gamma(shape = a)` variate, `a > 0`, `p ∈ (0, 1)`.
+///
+/// Uses the standard rational/Wilson–Hilferty initial estimate, except in the
+/// extreme lower tail where the exact small-`x` seed
+/// `exp((ln p + ln Γ(a + 1)) / a)` follows from `P(a, x) ~ x^a / Γ(a + 1)`.
+/// For `a ≤ 1` it keeps the Numerical Recipes series/log initial estimate. The
+/// seed is refined by Halley's method on the CDF residual — third order, a Newton
+/// step scaled by the local curvature of `P`. That residual is taken against
+/// whichever tail is small — `P(a,x) − p` below the median, `(1 − p) − Q(a,x)`
+/// above it — so it never subtracts two quantities of size 1; see the note at the
+/// iteration itself. Both tails come from the crate's own
+/// [`regularized_incomplete_gamma_pair`] (NOT `statrs::gamma_lr`, which clamps the
+/// residual to `−p` for tiny `x`; see that fn's note); the density
+/// `f(x) = x^{a−1} e^{−x} / Γ(a)` is evaluated through the same overflow-safe
+/// log factorization Numerical Recipes uses (`invgammp`), so the iteration stays
+/// finite across a wide range of `a`. A positivity step-halving guard keeps the
+/// iterate inside the support.
+pub fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
+    use statrs::function::gamma::ln_gamma;
+
+    if !(a.is_finite() && a > 0.0) {
+        return f64::NAN;
+    }
+    if !p.is_finite() || p <= 0.0 {
+        return 0.0;
+    }
+    if p >= 1.0 {
+        return f64::INFINITY;
+    }
+
+    let gln = ln_gamma(a);
+    let a1 = a - 1.0;
+
+    // Initial estimate. For `a > 1` a Wilson–Hilferty transform of a normal
+    // quantile works away from the extreme lower tail; there, the small-`x`
+    // analytic seed is essentially exact. Both seeds feed the same Halley polish,
+    // which starts from whichever the CDF places closer to `p`, measured in the
+    // same tail the polish measures its residual in.
+    let mut x = if a > 1.0 {
+        let pp = if p < 0.5 { p } else { 1.0 - p };
+        let t = (-2.0 * pp.ln()).sqrt();
+        let mut z = (2.30753 + t * 0.27061) / (1.0 + t * (0.99229 + t * 0.04481)) - t;
+        if p < 0.5 {
+            z = -z;
+        }
+        let wh_inner = 1.0 - 1.0 / (9.0 * a) - z / (3.0 * a.sqrt());
+        let wh_seed = if wh_inner > 0.0 {
+            a * wh_inner.powi(3)
+        } else {
+            f64::NAN
+        };
+        let analytic_seed = ((p.ln() + ln_gamma(a + 1.0)) / a).exp();
+        if analytic_seed == 0.0 {
+            return 0.0;
+        }
+        if !(wh_seed.is_finite() && wh_seed > 0.0) {
+            analytic_seed
+        } else {
+            let residual = |seed: f64| {
+                let (p_at_seed, q_at_seed) = regularized_incomplete_gamma_pair(a, seed);
+                if p > 0.5 {
+                    ((1.0 - p) - q_at_seed).abs()
+                } else {
+                    (p_at_seed - p).abs()
+                }
+            };
+            if residual(analytic_seed) < residual(wh_seed) {
+                analytic_seed
+            } else {
+                wh_seed
+            }
+        }
+    } else {
+        let t = 1.0 - a * (0.253 + a * 0.12);
+        if p < t {
+            (p / t).powf(1.0 / a)
+        } else {
+            1.0 - (1.0 - (p - t) / (1.0 - t)).ln()
+        }
+    };
+
+    // Density factorization constants for `a > 1` (kept overflow-safe in logs).
+    let (lna1, afac) = if a > 1.0 {
+        let lna1 = a1.ln();
+        (lna1, (a1 * (lna1 - 1.0) - gln).exp())
+    } else {
+        (0.0, 0.0)
+    };
+
+    // Halley refinement of the seeded quantile. Halley's cubic convergence
+    // shrinks the step geometrically from the standard Wilson-Hilferty /
+    // asymptotic seed; once a step is no smaller than the one before it, or no
+    // longer moves the iterate, the quantile is at the resolution its residual's
+    // arithmetic has and no further step can improve it.
+    let mut previous_step = f64::INFINITY;
+    loop {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        // Residual in whichever tail is small. `P(a,x) − p` subtracts two
+        // quantities of size 1 once `p > 1/2`, pinning the residual's absolute
+        // error at one ulp of 1 however close the iterate is; since the step is
+        // `err / dens` and `dens ≈ 1 − p` out there, the returned quantile carries
+        // a relative error of `ε / ((1 − p)·x)`, which diverges as `p → 1`
+        // (7.8e-4 at `1 − p = 1e-15`). Against the complement the same Newton step
+        // is `(1 − p) − Q(a,x)`: `1 − p` is exact for `p ≥ 1/2` by Sterbenz and `Q`
+        // is computed directly, so the residual carries *relative* accuracy. The
+        // branch point is the Sterbenz domain itself, not a tuned constant.
+        let (p_at_x, q_at_x) = regularized_incomplete_gamma_pair(a, x);
+        let err = if p > 0.5 {
+            (1.0 - p) - q_at_x
+        } else {
+            p_at_x - p
+        };
+        let dens = if a > 1.0 {
+            afac * (-(x - a1) + a1 * (x.ln() - lna1)).exp()
+        } else {
+            (-x + a1 * x.ln() - gln).exp()
+        };
+        if !(dens.is_finite() && dens > 0.0) {
+            break;
+        }
+        // Newton step `u = (P(a,x) − p) / f(x)`, then the Halley scaling by the
+        // local curvature `f'/f = (a−1)/x − 1`, capped (per NR) so the
+        // denominator never collapses below ½.
+        let u = err / dens;
+        let step = u / (1.0 - 0.5 * (u * (a1 / x - 1.0)).min(1.0));
+        if !(step.abs() < previous_step) || x - step == x {
+            break;
+        }
+        previous_step = step.abs();
+        x -= step;
+        if x <= 0.0 {
+            // Overshot the support floor: step back to half the prior iterate.
+            x = 0.5 * (x + step);
+        }
+    }
+    x
+}
+
 /// Fisher-Snedecor survival probability `P(F_{d1,d2} > statistic)`.
 ///
 /// The complementary regularized-beta identity is evaluated directly:
@@ -1661,6 +1902,30 @@ pub fn standard_normal_quantile_from_log_cdf(log_p: f64) -> Result<f64, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chi_square_quantile_matches_reference_values_and_inverts_the_tail() {
+        // Reference quantiles: qchisq(0.95, 1), qchisq(0.05, 10), qchisq(0.5, 100).
+        let cases: [(f64, f64, f64); 3] = [
+            (0.95, 1.0, 3.841_458_820_694_124),
+            (0.05, 10.0, 3.940_299_136_119_060_5),
+            (0.5, 100.0, 99.334_129_235_988_46),
+        ];
+        for (p, k, expected) in cases {
+            let got = chi_square_quantile(p, k);
+            let rel = (got - expected).abs() / expected;
+            assert!(rel < 1e-10, "chi_square_quantile({p}, {k}) = {got}, expected {expected}");
+        }
+        for &k in &[1.0_f64, 3.0, 17.0, 250.0, 4000.0] {
+            for &p in &[1.0e-4_f64, 0.03, 0.5, 0.97, 1.0 - 1.0e-4] {
+                let x = chi_square_quantile(p, k);
+                let upper = chi_square_sf(x, k);
+                let rel = (upper - (1.0 - p)).abs() / (1.0 - p).min(p);
+                assert!(rel < 1e-8, "k={k} p={p}: x={x}, sf={upper}");
+            }
+        }
+        assert!(chi_square_quantile(0.5, 0.0).is_nan());
+    }
 
     const TOL: f64 = 1e-12;
 

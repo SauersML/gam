@@ -2668,7 +2668,7 @@ fn penalty_candidates_under_collection_gauge(
             } else {
                 raw
             };
-            let (_, c_new) = normalize_penalty_in_constrained_space(restricted.dense());
+            let (_, c_new) = normalize_penalty_in_constrained_space(restricted.dense())?;
             let matrix = restricted.scaled(1.0 / c_new, "normalized global smooth penalty")?;
             Ok(PenaltyCandidate {
                 matrix,
@@ -2801,7 +2801,7 @@ fn penalty_candidates_under_collection_gauge(
                         full_factor,
                         "embedded global smooth null ridge",
                     )?;
-                    let (_, scale) = normalize_penalty_in_constrained_space(full.dense());
+                    let (_, scale) = normalize_penalty_in_constrained_space(full.dense())?;
                     candidate.matrix = full
                         .scaled(1.0 / scale, "normalized embedded global smooth null ridge")?;
                     candidate.normalization_scale = scale;

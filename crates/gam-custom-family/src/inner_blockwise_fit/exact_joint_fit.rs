@@ -1928,7 +1928,9 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         if current_kkt_norm.is_finite() {
             min_certified_residual = min_certified_residual.min(current_kkt_norm);
         }
-        let pcg_rel_tol = joint_pcg_eisenstat_walker_forcing(prev_kkt_norm, current_kkt_norm);
+        // The Eisenstat–Walker forcing reads this pair when a CG step is
+        // eligible; its resolution floor needs the step's right-hand side.
+        let forcing_kkt_norms = (prev_kkt_norm, current_kkt_norm);
         // The forcing ratio compares the residuals of successive iterates, so
         // the next head divides by this head's residual. The previous cycle's
         // post-step residual is measured at the very β this head re-measures:
@@ -2379,26 +2381,50 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 && !returned_mode_curvature_pending
                 && !true_jeffreys_hessian_required
                 && inner_jeffreys_term.is_none();
-            let pcg_preconditioner = pcg_eligible.then(|| match &joint_hessian_source {
-                JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
-                    &h_joint.diag().to_owned(),
-                    &ranges,
-                    &s_lambdas,
-                    joint_solver_diagonal_ridge,
-                    joint_bundle,
-                ),
-                JointHessianSource::Operator { diagonal, .. } => joint_penalty_preconditioner_diag(
-                    diagonal,
-                    &ranges,
-                    &s_lambdas,
-                    joint_solver_diagonal_ridge,
-                    joint_bundle,
-                ),
+            // The CG step's preconditioner and forcing. The forcing is
+            // Eisenstat–Walker floored at the resolution of `rhs = ∇L − Sβ`:
+            // its rounding band relative to `‖rhs‖₂` (gam#3285).
+            let pcg_setup = pcg_eligible.then(|| {
+                let preconditioner = match &joint_hessian_source {
+                    JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
+                        &h_joint.diag().to_owned(),
+                        &ranges,
+                        &s_lambdas,
+                        joint_solver_diagonal_ridge,
+                        joint_bundle,
+                    ),
+                    JointHessianSource::Operator { diagonal, .. } => {
+                        joint_penalty_preconditioner_diag(
+                            diagonal,
+                            &ranges,
+                            &s_lambdas,
+                            joint_solver_diagonal_ridge,
+                            joint_bundle,
+                        )
+                    }
+                };
+                let rhs_band = {
+                    let block_betas: Vec<&Array1<f64>> = states.iter().map(|s| &s.beta).collect();
+                    let grad_inf = grad_joint.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+                    joint_stationarity_rounding_band(
+                        &s_lambdas,
+                        &block_betas,
+                        joint_bundle,
+                        grad_inf,
+                        total_joint_n,
+                    )
+                };
+                let rel_tol = joint_pcg_eisenstat_walker_forcing(
+                    forcing_kkt_norms.0,
+                    forcing_kkt_norms.1,
+                    joint_pcg_forcing_floor(rhs_band, rhs.dot(&rhs).sqrt(), total_p),
+                );
+                (preconditioner, rel_tol)
             });
             let pcg_route =
-                pcg_preconditioner
+                pcg_setup
                     .as_ref()
-                    .and_then(|preconditioner| match joint_pcg_attempt {
+                    .and_then(|(preconditioner, rel_tol)| match joint_pcg_attempt {
                         gam_linalg::pcg::PcgAttempt::Only => Some(None),
                         gam_linalg::pcg::PcgAttempt::Budgeted { products } => joint_pcg_condition
                             .as_ref()
@@ -2406,7 +2432,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 record.cg_route(
                                     preconditioner,
                                     joint_solver_diagonal_ridge,
-                                    pcg_rel_tol,
+                                    *rel_tol,
                                     products,
                                 )
                             })
@@ -2414,9 +2440,10 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     });
             let mut spectral_nullity_for_step = 0usize;
             let mut delta = None;
-            if let (Some(preconditioner_diag), Some(route)) =
-                (pcg_preconditioner.as_ref(), pcg_route)
+            if let (Some((preconditioner_diag, pcg_rel_tol)), Some(route)) =
+                (pcg_setup.as_ref(), pcg_route)
             {
+                let pcg_rel_tol = *pcg_rel_tol;
                 let max_iter = route
                     .map_or(JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1), |route| {
                         route.iterations
