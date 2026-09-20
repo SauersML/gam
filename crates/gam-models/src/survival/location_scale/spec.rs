@@ -223,6 +223,12 @@ pub struct SurvivalLocationScaleTermFitResult {
 pub struct SurvivalLocationScaleFitResultParts {
     /// Number of original survival records used by every parameter block.
     pub training_sample_size: usize,
+    /// Authoritative log strengths from the fitted optimizer, in concatenated
+    /// block order. Preserve these across the coefficient-gauge lift: taking
+    /// `ln` of an already-rounded strength can erase a small nonzero rho, and
+    /// `exp(ln(lambda))` need not reproduce lambda bitwise. Block lambdas must
+    /// be the checked exponentials of these same values.
+    pub log_lambdas: Array1<f64>,
     pub beta_time: Array1<f64>,
     pub beta_threshold: Array1<f64>,
     pub beta_log_sigma: Array1<f64>,
@@ -276,8 +282,10 @@ pub struct SurvivalLocationScaleFitResultParts {
     /// The correction term `C` alone (raw frame) with the typed provenance that
     /// produced it. `V_c = V_cond + C`, so this is the same lift as the two
     /// covariances above. `None` is a typed absence, never an error.
-    pub smoothing_correction:
-        Option<(Array2<f64>, gam_solve::model_types::SmoothingCorrectionMethod)>,
+    pub smoothing_correction: Option<(
+        Array2<f64>,
+        gam_solve::model_types::SmoothingCorrectionMethod,
+    )>,
     /// Why the inner fit minted no correction although it selected ρ, carried through
     /// finalization with the correction it stands in for (#2677).
     pub smoothing_correction_absence: Option<gam_solve::model_types::SmoothingCorrectionAbsence>,
@@ -391,6 +399,7 @@ pub fn survival_fit_from_parts(
 ) -> Result<UnifiedFitResult, String> {
     let SurvivalLocationScaleFitResultParts {
         training_sample_size,
+        log_lambdas,
         beta_time,
         beta_threshold,
         beta_log_sigma,
@@ -708,12 +717,6 @@ pub fn survival_fit_from_parts(
         .iter()
         .flat_map(|b| b.lambdas.iter().copied())
         .collect();
-    let log_lambdas = Array1::from_vec(
-        all_lambdas
-            .iter()
-            .map(|&v| if v > 0.0 { v.ln() } else { f64::NEG_INFINITY })
-            .collect(),
-    );
     // One gate owns the negative-diagonal judgement for every lane's
     // `sqrt(diag(V))` (`gam_problem::se_from_covariance`), and the published
     // standard errors derive from this matrix (#2955). The location-scale

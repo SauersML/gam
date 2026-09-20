@@ -384,9 +384,6 @@ impl AnalyticPenalty for TotalVariationPenalty {
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-        if target.len() != v.len() {
-            return Array1::<f64>::zeros(target.len());
-        }
         let Some(d) = self.latent_dim(target.len()) else {
             return Array1::<f64>::zeros(target.len());
         };

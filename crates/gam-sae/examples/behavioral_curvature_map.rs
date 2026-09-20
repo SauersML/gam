@@ -69,7 +69,8 @@
 
 use gam_sae::inference::contracts::{HolonomyReport, invert_o2_edge, loop_holonomy};
 use gam_sae::inference::layer_transport::{
-    ChartTopology, CompositionDefectReport, FittedTransport, composition_defect, fit_transport_map,
+    ChartTopology, CompositionDefectReport, FittedTransport, PairLaw, composition_defect,
+    fit_transport_map,
 };
 use gam_sae::inference::transport_class::{CircleTransportReport, classify_circle_transport_fit};
 use ndarray::Array1;
@@ -259,6 +260,8 @@ fn run(args: &Args) -> Result<PathBuf, String> {
                 coords[b].view(),
                 ChartTopology::Circle,
                 ChartTopology::Circle,
+                // Each layer's angle is an estimated chart coordinate.
+                PairLaw::Stochastic,
             )
             .map_err(|e| format!("transport {}→{} failed: {e}", layers[a], layers[b]))?;
             let class = classify_circle_transport_fit(

@@ -247,6 +247,7 @@ fn test_survival_fit(
         .unwrap_or((None, None));
     survival_fit_from_parts(SurvivalLocationScaleFitResultParts {
         training_sample_size: 32,
+        log_lambdas: Array1::zeros(0),
         beta_time,
         beta_threshold,
         beta_log_sigma,
@@ -285,6 +286,7 @@ fn survival_fit_parts_with_outer_evidence(
 ) -> SurvivalLocationScaleFitResultParts {
     SurvivalLocationScaleFitResultParts {
         training_sample_size: 32,
+        log_lambdas: array![0.0],
         beta_time: array![0.1],
         beta_threshold: array![0.2],
         beta_log_sigma: array![0.0],
@@ -358,7 +360,10 @@ fn certified_survival_fit_quadratic() -> gam_solve::rho_optimizer::CertifiedOute
         >,
     );
     problem
-        .run_certified(&mut objective, "survival fit finalization certificate fixture")
+        .run_certified(
+            &mut objective,
+            "survival fit finalization certificate fixture",
+        )
         .expect("a real convex outer solve must issue the preservation proof")
 }
 
@@ -437,6 +442,76 @@ fn survival_fit_finalization_refuses_a_misaligned_edf_channel_3707() {
     aligned.penalty_block_trace = vec![0.4];
     let fit = survival_fit_from_parts(aligned).expect("an aligned trace finalizes");
     assert_eq!(fit.blocks[0].edf, 1.0 - 0.4);
+}
+
+#[test]
+fn survival_fit_finalization_validates_all_edf_layouts() {
+    use gam_solve::estimate::EdfRankBound;
+    let not_assessed = EdfRankBound::NotAssessed {
+        reason: "fixture".into(),
+    };
+    let mut misaligned_rank = survival_fit_parts_with_outer_evidence(0, None);
+    misaligned_rank.edf_rank_bound = vec![not_assessed.clone(); 2];
+    let error = survival_fit_from_parts(misaligned_rank).expect_err("rank layout must align");
+    assert!(error.contains("edf_rank_bound has 2 entries"), "{error}");
+
+    // Empty means no channel was recorded, including the zero-penalty case.
+    for no_penalties in [false, true] {
+        let mut empty = survival_fit_parts_with_outer_evidence(0, None);
+        if no_penalties {
+            empty.lambdas_time = Array1::zeros(0);
+            empty.log_lambdas = Array1::zeros(0);
+        }
+        let fit = survival_fit_from_parts(empty).expect("unrecorded channels are valid");
+        assert_eq!(
+            fit.blocks.iter().map(|block| block.edf).collect::<Vec<_>>(),
+            vec![1.0; 3]
+        );
+    }
+    for channel in 0..3 {
+        let mut invalid = survival_fit_parts_with_outer_evidence(0, None);
+        invalid.lambdas_time = Array1::zeros(0);
+        match channel {
+            0 => invalid.penalty_block_trace = vec![0.4],
+            1 => invalid.edf_by_block = vec![0.6],
+            _ => invalid.edf_rank_bound = vec![not_assessed.clone()],
+        }
+        let error = survival_fit_from_parts(invalid).expect_err("zero penalties accept no entries");
+        assert!(error.contains("0 smoothing parameters"), "{error}");
+    }
+    // Distinct traces exercise block offsets and retain uncertified signed EDF.
+    let mut aligned = survival_fit_parts_with_outer_evidence(0, None);
+    // Start from a lambda-only boundary containing the original lambda=3
+    // trigger, then establish the one canonical representation once. The
+    // production caller already owns rho and must preserve it verbatim.
+    let rho = array![1.0e-16, 2.0_f64.ln(), 3.0_f64.ln()];
+    let lambdas = rho.mapv(|value| gam_problem::checked_exp_log_strength(value).unwrap());
+    assert_eq!(lambdas[0], 1.0);
+    assert_ne!(rho[0], lambdas[0].ln(), "ln(exp(rho)) loses the fitted rho");
+    aligned.log_lambdas = rho.clone();
+    aligned.lambdas_time = array![lambdas[0]];
+    aligned.lambdas_threshold = array![lambdas[1]];
+    aligned.lambdas_log_sigma = array![lambdas[2]];
+    aligned.penalty_block_trace = vec![0.25, 0.5, 1.5];
+    aligned.edf_by_block = vec![0.75, 0.5, -0.5];
+    aligned.edf_rank_bound = vec![not_assessed.clone(); 3];
+    aligned.geometry = Some(FitGeometry {
+        coefficient_gauge: gam_problem::gauge::Gauge::identity(&[1, 1, 1]),
+        penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(Array2::eye(3)),
+        constrained_posterior: None,
+        working: None,
+    });
+    let fit = survival_fit_from_parts(aligned).expect("all aligned channels are valid");
+    assert_eq!(fit.log_lambdas, rho);
+    assert_eq!(fit.lambdas, lambdas);
+    let inference = fit.inference.as_ref().expect("geometry carries EDF inference");
+    assert_eq!(inference.penalty_block_trace, vec![0.25, 0.5, 1.5]);
+    assert_eq!(inference.edf_by_block, vec![0.75, 0.5, -0.5]);
+    assert_eq!(inference.edf_rank_bound, vec![not_assessed; 3]);
+    assert_eq!(
+        fit.blocks.iter().map(|block| block.edf).collect::<Vec<_>>(),
+        vec![0.75, 0.5, -0.5]
+    );
 }
 
 /// gam#2661: finalization carries the inner fit's mode-selection record rather than
@@ -867,7 +942,9 @@ fn survival_location_scale_outer_link_shape_gradient_matches_finite_difference_s
     // component before anything is asserted, so the misdifferentiated component is
     // named. The part count is printed first: an audit that records nothing shows.
     {
-        use gam_solve::estimate::outer_eval_capture::{enable_rho_outer_audit, take_rho_outer_audit};
+        use gam_solve::estimate::outer_eval_capture::{
+            enable_rho_outer_audit, take_rho_outer_audit,
+        };
         enable_rho_outer_audit();
         crate::custom_family::evaluate_custom_family_joint_hyper_owned(
             &family_at(epsilon0, log_delta0),
@@ -996,7 +1073,9 @@ fn survival_location_scale_outer_link_shape_gradient_matches_finite_difference_s
     // With r → 0 the difference needs neither IFT correction term, so it is the
     // profiled derivative the analytic gradient must equal.
     {
-        use gam_solve::estimate::outer_eval_capture::{enable_rho_outer_audit, take_rho_outer_audit};
+        use gam_solve::estimate::outer_eval_capture::{
+            enable_rho_outer_audit, take_rho_outer_audit,
+        };
         let tight_options = crate::custom_family::BlockwiseFitOptions {
             inner_tol: 1e-12,
             outer_tol: 1e-12,
@@ -1075,7 +1154,11 @@ fn survival_location_scale_outer_link_shape_gradient_matches_finite_difference_s
             ("rho", rho_difference(k, h), rho_difference(k, 10.0 * h))
         } else {
             let axis = k - rho.len();
-            ("shape", shape_difference(axis, h), shape_difference(axis, 10.0 * h))
+            (
+                "shape",
+                shape_difference(axis, h),
+                shape_difference(axis, 10.0 * h),
+            )
         };
         let analytic = base.gradient[k];
         eprintln!(
@@ -5657,9 +5740,7 @@ fn survival_ls_link_wiggle_block_gradient_matches_finite_difference_2695() {
     let event = [1.0, 0.0, 1.0, 1.0];
     let weight = [1.0, 0.8, 1.2, 1.1];
     let n = primaries.len();
-    let q0_exit = Array1::from_shape_fn(n, |i| {
-        -primaries[i][3] * (-primaries[i][6]).exp()
-    });
+    let q0_exit = Array1::from_shape_fn(n, |i| -primaries[i][3] * (-primaries[i][6]).exp());
     let knots = Array1::from_vec(vec![
         -3.0, -3.0, -3.0, -3.0, -1.5, 0.0, 1.5, 3.0, 3.0, 3.0, 3.0,
     ]);
@@ -5693,56 +5774,56 @@ fn survival_ls_link_wiggle_block_gradient_matches_finite_difference_2695() {
     family.wiggle_knots = Some(knots.clone());
     family.wiggle_degree = Some(degree);
 
-    // The oracle family's three additive designs are single columns holding the
-    // primary channels, so `eta_channel = channel · beta` exactly and the states
-    // can be rebuilt from the coefficients alone.
-    // Small positive amplitudes. The warp multiplies the event-time Jacobian by
-    // `m1 = 1 + sum_j betaw_j * B'_j(q0)`, and the family REFUSES any state whose
-    // `d_eta/dt` falls to zero (structural monotonicity, floor 1e-8); at
-    // `0.05 + 0.03*j` this fixture's row 1 lands at `d_eta/dt = -1.243e-2` and the
-    // gradient call errs before any derivative is compared. These amplitudes keep
-    // `m1` within a few percent of 1 while leaving every wiggle column live.
-    let beta_w0 = Array1::from_shape_fn(pw, |j| 0.002 + 0.001 * (j as f64));
-    let build = |betas: [f64; 3], beta_w: &Array1<f64>| -> Vec<ParameterBlockState> {
-        let stacked = |first: usize, second: usize, deriv: usize, scale: f64| {
-            let mut eta = Array1::<f64>::zeros(3 * n);
-            for i in 0..n {
-                eta[i] = primaries[i][first] * scale;
-                eta[n + i] = primaries[i][second] * scale;
-                eta[2 * n + i] = primaries[i][deriv] * scale;
-            }
-            eta
-        };
-        let flat = |channel: usize, scale: f64| {
-            Array1::from_shape_fn(n, |i| primaries[i][channel] * scale)
-        };
-        vec![
-            ParameterBlockState {
-                beta: array![betas[0]],
-                eta: stacked(0, 1, 2, betas[0]),
-            },
-            ParameterBlockState {
-                beta: array![betas[1]],
-                eta: if time_varying_channels {
-                    stacked(3, 4, 5, betas[1])
-                } else {
-                    flat(3, betas[1])
+        // The oracle family's three additive designs are single columns holding the
+        // primary channels, so `eta_channel = channel · beta` exactly and the states
+        // can be rebuilt from the coefficients alone.
+        // Small positive amplitudes. The warp multiplies the event-time Jacobian by
+        // `m1 = 1 + sum_j betaw_j * B'_j(q0)`, and the family REFUSES any state whose
+        // `d_eta/dt` falls to zero (structural monotonicity, floor 1e-8); at
+        // `0.05 + 0.03*j` this fixture's row 1 lands at `d_eta/dt = -1.243e-2` and the
+        // gradient call errs before any derivative is compared. These amplitudes keep
+        // `m1` within a few percent of 1 while leaving every wiggle column live.
+        let beta_w0 = Array1::from_shape_fn(pw, |j| 0.002 + 0.001 * (j as f64));
+        let build = |betas: [f64; 3], beta_w: &Array1<f64>| -> Vec<ParameterBlockState> {
+            let stacked = |first: usize, second: usize, deriv: usize, scale: f64| {
+                let mut eta = Array1::<f64>::zeros(3 * n);
+                for i in 0..n {
+                    eta[i] = primaries[i][first] * scale;
+                    eta[n + i] = primaries[i][second] * scale;
+                    eta[2 * n + i] = primaries[i][deriv] * scale;
+                }
+                eta
+            };
+            let flat = |channel: usize, scale: f64| {
+                Array1::from_shape_fn(n, |i| primaries[i][channel] * scale)
+            };
+            vec![
+                ParameterBlockState {
+                    beta: array![betas[0]],
+                    eta: stacked(0, 1, 2, betas[0]),
                 },
-            },
-            ParameterBlockState {
-                beta: array![betas[2]],
-                eta: if time_varying_channels {
-                    stacked(6, 7, 8, betas[2])
-                } else {
-                    flat(6, betas[2])
+                ParameterBlockState {
+                    beta: array![betas[1]],
+                    eta: if time_varying_channels {
+                        stacked(3, 4, 5, betas[1])
+                    } else {
+                        flat(3, betas[1])
+                    },
                 },
-            },
-            ParameterBlockState {
-                beta: beta_w.clone(),
-                eta: xwiggle.dot(beta_w),
-            },
-        ]
-    };
+                ParameterBlockState {
+                    beta: array![betas[2]],
+                    eta: if time_varying_channels {
+                        stacked(6, 7, 8, betas[2])
+                    } else {
+                        flat(6, betas[2])
+                    },
+                },
+                ParameterBlockState {
+                    beta: beta_w.clone(),
+                    eta: xwiggle.dot(beta_w),
+                },
+            ]
+        };
 
     let betas0 = [1.0_f64, 1.0, 1.0];
     let states = build(betas0, &beta_w0);
@@ -5788,50 +5869,54 @@ fn survival_ls_link_wiggle_block_gradient_matches_finite_difference_2695() {
             .0
     };
 
-    let cbrt_eps = f64::EPSILON.cbrt();
-    let bound_scale = 64.0 * cbrt_eps * cbrt_eps;
-    let mut worst = 0.0_f64;
-    let mut worst_index = 0usize;
-    for index in 0..analytic.len() {
-        let base = if index < 3 { betas0[index] } else { beta_w0[index - 3] };
-        let h = cbrt_eps * (1.0 + base.abs());
-        let shift = |delta: f64| -> f64 {
-            let mut betas = betas0;
-            let mut beta_w = beta_w0.clone();
-            if index < 3 {
-                betas[index] = base + delta;
+        let cbrt_eps = f64::EPSILON.cbrt();
+        let bound_scale = 64.0 * cbrt_eps * cbrt_eps;
+        let mut worst = 0.0_f64;
+        let mut worst_index = 0usize;
+        for index in 0..analytic.len() {
+            let base = if index < 3 {
+                betas0[index]
             } else {
-                beta_w[index - 3] = base + delta;
+                beta_w0[index - 3]
+            };
+            let h = cbrt_eps * (1.0 + base.abs());
+            let shift = |delta: f64| -> f64 {
+                let mut betas = betas0;
+                let mut beta_w = beta_w0.clone();
+                if index < 3 {
+                    betas[index] = base + delta;
+                } else {
+                    beta_w[index - 3] = base + delta;
+                }
+                ll_at(betas, &beta_w)
+            };
+            let fd = (shift(h) - shift(-h)) / (2.0 * h);
+            let tol = bound_scale * (1.0 + analytic[index].abs());
+            let drift = (fd - analytic[index]).abs();
+            if drift > worst {
+                worst = drift;
+                worst_index = index;
             }
-            ll_at(betas, &beta_w)
-        };
-        let fd = (shift(h) - shift(-h)) / (2.0 * h);
-        let tol = bound_scale * (1.0 + analytic[index].abs());
-        let drift = (fd - analytic[index]).abs();
-        if drift > worst {
-            worst = drift;
-            worst_index = index;
-        }
-        assert!(
-            drift <= tol,
-            "arm time_varying_channels={time_varying_channels}, coefficient {index} \
+            assert!(
+                drift <= tol,
+                "arm time_varying_channels={time_varying_channels}, coefficient {index} \
              (block {}): analytic ∂ℓ/∂β = {:.9e} but the central \
              difference of the SAME call's ℓ is {:.9e} (drift {:.3e} > {:.3e}); the joint \
              gradient does not differentiate the log-likelihood it returns",
-            if index < 3 { index } else { 3 },
-            analytic[index],
-            fd,
-            drift,
-            tol
-        );
-    }
-    // Non-vacuity: the gradient must not be the zero vector at this fixture, or
-    // the loop above would pass on an empty claim.
-    assert!(
-        analytic.iter().any(|value| value.abs() > 1e-6),
-        "arm time_varying_channels={time_varying_channels}: fixture must produce a non-trivial \
+                if index < 3 { index } else { 3 },
+                analytic[index],
+                fd,
+                drift,
+                tol
+            );
+        }
+        // Non-vacuity: the gradient must not be the zero vector at this fixture, or
+        // the loop above would pass on an empty claim.
+        assert!(
+            analytic.iter().any(|value| value.abs() > 1e-6),
+            "arm time_varying_channels={time_varying_channels}: fixture must produce a non-trivial \
          gradient (worst drift {worst:.3e} at {worst_index})"
-    );
+        );
     }
 }
 
@@ -5954,8 +6039,9 @@ fn survival_ls_link_wiggle_real_warp_oracle_2695(knot_half_span: f64) {
             }
             eta
         };
-        let flat =
-            |channel: usize, scale: f64| Array1::from_shape_fn(n, |i| primaries[i][channel] * scale);
+        let flat = |channel: usize, scale: f64| {
+            Array1::from_shape_fn(n, |i| primaries[i][channel] * scale)
+        };
         vec![
             ParameterBlockState {
                 beta: array![betas[0]],
@@ -6337,10 +6423,22 @@ fn link_warp_knot_crossing_gap_2695(
             eta
         };
         vec![
-            ParameterBlockState { beta: array![1.0], eta: stacked(0, 1, 2, 1.0) },
-            ParameterBlockState { beta: array![beta_thr], eta: stacked(3, 4, 5, beta_thr) },
-            ParameterBlockState { beta: array![1.0], eta: stacked(6, 7, 8, 1.0) },
-            ParameterBlockState { beta: beta_w.clone(), eta: xwiggle.dot(&beta_w) },
+            ParameterBlockState {
+                beta: array![1.0],
+                eta: stacked(0, 1, 2, 1.0),
+            },
+            ParameterBlockState {
+                beta: array![beta_thr],
+                eta: stacked(3, 4, 5, beta_thr),
+            },
+            ParameterBlockState {
+                beta: array![1.0],
+                eta: stacked(6, 7, 8, 1.0),
+            },
+            ParameterBlockState {
+                beta: beta_w.clone(),
+                eta: xwiggle.dot(&beta_w),
+            },
         ]
     };
     let hessian_at = |beta_thr: f64| -> Array2<f64> {
@@ -6513,12 +6611,18 @@ fn probe_2695_joint_hessian_across_an_interior_knot() {
                         eta
                     };
                     let states = vec![
-                        ParameterBlockState { beta: array![1.0], eta: stacked(0, 1, 2, 1.0) },
+                        ParameterBlockState {
+                            beta: array![1.0],
+                            eta: stacked(0, 1, 2, 1.0),
+                        },
                         ParameterBlockState {
                             beta: array![beta_thr],
                             eta: stacked(3, 4, 5, beta_thr),
                         },
-                        ParameterBlockState { beta: array![1.0], eta: stacked(6, 7, 8, 1.0) },
+                        ParameterBlockState {
+                            beta: array![1.0],
+                            eta: stacked(6, 7, 8, 1.0),
+                        },
                         ParameterBlockState {
                             beta: beta_w.clone(),
                             eta: xwiggle.dot(&beta_w),
@@ -6732,23 +6836,22 @@ fn survival_ls_packed_directional_matches_dense_tower_932() {
                 }
                 out
             };
-            let dense_fourth = |tower: &Tower4<SLS_ROW_K>,
-                                u: &[f64; SLS_ROW_K],
-                                v: &[f64; SLS_ROW_K]| {
-                let mut out = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
-                for a in 0..SLS_ROW_K {
-                    for b in 0..SLS_ROW_K {
-                        let mut acc = 0.0;
-                        for c in 0..SLS_ROW_K {
-                            for d in 0..SLS_ROW_K {
-                                acc += tower.t4[a][b][c][d] * u[c] * v[d];
+            let dense_fourth =
+                |tower: &Tower4<SLS_ROW_K>, u: &[f64; SLS_ROW_K], v: &[f64; SLS_ROW_K]| {
+                    let mut out = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
+                    for a in 0..SLS_ROW_K {
+                        for b in 0..SLS_ROW_K {
+                            let mut acc = 0.0;
+                            for c in 0..SLS_ROW_K {
+                                for d in 0..SLS_ROW_K {
+                                    acc += tower.t4[a][b][c][d] * u[c] * v[d];
+                                }
                             }
+                            out[a][b] = acc;
                         }
-                        out[a][b] = acc;
                     }
-                }
-                out
-            };
+                    out
+                };
 
             let primaries: Vec<[f64; SLS_ROW_K]> = vec![
                 [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
@@ -6912,23 +7015,22 @@ fn survival_ls_packed_directional_matches_dense_tower_high_curvature_932() {
                 }
                 out
             };
-            let dense_fourth = |tower: &Tower4<SLS_ROW_K>,
-                                u: &[f64; SLS_ROW_K],
-                                v: &[f64; SLS_ROW_K]| {
-                let mut out = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
-                for a in 0..SLS_ROW_K {
-                    for b in 0..SLS_ROW_K {
-                        let mut acc = 0.0;
-                        for c in 0..SLS_ROW_K {
-                            for d in 0..SLS_ROW_K {
-                                acc += tower.t4[a][b][c][d] * u[c] * v[d];
+            let dense_fourth =
+                |tower: &Tower4<SLS_ROW_K>, u: &[f64; SLS_ROW_K], v: &[f64; SLS_ROW_K]| {
+                    let mut out = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
+                    for a in 0..SLS_ROW_K {
+                        for b in 0..SLS_ROW_K {
+                            let mut acc = 0.0;
+                            for c in 0..SLS_ROW_K {
+                                for d in 0..SLS_ROW_K {
+                                    acc += tower.t4[a][b][c][d] * u[c] * v[d];
+                                }
                             }
+                            out[a][b] = acc;
                         }
-                        out[a][b] = acc;
                     }
-                }
-                out
-            };
+                    out
+                };
 
             // Channel layout (matches `SurvivalLsJointNllProgram::eval`):
             //   [0]=t_entry [1]=t_exit [2]=t_deriv [3]=thr_exit [4]=thr_entry
@@ -7476,7 +7578,11 @@ fn the_scale_divides_the_time_transform_so_a_covariate_scale_is_identified_2695(
             .map(|i| {
                 let s = (-eta_ls[i]).exp();
                 let (u0, u1, g) = if scaled {
-                    ((h_entry[i] - eta_t[i]) * s, (h_exit[i] - eta_t[i]) * s, hdot[i] * s)
+                    (
+                        (h_entry[i] - eta_t[i]) * s,
+                        (h_exit[i] - eta_t[i]) * s,
+                        hdot[i] * s,
+                    )
                 } else {
                     (h_entry[i] - eta_t[i] * s, h_exit[i] - eta_t[i] * s, hdot[i])
                 };
@@ -7593,7 +7699,13 @@ fn a_row_entering_at_the_origin_carries_no_entry_factor_2695() {
             .exact_row_kernel(row, state)
             .expect("row kernel")
             .expect("positive-weight row");
-        let entry_stack = [kernel.log_s0, kernel.r0, kernel.dr0, kernel.ddr0, kernel.dddr0];
+        let entry_stack = [
+            kernel.log_s0,
+            kernel.r0,
+            kernel.dr0,
+            kernel.ddr0,
+            kernel.dddr0,
+        ];
         assert_eq!(
             entry_stack.iter().all(|value| *value == 0.0),
             !on,
@@ -7666,10 +7778,9 @@ fn the_explicit_psi_terms_are_the_psi_derivatives_of_the_nll_2695() {
         x_ls_entry_action: None,
         x_ls_deriv_action: None,
     };
-    let (objective_psi, score_psi, hessian_psi) = survival_ls_joint_psi_first_order_terms(
-        &family, &dynamic, &direction, None, true,
-    )
-    .expect("explicit psi terms");
+    let (objective_psi, score_psi, hessian_psi) =
+        survival_ls_joint_psi_first_order_terms(&family, &dynamic, &direction, None, true)
+            .expect("explicit psi terms");
     let hessian_psi = hessian_psi.expect("dense psi Hessian");
 
     let h = f64::EPSILON.cbrt();
