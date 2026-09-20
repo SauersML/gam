@@ -376,7 +376,7 @@ def test_extended_model_save_and_reload_predicts_identically(tmp_path: pathlib.P
     np.testing.assert_allclose(eta_before, eta_after, atol=1e-12, rtol=0.0)
 
     # And the deployment extension survives serialization.
-    payload = json.loads(path.read_text())["payload"]
+    payload = json.loads(path.read_text())["model"]
     deployment = payload.get("deployment_extensions") or []
     assert any(
         ext.get("kind") == "random-effect-level"

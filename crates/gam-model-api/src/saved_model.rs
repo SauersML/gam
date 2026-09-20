@@ -2,18 +2,24 @@
 //! kind, written and read through the same Rust code by the CLI, pyffi and
 //! gamfit.
 //!
-//! A document is `{"kind": ..., "version": ..., "model": ...}`. Each kind's
-//! owner names the kind and holds its version constant. Loading probes the kind
-//! and the version before it parses the model, and refuses any other kind or
-//! version with a typed error; an older payload is never migrated. JSON has no
-//! encoding for a non-finite float, so saving refuses one instead of writing
-//! `null`. With serde_json's exact float round trip, save → reload reproduces
-//! every f64 bit.
+//! A document is `{"kind": ..., "version": ..., "model": ...}`, written as
+//! compact JSON with the kind and the version first. Each kind's owner names the
+//! kind and holds its version constant. Loading reads the document in one
+//! streaming pass: the kind and the version are checked as they are read, before
+//! the model, and the model is decoded straight from the bytes, never through an
+//! intermediate `serde_json::Value`. Any other kind or version is refused with a
+//! typed error; an older payload is never migrated. [`saved_model_header`] reads
+//! only the kind and the version and stops, so dispatching on the kind costs
+//! the header, not the model. JSON has no encoding for a non-finite float, so
+//! saving refuses one instead of writing `null`. With serde_json's exact float
+//! round trip, save → reload reproduces every f64 bit.
 
 use serde::Serialize;
-use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde::de::{self, DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+use std::cell::RefCell;
+use std::fmt;
 use std::io::Write;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -76,7 +82,7 @@ struct Envelope<'m, T> {
 /// Distinguishes the temporary files of saves within one process.
 static TEMPORARY_FILES: AtomicU64 = AtomicU64::new(0);
 
-/// The saved document of `model`, of `kind` at `version`.
+/// The saved document of `model`, of `kind` at `version`, as compact JSON.
 pub fn saved_model_text<T: Serialize>(
     kind: &'static str,
     version: u64,
@@ -87,7 +93,7 @@ pub fn saved_model_text<T: Serialize>(
             reason: format!("a saved model cannot hold a non-finite float: {found}").into(),
         }
     })?;
-    serde_json::to_string_pretty(&Envelope {
+    serde_json::to_string(&Envelope {
         kind,
         version,
         model,
@@ -103,32 +109,235 @@ pub fn read_saved_model_text<T: DeserializeOwned>(
     kind: &'static str,
     version: u64,
 ) -> Result<T, SavedModelError> {
-    let malformed = |error: serde_json::Error| SavedModelError::Malformed {
+    read_saved_model_bytes(text.as_bytes(), kind, version)
+}
+
+/// The model in a saved document of `kind` at `version`, decoded in one
+/// streaming pass over `bytes`.
+pub fn read_saved_model_bytes<T: DeserializeOwned>(
+    bytes: &[u8],
+    kind: &'static str,
+    version: u64,
+) -> Result<T, SavedModelError> {
+    let refusal = RefCell::new(None);
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let decoded = DocumentSeed::<T> {
+        kind,
+        version,
+        refusal: &refusal,
+        model: PhantomData,
+    }
+    .deserialize(&mut deserializer)
+    .and_then(|model| deserializer.end().map(|()| model));
+    match (decoded, refusal.into_inner()) {
+        (_, Some(refusal)) => Err(refusal),
+        (Ok(model), None) => Ok(model),
+        (Err(error), None) => Err(SavedModelError::Malformed {
+            reason: error.to_string(),
+        }),
+    }
+}
+
+/// The header of a saved document: the kind and the version it names, each
+/// `None` when the document does not name it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedModelHeader {
+    /// The kind of model the document holds.
+    pub kind: Option<String>,
+    /// The version of that kind's format.
+    pub version: Option<u64>,
+}
+
+/// The header of a saved document. Reading stops once the kind and the
+/// version are both read, which in a document this module wrote is before
+/// the model; so the cost is the header's, not the model's. Bytes that are not
+/// a JSON object are `Malformed`.
+pub fn saved_model_header(bytes: &[u8]) -> Result<SavedModelHeader, SavedModelError> {
+    let complete = RefCell::new(None);
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let scanned = de::Deserializer::deserialize_map(
+        &mut deserializer,
+        HeaderVisitor {
+            complete: &complete,
+        },
+    );
+    if let Some(header) = complete.into_inner() {
+        return Ok(header);
+    }
+    scanned.map_err(|error| SavedModelError::Malformed {
         reason: error.to_string(),
-    };
-    let mut document: Value = serde_json::from_str(text).map_err(malformed)?;
-    let found_kind = document.get("kind").and_then(Value::as_str);
-    if found_kind != Some(kind) {
-        return Err(SavedModelError::Kind {
-            found: found_kind.map(str::to_string),
-            expected: kind,
-        });
+    })
+}
+
+/// The keys of a saved document.
+enum DocumentKey {
+    Kind,
+    Version,
+    Model,
+    Other,
+}
+
+impl<'de> serde::Deserialize<'de> for DocumentKey {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+        impl Visitor<'_> for KeyVisitor {
+            type Value = DocumentKey;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a saved-model document key")
+            }
+            fn visit_str<E: de::Error>(self, key: &str) -> Result<DocumentKey, E> {
+                Ok(match key {
+                    "kind" => DocumentKey::Kind,
+                    "version" => DocumentKey::Version,
+                    "model" => DocumentKey::Model,
+                    _ => DocumentKey::Other,
+                })
+            }
+        }
+        deserializer.deserialize_identifier(KeyVisitor)
     }
-    let found = document.get("version").and_then(Value::as_u64);
-    if found != Some(version) {
-        return Err(SavedModelError::Version {
-            kind,
-            found,
-            expected: version,
-        });
+}
+
+/// Decodes a whole document, checking the kind and the version as they are
+/// read. A typed refusal is recorded in `refusal` and aborts the parse.
+struct DocumentSeed<'r, T> {
+    kind: &'static str,
+    version: u64,
+    refusal: &'r RefCell<Option<SavedModelError>>,
+    model: PhantomData<T>,
+}
+
+impl<T> DocumentSeed<'_, T> {
+    fn refuse<E: de::Error>(&self, refusal: SavedModelError) -> E {
+        let message = refusal.to_string();
+        *self.refusal.borrow_mut() = Some(refusal);
+        E::custom(message)
     }
-    let model = document
-        .get_mut("model")
-        .map(Value::take)
-        .ok_or_else(|| SavedModelError::Malformed {
-            reason: "the document has no model".to_string(),
-        })?;
-    serde_json::from_value(model).map_err(malformed)
+}
+
+impl<'de, T: DeserializeOwned> DeserializeSeed<'de> for DocumentSeed<'_, T> {
+    type Value = T;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, deserializer: D) -> Result<T, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de, T: DeserializeOwned> Visitor<'de> for DocumentSeed<'_, T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "a saved {} model document", self.kind)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<T, A::Error> {
+        let mut kind_read = false;
+        let mut version_read = false;
+        let mut model = None;
+        while let Some(key) = map.next_key::<DocumentKey>()? {
+            match key {
+                DocumentKey::Kind => {
+                    let found: Option<String> = map.next_value()?;
+                    if found.as_deref() != Some(self.kind) {
+                        return Err(self.refuse(SavedModelError::Kind {
+                            found,
+                            expected: self.kind,
+                        }));
+                    }
+                    kind_read = true;
+                }
+                DocumentKey::Version => {
+                    let found: Option<u64> = map.next_value()?;
+                    if found != Some(self.version) {
+                        return Err(self.refuse(SavedModelError::Version {
+                            kind: self.kind,
+                            found,
+                            expected: self.version,
+                        }));
+                    }
+                    version_read = true;
+                }
+                DocumentKey::Model => {
+                    // The model is decoded only once its kind and version are
+                    // known to be this reader's, so a model of another format
+                    // is refused by its header, never by a parse error inside it.
+                    if !kind_read {
+                        return Err(self.refuse(SavedModelError::Kind {
+                            found: None,
+                            expected: self.kind,
+                        }));
+                    }
+                    if !version_read {
+                        return Err(self.refuse(SavedModelError::Version {
+                            kind: self.kind,
+                            found: None,
+                            expected: self.version,
+                        }));
+                    }
+                    model = Some(map.next_value::<T>()?);
+                }
+                DocumentKey::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        if !kind_read {
+            return Err(self.refuse(SavedModelError::Kind {
+                found: None,
+                expected: self.kind,
+            }));
+        }
+        model.ok_or_else(|| {
+            self.refuse(SavedModelError::Malformed {
+                reason: "the document has no model".to_string(),
+            })
+        })
+    }
+}
+
+/// Reads a document's kind and version, and stops the parse once it has both
+/// by recording the header in `complete` and returning an error.
+struct HeaderVisitor<'c> {
+    complete: &'c RefCell<Option<SavedModelHeader>>,
+}
+
+impl<'de> Visitor<'de> for HeaderVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a saved-model document")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut header = SavedModelHeader {
+            kind: None,
+            version: None,
+        };
+        while let Some(key) = map.next_key::<DocumentKey>()? {
+            match key {
+                // A value of another type names no kind or version.
+                DocumentKey::Kind => {
+                    header.kind = match map.next_value::<serde_json::Value>()? {
+                        serde_json::Value::String(kind) => Some(kind),
+                        _ => None,
+                    }
+                }
+                DocumentKey::Version => {
+                    header.version = map.next_value::<serde_json::Value>()?.as_u64();
+                }
+                DocumentKey::Model | DocumentKey::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            if header.kind.is_some() && header.version.is_some() {
+                break;
+            }
+        }
+        *self.complete.borrow_mut() = Some(header);
+        // Stop here: the rest of the document is the model, which the header
+        // does not need. `serde_json` would otherwise require the map to end.
+        Err(de::Error::custom("saved-model header read"))
+    }
 }
 
 /// Write a saved document durably and atomically. The bytes go to a sibling
@@ -245,10 +454,10 @@ mod tests {
             read_saved_model_text::<Vec<f64>>(&text, "test", 4),
             Err(SavedModelError::Version { found: Some(3), expected: 4, .. })
         ));
-        assert!(text.contains("\"kind\": \"test\""));
+        assert!(text.starts_with("{\"kind\":\"test\",\"version\":3,"));
         assert!(matches!(
             read_saved_model_text::<Vec<f64>>(
-                &text.replace("\"kind\": \"test\"", "\"kind\": \"other\""),
+                &text.replace("\"kind\":\"test\"", "\"kind\":\"other\""),
                 "test",
                 3
             ),

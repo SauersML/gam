@@ -77,7 +77,7 @@ def test_default_uncertainty_uses_and_reports_smoothing_corrected_covariance(tmp
     path = tmp_path / "model.gam"
     model.save(path)
     saved = json.loads(path.read_text())
-    method = saved["payload"]["fit_result"]["inference"]["smoothing_correction_method"]
+    method = saved["model"]["fit_result"]["inference"]["smoothing_correction_method"]
     assert set(method) == {"FirstOrderIdentifiedSubspace"}, method
 
 

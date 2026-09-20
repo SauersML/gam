@@ -92,7 +92,7 @@ def test_separated_fit_names_its_estimator_identically_everywhere(tmp_path) -> N
 
 def _fitted_penalty(model) -> np.ndarray:
     """The fit's own lambda * S: penalized Hessian minus the weighted Gram at the mode."""
-    inference = json.loads(model.dumps())["payload"]["fit_result"]["inference"]
+    inference = json.loads(model.dumps())["model"]["fit_result"]["inference"]
     hessian = np.asarray(inference["penalized_hessian"]["data"]).reshape(2, 2)
     gram = np.asarray(inference["weighted_gram"]["data"]).reshape(2, 2)
     return hessian - gram

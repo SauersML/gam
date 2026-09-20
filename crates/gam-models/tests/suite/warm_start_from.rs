@@ -197,17 +197,6 @@ fn a_model_the_fit_cannot_resume_is_refused_by_name() {
             refusal: WarmStartRefusal::NoRecordedPoint
         }
     ));
-    unrecorded.version = 24;
-    let refit = resolve_warm_start(&unrecorded, FORMULA, &data, &config("age0"))
-        .expect_err("a model saved before points were recorded does not resume");
-    assert!(matches!(
-        refit,
-        WorkflowError::WarmStartRefused {
-            refusal: WarmStartRefusal::RefitRequired {
-                payload_version: 24
-            }
-        }
-    ));
 }
 
 /// A point of another outer dimension belongs to another search: the fit runs

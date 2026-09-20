@@ -14,19 +14,18 @@ def test_standalone_ctn_schema_uses_fit_request(tmp_path):
     config = {"transformation_normal_config": {"response_num_internal_knots": 2}}
     model = gamfit.fit(data, "pgs ~ x", config=config, transformation_normal=True)
     assert np.isfinite(model.transformation_score(data)).all()
-    posterior = json.loads(model.dumps())["payload"]["unified"]["geometry"]["constrained_posterior"]
+    posterior = json.loads(model.dumps())["model"]["fit_result"]["geometry"]["constrained_posterior"]
     assert posterior["moment_status"] == "Available"
     declined = json.loads(model.dumps())
-    for key in ("unified", "fit_result"):
-        fit = declined["payload"][key]
-        geometry = fit["geometry"]["constrained_posterior"]
-        geometry["moment_status"] = {"Declined": {
-            "ambient_precision_failure": "regression fixture",
-            "properness": {"CertificationFailed": {"reason": "regression fixture"}}}}
-        geometry["unconstrained_center"] = None
-        geometry["correction"] = None
-        fit["covariance_conditional"] = None
-        fit["covariance_corrected"] = None
+    fit = declined["model"]["fit_result"]
+    geometry = fit["geometry"]["constrained_posterior"]
+    geometry["moment_status"] = {"Declined": {
+        "ambient_precision_failure": "regression fixture",
+        "properness": {"CertificationFailed": {"reason": "regression fixture"}}}}
+    geometry["unconstrained_center"] = None
+    geometry["correction"] = None
+    fit["covariance_conditional"] = None
+    fit["covariance_corrected"] = None
     with pytest.raises(gamfit.errors.GamfitError, match="posterior-mean"):
         gamfit.loads(json.dumps(declined).encode()).transformation_score(data)
 
@@ -59,15 +58,15 @@ def test_native_ctn_chain_save_load_and_batches(tmp_path):
     np.testing.assert_allclose(restored.predict(test.iloc[::-1]), before[::-1], rtol=1e-8, atol=1e-10)
     np.testing.assert_allclose(restored.predict(test.iloc[[3]]), before[[3]], rtol=1e-8, atol=1e-10)
     payload = json.loads(restored.dumps())
-    transform_payload = payload["payload"]["score_transform"]
-    payload["payload"]["score_transform"] = None
-    payload["payload"]["score_crossfit_folds"] = None
+    transform_payload = payload["model"]["score_transform"]
+    payload["model"]["score_transform"] = None
+    payload["model"]["score_crossfit_folds"] = None
     outcome = gamfit.loads(json.dumps(payload).encode())
     # Explicit application uses the same saved native CTN evaluator.
     manual = outcome.predict(test.assign(__gamfit_ctn_score=restored.transformation_score(test)))
     np.testing.assert_allclose(manual, before, rtol=1e-8, atol=1e-10)
     assert transform_payload["score_transform"] is None
-    transform = gamfit.loads(json.dumps({"model_type": "transformation-normal", "payload": transform_payload}).encode())
+    transform = gamfit.loads(json.dumps({"kind": payload["kind"], "version": payload["version"], "model": transform_payload}).encode())
     gamfit.validate_formula(
         data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
         transformation_normal_stage1=transform)
@@ -102,6 +101,6 @@ def test_native_ctn_chain_save_load_and_batches(tmp_path):
     np.testing.assert_allclose(loaded_survival.predict(prospective.iloc[[3]]).survival_at(times),
                                probabilities[[3]], rtol=1e-8, atol=1e-10)
     for state in (model.dumps(), restored.dumps()):
-        saved = json.loads(state)["payload"]
+        saved = json.loads(state)["model"]
         assert saved.get("latent_z_rank_int_calibration") is None
         assert saved.get("latent_z_conditional_calibration") is None

@@ -195,9 +195,8 @@ fn fit_at_anchor(
     // split their coefficients into named channels).
     let beta = model
         .payload()
-        .unified
+        .fit_result
         .as_ref()
-        .or(model.payload().fit_result.as_ref())
         .map(|fit| fit.beta.to_vec())
         .expect("saved model must carry its fitted coefficients");
     let saved_anchor = model

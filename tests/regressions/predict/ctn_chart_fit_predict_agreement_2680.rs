@@ -137,7 +137,7 @@ fn fit_ctn(dataset: &EncodedDataset) -> (FittedModel, Array1<f64>) {
     )
     .expect("transformation-normal fit + payload");
     let fitted = payload
-        .unified
+        .fit_result
         .as_ref()
         .expect("transformation-normal payload carries a unified fit");
     // `calibrate_transformation_scores` overwrites the single block's `eta` with

@@ -102,7 +102,7 @@ def test_expectile_family_is_fittable_from_python_and_monotone_in_tau(
     model_path = tmp_path / "expectile.gam"
     hi_model.save(model_path)
     saved = json.loads(model_path.read_text(encoding="utf-8"))
-    assert saved["payload"]["estimator"] == {
+    assert saved["model"]["estimator"] == {
         "estimator_kind": "expectile",
         "tau": 0.9,
     }

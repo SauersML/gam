@@ -31,7 +31,10 @@ use serde::{Deserialize, Serialize};
 use crate::inference::model::FittedModel;
 
 const FIT_CONTEXT: &str = "shared-tangent Gaussian REML";
-pub(crate) const RESPONSE_GEOMETRY_MODEL_VERSION: u32 = 1;
+/// Version 2 (gam#3350): the embedded `template_model` is written as its bare
+/// payload, with no `model_type` tag, no `unified` copy and no payload version,
+/// so this container's version is the one guard on its nested model.
+pub(crate) const RESPONSE_GEOMETRY_MODEL_VERSION: u32 = 2;
 
 /// One compact predictor-space smoothing penalty.
 ///

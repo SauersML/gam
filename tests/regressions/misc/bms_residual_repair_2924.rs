@@ -232,7 +232,7 @@ fn fit_with(
     let payload = fit_formula_to_payload(formula.to_string(), &sample.dataset, &config)
         .unwrap_or_else(|e| panic!("bernoulli marginal-slope fit (block={with_block}): {e}"));
     let unified = payload
-        .unified
+        .fit_result
         .as_ref()
         .expect("marginal-slope payload carries the unified fit");
     let beta_residual = with_block.then(|| unified.blocks[2].beta.to_vec());

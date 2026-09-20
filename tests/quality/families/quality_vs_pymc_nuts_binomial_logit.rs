@@ -29,7 +29,7 @@
 //! reason to loosen the bounds or touch gam source.
 
 use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+    FittedFamily, FittedModel, FittedModelPayload, ModelKind,
 };
 use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
 use gam::test_support::reference::{Column, QualityPair, rmse, run_python};
@@ -200,7 +200,6 @@ fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated() {
     let frozenspec = freeze_term_collection_from_design(&fit.resolvedspec, &design)
         .expect("freeze resolved term spec");
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         "y ~ s(x)".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -217,7 +216,6 @@ fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated() {
         "binomial".to_string(),
     );
     payload.fit_result = Some(fit.fit.clone());
-    payload.unified = Some(fit.fit.clone());
     payload.data_schema = Some(ds.schema.clone());
     payload.resolved_termspec = Some(frozenspec);
     payload.set_training_feature_metadata(ds.headers.clone(), ds.feature_ranges());
@@ -607,7 +605,6 @@ fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated_on_real_data() {
     let frozenspec = freeze_term_collection_from_design(&fit.resolvedspec, &train_design)
         .expect("freeze resolved term spec");
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         "y ~ s(pc1) + s(pc2)".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -624,7 +621,6 @@ fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated_on_real_data() {
         "binomial".to_string(),
     );
     payload.fit_result = Some(fit.fit.clone());
-    payload.unified = Some(fit.fit.clone());
     payload.data_schema = Some(train_ds.schema.clone());
     payload.resolved_termspec = Some(frozenspec);
     payload.set_training_feature_metadata(train_ds.headers.clone(), train_ds.feature_ranges());

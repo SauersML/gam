@@ -681,7 +681,7 @@ mod tests {
     use super::*;
     use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
     use gam_models::inference::model::{
-        FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+        FittedModel, FittedModelPayload, ModelKind,
     };
     use gam_models::inference::model_payload_builders::assemble_spline_scan_payload;
     use ndarray::{Array2, array};
@@ -714,7 +714,6 @@ mod tests {
     #[test]
     fn expectile_surface_refuses_to_invent_a_gaussian_observation_law() {
         let mut payload = FittedModelPayload::new(
-            MODEL_PAYLOAD_VERSION,
             "y ~ 1".to_string(),
             ModelKind::Standard,
             FittedFamily::Standard {

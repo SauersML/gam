@@ -112,7 +112,7 @@ def test_dot_formula_is_identical_through_python_and_the_cli(tmp_path: Path) -> 
     )
     assert completed.returncode == 0, completed.stderr
     assert _EXPECTED in completed.stderr, completed.stderr
-    cli_formula = json.loads(model_path.read_text(encoding="utf-8"))["payload"]["formula"]
+    cli_formula = json.loads(model_path.read_text(encoding="utf-8"))["model"]["formula"]
 
     assert python_model.formula == _EXPECTED
     assert cli_formula == python_model.formula

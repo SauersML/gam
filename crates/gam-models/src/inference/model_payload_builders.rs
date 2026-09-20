@@ -32,7 +32,7 @@ use crate::gamlss::{
 };
 use crate::inference::model::{
     FittedEstimator, FittedFamily, FittedModelPayload, JOINT_EXPECTILE_FAMILY_TAG,
-    MODEL_PAYLOAD_VERSION, ModelKind, SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
+    ModelKind, SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
     SavedResidualCascade, SavedSplineScan, SavedSurvivalLocationScaleStructure,
     SavedTransformationNormalGeometry, TransformationNormalParameterization,
     TransformationScoreCalibration,
@@ -421,7 +421,6 @@ pub fn assemble_standard_payload(
         saved_latent_cloglog_state_from_fit(&fit)
     };
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         formula,
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -434,7 +433,6 @@ pub fn assemble_standard_payload(
         family_label,
     );
     payload.estimator = estimator;
-    payload.unified = Some(fit.clone());
     payload.fit_result = Some(fit.clone());
     payload.data_schema = Some(dataset.schema.clone());
     payload.link = fitted_inverse_link(&fit.fitted_link).or_else(|| Some(family.link.clone()));
@@ -671,7 +669,6 @@ pub fn assemble_spline_scan_payload(
     training_feature_ranges: Vec<(f64, f64)>,
 ) -> FittedModelPayload {
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         formula,
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -706,7 +703,6 @@ pub fn assemble_residual_cascade_payload(
     training_feature_ranges: Vec<(f64, f64)>,
 ) -> Result<FittedModelPayload, String> {
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         formula,
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -771,7 +767,6 @@ pub fn assemble_bernoulli_marginal_slope_payload(
         inverse_link_to_binomial_spec(&base_link).map_err(|e| e.to_string())?;
 
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         formula,
         ModelKind::MarginalSlope,
         FittedFamily::MarginalSlope {
@@ -781,7 +776,6 @@ pub fn assemble_bernoulli_marginal_slope_payload(
         },
         FAMILY_BERNOULLI_MARGINAL_SLOPE.to_string(),
     );
-    payload.unified = Some(fit_result.clone());
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(data_schema);
     payload.slope_formula = Some(slope_formula.clone());
@@ -844,7 +838,6 @@ pub fn assemble_transformation_normal_payload(
         .map_err(|error| error.to_string())?;
 
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         formula,
         ModelKind::TransformationNormal,
         FittedFamily::TransformationNormal {
@@ -855,7 +848,6 @@ pub fn assemble_transformation_normal_payload(
         },
         FAMILY_TRANSFORMATION_NORMAL.to_string(),
     );
-    payload.unified = Some(fit_result.clone());
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(data_schema);
     payload.resolved_termspec = Some(resolved_covariate_spec);
@@ -1020,7 +1012,6 @@ pub fn assemble_location_scale_payload(
     };
 
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         inputs.formula,
         ModelKind::LocationScale,
         FittedFamily::LocationScale {
@@ -1029,7 +1020,6 @@ pub fn assemble_location_scale_payload(
         },
         family_tag,
     );
-    payload.unified = Some(inputs.fit_result.clone());
     payload.fit_result = Some(inputs.fit_result);
     payload.data_schema = Some(inputs.data_schema);
     payload.link = link;
@@ -1138,7 +1128,6 @@ fn new_royston_parmar_survival_payload(
         );
     }
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         formula,
         ModelKind::Survival,
         FittedFamily::Survival {
@@ -1152,7 +1141,6 @@ fn new_royston_parmar_survival_payload(
         },
         ResponseFamily::RoystonParmar.name().to_string(),
     );
-    payload.unified = Some(fit_result.clone());
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(data_schema);
     Ok(payload)
@@ -1454,13 +1442,11 @@ pub fn assemble_latent_window_payload(
     source: SavedModelSourceMetadata,
 ) -> FittedModelPayload {
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         inputs.formula,
         ModelKind::Survival,
         inputs.family,
         inputs.model_class_label,
     );
-    payload.unified = Some(inputs.fit_result.clone());
     payload.fit_result = Some(inputs.fit_result);
     payload.data_schema = Some(inputs.data_schema);
     payload.survival_entry = inputs.survival_entry;
@@ -1510,13 +1496,12 @@ pub fn apply_request_metadata(
 /// the inputs it is certified for, so a later warm start can tell a resume from a
 /// new fit (gam#3002). `None` leaves the point able only to join a later search.
 fn record_input_fingerprint(payload: &mut FittedModelPayload, input_fingerprint: Option<String>) {
-    for fit in [payload.fit_result.as_mut(), payload.unified.as_mut()]
-        .into_iter()
-        .flatten()
+    if let Some(record) = payload
+        .fit_result
+        .as_mut()
+        .and_then(|fit| fit.artifacts.outer_warm_start.as_mut())
     {
-        if let Some(record) = fit.artifacts.outer_warm_start.as_mut() {
-            record.input_fingerprint = input_fingerprint.clone();
-        }
+        record.input_fingerprint = input_fingerprint;
     }
 }
 
@@ -2979,7 +2964,6 @@ mod apply_timewiggle_beta_tests {
     /// fixture-free `LatentBinary` family so the test needs no `LikelihoodSpec`.
     fn empty_payload() -> FittedModelPayload {
         FittedModelPayload::new(
-            MODEL_PAYLOAD_VERSION,
             "y ~ 1".to_string(),
             ModelKind::Survival,
             FittedFamily::LatentBinary {

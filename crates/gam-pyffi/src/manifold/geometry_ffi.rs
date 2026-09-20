@@ -6730,7 +6730,7 @@ fn fit_dataset_impl(
     let model = FittedModel::from_payload(payload);
     // A fitted model the engine cannot serialize breaks its own persistence
     // contract; it is not a solver failure of the fit (#2937).
-    serde_json::to_vec(&model).map_err(|err| {
+    model.to_saved_bytes().map_err(|err| {
         gam::families::fit_orchestration::WorkflowError::Fit(
             gam::families::fit_orchestration::FitFailure::raised(
                 gam::FailureCategory::Invariant,
@@ -6746,14 +6746,7 @@ fn fit_dataset_impl(
 fn load_model_impl(
     model_bytes: &[u8],
 ) -> Result<FittedModel, gam::inference::model::FittedModelError> {
-    let model: FittedModel = serde_json::from_slice(model_bytes).map_err(|err| {
-        gam::inference::model::FittedModelError::PayloadCorrupt {
-            reason: format!("failed to parse model json: {err}"),
-        }
-    })?;
-    model.validate_for_persistence()?;
-    model.validate_numeric_finiteness()?;
-    Ok(model)
+    FittedModel::from_saved_bytes(model_bytes)
 }
 
 fn extend_model_with_group_impl(model: &FittedModel, request_json: &str) -> Result<Vec<u8>, String> {
@@ -6774,7 +6767,9 @@ fn extend_model_with_group_impl(model: &FittedModel, request_json: &str) -> Resu
     // gam-models so the CLI and Rust library callers reach the same capability
     // (SPEC rule 9); this boundary only speaks JSON.
     model.extend_with_group(request)?;
-    serde_json::to_vec(&model).map_err(|err| format!("failed to serialize extended model: {err}"))
+    model
+        .to_saved_bytes()
+        .map_err(|err| format!("failed to serialize extended model: {err}"))
 }
 
 fn validate_formula_dataset_json_impl(

@@ -62,7 +62,7 @@ def _inference(model: Any) -> dict[str, Any]:
         path = os.path.join(directory, "model.gam")
         model.save(path)
         with open(path) as handle:
-            return json.load(handle)["payload"]["fit_result"]["inference"]
+            return json.load(handle)["model"]["fit_result"]["inference"]
 
 
 def test_the_fit_is_rail_certified(fitted: tuple[Any, dict[str, Any]]) -> None:

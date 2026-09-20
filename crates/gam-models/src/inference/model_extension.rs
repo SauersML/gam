@@ -253,12 +253,6 @@ fn extend_model_with_random_effect_level(
         coefficient_mean,
         coefficient_variance,
     )?;
-    insert_coefficient_into_saved_fit(
-        payload.unified.as_mut(),
-        coefficient_index,
-        coefficient_mean,
-        coefficient_variance,
-    )?;
 
     let extension_name = requested_name
         .map(str::to_string)

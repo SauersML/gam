@@ -1416,9 +1416,10 @@ def load(path: str | Path) -> LoadedModel:
 def loads(model_bytes: bytes) -> LoadedModel:
     """Load a fitted model from an in-memory bytes payload.
 
-    The Rust ``saved_model_kind`` reads the payload header and selects the
-    loader: manifold SAE (the ``schema`` names the class, #2567), response
-    geometry, multinomial, or the scalar :class:`Model` archive.
+    The Rust ``saved_model_kind`` reads the saved model's header and selects
+    the loader: manifold SAE (the ``schema`` names the class, #2567), response
+    geometry, multinomial, or a saved GAM (kind ``"gam"``) for
+    :class:`Model`. A saved model of any other kind is refused by name.
 
     Parameters
     ----------
@@ -1456,6 +1457,13 @@ def loads(model_bytes: bytes) -> LoadedModel:
         return MultinomialModel(
             _model_bytes=model_bytes,
             _training_table_kind=str(metadata["training_table_kind"]),
+        )
+    if kind != "gam":
+        from ._exceptions import SchemaMismatchError
+
+        raise SchemaMismatchError(
+            f"this is a saved model of kind {kind!r}; gamfit.loads reads saved "
+            "GAM, multinomial, response-geometry and manifold SAE models"
         )
     return Model(_model_bytes=model_bytes)
 

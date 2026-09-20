@@ -66,7 +66,7 @@ use gam::inference::formula_dsl::{
     ParsedTerm, effectivelinkwiggle_formulaspec, parse_link_choice, parse_linkwiggle_formulaspec,
 };
 use gam::inference::model::{
-    ColumnKindTag, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind, SavedCompiledFlexBlock,
+    ColumnKindTag, FittedModelPayload, ModelKind, SavedCompiledFlexBlock,
     SavedLatentZNormalization, SavedSurvivalLocationScaleStructure, SchemaColumn,
 };
 use gam::inference::model_payload_builders::{
@@ -2370,8 +2370,7 @@ fn saved_prediction_runtime_rejects_location_scale_survival_payload_drift() {
         },
         "survival",
     );
-    payload.fit_result = Some(fit_result.clone());
-    payload.unified = Some(fit_result);
+    payload.fit_result = Some(fit_result);
     payload.survival_likelihood = Some("location-scale".to_string());
     // Every location-scale survival artifact must carry the exact replay
     // structure: the field deliberately has no serde default, so a v11 artifact
@@ -2711,7 +2710,6 @@ fn saved_bernoulli_marginal_slope_replays_main_and_slope_deviation_runtimes() {
         },
     ).expect("saved fit reconstruction");
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         "y ~ x + link(type=probit) + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")"
             .to_string(),
         ModelKind::MarginalSlope,
@@ -2725,7 +2723,6 @@ fn saved_bernoulli_marginal_slope_replays_main_and_slope_deviation_runtimes() {
         },
         "bernoulli-marginal-slope".to_string(),
     );
-    payload.unified = Some(fit_result.clone());
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(DataSchema { columns: vec![] });
     payload.set_training_feature_metadata(vec![], vec![]);
@@ -2814,7 +2811,6 @@ fn nonlinear_saved_model_with_hessian_only_remains_persistable_and_predictable()
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "construct hessian-only fit result", e));
 
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         "y ~ x".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -2829,8 +2825,7 @@ fn nonlinear_saved_model_with_hessian_only_remains_persistable_and_predictable()
         },
         "binomial-logit".to_string(),
     );
-    payload.fit_result = Some(fit_result.clone());
-    payload.unified = Some(fit_result);
+    payload.fit_result = Some(fit_result);
     payload.data_schema = Some(DataSchema {
         columns: vec![
             SchemaColumn {
@@ -2980,7 +2975,6 @@ fn hessian_only_saved_model_reports_the_truncated_covariance_on_an_active_face()
     });
 
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         "y ~ x".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -2995,8 +2989,7 @@ fn hessian_only_saved_model_reports_the_truncated_covariance_on_an_active_face()
         },
         "binomial-logit".to_string(),
     );
-    payload.fit_result = Some(fit_result.clone());
-    payload.unified = Some(fit_result);
+    payload.fit_result = Some(fit_result);
     payload.data_schema = Some(DataSchema {
         columns: vec![
             SchemaColumn {
@@ -3493,7 +3486,6 @@ fn test_payload(
     family: impl Into<String>,
 ) -> FittedModelPayload {
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         formula.into(),
         model_kind,
         family_state,
@@ -6225,7 +6217,6 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
         "survival",
     );
     payload.fit_result = Some(fit_saved.clone());
-    payload.unified = Some(fit_saved.clone());
     payload.survival_entry = Some("entry".to_string());
     payload.survival_exit = Some("exit".to_string());
     payload.survival_event = Some("event".to_string());
@@ -6390,7 +6381,6 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
         "survival",
     );
     payload.fit_result = Some(fit_saved.clone());
-    payload.unified = Some(fit_saved.clone());
     payload.data_schema = Some(DataSchema {
         columns: vec![
             SchemaColumn {
@@ -6945,8 +6935,7 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         },
         "latent-survival",
     );
-    payload.fit_result = Some(fit_result.clone());
-    payload.unified = Some(fit_result);
+    payload.fit_result = Some(fit_result);
     payload.survival_entry = Some("entry".to_string());
     payload.survival_exit = Some("exit".to_string());
     payload.survival_event = Some("event".to_string());

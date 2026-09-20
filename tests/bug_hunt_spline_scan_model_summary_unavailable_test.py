@@ -247,10 +247,10 @@ def test_scan_predictions_intervals_and_summary_replay_exactly_after_save_load(t
     path = tmp_path / "scan_model.gam"
     model.save(str(path))
     wire = json.loads(path.read_text())
-    payload = wire["payload"]
+    payload = wire["model"]
     assert payload["spline_scan"]["feature_column"] == "x"
     assert payload["fit_result"] is None
-    assert payload["unified"] is None
+    assert "unified" not in payload
     assert payload["resolved_termspec"] is None
 
     reloaded = gamfit.load(str(path))

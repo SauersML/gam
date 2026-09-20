@@ -12,7 +12,7 @@
 
 use gam::hmc::NutsConfig;
 use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+    FittedFamily, FittedModel, FittedModelPayload, ModelKind,
 };
 use gam::sample::sample_saved_model;
 use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
@@ -67,7 +67,6 @@ fn saved_standard_gaussian_model(
         .expect("freeze training term collection");
 
     let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
         formula.to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -79,8 +78,7 @@ fn saved_standard_gaussian_model(
         },
         "gaussian".to_string(),
     );
-    payload.fit_result = Some(fit.fit.clone());
-    payload.unified = Some(fit.fit);
+    payload.fit_result = Some(fit.fit);
     payload.data_schema = Some(ds.schema.clone());
     payload.resolved_termspec = Some(frozenspec);
     payload.set_training_feature_metadata(ds.headers.clone(), ds.feature_ranges());

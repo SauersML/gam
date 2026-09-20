@@ -998,20 +998,6 @@ fn transformation_normal_draws(
         .ok_or_else(|| fitted_state_error(model_class, "missing canonical fit_result"))?;
     validate_flattened_fit(fit, model_class)?;
     validate_coefficient_count(model_class, fit.beta.len(), draws)?;
-    let unified = model
-        .unified()
-        .ok_or_else(|| fitted_state_error(model_class, "missing unified fit"))?;
-    validate_flattened_fit(unified, model_class)?;
-    if unified.beta.len() != fit.beta.len() {
-        return Err(inconsistent_state_error(
-            model_class,
-            format!(
-                "canonical fit_result has {} coefficients but unified fit has {}",
-                fit.beta.len(),
-                unified.beta.len(),
-            ),
-        ));
-    }
     let offset = resolve_offset(data, col_map, model.offset_column.as_deref(), "offset")?;
     let mut draw_model = model.clone();
     let mut eta = Array2::<f64>::zeros((draws.nrows(), data.nrows()));
@@ -1021,10 +1007,6 @@ fn transformation_normal_draws(
             fitted_state_error(model_class, "mutable model clone lost canonical fit_result")
         })?;
         assign_fit_theta(draw_fit, draw, model_class)?;
-        let draw_unified = draw_model.unified.as_mut().ok_or_else(|| {
-            fitted_state_error(model_class, "mutable model clone lost unified fit")
-        })?;
-        assign_fit_theta(draw_unified, draw, model_class)?;
         let grid = build_transformation_normal_quantile_grid(
             &draw_model,
             data,

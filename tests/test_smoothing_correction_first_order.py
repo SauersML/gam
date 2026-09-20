@@ -27,7 +27,7 @@ Z95 = 1.959963984540054
 def _saved_payload(model, tmp_path):
     path = tmp_path / "model.gam"
     model.save(path)
-    return json.loads(path.read_text())["payload"]["fit_result"]
+    return json.loads(path.read_text())["model"]["fit_result"]
 
 
 @pytest.mark.parametrize("family", ["binomial", "poisson", "gaussian"])

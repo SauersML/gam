@@ -76,18 +76,9 @@ pub fn resolve_warm_start(
         .as_ref()
         .and_then(|fit| fit.artifacts.outer_warm_start.as_ref())
         .ok_or(WorkflowError::WarmStartRefused {
-            refusal: if model.version
-                <= crate::inference::model::OUTER_WARM_START_ABSENT_PAYLOAD_VERSION
-            {
-                WarmStartRefusal::RefitRequired {
-                    payload_version: model.version,
-                }
-            } else {
-                WarmStartRefusal::NoRecordedPoint
-            },
+            refusal: WarmStartRefusal::NoRecordedPoint,
         })?;
-    // A v25 to v27 record carries neither its value nor its fingerprint, so it can only
-    // join a search.
+    // A record without its value or its fingerprint can only join a search.
     let same_inputs = record.value.is_some()
         && record.input_fingerprint.is_some()
         && record.input_fingerprint == fit_input_fingerprint(&formula, dataset, config);
