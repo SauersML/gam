@@ -2900,5 +2900,19 @@
     ],
     "reason": "#4466: the saved-model payload carried write-only mirrors (sas_param_covariance, mixture_link_param_covariance, beta_noise, slope_formulas, baseline_slopes, latent_score_contract). Predict reads the link covariance from fit_result.fitted_link, the noise coefficients from the fit's Scale block and the marginal-slope contract from slope_formula/baseline_slope/z_columns, so the mirrors could be edited or drift with no effect on any reloaded prediction. They are deleted with SavedLatentScoreContract, the struct only latent_score_contract held, and the FitResult::working_response/working_geometry accessors, which had no caller outside each other.",
     "evidence": "At 00b33efd50, git grep finds no reader of the six payload keys (beta_noise only behind a dead fallback after the fit's Scale block) outside their writers in model_payload_builders.rs, the new()/validate_numeric_finiteness boilerplate in model.rs and tests; SavedLatentScoreContract is named only in model.rs; '.working_response()' has no call site and '.working_geometry()' is called only by working_response, both in result_types.rs. stateful_saved_model_sync now asserts the SAS covariance round-trips through fit_result.fitted_link and pins 96 payload keys (the pin had also missed gaussian_sigma_floor and informational_notes)."
+  },
+  {
+    "base": "b4ab590eb5ca9c4e08dacc18e1a287eb8fecd78c",
+    "items": [
+      "crates/gam-event-history/src/joint/constant_rate_inference.rs:fn:add",
+      "crates/gam-event-history/src/joint/constant_rate_inference.rs:fn:value",
+      "crates/gam-event-history/src/joint/constant_rate_inference.rs:struct:CompensatedSum",
+      "crates/gam-math/src/sparse_grid.rs:fn:default",
+      "crates/gam-terms/src/smooth/input_standardization.rs:fn:add",
+      "crates/gam-terms/src/smooth/input_standardization.rs:fn:total",
+      "crates/gam-terms/src/smooth/input_standardization.rs:struct:CompensatedSum"
+    ],
+    "reason": "#4306: one canonical Neumaier accumulator in gam-math replaces private duplicate scalar sums and the quadrature duplicate. All former callers import the canonical live type.",
+    "evidence": "Four exact cancellation/copy/reset/quadrature regressions execute against rebuilt gam-math; complete changed consumer crates and their transitive dependency metadata compile with warnings denied on MSI. Source census enumerates all direct consumers and removed declarations."
   }
 ]
