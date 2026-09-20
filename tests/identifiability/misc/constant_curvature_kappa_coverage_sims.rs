@@ -566,15 +566,36 @@ fn flatness_test_holds_size_across_flat_replicates() {
          unresolved {unresolved}/{reps}  railed κ̂ {railed}/{reps}  p-values={pvals:?}"
     );
 
-    // SIZE CONTROL: a level-α interior χ²₁ test on truly flat data rejects ~α of
-    // the time (expected ≈0.05·reps). A test that over-rejects (wrong reference,
-    // e.g. a phantom curvature from the basis, or a mis-scaled LR) rejects many.
-    // Allow a strict minority (≤ reps/2) to absorb the small-R binomial tail while
-    // still failing a test that rejects flat data routinely, at either count.
+    // SIZE CONTROL: a level-α interior χ²₁ test on truly flat data rejects each
+    // replicate independently with probability α, so the rejection count is
+    // Binomial(reps, α). The bar is the SAME derived `MAX_MISSES` the coverage
+    // gates use: at n = 9, α = 0.05, `P(rejections ≤ 2) = 0.9916` (false alarm
+    // < 1%), while a test whose true size is 0.20 passes only 0.7382 and one at
+    // 0.30 only 0.4628. The previous "strict minority" bar (`≤ reps / 2` = 4) was
+    // not derived from anything and passed a 0.30-size test 90.1% of the time and
+    // a 0.20-size test 98.0% of the time — i.e. it could not see a size inflation
+    // of 4–6×.
     assert!(
-        rejections <= reps / 2,
+        rejections <= MAX_MISSES,
         "κ=0 flatness test rejected truly-flat data in {rejections}/{reps} replicates at α={alpha} \
-         (size-inflated): p-values {pvals:?}"
+         (size-inflated; the derived bar at n={reps} is at most {MAX_MISSES}): p-values {pvals:?}"
+    );
+    // CALIBRATION, TWO-SIDED: a rejection count only sees the ANTI-conservative
+    // side. A test whose p-values pile up near 1 (a deflated LR, a wrong
+    // reference with too many degrees of freedom, a profile that never leaves
+    // κ̂ = 0) rejects nothing and passes the size bar while having no power, and
+    // conservative is a bug just like anti-conservative. Under the null an
+    // interior χ²₁ p-value is Uniform(0, 1), so the replicate mean has expectation
+    // 1/2 and standard deviation `sqrt(1 / (12·reps))` (= 0.0962 at n = 9). A 4σ
+    // band (±0.385 → mean p ∈ [0.115, 0.885]) false-alarms with probability
+    // < 1e-4 on a calibrated test and still fails one whose p-values are
+    // systematically pinned at either end.
+    let mean_p = pvals.iter().sum::<f64>() / reps as f64;
+    let mean_p_band = 4.0 * (1.0 / (12.0 * reps as f64)).sqrt();
+    assert!(
+        (mean_p - 0.5).abs() <= mean_p_band,
+        "κ=0 flatness p-values on truly-flat data are not Uniform(0,1): mean p = {mean_p:.4} \
+         is outside 0.5 ± {mean_p_band:.4} (4σ of the null mean at n={reps}); p-values {pvals:?}"
     );
     // The profile CI must straddle 0 (verdict Flat) for flat data in all but the
     // derived bar — the CI-side mirror of the size claim. Unresolved replicates
