@@ -1093,7 +1093,12 @@ impl GaussianRemlMultiPenaltyProblem {
                 );
             }
         }
-        let (observations, coefficients) = (self.observations, self.coefficients);
+        // The criterion sums `m` response columns that share `λ` and one
+        // dispersion (`ν = m·(n − nullity)`), so the information about `ρ` is
+        // carried by `m·n` observations, not `n`: that count is the `n_eff` the
+        // outer certificate's resolution `τ_stat = 1/(2·n_eff)` is over (#3192).
+        // It is also the number of squared residuals `V` accumulates.
+        let (observations, coefficients) = (self.responses * self.observations, self.coefficients);
         let (lower, upper) = (self.rho_lower.clone(), self.rho_upper.clone());
         // One start: the caller's ρ, else each penalty's commensurate-curvature
         // start (`XᵀX = RᵀR` over the penalty's support against `tr S_k`),

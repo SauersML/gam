@@ -7424,7 +7424,7 @@ impl<'a> RemlState<'a> {
             )?;
             self.frozen_dispersion_phi
                 .store(phi.to_bits(), Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[OUTER] dispersion λ-search φ frozen at {phi:.6e} (measured at the \
                  converged η); outer REML criterion now stationary in ρ"
             );
@@ -7805,14 +7805,14 @@ mod stateless_pirls_tests {
                 .collect::<Vec<_>>()
                 .join(",");
             match result {
-                Ok((ref res, ref wm)) => log::info!(
+                Ok((ref res, ref wm)) => log::debug!(
                     "[STAGE] stateless pirls solve rho=[{rho_text}] iters={} status={:?} max_eta={:.1} elapsed={:.3}s",
                     wm.iterations,
                     res.status,
                     res.max_abs_eta,
                     pirls_elapsed.as_secs_f64(),
                 ),
-                Err(ref error) => log::info!(
+                Err(ref error) => log::debug!(
                     "[STAGE] stateless pirls solve rho=[{rho_text}] FAILED in {:.3}s: {error}",
                     pirls_elapsed.as_secs_f64(),
                 ),

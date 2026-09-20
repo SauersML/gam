@@ -59,8 +59,9 @@ def rust_module() -> RustModule:
     """The compiled engine, with its log filter matched to the ``gamfit`` logger.
 
     Every engine call goes through here, so a level set on the logger takes
-    effect on the next call, and records queued by the previous call are
-    delivered.
+    effect on the next call. Engine records reach the logger while the call
+    that produced them runs; anything still queued is delivered here before
+    the next call starts.
     """
     module = _load_rust_module()
     module.sync_log_level_from_python(_LOGGER.getEffectiveLevel())
