@@ -13,11 +13,14 @@ Verdict rules (all "lower is better"; every LOSS is printed, none is hidden):
 
 * Speed / memory: ratio of medians over the ok reps, gamfit / comparator.
   A ratio above 1.00 is marked **LOSS**.
-* Accuracy (rmse_mu, deviance, logscore, |coverage - 0.95|): paired by seed
-  over reps where both libraries are ok. The mean paired difference d
+* Accuracy (rmse_mu, deviance, logscore, |mean coverage - 0.95|): paired by
+  seed over reps where both libraries are ok. The mean paired difference d
   (gamfit - comparator) is a **LOSS** when d > 2 SE, a WIN when d < -2 SE,
   otherwise "worse n.s." / "better n.s." / TIE. With a single paired seed
   there is no SE, so the sign alone decides and the verdict says "(1 seed)".
+  Coverage is judged on each library's mean coverage over the paired seeds,
+  not per seed, so over-covering is scored as miscalibration exactly like
+  under-covering (see ``_coverage_calibration_diffs``).
 * Thread scaling (only for runs whose cells set ``threads`` / ``concurrency``):
   median fit wall per thread setting with its speedup over one thread, and for
   a process fan-out the batch wall and fits per second next to the same shape
@@ -155,7 +158,7 @@ def _paired(g: list[Record], c: list[Record], metric: str) -> tuple[list[float],
     comparator has on some seed where both are ok."""
     gs = {r["seed"]: r for r in _ok(g)}
     cs = {r["seed"]: r for r in _ok(c)}
-    diffs: list[float] = []
+    pairs: list[tuple[float, float]] = []
     missing = False
     for seed in sorted(set(gs) & set(cs)):
         gv, cv = gs[seed].get(metric), cs[seed].get(metric)
@@ -164,11 +167,31 @@ def _paired(g: list[Record], c: list[Record], metric: str) -> tuple[list[float],
         if gv is None:
             missing = True
             continue
-        if metric == "coverage":
-            diffs.append(abs(gv - COVERAGE_TARGET) - abs(cv - COVERAGE_TARGET))
-        else:
-            diffs.append(float(gv) - float(cv))
-    return diffs, missing
+        pairs.append((float(gv), float(cv)))
+    if metric == "coverage":
+        return _coverage_calibration_diffs(pairs), missing
+    return [gv - cv for gv, cv in pairs], missing
+
+
+def _coverage_calibration_diffs(pairs: list[tuple[float, float]]) -> list[float]:
+    """Per-seed terms whose mean is |mean g - 0.95| - |mean c - 0.95|.
+
+    Calibration is a property of the mean coverage over seeds: one fit's
+    intervals move together with that fit's error, so even an exactly
+    calibrated interval scatters per seed around the target, and a per-seed
+    |cov_s - 0.95| books that scatter as miscalibration (rewarding an interval
+    that over-covers every seed). With each library's side fixed at
+    sign(mean - 0.95), seed s contributes side_g (g_s - 0.95) - side_c (c_s -
+    0.95); these average to the mean-level difference exactly and their spread
+    is its delta-method SE. With one seed this is the per-seed rule.
+    """
+    if not pairs:
+        return []
+    side_g = math.copysign(1.0, statistics.fmean(g for g, _ in pairs) - COVERAGE_TARGET)
+    side_c = math.copysign(1.0, statistics.fmean(c for _, c in pairs) - COVERAGE_TARGET)
+    return [
+        side_g * (g - COVERAGE_TARGET) - side_c * (c - COVERAGE_TARGET) for g, c in pairs
+    ]
 
 
 def paired_verdict(g: list[Record], c: list[Record], metric: str) -> Verdict:
@@ -223,7 +246,7 @@ ACCURACY_METRICS: tuple[tuple[str, str], ...] = (
     ("rmse_mu", "RMSE vs true mean"),
     ("deviance", "held-out mean deviance"),
     ("logscore", "held-out log score (NLL)"),
-    ("coverage", "95% CI coverage of true mean (verdict on |cov-0.95|)"),
+    ("coverage", "95% CI coverage of true mean (verdict on |mean cov-0.95|)"),
 )
 
 
