@@ -2184,5 +2184,18 @@
     ],
     "reason": "#3140: the observation bands are built from one posterior law of the response mean with the complement 1 - mu carried, and each edge is a quantile of a law on the response's support, so nothing floors a variance or clamps an edge. family_response_variance returned E[Var(Y|mu)] and formed the Beta and Bernoulli arms as m(1-m) - v under a .max(0.0) floor; family_predictive_variance replaces it with the total E[Var(Y|mu)] + Var(mu) as a sum of non-negative terms, and every caller reads the total. ResponseBounds::response_support and ResponseFamily::response_support_bounds existed only to clamp the observation band to the response support; with that clamp deleted from both band drivers they have no reader, so they go with their three unit tests.",
     "evidence": "git grep at 4d529db085e4eb5925afb3057c584afeab57b2dd: family_response_variance is defined at crates/gam-predict/src/lib.rs:2209 and called only by the six skew arms of family_observation_band (lib.rs:2429-2535) and predictive_standard_error's conformal scale (lib.rs:3275); ResponseBounds::response_support (crates/gam-predict/src/interval_policy.rs:70) is called only at lib.rs:2328 and :2651, the two band clamps this landing deletes; ResponseFamily::response_support_bounds (crates/gam-spec/src/lib.rs:863) is called only by response_support and by its three unit tests (lib.rs:4395-4412). The landing tree names none of the six items."
+  },
+  {
+    "base": "04346780239dc8e32810c476bb12d0eef4033440",
+    "items": [
+      "crates/gam-gpu/src/calibration.rs:const:_",
+      "crates/gam-gpu/src/device_runtime.rs:fn:resolve_if_fused_batch_exceeds_floor",
+      "crates/gam-gpu/src/policy.rs:const:MIN_CALIBRATABLE_FUSED_KERNEL_N",
+      "crates/gam-gpu/src/policy.rs:fn:polya_gamma_admits_large_batch_and_refuses_small",
+      "crates/gam-gpu/src/policy.rs:fn:polya_gamma_batch_target_is_gpu",
+      "crates/gam-inference/src/gpu_polya_gamma.rs:fn:sub_crossover_batch_routes_to_cpu_bitwise_on_every_host"
+    ],
+    "reason": "#3024 slice A: the survival row jet and the Polya-Gamma batch are admitted under gpu=auto on their own two executors measured on their own workload (gam_gpu::row_kernel_race), not at fused_kernel_min_n, which calibration set to twice the xtwx Gram's crossover. GpuDispatchPolicy::fused_kernel_min_n is deleted with every reader: its pre-probe floor MIN_CALIBRATABLE_FUSED_KERNEL_N and the compile-time assert (const _) that pinned that floor to 2 * XTWX_DIMS[0]; GpuRuntime::resolve_if_fused_batch_exceeds_floor, the size-gated resolve built on the floor; and GpuDispatchPolicy::polya_gamma_batch_target_is_gpu, the PG predicate on it, with its pin polya_gamma_admits_large_batch_and_refuses_small. The PG seam test sub_crossover_batch_routes_to_cpu_bitwise_on_every_host is renamed an_untimed_batch_returns_the_cpu_draws_bitwise_on_every_host_3024: there is no crossover left to be under, and the same bitwise-CPU property now holds for any batch size the process has not timed.",
+    "evidence": "In the landing tree git grep -w finds none of fused_kernel_min_n, MIN_CALIBRATABLE_FUSED_KERNEL_N, resolve_if_fused_batch_exceeds_floor or polya_gamma_batch_target_is_gpu under crates, src or tests. an_untimed_batch_returns_the_cpu_draws_bitwise_on_every_host_3024 and rigid_row_jet_device_admission_and_parity_2900 pass. The race logic is pinned by a_measured_law_decides_every_row_count_3024, an_unfixed_law_is_raced_3024, a_race_returns_the_cpu_value_and_records_the_shape_3024 and a_measured_row_kernel_races_an_untimed_shape_and_then_reads_its_timing_3024."
   }
 ]

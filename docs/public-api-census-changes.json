@@ -4747,5 +4747,14 @@
     },
     "reason": "#3140: family_predictive_variance replaces family_response_variance (the total predictive variance as a sum of non-negative terms, no floored m(1-m) - v), and the observation-band support clamp is deleted from both band drivers, which leaves ResponseBounds::response_support and ResponseFamily::response_support_bounds without a reader.",
     "evidence": "git grep at 4d529db085e4eb5925afb3057c584afeab57b2dd: family_response_variance's only callers are the six skew arms of family_observation_band and the conformal predictive_standard_error in crates/gam-predict/src/lib.rs; response_support's only callers are the two band clamps at crates/gam-predict/src/lib.rs:2328 and :2651; response_support_bounds's only callers are response_support and its three unit tests in crates/gam-spec/src/lib.rs. The landing tree names none of the three."
+  },
+  {
+    "base": "04346780239dc8e32810c476bb12d0eef4033440",
+    "removed": {
+      "crates/gam-gpu/src/device_runtime.rs::resolve_if_fused_batch_exceeds_floor": 1,
+      "crates/gam-gpu/src/policy.rs::polya_gamma_batch_target_is_gpu": 1
+    },
+    "reason": "#3024 slice A: GpuDispatchPolicy::fused_kernel_min_n, twice the xtwx Gram's crossover borrowed as the survival row jet's and the Polya-Gamma batch's admission threshold, is deleted, and both kernels are admitted on their own measured executors (gam_gpu::row_kernel_race). The two public functions built on that threshold go with it: GpuRuntime::resolve_if_fused_batch_exceeds_floor (the pre-probe floor) and GpuDispatchPolicy::polya_gamma_batch_target_is_gpu (the PG predicate). draw_batch now decides through gam_gpu::decide_row_kernel.",
+    "evidence": "public_api_census.py, run against this entry's base with the slice-A commit as head, reports exactly these two identities as removed (13600 public function declarations before and 13604 after at the gate base 15c6d195ef). git grep -w finds neither name under crates, src or tests at the head tree."
   }
 ]
