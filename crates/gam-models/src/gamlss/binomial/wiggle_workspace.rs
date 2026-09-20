@@ -13,6 +13,10 @@ pub(crate) struct BinomialLocationScaleWiggleHessianWorkspace {
     pub(crate) x_t: Arc<Array2<f64>>,
     pub(crate) x_ls: Arc<Array2<f64>>,
     pub(crate) pieces: BinomialWiggleOrder2Rows,
+    /// Horvitz–Thompson row factor of the outer subsample, when one is
+    /// applied; the β-directional derivative operators are put on the same
+    /// row measure as the masked value Hessian.
+    pub(crate) outer_row_factor: Option<Array1<f64>>,
 }
 
 impl BinomialLocationScaleWiggleHessianWorkspace {
@@ -29,6 +33,7 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
             x_t: Arc::new(x_t),
             x_ls: Arc::new(x_ls),
             pieces,
+            outer_row_factor: None,
         })
     }
 
@@ -43,39 +48,24 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
     /// via `Xᵀ diag(W) Y`, the resulting joint-Hessian is an unbiased
     /// estimator of the full-data joint Hessian. The `b0`/`d0` basis matrices
     /// are independent of the per-row weights and remain unchanged.
+    ///
+    /// The same factor is kept for the β-directional derivatives: the outer
+    /// gradient differentiates this masked `log|H|`, so `D_βH[u]` and
+    /// `D²_βH[u,v]` must sum over the same rows.
     pub(crate) fn apply_outer_subsample(
         &mut self,
         rows: &[crate::outer_subsample::WeightedOuterRow],
     ) {
-        let n = self.pieces.coeff_tt.len();
-        let mut mask_tt = Array1::<f64>::zeros(n);
-        let mut mask_tl = Array1::<f64>::zeros(n);
-        let mut mask_ll = Array1::<f64>::zeros(n);
-        let mut mask_tw_b = Array1::<f64>::zeros(n);
-        let mut mask_tw_d = Array1::<f64>::zeros(n);
-        let mut mask_lw_b = Array1::<f64>::zeros(n);
-        let mut mask_lw_d = Array1::<f64>::zeros(n);
-        let mut mask_ww = Array1::<f64>::zeros(n);
-        for r in rows {
-            let i = r.index;
-            let w = r.weight;
-            mask_tt[i] = self.pieces.coeff_tt[i] * w;
-            mask_tl[i] = self.pieces.coeff_tl[i] * w;
-            mask_ll[i] = self.pieces.coeff_ll[i] * w;
-            mask_tw_b[i] = self.pieces.coeff_tw_b[i] * w;
-            mask_tw_d[i] = self.pieces.coeff_tw_d[i] * w;
-            mask_lw_b[i] = self.pieces.coeff_lw_b[i] * w;
-            mask_lw_d[i] = self.pieces.coeff_lw_d[i] * w;
-            mask_ww[i] = self.pieces.coeff_ww[i] * w;
-        }
-        self.pieces.coeff_tt = mask_tt;
-        self.pieces.coeff_tl = mask_tl;
-        self.pieces.coeff_ll = mask_ll;
-        self.pieces.coeff_tw_b = mask_tw_b;
-        self.pieces.coeff_tw_d = mask_tw_d;
-        self.pieces.coeff_lw_b = mask_lw_b;
-        self.pieces.coeff_lw_d = mask_lw_d;
-        self.pieces.coeff_ww = mask_ww;
+        let factor = outer_subsample_row_factor(rows, self.pieces.coeff_tt.len());
+        self.pieces.coeff_tt *= &factor;
+        self.pieces.coeff_tl *= &factor;
+        self.pieces.coeff_ll *= &factor;
+        self.pieces.coeff_tw_b *= &factor;
+        self.pieces.coeff_tw_d *= &factor;
+        self.pieces.coeff_lw_b *= &factor;
+        self.pieces.coeff_lw_d *= &factor;
+        self.pieces.coeff_ww *= &factor;
+        self.outer_row_factor = Some(factor);
     }
 }
 
@@ -198,6 +188,13 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if self.outer_row_factor.is_some() {
+            // The family's dense path sums every row; under a subsample the
+            // masked operator is the derivative of the masked value Hessian.
+            return Ok(self
+                .directional_derivative_operator(d_beta_flat)?
+                .map(|operator| operator.to_dense()));
+        }
         self.family
             .exact_newton_joint_hessian_directional_derivative(&self.block_states, d_beta_flat)
     }
@@ -211,6 +208,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
             self.x_t.clone(),
             self.x_ls.clone(),
             d_beta_flat,
+            self.outer_row_factor.as_ref(),
         )
     }
 
@@ -219,6 +217,11 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if self.outer_row_factor.is_some() {
+            return Ok(self
+                .second_directional_derivative_operator(d_beta_u_flat, d_beta_v_flat)?
+                .map(|operator| operator.to_dense()));
+        }
         self.family
             .exact_newton_joint_hessiansecond_directional_derivative(
                 &self.block_states,
@@ -238,6 +241,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
             self.x_ls.clone(),
             d_beta_u,
             d_beta_v,
+            self.outer_row_factor.as_ref(),
         )
     }
 }
