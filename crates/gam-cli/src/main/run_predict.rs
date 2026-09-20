@@ -2890,17 +2890,13 @@ pub(crate) fn run_predict_survival(
             },
         )
         .map_err(|e| format!("survival uncertainty prediction failed: {e}"))?;
-        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-        eta_se = Some(uncertainty.eta_standard_error.clone());
-        let (lo, hi) = response_interval_from_mean_sd(
-            mean.view(),
-            uncertainty.mean_standard_error.view(),
-            z,
-            0.0,
-            1.0,
-        );
-        mean_lo = Some(lo);
-        mean_hi = Some(hi);
+        // S = exp(-exp(eta)) is monotone in the one Gaussian linear predictor,
+        // so the image of the eta credible interval is the exact central
+        // band for S: publish the library's interval as-is (#3560). A
+        // mean +/- z*sd band clamped to [0, 1] is one-tailed near either rail.
+        eta_se = Some(uncertainty.eta_standard_error);
+        mean_lo = Some(uncertainty.mean_lower);
+        mean_hi = Some(uncertainty.mean_upper);
     }
     write_survival_prediction_csv(
         &args.out,
