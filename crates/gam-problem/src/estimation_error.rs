@@ -1334,14 +1334,23 @@ impl EstimationError {
     /// `InnerSolveNotConverged` reached it as `RemlOptimizationFailed` and did
     /// the same (#2590). Any site that adds context to an error it did not
     /// produce should use this instead of choosing a variant for it.
+    ///
+    /// The fatal branch keeps the source typed. Re-rendering it into
+    /// `InvalidInput` preserved the fatal verdict but replaced the producer's
+    /// variant: a `LinearSystemSolveFailed` or `HessianNotPositiveDefinite`
+    /// raised inside the evaluator reached the caller as an `Input` failure,
+    /// under the wrong variant name, CLI exit code and advice. Wrapping it as
+    /// [`Self::OuterObjectiveEvaluationFailed`] carries the context while
+    /// `innermost_estimation_error`, `failure_category` and `advice` still
+    /// answer for the source.
     #[must_use]
     pub fn wrap_preserving_trial_point(self, context: &str) -> Self {
-        let infeasible = self.is_trial_point_infeasible();
-        let reason = format!("{context}: {self}");
-        if infeasible {
-            Self::TrialPointRefused { reason }
+        if self.is_trial_point_infeasible() {
+            Self::TrialPointRefused {
+                reason: format!("{context}: {self}"),
+            }
         } else {
-            Self::InvalidInput(reason)
+            Self::fatal_outer_evaluation(context, self)
         }
     }
 
@@ -1918,6 +1927,50 @@ mod tests {
             nested.to_string().matches("Fatal outer-objective").count(),
             1,
             "fatal provenance must not be re-wrapped at every orchestration layer"
+        );
+    }
+
+    #[test]
+    fn wrap_preserving_trial_point_keeps_a_fatal_source_typed() {
+        let wrapped = EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: -1.0,
+        }
+        .wrap_preserving_trial_point("survival smoothing LAML evaluation failed");
+        assert!(!wrapped.is_trial_point_infeasible());
+        assert!(wrapped.is_fatal_outer_evaluation());
+        assert!(
+            wrapped
+                .to_string()
+                .contains("survival smoothing LAML evaluation failed"),
+            "{wrapped}"
+        );
+        assert_eq!(wrapped.failure_category(), FailureCategory::Numerical);
+        assert_eq!(
+            wrapped.variant_name(),
+            "EstimationError::HessianNotPositiveDefinite"
+        );
+        let advice = wrapped
+            .advice()
+            .expect("conditioning advice survives the wrap");
+        assert!(advice.contains("conditioning"), "{advice}");
+
+        let input = EstimationError::InvalidInput("frame mismatch".to_string())
+            .wrap_preserving_trial_point("inner state");
+        assert!(!input.is_trial_point_infeasible());
+        assert_eq!(input.failure_category(), FailureCategory::Input);
+    }
+
+    #[test]
+    fn wrap_preserving_trial_point_keeps_a_refusal_recoverable() {
+        let wrapped = EstimationError::TrialPointRefused {
+            reason: "lambda out of range".to_string(),
+        }
+        .wrap_preserving_trial_point("inner state");
+        assert!(wrapped.is_trial_point_infeasible());
+        assert!(!wrapped.is_fatal_outer_evaluation());
+        assert!(
+            wrapped.to_string().contains("lambda out of range"),
+            "{wrapped}"
         );
     }
 
