@@ -4607,7 +4607,41 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 block_accumulation.roundoff_ceiling(),
                 false,
             );
-            block_max_step[b] = trust_update.radius;
+            // A KEPT STEP NEITHER SIDE OF THE RATIO CAN RESOLVE IS NEUTRAL, NOT
+            // REJECTED (gam#3289). On this path the line search above decides
+            // whether the step is kept; the controller only sizes the next
+            // region. It reads a prediction inside the `|f|·1e-14` floor as
+            // `rho = -inf`, and it calls a realized change neutral only while
+            // that change sits inside the same floor. A realized decrease above
+            // the floor but inside the evaluation's own rounding ceiling
+            // satisfies neither the neutral test nor the gam#2637 override, so
+            // the controller shrinks the region to half the kept step. Neither
+            // reading of that change supports the shrink. If it is rounding,
+            // the step is neutral and the region holds. If it is a genuine
+            // decrease, the override accepts it and the region again holds.
+            // Only a model that predicts ascent is evidence against the region,
+            // and this one predicted a non-negative decrease.
+            //
+            // Measured on a railed `bounded()` slope, whose latent logit walks
+            // toward the injective clamp at one unit per cycle while the
+            // objective contracts by `e^-1` per cycle. At cycle 30 the realized
+            // change was `5.400e-13` against a floor of `5.366e-13`. The radius
+            // went from `40` to `5e-6`, the next step hit it, and the
+            // frozen-likelihood divergence exit refused the fit three cycles
+            // before the clamp would have produced the exactly-zero accepted
+            // step that certifies it.
+            let kept_step_is_numerically_neutral = accepted
+                && !trust_update.accepted
+                && trust_update.rho == f64::NEG_INFINITY
+                && predicted_reduction.is_finite()
+                && predicted_reduction >= 0.0
+                && actual_reduction >= 0.0
+                && actual_reduction <= block_accumulation.roundoff_ceiling();
+            block_max_step[b] = if kept_step_is_numerically_neutral {
+                block_max_step[b]
+            } else {
+                trust_update.radius
+            };
             if !accepted {
                 states[b].beta.assign(&beta_old);
                 eta_checkpoint.restore_eta(&mut states[b]);

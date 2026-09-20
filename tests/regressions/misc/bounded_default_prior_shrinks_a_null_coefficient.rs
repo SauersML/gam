@@ -183,3 +183,34 @@ fn bounded_shrinkage_is_equivariant_in_the_units_of_the_response() {
         slope_scaled / UNITS
     );
 }
+
+/// An unpenalised bounded fit whose constrained optimum sits on a bound is the
+/// rail itself (gam#3289). The least-squares slope here is the noise's, about
+/// 0.035, so `bounded(x, min=1, max=3, prior=none)` has its box-constrained
+/// optimum at exactly `beta = min = 1`. The bounded term fits that coefficient
+/// on a logit chart, where the rail is at infinity, and the inner solve must
+/// certify the rail rather than return the fit unconverged.
+#[test]
+fn bounded_unpenalised_fit_certifies_an_optimum_on_the_rail() {
+    init_parallelism();
+    let (x, y) = fixture();
+    let data = dataset(&x, &y);
+    let ols = ols_slope(&x, &y);
+    assert!(ols < 1.0, "non-vacuity: the least-squares slope {ols} must lie below the box");
+    let slope = bounded_slope("y ~ bounded(x, min=1, max=3, prior=none)", &data);
+    assert!(
+        (1.0..=3.0).contains(&slope),
+        "the railed slope must honour the box, got {slope}"
+    );
+    // The chart reaches the rail at its injective clamp `|logit| = ln(2/eps)`,
+    // where `width·sigmoid(-ln(2/eps)) = width·eps/(2 + eps)` is below one ulp of
+    // `min = 1` for this `width = 2`. Summing it onto `min` rounds once more, by
+    // at most half an ulp. The certified slope therefore lies within
+    // `2·eps` of the rail, and anything further out is an iterate still
+    // walking the chart.
+    const RAIL_TOL: f64 = 2.0 * f64::EPSILON;
+    assert!(
+        slope - 1.0 <= RAIL_TOL,
+        "the box-constrained optimum is the rail min = 1, got {slope}"
+    );
+}
