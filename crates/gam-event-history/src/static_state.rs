@@ -13,7 +13,7 @@
 //!   integrals, each resolved on a grid placed from its own prefix, with the
 //!   prior's absolute mass intact.
 
-use crate::chain::{Grid, log_standard_prior, log_sum_exp};
+use crate::chain::{Grid, SplitDensity, log_standard_prior, log_sum_exp};
 use crate::cohort::EventHistoryError;
 use crate::marginal::{ForwardPass, Spell, SubjectInputs, centred_baseline, condition, node_likelihood};
 use crate::scalar::{add_real, div, exp, ln, sqrt};
@@ -35,13 +35,13 @@ pub(crate) fn is_static<S: JetField>(rates: &[S]) -> bool {
     !rates.is_empty() && rates.iter().all(|r| r.value() == 0.0)
 }
 
-pub(crate) fn filter<S: JetField>(inputs: &SubjectInputs<'_, S>, initial: Option<(&Grid<S>, &[S])>,
+pub(crate) fn filter<S: JetField>(inputs: &SubjectInputs<'_, S>, initial: Option<(&Grid<S>, &[S], &SplitDensity<S>)>,
     compensated: &[bool]) -> Result<ForwardPass<S>, EventHistoryError> {
     let like = &inputs.eta0[0];
     let marks = inputs.nodes.counts.ncols();
     let atoms = inputs.rates.len();
     let (grid, mut log_density) = match initial {
-        Some((grid, log_density)) => (grid.clone(), log_density.to_vec()),
+        Some((grid, log_density, _)) => (grid.clone(), log_density.to_vec()),
         None => {
             let grid = posterior_grid(inputs, compensated)?;
             let log_density = log_standard_prior(&grid, like);
@@ -49,7 +49,7 @@ pub(crate) fn filter<S: JetField>(inputs: &SubjectInputs<'_, S>, initial: Option
         }
     };
     let mut pass = ForwardPass { grids: Vec::new(), log_alpha: Vec::new(), log_predicted: Vec::new(),
-        log_normalisers: Vec::new() };
+        log_normalisers: Vec::new(), densities: Vec::new() };
     for n in 0..inputs.nodes.len() {
         let likelihood = node_likelihood(&grid, &inputs.eta0[n * marks..(n + 1) * marks],
             inputs.loadings, &inputs.nodes.counts.row(n).to_vec(), &inputs.nodes.exposure_row(n),
@@ -59,6 +59,8 @@ pub(crate) fn filter<S: JetField>(inputs: &SubjectInputs<'_, S>, initial: Option
         pass.grids.push(grid.clone());
         pass.log_normalisers.push(add_real(&updated.log_normaliser, likelihood.shift));
         pass.log_alpha.push(updated.log_alpha.clone());
+        // No gap moves a static frailty, so no kernel ever reads a split.
+        pass.densities.push(SplitDensity::whole(&updated.log_alpha));
         log_density = updated.log_alpha;
     }
     Ok(pass)

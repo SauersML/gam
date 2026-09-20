@@ -52,8 +52,8 @@
 //! [`super::family`]).
 
 use super::chain::{
-    AtomTransition, ForwardKernel, GaussHermite, Grid, backward_axis_bases,
-    interpolate_at_inner_points, log_standard_prior, log_sum_exp,
+    AtomTransition, FactorMark, ForwardKernel, GaussHermite, Grid, LogFactor, SplitDensity,
+    backward_axis_bases, interpolate_at_inner_points, log_standard_prior, log_sum_exp,
 };
 use super::cohort::{EventHistoryError, SubjectNodes};
 use super::scalar::{add_real, div, exp, ln, recip, sqrt, square};
@@ -357,6 +357,9 @@ pub(crate) struct NodeLikelihood<S> {
     pub ell: Vec<S>,
     /// `max_i ell[i].value()`.
     pub shift: f64,
+    /// The same node term as an explicit function of the latent state, for
+    /// the forward kernel to evaluate off the grid.
+    pub factor: LogFactor<S>,
 }
 
 pub(crate) fn node_likelihood<S: JetField>(
@@ -383,6 +386,7 @@ pub(crate) fn node_likelihood<S: JetField>(
     let mut curvature = Vec::with_capacity(width);
     let mut informative = Vec::with_capacity(marks);
     let mut ell = vec![zero.clone(); size];
+    let mut factor = LogFactor::zero(&zero);
     for d in 0..marks {
         let exposure = if compensated.is_none_or(|mask| mask[d]) {
             exposures[d]
@@ -393,6 +397,14 @@ pub(crate) fn node_likelihood<S: JetField>(
         let base = centred_baseline(&eta0[d], loadings_d, log_normaliser.map(|m| &m[d]));
         let y = counts[d];
         informative.push(exposure != 0.0);
+        if y != 0.0 || exposure != 0.0 {
+            factor.marks.push(FactorMark {
+                count: y,
+                log_exposure: (exposure != 0.0).then(|| exposure.ln()),
+                base: base.clone(),
+                loadings: loadings_d.to_vec(),
+            });
+        }
         // Cache the axis contributions in log space. Exponentiating them
         // separately can produce 0 * infinity for a finite combined rate.
         let latent: Option<Vec<Vec<S>>> = (exposure != 0.0).then(|| {
@@ -449,6 +461,7 @@ pub(crate) fn node_likelihood<S: JetField>(
         informative,
         ell,
         shift,
+        factor,
     }
 }
 
@@ -547,32 +560,57 @@ pub(crate) struct FilteredNode<S> {
     /// `ln c`, the log normaliser before the node's shift is added back.
     pub log_normaliser: S,
     pub likelihood: NodeLikelihood<S>,
+    /// `log_alpha` split into its smooth part and the explicit node factors
+    /// conditioned on since the last gap, for the kernel out of this node.
+    pub density: SplitDensity<S>,
+}
+
+/// The split of a density conditioned on a node:
+/// `ln α = s + f_prior + (ell − shift − ln c)`, with `s` the smooth part on
+/// the node's grid, `f_prior` the factors the conditioned-on density already
+/// carried explicitly (across a gap of zero length), and the node's own term
+/// kept as the function it is.
+pub(crate) fn conditioned_density<S: JetField>(
+    smooth: Vec<S>,
+    prior: Option<&LogFactor<S>>,
+    likelihood: &NodeLikelihood<S>,
+    log_normaliser: &S,
+) -> SplitDensity<S> {
+    let constant = add_real(&log_normaliser.scale(-1.0), -likelihood.shift);
+    let node = likelihood.factor.shifted(&constant);
+    let factor = match prior {
+        Some(prior) => prior.joined(&node),
+        None => node,
+    };
+    SplitDensity { smooth, factor }
 }
 
 /// Where a node's grid goes: at the posterior mean, with the predictive
 /// spread.
 ///
-/// The forward kernel interpolates the square root of the filtered density
-/// divided by the grid's Gaussian envelope, exactly when that root is a
-/// polynomial of degree below the order. On a grid placed at the *predicted*
-/// moments the ratio is the node's likelihood factor itself, after an event
-/// an exponential tilt `exp(a z)` whose root `exp(a z / 2)` is no polynomial
-/// of any degree across a hull of `±x_max √2 σ`. Re-centring the grid on the
-/// posterior mean absorbs the tilt into the envelope (a tilted Gaussian is a
-/// shifted Gaussian) and leaves a ratio that is flat where the mass is.
+/// The grid's Gauss-Hermite rule integrates the filtered density against the
+/// grid's Gaussian envelope, exactly when their ratio is a polynomial of
+/// degree below twice the order. The Poisson node factor is not: after an
+/// event the log ratio is the log-intensity `a z` minus its exposure-weighted
+/// exponential, and on a grid placed at the *predicted* moments the posterior
+/// mass sits off the envelope's centre. Re-centring the grid on the posterior
+/// mean absorbs the tilt into the envelope (a tilted Gaussian is a shifted
+/// Gaussian) and leaves a ratio that is flat where the mass is. The forward
+/// kernel out of the node interpolates only the smooth part of the density
+/// and evaluates the node factor exactly ([`SplitDensity`]).
 ///
 /// The spread stays the predictive one. The Poisson node factor is
 /// log-concave with at most linear growth in `z`, so the posterior is
 /// dominated by a shifted Gaussian of the predictive variance: against that
-/// envelope the ratio is a bounded, mild tilt, and both the interpolation and
-/// the quadrature are benign at any order. Scaling the envelope down to the
-/// posterior variance would leave the integrand's Gaussian tails outside it
-/// and break the quadrature instead (a survival forecast above one is the
-/// symptom). The variance still narrows across nodes, through the predictive
-/// recursion. A node whose likelihood factor is much sharper than the
-/// predictive spread (a large integrated intensity at one node) makes the
-/// ratio a narrow bump that a polynomial resolves only at high order; the
-/// mesh refinement of the fit is what keeps every node mildly informative.
+/// envelope the ratio is a bounded, mild tilt, and the quadrature is benign
+/// at any order. Scaling the envelope down to the posterior variance would
+/// leave the integrand's Gaussian tails outside it and break the quadrature
+/// instead (a survival forecast above one is the symptom). The variance still
+/// narrows across nodes, through the predictive recursion. A node whose
+/// likelihood factor is much sharper than the predictive spread (a large
+/// integrated intensity at one node) makes the ratio a narrow bump that the
+/// rule resolves only at high order; the mesh refinement of the fit is what
+/// keeps every node mildly informative.
 pub(crate) fn filter_start<S: JetField>(
     gh: &GaussHermite,
     like: &S,
@@ -597,6 +635,8 @@ pub(crate) fn filter_start<S: JetField>(
     let log_predicted = log_standard_prior(&grid, like);
     let likelihood = node_terms(&grid, derivatives);
     let state = condition(&grid, &log_predicted, &likelihood.ell, likelihood.shift, label)?;
+    let density =
+        conditioned_density(log_predicted.clone(), None, &likelihood, &state.log_normaliser);
     Ok(FilteredNode {
         grid,
         transitions: Vec::new(),
@@ -605,6 +645,7 @@ pub(crate) fn filter_start<S: JetField>(
         alpha: state.alpha,
         log_normaliser: state.log_normaliser,
         likelihood,
+        density,
     })
 }
 
@@ -616,6 +657,7 @@ pub(crate) fn predict<S: JetField>(
     like: &S,
     previous_grid: &Grid<S>,
     previous_log_alpha: &[S],
+    previous_density: &SplitDensity<S>,
     transitions: &[AtomTransition<S>],
     label: &str,
 ) -> Result<(Grid<S>, Vec<S>), EventHistoryError> {
@@ -639,7 +681,7 @@ pub(crate) fn predict<S: JetField>(
         .collect();
     let predictive = Grid::new(gh, &centres, &scales, like);
     let log_predicted =
-        ForwardKernel::new(gh, previous_grid, previous_log_alpha, &predictive, transitions)
+        ForwardKernel::new(gh, previous_grid, previous_density, &predictive, transitions)
             .log_predicted(predictive.size());
     Ok((predictive, log_predicted))
 }
@@ -652,6 +694,7 @@ pub(crate) fn filter_step<S: JetField>(
     like: &S,
     previous_grid: &Grid<S>,
     previous_log_alpha: &[S],
+    previous_density: &SplitDensity<S>,
     transitions: Vec<AtomTransition<S>>,
     node_terms: &dyn Fn(&Grid<S>, bool) -> NodeLikelihood<S>,
     derivatives: bool,
@@ -661,12 +704,16 @@ pub(crate) fn filter_step<S: JetField>(
         let likelihood = node_terms(previous_grid, derivatives);
         let state = condition(previous_grid, previous_log_alpha, &likelihood.ell,
             likelihood.shift, label)?;
+        // The state does not move: the density conditioned on is the previous
+        // one, whose explicit factors stay explicit.
+        let density = conditioned_density(previous_density.smooth.clone(),
+            Some(&previous_density.factor), &likelihood, &state.log_normaliser);
         return Ok(FilteredNode { grid: previous_grid.clone(), transitions,
             log_predicted: previous_log_alpha.to_vec(), log_alpha: state.log_alpha,
-            alpha: state.alpha, log_normaliser: state.log_normaliser, likelihood });
+            alpha: state.alpha, log_normaliser: state.log_normaliser, likelihood, density });
     }
     let (predictive, rough_predicted) =
-        predict(gh, like, previous_grid, previous_log_alpha, &transitions, label)?;
+        predict(gh, like, previous_grid, previous_log_alpha, previous_density, &transitions, label)?;
     let rough = node_terms(&predictive, false);
     let rough_state = condition(
         &predictive,
@@ -682,10 +729,12 @@ pub(crate) fn filter_step<S: JetField>(
         .map(|axis| axis.sigma.clone())
         .collect();
     let grid = Grid::new(gh, &means, &scales, like);
-    let log_predicted = ForwardKernel::new(gh, previous_grid, previous_log_alpha, &grid, &transitions)
+    let log_predicted = ForwardKernel::new(gh, previous_grid, previous_density, &grid, &transitions)
         .log_predicted(grid.size());
     let likelihood = node_terms(&grid, derivatives);
     let state = condition(&grid, &log_predicted, &likelihood.ell, likelihood.shift, label)?;
+    let density =
+        conditioned_density(log_predicted.clone(), None, &likelihood, &state.log_normaliser);
     Ok(FilteredNode {
         grid,
         transitions,
@@ -694,6 +743,7 @@ pub(crate) fn filter_step<S: JetField>(
         alpha: state.alpha,
         log_normaliser: state.log_normaliser,
         likelihood,
+        density,
     })
 }
 
@@ -1264,7 +1314,7 @@ pub(crate) fn subject_marginal<S: JetField>(
         let source_size = source.grid.size();
         let propagate = |target: &Grid<S>| -> Vec<S> {
             let kernel =
-                ForwardKernel::new(inputs.gh, &source.grid, &source.log_alpha, target, transitions);
+                ForwardKernel::new(inputs.gh, &source.grid, &source.density, target, transitions);
             let target_size = target.size();
             let mut propagated = vec![zero.clone(); p_total * target_size];
             for j in 0..target_size {
@@ -1420,7 +1470,8 @@ fn filter_nodes<S: JetField>(
             FilteredNode { grid: pass.grids[n].clone(), transitions: Vec::new(),
                 log_predicted: pass.log_predicted[n].clone(), log_alpha: pass.log_alpha[n].clone(),
                 alpha: pass.log_alpha[n].iter().map(exp).collect(),
-                log_normaliser: add_real(&pass.log_normalisers[n], -likelihood.shift), likelihood }
+                log_normaliser: add_real(&pass.log_normalisers[n], -likelihood.shift), likelihood,
+                density: pass.densities[n].clone() }
         }).collect());
     }
     let mut filtered: Vec<FilteredNode<S>> = Vec::with_capacity(n_nodes);
@@ -1442,6 +1493,7 @@ fn filter_nodes<S: JetField>(
             like,
             &filtered[n].grid,
             &filtered[n].log_alpha,
+            &filtered[n].density,
             transitions,
             &|grid, store| node_terms(grid, n + 1, store),
             derivatives,
@@ -1642,7 +1694,7 @@ fn backward_smoother<S: JetField>(
             log_standard_prior(&grid, like)
         } else {
             let previous = &filtered[n - 1];
-            ForwardKernel::new(gh, &previous.grid, &previous.log_alpha, &grid,
+            ForwardKernel::new(gh, &previous.grid, &previous.density, &grid,
                 &filtered[n].transitions)
                 .log_predicted(size)
         };
@@ -1809,6 +1861,9 @@ pub(crate) struct ForwardPass<S> {
     pub log_alpha: Vec<Vec<S>>,
     pub log_predicted: Vec<Vec<S>>,
     pub log_normalisers: Vec<S>,
+    /// Each node's filtered log density split for the kernel out of it
+    /// ([`SplitDensity`]).
+    pub densities: Vec<SplitDensity<S>>,
 }
 
 /// Forward filter only, optionally continuing from a filtered state and
@@ -1816,7 +1871,7 @@ pub(crate) struct ForwardPass<S> {
 /// conditions on the absorbing marks not having fired).
 pub(crate) fn forward_filter<S: JetField>(
     inputs: &SubjectInputs<'_, S>,
-    initial: Option<(&Grid<S>, &[S])>,
+    initial: Option<(&Grid<S>, &[S], &SplitDensity<S>)>,
     compensated: &[bool],
 ) -> Result<ForwardPass<S>, EventHistoryError> {
     let nodes = inputs.nodes;
@@ -1837,6 +1892,7 @@ pub(crate) fn forward_filter<S: JetField>(
     let mut log_alpha: Vec<Vec<S>> = Vec::with_capacity(n_nodes);
     let mut log_predicted: Vec<Vec<S>> = Vec::with_capacity(n_nodes);
     let mut log_normalisers: Vec<S> = Vec::with_capacity(n_nodes);
+    let mut densities: Vec<SplitDensity<S>> = Vec::with_capacity(n_nodes);
     let node_terms = |grid: &Grid<S>, n: usize| -> NodeLikelihood<S> {
         node_likelihood(
             grid,
@@ -1863,11 +1919,12 @@ pub(crate) fn forward_filter<S: JetField>(
             false,
             "forecast first node",
         )?,
-        Some((grid, filtered)) => filter_step(
+        Some((grid, filtered, density)) => filter_step(
             gh,
             like,
             grid,
             filtered,
+            density,
             transitions_across(inputs.rates, inputs.continuation_gap, inputs.time_scale)?,
             &|grid, _| node_terms(grid, 0),
             false,
@@ -1877,6 +1934,7 @@ pub(crate) fn forward_filter<S: JetField>(
     log_normalisers.push(first.log_normaliser.add(&like.constant_like(first.likelihood.shift)));
     log_predicted.push(first.log_predicted);
     log_alpha.push(first.log_alpha);
+    densities.push(first.density);
     grids.push(first.grid);
     for n in 0..n_nodes - 1 {
         let step = filter_step(
@@ -1884,6 +1942,7 @@ pub(crate) fn forward_filter<S: JetField>(
             like,
             &grids[n],
             &log_alpha[n],
+            &densities[n],
             transitions_across(inputs.rates, nodes.gaps[n], inputs.time_scale)?,
             &|grid, _| node_terms(grid, n + 1),
             false,
@@ -1892,6 +1951,7 @@ pub(crate) fn forward_filter<S: JetField>(
         log_normalisers.push(step.log_normaliser.add(&like.constant_like(step.likelihood.shift)));
         log_predicted.push(step.log_predicted);
         log_alpha.push(step.log_alpha);
+        densities.push(step.density);
         grids.push(step.grid);
     }
     Ok(ForwardPass {
@@ -1899,6 +1959,7 @@ pub(crate) fn forward_filter<S: JetField>(
         log_alpha,
         log_predicted,
         log_normalisers,
+        densities,
     })
 }
 

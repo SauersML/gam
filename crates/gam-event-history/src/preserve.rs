@@ -6,9 +6,9 @@
 //! killing step. Finite steps approximate that identity; the fitting driver
 //! must resolve both normalisers and risk masses by time refinement.
 //!
-use super::chain::{GaussHermite, Grid, log_standard_prior, log_sum_exp};
+use super::chain::{GaussHermite, Grid, SplitDensity, log_standard_prior, log_sum_exp};
 use super::cohort::{EventHistoryError, MarkKind};
-use super::marginal::{condition, node_likelihood, predict, transitions_across};
+use super::marginal::{condition, conditioned_density, node_likelihood, predict, transitions_across};
 use super::scalar::ln;
 use gam_math::nested_dual::JetField;
 use gam_math::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
@@ -230,16 +230,21 @@ fn moments<S: JetField>(
 /// at most `γ_{2·atoms+4+marks}(1 + Λ_i)`. Adding the log density, removing
 /// the likelihood shift and the log normaliser round once each relative to
 /// their results.
+///
+/// Each population is a predicted density, smooth on its grid; the killed
+/// population's split ([`SplitDensity`]) keeps it as the smooth part and the
+/// killing compensator as the explicit factor, for the kernel out of it.
 fn kill<S: JetField>(
     populations: &[(Grid<S>, Vec<S>)], masks: &[Vec<bool>], eta0: &[S],
     loadings: &[S], shift: &[S], exposure: f64, atoms: usize,
-) -> Result<(Vec<(Grid<S>, Vec<S>)>, Vec<S>, f64), EventHistoryError> {
+) -> Result<(Vec<(Grid<S>, Vec<S>)>, Vec<S>, f64, Vec<SplitDensity<S>>), EventHistoryError> {
     let u = UNIT_ROUNDOFF;
     let marks = eta0.len();
     let no_counts = vec![0.0; marks];
     let intensity_growth = accumulation_growth(2 * atoms + 4 + marks);
     let mut out = Vec::with_capacity(masks.len());
     let mut masses = Vec::with_capacity(masks.len());
+    let mut densities = Vec::with_capacity(masks.len());
     let mut error = 0.0_f64;
     for ((grid, log_density), mask) in populations.iter().zip(masks) {
         let exposures: Vec<f64> = mask.iter().map(|&killed|
@@ -265,9 +270,11 @@ fn kill<S: JetField>(
             );
         }
         masses.push(state.log_normaliser.add(&eta0[0].constant_like(likelihood.shift)));
+        densities.push(conditioned_density(log_density.clone(), None, &likelihood,
+            &state.log_normaliser));
         out.push((grid.clone(), state.log_alpha));
     }
-    Ok((out, masses, error))
+    Ok((out, masses, error, densities))
 }
 
 /// Evolve from the reference entry to each endpoint, reporting the law AT
@@ -304,11 +311,17 @@ pub(crate) fn stratum_normalisers<S: JetField>(
         if n + 1 == nodes { break; }
         let dt = grid.gaps[n];
         let transitions = transitions_across(rates, 0.5 * dt, time_scale)?;
-        let diffuse = |populations: &[(Grid<S>, Vec<S>)]| -> Result<Vec<(Grid<S>, Vec<S>)>, EventHistoryError> {
-            populations.iter().map(|(grid, log_density)|
-                predict(gh, like, grid, log_density, &transitions, "reference population")).collect()
+        let diffuse = |populations: &[(Grid<S>, Vec<S>)], densities: &[SplitDensity<S>]|
+            -> Result<Vec<(Grid<S>, Vec<S>)>, EventHistoryError> {
+            populations.iter().zip(densities).map(|((grid, log_density), density)|
+                predict(gh, like, grid, log_density, density, &transitions,
+                    "reference population")).collect()
         };
-        let middle = diffuse(&populations)?;
+        // Every population entering a step is a predicted density (or the
+        // prior), smooth on its grid.
+        let whole: Vec<SplitDensity<S>> = populations.iter()
+            .map(|(_, log_density)| SplitDensity::whole(log_density)).collect();
+        let middle = diffuse(&populations, &whole)?;
         let eta_mid: Vec<S> = (0..marks).map(|d|
             eta0[n * marks + d].add(&eta0[(n + 1) * marks + d]).scale(0.5)).collect();
         let (mut shift, _) = moments(&middle, &of_mark, loadings, atoms, like)?;
@@ -322,7 +335,7 @@ pub(crate) fn stratum_normalisers<S: JetField>(
         // stops once the geometric remainder `change·q/(1 − q)` is within the band.
         let mut previous: Option<f64> = None;
         loop {
-            let (selected, _, conditioning) =
+            let (selected, _, conditioning, _) =
                 kill(&middle, &masks, &eta_mid, loadings, &shift, 0.5 * dt, atoms)?;
             let (next, moment_error) = moments(&selected, &of_mark, loadings, atoms, like)?;
             let change = shift.iter().zip(&next).map(|(a, b)|
@@ -350,9 +363,10 @@ pub(crate) fn stratum_normalisers<S: JetField>(
             }
             previous = Some(change);
         }
-        let (selected, masses, _) = kill(&middle, &masks, &eta_mid, loadings, &shift, dt, atoms)?;
+        let (selected, masses, _, killed) =
+            kill(&middle, &masks, &eta_mid, loadings, &shift, dt, atoms)?;
         for (mass, increment) in carried.iter_mut().zip(masses) { *mass = mass.add(&increment); }
-        populations = diffuse(&selected)?;
+        populations = diffuse(&selected, &killed)?;
     }
     Ok(Normalisers { log_normaliser, log_risk_mass, masks: masks.len() })
 }

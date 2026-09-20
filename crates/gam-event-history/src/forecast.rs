@@ -82,7 +82,7 @@
 //! a forecast made at a cutoff sees exactly what was known then and cannot
 //! change when later records are appended.
 
-use super::chain::{GaussHermite, Grid, product_grid_size};
+use super::chain::{GaussHermite, Grid, SplitDensity, product_grid_size};
 use super::cohort::{
     CohortNodes, CovariateSegment, EventHistoryCohort, EventHistoryError, MarkKind, SubjectHistory,
     SubjectNodes, cell_rule, expand_nodes, mesh_cells,
@@ -359,11 +359,13 @@ fn latent_parameters(fit: &EventHistoryFit) -> (Vec<f64>, Vec<f64>) {
     (loadings, fit.log_rates.iter().map(|r| r.exp()).collect())
 }
 
-/// A filtered latent state: the grid and log density at a time.
+/// A filtered latent state: the grid and log density at a time, with the
+/// density's split for the kernel out of it.
 #[derive(Clone)]
 struct LatentState {
     grid: Grid<f64>,
     log_alpha: Vec<f64>,
+    density: SplitDensity<f64>,
     time: f64,
 }
 
@@ -412,6 +414,7 @@ fn observed_state(
     Ok(LatentState {
         grid: pass.grids.pop().expect("at least one node"),
         log_alpha: pass.log_alpha.pop().expect("at least one node"),
+        density: pass.densities.pop().expect("at least one node"),
         time: observed.subjects[0].times[last],
     })
 }
@@ -623,7 +626,7 @@ impl WindowIntegrand<'_> {
                         designs: None,
                         log_normaliser: normaliser.as_deref(),
                     },
-                    state.map(|s| (&s.grid, s.log_alpha.as_slice())),
+                    state.map(|s| (&s.grid, s.log_alpha.as_slice(), &s.density)),
                     &run.exposed,
                 )
             };
@@ -662,6 +665,7 @@ impl WindowIntegrand<'_> {
                 state: Some(LatentState {
                     grid: pass.grids.pop().expect("cell has nodes"),
                     log_alpha: pass.log_alpha.pop().expect("cell has nodes"),
+                    density: pass.densities.pop().expect("cell has nodes"),
                     time: outer_times[q - 1],
                 }),
             });

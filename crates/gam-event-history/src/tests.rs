@@ -1,6 +1,6 @@
 use super::chain::{
-    AtomTransition, ForwardKernel, GaussHermite, Grid, backward_axis_bases,
-    interpolate_at_inner_points,
+    AtomTransition, FactorMark, ForwardKernel, GaussHermite, Grid, LogFactor, SplitDensity,
+    backward_axis_bases, interpolate_at_inner_points,
 };
 use super::cohort::{
     CovariateSegment, Event, EventHistoryCohort, MarkKind, SubjectHistory, SubjectNodes,
@@ -177,8 +177,83 @@ fn subject(times: &[f64], exposures: &[f64], counts: &[Vec<f64>]) -> SubjectNode
     }
 }
 
+/// #2964: past an event with a large loading the filtered log density is a
+/// Gaussian plus the node term `y η − Δ e^{η}`, whose compensator is a wall
+/// falling by millions across the hull. Interpolated through the nodes it
+/// oscillates by as much, and `exp` of the overshoot is a predicted density
+/// far above anything a Markov transition can produce. Carried as the
+/// explicit factor it is, it is evaluated exactly at the inner points: the
+/// prediction stays under the transition's ceiling
+/// `p̂(z') = ∫ N(z'; φz, q) α(z) dz ≤ sup α / φ` at every target point, and
+/// what error remains is the inner rule's quadrature of the wall, which
+/// shrinks as the order rises.
 #[test]
-fn forward_kernel_is_exact_on_an_enveloped_squared_polynomial() {
+fn a_forward_step_interpolates_no_node_factor_2964() {
+    let (base, loading, exposure, count) = (0.2, 2.0, 0.3, 1.0);
+    let kappa: f64 = 0.4;
+    let phi = (-kappa).exp();
+    let q = 1.0 - phi * phi;
+    let factor = |z: f64| count * (base + loading * z) - exposure * (base + loading * z).exp();
+    let unnormalised = |z: f64| gaussian(z, 0.0, 1.0).ln() + factor(z);
+    // The filtered density and every exact prediction from it, by a dense
+    // rectangle rule over a range its Gaussian tails never reach.
+    let h = 5e-4;
+    let dense: Vec<f64> = (0..=160_000).map(|i| -40.0 + h * i as f64).collect();
+    let log_sum_exp = |terms: &mut dyn Iterator<Item = f64>| -> f64 {
+        let terms: Vec<f64> = terms.collect();
+        let top = terms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        top + terms.iter().map(|t| (t - top).exp()).sum::<f64>().ln()
+    };
+    let log_c = log_sum_exp(&mut dense.iter().map(|&z| unnormalised(z))) + h.ln();
+    let log_alpha = |z: f64| unnormalised(z) - log_c;
+    let mean: f64 = dense.iter().map(|&z| h * log_alpha(z).exp() * z).sum();
+    let variance: f64 = dense.iter().map(|&z| h * log_alpha(z).exp() * (z - mean).powi(2)).sum();
+    let ceiling = dense.iter().map(|&z| log_alpha(z)).fold(f64::NEG_INFINITY, f64::max) - phi.ln();
+    let exact = |z_next: f64| -> f64 {
+        log_sum_exp(&mut dense.iter().map(|&z| gaussian(z_next, phi * z, q).ln() + log_alpha(z)))
+            + h.ln()
+    };
+    let mut previous_error = f64::INFINITY;
+    for order in [9, 15, 21] {
+        let gh = GaussHermite::new(order).expect("rule");
+        let from = Grid::new(&gh, &[0.0], &[1.0], &0.0);
+        // The next node's grid, at the predicted moments.
+        let to = Grid::new(&gh, &[phi * mean], &[(phi * phi * variance + q).sqrt()], &0.0);
+        let density = SplitDensity {
+            smooth: (0..from.size())
+                .map(|i| gaussian(*from.coordinate(i, 0), 0.0, 1.0).ln() - log_c)
+                .collect(),
+            factor: LogFactor {
+                marks: vec![FactorMark {
+                    count,
+                    log_exposure: Some(exposure.ln()),
+                    base,
+                    loadings: vec![loading],
+                }],
+                constant: 0.0,
+            },
+        };
+        let kernel = ForwardKernel::new(&gh, &from, &density, &to, &[AtomTransition::new(&kappa)]);
+        let predicted = kernel.log_predicted(to.size());
+        let mut error = 0.0_f64;
+        for (j, &log_p) in predicted.iter().enumerate() {
+            let z = *to.coordinate(j, 0);
+            assert!(
+                log_p.is_finite() && log_p <= ceiling,
+                "order {order}, node {j} at {z}: log predicted {log_p} above the ceiling {ceiling}"
+            );
+            error = error.max((log_p - exact(z)).abs());
+        }
+        assert!(
+            error < previous_error,
+            "order {order}: worst log error {error} did not shrink from {previous_error}"
+        );
+        previous_error = error;
+    }
+}
+
+#[test]
+fn forward_kernel_is_exact_on_a_gaussian() {
     let gh = GaussHermite::new(15).expect("rule");
     let from = Grid::new(&gh, &[0.1], &[0.9], &0.0);
     let to = Grid::new(&gh, &[0.4], &[0.5], &0.0);
@@ -186,39 +261,27 @@ fn forward_kernel_is_exact_on_an_enveloped_squared_polynomial() {
     let transition = AtomTransition::new(&kappa);
     let phi = (-kappa).exp();
     let q = 1.0 - phi * phi;
-    // The envelope of `from` times the square of a quadratic in its
-    // standardised coordinate that stays positive: the square root of the
-    // ratio is that quadratic, which the interpolant of degree 14 carries
-    // exactly, and its square is integrated exactly by the inner rule. The
-    // prediction is the convolution to roundoff, and so is the conditional
-    // mean, a polynomial of degree 5 against the inner Gaussian.
-    let (mu, sigma) = (0.1, 0.9);
-    let density = |z: f64| {
-        let xi = (z - mu) / (std::f64::consts::SQRT_2 * sigma);
-        let root = 1.0 + 0.3 * xi + 0.1 * xi * xi;
-        gaussian(z, mu, sigma * sigma) * root * root
-    };
+    // A Gaussian of a centre and width unrelated to either grid: its log
+    // density is quadratic, so the log-domain interpolant of degree 14 carries
+    // it exactly. What remains is the inner rule applied to `exp` of a
+    // quadratic of coefficient ≈ −0.18 in the Hermite variable, whose Taylor
+    // remainder past degree 29 is below 1e−20: the prediction is the Gaussian
+    // convolution to roundoff.
+    let (mu0, sigma0) = (0.3, 0.7);
     let log_alpha: Vec<f64> = (0..from.size())
-        .map(|i| density(*from.coordinate(i, 0)).ln())
+        .map(|i| gaussian(*from.coordinate(i, 0), mu0, sigma0 * sigma0).ln())
         .collect();
-    let kernel = ForwardKernel::new(&gh, &from, &log_alpha, &to, &[transition.clone()]);
+    let kernel =
+        ForwardKernel::new(&gh, &from, &SplitDensity::whole(&log_alpha), &to, &[transition.clone()]);
     let predicted = kernel.log_predicted(to.size());
-    // The reference convolution by the trapezoid rule, spectrally accurate
-    // for a smooth integrand that decays like a Gaussian: at a step of 1e−3
-    // over ±12 its error is far below roundoff.
-    let step = 1e-3;
-    let points: Vec<f64> = (0..=24_000).map(|m| -12.0 + step * m as f64).collect();
+    let tau2 = phi * phi * sigma0 * sigma0 + q;
     for j in 0..to.size() {
-        let target = *to.coordinate(j, 0);
-        let (mass, first) = points.iter().fold((0.0, 0.0), |(m, f), &z| {
-            let w = gaussian(target, phi * z, q) * density(z) * step;
-            (m + w, f + w * z)
-        });
+        let z = *to.coordinate(j, 0);
+        let exact = gaussian(z, phi * mu0, tau2).ln();
         assert!(
-            (predicted[j] - mass.ln()).abs() < 1e-9,
-            "node {j}: log predicted {} exact {}",
-            predicted[j],
-            mass.ln()
+            (predicted[j] - exact).abs() < 1e-8,
+            "node {j}: log predicted {} exact {exact}",
+            predicted[j]
         );
         // The row's conditional expectation of z is the exact posterior mean
         // of the source given the target.
@@ -227,10 +290,10 @@ fn forward_kernel_is_exact_on_an_enveloped_squared_polynomial() {
         let mean: f64 = (0..from.size())
             .map(|i| transfer[i] * from.coordinate(i, 0))
             .sum();
+        let exact_mean = mu0 + phi * sigma0 * sigma0 * (z - phi * mu0) / tau2;
         assert!(
-            (mean - first / mass).abs() < 1e-9,
-            "node {j}: conditional mean {mean} exact {}",
-            first / mass
+            (mean - exact_mean).abs() < 1e-8,
+            "node {j}: conditional mean {mean} exact {exact_mean}"
         );
     }
     // The backward interpolation reproduces a constant at every inner point

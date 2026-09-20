@@ -14,9 +14,10 @@
 //!
 //! Both operators interpolate a logarithm. Forward ([`ForwardKernel`]), the
 //! operand is a density, carried by its logarithm: `ln(density / envelope)`
-//! is interpolated by the tensor Lagrange polynomial on the nodes and
-//! exponentiated at the inner points, so every predicted density is a sum of
-//! positive terms and exact for any Gaussian density. Backward, the operand
+//! is interpolated by the tensor Lagrange polynomial on the nodes (continued
+//! beyond the hull by the quadratic through the end nodes) and exponentiated
+//! at the inner points, so every predicted density is a sum of positive terms
+//! and exact for any Gaussian density. Backward, the operand
 //! is the logarithm of a smoother residual, bounded and smooth, carried by
 //! the not-a-knot cubic spline through the nodes, continued linearly beyond
 //! the hull with the end slope. No density is ever a signed interpolant, so
@@ -285,6 +286,42 @@ impl GaussHermite {
             .map(|i| prefix[i].mul(&suffix[i + 1]).scale(self.lagrange_weights[i]))
             .collect()
     }
+
+    /// The forward kernel's basis at `xi`: the Lagrange basis inside the
+    /// hull `[x_0, x_{G−1}]` and, beyond it, the cardinal basis of the
+    /// quadratic through the three end nodes on that side.
+    ///
+    /// The forward inner points reach up to `√2·x_{G−1}`, past the last node,
+    /// where the degree-`G−1` interpolant is an extrapolation whose overshoot
+    /// grows like the leading coefficient times the distance to the power
+    /// `G−1`. The end quadratic reads three nodal values with bounded
+    /// coefficients, so it is exact for every quadratic (every Gaussian
+    /// `ln r`) and amplifies nodal errors by no more than the in-hull Lebesgue
+    /// constant across the whole reach. The two pieces agree in value at the
+    /// hull edge (both interpolate the end node), so the basis is continuous
+    /// in `xi`. The side is selected by the value alone, and every derivative
+    /// channel passes through each piece as through a polynomial.
+    pub(crate) fn forward_basis<S: JetField>(&self, xi: &S) -> Vec<S> {
+        let g = self.order;
+        let value = xi.value();
+        if g < 3 || (value >= self.nodes[0] && value <= self.nodes[g - 1]) {
+            return self.lagrange_basis(xi);
+        }
+        let end: [usize; 3] = if value < self.nodes[0] { [0, 1, 2] } else { [g - 1, g - 2, g - 3] };
+        let mut basis = vec![xi.constant_like(0.0); g];
+        for (a, &i) in end.iter().enumerate() {
+            let mut term = xi.constant_like(1.0);
+            let mut denominator = 1.0;
+            for (b, &m) in end.iter().enumerate() {
+                if a != b {
+                    term = term.mul(&add_real(xi, -self.nodes[m]));
+                    denominator *= self.nodes[i] - self.nodes[m];
+                }
+            }
+            basis[i] = term.scale(1.0 / denominator);
+        }
+        basis
+    }
 }
 
 /// One axis of a product grid: centre, scale, node values and plain weights.
@@ -491,27 +528,32 @@ pub(crate) fn log_standard_prior<S: JetField>(grid: &Grid<S>, like: &S) -> Vec<S
 /// is `centre + √(q/τ²) x` at Gauss-Hermite node `x`, with
 /// `centre = φσ(z' − φμ)/(τ²√2)`.
 ///
-/// The ratio enters through its square root: `s = √r` is carried by the
-/// tensor Lagrange interpolant `s̃` on the nodes of `from` and squared at the
-/// inner points. Every inner weight `w_l s̃²` is non-negative at any order and
-/// at any inner point, inside the hull or beyond it, so the predicted density
-/// cannot lose positivity. The prediction is exact whenever `s` agrees with a
-/// polynomial of degree below the order `G` on the nodes: `s̃²` is then a
-/// polynomial of degree `2G − 2` in the inner node, which the `G`-point inner
-/// rule integrates exactly. The densities carried exactly at order `G` are
-/// the envelope times the square of such a polynomial.
+/// The source density arrives split ([`SplitDensity`]) as `ln α = s + f`,
+/// with `f` the node log-likelihood factors conditioned on since the last
+/// gap. `f` is not polynomial in `z`: past an event with a large loading its
+/// compensator `−Δ e^{a z}` is a wall that falls by orders of magnitude
+/// across the hull, and the polynomial through the nodes oscillates between
+/// them by as much (on a unit grid at order 21 with `a = 2`, `Δ e^{b} = 0.3`,
+/// one event and `φ = e^{−0.4}`, interpolating `ln α` whole puts the largest
+/// `ln p̂` at `+164`, where no predicted density can exceed
+/// `sup α / φ = e^{0.18}`). `f` is an explicit formula, so it is evaluated
+/// exactly at every inner point; only `ln r = s − ln e` is interpolated.
 ///
-/// The square root is the carrier because it is bounded. A node factor can
-/// be an astronomically steep wall across the hull (a large loading over a
-/// long exposure puts `ln r` at `−3·10⁸` on one node and `3` on another).
-/// `ln r` is then no polynomial of any practical degree, and its interpolant
-/// overshoots between the nodes by amounts that `exp` turns into overflow.
-/// `s` lies in `[0, max s]` there, and its interpolant is bounded by the
-/// Lebesgue constant of the rule times that. The polynomial is used as the polynomial it is
-/// beyond the hull: its square grows polynomially while the target's Gaussian
-/// factor decays, and a clamp would put a kink into an otherwise smooth
-/// objective. `s` is formed relative to its largest node value, so nothing
-/// overflows; the shift is added back to the log predicted density.
+/// The ratio enters through its logarithm: `ln r` is carried on the nodes of
+/// `from` by the tensor product of [`GaussHermite::forward_basis`], `f` is
+/// added at the inner points, and the sum is exponentiated there. Every inner
+/// weight is then positive,
+/// the predicted density is a log-sum-exp of them, and the representation
+/// cannot lose positivity at any order. Inside the hull the basis is the
+/// Lagrange interpolant, exact whenever `ln r` is a polynomial of degree
+/// below the order. The inner points reach past the last node (up to
+/// `√2·x_{G−1}`), and there each axis continues by the quadratic through its
+/// three end nodes instead of extrapolating the degree-`G−1` polynomial,
+/// whose overshoot beyond the hull `exp` turns into spurious mass (a
+/// predicted density far above `sup α / Π φ`). The prediction is exact for
+/// every Gaussian `α` (`ln r` is then quadratic) whatever its centre and
+/// spread relative to the grid, and the continuation amplifies nodal errors
+/// by no more than the in-hull Lebesgue constant.
 ///
 /// Normalising the inner weights of target point `z'_j` gives `ŵ_{jl}`, the
 /// quadrature rule of the law of `z` given `z'_j` and the data so far. A
@@ -523,12 +565,11 @@ pub(crate) fn log_standard_prior<S: JetField>(grid: &Grid<S>, like: &S) -> Vec<S
 /// used and dropped.
 pub(crate) struct ForwardKernel<S> {
     order: usize,
-    /// `√r` on the points of `from`, relative to its largest node value.
-    root_ratio: Vec<S>,
-    /// `ln` of the largest node value of `r`, the shift of `root_ratio`.
-    log_ratio_shift: f64,
-    /// `bases[k][(j_k G + l) G + i] = L_i(raw_{k, j_k, l})`: the Lagrange
-    /// basis of `from` at the inner points of target coordinate `j_k`.
+    /// `ln r` on the points of `from`.
+    log_ratio: Vec<S>,
+    /// `bases[k][(j_k G + l) G + i] = B_i(raw_{k, j_k, l})`: the forward
+    /// basis of `from` ([`GaussHermite::forward_basis`]) at the inner points
+    /// of target coordinate `j_k`.
     bases: Vec<Vec<S>>,
     /// `ln N(z'_{j_k}; φμ, τ²)` per axis, `[k][j_k]`.
     log_gauss: Vec<Vec<S>>,
@@ -537,8 +578,11 @@ pub(crate) struct ForwardKernel<S> {
     innovations: Vec<Vec<S>>,
     /// The source coordinate `z` of every inner point, `[k][j_k G + l]`.
     coordinates: Vec<Vec<S>>,
-    /// `Π_k w_{l_k}/√π` per flat inner point, axis 0 fastest.
-    inner_weights: Vec<f64>,
+    /// `Σ_k ln(w_{l_k}/√π)` per flat inner point, axis 0 fastest.
+    log_inner_weights: Vec<f64>,
+    /// The explicit factor `f` of the source density, evaluated at the inner
+    /// points of each row.
+    factor: LogFactor<S>,
 }
 
 /// One target point of a [`ForwardKernel`]: the log predicted density there
@@ -548,19 +592,110 @@ pub(crate) struct KernelRow<S> {
     pub weights: Vec<S>,
 }
 
+/// One mark's Poisson node term `y η − Δ e^{η}` with `η = b + Σ_k a_k z_k`,
+/// as a function of the latent state.
+#[derive(Clone, Debug)]
+pub(crate) struct FactorMark<S> {
+    /// The event count `y`; its term is absent when zero.
+    pub count: f64,
+    /// `ln Δ`, or `None` where the mark has no compensator at this node.
+    pub log_exposure: Option<f64>,
+    /// The centred baseline `b`.
+    pub base: S,
+    /// The loadings `a_k`, one per atom.
+    pub loadings: Vec<S>,
+}
+
+/// A sum of node log-likelihood terms plus a constant, as an explicit
+/// function of the latent state `z`: `Σ_marks (y η − Δ e^{η}) + c`.
+#[derive(Clone, Debug)]
+pub(crate) struct LogFactor<S> {
+    pub marks: Vec<FactorMark<S>>,
+    pub constant: S,
+}
+
+impl<S: JetField> LogFactor<S> {
+    /// The factor that is identically zero.
+    pub fn zero(like: &S) -> Self {
+        Self { marks: Vec::new(), constant: like.constant_like(0.0) }
+    }
+
+    /// This factor plus the constant `c`.
+    pub fn shifted(&self, c: &S) -> Self {
+        Self { marks: self.marks.clone(), constant: self.constant.add(c) }
+    }
+
+    /// The sum of this factor and `other`.
+    pub fn joined(&self, other: &Self) -> Self {
+        let mut marks = self.marks.clone();
+        marks.extend(other.marks.iter().cloned());
+        Self { marks, constant: self.constant.add(&other.constant) }
+    }
+
+    /// The factor at every point of the tensor product of `axes`, axis 0
+    /// fastest. The axis contributions `a_k z_k` are tabulated once per mark,
+    /// and the intensity is formed from their sum in log space.
+    pub fn on_tensor(&self, axes: &[&[S]]) -> Vec<S> {
+        let size: usize = axes.iter().map(|axis| axis.len()).product();
+        let mut out = vec![self.constant.clone(); size];
+        for mark in &self.marks {
+            let tables: Vec<Vec<S>> = axes
+                .iter()
+                .zip(mark.loadings.iter())
+                .map(|(axis, a)| axis.iter().map(|z| a.mul(z)).collect())
+                .collect();
+            for (p, value) in out.iter_mut().enumerate() {
+                let mut eta = mark.base.clone();
+                let mut rest = p;
+                for (k, table) in tables.iter().enumerate() {
+                    eta = eta.add(&table[rest % axes[k].len()]);
+                    rest /= axes[k].len();
+                }
+                if mark.count != 0.0 {
+                    *value = value.add(&eta.scale(mark.count));
+                }
+                if let Some(log_exposure) = mark.log_exposure {
+                    *value = value.sub(&exp(&add_real(&eta, log_exposure)));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A filtered log density split as `ln α(z) = s(z) + f(z)`: a smooth part
+/// `s` carried by its values on the density's grid, and the node
+/// log-likelihood factors `f` conditioned on since the last gap, kept as the
+/// explicit function they are. The forward kernel interpolates only `s`;
+/// `f` is evaluated exactly wherever the kernel needs it.
+#[derive(Clone, Debug)]
+pub(crate) struct SplitDensity<S> {
+    /// `s` at the points of the density's grid.
+    pub smooth: Vec<S>,
+    pub factor: LogFactor<S>,
+}
+
+impl<S: JetField> SplitDensity<S> {
+    /// `ln α` carried whole by its grid values, with no explicit factor.
+    pub fn whole(log_alpha: &[S]) -> Self {
+        Self { smooth: log_alpha.to_vec(), factor: LogFactor::zero(&log_alpha[0]) }
+    }
+}
+
 impl<S: JetField> ForwardKernel<S> {
     pub fn new(
         gh: &GaussHermite,
         from: &Grid<S>,
-        log_alpha: &[S],
+        density: &SplitDensity<S>,
         to: &Grid<S>,
         transitions: &[AtomTransition<S>],
     ) -> Self {
         let g = gh.order;
         let atoms = from.dimension();
-        // ln r_i = ln α_i − ln e(z_i), with ln e(z_i) = Σ_k (−x_{i_k}² − ln σ_k − ln √(2π)).
+        // ln r_i = s_i − ln e(z_i), with ln e(z_i) = Σ_k (−x_{i_k}² − ln σ_k − ln √(2π)).
         let log_sigma: Vec<S> = from.axes.iter().map(|axis| ln(&axis.sigma)).collect();
-        let log_ratio: Vec<S> = log_alpha
+        let log_ratio: Vec<S> = density
+            .smooth
             .iter()
             .enumerate()
             .map(|(i, log_a)| {
@@ -569,14 +704,6 @@ impl<S: JetField> ForwardKernel<S> {
                     add_real(&acc.add(&log_sigma[k]), x * x + LOG_SQRT_TWO_PI)
                 })
             })
-            .collect();
-        let log_ratio_shift = log_ratio
-            .iter()
-            .map(|t| t.value())
-            .fold(f64::NEG_INFINITY, f64::max);
-        let root_ratio: Vec<S> = log_ratio
-            .iter()
-            .map(|t| exp(&add_real(t, -log_ratio_shift).scale(0.5)))
             .collect();
         let mut bases = Vec::with_capacity(atoms);
         let mut log_gauss = Vec::with_capacity(atoms);
@@ -620,7 +747,7 @@ impl<S: JetField> ForwardKernel<S> {
                 let u_offset = d.mul(&u_offset_factor);
                 for &x in &gh.nodes {
                     let raw = centre.add(&ratio.scale(x));
-                    axis_bases.extend(gh.lagrange_basis(&raw));
+                    axis_bases.extend(gh.forward_basis(&raw));
                     axis_innovations.push(u_offset.add(&u_slope.scale(x)));
                     axis_coordinates.push(old.mu.add(&spread.mul(&raw)));
                 }
@@ -630,12 +757,12 @@ impl<S: JetField> ForwardKernel<S> {
             innovations.push(axis_innovations);
             coordinates.push(axis_coordinates);
         }
-        let inner_weights = (0..from.size())
+        let log_inner_weights = (0..from.size())
             .map(|l| {
                 let mut rest = l;
-                let mut acc = 1.0;
+                let mut acc = 0.0;
                 for _ in 0..atoms {
-                    acc *= gh.normal_weights[rest % g];
+                    acc += gh.normal_weights[rest % g].ln();
                     rest /= g;
                 }
                 acc
@@ -643,13 +770,13 @@ impl<S: JetField> ForwardKernel<S> {
             .collect();
         Self {
             order: g,
-            root_ratio,
-            log_ratio_shift,
+            log_ratio,
             bases,
             log_gauss,
             innovations,
             coordinates,
-            inner_weights,
+            log_inner_weights,
+            factor: density.factor.clone(),
         }
     }
 
@@ -661,18 +788,26 @@ impl<S: JetField> ForwardKernel<S> {
     /// The log predicted density at target point `j` and its normalised
     /// inner weights.
     pub fn row(&self, j: usize) -> KernelRow<S> {
-        let at_inner = interpolate_at_inner_points(self.order, &self.bases, &self.root_ratio, j);
+        let g = self.order;
+        let at_inner = interpolate_at_inner_points(g, &self.bases, &self.log_ratio, j);
+        let inner_axes: Vec<&[S]> = self
+            .coordinates
+            .iter()
+            .enumerate()
+            .map(|(k, axis)| {
+                let base = self.target_index(j, k) * g;
+                &axis[base..base + g]
+            })
+            .collect();
+        let factor = self.factor.on_tensor(&inner_axes);
         let terms: Vec<S> = at_inner
             .iter()
-            .zip(self.inner_weights.iter())
-            .map(|(s, &w)| square(s).scale(w))
+            .zip(factor.iter())
+            .zip(self.log_inner_weights.iter())
+            .map(|((t, f), &w)| add_real(&t.add(f), w))
             .collect();
-        let mass = terms
-            .iter()
-            .fold(terms[0].constant_like(0.0), |acc, t| acc.add(t));
-        let inverse_mass = recip(&mass);
-        let weights = terms.iter().map(|t| t.mul(&inverse_mass)).collect();
-        let log_mass = add_real(&ln(&mass), self.log_ratio_shift);
+        let log_mass = log_sum_exp(&terms);
+        let weights = terms.iter().map(|t| exp(&t.sub(&log_mass))).collect();
         let log_predicted = self
             .log_gauss
             .iter()
@@ -691,7 +826,7 @@ impl<S: JetField> ForwardKernel<S> {
 
     /// Row `j` of the conditional-expectation operator: `Σ_i M_{ji} f(z_i)` is
     /// `E[f(z) | z'_j]` for `f` carried by its values on `from`, with
-    /// `M_{ji} = Σ_l ŵ_{jl} Π_k L_{i_k}(raw_{k, j_k, l_k})`. The inner weights
+    /// `M_{ji} = Σ_l ŵ_{jl} Π_k B_{i_k}(raw_{k, j_k, l_k})`. The inner weights
     /// are contracted one axis at a time against the transposed per-axis
     /// bases, using O(G^K) transient storage.
     pub fn transfer(&self, j: usize, weights: &[S]) -> Vec<S> {
