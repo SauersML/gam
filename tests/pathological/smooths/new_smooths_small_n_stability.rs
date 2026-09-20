@@ -13,7 +13,7 @@ use gam::{encode_recordswith_inferred_schema, init_parallelism};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
-use smooth_truth_scoring::{fit_and_score, probe_matrix};
+use smooth_truth_scoring::{FAMILY_WISE_ALPHA, fit_and_score, probe_matrix};
 
 const TAU: f64 = std::f64::consts::TAU;
 const PI: f64 = std::f64::consts::PI;
@@ -108,11 +108,19 @@ fn periodic_1d_small_n_stable() {
     let mut failures = Vec::new();
     let probes: Vec<Vec<f64>> = (0..10).map(|i| vec![TAU * (i as f64) / 9.0, 0.0]).collect();
     let truth: Vec<f64> = probes.iter().map(|p| p[0].cos()).collect();
-    for n in [20usize, 50, 100] {
+    let sizes = [20usize, 50, 100];
+    let alpha = FAMILY_WISE_ALPHA / sizes.len() as f64;
+    for n in sizes {
         let (data, train_truth) = make_1d_periodic(n, 7);
         let formula = "y ~ s(t, periodic=true, period=6.283185307179586)";
-        if let Err(e) = fit_and_score(formula, &data, &probe_matrix(&probes), &truth, &train_truth)
-        {
+        if let Err(e) = fit_and_score(
+            formula,
+            &data,
+            &probe_matrix(&probes),
+            &truth,
+            &train_truth,
+            alpha,
+        ) {
             failures.push(format!("n={n}: {e}"));
         }
     }
@@ -133,11 +141,19 @@ fn sphere_wahba_small_n_stable() {
     init_parallelism();
     let mut failures = Vec::new();
     let (probes, truth) = sphere_probes(&[(0.0, 0.0), (45.0, 90.0), (-30.0, -45.0)]);
-    for n in [20usize, 50, 100, 200] {
+    let sizes = [20usize, 50, 100, 200];
+    let alpha = FAMILY_WISE_ALPHA / sizes.len() as f64;
+    for n in sizes {
         let (data, train_truth) = make_sphere(n, 7);
         let formula = "y ~ sphere(lat, lon, k=10)";
-        if let Err(e) = fit_and_score(formula, &data, &probe_matrix(&probes), &truth, &train_truth)
-        {
+        if let Err(e) = fit_and_score(
+            formula,
+            &data,
+            &probe_matrix(&probes),
+            &truth,
+            &train_truth,
+            alpha,
+        ) {
             failures.push(format!("n={n}: {e}"));
         }
     }
@@ -152,11 +168,19 @@ fn sphere_harmonic_small_n_stable() {
     init_parallelism();
     let mut failures = Vec::new();
     let (probes, truth) = sphere_probes(&[(0.0, 0.0), (45.0, 90.0)]);
-    for n in [20usize, 50, 100, 200] {
+    let sizes = [20usize, 50, 100, 200];
+    let alpha = FAMILY_WISE_ALPHA / sizes.len() as f64;
+    for n in sizes {
         let (data, train_truth) = make_sphere(n, 7);
         let formula = "y ~ sphere(lat, lon, method=harmonic, max_degree=2)";
-        if let Err(e) = fit_and_score(formula, &data, &probe_matrix(&probes), &truth, &train_truth)
-        {
+        if let Err(e) = fit_and_score(
+            formula,
+            &data,
+            &probe_matrix(&probes),
+            &truth,
+            &train_truth,
+            alpha,
+        ) {
             failures.push(format!("n={n}: {e}"));
         }
     }
@@ -173,11 +197,19 @@ fn cylinder_te_small_n_stable() {
     let points = [(0.0, 0.0), (1.5, 0.5), (PI, -0.5)];
     let probes: Vec<Vec<f64>> = points.iter().map(|&(t, h)| vec![t, h, 0.0]).collect();
     let truth: Vec<f64> = points.iter().map(|&(t, h)| cylinder_truth(t, h)).collect();
-    for (nth, nh) in [(8usize, 4usize), (12, 5), (20, 6)] {
+    let grids = [(8usize, 4usize), (12, 5), (20, 6)];
+    let alpha = FAMILY_WISE_ALPHA / grids.len() as f64;
+    for (nth, nh) in grids {
         let (data, train_truth) = make_cylinder(nth, nh);
         let formula = "y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k=4)";
-        if let Err(e) = fit_and_score(formula, &data, &probe_matrix(&probes), &truth, &train_truth)
-        {
+        if let Err(e) = fit_and_score(
+            formula,
+            &data,
+            &probe_matrix(&probes),
+            &truth,
+            &train_truth,
+            alpha,
+        ) {
             failures.push(format!("({nth}x{nh})={}: {e}", nth * nh));
         }
     }

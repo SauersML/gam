@@ -17,7 +17,7 @@ use gam::{
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
-use smooth_truth_scoring::{fit_and_score, probe_matrix};
+use smooth_truth_scoring::{FAMILY_WISE_ALPHA, fit_and_score, probe_matrix};
 
 fn truth(x: f64) -> f64 {
     (4.0 * std::f64::consts::PI * x).sin()
@@ -47,7 +47,7 @@ fn make_dataset(n: usize) -> (EncodedDataset, Vec<f64>) {
     )
 }
 
-fn score(length_scale: f64) -> Result<(), String> {
+fn score(length_scale: f64, alpha: f64) -> Result<(), String> {
     let (data, train_truth) = make_dataset(300);
     let xg: Vec<f64> = (0..30).map(|i| 0.02 + 0.96 * (i as f64) / 29.0).collect();
     let probes: Vec<Vec<f64>> = xg.iter().map(|&x| vec![x, 0.0]).collect();
@@ -58,13 +58,16 @@ fn score(length_scale: f64) -> Result<(), String> {
         &probe_matrix(&probes),
         &probe_truth,
         &train_truth,
+        alpha,
     )
+    .map(|_| ())
 }
 
 fn failures(scales: &[f64]) -> Vec<String> {
+    let alpha = FAMILY_WISE_ALPHA / scales.len() as f64;
     scales
         .iter()
-        .filter_map(|&ls| score(ls).err().map(|e| format!("ls={ls}: {e}")))
+        .filter_map(|&ls| score(ls, alpha).err().map(|e| format!("ls={ls}: {e}")))
         .collect()
 }
 

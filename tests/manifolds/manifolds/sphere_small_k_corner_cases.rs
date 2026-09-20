@@ -14,7 +14,7 @@ use gam::{encode_recordswith_inferred_schema, init_parallelism};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
-use smooth_truth_scoring::{fit_and_score, probe_matrix};
+use smooth_truth_scoring::{FAMILY_WISE_ALPHA, fit_and_score, probe_matrix};
 
 fn truth(lat: f64, lon: f64) -> f64 {
     let (lat_r, lon_r) = (lat.to_radians(), lon.to_radians());
@@ -57,7 +57,7 @@ const PROBES: [(f64, f64); 5] = [
     (-89.0, 180.0),
 ];
 
-fn score(formula: &str) -> Result<(), String> {
+fn score(formula: &str, alpha: f64) -> Result<(), String> {
     let (data, train_truth) = make_dataset(12, 24, 0.05, 41);
     let probes: Vec<Vec<f64>> = PROBES.iter().map(|&(lat, lon)| vec![lat, lon, 0.0]).collect();
     let probe_truth: Vec<f64> = PROBES.iter().map(|&(lat, lon)| truth(lat, lon)).collect();
@@ -67,16 +67,20 @@ fn score(formula: &str) -> Result<(), String> {
         &probe_matrix(&probes),
         &probe_truth,
         &train_truth,
+        alpha,
     )
+    .map(|_| ())
 }
 
 #[test]
 fn sphere_wahba_small_k_recovers_truth() {
     init_parallelism();
-    let failures: Vec<String> = [2usize, 3, 4, 5, 6, 8, 12]
+    let ks = [2usize, 3, 4, 5, 6, 8, 12];
+    let alpha = FAMILY_WISE_ALPHA / ks.len() as f64;
+    let failures: Vec<String> = ks
         .into_iter()
         .filter_map(|k| {
-            score(&format!("y ~ sphere(lat, lon, k={k})"))
+            score(&format!("y ~ sphere(lat, lon, k={k})"), alpha)
                 .err()
                 .map(|e| format!("k={k}: {e}"))
         })
@@ -91,12 +95,15 @@ fn sphere_wahba_small_k_recovers_truth() {
 #[test]
 fn sphere_harmonic_small_max_degree_recovers_truth() {
     init_parallelism();
-    let failures: Vec<String> = [1usize, 2, 3, 4, 6]
+    let degrees = [1usize, 2, 3, 4, 6];
+    let alpha = FAMILY_WISE_ALPHA / degrees.len() as f64;
+    let failures: Vec<String> = degrees
         .into_iter()
         .filter_map(|l| {
-            score(&format!(
-                "y ~ sphere(lat, lon, method=harmonic, max_degree={l})"
-            ))
+            score(
+                &format!("y ~ sphere(lat, lon, method=harmonic, max_degree={l})"),
+                alpha,
+            )
             .err()
             .map(|e| format!("L={l}: {e}"))
         })

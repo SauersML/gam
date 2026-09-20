@@ -20,7 +20,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array2;
-use smooth_truth_scoring::{fit_and_score, probe_matrix};
+use smooth_truth_scoring::{FAMILY_WISE_ALPHA, fit_and_score, probe_matrix};
 
 const TAU: f64 = std::f64::consts::TAU;
 const PI: f64 = std::f64::consts::PI;
@@ -74,6 +74,7 @@ fn score(formula: &str, n_a: usize, n_b: usize, n_c: usize) {
         &probe_matrix(&probes),
         &probe_truth,
         &train_truth,
+        FAMILY_WISE_ALPHA,
     ) {
         panic!("{formula} on {n_a}x{n_b}x{n_c}: {e}");
     }

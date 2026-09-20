@@ -19,7 +19,7 @@ use gam::{
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
-use smooth_truth_scoring::{fit_and_score, probe_matrix};
+use smooth_truth_scoring::{FAMILY_WISE_ALPHA, fit_and_score, probe_matrix};
 
 fn truth(x: f64) -> f64 {
     (std::f64::consts::PI * x).sin()
@@ -54,10 +54,11 @@ fn failures(bc: &str, ks: &[usize]) -> Vec<String> {
     let xg: Vec<f64> = (0..20).map(|i| 0.02 + 0.96 * (i as f64) / 19.0).collect();
     let probes = probe_matrix(&xg.iter().map(|&x| vec![x, 0.0]).collect::<Vec<_>>());
     let probe_truth: Vec<f64> = xg.iter().map(|&x| truth(x)).collect();
+    let alpha = FAMILY_WISE_ALPHA / ks.len() as f64;
     ks.iter()
         .filter_map(|&k| {
             let formula = format!("y ~ s(x, bc={bc}, k={k})");
-            fit_and_score(&formula, &data, &probes, &probe_truth, &train_truth)
+            fit_and_score(&formula, &data, &probes, &probe_truth, &train_truth, alpha)
                 .err()
                 .map(|e| format!("{bc} k={k}: {e}"))
         })
