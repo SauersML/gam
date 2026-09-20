@@ -674,6 +674,31 @@ fn a_double_well_fit_publishes_its_uncertified_trace_2901() {
     );
 }
 
+/// A custom-family fit publishes its likelihood curvature `H − S(λ)` beside the
+/// penalized Hessian, so the smooth-term score test has the `G` it needs. It is
+/// the observed information, not a Gram: at the double well's certified mode
+/// it is negative, and that sign is published rather than projected away.
+#[test]
+fn a_custom_family_fit_publishes_its_likelihood_curvature() {
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let result = fit_custom_family(&family, &[double_well_spec(2.0)], &double_well_options())
+        .expect("a certified double-well mode fits");
+    let inference = result.inference.as_ref().expect("the fit computed inference");
+    let hessian = inference.penalized_hessian.as_array()[[0, 0]];
+    let curvature = inference
+        .weighted_gram
+        .as_ref()
+        .expect("an identity-gauge custom-family fit publishes its likelihood curvature");
+    assert_eq!(curvature.dim(), (1, 1));
+    let expected = hessian - result.lambdas[0];
+    assert!(
+        (curvature[[0, 0]] - expected).abs() <= 4.0 * f64::EPSILON * hessian.abs().max(result.lambdas[0]),
+        "published curvature {} is H − λS = {expected}",
+        curvature[[0, 0]]
+    );
+    assert!(curvature[[0, 0]] < 0.0, "the double well's data curvature is negative at its mode");
+}
+
 /// The end-to-end property: a whole production fit is a function of the model
 /// and the data, not of the coefficients the caller happened to pass in.
 ///
