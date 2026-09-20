@@ -385,7 +385,7 @@ fn default_univariate_duchon_center_count(t: ArrayView1<'_, f64>) -> usize {
         n,
         1,
         polynomial_cols,
-        univariate_spline_basis_dim(t),
+        univariate_spline_basis_dim(t, t.len()),
     )
 }
 
@@ -619,7 +619,7 @@ mod tests {
         assert_eq!(duchon.order, 2);
         assert_eq!(duchon.locations.len(), default_univariate_duchon_center_count(t.view()));
         assert!(
-            duchon.locations.len() >= univariate_spline_basis_dim(t.view()),
+            duchon.locations.len() >= univariate_spline_basis_dim(t.view(), t.len()),
             "the 1-D Duchon default is floored at the open s(x) dimension (#1867)"
         );
     }
@@ -641,7 +641,7 @@ mod tests {
         assert_eq!(open.order, DEFAULT_BSPLINE_DEGREE);
         assert_eq!(
             open.locations.len() - open.order - 1,
-            univariate_spline_basis_dim(t.view())
+            univariate_spline_basis_dim(t.view(), t.len())
         );
 
         let cyclic = resolve_basis_locations_1d(
