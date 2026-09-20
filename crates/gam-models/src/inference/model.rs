@@ -153,10 +153,19 @@ use std::path::Path;
 // count and its conformal rows are refused by name (`UnknownPenaltyStructure`); a v32 binary
 // refuses a v33 payload by version instead of publishing its frozen-λ set for a fit whose
 // selection it cannot see.
-pub const MODEL_PAYLOAD_VERSION: u32 = 33;
+// v34 records the closed-form certificate's null law (gam#2926):
+// `ClosedFormAnchorResidual::{null_p_value, null_p_value_relative_error, null_modes}`,
+// whose decision is now the null tail against its design rate instead of the sign of
+// `D̂`. All three carry serde defaults, so a v33 or older payload loads with none
+// recorded, its decision as it was made; a v33 binary refuses a v34 payload by version.
+pub const MODEL_PAYLOAD_VERSION: u32 = 34;
+
+/// The schema before the closed-form certificate's null law (gam#2926), whose only
+/// difference is those fields' absence.
+const CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION: u32 = 33;
 
 /// The schema before the full-conformal penalty count (gam#3296), whose only difference
-/// is that field's absence.
+/// from [`CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION`] is that field's absence.
 const CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION: u32 = 32;
 
 /// The schema before the moving-law arms' adequacy screens (gam#2926), whose only
@@ -199,7 +208,8 @@ const LOCATION_ONLY_SCALE_PAYLOAD_VERSION: u32 = 25;
 pub(crate) const OUTER_WARM_START_ABSENT_PAYLOAD_VERSION: u32 = 24;
 
 /// The schema before the residual repair block's covariance declination (gam#2985),
-/// whose only difference is that variant's absence.
+/// whose only difference from [`OUTER_WARM_START_ABSENT_PAYLOAD_VERSION`] is that
+/// variant's absence.
 const RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION: u32 = 23;
 
 /// The schema before the latent-law record (gam#2926), whose only difference from
@@ -228,8 +238,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 16] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 17] = [
     MODEL_PAYLOAD_VERSION,
+    CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
     CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
     MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
     SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
@@ -7932,6 +7943,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
             CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
             MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
             SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
@@ -7953,7 +7965,11 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
-        assert_eq!(CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(
+            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
+            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION - 1
+        );
         assert_eq!(
             MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
             CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION - 1
