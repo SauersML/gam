@@ -2410,7 +2410,7 @@
     "evidence": "At the head git grep -w finds none of these names under crates, src or tests. cargo check --workspace --tests passes on the merge of main into the branch; cargo test -p gam-inference --lib hmc_io 59/59 and rho_posterior (including the new escalation-routing test K=4 -> 81-node quadrature, K=5 and K=17 -> NUTS) pass; cargo test -p gam-solve --lib psis passes (reliable_sample_size S(0.5)=100, S(0.7)=2155). The Python sampling wrapper and its tests no longer pass target_accept."
   },
   {
-    "base": "80ab468ff39c082c07a472e84db4912e6c5a1beb",
+    "base": "e0f6e0b3f4dd2684c47289dfd02249d43bff6e0e",
     "items": [
       "crates/gam-cli/src/main.rs:const:CLI_WORKER_STACK_SIZE",
       "crates/gam-linalg/src/parallel.rs:fn:run_on_single_worker_pool",
