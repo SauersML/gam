@@ -1,5 +1,5 @@
 //! Regression for the #1476-class double-penalty null-space bug on the
-//! thin-plate / Matérn-blended (`bs="tp"`) path.
+//! thin-plate / Matérn-blended (`bs="tps"`) path.
 //!
 //! Like the tensor (`te`/`ti`) and 1-D B-spline paths, a thin-plate smooth's
 //! Marra & Wood (2011) double-penalty null-space shrinkage ridge must shrink the
@@ -71,12 +71,12 @@ fn frob(m: &Array2<f64>) -> f64 {
 
 #[test]
 fn thin_plate_double_penalty_ridge_lives_in_constrained_null_space() {
-    // 2-D thin-plate (`s(x, z)` auto-promotes to bs="tp"); poly nullspace =
+    // 2-D thin-plate (`s(x, z)` auto-promotes to bs="tps"); poly nullspace =
     // {const, x, z}. Default double_penalty=true emits the null-space ridge,
     // and the default OrthogonalToParametric identifiability drops the constant,
     // so the constrained null space genuinely differs from the raw one.
-    let fit = fit("y ~ s(x, z, bs=\"tp\", k=20, double_penalty=TRUE)");
-    let formula = "s(x, z, bs=\"tp\", double_penalty)";
+    let fit = fit("y ~ s(x, z, bs=\"tps\", k=20, double_penalty=TRUE)");
+    let formula = "s(x, z, bs=\"tps\", double_penalty)";
 
     let term = &fit.design.smooth.terms[0];
     let width = term.coeff_range.len();
@@ -96,7 +96,7 @@ fn thin_plate_double_penalty_ridge_lives_in_constrained_null_space() {
                 ridge = Some(s.clone());
             }
             // The thin-plate bending penalty the ridge's null space is built
-            // from. (The `bs="tp"` path emits exactly Primary + the ridge.)
+            // from. (The `bs="tps"` path emits exactly Primary + the ridge.)
             PenaltySource::Primary => bending += s,
             ref other => panic!("{formula}: unexpected thin-plate penalty source {other:?}"),
         }

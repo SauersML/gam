@@ -1,4 +1,4 @@
-//! Regression (#1541): a univariate `s(x, bs='cr')` / `bs='cs'` smooth must NOT
+//! Regression (#1541): a univariate `s(x, bs='cr')` smooth must NOT
 //! hard-fail the whole fit when the covariate has fewer distinct values than the
 //! requested basis size `k`. Before commit 7f806ff, `select_cr_knots` demanded
 //! "cubic regression spline with k=N requires at least N distinct values, got M"
@@ -7,7 +7,7 @@
 //! support and proceed.
 //!
 //! `capped_cr_marginal_knotspec()` (src/terms/term_builder.rs) now reduces the
-//! cr/cs marginal `k` to the number of distinct covariate values, so a ternary
+//! cr marginal `k` to the number of distinct covariate values, so a ternary
 //! covariate `x ∈ {0,1,2}` fitted with `s(x, bs='cr', k=10)` builds a 3-knot cr
 //! basis instead of erroring.
 //!

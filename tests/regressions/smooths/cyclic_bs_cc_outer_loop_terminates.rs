@@ -1,9 +1,9 @@
 //! Regression for #874: `fit()` must TERMINATE on a cyclic spline
-//! (`s(x, bs='cc')`) whose period is left to default to the data range.
+//! (`s(x, bs='cyclic')`) whose period is left to default to the data range.
 //!
 //! ## The bug
 //!
-//! `gamfit.fit(df, "y ~ s(hue, bs='cc')", config={"outer_max_iter": 12})` never
+//! `gamfit.fit(df, "y ~ s(hue, bs='cyclic')", config={"outer_max_iter": 12})` never
 //! returned. The outer REML optimizer reached `|gradient| ~ 1.8e-11` (clearly
 //! converged) but kept re-evaluating at the same point forever; `outer_max_iter`
 //! was not honored as a hard backstop. A non-cyclic `s(hue)` / `bs='cr'` on the
@@ -15,7 +15,7 @@
 //! `periodic_formula_integration.rs`) always fits cyclic smooths with an
 //! EXPLICIT period (`period_start=…, period_end=…`) and the production default
 //! outer-iteration budget. This repro exercises the previously-untested
-//! regime that hangs: `s(x, bs='cc')` with **no** period option, so the period
+//! regime that hangs: `s(x, bs='cyclic')` with **no** period option, so the period
 //! defaults to the data range `[min(x), max(x)]` (mgcv `bs="cc"` semantics). The
 //! data point at `x = max` then wraps onto `x = min`. The `outer_max_iter` option
 //! of the original repro is deleted (#2957).
@@ -82,7 +82,7 @@ fn cyclic_bs_cc_default_period_fit_terminates_and_is_periodic() {
             (lo.min(x), hi.max(x))
         });
 
-    // The failing repro: cyclic basis via the mgcv `bs='cc'` idiom and NO
+    // The failing repro: cyclic basis via `bs='cyclic'` and NO
     // explicit period (defaults to the data range).
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -92,7 +92,7 @@ fn cyclic_bs_cc_default_period_fit_terminates_and_is_periodic() {
     // If #874 is present this call never returns and the test times out; the
     // assertion is that it returns at all within the harness timeout.
     let result =
-        fit_from_formula("y ~ s(hue, bs='cc')", &ds, &cfg).expect("cyclic bs='cc' fit must return");
+        fit_from_formula("y ~ s(hue, bs='cyclic')", &ds, &cfg).expect("cyclic bs='cyclic' fit must return");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian cyclic smooth");
     };

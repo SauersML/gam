@@ -236,7 +236,7 @@ impl<'a> RemlState<'a> {
             return Ok(f64::INFINITY);
         }
         let t_pirls = std::time::Instant::now();
-        let bundle = match self.obtain_value_eval_bundle(p) {
+        let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
@@ -2173,15 +2173,21 @@ impl<'a> RemlState<'a> {
         // the same value+gradient splicing contract as the TK correction so the
         // outer REML/LAML stays consistent. A no-op when every direction is
         // Laplace-trustworthy.
-        let block_terms = self.block_local_quadrature_correction(rho, bundle, assembly_ext_len)?;
+        let block_terms = self.block_local_quadrature_correction(
+            rho,
+            bundle,
+            assembly_ext_len,
+            mode == super::reml_outer_engine::EvalMode::ValueGradientHessian,
+        )?;
         let block_atom = super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms(
             "sampled_block_marginal",
             block_terms,
         );
         let mut result = self.apply_theta_correction_atom_to_result(result, &block_atom)?;
-        // A latched correction's `Δ_b` has no ρ-Hessian: the spliced criterion
-        // declares none rather than the Laplace Hessian without `∂²Δ_b`.
-        if self.block_correction_latched() {
+        // A latched correction whose `Δ_b` has no closed-form ρ-Hessian: the
+        // spliced criterion declares none rather than the Laplace Hessian
+        // without `∂²Δ_b`. Otherwise the atom carried `∂²(−Δ_b)` in.
+        if self.block_correction_hessian_refusal().is_some() {
             result.hessian = HessianValue::Unavailable;
         }
         let components = [
@@ -2299,14 +2305,15 @@ impl<'a> RemlState<'a> {
         // surface. The correction enters through the gradient channel exactly
         // like TK, which the universal EFS step already folds in. No-op when no
         // direction is non-Gaussian.
-        let block_terms = self.block_local_quadrature_correction(rho, bundle, assembly_ext_len)?;
+        let block_terms =
+            self.block_local_quadrature_correction(rho, bundle, assembly_ext_len, false)?;
         let block_atom = super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms(
             "sampled_block_marginal",
             block_terms,
         );
         let mut cost_result =
             self.apply_theta_correction_atom_to_result(cost_result, &block_atom)?;
-        if self.block_correction_latched() {
+        if self.block_correction_hessian_refusal().is_some() {
             cost_result.hessian = HessianValue::Unavailable;
         }
         crate::estimate::outer_eval_capture::record_outer_criterion_components(
@@ -2659,7 +2666,7 @@ impl<'a> RemlState<'a> {
             return Ok(eval.gradient);
         }
         let t_pirls = std::time::Instant::now();
-        let bundle = match self.obtain_eval_bundle(p) {
+        let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(err @ EstimationError::ModelIsIllConditioned { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
@@ -2777,7 +2784,7 @@ impl<'a> RemlState<'a> {
         }
 
         let t_pirls = std::time::Instant::now();
-        let bundle = match self.obtain_eval_bundle(p) {
+        let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(err) if err.is_inner_solve_retreat() => {
                 self.cache_manager.invalidate_eval_bundle();
@@ -2794,7 +2801,7 @@ impl<'a> RemlState<'a> {
         };
 
         // Genuinely value-only fulfilment (#979). A `Value` request never needs
-        // the outer gradient. The inner solve above (`obtain_eval_bundle`) has
+        // the outer gradient. The inner solve above (`obtain_outer_eval_bundle`) has
         // already established its owned mode, so assemble only the scalar cost,
         // return a zero-length gradient, and surface the coefficient hint for a
         // typed reactive waypoint when one is active. Line-search, screening,
@@ -3332,10 +3339,9 @@ mod tk_math_tests {
         let theta = pc_prior_rate(upper, RHO_DISTRIBUTION_PC_TAIL_PROB);
 
         for &r in &[-30.0, -20.0, -4.7, 0.0, 5.0, 30.0] {
-            let (pc_cost, pc_grad, _) = pc_prior_terms(theta, r);
             assert_eq!(
                 rho_distribution_default_terms(theta, r),
-                (pc_cost, pc_grad),
+                pc_prior_terms(theta, r),
                 "the sampler correction is the PC prior at ρ={r}"
             );
         }
@@ -3344,7 +3350,7 @@ mod tk_math_tests {
         // `+1/2`, so the sampled density decays like `e^{−ρ/2}`. The shortfall is
         // exactly `(θ/2)·e^{−ρ/2}`, which is below 1e-7 by ρ = 30 — the ρ box bound,
         // i.e. the far edge of the region a sampler can reach.
-        let (_, tail_grad) = rho_distribution_default_terms(theta, 30.0);
+        let (_, tail_grad, _) = rho_distribution_default_terms(theta, 30.0);
         let shortfall = 0.5 * theta * (-0.5 * 30.0f64).exp();
         assert!(
             (0.5 - tail_grad - shortfall).abs() < 1e-15,

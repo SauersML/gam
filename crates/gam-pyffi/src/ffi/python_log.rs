@@ -1,19 +1,19 @@
 //! Forward the engine's [`log`] records to Python `logging` under the
-//! `gamfit` logger.
+//! `gamfit` logger, while the engine call that produced them is still running.
 //!
 //! The engine logs from whichever thread is doing the work: the Python thread
-//! inside a `#[pyfunction]` (holding the GIL) or a rayon worker (not holding
-//! it, while the Python thread that started the fit waits on it with the GIL
-//! held). A record therefore never calls into Python where it was produced —
-//! acquiring the GIL from a worker would deadlock. Records are queued instead
-//! and handed to `logging` with the GIL held, in the order they were produced,
-//! by whichever comes first:
+//! inside a `#[pyfunction]` or a rayon worker. A record never calls into Python
+//! where it was produced, because that thread may be a worker the GIL holder is
+//! waiting on. Records are queued instead, and one delivery thread per process
+//! hands them to `logging` in the order they were produced. It attaches to the
+//! interpreter as soon as the GIL is free, which it is for the whole of every
+//! engine call that detaches from Python (every fit does). So a fit that never
+//! returns, for example one killed at a caller's time cap, has already
+//! delivered everything it logged.
 //!
-//! * a pending call scheduled with `Py_AddPendingCall`, which the interpreter
-//!   runs on its main thread as soon as that thread is back in Python code;
-//! * [`sync_log_level_from_python`], which the Python wrapper calls before
-//!   every engine call, so a fit on a worker Python thread delivers the records
-//!   of the previous call even while the main thread is blocked.
+//! [`sync_log_level_from_python`], which the Python wrapper calls before every
+//! engine call, also delivers whatever is queued, so the records of one call
+//! are with the logger before the next call starts.
 //!
 //! The level filter follows the `gamfit` logger's effective level, which the
 //! same wrapper call reports: until someone lowers that level to `DEBUG`, the
@@ -21,9 +21,8 @@
 //! nothing.
 
 use std::collections::VecDeque;
-use std::ffi::{c_int, c_void};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use pyo3::prelude::*;
@@ -41,11 +40,31 @@ const PY_INFO: i32 = 20;
 const PY_DEBUG: i32 = 10;
 const PY_TRACE: i32 = PY_DEBUG / 2;
 
-static LOGGER: PythonLogger = PythonLogger;
-static PENDING: PendingQueue = Mutex::new(VecDeque::new());
-static DRAIN_SCHEDULED: AtomicBool = AtomicBool::new(false);
+/// No process: nothing is draining, or no delivery thread runs.
+const NO_PROCESS: u32 = 0;
 
-type PendingQueue = Mutex<VecDeque<PendingRecord>>;
+static LOGGER: PythonLogger = PythonLogger;
+static PENDING: Mutex<Pending> = Mutex::new(Pending {
+    records: VecDeque::new(),
+    delivery_requested: false,
+});
+static DELIVERY_REQUESTED: Condvar = Condvar::new();
+/// The process whose delivery thread is running. A forked child inherits the
+/// parent's id but not its threads, so it starts its own.
+static DELIVERY_PROCESS: AtomicU32 = AtomicU32::new(NO_PROCESS);
+/// The process one of whose threads is handing records to `logging`. Only one
+/// thread emits at a time, so records keep their order even when a handler
+/// releases the GIL mid-batch (every stream write does). A value that is not
+/// this process's id was inherited through a fork and is taken over.
+static DRAINING_PROCESS: AtomicU32 = AtomicU32::new(NO_PROCESS);
+
+struct Pending {
+    records: VecDeque<PendingRecord>,
+    /// Set by every push and cleared by the delivery thread when it wakes, so
+    /// the thread sleeps while another thread is draining instead of spinning
+    /// on a queue that thread is about to empty.
+    delivery_requested: bool,
+}
 
 struct PendingRecord {
     level: Level,
@@ -64,62 +83,104 @@ impl Log for PythonLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        lock_queue(&PENDING).push_back(PendingRecord {
+        let queued = PendingRecord {
             level: record.level(),
             target: record.target().to_owned(),
             message: record.args().to_string(),
-        });
-        schedule_drain();
+        };
+        {
+            let mut pending = lock_pending();
+            pending.records.push_back(queued);
+            pending.delivery_requested = true;
+        }
+        DELIVERY_REQUESTED.notify_one();
+        ensure_delivery_thread();
     }
 
     fn flush(&self) {}
 }
 
-fn lock_queue(queue: &PendingQueue) -> std::sync::MutexGuard<'_, VecDeque<PendingRecord>> {
-    queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock_pending() -> MutexGuard<'static, Pending> {
+    PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn schedule_drain() {
-    if DRAIN_SCHEDULED.swap(true, Ordering::AcqRel) {
+/// Start this process's delivery thread unless it is already running.
+fn ensure_delivery_thread() {
+    let process = std::process::id();
+    let running = DELIVERY_PROCESS.load(Ordering::Acquire);
+    if running == process
+        || DELIVERY_PROCESS
+            .compare_exchange(running, process, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
         return;
     }
-    let queue = std::ptr::from_ref(&PENDING).cast_mut().cast::<c_void>();
-    // SAFETY: `Py_AddPendingCall` is documented as callable from any thread
-    // without an attached thread state. The argument points at the `PENDING`
-    // static, which outlives every pending call, and `drain_pending_call` only
-    // reads it through a shared reference.
-    let status = unsafe { pyo3::ffi::Py_AddPendingCall(Some(drain_pending_call), queue) };
-    if status != 0 {
-        // The interpreter's pending-call queue is full. The record stays
-        // queued; the next record or the next engine call delivers it.
-        DRAIN_SCHEDULED.store(false, Ordering::Release);
+    let spawned = std::thread::Builder::new()
+        .name("gamfit-log".to_owned())
+        .spawn(deliver_until_the_interpreter_stops);
+    if spawned.is_err() {
+        // The records stay queued; the next record retries the spawn and the
+        // next engine call delivers them either way.
+        DELIVERY_PROCESS.store(NO_PROCESS, Ordering::Release);
     }
 }
 
-extern "C" fn drain_pending_call(queue: *mut c_void) -> c_int {
-    // SAFETY: `schedule_drain` is the only scheduler, and it passes a pointer
-    // to the `PENDING` static.
-    let queue = unsafe { &*queue.cast::<PendingQueue>().cast_const() };
-    // The interpreter runs pending calls on its main thread with the GIL held;
-    // attaching here only takes the already-held thread state.
-    Python::try_attach(|py| drain_pending(py, queue));
-    0
+/// The delivery thread: sleep until a record is queued, then attach to the
+/// interpreter (waiting for the GIL, never holding the queue lock while it
+/// waits) and deliver. It ends when the interpreter can no longer be attached
+/// to, which is at shutdown.
+fn deliver_until_the_interpreter_stops() {
+    loop {
+        {
+            let mut pending = lock_pending();
+            while !pending.delivery_requested {
+                pending = DELIVERY_REQUESTED
+                    .wait(pending)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            pending.delivery_requested = false;
+        }
+        if Python::try_attach(drain_pending).is_none() {
+            DELIVERY_PROCESS.store(NO_PROCESS, Ordering::Release);
+            return;
+        }
+    }
 }
 
 /// Hand every queued record to the `gamfit` logger. A failure inside Python
-/// logging is reported through `sys.unraisablehook` rather than raised: this
-/// runs from a pending call, where an exception would surface in unrelated
-/// user code.
-fn drain_pending(py: Python<'_>, queue: &PendingQueue) {
-    // Clear the flag before taking the queue: a record pushed after the take
-    // then schedules a fresh drain instead of waiting for the next one.
-    DRAIN_SCHEDULED.store(false, Ordering::Release);
-    let records = std::mem::take(&mut *lock_queue(queue));
-    if records.is_empty() {
-        return;
-    }
-    if let Err(err) = emit_records(py, records) {
-        err.write_unraisable(py, None);
+/// logging is reported through `sys.unraisablehook` rather than raised: the
+/// delivery thread has no caller to raise into, and an engine call must not
+/// fail over a handler's error.
+///
+/// If another thread of this process is already emitting, this returns at
+/// once: that thread empties the queue, and it looks again after releasing
+/// its claim, so no record is left behind by the hand-over.
+fn drain_pending(py: Python<'_>) {
+    let process = std::process::id();
+    loop {
+        let draining = DRAINING_PROCESS.load(Ordering::Acquire);
+        if draining == process
+            || DRAINING_PROCESS
+                .compare_exchange(draining, process, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        loop {
+            let records = std::mem::take(&mut lock_pending().records);
+            if records.is_empty() {
+                break;
+            }
+            if let Err(err) = emit_records(py, records) {
+                err.write_unraisable(py, None);
+            }
+        }
+        DRAINING_PROCESS.store(NO_PROCESS, Ordering::Release);
+        // A record queued between the last take and the release found the
+        // claim still held and was left to this thread.
+        if lock_pending().records.is_empty() {
+            return;
+        }
     }
 }
 
@@ -184,7 +245,7 @@ pub(crate) fn install() {
 #[pyfunction]
 pub(crate) fn sync_log_level_from_python(py: Python<'_>, effective_level: i32) {
     log::set_max_level(level_filter_for_python(effective_level));
-    drain_pending(py, &PENDING);
+    drain_pending(py);
 }
 
 #[cfg(test)]
