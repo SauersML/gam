@@ -1085,7 +1085,7 @@ impl<'a> RemlState<'a> {
                         evecs: &evecs,
                         block_cols: &block_cols,
                         c: c_weights,
-                        d: &pirls_result.solve_d_array,
+                        d: &pirls_result.solve_d_array.to_owned(),
                     },
                 )?;
                 log::trace!(
