@@ -2774,5 +2774,20 @@
     ],
     "reason": "#3824: the SAE coordinate prior switched from per-atom ARD to one ARD precision per axis index broadcast to every atom once K >= SAE_SHARED_ARD_K_THRESHOLD = 256, so the prior family and the REML/LAML criterion changed at an arbitrary atom count. Per-atom ARD costs 1+K+sum_k d_k outer coordinates against 1+K+max_d, both Theta(K), and the per-(k,j) energies were already assembled, so no derived crossover exists. The threshold, ArdSharing, the ard_sharing accessor, SaeManifoldRho::new_shared_ard and max_ard_axes go, with the tests that pinned the shared mode (shared_ard_flat_index_aliases_in_bounds_1026, shared_ard_collapses_outer_param_count_at_large_k, shared_ard_is_a_convergent_outer_coordinate_1026).",
     "evidence": "manifold::tests::ard_flat_index_is_unique_per_atom_axis_3824 and sae owed_1026::ard_outer_coordinates_are_per_atom_at_every_k_3824: for K in {2,255,256,1000} the flat length is 1+K+K and every (k,j) index is distinct; a heterogeneous d=[2,1,2] from_flat round trip is exact."
+  },
+  {
+    "base": "9a85f74852b47d8cfe85d9673f6940c96494a3aa",
+    "items": [
+      "crates/gam-report/src/lib.rs:fn:fmt_num",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_normal_range_positive",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_normal_range_negative",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_just_below_1e4",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_at_1e4_uses_scientific",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_just_above_0_01_threshold",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_exactly_0_01_uses_scientific",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_zero_uses_scientific"
+    ],
+    "reason": "#2469: fmt_num was a second number format with hand-picked switch points (1e-2, 1e4) beside format_significant, the documented format of every printed model summary. Every caller now uses format_significant (C %g at precision 6), and the fmt_num_* tests are replaced by format_significant_* tests.",
+    "evidence": "PR #4072: format_significant_is_six_significant_digits_in_fixed_range, format_significant_switches_to_scientific_by_decimal_exponent and format_significant_names_zero_and_non_finite_values pin the replacement; render_html_includes_smoothing_forensics_when_present expects 0.1 -> 0.2."
   }
 ]
