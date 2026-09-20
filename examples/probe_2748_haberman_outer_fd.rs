@@ -110,7 +110,7 @@ fn main() {
 
     let body = selected
         .iter()
-        .map(|name| format!("s({name}, type=ps, knots=8, double_penalty=true)"))
+        .map(|name| format!("s({name}, bs=ps, knots=8, double_penalty=true)"))
         .collect::<Vec<_>>()
         .join(" + ");
     let formula = format!("y ~ {body}");

@@ -15,7 +15,7 @@
 //!   the curve (#1214). Fix: anchor the `log λ` bracket to the abscissa span so
 //!   the search runs in scale-free units (`src/solver/spline_scan.rs`).
 //!
-//! * `s(x, bs="tp")` — the thin-plate kernel's length-scale `ℓ` was seeded from
+//! * `s(x, bs="tps")` — the thin-plate kernel's length-scale `ℓ` was seeded from
 //!   the *raw* covariate magnitude and the `ψ = log κ = −log ℓ` REML optimizer
 //!   ran in raw covariate units, landing in a scale-dependent basin (a bimodal
 //!   step across `|a| ⋛ 1`, ~2e-2 drift, #1215). 1-D spatial inputs were never
@@ -213,7 +213,7 @@ fn cr_smooth_is_invariant_to_covariate_rescaling() {
 #[test]
 fn tp_smooth_is_invariant_to_covariate_translation() {
     init_parallelism();
-    let formula = "y ~ s(x, bs=\"tp\")";
+    let formula = "y ~ s(x, bs=\"tps\")";
     let n = 400;
     let base = fit_grid_predictions_offset(formula, 0.0, n);
 
@@ -251,7 +251,7 @@ fn tp_smooth_is_invariant_to_covariate_translation() {
         let drift = max_shape_drift(&base, &fit_grid_predictions_offset(formula, b, n));
         assert!(
             drift < 1.0e-5,
-            "s(x, bs=\"tp\") fitted function changed under covariate translation b={b:.0e}: \
+            "s(x, bs=\"tps\") fitted function changed under covariate translation b={b:.0e}: \
              max |shape(0) − shape(b)| = {drift:.3e} over a signal of range ~2 \
              (must stay ≪ the 2.8e-2 pre-#1269 bug; the kernel, penalty, and basis \
              are translation-invariant to ~1e-13, the residual is the flat-REML-λ \
@@ -371,7 +371,7 @@ fn tp_basis_is_exactly_translation_invariant() {
 #[test]
 fn tp_smooth_is_invariant_to_covariate_rescaling() {
     init_parallelism();
-    let formula = "y ~ s(x, bs=\"tp\")";
+    let formula = "y ~ s(x, bs=\"tps\")";
     let n = 400;
     let base = fit_grid_predictions(formula, 1.0, n);
 
@@ -383,7 +383,7 @@ fn tp_smooth_is_invariant_to_covariate_rescaling() {
         let drift = max_shape_drift(&base, &fit_grid_predictions(formula, a, n));
         assert!(
             drift < 1.0e-4,
-            "s(x, bs=\"tp\") fitted function changed under covariate rescale a={a:.0e}: \
+            "s(x, bs=\"tps\") fitted function changed under covariate rescale a={a:.0e}: \
              max |shape(1) − shape(a)| = {drift:.3e} over a signal of range ~2 \
              (must be scale-free; observed ~2e-2 before the length-scale seed was \
              normalized by the covariate spread)."

@@ -297,7 +297,7 @@ fn measure_jet_range_state_on_the_2750_fixtures() {
     let mut measured = 0usize;
     for fixture in fixtures.iter() {
         let data = fixture.dataset();
-        for body in ["s(x, bs=\"mjs\")", "s(x)", "s(x, bs=\"tp\")"] {
+        for body in ["s(x, bs=\"mjs\")", "s(x)", "s(x, bs=\"tps\")"] {
             let Some(arm) = fit_arm(body, fixture, &data) else {
                 continue;
             };

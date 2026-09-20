@@ -216,7 +216,7 @@ fn spd_fast_path_still_reports_its_spectrum() {
 }
 
 /// #2428, the measured case. These are the real numbers from quakes split 7
-/// (`paired_holdout_partition(1000, 0.20, 7)`, `mag ~ s(long, lat, bs="tp") +
+/// (`paired_holdout_partition(1000, 0.20, 7)`, `mag ~ s(long, lat, bs="tps") +
 /// s(depth)`): the outer loop certified the fit (‖g‖ = 3.75e-6 against a
 /// stationarity bound of 2.38e-5) and the ρ-Hessian carried one eigenvalue at
 /// −7.27e-9 — 19x SMALLER than the residual gradient in that very coordinate,

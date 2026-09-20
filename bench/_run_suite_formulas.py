@@ -508,15 +508,15 @@ def _rust_formula_for_scenario(scenario_name: typing.Any, ds: typing.Any, *, cfg
             else:
                 for col in other_smooth_cols:
                     if basis in {"ps", "bspline", "p-spline"}:
-                        terms.append(f"s({col}, type=ps, knots={knot_count}{dp_opt})")
+                        terms.append(f"s({col}, bs=ps, knots={knot_count}{dp_opt})")
                     elif basis in {"thinplate", "tps"}:
-                        terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
+                        terms.append(f"s({col}, bs=tps, centers={knot_count}{dp_opt})")
                     elif basis == "duchon":
                         terms.append(
-                            f"s({col}, type=duchon, centers={knot_count}{_rust_duchon_options_for_dimension(1)})"
+                            f"s({col}, bs=duchon, centers={knot_count}{_rust_duchon_options_for_dimension(1)})"
                         )
                     elif basis == "matern":
-                        terms.append(f"s({col}, type=matern, centers={knot_count}{dp_opt})")
+                        terms.append(f"s({col}, bs=matern, centers={knot_count}{dp_opt})")
                     else:
                         raise RuntimeError(
                             f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
@@ -525,19 +525,19 @@ def _rust_formula_for_scenario(scenario_name: typing.Any, ds: typing.Any, *, cfg
         col = cfg.get("smooth_col")
         if col:
             if basis in {"thinplate", "tps"}:
-                terms.append(f"s({col}, type=tps, centers={knot_count}{dp_opt})")
+                terms.append(f"s({col}, bs=tps, centers={knot_count}{dp_opt})")
             elif basis in {"ps", "bspline", "p-spline"} and "double_penalty" in cfg:
                 dp = "true" if bool(cfg["double_penalty"]) else "false"
-                terms.append(f"s({col}, type=ps, knots={knot_count}, double_penalty={dp})")
+                terms.append(f"s({col}, bs=ps, knots={knot_count}, double_penalty={dp})")
             elif basis in {"ps", "bspline", "p-spline"}:
-                terms.append(f"s({col}, type=ps, knots={knot_count})")
+                terms.append(f"s({col}, bs=ps, knots={knot_count})")
             elif basis in {"duchon", "matern"}:
                 if basis == "duchon":
                     terms.append(
-                        f"s({col}, type=duchon, centers={knot_count}{_rust_duchon_options_for_dimension(1)})"
+                        f"s({col}, bs=duchon, centers={knot_count}{_rust_duchon_options_for_dimension(1)})"
                     )
                 else:
-                    terms.append(f"s({col}, type={basis}, centers={knot_count}{dp_opt})")
+                    terms.append(f"s({col}, bs={basis}, centers={knot_count}{dp_opt})")
             else:
                 raise RuntimeError(
                     f"Unsupported Rust smooth basis '{basis}' for scenario '{scenario_name}'"
@@ -750,7 +750,7 @@ def _survival_formula_mapping(scenario_name: str) -> dict[str, typing.Any]:
 def _rust_survival_formula_for_scenario(scenario_name: str, *, exclude_cols: typing.Any=None) -> str:
     cfg = _cfg_with_excluded_columns(_survival_formula_mapping(scenario_name), exclude_cols or [])
     terms = [f"linear({c})" for c in cfg["linear_cols"]]
-    terms.extend(f"s({c}, type=ps, knots={cfg['knots']})" for c in cfg["smooth_cols"])
+    terms.extend(f"s({c}, bs=ps, knots={cfg['knots']})" for c in cfg["smooth_cols"])
     return _formula_rhs_from_terms(terms)
 
 

@@ -393,7 +393,11 @@ fn measure(
     seed: u64,
 ) -> Measured {
     assert_eq!(
-        SurvivalPosteriorIntegration::default_for(model).expect("default integration"),
+        SurvivalPosteriorIntegration::default_for(
+            model,
+            SurvivalPredictionCovarianceMode::Conditional
+        )
+        .expect("default integration"),
         SurvivalPosteriorIntegration::ExactAnchor,
         "[{label}] a rigid survival marginal-slope model publishes the exact integration"
     );
