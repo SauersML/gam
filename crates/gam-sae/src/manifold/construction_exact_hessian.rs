@@ -1299,10 +1299,11 @@ pub(crate) struct PreparedResidualCurvatureRows {
     border_indices: Vec<usize>,
     /// #2822 — the softmax gate's resident row-jet plan; `None` for every other gate.
     softmax: Option<PreparedSoftmaxRowJets>,
-    /// #2933 F36 — every embedded-sphere coordinate block of this state, so an
-    /// apply sandwiches the raw-ambient legs in the tangent projector `B` was
-    /// assembled in. Empty when no atom lives on a sphere.
-    sphere_tangents: Vec<SphereTangentBlock>,
+    /// #2933 F36, #3438 — every coordinate tangent block of this state (embedded
+    /// spheres and interval slots pinned at an active bound), so an apply sandwiches
+    /// the raw-ambient legs in the tangent projector `B` was assembled in. Empty when
+    /// no atom lives on a sphere and no interval coordinate is pinned.
+    coordinate_tangents: Vec<CoordinateTangentBlock>,
 }
 
 /// #2822 — the state-only inputs of the softmax residual-curvature HVP
@@ -1384,16 +1385,59 @@ impl SphereTangentBlock {
     }
 }
 
-/// `P·v` on every sphere block of a joint vector in the cache layout. The blocks
-/// name coordinate slots only, so a `(t, β)` vector's border is untouched.
-fn project_sphere_tangent_slots(
-    blocks: &[SphereTangentBlock],
+/// One block of the coordinate tangent projector `B` was assembled in: an
+/// embedded-sphere block ([`SphereTangentBlock`]), or (#3438) an interval
+/// coordinate held at an active bound.
+///
+/// A bound is active when the descent direction leaves the interval: `t ≤ lo`
+/// with `g > 0`, or `t ≥ hi` with `g < 0` ([`LatentManifold::gradient_pinned_axes`]).
+/// There the conversion projects the slot out of `B`: its gradient, its `H_tt` row
+/// and column, and its `H_tβ` row are zero ([`LatentManifold::riemannian_hessian_matrix`]),
+/// so the slot is a flat direction of its row block, which the evidence
+/// factorization's row deflation carries at unit stiffness and excludes from the
+/// log-determinant traces. Under strict complementarity the coordinate stays on the
+/// bound for every nearby `(ρ, β)`, so its mode response is zero. The
+/// residual-curvature and prior legs of `ΔC` are written per raw coordinate. Added
+/// unprojected, they would give `A = B + ΔC` the slot's raw curvature on the
+/// diagonal and a `ΔC_uβ` coupling. The IFT solve would then move a coordinate the
+/// retraction holds fixed, and `½log|A|` would price the curvature of a direction
+/// the mode cannot take. So `ΔC` enters with the slot projected out, exactly as `B`
+/// does, and `A` keeps the same flat direction `B` has.
+pub(crate) enum CoordinateTangentBlock {
+    Sphere(SphereTangentBlock),
+    PinnedBound { row: usize, local: usize },
+}
+
+impl CoordinateTangentBlock {
+    fn row(&self) -> usize {
+        match self {
+            Self::Sphere(block) => block.row,
+            Self::PinnedBound { row, .. } => *row,
+        }
+    }
+
+    /// The block's projector on one row's local vector: `P = I − t tᵀ` on a sphere
+    /// block, and the zero map on a pinned bound slot.
+    fn project_local(&self, values: &mut ndarray::ArrayViewMut1<'_, f64>) {
+        match self {
+            Self::Sphere(block) => block.project_local(values),
+            Self::PinnedBound { local, .. } => values[*local] = 0.0,
+        }
+    }
+}
+
+/// The coordinate tangent projector on every block of a joint vector in the cache
+/// layout. The blocks name coordinate slots only, so a `(t, β)` vector's border is
+/// untouched.
+fn project_coordinate_tangent_slots(
+    blocks: &[CoordinateTangentBlock],
     row_offsets: &[usize],
     t: &mut ndarray::ArrayViewMut1<'_, f64>,
 ) {
     for block in blocks {
-        let start = row_offsets[block.row];
-        let end = row_offsets[block.row + 1];
+        let row = block.row();
+        let start = row_offsets[row];
+        let end = row_offsets[row + 1];
         block.project_local(&mut t.slice_mut(s![start..end]));
     }
 }
@@ -1452,6 +1496,51 @@ impl SaeManifoldTerm {
                 });
             }
         }
+        Ok(blocks)
+    }
+
+    /// Every block of the coordinate tangent projector `B` was last assembled in, in
+    /// row order: the sphere blocks of [`Self::sphere_tangent_blocks`] and the
+    /// interval slots the assembly pinned at an active bound
+    /// ([`CoordinateTangentBlock`]). The pinned slots are recorded by the
+    /// assembly itself from the raw gradient its conversion read, so the projector
+    /// names exactly the slots `B` projected out.
+    pub(crate) fn coordinate_tangent_blocks(
+        &self,
+        row_dims: &[usize],
+    ) -> Result<Vec<CoordinateTangentBlock>, String> {
+        let spheres = self.sphere_tangent_blocks(row_dims)?;
+        let pinned = &self.last_pinned_bound_slots;
+        if pinned.is_empty() {
+            return Ok(spheres
+                .into_iter()
+                .map(CoordinateTangentBlock::Sphere)
+                .collect());
+        }
+        if row_dims.len() != self.n_obs() {
+            return Err(format!(
+                "coordinate_tangent_blocks: {} row dimensions for {} observations",
+                row_dims.len(),
+                self.n_obs()
+            ));
+        }
+        for &(row, local) in pinned {
+            if row >= row_dims.len() || local >= row_dims[row] {
+                return Err(format!(
+                    "coordinate_tangent_blocks: pinned bound slot (row {row}, slot {local}) \
+                     lies outside the row layout the factor was built in"
+                ));
+            }
+        }
+        let mut blocks = Vec::with_capacity(spheres.len() + pinned.len());
+        let mut spheres = spheres.into_iter().peekable();
+        for &(row, local) in pinned {
+            while let Some(sphere) = spheres.next_if(|sphere| sphere.row <= row) {
+                blocks.push(CoordinateTangentBlock::Sphere(sphere));
+            }
+            blocks.push(CoordinateTangentBlock::PinnedBound { row, local });
+        }
+        blocks.extend(spheres.map(CoordinateTangentBlock::Sphere));
         Ok(blocks)
     }
 
@@ -1693,7 +1782,7 @@ impl SaeManifoldTerm {
                 rows: Vec::new(),
                 border_indices: Vec::new(),
                 softmax: Some(self.prepare_softmax_row_jets(target, cache)?),
-                sphere_tangents: self.sphere_tangent_blocks(&cache.row_dims)?,
+                coordinate_tangents: self.coordinate_tangent_blocks(&cache.row_dims)?,
             });
         }
         let p = self.output_dim();
@@ -1792,7 +1881,7 @@ impl SaeManifoldTerm {
             rows,
             border_indices: border.iter().map(|channel| channel.index).collect(),
             softmax: None,
-            sphere_tangents: self.sphere_tangent_blocks(&cache.row_dims)?,
+            coordinate_tangents: self.coordinate_tangent_blocks(&cache.row_dims)?,
         })
     }
 }
@@ -1920,8 +2009,8 @@ impl SaeManifoldTerm {
     /// the same treatment: `residual` is
     /// [`Self::prepare_residual_curvature_rows`] at this state.
     ///
-    /// #2933 F36 — on a sphere coordinate block the legs enter as `P·ΔC·P`, the
-    /// tangent projector `B` was assembled in (see [`SphereTangentBlock`]). Legs
+    /// #2933 F36, #3438 — on a coordinate tangent block the legs enter as `P·ΔC·P`,
+    /// the tangent projector `B` was assembled in (see [`CoordinateTangentBlock`]). Legs
     /// (4) and (5) live on logit and border slots, where `P` is the identity.
     fn apply_exact_hessian_minus_b_prepared_before_beta_prior_leg(
         &self,
@@ -1930,18 +2019,18 @@ impl SaeManifoldTerm {
         v: &SaeArrowVector,
         residual: &PreparedResidualCurvatureRows,
     ) -> Result<SaeArrowVector, String> {
-        if residual.sphere_tangents.is_empty() {
+        if residual.coordinate_tangents.is_empty() {
             return self.apply_exact_hessian_minus_b_ambient_legs(rho, cache, v, residual);
         }
         let mut tangent = v.clone();
-        project_sphere_tangent_slots(
-            &residual.sphere_tangents,
+        project_coordinate_tangent_slots(
+            &residual.coordinate_tangents,
             &cache.row_offsets,
             &mut tangent.t.view_mut(),
         );
         let mut out = self.apply_exact_hessian_minus_b_ambient_legs(rho, cache, &tangent, residual)?;
-        project_sphere_tangent_slots(
-            &residual.sphere_tangents,
+        project_coordinate_tangent_slots(
+            &residual.coordinate_tangents,
             &cache.row_offsets,
             &mut out.t.view_mut(),
         );
@@ -7200,8 +7289,8 @@ impl SaeManifoldTerm {
         let mut error = Array1::<f64>::zeros(p);
         let mut assignments = Array1::<f64>::zeros(k_atoms);
 
-        let sphere_tangents = self.sphere_tangent_blocks(row_dims)?;
-        let mut next_sphere_block = 0usize;
+        let coordinate_tangents = self.coordinate_tangent_blocks(row_dims)?;
+        let mut next_tangent_block = 0usize;
         let mut rows_out: Vec<ExactHessianDeltaRow> = Vec::with_capacity(n);
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
@@ -7334,11 +7423,11 @@ impl SaeManifoldTerm {
                     }
                 }
             }
-            // #2933 F36 — a sphere block's `ΔC_tt` is `P·ΔC_tt·P` and its `ΔC_tβ` is
-            // `P·ΔC_tβ`, in the tangent projector `B`'s row was assembled in.
-            while let Some(block) = sphere_tangents
-                .get(next_sphere_block)
-                .filter(|block| block.row == row)
+            // #2933 F36, #3438 — on every coordinate tangent block `ΔC_tt` is `P·ΔC_tt·P` and
+            // `ΔC_tβ` is `P·ΔC_tβ`, in the tangent projector `B`'s row was assembled in.
+            while let Some(block) = coordinate_tangents
+                .get(next_tangent_block)
+                .filter(|block| block.row() == row)
             {
                 for mut column in tt.axis_iter_mut(ndarray::Axis(1)) {
                     block.project_local(&mut column);
@@ -7349,7 +7438,7 @@ impl SaeManifoldTerm {
                 for mut column in tbeta.axis_iter_mut(ndarray::Axis(1)) {
                     block.project_local(&mut column);
                 }
-                next_sphere_block += 1;
+                next_tangent_block += 1;
             }
 
             rows_out.push(ExactHessianDeltaRow { tt, tbeta });

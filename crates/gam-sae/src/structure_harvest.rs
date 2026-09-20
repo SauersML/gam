@@ -2580,6 +2580,7 @@ pub(crate) fn remove_atoms(
     term.collapse_events.clear();
     term.last_row_layout = None;
     term.last_frames_active = false;
+    term.last_pinned_bound_slots.clear();
     term.fixed_decoder_assembly = false;
     term.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
     term.decoder_repulsion_gate = None;

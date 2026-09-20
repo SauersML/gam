@@ -1697,6 +1697,8 @@ impl SaeManifoldTerm {
         // return the block-diagonal system. `fixed_decoder_step_from_rows` reads
         // only `rows[*].htt`/`gt` + `row_offsets`, so no β-tier object is needed.
         if fixed_decoder {
+            self.last_pinned_bound_slots =
+                self.pinned_bound_slots_before_conversion(&sys, row_layout.as_ref());
             match row_layout.as_ref() {
                 None => {
                     // Dense uniform-q: project htt/gt (and the 0-width htbeta, a
@@ -1780,6 +1782,8 @@ impl SaeManifoldTerm {
         // Dense rows share one product manifold. Exact TopK rows may have
         // heterogeneous supports, so the compact arm rebuilds the corresponding
         // per-row product manifold before applying the same geometry.
+        self.last_pinned_bound_slots =
+            self.pinned_bound_slots_before_conversion(&sys, row_layout.as_ref());
         match row_layout.as_ref() {
             None => {
                 let raw_gt_rows: Vec<Array1<f64>> =
@@ -2655,6 +2659,46 @@ impl SaeManifoldTerm {
                 border_projection_depth,
             ),
         ))
+    }
+
+    /// #3438 — the `(row, local slot)` interval coordinates `B`'s Riemannian
+    /// conversion is about to pin in `sys`: the axes
+    /// [`LatentManifold::gradient_pinned_axes`] reads off each row's RAW gradient at
+    /// the row's ext-coord point, in the manifold and point the conversion itself
+    /// uses (the dense ext-coord product, or a compact row's own product). Called on
+    /// the unconverted system, since the conversion zeroes the gradient whose sign
+    /// decides the pin.
+    fn pinned_bound_slots_before_conversion(
+        &self,
+        sys: &ArrowSchurSystem,
+        layout: Option<&SaeRowLayout>,
+    ) -> Vec<(usize, usize)> {
+        let manifold = self.ext_coord_manifold();
+        if manifold.preserves_isometry_cross_block_coherence() {
+            // Euclidean and Circle factors only: no interval, nothing to pin.
+            return Vec::new();
+        }
+        let mut pinned = Vec::new();
+        match layout {
+            None => {
+                let ext = self.ext_coord_matrix();
+                for (row, block) in sys.rows.iter().enumerate() {
+                    for axis in manifold.gradient_pinned_axes(ext.row(row), block.gt.view()) {
+                        pinned.push((row, axis));
+                    }
+                }
+            }
+            Some(layout) => {
+                for (row, block) in sys.rows.iter().enumerate() {
+                    let (manifold_i, point_i) =
+                        self.compact_row_ext_manifold_and_point(row, layout);
+                    for axis in manifold_i.gradient_pinned_axes(point_i.view(), block.gt.view()) {
+                        pinned.push((row, axis));
+                    }
+                }
+            }
+        }
+        pinned
     }
 
     /// Project a dense full-`B` Beta-tier penalty Hessian `hbb` (`beta_dim ×

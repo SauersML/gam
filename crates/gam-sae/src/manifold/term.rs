@@ -514,6 +514,15 @@ pub struct SaeManifoldTerm {
     /// lock-step with the assembled system so the step interpretation cannot
     /// drift from the layout the system was built in.
     pub(crate) last_frames_active: bool,
+    /// #3438 — the `(row, local slot)` interval coordinates the MOST RECENT
+    /// `assemble_arrow_schur` pinned: at an endpoint whose descent direction leaves
+    /// the interval ([`LatentManifold::gradient_pinned_axes`] on the raw row
+    /// gradient), where `B`'s Riemannian conversion zeroes the gradient, the
+    /// Hessian row and column, and the cross-block row. Read off the raw gradient
+    /// before the conversion discards its sign, in the row layout the system was
+    /// built in, row-ascending. Every exact-information consumer applies the same
+    /// pin to `ΔC` ([`Self::coordinate_tangent_blocks`]).
+    pub(crate) last_pinned_bound_slots: Vec<(usize, usize)>,
     /// #1033 test seam: force the large-`n` assembly fold to use this row chunk
     /// width instead of the streaming-plan's `chunk_size`. `None` ⇒ production
     /// behavior (the admission plan picks the window). Tests set a tiny value to
@@ -839,6 +848,7 @@ impl Clone for SaeManifoldTerm {
             row_loss_weights: self.row_loss_weights.clone(),
             crosscoder_pricing_spans: self.crosscoder_pricing_spans.clone(),
             last_frames_active: self.last_frames_active,
+            last_pinned_bound_slots: self.last_pinned_bound_slots.clone(),
             assembly_chunk_override: self.assembly_chunk_override,
             fixed_decoder_assembly: false,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
@@ -953,6 +963,7 @@ pub(crate) struct SaeManifoldMutableState {
     pub(crate) logits: Array2<f64>,
     pub(crate) coords: Vec<LatentCoordValues>,
     pub(crate) last_row_layout: Option<SaeRowLayout>,
+    pub(crate) last_pinned_bound_slots: Vec<(usize, usize)>,
 }
 
 /// Typed refusal from an attempted mutable-state restore.
