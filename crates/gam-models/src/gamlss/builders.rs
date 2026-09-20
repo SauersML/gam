@@ -655,13 +655,21 @@ pub(crate) fn wiggle_block_penalty_matrices(
         .collect()
 }
 
-pub(crate) fn binomial_location_scale_link_eta_from_probability(
+/// The unit-scale threshold `eta_t` whose fitted probability is `probability`.
+///
+/// The family maps a threshold to its linear predictor through
+/// `binomial_location_scale_q0`, `q = -eta_t / sigma`, and then sets
+/// `mu = F(q)`. At the neutral scale `sigma = 1`, the threshold that
+/// reproduces `probability` is therefore the negated link quantile,
+/// `eta_t = -F^{-1}(probability)`, not the quantile itself. Seeding with the
+/// quantile itself would start every row at the mirrored prevalence (#3526).
+pub(crate) fn binomial_location_scale_threshold_from_probability(
     link_kind: &InverseLink,
     probability: f64,
 ) -> Result<f64, String> {
-    // The warm-start threshold is the link quantile of the weighted prevalence,
-    // finite only strictly inside (0, 1): a response whose weight sits on one
-    // outcome has no finite threshold, and a clamped probability would seed one.
+    // The link quantile of the weighted prevalence is finite only strictly
+    // inside (0, 1): a response whose weight sits on one outcome has no finite
+    // threshold, and a clamped probability would seed one.
     if !(probability > 0.0 && probability < 1.0) {
         return Err(GamlssError::InvalidInput {
             reason: format!(
@@ -671,15 +679,24 @@ pub(crate) fn binomial_location_scale_link_eta_from_probability(
         }
         .into());
     }
-    match link_kind {
-        InverseLink::Standard(StandardLink::Logit) => Ok((probability / (1.0 - probability)).ln()),
+    let q_target = match link_kind {
+        InverseLink::Standard(StandardLink::Logit) => (probability / (1.0 - probability)).ln(),
         InverseLink::Standard(StandardLink::Probit) => standard_normal_quantile(probability)
-            .map_err(|err| format!("failed to invert probit warm-start probability: {err}")),
-        InverseLink::Standard(StandardLink::CLogLog) => Ok((-((1.0 - probability).ln())).ln()),
-        other => Err(GamlssError::UnsupportedConfiguration { reason: format!(
-            "binomial location-scale warm start requires logit, probit, or cloglog link, got {other:?}"
-        ) }.into()),
-    }
+            .map_err(|err| format!("failed to invert probit warm-start probability: {err}"))?,
+        // ln(-ln(1 - p)), with ln(1 - p) formed as ln_1p(-p) so a rare
+        // prevalence keeps its digits instead of rounding 1 - p first.
+        InverseLink::Standard(StandardLink::CLogLog) => (-(-probability).ln_1p()).ln(),
+        other => {
+            return Err(GamlssError::UnsupportedConfiguration {
+                reason: format!(
+                    "binomial location-scale warm start requires logit, probit, or cloglog link, got {other:?}"
+                ),
+            }
+            .into());
+        }
+    };
+    // Invert `q = -eta_t / sigma` at sigma = 1.
+    Ok(-q_target)
 }
 
 #[cfg(test)]
@@ -690,16 +707,44 @@ mod warm_start_prevalence_tests {
     fn a_prevalence_on_one_outcome_has_no_warm_start_threshold() {
         let logit = InverseLink::Standard(StandardLink::Logit);
         for probability in [0.0, 1.0] {
-            let error = binomial_location_scale_link_eta_from_probability(&logit, probability)
+            let error = binomial_location_scale_threshold_from_probability(&logit, probability)
                 .expect_err("a single-outcome prevalence has no finite threshold");
             assert!(error.contains("strictly inside (0, 1)"), "{error}");
         }
         // Non-vacuity: an interior prevalence below the retired `1e-6` clamp
-        // maps verbatim.
+        // maps verbatim to the negated logit, i.e. logit(1 - p).
         let rare = 1.0e-9;
-        let eta = binomial_location_scale_link_eta_from_probability(&logit, rare)
+        let eta_t = binomial_location_scale_threshold_from_probability(&logit, rare)
             .expect("an interior prevalence has a threshold");
-        assert_eq!(eta, (rare / (1.0 - rare)).ln());
+        assert_eq!(eta_t, -(rare / (1.0 - rare)).ln());
+    }
+
+    /// The warm-start threshold must reproduce the prevalence through the
+    /// family's own map `mu = F(binomial_location_scale_q0(eta_t, 1))`, not
+    /// its mirror image (#3526). The round trip is one link quantile followed
+    /// by one inverse link, each accurate to a few ulps in `mu` on this
+    /// interior range, so `64 * EPSILON` in absolute `mu` bounds it.
+    #[test]
+    fn warm_start_threshold_reproduces_the_prevalence_through_the_family_map() {
+        let links = [
+            InverseLink::Standard(StandardLink::Logit),
+            InverseLink::Standard(StandardLink::Probit),
+            InverseLink::Standard(StandardLink::CLogLog),
+        ];
+        for link in &links {
+            for probability in [0.01, 0.2, 0.5, 0.85] {
+                let eta_t = binomial_location_scale_threshold_from_probability(link, probability)
+                    .expect("interior prevalence has a threshold");
+                let q = binomial_location_scale_q0(eta_t, 1.0);
+                let mu = inverse_link_jet_for_inverse_link(link, q)
+                    .expect("inverse-link jet")
+                    .mu;
+                assert!(
+                    (mu - probability).abs() <= 64.0 * f64::EPSILON,
+                    "{link:?}: seeded threshold {eta_t} gives mu={mu}, prevalence {probability}"
+                );
+            }
+        }
     }
 }
 
@@ -783,8 +828,8 @@ pub(crate) fn binomial_location_scalewarm_start(
         Some(beta) => beta.clone(),
         None => {
             let prevalence = weighted_binomial_prevalence(y, weights)?;
-            let eta = binomial_location_scale_link_eta_from_probability(link_kind, prevalence)?;
-            project_constant_eta_into_block(threshold_block, weights, eta)?
+            let eta_t = binomial_location_scale_threshold_from_probability(link_kind, prevalence)?;
+            project_constant_eta_into_block(threshold_block, weights, eta_t)?
         }
     };
     let beta_log_sigma = match noise_beta_hint {

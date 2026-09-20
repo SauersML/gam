@@ -492,13 +492,13 @@ struct CensusLedger {
 /// candidates instead would shrink every threshold `m/(α·k)` to the survivors
 /// and let the ledger reject at a level the search never paid for.
 fn ebh_ledger(adjudicated: &[f64], family: usize, alpha: f64) -> CensusLedger {
-    debug_assert!(
+    assert!(
         adjudicated.len() <= family,
         "curl census: {} adjudicated e-values from a family of {family}",
         adjudicated.len()
     );
     let mut e_values = adjudicated.to_vec();
-    e_values.resize(family.max(adjudicated.len()), 0.0);
+    e_values.resize(family, 0.0);
     // A padded `e = 0` can never clear the positive threshold `m/(α·k)`, so every
     // rejected index points into `adjudicated`.
     let rejected = ebh_reject(&e_values, alpha);
