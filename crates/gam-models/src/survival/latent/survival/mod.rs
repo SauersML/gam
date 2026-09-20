@@ -1449,14 +1449,6 @@ fn prepare_latent_time_block(
     design_right: Option<&DesignMatrix>,
     derivative_guard: f64,
 ) -> Result<PreparedLatentTimeBlock, LatentSurvivalError> {
-    if !input.time_monotonicity.is_coordinate_cone() {
-        return Err(LatentSurvivalError::UnsupportedConfiguration {
-            reason: format!(
-                "latent survival requires a coordinate-cone monotonicity strategy; got {:?}",
-                input.time_monotonicity
-            ),
-        });
-    }
     let design_entry = input
         .design_entry
         .try_to_dense_by_chunks("latent survival entry time design")?;

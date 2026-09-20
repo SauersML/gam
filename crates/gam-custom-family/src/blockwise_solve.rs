@@ -218,41 +218,6 @@ pub(crate) fn labeled_options_for_rho<'a>(
     Ok(std::borrow::Cow::Owned(owned))
 }
 
-pub(crate) fn outerobjectivegradienthessian_labeled<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    layout: &PenaltyLabelLayout,
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: &gam_problem::RhoPrior,
-    eval_mode: EvalMode,
-) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
-    let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
-    let physical_warm_start = physical_warm_start_for_labeled(warm_start, &physical_rho, layout);
-    // gam#1587: build the per-eval joint penalty bundle from the current outer ρ
-    // (each joint spec's λ pulled from its tied outer coordinate) and attach it
-    // to the inner-solve options so BOTH the inner β̂ AND the outer evaluator
-    // (penalty coords / logdet / operator) see the full-width centered penalty.
-    // No joint specs ⇒ `options` is passed through untouched (byte-identical).
-    let labeled_options = labeled_options_for_rho(options, specs, layout, rho)?;
-    let options = labeled_options.as_ref();
-    let base = outerobjectivegradienthessian_internal(
-        family,
-        specs,
-        options,
-        &layout.penalty_counts,
-        &physical_rho,
-        physical_warm_start.as_ref().or(warm_start),
-        gam_problem::RhoPrior::Flat,
-        eval_mode,
-    )?;
-    pullback_labeled_outer_eval(base, rho, layout, rho_prior, eval_mode)
-        .map_err(CustomFamilyError::from)
-}
-
 /// Correct one labeled-rho continuation waypoint to its certified coefficient
 /// mode, without constructing a Laplace scalar that an interior waypoint would
 /// discard.
@@ -2698,16 +2663,50 @@ pub(crate) fn strict_solve_spd_or_spectral_step(
 /// put that cutoff at `4.5e4` beside eigenvalues of `0.013`–`0.5`. The band
 /// there is `450`, and the eigensolver's backward error bounds each computed
 /// eigenvalue only to within it.
+///
+/// Every eigenvalue the rank drops must itself lie inside that band. A dropped
+/// positive eigenvalue always does (every resolved positive one is kept), but a
+/// negative one below `−band` is resolved curvature: `M` is indefinite, `β̂` is
+/// a saddle of the penalized objective, and no Laplace approximation exists
+/// there. Pricing `log|M₊|` over the positive part would be a different
+/// criterion, so that precision is refused by name, as
+/// `DenseSpectralOperator::from_eigenpairs` refuses an excluded eigenvalue
+/// outside the band (#3303). At the survival location-scale link-wiggle modes
+/// of #3303 the floor kept 8 of 10 eigenpairs and silently dropped `−4.577` and
+/// `−2.217` against a band of `1.3e-11`.
 pub(crate) fn laplace_precision_kept_eigenpairs(
     eigenvalues: &[f64],
     penalty_rank: usize,
-) -> Vec<usize> {
+) -> Result<Vec<usize>, String> {
     let rank = DenseSpectralOperator::identified_rank(eigenvalues, penalty_rank);
-    let mut kept: Vec<usize> = (0..eigenvalues.len()).collect();
-    kept.sort_by(|&a, &b| eigenvalues[b].total_cmp(&eigenvalues[a]));
+    let mut order: Vec<usize> = (0..eigenvalues.len()).collect();
+    order.sort_by(|&a, &b| eigenvalues[b].total_cmp(&eigenvalues[a]));
+    let rounding_band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(eigenvalues);
+    let material_negative: Vec<f64> = order[rank..]
+        .iter()
+        .map(|&index| eigenvalues[index])
+        .filter(|&value| !(value >= -rounding_band))
+        .collect();
+    if !material_negative.is_empty() {
+        return Err(format!(
+            "Laplace precision M is indefinite: {} dropped eigenvalue(s) lie below its \
+             rounding band -p*eps*||M||_2 = {:.6e} (lowest {:.6e}; kept rank {rank} of {}), so \
+             the mode is a saddle of the penalized objective and no Laplace approximation \
+             exists here; log|M+| over the positive part is a different criterion and is not \
+             priced in its place (#3303)",
+            material_negative.len(),
+            -rounding_band,
+            material_negative
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min),
+            eigenvalues.len(),
+        ));
+    }
+    let mut kept = order;
     kept.truncate(rank);
     kept.sort_unstable();
-    kept
+    Ok(kept)
 }
 
 /// Rank of a penalty `S_λ` at its own rounding band `p·ε·‖S_λ‖₂`: the
@@ -2810,6 +2809,9 @@ pub(crate) fn strict_exact_pseudo_logdet(
         });
     }
     Ok(laplace_precision_kept_eigenpairs(evals_slice, penalty_rank)
+        .map_err(|reason| CustomFamilyError::NumericalFailure {
+            reason: format!("strict pseudo-laplace logdet: {reason}"),
+        })?
         .into_iter()
         .map(|index| evals[index].ln())
         .sum())

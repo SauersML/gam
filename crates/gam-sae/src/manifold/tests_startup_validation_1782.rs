@@ -385,10 +385,9 @@ fn run_full_fit(
         .unwrap_or_else(|e| {
             // The two #1782 failure surfaces both land here: the threshold-gate / euclidean
             // "no candidate seeds passed outer startup validation" abort, and the
-            // softmax "BFGS aborted: globally infeasible neighbourhood at seed
-            // (probe-refusal guard)" abort — both are the emptied / globally-refused
-            // seed cascade the fit must avoid by entering a basin with defined
-            // quasi-Laplace score; infeasible probes remain `+∞` and cannot certify.
+            // softmax seed whose every probe was refused — both are the emptied /
+            // globally-refused seed cascade the fit must avoid by entering a basin with
+            // defined quasi-Laplace score; infeasible probes remain `+∞` and cannot certify.
             panic!("#1782 {label} fit must not abort at startup / in the outer solver, got: {e}")
         });
     objective
@@ -415,9 +414,8 @@ fn run_full_fit(
 /// `softmax` is the SECOND #1782 failure surface: its seed and its whole
 /// neighbourhood land in the recoverable infeasible-ρ refusal class, so the
 /// outer BFGS lane previously returned `+∞` for every probe, never accepted a
-/// step, and the bridge's non-termination guard escalated the globally-refused
-/// neighbourhood to a FATAL seed rejection ("BFGS aborted: globally infeasible
-/// neighbourhood at seed (probe-refusal guard)"). `ordered_beta_bernoulli`+`circle` lands in
+/// step, and the globally-refused neighbourhood ended as a rejected seed.
+/// `ordered_beta_bernoulli`+`circle` lands in
 /// the PD region and never trips it — RED before the fix on `softmax`, GREEN
 /// after (the entry path now reaches a basin with defined quasi-Laplace score).
 #[test]

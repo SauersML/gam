@@ -68,6 +68,9 @@ These are the plans (see `plans.py`):
 | `positive_small` | n ∈ {1e2, 1e3}, positive-response families × all designs | 3 |
 | `positive_1e4` | n=1e4, positive-response families × all designs | 2 |
 | `positive_1e5` | n=1e5, positive-response families × {`p1`, `p5`, `te`} | 1 |
+| `count_small` | n ∈ {1e2, 1e3}, count families × all designs | 3 |
+| `count_1e4` | n=1e4, count families × all designs | 2 |
+| `count_1e5` | n=1e5, count families × {`p1`, `p5`, `te`} | 1 |
 | `fuzz_families` | gamfit only: n ∈ {50, 500, 5000}, every family/link label × every support-edge regime (convergence fuzz, below) | 3 |
 | `fuzz_families_quick` | gamfit only: n ∈ {50, 500}, every family/link label × {base, edge, zeros, lowdisp} (the 0-failure regression test) | 1 |
 | `threads`   | gamfit only: n ∈ {1e4, 1e5, 1e6} × {gaussian, binomial} × {`p5`, `p20`, `te`} × threads {1, 2, 4, 8, auto} | 2 |
@@ -84,6 +87,17 @@ Gamma on y (`lognormal_gamma`), and scaled-t noise with 3 degrees of freedom
 It has no scaled-t family, and its inverse Gaussian stores sqrt(phi) as its
 scale, so `inverse_gaussian` and `student_t` run gamfit alone and report
 absolute numbers.
+
+The count plans are the count-family sweep. They use their own families:
+`poisson_lo`, `poisson_mid` and `poisson_hi` (Poisson with mean level 0.3, 5
+and 500), `poisson_exposure` (Poisson with a log-exposure offset), `negbin`
+(negative binomial, theta estimated) and `tweedie` (power fixed at 1.5, phi
+estimated). pyGAM has no negative binomial or Tweedie family, so those cells
+run gamfit alone and report absolute time and the certification rate (the
+`k/n ok` count in the Status table; a fit that returns has certified). For
+`poisson_exposure`, pyGAM is fitted on the rate `y/E` with weights `E`, which
+is the exposure likelihood; `PoissonGAM.gridsearch` in pyGAM 0.12.0 passes the
+weights on as the exposure a second time.
 
 The `fuzz_families` plans are a convergence fuzz, not a comparison
 (`fuzz_families.py`). A cell is one family/link label, n and an `ff-<regime>`
