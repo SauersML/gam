@@ -647,15 +647,16 @@ mod tests {
         // Sample covariance vs Σ = H⁻¹.
         let det = 4.0 * 3.0 - 1.0;
         let sigma = array![[3.0 / det, -1.0 / det], [-1.0 / det, 4.0 / det]];
+        let rows = s.nrows();
         let mut cov = Array2::<f64>::zeros((2, 2));
-        for k in 0..n {
+        for k in 0..rows {
             let d0 = s[(k, 0)] - mean[0];
             let d1 = s[(k, 1)] - mean[1];
             cov[(0, 0)] += d0 * d0;
             cov[(0, 1)] += d0 * d1;
             cov[(1, 1)] += d1 * d1;
         }
-        cov.mapv_inplace(|v| v / (n as f64 - 1.0));
+        cov.mapv_inplace(|v| v / (rows as f64 - 1.0));
         cov[(1, 0)] = cov[(0, 1)];
         for i in 0..2 {
             for j in 0..2 {
@@ -687,7 +688,7 @@ mod tests {
 
         let col = s.column(0);
         let mean = col.mean().unwrap();
-        let var = col.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0);
+        let var = col.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (col.len() as f64 - 1.0);
         let two_over_pi = 2.0 / std::f64::consts::PI;
         let expect_mean = sigma * two_over_pi.sqrt();
         let expect_var = sigma * sigma * (1.0 - two_over_pi);
