@@ -104,7 +104,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use gam_linalg::roundoff::factor_singular_band;
 use gam_math::probability::{fisher_snedecor_sf, ln_regularized_beta_lower_from_log_x};
-use gam_math::special::gauss_legendre;
+use gam_math::special::{gauss_legendre, logaddexp};
 use statrs::function::beta::ln_beta;
 
 /// Which binding notion a carve report speaks about (see module docs).
@@ -1815,21 +1815,9 @@ fn hypoexponential_survival(rates: &[f64], t: f64) -> f64 {
         }
         step += 1;
         log_weight += ln_qt - (step as f64).ln();
-        log_sum = log_add(log_sum, log_weight + log_mass);
+        log_sum = logaddexp(log_sum, log_weight + log_mass);
     }
     log_sum.exp()
-}
-
-/// `ln(eᵃ + eᵇ)`.
-fn log_add(a: f64, b: f64) -> f64 {
-    if a == f64::NEG_INFINITY {
-        return b;
-    }
-    if b == f64::NEG_INFINITY {
-        return a;
-    }
-    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
-    hi + (lo - hi).exp().ln_1p()
 }
 
 #[cfg(test)]
