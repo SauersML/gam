@@ -2870,6 +2870,52 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
     );
 }
 
+/// #3632: a Matérn `include_intercept=true` term realizes `[K·Z | 1]`, and
+/// its metadata chart `Z` acts on the kernel columns `K` alone. A centered
+/// term's collection transform acts on all realized columns, so it cannot
+/// compose with `Z`. When the transform drops exactly one column, its shape
+/// matches `Z`'s, and it used to be taken for `Z` silently. That gave a
+/// penalty one column wider than the design, which panicked in the penalty
+/// placement. The combination is now refused at every center count, and the
+/// uncentered form still builds with every penalty inside the design.
+#[test]
+fn matern_include_intercept_is_refused_under_centering_and_builds_uncentered() {
+    let ds = continuous_dataset(
+        &["y", "x", "zbig"],
+        (0..240)
+            .map(|i| {
+                let x = ((i % 24) as f64 / 23.0).powi(2);
+                let z = (i / 24) as f64 / 9.0;
+                vec![(i as f64 * 0.13).sin() + x + z, x, 500.0 * z + 3.0]
+            })
+            .collect(),
+    );
+    let col_map = ds.column_map();
+    let build = |formula: &str| {
+        let parsed = parse_formula(formula).expect("formula parses");
+        let mut notes = Vec::new();
+        let spec = build_termspec(&parsed.terms, &ds, &col_map, &mut notes).expect("termspec");
+        crate::smooth::build_term_collection_design(ds.values.view(), &spec)
+    };
+    for centers in ["", ", centers=6", ", centers=9", ", centers=16", ", centers=30"] {
+        let formula = format!("y ~ matern(x, zbig, include_intercept=true{centers})");
+        let err = match build(&formula) {
+            Ok(_) => panic!("`{formula}` must be refused, not built"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("include_intercept"), "`{formula}`: {err}");
+    }
+    let design = build("y ~ matern(x, zbig, include_intercept=true, identifiability=none)")
+        .expect("an uncentered Matérn keeps its appended constant");
+    let width = design.design.to_dense().ncols();
+    assert!(!design.smooth.penalties.is_empty());
+    for penalty in &design.smooth.penalties {
+        let range = &penalty.col_range;
+        assert!(range.end <= width, "penalty {range:?} outside the {width}-column design");
+        assert_eq!(penalty.local.nrows(), range.len(), "penalty block vs its column range");
+    }
+}
+
 #[test]
 fn sz_factor_smooth_low_cardinality_uses_bspline_marginal() {
     // #1605: the `sz` factor-smooth marginal is the SAME penalized B-spline

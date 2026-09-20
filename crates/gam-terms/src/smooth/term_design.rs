@@ -3072,19 +3072,43 @@ fn with_identifiability_transform(
             identifiability_transform,
             input_scale,
             aniso_log_scales,
-        } => Ok(BasisMetadata::Matern {
-            centers: centers.clone(),
-            length_scale: *length_scale,
-            periodic: periodic.clone(),
-            nu: *nu,
-            include_intercept: *include_intercept,
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
-            input_scale: *input_scale,
-            aniso_log_scales: aniso_log_scales.clone(),
-        }),
+        } => {
+            // Every consumer of the Matérn chart applies it to the KERNEL
+            // columns only: the design rebuild, the operator-penalty triplet
+            // and predict each form `K·Z` and append the `include_intercept`
+            // constant after it, as `[K·Z | 1]`. A collection transform is
+            // expressed on the realized `[K·Z | 1]` columns, so it composes
+            // with `Z` only when no column is appended. With one appended, no
+            // kernel-only chart reproduces it. The composition then either
+            // fails on shape, or it matches `Z`'s shape when the transform
+            // removes exactly one column, and is silently taken for `Z`. The
+            // penalty is then built one column wider than the design (#3632).
+            // The appended constant is also exactly the direction centering
+            // exists to remove, because the collection's constraint block
+            // always carries the constant column. So only an uncentered term
+            // can keep it.
+            if *include_intercept && transform.is_some() {
+                crate::bail_invalid_basis!(
+                    "matern include_intercept=true appends a constant column, but this term is \
+                     centered against the model's constant, which removes exactly that column; \
+                     drop include_intercept=true, or also pass identifiability=none to keep the \
+                     term uncentered"
+                );
+            }
+            Ok(BasisMetadata::Matern {
+                centers: centers.clone(),
+                length_scale: *length_scale,
+                periodic: periodic.clone(),
+                nu: *nu,
+                include_intercept: *include_intercept,
+                identifiability_transform: compose_identifiability_transforms(
+                    identifiability_transform.as_ref(),
+                    transform,
+                )?,
+                input_scale: *input_scale,
+                aniso_log_scales: aniso_log_scales.clone(),
+            })
+        }
         BasisMetadata::Duchon {
             centers,
             length_scale,
