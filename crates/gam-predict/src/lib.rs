@@ -2227,35 +2227,28 @@ where
     )
 }
 
-/// Per-row Gaussian conditional response (observation-noise) variance
-/// `Var(Y_i | μ_i) = σ̂² / w_i` (#2077).
-///
-/// A WEIGHTED Gaussian fit models `Var(y_i) = σ² / w_i`, so the observation
-/// noise a *prediction* interval must carry is heteroscedastic in the per-row
-/// prior weight — a weight-`w_i` row is `1/√(w_i)` as wide as a weight-1 row.
-/// This is the analytic-band sibling of the generative `sigma_i = σ̂/√(w_i)`
-/// scaling (#2025, `scale_gaussian_sigma_by_prior_weights`); before #2077 the
-/// analytic path broadcast the pooled scalar `σ̂²` to every row, contradicting
-/// the weight-aware `sample_replicates` path on the same model/rows.
-///
-/// `prior_weights` are the per-row weights resolved from the PREDICTION frame
-/// (the same weight column / unit-weight default `sample_replicates` resolves,
-/// via `resolve_weight_column`). `None` means unit weights, so an unweighted fit
-/// is byte-identical to the scalar broadcast. A zero or non-finite weight has no
-/// finite observation variance under the analytic-weight model, and a weight
-/// vector that does not span the rows describes other rows: both are refused
-/// with the row named, exactly as the generative sibling refuses them (#3957).
-fn gaussian_observation_variance_per_row(
+/// Per-row precision-scaled dispersion, `phi_i = phi / w_i`.
+/// Gaussian observation variance is the constant-variance special case. Gamma,
+/// inverse Gaussian and Tweedie use this same row dispersion in their variance
+/// functions; frequency-weighted families do not rescale their observation law.
+/// Missing weights mean unit precision. Present weights must match the rows and
+/// be finite and positive; an unrepresentable scaled dispersion is an error.
+fn precision_dispersion_per_row(
     obsvar: f64,
     n: usize,
     prior_weights: Option<&Array1<f64>>,
 ) -> Result<Array1<f64>, EstimationError> {
+    if !obsvar.is_finite() || obsvar < 0.0 {
+        return Err(EstimationError::InvalidInput(
+            "observation band: dispersion must be finite and non-negative".into(),
+        ));
+    }
     let Some(weights) = prior_weights else {
         return Ok(Array1::from_elem(n, obsvar));
     };
     if weights.len() != n {
         return Err(EstimationError::InvalidInput(format!(
-            "Gaussian observation band: prior weights length {} does not match the {n} \
+            "observation band: precision prior weights length {} does not match the {n} \
              prediction rows",
             weights.len()
         )));
@@ -2267,11 +2260,19 @@ fn gaussian_observation_variance_per_row(
         .find(|&(_, w)| !(w.is_finite() && w > 0.0))
     {
         return Err(EstimationError::InvalidInput(format!(
-            "Gaussian observation band: prior weight[{row}] = {w} has no finite \
-             observation variance sigma^2/w; weights must be finite and > 0"
+            "observation band: precision prior weight[{row}] = {w} has no finite \
+             dispersion phi/w; weights must be finite and > 0"
         )));
     }
-    Ok(weights.mapv(|w| obsvar / w))
+    weights.iter().enumerate().map(|(row, &weight)| {
+        let scaled = obsvar / weight;
+        if !scaled.is_finite() || scaled < 0.0 || (obsvar > 0.0 && scaled == 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "observation band: precision-scaled dispersion at row {row} is not representable"
+            )));
+        }
+        Ok(scaled)
+    }).collect()
 }
 
 /// Total predictive variance `Var(Y)` of a fresh response, per row, by the law of
@@ -2287,11 +2288,11 @@ fn gaussian_observation_variance_per_row(
 /// - Gaussian:   `σ̂²/w + v`
 /// - Poisson:    `m + v`
 /// - NegBin:     `m + (m² + v)/θ + v`
-/// - Tweedie:    `φE[μ^p] + v`, with `E[μ^p]` exact under the log-link log-normal
+/// - Tweedie:    `φE[μ^p]/w + v`, with `E[μ^p]` exact under the log-link log-normal
 ///   posterior: `E[μ^p] = m^p (1 + v/m²)^{p(p−1)/2}` (for p > 1 the factor is
 ///   ≥ 1, so the plug-in under-counts)
-/// - Gamma:      `φ(m² + v) + v`
-/// - InverseGaussian: `φE[μ³] + v`, `E[μ³] = m³(1 + v/m²)³` by the same closure
+/// - Gamma:      `φ(m² + v)/w + v`
+/// - InverseGaussian: `φE[μ³]/w + v`, `E[μ³] = m³(1 + v/m²)³` by the same closure
 /// - Beta:       `E[μ(1−μ)]/(1+φ) + v = (m·c + φ·v)/(1+φ)`
 /// - Bernoulli (Binomial, and Royston–Parmar's horizon indicator `1{T > t}`):
 ///   `E[μ(1−μ)] + v = m·c`, exactly
@@ -2304,8 +2305,8 @@ fn gaussian_observation_variance_per_row(
 /// carried: where μ rounds to one, `1 − m` is exactly zero while `c` is not
 /// (#3140). Without that complement those families return `Ok(None)`, as every
 /// family does without the fitted dispersion its law needs (`observation_phi` /
-/// `observation_theta`). An invalid Gaussian prior weight is an error (see
-/// [`gaussian_observation_variance_per_row`]).
+/// `observation_theta`). An invalid precision prior weight is an error (see
+/// [`precision_dispersion_per_row`]).
 pub(crate) fn family_predictive_variance<S>(
     response: &ResponseFamily,
     mean: &Array1<f64>,
@@ -2322,18 +2323,31 @@ where
     let rows = |term: &dyn Fn(usize, f64) -> f64| {
         Array1::from_iter(mean.iter().enumerate().map(|(i, &m)| term(i, m)))
     };
-    // The only fallible input: a Gaussian prior weight with no finite
-    // observation variance is refused before any family law is evaluated.
-    let gaussian_noise = match response {
+    // Precision families share the same per-row dispersion used by the fitted
+    // likelihood and observation sampler. Frequency weights leave the law alone.
+    let row_dispersion = match response {
         ResponseFamily::Gaussian => source
             .observation_standard_deviation()
-            .map(|sd| gaussian_observation_variance_per_row(sd.powi(2), n, prior_weights))
+            .map(|sd| precision_dispersion_per_row(sd.powi(2), n, prior_weights))
+            .transpose()?,
+        ResponseFamily::Gamma
+        | ResponseFamily::InverseGaussian
+        | ResponseFamily::Tweedie { .. } => source
+            .observation_phi()
+            .map(|phi| {
+                if !(phi.is_finite() && phi > 0.0) {
+                    return Err(EstimationError::InvalidInput(
+                        "observation band: fitted dispersion must be finite and positive".into(),
+                    ));
+                }
+                precision_dispersion_per_row(phi, n, prior_weights)
+            })
             .transpose()?,
         _ => None,
     };
     let variance = || match response {
         ResponseFamily::Gaussian => {
-            let noise = gaussian_noise.as_ref()?;
+            let noise = row_dispersion.as_ref()?;
             Some(rows(&|i, _| noise[i] + v[i]))
         }
         ResponseFamily::Poisson => Some(rows(&|i, m| m + v[i])),
@@ -2346,7 +2360,7 @@ where
             Some(rows(&|i, m| m + (m * m + v[i]) / theta + v[i]))
         }
         ResponseFamily::Tweedie { p } => {
-            let phi = source.observation_phi()?;
+            let phi = row_dispersion.as_ref()?;
             let power = *p;
             Some(rows(&|i, m| {
                 let moment = if v[i] > 0.0 && m > 0.0 {
@@ -2354,22 +2368,22 @@ where
                 } else {
                     m.powf(power)
                 };
-                phi * moment + v[i]
+                phi[i] * moment + v[i]
             }))
         }
         ResponseFamily::Gamma => {
-            let phi = source.observation_phi()?;
-            Some(rows(&|i, m| phi * (m * m + v[i]) + v[i]))
+            let phi = row_dispersion.as_ref()?;
+            Some(rows(&|i, m| phi[i] * (m * m + v[i]) + v[i]))
         }
         ResponseFamily::InverseGaussian => {
-            let phi = source.observation_phi()?;
+            let phi = row_dispersion.as_ref()?;
             Some(rows(&|i, m| {
                 let moment = if v[i] > 0.0 && m > 0.0 {
                     m.powi(3) * (1.0 + v[i] / (m * m)).powi(3)
                 } else {
                     m.powi(3)
                 };
-                phi * moment + v[i]
+                phi[i] * moment + v[i]
             }))
         }
         ResponseFamily::Beta { .. } => {
@@ -2385,7 +2399,19 @@ where
             (*nu > 2.0).then(|| rows(&|i, _| sigma * sigma * nu / (nu - 2.0) + v[i]))
         }
     };
-    Ok(variance())
+    let result = variance();
+    if let Some(values) = &result {
+        if let Some((row, value)) = values
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || **value < 0.0)
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "predictive variance at row {row} is not finite and non-negative: {value}"
+            )));
+        }
+    }
+    Ok(result)
 }
 
 #[inline]
@@ -6049,3 +6075,174 @@ mod gaussian_location_scale_gauge_lifted_precision_1561_tests;
 
 #[cfg(test)]
 mod gaussian_location_scale_wiggle_replay_3001_tests;
+
+#[cfg(test)]
+mod precision_weighted_observation_tests {
+    use super::*;
+
+    struct Scale;
+    impl UncertaintyCovarianceSource for Scale {
+        fn select_uncertainty_backend(
+            &self,
+            expected_dim: usize,
+            mode: InferenceCovarianceMode,
+            label: &str,
+        ) -> Result<(PredictionCovarianceBackend<'_>, InferenceCovarianceMode), EstimationError>
+        {
+            panic!(
+                "variance assembly does not select covariance: dimension={expected_dim}, mode={mode:?}, label={label}"
+            )
+        }
+        fn resolved_fitted_link_state(
+            &self,
+            family: &LikelihoodSpec,
+        ) -> Result<Option<FittedLinkState>, EstimationError> {
+            panic!("variance assembly does not resolve links: {family:?}")
+        }
+        fn observation_standard_deviation(&self) -> Option<f64> {
+            Some(0.5)
+        }
+        fn observation_phi(&self) -> Option<f64> {
+            Some(0.25)
+        }
+    }
+
+    #[test]
+    fn continuous_precision_weights_scale_only_conditional_noise() {
+        let m = ndarray::array![1.5, 2.5];
+        let v = ndarray::array![0.2, 0.3];
+        let w = ndarray::array![0.5, 4.0];
+        for response in [
+            ResponseFamily::Gaussian,
+            ResponseFamily::Gamma,
+            ResponseFamily::InverseGaussian,
+            ResponseFamily::Tweedie { p: 1.5 },
+        ] {
+            let got = family_predictive_variance(&response, &m, None, &v, &Scale, Some(&w))
+                .unwrap()
+                .unwrap();
+            let unweighted = family_predictive_variance(&response, &m, None, &v, &Scale, None)
+                .unwrap()
+                .unwrap();
+            let unit = family_predictive_variance(
+                &response,
+                &m,
+                None,
+                &v,
+                &Scale,
+                Some(&ndarray::array![1.0, 1.0]),
+            )
+            .unwrap()
+            .unwrap();
+            for row in 0..2 {
+                let moment = match response {
+                    ResponseFamily::Gaussian => 1.0,
+                    ResponseFamily::Gamma => m[row] * m[row] + v[row],
+                    ResponseFamily::InverseGaussian => {
+                        m[row].powi(3) * (1.0 + v[row] / m[row].powi(2)).powi(3)
+                    }
+                    ResponseFamily::Tweedie { p } => {
+                        // Independent lognormal moment formula from its normal
+                        // location and variance, rather than the production ratio.
+                        let log_variance = (1.0 + v[row] / m[row].powi(2)).ln();
+                        (p * (m[row].ln() - 0.5 * log_variance) + 0.5 * p * p * log_variance).exp()
+                    }
+                    other => panic!("unexpected precision family in fixture: {other:?}"),
+                };
+                let expected = 0.25 * moment / w[row] + v[row];
+                assert!((got[row] - expected).abs() < 2e-14 * expected.max(1.0));
+                assert_eq!(unit[row].to_bits(), unweighted[row].to_bits());
+                assert!(
+                    (got[row] - v[row] - (unweighted[row] - v[row]) / w[row]).abs()
+                        < 2e-14 * expected.max(1.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frequency_weights_do_not_change_law_or_invent_student_t_variance() {
+        let m = ndarray::array![2.0, 3.0];
+        let v = ndarray::array![0.2, 0.3];
+        let weights = ndarray::array![1.0, 4.0];
+        for response in [
+            ResponseFamily::Poisson,
+            ResponseFamily::StudentT {
+                sigma: 1.5,
+                nu: 4.0,
+            },
+        ] {
+            let a = family_predictive_variance(&response, &m, None, &v, &Scale, None).unwrap();
+            let b = family_predictive_variance(&response, &m, None, &v, &Scale, Some(&weights))
+                .unwrap();
+            assert_eq!(a, b);
+            if matches!(response, ResponseFamily::StudentT { .. }) {
+                assert_eq!(b.unwrap(), ndarray::array![4.5 + 0.2, 4.5 + 0.3]);
+            }
+        }
+        for nu in [1.0, 2.0] {
+            assert!(
+                family_predictive_variance(
+                    &ResponseFamily::StudentT { sigma: 1.5, nu },
+                    &m,
+                    None,
+                    &v,
+                    &Scale,
+                    Some(&weights)
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn precision_band_weights_and_scaled_parameters_are_checked() {
+        for response in [
+            ResponseFamily::Gamma,
+            ResponseFamily::InverseGaussian,
+            ResponseFamily::Tweedie { p: 1.5 },
+        ] {
+            let error = family_predictive_variance(
+                &response,
+                &ndarray::array![f64::MAX],
+                None,
+                &ndarray::array![0.0],
+                &Scale,
+                Some(&ndarray::array![1.0]),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("predictive variance at row 0"));
+        }
+
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for response in [
+                ResponseFamily::Gaussian,
+                ResponseFamily::Gamma,
+                ResponseFamily::InverseGaussian,
+                ResponseFamily::Tweedie { p: 1.5 },
+            ] {
+                assert!(
+                    family_predictive_variance(
+                        &response,
+                        &ndarray::array![1.0],
+                        None,
+                        &ndarray::array![0.0],
+                        &Scale,
+                        Some(&ndarray::array![invalid])
+                    )
+                    .is_err()
+                );
+            }
+        }
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(precision_dispersion_per_row(invalid, 1, None).is_err());
+        }
+        assert!(precision_dispersion_per_row(1.0, 1, Some(&Array1::zeros(0))).is_err());
+        assert!(precision_dispersion_per_row(f64::MAX, 1, Some(&ndarray::array![0.25])).is_err());
+        assert!(
+            precision_dispersion_per_row(f64::from_bits(1), 1, Some(&ndarray::array![4.0]))
+                .is_err()
+        );
+    }
+}

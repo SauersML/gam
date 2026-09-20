@@ -3111,5 +3111,14 @@
     ],
     "reason": "#4549: replace the expensive six-dimensional Duchon fixture with a bounded one-dimensional smooth that still fires latent-score calibration, selects the empirical measure, and fits smoothing coordinates. The unused old surface-formula constant is removed.",
     "evidence": "The exact revised fixture passes through unchanged production formula-to-payload dispatch in8.23seconds on MSI, including both covariance/SE pairs and save-load checks. Its exact integration-test source also compiles against the coherent phase4 dependency graph with warnings denied."
+  },
+  {
+    "base": "6f9276e7cdc2c8739bb908dcf4b0e49eaad12acb",
+    "items": [
+      "crates/gam-models/src/inference/generative.rs:fn:scale_gaussian_sigma_by_prior_weights",
+      "crates/gam-predict/src/lib.rs:fn:gaussian_observation_variance_per_row"
+    ],
+    "reason": "Replace Gaussian-only precision-weight helpers with live family-aware observation-law and per-row dispersion owners. Gamma, inverse Gaussian and Tweedie use the same fitted precision interpretation in sampling and predictive variance; frequency-weighted laws remain unchanged. No compatibility wrappers remain.",
+    "evidence": "Eight exact complete-generative-module tests pass, including 160000 seeded row draws against independent EDM moments, representability refusal and Student-t nu1/2/4 controls. Three exact predictive-variance tests cover total-variance formulas, frequency laws and invalid weights. Coherent production metadata checks pass for all changed crates and their reverse dependencies with warnings denied."
   }
 ]
