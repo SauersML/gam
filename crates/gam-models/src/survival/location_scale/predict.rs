@@ -375,11 +375,68 @@ pub(crate) fn inverse_link_failure_prob_checked(
         })
 }
 
+/// `S(η) = 1 − F(η)` for a location-scale survival fit's residual distribution,
+/// evaluated from `η` rather than as `1 − F`.
+///
+/// `F` rounds to exactly `1` far inside the upper tail (probit at `η ≈ 8.3`,
+/// cloglog at `η ≈ 3.6`, logit at `η ≈ 37`), after which `1 − F` is a hard `0`
+/// while the model's survival is a representable number, and before that `1 − F`
+/// keeps only `ε/S` relative digits. The fitted likelihood never forms `1 − F`
+/// ([`inverse_link_survival_probvalue`]); this is the same value, with the
+/// inverse link's evaluation errors reported instead of panicking. The standard
+/// links use their closed forms ([`standard_link_survival_value`]); the stateful
+/// links use the shared cancellation-free complement
+/// ([`gam_solve::mixture_link::inverse_link_complement_for_inverse_link`]).
 pub(crate) fn inverse_link_survival_prob_checked(
     inverse_link: &InverseLink,
     eta: f64,
 ) -> Result<f64, SurvivalLocationScaleError> {
-    inverse_link_failure_prob_checked(inverse_link, eta).map(|f| (1.0 - f).clamp(0.0, 1.0))
+    let failure = inverse_link_failure_prob_checked(inverse_link, eta)?;
+    let survival = match inverse_link {
+        InverseLink::Standard(link) => {
+            standard_link_survival_value(*link, eta).unwrap_or(1.0 - failure)
+        }
+        _ => gam_solve::mixture_link::inverse_link_complement_for_inverse_link(
+            inverse_link,
+            eta,
+            failure,
+        ),
+    };
+    Ok(survival.clamp(0.0, 1.0))
+}
+
+/// Closed-form `S(η) = 1 − F(η)` of a standard residual-distribution link, with
+/// no subtraction from one in either tail. `None` for the log and reciprocal
+/// links, which are not survival residual distributions
+/// ([`validate_predict_inverse_link`]).
+#[inline]
+fn standard_link_survival_value(link: StandardLink, eta: f64) -> Option<f64> {
+    Some(match link {
+        StandardLink::Probit => probit_survival_value(eta),
+        StandardLink::Logit => 1.0 / (1.0 + eta.exp()),
+        StandardLink::CLogLog => (-(eta.exp())).exp(),
+        // S = 1 − exp(−exp(−η)) evaluated as −expm1: the naive form loses all
+        // precision once exp(−exp(−η)) rounds to 1 (η ≳ 36), returning an
+        // exact 0 for valid far-tail rows whose true survival is ~exp(−η).
+        StandardLink::LogLog => -(-(-eta).exp()).exp_m1(),
+        // S = 1/2 − atan(η)/π. Past |η| = 1 the reciprocal reflection
+        // atan(η) = ±π/2 − atan(1/η) keeps the upper tail S ≈ 1/(πη) that the
+        // subtraction from 1/2 cancels away.
+        StandardLink::Cauchit => {
+            if eta > 1.0 {
+                eta.recip().atan() / std::f64::consts::PI
+            } else if eta < -1.0 {
+                1.0 - (-eta.recip()).atan() / std::f64::consts::PI
+            } else {
+                0.5 - eta.atan() / std::f64::consts::PI
+            }
+        }
+        StandardLink::Identity => 1.0 - eta,
+        StandardLink::Log
+        | StandardLink::Sqrt
+        | StandardLink::Inverse
+        | StandardLink::InverseSquared => return None,
+    })
 }
 
 /// `ln S(η)` for a location-scale survival fit's residual distribution,
@@ -407,29 +464,16 @@ pub(crate) fn inverse_link_log_survival_checked(
 
 pub(crate) fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 {
     match inverse_link {
-        InverseLink::Standard(StandardLink::Probit) => probit_survival_value(eta),
-        InverseLink::Standard(StandardLink::Logit) => 1.0 / (1.0 + eta.exp()),
-        InverseLink::Standard(StandardLink::CLogLog) => (-(eta.exp())).exp(),
-        // S = 1 − exp(−exp(−η)) evaluated as −expm1: the naive form loses all
-        // precision once exp(−exp(−η)) rounds to 1 (η ≳ 36), returning an
-        // exact 0 for valid far-tail rows whose true survival is ~exp(−η).
-        InverseLink::Standard(StandardLink::LogLog) => -(-(-eta).exp()).exp_m1(),
-        InverseLink::Standard(StandardLink::Cauchit) => 0.5 - eta.atan() / std::f64::consts::PI,
-        InverseLink::Standard(StandardLink::Identity) => 1.0 - eta,
-        InverseLink::Standard(
-            StandardLink::Log
-                | StandardLink::Sqrt
-                | StandardLink::Inverse
-                | StandardLink::InverseSquared,
-        ) => {
-            // SAFETY: survival families register only Probit/Logit/CLogLog/
-            // Identity/LatentCLogLog/Sas/BetaLogistic/Mixture inverse links;
-            // `validate_predict_inverse_link` rejects the log and reciprocal
-            // links upstream
-            // so this arm is unreachable on a validated survival model. A NaN
-            // sentinel here would silently corrupt the survival probability,
-            // so fail loudly on a contract violation instead.
-            panic!("the log and reciprocal inverse links are invalid for survival prediction")
+        // SAFETY: survival families register only Probit/Logit/CLogLog/
+        // Identity/LatentCLogLog/Sas/BetaLogistic/Mixture inverse links;
+        // `validate_predict_inverse_link` rejects the log and reciprocal
+        // links upstream, so the `None` arm is unreachable on a validated
+        // survival model. A NaN sentinel there would silently corrupt the
+        // survival probability, so fail loudly on a contract violation instead.
+        InverseLink::Standard(link) => {
+            standard_link_survival_value(*link, eta).unwrap_or_else(|| {
+                panic!("the log and reciprocal inverse links are invalid for survival prediction")
+            })
         }
         InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)
@@ -455,4 +499,88 @@ pub(crate) struct PredictionLinearPredictors {
     pub(crate) etaw: Option<Array1<f64>>,
     pub(crate) wiggle_design: Option<Array2<f64>>,
     pub(crate) dq_dq0: Option<Array1<f64>>,
+}
+
+#[cfg(test)]
+mod survival_prob_tail_tests {
+    use super::*;
+
+    fn rel_err(got: f64, want: f64) -> f64 {
+        ((got - want) / want).abs()
+    }
+
+    fn checked(link: StandardLink, eta: f64) -> f64 {
+        inverse_link_survival_prob_checked(&InverseLink::Standard(link), eta)
+            .expect("standard survival link evaluates at a finite eta")
+    }
+
+    /// At the probit, cloglog, logit and loglog rows `F(η)` rounds to exactly `1`
+    /// in `f64`, so `1 − F` is a hard `0`; at the cauchit row `1 − F` keeps only
+    /// about eight digits. Each survival probability is a normal-range number.
+    #[test]
+    fn upper_tail_survival_is_not_cancelled_to_zero() {
+        // Φ(−10) = 7.61985302416052606…e−24.
+        let probit = checked(StandardLink::Probit, 10.0);
+        assert!(
+            rel_err(probit, 7.619_853_024_160_526e-24) < 1e-12,
+            "probit S(10) = {probit:e}"
+        );
+
+        let cloglog = checked(StandardLink::CLogLog, 4.0);
+        assert!(
+            rel_err(cloglog, (-(4.0_f64.exp())).exp()) < 1e-14,
+            "cloglog S(4) = {cloglog:e}"
+        );
+
+        let logit = checked(StandardLink::Logit, 40.0);
+        assert!(
+            rel_err(logit, 1.0 / (1.0 + 40.0_f64.exp())) < 1e-14,
+            "logit S(40) = {logit:e}"
+        );
+
+        // S = atan(1/η)/π; atan(x) = x(1 − x²/3 + …), so at η = 1e8 the value is
+        // 1/(π·1e8) to relative order 1e-16.
+        let cauchit = checked(StandardLink::Cauchit, 1e8);
+        assert!(
+            rel_err(cauchit, 1.0 / (std::f64::consts::PI * 1e8)) < 1e-14,
+            "cauchit S(1e8) = {cauchit:e}"
+        );
+
+        // LogLog: S = 1 − exp(−e^{−η}) = e^{−η}(1 − e^{−η}/2 + …).
+        let loglog = checked(StandardLink::LogLog, 40.0);
+        assert!(
+            rel_err(loglog, (-40.0_f64).exp()) < 1e-14,
+            "loglog S(40) = {loglog:e}"
+        );
+    }
+
+    /// The checked prediction value, the fit's unchecked value and the log-space
+    /// survival are one quantity, in both tails and at the centre.
+    #[test]
+    fn checked_unchecked_and_log_survival_agree() {
+        for link in [
+            StandardLink::Probit,
+            StandardLink::Logit,
+            StandardLink::CLogLog,
+            StandardLink::LogLog,
+            StandardLink::Cauchit,
+        ] {
+            let inverse_link = InverseLink::Standard(link);
+            // η = 6 keeps every link's survival in the normal range (cloglog's
+            // exp(−e⁶) ≈ 5e−176) while probit's 1 − Φ(6) would keep only ~7 digits.
+            for eta in [-30.0, -3.0, -1.5, -0.4, 0.0, 0.37, 1.5, 3.0, 6.0] {
+                let s = checked(link, eta);
+                let unchecked = inverse_link_survival_probvalue(&inverse_link, eta);
+                assert_eq!(s, unchecked, "{link:?} at eta={eta}");
+                let log_s = inverse_link_log_survival_checked(&inverse_link, eta)
+                    .expect("standard survival link evaluates at a finite eta");
+                assert!(s > 0.0, "{link:?} at eta={eta}: S underflowed to {s:e}");
+                assert!(
+                    rel_err(log_s.exp(), s) < 1e-12,
+                    "{link:?} at eta={eta}: exp(ln S) = {:e}, S = {s:e}",
+                    log_s.exp()
+                );
+            }
+        }
+    }
 }
