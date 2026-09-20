@@ -4704,5 +4704,13 @@
     },
     "reason": "#3266: the survival FLEX jet arenas move out of two per-worker thread-locals into one fit-owned GovernedScratchPool<DynamicJetArena>, the SurvivalMarginalSlopeFamily field flex_jet_arenas made by new_flex_jet_arena_pool on the process MemoryGovernor. This is the survival twin of the BMS scratch fix a6d77058e6 (#2989). Each thread-local kept its worker's largest arena for the life of the process, where no ledger saw it. The two helpers become one method, SurvivalMarginalSlopeFamily::with_flex_jet_arena, which checks an arena out of the family's pool, resets it and checks it back in. An idle arena stays only while the governor admits its retained bytes, and the pool drops with the fit's families. Every caller now calls the method: the four in contracted.rs, the two timepoint builders in flex_jet.rs and three flex_jet tests. The statics FLEX_THIRD_JET_ARENA and FLEX_TIMEPOINT_JET_ARENA are deleted with the helpers.",
     "evidence": "At this base, public_api_census.py with the landing commit as head reports exactly this identity. git grep -w with_flex_third_jet_arena finds 0 hits under crates, src or tests in the head tree. Its replacement, SurvivalMarginalSlopeFamily::with_flex_jet_arena, is declared in flex_jet.rs. Gate direct-dy6-w2smb-3266-g4.log (acl42) runs flex_jet_arenas_are_charged_and_end_with_the_family_3266 and the flex third/fourth/fifth contraction witnesses through it."
+  },
+  {
+    "base": "a924471b61fe2b7ab2d27d1d4c9c63d7bfc936b0",
+    "removed": {
+      "crates/gam-math/src/bivariate_normal.rs::bivariate_normal_cdf_with_complement_bounded": 1
+    },
+    "reason": "#3253: one route for Φ₂. bivariate_normal_cdf_with_complement now evaluates the apex tree and returns its BoundedProbability, so the separate bounded entry is the same function under a second name and is deleted. Its callers (gaussian_activation, the bivariate normal tests, positive_form_tests) call bivariate_normal_cdf_with_complement.",
+    "evidence": "Gate dy5 w2slb-bvn-g1 at 94e6a59c5b (direct-dy5-w2slb-bvn-g1.log): the census lists exactly this removal, 13652 -> 13651 public function declarations. In the landing tree the name occurs 0 times (git grep -w -c). Final gate dy5 w2slb-bvn-g5 at 96a81f3bca (tree 0a497192f7): census 0 with this entry."
   }
 ]
