@@ -2732,5 +2732,14 @@
     ],
     "reason": "#3604: posterior_eta_bands had no Python caller (retired in docs/public-api-2829-disposition.tsv); its hand-copied band reducer never validated draws. draw_bands_from_matrices is the single reducer; matrix_bands calls quantile_from_sorted directly.",
     "evidence": "git grep finds no caller of posterior_eta_bands, posterior_eta_bands_impl, eta_bands_from_matrix_link, LinkSelector or posterior_quantile_from_sorted after the deletion."
+  },
+  {
+    "base": "5918b6a8f8b59e4138bdf2e8e13679386c46b2eb",
+    "items": [
+      "crates/gam-terms/tests/suite/probe_2761_penalty_topology.rs:fn:probe_frozen_chart_local_topology_versus_range",
+      "crates/gam-terms/tests/suite/probe_2761_penalty_topology.rs:fn:probe_term_collection_topology_versus_range"
+    ],
+    "reason": "#3884: the print-only probes are replaced by asserting tests (term_collection_penalty_topology_is_invariant_to_the_representer_range, frozen_chart_local_penalty_topology_matches_the_cached_one_at_every_range) that pin the same topology invariants.",
+    "evidence": "The two probe fns only printed penalty counts/ranks and asserted nothing; the replacement tests in the same file assert the invariants each probe printed."
   }
 ]
