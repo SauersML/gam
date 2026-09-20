@@ -1099,10 +1099,11 @@ impl SaeManifoldTerm {
         for value in descent.iter_mut() {
             *value /= descent_norm;
         }
-        let base_objective = match self.penalized_objective_total(target, rho, registry, 1.0) {
+        let base = match self.penalized_objective_banded(target, rho, registry, 1.0) {
             Ok(value) => value,
             Err(reason) => return format!("orbit=unresolved(objective: {reason})"),
         };
+        let base_objective = base.value;
         // Both probes run the mover's own line minimization, with its endpoints and
         // commit floor, so a zero drop here means what it means there.
         let material_floor =
@@ -1126,7 +1127,7 @@ impl SaeManifoldTerm {
             registry,
             descent_step.view(),
             step_coord_len,
-            base_objective,
+            base,
             descent_norm,
             0.0,
             material_floor,
@@ -1179,7 +1180,7 @@ impl SaeManifoldTerm {
                 registry,
                 steepest_step.view(),
                 step_coord_len,
-                base_objective,
+                base,
                 steepest_norm,
                 0.0,
                 material_floor,
@@ -1739,17 +1740,19 @@ impl SaeManifoldTerm {
                 quotient: 0.5 * quotient_grad_norm * quotient_grad_norm,
                 ambient: 0.5 * grad_norm_sq,
             };
-            // The smallest predicted reduction the acceptance test below can verify.
-            // That test admits `pre − trial ≥ c1·pred − cushion`, with the round-off
-            // cushion `opt::armijo_roundoff_cushion(pre)`. At or under
-            // `pred = cushion / c1` its right-hand side is not positive, so a trial
-            // that did not lower the objective, or raised it within round-off, would
-            // commit and report progress. Above this floor every committed step is a
-            // strict Armijo decrease (#2861), and a ladder whose prediction falls
-            // under it has no verifiable decrease left to buy.
-            let pre_objective = self.penalized_objective_total(target, rho_fixed, registry, 1.0)?;
-            let predicted_floor =
-                opt::armijo_roundoff_cushion(pre_objective) / SAE_MANIFOLD_ARMIJO_C1;
+            // The smallest predicted reduction the acceptance test below can verify
+            // (#3243). That test (`BandedPenalizedObjective::armijo_accepts`) commits
+            // a trial only when its objective is resolvably below `pre`, by more than
+            // the two evaluations' bands `B + B' ≥ B`, and relaxes Armijo by the same
+            // bands, so every committed step is a strict decrease of the exact
+            // objective (#2861). The prediction is the step's first-order decrease,
+            // and it falls monotonically along the ladder as the steps shorten and
+            // the model tightens. At or under `pred = B`, the band of `pre` itself,
+            // the step promises a change `pre` cannot resolve, so the ladder has no
+            // verifiable decrease left to buy.
+            let pre = self.penalized_objective_banded(target, rho_fixed, registry, 1.0)?;
+            let pre_objective = pre.value;
+            let predicted_floor = pre.band;
             let snapshot = self.snapshot_mutable_state();
             let backtrack_started = std::time::Instant::now();
             let mut trials = 0usize;
@@ -1777,7 +1780,7 @@ impl SaeManifoldTerm {
                     log::trace!(
                         "terminal Newton: damping ladder exhausted at ν={nu:.6e} — predicted \
                          objective decrease {predicted_objective_decrease:.6e} is under the \
-                         round-off floor {predicted_floor:.6e}",
+                         objective's rounding band {predicted_floor:.6e}",
                     );
                     break;
                 }
@@ -1819,17 +1822,15 @@ impl SaeManifoldTerm {
                         None,
                     )
                 };
-                let trial_objective = self
-                    .penalized_objective_total(target, rho_fixed, registry, 1.0)
-                    .unwrap_or(f64::INFINITY);
+                let trial = self
+                    .penalized_objective_banded(target, rho_fixed, registry, 1.0)
+                    .unwrap_or(BandedPenalizedObjective::UNUSABLE);
                 let sufficient = SAE_MANIFOLD_ARMIJO_C1 * predicted_objective_decrease;
-                // Acceptance is Armijo descent in the scalar objective. The residual is
-                // deliberately not constrained here: at negative curvature, genuine
-                // objective descent can and generally does increase its norm.
-                if trial_objective.is_finite()
-                    && pre_objective - trial_objective
-                        >= sufficient - opt::armijo_roundoff_cushion(pre_objective)
-                {
+                // Acceptance is resolved, band-relaxed Armijo descent in the scalar
+                // objective. The residual is deliberately not constrained here: at
+                // negative curvature, genuine objective descent can and generally
+                // does increase its norm.
+                if pre.armijo_accepts(&trial, sufficient) {
                     accepted = Some(AcceptedTerminalResidualStep {
                         damping: nu,
                         trial_merits,
@@ -2039,8 +2040,9 @@ impl SaeManifoldTerm {
     /// the ladder for a stated reason. The first rung above `σ = 0` is the shifted
     /// operator's own curvature along the rejected step, `Δᵀ(A + σI)Δ/‖Δ‖² =
     /// −gᵀΔ/‖Δ‖²`; later rungs grow by `RIDGE_GROWTH`. Acceptance, and the floor under
-    /// the prediction, are the dense ladder's own, so a committed step is a strict
-    /// Armijo decrease of the penalized objective (#2861), and a rejected trial
+    /// the prediction, are the dense ladder's own, so a committed step is a
+    /// resolved, band-relaxed Armijo decrease of the penalized objective (#2861,
+    /// #3243), and a rejected trial
     /// restores the snapshot. `None` means no rung bought that decrease, or a solve
     /// failed.
     fn shifted_exact_newton_polish_trials(
@@ -2065,11 +2067,13 @@ impl SaeManifoldTerm {
         let mut exact_options = options.clone();
         exact_options.sae_resident_frame = None;
         let total_t: usize = exact.rows.iter().map(|row| row.gt.len()).sum();
-        let pre_objective = self.penalized_objective_total(target, rho_fixed, registry, 1.0)?;
-        // The dense ladder's floor: the smallest prediction whose Armijo threshold
-        // `c1·pred − cushion` is positive, so every trial the test below admits
-        // lowered the objective.
-        let predicted_floor = opt::armijo_roundoff_cushion(pre_objective) / SAE_MANIFOLD_ARMIJO_C1;
+        // The dense ladder's floor and acceptance (#3243): a prediction at or under
+        // the band of `pre` promises a change `pre` cannot resolve, and a committed
+        // trial is resolvably below `pre` and passes Armijo relaxed by the two
+        // evaluations' bands, so it lowered the exact objective.
+        let pre = self.penalized_objective_banded(target, rho_fixed, registry, 1.0)?;
+        let pre_objective = pre.value;
+        let predicted_floor = pre.band;
         let snapshot = self.snapshot_mutable_state();
         let mut shift = carried_shift;
         let mut trials = 0usize;
@@ -2136,22 +2140,19 @@ impl SaeManifoldTerm {
                         None
                     }
                 };
-            let trial_objective = if trial_system.is_some() {
-                self.penalized_objective_total(target, rho_fixed, registry, 1.0)
-                    .unwrap_or(f64::INFINITY)
+            let trial = if trial_system.is_some() {
+                self.penalized_objective_banded(target, rho_fixed, registry, 1.0)
+                    .unwrap_or(BandedPenalizedObjective::UNUSABLE)
             } else {
-                f64::INFINITY
+                BandedPenalizedObjective::UNUSABLE
             };
             let sufficient = SAE_MANIFOLD_ARMIJO_C1 * predicted_objective_decrease;
-            if trial_objective.is_finite()
-                && pre_objective - trial_objective
-                    >= sufficient - opt::armijo_roundoff_cushion(pre_objective)
-            {
+            if pre.armijo_accepts(&trial, sufficient) {
                 return Ok(Some(ShiftedTerminalStep {
                     shift,
                     ridge_escalations: diagnostics.ridge_escalations,
                     pre_objective,
-                    committed_objective: trial_objective,
+                    committed_objective: trial.value,
                     predicted_objective_decrease,
                     curvature_along_step: predicted_objective_decrease / step_norm_sq,
                     step_norm_sq,

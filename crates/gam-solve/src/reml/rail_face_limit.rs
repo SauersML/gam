@@ -44,6 +44,9 @@ use crate::rho_optimizer::rail_face::{
     LamlFaceParts, RailFaceLimitOutcome, face_release_bases, gaussian_rail_face_limit,
     laml_rail_face_limit, released_rank, split_face_penalties,
 };
+use crate::rho_optimizer::zero_smoothing_face::{
+    ZeroSmoothingFaceOutcome, gaussian_zero_smoothing_face,
+};
 
 impl RemlState<'_> {
     /// Build the analytic λ→∞ limit data for the rail face `face` (ρ-block
@@ -145,6 +148,85 @@ impl RemlState<'_> {
             });
         }
         self.laml_rail_face_limit_via_limit_fit(&design, rho, face)
+    }
+
+    /// Build the analytic λ→0 (zero-smoothing) face law for `face` (ρ-block
+    /// indices) at `rho`: the exact slopes `c′_j = ∂V/∂λ_j` at `λ_face = 0`
+    /// (see [`crate::rho_optimizer::zero_smoothing_face`]).
+    ///
+    /// Profiled-Gaussian REML only; every other criterion declines TYPED. The
+    /// ρ-prior must be exactly linear in `λ` on each face coordinate, which is
+    /// the only way it can leave a finite slope at `λ = 0`.
+    pub(crate) fn zero_smoothing_face(
+        &self,
+        rho: &Array1<f64>,
+        face: &[usize],
+    ) -> Result<ZeroSmoothingFaceOutcome, EstimationError> {
+        let outside = if self.linear_constraints.is_some()
+            || self.coefficient_lower_bounds.is_some()
+        {
+            Some("the fit carries coefficient constraints, so the limit is a constrained optimum")
+        } else if self.runtime_mixture_link_state.is_some() || self.runtime_sas_link_state.is_some()
+        {
+            Some(
+                "the link carries runtime state, so the criterion is not one the closed form models",
+            )
+        } else if !reml_is_gaussian_identity(&self.config.likelihood) {
+            Some(
+                "the zero-smoothing closed form is derived for profiled-Gaussian REML; this \
+                 family's criterion carries terms the form does not",
+            )
+        } else if !matches!(self.x, DesignMatrix::Dense(_)) {
+            Some("the design is not dense")
+        } else {
+            None
+        };
+        if let Some(reason) = outside {
+            return Ok(ZeroSmoothingFaceOutcome::OutsideClosedForm {
+                reason: reason.to_string(),
+            });
+        }
+        let mut prior_rates = Vec::with_capacity(face.len());
+        for &coordinate in face.iter() {
+            match self.rho_prior.lower_tail_linear_rate(coordinate) {
+                Some(rate) => prior_rates.push(rate),
+                None => {
+                    return Ok(ZeroSmoothingFaceOutcome::OutsideClosedForm {
+                        reason: format!(
+                            "the rho-prior on coordinate {coordinate} is not linear in lambda, so \
+                             its gradient does not vanish into the lambda -> 0 tail and there is \
+                             no zero-smoothing face for the closed form to describe"
+                        ),
+                    });
+                }
+            }
+        }
+        let design = self
+            .x
+            .try_to_dense_by_chunks("zero-smoothing face")
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        if design.ncols() != self.p {
+            return Ok(ZeroSmoothingFaceOutcome::OutsideClosedForm {
+                reason: format!(
+                    "the densified design has {} columns against a coefficient layout of {}",
+                    design.ncols(),
+                    self.p
+                ),
+            });
+        }
+        let mut response = self.y.to_owned();
+        if self.offset.len() == response.len() {
+            response -= &self.offset;
+        }
+        Ok(gaussian_zero_smoothing_face(
+            design.view(),
+            response.view(),
+            self.weights,
+            self.canonical_penalties.as_slice(),
+            rho,
+            face,
+            &prior_rates,
+        ))
     }
 
     /// Solve the λ=∞ limit model — the fit restricted to the face's common
@@ -1652,6 +1734,199 @@ mod rail_face_limit_tests {
                 "the decline must name the armed Jeffreys term: {reason}"
             ),
             other => panic!("a Firth-armed criterion is outside the LAML form, got {other:?}"),
+        }
+    }
+
+    // ── the λ → 0 end (#2348 Inc 5, lower face) ─────────────────────────
+
+    /// A COVERED zero-smoothing geometry: the face is the bend block on the
+    /// quadratic+cubic columns, and the survivor is a ridge on the slope,
+    /// quadratic and cubic columns, so `range(S_bend) ⊆ range(S_ridge)` and
+    /// `λ_bend → 0` changes no rank.
+    fn covered_penalties(bend_cols: (usize, usize)) -> Vec<gam_terms::construction::CanonicalPenalty> {
+        let p = 4usize;
+        let mut bend = Array2::<f64>::zeros((p, p));
+        bend[[bend_cols.0, bend_cols.0]] = 1.0;
+        bend[[bend_cols.1, bend_cols.1]] = 2.0;
+        let mut ridge = Array2::<f64>::zeros((p, p));
+        for c in 1..p {
+            ridge[[c, c]] = 1.0;
+        }
+        gam_terms::construction::canonicalize_penalty_specs(
+            &[
+                crate::estimate::PenaltySpec::Dense(bend),
+                crate::estimate::PenaltySpec::Dense(ridge),
+            ],
+            &[2, 1],
+            p,
+            "zero_smoothing_face_fixture",
+        )
+        .map(|(canonical, _)| canonical)
+        .expect("canonicalize the zero-smoothing fixture penalties")
+    }
+
+    fn gaussian_state_for<'a>(
+        y: &'a Array1<f64>,
+        weights: &'a Array1<f64>,
+        x: &Array2<f64>,
+        offset: &Array1<f64>,
+        penalties: Vec<gam_terms::construction::CanonicalPenalty>,
+        nullspace_dims: Vec<usize>,
+        config: &'a RemlConfig,
+    ) -> RemlState<'a> {
+        RemlState::newwith_offset(
+            y.view(),
+            x.clone(),
+            weights.view(),
+            offset.view(),
+            penalties,
+            4,
+            config,
+            Some(nullspace_dims),
+            None,
+            None,
+        )
+        .expect("build the zero-smoothing fixture state")
+    }
+
+    /// THE VALIDATION for the λ → 0 law. On a covered face the criterion is
+    /// analytic in `λ_0`, so the production pencil `e^{−ρ_0}·∂V/∂ρ_0` equals
+    /// `∂V/∂λ_0` and approaches the analytic slope `c′_0` as
+    /// `c′_0 + q·e^{ρ_0} + O(e^{2ρ_0})`: the signed gap contracts by exactly
+    /// `e^{−Δ}` across a depth step `Δ`. A wrong dispersion convention, a
+    /// missing trace term or a sign error misses by orders of magnitude, not
+    /// by a factor that contracts like the law.
+    #[test]
+    fn covered_zero_smoothing_slope_reproduces_the_production_gradient() {
+        let (y, weights, x) = cubic_fixture_sized(SIGNAL_CURVATURE, 96);
+        let offset = Array1::<f64>::zeros(y.len());
+        let config = gaussian_config();
+        let state = gaussian_state_for(
+            &y,
+            &weights,
+            &x,
+            &offset,
+            covered_penalties((2, 3)),
+            vec![2, 1],
+            &config,
+        );
+        let mut rows = Vec::new();
+        for rho_0 in [-10.0_f64, -14.0] {
+            let rho = Array1::from(vec![rho_0, 1.0]);
+            let law = match state
+                .zero_smoothing_face(&rho, &[0])
+                .expect("the zero-smoothing gate must not error")
+            {
+                ZeroSmoothingFaceOutcome::Available(law) => *law,
+                other => panic!("a covered Gaussian face is inside the closed form: {other:?}"),
+            };
+            let eval = state
+                .compute_outer_eval_with_order(&rho, OuterEvalOrder::ValueAndGradient)
+                .expect("the production REML gradient must evaluate");
+            let pencil = (-rho_0).exp() * eval.gradient[0];
+            rows.push((rho_0, law.slopes[0], law.slope_bands[0], pencil));
+        }
+        let (_, slope, band, pencil_shallow) = rows[0];
+        let (_, slope_deep, _, pencil_deep) = rows[1];
+        println!(
+            "zero-smoothing law: c'={slope:.12e} band={band:.3e}; pencil(-10)={pencil_shallow:.12e} \
+             pencil(-14)={pencil_deep:.12e}"
+        );
+        // The slope is a property of the λ=0 limit, so it is the same number
+        // from either depth.
+        assert!(
+            (slope - slope_deep).abs() <= band,
+            "the λ=0 slope moved with the certified depth: {slope:.12e} vs {slope_deep:.12e}"
+        );
+        assert!(slope > band, "the SIGNAL fixture must prove the face: c'={slope:.6e} band={band:.3e}");
+        let gap_shallow = pencil_shallow - slope;
+        let gap_deep = pencil_deep - slope;
+        let ratio = gap_deep / gap_shallow;
+        let expected = (-4.0_f64).exp();
+        println!(
+            "gap(-10)={gap_shallow:.6e} gap(-14)={gap_deep:.6e} ratio={ratio:.6e} expected={expected:.6e}"
+        );
+        assert!(
+            gap_shallow.abs() < 1.0e-3 * slope.abs(),
+            "the production pencil does not approach the analytic slope: gap {gap_shallow:.3e} \
+             against c'={slope:.6e}"
+        );
+        assert!(
+            // The next order moves the ratio by O(λ_shallow) = O(e^{−10})
+            // relative; measured 2.9e-5.
+            (ratio - expected).abs() <= 1.0e-3 * expected,
+            "the gap does not contract like the O(λ) law: ratio {ratio:.6e} vs e^-4={expected:.6e}"
+        );
+    }
+
+    /// Adding the bend to a model whose survivor never touches the bend
+    /// columns adds rank: `log|S|₊` gains `2·log λ_0` and `V → +∞` at λ_0 = 0.
+    /// That corner is a barrier, and the law must refuse it as a face.
+    #[test]
+    fn uncovered_zero_smoothing_face_is_refused_as_a_barrier() {
+        let (y, weights, x) = cubic_fixture_sized(SIGNAL_CURVATURE, 96);
+        let offset = Array1::<f64>::zeros(y.len());
+        let config = gaussian_config();
+        let state = gaussian_state_for(
+            &y,
+            &weights,
+            &x,
+            &offset,
+            cubic_penalties(),
+            vec![2, 3],
+            &config,
+        );
+        let rho = Array1::from(vec![-12.0, 1.0]);
+        match state
+            .zero_smoothing_face(&rho, &[0])
+            .expect("the gate must decline, not error")
+        {
+            ZeroSmoothingFaceOutcome::FaceUnavailable { reason } => assert!(
+                reason.contains("barrier"),
+                "the refusal must name the barrier: {reason}"
+            ),
+            other => panic!("an uncovered face is a barrier, got {other:?}"),
+        }
+    }
+
+    /// A response the survivor-penalized model fits EXACTLY leaves no
+    /// residual, `D_p⁰ = 0` and `V → −∞` at λ_0 = 0: no minimizer, no face.
+    #[test]
+    fn exact_fit_zero_smoothing_face_is_refused() {
+        let n = 48usize;
+        let (_, weights, x) = cubic_fixture_sized(0.0, n);
+        let y: Array1<f64> = (0..n).map(|i| 0.8 + 0.3 * x[[i, 1]]).collect();
+        let offset = Array1::<f64>::zeros(n);
+        let config = gaussian_config();
+        let p = 4usize;
+        let mut bend = Array2::<f64>::zeros((p, p));
+        bend[[2, 2]] = 1.0;
+        bend[[3, 3]] = 2.0;
+        let mut ridge = Array2::<f64>::zeros((p, p));
+        ridge[[2, 2]] = 1.0;
+        ridge[[3, 3]] = 1.0;
+        let penalties = gam_terms::construction::canonicalize_penalty_specs(
+            &[
+                crate::estimate::PenaltySpec::Dense(bend),
+                crate::estimate::PenaltySpec::Dense(ridge),
+            ],
+            &[2, 2],
+            p,
+            "zero_smoothing_exact_fit_fixture",
+        )
+        .map(|(canonical, _)| canonical)
+        .expect("canonicalize the exact-fit fixture penalties");
+        let state = gaussian_state_for(&y, &weights, &x, &offset, penalties, vec![2, 2], &config);
+        let rho = Array1::from(vec![-12.0, 1.0]);
+        match state
+            .zero_smoothing_face(&rho, &[0])
+            .expect("the gate must decline, not error")
+        {
+            ZeroSmoothingFaceOutcome::FaceUnavailable { reason } => assert!(
+                reason.contains("exact"),
+                "the refusal must name the exact fit: {reason}"
+            ),
+            other => panic!("an exact fit has no zero-smoothing face, got {other:?}"),
         }
     }
 }
