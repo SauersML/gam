@@ -8,6 +8,8 @@ mod covariate_constant_slope_2930;
 mod declared_latent_law_2923;
 #[path = "survival_acceptance/joint_latent_law_2929.rs"]
 mod joint_latent_law_2929;
+#[path = "survival_acceptance/finite_law_score_units_3477.rs"]
+mod finite_law_score_units_3477;
 #[path = "survival_acceptance/follow_up_mode_response_fd_2765.rs"]
 mod follow_up_mode_response_fd_2765;
 #[path = "survival_acceptance/follow_up_varying_slope_2765.rs"]

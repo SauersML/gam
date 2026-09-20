@@ -211,6 +211,24 @@ pub(crate) enum SurvivalCertifiedFit {
 /// refuses (gam#2928).
 const DECLARED_LAW_COMPRESSION_REFINEMENTS: usize = 3;
 
+/// The converged slope coefficients a re-solve starts from when it reads the
+/// score on the axis `to` and the converged fit read it on `from`, each `(m, s)`
+/// with the score `(z − m)/s`, or `None` for the row-varying calibrated `ζ` axis
+/// (gam#3477). The slope is `s` times the slope on the score as given, so it
+/// carries over scaled by `s_to/s_from` between two fixed axes (a shift is
+/// absorbed by the row intercept) and not at all to or from `ζ`.
+fn slope_hint_across_score_axes(
+    from: Option<(f64, f64)>,
+    to: Option<(f64, f64)>,
+    beta: &Array1<f64>,
+) -> Option<Array1<f64>> {
+    match (from, to) {
+        _ if from == to => Some(beta.clone()),
+        (Some((_, sd_from)), Some((_, sd_to))) => Some(beta.mapv(|b| b * (sd_to / sd_from))),
+        _ => None,
+    }
+}
+
 /// The fit itself, on `compression_design` for a declared law with many atoms
 /// (gam#2928). Returns the anchors of the converged fit whose certified error
 /// missed its target, which the caller refines at.
@@ -516,7 +534,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             .map_err(FitFailure::invariant)?,
         );
     }
-    let latent_calibration = match fallback_law {
+    let mut latent_calibration = match fallback_law {
         // gam#2926: the re-solve of a closed form whose certificate preferred the
         // estimated law anchors on that law, and records why.
         // With several scores it anchors on their joint law, transported on the
@@ -578,6 +596,62 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         None => resolve_survival_latent_score_calibration(&mut spec, &marginal_design, data)
             .map_err(FitFailure::input)?,
     };
+    // gam#3477: on a finite law `{u_k, w_k}` the anchor `Σ_k w_k Φ(a + b·u_k) =
+    // Φ(q)` with `η = q·c(g) + g·z` is unchanged under `z → (z − m)/s`,
+    // `u_k → (u_k − m)/s`, `g → g·s` (the row intercept absorbs the shift), so the
+    // score's units are a coordinate choice there, and a single-score fit on an
+    // uncalibrated finite law solves in the score's weighted standard units,
+    // whatever units it was recorded in (as gam#3231 does for the Bernoulli
+    // family). The Gaussian closed form states the score is `N(0, 1)` as given
+    // and a calibrated law reads the scale-free `ζ` axis, so both keep the
+    // score's own axis. A K ≥ 2 fit keeps its scores as given: the saved contract
+    // records one normalisation, not one per score.
+    let standard_units = if spec.z.ncols() == 1 {
+        let units = crate::bms::weighted_location_scale(
+            &spec.z.column(0).to_owned(),
+            &spec.weights,
+            "survival marginal-slope",
+        )
+        .map_err(FitFailure::input)?;
+        Some((units.mean, units.sd))
+    } else {
+        None
+    };
+    let fit_units = match standard_units {
+        Some(units) => {
+            if let Some(candidates) = latent_calibration.moving_law.as_mut() {
+                candidates.set_standard_units(units.0, units.1);
+            }
+            let measure = std::mem::replace(
+                &mut latent_calibration.per_score_measure[0],
+                crate::bms::LatentMeasureKind::StandardNormal,
+            );
+            let (measure, fit_units) = crate::bms::finite_law_in_standard_units(
+                measure,
+                &latent_calibration.per_score[0],
+                units,
+            )
+            .map_err(FitFailure::invariant)?;
+            latent_calibration.per_score_measure[0] = measure;
+            fit_units
+        }
+        None => (0.0, 1.0),
+    };
+    if fit_units != (0.0, 1.0) {
+        spec.z
+            .column_mut(0)
+            .mapv_inplace(|score| (score - fit_units.0) / fit_units.1);
+    }
+    // The fit's score is `(z − m)/s` in the policy's units, so the saved map
+    // composes the policy's normalisation with it.
+    let z_normalization = LatentZNormalization {
+        mean: z_normalization.mean + z_normalization.sd * fit_units.0,
+        sd: z_normalization.sd * fit_units.1,
+    };
+    // The slope offset is a slope on the score as given; on the fit's score
+    // `(z − mean)/sd` the same slope is `sd` times it (prediction applies the
+    // identical factor).
+    spec.slope_offset *= z_normalization.sd;
     // gam#2766: `Σ` in this family's defining identity is `Var(z | a)`, so the
     // pooled matrix above is only the right object when that conditional
     // covariance does not move. One robust Rao score test per score PAIR, on the
@@ -2456,7 +2530,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 let slope = final_family
                     .row_slope_channels(row, &solved.fit.block_states)
                     .map_err(FitFailure::invariant)?;
-                let observed_slope = probit_scale * slope.exit;
+                // The declared atoms are on the score as given, where the fit's
+                // slope on its standard-units score `(z − m)/s` is `1/s` times it.
+                let observed_slope = probit_scale * slope.exit / fit_units.1;
                 anchors.push((q.q0, observed_slope));
                 anchors.push((q.q1, observed_slope));
             }
@@ -2690,10 +2766,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                             adequacy: adequacy.clone(),
                             residual: certificate,
                         },
+                        // The closed form reads the score as given; the finite
+                        // law is solved in its standard units.
                         hints: ThetaHints {
                             time_beta: Some(block_states[0].beta.clone()),
                             marginal_beta: Some(block_states[1].beta.clone()),
-                            slope_beta: Some(block_states[2].beta.clone()),
+                            slope_beta: slope_hint_across_score_axes(
+                                Some((0.0, 1.0)),
+                                Some(standard_units.unwrap_or((0.0, 1.0))),
+                                &block_states[2].beta,
+                            ),
                             score_warp_beta: None,
                             link_dev_beta: None,
                             influence_beta: None,
@@ -2780,16 +2862,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 certificate.chosen.label(),
                 certificate.summary()
             );
-            // The slope lives on the latent axis: it carries over only when the
-            // chosen arm reads the same axis as the fitted one.
-            let calibrated_axis = |arm: crate::bms::MovingLawArm| {
-                matches!(
-                    arm,
-                    crate::bms::MovingLawArm::LocationScaleGaussian
-                        | crate::bms::MovingLawArm::LocationScaleEmpirical
-                )
-            };
-            let same_axis = calibrated_axis(certificate.chosen) == calibrated_axis(certificate.fitted);
+            let slope_beta = slope_hint_across_score_axes(
+                candidates.score_axis(certificate.fitted),
+                candidates.score_axis(certificate.chosen),
+                &block_states[2].beta,
+            );
             let chosen = certificate.chosen;
             let decision = candidates.decision_for(chosen, Some(certificate))?;
             return Ok((
@@ -2800,7 +2877,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 hints: ThetaHints {
                     time_beta: Some(block_states[0].beta.clone()),
                     marginal_beta: Some(block_states[1].beta.clone()),
-                    slope_beta: same_axis.then(|| block_states[2].beta.clone()),
+                    slope_beta,
                     score_warp_beta: None,
                     link_dev_beta: None,
                     influence_beta: None,
