@@ -3956,6 +3956,13 @@ fn compose_derivatives6(outer: [f64; 6], inner: [f64; 6]) -> [f64; 6] {
     out
 }
 
+/// Bounded SAS core `u = smooth_bound(δ·asinh(η) + ε, SAS_U_CLAMP)` and its
+/// derivatives in the raw core, shared by the chains that differentiate it.
+#[inline]
+fn sas_bounded_core_jet(delta: f64, asinh_value: f64, epsilon: f64) -> SmoothBoundJet {
+    smooth_bound_jet(delta * asinh_value + epsilon, SAS_U_CLAMP)
+}
+
 /// Sixth derivative of the SAS inverse-link CDF (= fifth derivative of the PDF),
 /// on the same finite domain as [`sas_inverse_link_jet`]. The chain
 /// `r = δ·asinh(η) + ε`, `u = smooth_bound(r)`, `z = sinh(u)`, `μ = Φ(z)` is
@@ -3977,7 +3984,7 @@ fn sas_inverse_link_derivatives6(
     let eta = finite_inverse_link_eta("SAS inverse link", eta)?;
     let asinh = asinh_jet6(eta);
     let delta = sas_delta_from_raw_log_delta(log_delta);
-    let sb = smooth_bound_jet(delta * asinh.value + epsilon, SAS_U_CLAMP);
+    let sb = sas_bounded_core_jet(delta, asinh.value, epsilon);
     let r = [asinh.d1, asinh.d2, asinh.d3, asinh.d4, asinh.d5, asinh.d6].map(|d| delta * d);
     let u = compose_derivatives6([sb.d1, sb.d2, sb.d3, sb.d4, sb.d5, sb.d6], r);
     let (s, c) = (sb.g.sinh(), sb.g.cosh());
@@ -4010,7 +4017,7 @@ pub(crate) fn sas_inverse_link_pdfthird_derivative_param_partials(
     let (ld_eff, dld_eff_draw) = sas_effective_log_delta(log_delta);
     let delta = ld_eff.exp();
     let ddelta_draw = delta * dld_eff_draw;
-    let sb = smooth_bound_jet(delta * asinh.value + epsilon, SAS_U_CLAMP);
+    let sb = sas_bounded_core_jet(delta, asinh.value, epsilon);
     let (g1, g2, g3, g4, g5) = (sb.d1, sb.d2, sb.d3, sb.d4, sb.d5);
     let s = sb.g.sinh();
     let c = sb.g.cosh();
