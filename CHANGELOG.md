@@ -1,5 +1,14 @@
 ## Unreleased
 
+- **Warm-start lookup cache rows belong to one store root and see sibling writes** (#3882, #3885).
+  The process-global lookup cache was keyed by fingerprint alone, so a second
+  `WarmStartStore` on a different root returned, touched and could TTL-expire the
+  first root's entry. Rows are now keyed by the key directory. The fast path also
+  checked only the chosen meta file's mtime, so it never saw a better entry that a
+  sibling process wrote into the same key dir, and its own access-stamp rewrite
+  invalidated the row on every hit. A hit now requires both the meta and the key-dir
+  mtimes to match, and the row is re-recorded after the touch. `touch_lookup_hit` is
+  removed.
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
   `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and
