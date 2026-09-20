@@ -2142,24 +2142,27 @@ fn optimize_survival_transformation_smoothing(
     // in the error; a seed or best-so-far smoothing value is never promoted to
     // an estimator merely because a fixed-lambda inner solve was finite.
     //
-    // The shared gradient-only outer route disables `opt`'s relative-stall
-    // predicate. That predicate scales its stationarity band by
-    // `(1 + ‖ρ‖∞)`, which is not the KKT contract for log smoothing
-    // parameters and used to stop this fit before the certificate's own band.
-    // Keep this caller on that single authoritative route: a refused result is
-    // non-convergence, not an invitation to rebuild BFGS with an arbitrary
-    // caller-owned retry budget.
+    // A refused result is non-convergence, not an invitation to rebuild the
+    // search with an arbitrary caller-owned retry budget.
     let problem = OuterProblem::new(num_smoothing)
         .with_problem_size(model.n_observations(), beta0.len())
         .with_gradient(Derivative::Analytic)
-        // The analytic LAML ρ-Hessian is declared under #2359's
-        // optimize-3/certify-4 lifecycle: the search stays on BFGS over the
-        // analytic gradient, and the terminal mint requests
-        // `ValueGradientHessian` once, so the certificate carries curvature
-        // evidence and `final_hessian` holds the ρ-Hessian at the selected ρ
-        // (#2912).
+        // The analytic LAML ρ-Hessian (#2912) drives the search: the planner
+        // routes an analytic gradient over a declared analytic Hessian to ARC,
+        // whose cubic model is the exact second-order expansion of this
+        // criterion, and `final_hessian` holds the ρ-Hessian at the selected ρ.
+        //
+        // Searching gradient-only BFGS and reading this Hessian only at the
+        // terminal mint (#2359's optimize-3/certify-4 split) was measured to
+        // stop short of the certificate here. On the Weibull-AFT `by`-factor
+        // fixtures (dim=6), the mint refused |Pg| = 3.173e-2 against a bound
+        // of 1.855e-3, and 2.718e-1 against 1.887e-3 on the curved twin, with
+        // `hessian_psd=yes`. Main's reference-quality runs flipped between
+        // refusal and pass across unrelated commits (#3201 row 3). A
+        // positive-definite secant model built along six coupled log-λ
+        // coordinates, several near a λ → ∞ null-space rail, is not the
+        // curvature the certificate judges. The exact Hessian is.
         .with_hessian(gam_problem::DeclaredHessianForm::Dense)
-        .with_prefer_gradient_only(true)
         .with_bounds(lower.clone(), upper.clone())
         .with_initial_rho(seed_rho.clone());
     let mut obj = problem.build_objective_with_eval_order(
