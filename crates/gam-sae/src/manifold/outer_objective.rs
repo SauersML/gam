@@ -871,6 +871,10 @@ pub struct SaeManifoldOuterObjective {
 /// resulting capacity is deliberately conservative and comes from the same
 /// cgroup-aware host budget as the SAE streaming plan. Reaching it is an
 /// explicit feasibility error from `BasinBundle::admit`, not an inexact envelope.
+///
+/// The shape is read from `term` as it is NOW, the same shape
+/// [`SaeManifoldTerm::streaming_plan`] routes the probe on, so the envelope is
+/// never admitted by one shape and sized by another.
 fn basin_bundle_member_capacity(term: &SaeManifoldTerm) -> usize {
     // #2560 — derive from the reading the term captured once at construction,
     // not from a fresh probe. Available memory moves with every other process
@@ -1171,7 +1175,6 @@ impl SaeManifoldOuterObjective {
             .as_ref()
             .map(AnalyticPenaltyRegistry::isometry_scalar_weights)
             .unwrap_or_default();
-        let basin_member_capacity = basin_bundle_member_capacity(&term);
         Self {
             term,
             baseline_term,
@@ -1192,7 +1195,9 @@ impl SaeManifoldOuterObjective {
             cancel_flag: None,
             probe_converged_handoff: None,
             surrogate_lane: Some(SurrogateLaneState::new(sae_surrogate_lane_config())),
-            basin_bundle: BasinBundle::new(basin_member_capacity),
+            // Sized from the live shape at every envelope probe
+            // (`authoritative_envelope_value_probe`), never from this one.
+            basin_bundle: BasinBundle::new(0),
             // #2235 — outer-search accounting + the non-convergence forcing
             // function (stationarity defect raises a typed error; a fit object
             // only ever exists from a converged optimization).
@@ -1981,7 +1986,7 @@ impl SaeManifoldOuterObjective {
                 "converged outer result has a non-finite final criterion value".into(),
             ));
         }
-        let terminal = match self.validate_surrogate_certificate(result, certificate)? {
+        let terminal = match self.validate_surrogate_certificate(certificate)? {
             Some(validated) => validated,
             None => result.final_value,
         };
@@ -2010,9 +2015,10 @@ impl SaeManifoldOuterObjective {
     /// (`num_probes·k` now covers its build), there is no probe noise left and the
     /// certificate stands iff the exact `‖Pg‖ ≤ b`. The support LAML's search judges
     /// its certified points the same way (`run_support_outer_search`).
-    fn validate_surrogate_certificate(
+    /// The judged point is the installed `current_rho`, which
+    /// [`Self::certify_outer_result`] has verified bit-identical to the result's.
+    pub(crate) fn validate_surrogate_certificate(
         &mut self,
-        result: &OuterResult,
         certificate: &OuterCriterionCertificate,
     ) -> Result<Option<f64>, SaeOuterCertificationError> {
         use SaeOuterCertificationError::Refused;
@@ -2120,7 +2126,7 @@ impl SaeManifoldOuterObjective {
         );
         if gradient_norm > threshold {
             return Err(SaeOuterCertificationError::SurrogateDisagrees {
-                rho: result.rho.clone(),
+                rho: rho.flat_coordinates(),
                 detail: format!(
                     "the surrogate's certified point has |Pg| = {gradient_norm:.6e} on {lane} \
                      against band {band:.6e} plus search-probe resolution \
@@ -2800,9 +2806,15 @@ impl SaeManifoldOuterObjective {
             return self.evaluate_authoritative_value_probe(rho_flat);
         }
 
-        // (2) Seed the bundle with the accepted entry basin on first use. The
+        // (2) Size the bundle from the shape this probe routes on, then seed it
+        // with the accepted entry basin on first use. The route above is read
+        // from the live shape, which moves during a fit (an atom rank-reduces, a
+        // frame activates); a capacity frozen at another shape can refuse the
+        // seed on the very route that just admitted the envelope. The
         // placeholder +∞ value is overwritten the first time this member is
         // re-converged below.
+        self.basin_bundle
+            .set_member_capacity(basin_bundle_member_capacity(&self.term));
         if self.basin_bundle.is_empty() {
             self.basin_bundle
                 .admit_distinct(self.term.clone(), f64::INFINITY)
