@@ -1314,16 +1314,6 @@ impl EstimationError {
         matches!(self, EstimationError::OuterObjectiveEvaluationFailed { .. })
     }
 
-    /// Classifies inner-solve failures that the outer REML loop should
-    /// treat as a soft retreat (return +inf cost / infeasible outer-eval)
-    /// rather than propagate as a hard error.
-    ///
-    /// Why: when the penalised Hessian becomes effectively singular at the
-    /// current rho, when P-IRLS hits a perfect-separation diagnostic, or when
-    /// it exhausts its iteration budget, the outer optimiser's correct
-    /// response is to back away from this rho — not to terminate the fit.
-    /// All three variants encode "the inner problem at this rho is too hard
-    /// to evaluate, try a different rho".
     /// Re-report this failure with more context WITHOUT changing whether it
     /// is a trial-point refusal.
     ///
@@ -1354,6 +1344,16 @@ impl EstimationError {
         }
     }
 
+    /// Classifies inner-solve failures that the outer REML loop should
+    /// treat as a soft retreat (return +inf cost / infeasible outer-eval)
+    /// rather than propagate as a hard error.
+    ///
+    /// Why: when the penalised Hessian becomes effectively singular at the
+    /// current rho, when P-IRLS hits a perfect-separation diagnostic, or when
+    /// it exhausts its iteration budget, the outer optimiser's correct
+    /// response is to back away from this rho — not to terminate the fit.
+    /// Each of them encodes "the inner problem at this rho is too hard
+    /// to evaluate, try a different rho".
     pub fn is_inner_solve_retreat(&self) -> bool {
         // ONE table. This method and `is_trial_point_infeasible` ask the same
         // question -- "is this a statement about this rho, or about the
