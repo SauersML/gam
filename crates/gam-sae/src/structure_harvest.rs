@@ -7918,14 +7918,14 @@ fn curl_candidates(
     Ok(out)
 }
 
-/// The two in-plane coordinate sets a fitted circle atom is judged on
-/// (#3506): the atom's own centered image `Ĩ = Φ̃·B` in the principal plane of
-/// that image, and the rows the atom parses projected onto the same plane.
-struct AtomFlattenPlanes {
-    image_alpha: Array1<f64>,
-    image_beta: Array1<f64>,
-    parse_alpha: Array1<f64>,
-    parse_beta: Array1<f64>,
+/// The principal plane of an atom's centered image on its active rows (#3506):
+/// the image's own coordinates in that plane and the plane's unit ambient
+/// directions, onto which the parsed rows are projected.
+struct ImagePlane {
+    alpha: Array1<f64>,
+    beta: Array1<f64>,
+    e1: Array1<f64>,
+    e2: Array1<f64>,
 }
 
 /// Principal image plane of one atom on its active rows, computed exactly in the
@@ -7943,7 +7943,7 @@ struct AtomFlattenPlanes {
 fn principal_image_plane(
     atom: &SaeManifoldAtom,
     active_idx: &[usize],
-) -> Result<Option<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>)>, String> {
+) -> Result<Option<ImagePlane>, String> {
     use gam_linalg::faer_ndarray::strict_symmetric_eigh;
     let decoder = atom.decoder_coefficients();
     let (m, p) = decoder.dim();
@@ -8021,7 +8021,12 @@ fn principal_image_plane(
     } else {
         e2 = Array1::<f64>::zeros(p);
     }
-    Ok(Some((alpha, beta, e1, e2)))
+    Ok(Some(ImagePlane {
+        alpha,
+        beta,
+        e1,
+        e2,
+    }))
 }
 
 /// Why a fitted circle atom was flagged (or not) by the flatten audit.
@@ -8093,8 +8098,7 @@ fn flatten_audit(
         if active_idx.len() < 2 {
             continue;
         }
-        let Some((image_alpha, image_beta, e1, e2)) = principal_image_plane(atom, &active_idx)?
-        else {
+        let Some(plane) = principal_image_plane(atom, &active_idx)? else {
             out.push((a, FlattenAudit::ConstantImage));
             continue;
         };
@@ -8116,16 +8120,16 @@ fn flatten_audit(
         for mut row in y.rows_mut() {
             row -= &y_mean;
         }
-        let parse_alpha = y.dot(&e1);
-        let parse_beta = y.dot(&e2);
+        let parse_alpha = y.dot(&plane.e1);
+        let parse_beta = y.dot(&plane.e2);
         let parse_energy = parse_alpha.dot(&parse_alpha) + parse_beta.dot(&parse_beta);
         if !(parse_energy > 0.0) {
             out.push((a, FlattenAudit::EmptyParse));
             continue;
         }
         let verdict = crate::manifold::flatten_verdict(
-            image_alpha.view(),
-            image_beta.view(),
+            plane.alpha.view(),
+            plane.beta.view(),
             parse_alpha.view(),
             parse_beta.view(),
         )?;
