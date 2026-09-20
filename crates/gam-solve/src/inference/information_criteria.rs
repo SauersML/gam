@@ -410,7 +410,8 @@ mod tests {
             Some(1.0),
             1,
             true,
-        ).expect("availability result");
+        )
+        .expect("availability result");
         assert_eq!(edf.conditional, 5.5);
         assert_eq!(edf.corrected, None);
         assert_eq!(edf.rho_uncertainty_df(), None);

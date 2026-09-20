@@ -4690,9 +4690,10 @@ mod assembly_inner_status_gate_tests {
     fn score_test_p_value(fit: &UnifiedFitResult) -> f64 {
         let hessian = fit.saved_frame_penalized_hessian().unwrap().unwrap();
         let gram = fit.saved_frame_weighted_gram().unwrap().unwrap();
+        let beta = fit.beta_from_gauge_shift().unwrap();
         gam_terms::inference::smooth_score_test::smooth_score_test(
             gam_terms::inference::smooth_score_test::SmoothScoreTestInput {
-                beta: fit.beta.view(),
+                beta: beta.view(),
                 penalized_hessian: &hessian,
                 weighted_gram: &gram,
                 coeff_range: 0..2,
@@ -4758,6 +4759,57 @@ mod assembly_inner_status_gate_tests {
         assert!(
             (saved_p - lifted_p).abs() <= 1e-12,
             "the score test is frame-invariant: {saved_p} vs {lifted_p}"
+        );
+    }
+
+    /// gam#3346 review: under an affine gauge `β = Tθ + a` the active fit
+    /// carries the offset `X·a`, so the lifted `β̂` is the offset fit's
+    /// coefficients plus `a`. The score test measures `β̂` from the shift and
+    /// equals the test of the saved-frame fit with that offset; read off the
+    /// uncentred `H·β̂` it would test a different score.
+    #[test]
+    fn affine_gauge_score_test_measures_beta_from_the_shift_3346() {
+        let saved_gram = ndarray::array![[3.0, 0.5, 0.2], [0.5, 2.0, 0.1], [0.2, 0.1, 1.5]];
+        let mut saved_hessian = saved_gram.clone();
+        saved_hessian[[0, 0]] += 0.7;
+        saved_hessian[[1, 1]] += 0.7;
+        let offset_beta = ndarray::array![0.3, -0.2, 1.0];
+        let offset_fit = identity_frame_fit(&offset_beta, &saved_hessian, &saved_gram);
+
+        let de_alias = ndarray::array![[1.0, 0.0, -0.4], [0.0, 1.0, 0.3], [0.0, 0.0, 1.0]];
+        let mut frame = gam_problem::Gauge::from_t(de_alias, &[2, 1], &[2, 1]);
+        let shift = ndarray::array![0.25, -0.5, 0.75];
+        frame.affine_shift = shift.clone();
+        let active_beta = ndarray::array![0.3 + 0.4, -0.2 - 0.3, 1.0];
+        let mut active_fit = identity_frame_fit(
+            &active_beta,
+            &frame.restrict_penalty(&saved_hessian),
+            &frame.restrict_penalty(&saved_gram),
+        );
+        active_fit
+            .lift_to_saved_frame(&frame)
+            .expect("a square affine lift carries the weighted Gram");
+        let expected_beta = &offset_beta + &shift;
+        for (a, b) in active_fit.beta.iter().zip(expected_beta.iter()) {
+            assert!((a - b).abs() <= 1e-15, "{a} vs {b}");
+        }
+        let centred = active_fit.beta_from_gauge_shift().unwrap();
+        for (a, b) in centred.iter().zip(offset_beta.iter()) {
+            assert!((a - b).abs() <= 1e-15, "{a} vs {b}");
+        }
+
+        let offset_p = score_test_p_value(&offset_fit);
+        let lifted_p = score_test_p_value(&active_fit);
+        assert!(offset_p > 0.0 && offset_p < 1.0);
+        assert!(
+            (offset_p - lifted_p).abs() <= 1e-12,
+            "the score test keeps the shift as the null's offset: {offset_p} vs {lifted_p}"
+        );
+        let shifted_fit = identity_frame_fit(&expected_beta, &saved_hessian, &saved_gram);
+        let uncentred_p = score_test_p_value(&shifted_fit);
+        assert!(
+            (offset_p - uncentred_p).abs() > 1e-3,
+            "an uncentred score tests a different statistic: {offset_p} vs {uncentred_p}"
         );
     }
 }
@@ -6064,6 +6116,37 @@ impl UnifiedFitResult {
         self.penalized_hessian()
             .map(|hessian| self.active_quadratic_form_in_saved_frame(hessian))
             .transpose()
+    }
+
+    /// `β̂ − a`: the saved-frame coefficients measured from the gauge's affine
+    /// shift `a` of `β = Tθ + a`.
+    ///
+    /// The active penalty `θᵀS_θθ` is centred at `a` in the saved frame,
+    /// `(β − a)ᵀ T⁻ᵀS_θT⁻¹ (β − a)`, so stationarity in θ pushes forward to
+    /// `H_saved·(β̂ − a) = X_savedᵀW(z − X_saved·a)`: a score read off `H·β`
+    /// must read it off `H·(β̂ − a)`, with the shift as the known offset every
+    /// `τ = 0` null keeps (gam#3346).
+    pub fn beta_from_gauge_shift(&self) -> Result<std::borrow::Cow<'_, Array1<f64>>, String> {
+        match self.geometry.as_ref() {
+            Some(geometry)
+                if geometry
+                    .coefficient_gauge
+                    .affine_shift
+                    .iter()
+                    .any(|&shift| shift != 0.0) =>
+            {
+                let shift = &geometry.coefficient_gauge.affine_shift;
+                if shift.len() != self.beta.len() {
+                    return Err(format!(
+                        "the coefficient gauge's affine shift has {} coordinates but beta has {}",
+                        shift.len(),
+                        self.beta.len()
+                    ));
+                }
+                Ok(std::borrow::Cow::Owned(&self.beta - shift))
+            }
+            _ => Ok(std::borrow::Cow::Borrowed(&self.beta)),
+        }
     }
 
     fn active_quadratic_form_in_saved_frame<'a>(

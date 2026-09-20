@@ -264,7 +264,8 @@ pub fn smooth_term_summary_rows(
 
 /// The fit-level inputs of the smooth score test, shared by every term.
 struct ScoreTestFit<'a> {
-    beta: ndarray::ArrayView1<'a, f64>,
+    /// `β̂ − a`: the fitted coefficients measured from the penalty's centre.
+    beta: std::borrow::Cow<'a, ndarray::Array1<f64>>,
     penalized_hessian: std::borrow::Cow<'a, Array2<f64>>,
     weighted_gram: std::borrow::Cow<'a, Array2<f64>>,
     covariance_scale: f64,
@@ -291,11 +292,17 @@ impl<'a> ScoreTestFit<'a> {
         };
         let penalized_hessian = saved(fit.saved_frame_penalized_hessian())?;
         let weighted_gram = saved(fit.saved_frame_weighted_gram())?;
+        // The score is read off `b = H·β` through the stationarity identity
+        // `H·β = XᵀWz`, which holds for a penalty centred at the origin; under
+        // an affine gauge the penalty is centred at the shift (gam#3346).
+        let beta = fit
+            .beta_from_gauge_shift()
+            .map_err(|_| SmoothPValueUnavailable::FitCurvatureUnavailable)?;
         let covariance_scale = fit
             .coefficient_covariance_scale()
             .map_err(|_| SmoothPValueUnavailable::DispersionUnavailable)?;
         Ok(Self {
-            beta: fit.beta.view(),
+            beta,
             penalized_hessian,
             weighted_gram,
             covariance_scale,
@@ -337,7 +344,7 @@ impl<'a> ScoreTestFit<'a> {
             structural_penalties.push(matrix);
         }
         smooth_score_test(SmoothScoreTestInput {
-            beta: self.beta,
+            beta: self.beta.view(),
             penalized_hessian: &self.penalized_hessian,
             weighted_gram: &self.weighted_gram,
             coeff_range,
