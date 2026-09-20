@@ -39,6 +39,20 @@ pub(crate) const SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS: [&str; 7] = [
 ];
 pub(crate) const PREDICTION_INTERVAL_COLUMNS: [&str; 2] = ["mean_lower", "mean_upper"];
 pub(crate) const PREDICTION_STD_ERROR_COLUMN: &str = "std_error";
+/// Response-scale observation (prediction) band for a new response, the
+/// `gam predict --observation-interval` columns. The names are the ones the
+/// Python `predict(observation_interval=True)` surface publishes.
+pub(crate) const OBSERVATION_INTERVAL_COLUMNS: [&str; 2] =
+    ["observation_lower", "observation_upper"];
+
+/// A `(lower, upper)` observation band as the writers receive it.
+pub(crate) type ObservationBand<'a> = (ArrayView1<'a, f64>, ArrayView1<'a, f64>);
+
+/// Materialise an observation band into contiguous columns for
+/// [`write_prediction_csv_unified`].
+fn observation_band_columns(band: Option<ObservationBand<'_>>) -> Option<(Vec<f64>, Vec<f64>)> {
+    band.map(|(lower, upper)| (lower.to_vec(), upper.to_vec()))
+}
 
 pub(crate) fn load_prediction_id_values(
     path: &Path,
@@ -246,6 +260,7 @@ pub(crate) fn write_prediction_csv(
     eta_se: Option<ArrayView1<'_, f64>>,
     mean_lower: Option<ArrayView1<'_, f64>>,
     mean_upper: Option<ArrayView1<'_, f64>>,
+    observation_band: Option<ObservationBand<'_>>,
 ) -> CliResult<()> {
     // Materialise views into contiguous vecs so we can pass &[f64] slices.
     let eta_v: Vec<f64> = eta.to_vec();
@@ -288,6 +303,11 @@ pub(crate) fn write_prediction_csv(
             reason: "internal error: mean_lower missing while mean_upper is present".to_string(),
         });
     }
+    let observation = observation_band_columns(observation_band);
+    if let Some((lower, upper)) = observation.as_ref() {
+        cols.push((OBSERVATION_INTERVAL_COLUMNS[0], lower));
+        cols.push((OBSERVATION_INTERVAL_COLUMNS[1], upper));
+    }
 
     write_prediction_csv_unified(path, &cols)
 }
@@ -311,6 +331,7 @@ pub(crate) fn write_estimand_explicit_prediction_csv(
     posterior_mean_standard_error: Option<ArrayView1<'_, f64>>,
     posterior_mean_lower: Option<ArrayView1<'_, f64>>,
     posterior_mean_upper: Option<ArrayView1<'_, f64>>,
+    observation_band: Option<ObservationBand<'_>>,
 ) -> CliResult<()> {
     let linear_predictor_plugin = linear_predictor_plugin.to_vec();
     let mean_plugin = mean_plugin.to_vec();
@@ -369,6 +390,11 @@ pub(crate) fn write_estimand_explicit_prediction_csv(
                     .to_string(),
             });
         }
+    }
+    let observation = observation_band_columns(observation_band);
+    if let Some((lower, upper)) = observation.as_ref() {
+        columns.push((OBSERVATION_INTERVAL_COLUMNS[0], lower));
+        columns.push((OBSERVATION_INTERVAL_COLUMNS[1], upper));
     }
     write_prediction_csv_unified(path, &columns)
 }
@@ -450,6 +476,7 @@ pub(crate) fn write_survival_binary_prediction_csv(
     eta_se: Option<ArrayView1<'_, f64>>,
     event_lower: Option<ArrayView1<'_, f64>>,
     event_upper: Option<ArrayView1<'_, f64>>,
+    observation_band: Option<ObservationBand<'_>>,
 ) -> CliResult<()> {
     let eta_v: Vec<f64> = eta.to_vec();
     let plugin_v: Vec<f64> = event_prob_plugin
@@ -503,6 +530,11 @@ pub(crate) fn write_survival_binary_prediction_csv(
         return Err(CliError::Internal {
             reason: "internal error: event_lower missing while event_upper is present".to_string(),
         });
+    }
+    let observation = observation_band_columns(observation_band);
+    if let Some((lower, upper)) = observation.as_ref() {
+        cols.push((OBSERVATION_INTERVAL_COLUMNS[0], lower));
+        cols.push((OBSERVATION_INTERVAL_COLUMNS[1], upper));
     }
 
     write_prediction_csv_unified(path, &cols)

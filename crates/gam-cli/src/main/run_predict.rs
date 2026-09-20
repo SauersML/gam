@@ -997,6 +997,7 @@ pub(crate) fn run_predict_unified(
     pred_input: &PredictInput,
     predictor: &dyn PredictableModel,
     extrapolation_variance: Option<Array1<f64>>,
+    observation_prior_weights: Option<Array1<f64>>,
 ) -> Result<(), String> {
     let fit_for_predict = fit_result_from_saved_model_for_prediction(model)?;
     let model_class = model.predict_model_class();
@@ -1028,18 +1029,13 @@ pub(crate) fn run_predict_unified(
     let request = gam_predict::interval_policy::PredictionRequest {
         interval: args.uncertainty.then_some(args.level),
         covariance_mode: resolved_covariance_mode(args, model),
-        // The CLI cannot request the observation (prediction) band yet: it has
-        // no `--observation-interval` switch and its CSV writers carry no
-        // observation columns, while `predict(observation_interval=True)` from
-        // Python can. That gap is now ONE explicit `false` on the shared
-        // request instead of three hardcoded literals buried in three arms.
-        observation_interval: false,
-        // Same gap, second half: the #2077 heteroscedastic band needs the
-        // per-row prior weights from `resolve_weight_column`, which takes a
-        // `Dataset`; this predict path carries only the raw value matrix and a
-        // column map, so the weights are not reachable here without threading
-        // the dataset through `run_predict_model`.
-        observation_prior_weights: None,
+        // `--observation-interval` asks for the same response-scale observation
+        // (prediction) band `predict(observation_interval=True)` returns from
+        // Python, priced from each row's own prior weight when the fit was
+        // weighted (#2077); `run_predict` resolved those weights from the
+        // prediction table.
+        observation_interval: args.observation_interval,
+        observation_prior_weights,
         // V∞ §5: the measure-jet terms' priced off-support ignorance, which
         // `run_predict_model` prices over the raw rows.
         extrapolation_variance,
@@ -1060,6 +1056,8 @@ pub(crate) fn run_predict_unified(
         posterior_mean_standard_error,
         posterior_mean_lower,
         posterior_mean_upper,
+        observation_lower,
+        observation_upper,
         point_covariance,
         uncertainty_covariance,
         point_provenance,
@@ -1071,6 +1069,8 @@ pub(crate) fn run_predict_unified(
         columns.posterior_mean_standard_error,
         columns.posterior_mean_lower,
         columns.posterior_mean_upper,
+        columns.observation_lower,
+        columns.observation_upper,
         columns.point_covariance_source,
         columns.uncertainty_covariance_source,
         columns.point_covariance_provenance,
@@ -1078,6 +1078,18 @@ pub(crate) fn run_predict_unified(
     let specialised_point = posterior_mean
         .as_ref()
         .ok_or_else(|| "posterior-mean prediction did not produce a posterior mean".to_string())?;
+    // A requested observation band is published or refused, never silently
+    // dropped: a family with no conditional response variance returns none.
+    let observation_band = match (observation_lower.as_ref(), observation_upper.as_ref()) {
+        (Some(lower), Some(upper)) => Some((lower.view(), upper.view())),
+        (None, None) if !args.observation_interval => None,
+        _ => {
+            return Err(format!(
+                "--observation-interval: {} prediction published no observation (prediction) band",
+                pretty_predict_model_class(model_class)
+            ));
+        }
+    };
 
     // --- Write CSV output ---
 
@@ -1110,6 +1122,7 @@ pub(crate) fn run_predict_unified(
                 posterior_mean_standard_error.as_ref().map(|a| a.view()),
                 posterior_mean_lower.as_ref().map(|a| a.view()),
                 posterior_mean_upper.as_ref().map(|a| a.view()),
+                observation_band,
             )?;
         }
         PredictModelClass::BernoulliMarginalSlope => {
@@ -1141,6 +1154,7 @@ pub(crate) fn run_predict_unified(
                 posterior_mean_standard_error.as_ref().map(|a| a.view()),
                 posterior_mean_lower.as_ref().map(|a| a.view()),
                 posterior_mean_upper.as_ref().map(|a| a.view()),
+                observation_band,
             )?;
         }
         _ => {
@@ -1151,6 +1165,7 @@ pub(crate) fn run_predict_unified(
                 posterior_mean_standard_error.as_ref().map(|a| a.view()),
                 posterior_mean_lower.as_ref().map(|a| a.view()),
                 posterior_mean_upper.as_ref().map(|a| a.view()),
+                observation_band,
             )?;
         }
     }
@@ -1176,7 +1191,25 @@ pub(crate) fn run_predict_model(
     predict_offset: &Array1<f64>,
     predict_noise_offset: &Array1<f64>,
     noise_offset_supplied: bool,
+    observation_prior_weights: Option<Array1<f64>>,
 ) -> Result<(), String> {
+    // Survival, spline-scan and residual-cascade prediction do not run the
+    // shared `resolve_prediction_request` and publish no observation band.
+    let dedicated_path = if model.predict_model_class() == PredictModelClass::Survival {
+        Some("survival")
+    } else if model.spline_scan.is_some() {
+        Some("spline-scan")
+    } else if model.residual_cascade.is_some() {
+        Some("residual-cascade")
+    } else {
+        None
+    };
+    if let Some(path) = dedicated_path.filter(|_| args.observation_interval) {
+        return Err(format!(
+            "--observation-interval is not available for {path} models: their prediction path \
+             publishes no observation (prediction) band"
+        ));
+    }
     if model.predict_model_class() == PredictModelClass::Survival {
         return run_predict_survival(
             args,
@@ -1221,7 +1254,14 @@ pub(crate) fn run_predict_model(
     } else {
         None
     };
-    run_predict_unified(args, model, &pred_input, &*predictor, extrapolation_variance)
+    run_predict_unified(
+        args,
+        model,
+        &pred_input,
+        &*predictor,
+        extrapolation_variance,
+        observation_prior_weights,
+    )
 }
 
 pub(crate) fn validate_level(level: f64) -> Result<(), String> {
@@ -1289,6 +1329,7 @@ pub(crate) fn run_predict_spline_scan(
         se_opt.as_ref().map(|a| a.view()),
         mean_lo.as_ref().map(|a| a.view()),
         mean_hi.as_ref().map(|a| a.view()),
+        None,
     )?;
     cli_out!(
         "wrote predictions: {} (rows={}){}",
@@ -1373,6 +1414,7 @@ pub(crate) fn run_predict_residual_cascade(
         se_opt.as_ref().map(|a| a.view()),
         mean_lo.as_ref().map(|a| a.view()),
         mean_hi.as_ref().map(|a| a.view()),
+        None,
     )?;
     cli_out!(
         "wrote predictions: {} (rows={}){}",
@@ -1511,12 +1553,33 @@ fn run_predict_conformal(
 
 pub(crate) fn run_predict(args: PredictArgs) -> CliResult<()> {
     validate_level(args.level)?;
+    // The observation band is priced at `--level` beside the posterior band, so
+    // it is an addition to `--uncertainty`, never a band of its own (and never
+    // a conformal band, which `--conformal` already is).
+    if args.observation_interval && !args.uncertainty {
+        return Err("--observation-interval requires --uncertainty: the observation \
+                    (prediction) band is published at --level beside the posterior band"
+            .to_string()
+            .into());
+    }
+    if args.observation_interval && args.conformal {
+        return Err("--observation-interval and --conformal are two different bands; \
+                    --conformal already publishes the conformal prediction set"
+            .to_string()
+            .into());
+    }
     // A multinomial model persists as its own softmax-envelope file, not a
     // scalar `SavedModel`; dispatch on the file discriminator before the
     // standard load so `SavedModel::load_from_path` is never handed one.
     if is_multinomial_model_file(&args.model) {
         if args.conformal {
             return Err("--conformal supports standard models only".to_string().into());
+        }
+        if args.observation_interval {
+            return Err("--observation-interval supports standard models only: a \
+                        multinomial prediction publishes no observation band"
+                .to_string()
+                .into());
         }
         return run_predict_multinomial(&args).map_err(CliError::from);
     }
@@ -1531,12 +1594,24 @@ pub(crate) fn run_predict(args: PredictArgs) -> CliResult<()> {
     // name below) in addition to the model's referenced columns.
     let (effective_offset_column, effective_noise_offset_column) =
         effective_predict_offset_columns(&model, &args);
-    let offset_extras: Vec<String> = [effective_offset_column, effective_noise_offset_column]
-        .into_iter()
-        .flatten()
-        .map(str::to_string)
-        .collect();
-    let ds = load_datasetwith_model_schema_extra(&args.new_data, &model, &offset_extras)?;
+    // A prior-weighted fit's observation law is `Var(y_i) = σ̂²/w_i` (#2077): the
+    // band for a new row is priced from that row's own weight, so the weight
+    // column is a required prediction column exactly when the band is asked for.
+    let observation_weight_column = if args.observation_interval {
+        model.weight_column.as_deref()
+    } else {
+        None
+    };
+    let prediction_extras: Vec<String> = [
+        effective_offset_column,
+        effective_noise_offset_column,
+        observation_weight_column,
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_string)
+    .collect();
+    let ds = load_datasetwith_model_schema_extra(&args.new_data, &model, &prediction_extras)?;
     require_dataset_rows("predict", &args.new_data, ds.values.nrows())?;
     log::debug!(
         "[PHASE] predict load-data done elapsed={:.3}s n={}",
@@ -1560,6 +1635,12 @@ pub(crate) fn run_predict(args: PredictArgs) -> CliResult<()> {
         effective_offset_column,
         effective_noise_offset_column,
     )?;
+    let observation_prior_weights = observation_weight_column
+        .map(|column| resolve_weight_column(&ds, &col_map, Some(column)))
+        .transpose()
+        .map_err(|error| {
+            format!("failed to resolve the observation band's prior weights: {error}")
+        })?;
     let result = if args.conformal {
         run_predict_conformal(
             &args,
@@ -1581,6 +1662,7 @@ pub(crate) fn run_predict(args: PredictArgs) -> CliResult<()> {
             &predict_offset,
             &predict_noise_offset,
             effective_noise_offset_column.is_some(),
+            observation_prior_weights,
         )
     };
     if result.is_ok() {
@@ -1919,6 +2001,7 @@ impl SavedLatentWindowKind {
                 None,
                 mean_lower,
                 mean_upper,
+                None,
             ),
         }
     }

@@ -476,6 +476,16 @@ pub(crate) struct PredictArgs {
     pub(crate) uncertainty: bool,
     #[arg(long = "level", default_value_t = 0.95, value_parser = parse_probability_open_cli)]
     pub(crate) level: f64,
+    /// With `--uncertainty`, also publish the response-scale observation
+    /// (prediction) band for a NEW response at `--level` as
+    /// `observation_lower` / `observation_upper`: the same band
+    /// `predict(observation_interval=True)` returns from Python, built by the
+    /// shared `resolve_prediction_request`. A prior-weighted fit prices each
+    /// row's band from its own weight (`Var(y_i) = σ̂²/w_i`, #2077), so the
+    /// prediction table must then carry the model's weight column. A family
+    /// that publishes no observation band refuses the request.
+    #[arg(long = "observation-interval", default_value_t = false)]
+    pub(crate) observation_interval: bool,
     /// Covariance definition for the SE / band columns. Absent, the
     /// invocation uses the definition the saved fit publishes (the one `gam
     /// summary` prices its standard errors from) and labels it; naming a mode

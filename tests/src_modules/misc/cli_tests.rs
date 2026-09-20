@@ -2293,6 +2293,7 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -2517,6 +2518,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -3134,6 +3136,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -3176,6 +3179,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         id_column: None,
         uncertainty: true,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -3201,6 +3205,148 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
             "posterior-mean prediction with uncertainty is missing {required}: {band_header}"
         );
     }
+}
+
+/// `gam predict --uncertainty --observation-interval` publishes the same
+/// response-scale observation (prediction) band `predict(observation_interval=True)`
+/// returns from Python, built by the shared `resolve_prediction_request`, and a
+/// prior-weighted Gaussian fit prices each new row's band from that row's own
+/// weight: `Var(y_i) = σ̂²/w_i + Var(μ_i)` (#2077).
+///
+/// Three query rows share one `x`, so they share the posterior mean and its SE,
+/// and differ only in the weight. With half-width `h_w = z·√(σ̂²/w + se²)`,
+/// `(h_1² − h_2²)/(h_1² − h_4²) = (1 − 1/2)/(1 − 1/4) = 2/3` whatever `z`, `σ̂²`
+/// and `se` are, so the check pins the weight law itself, not a fitted number.
+#[test]
+fn cli_predict_observation_interval_prices_each_row_from_its_prior_weight() {
+    let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
+    let train_path = td.path().join("train.csv");
+    let new_path = td.path().join("new.csv");
+    let unweighted_new_path = td.path().join("new_unweighted.csv");
+    let model_path = td.path().join("model.json");
+    let pred_path = td.path().join("pred.csv");
+
+    let mut train = String::from("x,y,w\n");
+    for i in 0..48 {
+        let x = i as f64 / 47.0;
+        let y = 1.0 + 2.0 * x + 0.3 * (7.3 * i as f64).sin();
+        let w = [1.0, 2.0, 4.0][i % 3];
+        train.push_str(&format!("{x},{y},{w}\n"));
+    }
+    fs::write(&train_path, train)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write training csv", e));
+    fs::write(&new_path, "x,y,w\n0.5,0.0,1.0\n0.5,0.0,2.0\n0.5,0.0,4.0\n")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write prediction csv", e));
+    fs::write(&unweighted_new_path, "x,y\n0.5,0.0\n")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write unweighted prediction csv", e));
+
+    let fit_args = FitArgs {
+        expectile_tau: None,
+        data: train_path,
+        request: None,
+        formula_positional: Some("y ~ x".to_string()),
+        predict_noise: None,
+        slope_formula: None,
+        z_column: None,
+        residual_columns: Vec::new(),
+        weights_column: Some("w".to_string()),
+        offset_column: None,
+        noise_offset_column: None,
+        frailty_kind: None,
+        frailty_sd: None,
+        hazard_loading: None,
+        transformation_normal: false,
+        firth: false,
+        family: FamilyArg::Auto,
+        negative_binomial_theta: None,
+        survival_likelihood: None,
+        baseline_target: "linear".to_string(),
+        baseline_scale: None,
+        baseline_shape: None,
+        baseline_rate: None,
+        baseline_makeham: None,
+        time_basis: "ispline".to_string(),
+        threshold_time_k: None,
+        sigma_time_k: None,
+        slope_time_k: None,
+        scale_dimensions: false,
+        out: Some(model_path.clone()),
+    };
+    run_fit(fit_args).unwrap_or_else(|e| panic!("{} failed: {:?}", "weighted gaussian fit", e));
+
+    let predict_args = |new_data: PathBuf, uncertainty: bool| PredictArgs {
+        model: model_path.clone(),
+        new_data,
+        out: pred_path.clone(),
+        offset_column: None,
+        noise_offset_column: None,
+        id_column: None,
+        uncertainty,
+        level: 0.9,
+        observation_interval: true,
+        covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
+        conformal: false,
+        calibration: None,
+        training_data: None,
+    };
+
+    // The band is priced at `--level` beside the posterior band, never alone.
+    let alone = run_predict(predict_args(new_path.clone(), false))
+        .expect_err("--observation-interval without --uncertainty must be refused");
+    assert!(
+        alone.to_string().contains("requires --uncertainty"),
+        "wrong refusal for a band without --uncertainty: {alone}"
+    );
+    // A weighted fit's band needs each new row's weight; it is never priced at
+    // an unstated unit weight.
+    let unweighted = run_predict(predict_args(unweighted_new_path, true))
+        .expect_err("a weighted fit's observation band must require the weight column");
+    assert!(
+        unweighted.to_string().contains("'w'"),
+        "the refusal must name the missing weight column: {unweighted}"
+    );
+
+    run_predict(predict_args(new_path, true))
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "predict with observation band", e));
+
+    let mean = |row| csv_value_at(&pred_path, row, "posterior_mean");
+    let credible_half = |row| {
+        0.5 * (csv_value_at(&pred_path, row, "posterior_mean_upper")
+            - csv_value_at(&pred_path, row, "posterior_mean_lower"))
+    };
+    let observation_lower = |row| csv_value_at(&pred_path, row, "observation_lower");
+    let observation_upper = |row| csv_value_at(&pred_path, row, "observation_upper");
+    let half = |row| 0.5 * (observation_upper(row) - observation_lower(row));
+    for row in 0..3 {
+        assert!(
+            (mean(row) - mean(0)).abs() <= 1e-10 * mean(0).abs().max(1.0),
+            "rows at one x must share the posterior mean"
+        );
+        let centre = 0.5 * (observation_upper(row) + observation_lower(row));
+        assert!(
+            (centre - mean(row)).abs() <= 1e-9 * half(row),
+            "a Gaussian observation band is centred on the mean: row {row} centre {centre} mean {}",
+            mean(row)
+        );
+        assert!(
+            half(row) > credible_half(row),
+            "the observation band must contain the credible band: row {row} {} vs {}",
+            half(row),
+            credible_half(row)
+        );
+    }
+    assert!(
+        half(0) > half(1) && half(1) > half(2),
+        "a heavier prior weight must narrow the observation band: {} {} {}",
+        half(0),
+        half(1),
+        half(2)
+    );
+    let ratio = (half(0).powi(2) - half(1).powi(2)) / (half(0).powi(2) - half(2).powi(2));
+    assert!(
+        (ratio - 2.0 / 3.0).abs() <= 1e-9,
+        "the band must follow Var(y) = σ̂²/w + Var(μ): expected ratio 2/3, got {ratio}"
+    );
 }
 
 /// Build a standard (non-survival, non-location-scale) binomial `FitArgs` for the
@@ -3417,6 +3563,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -3459,6 +3606,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         id_column: None,
         uncertainty: true,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -3640,6 +3788,7 @@ fn posterior_mean_prediction_for_model(model: &SavedModel) -> f64 {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -5038,6 +5187,7 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
@@ -5448,6 +5598,7 @@ fn survival_binary_prediction_csv_includes_explicit_semantics_columns() {
         None,
         None,
         None,
+        None,
     )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival binary prediction csv", e));
 
@@ -5586,6 +5737,7 @@ fn survival_binary_prediction_csv_emits_bounds_without_std_error() {
         None,
         Some(lower.view()),
         Some(upper.view()),
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -5629,6 +5781,7 @@ fn survival_binary_prediction_csv_errors_on_half_supplied_bounds() {
         None,
         Some(lower.view()),
         None,
+        None,
     )
     .expect_err("lower-only binary bounds must be rejected");
     assert!(
@@ -5644,6 +5797,7 @@ fn survival_binary_prediction_csv_errors_on_half_supplied_bounds() {
         None,
         None,
         Some(upper.view()),
+        None,
     )
     .expect_err("upper-only binary bounds must be rejected");
     assert!(
@@ -5665,7 +5819,7 @@ fn prediction_csv_can_prepend_id_column() {
 
     let eta = array![0.5, -0.25];
     let mean = array![0.62, 0.44];
-    write_prediction_csv(&path, eta.view(), mean.view(), None, None, None)
+    write_prediction_csv(&path, eta.view(), mean.view(), None, None, None, None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write prediction csv", e));
     prepend_id_column_to_prediction_csv(&path, "person_id", &["p1".to_string(), "p2".to_string()])
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "prepend id column", e));
@@ -5699,6 +5853,7 @@ fn location_scale_prediction_csv_uses_estimand_explicit_schema() {
         Some(mean.view()),
         Some(sigma.view()),
         &[],
+        None,
         None,
         None,
         None,
@@ -5741,6 +5896,7 @@ fn location_scale_map_prediction_omits_the_posterior_estimand() {
         None,
         Some(sigma.view()),
         &[],
+        None,
         None,
         None,
         None,
@@ -5791,6 +5947,7 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
         Some(std_error.view()),
         Some(mean_lower.view()),
         Some(mean_upper.view()),
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -6593,6 +6750,7 @@ fn cli_survival_marginal_slope_predict_publishes_library_posterior_mean_3316() {
         id_column: None,
         uncertainty: true,
         level: 0.9,
+        observation_interval: false,
         covariance_mode: Some(InferenceCovarianceMode::Conditional),
         conformal: false,
         calibration: None,
@@ -6817,6 +6975,7 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         // The fit's published definition: these fixtures carry a conditional
         // covariance only, and naming `SmoothingCorrected` is a requirement the
         // fit refuses (#2779). The posterior-mean point needs a backend the
@@ -6981,6 +7140,7 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         id_column: None,
         uncertainty: false,
         level: 0.95,
+        observation_interval: false,
         // The fit's published definition: these fixtures carry a conditional
         // covariance only, and naming `SmoothingCorrected` is a requirement the
         // fit refuses (#2779). The posterior-mean point needs a backend the
