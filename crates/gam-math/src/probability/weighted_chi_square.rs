@@ -3,6 +3,7 @@
 
 use crate::double_double::SMALLEST_SUBNORMAL;
 use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
+use crate::special::softplus;
 
 /// One term `λ_j·χ²_{h_j}` of a weighted sum of independent central chi-squares, with the
 /// weight's SIGN and the term's degrees of freedom both carried explicitly.
@@ -237,11 +238,6 @@ enum Chart {
     Logit,
     /// No weight is positive (hence `x < 0`) and `c` is unbounded above: `y = ln θ`.
     Log,
-}
-
-/// `ln(1 + eᶻ)` without overflow or cancellation.
-fn softplus(z: f64) -> f64 {
-    z.max(0.0) + (-z.abs()).exp().ln_1p()
 }
 
 /// `ln(eᵃ + eᵇ)`.

@@ -101,7 +101,12 @@ fn slq_lanczos_options(steps: usize) -> SymmetricLanczosOptions {
 }
 
 /// Run one Rademacher-probe Lanczos and return the tridiagonal eigenpairs, or
-/// `None` if the Lanczos run declines (non-finite matvec / start). Shared by the
+/// the Lanczos error (non-finite matvec output, a matvec of the wrong length,
+/// or a failed tridiagonal eigensolve; a lucky breakdown is NOT an error — it
+/// returns the exhausted Krylov spectrum). Every estimator propagates that
+/// error: a probe that could not apply the operator carries no information
+/// about `tr(f(A))`, and averaging it in as a `0` contribution would bias the
+/// Hutchinson mean toward zero by the failed fraction (#3553). Shared by the
 /// plain [`slq_logdet`] and the unit-deflated `slq_logdet_unit_deflated`
 /// estimators so both draw the IDENTICAL probe vector and build the IDENTICAL
 /// Krylov space for a given `(dim, matvec, probe_seed, options)` — the two
@@ -115,7 +120,7 @@ fn probe_lanczos_eigenpairs(
     options: SymmetricLanczosOptions,
     matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
     lift_original_vectors: bool,
-) -> Option<SymmetricLanczosEigenpairs> {
+) -> Result<SymmetricLanczosEigenpairs, String> {
     let mut z = Array1::<f64>::zeros(dim);
     rademacher_into(&mut z, probe_seed);
     // The workspace Lanczos engine consumes `apply(&[f64], &mut [f64])`; wrap the
@@ -138,11 +143,22 @@ fn probe_lanczos_eigenpairs(
         Ok(())
     };
     let start = z.as_slice().expect("contiguous probe vector");
-    if lift_original_vectors {
-        symmetric_lanczos_eigenpairs_with_original_vectors(dim, start, options, &mut apply).ok()
+    let result = if lift_original_vectors {
+        symmetric_lanczos_eigenpairs_with_original_vectors(dim, start, options, &mut apply)
     } else {
-        symmetric_lanczos_eigenpairs(dim, start, options, &mut apply).ok()
-    }
+        symmetric_lanczos_eigenpairs(dim, start, options, &mut apply)
+    };
+    result.map_err(|reason| {
+        format!("SLQ Lanczos probe (seed {probe_seed:#018x}, dim {dim}) failed: {reason}")
+    })
+}
+
+/// Collapse the ORDERED per-probe results of a `rayon` fan-out into the probe
+/// values, returning the lowest-index failure. Collecting `Vec<Result<_>>` first
+/// and reducing serially keeps the reported error deterministic (rayon's own
+/// `Result` collect returns whichever failing worker finishes first).
+fn first_probe_failure<T>(per_probe: Vec<Result<T, String>>) -> Result<Vec<T>, String> {
+    per_probe.into_iter().collect()
 }
 
 /// Serial mean and standard error of the per-probe SLQ contributions. Runs over
@@ -178,6 +194,9 @@ fn slq_mean_std_err(contributions: &[f64]) -> (f64, f64) {
 ///
 /// Returns the averaged estimate and its standard error. For `dim == 0` the
 /// determinant of the empty operator is `1`, so the log-determinant is `0`.
+/// Any probe whose Lanczos run fails (non-finite or wrong-length matvec) is an
+/// error for the whole estimate: there is no valid Hutchinson mean over a probe
+/// set the operator could not be applied to.
 ///
 /// `lanczos_steps` is internally capped at `dim` (a Krylov subspace cannot
 /// exceed the dimension) and `num_probes` is treated as at least `1`.
@@ -187,12 +206,12 @@ pub fn slq_logdet(
     num_probes: usize,
     lanczos_steps: usize,
     seed: u64,
-) -> SlqLogDet {
+) -> Result<SlqLogDet, String> {
     if dim == 0 {
-        return SlqLogDet {
+        return Ok(SlqLogDet {
             estimate: 0.0,
             std_err: 0.0,
-        };
+        });
     }
     let num_probes = num_probes.max(1);
     let steps = lanczos_steps.max(1).min(dim);
@@ -212,31 +231,20 @@ pub fn slq_logdet(
     // num_probes, lanczos_steps, seed)` — the determinism the REML evidence outer
     // loop requires (see the module `Determinism` note).
     let matvec = &matvec;
-    let contributions: Vec<f64> = (0..num_probes)
-        .into_par_iter()
-        .map(|probe| {
-            let probe_seed = seed.wrapping_add(probe as u64);
-            match probe_lanczos_eigenpairs(
-                dim,
-                probe_seed,
-                lanczos_options,
-                matvec,
-                false,
-            ) {
-                Some(pairs) => {
-                    norm_sq * clamped_log_quadrature(&pairs.eigenvalues, &pairs.eigenvectors)
-                }
-                // A Lanczos failure (non-finite matvec / start) cannot be silently
-                // averaged in; the dense-Cholesky gate above this call should have
-                // caught a degenerate operator. Treat it as a zero contribution and
-                // let the std-error widen rather than poisoning the mean with NaN.
-                None => 0.0,
-            }
-        })
-        .collect();
+    let contributions = first_probe_failure(
+        (0..num_probes)
+            .into_par_iter()
+            .map(|probe| -> Result<f64, String> {
+                let probe_seed = seed.wrapping_add(probe as u64);
+                let pairs =
+                    probe_lanczos_eigenpairs(dim, probe_seed, lanczos_options, matvec, false)?;
+                Ok(norm_sq * clamped_log_quadrature(&pairs.eigenvalues, &pairs.eigenvectors))
+            })
+            .collect::<Vec<Result<f64, String>>>(),
+    )?;
 
     let (estimate, std_err) = slq_mean_std_err(&contributions);
-    SlqLogDet { estimate, std_err }
+    Ok(SlqLogDet { estimate, std_err })
 }
 
 /// Result of a unit-deflated SLQ log-determinant estimate.
@@ -303,7 +311,8 @@ impl SlqUnitDeflatedLogDet {
 /// floor would make the estimate non-linear in the probes and break determinism
 /// of the deflation set).
 ///
-/// Determinism, probe fan-out, and the `dim == 0 ⇒ 0` convention are identical to
+/// Determinism, probe fan-out, the `dim == 0 ⇒ 0` convention and the refusal of
+/// a failed probe are identical to
 /// [`slq_logdet`]; the two share `probe_lanczos_eigenpairs`, so for a fixed
 /// `(dim, matvec, num_probes, lanczos_steps, seed)` the two estimators build
 /// bit-identical Krylov spaces and differ ONLY in the applied spectral function.
@@ -314,14 +323,14 @@ pub(crate) fn slq_logdet_unit_deflated(
     lanczos_steps: usize,
     seed: u64,
     relative_floor: f64,
-) -> SlqUnitDeflatedLogDet {
+) -> Result<SlqUnitDeflatedLogDet, String> {
     if dim == 0 {
-        return SlqUnitDeflatedLogDet {
+        return Ok(SlqUnitDeflatedLogDet {
             estimate: 0.0,
             std_err: 0.0,
             lambda_max_abs: 0.0,
             deflate_floor: 0.0,
-        };
+        });
     }
     let num_probes = num_probes.max(1);
     let steps = lanczos_steps.max(1).min(dim);
@@ -331,31 +340,34 @@ pub(crate) fn slq_logdet_unit_deflated(
     // Pass 1 — build every probe's Ritz pairs (the expensive matvec work), fanned
     // across rayon workers. The ordered buffer keeps the reduction reproducible.
     let matvec = &matvec;
-    let per_probe: Vec<Option<SymmetricLanczosEigenpairs>> = (0..num_probes)
-        .into_par_iter()
-        .map(|probe| {
-            let probe_seed = seed.wrapping_add(probe as u64);
-            probe_lanczos_eigenpairs(dim, probe_seed, lanczos_options, matvec, false)
-        })
-        .collect();
+    let per_probe: Vec<SymmetricLanczosEigenpairs> = first_probe_failure(
+        (0..num_probes)
+            .into_par_iter()
+            .map(|probe| {
+                let probe_seed = seed.wrapping_add(probe as u64);
+                probe_lanczos_eigenpairs(dim, probe_seed, lanczos_options, matvec, false)
+            })
+            .collect::<Vec<Result<SymmetricLanczosEigenpairs, String>>>(),
+    )?;
 
     // A single shared spectral-radius estimate `max|λ|` over ALL probes' Ritz
     // values, and from it the ONE deflation floor every probe uses.
     let lambda_max_abs = per_probe
         .iter()
-        .flatten()
         .flat_map(|pairs| pairs.eigenvalues.iter())
         .filter(|value| value.is_finite())
         .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
     if !(lambda_max_abs.is_finite() && lambda_max_abs > 0.0) {
-        // No usable spectrum (empty / all-zero / every probe declined): the
-        // unit-deflated determinant of a fully-deflated operator is `Σ 0 = 0`.
-        return SlqUnitDeflatedLogDet {
+        // Every probe ran and every Ritz value is exactly zero (`A = 0` on the
+        // probed Krylov spaces): each direction is below any relative floor and
+        // pins to unit stiffness, so the unit-deflated determinant is `Σ 0 = 0`.
+        // Failed probes never reach here — they were propagated above.
+        return Ok(SlqUnitDeflatedLogDet {
             estimate: 0.0,
             std_err: 0.0,
             lambda_max_abs: 0.0,
             deflate_floor: 0.0,
-        };
+        });
     }
     let deflate_floor =
         relative_floor * lambda_max_abs * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
@@ -363,26 +375,19 @@ pub(crate) fn slq_logdet_unit_deflated(
     // Pass 2 — apply the unit-deflation spectral function against the shared floor.
     let contributions: Vec<f64> = per_probe
         .iter()
-        .map(|maybe_pairs| match maybe_pairs {
-            Some(pairs) => {
-                norm_sq
-                    * deflated_log_quadrature(
-                        &pairs.eigenvalues,
-                        &pairs.eigenvectors,
-                        deflate_floor,
-                    )
-            }
-            None => 0.0,
+        .map(|pairs| {
+            norm_sq
+                * deflated_log_quadrature(&pairs.eigenvalues, &pairs.eigenvectors, deflate_floor)
         })
         .collect();
 
     let (estimate, std_err) = slq_mean_std_err(&contributions);
-    SlqUnitDeflatedLogDet {
+    Ok(SlqUnitDeflatedLogDet {
         estimate,
         std_err,
         lambda_max_abs,
         deflate_floor,
-    }
+    })
 }
 
 struct ExactAProbeRitzGeometry {
@@ -426,15 +431,8 @@ pub(crate) fn slq_logdet_exact_a_classified(
         .into_par_iter()
         .map(|probe| {
             let probe_seed = seed.wrapping_add(probe as u64);
-            let Some(mut pairs) = probe_lanczos_eigenpairs(
-                dim,
-                probe_seed,
-                lanczos_options,
-                matvec,
-                true,
-            ) else {
-                return Ok(None);
-            };
+            let mut pairs =
+                probe_lanczos_eigenpairs(dim, probe_seed, lanczos_options, matvec, true)?;
             let original = pairs.original_eigenvectors.take().ok_or_else(|| {
                 "exact-A SLQ requested lifted Ritz vectors, but Lanczos returned none"
                     .to_string()
@@ -459,19 +457,17 @@ pub(crate) fn slq_logdet_exact_a_classified(
                 majorizer_curvatures[ritz] = majorizer;
                 clamp_curvatures[ritz] = clamp;
             }
-            Ok(Some(ExactAProbeRitzGeometry {
+            Ok(ExactAProbeRitzGeometry {
                 pairs,
                 majorizer_curvatures,
                 clamp_curvatures,
-            }))
+            })
         })
-        .collect::<Vec<Result<Option<ExactAProbeRitzGeometry>, String>>>()
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<Result<ExactAProbeRitzGeometry, String>>>();
+    let per_probe = first_probe_failure(per_probe)?;
 
     let spectral_norm = per_probe
         .iter()
-        .flatten()
         .flat_map(|probe| probe.pairs.eigenvalues.iter())
         .filter(|value| value.is_finite())
         .fold(0.0_f64, |scale, &value| scale.max(value.abs()));
@@ -480,11 +476,7 @@ pub(crate) fn slq_logdet_exact_a_classified(
     }
 
     let mut contributions = Vec::with_capacity(num_probes);
-    for (probe_index, maybe_probe) in per_probe.iter().enumerate() {
-        let Some(probe) = maybe_probe else {
-            contributions.push(0.0);
-            continue;
-        };
+    for (probe_index, probe) in per_probe.iter().enumerate() {
         let mut quadrature = 0.0_f64;
         for ritz in 0..probe.pairs.eigenvalues.len() {
             let raw = probe.pairs.eigenvalues[ritz];
@@ -543,7 +535,7 @@ pub(crate) fn exact_a_ritz_conditioning(
     }
     let options = slq_lanczos_options(lanczos_steps.max(1).min(dim));
     let mut pairs = probe_lanczos_eigenpairs(dim, seed, options, &matvec, true)
-        .ok_or_else(|| "exact-A rational conditioning Lanczos run declined".to_string())?;
+        .map_err(|reason| format!("exact-A rational conditioning: {reason}"))?;
     let original = pairs.original_eigenvectors.take().ok_or_else(|| {
         "exact-A rational conditioning requested lifted Ritz vectors, but Lanczos returned none"
             .to_string()
@@ -630,7 +622,7 @@ pub(crate) fn unit_deflation_ritz_conditioning(
     }
     let options = slq_lanczos_options(lanczos_steps.max(1).min(dim));
     let mut pairs = probe_lanczos_eigenpairs(dim, seed, options, &matvec, true)
-        .ok_or_else(|| "unit-deflation rational conditioning Lanczos run declined".to_string())?;
+        .map_err(|reason| format!("unit-deflation rational conditioning: {reason}"))?;
     let original = pairs.original_eigenvectors.take().ok_or_else(|| {
         "unit-deflation rational conditioning requested lifted Ritz vectors, but Lanczos \
          returned none"
@@ -775,7 +767,8 @@ mod tests {
             let exact = exact_logdet(&a);
             let cond = condition_number(&a);
 
-            let result = slq_logdet(dim, |v| a.dot(&v), 48, 70, 0xA5A5_0000 ^ seed);
+            let result = slq_logdet(dim, |v| a.dot(&v), 48, 70, 0xA5A5_0000 ^ seed)
+                .expect("SLQ on a finite operator");
 
             let rel_err = (result.estimate - exact).abs() / exact.abs();
             eprintln!(
@@ -814,7 +807,8 @@ mod tests {
             "test fixture should be moderately ill-conditioned, got cond={cond:.2e}"
         );
 
-        let result = slq_logdet(dim, |v| a.dot(&v), 40, 110, 0xC0FFEE);
+        let result = slq_logdet(dim, |v| a.dot(&v), 40, 110, 0xC0FFEE)
+            .expect("SLQ on a finite operator");
         let rel_err = (result.estimate - exact).abs() / exact.abs();
         eprintln!(
             "ill-conditioned dim={dim} cond={cond:.2e} exact={exact:.6} \
@@ -833,8 +827,8 @@ mod tests {
     fn slq_is_deterministic_for_fixed_seed() {
         let dim = 80usize;
         let a = random_spd(dim, dim + 20, 2.0, 11);
-        let r1 = slq_logdet(dim, |v| a.dot(&v), 24, 50, 99);
-        let r2 = slq_logdet(dim, |v| a.dot(&v), 24, 50, 99);
+        let r1 = slq_logdet(dim, |v| a.dot(&v), 24, 50, 99).expect("SLQ on a finite operator");
+        let r2 = slq_logdet(dim, |v| a.dot(&v), 24, 50, 99).expect("SLQ on a finite operator");
         assert_eq!(
             r1.estimate, r2.estimate,
             "SLQ must be bit-reproducible for a fixed seed"
@@ -866,7 +860,8 @@ mod tests {
             32,
             60,
             7,
-        );
+        )
+        .expect("SLQ on a finite operator");
         let rel_err = (result.estimate - exact).abs() / exact.abs();
         eprintln!(
             "diagonal dim={dim} exact={exact:.6} est={:.6} rel_err={rel_err:.4e}",
@@ -880,7 +875,7 @@ mod tests {
 
     #[test]
     fn slq_empty_operator_is_zero() {
-        let result = slq_logdet(0, |v| v.to_owned(), 8, 8, 1);
+        let result = slq_logdet(0, |v| v.to_owned(), 8, 8, 1).expect("SLQ on a finite operator");
         assert_eq!(result.estimate, 0.0);
         assert_eq!(result.std_err, 0.0);
     }
@@ -891,8 +886,8 @@ mod tests {
         // many probes should give a tighter band than few.
         let dim = 120usize;
         let a = random_spd(dim, dim + 30, 3.0, 21);
-        let few = slq_logdet(dim, |v| a.dot(&v), 6, 60, 5);
-        let many = slq_logdet(dim, |v| a.dot(&v), 96, 60, 5);
+        let few = slq_logdet(dim, |v| a.dot(&v), 6, 60, 5).expect("SLQ on a finite operator");
+        let many = slq_logdet(dim, |v| a.dot(&v), 96, 60, 5).expect("SLQ on a finite operator");
         eprintln!(
             "std_err few(6)={:.4e} many(96)={:.4e}",
             few.std_err, many.std_err
@@ -972,7 +967,8 @@ mod tests {
             dim,
             0xD1F,
             SPECTRAL_DEFLATION_REL_FLOOR,
-        );
+        )
+        .expect("unit-deflated SLQ on a finite operator");
         eprintln!(
             "unit-deflated est={:.6} reference={:.6} lambda_max_abs={:.6} floor={:.3e}",
             deflated.estimate, reference, deflated.lambda_max_abs, deflated.deflate_floor
@@ -1005,7 +1001,8 @@ mod tests {
         // the ρ-dependent-Occam-reward bug the matrix-free unit deflation removes.
         // The quadrature spreads one direction's weight over its nodes, so the
         // realized drop is bounded below by half the band's log, not by all of it.
-        let plain = slq_logdet(dim, |v| a.dot(&v), 48, dim, 0xD1F);
+        let plain = slq_logdet(dim, |v| a.dot(&v), 48, dim, 0xD1F)
+            .expect("SLQ on a finite operator");
         let ritz_band =
             gam_linalg::roundoff::accumulation_growth(48) * deflated.lambda_max_abs;
         let collapsed_direction_drop = -ritz_band.ln();
@@ -1038,8 +1035,10 @@ mod tests {
             70,
             0xA5A5,
             SPECTRAL_DEFLATION_REL_FLOOR,
-        );
-        let plain = slq_logdet(dim, |v| a.dot(&v), 48, 70, 0xA5A5);
+        )
+        .expect("unit-deflated SLQ on a finite operator");
+        let plain = slq_logdet(dim, |v| a.dot(&v), 48, 70, 0xA5A5)
+            .expect("SLQ on a finite operator");
         assert_eq!(
             deflated.estimate.to_bits(),
             plain.estimate.to_bits(),
@@ -1064,7 +1063,8 @@ mod tests {
             8,
             1,
             SPECTRAL_DEFLATION_REL_FLOOR,
-        );
+        )
+        .expect("unit-deflated SLQ on a finite operator");
         assert_eq!(empty.estimate, 0.0);
         assert_eq!(empty.lambda_max_abs, 0.0);
 
@@ -1076,7 +1076,8 @@ mod tests {
             dim,
             2,
             SPECTRAL_DEFLATION_REL_FLOOR,
-        );
+        )
+        .expect("unit-deflated SLQ on a finite operator");
         assert!(zeros.estimate.is_finite());
         assert_eq!(zeros.estimate, 0.0);
     }
@@ -1101,7 +1102,8 @@ mod tests {
             dim,
             99,
             SPECTRAL_DEFLATION_REL_FLOOR,
-        );
+        )
+        .expect("unit-deflated SLQ on a finite operator");
         let r2 = slq_logdet_unit_deflated(
             dim,
             |v| a.dot(&v),
@@ -1109,8 +1111,58 @@ mod tests {
             dim,
             99,
             SPECTRAL_DEFLATION_REL_FLOOR,
-        );
+        )
+        .expect("unit-deflated SLQ on a finite operator");
         assert_eq!(r1.estimate.to_bits(), r2.estimate.to_bits());
         assert_eq!(r1.deflate_floor.to_bits(), r2.deflate_floor.to_bits());
+    }
+
+    /// #3553 — a probe whose operator apply is non-finite (or the wrong length)
+    /// carries no information about `tr(f(A))`. Every SLQ estimator must refuse
+    /// it instead of averaging it in as a `0` contribution, which used to report
+    /// `log det = 0` with `std_err = 0` when every probe failed.
+    #[test]
+    fn slq_estimators_refuse_failed_probes_3553() {
+        fn nan_apply(v: ArrayView1<f64>) -> Array1<f64> {
+            Array1::<f64>::from_elem(v.len(), f64::NAN)
+        }
+        fn short_apply(v: ArrayView1<f64>) -> Array1<f64> {
+            Array1::<f64>::ones(v.len() - 1)
+        }
+        let dim = 12usize;
+
+        let plain = slq_logdet(dim, nan_apply, 8, dim, 3);
+        assert!(plain.is_err(), "plain SLQ averaged in a NaN probe: {plain:?}");
+        let plain_short = slq_logdet(dim, short_apply, 8, dim, 3);
+        assert!(
+            plain_short.is_err(),
+            "plain SLQ averaged in a wrong-length probe: {plain_short:?}"
+        );
+
+        let deflated = slq_logdet_unit_deflated(
+            dim,
+            nan_apply,
+            8,
+            dim,
+            3,
+            SPECTRAL_DEFLATION_REL_FLOOR,
+        );
+        assert!(
+            deflated.is_err(),
+            "unit-deflated SLQ reported a value for a NaN operator: {deflated:?}"
+        );
+
+        let exact_a = slq_logdet_exact_a_classified(
+            dim,
+            nan_apply,
+            |_| Ok((1.0, 1.0)),
+            8,
+            dim,
+            3,
+        );
+        assert!(
+            exact_a.is_err(),
+            "exact-A SLQ reported a value for a NaN operator: {exact_a:?}"
+        );
     }
 }
