@@ -195,14 +195,20 @@ impl crate::fit::RefinedContinuationPath for ScriptedContinuationPath {
     fn label(&self) -> &'static str {
         "scripted"
     }
+
+    fn observation_count(&self) -> usize {
+        SCRIPTED_OBSERVATIONS
+    }
 }
+
+/// The observation count the scripted criterion is summed over. The ladder is
+/// judged in the criterion's own units against `τ_stat = 1/(2n)`, so this sets
+/// the resolution the fixtures below are written against: `1e-6`.
+const SCRIPTED_OBSERVATIONS: usize = 500_000;
 
 fn scripted_options(outer_max_iter: usize) -> BlockwiseFitOptions {
     BlockwiseFitOptions {
         outer_max_iter,
-        // The ladder is judged in the criterion's own units, so this is the
-        // resolution the fixtures below are written against.
-        outer_rel_cost_tol: Some(1e-6),
         ..double_well_options()
     }
 }
@@ -220,7 +226,7 @@ fn scripted_options(outer_max_iter: usize) -> BlockwiseFitOptions {
 #[test]
 fn arbitrarily_slow_progress_still_terminates_in_bounded_work_2661() {
     // A criterion that creeps toward its limit by a factor 0.999 per refinement:
-    // strictly improving, never agreeing to `1e-6`.
+    // strictly improving, never agreeing to `τ_stat = 1e-6`.
     let script: Vec<f64> = (0..40).map(|k| 1.0 + 0.999_f64.powi(k)).collect();
     let path = ScriptedContinuationPath::new(script);
     let options = scripted_options(100);
@@ -406,7 +412,6 @@ fn double_well_options() -> BlockwiseFitOptions {
         inner_tol: 1e-10,
         outer_max_iter: 50,
         outer_tol: 1e-8,
-        outer_rel_cost_tol: None,
         rho_lower_bound: Some(-10.0),
         ridge_floor: 1e-8,
         use_remlobjective: true,

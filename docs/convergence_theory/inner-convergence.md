@@ -401,7 +401,7 @@ inner_solve(β0, ρ) -> (β̃, InnerCertificate) | NonExistence(LP witness)
 | `reml/gradient_hessian.rs:7543-7665, 7950-7972` | capped solve returns `Err(PirlsDidNotConverge)` logged as "scheduled" | delete (no caps ⇒ no scheduled failures) | Cor B1 |
 | `gam-solve/src/rho_optimizer/bridges.rs:2311, 2315, 2320, 2366-2449` (call sites 1899, 2481, 3683) | `INNER_CAP_*` 0.01 / 3 / 64, `first_order_inner_cap_schedule` | **delete entirely**; the log shows `inner_max_iterations=3` inside the outer line search | Props 6–7 |
 | `gam-models/src/survival/base.rs:4872` | `max_iterations: 400` | Prop 4 stop; Thm B′ step | Thm B′ |
-| `gam-models/src/multinomial.rs:116, 3505, 3508` | `MULTINOMIAL_FORMULA_INNER_TOL=1e-5` (comment: fp floor exceeds KKT target on saturated rows), `.max(tol)`, 1200 cycles | λ_fp from Prop 4 (this *is* the saturated-row floor, computed instead of guessed); block-q_i κ; no cycle cap | Prop 4, Thm A |
+| `gam-models/src/multinomial.rs` (was `:116, 3505, 3508`) | ~~`MULTINOMIAL_FORMULA_INNER_TOL=1e-5`~~ and ~~`.max(tol)`~~ **removed (#4053)**: the inner target is the caller's `tol` floored only by the joint solve's own rounding band `max(tol·(1+max(‖∇L‖∞,‖Sβ‖∞)), band)` (#2812, #2976, #2977); 1200 cycles remains | λ_fp from Prop 4 (this *is* the saturated-row floor, computed instead of guessed); block-q_i κ; no cycle cap | Prop 4, Thm A |
 | `gam-model-api/src/families/custom_family/options.rs:649, 665+` | `DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES=1200`, inner_tol 1e-6 | delete; Prop 4 | Prop 4 |
 | `gam-custom-family/src/inner_blockwise_fit.rs:220-235` | α = 1/(1+λ), `SC_QUADRATIC_PHASE_THRESHOLD = (3−√5)/2` | α = ln(1+c)/c (GSC) or Thm B′ (with barrier) | Thm B, B′ |
 | `inner_blockwise_fit.rs:2781, 2793, 4180, 4202, 4893` | `MAX_SADDLE_ESCAPES=2`, `MAX_ESCAPE_FACE_EXCHANGES=3`, `BLOCK_NEWTON_STEP_INITIAL=20`, `DIVERGENCE_FROZEN_LOGLIK_CYCLES=8`, `POLISH_MAX_ITER=16` | delete: convex families have no saddles; non-convex families use the trust region with second-order termination; divergence detected by Prop 5 LP | Thm B, C, Prop 5 |
@@ -436,7 +436,7 @@ Every inner solve returns `InnerCertificate { λ_cert, κ, r̄, gap, value_err =
   - Fix: delete the caps, stop at the fp floor, and apply 6.4(1)–(2).
   - This is the rail and box issue only in part. The box itself belongs to other lanes.
 - **x1+cyclic(x2) "Newton decrement stopped contracting"** (`rho_optimizer/newton_polish.rs:123`) and **multinomial "declined certified optimum"** (hessian_psd = NO, 7 railed coordinates).
-  - Cause: the outer Newton contraction test is impossible to satisfy when V and G carry O(r) inner noise. Multinomial also uses the hard-coded 1e-5 (`multinomial.rs:116`).
+  - Cause: the outer Newton contraction test is impossible to satisfy when V and G carry O(r) inner noise. Multinomial also used the hard-coded 1e-5 (`multinomial.rs:116`, removed in #4053).
   - Fix: fp-floor inner with the block-q_i κ, error bars passed to the outer, and delete the 1e-5 and 1200-cycle constants.
 - **Iso-kappa Matérn** (|Pg| 0.331 vs 0.0181; 3.622 vs 0.065).
   - The inner contribution is the envelope-theorem break from LM-ridge bias in g (#1122, `reweight.rs:2150-2215`). The joint (ρ, κ) gradient assumes ∇f(β̂) = 0 exactly.

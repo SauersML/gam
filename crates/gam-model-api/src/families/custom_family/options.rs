@@ -465,23 +465,6 @@ pub struct BlockwiseFitOptions {
     pub outer_max_iter: usize,
     /// Absolute outer stationarity tolerance; must be finite and positive.
     pub outer_tol: f64,
-    /// Optional override for the OUTER smoothing optimizer's
-    /// *relative-cost-decrease* convergence stop, decoupled from `outer_tol`.
-    ///
-    /// The outer convergence test derives BOTH the absolute projected-gradient
-    /// floor (`max(outer_tol, n·1e-9)`) AND the relative-cost stop
-    /// (`rel_cost = outer_tol`) from the single `outer_tol`. A caller that needs
-    /// a *tight absolute floor* to resolve λ to the genuine REML optimum at
-    /// large `n` (where the floor is `n·1e-9`) is then forced to also accept a
-    /// *tight rel-cost stop*, which on a flat REML ridge never trips and grinds
-    /// the optimizer to `outer_max_iter` — dozens of surplus O(D·p³)
-    /// Laplace-derivative outer iterations (the #1082 multinomial
-    /// smooth-by-factor wall-clock blow-up). When `Some(r)`, the rel-cost stop
-    /// uses `r` while the absolute floor keeps using `outer_tol`, so accuracy
-    /// (absolute floor) and perf (loose rel-cost) are selected independently.
-    /// `None` preserves the legacy coupling (`rel_cost = outer_tol`) for every
-    /// existing caller byte-for-byte.
-    pub outer_rel_cost_tol: Option<f64>,
     /// A family-declared floor for the smoothing coordinates ρ = log λ.
     ///
     /// `None` (the default) leaves the λ-selection domain to the engine's
@@ -601,7 +584,6 @@ impl Default for BlockwiseFitOptions {
             inner_tol: 1e-6,
             outer_max_iter: 60,
             outer_tol: 1e-5,
-            outer_rel_cost_tol: None,
             rho_lower_bound: None,
             // Conditioning is solver state, not a coefficient prior. Start at
             // the exact Hessian (zero shift); rank/curvature-aware damping may

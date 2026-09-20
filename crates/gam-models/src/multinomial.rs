@@ -99,22 +99,6 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
 
-/// Inner joint-Newton KKT tolerance for the multinomial formula path.
-///
-/// The softmax Fisher weight `W = diag(p) − ppᵀ` collapses on saturated rows,
-/// so near-separable fits (penguins, #715) reach the OBJECTIVE's f64 noise
-/// floor before the default `inner_tol = 1e-6` KKT target: measured on the
-/// penguins arm (standardized columns), the trust region collapses to 1e-12
-/// with per-attempt objective changes of ~+2e-9 on |obj| ≈ 1e2 (≈ 1e-11
-/// relative — pure rounding) while the KKT residual plateaus at 2.8e-5–9.4e-5
-/// against a scaled tolerance of ~1.9e-5. Demanding a residual below the
-/// floating-point noise floor is certifiable-never: every eval is rejected by
-/// the stall guard and the whole fit fails. `1e-5` certifies the measured
-/// plateaus while still resolving β to ~1e-6 in the relevant metric — the
-/// LAML criterion consumes β̂ with error O(residual²/curvature), far below
-/// any quantity the outer ρ-search can read.
-const MULTINOMIAL_FORMULA_INNER_TOL: f64 = 1.0e-5;
-
 /// Formula-adapter penalty calibration for multinomial softmax REML.
 ///
 /// The term builder's normalized penalties are calibrated on single-response
@@ -181,18 +165,6 @@ fn multinomial_formula_use_outer_hessian(total_rho_dim: usize) -> bool {
 /// surface can be the valid near-separated optimum that should be scored
 /// directly.
 const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
-
-/// Calibrated convergence tolerance for the OUTER REML/LAML smoothing-parameter
-/// search on the formula multinomial path. Matches the primary GLM REML outer
-/// (`solver::fit_orchestration::materialize` uses `tol = 1e-7`, mirrored by the
-/// `LOG_LAMBDA_TOL` / `KKT_TOL_*` constants across the REML stack): tight enough
-/// that the selected λ reaches the genuine REML optimum (the recovered
-/// probability surface matches the mature reference), loose enough that the
-/// optimizer does not grind surface-irrelevant ρ digits down to the inner KKT
-/// scale (the #1082 wall-clock overrun). The caller's `tol` is floored at this
-/// value for the OUTER loop, while it continues to drive the INNER joint-Newton
-/// KKT target unchanged.
-const MULTINOMIAL_OUTER_REML_TOL: f64 = 1e-7;
 
 fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
     let mut best = (0.0_f64, 0usize, 0usize);
@@ -3053,8 +3025,10 @@ pub struct MultinomialFitRequest<'a> {
     pub init_lambda: f64,
     /// OUTER REML/LAML smoothing-parameter iteration budget.
     pub max_iter: usize,
-    /// Requested accuracy; drives the inner joint-Newton KKT target (see the
-    /// control-split note inside the fit).
+    /// Requested accuracy, finite and positive: the convergence target of both
+    /// the inner joint-Newton KKT solve and the outer ρ-stationarity test, each
+    /// floored only by its own certificate's resolution (see the convergence
+    /// note inside the fit).
     pub tol: f64,
 }
 
@@ -3202,6 +3176,9 @@ pub(crate) fn penalized_multinomial_formula_parts(
         crate::bail_invalid_estim!(
             "multinomial fit: init_lambda must be finite and > 0 (got {init_lambda})"
         );
+    }
+    if !(tol.is_finite() && tol > 0.0) {
+        crate::bail_invalid_estim!("multinomial fit: tol must be finite and > 0 (got {tol})");
     }
     reject_unsupported_multinomial_config(config)?;
     let (raw_spec, design, y_col, response_name, y_kind) =
@@ -3410,96 +3387,38 @@ pub(crate) fn penalized_multinomial_formula_parts(
     let total_rho_dim = family.joint_smoothing_dimension();
     let use_outer_hessian = multinomial_formula_use_outer_hessian(total_rho_dim);
 
-    // ── Inner-vs-outer control split (#715 non-convergence root cause) ────────
-    // The legacy `max_iter` / `tol` parameters are the *outer* REML/LAML
-    // smoothing-parameter optimization controls — "how hard to search λ". The
-    // earlier wiring routed them straight into `inner_max_cycles` / `inner_tol`,
-    // capping the joint-Newton inner solve at `max_iter` (=50 in the quality
-    // suite) cycles with a `tol`-tight (=1e-8) KKT target. That is the #715
-    // hang: near the simplex boundary the softmax Fisher weight
-    // `W = diag(p) − p pᵀ` collapses, so `H = JᵀWJ + S_λ` is full-rank but
-    // ILL-CONDITIONED. The self-vanishing Levenberg–Marquardt damping
-    // (`levenberg_on_ill_conditioning()`) that keeps the inner solve from
-    // oscillating on those near-singular modes makes it converge only
-    // GEOMETRICALLY (linearly), not quadratically. Reaching a 1e-8 relative KKT
-    // residual under geometric descent needs FAR more than 50 cycles, so the
-    // inner returned `converged = false` on every outer ρ-evaluation; with the
-    // exact-Hessian outer optimizer on `FallbackPolicy::Disabled` that rejects
-    // every ρ-step — each rejected eval still paying a near-full 50-cycle inner
-    // solve plus the O(D²) pairwise outer-Hessian directional work — so the
-    // outer never certifies and the fit runs unbounded (the observed >8-minute
-    // non-termination). The certificate cannot be reached, not merely slow.
+    // ── Convergence controls (#715, #1082, #4053) ─────────────────────────────
+    // The inner joint-Newton gets the framework's production cycle budget
+    // (`DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES`): near the simplex boundary the
+    // softmax Fisher weight `W = diag(p) − ppᵀ` collapses, the LM-damped solve
+    // converges only geometrically, and capping it at the caller's `max_iter`
+    // (=50) left every outer evaluation unconverged (#715). `max_iter` is the
+    // OUTER search depth.
     //
-    // Fix: give the INNER joint-Newton the framework's principled production
-    // budget (`DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES` cycles at the default
-    // `inner_tol`), which exists precisely so an ill-conditioned LM-damped solve
-    // can certify a stationary KKT point instead of being declared non-converged
-    // prematurely — and the KKT/objective certificates still exit in a handful
-    // of cycles on the well-conditioned interior fits, so this is free there.
-    // The caller's `max_iter` / `tol` become the OUTER controls they were always
-    // meant to be (smoothing-parameter search depth / accuracy). The inner KKT
-    // target is kept no tighter than the outer accuracy can consume — and no
-    // tighter than the softmax objective's f64 noise floor on near-separable
-    // fits (see `MULTINOMIAL_FORMULA_INNER_TOL`).
+    // The caller's `tol` is the convergence target of BOTH levels, exactly as on
+    // the bounded custom-family route. Neither level is clamped by a constant:
+    // each certificate already stops at its own problem's resolution, which is
+    // what a constant tuned on one fixture was standing in for.
+    //  - Inner: the KKT target is `max(tol·(1 + max(‖∇L‖∞, ‖Sβ‖∞)), band)`,
+    //    `band` the residual's own rounding band (#2812, #2976), with the
+    //    returned-mode settling certificate (#2977) at the stall. A
+    //    near-separable fit whose residual sits in its rounding band certifies
+    //    there; one whose residual sits above it is not stationary, and no
+    //    looser constant makes it so.
+    //  - Outer: the per-coordinate stationarity bands `tol·(1 + s_j)` with
+    //    their arithmetic floor, and the Newton-decrement certificate against
+    //    the criterion's statistical resolution `τ_stat = 1/(2n)` (#2954) — the
+    //    certificate that ends a search on a flat REML ridge, where a
+    //    relative-cost plateau would only have declared it ended.
     let outer_max_iter = max_iter.max(1);
-    // The OUTER REML/LAML smoothing-parameter search must converge to a
-    // well-calibrated ρ-gradient tolerance, NOT to the caller's (typically very
-    // tight) INNER KKT tolerance. The #715 control-split repurposed the caller's
-    // `tol` as the outer control, but feeding an inner-scale `tol = 1e-8`
-    // straight into `outer_tol` makes REML grind dozens of extra exact-gradient
-    // outer iterations (each an O(D·p³) Laplace-derivative assembly over the full
-    // P·M joint design) to squeeze ρ digits that no longer move the fitted
-    // surface — the smooth-by-factor 269s wall-clock overrun (#1082).
-    //
-    // The right target is the framework's CALIBRATED REML convergence tolerance,
-    // `MULTINOMIAL_OUTER_REML_TOL = 1e-7` — the same value the primary GLM REML
-    // outer uses (`solver::fit_orchestration::materialize` `tol: 1e-7`, mirrored by the
-    // `LOG_LAMBDA_TOL`/`KKT_TOL_*` constants across the REML stack). At 1e-7 the
-    // λ-search reaches the genuine REML optimum (so the recovered probability
-    // surface matches the mature reference), but it does NOT chase the last
-    // surface-irrelevant ρ digits down to 1e-8. The earlier 1e-5 floor (the
-    // generic `BlockwiseFitOptions` default) was too LOOSE: the optimizer halted
-    // in a low-curvature region with λ still well above its optimum, UNDER-fitting
-    // the smooth-by-factor surface (truth-RMSE 0.164 vs VGAM's 0.061). So the
-    // outer tolerance is floored at the calibrated REML tol — never tighter than
-    // it (perf), never looser (accuracy) — while the caller's `tol` continues to
-    // drive the INNER joint-Newton KKT target (`inner_tol` below), where its
-    // precision actually matters.
-    let outer_tol = if tol.is_finite() && tol > 0.0 {
-        tol.max(MULTINOMIAL_OUTER_REML_TOL)
-    } else {
-        MULTINOMIAL_OUTER_REML_TOL
-    };
-    // #1082 root cause: the outer convergence test derives BOTH the absolute
-    // projected-gradient floor (`max(outer_tol, n·1e-9)`) AND the relative-cost
-    // stop (`rel_cost = outer_tol`) from the single `outer_tol`. The accuracy of
-    // the smooth-by-factor surface is governed by the ABSOLUTE floor reaching the
-    // n-scaled REML resolution `n·1e-9` (≈ 1.8e-6 at n = 1800) — that is why the
-    // earlier 1e-5 floor UNDER-fit (its absolute floor was pinned at 1e-5, well
-    // above the genuine optimum's gradient) and why 1e-7 recovered accuracy (it
-    // unpins the floor down to the n-scaled 1.8e-6). But tightening `outer_tol`
-    // to 1e-7 ALSO tightened the rel-cost stop to 1e-7, which on this family's
-    // dead-flat REML ridge NEVER trips — so the optimizer no longer converges and
-    // grinds all the way to `outer_max_iter`, each surplus step an O(D·p³) Laplace-
-    // derivative assembly over the 382-dim joint design (the >600s wall-clock
-    // overrun; tightening tol REINTRODUCED the crawl the 1e-5 floor had removed).
-    //
-    // The two requirements live on two different criteria, so they must be set
-    // independently. Keep `outer_tol = 1e-7` (drives the accurate absolute floor)
-    // but FLOOR the relative-cost stop at the framework default 1e-5 (the loose,
-    // fast value that resolves the cost-decrease plateau without chasing the flat
-    // tail). The absolute n·1e-9 floor still gates final λ accuracy; the rel-cost
-    // stop just lets the optimizer DECLARE convergence on the flat ridge instead
-    // of crawling to the iteration cap.
-    let outer_rel_cost_tol = Some(BlockwiseFitOptions::default().outer_tol);
-    let inner_tol = MULTINOMIAL_FORMULA_INNER_TOL.max(tol.max(0.0));
+    let inner_tol = tol;
+    let outer_tol = tol;
 
     let options = BlockwiseFitOptions {
         inner_max_cycles: crate::custom_family::DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
         inner_tol,
         outer_max_iter,
         outer_tol,
-        outer_rel_cost_tol,
         // The design/penalty spectrum determines the smoothing domain. A
         // sample-count floor changes the statistical fit and is not a prior.
         rho_lower_bound: None,

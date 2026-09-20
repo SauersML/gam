@@ -954,7 +954,6 @@ pub(crate) fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() 
         inner_tol: 1e-10,
         outer_max_iter: 1,
         outer_tol: 1e-8,
-        outer_rel_cost_tol: None,
         rho_lower_bound: Some(-10.0),
         ridge_floor: 0.0,
         use_remlobjective: false,

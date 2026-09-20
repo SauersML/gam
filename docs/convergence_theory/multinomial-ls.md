@@ -89,10 +89,10 @@ numerically (the script is named), **[C]** conjectured or supported by evidence 
    arm is undiagnosed. `survival/location_scale/constants.rs:57-112` lists seven magic constants on
    that path (cap 60, 1e-5, 1e-4, 1e-6, 1e-8, ×10, 1e8).
 8. **Ad hoc items in the multinomial path, each with a replacement in §6:**
-   - `multinomial.rs:116` (inner tol 1e-5 taken from a measured plateau);
+   - ~~`multinomial.rs:116` (inner tol 1e-5 taken from a measured plateau)~~ removed (#4053);
    - `:170` (exact outer Hessian gated at dimension ≤ 24);
    - `:183` (separation threshold |η| > 25);
-   - `:195` (outer tol 1e-7 as a floor);
+   - ~~`:195` (outer tol 1e-7 as a floor)~~ removed (#4053);
    - `:129` (a penalty rescale that is harmless but unneeded);
    - `:145` and `:3537-3542` (references to "±10 box" and `effective_df_floor_rho_upper_bounds`
      boxes);
@@ -599,16 +599,18 @@ formulas of §3.4 and Thm 3.6.
   the Prop 3.5 LP pre-check on N_λ, which with the default ridges means intercepts only (an empty or
   pure class). On ∂Λ (option A) or at λ → 0, report "no finite optimum", or require the Jeffreys
   term.
-- **Replace** `MULTINOMIAL_FORMULA_INNER_TOL = 1e-5` (`multinomial.rs:116`, justified by a measured
-  plateau) with the derived KKT band ‖∇f‖_{H^{−1}} ≤ δ_g. Here
-  δ_g² = Σ_i (ε·c_i)² ‖H^{−1/2}x_i‖²-type forward error bounds of the score summation, with
-  c_i = |y_i − p_i| + |p_i| per class and the standard summation bound (Higham 2002, §4.2). The
-  plateau it cites (KKT residual 2.8e-5 to 9.4e-5 with objective changes at 1e-11 relative) is
-  exactly the separation-regime ill-conditioning of Prop 3.5. The cure is the chart (option B) or
-  the LP refusal, not a looser tolerance.
-- **Replace** `MULTINOMIAL_OUTER_REML_TOL = 1e-7` (`multinomial.rs:195`) with the outer bands of the
-  floating-point companion report. The Newton decrement band is derived from the rounding error in
-  V_ρ and V_ρρ.
+- **Done (#4053):** `MULTINOMIAL_FORMULA_INNER_TOL = 1e-5` (justified by a measured plateau) is
+  deleted. The inner joint-Newton solve now targets the caller's `tol` against its own derived KKT
+  band, `max(tol·(1+max(‖∇L‖∞,‖Sβ‖∞)), band)`, where `band` is the f64 rounding band of the score
+  and penalty-gradient evaluation (#2812) plus the measured gradient bands and settling
+  certificate (#2976, #2977). The plateau it cited (KKT residual 2.8e-5 to 9.4e-5 with objective
+  changes at 1e-11 relative) is the separation-regime ill-conditioning of Prop 3.5. If it recurs,
+  it is to be cured by the chart (option B) or the LP refusal, not by a looser tolerance.
+- **Done (#4053):** `MULTINOMIAL_OUTER_REML_TOL = 1e-7` is deleted, and so is the family-set
+  relative continuation bar `outer_rel_cost_tol`. The outer ρ search uses the caller's `tol` for its
+  per-coordinate bands and certifies against the Newton-decrement resolution τ_stat = 1/(2n)
+  (#2954). The anchored-continuation ladder compares criterion values against the same τ_stat, in
+  the criterion's own absolute units.
 - **Remove** `multinomial_formula_penalty_scale` (`multinomial.rs:129`). It is not wrong, since a
   constant rescale of S only shifts ρ̂. But it exists to keep ρ inside boxes that SPEC forbids, and
   the "±10 box" / `effective_df_floor_rho_upper_bounds` comments (`multinomial.rs:145, 3537-3542`)
