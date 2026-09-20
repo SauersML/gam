@@ -1,5 +1,6 @@
 use super::*;
-use statrs::function::gamma::{digamma, ln_gamma};
+use gam_math::special::digamma;
+use statrs::function::gamma::ln_gamma;
 
 /// Ordered independent Beta--Bernoulli prior over relaxed assignment logits.
 ///

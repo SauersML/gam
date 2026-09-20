@@ -491,10 +491,10 @@ fn t09b_inf_score_must_err() {
 }
 
 // ====================================================================
-// Test 10: K=1 always Diagonal (or Err on zero-variance)
+// Test 10: K=1 always Diagonal with the exact population variance
 // ====================================================================
 #[test]
-fn t10_k_eq_1_always_diagonal_or_err() {
+fn t10_k_eq_1_always_diagonal() {
     let n = 100;
     let cases = 20;
     let mut state = 0xFACE_F00Du64;
@@ -531,19 +531,31 @@ fn t10_k_eq_1_always_diagonal_or_err() {
             }
         }
         let w = ones_weights(n);
-        let result = marginal_slope_covariance_from_scores(col.view(), &w);
-        match result {
-            Ok(covariance) => {
-                assert_eq!(
-                    covariance.shape(),
-                    MarginalSlopeCovarianceShape::Diagonal,
-                    "case {case}: K=1 must return Diagonal"
-                );
-                assert_eq!(covariance.dim(), 1);
-            }
-            Err(_) => {
-                // Err is also acceptable (e.g. degenerate zero variance).
-            }
-        }
+        // Every case has finite scores and positive weights, so the sample
+        // covariance is a finite sum of squares >= 0, and a zero variance is a
+        // valid diagonal entry. `Err` is never the correct answer here.
+        let covariance = marginal_slope_covariance_from_scores(col.view(), &w)
+            .unwrap_or_else(|e| panic!("case {case}: finite K=1 scores must succeed: {e}"));
+        assert_eq!(
+            covariance.shape(),
+            MarginalSlopeCovarianceShape::Diagonal,
+            "case {case}: K=1 must return Diagonal"
+        );
+        assert_eq!(covariance.dim(), 1);
+
+        // The entry is the unit-weight population variance of the column.
+        // Independent two-pass reference; the two summations differ only by
+        // rounding, bounded by O(n·ε) times the second moment Σ s² / n.
+        let column = col.column(0);
+        let mean = column.sum() / n as f64;
+        let reference = column.iter().map(|&s| (s - mean) * (s - mean)).sum::<f64>() / n as f64;
+        let second_moment = column.iter().map(|&s| s * s).sum::<f64>() / n as f64;
+        let tolerance = 4.0 * n as f64 * f64::EPSILON * second_moment;
+        let got = covariance.to_dense()[[0, 0]];
+        assert!(
+            (got - reference).abs() <= tolerance,
+            "case {case}: K=1 variance {got:e} != population variance {reference:e} \
+             (tolerance {tolerance:e})"
+        );
     }
 }
