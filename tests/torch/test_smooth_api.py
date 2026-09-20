@@ -1,5 +1,6 @@
 """Public smooth, fit, and GAM torch API smoke tests."""
 
+import numpy as np
 import pytest
 
 gt = pytest.importorskip("gamfit.torch")
@@ -374,6 +375,48 @@ def test_gam_frozen_eval_rejects_points_block_count_mismatch(block_count):
         match=rf"{block_count} points tensors for 2 smooths",
     ):
         model([torch.zeros(4)] * block_count)
+
+
+def test_fit_and_frozen_forward_split_a_non_list_points_sequence_alike():
+    # gam#3117: fit() used to copy any non-list/tuple sequence to every smooth
+    # while the frozen forward split it per smooth.
+    import collections
+
+    # The identified two-periodic fixture above, on two distinct inputs, so a
+    # copied or reordered split changes the fit.
+    n = 80
+    t1 = torch.arange(n, dtype=torch.float64) / n
+    t2 = torch.remainder(
+        0.137 + 0.6180339887498948 * torch.arange(n, dtype=torch.float64),
+        1.0,
+    )
+    y = torch.sin(2.0 * torch.pi * t1) + 0.6 * torch.cos(2.0 * torch.pi * t2)
+    y = y - y.mean()
+    smooths = [
+        gt.PeriodicSplineCurve(n_knots=7, degree=3),
+        gt.PeriodicSplineCurve(n_knots=8, degree=3),
+    ]
+    ref = gt.fit([t1, t2], y, smooths)
+    res = gt.fit(collections.deque([t1, t2]), y, smooths)
+    for a, b in zip(res.coefficients, ref.coefficients, strict=True):
+        torch.testing.assert_close(a, b)
+    model = gt.GAM(smooths)
+    model.freeze(collections.deque([t1, t2]), y)
+    torch.testing.assert_close(model(collections.deque([t1, t2])), model([t1, t2]))
+
+
+@pytest.mark.parametrize("bad", ["ndarray", "entry"])
+def test_fit_and_frozen_forward_refuse_non_tensor_points_alike(bad):
+    t, y = _inputs()
+    smooths = [gt.Duchon(centers=_centers(6), m=2), gt.Duchon(centers=_centers(7), m=2)]
+    pts = np.stack([t.numpy(), t.numpy()]) if bad == "ndarray" else [t, t.numpy()]
+    with pytest.raises(TypeError, match="torch.Tensor"):
+        gt.fit(pts, y, smooths)
+    model = gt.GAM(smooths)
+    model._install_frozen_coefficients([torch.zeros(6, 1), torch.zeros(7, 1)])
+    model.eval()
+    with pytest.raises(TypeError, match="torch.Tensor"):
+        model(pts)
 
 
 @pytest.mark.parametrize("block_count", [1, 3])

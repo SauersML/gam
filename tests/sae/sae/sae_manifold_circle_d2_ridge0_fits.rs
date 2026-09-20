@@ -11,7 +11,7 @@
 //! radius is unpopulated), so that undamped per-row Cholesky is non-PD BY
 //! CONSTRUCTION — the factorization errored, every acceptance certificate was
 //! skipped, and the fit was refused to the non-convergence sentinel → the public
-//! `sae_manifold_fit` K=1 circle returned a `GamError` at every N.
+//! `sae_manifold_fit` K=1 circle returned a `GamfitError` at every N.
 //!
 //! The fix routes the stall-acceptance factorization through the SAME per-row
 //! spectral-deflation the criterion log-det uses (the radial null is unit-stiffness
@@ -23,7 +23,7 @@
 //! This uses `RIDGE_EXT_COORD = 0.0` deliberately — the sibling circle pins mask
 //! this path with a hand ridge of `1e-6`. It drives the fit exactly the way
 //! production does (`OuterProblem::run` around `SaeManifoldOuterObjective`) and
-//! asserts the cascade COMPLETES with a finite criterion (a `GamError` / infeasible
+//! asserts the cascade COMPLETES with a finite criterion (a `GamfitError` / infeasible
 //! sentinel reproduces #1095/#2228), then re-evaluates the criterion directly at
 //! the converged ρ to pin the criterion PATH finite too.
 
@@ -169,7 +169,7 @@ fn sae_manifold_circle_d2_ridge0_fits() {
         RIDGE_BETA,
     );
     let problem = OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
-    // A `GamError` here (not a finite fit) is the #1095/#2228 refusal.
+    // A `GamfitError` here (not a finite fit) is the #1095/#2228 refusal.
     let result = problem
         .run(&mut objective, "SAE d=2 circle ridge-0 fits (#1095/#2228)")
         .expect(

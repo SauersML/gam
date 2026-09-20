@@ -31,13 +31,14 @@
 //! `quality_vs_gamlss_gaussian_location_scale.rs`, which compiles):
 //!   * `fit_from_formula(.., FitConfig{ noise_formula: Some(..), .. })` routes
 //!     through `materialize_location_scale` -> `FitResult::GaussianLocationScale`;
-//!     the in-Rust path does NOT rescale `y`, so reconstructed mu/sigma are in
-//!     raw response units.
+//!     the returned coefficients are mapped back to raw response units, so
+//!     reconstructed mu/sigma are in raw response units.
 //!   * the location block carries `BlockRole::Location`, the log-sigma block
 //!     `BlockRole::Scale`; resolved designs live in `fit.meanspec_resolved` /
 //!     `fit.noisespec_resolved`.
-//!   * the noise link is `sigma = LOGB_SIGMA_FLOOR + exp(eta_scale)` with
-//!     `LOGB_SIGMA_FLOOR = 0.01` (mirrors `families::sigma_link`, mgcv `gaulss(b=0.01)`).
+//!   * the noise link is `sigma = response_scale*sigma_floor + exp(eta_scale)`,
+//!     where `sigma_floor` is the fit's recording-grid bound δ/√12 of the
+//!     standardized response (`families::sigma_link`).
 
 use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
@@ -48,10 +49,6 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array2;
-
-/// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale).
-/// Mirrors `families::sigma_link::LOGB_SIGMA_FLOOR` (and mgcv `gaulss(b=0.01)`).
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
 /// Mean per-observation Gaussian negative log-likelihood. The natural objective
 /// score for a *location-scale* fit because it rewards BOTH the predicted mean
@@ -134,7 +131,12 @@ fn gam_gaussian_location_scale_matches_gamboostlss() {
         ..FitConfig::default()
     };
     let result = fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg).expect("gam location-scale fit");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
+        fit,
+        response_scale,
+        sigma_floor,
+        ..
+    }) = result
     else {
         panic!("expected a Gaussian location-scale fit");
     };
@@ -172,7 +174,7 @@ fn gam_gaussian_location_scale_matches_gamboostlss() {
     let gam_eta_sigma: Vec<f64> = scale_design_grid.design.apply(&beta_scale).to_vec();
     let gam_sigma: Vec<f64> = gam_eta_sigma
         .iter()
-        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| response_scale * sigma_floor + e.exp())
         .collect();
     let gam_log_sigma: Vec<f64> = gam_sigma.iter().map(|&s| s.ln()).collect();
 

@@ -1032,8 +1032,14 @@ where
     // decided the survival time-block λ until a03438645 (#2670) nor the
     // engine's ±30 fallback applies (#2902 row 8).
     let (lower, upper) = survival_baseline_theta_domain(target, &seed, age_exit).map_err(config)?;
+    // The criterion is the baseline likelihood summed over the survival
+    // records, in the `dim` baseline parameters themselves.
     let problem = contract
-        .configure(OuterProblem::new(dim).with_prefer_gradient_only(true))
+        .configure(
+            OuterProblem::new(dim)
+                .with_prefer_gradient_only(true)
+                .with_problem_size(age_exit.len(), dim),
+        )
         .with_bounds(lower, upper)
         .with_initial_rho(seed.clone());
     let mut obj = problem.build_objective(
@@ -2123,30 +2129,23 @@ pub fn build_survival_time_basis(
                 }
             }
 
-            // The value-space penalty S_I = L^T S_B[1:,1:] L has a 1-dimensional
-            // null space (constant γ ↦ affine c ↦ D₂c = 0). Detect it spectrally
-            // so the REML uses the generalized logdet over the penalized subspace.
-            let nullspace_dims: Vec<usize> = penalties
-                .iter()
-                .map(|s_mat| {
-                    let p = s_mat.nrows();
-                    if p == 0 {
-                        return 0;
-                    }
-                    match gam_linalg::faer_ndarray::FaerEigh::eigh(s_mat, faer::Side::Lower) {
-                        Ok((evals, _)) => {
-                            let max_ev = evals
-                                .iter()
-                                .copied()
-                                .fold(0.0_f64, |a, b| a.max(b.abs()))
-                                .max(1.0);
-                            let threshold = 100.0 * (p as f64) * f64::EPSILON * max_ev;
-                            evals.iter().filter(|&&e| e <= threshold).count()
-                        }
-                        Err(_) => 0,
-                    }
-                })
-                .collect();
+            // The value-space penalty's nullity is structural. `S_B = ∫B''B''ᵀ`
+            // annihilates exactly the affine functions, so `S_I`'s null space is the
+            // one direction `γ*_k = ξ_{k+1} − ξ_k` derived above, with full support
+            // whenever the Greville abscissae strictly increase. The `keep_cols`
+            // principal submatrix keeps it only when no column is dropped (its null
+            // vectors are `S_I`'s supported on the kept columns), so the declared
+            // nullity is 1 on the full basis and 0 on a restricted one. The rank
+            // reads that declaration together with the spectrum
+            // (`gam_problem::structural_penalty_root`, #2954): `S_I` is formed from
+            // the quadrature Gram through running sums of depth `2p`, and that
+            // rounding can leave its structural zero above the eigensolver's Weyl
+            // band (6.17e-16 against 5.87e-16 on the 2929 per-score fixture, all 7
+            // columns kept), where the spectrum alone would count it. The former
+            // `100·p·ε·max(σmax, 1)` count, a threshold of its own with an absolute
+            // floor, is gone (#2469).
+            let structural_nullity = usize::from(keep_cols.len() == p_time_full);
+            let nullspace_dims = vec![structural_nullity; penalties.len()];
             Ok(SurvivalTimeBuildOutput {
                 x_entry_time: DesignMatrix::Dense(DenseDesignMatrix::from(x_entry_time)),
                 x_exit_time: DesignMatrix::Dense(DenseDesignMatrix::from(x_exit_time)),

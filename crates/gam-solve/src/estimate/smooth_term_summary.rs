@@ -52,12 +52,28 @@ use gam_terms::inference::random_effect_test::RandomEffectTestOutcome;
 use gam_terms::inference::smooth_test::{
     SmoothTestInput, SmoothTestScale, wood_smooth_test,
 };
-use gam_terms::smooth::{ShapeSpec, TermCollectionDesign, TermCollectionSpec};
+use gam_terms::smooth::{BOUNDED_SHRINKAGE_PENALTY_SOURCE, ShapeSpec, TermCollectionDesign};
 use ndarray::Array2;
+
+/// Where the presented design's predictor block sits in the fit's flat
+/// coefficient and penalty layouts.
+///
+/// A single-predictor fit is the whole layout, [`SummaryBlockOffset::default`].
+/// A multi-predictor fit (the Bernoulli marginal-slope marginal and slope
+/// surfaces, #2997) presents each predictor from its own frozen design, and
+/// that design's block-local coefficient columns and penalty blocks start after
+/// the coefficients and λ of every block the fit orders before it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SummaryBlockOffset {
+    /// Coefficients of the fit's blocks before this one.
+    pub coefficients: usize,
+    /// Penalty blocks (λ) of the fit's blocks before this one.
+    pub penalties: usize,
+}
 
 /// Build the smooth/random-effect rows of a model summary.
 ///
-/// `design` and `spec` describe the term structure being presented — the real
+/// `design` describes the term structure being presented — the real
 /// training design on the in-process path, the frozen-basis replay on the
 /// persisted one. `fit` owns every fitted quantity, including both inputs to
 /// the Wald reference distribution. `whitening_gram` is the Wood (2013)
@@ -65,7 +81,9 @@ use ndarray::Array2;
 /// exact weighted Gram when the inference block survived, else a reconstructed
 /// unweighted `X'X`); `None` falls back to truncating the raw coefficient
 /// covariance, which is the documented behaviour for a persisted model whose
-/// Gram was not serialized.
+/// Gram was not serialized. `offset` places `design` inside the fit's layouts;
+/// every index into `fit` (β, covariance, influence matrix, λ, traces) and into
+/// `whitening_gram` is global, every index into `design` is block-local.
 ///
 /// Random-effect rows do not use the Wald test: their null `σ²_b = 0` is on the
 /// boundary, where a coefficient Wald `χ²` has no valid reference. They carry
@@ -74,9 +92,9 @@ use ndarray::Array2;
 /// `gam_terms::inference::random_effect_test`), or its typed absence.
 pub fn smooth_term_summary_rows(
     design: &TermCollectionDesign,
-    spec: &TermCollectionSpec,
     fit: &UnifiedFitResult,
     whitening_gram: Option<&Array2<f64>>,
+    offset: SummaryBlockOffset,
 ) -> Vec<SmoothTermSummary> {
     // The Wald smooth test uses the CONDITIONAL Bayesian covariance
     // `Vb = H⁻¹·φ̂` (mgcv's `Vp`, the covariance mgcv's `testStat` whitens by
@@ -102,8 +120,11 @@ pub fn smooth_term_summary_rows(
         SmoothTestScale::Known
     };
 
+    let shift = |range: &std::ops::Range<usize>| {
+        (offset.coefficients + range.start)..(offset.coefficients + range.end)
+    };
     let gauge_free_gram = whitening_gram.map(|gram| {
-        intercept_projected_gram(gram, design.intercept_range.clone())
+        intercept_projected_gram(gram, shift(&design.intercept_range))
             .unwrap_or_else(|| gram.clone())
     });
     let whitening_gram = gauge_free_gram.as_ref();
@@ -112,6 +133,7 @@ pub fn smooth_term_summary_rows(
 
     // The fit's GLOBAL penalty layout (and thus `penalty_block_trace`) opens with
     // ONE `LinearTermRidge` block PER linear term carrying `double_penalty=true`
+    // (or a `BoundedShrinkage` block per shrinkage-prior `bounded()` term)
     // — not one shared block (`smooth/term_design.rs:289-311`; every non-intercept
     // effect owns its own REML coordinate so an unsupported slope can be shrunk
     // independently). Random-effect and smooth penalty blocks follow them.
@@ -122,34 +144,25 @@ pub fn smooth_term_summary_rows(
     // them in the recorded global ordering rather than re-deriving it — which is
     // what the `.count()` below does, and why it must not be replaced by a
     // boolean.
-    let mut penalty_cursor = design
-        .penaltyinfo
-        .iter()
-        .filter(|info| {
-            matches!(&info.penalty.source, PenaltySource::Other(s) if s == "LinearTermRidge")
-        })
-        .count();
+    let mut penalty_cursor = offset.penalties
+        + design
+            .penaltyinfo
+            .iter()
+            .filter(|info| {
+                matches!(
+                    &info.penalty.source,
+                    PenaltySource::Other(s)
+                        if s == "LinearTermRidge" || s == BOUNDED_SHRINKAGE_PENALTY_SOURCE
+                )
+            })
+            .count();
 
-    for (re_idx, (name, range)) in design.random_effect_ranges.iter().enumerate() {
-        // The design's RE-penalty loop skips a block when EITHER it is
-        // unpenalised OR its coefficient range is empty
-        // (`design_construction.rs` `range.is_empty() || !penalized` →
-        // `continue`), so such a term owns NO entry in the flat
-        // `lambdas`/`penalty_block_trace`/`edf_by_block` layout. A factor `by=`
-        // smooth injects exactly such an UNPENALISED treatment-coded factor
-        // main-effect block, and a penalised RE term with zero kept groups is
-        // the empty-range case. Advancing the cursor by a fixed 1 (the #1368
-        // defect) slides it one block past every RE/smooth term that follows, so
-        // the trailing smooth's `cursor..+k` window runs off the end of
-        // `penalty_block_trace`, `per_term_edf` returns 0, the Wood test is
-        // skipped, and ref_df/chi_sq/p_value collapse to 0/None. Mirror BOTH
-        // design conditions.
-        let penalized = spec
-            .random_effect_terms
-            .get(re_idx)
-            .map(|term| term.penalized)
-            .unwrap_or(true);
-        let k_pen = usize::from(penalized && !range.is_empty());
+    for (name, local_range) in design.random_effect_ranges.iter() {
+        let range = &shift(local_range);
+        // Every random-effect block owns exactly one ridge in the flat
+        // `lambdas`/`penalty_block_trace`/`edf_by_block` layout, placed after
+        // the linear ridges and before the smooths in the design's order.
+        let k_pen = 1;
         // Per-term EDF as the influence-matrix trace over the term's coefficient
         // block (#1219, #1277) — never the legacy per-block-EDF sum, which
         // double-counts shared coefficients and can exceed the model total.
@@ -202,10 +215,11 @@ pub fn smooth_term_summary_rows(
     // global `fit.beta` / covariance / influence matrix. Omitting this offset
     // (the #1360 defect) slid each smooth's window one-per-preceding-column off,
     // folding the intercept and a neighbouring term's coefficients into the test.
-    let smooth_start = design
-        .design
-        .ncols()
-        .saturating_sub(design.smooth.total_smooth_cols());
+    let smooth_start = offset.coefficients
+        + design
+            .design
+            .ncols()
+            .saturating_sub(design.smooth.total_smooth_cols());
 
     for term in &design.smooth.terms {
         let k = term.active_penalties.len();
@@ -252,7 +266,13 @@ pub fn smooth_term_summary_rows(
                 .unwrap_or(edf.max(0.0)),
             chi_sq: smooth_test.as_ref().map(|test| test.statistic),
             pvalue: smooth_test.as_ref().map(|test| test.p_value),
-            continuous_order: continuous_order_for_term(design, fit, term_penalty_start, k),
+            continuous_order: continuous_order_for_term(
+                design,
+                fit,
+                term_penalty_start,
+                term_penalty_start - offset.penalties,
+                k,
+            ),
             basis_note: match &term.metadata {
                 BasisMetadata::BSpline1D {
                     auto_shrink_note, ..
@@ -350,20 +370,23 @@ fn edf_rank_bound_label(fit: &UnifiedFitResult, start: usize, count: usize) -> O
 /// the physical λ the diagnostic needs is `λ_k = λ̃_k / c_k`. Returns `None`
 /// unless the term owns exactly the three penalty blocks the identity is
 /// written over and every one of them reports a usable normalization scale.
+/// `term_penalty_start` indexes the fit's λ, `local_penalty_start` the same
+/// blocks in `design`'s own penalty list.
 fn continuous_order_for_term(
     design: &TermCollectionDesign,
     fit: &UnifiedFitResult,
     term_penalty_start: usize,
+    local_penalty_start: usize,
     k: usize,
 ) -> Option<crate::estimate::summary::ContinuousSmoothnessOrder> {
     if k != 3
         || term_penalty_start + 2 >= fit.lambdas.len()
-        || term_penalty_start + 2 >= design.penaltyinfo.len()
+        || local_penalty_start + 2 >= design.penaltyinfo.len()
     {
         return None;
     }
     let normalized_scale = |idx: usize| {
-        let c = design.penaltyinfo[idx].penalty.normalization_scale;
+        let c = design.penaltyinfo[local_penalty_start + idx].penalty.normalization_scale;
         (c.is_finite() && c > 0.0).then_some(c)
     };
     let lambda_tilde = [
@@ -371,11 +394,7 @@ fn continuous_order_for_term(
         fit.lambdas[term_penalty_start + 1],
         fit.lambdas[term_penalty_start + 2],
     ];
-    let scales = [
-        normalized_scale(term_penalty_start)?,
-        normalized_scale(term_penalty_start + 1)?,
-        normalized_scale(term_penalty_start + 2)?,
-    ];
+    let scales = [normalized_scale(0)?, normalized_scale(1)?, normalized_scale(2)?];
     Some(compute_continuous_smoothness_order(lambda_tilde, scales))
 }
 

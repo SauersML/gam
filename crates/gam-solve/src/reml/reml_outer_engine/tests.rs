@@ -148,6 +148,8 @@ pub(crate) fn xt_projected_kernel_diagonal_iterator_matches_scalar_reference_bit
     let u_s = array![[0.8_f64, -0.2], [0.1, 0.9], [0.5, 0.3], [-0.4, 0.6]];
     let h_proj_inverse = array![[1.6_f64, -0.25], [-0.25, 2.1]];
     let subspace = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: u_s.clone(),
         h_proj_inverse: h_proj_inverse.clone(),
         logdet_correction: 0.0,
@@ -176,6 +178,8 @@ pub(crate) fn xt_projected_kernel_diagonal_iterator_matches_scalar_reference_bit
 #[test]
 pub(crate) fn projected_logdet_cross_reduced_uses_trace_product_reference() {
     let kernel = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((3, 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: Array2::<f64>::eye(3),
         h_proj_inverse: array![[1.4, 0.2, -0.1], [0.2, 1.9, 0.3], [-0.1, 0.3, 1.6]],
         logdet_correction: 0.0,
@@ -1320,6 +1324,8 @@ pub(crate) fn batched_penalty_subspace_traces_match_exact_kernel_on_ill_conditio
         m[[a, a]] = 1.0 / s;
     }
     let kernel = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: u_s.clone(),
         h_proj_inverse: m,
         logdet_correction: 0.0,
@@ -1474,6 +1480,8 @@ pub(crate) fn active_projected_kkt_residual_drops_gauge_mass_of_any_magnitude() 
     // gauge mass, which is precisely what the inner solver leaves unmoved on an
     // oversmoothed marginal-slope fit.
     let kernel = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((2, 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: array![[1.0], [0.0]],
         h_proj_inverse: array![[0.25]],
         logdet_correction: 0.0,
@@ -1500,6 +1508,8 @@ pub(crate) fn active_projected_kkt_residual_rejects_retained_range_leak() {
     // `U_Sᵀ(r_A − r_R) = −18 ≠ 0`: reducing this residual would CHANGE the IFT
     // correction rather than leave it invariant, so it must be rejected.
     let kernel = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((2, 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: array![[2.0], [0.0]],
         h_proj_inverse: array![[0.25]],
         logdet_correction: 0.0,
@@ -1556,6 +1566,8 @@ pub(crate) fn build_subspace_kernel(
         }
     }
     PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: u_s.clone(),
         h_proj_inverse,
         logdet_correction: 0.0,
@@ -2615,6 +2627,8 @@ pub(crate) fn theta_mode_response_kernel_matches_preport_assembly_bitwise() {
 
     // ── Constrained regime: lifted kernel K_T, selection + emission. ──
     let trace = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((3, 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
         h_proj_inverse: array![[0.5, 0.1], [0.1, 0.8]],
         logdet_correction: 0.0,
@@ -3791,6 +3805,8 @@ pub(crate) fn subspace_projected_leverage_and_adjoint_shortcut_match_dense() {
     let det = 3.0_f64 * 5.0 - 0.1 * 0.1;
     let h_proj_inverse = array![[5.0 / det, -0.1 / det], [-0.1 / det, 3.0 / det]];
     let subspace = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: u_s.clone(),
         h_proj_inverse: h_proj_inverse.clone(),
         logdet_correction: 0.0,
@@ -3858,6 +3874,8 @@ pub(crate) fn subspace_base_h2_traces_match_scalar_projected_kernel_path() {
     let u_s = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]];
     let det = 3.0_f64 * 5.0 - 0.1 * 0.1;
     let kernel = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s,
         h_proj_inverse: array![[5.0 / det, -0.1 / det], [-0.1 / det, 3.0 / det]],
         logdet_correction: 0.0,
@@ -3992,6 +4010,8 @@ pub(crate) fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alp
         firth: None,
         hessian_logdet_correction: logdet_h_proj - hop.logdet(),
         penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
+            dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+            dropped_eigenvalues: Array1::zeros(0),
             u_s,
             h_proj_inverse,
             logdet_correction: 0.0,
@@ -4088,6 +4108,8 @@ pub(crate) fn projected_operator_hessian_matches_dense_subspace_trace() {
         firth: None,
         hessian_logdet_correction: h_proj.ln() - hop.logdet(),
         penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
+            dropped_basis: Array2::zeros((2, 0)),
+            dropped_eigenvalues: Array1::zeros(0),
             u_s: array![[0.0], [1.0]],
             h_proj_inverse: array![[1.0 / h_proj]],
             logdet_correction: 0.0,
@@ -4160,6 +4182,8 @@ pub(crate) fn projected_operator_hessian_matches_dense_subspace_trace() {
 #[test]
 pub(crate) fn penalty_subspace_batched_reduction_matches_serial_operator_reduction() {
     let kernel = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((3, 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: array![[1.0, 0.0], [0.2, 0.8], [-0.1, 0.6]],
         h_proj_inverse: array![[0.8, 0.1], [0.1, 0.6]],
         logdet_correction: 0.0,
@@ -4919,6 +4943,8 @@ pub(crate) fn build_projected_rho_gradient_solution(rho: f64) -> InnerSolution<'
         firth: None,
         hessian_logdet_correction: projected_logdet - full_logdet,
         penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
+            dropped_basis: Array2::zeros((2, 0)),
+            dropped_eigenvalues: Array1::zeros(0),
             u_s: array![[0.0], [1.0]],
             h_proj_inverse: array![[1.0 / h[[1, 1]]]],
             logdet_correction: 0.0,
@@ -6962,6 +6988,8 @@ pub(crate) fn build_leak_proof_solution(
 
     let penalty_subspace_trace = if use_projected_kernel {
         Some(Arc::new(PenaltySubspaceTrace {
+            dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+            dropped_eigenvalues: Array1::zeros(0),
             u_s,
             h_proj_inverse: h_proj_inv,
             logdet_correction: 0.0,

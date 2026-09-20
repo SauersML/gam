@@ -238,11 +238,12 @@ fn build_rho(
     }
     let mut ard = Vec::with_capacity(k_atoms);
     for (atom_index, (values, &dim)) in log_ard.iter().zip(latent_dims).enumerate() {
-        if !(values.is_empty() || values.len() == dim)
-            || !values.iter().all(|value| value.is_finite())
-        {
+        // Every coordinate atom carries a full ARD block (#2822): the coordinate
+        // prior is what makes the frozen-decoder row posterior proper.
+        if values.len() != dim || !values.iter().all(|value| value.is_finite()) {
             return Err(format!(
-                "run_sae_manifold_oos: trained log_ard[{atom_index}] must be empty or contain {dim} finite values"
+                "run_sae_manifold_oos: trained log_ard[{atom_index}] must contain {dim} finite values; got {}",
+                values.len()
             ));
         }
         ard.push(Array1::from(values.clone()));
@@ -1084,7 +1085,7 @@ mod tests {
             regularization: SaeOosRegularization {
                 log_lambda_sparse: 0.01_f64.ln(),
                 log_lambda_smooth: vec![0.01_f64.ln()],
-                log_ard: vec![Vec::new()],
+                log_ard: vec![vec![0.01_f64.ln()]],
             },
             max_iter: 1,
             learning_rate: 1.0,
@@ -1214,6 +1215,7 @@ mod tests {
     fn typed_oos_entry_reconstructs_frozen_periodic_dictionary() {
         let request = periodic_request();
         let expected = request.target.clone();
+        let ard_strength = request.regularization.log_ard[0][0].exp();
         let report = run_sae_manifold_oos(request).unwrap();
         assert_eq!(report.assignments.dim(), (4, 1));
         assert!(
@@ -1229,7 +1231,24 @@ mod tests {
             .iter()
             .map(|value| value.abs())
             .fold(0.0_f64, f64::max);
-        assert!(max_error <= 1.0e-12, "max reconstruction error={max_error}");
+        // The target lies exactly on the frozen dictionary, so the only pull
+        // off it is the ARD coordinate prior (#2822): the miss is at most of
+        // the prior's order and vanishes linearly as the prior weakens.
+        assert!(
+            max_error <= ard_strength,
+            "max reconstruction error={max_error} exceeds the ARD strength {ard_strength}"
+        );
+        let mut weak = periodic_request();
+        weak.regularization.log_ard = vec![vec![(ard_strength * 1.0e-2).ln()]];
+        let weak_report = run_sae_manifold_oos(weak).unwrap();
+        let weak_error = (&weak_report.fitted - &expected)
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            weak_error <= 1.0e-1 * max_error,
+            "a 100x weaker ARD prior must shrink the miss: {weak_error} vs {max_error}"
+        );
         let atom_error = (&report.atoms[0].reconstruction - &report.fitted)
             .iter()
             .map(|value| value.abs())
@@ -1276,6 +1295,16 @@ mod tests {
         let error = run_sae_manifold_oos(request).err().unwrap();
         assert!(
             error.contains("trained log_ard must contain 1 atom blocks"),
+            "{error}"
+        );
+
+        // #2822 — an empty per-atom ARD block is refused at the entry, not
+        // accepted and then rejected by the rho domain check.
+        let mut request = periodic_request();
+        request.regularization.log_ard = vec![Vec::new()];
+        let error = run_sae_manifold_oos(request).err().unwrap();
+        assert!(
+            error.contains("trained log_ard[0] must contain 1 finite values; got 0"),
             "{error}"
         );
     }

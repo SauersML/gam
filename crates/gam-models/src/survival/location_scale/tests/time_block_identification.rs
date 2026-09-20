@@ -1348,3 +1348,155 @@ fn time_parameterization_follows_the_log_time_collapse_not_the_smoothing_layout(
         SurvivalLocationScaleTimeParameterization::MonotoneWarp
     );
 }
+
+/// A collapsed warp reads none of the time block's offsets (#892), so the offsets
+/// a Weibull baseline target defines cannot enter a constant-scale fit: the
+/// prepared time block carries only zero offsets, and the fitted likelihood and
+/// coefficients are bitwise the same for every `(scale, shape)`. The target has
+/// no parameter in this likelihood, which is why materialize refuses one here
+/// instead of searching it.
+#[test]
+fn collapsed_warp_likelihood_is_invariant_in_the_weibull_target() {
+    use crate::survival::construction::{
+        SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
+        build_survival_time_offsets_for_likelihood,
+    };
+
+    let (age_exit, event, _log_t) = reduced_aft_lognormal_sample(400, 1.4, 0.5, 5);
+    let inverse_link = residual_distribution_inverse_link(ResidualDistribution::Gaussian);
+    let fit_with_target = |scale: f64, shape: f64| {
+        let mut spec = reduced_aft_lognormal_spec(&age_exit, &event, 1.0);
+        let target = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Weibull,
+            scale: Some(scale),
+            shape: Some(shape),
+            rate: None,
+            makeham: None,
+        };
+        let (entry, exit, derivative) = build_survival_time_offsets_for_likelihood(
+            &spec.age_entry,
+            &spec.age_exit,
+            &target,
+            SurvivalLikelihoodMode::LocationScale,
+            Some(&inverse_link),
+        )
+        .expect("Weibull target offsets");
+        assert!(
+            exit.iter().any(|&value| value != 0.0),
+            "the Weibull target must define nonzero time offsets"
+        );
+        spec.time_block.offset_entry = entry;
+        spec.time_block.offset_exit = exit;
+        spec.time_block.derivative_offset_exit =
+            derivative + DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD;
+
+        let prepared = prepare_survival_location_scale_model(&spec).expect("prepare");
+        assert!(prepared.family.location_log_time.is_some());
+        let time = &prepared.blockspecs[SurvivalLocationScaleFamily::BLOCK_TIME];
+        assert!(
+            time.offset.iter().all(|&value| value == 0.0)
+                && time
+                    .stacked_offset
+                    .as_ref()
+                    .is_none_or(|offset| offset.iter().all(|&value| value == 0.0)),
+            "the collapsed time block must read none of the target's offsets"
+        );
+        let (fit, _) = fit_survival_location_scale_with_geometry(spec).expect("collapsed fit");
+        (
+            fit.log_likelihood_at_mode(),
+            fit.beta_threshold(),
+            fit.beta_log_sigma(),
+        )
+    };
+
+    let (ll_a, threshold_a, log_sigma_a) = fit_with_target(3.0, 1.0);
+    let (ll_b, threshold_b, log_sigma_b) = fit_with_target(9.0, 2.5);
+    assert_eq!(ll_a.to_bits(), ll_b.to_bits(), "log-likelihood {ll_a} vs {ll_b}");
+    assert_eq!(threshold_a, threshold_b);
+    assert_eq!(log_sigma_a, log_sigma_b);
+}
+
+/// gam#3037: the flexible I-spline time block declares its coordinate cone and
+/// nothing else, because the cone already implies every training row's
+/// derivative guard. The premise is checked on the real survival I-spline
+/// construction: the derivative design is non-negative entrywise and every
+/// column carrying it is bounded, so the least value of `D_i β + o_i` over the
+/// cone is `o_i`, which is the guard under the default linear baseline. Before
+/// the fix, the block declared `p + n` rows for this `p`-row set. That gave a
+/// degenerate vertex wherever a guard row bound, and a constrained Laplace
+/// normalizer priced over every row.
+#[test]
+fn flexible_time_block_declares_its_coordinate_cone_once_3037() {
+    let n = 80;
+    let age_entry = Array1::from_shape_fn(n, |i| 18.0 + 0.5 * i as f64);
+    let age_exit = Array1::from_shape_fn(n, |i| age_entry[i] + 1.0 + 2.5 * (i % 7) as f64);
+    let build = crate::survival::build_survival_time_basis(
+        &age_entry,
+        &age_exit,
+        crate::survival::SurvivalTimeBasisConfig::ISpline {
+            degree: 3,
+            knots: Array1::zeros(0),
+            keep_cols: Vec::new(),
+        },
+        Some(4),
+    )
+    .expect("build the survival I-spline time basis");
+    let guard = crate::survival::survival_derivative_guard_for_likelihood(
+        crate::survival::SurvivalLikelihoodMode::LocationScale,
+    );
+    let time_block = TimeBlockInput {
+        design_entry: build.x_entry_time.clone(),
+        design_exit: build.x_exit_time.clone(),
+        design_derivative_exit: build.x_derivative_time.clone(),
+        offset_entry: Array1::zeros(n),
+        offset_exit: Array1::zeros(n),
+        // The linear baseline has no derivative of its own: each offset is the guard.
+        derivative_offset_exit: Array1::from_elem(n, guard),
+        time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
+        penalties: build.penalties.clone(),
+        nullspace_dims: build.nullspace_dims.clone(),
+        initial_log_lambdas: None,
+        initial_beta: None,
+    };
+    let prepared = prepare_identified_time_block(
+        &time_block,
+        guard,
+        0,
+        false,
+        age_entry.mapv(f64::ln).view(),
+        age_exit.mapv(f64::ln).view(),
+    )
+    .expect("prepare the flexible time block");
+
+    let bounds = prepared
+        .coefficient_lower_bounds
+        .as_ref()
+        .expect("the flexible block carries its cone bounds");
+    let declared = prepared
+        .linear_constraints
+        .as_ref()
+        .expect("the flexible block declares constraints");
+    let cone = lower_bound_constraints(bounds).expect("the cone has rows");
+    assert_eq!(declared.a, cone.a, "declared rows must be the cone rows");
+    assert_eq!(declared.b, cone.b, "declared bounds must be the cone bounds");
+    let bounded = bounds.iter().filter(|lower| lower.is_finite()).count();
+    assert!(bounded > 0);
+    assert_eq!(
+        declared.a.nrows(),
+        bounded,
+        "one row per bounded coefficient, none per training row"
+    );
+
+    for ((row, col), &value) in prepared.design_derivative_exit.indexed_iter() {
+        assert!(
+            value >= 0.0,
+            "derivative design entry ({row}, {col}) = {value:e} is negative"
+        );
+        if value != 0.0 {
+            assert_eq!(
+                bounds[col], 0.0,
+                "column {col} carries derivative {value:e} at row {row} but is not bounded"
+            );
+        }
+    }
+}

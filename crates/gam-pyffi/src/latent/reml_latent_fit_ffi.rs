@@ -3,7 +3,7 @@
 /// In particular, a completed-but-nonstationary outer search is not an input
 /// error: it is a typed REML convergence failure whose full `OuterResult`
 /// remains the resume/evidence payload.  Keep that distinction instead of
-/// flattening `SaeFitError` through `Display` into `GamError`.
+/// flattening `SaeFitError` through `Display` into `GamfitError`.
 fn sae_fit_error_to_pyerr(py: Python<'_>, err: gam::terms::sae::manifold::SaeFitError) -> PyErr {
     use gam::terms::sae::manifold::SaeFitError;
 
@@ -4046,9 +4046,66 @@ fn resolve_average_derivative_column(
     }
 }
 
+/// The summary as a Python dict. The saved payload's row-major
+/// `covariance_flat` / `covariance_n` pair arrives as one `(n, n)` float64
+/// array under `"covariance"`; every other field converts as JSON.
 #[pyfunction]
 fn summary_payload_from_model(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<PyObject> {
-    json_object_to_py_dict(py, model.summary_value()?.clone())
+    let serde_json::Value::Object(items) = model.summary_value()? else {
+        return Err(py_value_error(
+            "model summary payload must be a JSON object".to_string(),
+        ));
+    };
+    let out = PyDict::new(py);
+    for (key, value) in items {
+        match key.as_str() {
+            "covariance_n" => {}
+            "covariance_flat" => {
+                let covariance = summary_covariance_matrix(items.get("covariance_n"), value)?;
+                match covariance {
+                    Some(covariance) => out.set_item("covariance", covariance.into_pyarray(py))?,
+                    None => out.set_item("covariance", py.None())?,
+                }
+            }
+            _ => out.set_item(key, json_value_to_py(py, value)?.bind(py))?,
+        }
+    }
+    Ok(out.unbind().into_any())
+}
+
+/// `covariance_flat` reshaped to its `covariance_n` side. JSON has no
+/// non-finite numbers, so serde writes a non-finite entry as `null`; it reads
+/// back as NaN.
+fn summary_covariance_matrix(
+    side: Option<&serde_json::Value>,
+    flat: &serde_json::Value,
+) -> PyResult<Option<Array2<f64>>> {
+    let Some(flat) = flat.as_array() else {
+        return Ok(None);
+    };
+    let side = side
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|side| usize::try_from(side).ok())
+        .ok_or_else(|| {
+            py_value_error("summary covariance_flat is present without covariance_n".to_string())
+        })?;
+    let entries = flat
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| match value {
+            serde_json::Value::Null => Ok(f64::NAN),
+            _ => value.as_f64().ok_or_else(|| {
+                py_value_error(format!("summary covariance_flat[{idx}] must be a JSON number"))
+            }),
+        })
+        .collect::<PyResult<Vec<f64>>>()?;
+    Array2::from_shape_vec((side, side), entries)
+        .map(Some)
+        .map_err(|err| {
+            py_value_error(format!(
+                "summary covariance_flat does not fill a {side}x{side} matrix: {err}"
+            ))
+        })
 }
 
 #[pyfunction]
@@ -4070,7 +4127,7 @@ fn smoothing_parameters_from_model(py: Python<'_>, model: PyRef<'_, PyFittedMode
 #[pyfunction]
 fn model_group_metadata(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<PyObject> {
     match model.summary_value()?.get("group_metadata") {
-        Some(value @ serde_json::Value::Object(_)) => json_value_to_py(py, value.clone()),
+        Some(value @ serde_json::Value::Object(_)) => json_value_to_py(py, value),
         _ => Ok(py.None()),
     }
 }
@@ -4087,7 +4144,7 @@ fn model_deployment_extensions(py: Python<'_>, model: PyRef<'_, PyFittedModel>) 
     };
     for extension in extensions {
         if matches!(extension, serde_json::Value::Object(_)) {
-            let py_value = json_value_to_py(py, extension.clone())?;
+            let py_value = json_value_to_py(py, extension)?;
             out.append(py_value.bind(py))?;
         }
     }
@@ -4109,7 +4166,7 @@ fn summary_payload_value(model: &FittedModel) -> Result<serde_json::Value, Strin
     Ok(value)
 }
 
-fn json_object_to_py_dict(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
+fn json_object_to_py_dict(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     let serde_json::Value::Object(items) = value else {
         return Err(py_value_error(
             "model summary payload must be a JSON object".to_string(),
@@ -4123,7 +4180,7 @@ fn json_object_to_py_dict(py: Python<'_>, value: serde_json::Value) -> PyResult<
     Ok(out.unbind().into_any())
 }
 
-fn json_value_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
+fn json_value_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     match value {
         serde_json::Value::Null => Ok(py.None()),
         serde_json::Value::Bool(value) => value.into_py_any(py),
@@ -4139,7 +4196,7 @@ fn json_value_to_py(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObje
                 .ok_or_else(|| py_value_error("JSON number is not representable".to_string()))?;
             value.into_py_any(py)
         }
-        serde_json::Value::String(value) => value.into_py_any(py),
+        serde_json::Value::String(value) => value.as_str().into_py_any(py),
         serde_json::Value::Array(values) => {
             let out = PyList::empty(py);
             for value in values {
@@ -4200,7 +4257,7 @@ fn summary_html(payload: &Bound<'_, PyDict>) -> PyResult<String> {
     let mut rows = String::new();
     for (key, value) in payload.iter() {
         let key_text = key.str()?.extract::<String>()?;
-        if key_text == "coefficients" || key_text == "covariance_flat" {
+        if key_text == "coefficients" || key_text == "covariance" {
             continue;
         }
         rows.push_str("<tr>");
@@ -4403,7 +4460,7 @@ fn check_payload_from_model(
         serde_json::from_str::<serde_json::Value>(&check_json)
             .map_err(|err| format!("invalid schema check JSON: {err}"))
     })?;
-    json_object_to_py_dict(py, payload)
+    json_object_to_py_dict(py, &payload)
 }
 
 #[pyfunction]

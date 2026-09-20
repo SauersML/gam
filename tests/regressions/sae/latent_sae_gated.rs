@@ -5,7 +5,7 @@ use gam::terms::sae::manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAssignment, SaeManifoldAtom,
     SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm, ScheduleKind,
 };
-use ndarray::{Array2, Array3, Array4, Array5, ArrayView2, array};
+use ndarray::{Array2, Array3, Array4, Array5, ArrayView1, ArrayView2, array};
 use std::sync::Arc;
 
 /// An explicitly affine basis: phi(t) = phi(t0) + J (t - t0).
@@ -72,6 +72,19 @@ impl gam::terms::sae::basis::SaeBasisSecondJet for PrecomputedAffineBasis {
         let d = self.latent_dim();
         Ok(Array4::<f64>::zeros((coords.nrows(), self.n_basis(), d, d)))
     }
+
+    /// Each row carries its own affine map, so one ball of coordinates has no bound
+    /// that holds for every row.
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<gam::terms::sae::basis::SaeBasisJetBallCapability, String> {
+        Ok(gam::terms::sae::basis::SaeBasisJetBallCapability::Unavailable(format!(
+            "PrecomputedAffineBasis maps each row by its own Jacobian, so a ball of radius \
+             {radius} around {center} has no row-independent bound"
+        )))
+    }
 }
 
 /// The global identity function, evaluated on any batch of coordinates.
@@ -108,6 +121,19 @@ impl gam::terms::sae::basis::SaeBasisSecondJet for IdentityBasis {
     fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
         let (n, d) = coords.dim();
         Ok(Array4::zeros((n, d, d, d)))
+    }
+
+    /// `φ_b(t) = t_b`: `|t_b| ≤ |c_b| + radius` on the ball, a unit gradient, no curvature.
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<gam::terms::sae::basis::SaeBasisJetBallCapability, String> {
+        Ok(gam::terms::sae::basis::SaeBasisJetBallCapability::Bounded(
+            gam::terms::sae::basis::SaeBasisJetBallBound {
+                columns: center.iter().map(|value| [value.abs() + radius, 1.0, 0.0, 0.0]).collect(),
+            },
+        ))
     }
 }
 

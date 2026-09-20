@@ -41,6 +41,7 @@ use crate::bms::{
     LatentMeasureSpec, LatentZConditionalCalibration, build_latent_measure_decision,
     estimated_latent_law,
 };
+use crate::inference::predict_io::FittedLatentScoreMap;
 
 /// Everything the fit and its persistence need from the latent-law gate: the
 /// per-coordinate decisions, the law the primary score consumed, the score the
@@ -372,7 +373,8 @@ pub(crate) fn resolve_latent_score_calibration_from_parts(
                      marginal conditioning block"
                         .to_string()
                 })?;
-                cal.apply(raw.view(), a_block.view())?
+                FittedLatentScoreMap::conditional_only(cal)
+                    .calibrate(raw.view(), Some(a_block.view()))?
             }
         };
         if !matches!(decision.calibration, LatentMeasureCalibration::None) {

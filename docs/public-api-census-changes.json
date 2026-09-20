@@ -4497,6 +4497,37 @@
     "evidence": "public_api_census.py, run with base 28a216c08d and the code-only probe c70a6f4ebb, reported exactly this identity as removed (13307 public function declarations before and after, since resolve_marginal_slope_link is the replacement). git grep -c -w resolve_marginal_slope_base_link finds 0 files under crates, src and tests at the landing tree. Gate on 28a216c08d (acn112, 6 cores): the materialize tests 65 of 67, whose two failures are the location-scale tests that fail identically on unpatched base (gam#2953 comment); gamfit pins 13 of 13 on the candidate wheel, and on the base wheel every gam#2999 pin but link=probit fails (5 DID NOT RAISE, 2 coefficient-state mismatches, 1 survival fit reaching the solver); cargo build --workspace --lib and cargo check --workspace --all-targets green."
   },
   {
+    "base": "12d4f8d71d84c11f6f7e4c6937efdf0d54688d7b",
+    "removed": {
+      "crates/gam-solve/src/estimate/smoothing_correction.rs::active_directions": 1,
+      "crates/gam-solve/src/gpu_kernels/sigma_cubature.rs::certified_sigma_point_covariance": 1,
+      "crates/gam-solve/src/gpu_kernels/sigma_cubature.rs::curvature_kind_to_row": 1,
+      "crates/gam-solve/src/gpu_kernels/sigma_cubature.rs::family_kind_to_row": 1,
+      "crates/gam-solve/src/gpu_kernels/sigma_cubature.rs::stream_pool_eval": 1,
+      "crates/gam-solve/src/gpu_kernels/sigma_cubature.rs::try_gpu_sigma_stream_pool_eval": 1,
+      "crates/gam-solve/src/reml/eval.rs::accumulate_sigma_cubature_total_covariance": 1,
+      "crates/gam-solve/src/reml/eval.rs::branch_label": 1,
+      "crates/gam-solve/src/reml/eval.rs::calibrate_sigma_node": 1,
+      "crates/gam-solve/src/reml/eval.rs::classification_reason_strings_are_nonempty_and_distinct": 1,
+      "crates/gam-solve/src/reml/eval.rs::compute_smoothing_correction_auto": 1,
+      "crates/gam-solve/src/reml/eval.rs::cubature_branch_label_and_extraction": 1,
+      "crates/gam-solve/src/reml/eval.rs::cubature_counter_is_observable": 1,
+      "crates/gam-solve/src/reml/eval.rs::cubature_smoothing_correction_is_response_scale_equivariant": 1,
+      "crates/gam-solve/src/reml/eval.rs::device_pirls_stage3_ready": 1,
+      "crates/gam-solve/src/reml/eval.rs::finalize_smoothing_outcome": 1,
+      "crates/gam-solve/src/reml/eval.rs::first_order_numerical_branch_label_and_extraction": 1,
+      "crates/gam-solve/src/reml/eval.rs::first_order_routine_branch_label_and_extraction": 1,
+      "crates/gam-solve/src/reml/eval.rs::make_first_order": 1,
+      "crates/gam-solve/src/reml/eval.rs::sigma_cubature_dispatch": 1,
+      "crates/gam-solve/src/reml/eval.rs::sigma_cubature_evaluate_cpu_rayon": 1,
+      "crates/gam-solve/src/reml/eval.rs::sigma_cubature_evaluate_gpu_stream_pool": 1,
+      "crates/gam-solve/src/reml/gradient_hessian.rs::execute_pirls_stateless_for_cubature": 1,
+      "crates/gam-solve/src/reml/objective.rs::compute_cost_uncharged": 1
+    },
+    "reason": "pyGAM audit F4/G6: the sigma-point cubature smoothing correction and its GPU stream-pool lane are deleted (see docs/source-removal-changes.json). The analytic first-order Vp = Vb + J V_rho J^T, already the correction for every fit the cubature gates refused, is now the only one.",
+    "evidence": "git grep -w at the head finds no call of any listed function. Remaining occurrences of the names are unrelated locals and fields. The callers were the deleted cubature dispatch in reml/eval.rs and tests of that path. tests/test_smoothing_correction_first_order.py pins the replacement: the first-order correction on 6-smooth GLMs and nominal coverage for Gaussian, Poisson and binomial."
+  },
+  {
     "base": "c981848bcb2ddbde8a46383c9c065105a19e4525",
     "removed": {
       "crates/gam-models/src/fit_orchestration/warm_start_from.rs::consumed": 1,
@@ -4530,5 +4561,97 @@
     },
     "reason": "SPEC R25 (bic-removal M2): the topology lifecycle selector's BIC score kind is deleted with its plumbing. bic_score computed deviance + p log(n), a large-sample surrogate for the evidence that the REML, LAML and TK kinds already compute; the Bic variant, the candidate deviance field that only fed it, the pyffi ScoreKind::Bic decode and the Python 'bic' literal go with it.",
     "evidence": "source_removal_guard.py and public_api_census.py, run against this base, each report exactly this one identity. git grep -w bic_score finds no occurrence under crates, src or tests at the head tree. cargo test -p gam-solve --lib topology_selector passes 23 tests, including typed_lifecycle_disagreement_compares_only_evidence_families."
+  },
+  {
+    "base": "700c8e6300da9abcd2b722c827792ca81283035a",
+    "removed": {
+      "crates/gam-solve/src/rho_optimizer/newton_polish.rs::newton_polish_step_budget": 1
+    },
+    "reason": "#3012 (996d0af2c1, acknowledged after it landed, gam#3166): the Newton polish's step budget is deleted. newton_polish_step_budget counted the steps that quadratic convergence (λ₊ ≤ 2λ²) allowed from the first decrement, and it allowed none outside λ ≤ 1/4. On the exponential tail a smoothing parameter takes toward a limit model, Newton converges linearly, so the count stopped walks that were converging. The polish now measures the rate each step achieved, so no caller needs a predicted step count and nothing replaces the function.",
+    "evidence": "public_api_census.py --base 700c8e6300 --head 996d0af2c1 reported exactly this removal (13510 public function declarations before, 13509 after) with no acknowledgement. With this entry, it passes on a probe commit made of 996d0af2c1's tree plus this ledger (gam#3166, run on MSI). git grep -n -w newton_polish_step_budget finds no occurrence under crates, src, tests or docs at 72d1e93bee."
+  },
+  {
+    "base": "26afd99f5fbbbbfca8daf5921bf054b96b0d6cc4",
+    "removed": {
+      "crates/gam-models/src/bms/row_kernel.rs::fourth_full_cache": 1,
+      "crates/gam-models/src/bms/row_kernel.rs::third_full_cache": 1,
+      "crates/gam-models/src/bms/row_primary_hessian.rs::build_row_exact_context_with_stats_and_cell_cache": 1,
+      "crates/gam-models/src/row_kernel.rs::validate_row_kernel_cache_lengths": 1
+    },
+    "reason": "#3022 and #2998: the rigid BMS row kernel builds each row's derivative tensors once and hands the same tensors to every consumer, so the per-row third/fourth full-tensor caches (RigidThirdFull, RigidFourthFull, their get/insert helpers and the third_full_cache/fourth_full_cache accessors) and the cache-length validator that policed them (validate_row_kernel_cache_lengths with its test) have no remaining purpose. The empirical third directional trace is contracted in factored form through gam-math jet_trace, whose cost does not depend on the flex width, so the fixed-width third-trace dispatch (empirical_fixed_third_trace_dispatch, empirical_fixed_third_trace_from_plan) is deleted. The degree-9 cell cache flag is gone, so build_row_exact_context_with_stats_and_cell_cache is renamed build_row_exact_context.",
+    "evidence": "source_removal_guard.py and public_api_census.py run against base 26afd99f5f report exactly these identities. git grep -w finds none of the removed names under crates, src or tests at the head tree. Targeted tests: gam-models third_trace_2998, rigid_row_tensors_3022 (3), multistart_member_2359, flex_measure_932 pass; gam-math jet_trace 2/2; gam-custom-family warm_start 14/14."
+  },
+  {
+    "base": "de32bc5c716e7595df9b36f3fc358029ae1b3975",
+    "removed": {
+      "crates/gam-models/src/gpu_kernels/survival_rowjet.rs::survival_rigid_row_vgh_device_selected": 1
+    },
+    "reason": "#3000 slice 2: the survival row jet's own admission, a bool from the fused-kernel threshold that ignored gpu=required and let G::ANCHORED / G::FOLLOW_UP_VARYING bypass the policy, is replaced by survival_rigid_row_vgh_decision in the same file. It decides through gam_gpu::decide_row_kernel from the row jet's declared SURVIVAL_ROWJET_CAPABILITY and returns the typed GpuDecision; its two callers now call rigid_row_jet_decision::<P, G>, which forwards to it.",
+    "evidence": "public_api_census.py, run against this entry's base with the slice-2 commit as head, reports exactly this identity as removed (13561 public function declarations before and 13565 after at the gate base bd435db0df). git grep -c -w survival_rigid_row_vgh_device_selected finds 0 under crates, src and tests at the head tree; rigid_row_jet_device_admission_and_parity_2900 and rigid_row_jet_capability_follows_the_frame_declarations_3000 exercise the replacement and pass."
+  },
+  {
+    "base": "bdd00e20fd46860b917ff233fc268f9a8f293f9d",
+    "removed": {
+      "crates/gam-solve/src/rho_optimizer/run.rs::negative_curvature_claim": 1
+    },
+    "reason": "#3036 follow-up to 16db27c9a8: the gam-local NegativeCurvatureClaim and negative_curvature_claim move to opt (SauersML/opt 17dea8b4539a526ec311bc312945bb0d8a1f761f, SPEC 24: general outer-optimizer work lives in opt), beside opt::unresolvable_curvature_magnitude(alpha_max, res) = 2*res/alpha_max^2, which the predicate reads. gam re-exports both from opt under their old paths (rho_optimizer/run.rs `pub(crate) use opt::{...}`, next to certificate_curvature_shift), so every call site and the #3036 tests resolve unchanged, and gam's criterion_curvature_resolution now calls the same magnitude at NEGATIVE_CURVATURE_LADDER_LARGEST_STEP. One number decides resolvability for the adjudication and for the definiteness, seed and decrement verdicts.",
+    "evidence": "At base bdd00e20fd46860b917ff233fc268f9a8f293f9d, source_removal_guard.py and public_api_census.py (run against this base) report exactly these identities, and git grep -w finds both names only in the opt re-export and their callers at the head tree. At the head tree: cargo check --workspace --all-targets RC 0 with 0 warnings, cargo build --workspace --lib RC 0, and gam-solve rho_optimizer:: plus the _3036 pins all pass (acn112, toolchain 1.97.1)."
+  },
+  {
+    "base": "c8f927327ae4b3fa476d8ceb9242798c2d3d7578",
+    "removed": {
+      "crates/gam-sae/src/inference/intervention_shard.rs::kl_measurement_band_nats": 1
+    },
+    "reason": "gh#2263 F3: kl_measurement_floor is now the one owner of a KL measurement's floor, max(B, control), and returns the band B beside it. kl_measurement_band_nats stays as its private component, so a caller cannot rebuild the floor as band.max(control) beside the owner. The function and its formula are unchanged; only its visibility narrows.",
+    "evidence": "public_api_census.py, run with this base and the landing commit, reports exactly this identity. git grep -w kl_measurement_band_nats finds it only in crates/gam-sae/src/inference/intervention_shard.rs at the head tree: its definition, kl_measurement_floor, and the module's tests. cargo nextest run -p gam-sae --lib on the intervention_shard tests passes, including a_measurement_floor_is_its_band_raised_only_by_stochastic_control_evidence_2263."
+  },
+  {
+    "base": "c14c88d3ab59a78e5741d37a295c4132826cab29",
+    "removed": {
+      "crates/gam-models/src/survival/location_scale/time_block.rs::append_linear_constraints": 1
+    },
+    "reason": "gam#3037: append_linear_constraints concatenated the flexible survival location-scale time block's coordinate cone with its per-row derivative-guard rows. The cone implies every guard row, so the block now declares the cone alone and nothing concatenates two time constraint systems. It was pub(crate), with one caller.",
+    "evidence": "public_api_census.py, run without this acknowledgement against a candidate with this change, reported exactly this identity as removed (13546 public function declarations before, 13545 after). git grep finds append_linear_constraints only at its declaration and its one call in prepare_identified_time_block, both in time_block.rs, which this commit replaces."
+  },
+  {
+    "base": "89bea032636428fd8e2ca7e7d5b1762854ff886a",
+    "removed": {
+      "crates/gam-models/src/bms/estimated_latent_law.rs::closed_form_survival_anchor_log_probabilities": 1
+    },
+    "reason": "gam#2926 (moving-law certificate at the fitted law's anchor): the certificate scores a rigid survival row at the intercept the fit solved on its own law. closed_form_survival_anchor_log_probabilities(q, b, law) computed the closed-form intercept q·sqrt(1 + b²) itself, which is the fit's anchor only when the fitted law is Gaussian. It becomes survival_anchor_log_probabilities(alpha, b, law), which takes the intercept: calibration.rs's rigid arm passes solve_anchor(q, s·b, fitted law), the root the fit solved (#2983), or the closed form on the Gaussian law, where the two coincide.",
+    "evidence": "source_removal_guard.py and public_api_census.py each reported exactly this one identity at base de9b43848b (gateDr4 on acl42), and both passed with this entry at base 136b8383a5 (gateD5). git grep -w closed_form_survival_anchor_log_probabilities finds no occurrence under crates, src or tests at the head tree; survival_anchor_log_probabilities is declared at crates/gam-models/src/bms/estimated_latent_law.rs:253 and called at moving_law_rule.rs:1580, survival/marginal_slope/calibration.rs:197 and timepoint_exact/law_node_tests.rs:490, whose the_moving_law_certificate_scores_a_rigid_row_at_its_fitted_laws_anchor_2926 pins the intercept it takes."
+  },
+  {
+    "base": "94e6a59c5b31edf06a4d4b4b52885099ff721b22",
+    "removed": {
+      "crates/gam-custom-family/src/blockwise_solve.rs::block_quadratic_penalty": 1,
+      "crates/gam-custom-family/src/blockwise_solve.rs::block_quadratic_penalty_with_accumulation": 1,
+      "crates/gam-custom-family/src/blockwise_solve.rs::total_quadratic_penalty": 1,
+      "crates/gam-custom-family/src/blockwise_solve.rs::total_quadratic_penalty_parallel_worthwhile": 1,
+      "crates/gam-custom-family/src/blockwise_solve.rs::total_quadratic_penalty_with_accumulation": 1,
+      "crates/gam-problem/src/joint_penalty.rs::quadratic_form_with_accumulation": 1,
+      "crates/gam-problem/src/joint_penalty.rs::quadratic_with_accumulation": 1,
+      "crates/gam-solve/src/reml/assembly.rs::penalty_coords_from_blocks": 1
+    },
+    "reason": "#2954 stage 1b, ruling (C): the custom-family penalty is evaluated on its structural roots by one function, gam_custom_family::BlockPenaltyRoots (value, penalty_increment, s_lambdas, block_value, terms). It replaces the dense block_quadratic_penalty, block_quadratic_penalty_with_accumulation, total_quadratic_penalty, total_quadratic_penalty_with_accumulation and total_quadratic_penalty_parallel_worthwhile in place, because the dense 1/2 b'S_lambda b carried lambda times the stored matrix's null eigenvalue (measured lambda*2.14e-16 on 2923's time block). The joint bundle's quadratic_with_accumulation and JointPenaltySpec::quadratic_form_with_accumulation go the same way: the bundle's quadratic reads its validated roots, and BlockPenaltyRoots carries the accumulation for per-block and joint terms alike. gam-solve's penalty_coords_from_blocks built the criterion's coordinates from the dense matrices with its own rank threshold; its one caller, the custom-family assembly, now builds them from the same roots.",
+    "evidence": "public_api_census.py and source_removal_guard.py, run against this base, report exactly these eight public functions, and git grep -w finds none of them under crates, src or tests at the head tree. Every former caller reads gam_custom_family::BlockPenaltyRoots or the joint bundle's validated roots; the landing gate at this base ran every lib and integration test target of gam-problem, gam-custom-family, gam-solve and gam-models, and every test that fails at the head fails at the base."
+  },
+  {
+    "base": "890f20cb3e96f1fa3856ec167bebd9cc6734845f",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/materialize/terms.rs::gate_duchon_operator_penalties_for_family": 1
+    },
+    "reason": "Duchon operator penalties: one penalty structure for every family. gate_duchon_operator_penalties_for_family (with its helper disable_duchon_operator_penalties_in_basis) stripped the Duchon mass and tension operator penalties from every standard fit that was not Gaussian-identity (#1074), on the claim that fixed-dispersion LAML mis-rewards those blocks. Both LAML arms keep log|H| and log|S|+ (the Fixed arm sets include_logdet_h and include_logdet_s exactly as ProfiledGaussian does), so the claim has no criterion basis. What the gate did in practice was make scale_dimensions a no-op for GLMs: the promoted anisotropic s=0 Duchon carries per-axis relevance only through the tension-ARD penalties it removed. The gate and its call in materialize/standard.rs are deleted; every family now fits the resolved Duchon operator penalties as specified.",
+    "evidence": "Removed with no replacement: no caller should rewrite the Duchon penalty structure by family. In the landing tree the name occurs 0 times (git grep -c); its only caller, materialize/standard.rs, drops the call in the same change."
+  },
+  {
+    "base": "7b249280deb52c24f0f413208659dc4328c68fb3",
+    "removed": {
+      "crates/gam-models/src/inference/full_conformal.rs::new": 1,
+      "crates/gam-models/src/inference/full_conformal.rs::penalized_rss": 1,
+      "crates/gam-models/src/inference/full_conformal.rs::select_rho": 1
+    },
+    "reason": "#3275: GaussianRemlRhoResponse::select_rho, the full-conformal rho-hat(z) Newton polish with the contraction-ratio stop, had no production caller. Since #3213 (63d0074714) the Layer-3 map re-selects rho-hat(z) in full_conformal/honest.rs (branch and bound, then refit_at through OuterProblem, which takes the engine's certified result with no polish), and 1d6a22a6b0 moved the coverage study's training strength off select_rho(None) to the oracle's brute_force_rho because the ratio stop refused it. select_rho was a second, unused route to rho-hat(z), so it is deleted with its polish, not re-tuned. The deny-warnings cascade goes with it: the oracle's gradient, gradient band and Hessian (read only by select_rho), and the rounding scale of residual_sum_of_squares that fed that band. The rest of GaussianRemlRhoResponse (new, eval, penalized_rss, the rho domains) is the independent REML oracle that only the honest tests and the #2280/#2902 pins use, so it moves unchanged in arithmetic into a private #[cfg(test)] mod test_support (full_conformal/test_support.rs), with RemlEval and residual_sum_of_squares. select_rho_domain_is_the_resolvability_interval_of_its_gram_2902 is renamed oracle_rho_domain_is_the_resolvability_interval_of_its_gram_2902 (same body), and gaussian_reml_reselection_is_stationary_on_the_augmented_criterion, which tested only select_rho, is deleted.",
+    "evidence": "git grep -w select_rho at base 7fff1617da finds only the definition and that one unit test; git grep GaussianRemlRhoResponse finds uses only in full_conformal.rs tests and full_conformal/honest/tests.rs. At the head tree git grep -w select_rho -- crates src tests finds nothing, and under crates GaussianRemlRhoResponse, RemlEval and residual_sum_of_squares occur only in full_conformal/test_support.rs and the two test modules. Gate direct-dy5-w2oc-3275-g1.log, TIPCHECK at tip 94e6a59c5b (tree d165e56dc0): cargo check --workspace --all-targets RC 0 with SCANNER_ERRORS=0, gam-pyffi check RC 0, source_removal_guard and public_api_census RC 0, and 16 of 17 gam-models full_conformal:: tests pass, including oracle_rho_domain_is_the_resolvability_interval_of_its_gram_2902, the #2280 penalized-RSS pin and honest_set_matches_brute_force_reml_refits. The 17th, full_conformal_coverage_holds_for_every_row_class, hit nextest's 600 s per-test cap after 5 of its 9 (scenario, n) cells. It executes no code this change touches except the oracle's eval, which now does strictly less work (no A^-1 S solve, traces or Hessian), so the cap is not this change's (read, not measured at main)."
   }
 ]

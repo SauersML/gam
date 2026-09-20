@@ -37,9 +37,14 @@ The coverage it certifies. The expansion needs the logits to be three times
 differentiable in the activation. On a mixture-of-experts model they are not
 where a router's top-k expert set changes, so a chord's resolved doses stop at its
 first patched forward whose top-k sets differ from the base forward's
-(``router_topk_changes > 0``). Held-out doses count only inside the region the
-calibration rows occupy for the same atom, from their lowest dose to their
-highest; calibration chords publish the error law ``γ`` over that region.
+(``router_topk_changes > 0``). A dose resolves only when its KL exceeds its own
+measurement floor (``measurement_floor_nats``), which the Rust owner derives
+from the record's logit format and extents and raises by stochastic control
+evidence; a row at or under it is kept, reported and left out, never clamped, and
+a KL below minus its float64 evaluation band is refused, because roundoff cannot
+produce it. Held-out doses count only inside the region the resolved calibration
+rows occupy for the same atom, from their lowest dose to their highest;
+calibration chords publish the error law ``γ`` over that region.
 
 The historical private-driver monkeypatch is intentionally gone. A ledger that
 does not carry strict public-plan values, stable intervention identifiers, and
@@ -89,7 +94,6 @@ _PROTOCOL_FIELDS = (
     "harvest_cache_sha256",
     "seed",
     "fractions",
-    "floor_multiplier",
     "floor_repetitions",
     "max_templates",
     "bases",
@@ -161,9 +165,26 @@ def _validate_ledger(ledger: dict[str, Any]) -> list[dict[str, Any]]:
         predicted = _finite_nonnegative(
             raw["predicted_nats"], field="predicted_nats", intervention_id=intervention_id
         )
-        measured = _finite_nonnegative(
-            raw["measured_nats"], field="measured_nats", intervention_id=intervention_id
+        evaluation_band = _finite_nonnegative(
+            raw["measurement_evaluation_nats"],
+            field="measurement_evaluation_nats",
+            intervention_id=intervention_id,
         )
+        floor = float(raw["measurement_floor_nats"])
+        if not (math.isfinite(floor) and floor > 0.0):
+            raise ValueError(
+                f"intervention {intervention_id!r} needs a finite positive measurement_floor_nats; "
+                f"got {floor!r}"
+            )
+        # The measured KL is scored as computed, never clamped. A true KL is
+        # non-negative, so only roundoff within the float64 evaluation band can make a
+        # computed one negative; below that it is a sign error.
+        measured = float(raw["measured_nats"])
+        if not (math.isfinite(measured) and measured >= -evaluation_band):
+            raise ValueError(
+                f"intervention {intervention_id!r} measured_nats {measured!r} is below minus its "
+                f"float64 evaluation band {evaluation_band!r}, which roundoff cannot produce"
+            )
         exact = _finite_nonnegative(
             raw.get("exact_directional_nats", predicted),
             field="exact_directional_nats",
@@ -191,7 +212,7 @@ def _validate_ledger(ledger: dict[str, Any]) -> list[dict[str, Any]]:
         ):
             raise ValueError(
                 f"intervention {intervention_id!r} needs router_topk_changes, the count of "
-                "router calls whose top-k set differs from the base forward's; got "
+                "token rows whose router top-k set differs from the base forward's; got "
                 f"{router_topk_changes!r}"
             )
         row = dict(raw)
@@ -206,24 +227,26 @@ def _validate_ledger(ledger: dict[str, Any]) -> list[dict[str, Any]]:
             predicted_nats_kind=kind,
             resident_metric_nats_kind=resident_kind,
             router_topk_changes=router_topk_changes,
+            measurement_evaluation_nats=evaluation_band,
+            measurement_floor_nats=floor,
         )
         validated.append(row)
     return validated
 
 
 def _calibrated_regions(rows: list[dict[str, Any]]) -> dict[int, tuple[float, float]]:
-    """Each atom's calibrated dose region, ``(lowest, highest)`` calibration dose.
+    """Each atom's calibrated dose region, ``(lowest, highest)`` resolved calibration dose.
 
-    A calibration certifies only the doses its rows occupy, so a held-out dose
-    below the lowest or above the highest calibration dose of its atom is not
-    scored.
+    A calibration certifies only the doses its rows occupy and resolve, so a
+    held-out dose below the lowest or above the highest calibration dose of its
+    atom that cleared its own measurement floor is not scored.
     """
-    calibration = [row for row in rows if row["split"] == "calibration"]
+    calibration = [row for row in rows if row["split"] == "calibration" and _resolved(row)]
     regions: dict[int, tuple[float, float]] = {}
     for atom in sorted({int(row["atom"]) for row in rows}):
         doses = [float(row["predicted_nats"]) for row in calibration if int(row["atom"]) == atom]
         if not doses:
-            raise ValueError(f"atom {atom} has no calibration rows to certify a dose region")
+            raise ValueError(f"atom {atom} has no resolved calibration rows to certify a dose region")
         regions[atom] = (min(doses), max(doses))
     return regions
 
@@ -274,42 +297,56 @@ def _chord_extrapolation(window: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
+def _resolved(row: dict[str, Any]) -> bool:
+    """A measurement resolves its dose only strictly above its own floor."""
+    return float(row["measured_nats"]) > float(row["measurement_floor_nats"])
+
+
 def _chords(
     rows: list[dict[str, Any]], regions: dict[int, tuple[float, float]], split: str
-) -> tuple[dict[tuple[int, str], dict[str, Any]], list[str], list[str], list[str]]:
-    """Per-chord extrapolations for one split, plus the rows each rule set aside.
+) -> tuple[dict[tuple[int, str], dict[str, Any]], dict[str, list[str]]]:
+    """Per-chord extrapolations for one split, plus the rows and chords each rule set aside.
 
-    The router window is cut on the whole chord before the calibrated region is
-    applied: a top-k change at a dose outside the region still ends the smooth
-    part of the chord for every larger dose.
+    The router window is cut on the whole chord before the calibrated region and the
+    measurement floor are applied: a top-k change at a dose outside the region, or
+    one the forward does not resolve, still ends the smooth part of the chord for
+    every larger dose. A dose at or under its own floor is kept and set aside, never
+    clamped, and the chord's next resolved doses take its place.
     """
     grouped: dict[tuple[int, str], list[dict[str, Any]]] = {}
     for row in rows:
         if row["split"] == split:
             grouped.setdefault((int(row["atom"]), str(row["base_prompt_id"])), []).append(row)
     chords: dict[tuple[int, str], dict[str, Any]] = {}
-    outside: list[str] = []
-    past_router_change: list[str] = []
-    unresolved: list[str] = []
+    set_aside: dict[str, list[str]] = {
+        "outside_calibrated_region": [],
+        "past_router_change": [],
+        "at_or_under_measurement_floor": [],
+        "unresolved_chords": [],
+    }
     for key in sorted(grouped):
         window = _chord_window(grouped[key])
         in_window = {row["intervention_id"] for row in window}
-        past_router_change.extend(
+        set_aside["past_router_change"].extend(
             row["intervention_id"] for row in grouped[key] if row["intervention_id"] not in in_window
         )
         lo, hi = regions[key[0]]
         resolved = []
         for row in window:
-            if lo <= float(row["predicted_nats"]) <= hi:
-                resolved.append(row)
+            if not lo <= float(row["predicted_nats"]) <= hi:
+                set_aside["outside_calibrated_region"].append(row["intervention_id"])
+            elif not _resolved(row):
+                set_aside["at_or_under_measurement_floor"].append(row["intervention_id"])
             else:
-                outside.append(row["intervention_id"])
+                resolved.append(row)
         extrapolation = _chord_extrapolation(resolved)
         if extrapolation is None:
-            unresolved.append(f"{key[0]}:{key[1]}")
+            set_aside["unresolved_chords"].append(f"{key[0]}:{key[1]}")
             continue
         chords[key] = extrapolation
-    return chords, sorted(outside), sorted(past_router_change), unresolved
+    for name in ("outside_calibrated_region", "past_router_change", "at_or_under_measurement_floor"):
+        set_aside[name].sort()
+    return chords, set_aside
 
 
 def _bootstrap_mean_ci(values: np.ndarray, *, draws: int, seed: int) -> list[float]:
@@ -330,8 +367,8 @@ def acceptance_report(
 ) -> dict[str, Any]:
     rows = _validate_ledger(ledger)
     regions = _calibrated_regions(rows)
-    heldout, outside, past_router_change, unresolved = _chords(rows, regions, "heldout")
-    calibration, _, calibration_past_router_change, _ = _chords(rows, regions, "calibration")
+    heldout, heldout_set_aside = _chords(rows, regions, "heldout")
+    calibration, calibration_set_aside = _chords(rows, regions, "calibration")
     r0 = np.asarray([chord["r0"] for chord in heldout.values()], dtype=np.float64)
     lo, hi = _bootstrap_mean_ci(r0, draws=bootstrap_draws, seed=seed)
     truncation = [chord["r0_truncation"] for chord in heldout.values() if chord["r0_truncation"] is not None]
@@ -362,13 +399,20 @@ def acceptance_report(
             "total": len(rows),
             "calibration": sum(row["split"] == "calibration" for row in rows),
             "heldout": sum(row["split"] == "heldout" for row in rows),
-            "heldout_outside_calibrated_region": len(outside),
-            "heldout_past_router_change": len(past_router_change),
-            "calibration_past_router_change": len(calibration_past_router_change),
+            "heldout_outside_calibrated_region": len(heldout_set_aside["outside_calibrated_region"]),
+            "heldout_past_router_change": len(heldout_set_aside["past_router_change"]),
+            "heldout_at_or_under_measurement_floor": len(
+                heldout_set_aside["at_or_under_measurement_floor"]
+            ),
+            "calibration_past_router_change": len(calibration_set_aside["past_router_change"]),
+            "calibration_at_or_under_measurement_floor": len(
+                calibration_set_aside["at_or_under_measurement_floor"]
+            ),
         },
-        "heldout_outside_calibrated_region": outside,
-        "heldout_past_router_change": past_router_change,
-        "heldout_chords_unresolved": unresolved,
+        "heldout_outside_calibrated_region": heldout_set_aside["outside_calibrated_region"],
+        "heldout_past_router_change": heldout_set_aside["past_router_change"],
+        "heldout_at_or_under_measurement_floor": heldout_set_aside["at_or_under_measurement_floor"],
+        "heldout_chords_unresolved": heldout_set_aside["unresolved_chords"],
         "resident_metric_kind_counts": dict(
             sorted(Counter(row["resident_metric_nats_kind"] for row in rows).items())
         ),
@@ -377,7 +421,8 @@ def acceptance_report(
         "measurement": "KL(p_base || p_patched) for the same effective_delta",
         "validity_rule": (
             "held-out doses inside the atom's calibrated region, before the chord's first "
-            "router top-k change; r0 from the two smallest, extrapolated linearly in sqrt(dose)"
+            "router top-k change, and measured strictly above their own measurement floor; "
+            "r0 from the two smallest, extrapolated linearly in sqrt(dose)"
         ),
     }
     defects_in_interval = sorted(

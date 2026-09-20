@@ -1460,22 +1460,16 @@ fn cli_firth_preflight_accepts_redundant_survival_marginal_slope_flag() {
 }
 
 #[test]
-fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
-    // #2116: the `gam` CLI and the `gamfit` Python API are two front-ends of ONE
-    // shared engine (#1191/#1196). The Python/materialize standard path drops the
-    // Duchon *operator* penalties (the mass/tension collocation-Gram blocks) for a
-    // non-Gaussian-identity family via `gate_duchon_operator_penalties_for_family`
-    // (materialize/standard.rs), but the CLI's hand-built `StandardFitRequest`
-    // never applied that gate — so a Duchon smooth under e.g. Poisson fit a
-    // DIFFERENT penalty structure through the CLI than through Python, a genuine
-    // single-engine-contract violation. `run_fit` now applies the SAME gate. This
-    // test drives the real CLI fit end-to-end and pins that the persisted (frozen)
-    // Duchon term carries ALL operator penalties DISABLED under Poisson — matching
-    // the materialize path. Before the fix the frozen term kept the default
-    // (mass + tension Active), so the assertion failed; after the fix it passes.
+fn cli_scale_dimensions_fit_keeps_one_duchon_penalty_structure_for_every_family() {
+    // `scale_dimensions` promotes a multi-D thin-plate smooth to an anisotropic
+    // Duchon whose per-axis relevance is carried ONLY by the tension-ARD
+    // penalties. The materialize path used to switch the Duchon operator
+    // penalties off for every non-Gaussian-identity family, which silently
+    // turned `scale_dimensions` into a no-op for a GLM. The penalty structure is
+    // a property of the smooth, not of the likelihood: a Poisson fit must
+    // persist the same mass + tension operator penalties a Gaussian fit does.
     let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
     let train_path = td.path().join("duchon_poisson.csv");
-    let model_path = td.path().join("model.json");
 
     // Deterministic 7x7 spatial grid with a smooth log-linear Poisson mean; every
     // count is a non-negative integer so the Poisson support check passes.
@@ -1491,75 +1485,72 @@ fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
     }
     fs::write(&train_path, csv).unwrap_or_else(|e| panic!("{} failed: {:?}", "write csv", e));
 
-    run_fit(FitArgs {
-        expectile_tau: None,
-        data: train_path,
-        request: None,
-        formula_positional: Some("y ~ s(pc1, pc2, type=duchon, centers=6)".to_string()),
-        predict_noise: None,
-        slope_formula: None,
-        z_column: None,
-        residual_columns: Vec::new(),
-        weights_column: None,
-        offset_column: None,
-        noise_offset_column: None,
-        frailty_kind: None,
-        frailty_sd: None,
-        hazard_loading: None,
-        transformation_normal: false,
-        firth: false,
-        family: FamilyArg::PoissonLog,
-        negative_binomial_theta: None,
-        // `survival_likelihood` is read exclusively by the survival fit path.
-        // On a Poisson response nothing consumes it, so the requested survival
-        // model would silently degrade to an ordinary GAM -- the fit now refuses
-        // it rather than ignoring it. This test gates Duchon operator penalties
-        // and never needed the option.
-        survival_likelihood: None,
-        baseline_target: "linear".to_string(),
-        baseline_scale: None,
-        baseline_shape: None,
-        baseline_rate: None,
-        baseline_makeham: None,
-        time_basis: "ispline".to_string(),
-        threshold_time_k: None,
-        sigma_time_k: None,
-        slope_time_k: None,
-        scale_dimensions: false,
-        out: Some(model_path.clone()),
-    })
-    .unwrap_or_else(|e| {
-        panic!(
-            "{} failed: {:?}",
-            "CLI Poisson Duchon fit should succeed", e
-        )
-    });
-
-    let saved = SavedModel::load_from_path(&model_path)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
-    let spec = saved
-        .resolved_termspec
-        .as_ref()
-        .expect("standard fit must persist a resolved termspec");
-    let duchon = spec
-        .smooth_terms
-        .iter()
-        .find_map(|term| match &term.basis {
-            SmoothBasisSpec::Duchon { spec, .. } => Some(spec),
-            _ => None,
+    for family in [FamilyArg::Gaussian, FamilyArg::PoissonLog] {
+        let model_path = td.path().join(format!("model_{family:?}.json"));
+        run_fit(FitArgs {
+            expectile_tau: None,
+            data: train_path.clone(),
+            request: None,
+            formula_positional: Some("y ~ s(pc1, pc2)".to_string()),
+            predict_noise: None,
+            slope_formula: None,
+            z_column: None,
+            residual_columns: Vec::new(),
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
+            transformation_normal: false,
+            firth: false,
+            family,
+            negative_binomial_theta: None,
+            survival_likelihood: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            threshold_time_k: None,
+            sigma_time_k: None,
+            slope_time_k: None,
+            scale_dimensions: true,
+            out: Some(model_path.clone()),
         })
-        .expect("resolved termspec must contain the Duchon smooth");
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "CLI scale_dimensions fit should succeed", e
+            )
+        });
 
-    use gam::basis::OperatorPenaltySpec::Disabled;
-    assert!(
-        matches!(duchon.operator_penalties.mass, Disabled)
-            && matches!(duchon.operator_penalties.tension, Disabled)
-            && matches!(duchon.operator_penalties.stiffness, Disabled),
-        "CLI standard fit under Poisson must gate the Duchon operator penalties \
-         (mass/tension collocation-Gram blocks) off, matching the Python/materialize \
-         path (#2116); got {:?}",
-        duchon.operator_penalties
-    );
+        let saved = SavedModel::load_from_path(&model_path)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+        let spec = saved
+            .resolved_termspec
+            .as_ref()
+            .expect("standard fit must persist a resolved termspec");
+        let duchon = spec
+            .smooth_terms
+            .iter()
+            .find_map(|term| match &term.basis {
+                SmoothBasisSpec::Duchon { spec, .. } => Some(spec),
+                _ => None,
+            })
+            .expect("resolved termspec must contain the Duchon smooth");
+
+        use gam::basis::OperatorPenaltySpec::{Active, Disabled};
+        assert!(
+            matches!(duchon.operator_penalties.mass, Active { .. })
+                && matches!(duchon.operator_penalties.tension, Active { .. })
+                && matches!(duchon.operator_penalties.stiffness, Disabled),
+            "{family:?} scale_dimensions fit must keep the Duchon mass + tension \
+             operator penalties that carry the per-axis relevance; got {:?}",
+            duchon.operator_penalties
+        );
+    }
 }
 
 /// #2631: the CLI and the engine must resolve the SAME baseline time anchor for
@@ -2600,7 +2591,8 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
         scale_dimensions: false,
         out: Some(td.path().join("model.json")),
     })
-    .expect_err("main formula should reject z-column reuse");
+    .expect_err("main formula should reject z-column reuse")
+    .to_string();
 
     assert!(err.contains("reserves z column 'z'"), "{err}");
     assert!(err.contains("main formula"), "{err}");
@@ -2644,7 +2636,8 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_slope_formula() {
         scale_dimensions: false,
         out: Some(td.path().join("model.json")),
     })
-    .expect_err("slope formula should reject z-column reuse");
+    .expect_err("slope formula should reject z-column reuse")
+    .to_string();
 
     assert!(err.contains("reserves z column 'z'"), "{err}");
     assert!(err.contains("slope_formula"), "{err}");
@@ -3509,6 +3502,11 @@ fn test_payload(
     payload
 }
 
+/// Standardized-units σ floor saved with the intercept-only Gaussian
+/// location-scale fixture (a fitted model derives it from the response's
+/// recording grid; the fixture has no training response, so it pins one).
+const INTERCEPT_ONLY_GAUSSIAN_SIGMA_FLOOR: f64 = 0.01;
+
 fn intercept_only_gaussian_location_scale_model(
     beta_mu: f64,
     beta_log_sigma: f64,
@@ -3552,6 +3550,7 @@ fn intercept_only_gaussian_location_scale_model(
     payload.formula_noise = Some("1".to_string());
     payload.beta_noise = Some(vec![beta_log_sigma]);
     payload.gaussian_response_scale = Some(response_scale);
+    payload.gaussian_sigma_floor = Some(INTERCEPT_ONLY_GAUSSIAN_SIGMA_FLOOR);
     payload.set_training_feature_metadata(vec![], vec![]);
     payload.resolved_termspec = Some(empty_termspec());
     payload.resolved_termspec_noise = Some(empty_termspec());
@@ -3947,7 +3946,7 @@ fn core_saved_fit_result_json_roundtripswith_finite_summary() {
 }
 
 #[test]
-fn parse_bounded_linear_term_defaults_to_no_prior() {
+fn parse_bounded_linear_term_defaults_to_shrinkage_prior() {
     let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1) + z")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     assert_eq!(parsed.terms.len(), 2);
@@ -3962,7 +3961,7 @@ fn parse_bounded_linear_term_defaults_to_no_prior() {
             assert_eq!(name, "mu_hat");
             assert_eq!((*min, *max), (0.0, 1.0));
             match prior {
-                BoundedCoefficientPriorSpec::None => {}
+                BoundedCoefficientPriorSpec::Shrinkage => {}
                 other => panic!("unexpected prior: {other:?}"),
             }
             assert!(!*double_penalty);
@@ -5700,6 +5699,7 @@ fn location_scale_prediction_csv_uses_estimand_explicit_schema() {
         None,
         None,
         None,
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -5741,6 +5741,7 @@ fn location_scale_map_prediction_omits_the_posterior_estimand() {
         None,
         None,
         None,
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -5772,6 +5773,7 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
     let eta = array![1.0];
     let mean = array![1.0];
     let sigma = array![0.4];
+    let eta_std_error = array![0.25];
     let std_error = array![0.3];
     let mean_lower = array![0.2];
     let mean_upper = array![1.8];
@@ -5782,6 +5784,7 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
         Some(mean.view()),
         Some(sigma.view()),
         &[],
+        Some(eta_std_error.view()),
         Some(std_error.view()),
         Some(mean_lower.view()),
         Some(mean_upper.view()),
@@ -5799,14 +5802,14 @@ fn location_scale_prediction_csv_names_posterior_uncertainty_explicitly() {
     assert_eq!(
         lines.next(),
         Some(
-            "linear_predictor_plugin,mean_plugin,posterior_mean,noise_scale,posterior_mean_standard_error,posterior_mean_lower,posterior_mean_upper"
+            "linear_predictor_plugin,mean_plugin,posterior_mean,noise_scale,linear_predictor_standard_error,posterior_mean_standard_error,posterior_mean_lower,posterior_mean_upper"
         ),
         "location-scale uncertainty output must name the posterior estimand"
     );
     assert_eq!(
         lines.next(),
         Some(
-            "1.000000000000,1.000000000000,1.000000000000,0.400000000000,0.300000000000,0.200000000000,1.800000000000"
+            "1.000000000000,1.000000000000,1.000000000000,0.400000000000,0.250000000000,0.300000000000,0.200000000000,1.800000000000"
         )
     );
 
@@ -5822,8 +5825,8 @@ fn gaussian_location_scale_generate_restores_sigma_to_response_units() {
     // that shift, so it is the only piece still standardized and the only piece
     // multiplied here:
     //
-    //   σ_raw = response_scale·LOGB_SIGMA_FLOOR + exp(η_ls)
-    //         = response_scale·(LOGB_SIGMA_FLOOR + exp(η_internal))
+    //   σ_raw = response_scale·sigma_floor + exp(η_ls)
+    //         = response_scale·(sigma_floor + exp(η_internal))
     //
     // Scaling the whole `(floor + exp(η_ls))` instead would apply
     // `response_scale` twice on the exp term and break σ's response-scale
@@ -5831,7 +5834,7 @@ fn gaussian_location_scale_generate_restores_sigma_to_response_units() {
     // fixture used to assert. See `GaussianLocationScalePredictor::compute_sigma`.
     //
     // Pick the input so σ exits at 2.0 exactly under the real convention:
-    // exp(η_ls) = 2.0 − 8·0.01 = 1.92.
+    // exp(η_ls) = 2.0 − 8·INTERCEPT_ONLY_GAUSSIAN_SIGMA_FLOOR = 1.92.
     let model = intercept_only_gaussian_location_scale_model(-3.0, (1.92f64).ln(), 8.0);
     let data = ndarray::Array2::<f64>::zeros((2, 0));
     let headers = vec![];
@@ -7594,7 +7597,7 @@ fn run_fit_request_document(data: PathBuf, out: PathBuf, document: &str) -> Resu
     args.formula_positional = None;
     args.predict_noise = None;
     args.survival_likelihood = None;
-    run_fit(args)
+    run_fit(args).map_err(|error| error.to_string())
 }
 
 /// Integration test: a small survival dataset (6 rows, intercept-only

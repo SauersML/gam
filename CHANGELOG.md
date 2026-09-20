@@ -1,5 +1,26 @@
 ## Unreleased
 
+- **One exception hierarchy, chosen by the engine's error category.** Every engine
+  error now reports one Rust `ErrorCategory` (formula, data, convergence, not fitted,
+  internal). Python raises a class under that category's base, and the CLI exits
+  with that category's code (2, 3, 4, 5, 70), so the two classify a failure the same
+  way without reading its message. The bases are `GamfitError(Exception)`,
+  `FormulaError(GamfitError, ValueError)`, `DataError(GamfitError, ValueError)`,
+  `ConvergenceError(GamfitError, RuntimeError)`, `NotFittedError` (the bases of
+  scikit-learn's `NotFittedError`) and `InternalError(GamfitError, RuntimeError)`.
+  Every other class sits under exactly one of them, and all live in `gamfit.errors`.
+  Classes that no engine path raised are removed. `gamfit.sklearn` estimators raise
+  `gamfit.errors.NotFittedError` before `fit`, a subclass that is also scikit-learn's
+  `NotFittedError`. **Migration:** `GamError` is now
+  `GamfitError` and no longer a `ValueError`. Code that caught `ValueError` for a
+  solver failure should catch `ConvergenceError`, and code that caught `FitError`
+  should catch `ConvergenceError` or the category it means.
+- **`s()` / `te()` / `linear()` on a string or categorical column is a formula error.**
+  These fits used to succeed silently on the column's level codes, and a stray string in
+  a numeric column raised pyarrow's `ArrowInvalid`. Formula resolution in Rust now refuses it,
+  for the CLI and Python alike. The message names the column and its first
+  non-numeric value and row, and lists the terms that accept the column:
+  `factor(g)` / `group(g)`, `s(x, by=g)`, `fs(x, g)` and `s(g, bs="re")`.
 - **The default `s(x)` sizes its basis from the data** (slop.md G1). The formula-default
   open B-spline was capped at `clamp(unique/4, 4..8)` internal knots (12 cubic
   coefficients), so `y ~ s(x)` stopped improving with `n`: on `sin(8πx) + N(0, 0.3²)`
@@ -22,8 +43,24 @@
   adequate basis it rejected 2.3% of the time at 0.05 and 0.1% at 0.01 (1000 seeded
   replicates). It now refers `(T/r)·(ν − r)/(ν − T)` to `F(r, ν − r)`, the classical test of
   the enrichment columns added to the fit, and reports no p-value when `ν ≤ r` or `T ≥ ν`.
-  Estimated-scale `basis_checks` p-values are smaller than before. Known-scale families
-  (binomial, Poisson) are unchanged. Calibration is in `bench/pvalue_calibration/pv-model-comparison/`.
+  Estimated-scale `basis_checks` p-values are smaller than before. Calibration is in
+  `bench/pvalue_calibration/pv-model-comparison/`.
+- **`basis_check` on a canonical binomial or Poisson fit uses the score's conditional law**
+  (pyGAM audit, lane pv-model-comparison). The χ²_r reference for the score at the
+  penalized fit is only first order, and at small n it was miscalibrated in both
+  directions: at n = 200 with a default `s(x)` it was conservative (binomial size 0.032 at
+  0.05; with success probabilities 0.05–0.27 size 0.024 at 0.05, KS p = 1e-9), and with
+  Poisson means 0.14–1.0 its p-values failed a KS test against U(0, 1) (p = 3e-5). The score
+  is now taken at the unpenalized null MLE and referred to its law conditional on the
+  sufficient statistic `Xᵀ(w∘y)`, with its mean, covariance and fourth cumulant corrected
+  to O(1/n) (`c·χ²_{r/c}`, `c = 1 + K₄/(2r)`). Binomial and Poisson `basis_checks` p-values
+  change. Where the expansion leaves its range of validity (Σ not positive definite, or
+  `c ≤ 0`) the row reports provenance `conditional_reference_unavailable` and no p-value;
+  `null_fit_unavailable` means the null MLE could not be certified. A row that is not
+  measured omits the `p_value` key. **Open limit:** with rare events (28–34 expected
+  events in 200 rows) two-thirds of rows are refused and the Poisson p-values that are
+  reported are conservative (size 0.030 at 0.05, KS p = 2e-4); that regime needs the next
+  order of the expansion.
 - **The top-level `gamfit` namespace is 19 names** (PKG-06). `import gamfit` exposed about
   340 names: the core API next to every research helper, basis primitive, result class and
   error type, several under two names. The top level now holds the fit and load entry
@@ -38,7 +75,7 @@
   `topology`, `torch` (and `kernels_jax` / `kernels_torch`). Every other module is private.
   `import gamfit` no longer loads the SAE, topology-selection or plotting code.
   **Migration:** `gamfit.X` becomes `gamfit.<submodule>.X`, for example
-  `gamfit.GamError` → `gamfit.errors.GamError`, `gamfit.Diagnostics` →
+  `gamfit.FormulaError` → `gamfit.errors.FormulaError`, `gamfit.Diagnostics` →
   `gamfit.results.Diagnostics`, `gamfit.bspline_basis` → `gamfit.basis.bspline_basis`,
   `gamfit.sae_manifold_fit` → `gamfit.sae.sae_manifold_fit`,
   `gamfit.select_topology` → `gamfit.topology.select_topology`. Duplicates were removed
@@ -243,6 +280,11 @@
   `declared_latent_law` now serves the Bernoulli family too.
 - Saved models record which law the fit consumed in `latent_law_consumed`.
   Models saved earlier replay their old calibration unchanged.
+- Where the score's law moves, an arm that anchors on a Gaussian residual is a
+  candidate of the moving-law rule only if that residual passes the adequacy
+  screen, and the fit is solved on the simplest candidate first; each arm's
+  screen is recorded in the certificate (`MovingLawArmScore::adequacy`,
+  payload 32).
 - Fits that anchor on an estimated law are slower than the closed form until
   the anchor kernel follow-up lands: a 100 000-row Bernoulli fit on a skewed
   score took 199 s where the closed form took 4.6 s, and on a moving law
