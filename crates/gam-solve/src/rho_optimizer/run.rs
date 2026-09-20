@@ -4161,13 +4161,11 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // or the caller's own requirement. No rung is a magic relative constant, and
     // none is selected by how the search exited.
     let mut stationarity_bound = solver_bound;
-    // #2568/#2688 -- the caller's requirement is applied once, inside
-    // `outer_certificate_band_at`, which labels the band it capped
-    // (audited just above). A second cap used to sit here for a bound that a
-    // widening between the two pushed back past the requirement; the only such
-    // widening was the probe-noise rung, and with it deleted (#2817) nothing
-    // above this point can widen the already-capped band, so that cap could
-    // never fire and was removed.
+    // #2568/#2688 -- the caller's requirement caps `outer_certificate_band_at`'s
+    // band (audited just above), and caps the ladder's top again once the
+    // widening rungs below have run: the Newton-decrement verdict, the
+    // curvature-resolvability rung and the reproducibility floor all replace
+    // this band, and a cap applied only before them was defeated by each (#3311).
     audit_outer_value_agreement(
         context,
         value_only,
@@ -4620,6 +4618,14 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         }
     }
 
+    // #2568 -- the caller's requirement caps the ladder's TOP, after every
+    // widening rung above (#3311: an exact block Gaussian REML fit that asked for
+    // |Pg| ≤ 1e-8 was minted at |Pg| = 9.8e-3 on the curvature-resolvability
+    // rung, and its envelope-theorem weight VJP was off by that gradient).
+    let capped = cap_at_caller_requirement(config, stationarity_bound, bound_source);
+    stationarity_bound = capped.bound;
+    bound_source = capped.source;
+
     // #2458/#2479 -- the bound's own provenance, emitted UNCONDITIONALLY rather
     // than only when a rung happens to widen. A certificate that does not carry
     // which of its five terms decided it can only be re-derived from source,
@@ -4926,8 +4932,9 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                          |Pg|={certified_projected_grad_norm:.3e} (#2954)",
                         source.label(),
                     );
-                    stationarity_bound = bound;
-                    bound_source = source;
+                    let capped = cap_at_caller_requirement(config, bound, source);
+                    stationarity_bound = capped.bound;
+                    bound_source = capped.source;
                 }
             }
         }
@@ -7181,6 +7188,16 @@ pub(crate) fn run_outer_uncertified(
     // there instead of replaying the same refuted fixed-point walk or throwing
     // away useful work.
     let mut refuted_fixed_point_continuation: Option<OuterResult> = None;
+    // The lowest finite state an earlier attempt of THIS ladder ended at without a
+    // claim (#3306). A degraded plan changes how the search moves, not the
+    // objective, so it resumes that state instead of re-searching from the seed:
+    // restarting discarded every accepted step of the refused attempt. On a binary
+    // Bernoulli marginal-slope fit the gradient-only BFGS attempt ended at the
+    // certified value to seven digits, and exact-curvature ARC re-searched from
+    // the seed. A state carried in from an earlier search is only this ladder's
+    // comparator (`carried_checkpoint`), never its start: the caller chose this
+    // ladder's seed, and a multistart member keeps its own basin.
+    let mut ladder_incumbent: Option<OuterResult> = None;
     // Iterations spent by attempts whose results this function discards: a plan
     // the degraded ladder replaces, a fixed-point walk handed to BFGS.
     // `OuterResult.iterations` is the total across solver restarts and these are
@@ -7202,6 +7219,26 @@ pub(crate) fn run_outer_uncertified(
         // would be. Otherwise this attempt could publish the optimum an earlier attempt declined
         // (#2953).
         attempt_config.carried_checkpoint = best_checkpoint.as_ref().map(carried_checkpoint_of);
+        if let Some(incumbent) = ladder_incumbent.as_ref() {
+            attempt_config.initial_rho = Some(incumbent.rho.clone());
+            // The configured inner seed belongs to the configured start, not to
+            // this incumbent; the inner solve warm-starts from its own cache.
+            attempt_config.initial_inner_seed = None;
+            // A mid-run incumbent is not a terminal certificate imported from a
+            // prior fit, and a transferred Hessian is bound to that prior fit's
+            // rho, not to this state.
+            attempt_config.initial_rho_is_prior_terminal_certificate = false;
+            attempt_config.warm_start_outer_hessian = None;
+            log::debug!(
+                "[OUTER] {context}: resuming {the_plan} from the lowest finite state an \
+                 earlier attempt of this ladder ended at ({:?}, {} iteration(s)): \
+                 cost={:.6e}, |g|={:?}",
+                incumbent.plan_used.solver,
+                incumbent.iterations,
+                incumbent.final_value,
+                incumbent.final_grad_norm,
+            );
+        }
         if let Some(checkpoint) = fixed_point_continuation.take() {
             if !matches!(the_plan.solver, Solver::Bfgs) {
                 return Err(EstimationError::RemlOptimizationFailed(format!(
@@ -7393,6 +7430,13 @@ pub(crate) fn run_outer_uncertified(
                         !checkpoint.final_value.is_finite()
                             || result.final_value < checkpoint.final_value
                     });
+                let improves_incumbent = result.final_value.is_finite()
+                    && ladder_incumbent
+                        .as_ref()
+                        .is_none_or(|incumbent| result.final_value < incumbent.final_value);
+                if improves_incumbent {
+                    ladder_incumbent = Some(result.clone());
+                }
                 if improves_checkpoint {
                     best_checkpoint = Some(result);
                 }
@@ -8328,7 +8372,7 @@ pub(crate) fn run_fixed_point_outer_solver(
             &mut seed_result,
             CertificationFidelity::Screening,
         ) {
-            log::info!(
+            log::debug!(
                 "[OUTER] {context}: {label} seed is already stationary at cost={:.6e}; \
                  no fixed-point step taken",
                 seed_result.final_value,

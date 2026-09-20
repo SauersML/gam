@@ -190,7 +190,7 @@ fn sphere_evidence_metric_theta_channel_matches_fd_of_the_evidence_factor_2933_f
         ((i + 2 * j + 1) as f64 * 0.19).sin() + ((2 * i + j + 1) as f64 * 0.19).sin()
     });
     let (_, gamma) = state
-        .evidence_metric_derivative_channels(&rho, target.view(), &cache, &weight)
+        .evidence_metric_derivative_channels(&rho, target.view(), &cache, &weight, None)
         .expect("the metric θ-channel converts the sphere rows");
     let (worst, tangent_signal, report) =
         sphere_direction_gaps(&state, &cache, &gamma, &|endpoint| {

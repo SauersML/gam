@@ -20,7 +20,7 @@ impl crate::custom_family::JeffreysThirdInformationDerivative for SurvivalMargin
         // A time wiggle takes the ζ composition of `timewiggle_third` on every frame it serves,
         // from the FLEX base or the rigid closed-form fifth derivatives (gam#2893).
         if self.flex_timewiggle_active() {
-            return if self.timewiggle_zeta_available() {
+            return if self.timewiggle_zeta_fifth_available() {
                 self.exact_newton_joint_hessian_third_directional_derivative_timewiggle_all_axes(
                     states, u, v,
                 )
@@ -184,7 +184,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             log_likelihood,
             penalty_value,
         )?;
-        log::info!("[survival-marginal-slope] frozen-time certificate {verdict:?}");
+        log::debug!("[survival-marginal-slope] frozen-time certificate {verdict:?}");
         Ok(verdict.refusal_reason())
     }
 
@@ -906,7 +906,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         // flex block runs the row through the order-five flex contraction, which
         // anchors on the law itself (gam#2948).
         let served = if self.flex_timewiggle_active() {
-            self.timewiggle_zeta_available()
+            self.timewiggle_zeta_fifth_available()
         } else {
             !self.per_z_slope_active()
                 && self.influence_absorber.is_none()
