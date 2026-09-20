@@ -203,10 +203,11 @@ fn assert_spectra_match(left: &[ActiveCodeSource], right: &[ActiveCodeSource], w
 fn native_code_rate_is_the_output_metric_gaussian_rate_2933_f11() {
     // Audit check 3. Independent latent coordinates with variances in the ratio
     // (100, 1), decoded by diag(0.1, 1), so the decoded output covariance is
-    // isotropic with spectrum (1, 1). The fit leaves a residual of energy 0.3 in the
-    // channel the atom does not decode. Joint water filling of the code (1, 1) and
-    // the residual (0.3) to the delivered distortion 0.3 sets the water level
-    // 0.3 / 3 = 0.1, so the Gaussian output rate of the code is log2(10) bits per
+    // isotropic: the unbiased covariance over the four firings has spectrum
+    // (4/3, 4/3). The fit leaves a residual of raw second moment 0.3 in the channel
+    // the atom does not decode. Joint water filling of the code (4/3, 4/3) and the
+    // residual (0.3) to the delivered distortion 0.3 sets the water level
+    // 0.3 / 3 = 0.1, so the Gaussian output rate of the code is log2(40/3) bits per
     // token and the residual costs ½·log2(3). Water filling the latent spectrum
     // instead spends the budget on the insensitive coordinate.
     let coords = array![[10.0, 1.0], [-10.0, 1.0], [10.0, -1.0], [-10.0, -1.0]];
@@ -224,7 +225,7 @@ fn native_code_rate_is_the_output_metric_gaussian_rate_2933_f11() {
         None,
         &residual,
     );
-    let expected = 10.0_f64.log2();
+    let expected = (40.0_f64 / 3.0).log2();
     assert!(
         (dl.code_bits_per_token - expected).abs() < 1.0e-12,
         "output-metric Gaussian rate at distortion 0.3 is {expected}; got {}",
@@ -232,7 +233,8 @@ fn native_code_rate_is_the_output_metric_gaussian_rate_2933_f11() {
     );
     assert!((dl.residual_bits_per_token - 0.5 * 3.0_f64.log2()).abs() < 1.0e-12);
     assert!((dl.distortion - 0.3).abs() < 1.0e-12, "distortion {}", dl.distortion);
-    // TSS: the decoded channels have unit variance each, the residual channel 0.3.
+    // TSS (population moments about the column means): the decoded channels have
+    // unit variance each, the residual channel 0.3.
     assert!((dl.ev - (1.0 - 0.3 / 2.3)).abs() < 1.0e-12, "ev {}", dl.ev);
 }
 
@@ -546,8 +548,10 @@ fn native_description_length_validates_its_input_domain_2933_f44() {
         try_describe(&assignments, &plans, &decoders, &coords, None, target, fitted)
     };
     assert!(check(&target, &fitted).is_ok());
-    let reversed = &target + &(&target - &fitted).mapv(|v| 5.0 * v);
-    let poor = check(&reversed, &fitted).expect("a reconstruction worse than the mean is valid");
+    // Shifting every reconstructed entry by 10 adds 10² per channel to the
+    // residual energy, far above the target's variance.
+    let shifted = fitted.mapv(|v| v + 10.0);
+    let poor = check(&target, &shifted).expect("a reconstruction worse than the mean is valid");
     assert!(poor.ev < 0.0, "negative EV expected, got {}", poor.ev);
     let exact = check(&fitted, &fitted).expect("an exact reconstruction");
     assert_eq!(exact.distortion, 0.0);
