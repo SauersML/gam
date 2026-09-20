@@ -91,6 +91,7 @@
 
 use crate::interval_policy::ResponseBounds;
 use gam_math::quantile::order_statistic;
+use gam_models::inference::full_conformal::conformal_rank_threshold;
 use gam_problem::EstimationError;
 use ndarray::{Array1, ArrayView1};
 
@@ -170,8 +171,13 @@ pub(crate) fn conformal_multiplier(
             )));
         }
     }
-    // 1-based rank ⌈(n+1)(1−α)⌉.
-    let rank = ((n as f64 + 1.0) * (1.0 - alpha)).ceil() as usize;
+    // 1-based rank ⌈(n+1)(1−α)⌉ = (n+1) − ⌊α(n+1)⌋. The threshold α(n+1) goes
+    // through the full-conformal snap: α arrives as `1 − level` from a decimal
+    // level, and computing ⌈(n+1)(1−α)⌉ in floating point directly lands just
+    // above an integer for some (level, n) (level 0.68 at n = 74 gives 51.000…01),
+    // which takes one rank too many and over-covers by 1/(n+1).
+    let tau = conformal_rank_threshold(alpha, n + 1);
+    let rank = (n + 1 - tau.floor() as usize).max(1);
     if rank > n {
         // Too few calibration points to certify coverage at this level.
         return Ok(f64::INFINITY);
@@ -334,6 +340,32 @@ mod tests {
         // alpha = 0.25, rank = ceil(10 * 0.75) = 8 → 8th smallest = 8.
         let q2 = conformal_multiplier(scores.view(), 0.25).expect("valid");
         assert_eq!(q2, 8.0);
+    }
+
+    #[test]
+    fn multiplier_rank_is_exact_for_decimal_levels() {
+        // Level 0.68 at n = 74: the exact rank is ⌈75·0.68⌉ = 51, but
+        // 75·(1 − (1 − 0.68)) evaluates to 51.000…01 in floating point.
+        let scores: Array1<f64> = (1..=74).map(|k| k as f64).collect();
+        let q = conformal_multiplier(scores.view(), 1.0 - 0.68).expect("valid");
+        assert_eq!(q, 51.0);
+
+        // α = 0.95 at n = 19: the exact rank is ⌈20·0.05⌉ = 1.
+        let scores: Array1<f64> = (1..=19).map(|k| k as f64).collect();
+        let q = conformal_multiplier(scores.view(), 0.95).expect("valid");
+        assert_eq!(q, 1.0);
+
+        // Nominal levels whose product is an exact integer keep their rank:
+        // n = 99 at level 0.9 is rank 90, at level 0.95 is rank 95.
+        let scores: Array1<f64> = (1..=99).map(|k| k as f64).collect();
+        assert_eq!(
+            conformal_multiplier(scores.view(), 1.0 - 0.9).expect("valid"),
+            90.0
+        );
+        assert_eq!(
+            conformal_multiplier(scores.view(), 1.0 - 0.95).expect("valid"),
+            95.0
+        );
     }
 
     #[test]
