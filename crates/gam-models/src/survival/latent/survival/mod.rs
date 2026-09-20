@@ -1160,13 +1160,9 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
             promote_pending_seed(&blocks);
             let rho = theta.slice(s![..rho_dim]).to_owned();
             let hyper_layout = family_hyper_layout(&blocks, theta)?;
-            // No exact outer Hessian along the chart axes (see above): ask for the gradient.
-            let eval_mode = match eval_mode {
-                gam_problem::EvalMode::ValueGradientHessian => {
-                    gam_problem::EvalMode::ValueAndGradient
-                }
-                other => other,
-            };
+            // The requested order is served as asked: the chart axes carry the exact
+            // outer Hessian (see above), so a Hessian request is never demoted to a
+            // gradient (#3321).
             let eval_options = crate::outer_subsample::exact_outer_options(options);
             let (first_iterate, candidates) =
                 exact_mode_branch
