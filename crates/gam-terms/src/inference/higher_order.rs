@@ -14,9 +14,15 @@
 
 /// The Bartlett factor from a second-order null mean: `c = E[W] / d`.
 ///
-/// This is the general entry point — `mean_w` is the (analytic-cumulant or
-/// null-bootstrap) expectation of the statistic under the penalized null, and
-/// `ref_df` is the nominal reference `d`. Returns `None` on degenerate inputs.
+/// `mean_w` is the (analytic-cumulant or null-bootstrap) expectation of the
+/// statistic under the penalized null, and `ref_df` is the nominal reference
+/// `d`. Returns `None` on degenerate inputs.
+///
+/// The ratio is a rescale of the whole reference, so it is only the right
+/// correction for a mean shift that scales with `d` — a fixed-λ shift taken at
+/// the λ the reference was built at. A shift that survives `d → 0` (Lawley's
+/// ρ̂-variation term) divided by `d` is unbounded; that one is an additive
+/// location, see `crate::inference::lawley::LawleyLrCorrection`.
 pub fn bartlett_factor_from_mean(mean_w: f64, ref_df: f64) -> Option<f64> {
     if !(mean_w.is_finite() && ref_df.is_finite()) || mean_w <= 0.0 || ref_df <= 0.0 {
         return None;

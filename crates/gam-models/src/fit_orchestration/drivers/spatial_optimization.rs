@@ -1,10 +1,3 @@
-/// Per-iteration BFGS step budget on the ψ axes (log κ and the anisotropy log-scales):
-/// one doubling of the kernel length scale. `opt`'s per-axis trust budget exists because
-/// ρ (natural step ≈ 5 in log λ) and ψ step on very different natural magnitudes, and a
-/// single radius either starves ρ or lets the kernel scale jump orders of magnitude per
-/// iteration (#1053/#1066/#1069).
-const SPATIAL_PSI_BFGS_STEP_CAP: f64 = std::f64::consts::LN_2;
-
 // The ψ hyper-direction builders and latent/analytic-penalty objective terms (moved verbatim, line limit).
 include!("spatial_hyper_dirs.rs");
 
@@ -1863,11 +1856,6 @@ fn run_exact_joint_spatial_optimization(
         suppress_outer_hessian_for_nfree,
         kappa_options.rel_tol,
         kappa_options.max_outer_iter.max(1),
-        // Rho-axis BFGS cap: log-λ's natural step is ≈ 5. Anything tighter
-        // throttles BFGS on flat REML valleys.
-        Some(5.0),
-        // Psi-axis BFGS cap: one doubling of the kernel length scale per iteration.
-        Some(SPATIAL_PSI_BFGS_STEP_CAP),
         // Calibrate the outer to the n-scaled profiled REML/LAML objective for
         // every family — the iso-κ non-convergence cure (#1053 1-D Matérn,
         // #1066 2-D binomial geo, #1069 GP/kriging). p = baseline design column
@@ -5280,16 +5268,6 @@ pub(crate) fn exact_joint_outer_problem(
     disable_fixed_point: bool,
     tolerance: f64,
     max_iter: usize,
-    // BFGS step caps split by parameter type. `bfgs_step_cap` (rho-axis cap)
-    // bounds first-trial moves on log-λ; documented natural step is ≈ 5.
-    // `bfgs_step_cap_psi` bounds moves on the trailing `auxiliary_dim`
-    // psi-axes (kappa / aniso-log-scales), where ≈ ln 2 keeps the kernel
-    // scale from oscillating across orders of magnitude per iter. Using a
-    // single uniform cap (the old API) starved rho on the survival-marg-slope
-    // joint solver because the psi-calibrated value (`ln 2 ≈ 0.69`) was
-    // applied to log-λ, where |d|≈5 is the natural quasi-Newton magnitude.
-    bfgs_step_cap: Option<f64>,
-    bfgs_step_cap_psi: Option<f64>,
     // `Some((n_obs, p_cols))` declares the profiled REML/LAML criterion's size,
     // the formation count its certificate charges gradient and objective
     // rounding at. The stationarity band does not grow with `n` (#2954): the
@@ -5360,10 +5338,11 @@ pub(crate) fn exact_joint_outer_problem(
         // Re-enable the automatic fallback ladder for exact joint spatial
         // problems. It was previously `Disabled` to suppress a geo-bench
         // fallback bug where HybridEFS ψ stagnation degraded silently to
-        // BfgsApprox on a Charbonnier surface. With the ψ-stagnation guard
-        // in OuterFixedPointBridge (`MAX_CONSECUTIVE_PSI_STAGNATION`) the
-        // bridge now surfaces `EFS_FIRST_ORDER_FALLBACK_MARKER` when ψ
-        // stationarity cannot be enforced, so the ladder routes correctly
+        // BfgsApprox on a Charbonnier surface. OuterFixedPointBridge now
+        // surfaces `EFS_FIRST_ORDER_FALLBACK_MARKER` when ψ stationarity cannot
+        // be enforced (a nonstationary ψ block at arithmetic resolution, or an
+        // EFS direction no resolvable contraction of which descends), so
+        // the ladder routes correctly
         // to a joint gradient-based solver instead of grinding HybridEFS
         // for thousands of iterations.
         .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Automatic)
@@ -5372,13 +5351,79 @@ pub(crate) fn exact_joint_outer_problem(
         .with_max_iter(max_iter)
         .with_bounds(lower.clone(), upper.clone())
         .with_initial_rho(theta0.clone())
-        .with_bfgs_step_cap(bfgs_step_cap)
-        .with_bfgs_step_cap_psi(bfgs_step_cap_psi)
         .with_heuristic_log_lambdas(seed_heuristic);
     if let Some((n_obs, p_cols)) = profiled_objective_size {
         problem = problem.with_problem_size(n_obs, p_cols);
     }
     Ok(problem)
+}
+
+/// The exact-joint outer problem imposes no per-iteration step budget on any
+/// axis (SPEC: no caps; #2902). It used to cap every BFGS direction at 5 in
+/// log λ and ln 2 in ψ, so a kernel scale 8 e-folds from its seed took one
+/// doubling per iteration. On this separable quadratic the uncapped search
+/// takes 3 outer iterations; under those budgets it took 11.
+#[cfg(test)]
+mod exact_joint_outer_step_budget_tests {
+    use super::*;
+    use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, HessianValue, OuterEval};
+
+    #[test]
+    fn a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget() {
+        let center = ndarray::array![1.0, 8.0];
+        let problem = exact_joint_outer_problem(
+            &ndarray::array![0.0, 0.0],
+            &ndarray::array![-20.0, -20.0],
+            &ndarray::array![20.0, 20.0],
+            1,
+            1,
+            2,
+            Derivative::Analytic,
+            DeclaredHessianForm::Unavailable,
+            true,
+            1e-8,
+            200,
+            None,
+        )
+        .expect("a valid exact-joint outer problem");
+        let cost_center = center.clone();
+        let grad_center = center.clone();
+        let mut objective = problem.build_objective(
+            (),
+            move |_: &mut (), theta: &Array1<f64>| {
+                let d = theta - &cost_center;
+                Ok(0.5 * d.dot(&d))
+            },
+            move |_: &mut (), theta: &Array1<f64>| {
+                let d = theta - &grad_center;
+                Ok(OuterEval {
+                    cost: 0.5 * d.dot(&d),
+                    gradient: d,
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut objective, "exact-joint step budget")
+            .expect("the separable quadratic must optimize");
+        let error = (&result.rho - &center)
+            .mapv(f64::abs)
+            .fold(0.0_f64, |a, &b| a.max(b));
+        assert!(
+            error < 1e-4,
+            "optimum {:?} is not the center {center:?}",
+            result.rho
+        );
+        assert!(
+            result.iterations <= 6,
+            "{} outer iterations to travel 8 e-folds in ψ: a per-iteration step budget is \
+             throttling the quasi-Newton step",
+            result.iterations
+        );
+    }
 }
 
 /// The n-block exact-joint spatial driver. Its final coefficient fit and the
@@ -5686,10 +5731,6 @@ where
         disable_fixed_point,
         kappa_options.rel_tol,
         kappa_options.max_outer_iter.max(1),
-        // Rho-axis cap: log-λ natural step ≈ 5.
-        Some(5.0),
-        // Psi-axis cap: one doubling of the kernel length scale per iteration.
-        Some(SPATIAL_PSI_BFGS_STEP_CAP),
         // n-scaled profiled-criterion calibration for every family (#1053 /
         // #1066 / #1069 iso-κ non-convergence cure).
         Some((n_total, joint_p_cols)),
@@ -6402,8 +6443,6 @@ fn try_exact_joint_latent_coord_optimization(
         false,
         options.tol,
         options.max_iter.max(1),
-        Some(5.0),
-        Some(0.5),
         // n-scaled profiled-criterion calibration (same absolute-gradient-floor
         // correction as the spatial paths; #1053 / #1066 / #1069).
         Some((data.nrows(), best.design.design.ncols().max(1))),
