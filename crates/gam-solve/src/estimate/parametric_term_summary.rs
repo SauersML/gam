@@ -2,15 +2,27 @@
 //!
 //! The in-process CLI summary and the persisted-model summary the Python
 //! `summary()` reads present the same table from the same fit, so the table is
-//! built once, here, beside [`super::smooth_term_summary_rows`]. The Wald
-//! reference distribution is read off the fit — `N(0, 1)` when the scale is
-//! known, Student-t on `wald_residual_degrees_of_freedom` when it is estimated
-//! — so no caller chooses it.
+//! built once, here, beside [`super::smooth_term_summary_rows`].
+//!
+//! An unpenalized coefficient is tested by its Wald ratio, whose reference
+//! distribution is read off the fit — `N(0, 1)` when the scale is known,
+//! Student-t on `wald_residual_degrees_of_freedom` when it is estimated — so no
+//! caller chooses it.
+//!
+//! A linear term carrying the REML-selected `LinearTermRidge` is NOT: its `β̂`
+//! was shrunk toward zero by a `λ` chosen from the same data, and under the
+//! null REML drives `λ` large, so `β̂/se` collapses toward zero and its Wald
+//! p-value piles up at one (a null slope then reads `p > 0.999` on most data
+//! sets, gam#3573). "No effect" for a ridged slope is its variance component on
+//! the boundary, and the row reports the variance-component score test the fit
+//! recorded for it (`gam_terms::inference::random_effect_test`) — the same test
+//! and record the random-effect rows read.
 
 use crate::estimate::smooth_term_summary::SummaryBlockOffset;
 use crate::estimate::summary::ParametricTermSummary;
 use crate::model_types::result_types::UnifiedFitResult;
 use gam_math::probability::{normal_two_sided_probability, student_t_two_sided_probability};
+use gam_terms::inference::random_effect_test::RandomEffectTestOutcome;
 use gam_terms::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, TermCollectionDesign,
     TermCollectionSpec,
@@ -20,8 +32,12 @@ use gam_terms::smooth::{
 ///
 /// Standard errors are the fit's display pair
 /// (`UnifiedFitResult::display_coefficient_uncertainty`), so they carry one
-/// recorded covariance definition (#2296). A multi-column linear term yields one
-/// row per column, suffixed `[i]`; a constrained or bounded coefficient names
+/// recorded covariance definition (#2296). A ridged linear term's `statistic`
+/// and `pvalue` are its recorded score test (see the module docs), matched by
+/// name AND global coefficient range; a ridged term with no usable record
+/// reports neither rather than the shrunk estimate's Wald ratio. A
+/// multi-column linear term yields one row per column, suffixed `[i]`; a
+/// constrained or bounded coefficient names
 /// its geometry in the row label. `offset` places `design` inside the fit's
 /// coefficient layout, as for [`super::smooth_term_summary_rows`]: every index
 /// into `fit` is global, every index into `design` block-local.
@@ -63,6 +79,40 @@ pub fn parametric_term_summary_rows(
         }
     };
 
+    // The score-tested row of a ridged slope. The recorded statistic is on the
+    // chi-square scale with one reference degree of freedom — `z²` for a known
+    // scale, the `F(1, ν)` ratio `t²` for an estimated one — so the row carries
+    // its signed square root, oriented by the fitted slope, beside the exact
+    // tail the record already holds.
+    let ridged_row = |name: String, local: usize, outcome: Option<&RandomEffectTestOutcome>| {
+        let idx = offset.coefficients + local;
+        let estimate = fit.beta.get(idx).copied().unwrap_or(f64::NAN);
+        let std_error = se.and_then(|s| s.get(idx).copied());
+        let (statistic, pvalue) = match outcome {
+            Some(RandomEffectTestOutcome::Tested(test)) if test.rank == 1 => {
+                let magnitude = test.statistic.max(0.0).sqrt();
+                let statistic = if estimate < 0.0 {
+                    -magnitude
+                } else {
+                    magnitude
+                };
+                (
+                    Some(statistic).filter(|z| z.is_finite()),
+                    Some(test.p_value).filter(|p| p.is_finite()),
+                )
+            }
+            _ => (None, None),
+        };
+        ParametricTermSummary {
+            name,
+            estimate,
+            std_error,
+            statistic,
+            pvalue,
+        }
+    };
+
+    let ridged = design.ridged_linear_ranges();
     let mut rows = Vec::new();
     for idx in design.intercept_range.clone() {
         rows.push(row("Intercept".to_string(), idx));
@@ -72,6 +122,31 @@ pub fn parametric_term_summary_rows(
             name,
             spec.linear_terms.iter().find(|term| term.name == *name),
         );
+        let is_ridged = ridged
+            .iter()
+            .any(|(ridged_name, ridged_range)| ridged_name == name && ridged_range == range);
+        if is_ridged {
+            let global = (offset.coefficients + range.start)..(offset.coefficients + range.end);
+            let outcome = fit
+                .artifacts
+                .random_effect_tests
+                .iter()
+                .find(|record| record.term == *name && record.coefficient_range == global)
+                .map(|record| &record.outcome);
+            // The record tests the term's whole block jointly; a single column
+            // is the only shape a ridged linear term is built with, and a
+            // per-column split of a joint test does not exist.
+            let outcome = outcome.filter(|_| range.len() == 1);
+            for idx in range.clone() {
+                let name = if range.len() > 1 {
+                    format!("{label}[{}]", idx - range.start)
+                } else {
+                    label.clone()
+                };
+                rows.push(ridged_row(name, idx, outcome));
+            }
+            continue;
+        }
         for idx in range.clone() {
             let name = if range.len() > 1 {
                 format!("{label}[{}]", idx - range.start)

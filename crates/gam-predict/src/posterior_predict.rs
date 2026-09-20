@@ -802,7 +802,8 @@ fn gaussian_location_scale_draws(
             .slice(s![scale_range.start..scale_range.end])
             .to_owned(),
         sigma_floor,
-        response_scale: model.gaussian_response_scale.unwrap_or(1.0),
+        response_scale: crate::gaussian_response_scale_for_prediction(model)
+            .map_err(|reason| inconsistent_state_error(model_class, reason))?,
         covariance: None,
         link_wiggle: link_wiggle.take(),
     };
@@ -1307,4 +1308,24 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn gaussian_draw_replay_requires_saved_response_scale() {
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]), offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])), offset_noise: None,
+            auxiliary_scalar: None, auxiliary_matrix: None,
+        };
+        let draws = array![[2.0, 0.0]];
+        let missing = crate::tests::saved_gaussian_predictor_fixture(None);
+        let reason = match gaussian_location_scale_draws(&missing, &input, draws.view()) {
+            Ok(_) => panic!("draw replay must not invent a unit response scale"),
+            Err(error) => error.to_string(),
+        };
+        assert!(reason.contains("response standardization scale"), "{reason}");
+        let valid = crate::tests::saved_gaussian_predictor_fixture(Some(3.0));
+        gaussian_location_scale_draws(&valid, &input, draws.view())
+            .expect("draw replay with the fitted response scale");
+    }
+
 }

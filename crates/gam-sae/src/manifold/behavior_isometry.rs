@@ -544,8 +544,8 @@ fn assemble(
         };
     }
 
-    // Weighted mean and variance of r = s_x/s_y on the complete support.
-    let mut r_mass = 0.0_f64;
+    // Weighted mean and variance of r = s_x/s_y on the complete support. The
+    // support mass is `mass` (> 0 by the engagement check above).
     let mut r_mean = 0.0_f64;
     let mut r_min = f64::INFINITY;
     let mut r_max = f64::NEG_INFINITY;
@@ -556,37 +556,18 @@ fn assemble(
             continue;
         }
         let r = s_x[i] / s_y[i];
-        r_mass += w;
         r_mean += w * r;
         r_min = r_min.min(r);
         r_max = r_max.max(r);
         ratios.push((r, w));
     }
-    if !(r_mass > 0.0) {
-        // Every moving row was floored out — treat as not engaged.
-        return AtomBehaviorIsometry {
-            atom_idx,
-            n_rows,
-            support_mass,
-            behavior_engaged: false,
-            behavior_metric_collapse_rows: n_rows,
-            activation_speed_rms,
-            behavior_speed_rms,
-            scale: f64::NAN,
-            defect_cv: f64::NAN,
-            min_ratio_over_scale: f64::NAN,
-            max_ratio_over_scale: f64::NAN,
-            nats_per_unit_t,
-            behavior_pinned_chart: None,
-        };
-    }
-    r_mean /= r_mass;
+    r_mean /= mass;
     let mut r_var = 0.0_f64;
     for (r, w) in &ratios {
         let d = r - r_mean;
         r_var += w * d * d;
     }
-    r_var /= r_mass;
+    r_var /= mass;
     let defect_cv = if r_mean != 0.0 {
         r_var.sqrt() / r_mean.abs()
     } else {

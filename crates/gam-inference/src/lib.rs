@@ -39,7 +39,8 @@ pub mod gpu_polya_gamma;
 pub mod polya_gamma;
 pub mod posterior;
 pub use gam_models::inference::{
-    ctn, full_conformal, generative, model, model_extension, model_payload_builders, predict_io,
+    ctn, full_conformal, full_conformal_glm, generative, model, model_extension,
+    model_payload_builders, predict_io,
 };
 pub use gam_terms::inference::formula_dsl;
 pub mod probability;
@@ -54,6 +55,7 @@ pub use gam_sae::inference::riesz;
 pub use gam_solve::row_sampling_measure as row_measure;
 pub mod row_metric;
 pub mod sample;
+pub mod shared_precision;
 pub mod skovgaard;
 pub use gam_sae::inference::steering;
 pub use gam_terms::inference::smooth_test;

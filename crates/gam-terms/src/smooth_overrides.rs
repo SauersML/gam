@@ -779,16 +779,52 @@ fn apply_bspline_1d(
     // count is interpreted; converting against the formula's default degree
     // and swapping the degree afterwards built a basis whose width matched
     // neither reading of the request.
+    //
+    // A natural cubic regression spline (`bs="cr"`/`"cs"`) is cubic with the
+    // ∫f''² penalty by construction: `build_cubic_regression_basis_1d` reads
+    // neither `degree` nor `penalty_order`. Any other value was written onto
+    // the spec and never read, the same accepted-and-inert option the formula
+    // DSL refuses on `bs=cr`. Only the cr's own values pass; the Python
+    // `BSpline` descriptor always emits them as its defaults.
+    let is_cr = matches!(
+        spec.knotspec,
+        BSplineKnotSpec::NaturalCubicRegression { .. }
+    );
     if let Some(d) = descriptor_u64(descriptor, "degree", symbol)? {
+        if is_cr && d as usize != crate::term_builder::CR_MARGIN_DEGREE {
+            return Err(format!(
+                "smooths[{symbol:?}]: degree={d} does not apply to a natural cubic regression \
+                 spline (bs=\"cr\"/\"cs\"), which is cubic; use bs=\"ps\" in the formula for a \
+                 B-spline of another degree"
+            ));
+        }
         spec.degree = d as usize;
     }
     if let Some(po) = descriptor_u64(descriptor, "penalty_order", symbol)? {
+        if is_cr && po as usize != crate::term_builder::CR_MARGIN_PENALTY_ORDER {
+            return Err(format!(
+                "smooths[{symbol:?}]: penalty_order={po} does not apply to a natural cubic \
+                 regression spline (bs=\"cr\"/\"cs\"), whose penalty is the integrated squared \
+                 second derivative; use bs=\"ps\" in the formula for another penalty order"
+            ));
+        }
         spec.penalty_order = po as usize;
     }
     if let Some(dp) = descriptor_bool(descriptor, "double_penalty", symbol)? {
         spec.double_penalty = dp;
     }
     if let Some(knots_val) = descriptor.get("knots") {
+        // A cr basis is indexed by its value knots. Writing an open B-spline
+        // knot vector over them used to turn the formula's cr smooth into a
+        // `Provided` B-spline without any message, which changed the basis
+        // kind. It is refused, matching the `knots=<count>` refusal below.
+        if is_cr {
+            return Err(format!(
+                "smooths[{symbol:?}]: an explicit knot vector cannot replace the value knots of \
+                 a natural cubic regression spline (bs=\"cr\"/\"cs\"); give them in the formula \
+                 as s(x, bs=cr, knots=[...])"
+            ));
+        }
         let knots = parse_f64_vec(knots_val, "knots", symbol)?;
         spec.knotspec = BSplineKnotSpec::Provided(Array1::from(knots));
     } else if let Some(n) = descriptor_u64(descriptor, "n_knots", symbol)? {
@@ -1627,6 +1663,64 @@ mod tests {
             "x",
         )
         .expect("double_penalty: false must be accepted by Duchon");
+    }
+
+    /// A `BSpline` override on a natural cubic regression smooth (`bs=cr`)
+    /// can only restate the cr's own degree (3) and penalty order (2): the cr
+    /// builder reads neither, so another value would be accepted and inert.
+    /// An explicit knot vector used to turn the cr silently into a `Provided`
+    /// B-spline; it is refused like the `knots=<count>` resize.
+    #[test]
+    fn bspline_override_on_cr_refuses_inert_degree_penalty_and_knot_vector() {
+        let cr_spec = || {
+            let mut spec = open_bspline_spec();
+            spec.knotspec = BSplineKnotSpec::NaturalCubicRegression {
+                knots: Array1::from(vec![0.0, 0.25, 0.5, 0.75, 1.0]),
+            };
+            spec
+        };
+
+        // The Python descriptor's defaults restate the cr and pass.
+        let mut ok = cr_spec();
+        apply_bspline_1d(
+            &mut ok,
+            &obj(json!({"degree": 3, "penalty_order": 2, "double_penalty": true})),
+            "x",
+        )
+        .expect("the cr's own degree and penalty order must be accepted");
+        assert!(matches!(
+            ok.knotspec,
+            BSplineKnotSpec::NaturalCubicRegression { .. }
+        ));
+        assert!(ok.double_penalty);
+
+        let err = apply_bspline_1d(&mut cr_spec(), &obj(json!({"degree": 2})), "x")
+            .expect_err("degree=2 on cr must be refused");
+        assert!(err.contains("degree=2 does not apply"), "got: {err}");
+
+        let err = apply_bspline_1d(&mut cr_spec(), &obj(json!({"penalty_order": 1})), "x")
+            .expect_err("penalty_order=1 on cr must be refused");
+        assert!(err.contains("penalty_order=1 does not apply"), "got: {err}");
+
+        let err = apply_bspline_1d(
+            &mut cr_spec(),
+            &obj(json!({"knots": [0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0]})),
+            "x",
+        )
+        .expect_err("a knot vector on cr must be refused");
+        assert!(err.contains("cannot replace the value knots"), "got: {err}");
+
+        // The open B-spline path is unchanged: other degrees and vectors apply.
+        let mut open = open_bspline_spec();
+        apply_bspline_1d(
+            &mut open,
+            &obj(json!({"degree": 2, "penalty_order": 1,
+                        "knots": [0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0]})),
+            "x",
+        )
+        .expect("open B-spline overrides must still apply");
+        assert_eq!((open.degree, open.penalty_order), (2, 1));
+        assert!(matches!(open.knotspec, BSplineKnotSpec::Provided(_)));
     }
 
     /// Regression for gam issue #1565: the Python `Smooth.to_rust_descriptor`

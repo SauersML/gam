@@ -46,7 +46,7 @@
 //! band and never folded into it (#2951 correction C2).
 
 use super::apply::{ApplyError, FactorView, apply_anchored_linear, native_linear};
-use super::block::rms_norm_band;
+use super::block::{NormBandUnbounded, SUBNORMAL_SPACING, down, rms_norm_band, up};
 use super::gated_rewrite::{GatedRewriteError, MaskedNorm, swiglu_hidden};
 use super::occurrence::{OccurrenceError, PositionScope};
 use super::rewrite::{NativeMlp, ShapeMismatch};
@@ -114,6 +114,8 @@ pub enum ReceiptRefusal {
     /// A norm epsilon the binary32 program's band does not cover: not a positive binary32
     /// normal number, so `fl32(ε)` and `mean + ε` are not relative roundings.
     Binary32Epsilon { epsilon: f64 },
+    /// A binary64 RMSNorm row with no finite band ([`rms_norm_band`]).
+    NormBand(NormBandUnbounded),
 }
 
 impl From<ShapeMismatch> for ReceiptRefusal {
@@ -137,6 +139,12 @@ impl From<GaussianActivationError> for ReceiptRefusal {
 impl From<GatedRewriteError> for ReceiptRefusal {
     fn from(error: GatedRewriteError) -> Self {
         Self::GatedRewrite(error)
+    }
+}
+
+impl From<NormBandUnbounded> for ReceiptRefusal {
+    fn from(unbounded: NormBandUnbounded) -> Self {
+        Self::NormBand(unbounded)
     }
 }
 
@@ -184,6 +192,7 @@ impl fmt::Display for ReceiptRefusal {
                 formatter,
                 "the norm epsilon {epsilon:e} is not a positive binary32 normal number, outside the binary32 norm band"
             ),
+            Self::NormBand(unbounded) => write!(formatter, "the binary64 norm band refused: {unbounded}"),
         }
     }
 }
@@ -200,14 +209,6 @@ fn check(what: &'static str, expected: usize, found: usize) -> Result<(), ShapeM
             found,
         })
     }
-}
-
-fn up(value: f64) -> f64 {
-    value.next_up()
-}
-
-fn down(value: f64) -> f64 {
-    value.next_down().max(0.0)
 }
 
 /// The certified band of one evaluation: `γ_k` rounded up times an upper bound on
@@ -648,9 +649,6 @@ const BINARY32_UNIT_ROUNDOFF: f64 = f32::EPSILON as f64 / 2.0;
 /// half the subnormal spacing, `2^-150`.
 const BINARY32_UNDERFLOW: f64 = f32::MIN_POSITIVE as f64 * BINARY32_UNIT_ROUNDOFF;
 
-/// The same for binary64, `2^-1075`.
-const BINARY64_UNDERFLOW: f64 = f64::MIN_POSITIVE * UNIT_ROUNDOFF;
-
 /// `γ_k` at the binary32 unit roundoff, rounded up; infinite when `k u ≥ 1`.
 fn binary32_growth(operations: usize) -> f64 {
     let scaled = up(operations as f64 * BINARY32_UNIT_ROUNDOFF);
@@ -686,7 +684,8 @@ fn binary32_growth(operations: usize) -> f64 {
 ///   entries move `W` by at most `A = (1 + γ_(d+6)) n 2^-126 / d + μ` (the last `μ` for a subnormal
 ///   mean), and `A/X ≤ A/ε`.
 /// - The cast of an entry below `2^-126` and the product `z` in the subnormal range add
-///   `a = |w| μ (1 + (1 + ρ)(1 + u)/√ε)(1 + U) + 2^-1075` to each entry.
+///   `a = |w| μ (1 + (1 + ρ)(1 + u)/√ε)(1 + U) + 2^-1074` to each entry, the last term
+///   bounding the binary64 product's `2^-1075` by [`SUBNORMAL_SPACING`].
 ///
 /// Every operation here rounds to nearest and then steps one float up (or down where the value
 /// is subtracted), so the band is an upper bound computed in binary64.
@@ -745,7 +744,7 @@ pub fn binary32_internal_rms_norm_band(
         for ((slot, &weight), &value) in band_row.iter_mut().zip(gain.iter()).zip(executed.iter()) {
             let absolute = up(up(up(up(weight.abs() * BINARY32_UNDERFLOW) * up(1.0 + cast_reach))
                 * up(1.0 + UNIT_ROUNDOFF))
-                + BINARY64_UNDERFLOW);
+                + SUBNORMAL_SPACING);
             *slot = up(up(up(lambda * up(value.abs() + absolute)) / dominance) + absolute);
         }
     }
@@ -765,13 +764,13 @@ pub fn rms_norm_stage(
 ) -> Result<StageAgreement, ReceiptRefusal> {
     external_execution.require_binary64_bands()?;
     let native = MaskedNorm::Rms { epsilon, gain }.apply(inputs)?;
-    let native_band = rms_norm_band(native.view());
+    let native_band = rms_norm_band(epsilon, gain, inputs, native.view())?;
     let external_band = match program {
         ExternalRmsNormProgram::Binary64 => {
             check("external norm rows", native.nrows(), external.nrows())?;
             check("external norm width", native.ncols(), external.ncols())?;
             require_finite("external output", external)?;
-            rms_norm_band(external)
+            rms_norm_band(epsilon, gain, inputs, external)?
         }
         ExternalRmsNormProgram::Binary32Internal => {
             if external_execution.device != "cpu" {
@@ -1212,7 +1211,7 @@ mod tests {
         let band = binary32_internal_rms_norm_band(epsilon, gain.view(), inputs.view(), external.view())
             .expect("rows in binary32 range");
         let native = MaskedNorm::Rms { epsilon, gain: gain.view() }.apply(inputs.view()).expect("finite rows");
-        let native_band = rms_norm_band(native.view());
+        let native_band = rms_norm_band(epsilon, gain.view(), inputs.view(), native.view()).expect("resolved rows");
         let mut displaced = external.clone();
         displaced[[3, 5]] += 2.0 * (band[[3, 5]] + native_band[[3, 5]]);
         let refuted = stage(ExternalRmsNormProgram::Binary32Internal, BINARY64_CPU, &displaced)
