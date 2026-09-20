@@ -4852,5 +4852,13 @@
     },
     "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
     "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
+  },
+  {
+    "base": "d027be231ca8fdf6f8104690ae68869486db51ab",
+    "removed": {
+      "crates/gam-linalg/src/parallel.rs::run_on_single_worker_pool": 1
+    },
+    "reason": "PKG-01 fork safety (#3189): gam no longer builds rayon's global pool, which a fork()ed child cannot rebuild. run_on_single_worker_pool moved a driver onto a one-thread global pool; every entry point now runs on the one process worker pool in gam_runtime::parallel (parallel::install), which is rebuilt in a forked child.",
+    "evidence": "No source reference to run_on_single_worker_pool remains. tests/fork_safety.rs fits in a forked child after the parent used the pool; the multistart lane tests (multistart_tests.rs) run the lanes as tasks of the caller's pool through parallel::fan_out, and a_lane_refused_beside_a_live_search_retires_at_once_instead_of_waiting_2359 pins the non-blocking admission those pool-task lanes need."
   }
 ]
