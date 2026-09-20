@@ -370,6 +370,53 @@ mod tests {
         }
     }
 
+    struct Lc22CriterionLogger;
+    impl log::Log for Lc22CriterionLogger {
+        fn enabled(&self, _m: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            let msg = format!("{}", record.args());
+            if msg.starts_with("[SAE-CRITERION]") || msg.contains("rank") && msg.contains("MP") {
+                eprintln!("[probe3 log] {msg}");
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn lc22_probe3_3474() {
+        use gam_solve::rho_optimizer::OuterObjective;
+        let _ = log::set_boxed_logger(Box::new(Lc22CriterionLogger));
+        log::set_max_level(log::LevelFilter::Debug);
+        let fresh = || {
+            let (target, term, rho, _pin, _provenance) = seeded_external_fixture();
+            SaeManifoldOuterObjective::new(
+                term, target, Some(AnalyticPenaltyRegistry::new()), rho, 40, 1.0, 1.0e-6, 1.0e-6,
+            )
+        };
+        let pts = [
+            [-6.054325069138625, -6.054325069138625],
+            [10.0, -4.0],
+            [10.5, -4.0],
+            [11.0, -4.0],
+            [11.5, -4.0],
+            [12.0, -4.0],
+            [12.0, -6.0],
+            [16.867491342553677, -7.261040811383532],
+            [20.0, -7.261040811383532],
+            [22.185195809350546, -14.351306798629912],
+        ];
+        for p in pts {
+            let mut o = fresh();
+            eprintln!("[probe3] ---- rho={p:?}");
+            match o.eval(&ndarray::Array1::from(vec![p[0], p[1]])) {
+                Ok(ev) => eprintln!("[probe3] rho={p:?} cost={:.10e} g={:?}", ev.cost, ev.gradient.to_vec()),
+                Err(e) => eprintln!("[probe3] rho={p:?} err {e}"),
+            }
+        }
+    }
+
     #[test]
     fn lc22_probe2_3474() {
         use gam_solve::rho_optimizer::OuterObjective;
