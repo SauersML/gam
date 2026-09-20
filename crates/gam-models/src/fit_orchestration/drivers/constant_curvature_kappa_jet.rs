@@ -162,7 +162,7 @@ fn profiled_gaussian_reml_psi_jet(
     response: ArrayView1<'_, f64>,
 ) -> Result<ProfiledRemlPsiJet, EstimationError> {
     use faer::Side;
-    use gam_linalg::faer_ndarray::{FaerCholesky, strict_symmetric_eigh};
+    use gam_linalg::faer_ndarray::FaerCholesky;
 
     let (n, p) = design.dim();
     let design_shape_ok = blocks
@@ -290,73 +290,11 @@ fn profiled_gaussian_reml_psi_jet(
         })
         .collect();
 
-    // log|S|₊ and its ψ-jets on the penalty's POSITIVE subspace. The subspace is
-    // ψ-fixed (the smooth's null directions are structural — the unpenalized
-    // parametric coordinates — and carry no ψ dependence), which is what makes
-    // the pseudo-determinant differentiable at all; it is verified rather than
-    // assumed: every S′ and S″ must annihilate the null frame.
-    let (s_eigenvalues, s_eigenvectors) = strict_symmetric_eigh(&s0, Side::Lower)
-        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-    let mut order: Vec<usize> = (0..p).collect();
-    order.sort_by(|&i, &j| {
-        s_eigenvalues[j]
-            .partial_cmp(&s_eigenvalues[i])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut positive_frame = Array2::<f64>::zeros((p, rank));
-    for (column, &index) in order.iter().take(rank).enumerate() {
-        positive_frame
-            .column_mut(column)
-            .assign(&s_eigenvectors.column(index));
-    }
-    if nullity > 0 {
-        let mut null_frame = Array2::<f64>::zeros((p, nullity));
-        for (column, &index) in order.iter().skip(rank).enumerate() {
-            null_frame
-                .column_mut(column)
-                .assign(&s_eigenvectors.column(index));
-        }
-        let s0_scale = s0.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-        let labelled = [
-            ("∂S/∂κ", &s1[0]),
-            ("∂S/∂η", &s1[1]),
-            ("∂²S/∂κ²", &s2[0]),
-            ("∂²S/∂κ∂η", &s2[1]),
-            ("∂²S/∂η²", &s2[2]),
-        ];
-        for (label, block) in labelled {
-            let leak = block.dot(&null_frame);
-            let leak_norm = leak.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-            if leak_norm > 1.0e-8 * (1.0 + s0_scale) {
-                crate::bail_invalid_estim!(
-                    "constant-curvature profile ψ-jet requires a ψ-fixed penalty null space, but {label} moves it by {leak_norm:.3e}"
-                );
-            }
-        }
-    }
-    let restrict =
-        |m: &Array2<f64>| -> Array2<f64> { sym(positive_frame.t().dot(&m.dot(&positive_frame))) };
-    let r0 = restrict(&s0);
-    let r_chol = r0
-        .cholesky(Side::Lower)
-        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-    let logdet_s_positive = {
-        let diag = r_chol.diag();
-        2.0 * diag.iter().map(|value| value.ln()).sum::<f64>()
-    };
-    let m1: Vec<Array2<f64>> = (0..2)
-        .map(|a| r_chol.solve_mat(&restrict(&s1[a])))
-        .collect();
-    let m2: Vec<Array2<f64>> = (0..3)
-        .map(|s| r_chol.solve_mat(&restrict(&s2[s])))
-        .collect();
-    let logdet_s_1: Vec<f64> = (0..2).map(|a| trace(&m1[a])).collect();
-    let logdet_s_2: Vec<f64> = (0..3)
-        .map(|s| {
-            let (a, b) = pair(s);
-            trace(&m2[s]) - trace_product(&m1[a], &m1[b])
-        })
-        .collect();
+    // log|S|₊ and its ψ-jets, with the positive/null split held fixed.
+    let logdet_s = positive_pseudo_logdet_psi_jet(&s0, &s1, &s2, rank)?;
+    let logdet_s_positive = logdet_s.value;
+    let logdet_s_1 = logdet_s.first;
+    let logdet_s_2 = logdet_s.second;
 
     // Penalized deviance `dp = ‖y − Xβ‖² + λβᵀSβ` and its ψ-jets. `β` minimizes the
     // penalized sum of squares, so by the envelope theorem its ψ response does not
@@ -464,4 +402,326 @@ fn profiled_gaussian_reml_psi_jet(
         gradient,
         hessian,
     })
+}
+
+/// `log|S|₊ = Σ_{i∈pos} ln λ_i` and its exact ψ-jets. Index order is (κ, η) for
+/// first derivatives and (κκ, κη, ηη) for seconds, as in
+/// [`profiled_gaussian_reml_psi_jet`].
+struct PseudoLogdetPsiJet {
+    value: f64,
+    first: [f64; 2],
+    second: [f64; 3],
+}
+
+/// `log|S(ψ)|₊` over the `rank` largest eigenvalues of `S`, differentiated with
+/// the positive/null classification held fixed. That is the function the
+/// forward fit evaluates at every ψ: it classifies the spectrum with a
+/// tolerance, and a null eigenvalue that moves by roundoff stays null.
+///
+/// Write `S = Σ λ_i v_i v_iᵀ` with eigenvalues in descending order, `P` for the
+/// first `rank` eigenvectors (λ_i > 0) and `N` for the rest (eigenvalues μ_j),
+/// and `S_a`, `S_ab` for the ψ-derivatives expressed in that eigenbasis.
+/// Hellmann–Feynman and second-order Rayleigh–Schrödinger perturbation theory
+/// give
+///
+/// ```text
+///   λ_i,a  = (S_a)_ii
+///   λ_i,ab = (S_ab)_ii + 2 Σ_{j≠i} (S_a)_ij (S_b)_ij / (λ_i − λ_j)
+/// ```
+///
+/// Summing `λ_i,a/λ_i` and `λ_i,ab/λ_i − λ_i,a λ_i,b/λ_i²` over i∈pos, the
+/// positive–positive pairs of the sum collapse to `−(S_a)_ij (S_b)_ij/(λ_iλ_j)`,
+/// which needs no gap between positive eigenvalues:
+///
+/// ```text
+///   ∂_a  log|S|₊ = Σ_{i∈pos} (S_a)_ii / λ_i
+///   ∂_ab log|S|₊ = Σ_{i∈pos} (S_ab)_ii / λ_i
+///                − Σ_{i,j∈pos} (S_a)_ij (S_b)_ij / (λ_i λ_j)
+///                + 2 Σ_{i∈pos, j∈null} (S_a)_ij (S_b)_ij / (λ_i (λ_i − μ_j))
+/// ```
+///
+/// The first two terms of the second derivative are `tr(R⁻¹R_ab) − tr(R⁻¹R_aR⁻¹R_b)`
+/// with `R = PᵀSP`, the formula restricted to the positive subspace. That
+/// formula alone is exact only if every `S_a` annihilates the null frame. The
+/// last term is the positive/null coupling it leaves out. It is present whenever
+/// ψ rotates the null space. For example, a whitening chart that re-realizes
+/// the identifiable subspace at each ψ moves the null directions of `TᵀST` even
+/// though the penalty's structural null space is fixed. The first derivative
+/// has no such term, so the gradient was exact either way.
+///
+/// The only premise is that the split is resolved. A backward-stable symmetric
+/// eigensolver returns the spectrum of `S + E` with `‖E‖₂` inside
+/// [`gam_linalg::roundoff::symmetric_spectrum_rounding_band`] (`band`). By Weyl,
+/// each computed eigenvalue is within `band` of an exact one. So the smallest
+/// positive eigenvalue is certified positive only above `band`, and a computed
+/// gap `λ_rank − μ_max` certifies an open gap only above `2·band`. Below that,
+/// the coupling denominators are not measurements, and the jet refuses.
+fn positive_pseudo_logdet_psi_jet(
+    s0: &Array2<f64>,
+    s1: &[Array2<f64>],
+    s2: &[Array2<f64>],
+    rank: usize,
+) -> Result<PseudoLogdetPsiJet, EstimationError> {
+    use faer::Side;
+    use gam_linalg::faer_ndarray::strict_symmetric_eigh;
+
+    let p = s0.nrows();
+    let shapes_ok = s0.ncols() == p
+        && s1.len() == 2
+        && s2.len() == 3
+        && s1.iter().chain(s2.iter()).all(|m| m.dim() == (p, p));
+    if !shapes_ok || rank == 0 || rank > p {
+        crate::bail_invalid_estim!(
+            "log|S|₊ ψ-jet shape mismatch (p {p}, rank {rank}, {} first and {} second blocks)",
+            s1.len(),
+            s2.len()
+        );
+    }
+    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(s0, Side::Lower)
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    let mut order: Vec<usize> = (0..p).collect();
+    order.sort_by(|&i, &j| {
+        eigenvalues[j]
+            .partial_cmp(&eigenvalues[i])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let values: Vec<f64> = order.iter().map(|&i| eigenvalues[i]).collect();
+    let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(&values);
+    let smallest_positive = values[rank - 1];
+    if !(smallest_positive > band) {
+        crate::bail_invalid_estim!(
+            "log|S|₊ ψ-jet: the smallest of {rank} positive eigenvalues, {smallest_positive:.3e}, is not resolved from zero (rounding band {band:.3e})"
+        );
+    }
+    if rank < p {
+        let gap = smallest_positive - values[rank];
+        if !(gap > 2.0 * band) {
+            crate::bail_invalid_estim!(
+                "log|S|₊ ψ-jet: the positive/null eigengap {gap:.3e} is not resolved (twice the rounding band is {:.3e})",
+                2.0 * band
+            );
+        }
+    }
+    let mut basis = Array2::<f64>::zeros((p, p));
+    for (column, &index) in order.iter().enumerate() {
+        basis.column_mut(column).assign(&eigenvectors.column(index));
+    }
+    let project = |m: &Array2<f64>| -> Array2<f64> {
+        let projected = basis.t().dot(&m.dot(&basis));
+        (&projected + &projected.t()) * 0.5
+    };
+    let first_blocks: Vec<Array2<f64>> = s1.iter().map(|m| project(m)).collect();
+    let second_blocks: Vec<Array2<f64>> = s2.iter().map(|m| project(m)).collect();
+
+    let value = values[..rank].iter().map(|v| v.ln()).sum::<f64>();
+    let first: [f64; 2] = std::array::from_fn(|a| {
+        (0..rank)
+            .map(|i| first_blocks[a][(i, i)] / values[i])
+            .sum::<f64>()
+    });
+    let second: [f64; 3] = std::array::from_fn(|s| {
+        let (a, b) = match s {
+            0 => (0, 0),
+            1 => (0, 1),
+            _ => (1, 1),
+        };
+        let (block_a, block_b) = (&first_blocks[a], &first_blocks[b]);
+        let mut total = 0.0_f64;
+        for i in 0..rank {
+            total += second_blocks[s][(i, i)] / values[i];
+            for j in 0..rank {
+                total -= block_a[(i, j)] * block_b[(i, j)] / (values[i] * values[j]);
+            }
+            for j in rank..p {
+                total += 2.0 * block_a[(i, j)] * block_b[(i, j)]
+                    / (values[i] * (values[i] - values[j]));
+            }
+        }
+        total
+    });
+    Ok(PseudoLogdetPsiJet {
+        value,
+        first,
+        second,
+    })
+}
+
+#[cfg(test)]
+mod positive_pseudo_logdet_psi_jet_tests {
+    use super::*;
+
+    fn unit(p: usize, i: usize, j: usize) -> Array2<f64> {
+        let mut m = Array2::<f64>::zeros((p, p));
+        m[(i, j)] = 1.0;
+        m
+    }
+
+    fn rotation_generator(p: usize, i: usize, j: usize) -> Array2<f64> {
+        unit(p, i, j) - unit(p, j, i)
+    }
+
+    fn commutator(left: &Array2<f64>, right: &Array2<f64>) -> Array2<f64> {
+        left.dot(right) - right.dot(left)
+    }
+
+    /// The exact ψ-jets at ψ = 0 of `S(ψ) = e^X D(ψ) e^{−X}` with
+    /// `X = ψ_κ G_κ + ψ_η G_η` and antisymmetric `G_a`. The spectrum of `S(ψ)` is
+    /// that of `D(ψ)`, so log|S|₊ is known in closed form, and every nonzero
+    /// `G_a` moves the null space.
+    fn rotated_jets(
+        generators: [&Array2<f64>; 2],
+        d0: &Array2<f64>,
+        d1: [&Array2<f64>; 2],
+        d2: [&Array2<f64>; 3],
+    ) -> (Vec<Array2<f64>>, Vec<Array2<f64>>) {
+        let first = (0..2)
+            .map(|a| d1[a] + &commutator(generators[a], d0))
+            .collect();
+        let second = (0..3)
+            .map(|s| {
+                let (a, b) = match s {
+                    0 => (0, 0),
+                    1 => (0, 1),
+                    _ => (1, 1),
+                };
+                d2[s]
+                    + &commutator(generators[a], d1[b])
+                    + &commutator(generators[b], d1[a])
+                    + &((commutator(generators[a], &commutator(generators[b], d0))
+                        + commutator(generators[b], &commutator(generators[a], d0)))
+                        * 0.5)
+            })
+            .collect();
+        (first, second)
+    }
+
+    // p = 3 with O(1) entries and gaps ≥ 1: each derivative is a sum of at most
+    // p² = 9 products of a few rounded operations each. An error above 1e-12
+    // (about 4500 ulps of 1) is therefore not roundoff.
+    const ARITHMETIC_BAND: f64 = 1.0e-12;
+
+    #[test]
+    fn a_rotating_null_space_keeps_log_pseudo_determinant_flat_2902() {
+        // D = diag(2, 1, 0). G_κ rotates (e₂, e₃), mixing λ = 1 into the null
+        // direction, and G_η rotates (e₁, e₃), mixing λ = 2 into it. The
+        // spectrum never moves, so log|S|₊ = ln 2 with zero gradient and Hessian.
+        let p = 3;
+        let mut d0 = Array2::<f64>::zeros((p, p));
+        d0[(0, 0)] = 2.0;
+        d0[(1, 1)] = 1.0;
+        let zero = Array2::<f64>::zeros((p, p));
+        let g_kappa = rotation_generator(p, 1, 2);
+        let g_eta = rotation_generator(p, 0, 2);
+        let (s1, s2) = rotated_jets(
+            [&g_kappa, &g_eta],
+            &d0,
+            [&zero, &zero],
+            [&zero, &zero, &zero],
+        );
+        let jet = positive_pseudo_logdet_psi_jet(&d0, &s1, &s2, 2).expect("resolved split");
+        assert!((jet.value - 2.0_f64.ln()).abs() <= ARITHMETIC_BAND);
+        for (a, g) in jet.first.iter().enumerate() {
+            assert!(g.abs() <= ARITHMETIC_BAND, "gradient[{a}] = {g:e}");
+        }
+        for (s, h) in jet.second.iter().enumerate() {
+            assert!(h.abs() <= ARITHMETIC_BAND, "hessian[{s}] = {h:e}");
+        }
+
+        // Positive control: the positive-subspace formula alone,
+        // tr(R⁻¹R_aa) − tr((R⁻¹R_a)²) with R = diag(2, 1), reads −2 on both
+        // diagonal entries. That −2 is what the coupling term cancels, and it
+        // is the defect the old null-frame leak check refused instead of
+        // computing.
+        for (s, a) in [(0usize, 0usize), (2, 1)] {
+            let restricted = (0..2)
+                .map(|i| {
+                    s2[s][(i, i)] / d0[(i, i)]
+                        - (0..2)
+                            .map(|j| s1[a][(i, j)].powi(2) / (d0[(i, i)] * d0[(j, j)]))
+                            .sum::<f64>()
+                })
+                .sum::<f64>();
+            assert!(
+                (restricted + 2.0).abs() <= ARITHMETIC_BAND,
+                "restricted formula entry {s}: {restricted:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_moving_spectrum_under_rotation_has_its_closed_form_jet_2902() {
+        // D(ψ) = diag(2e^{ψ_κ}, 1 + ψ_η², 0), rotated by generators that each
+        // couple every pair of directions. log|S|₊ = ln 2 + ψ_κ + ln(1 + ψ_η²):
+        // gradient (1, 0) and Hessian diag(0, 2) at ψ = 0.
+        let p = 3;
+        let mut d0 = Array2::<f64>::zeros((p, p));
+        d0[(0, 0)] = 2.0;
+        d0[(1, 1)] = 1.0;
+        let mut d_kappa = Array2::<f64>::zeros((p, p));
+        d_kappa[(0, 0)] = 2.0;
+        let mut d_eta_eta = Array2::<f64>::zeros((p, p));
+        d_eta_eta[(1, 1)] = 2.0;
+        let zero = Array2::<f64>::zeros((p, p));
+        let g_kappa = rotation_generator(p, 1, 2) + rotation_generator(p, 0, 1) * 0.3;
+        let g_eta = rotation_generator(p, 0, 2) + rotation_generator(p, 0, 1) * 0.5
+            - rotation_generator(p, 1, 2) * 0.7;
+        let (s1, s2) = rotated_jets(
+            [&g_kappa, &g_eta],
+            &d0,
+            [&d_kappa, &zero],
+            [&d_kappa, &zero, &d_eta_eta],
+        );
+        // Conjugate by a fixed rotation so the null direction is not a
+        // coordinate axis. The jet must not depend on the basis.
+        let q = {
+            let (c, s) = (0.6_f64, 0.8_f64);
+            let mut q = Array2::<f64>::eye(p);
+            q[(0, 0)] = c;
+            q[(0, 2)] = -s;
+            q[(2, 0)] = s;
+            q[(2, 2)] = c;
+            q
+        };
+        let turn = |m: &Array2<f64>| {
+            let turned = q.dot(&m.dot(&q.t()));
+            (&turned + &turned.t()) * 0.5
+        };
+        let s0 = turn(&d0);
+        let s1: Vec<Array2<f64>> = s1.iter().map(|m| turn(m)).collect();
+        let s2: Vec<Array2<f64>> = s2.iter().map(|m| turn(m)).collect();
+        let jet = positive_pseudo_logdet_psi_jet(&s0, &s1, &s2, 2).expect("resolved split");
+        let expected_first = [1.0, 0.0];
+        let expected_second = [0.0, 0.0, 2.0];
+        assert!((jet.value - 2.0_f64.ln()).abs() <= ARITHMETIC_BAND);
+        for a in 0..2 {
+            assert!(
+                (jet.first[a] - expected_first[a]).abs() <= ARITHMETIC_BAND,
+                "gradient[{a}] = {:e}",
+                jet.first[a]
+            );
+        }
+        for s in 0..3 {
+            assert!(
+                (jet.second[s] - expected_second[s]).abs() <= ARITHMETIC_BAND,
+                "hessian[{s}] = {:e} against {:e}",
+                jet.second[s],
+                expected_second[s]
+            );
+        }
+    }
+
+    #[test]
+    fn an_unresolved_positive_null_split_is_refused_2902() {
+        // λ₂ = 1e-17 sits inside 3·ε·2 of the null eigenvalue, so no
+        // decomposition can tell it is positive, and the coupling denominator
+        // λ₂ − μ is not a measurement.
+        let p = 3;
+        let mut d0 = Array2::<f64>::zeros((p, p));
+        d0[(0, 0)] = 2.0;
+        d0[(1, 1)] = 1.0e-17;
+        let zero = Array2::<f64>::zeros((p, p));
+        let s1 = vec![zero.clone(), zero.clone()];
+        let s2 = vec![zero.clone(), zero.clone(), zero];
+        assert!(positive_pseudo_logdet_psi_jet(&d0, &s1, &s2, 2).is_err());
+    }
 }
