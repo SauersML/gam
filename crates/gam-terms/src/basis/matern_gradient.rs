@@ -416,11 +416,12 @@ mod tests {
     fn anisotropic_gradient_differentiates_contrasts_beyond_fifty() {
         // eta = [80, 0, 0] centers to ψ = [160/3, -80/3, -80/3]: axis 0 sits past the
         // old ±50 saturation box. The displacements undo each axis scale exactly,
-        // so the weighted components are (0.4, 0.5, 0.3), r = √0.5 and every
-        // derivative is O(1) — a zeroed axis cannot hide under an e^-48 kernel.
+        // so the weighted components are (0.6, 0.3, 0.1) and r = √0.46. Their squared
+        // fractions (0.78, 0.20, 0.02) sit well away from the centering mean 1/3, so
+        // every derivative is O(1): a zeroed axis cannot hide under an e^-48 kernel.
         let eta = [80.0_f64, 0.0, 0.0];
         let psi = [160.0_f64 / 3.0, -80.0 / 3.0, -80.0 / 3.0];
-        let weighted = [0.4_f64, 0.5, 0.3];
+        let weighted = [0.6_f64, 0.3, 0.1];
         let data = array![[
             weighted[0] * (-psi[0]).exp(),
             weighted[1] * (-psi[1]).exp(),
