@@ -15,8 +15,7 @@ use super::covariance::{
     empirical_bayes_ridge,
 };
 use super::marginal::{
-    LOST_POSITIVITY, SubjectInputs, expected_intensities, forward_filter, pairwise_sum,
-    subject_marginal,
+    SubjectInputs, expected_intensities, forward_filter, pairwise_sum, subject_marginal,
 };
 use super::preserve::{ReferenceGrid, ReferenceStrata, stratum_normalisers};
 use super::scalar::{Tangent, add_real, recip};
@@ -848,7 +847,7 @@ impl EventHistoryFamily {
                 for node in 0..n {
                     let intensities = expected_intensities(
                         &pass.grids[node],
-                        &pass.predicted[node],
+                        &pass.log_predicted[node],
                         &eta0[node * marks..(node + 1) * marks],
                         &loadings,
                         normaliser.as_ref().map(|m| &m[node * marks..(node + 1) * marks]),
@@ -1587,8 +1586,9 @@ impl Built {
 
 /// Bytes the family's evaluation may hold at once: the streamed backward
 /// kernel row for one gap, the carried `P × S` conditional expectations,
-/// the per-node densities and operators of every node, per parallel
-/// subject, in the widest scalar the outer solve uses (sixteen channels
+/// the per-node densities of every node and the one forward kernel built at
+/// a time (`G³` Lagrange bases and `2G²` inner coordinates per axis, and the
+/// log ratio and inner weights over the grid), per parallel subject, in the widest scalar the outer solve uses (sixteen channels
 /// for mixed reference sensitivities nested over two outer directions).
 fn transient_footprint_bytes(
     order: usize,
@@ -1603,7 +1603,8 @@ fn transient_footprint_bytes(
     let per_subject = 4.0 * s
         + total_width as f64 * s
         + n * s * (4.0 + marks as f64)
-        + n * atoms as f64 * 3.0 * g * g;
+        + atoms as f64 * (g * g * g + 2.0 * g * g)
+        + 2.0 * s;
     let channels = 16.0;
     let bytes = 8.0 * channels * per_subject * rayon::current_num_threads() as f64;
     Ok(bytes)
@@ -1805,18 +1806,12 @@ pub struct RankStep {
 pub enum DecisionIntegral {
     /// The added factor's loading curvature at zero loading.
     AddedFactorCurvature,
-    /// The likelihood profile along a proposed loading direction.
-    DirectionalProfile,
-    /// The grown candidate's posterior at the incumbent's setting.
-    CandidatePosterior,
 }
 
 impl DecisionIntegral {
     pub fn name(self) -> &'static str {
         match self {
             Self::AddedFactorCurvature => "added_factor_curvature",
-            Self::DirectionalProfile => "directional_profile",
-            Self::CandidatePosterior => "candidate_posterior",
         }
     }
 }
@@ -2155,7 +2150,7 @@ fn certifiable(order: usize, max_subject_nodes: usize, tolerance: f64) -> bool {
 /// The Gauss-Hermite order a decision the grid cannot resolve is raised to,
 /// `2·order − 1`, when that rung is itself [`certifiable`]; `None` at the
 /// ladder's top certifiable rung.
-fn positivity_raise(order: usize, max_subject_nodes: usize, tolerance: f64) -> Option<usize> {
+fn next_certifiable_order(order: usize, max_subject_nodes: usize, tolerance: f64) -> Option<usize> {
     let next_order = 2 * order - 1;
     certifiable(next_order, max_subject_nodes, tolerance).then_some(next_order)
 }
@@ -2364,49 +2359,12 @@ pub(crate) fn fit_at_rank(
                 // reference step the reference grid cannot take is read back
                 // typed from the family, for `fit_event_history` to answer by
                 // refining that grid.
-                let message = error.to_string();
-                let failure = typed_failure(
+                return Err(typed_failure(
                     &built.family,
                     format!(
-                        "event-history LAML fit at Gauss-Hermite order {order}, mesh refinement {refinement}: {message}"
+                        "event-history LAML fit at Gauss-Hermite order {order}, mesh refinement {refinement}: {error}"
                     ),
-                );
-                if matches!(failure, EventHistoryError::ReferenceStep { .. }) {
-                    return Err(failure);
-                }
-                // A posterior the grid cannot represent (its interpolant goes
-                // negative where the mass is) is answered by resolving the
-                // grid, which is the ladder this driver already owns — not by
-                // handing the caller a number the representation could not
-                // carry. The grid is raised a rung at a time up to where the
-                // raised rule's interpolant would amplify roundoff past the
-                // certificate's tolerance. A pinned candidate is not raised:
-                // it must stay at the incumbent's setting, so the loss is the
-                // caller's, typed, to answer by raising the incumbent.
-                // Anything else is the caller's to see.
-                if message.contains(LOST_POSITIVITY) {
-                    if pinned.is_some() {
-                        return Err(EventHistoryError::LostPositivity {
-                            reason: format!(
-                                "the candidate at rank {atoms}, pinned at Gauss-Hermite order {order}, mesh refinement {refinement}: {message}"
-                            ),
-                        });
-                    }
-                    let raised = if atoms > 0 {
-                        positivity_raise(order, built.nodes.max_subject_nodes(), spec.quadrature_tolerance)
-                    } else {
-                        None
-                    };
-                    if let Some(next_order) = raised {
-                        log::debug!(
-                            "[event-history] Gauss-Hermite order {order} cannot represent a posterior on this cohort; raising it to {next_order}"
-                        );
-                        order = next_order;
-                        built = build(order, refinement)?;
-                        continue;
-                    }
-                }
-                return Err(failure);
+                ));
             }
         };
         let (covariance, sd) = posterior_scale(&fit, built.family.total_width())?;
@@ -2862,7 +2820,7 @@ fn loading_curvature(probe: &EventHistoryFamily, states: &[ParameterBlockState])
 /// (`2·order − 1`, the step the fit's certificate takes), and the proposal
 /// prices the difference by what it moves ([`proposal_start_shift`]). `None`
 /// where that rung would amplify interpolation roundoff past `tolerance`
-/// ([`positivity_raise`]): the curvature at this order can no longer be
+/// ([`next_certifiable_order`]): the curvature at this order can no longer be
 /// checked. A factor held static has no interpolant and is always checkable.
 fn added_factor_curvature_pair(
     probe: &EventHistoryFamily,
@@ -2949,9 +2907,8 @@ enum Proposal {
 /// direction from the added-factor curvature, its prior from the directional
 /// profiles, and its start loading. Unresolved when a rung's worth of
 /// curvature error moves that start by more than `tolerance` posterior sd
-/// ([`proposal_start_shift`]), when no rung remains to check the curvature
-/// against, or when the curvature or a profile evaluates a posterior the grid
-/// cannot represent (`LostPositivity`).
+/// ([`proposal_start_shift`]) or when no rung remains to check the curvature
+/// against.
 fn propose_atom(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
@@ -2971,13 +2928,6 @@ fn propose_atom(
                 DecisionIntegral::AddedFactorCurvature,
                 Rung::GaussHermite,
                 format!("no Gauss-Hermite rung above order {order} checks the added-factor curvature"),
-            ));
-        }
-        Err(EventHistoryError::LostPositivity { reason }) => {
-            return Ok(Proposal::Unresolved(
-                DecisionIntegral::AddedFactorCurvature,
-                Rung::GaussHermite,
-                reason,
             ));
         }
         Err(error) => return Err(error),
@@ -3026,17 +2976,9 @@ fn propose_atom(
     let (refined, directions) = loop {
         let mut directions = Vec::with_capacity(marks);
         for (along, prior) in alongs.iter().zip(priors.iter()) {
-            match direction_profile(fit, along, time_scale, *prior) {
-                Ok(profile) => directions.push(DirectionEvidence::Sampled(profile)),
-                Err(EventHistoryError::LostPositivity { reason }) => {
-                    return Ok(Proposal::Unresolved(
-                        DecisionIntegral::DirectionalProfile,
-                        Rung::GaussHermite,
-                        reason,
-                    ));
-                }
-                Err(error) => return Err(error),
-            }
+            directions.push(DirectionEvidence::Sampled(direction_profile(
+                fit, along, time_scale, *prior,
+            )?));
         }
         let refined = empirical_bayes_ridge(&directions)?;
         let lambda = refined.log_lambda.exp();
@@ -3117,17 +3059,7 @@ fn propose_atom(
             atom.log_rate,
             reference_refinement,
         )?;
-        let mesh_curvature = match loading_curvature(&probe, &states) {
-            Ok(mesh_curvature) => mesh_curvature,
-            Err(EventHistoryError::LostPositivity { reason }) => {
-                return Ok(Proposal::Unresolved(
-                    DecisionIntegral::AddedFactorCurvature,
-                    Rung::GaussHermite,
-                    reason,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
+        let mesh_curvature = loading_curvature(&probe, &states)?;
         if mesh_curvature.iter().any(|x| !x.is_finite()) {
             return Err(EventHistoryError::NumericalFailure {
                 reason: format!(
@@ -3247,9 +3179,7 @@ fn direction_profile(
     }
     // Finite sampled profiles propose a prior. Every sample must be
     // evaluated successfully at the same quadrature setting; a failed tail
-    // is an unresolved proposal, never an invented continuation, and a sample
-    // the grid cannot represent is refused as `LostPositivity`, at a setting
-    // the incumbent was certified at.
+    // is an unresolved proposal, never an invented continuation.
     let resolved_depth = resolved_profile_depth();
     let (base, _) = probe.directional_log_likelihood(&states_at(0.0), &direction)?;
     let mut step = atom.ridge.mode_scale / 8.0;
@@ -3314,7 +3244,7 @@ fn fit_event_history_on_grid(
     // candidate all run at that certified setting, so the two criteria the
     // rank decision compares are one functional at a resolved setting. That
     // setting must also resolve every integral the decision reads — the
-    // proposal's added-factor curvature, its profiles and their positivity —
+    // proposal's added-factor curvature and its profiles —
     // so while any is unresolved the incumbent is refitted one ladder rung up
     // and the proposal is formed again there. Where no certifiable rung
     // remains, the path stops at the certified incumbent and records the
@@ -3489,32 +3419,6 @@ fn fit_event_history_on_grid(
                     reference_refinement,
                 )?;
             }
-            // The candidate is fitted at the incumbent's setting, so a
-            // posterior that setting cannot represent is the incumbent's
-            // setting failing to resolve the decision.
-            Err(EventHistoryError::LostPositivity { reason }) => {
-                match raise_incumbent(
-                    cohort,
-                    &mut rank_spec,
-                    &fit,
-                    Rung::GaussHermite,
-                    &reason,
-                    reference_refinement,
-                )? {
-                    Some(raised) => fit = raised,
-                    None => {
-                        step.accepted = false;
-                        step.converged = false;
-                        step.growth_unresolved = Some(UnresolvedGrowth {
-                            gauss_hermite_order: fit.quadrature.gauss_hermite_order,
-                            integral: DecisionIntegral::CandidatePosterior,
-                            reason,
-                        });
-                        rank_path.push(step);
-                        break;
-                    }
-                }
-            }
             // A reference step the reference grid cannot take is answered by
             // refining that grid for the whole selection, not by stopping the
             // path at this rank.
@@ -3581,7 +3485,7 @@ enum Rung {
 /// (`2·order − 1`) or the time mesh (one refinement), warm-started from its
 /// own converged values, because an integral the rank decision reads is
 /// unresolved at its certified setting. `None` at that ladder's top rung, the
-/// top certifiable order ([`positivity_raise`]) or the mesh ceiling
+/// top certifiable order ([`next_certifiable_order`]) or the mesh ceiling
 /// ([`EventHistoryCohort::mesh_refinement_ceiling`]): the incumbent stays the
 /// certified model and the decision is recorded as unresolved.
 fn raise_incumbent(
@@ -3598,7 +3502,7 @@ fn raise_incumbent(
     let from_refinement = match rung {
         Rung::GaussHermite => {
             let Some(next_order) =
-                positivity_raise(order, fit.nodes.max_subject_nodes(), rank_spec.quadrature_tolerance)
+                next_certifiable_order(order, fit.nodes.max_subject_nodes(), rank_spec.quadrature_tolerance)
             else {
                 log::debug!(
                     "[event-history] rank {rank} → {}: the decision is unresolved at Gauss-Hermite order {order} ({reason}), the ladder's top certifiable rung: the path stops at the certified rank-{rank} model with growth unresolved",

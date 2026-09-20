@@ -5,40 +5,36 @@
 //! carried as its values on an adaptive product Gauss-Hermite grid whose
 //! per-axis centre and scale follow the predicted moments. The two operators
 //! the chain needs — predict forward across a gap and condition backward
-//! across a gap — are Gaussian convolutions, and a Gaussian convolution of
-//! `envelope × polynomial` is exact: the product of the transition kernel and
-//! the grid envelope is again a Gaussian, so the convolution is an expectation
-//! of the Lagrange interpolant under that Gaussian, evaluated by Gauss-Hermite
-//! quadrature to which it is exact. Both operators are therefore `G × G`
-//! matrices per axis, valid for gaps of any size, including gaps far shorter
-//! than the grid spacing where direct kernel quadrature fails.
+//! across a gap — are Gaussian convolutions. The product of the transition
+//! kernel and a Gaussian is again a Gaussian, so each convolution is an
+//! expectation under a Gaussian of an interpolated residual, evaluated by
+//! Gauss-Hermite quadrature at inner points; this holds for gaps of any size,
+//! including gaps far shorter than the grid spacing where direct kernel
+//! quadrature fails.
 //!
-//! The two operators interpolate different classes. Forward, the operand is
-//! a density, Gaussian-enveloped, so the interpolant is of `density /
-//! envelope` and the convolution is exact for `envelope × polynomial`; the
-//! Lagrange interpolant is used as the polynomial it is, inside and beyond
-//! the hull, because the envelope's Gaussian decay beats its growth there
-//! and a clamp would put a kink into the objective. Backward, the operand is
-//! the logarithm of a smoother residual, bounded and smooth but not
-//! enveloped, so it is carried by the not-a-knot cubic spline through the
-//! nodes, continued linearly beyond the hull with the end slope.
+//! Both operators interpolate a logarithm. Forward ([`ForwardKernel`]), the
+//! operand is a density, carried by its logarithm: `ln(density / envelope)`
+//! is interpolated by the tensor Lagrange polynomial on the nodes and
+//! exponentiated at the inner points, so every predicted density is a sum of
+//! positive terms and exact for any Gaussian density. Backward, the operand
+//! is the logarithm of a smoother residual, bounded and smooth, carried by
+//! the not-a-knot cubic spline through the nodes, continued linearly beyond
+//! the hull with the end slope. No density is ever a signed interpolant, so
+//! neither pass can lose positivity at any order.
 //!
-//! Both interpolants are signed linear maps of the nodal values: neither is
-//! a positivity-preserving operator, and neither claims to be. A density's
-//! interpolant can dip below zero far in the tails, at the level of the
-//! interpolation error; the filter treats such values as the numerical noise
-//! they are (they carry no smoothed mass) and the Gauss-Hermite certificate
-//! of the fit is what bounds them. The Lebesgue constant of the Lagrange
-//! interpolant on Hermite nodes grows exponentially with the order, so the
-//! rule records it and the fit refuses an order whose roundoff amplification
-//! would exceed the certificate's tolerance.
+//! A conditional expectation of a carried function (not a density) given the
+//! next state is a Lagrange interpolant of its values averaged under the
+//! forward inner weights. The Lebesgue constant of that interpolant on
+//! Hermite nodes grows exponentially with the order, so the rule records it
+//! and the fit refuses an order whose roundoff amplification would exceed the
+//! certificate's tolerance.
 //!
 //! Everything is generic over a [`JetField`] scalar so the same code yields
 //! the value, one directional derivative, or a mixed second directional
 //! derivative of every quantity downstream.
 
 use super::cohort::EventHistoryError;
-use super::scalar::{add_real, div, exp, recip, sqrt, square};
+use super::scalar::{add_real, div, exp, ln, recip, sqrt, square};
 use gam_math::nested_dual::JetField;
 
 /// Physicists' Gauss-Hermite rule with the derived constants the chain uses.
@@ -395,30 +391,6 @@ impl<S: JetField> Grid<S> {
     }
 }
 
-/// Apply a per-axis `G × G` matrix (row-major `[j * G + i]`, output index
-/// `j`, input index `i`) along `axis` of a flat tensor.
-pub(crate) fn apply_axis<S: JetField>(values: &[S], matrix: &[S], order: usize, axis: usize) -> Vec<S> {
-    let stride = order.pow(axis as u32);
-    let block = stride * order;
-    let total = values.len();
-    let zero = values[0].constant_like(0.0);
-    let mut out = vec![zero.clone(); total];
-    let mut base = 0;
-    while base < total {
-        for inner in 0..stride {
-            for j in 0..order {
-                let mut acc = zero.clone();
-                for i in 0..order {
-                    acc = acc.add(&matrix[j * order + i].mul(&values[base + inner + i * stride]));
-                }
-                out[base + inner + j * stride] = acc;
-            }
-        }
-        base += block;
-    }
-    out
-}
-
 /// Transition of one unit-variance Ornstein–Uhlenbeck atom across a gap of
 /// dimensionless length `kappa = rate · gap`: `z' | z ~ N(φ z, 1 − φ²)`.
 #[derive(Clone, Debug)]
@@ -480,130 +452,285 @@ impl<S: JetField> AtomTransition<S> {
     }
 }
 
-const LOG_SQRT_TWO_PI: f64 = 0.918_938_533_204_672_8;
+/// `ln √(2π)`.
+pub(crate) const LOG_SQRT_TWO_PI: f64 = 0.918_938_533_204_672_8;
 
-/// `N(x; mean, variance)` as a scalar.
-pub(crate) fn normal_density<S: JetField>(x: &S, mean: &S, variance: &S) -> S {
+/// `ln N(x; mean, variance)` as a scalar.
+pub(crate) fn log_normal_density<S: JetField>(x: &S, mean: &S, variance: &S) -> S {
     let d = x.sub(mean);
     let quad = div(&square(&d), variance).scale(-0.5);
-    let log_norm = super::scalar::ln(variance).scale(-0.5);
-    exp(&quad.add(&log_norm).add(&x.constant_like(-LOG_SQRT_TWO_PI)))
+    add_real(&quad.add(&ln(variance).scale(-0.5)), -LOG_SQRT_TWO_PI)
 }
 
-/// The innovation-weighted operators of one gap, every axis and every
-/// innovation power at once: `per_axis[k][b]` is the `G × G` matrix of axis
-/// `k` with weight `u_k^b`. One Lagrange-basis pass per axis serves all
-/// powers, and the plain operator is power zero.
-#[derive(Clone, Debug)]
-pub(crate) struct OperatorFamily<S> {
-    pub per_axis: Vec<Vec<Vec<S>>>,
-    pub order: usize,
+/// `ln` of the standard normal density of every atom at every point of
+/// `grid`: the stationary prior every chain starts from.
+pub(crate) fn log_standard_prior<S: JetField>(grid: &Grid<S>, like: &S) -> Vec<S> {
+    (0..grid.size())
+        .map(|i| {
+            (0..grid.dimension()).fold(like.constant_like(0.0), |acc, k| {
+                let z = grid.coordinate(i, k);
+                add_real(&acc.sub(&square(z).scale(0.5)), -LOG_SQRT_TWO_PI)
+            })
+        })
+        .collect()
 }
 
-impl<S: JetField> OperatorFamily<S> {
-    /// Apply the separable operator whose axis-`k` factor carries power
-    /// `powers[k]`.
-    pub fn apply(&self, powers: &[u8], values: &[S]) -> Vec<S> {
-        let mut current = values.to_vec();
-        for (axis, family) in self.per_axis.iter().enumerate() {
-            let power = usize::from(powers.get(axis).copied().unwrap_or(0));
-            current = apply_axis(&current, &family[power], self.order, axis);
-        }
-        current
-    }
-
-    /// The plain (power-zero) operator.
-    pub fn plain(&self, values: &[S]) -> Vec<S> {
-        let zeros = vec![0u8; self.per_axis.len()];
-        self.apply(&zeros, values)
-    }
+/// The Gaussian transition across one gap, from a filtered density on `from`
+/// to the grid `to`, evaluated one target point at a time.
+///
+/// Per axis `z' | z ~ N(φz, q)`. Write the filtered density against the
+/// envelope `e = N(μ, σ²)` of `from` as `α(z) = e(z) r(z)`. The product of the
+/// kernel and the envelope is `N(z'; φμ, τ²) N(z; m(z'), σ² q/τ²)` with
+/// `τ² = φ²σ² + q`, so
+///
+/// ```text
+/// p̂(z') = ∫ N(z'; φz, q) α(z) dz = N(z'; φμ, τ²) · E[r(z) | z'],
+/// ```
+///
+/// an expectation under a Gaussian whose standardised coordinate on `from`
+/// is `centre + √(q/τ²) x` at Gauss-Hermite node `x`, with
+/// `centre = φσ(z' − φμ)/(τ²√2)`.
+///
+/// The ratio enters through its logarithm: `ln r` is carried by the tensor
+/// Lagrange interpolant on the nodes of `from` and exponentiated at the inner
+/// points. Every inner weight is then positive, the predicted density is a
+/// log-sum-exp of them, and the representation cannot lose positivity at any
+/// order. The interpolation is exact whenever `ln α` is a polynomial of
+/// degree below the order, which includes every Gaussian (`ln r` is then
+/// quadratic) whatever its centre and spread relative to the grid. The
+/// polynomial is used as the polynomial it is beyond the hull: the inner
+/// points are finitely many, each a finite value, and a clamp would put a
+/// kink into an otherwise smooth objective.
+///
+/// Normalising the inner weights of target point `z'_j` gives `ŵ_{jl}`, the
+/// quadrature rule of the law of `z` given `z'_j` and the data so far. A
+/// conditional expectation `E[f(z) | z'_j]` of a function carried on `from`
+/// is `Σ_l ŵ_{jl} f̃(z_{jl})` with `f̃` its Lagrange interpolant
+/// ([`Self::transfer`]); a polynomial in the inner coordinates and the
+/// innovation is evaluated at them exactly ([`Self::innovation_moment`]).
+/// Nothing of size `|to| × |from|` is formed: each target row is built,
+/// used and dropped.
+pub(crate) struct ForwardKernel<S> {
+    order: usize,
+    /// `ln r` on the points of `from`.
+    log_ratio: Vec<S>,
+    /// `bases[k][(j_k G + l) G + i] = L_i(raw_{k, j_k, l})`: the Lagrange
+    /// basis of `from` at the inner points of target coordinate `j_k`.
+    bases: Vec<Vec<S>>,
+    /// `ln N(z'_{j_k}; φμ, τ²)` per axis, `[k][j_k]`.
+    log_gauss: Vec<Vec<S>>,
+    /// The standardised innovation `u = (z' − φz)/√q` at every inner point,
+    /// `[k][j_k G + l]`.
+    innovations: Vec<Vec<S>>,
+    /// The source coordinate `z` of every inner point, `[k][j_k G + l]`.
+    coordinates: Vec<Vec<S>>,
+    /// `Σ_k ln(w_{l_k}/√π)` per flat inner point, axis 0 fastest.
+    log_inner_weights: Vec<f64>,
 }
 
-/// Build the forward (predict) operators across one gap for innovation
-/// powers `0..=max_power`: input values on `from`, output values on `to`,
-/// `F_b[f](z') = ∫ N(z'; φz, q) u^b f(z) dz` with `u = (z' − φz)/√q` the
-/// standardised innovation.
-pub(crate) fn forward_operators<S: JetField>(
-    gh: &GaussHermite,
-    from: &Grid<S>,
-    to: &Grid<S>,
-    transitions: &[AtomTransition<S>],
-    max_power: u8,
-) -> OperatorFamily<S> {
-    let g = gh.order;
-    let powers = usize::from(max_power) + 1;
-    let mut per_axis = Vec::with_capacity(from.dimension());
-    for (axis, transition) in transitions.iter().enumerate() {
-        let old = &from.axes[axis];
-        let new = &to.axes[axis];
-        let phi = &transition.phi;
-        let q = &transition.innovation;
-        let root_q = if q.value() == 0.0 { q.constant_like(0.0) } else { sqrt(q) };
-        let sigma2 = square(&old.sigma);
-        let tau2 = square(phi).mul(&sigma2).add(q);
-        let inv_tau2 = recip(&tau2);
-        let ratio = if q.value() == 0.0 { q.constant_like(0.0) } else { sqrt(&q.mul(&inv_tau2)) };
-        let phi_mu = phi.mul(&old.mu);
-        // The standardised innovation at inner node `x` of target point `z'`:
-        // with `z = μ + √2 σ (centre + ratio·x)` and `d = z' − φμ`,
-        //   z' − φz = d q/τ² − φ √2 σ √(q/τ²) x,
-        // so `u = (z' − φz)/√q = d √q/τ² − φ √2 σ x/τ`. Forming `z' − φz` as
-        // a difference would cancel to roundoff at small `q` (a short gap or
-        // a slow atom) and dividing by `√q` would amplify that roundoff
-        // without bound; the closed form is exact in the limit.
-        let u_slope = phi
-            .mul(&old.sigma)
-            .mul(&sqrt(&inv_tau2))
-            .scale(-std::f64::consts::SQRT_2);
-        let u_offset_factor = root_q.mul(&inv_tau2);
-        // 1 / e(z_i) with e = N(z_i; mu, sigma²): √(2π) σ e^{x_i²}.
-        let inverse_envelope: Vec<S> = gh
-            .nodes
+/// One target point of a [`ForwardKernel`]: the log predicted density there
+/// and the normalised inner weights `ŵ_{j·}`, axis 0 fastest.
+pub(crate) struct KernelRow<S> {
+    pub log_predicted: S,
+    pub weights: Vec<S>,
+}
+
+impl<S: JetField> ForwardKernel<S> {
+    pub fn new(
+        gh: &GaussHermite,
+        from: &Grid<S>,
+        log_alpha: &[S],
+        to: &Grid<S>,
+        transitions: &[AtomTransition<S>],
+    ) -> Self {
+        let g = gh.order;
+        let atoms = from.dimension();
+        // ln r_i = ln α_i − ln e(z_i), with ln e(z_i) = Σ_k (−x_{i_k}² − ln σ_k − ln √(2π)).
+        let log_sigma: Vec<S> = from.axes.iter().map(|axis| ln(&axis.sigma)).collect();
+        let log_ratio: Vec<S> = log_alpha
             .iter()
-            .map(|&x| {
-                old.sigma
-                    .scale((2.0 * std::f64::consts::PI).sqrt() * (x * x).exp())
+            .enumerate()
+            .map(|(i, log_a)| {
+                (0..atoms).fold(log_a.clone(), |acc, k| {
+                    let x = gh.nodes[from.index(i, k)];
+                    add_real(&acc.add(&log_sigma[k]), x * x + LOG_SQRT_TWO_PI)
+                })
             })
             .collect();
-        let mut matrices = vec![vec![old.mu.constant_like(0.0); g * g]; powers];
-        for j in 0..g {
-            let d = new.points[j].sub(&phi_mu);
-            let gauss = normal_density(&new.points[j], &phi_mu, &tau2);
-            let centre = phi
+        let mut bases = Vec::with_capacity(atoms);
+        let mut log_gauss = Vec::with_capacity(atoms);
+        let mut innovations = Vec::with_capacity(atoms);
+        let mut coordinates = Vec::with_capacity(atoms);
+        for (axis, transition) in transitions.iter().enumerate() {
+            let old = &from.axes[axis];
+            let new = &to.axes[axis];
+            let phi = &transition.phi;
+            let q = &transition.innovation;
+            let root_q = if q.value() == 0.0 { q.constant_like(0.0) } else { sqrt(q) };
+            let tau2 = square(phi).mul(&square(&old.sigma)).add(q);
+            let inv_tau2 = recip(&tau2);
+            let ratio = if q.value() == 0.0 { q.constant_like(0.0) } else { sqrt(&q.mul(&inv_tau2)) };
+            let phi_mu = phi.mul(&old.mu);
+            // The standardised innovation at inner node `x` of target point `z'`:
+            // with `z = μ + √2 σ (centre + ratio·x)` and `d = z' − φμ`,
+            //   z' − φz = d q/τ² − φ √2 σ √(q/τ²) x,
+            // so `u = (z' − φz)/√q = d √q/τ² − φ √2 σ x/τ`. Forming `z' − φz` as
+            // a difference would cancel to roundoff at small `q` (a short gap or
+            // a slow atom) and dividing by `√q` would amplify that roundoff
+            // without bound; the closed form is exact in the limit.
+            let u_slope = phi
                 .mul(&old.sigma)
-                .mul(&d)
-                .mul(&inv_tau2)
-                .scale(1.0 / std::f64::consts::SQRT_2);
-            let mut accumulated = vec![vec![old.mu.constant_like(0.0); g]; powers];
-            for (l, &x) in gh.nodes.iter().enumerate() {
-                // The interpolant is used as the polynomial it is, inside
-                // and beyond the hull: the source envelope's Gaussian decay
-                // beats the polynomial's growth there, and a clamp would put
-                // a kink into an otherwise smooth objective.
-                let raw = centre.add(&ratio.scale(x));
-                let basis = gh.lagrange_basis(&raw);
-                let u = d.mul(&u_offset_factor).add(&u_slope.scale(x));
-                let mut weight = old.mu.constant_like(gh.normal_weights[l]);
-                for power in 0..powers {
-                    if power > 0 {
-                        weight = weight.mul(&u);
-                    }
-                    for i in 0..g {
-                        accumulated[power][i] = accumulated[power][i].add(&basis[i].mul(&weight));
-                    }
+                .mul(&sqrt(&inv_tau2))
+                .scale(-std::f64::consts::SQRT_2);
+            let u_offset_factor = root_q.mul(&inv_tau2);
+            let spread = old.sigma.scale(std::f64::consts::SQRT_2);
+            let mut axis_bases = Vec::with_capacity(g * g * g);
+            let mut axis_gauss = Vec::with_capacity(g);
+            let mut axis_innovations = Vec::with_capacity(g * g);
+            let mut axis_coordinates = Vec::with_capacity(g * g);
+            for j in 0..g {
+                let d = new.points[j].sub(&phi_mu);
+                axis_gauss.push(log_normal_density(&new.points[j], &phi_mu, &tau2));
+                let centre = phi
+                    .mul(&old.sigma)
+                    .mul(&d)
+                    .mul(&inv_tau2)
+                    .scale(1.0 / std::f64::consts::SQRT_2);
+                let u_offset = d.mul(&u_offset_factor);
+                for &x in &gh.nodes {
+                    let raw = centre.add(&ratio.scale(x));
+                    axis_bases.extend(gh.lagrange_basis(&raw));
+                    axis_innovations.push(u_offset.add(&u_slope.scale(x)));
+                    axis_coordinates.push(old.mu.add(&spread.mul(&raw)));
                 }
             }
-            for power in 0..powers {
-                for i in 0..g {
-                    matrices[power][j * g + i] = gauss
-                        .mul(&accumulated[power][i])
-                        .mul(&inverse_envelope[i]);
-                }
-            }
+            bases.push(axis_bases);
+            log_gauss.push(axis_gauss);
+            innovations.push(axis_innovations);
+            coordinates.push(axis_coordinates);
         }
-        per_axis.push(matrices);
+        let log_inner_weights = (0..from.size())
+            .map(|l| {
+                let mut rest = l;
+                let mut acc = 0.0;
+                for _ in 0..atoms {
+                    acc += gh.normal_weights[rest % g].ln();
+                    rest /= g;
+                }
+                acc
+            })
+            .collect();
+        Self {
+            order: g,
+            log_ratio,
+            bases,
+            log_gauss,
+            innovations,
+            coordinates,
+            log_inner_weights,
+        }
     }
-    OperatorFamily { per_axis, order: g }
+
+    /// Axis-`k` coordinate index of flat target point `j`.
+    fn target_index(&self, j: usize, k: usize) -> usize {
+        (j / self.order.pow(k as u32)) % self.order
+    }
+
+    /// The log predicted density at target point `j` and its normalised
+    /// inner weights.
+    pub fn row(&self, j: usize) -> KernelRow<S> {
+        let at_inner = interpolate_at_inner_points(self.order, &self.bases, &self.log_ratio, j);
+        let terms: Vec<S> = at_inner
+            .iter()
+            .zip(self.log_inner_weights.iter())
+            .map(|(q, &w)| add_real(q, w))
+            .collect();
+        let log_mass = log_sum_exp(&terms);
+        let weights = terms.iter().map(|t| exp(&t.sub(&log_mass))).collect();
+        let log_predicted = self
+            .log_gauss
+            .iter()
+            .enumerate()
+            .fold(log_mass, |acc, (k, gauss)| acc.add(&gauss[self.target_index(j, k)]));
+        KernelRow {
+            log_predicted,
+            weights,
+        }
+    }
+
+    /// The log predicted density at every point of the target grid.
+    pub fn log_predicted(&self, target_size: usize) -> Vec<S> {
+        (0..target_size).map(|j| self.row(j).log_predicted).collect()
+    }
+
+    /// Row `j` of the conditional-expectation operator: `Σ_i M_{ji} f(z_i)` is
+    /// `E[f(z) | z'_j]` for `f` carried by its values on `from`, with
+    /// `M_{ji} = Σ_l ŵ_{jl} Π_k L_{i_k}(raw_{k, j_k, l_k})`. The inner weights
+    /// are contracted one axis at a time against the transposed per-axis
+    /// bases, using O(G^K) transient storage.
+    pub fn transfer(&self, j: usize, weights: &[S]) -> Vec<S> {
+        let g = self.order;
+        let zero = weights[0].constant_like(0.0);
+        let mut cur = weights.to_vec();
+        let mut stride = 1;
+        for (k, basis) in self.bases.iter().enumerate() {
+            let target = self.target_index(j, k);
+            let blocks = cur.len() / (stride * g);
+            let mut next = vec![zero.clone(); cur.len()];
+            for block in 0..blocks {
+                for i in 0..g {
+                    for inner in 0..stride {
+                        let mut acc = zero.clone();
+                        for l in 0..g {
+                            acc = acc.add(&basis[(target * g + l) * g + i]
+                                .mul(&cur[inner + stride * (l + g * block)]));
+                        }
+                        next[inner + stride * (i + g * block)] = acc;
+                    }
+                }
+            }
+            cur = next;
+            stride *= g;
+        }
+        cur
+    }
+
+    /// The per-axis marginals of a row's inner weights, `[k][l_k]`.
+    pub fn axis_marginals(&self, weights: &[S]) -> Vec<Vec<S>> {
+        let g = self.order;
+        let zero = weights[0].constant_like(0.0);
+        (0..self.bases.len())
+            .map(|k| {
+                let stride = g.pow(k as u32);
+                let mut marginal = vec![zero.clone(); g];
+                for (l, w) in weights.iter().enumerate() {
+                    let lk = (l / stride) % g;
+                    marginal[lk] = marginal[lk].add(w);
+                }
+                marginal
+            })
+            .collect()
+    }
+
+    /// `E[u_k^b z_k^a | z'_j]` from the axis-`k` marginal of row `j`, with the
+    /// innovation and the source coordinate evaluated at the inner points
+    /// exactly.
+    pub fn innovation_moment(&self, j: usize, marginal: &[S], k: usize, b: usize, a: usize) -> S {
+        let g = self.order;
+        let base = self.target_index(j, k) * g;
+        let mut acc = marginal[0].constant_like(0.0);
+        for (l, w) in marginal.iter().enumerate() {
+            let mut term = w.clone();
+            for _ in 0..b {
+                term = term.mul(&self.innovations[k][base + l]);
+            }
+            for _ in 0..a {
+                term = term.mul(&self.coordinates[k][base + l]);
+            }
+            acc = acc.add(&term);
+        }
+        acc
+    }
 }
 
 /// Per-axis spline basis of `to` at the backward inner points
@@ -688,5 +815,5 @@ pub(crate) fn log_sum_exp<S: JetField>(terms: &[S]) -> S {
     let sum = terms
         .iter()
         .fold(terms[0].constant_like(0.0), |acc, t| acc.add(&exp(&add_real(t, -shift))));
-    add_real(&super::scalar::ln(&sum), shift)
+    add_real(&ln(&sum), shift)
 }

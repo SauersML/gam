@@ -35,12 +35,6 @@ pub enum EventHistoryError {
     InvalidInput { reason: String },
     #[error("{reason}")]
     NumericalFailure { reason: String },
-    /// The grid representation of a density carried negative mass where its
-    /// mass is: a signed interpolant too coarse for the posterior it holds. A
-    /// failure of the representation, not of the model, which the fit driver
-    /// answers by raising the Gauss-Hermite order.
-    #[error("{reason}")]
-    LostPositivity { reason: String },
     /// A finite coefficient point needs a different integration bank or
     /// resolution. It is not outside the probability model's parameter space.
     #[error("{reason}")]

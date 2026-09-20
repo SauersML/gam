@@ -1,5 +1,5 @@
 use super::chain::{
-    AtomTransition, GaussHermite, Grid, backward_axis_bases, forward_operators,
+    AtomTransition, ForwardKernel, GaussHermite, Grid, backward_axis_bases,
     interpolate_at_inner_points,
 };
 use super::cohort::{
@@ -137,8 +137,8 @@ fn a_rank_stop_with_its_verdict_dropped_is_unexplained() {
         converged: false,
         growth_unresolved: Some(UnresolvedGrowth {
             gauss_hermite_order: 11,
-            integral: DecisionIntegral::DirectionalProfile,
-            reason: "the density representation lost positivity".to_string(),
+            integral: DecisionIntegral::AddedFactorCurvature,
+            reason: "no Gauss-Hermite rung above order 11 checks the added-factor curvature".to_string(),
         }),
     };
     assert!(rank_stop_explanation(std::slice::from_ref(&step), 11, 449, tolerance).is_ok());
@@ -178,51 +178,46 @@ fn subject(times: &[f64], exposures: &[f64], counts: &[Vec<f64>]) -> SubjectNode
 }
 
 #[test]
-fn forward_operator_is_exact_on_envelope_times_polynomial() {
+fn forward_kernel_is_exact_on_a_gaussian() {
     let gh = GaussHermite::new(15).expect("rule");
-    let (mu, sigma) = (0.1, 0.9);
-    let from = Grid::new(&gh, &[mu], &[sigma], &0.0);
+    let from = Grid::new(&gh, &[0.1], &[0.9], &0.0);
     let to = Grid::new(&gh, &[0.4], &[0.5], &0.0);
     let kappa = 0.35;
     let transition = AtomTransition::new(&kappa);
     let phi = (-kappa).exp();
     let q = 1.0 - phi * phi;
-    // f(z) = N(z; mu, sigma²) (1 + 0.3 z + 0.2 z²)
-    let values: Vec<f64> = (0..from.size())
-        .map(|i| {
-            let z = *from.coordinate(i, 0);
-            gaussian(z, mu, sigma * sigma) * (1.0 + 0.3 * z + 0.2 * z * z)
-        })
+    // A Gaussian of a centre and width unrelated to either grid: its log
+    // density is quadratic, so the log-domain interpolant of degree 14 carries
+    // it exactly. What remains is the inner rule applied to `exp` of a
+    // quadratic of coefficient ≈ −0.18 in the Hermite variable, whose Taylor
+    // remainder past degree 29 is below 1e−20: the prediction is the Gaussian
+    // convolution to roundoff.
+    let (mu0, sigma0) = (0.3, 0.7);
+    let log_alpha: Vec<f64> = (0..from.size())
+        .map(|i| gaussian(*from.coordinate(i, 0), mu0, sigma0 * sigma0).ln())
         .collect();
-    let forward = forward_operators(&gh, &from, &to, &[transition.clone()], 0);
-    let predicted = forward.plain(&values);
-    let tau2 = phi * phi * sigma * sigma + q;
-    let s2 = sigma * sigma * q / tau2;
+    let kernel = ForwardKernel::new(&gh, &from, &log_alpha, &to, &[transition.clone()]);
+    let predicted = kernel.log_predicted(to.size());
+    let tau2 = phi * phi * sigma0 * sigma0 + q;
     for j in 0..to.size() {
         let z = *to.coordinate(j, 0);
-        let m = mu + phi * sigma * sigma * (z - phi * mu) / tau2;
-        let exact = gaussian(z, phi * mu, tau2) * (1.0 + 0.3 * m + 0.2 * (m * m + s2));
+        let exact = gaussian(z, phi * mu0, tau2).ln();
         assert!(
-            (predicted[j] - exact).abs() < 1e-8 * exact.abs().max(1e-8),
-            "node {j}: predicted {} exact {exact}",
+            (predicted[j] - exact).abs() < 1e-8,
+            "node {j}: log predicted {} exact {exact}",
             predicted[j]
         );
-    }
-    // A Gaussian of a different centre and width is not envelope × polynomial;
-    // the interpolant is then an approximation, accurate to the interpolation
-    // error of a degree-14 polynomial.
-    let (mu0, sigma0) = (0.3, 0.7);
-    let other: Vec<f64> = (0..from.size())
-        .map(|i| gaussian(*from.coordinate(i, 0), mu0, sigma0 * sigma0))
-        .collect();
-    let predicted = forward.plain(&other);
-    for j in 0..to.size() {
-        let z = *to.coordinate(j, 0);
-        let exact = gaussian(z, phi * mu0, phi * phi * sigma0 * sigma0 + q);
+        // The row's conditional expectation of z is the exact posterior mean
+        // of the source given the target.
+        let row = kernel.row(j);
+        let transfer = kernel.transfer(j, &row.weights);
+        let mean: f64 = (0..from.size())
+            .map(|i| transfer[i] * from.coordinate(i, 0))
+            .sum();
+        let exact_mean = mu0 + phi * sigma0 * sigma0 * (z - phi * mu0) / tau2;
         assert!(
-            (predicted[j] - exact).abs() < 1e-4 * exact.abs().max(1e-3),
-            "node {j}: predicted {} exact {exact}",
-            predicted[j]
+            (mean - exact_mean).abs() < 1e-8,
+            "node {j}: conditional mean {mean} exact {exact_mean}"
         );
     }
     // The backward interpolation reproduces a constant at every inner point

@@ -359,11 +359,11 @@ fn latent_parameters(fit: &EventHistoryFit) -> (Vec<f64>, Vec<f64>) {
     (loadings, fit.log_rates.iter().map(|r| r.exp()).collect())
 }
 
-/// A filtered latent state: the grid and density at a time.
+/// A filtered latent state: the grid and log density at a time.
 #[derive(Clone)]
 struct LatentState {
     grid: Grid<f64>,
-    alpha: Vec<f64>,
+    log_alpha: Vec<f64>,
     time: f64,
 }
 
@@ -411,7 +411,7 @@ fn observed_state(
     let last = observed.subjects[0].len() - 1;
     Ok(LatentState {
         grid: pass.grids.pop().expect("at least one node"),
-        alpha: pass.alpha.pop().expect("at least one node"),
+        log_alpha: pass.log_alpha.pop().expect("at least one node"),
         time: observed.subjects[0].times[last],
     })
 }
@@ -561,7 +561,7 @@ struct WindowIntegrand<'a> {
     gh: &'a GaussHermite,
     /// Whether the filter interpolates its density onto a new grid at every
     /// node. A dynamic factor's does: `marginal::filter_step` carries the
-    /// density through `chain::forward_operators`, which evaluates the rule's
+    /// log density through `chain::ForwardKernel`, which evaluates the rule's
     /// Lagrange basis at every target point (`gh.lagrange_basis(&raw)`). A
     /// static factor's grid is conditioned in place (`static_state::filter`),
     /// and a rank-zero window has no grid.
@@ -623,7 +623,7 @@ impl WindowIntegrand<'_> {
                         designs: None,
                         log_normaliser: normaliser.as_deref(),
                     },
-                    state.map(|s| (&s.grid, s.alpha.as_slice())),
+                    state.map(|s| (&s.grid, s.log_alpha.as_slice())),
                     &run.exposed,
                 )
             };
@@ -641,7 +641,7 @@ impl WindowIntegrand<'_> {
                 let at_j = forecast_normaliser(fit, self.stratum, &outer_times[j..j + 1])?;
                 let intensities = expected_intensities(
                     &pass.grids[q],
-                    &pass.predicted[q],
+                    &pass.log_predicted[q],
                     &eta0[j * marks..(j + 1) * marks],
                     self.loadings,
                     at_j.as_deref(),
@@ -661,7 +661,7 @@ impl WindowIntegrand<'_> {
                 sub_densities,
                 state: Some(LatentState {
                     grid: pass.grids.pop().expect("cell has nodes"),
-                    alpha: pass.alpha.pop().expect("cell has nodes"),
+                    log_alpha: pass.log_alpha.pop().expect("cell has nodes"),
                     time: outer_times[q - 1],
                 }),
             });
