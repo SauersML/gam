@@ -41,7 +41,7 @@ pub use dictionary_score::{
     DictionaryScoreRoutePlan,
 };
 pub use gpu_error::GpuError;
-pub use policy::{GpuDispatchPolicy, GpuMixedPrecisionPolicy};
+pub use policy::GpuDispatchPolicy;
 pub use pool::{balanced_partition, scatter_batched};
 pub use row_kernel_race::{
     ReusedStateRace, RowKernelShape, race_row_kernel, run_measured_row_kernel,

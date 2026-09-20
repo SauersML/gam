@@ -731,6 +731,10 @@ def run_fuzz(family: str, n: int, design: str, seed: int) -> dict[str, Any]:
     out: dict[str, Any] = {"base_rss_mb": rss_peak_mb(), "formula": data.formula}
     errors: dict[str, str] = {}
     error_types: dict[str, str] = {}
+    # The traceback keeps only its last 2000 characters, which drops the
+    # exception line of a long engine message; its first line is kept whole
+    # so triage groups the rep by what it says, not by a mid-message tail.
+    error_heads: dict[str, str] = {}
 
     def phase(name: str, fn: Callable[[], Any]) -> Any:
         t = Timer()
@@ -739,6 +743,7 @@ def run_fuzz(family: str, n: int, design: str, seed: int) -> dict[str, Any]:
         except Exception as exc:
             errors[name] = traceback.format_exc(limit=4)[-2000:]
             error_types[name] = type(exc).__name__
+            error_heads[name] = (str(exc).strip().splitlines() or [""])[0]
             return None
         out[f"{name}_s"], out[f"{name}_cpu_s"] = t.stop()
         return value
@@ -790,6 +795,7 @@ def run_fuzz(family: str, n: int, design: str, seed: int) -> dict[str, Any]:
     if errors:
         out["errors"] = errors
         out["error_types"] = error_types
+        out["error_heads"] = error_heads
     return out
 
 

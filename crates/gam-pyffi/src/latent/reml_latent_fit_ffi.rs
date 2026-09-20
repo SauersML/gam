@@ -3486,11 +3486,9 @@ fn curvature_inference_json(
 }
 
 /// #1063 per-term LR significance report for every penalized smooth term:
-/// `statistic_lr`, `ref_df`, `bartlett_factor`,
-/// `bartlett_factor_conditional`, `rho_variation_shift`,
-/// `statistic_corrected`, `p_value_uncorrected`, `p_value_corrected`,
-/// `correction_provenance` (`"lawley_lr_estimated_lambda"` |
-/// `"lawley_lr_fixed_lambda"` | `"none"`), and exactly one of `p_value`,
+/// `statistic_lr`, `ref_df`, `bartlett_factor`, `statistic_corrected`,
+/// `p_value_uncorrected`, `p_value_corrected`, `correction_provenance`
+/// (`"lawley_lr_fixed_lambda"` | `"none"`), and exactly one of `p_value`,
 /// `p_value_upper_bound` or `unavailable_reason` (with `unavailable_message`).
 /// Every row carries every key.
 ///
@@ -4458,13 +4456,43 @@ fn py_list_append_json_number(list: &Bound<'_, PyList>, value: serde_json::Numbe
     }
 }
 
+/// Marshalling for [`gam::inference::shared_precision::shared_precision_updates`]
+/// (#3523): `request_json` is `{"models": [key per model], "groups": [...]}`.
 #[pyfunction]
 fn cross_fit_shared_precision_groups_json(
     py: Python<'_>,
+    models: Vec<PyRef<'_, PyFittedModel>>,
     request_json: String,
 ) -> PyResult<String> {
+    let models = models
+        .iter()
+        .map(|model| Arc::clone(&model.model))
+        .collect::<Vec<_>>();
     detach_py_result(py, "cross_fit_shared_precision_groups_json", move || {
-        cross_fit_shared_precision_groups_json_impl(&request_json)
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            models: Vec<serde_json::Value>,
+            groups: Vec<gam::inference::shared_precision::SharedPrecisionGroup>,
+        }
+        let request: Request = serde_json::from_str(&request_json)
+            .map_err(|err| format!("failed to parse shared precision request json: {err}"))?;
+        if request.models.len() != models.len() {
+            return Err(format!(
+                "shared precision request names {} model key(s) for {} model(s)",
+                request.models.len(),
+                models.len()
+            ));
+        }
+        let fits = request
+            .models
+            .into_iter()
+            .zip(models.iter().map(|model| &**model))
+            .collect::<Vec<_>>();
+        let updates =
+            gam::inference::shared_precision::shared_precision_updates(&fits, &request.groups)?;
+        serde_json::to_string(&updates)
+            .map_err(|err| format!("failed to serialize shared precision result: {err}"))
     })
 }
 
@@ -4649,13 +4677,12 @@ fn survival_concordance(
         )));
     }
     // Delegate to the single source of truth for Harrell's C-index in
-    // gam-models (`survival::predict::harrell_concordance`). The core counts
-    // tied event times as a comparable half-credit pair and returns None when
-    // there are no comparable pairs at all (e.g. every row censored); the old
-    // hand-rolled pair loop here dropped tied-time pairs entirely and returned
-    // a silent 0.5 sentinel. Where the two disagreed the core wins — a None
-    // degenerate result is surfaced as Python None, matching how the
-    // neighboring metric pyfunctions report an undefined score.
+    // gam-models (`survival::predict::harrell_concordance`), which applies the
+    // standard pair rules (tied events are not comparable; an event tied with a
+    // censoring is, the censored subject being the survivor) and returns None
+    // when the score is undefined (no comparable pair, or a non-finite input).
+    // None is surfaced as Python None, matching how the neighboring metric
+    // pyfunctions report an undefined score.
     Ok(gam::families::survival::predict::harrell_concordance(
         &event_times,
         &events,
@@ -4690,53 +4717,9 @@ fn survival_null_curve_from_train<'py>(
             train_events.len()
         )));
     }
-    let curve = gam::families::survival::risk_calibration::km_curve_on_grid(
-        &train_times,
-        &train_events,
-        &grid,
-    );
+    let curve = gam::families::survival::predict::KaplanMeier::fit(&train_times, &train_events)
+        .on_grid(&grid);
     Ok(Array1::from_vec(curve).into_pyarray(py).unbind())
-}
-
-/// Thin wrapper over
-/// [`gam::families::survival::risk_calibration::cox_calibrated_survival_matrix`],
-/// which owns the univariate Cox fit and the Breslow baseline. pyffi only maps
-/// the core error into a Python exception.
-fn benchmark_survival_matrix_from_risk(
-    train_times: &[f64],
-    train_events: &[f64],
-    train_risk: &[f64],
-    test_risk: &[f64],
-    grid: &[f64],
-) -> PyResult<Array2<f64>> {
-    gam::families::survival::risk_calibration::cox_calibrated_survival_matrix(
-        train_times,
-        train_events,
-        train_risk,
-        test_risk,
-        grid,
-    )
-    .map_err(PyValueError::new_err)
-}
-
-#[pyfunction]
-fn survival_matrix_from_risk_calibration<'py>(
-    py: Python<'py>,
-    train_times: Vec<f64>,
-    train_events: Vec<f64>,
-    train_risk: Vec<f64>,
-    test_risk: Vec<f64>,
-    grid: Vec<f64>,
-) -> PyResult<Py<PyArray2<f64>>> {
-    Ok(benchmark_survival_matrix_from_risk(
-        &train_times,
-        &train_events,
-        &train_risk,
-        &test_risk,
-        &grid,
-    )?
-    .into_pyarray(py)
-    .unbind())
 }
 
 #[pyfunction(signature = (event_times, events, grid, survival_matrix, null_survival_matrix = None))]

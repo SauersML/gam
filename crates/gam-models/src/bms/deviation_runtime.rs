@@ -26,13 +26,15 @@ fn validate_breakpoints(breakpoints: &[f64], label: &str) -> Result<(), String> 
 
 /// Deduplicate an ordered BMS knot sequence into strictly increasing
 /// breakpoints.
+///
+/// A repeated knot is a stored copy of the same value, and the B-spline basis
+/// opens a span between any two knots that differ at all. So a knot is merged
+/// only when it equals its predecessor exactly; a tolerance would merge a real
+/// span the basis still has.
 fn breakpoints_from_knots(knots: &[f64], label: &str) -> Result<Vec<f64>, String> {
     let mut breakpoints = Vec::new();
     for &knot in knots {
-        if breakpoints
-            .last()
-            .is_none_or(|prev: &f64| (knot - *prev).abs() > 1e-12)
-        {
+        if breakpoints.last().is_none_or(|prev: &f64| knot != *prev) {
             breakpoints.push(knot);
         }
     }
@@ -1587,5 +1589,20 @@ impl DeviationRuntime {
             }
             .into())
         }
+    }
+}
+
+#[cfg(test)]
+mod breakpoint_tests {
+    use super::breakpoints_from_knots;
+
+    #[test]
+    fn breakpoints_merge_only_exactly_repeated_knots_2469() {
+        // 0.25 + 2⁻⁵⁰ is a distinct knot the basis opens a span at, closer to
+        // 0.25 than any fixed tolerance would allow; exact repeats collapse.
+        let near = 0.25 + 2.0_f64.powi(-50);
+        let knots = [0.0, 0.0, 0.25, 0.25, near, 1.0, 1.0];
+        let breakpoints = breakpoints_from_knots(&knots, "test").unwrap();
+        assert_eq!(breakpoints, vec![0.0, 0.25, near, 1.0]);
     }
 }

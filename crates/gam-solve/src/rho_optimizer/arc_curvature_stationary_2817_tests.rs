@@ -1538,67 +1538,91 @@ fn a_crawl_the_evaluations_band_resolves_is_never_stalled_3018() {
 
 // ─── an unprogressing fixed-point walk stops ─────────────────────────────────
 
-/// A fixed-point walk caught in a limit cycle stops when its second window
-/// fills (#2817).
+/// A fixed-point walk caught in a limit cycle stops at its first evaluation
+/// that buys nothing (#2817, #3176).
 ///
-/// The map alternates between two points and never improves on the first
-/// value, so nothing after the first evaluation buys anything. The first filled
-/// window is licensed. The second bought no resolved improvement and did not
-/// contract the step at the incumbent, so the walk stops there. Before, a
-/// cycling walk ran until its iteration count ran out.
+/// The map alternates between two points, so its step norm is the constant
+/// distance between them and it never improves on the first value. The first
+/// evaluation sets the incumbent; the second neither improves on it beyond the
+/// two values' rounding nor contracts the step, so the walk stops there.
+/// Before, a cycling walk ran two 6-evaluation windows first, and before that
+/// until its iteration count ran out.
 #[test]
-fn a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817() {
-    let mut progress = FixedPointProgress::new(RESOLUTION_2817, COST_STALL_WINDOW);
-    let stop = 2 * COST_STALL_WINDOW;
-    for index in 0..=stop {
-        let value = if index % 2 == 0 {
-            COST_2817
-        } else {
-            COST_2817 + 1.0
-        };
-        let stopped = progress.observe(value, 0.5);
-        assert_eq!(
-            stopped,
-            index == stop,
-            "evaluation {index}: the walk must stop exactly when its second window fills"
-        );
-    }
+fn a_limit_cycling_fixed_point_walk_stops_at_its_first_unprogressing_evaluation_2817() {
+    let mut progress = FixedPointProgress::new();
+    assert!(
+        !progress.observe(COST_2817, 0.5),
+        "the first evaluation sets the incumbent"
+    );
+    assert!(
+        progress.observe(COST_2817 + 1.0, 0.5),
+        "the cycle's second point bought neither improvement nor contraction"
+    );
 }
 
-/// NEGATIVE CONTROL: no resolved improvement between the windows, but the step
-/// at the incumbent halved. The walk is converging, so it keeps walking.
+/// NEGATIVE CONTROL: no evaluation improves the incumbent, but every step is
+/// shorter than the one before it. The map is contracting, so the walk keeps
+/// walking.
 ///
-/// Each evaluation improves by `1e-6`, below the resolution `1e-4`, so every
-/// one counts toward the window while the incumbent still moves and carries the
-/// step of the point that set it.
+/// Once the step stops contracting, a value one ulp below the incumbent does
+/// not carry the walk: at `|V| = 1e3` one ulp is `1.1e-13`, inside the two
+/// values' rounding `γ₁|V_best| + γ₁|V| ≈ 2.2e-13`, so it is no resolved
+/// improvement and the walk stops.
 #[test]
 fn a_fixed_point_walk_whose_step_contracted_keeps_walking_2817() {
-    let mut progress = FixedPointProgress::new(RESOLUTION_2817, COST_STALL_WINDOW);
-    for index in 0..=(2 * COST_STALL_WINDOW + 1) {
-        let step_norm = if index <= COST_STALL_WINDOW { 0.5 } else { 0.25 };
-        let stopped = progress.observe(COST_2817 - 1.0e-6 * index as f64, step_norm);
+    let mut progress = FixedPointProgress::new();
+    for index in 0..40 {
+        let step_norm = 0.5 * 0.5_f64.powi(index);
+        let stopped = progress.observe(COST_2817, step_norm);
         assert!(
             !stopped,
-            "evaluation {index}: a walk whose incumbent step halved must keep walking"
+            "evaluation {index}: a walk whose step contracts must keep walking"
         );
     }
+    let one_ulp_below = f64::from_bits(COST_2817.to_bits() - 1);
+    assert!(one_ulp_below < COST_2817);
+    assert!(
+        progress.observe(one_ulp_below, 0.5),
+        "once the step stops contracting with no resolved improvement, the walk stops"
+    );
 }
 
-/// NEGATIVE CONTROL: the incumbent improved by 10000 resolutions between the two
-/// windows, which licenses the second.
+/// NEGATIVE CONTROL: every evaluation improves the incumbent by a whole unit
+/// at a constant step, so the walk keeps walking.
 #[test]
 fn a_fixed_point_walk_that_bought_resolved_improvement_keeps_walking_2817() {
-    let mut progress = FixedPointProgress::new(RESOLUTION_2817, COST_STALL_WINDOW);
-    for index in 0..=(2 * COST_STALL_WINDOW + 1) {
-        let value = if index <= COST_STALL_WINDOW {
-            COST_2817
-        } else {
-            COST_2817 - 1.0
-        };
-        let stopped = progress.observe(value, 0.5);
+    let mut progress = FixedPointProgress::new();
+    for index in 0..40 {
+        let stopped = progress.observe(COST_2817 - f64::from(index), 0.5);
         assert!(
             !stopped,
             "evaluation {index}: a walk that bought a resolved improvement must keep walking"
+        );
+    }
+}
+
+/// An improvement smaller than the criterion's statistical resolution `τ`, but
+/// far beyond its values' rounding, is progress (#3176).
+///
+/// `τ = 1/(2n)` is the certificate's decrement tolerance: how much decrease may
+/// be left at a certified point. It is not the arithmetic error of one value.
+/// At `n = 80`, `τ = 6.25e-3`; a walk at `V ≈ 100` improving by `1e-3` per
+/// evaluation at a constant step is still descending by about `10¹¹` times its
+/// values' rounding. Charging each value `τ` stopped it at its second
+/// evaluation (`1e-3 < 2τ` and no contraction); charging each value its own
+/// rounding `γ₁|V|` keeps it walking.
+#[test]
+fn a_fixed_point_walk_improving_below_tau_but_above_rounding_keeps_walking_3176() {
+    let tau = 0.5 / 80.0;
+    let improvement = 1.0e-3;
+    assert!(improvement < 2.0 * tau, "the separating case improves by less than 2τ");
+    let mut progress = FixedPointProgress::new();
+    for index in 0..40 {
+        let stopped = progress.observe(100.0 - improvement * f64::from(index), 0.5);
+        assert!(
+            !stopped,
+            "evaluation {index}: a walk improving by {improvement:e} per step, above its \
+             values' rounding, must keep walking"
         );
     }
 }
@@ -1789,4 +1813,113 @@ fn the_census_separates_a_crawl_from_a_thrash_2735() {
 #[test]
 fn a_census_with_no_observed_step_describes_nothing_2735() {
     assert!(OuterStepCensus::default().describe().is_none());
+}
+
+/// The criterion value the no-size fixture sits at, large enough that its own
+/// representation band `γ₁·|V| ≈ 1.1e-5` puts the flipping gradient above the
+/// claim band [`CLAIM_BAND_2817`], so the stall is the guard's cost verdict and not
+/// its stationary claim.
+const COST_3286: f64 = 1.0e11;
+
+/// A ROUTE THAT DECLARES NO SIZE STILL STOPS, AT ITS ARITHMETIC RESOLUTION
+/// (#3286). With no observation count the criterion has no statistical slack,
+/// `τ_stat = 0`, and the online stop decides at the band of the value it
+/// evaluated: with no evidence published, `γ₁·|V|`. Reading the bare `0` there
+/// switched the stop off, and a no-size ARC search ran on to its reject floor
+/// (#3286's `100·eʳ − 1e5·ρ`). The decrement flips the verdict where it crosses
+/// that band, 1% either side, as it crosses `τ_stat` on a sized route
+/// (`the_adjudication_threshold_is_the_criterion_resolution_2817`).
+#[test]
+fn a_route_that_declares_no_size_stops_at_its_arithmetic_resolution_3286() {
+    let band = crate::rho_optimizer::decrement_bands::value_representation_band(COST_3286);
+    let critical = (2.0 * band * (1.0 + f64::EPSILON.sqrt())).sqrt();
+    assert!(
+        critical > CLAIM_BAND_2817,
+        "fixture premise: the flipping gradient {critical:.3e} must sit above the claim band"
+    );
+    let flat = |gradient: f64| {
+        (0..FIRST_STALL_2817)
+            .map(|_| (COST_3286, array![gradient]))
+            .collect::<Vec<_>>()
+    };
+    let (inside, _) = drive_arc_oracle_2817(
+        array![0.5],
+        flat(critical * 0.99),
+        array![[1.0]],
+        wide_box_2817(1),
+        Some(0.0),
+    );
+    assert_eq!(
+        inside.last().expect("ran").clone().err().as_deref(),
+        Some(ARC_CURVATURE_STATIONARY_SENTINEL),
+        "a decrement 1% inside the value's own band {band:.3e} must end the stall on a route \
+         with no declared size"
+    );
+    let (outside, _) = drive_arc_oracle_2817(
+        array![0.5],
+        flat(critical * 1.01),
+        array![[1.0]],
+        wide_box_2817(1),
+        Some(0.0),
+    );
+    assert!(
+        outside.iter().all(|o| o.is_ok()),
+        "a decrement 1% outside the value's own band must not end the stall: {outside:?}"
+    );
+}
+
+/// ONE RESOLUTION, BOTH ARMS (#3286, #3192). The online stop decides the decrease
+/// left at `outer_resolution(τ, b) = max(τ − b, b)`, with `b` the band the
+/// evaluated value's own evidence forms: `τ − b` while the band is small against
+/// `τ`, and `b` itself once it exceeds `τ/2`, where the arithmetic cannot resolve
+/// the statistical standard. The same fixture with the band on either side of
+/// `τ/2` flips its stop where the decrement crosses each arm, 1% either side.
+#[test]
+fn the_online_stop_decides_on_both_arms_of_the_one_resolution_3286() {
+    use crate::estimate::outer_eval_capture as capture;
+    use crate::rho_optimizer::decrement_bands::{outer_resolution, value_representation_band};
+    let config = claim_band_config_2817(CLAIM_BAND_2817);
+    let stop = |inner_residual: f64, gradient: f64| {
+        let evidence = capture::CertificateEvidence {
+            inner_residual: Some(capture::InnerResidualCharge {
+                energy: inner_residual,
+                source: capture::InnerResidualSource::InnerGradient,
+            }),
+            ..capture::CertificateEvidence::default()
+        };
+        let samples = flatlined_2817(array![gradient], FIRST_STALL_2817);
+        let (outcomes, _) = drive_arc_oracle_publishing_2817(
+            vec![array![0.5]; samples.len()],
+            samples,
+            array![[1.0]],
+            wide_box_2817(1),
+            Some(RESOLUTION_2817),
+            |_| COST_2817,
+            Some((&config, evidence)),
+        );
+        outcomes.last().expect("ran").clone().err().as_deref()
+            == Some(ARC_CURVATURE_STATIONARY_SENTINEL)
+    };
+    for (arm, inner_residual) in [("τ − b", 1.0e-6), ("b", 0.8 * RESOLUTION_2817)] {
+        let band = value_representation_band(COST_2817) + inner_residual;
+        let resolution = outer_resolution(RESOLUTION_2817, band);
+        let expected = if band < 0.5 * RESOLUTION_2817 {
+            RESOLUTION_2817 - band
+        } else {
+            band
+        };
+        assert_eq!(
+            resolution, expected,
+            "fixture premise: the {arm} arm decides"
+        );
+        let critical = (2.0 * resolution * (1.0 + f64::EPSILON.sqrt())).sqrt();
+        assert!(
+            stop(inner_residual, critical * 0.99),
+            "a decrement 1% inside the {arm} arm {resolution:.3e} must end the stall"
+        );
+        assert!(
+            !stop(inner_residual, critical * 1.01),
+            "a decrement 1% outside the {arm} arm {resolution:.3e} must not end the stall"
+        );
+    }
 }

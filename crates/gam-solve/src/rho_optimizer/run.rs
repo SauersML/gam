@@ -250,20 +250,6 @@ pub(crate) struct OuterConfig {
     pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
     pub(crate) operator_initial_trust_radius: Option<f64>,
     pub(crate) arc_initial_regularization: Option<f64>,
-    /// BFGS line-search infinity-norm cap applied to the leading `rho_dim`
-    /// outer parameters (log-λ axes). Documented natural step for
-    /// `log(lambda)` is ≈ 5 (`e^5 ≈ 148`-fold smoothing-parameter change
-    /// per accepted outer iter — matches typical quasi-Newton direction
-    /// magnitude on flat REML surfaces). Setting this `None` disables the
-    /// rho-axis cap entirely.
-    pub(crate) bfgs_step_cap: Option<f64>,
-    /// BFGS line-search infinity-norm cap applied to the trailing `psi_dim`
-    /// outer parameters (kappa / aniso-log-scale axes). Required because
-    /// the kernel scale axes need much tighter control (`e^1 ≈ 2.7`-fold
-    /// per iter is plenty) — using the rho-axis cap here lets the optimizer
-    /// jump kappa by orders of magnitude per step and oscillate. Setting
-    /// this `None` disables the psi-axis cap.
-    pub(crate) bfgs_step_cap_psi: Option<f64>,
     /// Optional persistent-cache session. When `Some`, every finite objective
     /// evaluation is written through to disk (rate-limited, atomic-rename)
     /// and the best on-disk rho is prepended as a seed at the start of each
@@ -393,7 +379,9 @@ pub(crate) struct OuterConfig {
 ///   stuck-stall escapes, license another filled cost-stall window only after
 ///   resolved descent or a smaller incumbent residual
 ///   (`CostStallGuard::license_continuation`).
-/// - The fixed-point and per-atom walks carry `FixedPointProgress`.
+/// - The fixed-point and per-atom walks carry `FixedPointProgress`, which
+///   stops at an evaluation that buys neither a resolved improvement nor a
+///   contraction of its step (#3176).
 /// - The device BFGS walk carries opt's native cost stall.
 ///
 /// A stationary point stops on the certificate's own rungs. The 200-iteration
@@ -422,8 +410,6 @@ impl Default for OuterConfig {
             outer_inner_cap: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
-            bfgs_step_cap: None,
-            bfgs_step_cap_psi: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
             problem_size: OuterProblemSize::default(),
@@ -470,8 +456,6 @@ pub struct OuterProblem {
     outer_inner_cap: Option<InnerProgressFeedback>,
     operator_initial_trust_radius: Option<f64>,
     arc_initial_regularization: Option<f64>,
-    bfgs_step_cap: Option<f64>,
-    bfgs_step_cap_psi: Option<f64>,
     cache_session: Option<Arc<CacheSession>>,
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
     problem_size: OuterProblemSize,
@@ -514,8 +498,6 @@ impl OuterProblem {
             outer_inner_cap: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
-            bfgs_step_cap: None,
-            bfgs_step_cap_psi: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
             problem_size: OuterProblemSize::default(),
@@ -566,8 +548,7 @@ impl OuterProblem {
     // 3-coordinate measure-jet ψ group (s, α, ln τ) — `psi_dim` is generic,
     // `with_bounds` carries the s ∈ (0, 2) box (the same convention matern κ
     // uses for its log-κ window; no logistic reparameterization exists or is
-    // needed in-house), `with_bfgs_step_cap_psi` caps per-iteration ψ moves,
-    // and `DirectionalHyperParam::new_compact` (solver/reml/mod.rs) carries
+    // needed in-house), and `DirectionalHyperParam::new_compact` (solver/reml/mod.rs) carries
     // penalty-only first/second/cross jets with `is_penalty_like`
     // auto-derived from the identically-zero design drift (∂X/∂ψ ≡ 0).
     // Every remaining registration arm is formula-layer dispatch in
@@ -601,6 +582,10 @@ impl OuterProblem {
     pub fn with_max_iter(mut self, n: usize) -> Self {
         self.max_iter = n;
         self
+    }
+    /// The outer iteration budget this problem declares.
+    pub fn max_iter(&self) -> usize {
+        self.max_iter
     }
     pub fn with_bounds(mut self, lo: Array1<f64>, hi: Array1<f64>) -> Self {
         self.bounds = Some((lo, hi));
@@ -764,30 +749,6 @@ impl OuterProblem {
         self
     }
 
-    /// Cap the infinity-norm displacement of BFGS cost-only line-search probes
-    /// on the **rho axes** (the first `n_params - psi_dim` outer parameters,
-    /// = log-λ). Also scales the initial inverse metric so the first trial
-    /// direction respects the same local budget coordinate-wise. Documented
-    /// natural step on log-λ is ≈ 5; tighter values throttle BFGS and starve
-    /// convergence on flat REML valleys.
-    pub fn with_bfgs_step_cap(mut self, cap: Option<f64>) -> Self {
-        self.bfgs_step_cap = cap.filter(|v| v.is_finite() && *v > 0.0);
-        self
-    }
-
-    /// Cap the infinity-norm displacement of BFGS cost-only line-search probes
-    /// on the **psi axes** (the trailing `psi_dim` outer parameters, = kappa
-    /// or anisotropic log-scales). Mirrors [`Self::with_bfgs_step_cap`] but
-    /// scoped to kernel-scale parameters whose natural step is much smaller
-    /// than log-λ (≈ ln 2 per iter keeps kappa from oscillating). Without
-    /// this split, a uniform rho-scale cap lets psi explode while a uniform
-    /// psi-scale cap throttles rho — both fail the survival-marginal-slope
-    /// path at large scale, where rho needs |d|≈5 while psi wants |d|≤1.
-    pub fn with_bfgs_step_cap_psi(mut self, cap: Option<f64>) -> Self {
-        self.bfgs_step_cap_psi = cap.filter(|v| v.is_finite() && *v > 0.0);
-        self
-    }
-
     pub fn with_cache_session(mut self, session: Arc<CacheSession>) -> Self {
         self.cache_session = Some(session);
         self
@@ -869,8 +830,6 @@ impl OuterProblem {
             outer_inner_cap: self.outer_inner_cap.clone(),
             operator_initial_trust_radius: self.operator_initial_trust_radius,
             arc_initial_regularization: self.arc_initial_regularization,
-            bfgs_step_cap: self.bfgs_step_cap,
-            bfgs_step_cap_psi: self.bfgs_step_cap_psi,
             cache_session: self.cache_session.clone(),
             cache_mirror_sessions: self.cache_mirror_sessions.clone(),
             problem_size: self.problem_size,
@@ -1562,12 +1521,6 @@ pub struct OuterResult {
     /// Final value and gradient when the solver is gradient-based, with the ρ
     /// they were measured at.
     pub final_measurement: Option<OuterFirstOrderMeasurement>,
-    /// The measurement a certificate pass displaced from `final_measurement`
-    /// when it re-measured this ρ. A later pass at the same ρ re-measures from
-    /// the same reset state and replays the earlier pass bit for bit, so without
-    /// this record it would hold two copies of one measurement and never the
-    /// independent one the solver took.
-    pub displaced_measurement: Option<OuterFirstOrderMeasurement>,
     /// Final Hessian when the solver tracks one.
     pub final_hessian: Option<Array2<f64>>,
     /// Single authoritative termination lifecycle. Private so downstream
@@ -1743,7 +1696,6 @@ impl OuterResult {
             iterations,
             final_grad_norm: None,
             final_measurement: None,
-            displaced_measurement: None,
             final_hessian: None,
             termination: OuterTermination::from_solver_claim(solver_claimed_convergence),
             plan_used,
@@ -2611,7 +2563,7 @@ pub(crate) fn adjudicate_negative_curvature(
     //
     // is therefore the exact end of the claim's FALSIFIABLE RANGE — derived
     // from the eigenvalue in dispute and the same criterion resolution
-    // (`outer_criterion_resolution`) the rail and cost-stall machinery already use, with no
+    // (`decrement_bands::outer_resolution`) the rail and cost-stall machinery already use, with no
     // constant chosen here. Probing from `1` down to it and finding no descent
     // in either sign is a measurement of the criterion that contradicts the
     // matrix; stopping earlier would only have been a statement about the
@@ -3092,9 +3044,6 @@ pub(crate) enum StationarityBoundSource {
     /// `|Pg|·√(τ/Δpred)` = `√(2·h·τ)` (#2253/#2249/#2015/#2091) -- the only rung
     /// with a derivation from the criterion's own resolution.
     CurvatureResolvability,
-    /// Twice the same-ρ spread between the run-recorded and certificate-time
-    /// gradients (#2299): the measuring instrument's demonstrated noise.
-    GradientReproducibility,
     /// `config.tolerance` judged against the EFS/fixed-point route's
     /// normalized residual `‖(θ⁺−θ)/scale‖_∞` -- not against a gradient norm
     /// at all. The route has no ladder: it exposes no analytic gradient, so
@@ -3148,7 +3097,6 @@ impl StationarityBoundSource {
             Self::CoordinateBand => "coordinate-band",
             Self::ArithmeticLimited => "arithmetic-limited",
             Self::CurvatureResolvability => "curvature-resolvability",
-            Self::GradientReproducibility => "gradient-reproducibility",
             Self::FixedPointResidual => "fixed-point-residual",
             Self::CallerRequirement => "caller-requirement",
             Self::NewtonDecrement => "newton-decrement",
@@ -3652,7 +3600,6 @@ fn certify_fixed_point_optimality(
     result.final_value = evaluation.cost;
     result.final_grad_norm = None;
     result.final_measurement = None;
-    result.displaced_measurement = None;
     result.final_hessian = None;
 
     let certificate = OuterCriterionCertificate {
@@ -4001,6 +3948,15 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             StationarityStandard::NoComparison,
         )
     })?;
+    // The criterion's resolution at the certified value (#3286): its statistical
+    // resolution less the value's own band, or on a route that declares no size, that
+    // band itself. Every rung below that compares a decrease with the criterion's
+    // resolution reads this one number, and a comparison of two values charges both
+    // values' bands.
+    let tau_stat = outer_criterion_resolution(config);
+    let point_band =
+        super::decrement_bands::outer_value_band(config, evaluation.cost, Some(&terminal_evidence));
+    let point_resolution = super::decrement_bands::outer_resolution(tau_stat, point_band);
 
     let analytic_lane_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
     if !analytic_lane_inner_converged {
@@ -4179,32 +4135,12 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         ),
     )?;
 
-    // The optimizer's own recorded best-iterate evidence, captured before the
-    // fresh certificate-time measurement overwrites it below. When it was taken
-    // at this ρ, it and `evaluation` are TWO independent measurements of the
-    // objective at one point — the raw material for the gradient-reproducibility
-    // floor further down, at zero additional objective evaluations.
-    let run_recorded = result.final_measurement.take();
-    // A previous certificate pass at this ρ (screening, before this mint)
-    // replaced the solver's measurement with its own reset re-measurement, which
-    // this pass's evaluation replays bit for bit. The measurement it displaced is
-    // the independent one.
-    let displaced = result
-        .displaced_measurement
-        .take()
-        .filter(|measurement| measurement.is_at(&result.rho));
-
     // Install measured first-order evidence before any fallible curvature
     // processing. If curvature is malformed, the retained resume checkpoint
     // still carries the exact value/gradient that caused certification to stop.
     result.final_value = evaluation.cost;
     result.final_grad_norm = Some(projected_grad_norm);
     result.record_measurement_at_rho(evaluation.cost, evaluation.gradient);
-    result.displaced_measurement = displaced.clone().or_else(|| {
-        run_recorded
-            .clone()
-            .filter(|measurement| measurement.is_at(&result.rho))
-    });
 
     // #2596 — a pass that spends LESS evidence must not produce a STRONGER
     // refusal than the pass that mints.
@@ -4475,7 +4411,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         && let Some(predicted_decrease) = newton_predicted_decrease_at_resolution(
             hessian,
             &projected_gradient,
-            criterion_curvature_resolution(outer_criterion_resolution(config)),
+            criterion_curvature_resolution(point_resolution),
         )
         && predicted_decrease.is_finite()
         && predicted_decrease > 0.0
@@ -4483,7 +4419,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         // The criterion's resolution, the SAME one the cost-stall guard declares
         // the criterion stalled at (run_plan.rs), so certification asserts
         // nothing tighter than the loop already proved about this surface.
-        let objective_tol = outer_criterion_resolution(config);
+        let objective_tol = point_resolution;
         let curvature_grad_bound =
             projected_grad_norm * (objective_tol / predicted_decrease).sqrt();
         if curvature_grad_bound.is_finite() && curvature_grad_bound > stationarity_bound {
@@ -4525,97 +4461,6 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             bound_source,
         };
         return super::newton_polish::polish_the_mint(obj, config, context, result, inputs);
-    }
-
-    // Gradient-reproducibility floor (#2299 fully-saturated smooth). A
-    // stationarity certificate cannot resolve below the reproducibility of its
-    // own measuring instrument: at a rail-adjacent optimum (λ ~ 1e12, the term
-    // collapsed onto its penalty null space, edf saturated) the analytic
-    // gradient is a difference of enormous canceling log-det terms whose
-    // evaluation drifts run to run, so |Pg| measures round-off, not slope —
-    // observed as the SAME ρ returning |g| ∈ {2.5e-3 … 4.5e-2} across
-    // consecutive evaluations while the objective stays flat to 1e-7.
-    //
-    // The certifier may already hold TWO independent measurements at this ρ:
-    // the optimizer's recorded best-iterate measurement (`run_recorded`) and
-    // the fresh certificate-time `evaluation` — so the instrument's
-    // demonstrated noise costs ZERO additional objective evaluations (scripted
-    // test objectives keep their exact call counts). A REAL residual gradient
-    // reproduces (spread ≈ 0, no widening — genuine descent can never be
-    // masked, and a deterministic objective yields bit-identical pairs), while
-    // cancellation noise decorrelates (spread ~ |Pg|). The widening is gated
-    // on the recorded measurement having been taken at exactly this ρ, and on
-    // the two measurements' objective VALUES agreeing to the same relative
-    // floor the cost-stall guard uses; the PSD gate below is unchanged.
-    //
-    // #2953: the point gate is what makes the spread a measure of noise. The
-    // gradients of two DIFFERENT points differ by the slope between them, and
-    // on a deterministic objective that is the only way the spread can be
-    // nonzero, so without the gate the floor widened exactly where the
-    // criterion was not flat.
-    //
-    // A decrement verdict is not widened here (#2954): measured gradient noise can
-    // only make its decrement unresolvable, never make a resolvable decrease
-    // stationary.
-    if decrement_decided.is_none()
-        && projected_grad_norm > stationarity_bound
-        && let Some(prior) = run_recorded.as_ref()
-        && !prior.is_at(&result.rho)
-    {
-        log::debug!(
-            "[CERTIFICATE] {context}: gradient-reproducibility floor not applied: the \
-             run-recorded measurement was taken at rho={:?}, not at the certified rho={:?} \
-             (#2953)",
-            prior.rho().to_vec(),
-            result.rho.to_vec(),
-        );
-    }
-    //
-    // A mint that follows a screening pass at this ρ holds the screening's reset
-    // re-measurement as `run_recorded`, a bit-for-bit replay of its own
-    // evaluation, so the solver's measurement that screening displaced is
-    // weighed too. Otherwise the mint refuses on a spread of exactly zero a
-    // point the screening certified on the solver's evidence at the same ρ.
-    for prior in run_recorded.iter().chain(displaced.iter()) {
-        if decrement_decided.is_some()
-            || projected_grad_norm <= stationarity_bound
-            || !prior.is_at(&result.rho)
-            || layout
-                .validate_gradient_len(prior.gradient(), "outer run-recorded gradient")
-                .is_err()
-            || !prior.gradient().iter().all(|value| value.is_finite())
-            || !prior.value().is_finite()
-        {
-            continue;
-        }
-        const GRADIENT_REPRODUCIBILITY_WIDENING: f64 = 2.0;
-        let objective_tol = outer_criterion_resolution(config);
-        let cost_drift = (prior.value() - evaluation.cost).abs();
-        let prior_projected = project_gradient_vector(
-            &result.rho,
-            prior.gradient(),
-            Some(&rail_projection_bounds),
-        );
-        let spread = (&prior_projected - &projected_gradient)
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
-        let repro_bound = GRADIENT_REPRODUCIBILITY_WIDENING * spread;
-        if cost_drift <= objective_tol
-            && repro_bound.is_finite()
-            && repro_bound > stationarity_bound
-            && projected_grad_norm <= repro_bound
-        {
-            log::debug!(
-                "[CERTIFICATE] {context}: gradient-reproducibility floor widened the \
-                 stationarity bound to {repro_bound:.3e} (|Pg|={projected_grad_norm:.3e}, \
-                 same-ρ spread between the run-recorded and certificate-time gradients \
-                 {spread:.3e}, cost drift {cost_drift:.3e} ≤ tol {objective_tol:.3e})"
-            );
-            stationarity_bound = repro_bound;
-            bound_source = StationarityBoundSource::GradientReproducibility;
-        }
     }
 
     // #2568 -- the caller's requirement caps the ladder's TOP, after every
@@ -4704,7 +4549,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // with outward pull (`grad_norm` above the stationarity bound) and an analytic
     // Hessian: a well-conditioned interior fit, or a coordinate merely resting near a
     // bound with a vanishing gradient, probes nothing and keeps its ordinary verdict.
-    let asymptote_objective_tol = outer_criterion_resolution(config);
+    let asymptote_objective_tol = point_resolution;
     let rail_outcome = match analytic_hessian.as_ref() {
         Some(hessian) if !certificate_railed.is_empty() && grad_norm > stationarity_bound => {
             Some(try_certify_asymptote_rail(
@@ -4839,8 +4684,15 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         let null_curvature_threshold = f64::EPSILON.sqrt() * max_diag.max(1.0);
         // The SAME criterion resolution the cost-stall guard and both widenings
         // above use: certification asserts nothing tighter about this surface's
-        // macroscopic flatness than the loop already proved.
-        let objective_tol = outer_criterion_resolution(config);
+        // macroscopic flatness than the loop already proved. Each probe compares two
+        // values, so its tolerance charges both bands (#3286).
+        let objective_tol = point_resolution;
+        let probe_tol = |probe: f64| {
+            super::decrement_bands::outer_resolution(
+                tau_stat,
+                point_band + super::decrement_bands::value_representation_band(probe),
+            )
+        };
         // One e-fold in log-λ per coordinate (ρ IS log-λ): the +δ/−δ pair spans e²
         // in λ, a macroscopic move across which no genuine descent slope can hide.
         const LARGE_STEP_DELTA: f64 = 1.0;
@@ -4874,7 +4726,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             }
             let up = (cost_plus - evaluation.cost).abs();
             let down = (cost_minus - evaluation.cost).abs();
-            if up <= objective_tol && down <= objective_tol {
+            if up <= probe_tol(cost_plus) && down <= probe_tol(cost_minus) {
                 saturated_flat.push(k);
                 probe_reports.push(format!(
                     "k={} |ΔV|+={up:.3e} |ΔV|-={down:.3e}",
@@ -7523,11 +7375,7 @@ pub(crate) fn is_per_atom_efs_frontier(cap: &OuterCapability) -> bool {
 /// Builds the same bounded seed and tolerance/budget the standard plan path
 /// uses, takes the same single derived start (initial-ρ if supplied, else the
 /// commensurate-curvature start — the per-atom fixed point is a contraction
-/// near the optimum), then drives the per-atom EFS loop. The shared-border
-/// topology defaults to disjoint (every atom owns a private penalty block — the
-/// common ARD-per-atom case); callers with a known arrow-border overlap can run
-/// the module's `run_per_atom_efs` directly with a populated
-/// `SharedBorderTopology`.
+/// near the optimum), then drives the per-atom EFS loop.
 ///
 /// Additive: this function neither mutates nor bypasses the dense path; it is
 /// the pre-dispatch shortcut [`run_outer`] calls before the dense ladder.
@@ -7568,14 +7416,11 @@ pub(crate) fn run_per_atom_efs_if_frontier(
         config.max_iter,
         lower,
         upper,
-        outer_criterion_resolution(config),
     );
-    let topology = crate::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
 
     obj.reset();
     install_matching_initial_inner_seed(obj, config, &seed, context)?;
-    let result =
-        crate::estimate::reml::per_atom_efs::run_per_atom_efs(obj, &seed, &pa_cfg, &topology)?;
+    let result = crate::estimate::reml::per_atom_efs::run_per_atom_efs(obj, &seed, &pa_cfg)?;
     Ok(Some(result.into_outer_result(the_plan)))
 }
 
@@ -7728,25 +7573,29 @@ pub(crate) fn fixed_point_step_resolution(config: &OuterConfig, n_params: usize)
     f64::EPSILON.sqrt() * (n_params.max(1) as f64).sqrt() * (1.0 + box_scale)
 }
 
-/// The criterion's resolution in its own absolute units: the statistical
-/// resolution `τ_stat = 1/(2n)` over the declared observations
+/// The criterion's statistical resolution in its own absolute units, `τ_stat =
+/// 1/(2n)` over the declared observations
 /// ([`OuterProblemSize::statistical_resolution`], C3).
 ///
-/// Every judgement of "the criterion cannot tell these apart" reads this one
-/// number: the cost-stall guard's no-improvement test where the evaluations
-/// carry no objective band, the ARC online stop and the matrix-free model
-/// decrement, the curvature-resolvability and gradient-reproducibility rungs,
-/// the asymptote-rail and large-step flatness certificates, and the
-/// negative-curvature adjudication's falsifiable range. A decrease below
+/// It is never a resolution by itself. Every test of the decrease left combines it
+/// with the band of the values it judges, through
+/// [`outer_resolution`](super::decrement_bands::outer_resolution) (#3286): the ARC
+/// online stop and the matrix-free model decrement, the curvature-resolvability
+/// rung, the asymptote-rail and large-step flatness certificates, and the
+/// negative-curvature adjudication's falsifiable range. One
+/// step's decrease is not the decrease left: the cost-stall guard's
+/// resolved-descent test charges each value its resolution
+/// ([`sample_resolution`](super::bridges::sample_resolution)), and the fixed-point
+/// walk each value its own rounding (#3176). A decrease below
 /// `τ_stat` moves no reported quantity by more than the `n^{-1/2}` sampling
 /// error the inference built on the optimum already carries; it does not move
 /// with the units of `y` or with an additive constant in `V`, which the
 /// `rel·(1 + |V|)` floor it replaces did, and it shrinks as `n` grows (#2954).
 ///
 /// `0.0` when the route declares no observation count: such a criterion has no
-/// statistical resolution, so nothing is waived as unresolvable — a tolerance
-/// test `x ≤ 0` passes only on exact equality and the rung it gates does not
-/// fire.
+/// statistical slack, so it decides at the arithmetic's own resolution, the
+/// compared values' bands. Read bare, the `0` resolved every difference and
+/// switched both of ARC's stops off (#3286).
 pub(crate) fn outer_criterion_resolution(config: &OuterConfig) -> f64 {
     config
         .problem_size
@@ -7760,7 +7609,8 @@ pub(crate) fn outer_criterion_resolution(config: &OuterConfig) -> f64 {
 pub(crate) const NEGATIVE_CURVATURE_LADDER_LARGEST_STEP: f64 = 1.0;
 
 /// The criterion's curvature resolution `2·τ` over its objective resolution
-/// `τ` ([`outer_criterion_resolution`]; #1082, #2817).
+/// `τ` at the evaluated value
+/// ([`outer_resolution`](super::decrement_bands::outer_resolution); #1082, #2817, #3286).
 ///
 /// Along an eigenvector of `λ < 0` at a stationary point the quadratic model
 /// predicts the decrease `½|λ|α²`. The largest step the negative-curvature
@@ -8060,27 +7910,6 @@ pub(crate) fn sanitized_operator_trust_restart_radius(radius: Option<f64>) -> Op
         .map(|value| value.max(OPERATOR_TRUST_RESTART_RADIUS_FLOOR))
 }
 
-pub(crate) fn bfgs_axis_step_caps(
-    config: &OuterConfig,
-    layout: OuterThetaLayout,
-) -> Option<Array1<f64>> {
-    if config.bfgs_step_cap.is_none() && config.bfgs_step_cap_psi.is_none() {
-        return None;
-    }
-    let mut caps = Array1::from_elem(layout.n_params, f64::INFINITY);
-    if let Some(cap) = config.bfgs_step_cap {
-        for i in 0..layout.rho_dim() {
-            caps[i] = cap;
-        }
-    }
-    if let Some(cap) = config.bfgs_step_cap_psi {
-        for i in layout.rho_dim()..layout.n_params {
-            caps[i] = cap;
-        }
-    }
-    Some(caps)
-}
-
 pub(crate) enum FixedPointOuterRunError {
     SeedRejected(ObjectiveEvalError),
     IterationRejected(FixedPointContinuationRequest),
@@ -8356,7 +8185,7 @@ pub(crate) fn run_fixed_point_outer_solver(
     // test, never stationarity (see the certificate after the walk), so a seed
     // that is already stationary is walked anyway: a smoothing parameter on its
     // rail keeps proposing an outward EFS step, and nothing short of the
-    // unprogressing-walk window ends it. On the ISLR `Default` logistic fit the
+    // unprogressing-walk stop ends it. On the ISLR `Default` logistic fit the
     // #784 corrected continuation starts from the certified Laplace optimum, which
     // is stationary under the correction too (the BFGS continuation later
     // certified it at zero iterations, |g| = 5.9e-6), yet the walk spent ~60
@@ -8396,12 +8225,11 @@ pub(crate) fn run_fixed_point_outer_solver(
         barrier_config,
         config,
         evaluated_inner_seed: Arc::clone(&evaluated_inner_seed),
-        consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::clone(&recurrent_incumbent_exit),
         // The same criterion resolution the gradient routes' cost-stall guard
         // uses, and its first-order window.
-        progress: FixedPointProgress::new(outer_criterion_resolution(config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(),
         unprogressing_exit: Arc::clone(&unprogressing_exit),
     };
     let seed_sample = match objective.eval_step(seed) {
@@ -8490,11 +8318,12 @@ pub(crate) fn run_fixed_point_outer_solver(
                 };
                 return Ok(result);
             }
-            // The bridge stopped a walk that bought nothing since its previous
-            // window (#2817). That is no convergence claim: the best iterate the
+            // The bridge stopped a walk at an evaluation that bought neither a
+            // resolved improvement nor a contraction of its step (#2817, #3176).
+            // That is no convergence claim: the best iterate the
             // walk evaluated is the point it leaves behind. It is judged below
             // exactly as a step-norm stop is, because an unprogressing EFS walk
-            // is the same failure one window later: the ratio-of-traces map has
+            // is the same failure: the ratio-of-traces map has
             // stopped moving the criterion, which says nothing about the
             // gradient. On the K=1 generated-seed circle (#2153) the walk
             // stalled 32 iterations in at |g| = 7.3e-3, and publishing that
