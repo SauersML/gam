@@ -96,6 +96,7 @@ def test_linear_gaussian_deviance_explained_is_the_fits_r_squared():
         1.0 - (rss / (n - summary.edf_total)) / (tss / (n - 1)), rel=1e-12
     )
     assert summary.parametric_statistic == "t"
+    assert summary.parametric_term_statistic == "F"
     assert [row["name"] for row in summary.parametric_terms] == ["Intercept", "x1"]
 
 
@@ -119,6 +120,7 @@ def test_poisson_null_deviance_is_the_intercept_only_deviance():
     # its variance-component score statistic, referred to its own law.
     assert summary.adjusted_r_squared is None
     assert summary.parametric_statistic == "z"
+    assert summary.parametric_term_statistic == "Chi.sq"
     (smooth,) = summary.smooth_terms
     assert "statistic" not in smooth
     assert smooth["chi_sq"] > 0.0

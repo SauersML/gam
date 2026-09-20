@@ -64,6 +64,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "coefficients",
     "parametric_statistic",
     "parametric_terms",
+    "parametric_term_statistic",
     "parametric_term_tests",
     "parametric_terms_unavailable",
     "smooth_terms",
@@ -294,12 +295,16 @@ class Summary:
         ``std_error`` is the estimate's sampling SD under the null with the
         ridge prior's own variance removed, which is what the Wald statistic
         is scaled by.
+    parametric_term_statistic : str or None
+        The reference of :attr:`parametric_term_tests`: ``"F"`` (on ``df``
+        and the residual degrees of freedom) when the scale is estimated,
+        ``"Chi.sq"`` (on ``df``) when it is known.
     parametric_term_tests : list of dict
         One joint Wald test per parametric term (not the intercept), with
         ``name``, ``df``, ``statistic``, ``p_value`` and, when withheld,
         ``p_value_unavailable``. A factor with ``L`` levels is tested once on
         ``L - 1`` degrees of freedom; ``statistic`` is referred to the
-        distribution :attr:`smooth_statistic` names.
+        distribution :attr:`parametric_term_statistic` names.
     parametric_terms_unavailable : str or None
         Why :attr:`parametric_terms` could not be built; the same causes as
         :attr:`smooth_terms_unavailable`.
@@ -451,6 +456,7 @@ class Summary:
     coefficients: Sequence[Mapping[str, Any]] = field(default_factory=list)
     parametric_statistic: str | None = None
     parametric_terms: list[dict[str, Any]] = field(default_factory=list)
+    parametric_term_statistic: str | None = None
     parametric_term_tests: list[dict[str, Any]] = field(default_factory=list)
     parametric_terms_unavailable: str | None = None
     smooth_terms: list[dict[str, Any]] = field(default_factory=list)

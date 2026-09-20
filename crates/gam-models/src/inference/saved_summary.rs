@@ -632,6 +632,7 @@ fn scan_summary_payload(
         coefficients: Vec::new(),
         parametric_statistic: None,
         parametric_terms: Vec::new(),
+        parametric_term_statistic: None,
         parametric_term_tests: Vec::new(),
         parametric_terms_unavailable: None,
         smooth_terms,
@@ -934,6 +935,7 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         coefficients,
         parametric_statistic: Some(if scale_is_estimated { "t" } else { "z" }),
         parametric_terms,
+        parametric_term_statistic: Some(if scale_is_estimated { "F" } else { "Chi.sq" }),
         parametric_term_tests,
         parametric_terms_unavailable,
         smooth_terms,
@@ -1015,7 +1017,8 @@ pub struct SummaryParametricTermRow {
 /// One joint Wald test of a parametric term: every coefficient of the term is
 /// zero, on `df` degrees of freedom. `statistic` is `F = W / df` referred to
 /// `F(df, n − edf)` when the scale is estimated, and `W` referred to `χ²_df`
-/// when it is known — the reference `SummaryPayload::smooth_statistic` names.
+/// when it is known — the reference `SummaryPayload::parametric_term_statistic`
+/// names.
 #[derive(Serialize)]
 pub struct SummaryParametricTermTestRow {
     pub name: String,
@@ -1334,6 +1337,9 @@ pub struct SummaryPayload {
     /// Intercept, linear-term and factor-contrast coefficients with their
     /// Wald tests.
     pub parametric_terms: Vec<SummaryParametricTermRow>,
+    /// The reference of `parametric_term_tests`: `"F"` (`F(df, n − edf)`)
+    /// when the scale is estimated, `"Chi.sq"` (`χ²_df`) when it is known.
+    pub parametric_term_statistic: Option<&'static str>,
     /// One joint Wald test per parametric term (not the intercept): a factor
     /// with `L` levels is tested once on `L − 1` degrees of freedom.
     pub parametric_term_tests: Vec<SummaryParametricTermTestRow>,

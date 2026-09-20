@@ -206,7 +206,7 @@ fn parametric_term_test_table(summary: &SummaryPayload, out: &mut String) {
     let header = [
         String::new(),
         "df".to_string(),
-        summary.smooth_statistic.unwrap_or("statistic").to_string(),
+        summary.parametric_term_statistic.unwrap_or("statistic").to_string(),
         "p-value".to_string(),
         String::new(),
     ];
@@ -483,6 +483,7 @@ mod tests {
                     p_value_unavailable: None,
                 },
             ],
+            parametric_term_statistic: Some("F"),
             parametric_term_tests: vec![SummaryParametricTermTestRow {
                 name: "x1".to_string(),
                 predictor: None,
