@@ -1651,32 +1651,72 @@ fn test_schoenberg_isotropic_agrees_with_partial_fraction() {
     }
 }
 
-fn build_collocation_operator_penalty_via_dq_dq(
+/// Product rule for `∫_{ℝ³} f(x) dx` in spherical coordinates: Gauss–Legendre
+/// in `u ∈ (0, 1)` under the radial map `r = ℓ·u/(1 − u)`, which carries the
+/// whole half-line so no tail is truncated; Gauss–Legendre in `cos θ`; and the
+/// trapezoid rule in the periodic azimuth `φ`. Returns the nodes (one per row)
+/// and their volume weights `r² dr d(cos θ) dφ`.
+fn spherical_quadrature_rule_3d(
+    n_radial: usize,
+    n_polar: usize,
+    n_azimuth: usize,
+    radial_scale: f64,
+) -> (Array2<f64>, Array1<f64>) {
+    let (u_nodes, u_weights) = gam_math::special::gauss_legendre(n_radial);
+    let (cos_nodes, cos_weights) = gam_math::special::gauss_legendre(n_polar);
+    let azimuth_weight = 2.0 * std::f64::consts::PI / n_azimuth as f64;
+    let n = n_radial * n_polar * n_azimuth;
+    let mut points = Array2::<f64>::zeros((n, 3));
+    let mut weights = Array1::<f64>::zeros(n);
+    let mut row = 0;
+    for (&u_raw, &u_weight) in u_nodes.iter().zip(u_weights.iter()) {
+        // Gauss–Legendre is on [−1, 1]; u = (u_raw + 1)/2 carries du = ½ du_raw.
+        let u = 0.5 * (u_raw + 1.0);
+        let r = radial_scale * u / (1.0 - u);
+        let dr = radial_scale * 0.5 * u_weight / (1.0 - u).powi(2);
+        for (&cos_theta, &cos_weight) in cos_nodes.iter().zip(cos_weights.iter()) {
+            let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
+            for step in 0..n_azimuth {
+                let phi = azimuth_weight * step as f64;
+                points[[row, 0]] = r * sin_theta * phi.cos();
+                points[[row, 1]] = r * sin_theta * phi.sin();
+                points[[row, 2]] = r * cos_theta;
+                weights[row] = r * r * dr * cos_weight * azimuth_weight;
+                row += 1;
+            }
+        }
+    }
+    (points, weights)
+}
+
+/// The tension Gram `D_1ᵀ W D_1` of the hybrid Duchon kernel collocated on the
+/// spherical rule `(n_radial, n_polar, n_azimuth)`: a quadrature of the same
+/// `∫_{ℝ³} ∇f·∇f` the closed form evaluates exactly.
+fn quadrature_tension_gram(
     centers: ArrayView2<'_, f64>,
-    q: usize,
     length_scale: f64,
     power: f64,
     nullspace_order: DuchonNullspaceOrder,
-    aniso_log_scales: Option<&[f64]>,
+    (n_radial, n_polar, n_azimuth): (usize, usize, usize),
 ) -> Array2<f64> {
-    let ops = build_duchon_collocation_operator_matrices(
+    let (points, weights) =
+        spherical_quadrature_rule_3d(n_radial, n_polar, n_azimuth, length_scale);
+    let mut workspace = BasisWorkspace::default();
+    let ops = build_duchon_collocation_operator_matriceswithworkspace(
         centers,
-        None,
+        points.view(),
+        Some(weights.view()),
         Some(length_scale),
         power,
         nullspace_order,
-        aniso_log_scales,
         None,
-        q.max(1),
+        None,
+        1,
+        None,
+        &mut workspace,
     )
-    .expect("collocation operator matrices");
-    let dq = match q {
-        0 => &ops.d0,
-        1 => &ops.d1,
-        2 => &ops.d2,
-        _ => panic!("unsupported derivative order"),
-    };
-    symmetrize(&fast_ata(dq))
+    .expect("quadrature collocation operator matrices");
+    symmetrize(&fast_ata(&ops.d1))
 }
 
 fn build_closed_form_operator_penalty(
@@ -1714,27 +1754,23 @@ fn build_closed_form_operator_penalty(
     )
 }
 
-fn frobenius_relative_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+fn frobenius_distance(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     assert_eq!(a.dim(), b.dim());
-    let diff_norm = a
-        .iter()
+    a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).powi(2))
         .sum::<f64>()
-        .sqrt();
-    let scale = a.iter().map(|v| v * v).sum::<f64>().sqrt();
-    diff_norm / scale.max(1e-300)
+        .sqrt()
 }
 
 #[test]
 fn test_analytic_vs_collocation_high_k_agreement() {
-    // Synthesize K=200 deterministic knots in d=3, build s_1 via
-    // closed-form (Schoenberg/Riesz-Matérn) and via the existing K-knot
-    // collocation D_1^T D_1. Check structural invariants and rough
-    // numerical correlation. Convergent regime requires `2m-q ≥ 1` (for
-    // the partial-fraction expansion), `4(m+s) > d + 2q` (UV), `d + 2q
-    // > 4m` (IR with κ>0), and `2(p+s) > d+1` (D1 collocation validity).
-    // (d=3, m=1, s=2) with q=1 is the smallest valid test setup.
+    // Synthesize K=200 deterministic knots in d=3 and build s_1 in closed form
+    // (Schoenberg/Riesz-Matérn: the exact ∫_{ℝ^d} ∇f·∇f over the constrained
+    // kernel basis). Convergent regime requires `2m-q ≥ 1` (for the
+    // partial-fraction expansion), `4(m+s) > d + 2q` (UV), `d + 2q > 4m` (IR
+    // with κ>0), and `2(p+s) > d+1` (D1 collocation validity). (d=3, m=1, s=2)
+    // with q=1 is the smallest valid test setup.
     let k = 200;
     let d = 3;
     let length_scale = 1.0; // kappa = 1
@@ -1756,69 +1792,49 @@ fn test_analytic_vs_collocation_high_k_agreement() {
         }
     }
 
-    {
-        let q = 1usize;
-        let analytic = build_closed_form_operator_penalty(
-            centers.view(),
-            q,
-            length_scale,
-            power,
-            nullspace,
-            None,
-        );
-        let colloc = build_collocation_operator_penalty_via_dq_dq(
-            centers.view(),
-            q,
-            length_scale,
-            power,
-            nullspace,
-            None,
-        );
+    let analytic =
+        build_closed_form_operator_penalty(centers.view(), 1, length_scale, power, nullspace, None);
+    assert_eq!(analytic.dim(), (k, k), "closed-form penalty shape");
+    let asym = analytic
+        .iter()
+        .zip(analytic.t().iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        asym < 1e-9,
+        "closed-form penalty not symmetric: max|a-aᵀ|={asym}"
+    );
+    assert!(
+        analytic.iter().all(|v| v.is_finite()),
+        "non-finite closed-form penalty"
+    );
 
-        assert_eq!(analytic.dim(), colloc.dim(), "shape mismatch q={q}");
-
-        // Symmetry of the closed-form penalty.
-        let asym = analytic
-            .iter()
-            .zip(analytic.t().iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        assert!(
-            asym < 1e-9,
-            "closed-form penalty not symmetric (q={q}): max|a-aᵀ|={asym}"
-        );
-
-        // Both should be finite.
-        assert!(
-            analytic.iter().all(|v| v.is_finite()),
-            "non-finite analytic q={q}"
-        );
-        assert!(
-            colloc.iter().all(|v| v.is_finite()),
-            "non-finite collocation q={q}"
-        );
-
-        // Both should be nontrivial (non-zero Frobenius norm).
-        let an_norm = analytic.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let cl_norm = colloc.iter().map(|v| v * v).sum::<f64>().sqrt();
-        assert!(an_norm > 1e-9, "closed-form penalty is ~zero (q={q})");
-        assert!(cl_norm > 1e-9, "collocation penalty is ~zero (q={q})");
-
-        // Normalized matrices (unit Frobenius) — closed-form is the exact
-        // integral; collocation is a Riemann-style approximation. After
-        // normalization the relative Frobenius difference should be bounded
-        // (not necessarily small at K=200 since the two operators differ by
-        // a quadrature scheme). Use a permissive bound to assert the two are
-        // in the same equivalence class, not just any random matrix.
-        let an_normalized = analytic.mapv(|v| v / an_norm);
-        let cl_normalized = colloc.mapv(|v| v / cl_norm);
-        let rel = frobenius_relative_diff(&an_normalized, &cl_normalized);
-        assert!(rel.is_finite(), "non-finite relative diff for q={q}: {rel}");
-        assert!(
-            rel < 1.5,
-            "closed-form vs collocation drift too far at K={k}, q={q}: rel_frob={rel}"
-        );
-    }
+    // gam#3890: the collocation Gram on a rule that covers ℝ³ is a quadrature
+    // of the same integral, so it converges to the closed form itself —
+    // unnormalized, which also pins the chart amplitude both carry. (Collocating
+    // at the K centers inside the unit cube converges to nothing, and a
+    // unit-Frobenius comparison of two PSD matrices is bounded by √2 whatever
+    // they are.) Two nested rules give the rule's own error estimate: when the
+    // refinement at least halves the error, ‖Q_c − S‖ ≥ 2‖Q_f − S‖, the
+    // triangle inequality gives ‖Q_f − S‖ ≤ ‖Q_f − Q_c‖.
+    let coarse =
+        quadrature_tension_gram(centers.view(), length_scale, power, nullspace, (16, 12, 24));
+    let fine =
+        quadrature_tension_gram(centers.view(), length_scale, power, nullspace, (24, 16, 32));
+    let fine_norm = fine.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let estimate = frobenius_distance(&fine, &coarse);
+    // An estimate as large as the Gram itself would admit S = 0; the rule has
+    // to resolve the matrix for the comparison to decide anything.
+    assert!(
+        estimate < fine_norm,
+        "quadrature does not resolve the tension Gram: ‖Q_f − Q_c‖={estimate:.3e}, ‖Q_f‖={fine_norm:.3e}"
+    );
+    let error = frobenius_distance(&fine, &analytic);
+    assert!(
+        error <= estimate,
+        "closed-form tension penalty is not the limit of its quadrature at K={k}: \
+         ‖Q_f − S‖={error:.3e} > ‖Q_f − Q_c‖={estimate:.3e} (‖Q_f‖={fine_norm:.3e})"
+    );
 }
 
 // =====================================================================

@@ -467,10 +467,11 @@ fn parametric_terms(
     // A genuine random effect (`group(g)`, `re(g)`) is a variance component,
     // tested (or not) with the smooth terms. A fixed factor is parametric:
     // tested on its contrasts, since the intercept carries its level.
-    for (re_idx, (name, range)) in design.random_effect_ranges.iter().enumerate() {
+    for (name, range) in &design.random_effect_ranges {
         let fixed_factor = spec
             .random_effect_terms
-            .get(re_idx)
+            .iter()
+            .find(|term| term.name == *name)
             .is_some_and(|meta| !meta.lenient_unseen);
         if !fixed_factor || range.is_empty() {
             continue;

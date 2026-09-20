@@ -204,6 +204,7 @@ fn neglog_finite_and_continuous_just_above_guard() {
     let log_lo = lo.ln();
     let log_hi = hi.ln();
 
+    let mut qd1s = Vec::with_capacity(n);
     let mut values = Vec::with_capacity(n);
     for i in 0..n {
         let t = i as f64 / (n - 1) as f64;
@@ -229,11 +230,25 @@ fn neglog_finite_and_continuous_just_above_guard() {
             v.is_finite(),
             "v not finite at i={i} qd1={qd1:.3e}: {v:.17e}"
         );
+        qd1s.push(qd1);
         values.push(v);
     }
-    for (i, w) in values.windows(2).enumerate() {
-        let diff = (w[1] - w[0]).abs();
-        assert!(diff < 1e6, "i={i}: consecutive diff too large: {diff:.3e}");
+    // On a time-constant slope the row program reads qd1 only through
+    // `adjusted_derivative = qd1·c₁` with `c₁ = √(1 + s²·V₁)` free of qd1, so
+    // `neglog(qd1) = C − w·d·ln(qd1)` and each step is exactly
+    // `w·d·ln(qd1[i]/qd1[i+1])`. The bar bounds the roundoff of a handful of
+    // O(|v|) terms and of `ln` of the stored qd1 ratio; a guard barrier, clamp
+    // or branch switch leaking above the guard breaks the identity.
+    for i in 0..n - 1 {
+        let step = values[i + 1] - values[i];
+        let exact = weight * event * (qd1s[i] / qd1s[i + 1]).ln();
+        let bar = 256.0 * f64::EPSILON * values[i].abs().max(values[i + 1].abs()).max(1.0);
+        assert!(
+            (step - exact).abs() <= bar,
+            "i={i}: step {step:.17e} vs exact w·d·ln(qd1[i]/qd1[i+1]) = {exact:.17e} \
+             (|diff| = {:.3e} > {bar:.3e})",
+            (step - exact).abs()
+        );
     }
 }
 
