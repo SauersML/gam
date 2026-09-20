@@ -658,15 +658,45 @@ fn a_double_well_fit_publishes_its_uncertified_trace_2901() {
     let exact = lambda / hessian;
     let trace = result.penalty_block_trace()[0];
     assert!(trace > 1.0, "the trace {trace} lies above the block's rank of 1");
+    // The trace is `λ·(r·x̂)` with `x̂` a dense Cholesky solve of the 1×1 `H` and
+    // `r = 1` the exact root of `S = [1]`. To first order in the unit roundoff
+    // `u = ε/2`: `l = fl(√H)` enters squared (2u), the forward and back divisions
+    // (2u), the product with λ (u), and the reference quotient `λ/H` itself (u),
+    // so the two agree to `6u = 3ε` relative.
     assert!(
-        (trace - exact).abs() <= 2.0 * f64::EPSILON * exact,
-        "the published trace {trace} is λ/H = {exact} to one solve and one product"
+        (trace - exact).abs() <= 3.0 * f64::EPSILON * exact,
+        "the published trace {trace} is λ/H = {exact} to one Cholesky solve and one product"
     );
     assert_eq!(
         result.edf_by_block()[0],
         1.0 - trace,
         "an uncertified block's EDF is published unclamped"
     );
+}
+
+/// A custom-family fit publishes its likelihood curvature `H − S(λ)` beside the
+/// penalized Hessian, so the smooth-term score test has the `G` it needs. It is
+/// the observed information, not a Gram: at the double well's certified mode
+/// it is negative, and that sign is published rather than projected away.
+#[test]
+fn a_custom_family_fit_publishes_its_likelihood_curvature() {
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let result = fit_custom_family(&family, &[double_well_spec(2.0)], &double_well_options())
+        .expect("a certified double-well mode fits");
+    let inference = result.inference.as_ref().expect("the fit computed inference");
+    let hessian = inference.penalized_hessian.as_array()[[0, 0]];
+    let curvature = inference
+        .weighted_gram
+        .as_ref()
+        .expect("an identity-gauge custom-family fit publishes its likelihood curvature");
+    assert_eq!(curvature.dim(), (1, 1));
+    let expected = hessian - result.lambdas[0];
+    assert!(
+        (curvature[[0, 0]] - expected).abs() <= 4.0 * f64::EPSILON * hessian.abs().max(result.lambdas[0]),
+        "published curvature {} is H − λS = {expected}",
+        curvature[[0, 0]]
+    );
+    assert!(curvature[[0, 0]] < 0.0, "the double well's data curvature is negative at its mode");
 }
 
 /// The end-to-end property: a whole production fit is a function of the model

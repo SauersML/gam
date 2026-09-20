@@ -279,6 +279,78 @@ pub(crate) fn validate_lambda_pair_consistency(
     Ok(())
 }
 
+/// The joint-layout columns a block penalty acts on. `PenaltyMatrix::to_dense`
+/// returns the *local* block matrix for the `Dense` variant but the
+/// already-embedded full-width matrix for `Blockwise`/`Kronecker`, so the
+/// materialized dimension decides: a full-width penalty acts on every column, a
+/// local one on its block's columns.
+fn joint_penalty_columns(
+    s_local: &Array2<f64>,
+    p: usize,
+    block_col_start: usize,
+    block_cols: usize,
+) -> Result<std::ops::Range<usize>, String> {
+    if s_local.dim() == (p, p) {
+        Ok(0..p)
+    } else if s_local.dim() == (block_cols, block_cols) {
+        Ok(block_col_start..block_col_start + block_cols)
+    } else {
+        Err(format!(
+            "materialized to {}x{}, expected {p}x{p} or {block_cols}x{block_cols}",
+            s_local.nrows(),
+            s_local.ncols()
+        ))
+    }
+}
+
+/// The likelihood curvature `H − S(λ)` of a blockwise custom-family fit in its
+/// joint coefficient layout, with `S(λ) = Σ_k λ_k S_k` over every block's
+/// penalties. At the penalized mode this is `−∇²ℓ(β̂)` (the observed
+/// information), or the expected information when that is the curvature the
+/// family's penalized Hessian carries: exactly `H` with the prior's curvature
+/// taken back out. Unlike a GLM's `X'WX` it need not be positive semidefinite.
+pub(crate) fn custom_family_likelihood_curvature(
+    penalized_hessian: &Array2<f64>,
+    specs: &[ParameterBlockSpec],
+    lambdas: &ndarray::ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, CustomFamilyError> {
+    let p = penalized_hessian.nrows();
+    let total_cols: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    let expected_rho: usize = specs.iter().map(|s| s.penalties.len()).sum();
+    if penalized_hessian.ncols() != p || total_cols != p || lambdas.len() != expected_rho {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "custom-family likelihood curvature: penalized Hessian {}x{}, total block width {total_cols}, \
+                 {} lambdas for {expected_rho} penalties",
+                penalized_hessian.nrows(),
+                penalized_hessian.ncols(),
+                lambdas.len()
+            ),
+        });
+    }
+    let mut curvature = penalized_hessian.clone();
+    let mut global_k = 0usize;
+    let mut block_col_start = 0usize;
+    for spec in specs {
+        let block_cols = spec.design.ncols();
+        for penalty in &spec.penalties {
+            let s_local = penalty.to_dense();
+            let placed = joint_penalty_columns(&s_local, p, block_col_start, block_cols)
+                .map_err(|reason| CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "custom-family likelihood curvature: penalty {global_k} {reason}"
+                    ),
+                })?;
+            curvature
+                .slice_mut(ndarray::s![placed.clone(), placed])
+                .scaled_add(-lambdas[global_k], &s_local);
+            global_k += 1;
+        }
+        block_col_start += block_cols;
+    }
+    Ok(curvature)
+}
+
 /// Effective degrees of freedom for a converged blockwise custom-family fit,
 /// computed from the joint penalized Hessian `H = X'W_HX + S(λ)` and the
 /// per-penalty matrices `S_k` exactly as the standard GAM path and mgcv do:
@@ -401,24 +473,20 @@ pub(crate) fn custom_family_blockwise_edf(
                 format!("custom-family edf: penalty {global_k} rank factorization failed: {error}")
             })?;
             let penalty_rank = root.nrows();
+            let placed = joint_penalty_columns(&s_local, p, block_col_start, block_cols)
+                .map_err(|reason| {
+                    CustomFamilyError::trial_point(format!("custom-family edf: penalty {global_k} {reason}"))
+                })?;
             let mut s_full = Array2::<f64>::zeros((p, p));
+            s_full
+                .slice_mut(ndarray::s![placed.clone(), placed.clone()])
+                .assign(&s_local);
             // The root's rows are its modes (`S_k = RᵀR`); they become the columns
             // of the right-hand side in the joint layout.
             let mut root_columns = Array2::<f64>::zeros((p, penalty_rank));
-            if s_local.nrows() == p && s_local.ncols() == p {
-                s_full.assign(&s_local);
-                root_columns.assign(&root.t());
-            } else if s_local.nrows() == block_cols && s_local.ncols() == block_cols {
-                let r = block_col_start..block_col_start + block_cols;
-                s_full.slice_mut(ndarray::s![r.clone(), r.clone()]).assign(&s_local);
-                root_columns.slice_mut(ndarray::s![r, ..]).assign(&root.t());
-            } else {
-                return Err(CustomFamilyError::trial_point(format!(
-                    "custom-family edf: penalty {global_k} materialized to {}x{}, expected {p}x{p} or {block_cols}x{block_cols}",
-                    s_local.nrows(),
-                    s_local.ncols()
-                )));
-            }
+            root_columns
+                .slice_mut(ndarray::s![placed, ..])
+                .assign(&root.t());
             // λ_k tr(H⁻¹S_k) = λ_k Σ_c r_cᵀ H⁻¹ r_c over the root columns, priced
             // against the Hessian the solve represents.
             if lambda > 0.0 {
@@ -1048,6 +1116,19 @@ pub fn blockwise_fit_from_parts(
                 "conditional covariance V_cond has an invalid diagonal: {reason}"
             ),
         })?;
+    // The likelihood curvature `H − S(λ)` beside `H`, so the smooth score test
+    // can read the score's covariance off the fit as it does on the standard
+    // lane. It is in the saved coefficient layout only when the gauge is the
+    // identity; an active-coordinate `H` has no raw-layout `S(λ)` to subtract.
+    let weighted_gram = if geom.coefficient_gauge.is_identity() {
+        Some(custom_family_likelihood_curvature(
+            geom.penalized_hessian.as_array(),
+            specs,
+            &lambdas.view(),
+        )?)
+    } else {
+        None
+    };
     let inference = Some(gam_solve::model_types::FitInference {
         edf_by_block: edf_by_penalty,
         penalty_block_trace: penalty_trace,
@@ -1069,7 +1150,7 @@ pub fn blockwise_fit_from_parts(
         factorized_standard_errors: None,
         beta_covariance_frequentist: None,
         coefficient_influence: None,
-        weighted_gram: None,
+        weighted_gram,
         identified_subspace: None,
     });
 

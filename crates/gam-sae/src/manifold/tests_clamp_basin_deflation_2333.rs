@@ -34,7 +34,7 @@ struct ClampBasinState {
 }
 
 /// A clone of `anchor` that keeps its three per-assembly gates and its freeze
-/// flag. `SaeManifoldTerm::clone` drops the gates, so a finite-difference
+/// flag. `SaeManifoldTerm::clone` carries only declared gates, so a finite-difference
 /// endpoint built from a plain clone re-derives them from its own state, a
 /// motion production holds fixed across a step. A fresh fixture carries no
 /// gates and is not frozen, so its first assembly derives them.

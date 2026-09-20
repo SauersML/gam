@@ -31,7 +31,7 @@ use csv::StringRecord;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use gam_solve::estimate::smooth_term_summary_rows;
+use gam_solve::estimate::{SummaryBlockOffset, smooth_term_summary_rows};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Poisson, Uniform};
@@ -130,7 +130,7 @@ fn group_p_value(family: Family, rep: u64, group_sd: f64) -> f64 {
     let rows = smooth_term_summary_rows(
         &fit.design,
         &fit.fit,
-        fit.fit.weighted_gram(),
+        SummaryBlockOffset::default(),
     );
     let row = rows
         .iter()

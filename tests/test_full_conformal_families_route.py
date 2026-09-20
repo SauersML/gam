@@ -15,9 +15,9 @@ the fitted smoothing parameters (``gam_models::inference::full_conformal_glm``):
 Discrete ties are randomized with a seed drawn from the data, so the set is
 exact (coverage ``1 - alpha`` on average) rather than conservative. A
 prior-weighted fit has no exchangeable augmented problem, so it refuses with a
-typed error that names split conformal. GLM rows report
-``frozen_rho_certified`` 0 because only the Gaussian route certifies the frozen
-smoothing parameters.
+typed error that names split conformal. GLM rows of a smooth fit report
+``conformal_certificate`` -7 (glm_frozen_penalty) because only the Gaussian
+route re-selects the smoothing parameters on the augmented rows.
 """
 
 from __future__ import annotations
@@ -83,8 +83,8 @@ def test_glm_full_conformal_set_is_a_set_in_the_support(family: str) -> None:
     lo = np.asarray(out["posterior_mean_lower"], dtype=float)
     hi = np.asarray(out["posterior_mean_upper"], dtype=float)
     comps = np.asarray(out["conformal_set_components"], dtype=float)
-    certified = np.asarray(out["frozen_rho_certified"], dtype=float)
-    assert np.all(certified == 0.0), "only the Gaussian route certifies frozen rho"
+    certificate = np.asarray(out["conformal_certificate"], dtype=float)
+    assert np.all(certificate == -7.0), "a smooth GLM fit is refused as glm_frozen_penalty"
     assert np.all(comps >= 1), f"{family}: empty set at alpha={ALPHA}"
     assert np.all(lo <= hi)
     if family == "gamma":
@@ -127,8 +127,8 @@ def test_glm_full_conformal_covers_at_the_nominal_level(family: str) -> None:
     augmented rows are exchangeable: coverage is then exactly 1 - alpha, which
     tests the set construction itself. With the penalty selected on the labeled
     rows (the usual call) the smoothing step sees the labeled rows but not the
-    candidate, which costs O(1/n) coverage; ``frozen_rho_certified`` is 0 for
-    every GLM row for that reason, and bench/pygam_audit/conformal_coverage.md
+    candidate, which costs O(1/n) coverage; ``conformal_certificate`` is -7
+    (glm_frozen_penalty) for every smooth GLM row for that reason, and bench/pygam_audit/conformal_coverage.md
     reports that route's coverage.
     """
 
@@ -316,7 +316,7 @@ def test_cli_full_conformal_matches_python_for_a_poisson_offset_fit(tmp_path: Pa
         "posterior_mean_lower",
         "posterior_mean_upper",
         "conformal_set_components",
-        "frozen_rho_certified",
+        "conformal_certificate",
     ):
         cli = np.array([float(r[key]) for r in rows])
         np.testing.assert_array_equal(cli, np.asarray(python[key], dtype=float), err_msg=key)

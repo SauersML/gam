@@ -2557,6 +2557,22 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         }
     }
 
+    /// The first directional derivative closes through the packed pair plan on
+    /// every row set: the full data, or a Horvitz-Thompson row set over its own
+    /// rows and weights.
+    fn directional_derivative_dense_override(
+        &self,
+        rows: &crate::row_kernel::RowSet,
+        d_beta: &[f64],
+    ) -> Option<Result<Array2<f64>, String>> {
+        Some(self.family.survival_ls_coefficient_hessian_directional_derivative(
+            self.dynamic,
+            self.deriv_log_scale,
+            rows,
+            d_beta,
+        ))
+    }
+
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; SLS_ROW_K] {
         let d_beta = ndarray::ArrayView1::from(d_beta);
         let d_time = d_beta.slice(s![self.offsets[0]..self.offsets[1]]);
@@ -2718,12 +2734,11 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
     /// per-axis `row_kernel_directional_derivative(self, rows, e_a)`: the unit-axis
     /// direction read from the channel cache (`axis_direction_from_channel_cache`),
     /// the `sls_row_third_generated_with_plan` contraction the per-row hook
-    /// reaches through `sls_row_third_generated`, the same pullback order, and the
-    /// chunk-ordered reduction of `RowSet::All::par_try_reduce_fold`. A row without
-    /// an exact kernel (non-positive weight) is the per-row hook's all-zero matrix,
-    /// whose pullback adds nothing. Only the full-data unit-weight `RowSet::All`
-    /// case is accelerated; a subsample declines (`None`) so the generic
-    /// Horvitz–Thompson per-axis path runs.
+    /// reaches through `sls_row_third_generated`, the same Horvitz–Thompson row
+    /// weight and pullback order, and the chunk-ordered reduction of
+    /// `RowSet::par_try_reduce_fold` over the row set's walk positions. A row
+    /// without an exact kernel (non-positive weight) is the per-row hook's
+    /// all-zero matrix, whose pullback adds nothing. Every `RowSet` is handled.
     fn directional_derivative_all_axes_dense_override(
         &self,
         rows: &crate::row_kernel::RowSet,
@@ -2736,25 +2751,22 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                 self.n_coefficients(),
             )));
         }
-        let crate::row_kernel::RowSet::All = rows else {
-            return None;
-        };
         Some((|| {
-            let n = gam_math::jet_tower::RowProgram::n_rows(self);
-            // Per row, shared by every axis: the primary values and outer derivative plan.
-            let fixed: Vec<Option<([f64; SLS_ROW_K], SlsOuterPlan<5>)>> = (0..n)
+            let m = rows.walk_len(gam_math::jet_tower::RowProgram::n_rows(self));
+            // Per walk position, shared by every axis: the primary values and outer derivative plan.
+            let fixed: Vec<Option<([f64; SLS_ROW_K], SlsOuterPlan<5>)>> = (0..m)
                 .into_par_iter()
-                .map(|row| {
+                .map(|position| {
                     Ok(self
-                        .row_nll_inputs_opt(row)?
+                        .row_nll_inputs_opt(rows.row_at(position).0)?
                         .map(|(primary, kernel)| (primary, sls_outer_plan::<5>(&kernel))))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            let chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = (0..n)
+            let chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = (0..m)
                 .into_par_iter()
-                .map(|row| self.cached_channel_rows(row))
+                .map(|position| self.cached_channel_rows(rows.row_at(position).0))
                 .collect();
-            let n_chunks = arrow_row_chunk_count(n);
+            let n_chunks = arrow_row_chunk_count(m);
             (0..p)
                 .into_par_iter()
                 .map(|a| {
@@ -2763,17 +2775,18 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                             .into_par_iter()
                             .map(|chunk_idx| {
                                 let start = chunk_idx * ARROW_ROW_CHUNK;
-                                let end = (start + ARROW_ROW_CHUNK).min(n);
+                                let end = (start + ARROW_ROW_CHUNK).min(m);
                                 let mut acc = Array2::<f64>::zeros((p, p));
-                                for row in start..end {
-                                    let Some((primary, plan)) = fixed[row].as_ref() else {
+                                for position in start..end {
+                                    let Some((primary, plan)) = fixed[position].as_ref() else {
                                         continue;
                                     };
+                                    let weight = rows.row_at(position).1;
                                     let direction =
-                                        axis_direction_from_channel_cache(&chans[row], a);
+                                        axis_direction_from_channel_cache(&chans[position], a);
                                     let third =
                                         sls_row_third_generated_with_plan(primary, plan, &direction);
-                                    pullback_from_channel_cache(&chans[row], &third, 1.0, &mut acc);
+                                    pullback_from_channel_cache(&chans[position], &third, weight, &mut acc);
                                 }
                                 acc
                             })
@@ -2805,11 +2818,10 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
     /// `jacobian_action` for `u`, the unit-axis direction read from the channel cache
     /// (`axis_direction_from_channel_cache`, as the override above does), the
     /// `sls_row_fourth_generated_with_plan` contraction the per-row hook reaches through
-    /// `sls_row_fourth_generated`, the same pullback order, and the chunk-ordered reduction
-    /// of `RowSet::All::par_try_reduce_fold`. A row without an exact kernel (non-positive
-    /// weight) is the per-row hook's all-zero matrix, whose pullback adds nothing. Only the
-    /// full-data unit-weight `RowSet::All` case is accelerated; a subsample declines
-    /// (`None`) so the generic Horvitz–Thompson per-axis path runs.
+    /// `sls_row_fourth_generated`, the same Horvitz–Thompson row weight and pullback order,
+    /// and the chunk-ordered reduction of `RowSet::par_try_reduce_fold` over the row set's
+    /// walk positions. A row without an exact kernel (non-positive weight) is the per-row
+    /// hook's all-zero matrix, whose pullback adds nothing. Every `RowSet` is handled.
     fn second_directional_derivative_all_axes_dense_override(
         &self,
         rows: &crate::row_kernel::RowSet,
@@ -2823,20 +2835,18 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                 d_beta_u.len(),
             )));
         }
-        let crate::row_kernel::RowSet::All = rows else {
-            return None;
-        };
         Some((|| {
             crate::row_kernel::RowKernel::<SLS_ROW_K>::warm_up_directional_caches(
                 self,
                 gam_problem::EvalMode::ValueGradientHessian,
             )?;
-            let n = gam_math::jet_tower::RowProgram::n_rows(self);
-            // Per row, shared by every axis: the primary values and outer derivative plan,
-            // and the fixed direction's primary projection `J·u`.
-            let fixed: Vec<Option<([f64; SLS_ROW_K], SlsOuterPlan<5>, [f64; SLS_ROW_K])>> = (0..n)
+            let m = rows.walk_len(gam_math::jet_tower::RowProgram::n_rows(self));
+            // Per walk position, shared by every axis: the primary values and outer derivative
+            // plan, and the fixed direction's primary projection `J·u`.
+            let fixed: Vec<Option<([f64; SLS_ROW_K], SlsOuterPlan<5>, [f64; SLS_ROW_K])>> = (0..m)
                 .into_par_iter()
-                .map(|row| {
+                .map(|position| {
+                    let row = rows.row_at(position).0;
                     Ok(self.row_nll_inputs_opt(row)?.map(|(primary, kernel)| {
                         (
                             primary,
@@ -2848,11 +2858,11 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                     }))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            let chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = (0..n)
+            let chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = (0..m)
                 .into_par_iter()
-                .map(|row| self.cached_channel_rows(row))
+                .map(|position| self.cached_channel_rows(rows.row_at(position).0))
                 .collect();
-            let n_chunks = arrow_row_chunk_count(n);
+            let n_chunks = arrow_row_chunk_count(m);
             (0..p)
                 .into_par_iter()
                 .map(|a| {
@@ -2861,15 +2871,16 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                             .into_par_iter()
                             .map(|chunk_idx| {
                                 let start = chunk_idx * ARROW_ROW_CHUNK;
-                                let end = (start + ARROW_ROW_CHUNK).min(n);
+                                let end = (start + ARROW_ROW_CHUNK).min(m);
                                 let mut acc = Array2::<f64>::zeros((p, p));
-                                for row in start..end {
-                                    let Some((primary, plan, direction_u)) = fixed[row].as_ref()
+                                for position in start..end {
+                                    let Some((primary, plan, direction_u)) = fixed[position].as_ref()
                                     else {
                                         continue;
                                     };
+                                    let weight = rows.row_at(position).1;
                                     let direction_a =
-                                        axis_direction_from_channel_cache(&chans[row], a);
+                                        axis_direction_from_channel_cache(&chans[position], a);
                                     let fourth = sls_row_fourth_generated_with_plan(
                                         primary,
                                         plan,
@@ -2877,9 +2888,9 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                                         &direction_a,
                                     );
                                     pullback_from_channel_cache(
-                                        &chans[row],
+                                        &chans[position],
                                         &fourth,
-                                        1.0,
+                                        weight,
                                         &mut acc,
                                     );
                                 }
@@ -3549,6 +3560,41 @@ impl SlsCoefficientHessian {
     }
 }
 
+/// The per-row coefficients a packed pair lowering reads: the row program's
+/// Hessian, or its third tensor contracted with the channel directions of a
+/// coefficient direction `d`.
+#[derive(Clone, Copy)]
+enum SlsPairRowCoefficients<'a> {
+    Hessian,
+    HessianDirectional(&'a [f64]),
+}
+
+/// The rows a packed pair lowering sums, each with the weight it carries: every
+/// row, scaled by an HT mask when one is given, or a Horvitz-Thompson row set's
+/// own rows and weights. Only the rows it lists are evaluated and closed.
+#[derive(Clone, Copy)]
+enum SlsLoweringRows<'a> {
+    All(Option<&'a Array1<f64>>),
+    Listed(&'a [crate::outer_subsample::WeightedOuterRow]),
+}
+
+impl SlsLoweringRows<'_> {
+    fn len(&self, n: usize) -> usize {
+        match self {
+            Self::All(_) => n,
+            Self::Listed(rows) => rows.len(),
+        }
+    }
+
+    /// The data row and weight of the lowering's `k`-th row.
+    fn row(&self, k: usize) -> (usize, Option<f64>) {
+        match self {
+            Self::All(mask) => (k, mask.map(|mask| mask[k])),
+            Self::Listed(rows) => (rows[k].index, Some(rows[k].weight)),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SlsHessianPairGroup {
     left_channel: usize,
@@ -3565,7 +3611,7 @@ struct SlsHessianPairGroup {
 /// which is what makes `(1, 2)`, `(1, 5)` and `(1, 8)` live. The scale reaches
 /// the event log-density only through its linear `−eta_ls` term, so no pair of
 /// `eta_ls_exit` with a rate-only channel is live.
-const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
+pub(super) const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
     (0, 0),
     (1, 1),
     (2, 2),
@@ -3666,13 +3712,6 @@ impl SurvivalLocationScaleFamily {
         row_mask: Option<&Array1<f64>>,
         target: SlsCoefficientHessianTarget,
     ) -> Result<SlsCoefficientHessian, String> {
-        if self.x_link_wiggle.is_some() {
-            return Err(SurvivalLocationScaleError::InternalInvariant {
-                reason: "the packed 24-pair survival-LS plan requires fixed non-wiggle geometry"
-                    .to_string(),
-            }
-            .into());
-        }
         if let Some(mask) = row_mask
             && mask.len() != self.n
         {
@@ -3682,6 +3721,78 @@ impl SurvivalLocationScaleFamily {
                     mask.len(),
                     self.n
                 ),
+            }
+            .into());
+        }
+        self.survival_ls_packed_pair_lowering(
+            dynamic,
+            deriv_log_scale,
+            SlsLoweringRows::All(row_mask),
+            target,
+            SlsPairRowCoefficients::Hessian,
+        )
+    }
+
+    /// The first directional derivative `Σ_i Jᵢᵀ T³ᵢ[Jᵢ·d] Jᵢ` of the non-wiggle
+    /// joint Hessian, lowered through the Hessian's own packed pair plan.
+    ///
+    /// The row program's third tensor is a sum over the index atoms `u0`, `u1`
+    /// and `g`, each a function of its own axes, so its contraction is live only
+    /// on pairs inside one atom's axes: the Hessian's structural pairs. Each
+    /// channel's direction `X_c·d` is one design product, and each group closes
+    /// with one `Xᵀ diag(w) X` in place of a per-row rank-`K` scatter. A far-tail
+    /// row keeps the plain pair fold, as the per-row pullback does.
+    ///
+    /// A Horvitz-Thompson row set is a weighted sum over its own rows: only those
+    /// rows are evaluated, each group closes over their gathered design rows, and
+    /// the full data is the row set whose weights are all one.
+    pub(crate) fn survival_ls_coefficient_hessian_directional_derivative(
+        &self,
+        dynamic: &SurvivalDynamicGeometry,
+        deriv_log_scale: f64,
+        rows: &crate::row_kernel::RowSet,
+        d_beta: &[f64],
+    ) -> Result<Array2<f64>, String> {
+        let rows = match rows {
+            crate::row_kernel::RowSet::All => SlsLoweringRows::All(None),
+            crate::row_kernel::RowSet::Subsample { rows, n_full } => {
+                if *n_full != self.n || rows.iter().any(|row| row.index >= self.n) {
+                    return Err(SurvivalLocationScaleError::DimensionMismatch {
+                        reason: format!(
+                            "survival-LS Hessian directional derivative: a row set over \
+                             {n_full} rows for a family of {}",
+                            self.n
+                        ),
+                    }
+                    .into());
+                }
+                SlsLoweringRows::Listed(rows)
+            }
+        };
+        self.survival_ls_packed_pair_lowering(
+            dynamic,
+            deriv_log_scale,
+            rows,
+            SlsCoefficientHessianTarget::DenseFull,
+            SlsPairRowCoefficients::HessianDirectional(d_beta),
+        )?
+        .into_dense_full()
+    }
+
+    fn survival_ls_packed_pair_lowering(
+        &self,
+        dynamic: &SurvivalDynamicGeometry,
+        deriv_log_scale: f64,
+        rows: SlsLoweringRows<'_>,
+        target: SlsCoefficientHessianTarget,
+        row_coefficients: SlsPairRowCoefficients<'_>,
+    ) -> Result<SlsCoefficientHessian, String> {
+        use crate::row_kernel::RowKernel;
+
+        if self.x_link_wiggle.is_some() {
+            return Err(SurvivalLocationScaleError::InternalInvariant {
+                reason: "the packed 24-pair survival-LS plan requires fixed non-wiggle geometry"
+                    .to_string(),
             }
             .into());
         }
@@ -3772,6 +3883,35 @@ impl SurvivalLocationScaleFamily {
 
         let kernel = self.survival_ls_row_kernel_rescaled(dynamic, deriv_log_scale);
 
+        let offsets = self.joint_block_offsets();
+        let channel_directions = match row_coefficients {
+            SlsPairRowCoefficients::Hessian => None,
+            SlsPairRowCoefficients::HessianDirectional(d_beta) => {
+                if offsets.last() != Some(&d_beta.len()) {
+                    return Err(SurvivalLocationScaleError::DimensionMismatch {
+                        reason: format!(
+                            "survival-LS Hessian directional derivative: direction has {} \
+                             entries for block offsets {offsets:?}",
+                            d_beta.len()
+                        ),
+                    }
+                    .into());
+                }
+                // Channel `c` reads block `c / 3` (time, threshold, log-σ), on the
+                // lowering's own rows.
+                let d_beta = ndarray::ArrayView1::from(d_beta);
+                Some(std::array::from_fn::<_, SLS_ROW_K, _>(|channel| {
+                    let d = d_beta.slice(s![offsets[channel / 3]..offsets[channel / 3 + 1]]);
+                    designs[channel].map(|x| match rows {
+                        SlsLoweringRows::All(_) => x.dot(&d),
+                        SlsLoweringRows::Listed(listed) => Array1::from_shape_fn(listed.len(), |k| {
+                            x.row(listed[k].index).dot(&d)
+                        }),
+                    })
+                }))
+            }
+        };
+
         // #2342: per-row stable paired index-derivative sums S1, S2 for the
         // far-tail rows whose entry/exit hazard channels are each ~1e300 and
         // (near-)opposite. The compiled 24-pair Hessian merges them onto a
@@ -3788,7 +3928,8 @@ impl SurvivalLocationScaleFamily {
         let mut use_paired = vec![false; self.n];
         for row in 0..self.n {
             let u0 = dynamic.hs_entry[row] + dynamic.q_entry[row];
-            if self.w[row] > 0.0
+            if channel_directions.is_none()
+                && self.w[row] > 0.0
                 && self.entry_active[row]
                 && paired_stacks::paired_contraction_needs_regroup(&self.inverse_link, u0)
             {
@@ -3810,18 +3951,29 @@ impl SurvivalLocationScaleFamily {
             }
         }
 
-        let mut slots = Array2::<f64>::zeros((groups.len(), self.n));
+        let row_count = rows.len(self.n);
+        let mut slots = Array2::<f64>::zeros((groups.len(), row_count));
         slots
             .axis_iter_mut(Axis(1))
             .into_par_iter()
             .enumerate()
-            .try_for_each(|(row, mut row_slots)| -> Result<(), String> {
-                let (coefficients, entry_stack) = match kernel.row_nll_inputs_opt(row)? {
-                    Some((primary, exact)) => (
-                        sls_row_hessian_pairs_compiled(&primary, &exact),
-                        sls_outer_plan::<5>(&exact).u0,
-                    ),
-                    None => ([0.0; SLS_HESSIAN_PAIRS.len()], [0.0; 5]),
+            .try_for_each(|(k, mut row_slots)| -> Result<(), String> {
+                let (row, weight) = rows.row(k);
+                let (coefficients, entry_stack) = match channel_directions.as_ref() {
+                    None => match kernel.row_nll_inputs_opt(row)? {
+                        Some((primary, exact)) => (
+                            sls_row_hessian_pairs_compiled(&primary, &exact),
+                            sls_outer_plan::<5>(&exact).u0,
+                        ),
+                        None => ([0.0; SLS_HESSIAN_PAIRS.len()], [0.0; 5]),
+                    },
+                    Some(directions) => {
+                        let direction = std::array::from_fn(|channel| {
+                            directions[channel].as_ref().map_or(0.0, |d| d[k])
+                        });
+                        let third = kernel.row_third_contracted(row, &direction)?;
+                        (SLS_HESSIAN_PAIRS.map(|(left, right)| third[left][right]), [0.0; 5])
+                    }
                 };
                 for (slot, group) in groups.iter().enumerate() {
                     let mut coefficient = group
@@ -3866,15 +4018,14 @@ impl SurvivalLocationScaleFamily {
                             coefficient = -(paired_s2[row] * d1 * d1);
                         }
                     }
-                    row_slots[slot] = match row_mask {
-                        Some(mask) => coefficient * mask[row],
+                    row_slots[slot] = match weight {
+                        Some(weight) => coefficient * weight,
                         None => coefficient,
                     };
                 }
                 Ok(())
             })?;
 
-        let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()
             .ok_or_else(|| "missing survival-LS joint block offsets".to_string())?;
@@ -3888,6 +4039,20 @@ impl SurvivalLocationScaleFamily {
             .into());
         }
 
+        // Each group closes over the lowering's own design rows: a listed row set
+        // gathers its rows, and every row of the full data is the design itself.
+        let gathered = match rows {
+            SlsLoweringRows::All(_) => None,
+            SlsLoweringRows::Listed(listed) => {
+                let index = listed.iter().map(|row| row.index).collect::<Vec<_>>();
+                Some(designs.map(|design| design.map(|x| x.select(Axis(0), &index))))
+            }
+        };
+        let closing: [Option<&Array2<f64>>; SLS_ROW_K] = match gathered.as_ref() {
+            None => designs,
+            Some(gathered) => std::array::from_fn(|channel| gathered[channel].as_ref()),
+        };
+
         if target == SlsCoefficientHessianTarget::DiagonalOnly {
             let mut diagonal = Array1::<f64>::zeros(p_total);
             for (slot, group) in groups.iter().enumerate() {
@@ -3897,8 +4062,8 @@ impl SurvivalLocationScaleFamily {
                     continue;
                 }
                 let left =
-                    designs[group.left_channel].expect("active survival-LS pair has a left design");
-                let right = designs[group.right_channel]
+                    closing[group.left_channel].expect("active survival-LS pair has a left design");
+                let right = closing[group.right_channel]
                     .expect("active survival-LS pair has a right design");
                 let weights = sanitize_survival_weight_vector(&slots.row(slot).to_owned());
                 let multiplicity = if group.left_channel == group.right_channel {
@@ -3907,7 +4072,7 @@ impl SurvivalLocationScaleFamily {
                     2.0
                 };
                 let offset = offsets[left_block];
-                for row in 0..self.n {
+                for row in 0..row_count {
                     let weight = multiplicity * weights[row];
                     if weight == 0.0 {
                         continue;
@@ -3933,8 +4098,8 @@ impl SurvivalLocationScaleFamily {
             .into_par_iter()
             .map(|(slot, group)| {
                 let left =
-                    designs[group.left_channel].expect("active survival-LS pair has a left design");
-                let right = designs[group.right_channel]
+                    closing[group.left_channel].expect("active survival-LS pair has a left design");
+                let right = closing[group.right_channel]
                     .expect("active survival-LS pair has a right design");
                 let weights = slots.row(slot).to_owned();
                 weighted_crossprod_dense_with_parallelism(left, &weights, right, faer::Par::Seq)

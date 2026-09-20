@@ -176,7 +176,9 @@ class Model:
             Single uncertainty knob. ``None`` returns the point prediction(s)
             only. A float in ``(0, 1)`` (e.g. ``0.95``) requests the full
             uncertainty decomposition at that pointwise coverage; the output
-            gains ``posterior_mean_standard_error``,
+            gains ``linear_predictor_standard_error`` (the posterior SD of η),
+            ``posterior_mean_standard_error`` (the posterior SD of the
+            response, from the same η integral as ``posterior_mean``),
             ``posterior_mean_lower``, and ``posterior_mean_upper`` columns
             alongside ``linear_predictor_plugin`` / ``mean_plugin`` /
             ``posterior_mean``. On survival models it
@@ -189,32 +191,36 @@ class Model:
             band at ``conformal_level`` coverage in ``posterior_mean_lower`` /
             ``posterior_mean_upper`` — the same routes as ``gam predict
             --conformal``. Exactly one of ``training_data`` or ``calibration``
-            is required. With ``training_data`` it is the exact full-conformal
-            set at the fitted (frozen) smoothing parameters (#942 Layer 1):
-            every labeled row is used for both fitting and calibration and the
-            set is exact *given* the frozen penalty. Gaussian-identity models
-            cost one Cholesky per test point with zero refits; Bernoulli-logit
-            (the set is a subset of ``{0, 1}``), Poisson-log and
-            negative-binomial-log (candidates enumerated up to a data-derived
-            tail beyond which none can conform; NB theta frozen at its fitted
-            value) and Gamma-log (Pearson score, so the set is a band in
-            ``y / mu``) refit the augmented penalized likelihood per candidate.
-            Discrete ties are broken by a seeded uniform so the set is exact
-            rather than conservative. Offsets are honoured. A model fitted with
-            prior weights raises ``InvalidConfigurationError``: the candidate
-            point has no weight, so use ``calibration=`` (split conformal)
-            instead. The saved model carries only the ``p x p`` frozen penalty,
-            never per-row training data, so the labeled rows are passed again
-            here. Because the smoothing parameters were selected from all
-            training responses, the finite-sample ``conformal_level`` coverage
-            theorem applies only where the per-row ``frozen_rho_certified``
-            output column is 1.0 (the Layer-3 certificate that freezing the
-            global smoothing parameter matches the honest ρ-re-selecting set,
-            Gaussian REML only; every GLM row reports 0.0); rows with 0.0 carry
-            no finite-sample certificate for the smoothing step. The set is a
-            union of ``conformal_set_components`` intervals and the bounds
-            report its outer envelope (NaN for an empty randomized set). With
-            ``calibration`` it is the
+            is required. With ``training_data`` it is the full-conformal set
+            built on the labeled rows plus the candidate test row: every
+            labeled row is used for both fitting and calibration. A
+            Gaussian-identity model gets the set of the fit that re-selects the
+            smoothing strength by REML on the augmented rows (#942 Layer 3), so
+            the finite-sample ``conformal_level`` coverage theorem holds; it
+            costs one Cholesky per test point plus a cold REML refit at each
+            finite endpoint. Bernoulli-logit (the set is a subset of
+            ``{0, 1}``), Poisson-log and negative-binomial-log (candidates
+            enumerated up to a data-derived tail beyond which none can conform;
+            NB theta frozen at its fitted value) and Gamma-log (Pearson score,
+            so the set is a band in ``y / mu``) refit the augmented penalized
+            likelihood per candidate at the frozen penalty. Discrete ties are
+            broken by a seeded uniform so the set is exact rather than
+            conservative. Offsets are honoured. A model fitted with prior
+            weights raises ``InvalidConfigurationError``: the candidate point
+            has no weight, so use ``calibration=`` (split conformal) instead.
+            The saved model carries only the ``p x p`` frozen penalty and its
+            smoothing-parameter count, never per-row training data, so the
+            labeled rows are passed again here. The per-row
+            ``conformal_certificate`` output column is 0 (exact_frozen: nothing
+            to re-select) or 1 (honest_refit) where the guarantee holds; a
+            negative code is a typed refusal where the row carries the
+            frozen-penalty set with no finite-sample guarantee for the
+            selection step (several smoothing parameters, a payload without the
+            count, a degenerate criterion, or ``-7`` glm_frozen_penalty for a
+            non-Gaussian fit that selected a smoothing parameter or NB theta).
+            The set is a union of ``conformal_set_components`` intervals and
+            the bounds report its outer envelope (NaN for an empty randomized
+            set). With ``calibration`` it is the
             split-conformal band ``mu_hat(x) +/- q_hat * s(x)`` calibrated on
             that held-out fold, with finite-sample marginal coverage
             ``>= conformal_level`` regardless of model misspecification, for
@@ -284,8 +290,10 @@ class Model:
               ``linear_predictor_plugin`` (``X·beta_hat``), ``mean_plugin``
               (its inverse-link image), and ``posterior_mean`` (the default
               response-scale point prediction). When ``interval`` is set it
-              adds ``posterior_mean_standard_error`` plus
-              ``posterior_mean_lower`` / ``posterior_mean_upper``.
+              adds ``linear_predictor_standard_error`` (``SE(η)``),
+              ``posterior_mean_standard_error`` (``√Var[link^{-1}(η)]``) plus
+              ``posterior_mean_lower`` / ``posterior_mean_upper`` (the
+              inverse link of the η credible quantiles).
               When the requested table container is ``"dict"``, the return is
               a ``PredictionResult``: it supports normal mapping access
               (``pred["posterior_mean"]``) and column attributes
@@ -447,6 +455,48 @@ class Model:
         if return_type is None and id_column is None:
             return scores
         columns: dict[str, list[Any]] = {"score": scores.tolist()}
+        if id_column is not None:
+            columns = {id_column: list(row_ids or []), **columns}
+        return restore_output_table(
+            columns,
+            requested=return_type,
+            input_kind=table_kind,
+            training_kind=self._training_table_kind,
+        )
+
+    def latent_conditional_residual(
+        self,
+        data: Any,
+        *,
+        return_type: str | None = None,
+        id_column: str | None = None,
+    ) -> Any:
+        """Evaluate the conditional latent residual ``(z - m(a)) / sqrt(v(a))``.
+
+        This method is defined for marginal-slope models fitted with a
+        conditional latent law (``latent_measure="conditional-location-scale"``).
+        It applies the map the fit applied to its own score, so at the
+        training rows it returns the fit's standardized score bit for bit, and
+        on new rows it returns the residual a held-out adequacy check compares
+        with the training residual law. The rows need the score column and the
+        conditioning covariates; a survival model's time columns are not read.
+
+        Returns ``None`` when the fit consumed no conditional latent law. By
+        default the residual is a one-dimensional NumPy array;
+        ``return_type=`` or ``id_column=`` requests a one-column table named
+        ``residual`` (plus the requested identifier).
+        """
+        headers, rows, table_kind = normalize_table(data)
+        row_ids = extract_row_ids(headers, rows, id_column)
+        try:
+            residual = rust_module().latent_conditional_residual_table(
+                self._prediction_model, headers, rows
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        if residual is None or (return_type is None and id_column is None):
+            return residual
+        columns: dict[str, list[Any]] = {"residual": residual.tolist()}
         if id_column is not None:
             columns = {id_column: list(row_ids or []), **columns}
         return restore_output_table(
@@ -675,12 +725,11 @@ class Model:
     def smooth_significance(self, data: Any) -> list[dict[str, Any]]:
         """Per-term likelihood-ratio significance for every penalized smooth (#1063).
 
-        :meth:`summary` reports Wood's rank-truncated *Wald* statistic
-        :math:`T = \\hat\\beta'\\hat\\Sigma^- \\hat\\beta`. The exact Lawley /
-        Bartlett factor corrects the *likelihood-ratio* statistic, and under
-        penalization the Wald form is already a weighted :math:`\\chi^2` whose
-        second-order mean is not :math:`d + \\Delta\\varepsilon`, so dividing
-        :math:`T` by the LR factor would correct the wrong statistic. This method
+        :meth:`summary` reports a variance-component *score* statistic. The
+        exact Lawley / Bartlett factor corrects the *likelihood-ratio*
+        statistic, and a score statistic's second-order mean is not
+        :math:`d + \\Delta\\varepsilon`, so dividing it by the LR factor would
+        correct the wrong statistic. This method
         instead computes a genuine per-term LR statistic
         :math:`W = 2(\\ell_{\\text{full}} - \\ell_{\\text{null}})` by a
         constrained fit that fixes the smooth's coefficients at zero while
@@ -1820,8 +1869,8 @@ class MultinomialModel:
         """Wood rank-truncated Wald smooth-term significance table (#1101).
 
         One row per ``(active class, smooth term)`` with keys ``class``,
-        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value`` — the same
-        kernel the scalar :meth:`Model.summary` smooth-term p-values use. Empty
+        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value`` from the Wood
+        rank-truncated Wald kernel. Empty
         when the model has no smooth terms or no stored covariance.
         """
         try:

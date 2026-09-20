@@ -124,9 +124,10 @@ Required options: `min` and `max` (finite, `min < max`).
 ### bounded() priors
 
 `bounded()` accepts one of `prior=`, `target=`+`strength=`, or no
-prior:
+prior option:
 
 ```
+bounded(x, min=-1, max=1)                  # default: prior=shrinkage
 bounded(x, min=0, max=1, prior=uniform)
 bounded(x, min=0, max=1, prior=center)
 bounded(x, min=0, max=1, target=0.5, strength=3)
@@ -134,7 +135,16 @@ bounded(x, min=0, max=1, target=0.5, strength=3)
 
 `prior=` values:
 
-- `none` — flat on the transformed scale, no penalty.
+- `shrinkage` (the default when no prior option is given) — a Gaussian
+  prior on the latent logit coordinate of the interval transform,
+  centred at the null, with its precision estimated by REML like any
+  other smoothing parameter. A coefficient the data do not support is
+  shrunk back to the null. The null is `0` when `min < 0 < max`. When
+  zero lies outside the box it is not an admissible value, and the
+  prior centres at the box midpoint `(min + max) / 2`, the point of the
+  interval map that favours neither bound.
+- `none` — flat on the transformed scale, no penalty: the constrained
+  maximum-likelihood fit.
 - `uniform` (aliases `log-jacobian`, `log_jacobian`, `jacobian`) — flat
   on the original scale, applied as a log-Jacobian correction.
 - `center` — `Beta(2, 2)` toward the midpoint.
@@ -229,8 +239,8 @@ They differ in two ways only:
 
 | Spelling | Numeric column | Level unseen in training |
 | --- | --- | --- |
-| `+ site` | used as a numeric slope | `predict` raises `gamfit.errors.GamError`; `check()` reports it |
-| `factor(site)` | forced to categorical levels | `predict` raises `gamfit.errors.GamError`; `check()` reports it |
+| `+ site` | used as a numeric slope | `predict` raises `gamfit.errors.PredictionError` (a `DataError`); `check()` reports it |
+| `factor(site)` | forced to categorical levels | `predict` raises `gamfit.errors.PredictionError` (a `DataError`); `check()` reports it |
 | `group(site)`, `re(site)` | forced to categorical levels | predicted at the population level (the level effect is 0) |
 
 So `factor(year)` treats `year` as levels rather than as a slope, and a
@@ -245,8 +255,8 @@ points to `factor(site)`. A categorical column is also
 refused inside a term that treats its inputs as numeric axes (`linear()`,
 `s()`, `te()`, `thinplate()`, `matern()`, cyclic smooths and the other
 non-factor bases): the error points to `factor(site)` or `group(site)` for
-the level effect, or `s(x, site, bs="fs")` for a per-level smooth of a
-numeric `x`.
+the level effect, or `s(x, by=site)` / `fs(x, site)` for a per-level
+smooth of a numeric `x`.
 
 Why estimate the penalty rather than leave the levels unpenalized? The
 penalized estimate is the random-effect (partial-pooling) estimate, and

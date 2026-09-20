@@ -38,9 +38,11 @@
 //! turns the candidate line into a monotone walk and makes the tails provable.
 //!
 //! The penalty is frozen at the training fit, whose smoothing parameters saw
-//! the n training responses and not the test response. Every row therefore
-//! reports `frozen_rho_certified = 0`: the set is exact for the frozen-penalty
-//! map, and the honest ρ-re-selecting map is not certified here.
+//! the n training responses and not the test response. A row of a fit that
+//! selected a smoothing parameter (or a negative-binomial θ) therefore reports
+//! [`ConformalRefusal::GlmFrozenPenalty`]: the set is exact for the
+//! frozen-penalty map, and the honest ρ-re-selecting map is not built here
+//! ([`ConformalGlmFamily::certificate`]).
 //!
 //! # Certified solves
 //!
@@ -108,7 +110,7 @@ use gam_spec::FamilySpecKind;
 use opt::{BacktrackConfig, backtracking_line_search};
 
 use super::full_conformal::{
-    ConformalInterval, GLM_ARMIJO_C1, GLM_CONVERGENCE_RTOL, GLM_NEWTON_MAX_BACKTRACKS,
+    ConformalCertificate, ConformalInterval, ConformalRefusal, GLM_ARMIJO_C1, GLM_CONVERGENCE_RTOL, GLM_NEWTON_MAX_BACKTRACKS,
     GLM_NEWTON_MAX_ITERS, conformal_rank_threshold, vec_norm,
 };
 
@@ -136,6 +138,25 @@ impl ConformalGlmFamily {
             }
             FamilySpecKind::GammaLog => Some(Self::GammaLog),
             _ => None,
+        }
+    }
+
+    /// What this arm's set guarantees for a fit that selected `penalty_count`
+    /// smoothing parameters (`None` for a payload that did not record it).
+    ///
+    /// With no smoothing parameter the frozen-penalty fitting map selects
+    /// nothing from the responses (the Gamma dispersion does not enter an
+    /// unpenalized fit, and the score is dispersion-free), so the set is
+    /// exact. A selected λ, or the negative-binomial θ estimated from the
+    /// responses, makes the frozen map asymmetric in the augmented row; those
+    /// rows are refused with [`ConformalRefusal::GlmFrozenPenalty`].
+    pub fn certificate(self, penalty_count: Option<usize>) -> ConformalCertificate {
+        match (self, penalty_count) {
+            (_, None) => ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure),
+            (Self::NegativeBinomialLog { .. }, _) | (_, Some(1..)) => {
+                ConformalCertificate::Refused(ConformalRefusal::GlmFrozenPenalty)
+            }
+            (_, Some(0)) => ConformalCertificate::ExactFrozen,
         }
     }
 
@@ -1246,6 +1267,28 @@ mod tests {
             let z = z as f64;
             assert_eq!(contains(&set, z), brute_force_member(&sub, &x_star, 0.0, z, ALPHA), "z={z}");
         }
+    }
+
+    #[test]
+    fn certificate_is_exact_only_when_nothing_was_selected() {
+        let refused = ConformalCertificate::Refused(ConformalRefusal::GlmFrozenPenalty);
+        for family in [
+            ConformalGlmFamily::BernoulliLogit,
+            ConformalGlmFamily::PoissonLog,
+            ConformalGlmFamily::GammaLog,
+        ] {
+            assert_eq!(family.certificate(Some(0)), ConformalCertificate::ExactFrozen);
+            assert_eq!(family.certificate(Some(1)), refused);
+            assert_eq!(family.certificate(Some(3)), refused);
+        }
+        let nb = ConformalGlmFamily::NegativeBinomialLog { theta: 2.0 };
+        assert_eq!(nb.certificate(Some(0)), refused, "θ is selected on the responses");
+        assert_eq!(
+            ConformalGlmFamily::PoissonLog.certificate(None),
+            ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure)
+        );
+        assert_eq!(refused.code(), -7);
+        assert_eq!(refused.label(), "refused:glm_frozen_penalty");
     }
 
     #[test]

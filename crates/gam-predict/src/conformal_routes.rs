@@ -80,33 +80,36 @@ impl From<String> for FullConformalError {
     }
 }
 
-/// Exact full-conformal prediction columns at the fitted smoothing parameters.
+/// Full-conformal prediction columns for a Gaussian-identity fit.
 ///
-/// Reads the frozen penalty `Ŝ` persisted at fit time (a p×p matrix; the saved
-/// model persists no training rows), rebuilds the design and composed offset of
-/// the `labeled` rows and of the `test` rows from the saved `resolved_termspec`,
-/// and builds the set per test row. The caller supplies the labeled rows the
-/// set is built on: the training table gives the frozen-λ full-conformal set of
-/// the fit.
+/// Reads the frozen penalty `Ŝ` and its smoothing-parameter count persisted at
+/// fit time (a p×p matrix; the saved model persists no training rows), rebuilds
+/// the design and composed offset of the `labeled` rows and of the `test` rows
+/// from the saved `resolved_termspec`, and builds the set per test row. The
+/// caller supplies the labeled rows the set is built on.
 ///
-/// * Gaussian identity: the closed-form set of
-///   [`gam_models::inference::full_conformal`] on `y − o` (one Cholesky per
-///   row, zero refits), shifted back by the test offset.
+/// * Gaussian identity: the set of
+///   [`gam_models::inference::full_conformal`] on `y − o`, shifted back by the
+///   test offset. It is the set of the fitting map that re-selects the
+///   smoothing strength by REML on the augmented rows, so the finite-sample
+///   coverage theorem holds for it, or the frozen-ρ set with a typed refusal.
 /// * Bernoulli logit, Poisson log, negative binomial log (θ frozen at its
 ///   fitted value, like λ) and Gamma log: the certified augmented-refit set of
-///   [`gam_models::inference::full_conformal_glm`] with the score `|∂ℓ/∂η|`
-///   (the Pearson residual for Gamma). Discrete candidates are enumerated up to
-///   a data-derived tail beyond which no candidate can enter; ties are broken by
-///   a seeded uniform so the set is exact rather than conservative.
+///   [`gam_models::inference::full_conformal_glm`] at the frozen penalty, with
+///   the score `|∂ℓ/∂η|` (the Pearson residual for Gamma). Discrete candidates
+///   are enumerated up to a data-derived tail beyond which no candidate can
+///   enter; ties are broken by a seeded uniform so the set is exact rather than
+///   conservative.
 ///
-/// The set is exact *given the frozen penalty*. On the training rows the fitted
-/// λ̂ was selected from all training responses, so the frozen-λ score
-/// construction is not permutation symmetric in the n+1 augmented points; the
-/// finite-sample guarantee applies only where the per-row frozen-ρ certificate
-/// accepts (`frozen_rho_certified` = 1.0, Gaussian REML only). A 0.0 row —
-/// every GLM row — is the frozen-λ set with no finite-sample certificate for
-/// the λ step. The set is a union of `conformal_set_components` intervals;
-/// `posterior_mean_lower` / `posterior_mean_upper` are its outer envelope.
+/// The `conformal_certificate` column says what each row carries: `0`
+/// exact_frozen (no strength to re-select), `1` honest_refit, and a negative
+/// code for a typed refusal (`-1` multi_penalty, `-2`
+/// unknown_penalty_structure, `-3` augmented_gram_singular, `-4`
+/// reml_undefined, `-5` refit_outside_tube, `-6` refit_failed, `-7`
+/// glm_frozen_penalty), where the row gets the frozen-penalty set with no
+/// finite-sample guarantee for the selection step. The set is a union of
+/// `conformal_set_components` intervals; `posterior_mean_lower` /
+/// `posterior_mean_upper` are its outer envelope.
 ///
 /// `alpha = 1 − conformal_level`: the full-conformal set `C_α` has marginal
 /// coverage `≥ 1 − α`, with no factor of two.
@@ -218,7 +221,7 @@ pub fn full_conformal_prediction_columns(
     let mut lower_vec = Vec::with_capacity(n_test);
     let mut upper_vec = Vec::with_capacity(n_test);
     let mut components_vec = Vec::with_capacity(n_test);
-    let mut certified_vec = Vec::with_capacity(n_test);
+    let mut certificate_vec = Vec::with_capacity(n_test);
     match glm {
         None => {
             // Gaussian identity: the offset is a known shift of the response,
@@ -232,10 +235,11 @@ pub fn full_conformal_prediction_columns(
                 lower_vec.push(iv.lo + offset_test[i]);
                 upper_vec.push(iv.hi + offset_test[i]);
                 components_vec.push(iv.set.intervals.len() as f64);
-                certified_vec.push(if iv.frozen_rho_certified { 1.0 } else { 0.0 });
+                certificate_vec.push(f64::from(iv.certificate.code()));
             }
         }
         Some(family) => {
+            let glm_certificate = f64::from(family.certificate(penalty.penalty_count()).code());
             let substrate = GlmFullConformalSubstrate::new(
                 family,
                 x_labeled,
@@ -259,9 +263,7 @@ pub fn full_conformal_prediction_columns(
                 lower_vec.push(lo);
                 upper_vec.push(hi);
                 components_vec.push(set.intervals.len() as f64);
-                // The frozen-ρ certificate is the Gaussian REML construction;
-                // no GLM row carries it.
-                certified_vec.push(0.0);
+                certificate_vec.push(glm_certificate);
             }
         }
     }
@@ -309,7 +311,7 @@ pub fn full_conformal_prediction_columns(
     columns.insert("posterior_mean_lower".to_string(), lower_vec);
     columns.insert("posterior_mean_upper".to_string(), upper_vec);
     columns.insert("conformal_set_components".to_string(), components_vec);
-    columns.insert("frozen_rho_certified".to_string(), certified_vec);
+    columns.insert("conformal_certificate".to_string(), certificate_vec);
     Ok(columns)
 }
 

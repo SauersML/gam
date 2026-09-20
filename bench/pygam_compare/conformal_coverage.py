@@ -2,6 +2,10 @@
 
     python -m bench.pygam_compare.conformal_coverage [--reps R] [--ns 30,100,1000]
         [--dgps correct,...] [--workers W] [--out bench/pygam_audit/conformal_coverage.md]
+        [--checkpoint records.jsonl]
+
+``--checkpoint`` appends every finished replicate to a JSON-lines file and, on
+a rerun, skips the replicates already in it, so an interrupted run resumes.
 
 For every data-generating process (DGP) and training size ``n`` the script
 draws ``R`` seeded replicates. Each replicate draws ``n`` training rows and
@@ -54,6 +58,7 @@ Bench-only dependency: ``pygam`` (bench/pygam_compare/requirements.txt).
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import multiprocessing as mp
 import os
@@ -328,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--m-test", type=int, default=M_TEST)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--out", default="bench/pygam_audit/conformal_coverage.md")
+    ap.add_argument("--checkpoint", default="", help="JSON-lines file of finished replicates")
     args = ap.parse_args(argv)
     ns = [int(v) for v in args.ns.split(",")]
     dgps = [d for d in args.dgps.split(",") if d]
@@ -339,14 +345,35 @@ def main(argv: list[str] | None = None) -> int:
         os.environ[var] = "1"
     tasks = [(d, n, r, args.m_test) for n in ns for d in dgps for r in range(args.reps)]
     records: list[dict] = []
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        wanted = {(d, n, r) for d, n, r, _ in tasks}
+        with open(args.checkpoint, encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    rec = json.loads(line)
+                    if (rec["dgp"], rec["n"], rec["rep"]) in wanted:
+                        records.append(rec)
+                        wanted.discard((rec["dgp"], rec["n"], rec["rep"]))
+        tasks = [t for t in tasks if (t[0], t[1], t[2]) in wanted]
+        print(f"resuming: {len(records)} replicates from {args.checkpoint}", file=sys.stderr)
+    sink = open(args.checkpoint, "a", encoding="utf-8") if args.checkpoint else None
     t0 = time.perf_counter()
-    with mp.get_context("spawn").Pool(args.workers, maxtasksperchild=200) as pool:
-        for i, rec in enumerate(pool.imap_unordered(_rep, tasks, chunksize=4), 1):
-            records.append(rec)
-            if i % 500 == 0 or i == len(tasks):
-                print(
-                    f"[{i}/{len(tasks)}] {time.perf_counter() - t0:.0f}s", file=sys.stderr, flush=True
-                )
+    try:
+        with mp.get_context("spawn").Pool(args.workers, maxtasksperchild=200) as pool:
+            for i, rec in enumerate(pool.imap_unordered(_rep, tasks, chunksize=1), 1):
+                records.append(rec)
+                if sink is not None:
+                    sink.write(json.dumps(rec) + "\n")
+                    sink.flush()
+                if i % 500 == 0 or i == len(tasks):
+                    print(
+                        f"[{i}/{len(tasks)}] {time.perf_counter() - t0:.0f}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+    finally:
+        if sink is not None:
+            sink.close()
     records.sort(key=lambda r: (dgps.index(r["dgp"]), r["n"], r["rep"]))
     report = render(records, args.reps, args.m_test, ns, dgps)
     with open(args.out, "w", encoding="utf-8") as fh:

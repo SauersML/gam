@@ -1208,16 +1208,20 @@ pub(crate) fn build_outer_hessian_operator(
                 })
                 .collect::<Vec<_>>();
             let reduced = penalty_subspace_reduce_drifts_batched(kernel, &drift_parts);
+            // The exact cross term also pairs the kept–dropped blocks: the
+            // kernel's pseudo-inverse rotates into the eigenpairs it drops
+            // (gam#2952).
+            let coupled = penalty_subspace_couple_dropped_drifts_batched(kernel, &drift_parts);
             let pair_count = total * (total + 1) / 2;
             let pair_values: Vec<((usize, usize), f64)> = (0..pair_count)
                 .into_par_iter()
                 .map(|pair_idx| {
                     let (ii, jj) = upper_triangle_pair_from_index(pair_idx, total);
-                    let value =
-                        -kernel.trace_projected_logdet_cross_reduced(&reduced[ii], &reduced[jj]);
-                    ((ii, jj), value)
+                    kernel
+                        .pseudo_logdet_cross(&reduced[ii], &reduced[jj], &coupled[ii], &coupled[jj])
+                        .map(|value| ((ii, jj), value))
                 })
-                .collect();
+                .collect::<Result<_, String>>()?;
             let mut ct = Array2::<f64>::zeros((total, total));
             for ((ii, jj), value) in pair_values {
                 if !value.is_finite() {

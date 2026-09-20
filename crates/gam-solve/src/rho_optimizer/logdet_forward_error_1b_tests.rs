@@ -2,10 +2,12 @@
 //! object that priced the criterion's `log|H|` did not derive.
 
 use crate::estimate::reml::reml_outer_engine::PenaltySubspaceTrace;
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 
 fn kernel(logdet_correction: f64) -> PenaltySubspaceTrace {
     PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((2, 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: Array2::eye(2),
         h_proj_inverse: Array2::eye(2),
         logdet_correction,

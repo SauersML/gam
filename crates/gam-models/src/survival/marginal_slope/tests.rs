@@ -155,112 +155,6 @@ fn base_time_block() -> TimeBlockInput {
     }
 }
 
-/// Endpoint evaluations whose average empirical function Gram is exactly
-/// `(2/3) I`.  Both endpoint charts span the two coefficient directions, so
-/// they exercise function-space shrinkage without the singular all-zero
-/// design that the production generalized eigensolve correctly rejects.
-fn full_span_time_endpoint_designs() -> (DesignMatrix, DesignMatrix) {
-    (
-        DesignMatrix::from(array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
-        DesignMatrix::from(array![[1.0, 0.0], [0.0, 1.0], [1.0, -1.0]]),
-    )
-}
-
-#[test]
-fn time_nullspace_shrinkage_adds_precision_for_uncontrolled_time_direction() {
-    let (design_entry, design_exit) = full_span_time_endpoint_designs();
-    let mut block = TimeBlockInput {
-        design_entry,
-        design_exit,
-        design_derivative_exit: DesignMatrix::from(Array2::ones((3, 2))),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(
-            3,
-            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
-        ),
-        penalties: vec![array![[1.0, 0.0], [0.0, 0.0]]],
-        nullspace_dims: vec![1],
-        initial_beta: Some(Array1::zeros(2)),
-        ..base_time_block()
-    };
-    let no_origin_entries = Array1::from_elem(block.design_entry.nrows(), false);
-
-    assert!(
-        install_time_nullspace_shrinkage_penalty(&mut block, 0, &no_origin_entries)
-            .expect("time nullspace shrinkage should build"),
-        "expected a shrinkage penalty to be appended",
-    );
-    assert_eq!(block.penalties.len(), 2);
-    assert_eq!(block.nullspace_dims, vec![1, 0]);
-    let expected = array![[0.0, 0.0], [0.0, 2.0 / 3.0]];
-    for i in 0..2 {
-        for j in 0..2 {
-            assert_close(
-                block.penalties[1][[i, j]],
-                expected[[i, j]],
-                1e-12,
-                &format!("time nullspace function-metric ridge ({i},{j})"),
-            );
-        }
-    }
-}
-
-/// gnomon#2336: a row entering at the time origin has no entry factor, so its
-/// entry evaluation carries no function-metric mass. The ridge must not read an
-/// origin row's entry design, and a fully landmarked block gets the exit metric.
-#[test]
-fn time_nullspace_shrinkage_metric_ignores_origin_entry_rows_2336() {
-    let (design_entry, design_exit) = full_span_time_endpoint_designs();
-    let block_with = |entry: DesignMatrix| TimeBlockInput {
-        design_entry: entry,
-        design_exit: design_exit.clone(),
-        design_derivative_exit: DesignMatrix::from(Array2::ones((3, 2))),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(
-            3,
-            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
-        ),
-        penalties: vec![array![[1.0, 0.0], [0.0, 0.0]]],
-        nullspace_dims: vec![1],
-        initial_beta: Some(Array1::zeros(2)),
-        ..base_time_block()
-    };
-    let ridge = |mut block: TimeBlockInput, entry_at_origin: &Array1<bool>| {
-        assert!(
-            install_time_nullspace_shrinkage_penalty(&mut block, 0, entry_at_origin)
-                .expect("time nullspace shrinkage should build"),
-            "expected a shrinkage penalty to be appended",
-        );
-        block.penalties.last().expect("appended ridge").clone()
-    };
-
-    let one_origin_row = array![false, false, true];
-    let reference = ridge(block_with(design_entry.clone()), &one_origin_row);
-    let moved_origin_row = ridge(
-        block_with(DesignMatrix::from(array![[1.0, 0.0], [0.0, 1.0], [7.5, -3.0]])),
-        &one_origin_row,
-    );
-    assert_eq!(
-        reference, moved_origin_row,
-        "the ridge read the entry design of a row that enters at the origin"
-    );
-
-    let landmarked = ridge(block_with(design_entry), &Array1::from_elem(3, true));
-    let exit_metric = ridge(block_with(design_exit.clone()), &Array1::from_elem(3, false));
-    for i in 0..2 {
-        for j in 0..2 {
-            assert_close(
-                landmarked[[i, j]],
-                exit_metric[[i, j]],
-                1e-12,
-                &format!("landmarked block metric ({i},{j})"),
-            );
-        }
-    }
-}
-
 /// gnomon#2336: the pilot baseline slope solves the fitted row objective, so a
 /// row entering at the time origin contributes no entry factor there either.
 /// Moving the entry offsets of landmarked rows must leave the pilot slope
@@ -382,35 +276,6 @@ fn pooled_survival_baseline_solves_at_the_conditional_score_variance_2952() {
          {conditional_slope:.12e} scores {at_conditional:.15e}, not below the unit-variance slope \
          {unit_slope:.12e}'s {at_unit:.15e} by more than the rounding {rounding:.3e}"
     );
-}
-
-#[test]
-fn time_nullspace_shrinkage_is_noop_for_full_rank_time_penalty() {
-    let (design_entry, design_exit) = full_span_time_endpoint_designs();
-    let mut block = TimeBlockInput {
-        design_entry,
-        design_exit,
-        design_derivative_exit: DesignMatrix::from(Array2::ones((3, 2))),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(
-            3,
-            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
-        ),
-        penalties: vec![Array2::<f64>::eye(2)],
-        nullspace_dims: vec![0],
-        initial_beta: Some(Array1::zeros(2)),
-        ..base_time_block()
-    };
-    let no_origin_entries = Array1::from_elem(block.design_entry.nrows(), false);
-
-    assert!(
-        !install_time_nullspace_shrinkage_penalty(&mut block, 0, &no_origin_entries)
-            .expect("full-rank time penalty should be accepted"),
-        "full-rank time penalties should not get another penalty",
-    );
-    assert_eq!(block.penalties.len(), 1);
-    assert_eq!(block.nullspace_dims, vec![0]);
 }
 
 fn sparse_design(dense: &Array2<f64>) -> DesignMatrix {
@@ -4760,11 +4625,14 @@ fn flex_timewiggle_baseline_public_workspace_owns_family_and_design_pairs_withou
         .expect("FLEX baseline first callback")
         .expect("FLEX baseline first terms are present");
     assert_eq!(first.score_psi.len(), dimension);
-    let first_hessian = first
-        .hessian_psi_operator
-        .as_ref()
-        .expect("FLEX baseline first Hessian operator")
-        .to_dense();
+    // gam#3061: the ζ composition serves this frame's chart terms with a dense θ Hessian.
+    assert!(family.timewiggle_zeta_available());
+    assert!(
+        first.hessian_psi_operator.is_none(),
+        "the ζ composition publishes a dense baseline θ Hessian"
+    );
+    let first_hessian = first.hessian_psi.clone();
+    assert!(first_hessian.iter().any(|value| *value != 0.0));
     assert_eq!(first_hessian.dim(), (dimension, dimension));
     assert!(first.score_psi.iter().all(|value| value.is_finite()));
     assert!(first_hessian.iter().all(|value| value.is_finite()));
@@ -6805,6 +6673,57 @@ fn survival_dense_hessian_is_bitwise_invariant_to_the_worker_count_2337() {
     }
 }
 
+/// gam#3035: the dense Hessian and all-axes overrides agree with the generic
+/// per-row reductions on the full data and on a Horvitz–Thompson-weighted
+/// subsample. `n = 700` puts the subsample's walk past one 256-row chunk.
+#[test]
+fn rigid_survival_dense_overrides_match_generic_on_every_row_set_3035() {
+    let n = 700usize;
+    let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.37).sin() * 1.1).collect();
+    let weights: Vec<f64> = (0..n).map(|r| 0.7 + 0.5 * ((r % 5) as f64) / 5.0).collect();
+    let event: Vec<f64> = (0..n).map(|r| ((r % 3 == 0) as u8) as f64).collect();
+    let marginal_design = Array2::from_shape_fn((n, 2), |(r, j)| {
+        0.2 + 0.05 * (r as f64).cos() + 0.11 * (j as f64) - 0.013 * (r as f64) / (n as f64)
+    });
+    let slope_design = Array2::from_shape_fn((n, 2), |(r, j)| {
+        0.1 + 0.07 * (r as f64).sin() - 0.09 * (j as f64) + 0.004 * (r as f64) / (n as f64)
+    });
+    let beta_marginal = Array1::from_vec(vec![0.18, -0.12]);
+    let beta_slope = Array1::from_vec(vec![-0.2, 0.13]);
+    for frailty in [None, Some(0.55_f64)] {
+        let mut family = oracle_rigid_family(n, &z, &weights, &event, frailty);
+        family.marginal_design = DesignMatrix::from(marginal_design.clone());
+        family
+            .slope_layout
+            .replace_coefficient_design(DesignMatrix::from(slope_design.clone()));
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.65],
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: beta_marginal.clone(),
+                eta: marginal_design.dot(&beta_marginal),
+            },
+            ParameterBlockState {
+                beta: beta_slope.clone(),
+                eta: slope_design.dot(&beta_slope),
+            },
+        ];
+        let kernel = SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+            family,
+            block_states,
+        );
+        crate::test_support::row_set_overrides::assert_dense_overrides_match_generic(
+            &format!("rigid survival marginal-slope frailty={frailty:?}"),
+            &kernel,
+            &[0.4, -0.6, 0.3, 0.8, -0.2],
+            &[0.5, 0.3, -0.7, 0.9, -0.4],
+            1e-13,
+        );
+    }
+}
+
 /// gam#979 build-once equality contract for the rigid survival marginal-slope
 /// kernel.
 ///
@@ -6994,7 +6913,7 @@ fn rigid_survival_all_axes_build_once_equals_per_axis_sweep_979() {
                 ((row + 3 * (a + b + c)) as f64 * 0.17).sin()
             })))
         }).collect();
-        let assembled = kernel.all_axes_primary_tensor_pullback(&tensors).unwrap();
+        let assembled = kernel.all_axes_primary_tensor_pullback(&RowSet::All, &tensors).unwrap();
         for axis in 0..p {
             let mut direction = vec![0.0; p];
             direction[axis] = 1.0;
@@ -7185,7 +7104,7 @@ fn rigid_survival_all_axes_tensor_pullback_is_accurate_and_width_invariant_2337(
             .num_threads(workers)
             .build()
             .expect("test worker pool")
-            .install(|| kernel.all_axes_primary_tensor_pullback(&tensors))
+            .install(|| kernel.all_axes_primary_tensor_pullback(&crate::row_kernel::RowSet::All, &tensors))
             .expect("all-axes tensor pullback")
     };
     let one_worker = pullback(1);
@@ -8597,51 +8516,104 @@ fn rigid_row_primary_mixed_in_z_matches_finite_difference() {
     );
 }
 
-/// gam#979: with a time-wiggle block the time value designs carry trailing
-/// zero placeholder columns; the shrinkage metric is the empirical Gram of the
-/// value block only, and the ridge is embedded at zero on the placeholders.
+/// A time block's exit design with `p_base` base columns and a zero placeholder
+/// wiggle tail, the baseline predictor it carries, and the wiggle it declares.
+fn placeholder_time_exit_with_wiggle(
+    p_base: usize,
+) -> (DesignMatrix, Array1<f64>, TimeWiggleBlockInput, Array2<f64>) {
+    let n = 40;
+    let offset_exit = Array1::from_shape_fn(n, |i| -1.5 + 3.0 * i as f64 / (n - 1) as f64);
+    let degree = 3;
+    let knots = gam_terms::basis::initializewiggle_knots_from_seed(offset_exit.view(), degree, 2)
+        .expect("wiggle knots from the baseline predictor");
+    let jacobian = crate::wiggle::monotone_wiggle_basis_from_knots(offset_exit.view(), &knots, degree)
+        .expect("warp Jacobian at the baseline predictor");
+    let ncols = jacobian.ncols();
+    let mut placeholder = Array2::<f64>::zeros((n, p_base + ncols));
+    for i in 0..n {
+        for j in 0..p_base {
+            placeholder[[i, j]] = offset_exit[i].powi(j as i32);
+        }
+    }
+    (
+        DesignMatrix::from(placeholder),
+        offset_exit,
+        TimeWiggleBlockInput { knots, degree, ncols },
+        jacobian,
+    )
+}
+
+fn embedded_penalty(p: usize, range: std::ops::Range<usize>, local: &Array2<f64>) -> Array2<f64> {
+    let mut embedded = Array2::<f64>::zeros((p, p));
+    embedded.slice_mut(s![range.clone(), range]).assign(local);
+    embedded
+}
+
+/// gam#3061: a timewiggle-only time block (no base columns) is exactly the
+/// production refusal when seeded against its placeholder design; seeded against
+/// the acting design, its wiggle penalty reads the warp Jacobian's scale.
 #[test]
-fn time_shrinkage_metric_excludes_timewiggle_placeholder_columns() {
-    let (entry, exit) = full_span_time_endpoint_designs();
-    let pad = |design: &DesignMatrix| -> DesignMatrix {
-        let dense = design.to_dense();
-        let mut padded = Array2::<f64>::zeros((dense.nrows(), dense.ncols() + 2));
-        padded.slice_mut(s![.., ..dense.ncols()]).assign(&dense);
-        DesignMatrix::from(padded)
-    };
-    let mut penalty = Array2::<f64>::zeros((4, 4));
-    penalty[[0, 0]] = 1.0;
-    let mut block = TimeBlockInput {
-        design_entry: pad(&entry),
-        design_exit: pad(&exit),
-        design_derivative_exit: pad(&exit),
-        penalties: vec![penalty],
-        nullspace_dims: vec![1],
-        initial_beta: Some(Array1::zeros(4)),
-        ..base_time_block()
-    };
-    // The same block through the all-columns metric is exactly the production
-    // refusal: the placeholder columns have no value support.
-    let mut all_columns = block.clone();
-    let no_origin_entries = Array1::from_elem(block.design_entry.nrows(), false);
-    let refused = install_time_nullspace_shrinkage_penalty(&mut all_columns, 0, &no_origin_entries);
-    assert!(
-        refused.is_err(),
-        "the control must refuse: an all-columns metric over zero placeholders is singular"
+fn timewiggle_penalties_are_seeded_against_the_warp_jacobian_3061() {
+    let (placeholder, offset_exit, wiggle, jacobian) = placeholder_time_exit_with_wiggle(0);
+    let wiggle_local = Array2::<f64>::eye(wiggle.ncols);
+    let penalties = vec![embedded_penalty(wiggle.ncols, 0..wiggle.ncols, &wiggle_local)];
+
+    let refused = block_log_lambda_seeds(&placeholder, penalties.iter())
+        .expect_err("the control must refuse: the placeholder tail has an all-zero Gram");
+    assert!(refused.contains("mean Gram diagonal is 0e0"), "{refused}");
+
+    let acting = time_block_acting_exit_design(&placeholder, offset_exit.view(), Some(&wiggle))
+        .expect("acting exit design");
+    assert_eq!(acting.to_dense(), jacobian, "the wiggle tail must be the warp Jacobian");
+    let seeds = time_block_log_lambda_seeds(&acting, &penalties, wiggle.ncols)
+        .expect("a wiggle penalty seeds against the Jacobian");
+    let expected = block_log_lambda_seeds(&DesignMatrix::from(jacobian.clone()), [&wiggle_local])
+        .expect("seed against the Jacobian itself");
+    assert_eq!(seeds, expected);
+
+    // The ρ domain is read against the same design, and the placeholder's all-zero
+    // Gram carried no resolvability information for it.
+    let (lo, hi) =
+        crate::fit_orchestration::drivers::penalized_block_rho_domain(&acting, penalties.iter());
+    let (placeholder_lo, placeholder_hi) =
+        crate::fit_orchestration::drivers::penalized_block_rho_domain(&placeholder, penalties.iter());
+    assert!(lo[0].is_finite() && hi[0].is_finite() && lo[0] < hi[0], "[{}, {}]", lo[0], hi[0]);
+    assert_ne!(
+        (lo[0], hi[0]),
+        (placeholder_lo[0], placeholder_hi[0]),
+        "the acting design must resolve the wiggle penalty's own domain"
     );
-    assert!(
-        install_time_nullspace_shrinkage_penalty(&mut block, 2, &no_origin_entries)
-            .expect("value-block metric with placeholders excluded"),
-        "expected a shrinkage penalty on the value block"
-    );
-    let ridge = block.penalties.last().expect("appended ridge");
-    assert_eq!(ridge.dim(), (4, 4));
-    assert!(
-        ridge.slice(s![2.., ..]).iter().all(|v| *v == 0.0)
-            && ridge.slice(s![.., 2..]).iter().all(|v| *v == 0.0),
-        "the ridge must be zero on the placeholder columns"
-    );
-    assert!(ridge[[1, 1]] > 0.0, "the null direction of the value block must be shrunk");
+}
+
+/// gam#3061: with base columns beside the wiggle, each time penalty is seeded
+/// against the part it acts on, and a penalty coupling the two parts is refused.
+#[test]
+fn time_penalties_are_seeded_against_the_part_they_act_on_3061() {
+    let p_base = 2;
+    let (placeholder, offset_exit, wiggle, jacobian) = placeholder_time_exit_with_wiggle(p_base);
+    let p = p_base + wiggle.ncols;
+    let base_local = array![[0.0, 0.0], [0.0, 1.0]];
+    let wiggle_local = Array2::<f64>::eye(wiggle.ncols);
+    let penalties = vec![
+        embedded_penalty(p, 0..p_base, &base_local),
+        embedded_penalty(p, p_base..p, &wiggle_local),
+    ];
+    let acting = time_block_acting_exit_design(&placeholder, offset_exit.view(), Some(&wiggle))
+        .expect("acting exit design");
+    let seeds = time_block_log_lambda_seeds(&acting, &penalties, wiggle.ncols)
+        .expect("time seeds on the acting design");
+
+    let base_design = DesignMatrix::from(placeholder.to_dense().slice(s![.., ..p_base]).to_owned());
+    let base_seed = block_log_lambda_seeds(&base_design, [&base_local]).expect("base seed");
+    let wiggle_seed = block_log_lambda_seeds(&DesignMatrix::from(jacobian), [&wiggle_local])
+        .expect("wiggle seed");
+    assert_relative_eq!(seeds[0], base_seed[0], max_relative = 1e-12);
+    assert_relative_eq!(seeds[1], wiggle_seed[0], max_relative = 1e-12);
+
+    let coupled = &penalties[0] + &penalties[1];
+    let refused = time_block_log_lambda_seeds(&acting, &[coupled], wiggle.ncols)
+        .expect_err("a penalty on both parts has no single scale");
+    assert!(refused.contains("couples the base columns"), "{refused}");
 }
 
 /// #932 single-source pin, restored (#2818): the SPECIALIZED rigid-row
@@ -9213,4 +9185,176 @@ fn closed_form_certificate_anchors_exclude_the_influence_offset_2926() {
             "row {row}: the certificate must score the offset-free anchor, whatever o_infl = {offset}"
         );
     }
+}
+
+/// gam#2971: a survival event row's likelihood keeps its value and its slope as
+/// the row's link-deviation argument `u = a₁ + g·z` crosses the support's right
+/// end. The event density carries `ln χ₁`, `χ₁ = 1 + w′(u)`, and outside the
+/// support the deviation is flat, so a link basis whose `w′` survives at the end
+/// made the row likelihood jump by `ln(1 + w′(end))` there. The inner Newton
+/// crept toward that cliff and never certified. The likelihood's gradient reads
+/// `w″` through `∂χ₁/∂a`, so its slope jumps as well unless `w″` also vanishes.
+///
+/// The exit index `q₁*` putting `u` on the end is bisected, and the row
+/// likelihood is read at `q₁* ± h, ± 2h, ± 3h`. Each side's three points give a
+/// quadratic extrapolation of the value and the slope at `q₁*`. Its gap to the
+/// linear extrapolation from the two nearer points is that side's truncation
+/// estimate. The two sides must agree within the sum of their estimates.
+#[test]
+fn link_deviation_row_likelihood_is_c1_across_its_support_end_2971() {
+    let score_runtime = test_deviation_runtime();
+    let link_seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
+    let link_runtime = build_link_deviation_block_from_knots_design_seed_and_weights(
+        &link_seed,
+        &link_seed,
+        &DeviationBlockConfig {
+            degree: 3,
+            num_internal_knots: 3,
+            penalty_order: 2,
+            penalty_orders: vec![1, 2, 3],
+            double_penalty: false,
+            monotonicity_eps: 1e-4,
+        },
+    )
+    .expect("build the production survival link deviation")
+    .runtime;
+    let h_dim = score_runtime.basis_dim();
+    let w_dim = link_runtime.basis_dim();
+    let q0v = -0.25_f64;
+    let qd1v = 0.9_f64;
+    let gv = 0.4_f64;
+    let family = SurvivalMarginalSlopeFamily {
+        jeffreys_armed: true,
+        latent_law: None,
+        n: 1,
+        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
+        event: Arc::new(array![1.0]),
+        weights: Arc::new(array![1.0]),
+        z: Arc::new(array![0.3].insert_axis(Axis(1))),
+        score_covariance: unit_score_covariance(),
+        gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
+        derivative_guard: 1e-6,
+        design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        offset_entry: Arc::new(array![q0v]),
+        offset_exit: Arc::new(array![0.0]),
+        derivative_offset_exit: Arc::new(array![qd1v]),
+        marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        slope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
+        score_warp: Some(score_runtime.clone()),
+        link_dev: Some(link_runtime.clone()),
+        influence_absorber: None,
+        time_linear_constraints: None,
+        time_wiggle_knots: None,
+        time_wiggle_degree: None,
+        time_wiggle_ncols: 0,
+        intercept_warm_starts: None,
+    };
+    let beta_h = Array1::from_iter((0..h_dim).map(|k| 0.04 * (k as f64 + 1.3).sin()));
+    let beta_w = Array1::from_iter((0..w_dim).map(|k| 0.035 * (k as f64 + 0.7).cos()));
+    let z_obs = family.observed_score_projection(0);
+    let breakpoints = link_runtime.breakpoints();
+    let right_end = breakpoints[breakpoints.len() - 1];
+    let last_interior = breakpoints[breakpoints.len() - 2];
+    let argument = |q1: f64| -> f64 {
+        let (a1, _) = family
+            .solve_row_survival_intercept_with_slot(q1, gv, Some(&beta_h), Some(&beta_w), None)
+            .expect("exit intercept solve");
+        a1 + gv * z_obs
+    };
+    let neglog = |q1: f64| -> f64 {
+        family
+            .row_neglog_flex_value_from_parts(
+                0,
+                q0v,
+                q1,
+                qd1v,
+                gv,
+                Some(&beta_h),
+                Some(&beta_w),
+                0.0,
+            )
+            .expect("row neglog")
+    };
+
+    // The argument rises with q₁; bisect until the bracket stops shrinking.
+    let (mut lo, mut hi) = (-4.0_f64, 4.0_f64);
+    assert!(
+        argument(lo) < right_end && argument(hi) > right_end,
+        "the bracket must straddle the support end {right_end}: u(lo)={:.6} u(hi)={:.6}",
+        argument(lo),
+        argument(hi)
+    );
+    loop {
+        let mid = 0.5 * (lo + hi);
+        if !(mid > lo && mid < hi) {
+            break;
+        }
+        if argument(mid) <= right_end {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let q_star = 0.5 * (lo + hi);
+    let h = 1e-3;
+    let values: Vec<(f64, f64, f64)> = [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0]
+        .iter()
+        .map(|&k: &f64| {
+            let q = q_star + k * h;
+            (q, argument(q), neglog(q))
+        })
+        .collect();
+    for (q, u, value) in &values {
+        eprintln!(
+            "support end 2971: q1={q:.12e} u={u:.12e} (end {right_end:.6}) neglog={value:.15e}"
+        );
+    }
+    // Every left point lies in the last span and every right point in the flat
+    // tail, so each side's stencil reads one polynomial piece.
+    assert!(
+        values[..3]
+            .iter()
+            .all(|&(_, u, _)| u > last_interior && u <= right_end)
+            && values[3..].iter().all(|&(_, u, _)| u > right_end),
+        "the stencil must sit in the last span on the left and in the tail on the right"
+    );
+    let side = |near: f64, mid: f64, far: f64, sign: f64| -> (f64, f64, f64, f64) {
+        let value = 3.0 * near - 3.0 * mid + far;
+        let value_linear = 2.0 * near - mid;
+        let slope = sign * (2.5 * near - 4.0 * mid + 1.5 * far) / h;
+        let slope_linear = sign * (near - mid) / h;
+        (
+            value,
+            (value - value_linear).abs(),
+            slope,
+            (slope - slope_linear).abs(),
+        )
+    };
+    let (left_value, left_value_est, left_slope, left_slope_est) =
+        side(values[2].2, values[1].2, values[0].2, 1.0);
+    let (right_value, right_value_est, right_slope, right_slope_est) =
+        side(values[3].2, values[4].2, values[5].2, -1.0);
+    let value_gap = (left_value - right_value).abs();
+    let slope_gap = (left_slope - right_slope).abs();
+    eprintln!(
+        "support end 2971: q1*={q_star:.12e} value left={left_value:.15e} right={right_value:.15e} \
+         gap={value_gap:.3e} bound={:.3e} | slope left={left_slope:.12e} right={right_slope:.12e} \
+         gap={slope_gap:.3e} bound={:.3e}",
+        left_value_est + right_value_est,
+        left_slope_est + right_slope_est
+    );
+    assert!(
+        value_gap <= left_value_est + right_value_est,
+        "the row likelihood jumps at the link support end: gap={value_gap:.3e} > bound={:.3e}",
+        left_value_est + right_value_est
+    );
+    assert!(
+        slope_gap <= left_slope_est + right_slope_est,
+        "the row likelihood's slope jumps at the link support end: gap={slope_gap:.3e} > \
+         bound={:.3e}",
+        left_slope_est + right_slope_est
+    );
 }

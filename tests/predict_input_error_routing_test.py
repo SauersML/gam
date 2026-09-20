@@ -5,7 +5,7 @@ level are problems with the rows handed to ``predict``, not with the fitted
 model or its schema, so they raise the documented ``PredictInputError`` (a
 ``PredictionError``) with the column, the row and the offending level in the
 message and a ``help:`` line. Before the fix they surfaced as the bare
-``GamError`` umbrella, and a numeric-coded ``factor(g)`` level only failed deep
+``GamfitError`` umbrella, and a numeric-coded ``factor(g)`` level only failed deep
 inside the design build without naming its column's training levels.
 """
 

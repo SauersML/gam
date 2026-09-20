@@ -28,9 +28,12 @@ This test fits ``te(x, z)`` on the original frame and on several fixed row
 permutations and asserts:
   * the deviances agree (same data / same fit quality — the anchor),
   * the reported EDF agrees across orderings (invariance), and
-  * the summed standard errors agree across orderings (invariance).
+  * on every ordering the conditional covariance carries the fit's own EDF,
+    ``Σᵢ Var(η̂ᵢ) = φ·edf`` (no collapsed covariance).
 It previously failed with edf 52 vs 13.5 (ΣSE 3.84 vs 12.98) on the original
 order; with the reparameterization + covariance fixes it passes without edits.
+A sum of coefficient SEs is not the covariance check: at a fixed edf it moves
+with the basis size and scaling, so it cannot separate a collapse from a chart.
 """
 
 from __future__ import annotations
@@ -57,12 +60,46 @@ def _frame(seed: int = 0, n: int = 300):
 def _fit_stats(frame: pd.DataFrame) -> dict[str, float]:
     model = gamfit.fit(frame, "y ~ te(x, z)")
     s = model.summary()
-    se = np.asarray(s.coefficients_frame()["std_error"], dtype=float)
+    design = model.design_matrix(frame)
+    assert design.covariance_conditional is not None
+    covariance = np.asarray(design.covariance_conditional, dtype=float)
+    gradient = np.asarray(design.eta_gradient, dtype=float)
+    eta_variance = np.einsum("ij,jk,ik->i", gradient, covariance, gradient)
+    spectrum = np.linalg.eigvalsh(covariance)
     return {
         "edf": float(s.edf_total),
         "deviance": float(s.deviance),
-        "se_sum": float(np.nansum(se)),
+        "scale": float(s.scale),
+        "eta_variance_sum": float(eta_variance.sum()),
+        "covariance_eig_min": float(spectrum[0]),
+        "covariance_eig_max": float(spectrum[-1]),
+        "coefficients": float(covariance.shape[0]),
     }
+
+
+def _assert_covariance_carries_edf(stats: dict[str, float], label: str) -> None:
+    """The conditional covariance must carry the fit's own effective dof.
+
+    For a Gaussian identity fit ``V = φ·H⁻¹`` with ``H = XᵀX + S_λ``, so the
+    training rows' posterior variances sum to
+    ``Σᵢ xᵢᵀ V xᵢ = φ·tr(H⁻¹ XᵀX) = φ·edf`` in every coefficient chart. A
+    covariance shrunk by an additive stabilizing ridge (the #2123 failure) breaks
+    this identity. The bar is the relative error a backward-stable solve with
+    ``H`` carries, ``p·ε·κ(H)``, where ``κ(H) = κ(V)``.
+    """
+    assert stats["covariance_eig_min"] > 0.0, (
+        f"{label}: conditional covariance is not positive definite "
+        f"(smallest eigenvalue {stats['covariance_eig_min']:.3e})"
+    )
+    condition = stats["covariance_eig_max"] / stats["covariance_eig_min"]
+    bar = stats["coefficients"] * np.finfo(float).eps * condition
+    carried = stats["scale"] * stats["edf"]
+    gap = abs(stats["eta_variance_sum"] / carried - 1.0)
+    assert gap <= bar, (
+        f"{label}: conditional covariance does not carry the fit's EDF: "
+        f"sum Var(eta_i) = {stats['eta_variance_sum']:.6e} vs scale*edf = {carried:.6e} "
+        f"(relative gap {gap:.3e} > bar {bar:.3e}) — covariance degenerate"
+    )
 
 
 def test_te_tensor_smooth_edf_and_se_invariant_to_row_order() -> None:
@@ -78,10 +115,8 @@ def test_te_tensor_smooth_edf_and_se_invariant_to_row_order() -> None:
         f"original-order te(x,z) EDF={base['edf']:.3f} is not a sensible smooth fit "
         f"(railed/floored?)"
     )
-    # And its standard errors must not have collapsed toward zero.
-    assert base["se_sum"] > 5.0, (
-        f"original-order ΣSE={base['se_sum']:.3f} collapsed — covariance is degenerate"
-    )
+    # And its covariance must not have collapsed.
+    _assert_covariance_carries_edf(base, "original order")
 
     for seed in (1, 7, 101, 2024, 3, 10, 5, 8):
         perm = d.iloc[np.random.default_rng(seed).permutation(n)].reset_index(drop=True)
@@ -103,8 +138,5 @@ def test_te_tensor_smooth_edf_and_se_invariant_to_row_order() -> None:
         # κ(H)≈1e13). There the additive stabilization ridge in the naive inverse
         # uniformly shrank every posterior variance (ΣSE collapsed to ≈0.16); the
         # ridge-free spectral covariance inverse keeps the well-determined
-        # directions' variances intact, so ΣSE stays a real (non-degenerate) value.
-        assert got["se_sum"] > 1.0, (
-            f"ΣSE collapsed under permutation seed={seed}: {got['se_sum']:.3f} "
-            f"(covariance degenerate at the saturated ρ rail)"
-        )
+        # directions' variances intact, which the identity checks at any λ.
+        _assert_covariance_carries_edf(got, f"permutation seed={seed}")
