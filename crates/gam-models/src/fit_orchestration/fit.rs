@@ -506,7 +506,6 @@ pub(crate) fn fit_standard_model_on_design(
         wiggle_knots: None,
         wiggle_degree: None,
         wiggle_penalty_metadata: None,
-        wiggle_saved_warp_beta: None,
         wiggle_saved_index_shift: None,
     };
 
@@ -635,7 +634,6 @@ pub(crate) fn fit_standard_model_on_design(
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),
         wiggle_penalty_metadata: Some(wiggle_penalty_metadata),
-        wiggle_saved_warp_beta: solved.saved_warp_beta,
         wiggle_saved_index_shift: solved.saved_index_shift,
     })
 }

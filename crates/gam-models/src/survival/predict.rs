@@ -672,7 +672,7 @@ fn saved_model_with_survival_coefficients(
         | SavedModel::TransformationNormal { payload } => payload,
     };
 
-    let (beta_time, beta_threshold, beta_log_sigma, beta_link_wiggle, beta_time_blocks) = {
+    let (beta_time, beta_time_blocks) = {
         let fit = payload.fit_result.as_mut().ok_or_else(|| {
             SurvivalPredictError::MissingFitMetadata {
                 reason: "saved survival model is missing canonical fit_result".to_string(),
@@ -682,12 +682,6 @@ fn saved_model_with_survival_coefficients(
         (
             fit.block_by_role(BlockRole::Time)
                 .map(|block| block.beta.to_vec()),
-            fit.block_by_role(BlockRole::Threshold)
-                .map(|block| block.beta.to_vec()),
-            fit.block_by_role(BlockRole::Scale)
-                .map(|block| block.beta.to_vec()),
-            fit.block_by_role(BlockRole::LinkWiggle)
-                .map(|block| block.beta.to_vec()),
             fit.blocks
                 .iter()
                 .map(|block| block.beta.to_vec())
@@ -695,18 +689,6 @@ fn saved_model_with_survival_coefficients(
         )
     };
 
-    if payload.survival_beta_time.is_some() {
-        payload.survival_beta_time = beta_time.clone();
-    }
-    if payload.survival_beta_threshold.is_some() {
-        payload.survival_beta_threshold = beta_threshold;
-    }
-    if payload.survival_beta_log_sigma.is_some() {
-        payload.survival_beta_log_sigma = beta_log_sigma;
-    }
-    if payload.beta_link_wiggle.is_some() {
-        payload.beta_link_wiggle = beta_link_wiggle;
-    }
     if let (Some(saved), Some(time_beta)) = (
         payload.beta_baseline_timewiggle.as_mut(),
         beta_time.as_ref(),

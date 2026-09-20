@@ -922,11 +922,6 @@ pub(crate) struct BinomialMeanWiggleTermFitResult {
     pub design: TermCollectionDesign,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
-    /// Standard I-spline warp coefficients `β_w` for the saved-model predict
-    /// runtime when frozen-basis de-aliasing engaged (#1596). Observation-space
-    /// residualization preserves this coefficient chart, so the fit and predict
-    /// runtime consume the same non-negative vector.
-    pub saved_warp_beta: Option<Vec<f64>>,
     /// Frozen-index mean-coordinate shift `s = β_frozen_source − β_saved` for the
     /// predict runtime (#2141). Predict evaluates the warp basis at
     /// `X·(β_saved + s) = η̂` (the frozen index the fit pinned `B` at) instead of
@@ -2316,7 +2311,6 @@ mod binomial_mean_wiggle_dealias_metric_tests {
 /// DE-ALIASED predictor and not at `η̂`.
 pub(crate) struct BinomialMeanWiggleFrozenFit {
     pub(crate) fit: UnifiedFitResult,
-    pub(crate) saved_warp_beta: Option<Vec<f64>>,
     /// `β_frozen_source − β_saved` in mean coordinates, so `X·(β_saved + shift)`
     /// is the frozen index `η̂` (#2141).
     pub(crate) saved_index_shift: Option<Vec<f64>>,
@@ -2776,7 +2770,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
     // constrained REML/LAML fit. Since B' is an M-spline basis with non-negative
     // values, dq/dη = 1 + B'(η)·β_w ≥ 1 for every η, including between
     // knots; no post-fit sampling or smoothing-parameter ladder is needed.
-    let saved_warp_beta = fit
+    let fitted_warp_beta = fit
         .block_states
         .get(BinomialMeanWiggleFamily::BLOCK_WIGGLE)
         .map(|state| state.beta.to_vec())
@@ -2785,7 +2779,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
                 .to_string()
         })?;
     validate_monotone_wiggle_beta_nonnegative(
-        &saved_warp_beta,
+        &fitted_warp_beta,
         "fit_binomial_mean_wiggle saved warp",
     )?;
     finalize_binomial_mean_wiggle_saved_frame(
@@ -2797,7 +2791,6 @@ pub(crate) fn fit_binomial_mean_wiggle(
     // The frozen-index shift `s = β_frozen_source − β_saved` for the predict
     // runtime (#2141). `β_saved` is the just-de-aliased mean block; adding
     // `X·s` to the predict base predictor recovers the frozen warp index `η̂`.
-    // Only meaningful when a warp actually engaged (`saved_warp_beta` present).
     let saved_mean_state = fit
         .block_states
         .get(BinomialMeanWiggleFamily::BLOCK_ETA)
@@ -2814,7 +2807,6 @@ pub(crate) fn fit_binomial_mean_wiggle(
     let saved_index_shift = Some((&frozen_source_beta - &saved_mean_state.beta).to_vec());
     Ok(BinomialMeanWiggleFrozenFit {
         fit,
-        saved_warp_beta: Some(saved_warp_beta),
         saved_index_shift,
         frozen_warp_design,
     })
@@ -4237,7 +4229,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     if spatial_terms.is_empty() {
         let BinomialMeanWiggleFrozenFit {
             fit,
-            saved_warp_beta,
             saved_index_shift,
             ..
         } = fit_binomial_mean_wiggle(
@@ -4272,7 +4263,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             design: pilot_design.clone(),
             wiggle_knots,
             wiggle_degree,
-            saved_warp_beta,
             saved_index_shift,
         });
     }
@@ -4882,7 +4872,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     )?;
     let BinomialMeanWiggleFrozenFit {
         fit,
-        saved_warp_beta,
         saved_index_shift,
         ..
     } = fit;
@@ -4893,7 +4882,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         design,
         wiggle_knots,
         wiggle_degree,
-        saved_warp_beta,
         saved_index_shift,
     })
 }

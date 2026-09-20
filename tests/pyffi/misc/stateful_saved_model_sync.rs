@@ -81,10 +81,14 @@ const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
 // prediction reads), `beta_noise` (a copy of the fit's `Scale` block, which
 // prediction reads), `slope_formulas` and `baseline_slopes` (singleton mirrors
 // of `slope_formula` and `baseline_slope` that nothing read) and the
-// never-written `latent_score_contract`. `FittedModelPayload` now declares 100
-// `pub` fields, so the JSON payload carries 100 - 4 = 96 keys. The stateful sync
-// keeps mirroring each link's point state; the link covariance stays on the fit.
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 96;
+// never-written `latent_score_contract`. gam#4507 removes four more flat
+// coefficient copies: `beta_link_wiggle`, `survival_beta_time`,
+// `survival_beta_threshold` and `survival_beta_log_sigma`; the fit's
+// `LinkWiggle`, `Time`, `Threshold` and `Scale` blocks are the only coefficient
+// store. `FittedModelPayload` now declares 96 `pub` fields, so the JSON payload
+// carries 96 - 4 = 92 keys. The stateful sync keeps mirroring each link's point
+// state; the link covariance stays on the fit.
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 92;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {

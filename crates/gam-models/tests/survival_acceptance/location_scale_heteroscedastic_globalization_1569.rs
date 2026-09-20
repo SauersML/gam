@@ -302,10 +302,6 @@ fn a_pre_2695_heteroscedastic_payload_is_refused_and_a_constant_scale_one_loads_
             block.beta.fill(0.0);
         }
     }
-    unit_scale.survival_beta_log_sigma = unit_scale
-        .survival_beta_log_sigma
-        .as_ref()
-        .map(|beta| vec![0.0; beta.len()]);
     assert!(
         !block_can_move(&unit_scale, BlockRole::Scale)
             && block_can_move(&unit_scale, BlockRole::Time),

@@ -443,7 +443,6 @@ pub fn assemble_standard_payload(
         wiggle_knots,
         wiggle_degree,
         wiggle_penalty_metadata,
-        wiggle_saved_warp_beta,
         wiggle_saved_index_shift,
         ..
     } = result;
@@ -517,7 +516,6 @@ pub fn assemble_standard_payload(
     payload.linkwiggle_knots = wiggle_knots.map(|knots| knots.to_vec());
     payload.linkwiggle_degree = wiggle_degree;
     payload.linkwiggle_penalty_metadata = wiggle_penalty_metadata;
-    payload.beta_link_wiggle = wiggle_saved_warp_beta;
     payload.link_wiggle_index_shift = wiggle_saved_index_shift;
     payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
     payload.resolved_termspec = Some(resolved_termspec);
@@ -1005,14 +1003,15 @@ pub enum LocationScaleResponse {
     },
 }
 
-/// Optional link-wiggle metadata persisted alongside a location-scale model.
-/// Knots/coefficients are already in raw response units — the Gaussian
+/// Optional link-wiggle basis metadata persisted alongside a location-scale
+/// model. The knots are already in raw response units — the Gaussian
 /// standardization and its inverse remap live inside
 /// `fit_gaussian_location_scale_model`, so the save path persists them verbatim.
+/// The wiggle coefficients are the fit's `LinkWiggle` block; they are not
+/// stored a second time.
 pub struct LocationScaleWiggle {
     pub knots: Vec<f64>,
     pub degree: usize,
-    pub beta_link_wiggle: Vec<f64>,
 }
 
 /// Source-agnostic semantic content of a (non-survival) location-scale saved
@@ -1103,7 +1102,6 @@ pub fn assemble_location_scale_payload(
     if let Some(wiggle) = inputs.wiggle {
         payload.linkwiggle_knots = Some(wiggle.knots);
         payload.linkwiggle_degree = Some(wiggle.degree);
-        payload.beta_link_wiggle = Some(wiggle.beta_link_wiggle);
     }
     source.apply_to(&mut payload);
     Ok(payload)
@@ -1345,8 +1343,6 @@ pub struct SurvivalTransformationInputs {
     pub time_basis: SavedSurvivalTimeBasis,
     pub survival_likelihood_label: String,
     pub resolved_termspec: TermCollectionSpec,
-    /// Rigid time-block beta, persisted only by the cause-specific CLI path.
-    pub survival_beta_time: Option<Vec<f64>>,
     pub timewiggle: Option<SurvivalTimewiggle>,
 }
 
@@ -1391,7 +1387,6 @@ pub fn assemble_survival_transformation_payload(
         apply_timewiggle_beta(&mut payload, timewiggle.beta);
     }
     payload.survival_likelihood = Some(inputs.survival_likelihood_label);
-    payload.survival_beta_time = inputs.survival_beta_time;
     payload.resolved_termspec = Some(inputs.resolved_termspec);
     source.apply_to(&mut payload);
     Ok(payload)
@@ -1412,7 +1407,6 @@ pub struct SurvivalLocationScaleInputs {
     // reproduces exactly what the CLI and FFI each persist independently.
     pub linkwiggle_degree: Option<usize>,
     pub linkwiggle_knots: Option<Vec<f64>>,
-    pub beta_link_wiggle: Option<Vec<f64>>,
     pub baseline_timewiggle: Option<SurvivalTimewiggle>,
     pub survival_entry: Option<String>,
     pub survival_exit: String,
@@ -1425,9 +1419,6 @@ pub struct SurvivalLocationScaleInputs {
     pub threshold_time_basis: Option<SurvivalCovariateTimeBasis>,
     pub log_sigma_time_basis: Option<SurvivalCovariateTimeBasis>,
     pub formula_noise: Option<String>,
-    pub survival_beta_time: Vec<f64>,
-    pub survival_beta_threshold: Vec<f64>,
-    pub survival_beta_log_sigma: Vec<f64>,
     pub resolved_thresholdspec: TermCollectionSpec,
     pub resolved_log_sigmaspec: TermCollectionSpec,
 }
@@ -1451,7 +1442,6 @@ pub fn assemble_survival_location_scale_payload(
     payload.link = Some(inputs.fitted_inverse_link);
     payload.linkwiggle_degree = inputs.linkwiggle_degree;
     payload.linkwiggle_knots = inputs.linkwiggle_knots;
-    payload.beta_link_wiggle = inputs.beta_link_wiggle;
     if let Some(timewiggle) = inputs.baseline_timewiggle {
         payload.baseline_timewiggle_degree = Some(timewiggle.degree);
         payload.baseline_timewiggle_knots = Some(timewiggle.knots);
@@ -1477,9 +1467,6 @@ pub fn assemble_survival_location_scale_payload(
         log_sigma_time_basis: inputs.log_sigma_time_basis,
     });
     payload.formula_noise = inputs.formula_noise;
-    payload.survival_beta_time = Some(inputs.survival_beta_time);
-    payload.survival_beta_threshold = Some(inputs.survival_beta_threshold);
-    payload.survival_beta_log_sigma = Some(inputs.survival_beta_log_sigma);
     payload.survival_distribution = survival_distribution;
     payload.resolved_termspec = Some(inputs.resolved_thresholdspec);
     payload.resolved_termspec_noise = Some(inputs.resolved_log_sigmaspec);
@@ -1502,7 +1489,6 @@ pub struct LatentWindowInputs {
     pub survival_event: String,
     pub baseline_cfg: SurvivalBaselineConfig,
     pub time_basis: SavedSurvivalTimeBasis,
-    pub beta_time: Vec<f64>,
     pub resolved_termspec: TermCollectionSpec,
 }
 
@@ -1533,7 +1519,6 @@ pub fn assemble_latent_window_payload(
     payload.survival_baseline_makeham = inputs.baseline_cfg.makeham;
     payload.apply_survival_time_basis(&inputs.time_basis);
     payload.survival_likelihood = Some(inputs.likelihood_label);
-    payload.survival_beta_time = Some(inputs.beta_time);
     payload.resolved_termspec = Some(inputs.resolved_termspec);
     source.apply_to(&mut payload);
     payload
@@ -2498,7 +2483,6 @@ fn payload_for_survival_transformation(
             time_basis: rp_result.time_basis.clone(),
             survival_likelihood_label: likelihood_label,
             resolved_termspec: rp_result.resolvedspec,
-            survival_beta_time: None,
             timewiggle,
         },
         SavedModelSourceMetadata {
@@ -2540,11 +2524,7 @@ pub fn payload_for_gaussian_location_scale(
         .ok_or_else(|| "gaussian location-scale requires noise_formula".to_string())?;
 
     let fit = ls_result.fit.fit;
-    let wiggle = location_scale_wiggle_from_parts(
-        ls_result.wiggle_knots,
-        ls_result.wiggle_degree,
-        ls_result.beta_link_wiggle,
-    );
+    let wiggle = location_scale_wiggle_from_parts(ls_result.wiggle_knots, ls_result.wiggle_degree);
 
     // Thin adapter over the shared core assembler; the FFI freezes the mean and
     // noise specs from their designs and reads offset columns from the
@@ -2602,19 +2582,18 @@ fn payload_for_joint_expectile(
     Ok(payload)
 }
 
-/// Map the optional `(knots, degree, beta)` link-wiggle parts a location-scale
-/// fit may produce into the shared [`LocationScaleWiggle`] form. All three are
-/// present together or not at all.
+/// Map the optional `(knots, degree)` link-wiggle basis a location-scale fit
+/// may produce into the shared [`LocationScaleWiggle`] form. Both are present
+/// together or not at all; the coefficients stay in the fit's `LinkWiggle`
+/// block.
 fn location_scale_wiggle_from_parts(
     knots: Option<Array1<f64>>,
     degree: Option<usize>,
-    beta_link_wiggle: Option<Vec<f64>>,
 ) -> Option<LocationScaleWiggle> {
-    match (knots, degree, beta_link_wiggle) {
-        (Some(knots), Some(degree), Some(beta_link_wiggle)) => Some(LocationScaleWiggle {
+    match (knots, degree) {
+        (Some(knots), Some(degree)) => Some(LocationScaleWiggle {
             knots: knots.to_vec(),
             degree,
-            beta_link_wiggle,
         }),
         _ => None,
     }
@@ -2644,11 +2623,7 @@ fn payload_for_binomial_location_scale(
         .ok_or_else(|| "binomial location-scale requires noise_formula".to_string())?;
 
     let fit = ls_result.fit.fit;
-    let wiggle = location_scale_wiggle_from_parts(
-        ls_result.wiggle_knots,
-        ls_result.wiggle_degree,
-        ls_result.beta_link_wiggle,
-    );
+    let wiggle = location_scale_wiggle_from_parts(ls_result.wiggle_knots, ls_result.wiggle_degree);
 
     // Thin adapter over the shared core assembler; the FFI freezes the threshold
     // and noise specs from their designs and reads offset columns from the
@@ -2795,12 +2770,6 @@ fn payload_for_survival_location_scale(
             fitted_inverse_link: fitted_inverse_link.clone(),
             linkwiggle_degree: ls_result.wiggle_degree,
             linkwiggle_knots: ls_result.wiggle_knots.as_ref().map(|k| k.to_vec()),
-            beta_link_wiggle: ls_result
-                .fit
-                .fit
-                .beta_link_wiggle()
-                .as_ref()
-                .map(|b| b.to_vec()),
             baseline_timewiggle: None,
             survival_entry: entryname,
             survival_exit: exitname,
@@ -2819,9 +2788,6 @@ fn payload_for_survival_location_scale(
             threshold_time_basis: ls_result.fit.threshold_time_basis.clone(),
             log_sigma_time_basis: ls_result.fit.log_sigma_time_basis.clone(),
             formula_noise: fit_config.noise_formula.clone(),
-            survival_beta_time: ls_result.fit.fit.beta_time().to_vec(),
-            survival_beta_threshold: ls_result.fit.fit.beta_threshold().to_vec(),
-            survival_beta_log_sigma: ls_result.fit.fit.beta_log_sigma().to_vec(),
             resolved_thresholdspec,
             resolved_log_sigmaspec,
         },
@@ -2953,7 +2919,6 @@ fn payload_for_latent_window(
         "latent-binary".to_string()
     };
 
-    let beta_time = fit.beta_time().to_vec();
     let resolved_termspec = freeze_term_collection_from_design(&resolvedspec, &cov_design)
         .map_err(|err| err.to_string())?;
 
@@ -2970,7 +2935,6 @@ fn payload_for_latent_window(
             survival_event: eventname,
             baseline_cfg,
             time_basis,
-            beta_time,
             resolved_termspec,
         },
         SavedModelSourceMetadata {
