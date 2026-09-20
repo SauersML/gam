@@ -3138,5 +3138,14 @@
     ],
     "reason": "Route all residual-cascade Lanczos and Ritz callers through the canonical unit-scaled quadrature QL owner. Delete the last private unscaled, relative-only solver and its independent iteration limit; no wrapper or fallback remains.",
     "evidence": "Exact complete solver source with the changed quadrature module passes real residual Gauss scaling/mass checks and Schur-Lanczos shape, mass, and four moments against an independent dense spectrum. Rebuilt math and all reverse dependencies pass coherent production metadata with warnings denied; complete solver unit-source metadata also passes."
+  },
+  {
+    "base": "9718a5336096afc15bd16b03679bc74530047022",
+    "items": [
+      "crates/gam-gpu/src/device_cache.rs:fn:get_or_load",
+      "crates/gam-models/src/gpu_kernels/survival_rowjet.rs:fn:compile_survival_rowjet_ptx"
+    ],
+    "reason": "#4097: remove the unused custom-compiler cache entry and its one forwarding wrapper; all three NVRTC compile paths use one shared-options implementation, preserving typed library failures and one diagnostic label. The keyed map recovers poisoned locks rather than bypassing caching.",
+    "evidence": "MSI complete GPU unit binary builds in3.28seconds and the actual keyed-map poison/reacquisition regression passes. Coherent complete production dependency metadata is checked with warnings denied. Read audit confirms the removed custom-compiler entry had one caller using the identical shared options; fused consumers select the singleton runtime context. No GPU hardware execution is claimed."
   }
 ]

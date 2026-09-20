@@ -4988,5 +4988,14 @@
     },
     "reason": "Remove a crate-visible predicate for an enum variant no production path constructs, together with its unreachable counter and artificial-only self-test.",
     "evidence": "The only caller was SaeMigrationLedger::record; that branch and the PrincipalComponent variant are deleted. All live migration accounting is covered by exact ledger tests and an actual seeded SAE fission/fusion/death integration test on MSI; complete SAE unit metadata passes with warnings denied."
+  },
+  {
+    "base": "9718a5336096afc15bd16b03679bc74530047022",
+    "removed": {
+      "crates/gam-gpu/src/device_cache.rs::get_or_load": 1,
+      "crates/gam-models/src/gpu_kernels/survival_rowjet.rs::compile_survival_rowjet_ptx": 1
+    },
+    "reason": "#4097: remove the unused custom-compiler cache entry and its one forwarding wrapper; all three NVRTC compile paths use one shared-options implementation, preserving typed library failures and one diagnostic label. The keyed map recovers poisoned locks rather than bypassing caching.",
+    "evidence": "MSI complete GPU unit binary builds in3.28seconds and the actual keyed-map poison/reacquisition regression passes. Coherent complete production dependency metadata is checked with warnings denied. Read audit confirms the removed custom-compiler entry had one caller using the identical shared options; fused consumers select the singleton runtime context. No GPU hardware execution is claimed."
   }
 ]
