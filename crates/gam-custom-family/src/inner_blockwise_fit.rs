@@ -2549,14 +2549,17 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
             }
         }
     }
-    let mut jeffreys_score: Option<Array1<f64>> = None;
+    // The score `∇Φ` and its rounding band from the same spectrum (#3345).
+    let mut jeffreys_score: Option<(Array1<f64>, Array1<f64>)> = None;
     let jeffreys_curvature = if family.joint_jeffreys_term_required() {
         let z_joint = build_joint_jeffreys_subspace(family, specs, ranges)?.ok_or_else(|| {
             "fresh exact joint-mode curvature certificate: Jeffreys family has no coefficient subspace"
                 .to_string()
         })?;
-        match custom_family_joint_jeffreys_term(family, states, specs, ranges, &z_joint)? {
-            Some((_phi, score, hphi)) => {
+        match custom_family_joint_jeffreys_term_with_score_band(
+            family, states, specs, ranges, &z_joint,
+        )? {
+            Some(term) => {
                 let completion = exact_joint_jeffreys_completion_at(
                     family,
                     states,
@@ -2565,8 +2568,8 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
                     total_p,
                     "fresh exact joint-mode curvature certificate",
                 )?;
-                jeffreys_score = Some(score);
-                Some((hphi, completion))
+                jeffreys_score = Some((term.gradient, term.score_rounding_band));
+                Some((term.curvature, completion))
             }
             None => None,
         }
@@ -2577,6 +2580,10 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
     // The stationarity system this returned β was solved for, `∇ℓ − Sβ + ∇Φ`,
     // read at the returned β itself. Its whitened coefficients on the certified
     // face give the Newton decrement the local model still promises there.
+    // The score the stationarity system folds, and whose band its decrements carry.
+    let folded_jeffreys_score = jeffreys_score
+        .as_ref()
+        .filter(|(score, _)| score.len() == total_p);
     let stationarity_rhs = match crate::joint_newton::load_joint_gradient_evaluation(
         family,
         specs,
@@ -2597,9 +2604,7 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
                     0.0,
                     joint_bundle,
                 );
-            if let Some(score) = jeffreys_score.as_ref()
-                && score.len() == total_p
-            {
+            if let Some(score) = folded_jeffreys_score.map(|(score, _)| score) {
                 rhs += score;
             }
             let gradient_inf = likelihood_gradient
@@ -2738,6 +2743,7 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
             s_lambdas,
             states,
             joint_bundle,
+            folded_jeffreys_score.map(|(_, score_band)| score_band),
             0.0,
         )?,
         None => DecrementResolution {
@@ -4616,7 +4622,41 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 block_accumulation.roundoff_ceiling(),
                 false,
             );
-            block_max_step[b] = trust_update.radius;
+            // A KEPT STEP NEITHER SIDE OF THE RATIO CAN RESOLVE IS NEUTRAL, NOT
+            // REJECTED (gam#3289). On this path the line search above decides
+            // whether the step is kept; the controller only sizes the next
+            // region. It reads a prediction inside the `|f|·1e-14` floor as
+            // `rho = -inf`, and it calls a realized change neutral only while
+            // that change sits inside the same floor. A realized decrease above
+            // the floor but inside the evaluation's own rounding ceiling
+            // satisfies neither the neutral test nor the gam#2637 override, so
+            // the controller shrinks the region to half the kept step. Neither
+            // reading of that change supports the shrink. If it is rounding,
+            // the step is neutral and the region holds. If it is a genuine
+            // decrease, the override accepts it and the region again holds.
+            // Only a model that predicts ascent is evidence against the region,
+            // and this one predicted a non-negative decrease.
+            //
+            // Measured on a railed `bounded()` slope, whose latent logit walks
+            // toward the injective clamp at one unit per cycle while the
+            // objective contracts by `e^-1` per cycle. At cycle 30 the realized
+            // change was `5.400e-13` against a floor of `5.366e-13`. The radius
+            // went from `40` to `5e-6`, the next step hit it, and the
+            // frozen-likelihood divergence exit refused the fit three cycles
+            // before the clamp would have produced the exactly-zero accepted
+            // step that certifies it.
+            let kept_step_is_numerically_neutral = accepted
+                && !trust_update.accepted
+                && trust_update.rho == f64::NEG_INFINITY
+                && predicted_reduction.is_finite()
+                && predicted_reduction >= 0.0
+                && actual_reduction >= 0.0
+                && actual_reduction <= block_accumulation.roundoff_ceiling();
+            block_max_step[b] = if kept_step_is_numerically_neutral {
+                block_max_step[b]
+            } else {
+                trust_update.radius
+            };
             if !accepted {
                 states[b].beta.assign(&beta_old);
                 eta_checkpoint.restore_eta(&mut states[b]);

@@ -119,6 +119,7 @@ impl JeffreysHphiDriftBase {
             floor_in_relative_regime: self.floor_in_relative_regime,
             idx_min: self.idx_min,
             idx_max: self.idx_max,
+            information_rounding_band: self.information_rounding_band,
         };
         let zero = Array2::zeros((self.m,self.m));
         let (we,wf,wef,w0) = (plan.explicit_param_mixed_trace_weights(&e)?,plan.explicit_param_mixed_trace_weights(&f)?,

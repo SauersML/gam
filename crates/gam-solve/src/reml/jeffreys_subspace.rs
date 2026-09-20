@@ -1687,6 +1687,51 @@ pub struct JointJeffreysPlan {
     floor_in_relative_regime: bool,
     idx_min: usize,
     idx_max: usize,
+    information_rounding_band: f64,
+}
+
+/// The Jeffreys term at one coefficient point: the value `Φ`, the score `∇Φ`, the
+/// divided-difference curvature `H_Φ`, and the rounding band of the score per
+/// coefficient (#3345).
+///
+/// All four come from one [`JointJeffreysPlan`] spectrum and one set of reduced axis
+/// derivatives, so the band always describes the score it sits beside.
+#[derive(Clone, Debug)]
+pub struct JointJeffreysTerm {
+    pub value: f64,
+    pub gradient: Array1<f64>,
+    pub curvature: Array2<f64>,
+    /// `|fl(∇Φ_k) − ∇Φ_k| ≤ score_rounding_band[k]`, to first order in the rounding
+    /// of the reduced information ([`JointJeffreysPlan::information_rounding_band`]).
+    pub score_rounding_band: Array1<f64>,
+}
+
+impl JointJeffreysTerm {
+    fn flat(value: f64, p: usize) -> Self {
+        Self {
+            value,
+            gradient: Array1::zeros(p),
+            curvature: Array2::zeros((p, p)),
+            score_rounding_band: Array1::zeros(p),
+        }
+    }
+
+    /// The `(Φ, ∇Φ, H_Φ)` triple, for a consumer that settles nothing on the score.
+    pub fn into_triple(self) -> (f64, Array1<f64>, Array2<f64>) {
+        (self.value, self.gradient, self.curvature)
+    }
+
+    /// The term of `strength · Φ`.
+    pub fn scaled(mut self, strength: f64) -> Self {
+        if strength == 1.0 {
+            return self;
+        }
+        self.value *= strength;
+        self.gradient *= strength;
+        self.curvature *= strength;
+        self.score_rounding_band *= strength.abs();
+        self
+    }
 }
 
 /// Prepared ambient trace weights for one explicit-parameter/inner-state mixed
@@ -1770,46 +1815,13 @@ impl JointJeffreysPlan {
     /// refusal reaches a custom-family caller as a trial-point refusal, so the outer search
     /// steps away from that ρ; a seed that refuses refuses the fit.
     ///
-    /// The resolution band is the eigensolve's own band,
-    /// [`gam_linalg::roundoff::symmetric_spectrum_rounding_band`], plus the rounding the
-    /// formation of `H_id = Z_Jᵀ·(H·Z_J)` left in the matrix it decomposes. Each of the
-    /// two products is an inner product of length `p` and the symmetrization averages
-    /// two computed entries, so every entry is rounded along `2p + 1` operations and
-    /// (Higham, *ASNA* 2nd ed., §3.5)
-    ///
-    /// ```text
-    /// |fl(H_id) − H_id|_ij  ≤  γ_{2p+1} · Σ_ab |z_ai|·|H_ab|·|z_bj|  ≤  γ_{2p+1} · M · ‖z_i‖₁·‖z_j‖₁,
-    /// ```
-    ///
-    /// where `M` is the largest `|H_ab|` with both `a` and `b` in the support of `Z_J`
-    /// (entries outside it multiply a zero `z` and never enter `H_id`). The last bound is
-    /// `M` times the rank-one matrix `u uᵀ` with `u_i = ‖z_i‖₁`, whose Frobenius norm is
-    /// `Σ_i ‖z_i‖₁²`, and the spectral norm of the error is at most that. By Weyl an
-    /// eigenvalue within `γ_{2p+1}·M·Σ_i ‖z_i‖₁²` of zero is not resolved by the formation.
-    /// It costs `O(p·m + |support|²)`, against the `O(p²·m)` of the entrywise bound.
+    /// The resolution band is [`Self::information_rounding_band`].
     pub fn prepare(h_joint: ArrayView2<'_, f64>, z_j: ArrayView2<'_, f64>) -> Result<Self, String> {
         let plan = Self::diagnose(h_joint, z_j)?;
         if plan.reduced_dim == 0 {
             return Ok(plan);
         }
-        let support: Vec<usize> = (0..z_j.nrows())
-            .filter(|&row| z_j.row(row).iter().any(|&value| value != 0.0))
-            .collect();
-        let max_abs_h = support
-            .iter()
-            .flat_map(|&a| support.iter().map(move |&b| h_joint[[a, b]].abs()))
-            .fold(0.0_f64, f64::max);
-        let column_l1_squares = z_j
-            .columns()
-            .into_iter()
-            .map(|column| column.iter().map(|value| value.abs()).sum::<f64>().powi(2))
-            .sum::<f64>();
-        let formation_band = gam_linalg::roundoff::accumulation_growth(2 * h_joint.nrows() + 1)
-            * max_abs_h
-            * column_l1_squares;
-        let resolution_band =
-            gam_linalg::roundoff::symmetric_spectrum_rounding_band(&plan.evals.to_vec())
-                + formation_band;
+        let resolution_band = plan.information_rounding_band;
         if plan.evals.iter().all(|&lambda| lambda.abs() <= resolution_band) {
             return Err(format!(
                 "joint_jeffreys_term: the reduced information on the {}-dimensional Jeffreys \
@@ -1858,6 +1870,7 @@ impl JointJeffreysPlan {
                 floor_in_relative_regime: false,
                 idx_min: 0,
                 idx_max: 0,
+                information_rounding_band: 0.0,
             });
         }
 
@@ -1884,6 +1897,23 @@ impl JointJeffreysPlan {
                 idx_max = i;
             }
         }
+        let support: Vec<usize> = (0..z_j.nrows())
+            .filter(|&row| z_j.row(row).iter().any(|&value| value != 0.0))
+            .collect();
+        let max_abs_h = support
+            .iter()
+            .flat_map(|&a| support.iter().map(move |&b| h_joint[[a, b]].abs()))
+            .fold(0.0_f64, f64::max);
+        let column_l1_squares = z_j
+            .columns()
+            .into_iter()
+            .map(|column| column.iter().map(|value| value.abs()).sum::<f64>().powi(2))
+            .sum::<f64>();
+        let formation_band =
+            gam_linalg::roundoff::accumulation_growth(2 * p + 1) * max_abs_h * column_l1_squares;
+        let information_rounding_band =
+            gam_linalg::roundoff::symmetric_spectrum_rounding_band(&evals.to_vec())
+                + formation_band;
         Ok(Self {
             z_j: z_j.to_owned(),
             reduced_dim: m,
@@ -1896,7 +1926,35 @@ impl JointJeffreysPlan {
             floor_in_relative_regime,
             idx_min,
             idx_max,
+            information_rounding_band,
         })
+    }
+
+    /// The rounding band `b` of the computed reduced spectrum: every computed eigenvalue
+    /// `fl(λ_i)` lies within `b` of an eigenvalue of the exact `H_id = Z_Jᵀ·H·Z_J`.
+    ///
+    /// It is the eigensolve's own band,
+    /// [`gam_linalg::roundoff::symmetric_spectrum_rounding_band`], plus the rounding the
+    /// formation of `H_id = Z_Jᵀ·(H·Z_J)` left in the matrix it decomposes. Each of the
+    /// two products is an inner product of length `p` and the symmetrization averages
+    /// two computed entries, so every entry is rounded along `2p + 1` operations and
+    /// (Higham, *ASNA* 2nd ed., §3.5)
+    ///
+    /// ```text
+    /// |fl(H_id) − H_id|_ij  ≤  γ_{2p+1} · Σ_ab |z_ai|·|H_ab|·|z_bj|  ≤  γ_{2p+1} · M · ‖z_i‖₁·‖z_j‖₁,
+    /// ```
+    ///
+    /// where `M` is the largest `|H_ab|` with both `a` and `b` in the support of `Z_J`
+    /// (entries outside it multiply a zero `z` and never enter `H_id`). The last bound is
+    /// `M` times the rank-one matrix `u uᵀ` with `u_i = ‖z_i‖₁`, whose Frobenius norm is
+    /// `Σ_i ‖z_i‖₁²`, and the spectral norm of the error is at most that. By Weyl an
+    /// eigenvalue within `γ_{2p+1}·M·Σ_i ‖z_i‖₁²` of zero is not resolved by the formation.
+    /// It costs `O(p·m + |support|²)`, against the `O(p²·m)` of the entrywise bound.
+    ///
+    /// [`Self::prepare`] refuses a span with no eigenvalue outside it, and the score's
+    /// rounding band ([`JointJeffreysTerm::score_rounding_band`]) propagates it.
+    pub fn information_rounding_band(&self) -> f64 {
+        self.information_rounding_band
     }
 
     /// Whether the exact conditioning gate permits a nonzero Jeffreys term.
@@ -2817,19 +2875,20 @@ where
         }
         Ok(Some(hdots))
     })
+    .map(JointJeffreysTerm::into_triple)
 }
 
 /// Batched joint-Jeffreys evaluation with a lazy all-axes derivative provider.
 ///
 /// `hessian_axes` is invoked exactly once when the prepared conditioning gate is
 /// active and never when it is inactive.  The same [`JointJeffreysPlan`] supplies
-/// the value, gradient, and curvature, so the optimization cannot accidentally
-/// gate one information matrix and differentiate another.
+/// the value, gradient, curvature and score rounding band, so the optimization cannot
+/// accidentally gate one information matrix and differentiate another.
 pub fn joint_jeffreys_term_batched<AxesFn>(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
     hessian_axes: AxesFn,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String>
+) -> Result<JointJeffreysTerm, String>
 where
     AxesFn: FnOnce() -> Result<Option<Vec<Array2<f64>>>, String>,
 {
@@ -2840,7 +2899,7 @@ where
 fn joint_jeffreys_term_from_plan<AxesFn>(
     plan: JointJeffreysPlan,
     hessian_axes: AxesFn,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String>
+) -> Result<JointJeffreysTerm, String>
 where
     AxesFn: FnOnce() -> Result<Option<Vec<Array2<f64>>>, String>,
 {
@@ -2858,7 +2917,7 @@ pub fn joint_jeffreys_term_batched_rotated<RotatedFn, AxesFn>(
     z_j: ArrayView2<'_, f64>,
     rotated_axes: RotatedFn,
     hessian_axes: AxesFn,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String>
+) -> Result<JointJeffreysTerm, String>
 where
     RotatedFn: FnOnce(ArrayView2<'_, f64>) -> Result<Option<Array2<f64>>, String>,
     AxesFn: FnOnce() -> Result<Option<Vec<Array2<f64>>>, String>,
@@ -2934,18 +2993,39 @@ where
     ))
 }
 
-/// The Jeffreys triple from the plan and the reduced axis derivatives `Ṽ_k` that
-/// `reduced_axes(Z_J, V)` supplies. `None` degenerates to `(phi, 0, 0)`.
+/// The Jeffreys term from the plan and the reduced axis derivatives `Ṽ_k` that
+/// `reduced_axes(Z_J, V)` supplies. `None` degenerates to `(phi, 0, 0)` with a zero band.
+///
+/// SCORE ROUNDING BAND (#3345). With `Ψ` the divided differences of the floored inverse
+/// `d = g'` on the spectrum, the gate-frozen score is `∇Φ_k = ½·G·tr(K·D_k)` and the
+/// Fréchet derivative of `K = V·diag(d)·Vᵀ` along a perturbation `E` of `H_id` is
+/// `V·(Ψ ∘ VᵀEV)·Vᵀ`, so to first order
+///
+/// ```text
+/// δ∇Φ_k = ½·G · Σ_ij Ψ_ij · (VᵀEV)_ij · (Ṽ_k)_ij.
+/// ```
+///
+/// The computed spectrum is exact for some `H_id + E` with `‖E‖₂ ≤ b`
+/// ([`JointJeffreysPlan::information_rounding_band`]), and every entry of `VᵀEV` is at
+/// most `‖E‖₂`, so
+///
+/// ```text
+/// |δ∇Φ_k| ≤ ½·|G|·b · Σ_ij |Ψ_ij|·|(Ṽ_k)_ij|.
+/// ```
+///
+/// That is the score's rounding the certificates charge beside the likelihood and penalty
+/// bands. The gate and floor motion terms are `O(b)` multiples of the ungated value's
+/// rounding and are not charged; the axis derivatives' own formation `D_k` is not either.
 fn joint_jeffreys_term_from_reduced_axes<ReducedFn>(
     plan: JointJeffreysPlan,
     reduced_axes: ReducedFn,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String>
+) -> Result<JointJeffreysTerm, String>
 where
     ReducedFn: FnOnce(&Array2<f64>, &Array2<f64>) -> Result<Option<Vec<Array2<f64>>>, String>,
 {
     let p = plan.coefficient_dim();
     if !plan.is_active() {
-        return Ok((0.0, Array1::zeros(p), Array2::zeros((p, p))));
+        return Ok(JointJeffreysTerm::flat(0.0, p));
     }
     // SINGLE-EMISSION (gam#931). The Jeffreys value is the plan's own
     // projection of its spectrum through `JeffreysLogdetAtom`; the value-only
@@ -2962,6 +3042,7 @@ where
     let floor_in_relative_regime = plan.floor_in_relative_regime;
     let idx_min_gate = plan.idx_min;
     let idx_max_gate = plan.idx_max;
+    let information_rounding_band = plan.information_rounding_band;
 
     // FULL-SPAN ROBUSTNESS. With the Jeffreys span equal to the FULL identifiable
     // coefficient space, `H_id` is the (reduced) observed information over every
@@ -3061,7 +3142,7 @@ where
     // `Err` propagates.
     let reduced = match reduced_axes(&z_j, &evecs)? {
         Some(reduced) => reduced,
-        None => return Ok((phi, Array1::zeros(p), Array2::zeros((p, p)))),
+        None => return Ok(JointJeffreysTerm::flat(phi, p)),
     };
     if reduced.len() != p || reduced.iter().any(|a_k| a_k.dim() != (m, m)) {
         return Err(format!(
@@ -3075,7 +3156,17 @@ where
     // Empty when the gate is saturated (`∂G = 0`), so a clean/fully-active fit is
     // byte-unchanged.
     let mut gate_dot: HashMap<usize, f64> = HashMap::new();
+    // Score rounding band (see the doc above): `½·|G|·b · Σ_ij |Ψ_ij|·|(Ṽ_k)_ij|`.
+    let psi_abs = floored_inverse_divided_differences(&evals, floor).mapv(f64::abs);
+    let band_scale = 0.5 * gate_weight.abs() * information_rounding_band;
+    let mut score_rounding_band = Array1::<f64>::zeros(p);
     for (k, a_k) in reduced.into_iter().enumerate() {
+        score_rounding_band[k] = band_scale
+            * psi_abs
+                .iter()
+                .zip(a_k.iter())
+                .map(|(&psi, &axis)| psi * axis.abs())
+                .sum::<f64>();
         // FLOOR-RESPONSE term (see the `floor` block above). The atom consumes
         // `floor_dot` beside `Ṽ_k`, so `dΦ/dβ_k` remains the derivative of its
         // own `value()`.
@@ -3156,7 +3247,12 @@ where
     // exactly where `Φ` is (mixed-sign spectrum); the exact Moré–Sorensen
     // trust-region subproblem handles that rigorously.
     let hphi = gradient_atom.second_order_curvature(p)?;
-    Ok((phi, grad, hphi))
+    Ok(JointJeffreysTerm {
+        value: phi,
+        gradient: grad,
+        curvature: hphi,
+        score_rounding_band,
+    })
 }
 
 /// Exact second-directional-Hessian completion for the Tier-B joint Jeffreys
@@ -3527,6 +3623,9 @@ pub struct JeffreysHphiDriftBase {
     floor_in_relative_regime: bool,
     idx_min: usize,
     idx_max: usize,
+    /// The source plan's [`JointJeffreysPlan::information_rounding_band`], kept so
+    /// a plan rebuilt from this spectrum states the same information resolution.
+    information_rounding_band: f64,
     /// Per-axis rotated base derivative rows `vec(Ṽ_a)` (`p × m·m`).
     a_rows: Array2<f64>,
     /// `vec(Ψ ∘ Ṽ_a)` (`p × m·m`).
@@ -4186,6 +4285,7 @@ impl JeffreysHphiDriftBase {
             floor_in_relative_regime: plan.floor_in_relative_regime,
             idx_min: plan.idx_min,
             idx_max: plan.idx_max,
+            information_rounding_band: plan.information_rounding_band,
             a_rows: rows,
             aw_rows,
             divided_differences: std::sync::OnceLock::new(),
@@ -4221,6 +4321,7 @@ impl JeffreysHphiDriftBase {
         let floor_in_relative_regime = plan.floor_in_relative_regime;
         let idx_min = plan.idx_min;
         let idx_max = plan.idx_max;
+        let information_rounding_band = plan.information_rounding_band;
         let psi = floored_inverse_divided_differences(&evals, floor);
         let ambient_eigenbasis = z_owned.dot(&evecs);
         // The β-FIXED per-axis base: `Ṽ_a = Vᵀ D_a V` and `Ψ ∘ Ṽ_a`, formed from
@@ -4271,6 +4372,7 @@ impl JeffreysHphiDriftBase {
             floor_in_relative_regime,
             idx_min,
             idx_max,
+            information_rounding_band,
             a_rows,
             aw_rows,
             divided_differences: std::sync::OnceLock::new(),
@@ -5378,16 +5480,18 @@ mod tests {
         let z = array![[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]];
         let all_axis_builds = Cell::new(0usize);
 
-        let (phi, grad, hphi) = joint_jeffreys_term_batched(h.view(), z.view(), || {
+        let term = joint_jeffreys_term_batched(h.view(), z.view(), || {
             all_axis_builds.set(all_axis_builds.get() + 1);
             Ok(Some(vec![Array2::zeros((3, 3)); 3]))
         })
         .expect("inactive reduced Jeffreys plan");
 
         assert_eq!(all_axis_builds.get(), 0);
-        assert_eq!(phi, 0.0);
-        assert_eq!(grad, Array1::<f64>::zeros(3));
-        assert_eq!(hphi, Array2::<f64>::zeros((3, 3)));
+        assert_eq!(term.value, 0.0);
+        assert_eq!(term.gradient, Array1::<f64>::zeros(3));
+        assert_eq!(term.curvature, Array2::<f64>::zeros((3, 3)));
+        // An inactive term forms no score, so it carries no score rounding (#3345).
+        assert_eq!(term.score_rounding_band, Array1::<f64>::zeros(3));
 
         let outer_axis_builds = AtomicUsize::new(0);
         let outer_base = JeffreysHphiDriftBase::prepare(h.view(), z.view(), |_| {
@@ -5397,6 +5501,54 @@ mod tests {
         .expect("inactive outer Jeffreys plan");
         assert!(outer_base.is_none());
         assert_eq!(outer_axis_builds.load(Ordering::Relaxed), 0);
+    }
+
+    /// On a one-direction span at `λ = 1/2` the absolute gate is saturated (`G = 1`, no
+    /// gate motion) and `λ` sits in the log window above the relative floor, so the
+    /// score is `∇Φ_k = ½·a_k/λ` with `a_k = zᵀ·Hdot[e_k]·z`, and the kernel is the
+    /// confluent `Ψ = d'(λ) = −1/λ²`. The score band `½·|G|·b·|Ψ|·|a_k|` is then exactly
+    /// `b·|∇Φ_k|/λ`: the information's rounding `b`, amplified by the inverse curvature
+    /// the score divides by (#3345).
+    #[test]
+    fn score_rounding_band_is_the_closed_form_on_a_one_direction_span_3345() {
+        let lambda = 0.5;
+        let h = array![[lambda, 0.2], [0.2, 40.0]];
+        let z = array![[1.0], [0.0]];
+        let hdots = vec![
+            array![[0.3, 0.1], [0.1, -2.0]],
+            array![[-0.7, 0.4], [0.4, 5.0]],
+        ];
+        let plan = JointJeffreysPlan::prepare(h.view(), z.view()).expect("Jeffreys plan");
+        assert!(plan.is_active(), "a sub-one-observation direction arms the term");
+        assert_eq!(plan.conditioning_gate_weight(), 1.0, "the absolute gate is saturated");
+        let band = plan.information_rounding_band();
+        assert!(
+            band > 0.0 && band < 1e3 * f64::EPSILON * lambda,
+            "the information band is a positive rounding-scale quantity (band {band:e})"
+        );
+        let term = joint_jeffreys_term_batched(h.view(), z.view(), || Ok(Some(hdots.clone())))
+            .expect("active Jeffreys term");
+        for (k, hdot) in hdots.iter().enumerate() {
+            let expected_gradient = 0.5 * hdot[[0, 0]] / lambda;
+            assert!(
+                (term.gradient[k] - expected_gradient).abs() <= 4.0 * f64::EPSILON * expected_gradient.abs(),
+                "axis {k}: score {} against the closed form {expected_gradient}",
+                term.gradient[k]
+            );
+            let expected_band = band * term.gradient[k].abs() / lambda;
+            assert!(
+                expected_band > 0.0
+                    && (term.score_rounding_band[k] - expected_band).abs() <= 4.0 * f64::EPSILON * expected_band,
+                "axis {k}: score band {:e} against the closed form {expected_band:e}",
+                term.score_rounding_band[k]
+            );
+        }
+        let scaled = term.clone().scaled(-2.0);
+        assert_eq!(
+            scaled.score_rounding_band,
+            term.score_rounding_band.mapv(|b| 2.0 * b),
+            "a strength scales the band by its magnitude"
+        );
     }
 
     /// Test-only analytic oracle: the per-direction mode-response drift
@@ -5811,6 +5963,7 @@ mod tests {
         for z in [Array2::<f64>::eye(p), narrow] {
             let width = z.ncols();
             let dense = joint_jeffreys_term_batched(h0.view(), z.view(), || Ok(Some(hdots.clone())))
+                .map(JointJeffreysTerm::into_triple)
                 .expect("dense Jeffreys term");
             let declined = joint_jeffreys_term_batched_rotated(
                 h0.view(),
@@ -5818,6 +5971,7 @@ mod tests {
                 |_| Ok(None),
                 || Ok(Some(hdots.clone())),
             )
+            .map(JointJeffreysTerm::into_triple)
             .expect("declined rotated Jeffreys term");
             assert_eq!(dense.0.to_bits(), declined.0.to_bits(), "span width {width}: declined value");
             assert!(
@@ -5835,6 +5989,7 @@ mod tests {
                 |basis| gam_model_api::jeffreys_rotated_axis_rows(&hdots, basis).map(Some),
                 || Err("the dense provider must not run when rows are supplied".to_string()),
             )
+            .map(JointJeffreysTerm::into_triple)
             .expect("rotated Jeffreys term");
             let gradient = dense.1.as_slice().expect("gradient");
             let curvature = dense.2.as_slice().expect("curvature");
@@ -5859,6 +6014,7 @@ mod tests {
                 |basis| gam_model_api::jeffreys_rotated_axis_rows(&other, basis).map(Some),
                 || Ok(None),
             )
+            .map(JointJeffreysTerm::into_triple)
             .expect("rotated Jeffreys term of other axes");
             let wrong_gap = max_gap(curvature, wrong.2.as_slice().expect("curvature"));
             assert!(

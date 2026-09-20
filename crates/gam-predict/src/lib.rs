@@ -534,9 +534,16 @@ pub trait UncertaintyCovarianceSource {
         label: &str,
     ) -> Result<(PredictionCovarianceBackend<'_>, InferenceCovarianceMode), EstimationError>;
     /// Optional fitted adaptive-link state (SAS / BetaLogistic / Mixture /
-    /// latent cloglog). Standard links and raw covariance sources return
-    /// `None` and are handled with the family's own `InverseLink`.
-    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState>;
+    /// latent cloglog). Raw covariance sources return `Ok(None)` and are
+    /// handled with the family's own `InverseLink`. A fitted source whose
+    /// recorded link state is inconsistent with `family` (an adaptive link
+    /// with no fitted state, or an unsupported binomial link) returns the
+    /// typed error rather than silently predicting with the family's
+    /// embedded link, matching `strategy_from_fit` on the posterior-mean path.
+    fn resolved_fitted_link_state(
+        &self,
+        family: &LikelihoodSpec,
+    ) -> Result<Option<FittedLinkState>, EstimationError>;
     /// Gaussian residual standard deviation used to widen observation
     /// intervals for `ResponseFamily::Gaussian`. Raw-covariance sources
     /// report `0.0`, which collapses the observation interval to the mean
@@ -582,8 +589,11 @@ impl UncertaintyCovarianceSource for UnifiedFitResult {
     ) -> Result<(PredictionCovarianceBackend<'_>, InferenceCovarianceMode), EstimationError> {
         selected_uncertainty_backend(self, expected_dim, mode, label)
     }
-    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
-        UnifiedFitResult::fitted_link_state(self, family).ok()
+    fn resolved_fitted_link_state(
+        &self,
+        family: &LikelihoodSpec,
+    ) -> Result<Option<FittedLinkState>, EstimationError> {
+        UnifiedFitResult::fitted_link_state(self, family).map(Some)
     }
     fn observation_standard_deviation(&self) -> f64 {
         self.standard_deviation
@@ -632,13 +642,16 @@ impl UncertaintyCovarianceSource for Array2<f64> {
         }
     }
 
-    fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
+    fn resolved_fitted_link_state(
+        &self,
+        family: &LikelihoodSpec,
+    ) -> Result<Option<FittedLinkState>, EstimationError> {
         match &family.link {
             InverseLink::Standard(_)
             | InverseLink::LatentCLogLog(_)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
-            | InverseLink::Mixture(_) => None,
+            | InverseLink::Mixture(_) => Ok(None),
         }
     }
 }
@@ -2834,7 +2847,7 @@ where
     eta += &offset;
     // Track whether the centre was actually shifted to β_BC: the covariance must
     // gain the matching A·V·Aᵀ Jacobian only when it did (#1870).
-    let fitted_link_state = source.resolved_fitted_link_state(&family);
+    let fitted_link_state = source.resolved_fitted_link_state(&family)?;
     let mixture_state = match fitted_link_state.as_ref() {
         Some(FittedLinkState::Mixture { state, .. }) => Some(state.clone()),
         _ => None,
@@ -3453,6 +3466,51 @@ mod tests {
             nb_raw.observation_lower.is_none() && nb_raw.observation_upper.is_none(),
             "bare Vb must not build an estimated-NB observation interval from the seed theta"
         );
+    }
+
+    #[test]
+    fn fitted_source_missing_adaptive_link_state_errors_instead_of_using_embedded_link() {
+        // A Binomial-SAS family paired with a fit that recorded no SAS state is
+        // an inconsistent fit/family pair. `strategy_from_fit` refuses it on the
+        // posterior-mean path; the uncertainty path must refuse it too instead
+        // of silently predicting with the family's embedded seed link.
+        let x = array![[1.0_f64]];
+        let beta = array![0.0_f64];
+        let offset = array![0.0_f64];
+        let state = gam_solve::mixture_link::sas_link_state_from_raw(0.7, -0.4)
+            .expect("valid SAS link state");
+        let family =
+            gam_spec::LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(state));
+        let options = PredictUncertaintyOptions {
+            confidence_level: 0.95,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            mean_interval_method: MeanIntervalMethod::TransformEta,
+            includeobservation_interval: false,
+            ..PredictUncertaintyOptions::default()
+        };
+        let mut fit = test_fit_with_covariance(beta.clone(), array![[0.25]]);
+        let error = expect_estimation_error(
+            predict_gamwith_uncertainty(
+                x.view(),
+                beta.view(),
+                offset.view(),
+                family.clone(),
+                &fit,
+                &options,
+            ),
+            "a SAS family with no fitted SAS state must not predict",
+        );
+        assert!(
+            error.to_string().contains("SAS"),
+            "unexpected error for missing SAS state: {error}"
+        );
+
+        fit.fitted_link = FittedLinkState::Sas {
+            state,
+            covariance: None,
+        };
+        predict_gamwith_uncertainty(x.view(), beta.view(), offset.view(), family, &fit, &options)
+            .expect("a fit carrying its SAS state predicts");
     }
 
     fn test_fit_with_covariance(beta: Array1<f64>, covariance: Array2<f64>) -> UnifiedFitResult {
