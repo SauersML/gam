@@ -135,25 +135,39 @@ impl EventHistoryFamily {
     pub(super) fn coordinate_hessian<S: JetField + Send + Sync>(
         &self, states: &[ParameterBlockState], beta: &[S], coordinates: &[usize],
     ) -> Result<(S, Vec<S>, Vec<S>), EventHistoryError> {
-        let width = coordinates.len();
-        if width == 0 {
-            return Ok((self.path_value(states, beta)?, Vec::new(), Vec::new()));
+        // Fewer coordinates than a full block run on the narrowest width that
+        // holds them in one: a channel seeded with no coordinate is identically
+        // zero, and each level of `Rows<Rows<S, W>, W>` costs `1 + W` channels.
+        // Any width gives the same entries bit for bit ([`TANGENT_WIDTH`]).
+        match coordinates.len() {
+            0 => Ok((self.path_value(states, beta)?, Vec::new(), Vec::new())),
+            1 => self.coordinate_hessian_at::<S, 1>(states, beta, coordinates),
+            2 => self.coordinate_hessian_at::<S, 2>(states, beta, coordinates),
+            3 | 4 => self.coordinate_hessian_at::<S, 4>(states, beta, coordinates),
+            _ => self.coordinate_hessian_at::<S, TANGENT_WIDTH>(states, beta, coordinates),
         }
+    }
+
+    /// [`Self::coordinate_hessian`] over blocks of `W` coordinates.
+    fn coordinate_hessian_at<S: JetField + Send + Sync, const W: usize>(
+        &self, states: &[ParameterBlockState], beta: &[S], coordinates: &[usize],
+    ) -> Result<(S, Vec<S>, Vec<S>), EventHistoryError> {
+        let width = coordinates.len();
         let zero = beta[0].constant_like(0.0);
         let mut value = zero.clone();
         let mut gradient = vec![zero.clone(); width];
         let mut hessian = vec![zero; width * width];
-        let tangents = |q: usize, start: usize| -> [f64; TANGENT_WIDTH] {
+        let tangents = |q: usize, start: usize| -> [f64; W] {
             std::array::from_fn(|k| f64::from(coordinates.get(start + k) == Some(&q)))
         };
         // The block pairs are independent path evaluations, run together so
         // one pair's serial reference evolution overlaps the others' work.
-        let pairs: Vec<(usize, usize)> = (0..width.div_ceil(TANGENT_WIDTH))
-            .flat_map(|a| (0..=a).map(move |b| (a * TANGENT_WIDTH, b * TANGENT_WIDTH)))
+        let pairs: Vec<(usize, usize)> = (0..width.div_ceil(W))
+            .flat_map(|a| (0..=a).map(move |b| (a * W, b * W)))
             .collect();
-        let results: Vec<Result<Rows<Rows<S, TANGENT_WIDTH>, TANGENT_WIDTH>, EventHistoryError>> =
+        let results: Vec<Result<Rows<Rows<S, W>, W>, EventHistoryError>> =
             pairs.par_iter().map(|&(rows, columns)| {
-                let seeded: Vec<Rows<Rows<S, TANGENT_WIDTH>, TANGENT_WIDTH>> = beta.iter().enumerate()
+                let seeded: Vec<Rows<Rows<S, W>, W>> = beta.iter().enumerate()
                     .map(|(q, coefficient)| Rows::seed(
                         Rows::seed(coefficient.clone(), tangents(q, columns)), tangents(q, rows)))
                     .collect();
@@ -161,14 +175,14 @@ impl EventHistoryFamily {
             }).collect();
         for (&(rows, columns), result) in pairs.iter().zip(results) {
             let result = result?;
-            for l in 0..TANGENT_WIDTH.min(width - columns) {
+            for l in 0..W.min(width - columns) {
                 gradient[columns + l] = result.base.rows[l].clone();
             }
-            for k in 0..TANGENT_WIDTH.min(width - rows) {
+            for k in 0..W.min(width - rows) {
                 let i = rows + k;
                 // Within a diagonal block only `j ≤ i` is read, so each
                 // mirrored pair comes from one channel.
-                for l in 0..TANGENT_WIDTH.min(width - columns).min(i + 1 - columns) {
+                for l in 0..W.min(width - columns).min(i + 1 - columns) {
                     let j = columns + l;
                     hessian[i * width + j] = result.rows[k].rows[l].clone();
                     hessian[j * width + i] = result.rows[k].rows[l].clone();
