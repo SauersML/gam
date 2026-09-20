@@ -132,7 +132,6 @@ fn penalized_location_spec(x: &Array1<f64>, age_exit: &Array1<f64>) -> SurvivalL
                 n,
                 DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
             ),
-            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
             penalties: vec![time_penalty],
             nullspace_dims: vec![],
             initial_log_lambdas: Some(Array1::from_elem(1, 0.0)),
