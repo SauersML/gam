@@ -44,7 +44,8 @@ fn a_tensor_smooth_beside_a_factor_gets_its_lr_pvalue() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let materialized = materialize("y ~ factor(g) + te(x, z)", &data, &config).expect("materialize");
+    let materialized =
+        materialize("y ~ factor(g) + te(x, z)", &data, &config).expect("materialize");
     let FitRequest::Standard(request) = materialized.request else {
         panic!("expected a standard fit request");
     };
