@@ -938,3 +938,48 @@ fn only_a_payload_that_cannot_be_published_is_dropped_3238() {
         }
     }
 }
+
+/// Under `parallel::install` every lane is a pool task, so a worker waiting at a
+/// join inside a live search can steal a lane. An admission that waited for that
+/// search's grant would then block the worker the search needs: a lane refused
+/// beside a live search must retire at once and be respawned by the release.
+#[test]
+fn a_lane_refused_beside_a_live_search_retires_at_once_instead_of_waiting_2359() {
+    static GOVERNOR: std::sync::OnceLock<gam_runtime::resource::MemoryGovernor> =
+        std::sync::OnceLock::new();
+    let working_set = 1_000usize;
+    let governor = GOVERNOR.get_or_init(|| {
+        gam_runtime::resource::MemoryGovernor::with_budget_bytes(working_set + working_set / 2)
+    });
+    let admission = std::sync::Arc::new(LaneAdmission {
+        governor,
+        working_set_bytes: working_set,
+        serial_available_bytes: PRE_LAUNCH_AVAILABLE,
+        lanes: std::sync::Mutex::new(LaneCount::default()),
+        most_live: AtomicUsize::new(0),
+    });
+    let live = admission
+        .admit("admission deadlock pin")
+        .expect("the first search is admitted");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let refused = std::sync::Arc::clone(&admission);
+    std::thread::spawn(move || {
+        sender
+            .send(refused.admit("admission deadlock pin").is_none())
+            .expect("send");
+    });
+    let retired = receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("an admission refused beside a live search returns instead of waiting for it");
+    assert!(retired, "a lane refused while a search is live retires");
+    assert_eq!(
+        admission.release(vec![(None::<()>, live)]),
+        1,
+        "the release respawns it"
+    );
+    let respawned = admission
+        .admit("admission deadlock pin")
+        .expect("the respawned lane is admitted");
+    assert_eq!(respawned.granted_bytes(), working_set);
+    assert_eq!(admission.release(vec![(None::<()>, respawned)]), 0);
+}

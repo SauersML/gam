@@ -59,11 +59,14 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 /// location-scale row kernel contracts a `Tower4<9>` jet program (9⁴
 /// fourth-order entries, ≈59 KiB per scalar held by value, several towers live
 /// at once), and the SAE outer-ρ per-row jet loop holds multi-megabyte
-/// `Tower4<16>` frames. The CLI and the SAE Python entry point ran those
-/// drivers on 512 MiB threads; the worker that now runs them gets the same
-/// reservation. It is virtual address space: pages commit lazily, so the
-/// headroom costs nothing until a deep path uses it.
-pub const WORKER_STACK_SIZE: usize = 512 << 20;
+/// `Tower4<16>` frames. gam#2967 bounds those frames at their cause: every
+/// split-level primitive calls its caller's closure only through an
+/// `#[inline(never)]` leaf owner, so each large row program is live at most
+/// once per stack, and the root `build.rs` refuses a regression. The worker
+/// therefore carries the 64 MiB stack rayon's global-pool workers had, not a
+/// wider one that would hide the next deep frame instead of exposing it: a
+/// path that overflows here is a frame defect under gam#2967's rule.
+pub const WORKER_STACK_SIZE: usize = 64 << 20;
 
 /// The pool, together with the process that built it.
 struct ProcessPool {

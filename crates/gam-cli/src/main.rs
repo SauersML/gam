@@ -210,7 +210,7 @@ const HARD_EXIT: fn(i32) -> ! = std::process::exit;
 fn main() {
     gam::init_parallelism();
     // Drive the whole command on the process worker pool, whose workers carry
-    // the wide stack the fit drivers need (`gam::parallel::WORKER_STACK_SIZE`).
+    // the stack the fit drivers need (`gam::parallel::WORKER_STACK_SIZE`).
     // A panic in `run` has already been reported by the default panic hook, so
     // we flush and exit non-zero.
     let result = match std::panic::catch_unwind(|| gam::parallel::install(run)) {
