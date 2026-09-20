@@ -378,24 +378,23 @@ pub(crate) enum SurvivalInterceptSlotKind {
 /// Per-row warm-start storage for the survival calibration root solver.
 ///
 /// Two slots per row (entry intercept against `q0`, exit intercept against
-/// `q1`). Each slot stores the converged intercept `a` alongside a
-/// `beta_tag: u64` — a 64-bit hash of the joint coefficient vector at the
-/// time of write. Reads return `Some(a)` only when the caller's tag matches
-/// the stored tag AND the stored value is finite. This makes the cache
-/// transactional with respect to trust-region trials and subsampled probes:
-/// a rejected trial at β_A and an accepted full-data eval at β_B key under
-/// distinct tags, so writes from one cannot poison reads from the other.
+/// `q1`). Each slot stores the certified intercept `a` alongside a
+/// `beta_tag: u64` — [`hash_intercept_warm_start_key`] of every input of the
+/// calibration equation `a` solves. Reads return `Some(a)` only when the
+/// caller's tag matches the stored tag AND the stored value is finite, so a
+/// hit is the certified root of the very equation being solved: a rejected
+/// trust-region trial or a subsampled probe keys under its own inputs, and a
+/// change to any of them (not just the deviation coefficients) is a miss.
 ///
-/// The "never written" sentinel is `beta_tag == 0`. Callers compute their
-/// tag with `hash_intercept_warm_start_key` and remap `0` to `1` so that the
-/// sentinel can never collide with a real key. Two consecutive evaluations
-/// at the same β share the same tag and reuse the cached root.
+/// The "never written" sentinel is `beta_tag == 0`; the key remaps `0` to `1`
+/// so the sentinel can never collide with a real key.
 ///
-/// Memory ordering: the writer stores `value` with `Relaxed` and then `tag`
-/// with `Release`. The reader loads `tag` with `Acquire`, reads `value`
-/// with `Relaxed`, and re-checks `tag` with `Acquire`. The double-check
-/// detects a torn read where another thread interleaved a tag bump between
-/// the value read and the second tag load.
+/// Memory ordering is a sequence lock: the writer invalidates the tag, fences
+/// (`Release`), writes the value and publishes the tag with `Release`; the
+/// reader loads the tag with `Acquire`, reads the value, fences (`Acquire`) and
+/// re-reads the tag. The fences keep the value accesses between the two tag
+/// accesses on both sides, so a matching tag pair means the value is the one
+/// written under that tag.
 pub(crate) struct SurvivalInterceptWarmStartCache {
     pub(crate) entry_value: Vec<std::sync::atomic::AtomicU64>,
     pub(crate) entry_tag: Vec<std::sync::atomic::AtomicU64>,
@@ -420,7 +419,7 @@ impl SurvivalInterceptWarmStartCache {
 
     /// Return the cached intercept iff the slot's stored `beta_tag` matches
     /// the caller's `beta_tag` and the stored value is finite. Otherwise
-    /// returns `None` (cache miss — caller falls back to closed-form seed).
+    /// returns `None` (cache miss — caller seeds from the rigid closed form).
     #[inline]
     pub(crate) fn load(
         &self,
@@ -436,7 +435,8 @@ impl SurvivalInterceptWarmStartCache {
             return None;
         }
         let bits = value_slot.load(std::sync::atomic::Ordering::Relaxed);
-        let tag_after = tag_slot.load(std::sync::atomic::Ordering::Acquire);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let tag_after = tag_slot.load(std::sync::atomic::Ordering::Relaxed);
         if tag_after != beta_tag {
             return None;
         }
@@ -453,7 +453,8 @@ impl SurvivalInterceptWarmStartCache {
         if let (Some(value_slot), Some(tag_slot)) = (values.get(row), tags.get(row)) {
             // Invalidate before writing the new value so an interleaved
             // reader cannot see the new tag paired with the old value.
-            tag_slot.store(0, std::sync::atomic::Ordering::Release);
+            tag_slot.store(0, std::sync::atomic::Ordering::Relaxed);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             value_slot.store(a.to_bits(), std::sync::atomic::Ordering::Relaxed);
             tag_slot.store(beta_tag, std::sync::atomic::Ordering::Release);
         }
@@ -493,17 +494,43 @@ pub(crate) fn new_flex_jet_arena_pool() -> Arc<FlexJetArenaPool> {
     ))
 }
 
-/// FNV-1a 64-bit hash of the joint coefficient slices `(beta_h, beta_w)`.
-/// Returned tag is guaranteed non-zero (zero is remapped to one) so that
-/// the cache's "never written" sentinel cannot collide with a real key.
-/// At 64 bits, false collisions across distinct β are astronomically rare;
-/// on a miss we just re-solve from the closed-form seed.
+/// FNV-1a 64-bit key of one row's intercept calibration equation
+/// `T(a; q, slope, s, law, β_h, β_w) = Φ(∓q)`: the marginal index `q`, the
+/// slope, the probit frailty scale `s`, the row's finite latent law (nodes and
+/// log weights; `None` is the Gaussian law) and the deviation coefficients.
+/// These are every input the equation reads, so equal keys mean the same
+/// equation and a cached root is that equation's certified root. Keying only
+/// the deviation coefficients made the time, marginal and slope blocks share
+/// one key, so a cached "warm start" was the root of a different equation.
+/// The tag is non-zero (zero is remapped to one) so the cache's "never
+/// written" sentinel cannot collide with a real key.
 #[inline]
 pub(crate) fn hash_intercept_warm_start_key(
+    q: f64,
+    slope: f64,
+    probit_scale: f64,
+    law: Option<AnchorGrid<'_>>,
     beta_h: Option<&Array1<f64>>,
     beta_w: Option<&Array1<f64>>,
 ) -> u64 {
     let mut hash = Fnv1a::new();
+    hash.mix_byte(0xa3);
+    hash.mix_f64(q);
+    hash.mix_f64(slope);
+    hash.mix_f64(probit_scale);
+    hash.mix_byte(0xa4);
+    match law {
+        None => hash.mix_byte(0xff),
+        Some(grid) => {
+            for b in (grid.len() as u64).to_le_bytes() {
+                hash.mix_byte(b);
+            }
+            for (&node, &log_weight) in grid.nodes.iter().zip(grid.log_weights) {
+                hash.mix_f64(node);
+                hash.mix_f64(log_weight);
+            }
+        }
+    }
     hash.mix_opt_beta(0xa1, beta_h);
     hash.mix_opt_beta(0xa2, beta_w);
     hash.finish_nonzero()

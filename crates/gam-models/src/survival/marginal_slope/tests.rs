@@ -9036,13 +9036,21 @@ fn survival_intercept_root_does_not_follow_its_warm_seed_2971() {
         .solve_row_survival_intercept_with_slot(q1v, gv, Some(&beta_h), Some(&beta_w), None)
         .expect("cold survival intercept solve");
 
-    let cache = new_intercept_warm_start_cache(1);
-    cache.store(
-        0,
-        SurvivalInterceptSlotKind::Exit,
-        a_cold + 0.5,
-        hash_intercept_warm_start_key(Some(&beta_h), Some(&beta_w)),
+    // The slot is keyed on every input of the exit equation, exactly as the
+    // production solve keys it; the entry equation at `q₀` shares the
+    // coefficients and the row but must not share the key.
+    let law = cold.flex_law_grid(Some(0)).expect("row law");
+    let probit_scale = cold.probit_frailty_scale();
+    let exit_key =
+        hash_intercept_warm_start_key(q1v, gv, probit_scale, law, Some(&beta_h), Some(&beta_w));
+    let entry_key =
+        hash_intercept_warm_start_key(q0v, gv, probit_scale, law, Some(&beta_h), Some(&beta_w));
+    assert_ne!(
+        exit_key, entry_key,
+        "equations with different targets must not share a warm-start key"
     );
+    let cache = new_intercept_warm_start_cache(1);
+    cache.store(0, SurvivalInterceptSlotKind::Exit, a_cold + 0.5, exit_key);
     let warm = make_family(Some(Arc::clone(&cache)));
     let (a_warm, density_warm) = warm
         .solve_row_survival_intercept_with_slot(
