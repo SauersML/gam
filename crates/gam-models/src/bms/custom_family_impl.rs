@@ -593,6 +593,84 @@ impl gam_model_api::families::custom_family::IndependentOuterSearch<BernoulliMar
     }
 }
 
+/// Absorb a score-warp or link-deviation basis into a warm-start fingerprint:
+/// its presence, the span tables the row kernel evaluates, the monotonicity
+/// rows, and the installed cross-block anchor correction (gam#3002).
+fn fingerprint_bms_deviation(
+    hasher: &mut gam_runtime::warm_start::Fingerprinter,
+    deviation: Option<&super::deviation_runtime::DeviationRuntime>,
+) {
+    use super::deviation_runtime::{AnchorComponentTag, ParametricAnchorBlock};
+    let Some(deviation) = deviation else {
+        hasher.write_bool(false);
+        return;
+    };
+    hasher.write_bool(true);
+    hasher.write_usize(deviation.degree);
+    hasher.write_usize(deviation.value_span_degree);
+    hasher.write_usize(deviation.basis_dim);
+    hasher.write_f64(deviation.monotonicity_eps);
+    hasher.write_f64_array1(&deviation.endpoint_points);
+    hasher.write_f64_array2(&deviation.span_c0);
+    hasher.write_f64_array2(&deviation.span_c1);
+    hasher.write_f64_array2(&deviation.span_c2);
+    hasher.write_f64_array2(&deviation.span_c3);
+    hasher.write_f64_array2(&deviation.monotonicity_constraint_rows);
+    hasher.write_f64_array1(&deviation.right_boundary_value_row);
+    match deviation.anchor_rows_at_training.as_ref() {
+        Some(rows) => {
+            hasher.write_bool(true);
+            hasher.write_f64_array2(rows);
+        }
+        None => hasher.write_bool(false),
+    }
+    match deviation.installed_flex_block.as_ref() {
+        Some(installed) => {
+            hasher.write_bool(true);
+            hasher.write_f64_array2(&installed.anchor_correction);
+            hasher.write_usize(installed.anchor_components.len());
+            for component in &installed.anchor_components {
+                match component {
+                    AnchorComponentTag::Parametric { block, ncols } => {
+                        hasher.write_str(match block {
+                            ParametricAnchorBlock::Marginal => "parametric-marginal",
+                            ParametricAnchorBlock::Slope => "parametric-slope",
+                        });
+                        hasher.write_usize(*ncols);
+                    }
+                    AnchorComponentTag::FlexEvaluation { ncols } => {
+                        hasher.write_str("flex-evaluation");
+                        hasher.write_usize(*ncols);
+                    }
+                }
+            }
+        }
+        None => hasher.write_bool(false),
+    }
+}
+
+/// Absorb a latent-score covariance into a warm-start fingerprint as its
+/// representation tag and the array that representation stores (gam#3002).
+fn fingerprint_bms_covariance(
+    hasher: &mut gam_runtime::warm_start::Fingerprinter,
+    covariance: &MarginalSlopeCovariance,
+) {
+    match covariance.representation() {
+        MarginalSlopeCovarianceRef::Diagonal(values) => {
+            hasher.write_str("diagonal");
+            hasher.write_f64_array1(values);
+        }
+        MarginalSlopeCovarianceRef::Full(values) => {
+            hasher.write_str("full");
+            hasher.write_f64_array2(values);
+        }
+        MarginalSlopeCovarianceRef::LowRank(values) => {
+            hasher.write_str("low-rank");
+            hasher.write_f64_array2(values);
+        }
+    }
+}
+
 impl CustomFamily for BernoulliMarginalSlopeFamily {
     fn independent_outer_search(
         &self,
@@ -617,6 +695,76 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     // unarmed fit proves it is needed (#979).
     fn joint_jeffreys_term_required(&self) -> bool {
         self.jeffreys_armed
+    }
+
+    // gam#3002: a persisted mode minimises `−ℓ(β) + ½βᵀS_λβ − τΦ(β)`, so its
+    // record may be reused only on the same `ℓ`. The generic key already
+    // carries the block specs (designs, offsets, penalties), the options and
+    // `τ`; this fingerprint carries every other input of the Bernoulli
+    // marginal-slope likelihood held on the family: the response, prior
+    // weights and score, the latent law the row intercept is calibrated
+    // against (with its training-row mixtures, which serde skips), the frailty
+    // scale, the base link, the marginal and slope designs the row kernel
+    // reads, the score-warp and link-deviation bases, the residual repair
+    // block, and whether the Jeffreys prior is armed. Caches, the resource
+    // policy and multistart state are numerics-only and stay out.
+    fn persistent_warm_start_fingerprint(
+        &self,
+        _specs: &[ParameterBlockSpec],
+        _options: &BlockwiseFitOptions,
+    ) -> Option<String> {
+        let mut hasher = gam_runtime::warm_start::Fingerprinter::new();
+        hasher.write_str("bernoulli-marginal-slope-family");
+        hasher.write_f64_array1(&self.y);
+        hasher.write_f64_array1(&self.weights);
+        hasher.write_f64_array1(&self.z);
+        hasher.write_str(&serde_json::to_string(&self.latent_measure).ok()?);
+        if let LatentMeasureKind::LocalEmpirical {
+            train_row_mixtures, ..
+        } = &self.latent_measure
+        {
+            hasher.write_usize(train_row_mixtures.len());
+            for row in train_row_mixtures.iter() {
+                hasher.write_usize(row.len());
+                for &(component, weight) in row {
+                    hasher.write_usize(component);
+                    hasher.write_f64(weight);
+                }
+            }
+        }
+        match self.gaussian_frailty_sd {
+            Some(value) => {
+                hasher.write_bool(true);
+                hasher.write_f64(value);
+            }
+            None => hasher.write_bool(false),
+        }
+        hasher.write_str(&serde_json::to_string(&self.base_link).ok()?);
+        gam_custom_family::hash_cf_design_matrix(&mut hasher, &self.marginal_design).ok()?;
+        gam_custom_family::hash_cf_design_matrix(&mut hasher, &self.slope_design).ok()?;
+        fingerprint_bms_deviation(&mut hasher, self.score_warp.as_ref());
+        fingerprint_bms_deviation(&mut hasher, self.link_dev.as_ref());
+        match self.residual.as_deref() {
+            Some(residual) => {
+                hasher.write_bool(true);
+                hasher.write_f64_array2(&residual.features);
+                hasher.write_str(&serde_json::to_string(&residual.geometry).ok()?);
+                // The field the row kernel reads: its pooled covariance and,
+                // when conditional, the covariance materialised at each row.
+                fingerprint_bms_covariance(&mut hasher, residual.field.pooled_covariance());
+                let rows = residual.field.materialised_rows();
+                hasher.write_bool(rows.is_some());
+                if let Some(rows) = rows {
+                    hasher.write_usize(rows);
+                    for row in 0..rows {
+                        fingerprint_bms_covariance(&mut hasher, residual.field.at_row(row));
+                    }
+                }
+            }
+            None => hasher.write_bool(false),
+        }
+        hasher.write_bool(self.jeffreys_armed);
+        Some(hasher.finish_hex())
     }
 
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
@@ -2098,33 +2246,50 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
+    /// The structural monotonicity rows of the score-warp or link-deviation
+    /// block; no other block is constrained. The rows come from the block's
+    /// deviation runtime, so they constrain the block only if `spec` describes
+    /// the block the solver carries and the rows have that block's width.
     fn block_linear_constraints(
         &self,
         block_states: &[ParameterBlockState],
         block_idx: usize,
         spec: &ParameterBlockSpec,
     ) -> Result<Option<ConstraintSet>, String> {
-        if block_states.len() == usize::MAX
-            || block_idx == usize::MAX
-            || spec.design.ncols() == usize::MAX
-        {
-            return Err("unreachable bernoulli marginal-slope constraint state".to_string());
+        let state = block_states.get(block_idx).ok_or_else(|| {
+            format!(
+                "bernoulli marginal-slope block constraints: block {block_idx} is out of range \
+                 for {} blocks",
+                block_states.len()
+            )
+        })?;
+        let width = spec.design.ncols();
+        if state.beta.len() != width {
+            return Err(format!(
+                "bernoulli marginal-slope block constraints: block {block_idx} carries {} \
+                 coefficients but its design has {width} columns",
+                state.beta.len()
+            ));
         }
-        if self.score_block_index().is_some_and(|idx| block_idx == idx) {
-            return Ok(self
-                .score_warp
-                .as_ref()
-                .map(DeviationRuntime::structural_monotonicity_constraints)
-                .map(ConstraintSet::Dense));
+        let runtime = if self.score_block_index() == Some(block_idx) {
+            self.score_warp.as_ref()
+        } else if self.link_block_index() == Some(block_idx) {
+            self.link_dev.as_ref()
+        } else {
+            None
+        };
+        let Some(runtime) = runtime else {
+            return Ok(None);
+        };
+        let constraints = runtime.structural_monotonicity_constraints();
+        if constraints.a.ncols() != width {
+            return Err(format!(
+                "bernoulli marginal-slope block constraints: block {block_idx}'s monotonicity \
+                 rows have {} columns but its design has {width}",
+                constraints.a.ncols()
+            ));
         }
-        if self.link_block_index().is_some_and(|idx| block_idx == idx) {
-            return Ok(self
-                .link_dev
-                .as_ref()
-                .map(DeviationRuntime::structural_monotonicity_constraints)
-                .map(ConstraintSet::Dense));
-        }
-        Ok(None)
+        Ok(Some(ConstraintSet::Dense(constraints)))
     }
 
     fn post_update_block_beta(
@@ -3008,6 +3173,38 @@ impl BernoulliMarginalSlopeFamily {
                     Ok(out)
                 })
                 .collect();
+        }
+        // The contraction is linear in its direction. Past the row's `r` axes,
+        // contract those once and read every direction off them, `T3[d] =
+        // Σ_a d_a·T3[e_a]`, the way the rigid path reads its directions off
+        // `rigid_third_full` (gam#2922).
+        if row_dirs.len() > r {
+            let axes = (0..r)
+                .map(|axis| {
+                    let mut unit = Array1::<f64>::zeros(r);
+                    unit[axis] = 1.0;
+                    unit
+                })
+                .collect::<Vec<_>>();
+            let axis_thirds = self.row_primary_third_contracted_many_with_moments(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &axes,
+            )?;
+            return Ok(row_dirs
+                .iter()
+                .map(|dir| {
+                    let mut out = Array2::<f64>::zeros((r, r));
+                    for (&weight, third) in dir.iter().zip(&axis_thirds) {
+                        if weight != 0.0 {
+                            out.scaled_add(weight, third);
+                        }
+                    }
+                    out
+                })
+                .collect());
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
             return Err(

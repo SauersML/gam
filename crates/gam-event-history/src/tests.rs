@@ -3026,10 +3026,13 @@ fn traced_fixed_lambda_inner_solve_on_the_loaded_cohort_reports_its_cost() {
                 ));
             }
         }
-        Err(error) => emit(&format!(
-            "[cost] error after {:.1}s: {error}",
+        // `fit_custom_family_fixed_log_lambdas` returns `Ok` only for a
+        // converged inner mode, so a refusal is the stall this trace reports;
+        // it fails the test instead of being printed and passed.
+        Err(error) => panic!(
+            "fixed-λ inner solve on the loaded cohort must converge; it refused after {:.1}s: {error}",
             clock.elapsed().as_secs_f64()
-        )),
+        ),
     }
 }
 

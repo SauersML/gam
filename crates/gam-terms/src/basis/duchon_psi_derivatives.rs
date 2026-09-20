@@ -207,9 +207,9 @@ pub(crate) fn duchon_partial_fraction_kernel_psi_triplet(
     }
 
     let kappa2 = kappa * kappa;
-    let mut value = KahanSum::default();
-    let mut first = KahanSum::default();
-    let mut second = KahanSum::default();
+    let mut value = CompensatedSum::default();
+    let mut first = CompensatedSum::default();
+    let mut second = CompensatedSum::default();
     for (m, &coefficient) in coeffs.a.iter().enumerate().skip(1) {
         if coefficient == 0.0 {
             continue;
@@ -235,12 +235,10 @@ pub(crate) fn duchon_partial_fraction_kernel_psi_triplet(
         first.add(coefficient * (exponent * block + block_first));
         second.add(
             coefficient
-                * (exponent * exponent * block
-                    + 2.0 * exponent * block_first
-                    + block_second),
+                * (exponent * exponent * block + 2.0 * exponent * block_first + block_second),
         );
     }
-    let triplet = (value.sum(), first.sum(), second.sum());
+    let triplet = (value.value(), first.value(), second.value());
     if !(triplet.0.is_finite() && triplet.1.is_finite() && triplet.2.is_finite()) {
         crate::bail_invalid_basis!(
             "non-finite Duchon partial-fraction psi jet at r={r}, length_scale={length_scale}, p={p_order}, s={s_order}, dim={k_dim}"
@@ -433,10 +431,10 @@ pub(crate) fn duchon_regularized_operator_core(
     // Assemble the operator scalars with compensated summation because the
     // partial-fraction coefficients can alternate in sign and span many orders
     // of magnitude in higher dimensions.
-    let mut q_sum = KahanSum::default();
-    let mut t_sum = KahanSum::default();
-    let mut t_r_sum = KahanSum::default();
-    let mut t_rr_sum = KahanSum::default();
+    let mut q_sum = CompensatedSum::default();
+    let mut t_sum = CompensatedSum::default();
+    let mut t_r_sum = CompensatedSum::default();
+    let mut t_rr_sum = CompensatedSum::default();
 
     for (m, coeff) in coeffs.a.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
@@ -476,10 +474,10 @@ pub(crate) fn duchon_regularized_operator_core(
         }
     }
     Ok(DuchonRegularizedOperatorCore {
-        q: q_sum.sum(),
-        t: t_sum.sum(),
-        t_r: t_r_sum.sum(),
-        t_rr: t_rr_sum.sum(),
+        q: q_sum.value(),
+        t: t_sum.value(),
+        t_r: t_r_sum.value(),
+        t_rr: t_rr_sum.value(),
     })
 }
 
@@ -1134,9 +1132,9 @@ pub(crate) fn duchon_phi_even_derivative_collision(
 
     // Analytic path: extract per-block Taylor r^{2j} coefficients and sum.
     let kappa = duchon_inverse_length_scale(length_scale, "Duchon even-derivative collision")?;
-    let mut total_pure = KahanSum::default();
-    let mut total_log = KahanSum::default();
-    let mut total_log_abs_scale = KahanSum::default();
+    let mut total_pure = CompensatedSum::default();
+    let mut total_log = CompensatedSum::default();
+    let mut total_log_abs_scale = CompensatedSum::default();
 
     // Polyharmonic blocks.
     for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
@@ -1159,9 +1157,9 @@ pub(crate) fn duchon_phi_even_derivative_collision(
         total_log.add(b_n * log);
         total_log_abs_scale.add((b_n * log).abs());
     }
-    let total_pure = total_pure.sum();
-    let total_log = total_log.sum();
-    let total_log_abs_scale = total_log_abs_scale.sum();
+    let total_pure = total_pure.value();
+    let total_log = total_log.value();
+    let total_log_abs_scale = total_log_abs_scale.value();
 
     // The ln(r) coefficients should cancel to zero (guaranteed by the PFD
     // identity when 2(p+s) > d+2j).  Check this as a sanity guard.
@@ -1203,14 +1201,15 @@ pub(crate) fn duchon_phi_even_derivative_collision_psi_triplet(
         ));
     }
 
-    let kappa = duchon_inverse_length_scale(length_scale, "Duchon even-derivative collision ψ-triplet")?;
-    let mut value = KahanSum::default();
-    let mut psi = KahanSum::default();
-    let mut psi_psi = KahanSum::default();
-    let mut log_value = KahanSum::default();
-    let mut log_psi = KahanSum::default();
-    let mut log_psi_psi = KahanSum::default();
-    let mut log_abs_scale = KahanSum::default();
+    let kappa =
+        duchon_inverse_length_scale(length_scale, "Duchon even-derivative collision ψ-triplet")?;
+    let mut value = CompensatedSum::default();
+    let mut psi = CompensatedSum::default();
+    let mut psi_psi = CompensatedSum::default();
+    let mut log_value = CompensatedSum::default();
+    let mut log_psi = CompensatedSum::default();
+    let mut log_psi_psi = CompensatedSum::default();
+    let mut log_abs_scale = CompensatedSum::default();
 
     for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
         if a_m == 0.0 {
@@ -1249,13 +1248,13 @@ pub(crate) fn duchon_phi_even_derivative_collision_psi_triplet(
         log_abs_scale.add(log_pp.abs());
     }
 
-    let value = value.sum();
-    let psi = psi.sum();
-    let psi_psi = psi_psi.sum();
-    let log_value = log_value.sum();
-    let log_psi = log_psi.sum();
-    let log_psi_psi = log_psi_psi.sum();
-    let log_abs_scale = log_abs_scale.sum();
+    let value = value.value();
+    let psi = psi.value();
+    let psi_psi = psi_psi.value();
+    let log_value = log_value.value();
+    let log_psi = log_psi.value();
+    let log_psi_psi = log_psi_psi.value();
+    let log_abs_scale = log_abs_scale.value();
     let scale = value.abs().max(psi.abs()).max(psi_psi.abs()).max(1e-30);
     let log_cancel_tol = 1e-10 * log_abs_scale.max(scale);
     if log_value.abs().max(log_psi.abs()).max(log_psi_psi.abs()) > log_cancel_tol {
@@ -1481,7 +1480,9 @@ pub fn build_duchon_basis_log_kappa_aniso_derivativeswith_collocationwithworkspa
             spec.power
         );
     }
-    let length_scale = spec.length_scale.expect("capability check requires a hybrid scale");
+    let length_scale = spec
+        .length_scale
+        .expect("capability check requires a hybrid scale");
     let eta = spec
         .aniso_log_scales
         .clone()
@@ -2053,38 +2054,41 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
     // Chebyshev profile below would approximate the same universal G a second
     // time, and the n·k distance pre-pass that sizes it would walk every pair
     // before the loop that walks them again.
-    let value_profile = hybrid_kind.as_ref().filter(|_| hybrid_eval.is_none()).and_then(|kind| {
-        if n.saturating_mul(k) < RADIAL_PROFILE_MIN_PAIRS {
-            return None;
-        }
-        let (r_lo, r_hi) = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mut lo = f64::INFINITY;
-                let mut hi = 0.0_f64;
-                for j in 0..k {
-                    let r = if let Some(scales) = axis_scales.as_deref() {
-                        aniso_distance_rows_with_scales(data, i, centers, j, scales)
-                    } else {
-                        euclidean_distance_rows(data, i, centers, j)
-                    };
-                    if r > 0.0 {
-                        lo = lo.min(r);
-                        hi = hi.max(r);
+    let value_profile = hybrid_kind
+        .as_ref()
+        .filter(|_| hybrid_eval.is_none())
+        .and_then(|kind| {
+            if n.saturating_mul(k) < RADIAL_PROFILE_MIN_PAIRS {
+                return None;
+            }
+            let (r_lo, r_hi) = (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let mut lo = f64::INFINITY;
+                    let mut hi = 0.0_f64;
+                    for j in 0..k {
+                        let r = if let Some(scales) = axis_scales.as_deref() {
+                            aniso_distance_rows_with_scales(data, i, centers, j, scales)
+                        } else {
+                            euclidean_distance_rows(data, i, centers, j)
+                        };
+                        if r > 0.0 {
+                            lo = lo.min(r);
+                            hi = hi.max(r);
+                        }
                     }
-                }
-                (lo, hi)
-            })
-            .reduce(
-                || (f64::INFINITY, 0.0_f64),
-                |a, b| (a.0.min(b.0), a.1.max(b.1)),
-            );
-        if r_lo.is_finite() && r_hi > r_lo {
-            radial_profile::RadialProfile::build(kind, r_lo, r_hi)
-        } else {
-            None
-        }
-    });
+                    (lo, hi)
+                })
+                .reduce(
+                    || (f64::INFINITY, 0.0_f64),
+                    |a, b| (a.0.min(b.0), a.1.max(b.1)),
+                );
+            if r_lo.is_finite() && r_hi > r_lo {
+                radial_profile::RadialProfile::build(kind, r_lo, r_hi)
+            } else {
+                None
+            }
+        });
     let mut basis = Array2::<f64>::zeros((n, total_cols));
     // Process rows in chunks to amortize thread-local allocation across many rows.
     // Use larger chunks (1024) for better cache utilization at large scale.

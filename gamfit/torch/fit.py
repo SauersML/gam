@@ -433,6 +433,17 @@ def _build_design_penalty(
         pca = smooth
         if pca.lazy_path is not None:
             raise NotImplementedError("Pca lazy_path is available on the Rust formula path")
+        # Pca is a precomputed projection on every entry point (the Rust
+        # formula builder, the `smooths=` override, and every descriptor
+        # evaluator all require the supplied basis); `pca_basis_matrix` is the
+        # one definition of it.
+        basis = torch.as_tensor(
+            pca_basis_matrix(pca), dtype=torch.float64, device=points.device
+        )
+        if basis.shape[0] != points.shape[1]:
+            raise ValueError(
+                f"Pca: points d={points.shape[1]} but basis has {basis.shape[0]} rows"
+            )
         design_points = points.to(torch.float64)
         if pca.centered:
             # Fitting is the fit/transform boundary: resolve the training mean
@@ -443,24 +454,16 @@ def _build_design_penalty(
             design_points = design_points - torch.as_tensor(
                 mean_np, dtype=torch.float64, device=points.device
             ).reshape(1, -1)
-        if pca.basis is None:
-            if pca.K is None:
-                raise ValueError("Pca requires K when basis is None")
-            _u, _s, vh = torch.linalg.svd(design_points, full_matrices=False)
-            basis = vh[: int(pca.K)].T.contiguous()
-            # Persist the fitted projection so later descriptor evaluations
-            # reuse the map this fit selected.
-            pca.basis = basis.detach().cpu().numpy()
-        else:
-            basis = torch.as_tensor(
-                pca_basis_matrix(pca), dtype=torch.float64, device=points.device
-            )
-        if basis.shape[0] != points.shape[1]:
-            raise ValueError(
-                f"Pca: points d={points.shape[1]} but basis has {basis.shape[0]} rows"
-            )
         design = design_points @ basis
-        penalty = torch.eye(basis.shape[1], dtype=torch.float64, device=points.device)
+        # Penalty: the empirical function mass `βᵀSβ = mean_i((Zβ)_i²)`, i.e.
+        # `S = ZᵀZ / N` — the Rust `pca_function_mass_penalty` functional. It
+        # prices the fitted function, not whichever coefficient chart encodes
+        # the score columns (an identity ridge would agree only when the
+        # scores are empirically orthonormal). REML learns the strength, so it
+        # carries no scale of its own. A null direction of `Z` is a shared
+        # design/penalty null direction, which the REML backend refuses rather
+        # than stabilizing with a ridge.
+        penalty = design.transpose(0, 1) @ design / float(design.shape[0])
         return design, penalty
 
     if entry == "tensor_bspline" and isinstance(smooth, TensorBSpline):

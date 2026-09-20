@@ -49,9 +49,7 @@ use crate::survival::location_scale::{
 use crate::transformation_normal::{TransformationNormalFamily, TransformationNormalFitResult};
 use crate::wiggle::{WigglePenaltyMetadata, canonical_wiggle_function_penalties};
 use gam_data::{DataSchema, EncodedDataset};
-use gam_linalg::faer_ndarray::array2_to_nested_vec;
 use gam_linalg::matrix::LinearOperator;
-use gam_problem::BlockRole;
 use gam_problem::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, StandardLink, inverse_link_to_binomial_spec,
 };
@@ -521,16 +519,6 @@ pub fn assemble_standard_payload(
     payload.linkwiggle_penalty_metadata = wiggle_penalty_metadata;
     payload.beta_link_wiggle = wiggle_saved_warp_beta;
     payload.link_wiggle_index_shift = wiggle_saved_index_shift;
-    match &fit.fitted_link {
-        FittedLinkState::Mixture { covariance, .. } => {
-            payload.mixture_link_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
-        }
-        FittedLinkState::Sas { covariance, .. }
-        | FittedLinkState::BetaLogistic { covariance, .. } => {
-            payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
-        }
-        FittedLinkState::Standard(_) | FittedLinkState::LatentCLogLog { .. } => {}
-    }
     payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
     payload.resolved_termspec = Some(resolved_termspec);
     payload.basis_adequacy = basis_adequacy;
@@ -811,8 +799,7 @@ pub fn assemble_residual_cascade_payload(
 ///
 /// This is the single place that decides which payload fields a marginal-slope
 /// model carries and how the singular/vector mirror fields
-/// (`slope_formula(s)`, `z_column(s)`, `baseline_slope(s)`,
-/// `resolved_slopespec(s)`) are kept consistent — so the CLI and FFI
+/// (`z_column(s)`, `resolved_slopespec(s)`) are kept consistent — so the CLI and FFI
 /// saved models are byte-equivalent for identical semantic content.
 pub fn assemble_bernoulli_marginal_slope_payload(
     inputs: BernoulliMarginalSlopeInputs<'_>,
@@ -862,9 +849,8 @@ pub fn assemble_bernoulli_marginal_slope_payload(
     payload.unified = Some(fit_result.clone());
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(data_schema);
-    payload.slope_formula = Some(slope_formula.clone());
+    payload.slope_formula = Some(slope_formula);
     payload.z_column = Some(z_column.clone());
-    payload.slope_formulas = Some(vec![slope_formula]);
     payload.z_columns = Some(vec![z_column]);
     payload.latent_z_normalization = Some(latent_z_normalization);
     payload.latent_measure = Some(latent_measure);
@@ -873,7 +859,6 @@ pub fn assemble_bernoulli_marginal_slope_payload(
     payload.latent_z_conditional_calibration = latent_z_conditional_calibration;
     payload.marginal_baseline = Some(baseline_marginal);
     payload.baseline_slope = Some(baseline_slope);
-    payload.baseline_slopes = Some(vec![baseline_slope]);
     payload.link = Some(base_link);
     payload.resolved_termspec = Some(resolved_marginalspec);
     payload.resolved_slopespecs = Some(vec![resolved_slopespec.clone()]);
@@ -1012,7 +997,7 @@ pub enum LocationScaleResponse {
     /// Tweedie) whose log-precision channel carries `noise_formula` (#913). The
     /// `likelihood` is the family's own [`LikelihoodSpec`]; `base_link` is the
     /// mean inverse link (log, or logit for Beta). The log-precision block
-    /// coefficients ride in [`LocationScaleInputs::beta_noise`].
+    /// coefficients are the fit's `BlockRole::Scale` block.
     Dispersion {
         likelihood: LikelihoodSpec,
         base_link: InverseLink,
@@ -1040,7 +1025,6 @@ pub struct LocationScaleInputs {
     pub resolved_termspec: TermCollectionSpec,
     pub resolved_termspec_noise: TermCollectionSpec,
     pub fit_result: UnifiedFitResult,
-    pub beta_noise: Option<Vec<f64>>,
     pub wiggle: Option<LocationScaleWiggle>,
 }
 
@@ -1112,7 +1096,6 @@ pub fn assemble_location_scale_payload(
     payload.data_schema = Some(inputs.data_schema);
     payload.link = link;
     payload.formula_noise = Some(inputs.noise_formula);
-    payload.beta_noise = inputs.beta_noise;
     payload.gaussian_response_scale = gaussian_scales.map(|(response_scale, _)| response_scale);
     payload.gaussian_sigma_floor = gaussian_scales.map(|(_, sigma_floor)| sigma_floor);
     payload.resolved_termspec = Some(inputs.resolved_termspec);
@@ -1128,8 +1111,7 @@ pub fn assemble_location_scale_payload(
 
 /// Source-agnostic semantic content of a survival marginal-slope
 /// (Royston-Parmar net) saved model. Centralizing assembly also fixes the
-/// FFI's prior omission of the `*_slopes`/`*_columns`/`slope_formulas`
-/// vector mirrors the CLI wrote.
+/// FFI's prior omission of the `*_columns` vector mirrors the CLI wrote.
 pub struct SurvivalMarginalSlopeInputs<'a> {
     pub formula: String,
     pub data_schema: DataSchema,
@@ -1268,8 +1250,7 @@ pub fn assemble_survival_marginal_slope_payload(
     payload.resolved_slopespecs = Some(vec![inputs.resolved_slopespec.clone()]);
     payload.resolved_slopespec = Some(inputs.resolved_slopespec);
     payload.slope_time_basis = inputs.slope_time_basis;
-    payload.slope_formula = Some(inputs.slope_formula.clone());
-    payload.slope_formulas = Some(vec![inputs.slope_formula]);
+    payload.slope_formula = Some(inputs.slope_formula);
     payload.z_column = Some(inputs.z_column.clone());
     payload.z_columns = Some(vec![inputs.z_column]);
     payload.latent_z_normalization = Some(inputs.latent_z_normalization);
@@ -1286,7 +1267,6 @@ pub fn assemble_survival_marginal_slope_payload(
     payload.latent_law_consumed = Some(inputs.latent_law_consumed);
     payload.latent_z_conditional_calibration = inputs.latent_z_conditional_calibration;
     payload.baseline_slope = Some(inputs.baseline_slope);
-    payload.baseline_slopes = Some(vec![inputs.baseline_slope]);
     if let Some(timewiggle) = inputs.timewiggle {
         payload.baseline_timewiggle_degree = Some(timewiggle.degree);
         payload.baseline_timewiggle_knots = Some(timewiggle.knots);
@@ -2423,10 +2403,8 @@ fn payload_for_survival_marginal_slope(
         },
     )?;
     if let Some((law, z_columns, surface_specs)) = joint_state {
-        let k = law.score_dim;
         payload.z_columns = Some(z_columns);
         payload.resolved_slopespecs = Some(surface_specs);
-        payload.baseline_slopes = Some(vec![ms_result.baseline_slope; k]);
         payload.survival_marginal_slope_joint_latent_law = Some(law);
     }
     Ok(payload)
@@ -2568,9 +2546,6 @@ pub fn payload_for_gaussian_location_scale(
         .ok_or_else(|| "gaussian location-scale requires noise_formula".to_string())?;
 
     let fit = ls_result.fit.fit;
-    let scale_beta = fit
-        .block_by_role(BlockRole::Scale)
-        .map(|block| block.beta.to_vec());
     let wiggle = location_scale_wiggle_from_parts(
         ls_result.wiggle_knots,
         ls_result.wiggle_degree,
@@ -2588,7 +2563,6 @@ pub fn payload_for_gaussian_location_scale(
             resolved_termspec: frozen_meanspec,
             resolved_termspec_noise: frozen_noisespec,
             fit_result: fit,
-            beta_noise: scale_beta,
             wiggle,
         },
         LocationScaleResponse::Gaussian {
@@ -2676,9 +2650,6 @@ fn payload_for_binomial_location_scale(
         .ok_or_else(|| "binomial location-scale requires noise_formula".to_string())?;
 
     let fit = ls_result.fit.fit;
-    let scale_beta = fit
-        .block_by_role(BlockRole::Scale)
-        .map(|block| block.beta.to_vec());
     let wiggle = location_scale_wiggle_from_parts(
         ls_result.wiggle_knots,
         ls_result.wiggle_degree,
@@ -2696,7 +2667,6 @@ fn payload_for_binomial_location_scale(
             resolved_termspec: frozen_meanspec,
             resolved_termspec_noise: frozen_noisespec,
             fit_result: fit,
-            beta_noise: scale_beta,
             wiggle,
         },
         LocationScaleResponse::Binomial { link: link_kind },
@@ -2715,8 +2685,8 @@ fn payload_for_binomial_location_scale(
 /// (`assemble_location_scale_payload` + `LocationScaleResponse::Dispersion`),
 /// deriving the persisted likelihood and mean base-link from the single
 /// source of truth on [`DispersionFamilyKind`]. The log-precision block
-/// coefficients ride in `beta_noise`; there is no link-wiggle and no response
-/// standardization for these families.
+/// coefficients are the fit's `BlockRole::Scale` block; there is no
+/// link-wiggle and no response standardization for these families.
 fn payload_for_dispersion_location_scale(
     formula: String,
     dataset: &EncodedDataset,
@@ -2741,9 +2711,6 @@ fn payload_for_dispersion_location_scale(
         .ok_or_else(|| "dispersion location-scale requires noise_formula".to_string())?;
 
     let fit = ls_result.fit.fit;
-    let scale_beta = fit
-        .block_by_role(BlockRole::Scale)
-        .map(|block| block.beta.to_vec());
 
     assemble_location_scale_payload(
         LocationScaleInputs {
@@ -2753,7 +2720,6 @@ fn payload_for_dispersion_location_scale(
             resolved_termspec: frozen_meanspec,
             resolved_termspec_noise: frozen_noisespec,
             fit_result: fit,
-            beta_noise: scale_beta,
             wiggle: None,
         },
         LocationScaleResponse::Dispersion {
@@ -3563,6 +3529,7 @@ mod latent_saved_baseline_tests {
 mod survival_payload_decline_tests {
     use super::*;
     use crate::survival::lognormal_kernel::FrailtySpec;
+    use gam_problem::BlockRole;
     use gam_problem::LinearInequalityConstraints;
     use gam_problem::types::{LikelihoodScaleMetadata, LogLikelihoodNormalization};
     use gam_solve::constrained_posterior::{

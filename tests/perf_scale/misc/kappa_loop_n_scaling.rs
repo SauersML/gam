@@ -198,7 +198,6 @@ fn run_fit(n: usize, kappa_enabled: bool, aniso: bool) -> Result<FitTiming, Stri
         coefficient_groups: Vec::new(),
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
-        estimate_tweedie_p: false,
     }))
     .map_err(|e| format!("{e:?}"))?;
     let dt = t0.elapsed().as_secs_f64();
