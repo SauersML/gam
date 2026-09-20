@@ -63,8 +63,6 @@ magic	crates/gam-models/src/survival/marginal_slope/spec.rs	< -1e-12	https://git
 magic	crates/gam-models/src/survival/marginal_slope/spec.rs	< -1e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/predict.rs	.max(1.0e-9)	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/time_constraints.rs	<= 1e-24	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-report/src/lib.rs	< 1.0e-3	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-report/src/lib.rs	> 1e-2	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-sae/src/manifold/fit_drivers.rs	> 1.0e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-sae/src/manifold/fit_drivers.rs	> 1.0e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-sae/src/manifold/fit_drivers.rs	> 1.0e-12	https://github.com/SauersML/gam/issues/2469

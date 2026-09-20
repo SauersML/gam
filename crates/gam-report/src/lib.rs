@@ -547,10 +547,10 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
     if let Some(n) = input.n_obs {
         summary_pairs.push(("Observations", format!("{}", n)));
     }
-    summary_pairs.push(("Deviance", fmt_num(input.deviance)));
+    summary_pairs.push(("Deviance", format_significant(input.deviance)));
     summary_pairs.push((
         "REML / LAML",
-        criterion_row(input.reml_score, input.raw_reml_score, fmt_num),
+        criterion_row(input.reml_score, input.raw_reml_score, format_significant),
     ));
     if let Some(r2) = input.r_squared {
         summary_pairs.push(("R-squared", format!("{:.6}", r2)));
@@ -815,10 +815,10 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
             .map(|r| {
                 let band = format!(
                     "band {}..{} ({} scales, \u{2113}={})",
-                    fmt_num(r.eps_min),
-                    fmt_num(r.eps_max),
+                    format_significant(r.eps_min),
+                    format_significant(r.eps_max),
                     r.n_scales,
-                    fmt_num(r.length_scale),
+                    format_significant(r.length_scale),
                 );
                 let tail = if r.per_scale.is_empty() {
                     format!("fused penalty, spec order s={:.2}", r.spec_order_s)
@@ -866,12 +866,12 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
             } else {
                 values
                     .iter()
-                    .map(|value| fmt_num(*value))
+                    .map(|value| format_significant(*value))
                     .collect::<Vec<_>>()
                     .join(" → ")
             }
         };
-        let fmt_opt = |value: Option<f64>| value.map(fmt_num).unwrap_or_else(|| "—".to_string());
+        let fmt_opt = |value: Option<f64>| value.map(format_significant).unwrap_or_else(|| "—".to_string());
         let rows = input
             .smoothing_forensics
             .iter()
@@ -969,15 +969,13 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
                 let rank = row
                     .enrichment_rank
                     .map_or_else(|| "&mdash;".to_string(), |v| v.to_string());
-                // A failing term is marked, and the mark is the p-value cell
-                // rather than a separate verdict column: the number and the
-                // judgement should not be able to disagree.
-                let flagged = row.p_value.is_some_and(|p| p < 1.0e-3);
-                let p_cell = match row.p_value {
-                    Some(p) if flagged => format!("<strong>{p:.3e}</strong>"),
-                    Some(p) => format!("{p:.3e}"),
-                    None => "&mdash;".to_string(),
-                };
+                // The p-value is the evidence and the table prints it with no
+                // verdict attached: the fit carries no test level, so any
+                // cutoff drawn here would be a level the report invented and
+                // the reader never chose.
+                let p_cell = row
+                    .p_value
+                    .map_or_else(|| "&mdash;".to_string(), |p| format!("{p:.3e}"));
                 format!(
                     "<tr><td class=\"mono\">{}</td><td class=\"num\">{}</td>\
                      <td class=\"num\">{}</td><td class=\"num\">{}</td>\
@@ -1329,14 +1327,6 @@ fn to_html_id(s: &str) -> String {
         .collect()
 }
 
-fn fmt_num(v: f64) -> String {
-    if v.abs() < 1e4 && v.abs() > 1e-2 {
-        format!("{:.4}", v)
-    } else {
-        format!("{:.6e}", v)
-    }
-}
-
 /// `value` to six significant digits in C's `%g` form: fixed notation for
 /// decimal exponents in `[-4, 6)`, scientific otherwise, trailing zeros trimmed.
 /// The number format of every printed model summary.
@@ -1460,7 +1450,7 @@ mod tests {
         input.raw_reml_score = Some(-17.3);
         let html = render_html(&input).expect("render a report without a comparable criterion");
         assert!(
-            html.contains(&criterion_row(None, Some(-17.3), fmt_num)),
+            html.contains(&criterion_row(None, Some(-17.3), format_significant)),
             "the report must render the one owner's words for a fit without null-space metadata"
         );
         input.raw_reml_score = None;
@@ -1559,42 +1549,34 @@ mod tests {
         assert_eq!(to_html_id(""), "");
     }
 
-    // ── fmt_num ──────────────────────────────────────────────────────────────
+    // ── format_significant (every number the report prints) ─────────────────
 
     #[test]
-    fn fmt_num_normal_range_positive() {
-        assert_eq!(fmt_num(1.5), "1.5000");
+    fn format_significant_is_six_significant_digits_in_fixed_range() {
+        assert_eq!(format_significant(1.5), "1.5");
+        assert_eq!(format_significant(-3.14), "-3.14");
+        assert_eq!(format_significant(9999.0), "9999");
+        assert_eq!(format_significant(10000.0), "10000");
+        assert_eq!(format_significant(0.011), "0.011");
+        assert_eq!(format_significant(0.01), "0.01");
+        assert_eq!(format_significant(1234.56789), "1234.57");
     }
 
     #[test]
-    fn fmt_num_normal_range_negative() {
-        assert_eq!(fmt_num(-3.14), "-3.1400");
+    fn format_significant_switches_to_scientific_by_decimal_exponent() {
+        assert_eq!(format_significant(123456.7), "123457");
+        assert_eq!(format_significant(1234567.0), "1.23457e+06");
+        assert_eq!(format_significant(2.5e-4), "0.00025");
+        assert_eq!(format_significant(1.25e-5), "1.25e-05");
     }
 
     #[test]
-    fn fmt_num_just_below_1e4() {
-        assert_eq!(fmt_num(9999.0), "9999.0000");
-    }
-
-    #[test]
-    fn fmt_num_at_1e4_uses_scientific() {
-        // Rust `{:.6e}` prints a bare exponent (no zero padding, no plus).
-        assert_eq!(fmt_num(10000.0), "1.000000e4");
-    }
-
-    #[test]
-    fn fmt_num_just_above_0_01_threshold() {
-        assert_eq!(fmt_num(0.011), "0.0110");
-    }
-
-    #[test]
-    fn fmt_num_exactly_0_01_uses_scientific() {
-        assert_eq!(fmt_num(0.01), "1.000000e-2");
-    }
-
-    #[test]
-    fn fmt_num_zero_uses_scientific() {
-        assert_eq!(fmt_num(0.0), "0.000000e0");
+    fn format_significant_names_zero_and_non_finite_values() {
+        assert_eq!(format_significant(0.0), "0");
+        assert_eq!(format_significant(-0.0), "0");
+        assert_eq!(format_significant(f64::NAN), "nan");
+        assert_eq!(format_significant(f64::INFINITY), "inf");
+        assert_eq!(format_significant(f64::NEG_INFINITY), "-inf");
     }
 
     // ── render_html smoke test ────────────────────────────────────────────────
@@ -1815,7 +1797,7 @@ mod tests {
         }];
         let html = render_html(&input).unwrap();
         assert!(html.contains("Smoothing Forensics"));
-        assert!(html.contains("0.1000 → 0.2000"));
+        assert!(html.contains("0.1 → 0.2"));
     }
 
     #[test]
