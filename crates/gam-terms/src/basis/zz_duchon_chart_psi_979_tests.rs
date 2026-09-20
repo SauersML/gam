@@ -107,7 +107,7 @@ fn chart_amplification(data: ArrayView2<'_, f64>, spec: &DuchonBasisSpec) -> f64
     let centers = fixture_centers(spec);
     let order = duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(order);
-    let s_order = spec.power_as_usize();
+    let s_order = spec.hybrid_s_order().expect("integer hybrid power");
     let length_scale = spec.length_scale.expect("hybrid fixture");
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
     duchon_kernel_chart(
@@ -192,7 +192,7 @@ fn mass_reconstruction(
 ) -> (Array2<f64>, Array2<f64>) {
     let order = duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(order);
-    let s_order = spec.power_as_usize();
+    let s_order = spec.hybrid_s_order().expect("integer hybrid power");
     let ell = spec.length_scale.expect("hybrid fixture");
     let d = centers.ncols();
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ell);
@@ -307,7 +307,7 @@ fn operator_penalty_gaps(
             {
                 let order = duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
                 let p_order = duchon_p_from_nullspace_order(order);
-                let s_order = spec.power_as_usize();
+                let s_order = spec.hybrid_s_order().expect("integer hybrid power");
                 let ell = spec.length_scale.expect("hybrid fixture");
                 let d = centers.ncols();
                 let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ell);

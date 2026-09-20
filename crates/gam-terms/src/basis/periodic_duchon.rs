@@ -1065,10 +1065,13 @@ pub(crate) fn build_periodic_duchon_basis_1d(
     let user_m = duchon_p_from_nullspace_order(spec.nullspace_order);
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    let s_order = spec.power_as_usize();
-    // Validate against the INTEGER `s` the hybrid kernel actually evaluates
-    // (`power_as_usize` truncates a fractional `spec.power`), so the
-    // well-posedness gate matches the realized kernel rather than the raw power.
+    // The hybrid kernel takes an integer `s` and refuses a fractional one
+    // (#3541). The scale-free periodic kernel is the Bernoulli Green's function
+    // of order `user_m` below and does not read `s`.
+    let s_order = match spec.length_scale {
+        Some(_) => spec.hybrid_s_order()?,
+        None => duchon_power_to_usize(spec.power),
+    };
     validate_duchon_kernel_orders(spec.length_scale, p_order, s_order as f64, 1)?;
     let z = kernel_constraint_nullspace(
         centers.view(),
@@ -1719,7 +1722,10 @@ pub(crate) fn duchon_center_kernel_value_matrix(
     }
     let k = centers.nrows();
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
-    let s_int = duchon_power_to_usize(power);
+    let s_int = match length_scale {
+        Some(_) => duchon_hybrid_s_order(power)?,
+        None => duchon_power_to_usize(power),
+    };
     let pure = length_scale.is_none();
     let pure_poly_coeff = if pure {
         Some(PolyharmonicBlockCoeff::new(
@@ -2259,7 +2265,7 @@ pub(crate) fn duchon_operator_penalty_candidates(
             ops.kernel_amplification,
             &factory_spec,
             p_order,
-            duchon_power_to_usize(power),
+            duchon_hybrid_s_order(power)?,
             length_scale,
             None,
             kernel_nullspace,

@@ -1386,7 +1386,7 @@ pub(crate) fn build_duchon_design_psi_derivativeswithworkspace(
     // 4. apply any frozen identifiability transform
     let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    let s_order = spec.power_as_usize();
+    let s_order = spec.hybrid_s_order()?;
     let kappa = 1.0 / length_scale;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
     // #1355/#2638: the design ψ-derivatives assemble in the SAME frozen radial
@@ -1488,7 +1488,7 @@ pub fn build_duchon_basis_log_kappa_aniso_derivativeswith_collocationwithworkspa
         .expect("capability check requires resolved anisotropy");
     let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    let s_order = spec.power_as_usize();
+    let s_order = spec.hybrid_s_order()?;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
     let z_kernel = duchon_frozen_radial_chart(
         kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?,
@@ -1904,19 +1904,9 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
     let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order: f64 = power;
-    // Gate on the spectral power the kernel actually evaluates: the scale-free
-    // native Gram uses the literal fractional `power`, but the hybrid
-    // (`length_scale=Some`) partial-fraction kernel reads `s` back through
-    // `duchon_power_to_usize` (truncating a fractional `power`). Validating the
-    // raw fractional power on the hybrid path would desync the `2(p+s) > d`
-    // gate from the realized kernel and let the non-finite-at-origin case
-    // through (gh#750).
-    let validation_power = if length_scale.is_some() {
-        duchon_power_to_usize(s_order) as f64
-    } else {
-        s_order
-    };
-    validate_duchon_kernel_orders(length_scale, p_order, validation_power, d)?;
+    // Validate the requested power itself: the hybrid kernel refuses a
+    // fractional `power` (#3541), the scale-free one evaluates it literally.
+    validate_duchon_kernel_orders(length_scale, p_order, s_order, d)?;
 
     // Translation-invariant polynomial frame (#1375, mirroring the #1269 tp fix).
     // The Duchon kernel reads only coordinate *differences* `data − centers`, so
@@ -2254,10 +2244,12 @@ pub fn create_duchon_basis_1d_derivative_dense_with_radial_reparam(
         duchon_effective_nullspace_order(center_matrix.view(), nullspace_order)
     };
     let p_order = duchon_p_from_nullspace_order(effective_order);
-    let s_order = duchon_power_to_usize(power);
-    validate_duchon_kernel_orders(None, p_order, s_order as f64, 1)?;
 
     if periodic {
+        // The periodic kernel is the Bernoulli Green's function of order
+        // `user_m` and does not read `s`; validate exactly as the forward
+        // periodic builder does.
+        validate_duchon_kernel_orders(None, p_order, duchon_power_to_usize(power) as f64, 1)?;
         // Periodic case: mirror the forward Bernoulli Green's-function design
         // (`build_periodic_duchon_basis_1d`) EXACTLY — same collapsed centers,
         // same domain-wrap period, same constant-only constraint nullspace —
@@ -2333,13 +2325,17 @@ pub fn create_duchon_basis_1d_derivative_dense_with_radial_reparam(
     let kernel_cols = z.ncols();
     let poly_cols = polynomial_block_from_order(data.view(), effective_order).ncols();
 
-    let pure_coeff =
-        PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, 1);
+    // The scale-free kernel evaluates the literal spectral power, exactly as
+    // the forward 1-D design (`build_duchon_basis`) does. Truncating it to an
+    // integer here differentiated a different kernel than the one the fit
+    // realized whenever `power` was fractional (#3541).
+    validate_duchon_kernel_orders(None, p_order, power, 1)?;
+    let pure_coeff = PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, power), 1);
     let kernel_amp = duchon_kernel_amplification(
         center_matrix.view(),
         None,
         p_order,
-        s_order,
+        duchon_power_to_usize(power),
         1,
         None,
         None,
@@ -2360,7 +2356,7 @@ pub fn create_duchon_basis_1d_derivative_dense_with_radial_reparam(
                 0.0
             };
             let (phi, phi_r, phi_rr) =
-                duchon_kernel_radial_triplet(r, None, p_order, s_order as f64, 1, None)?;
+                duchon_kernel_radial_triplet(r, None, p_order, power, 1, None)?;
             raw_kernel[[i, j]] = match order {
                 0 => phi,
                 1 => phi_r * sign,
@@ -2448,6 +2444,75 @@ mod taylor_degree_tests {
 mod end_to_end_1604_tests {
     use super::*;
     use gam_linalg::faer_ndarray::FaerEigh;
+
+    /// #3541 — the 1-D derivative builder must differentiate the kernel the
+    /// forward design realized. For a fractional scale-free power it used to
+    /// truncate `s` to an integer, so its order-0 output was a different basis
+    /// than `build_duchon_basis`. The integer power is the control: it pins the
+    /// frame (standardized centers, frozen radial chart) this comparison needs.
+    #[test]
+    fn d1_pure_fractional_power_derivative_matches_forward_design_3541() {
+        let n = 30usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            let u = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = -1.0 + 2.0 * u + 0.15 * (5.0 * u).sin();
+        }
+        for &power in &[0.0f64, 0.25] {
+            let spec = DuchonBasisSpec {
+                center_strategy: CenterStrategy::FarthestPoint { num_centers: 9 },
+                periodic: None,
+                length_scale: None,
+                power,
+                nullspace_order: DuchonNullspaceOrder::Linear,
+                identifiability: SpatialIdentifiability::None,
+                aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
+                boundary: OneDimensionalBoundary::Open,
+                radial_reparam: None,
+            };
+            let built = build_duchon_basis(data.view(), &spec)
+                .unwrap_or_else(|e| panic!("power={power}: forward build failed: {e}"));
+            let BasisMetadata::Duchon {
+                centers,
+                input_scale,
+                radial_reparam,
+                ..
+            } = &built.metadata
+            else {
+                panic!("power={power}: expected Duchon metadata");
+            };
+            let forward = built
+                .design
+                .try_to_dense_by_chunks("d1_pure_fractional_power_3541")
+                .expect("dense forward design");
+            let t = data.column(0).mapv(|x| x / input_scale.get());
+            let replay = create_duchon_basis_1d_derivative_dense_with_radial_reparam(
+                t.view(),
+                centers.column(0),
+                power,
+                DuchonNullspaceOrder::Linear,
+                false,
+                None,
+                radial_reparam.as_ref().map(|v| v.view()),
+                0,
+            )
+            .unwrap_or_else(|e| panic!("power={power}: derivative builder failed: {e}"));
+            assert_eq!(replay.dim(), forward.dim(), "power={power}: layout mismatch");
+            let scale = forward.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            let worst = forward
+                .iter()
+                .zip(replay.iter())
+                .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+            // Both sides evaluate the same closed form on the same inputs, so
+            // they agree to a few ulps of the design's magnitude.
+            assert!(
+                worst <= 1e-10 * scale.max(1.0),
+                "power={power}: order-0 derivative basis differs from the forward design \
+                 by {worst:.3e} (design scale {scale:.3e})"
+            );
+        }
+    }
 
     /// gam#1604 — end-to-end: a 1-D hybrid Duchon smooth with power ≥ 2 must
     /// build successfully through the public `build_duchon_basis` path and emit
