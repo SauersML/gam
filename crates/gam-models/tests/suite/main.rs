@@ -3,6 +3,7 @@
 //! its dependency tree. One binary, same tests, same names.
 
 mod adaptive_basis_resolution_3078;
+mod bms_finite_law_score_units_3231;
 mod bms_generated_regressor_covariance_2943;
 mod bms_latent_conditional_residual_3016;
 mod bms_learned_sigma_finite_law_3059;

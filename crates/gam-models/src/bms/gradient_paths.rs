@@ -5,12 +5,22 @@ use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
 use gam_math::probability::normal_logcdf_derivatives;
 use gam_row_macros::row_program;
 
-pub(crate) fn standardize_latent_z_with_policy(
+/// The weighted location and scale of a latent score, with its effective sample
+/// size `(Σw)²/Σw²`.
+pub(crate) struct WeightedLocationScale {
+    pub(crate) mean: f64,
+    pub(crate) sd: f64,
+    pub(crate) effective_n: f64,
+}
+
+/// The weighted mean and standard deviation of `z`, refused where the weights
+/// carry fewer than two effective observations or the spread is inside the
+/// weighted mean's rounding band.
+pub(crate) fn weighted_location_scale(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     context: &str,
-    policy: &LatentZPolicy,
-) -> Result<(Array1<f64>, LatentZNormalization), String> {
+) -> Result<WeightedLocationScale, String> {
     if z.len() != weights.len() {
         return Err(format!(
             "{context} latent-score normalization length mismatch: z={}, weights={}",
@@ -56,6 +66,25 @@ pub(crate) fn standardize_latent_z_with_policy(
             "{context} requires z with positive finite weighted standard deviation"
         ));
     }
+    Ok(WeightedLocationScale {
+        mean,
+        sd,
+        effective_n,
+    })
+}
+
+pub(crate) fn standardize_latent_z_with_policy(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    context: &str,
+    policy: &LatentZPolicy,
+) -> Result<(Array1<f64>, LatentZNormalization), String> {
+    let WeightedLocationScale {
+        mean,
+        sd,
+        effective_n,
+    } = weighted_location_scale(z, weights, context)?;
+    let weight_sum = weights.iter().copied().sum::<f64>();
     let target_norm = match policy.normalization {
         LatentZNormalizationMode::None => LatentZNormalization { mean: 0.0, sd: 1.0 },
         LatentZNormalizationMode::FitWeighted => LatentZNormalization { mean, sd },
