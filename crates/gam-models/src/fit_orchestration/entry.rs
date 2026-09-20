@@ -1161,6 +1161,11 @@ fn deterministic_gaussian_standard_fit(
         // `Z'X'WX Z` is the penalized Hessian itself.
         weighted_gram: Some(penalized_hessian.clone()),
         identified_subspace: None,
+        // Exact fit ⇒ no working residual on any row that carries weight.
+        working_residual: Some(gam_terms::inference::smooth_score_test::WorkingResidual {
+            weighted_norm: 0.0,
+            rows: weights.iter().filter(|&&w| w > 0.0).count(),
+        }),
     };
     let geometry = Some(gam_solve::estimate::FitGeometry {
         coefficient_gauge,
@@ -1821,9 +1826,7 @@ pub fn drop_zero_weight_rows<'a>(
         return Ok(Cow::Borrowed(data));
     }
     if keep.is_empty() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: format!("weight column '{name}' is zero on every row; there is nothing to fit"),
-        });
+        return Err(no_positive_weight_error(name, weights.len()));
     }
     data.select_rows(&keep)
         .map(Cow::Owned)
@@ -3580,17 +3583,20 @@ fn cascade_sobolev_order(requested: f64, d: usize) -> f64 {
     requested.clamp(lo + eps, hi)
 }
 
-/// Detection seam for the O(n log n) multiresolution residual-cascade fast path
-/// (issue #1032).
-///
-/// This mirrors [`spline_scan_fast_path`] in shape but carries one CRITICAL
-/// difference dictated by the issue: the cascade is **not** the same posterior
-/// as the Duchon/Matérn term it stands in for (a different finite basis — the
-/// multilevel Wendland frame, not the reduced-rank radial kernel). So unlike
-/// the 1-D scan, which silently swaps an identical posterior, this path must
-/// only fire as an explicit alternative estimator on the structural signature
-/// the issue names, never as a transparent replacement. It returns `Some` only
-/// when ALL of the following hold:
+/// Structural signature of a residual-cascade-eligible request: the scattered
+/// radial smooth's coordinate columns and the Sobolev order it requests
+/// (before the Wendland native-window clamp). Produced by
+/// [`residual_cascade_structural_signature`]; carries no size information.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResidualCascadeSignature {
+    pub feature_cols: Vec<usize>,
+    pub requested_sobolev_order: f64,
+}
+
+/// Pure structural predicate for the O(n log n) multiresolution
+/// residual-cascade fast path (issue #1032): every eligibility guard of
+/// [`residual_cascade_fast_path`] EXCEPT the dense-kernel size gate. It returns
+/// `Some` only when ALL of the following hold:
 /// - family is Gaussian + identity link (the scattered low-d smooth the
 ///   cascade solves);
 /// - none of the exotic-link / constraint / Firth / coefficient-group /
@@ -3599,20 +3605,15 @@ fn cascade_sobolev_order(requested: f64, d: usize) -> f64 {
 ///   effects, no by-variables;
 /// - that smooth is a scattered radial spatial smooth (`Duchon` or `Matern`)
 ///   over `d ∈ {2, 3}` coordinates with no shape constraint;
-/// - the offset is identically zero and every weight is finite and positive;
-/// - `n` is past the derived dense-kernel cliff
-///   (`past_dense_kernel_cliff`) — below it the dense radial path is both
-///   exact-posterior and cheap, so there is no reason to change estimators.
+/// - the offset is identically zero, every weight is finite and positive, and
+///   every coordinate and response value is finite.
 ///
-/// The returned [`ResidualCascadeInputs`] carry a unit per-axis metric (the
-/// spec's isotropic radial distance); the quasi-uniformity guard inside
-/// [`gam_solve::residual_cascade::fit_residual_cascade`] (issue caveat 2)
-/// is the no-regression gate that refuses the selected route when a
-/// near-degenerate metric would break the BPX iteration bound. That refusal is
-/// propagated; it never silently changes the estimator.
-pub fn residual_cascade_fast_path(
+/// Kept separate from the size gate so each structural guard is observable on
+/// its own at small `n` (issue #3550): below the cliff the full fast path is
+/// `None` for every input, which would mask a mis-firing structural guard.
+pub fn residual_cascade_structural_signature(
     request: &StandardFitRequest<'_>,
-) -> Option<ResidualCascadeInputs> {
+) -> Option<ResidualCascadeSignature> {
     if !request.family.is_gaussian_identity() {
         return None;
     }
@@ -3667,8 +3668,8 @@ pub fn residual_cascade_fast_path(
             feature_cols, spec, ..
         } => {
             // Matérn smoothness ν sets native Sobolev order ν + d/2; the cascade
-            // frame represents up to (d+3)/2, so the clamp below applies the
-            // ceiling. (d is known just below from feature_cols.)
+            // frame represents up to (d+3)/2, so the fast path's clamp applies
+            // the ceiling. (d is known just below from feature_cols.)
             let nu = spec.nu.half_integer_value();
             (feature_cols, nu + feature_cols.len() as f64 / 2.0)
         }
@@ -3684,28 +3685,63 @@ pub fn residual_cascade_fast_path(
     if request.weights.iter().any(|&v| !(v.is_finite() && v > 0.0)) {
         return None;
     }
-    let n = request.y.len();
-    if n != request.data.nrows() || feature_cols.iter().any(|&c| c >= request.data.ncols()) {
+    if request.y.len() != request.data.nrows()
+        || feature_cols.iter().any(|&c| c >= request.data.ncols())
+    {
         return None;
     }
-    if !past_dense_kernel_cliff(n, d) {
+    if feature_cols
+        .iter()
+        .any(|&c| request.data.column(c).iter().any(|v| !v.is_finite()))
+        || request.y.iter().any(|v| !v.is_finite())
+    {
         return None;
     }
-    let coords: Vec<Vec<f64>> = feature_cols
+    Some(ResidualCascadeSignature {
+        feature_cols: feature_cols.to_vec(),
+        requested_sobolev_order: requested_s,
+    })
+}
+
+/// Detection seam for the O(n log n) multiresolution residual-cascade fast path
+/// (issue #1032).
+///
+/// This mirrors [`spline_scan_fast_path`] in shape but carries one CRITICAL
+/// difference dictated by the issue: the cascade is **not** the same posterior
+/// as the Duchon/Matérn term it stands in for (a different finite basis — the
+/// multilevel Wendland frame, not the reduced-rank radial kernel). So unlike
+/// the 1-D scan, which silently swaps an identical posterior, this path must
+/// only fire as an explicit alternative estimator on the structural signature
+/// the issue names, never as a transparent replacement. It returns `Some` only
+/// when the request carries the structural signature
+/// ([`residual_cascade_structural_signature`]) AND `n` is past the derived
+/// dense-kernel cliff (`past_dense_kernel_cliff`) — below it the dense radial
+/// path is both exact-posterior and cheap, so there is no reason to change
+/// estimators.
+///
+/// The returned [`ResidualCascadeInputs`] carry a unit per-axis metric (the
+/// spec's isotropic radial distance); the quasi-uniformity guard inside
+/// [`gam_solve::residual_cascade::fit_residual_cascade`] (issue caveat 2)
+/// is the no-regression gate that refuses the selected route when a
+/// near-degenerate metric would break the BPX iteration bound. That refusal is
+/// propagated; it never silently changes the estimator.
+pub fn residual_cascade_fast_path(
+    request: &StandardFitRequest<'_>,
+) -> Option<ResidualCascadeInputs> {
+    let signature = residual_cascade_structural_signature(request)?;
+    let d = signature.feature_cols.len();
+    if !past_dense_kernel_cliff(request.y.len(), d) {
+        return None;
+    }
+    let coords: Vec<Vec<f64>> = signature
+        .feature_cols
         .iter()
         .map(|&c| request.data.column(c).iter().copied().collect())
         .collect();
     let y: Vec<f64> = request.y.iter().copied().collect();
     let w: Vec<f64> = request.weights.iter().copied().collect();
-    if coords
-        .iter()
-        .any(|axis| axis.iter().any(|v| !v.is_finite()))
-        || y.iter().any(|v| !v.is_finite())
-    {
-        return None;
-    }
     let metric = vec![1.0_f64; d];
-    let sobolev_s = cascade_sobolev_order(requested_s, d);
+    let sobolev_s = cascade_sobolev_order(signature.requested_sobolev_order, d);
     Some(ResidualCascadeInputs {
         coords,
         y,
@@ -3721,6 +3757,21 @@ fn family_requests_transformation_normal(family: Option<&str>) -> bool {
         .map(|name| name.trim().to_ascii_lowercase().replace('_', "-"))
         .as_deref()
         == Some("transformation-normal")
+}
+
+/// Refuse `firth=true` on a route whose fit reads no Firth setting.
+///
+/// Only the standard route passes `config.firth` to the solver; the survival,
+/// transformation-normal and location-scale fits run with Firth off. The CLI
+/// refused `--firth` on those routes itself, so `gamfit.fit(..., firth=True)`
+/// and a Rust caller got a fit without Firth instead of the refusal.
+fn refuse_unread_firth(config: &FitConfig, model: &str) -> Result<(), WorkflowError> {
+    if config.firth {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!("firth is not supported for {model}; that fit reads no Firth setting"),
+        });
+    }
+    Ok(())
 }
 
 /// Build the design/request geometry for a formula against a dataset. This is the
@@ -3789,6 +3840,7 @@ fn materialize_impl<'a>(
                 conflict: TransformationNormalConflict::SurvIntervalResponse,
             });
         }
+        refuse_unread_firth(effective_config, "survival models")?;
         // Interval censoring `T ∈ (L, R]` is only defined for the latent
         // hazard-window survival likelihood, whose kernel carries the
         // `log[S(L) − S(R)]` interval contribution. Route the left boundary `L`
@@ -3813,6 +3865,7 @@ fn materialize_impl<'a>(
                 conflict: TransformationNormalConflict::SurvResponse,
             });
         }
+        refuse_unread_firth(effective_config, "survival models")?;
         if !effective_config.residual_columns.is_empty() {
             return Err(WorkflowError::InvalidConfig {
                 reason: "residual_columns is a Bernoulli marginal-slope block (gam#2924); the \
@@ -3865,10 +3918,25 @@ fn materialize_impl<'a>(
                     conflict: TransformationNormalConflict::NoiseFormula,
                 });
             }
+            refuse_unread_firth(effective_config, "the transformation-normal family")?;
+            // The transformation-normal fit has its own likelihood and reads no
+            // other family, so `transformation_normal=true` beside another family
+            // is a conflict, not a family to drop.
+            if let Some(family) = effective_config.family.as_deref()
+                && !family_requests_transformation_normal(Some(family))
+            {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "transformation_normal conflicts with family `{family}`; the \
+                         transformation-normal fit reads no other family"
+                    ),
+                });
+            }
             materialize_transformation_normal(&parsed, data, &col_map, effective_config)
         } else if requests_bernoulli_marginal_slope(effective_config) {
             materialize_bernoulli_marginal_slope(&parsed, data, &col_map, effective_config)
         } else if effective_config.noise_formula.is_some() {
+            refuse_unread_firth(effective_config, "noise_formula location-scale fits")?;
             materialize_location_scale(&parsed, data, &col_map, effective_config)
         } else {
             materialize_standard(&parsed, data, &col_map, effective_config)
@@ -4239,5 +4307,143 @@ mod joint_expectile_scale_posterior_tests {
                  {plug_in:?} (integrated {integrated:?})"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod unread_firth_and_family_refusal_tests {
+    //! A setting the selected fit does not read is refused by the library, the
+    //! one place every front end reaches, rather than dropped for a fit without it.
+    use super::*;
+    use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
+    use ndarray::Array2;
+
+    /// `t` a positive exit time, `e` a {0,1} event, `y` a continuous response,
+    /// `x` a covariate.
+    fn dataset() -> Dataset {
+        let names = ["t", "e", "y", "x"];
+        let kinds = [
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Binary,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+        ];
+        let t = [1.2, 2.5, 0.8, 3.1, 1.9, 2.2, 4.0, 0.6, 2.8, 1.4];
+        let e = [1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+        let y = [0.3, -0.2, 1.1, 0.7, -0.5, 0.2, 1.4, -0.9, 0.5, 0.0];
+        let x = [-1.0, -0.7, -0.4, -0.2, 0.0, 0.1, 0.3, 0.5, 0.8, 1.0];
+        let values = Array2::from_shape_fn((t.len(), 4), |(i, j)| [t[i], e[i], y[i], x[i]][j]);
+        Dataset {
+            headers: names.iter().map(|n| n.to_string()).collect(),
+            values,
+            schema: DataSchema {
+                columns: names
+                    .iter()
+                    .zip(kinds)
+                    .map(|(name, kind)| SchemaColumn {
+                        name: name.to_string(),
+                        kind,
+                        levels: vec![],
+                    })
+                    .collect(),
+            },
+            column_kinds: kinds.to_vec(),
+        }
+    }
+
+    fn refusal(formula: &str, config: FitConfig) -> String {
+        match materialize(formula, &dataset(), &config) {
+            Ok(_) => panic!("`{formula}` with {config:?} must be refused"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn firth_is_refused_where_the_fit_reads_no_firth_setting() {
+        let cases = [
+            (
+                "y ~ x",
+                FitConfig {
+                    transformation_normal: true,
+                    firth: true,
+                    ..FitConfig::default()
+                },
+                "firth is not supported for the transformation-normal family",
+            ),
+            (
+                "y ~ x",
+                FitConfig {
+                    family: Some("transformation-normal".to_string()),
+                    firth: true,
+                    ..FitConfig::default()
+                },
+                "firth is not supported for the transformation-normal family",
+            ),
+            (
+                "y ~ x",
+                FitConfig {
+                    family: Some("gaussian".to_string()),
+                    noise_formula: Some("1".to_string()),
+                    firth: true,
+                    ..FitConfig::default()
+                },
+                "firth is not supported for noise_formula location-scale fits",
+            ),
+            (
+                "Surv(t, e) ~ x",
+                FitConfig {
+                    firth: true,
+                    ..FitConfig::default()
+                },
+                "firth is not supported for survival models",
+            ),
+        ];
+        for (formula, config, expected) in cases {
+            let message = refusal(formula, config);
+            assert!(message.contains(expected), "`{formula}`: expected `{expected}`, got: {message}");
+        }
+    }
+
+    #[test]
+    fn transformation_normal_beside_another_family_is_refused() {
+        let message = refusal(
+            "y ~ x",
+            FitConfig {
+                transformation_normal: true,
+                family: Some("poisson".to_string()),
+                ..FitConfig::default()
+            },
+        );
+        assert!(
+            message.contains("transformation_normal conflicts with family `poisson`"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn the_routes_that_read_their_settings_still_materialize() {
+        let data = dataset();
+        let tn = materialize(
+            "y ~ x",
+            &data,
+            &FitConfig {
+                transformation_normal: true,
+                family: Some("transformation_normal".to_string()),
+                ..FitConfig::default()
+            },
+        )
+        .expect("transformation_normal=true with its own family name");
+        assert!(matches!(tn.request, FitRequest::TransformationNormal(_)));
+        let firth = materialize(
+            "e ~ x",
+            &data,
+            &FitConfig {
+                family: Some("binomial".to_string()),
+                firth: true,
+                ..FitConfig::default()
+            },
+        )
+        .expect("the standard binomial route reads firth");
+        assert!(matches!(firth.request, FitRequest::Standard(_)));
     }
 }

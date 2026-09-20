@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 
 from .plans import HOST_WORKERS, PLANS, Cell
-from .report import paired_verdict, ratio_verdict, render
+from .report import _coverage_calibration_diffs, paired_verdict, ratio_verdict, render
 from .run import THREAD_ENV, run_batch, run_rep, thread_env
 from .worker import COUNT_FAMILIES, COUNT_SLOPE, EXPOSURE_RATE, make_data, supports
 
@@ -126,6 +126,31 @@ def test_paired_accuracy_verdicts() -> None:
     g = [_rec("gamfit", 0)]
     c = [_rec("pygam", 0, logscore=1.0)]
     assert paired_verdict(g, c, "logscore").text == "**LOSS(missing)**"
+
+
+def test_coverage_verdict_is_on_mean_coverage_not_per_seed_scatter() -> None:
+    # A calibrated interval scatters per seed around 0.95 (its intervals move
+    # with the fit's error); an interval covering every true mean on every seed
+    # is conservative. Per-seed |cov_s - 0.95| scores the scatter (0.06) as
+    # worse than the over-coverage (0.05); calibration is the mean coverage.
+    seeds = range(12)
+    calibrated = [0.95 + (0.06 if s % 2 else -0.06) for s in seeds]
+    over = [_rec("gamfit", s, coverage=1.0) for s in seeds]
+    cal = [_rec("pygam", s, coverage=v) for s, v in zip(seeds, calibrated)]
+    v = paired_verdict(over, cal, "coverage")
+    assert v.loss, v.text
+    v = paired_verdict(
+        [_rec("gamfit", s, coverage=v) for s, v in zip(seeds, calibrated)],
+        [_rec("pygam", s, coverage=1.0) for s in seeds],
+        "coverage",
+    )
+    assert v.win, v.text
+    # The paired terms average to |mean g - 0.95| - |mean c - 0.95| exactly.
+    pairs = [(0.99, 0.90), (0.97, 0.96), (0.93, 0.88)]
+    mg = sum(p[0] for p in pairs) / 3
+    mc = sum(p[1] for p in pairs) / 3
+    terms = _coverage_calibration_diffs(pairs)
+    assert abs(sum(terms) / 3 - (abs(mg - 0.95) - abs(mc - 0.95))) < 1e-15
 
 
 def test_count_plans_run_pygam_only_where_it_has_the_family() -> None:
