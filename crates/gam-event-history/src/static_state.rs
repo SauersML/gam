@@ -15,9 +15,10 @@
 
 use crate::chain::{Grid, log_sum_exp, normal_density};
 use crate::cohort::EventHistoryError;
-use crate::marginal::{ForwardPass, Spell, SubjectInputs, centred_baseline, condition, node_likelihood};
+use crate::marginal::{ForwardPass, NodeLikelihood, Spell, SubjectInputs, centred_baseline, condition, node_likelihood};
 use crate::scalar::{add_real, div, exp, ln, sqrt};
 use gam_math::nested_dual::{JET_ORDER_CAP, JetField};
+use std::sync::Arc;
 
 /// Newton steps that carry every derivative order a jet holds from a converged
 /// value: a step squares the error's order, so `k` steps from an exact value
@@ -37,6 +38,14 @@ pub(crate) fn is_static<S: JetField>(rates: &[S]) -> bool {
 
 pub(crate) fn filter<S: JetField>(inputs: &SubjectInputs<'_, S>, initial: Option<(&Grid<S>, &[S])>,
     compensated: &[bool]) -> Result<ForwardPass<S>, EventHistoryError> {
+    Ok(conditioned(inputs, initial, compensated, false)?.0)
+}
+
+/// [`filter`] together with the likelihood each node was conditioned on, every
+/// one on the pass's single grid; `derivatives` keeps their scores and
+/// curvatures too, for a caller that differentiates the pass.
+pub(crate) fn conditioned<S: JetField>(inputs: &SubjectInputs<'_, S>, initial: Option<(&Grid<S>, &[S])>,
+    compensated: &[bool], derivatives: bool) -> Result<(ForwardPass<S>, Vec<NodeLikelihood<S>>), EventHistoryError> {
     let like = &inputs.eta0[0];
     let marks = inputs.nodes.counts.ncols();
     let atoms = inputs.rates.len();
@@ -48,19 +57,23 @@ pub(crate) fn filter<S: JetField>(inputs: &SubjectInputs<'_, S>, initial: Option
             (grid, density)
         }
     };
+    let grid = Arc::new(grid);
     let mut pass = ForwardPass { grids: Vec::new(), alpha: Vec::new(), predicted: Vec::new(), log_normalisers: Vec::new() };
+    let mut likelihoods = Vec::with_capacity(inputs.nodes.len());
     for n in 0..inputs.nodes.len() {
         let likelihood = node_likelihood(&grid, &inputs.eta0[n * marks..(n + 1) * marks],
             inputs.loadings, &inputs.nodes.counts.row(n).to_vec(), &inputs.nodes.exposure_row(n),
-            Some(compensated), inputs.log_normaliser.map(|m| &m[n * marks..(n + 1) * marks]), marks, atoms, false);
+            Some(compensated), inputs.log_normaliser.map(|m| &m[n * marks..(n + 1) * marks]), marks, atoms,
+            derivatives);
         let (updated, mass) = condition(&grid, &density, &likelihood.ell, likelihood.shift, "static frailty")?;
         pass.predicted.push(density);
-        pass.grids.push(grid.clone());
+        pass.grids.push(Arc::clone(&grid));
         pass.log_normalisers.push(add_real(&ln(&mass), likelihood.shift));
         pass.alpha.push(updated.clone());
+        likelihoods.push(likelihood);
         density = updated;
     }
-    Ok(pass)
+    Ok((pass, likelihoods))
 }
 
 /// The spells of a static factor's follow-up (see [`crate::marginal::spells`]).

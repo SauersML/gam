@@ -1,5 +1,5 @@
 //! Regression guard for issue #530: `debug_assert!{,_eq,_ne}!` must never
-//! reappear anywhere under `src/`.
+//! reappear in any production source (`src/` and every `crates/*/src`).
 //!
 //! Background: the `debug_assert*` family compiles to nothing in release, so
 //! any shape/finiteness invariant guarded by one is *silently unchecked* in
@@ -13,8 +13,8 @@
 //! re-runs its scan when `build.rs` or `src/terms/analytic_penalties/manifest.rs` change
 //! (`cargo:rerun-if-changed`), so its verdict *caches* — a `debug_assert*`
 //! added elsewhere in `src/` on a warm `target/` would not re-trip the gate
-//! until something it watches changes. This `#[test]` re-scans the whole `src/`
-//! tree on every `cargo test`, independent of that cache, so a regression is
+//! until something it watches changes. This `#[test]` re-scans every production
+//! source tree on every `cargo test`, independent of that cache, so a regression is
 //! caught from a different angle than the build-time gate.
 //!
 //! The banned needles are assembled with `concat!` so this test file does not
@@ -96,10 +96,8 @@ fn strip_code_only(line: &str) -> String {
 
 /// Recursively collect `.rs` files under `dir`, skipping build artifact dirs.
 fn collect_rs_files(dir: &Path, acc: &mut Vec<PathBuf>) {
-    let read = match fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
+    let read =
+        fs::read_dir(dir).unwrap_or_else(|err| panic!("read_dir {}: {err}", dir.display()));
     for entry in read.flatten() {
         let path = entry.path();
         let name = path
@@ -118,30 +116,47 @@ fn collect_rs_files(dir: &Path, acc: &mut Vec<PathBuf>) {
     }
 }
 
+/// The root crate `src` plus every `crates/*/src`, in stable sorted order.
+/// Production code lives in the workspace crates since the #1521 carve-out;
+/// the root `src/` alone is three re-export files, so scanning only it made
+/// this gate pass whatever the crates contained.
+fn workspace_production_src_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![root.join("src")];
+    let crates = root.join("crates");
+    let mut crate_dirs: Vec<PathBuf> = fs::read_dir(&crates)
+        .unwrap_or_else(|err| panic!("read_dir {}: {err}", crates.display()))
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.join("src").is_dir())
+        .collect();
+    crate_dirs.sort();
+    dirs.extend(crate_dirs.into_iter().map(|dir| dir.join("src")));
+    dirs
+}
+
 #[test]
 fn no_debug_assert_family_anywhere_in_src() {
-    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src_dirs = workspace_production_src_dirs(root);
     assert!(
-        src_root.is_dir(),
-        "src/ tree not found at {}",
-        src_root.display()
+        src_dirs.len() > 1,
+        "expected the root src/ plus every crates/*/src, found only {src_dirs:?}"
     );
 
     let needles = banned_needles();
     let mut files = Vec::new();
-    collect_rs_files(&src_root, &mut files);
+    for dir in &src_dirs {
+        collect_rs_files(dir, &mut files);
+    }
     assert!(
-        !files.is_empty(),
-        "scanned 0 .rs files under {} — traversal is broken, not a clean tree",
-        src_root.display()
+        files.len() > 100,
+        "scanned only {} .rs files under {src_dirs:?} — traversal is broken, not a clean tree",
+        files.len()
     );
 
     let mut offenders: Vec<String> = Vec::new();
     for path in &files {
-        let content = match fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        let content = fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
         for (idx, raw) in content.lines().enumerate() {
             let code = strip_code_only(raw);
             for needle in &needles {
@@ -154,7 +169,7 @@ fn no_debug_assert_family_anywhere_in_src() {
 
     assert!(
         offenders.is_empty(),
-        "found {} banned debug_assert* call(s) under src/ \
+        "found {} banned debug_assert* call(s) in production sources \
          (they compile to nothing in release — make them release-active \
          `assert*!`/`Result`, or delete them):\n{}",
         offenders.len(),
