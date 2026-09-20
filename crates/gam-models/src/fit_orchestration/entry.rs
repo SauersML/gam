@@ -3583,6 +3583,18 @@ fn cascade_sobolev_order(requested: f64, d: usize) -> f64 {
     requested.clamp(lo + eps, hi)
 }
 
+/// Whether a radial spec asks for geometry the cascade cannot represent. The
+/// cascade fits in open Euclidean coordinates under one unit per-axis metric,
+/// so a wrapped axis (`period=[…]`) or learned per-axis length scales
+/// (`scale_dims=true`, `FitConfig::scale_dimensions`) would be silently
+/// dropped. Such a term stays on the dense radial path, which honours both.
+fn radial_geometry_leaves_cascade_metric(
+    periodic: Option<&[Option<f64>]>,
+    aniso_log_scales: Option<&[f64]>,
+) -> bool {
+    periodic.is_some_and(|axes| axes.iter().any(Option::is_some)) || aniso_log_scales.is_some()
+}
+
 /// Structural signature of a residual-cascade-eligible request: the scattered
 /// radial smooth's coordinate columns and the Sobolev order it requests
 /// (before the Wendland native-window clamp). Produced by
@@ -3604,7 +3616,9 @@ pub struct ResidualCascadeSignature {
 /// - the model is exactly one smooth term — no linear terms, no random
 ///   effects, no by-variables;
 /// - that smooth is a scattered radial spatial smooth (`Duchon` or `Matern`)
-///   over `d ∈ {2, 3}` coordinates with no shape constraint;
+///   over `d ∈ {2, 3}` coordinates with no shape constraint, no periodic axis
+///   and no per-axis anisotropy (the cascade's open unit metric represents
+///   neither);
 /// - the offset is identically zero, every weight is finite and positive, and
 ///   every coordinate and response value is finite.
 ///
@@ -3657,6 +3671,12 @@ pub fn residual_cascade_structural_signature(
             // Pure-Duchon native order is `p + s` (kernel exponent 2(p+s)−d);
             // the multilevel frame targets the same continuum smoothness. `p`
             // is the polynomial nullspace degree, `s` the spectral power.
+            if radial_geometry_leaves_cascade_metric(
+                spec.periodic.as_deref(),
+                spec.aniso_log_scales.as_deref(),
+            ) {
+                return None;
+            }
             let p = match spec.nullspace_order {
                 gam_terms::basis::DuchonNullspaceOrder::Zero => 0.0,
                 gam_terms::basis::DuchonNullspaceOrder::Linear => 1.0,
@@ -3667,6 +3687,12 @@ pub fn residual_cascade_structural_signature(
         gam_terms::smooth::SmoothBasisSpec::Matern {
             feature_cols, spec, ..
         } => {
+            if radial_geometry_leaves_cascade_metric(
+                spec.periodic.as_deref(),
+                spec.aniso_log_scales.as_deref(),
+            ) {
+                return None;
+            }
             // Matérn smoothness ν sets native Sobolev order ν + d/2; the cascade
             // frame represents up to (d+3)/2, so the fast path's clamp applies
             // the ceiling. (d is known just below from feature_cols.)
@@ -3719,8 +3745,9 @@ pub fn residual_cascade_structural_signature(
 /// path is both exact-posterior and cheap, so there is no reason to change
 /// estimators.
 ///
-/// The returned [`ResidualCascadeInputs`] carry a unit per-axis metric (the
-/// spec's isotropic radial distance); the quasi-uniformity guard inside
+/// The returned [`ResidualCascadeInputs`] carry a unit per-axis metric, which
+/// is the spec's own radial distance because the structural signature refuses
+/// periodic and anisotropic specs; the quasi-uniformity guard inside
 /// [`gam_solve::residual_cascade::fit_residual_cascade`] (issue caveat 2)
 /// is the no-regression gate that refuses the selected route when a
 /// near-degenerate metric would break the BPX iteration bound. That refusal is
@@ -4445,5 +4472,99 @@ mod unread_firth_and_family_refusal_tests {
         )
         .expect("the standard binomial route reads firth");
         assert!(matches!(firth.request, FitRequest::Standard(_)));
+    }
+}
+
+#[cfg(test)]
+mod residual_cascade_geometry_tests {
+    use super::*;
+
+    /// Deterministic scattered 2-D sample on the unit square.
+    fn scattered_2d(n: usize) -> Dataset {
+        let golden = 0.618_033_988_749_894_9_f64;
+        let root2 = std::f64::consts::SQRT_2.fract();
+        let rows = (0..n)
+            .map(|i| {
+                let a = ((i + 1) as f64 * golden).fract();
+                let b = ((i + 1) as f64 * root2).fract();
+                let u = ((i + 3) as f64 * golden).fract();
+                let y = (std::f64::consts::TAU * a).sin() * (std::f64::consts::TAU * b).cos()
+                    + 0.1 * (u - 0.5);
+                csv::StringRecord::from(vec![a.to_string(), b.to_string(), y.to_string()])
+            })
+            .collect();
+        let headers = ["x1", "x2", "y"].into_iter().map(String::from).collect();
+        gam_data::encode_recordswith_inferred_schema(headers, rows).expect("encode fixture")
+    }
+
+    fn gaussian(scale_dimensions: bool) -> FitConfig {
+        FitConfig {
+            family: Some("gaussian".to_string()),
+            scale_dimensions,
+            ..FitConfig::default()
+        }
+    }
+
+    fn standard_request<'a>(
+        formula: &str,
+        data: &'a Dataset,
+        config: &FitConfig,
+    ) -> StandardFitRequest<'a> {
+        let mat = materialize(formula, data, config).expect("materialize");
+        let FitRequest::Standard(request) = mat.request else {
+            panic!("`{formula}` must materialize as a standard request");
+        };
+        request
+    }
+
+    /// The cascade fits open coordinates under a unit metric. A term that asks
+    /// for learned per-axis length scales must stay on the dense radial path,
+    /// whether it asks per term or through the global flag; the isotropic
+    /// control on the same data stays eligible.
+    #[test]
+    fn anisotropic_radial_smooth_is_not_a_cascade_candidate() {
+        let data = scattered_2d(600);
+        for formula in ["y ~ duchon(x1, x2)", "y ~ matern(x1, x2)"] {
+            let control = standard_request(formula, &data, &gaussian(false));
+            assert!(
+                residual_cascade_structural_signature(&control).is_some(),
+                "`{formula}` (isotropic) is the eligible control"
+            );
+            let global = standard_request(formula, &data, &gaussian(true));
+            assert!(
+                residual_cascade_structural_signature(&global).is_none(),
+                "`{formula}` with scale_dimensions must not take the unit-metric cascade"
+            );
+        }
+        let per_term =
+            standard_request("y ~ duchon(x1, x2, scale_dims=true)", &data, &gaussian(false));
+        assert!(
+            residual_cascade_structural_signature(&per_term).is_none(),
+            "duchon(scale_dims=true) must not take the unit-metric cascade"
+        );
+    }
+
+    /// A wrapped axis has no representation in the cascade's open Euclidean
+    /// frame, so a periodic radial spec must not be structurally eligible.
+    #[test]
+    fn periodic_radial_smooth_is_not_a_cascade_candidate() {
+        let data = scattered_2d(600);
+        for formula in ["y ~ duchon(x1, x2)", "y ~ matern(x1, x2)"] {
+            let mut request = standard_request(formula, &data, &gaussian(false));
+            assert!(residual_cascade_structural_signature(&request).is_some());
+            match &mut request.spec.smooth_terms[0].basis {
+                gam_terms::smooth::SmoothBasisSpec::Duchon { spec, .. } => {
+                    spec.periodic = Some(vec![Some(1.0), None]);
+                }
+                gam_terms::smooth::SmoothBasisSpec::Matern { spec, .. } => {
+                    spec.periodic = Some(vec![Some(1.0), None]);
+                }
+                _ => panic!("`{formula}` must materialize a radial basis"),
+            }
+            assert!(
+                residual_cascade_structural_signature(&request).is_none(),
+                "`{formula}` with a periodic axis must not take the open-domain cascade"
+            );
+        }
     }
 }
