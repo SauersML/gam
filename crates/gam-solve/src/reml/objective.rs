@@ -2527,6 +2527,17 @@ impl<'a> RemlState<'a> {
         } else {
             (Vec::new(), None, None, None)
         };
+        // gam#2987: θ carries one ψ coordinate per direction, so a builder that
+        // returned a different number would give the outer plan a gradient of
+        // the wrong length.
+        if ext_coords.len() != hyper_dirs.len() {
+            return Err(EstimationError::LayoutError(format!(
+                "the τ-coordinate builder returned {} coordinates for {} ψ directions \
+                 ({mode:?} evaluation)",
+                ext_coords.len(),
+                hyper_dirs.len()
+            )));
+        }
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let t2 = std::time::Instant::now();
         // #1376: when this evaluation carries a design-moving ψ coordinate
