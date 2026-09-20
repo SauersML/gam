@@ -2302,7 +2302,8 @@ fn payload_for_survival_marginal_slope(
     let persisted_conditional = ms_result.persisted_latent_z_calibrations()?;
     // gam#2929: a K ≥ 2 per-score fit anchored on the joint law of its score
     // vector persists that law, one score column and one slope surface per
-    // coordinate. What the single-score contract cannot carry is refused here.
+    // coordinate; the law carries each coordinate's unit map (gam#4331). What
+    // the single-score contract cannot carry is refused here.
     let joint_state = match ms_result.joint_latent_law.as_ref() {
         None => None,
         Some(law) => {
@@ -2317,14 +2318,6 @@ fn payload_for_survival_marginal_slope(
                          per-score slope surface specs to rebuild its surfaces"
                     )
                 })?;
-            if !(ms_result.z_normalization.mean == 0.0 && ms_result.z_normalization.sd == 1.0) {
-                return Err(
-                    "survival marginal-slope K ≥ 2 model normalised its scores before the fit, \
-                     and the saved contract records one normalisation, not one per score: \
-                     supply already-standardised scores if this model must be saved"
-                        .to_string(),
-                );
-            }
             if let Some(reason) =
                 joint_latent_law_calibration_save_refusal(persisted_conditional.as_ref())
             {

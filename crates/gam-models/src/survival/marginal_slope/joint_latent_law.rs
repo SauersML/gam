@@ -90,6 +90,15 @@ pub struct SurvivalJointLatentLaw {
     /// the marginal-index span, so prediction must rebuild that span.
     #[serde(default)]
     pub conditional: Option<ConditionalScoreCovariance>,
+    /// Per-coordinate unit maps (gam#4331): the law, its nodes, its mean and its
+    /// factors all live on the axes `z̃_j = (z_j − score_location[j]) /
+    /// score_scale[j]`, where `z_j` is score `j` in the units it was recorded
+    /// in. On a finite law the anchor is invariant under an affine change of each
+    /// score's units, so the fit solves on these standardised axes and prediction
+    /// maps each new score onto them with the same map.
+    pub score_location: Vec<f64>,
+    /// See [`Self::score_location`]; every entry is finite and positive.
+    pub score_scale: Vec<f64>,
 }
 
 impl SurvivalJointLatentLaw {
@@ -164,7 +173,29 @@ impl SurvivalJointLatentLaw {
                 model.score_dim
             ));
         }
+        if self.score_location.len() != k
+            || self.score_scale.len() != k
+            || self.score_location.iter().any(|value| !value.is_finite())
+            || self
+                .score_scale
+                .iter()
+                .any(|&value| !(value.is_finite() && value > 0.0))
+        {
+            return Err(format!(
+                "{context}: joint latent score units must hold {k} finite locations and {k} \
+                 finite positive scales; got {} and {}",
+                self.score_location.len(),
+                self.score_scale.len()
+            ));
+        }
         Ok(())
+    }
+
+    /// Score `j` recorded as `raw` on the law's standardised axis
+    /// `(raw − score_location[j]) / score_scale[j]`.
+    #[inline]
+    pub fn standardized_score(&self, j: usize, raw: f64) -> f64 {
+        (raw - self.score_location[j]) / self.score_scale[j]
     }
 
     /// Materialise the law for `n_rows` rows whose marginal-index span is
@@ -639,18 +670,27 @@ pub(crate) fn joint_latent_law_measure_refusal(
 /// `scores` are the calibrated scores the row program sees; `covariance` is the
 /// field [`resolve_score_covariance_field`] resolved on them, whose conditional
 /// model — when present — supplies the transport; `conditioning` is the span it
-/// was fitted on.
+/// was fitted on. `score_units[j]` is the map that took score `j` from the
+/// units it was recorded in onto the axis `scores` hold it on (gam#4331); the
+/// persisted law records it so prediction reads a new score on the same axis.
 pub(crate) fn build_joint_latent_law(
     scores: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
     covariance: &ScoreCovarianceField,
     conditioning: Option<ArrayView2<'_, f64>>,
+    score_units: &[LatentZNormalization],
     node_count: usize,
 ) -> Result<(SurvivalJointLatentLaw, JointLatentLawRuntime), String> {
     let (n, k) = scores.dim();
     if k < 2 {
         return Err(format!(
             "survival marginal-slope joint latent law needs K ≥ 2 scores, got {k}"
+        ));
+    }
+    if score_units.len() != k {
+        return Err(format!(
+            "survival marginal-slope joint latent law carries {} score unit maps for K={k} scores",
+            score_units.len()
         ));
     }
     if weights.len() != n {
@@ -708,6 +748,8 @@ pub(crate) fn build_joint_latent_law(
         score_mean,
         pooled_factor: pooled.chunks(k).map(<[f64]>::to_vec).collect(),
         conditional: model.cloned(),
+        score_location: score_units.iter().map(|units| units.mean).collect(),
+        score_scale: score_units.iter().map(|units| units.sd).collect(),
     };
     persisted.validate("survival marginal-slope joint latent law")?;
     let log_weights = node_weights.iter().map(|weight| weight.ln()).collect();
@@ -2741,6 +2783,8 @@ mod joint_latent_law_tests {
             score_mean: mean.to_vec(),
             pooled_factor: vec![vec![l00, 0.0], vec![l10, l11]],
             conditional: None,
+            score_location: vec![0.0; 2],
+            score_scale: vec![1.0; 2],
         }
     }
 
@@ -3047,6 +3091,7 @@ mod joint_latent_law_tests {
             weights.view(),
             &field,
             Some(design.view()),
+            &[LatentZNormalization { mean: 0.0, sd: 1.0 }; 2],
             DEFAULT_JOINT_LATENT_NODES,
         )
         .expect("joint law");
@@ -3167,9 +3212,16 @@ mod joint_latent_law_tests {
             marginal_slope_covariance_from_scores(z.view(), &weights).expect("pooled covariance");
         let field = ScoreCovarianceField::pooled(pooled);
         let latent_law = anchored.then(|| {
-            let (_, runtime) =
-                build_joint_latent_law(z.view(), weights.view(), &field, None, 3 * n / 4)
-                    .expect("joint law");
+            let identity = vec![LatentZNormalization { mean: 0.0, sd: 1.0 }; k];
+            let (_, runtime) = build_joint_latent_law(
+                z.view(),
+                weights.view(),
+                &field,
+                None,
+                &identity,
+                3 * n / 4,
+            )
+            .expect("joint law");
             Arc::new(SurvivalLatentLaw::from_joint(
                 crate::bms::LatentMeasureKind::StandardNormal,
                 runtime,

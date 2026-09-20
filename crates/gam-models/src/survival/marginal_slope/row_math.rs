@@ -1936,12 +1936,16 @@ pub(crate) fn row_primary_closed_form_vector_into(
     Ok(value)
 }
 
+/// Standardise every latent-score column under `policy` and return the map
+/// applied to each column, in column order. A vector score carries one unit
+/// map per coordinate (gam#4331): dropping the maps of columns `1..` would
+/// leave their standardised axes unrecoverable at save and predict time.
 pub(crate) fn standardize_latent_z_matrix_with_policy(
     z: &Array2<f64>,
     weights: &Array1<f64>,
     context: &str,
     policy: &LatentZPolicy,
-) -> Result<(Array2<f64>, LatentZNormalization), String> {
+) -> Result<(Array2<f64>, Vec<LatentZNormalization>), String> {
     if z.ncols() == 0 {
         return Err(SurvivalMarginalSlopeError::InvalidInput {
             reason: format!("{context} requires at least one z column"),
@@ -1949,17 +1953,15 @@ pub(crate) fn standardize_latent_z_matrix_with_policy(
         .into());
     }
     let mut out = Array2::<f64>::zeros(z.raw_dim());
-    let mut first_norm = LatentZNormalization { mean: 0.0, sd: 1.0 };
+    let mut normalizations = Vec::with_capacity(z.ncols());
     for col in 0..z.ncols() {
         let input = z.column(col).to_owned();
         let (standardized, normalization) =
             standardize_latent_z_with_policy(&input, weights, context, policy)?;
-        if col == 0 {
-            first_norm = normalization;
-        }
+        normalizations.push(normalization);
         out.column_mut(col).assign(&standardized);
     }
-    Ok((out, first_norm))
+    Ok((out, normalizations))
 }
 
 /// Derivatives of c(g) = √(1 + (s_f g)^2) up to 4th order in the raw slope g.
