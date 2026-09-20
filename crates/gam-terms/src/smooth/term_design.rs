@@ -315,20 +315,19 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     // a unit ridge on its latent logit coordinate, centred at the null. The
     // latent coordinate is dimensionless, so the unit scale carries no
     // covariate units; the bounded fit applies this block in latent space.
+    //
+    // `LinearTermSpec::owns_penalty_block` is the one statement of which
+    // terms own a block here; `TermCollectionSpec::random_effect_penalty_index`
+    // reads the same predicate to locate a random-effect ridge in a saved fit.
     for (j, linear) in spec.linear_terms.iter().enumerate() {
+        if !linear.owns_penalty_block() {
+            continue;
+        }
+        // A `double_penalty` term always has its function mass here; the
+        // remaining owners are bounded-shrinkage coefficients.
         let (mass, source) = match linear_function_masses.get(j).copied().flatten() {
             Some(function_mass) => (function_mass, "LinearTermRidge"),
-            None if matches!(
-                linear.coefficient_geometry,
-                LinearCoefficientGeometry::Bounded {
-                    prior: BoundedCoefficientPriorSpec::Shrinkage,
-                    ..
-                }
-            ) =>
-            {
-                (1.0, BOUNDED_SHRINKAGE_PENALTY_SOURCE)
-            }
-            None => continue,
+            None => (1.0, BOUNDED_SHRINKAGE_PENALTY_SOURCE),
         };
         let col = p_intercept + j;
         let global_index = penalties.len();
@@ -3533,5 +3532,91 @@ mod frozen_linear_term_mass_rebuild_tests {
             "the rebuilt design must carry the REUSED training-time mass, not a value \
              recomputed from the (all-zero) evaluation rows"
         );
+    }
+}
+
+#[cfg(test)]
+mod random_effect_penalty_index_tests {
+    use super::*;
+
+    fn linear(
+        name: &str,
+        col: usize,
+        double_penalty: bool,
+        geometry: LinearCoefficientGeometry,
+    ) -> LinearTermSpec {
+        LinearTermSpec {
+            name: name.to_string(),
+            feature_col: col,
+            feature_cols: vec![col],
+            categorical_levels: Vec::new(),
+            double_penalty,
+            coefficient_geometry: geometry,
+            coefficient_min: None,
+            coefficient_max: None,
+            frozen_function_mass: None,
+        }
+    }
+
+    fn group(name: &str, col: usize) -> RandomEffectTermSpec {
+        RandomEffectTermSpec {
+            name: name.to_string(),
+            feature_col: col,
+            frozen_levels: None,
+            lenient_unseen: true,
+        }
+    }
+
+    /// `random_effect_penalty_index` must name the block the design builder
+    /// actually emitted for each random-effect term. Two ridged slopes, one
+    /// unpenalized slope and one bounded-shrinkage slope put three linear
+    /// blocks ahead of the random-effect ridges; the index formerly counted
+    /// at most one, so a saved fit's unseen-level prior read a slope's `λ`.
+    #[test]
+    fn random_effect_penalty_index_names_the_emitted_random_effect_ridge() {
+        let n = 24;
+        let data = Array2::from_shape_fn((n, 6), |(i, j)| match j {
+            0 => 1.0 + i as f64,
+            1 => ((i * 7) % 11) as f64 - 5.0,
+            2 => (i % 5) as f64,
+            3 => ((i * 3) % 13) as f64 / 13.0,
+            4 => (i % 3) as f64,
+            _ => (i % 4) as f64,
+        });
+        let shrink = LinearCoefficientGeometry::Bounded {
+            min: -1.0,
+            max: 1.0,
+            prior: BoundedCoefficientPriorSpec::Shrinkage,
+        };
+        let spec = TermCollectionSpec {
+            linear_terms: vec![
+                linear("x0", 0, true, LinearCoefficientGeometry::Unconstrained),
+                linear("x1", 1, true, LinearCoefficientGeometry::Unconstrained),
+                linear("x2", 2, false, LinearCoefficientGeometry::Unconstrained),
+                linear("x3", 3, false, shrink),
+            ],
+            random_effect_terms: vec![group("g0", 4), group("g1", 5)],
+            smooth_terms: Vec::new(),
+            level: Default::default(),
+        };
+        let design = build_term_collection_design(data.view(), &spec).expect("design builds");
+        for (term_idx, term) in spec.random_effect_terms.iter().enumerate() {
+            let index = spec.random_effect_penalty_index(term_idx);
+            assert_eq!(index, 3 + term_idx);
+            let info = design
+                .penaltyinfo
+                .get(index)
+                .unwrap_or_else(|| panic!("no penalty block at index {index}"));
+            assert!(
+                matches!(
+                    &info.penalty.source,
+                    crate::basis::PenaltySource::Other(source)
+                        if *source == format!("RandomEffectRidge({})", term.name)
+                ),
+                "penalty block {index} is {:?}, not the ridge of '{}'",
+                info.penalty.source,
+                term.name
+            );
+        }
     }
 }
