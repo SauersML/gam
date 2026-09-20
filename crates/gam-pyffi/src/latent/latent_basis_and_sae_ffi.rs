@@ -2598,6 +2598,7 @@ fn layer_transport_report_to_pydict<'py>(
     out.set_item("layer_to", report.layer_to)?;
     out.set_item("topology_from", report.topology_from.name())?;
     out.set_item("topology_to", report.topology_to.name())?;
+    out.set_item("pairs", pair_law_name(report.pair_law))?;
     out.set_item("topology_preserved", report.topology_preserved)?;
     out.set_item("degree", report.degree)?;
     out.set_item("degree_concentration", report.degree_concentration)?;
@@ -2626,13 +2627,37 @@ fn layer_transport_report_to_pydict<'py>(
     Ok(out)
 }
 
-/// Fit one inter-layer concept transport map `t_to = h(t_from)` with the
-/// engine's REML machinery (issue #1013) and return the evidence payload:
+/// Parse the declared law of transport pairs: `"stochastic"` pairs scatter
+/// about the map (estimated chart coordinates), `"deterministic"` pairs are one
+/// function of the source coordinate (a held executed transport, a noise-free
+/// synthetic map).
+fn parse_pair_law(pairs: &str) -> PyResult<gam::inference::layer_transport::PairLaw> {
+    use gam::inference::layer_transport::PairLaw;
+    match pairs {
+        "stochastic" => Ok(PairLaw::Stochastic),
+        "deterministic" => Ok(PairLaw::Deterministic),
+        other => Err(PyValueError::new_err(format!(
+            "pairs must be \"stochastic\" or \"deterministic\", got {other:?}"
+        ))),
+    }
+}
+
+fn pair_law_name(pair_law: gam::inference::layer_transport::PairLaw) -> &'static str {
+    use gam::inference::layer_transport::PairLaw;
+    match pair_law {
+        PairLaw::Stochastic => "stochastic",
+        PairLaw::Deterministic => "deterministic",
+    }
+}
+
+/// Fit one inter-layer concept transport map `t_to = h(t_from)` (issue #1013)
+/// under the declared pair law — the REML smooth of stochastic pairs, the
+/// minimum-curvature interpolant of deterministic ones — and return the evidence payload:
 /// winding degree (circle→circle), topology-preservation verdict, the
 /// data-density-weighted isometry defect with its delta-method SE, EDF, and
 /// the selected smoothing level. See
 /// `gam::inference::layer_transport` for the estimator and gauge discipline.
-#[pyfunction(signature = (coords_from, coords_to, topology_from = "circle", topology_to = "circle", layer_from = 0, layer_to = 1))]
+#[pyfunction(signature = (coords_from, coords_to, topology_from = "circle", topology_to = "circle", layer_from = 0, layer_to = 1, pairs = "stochastic"))]
 fn layer_transport_fit(
     py: Python<'_>,
     coords_from: PyReadonlyArray1<'_, f64>,
@@ -2641,13 +2666,15 @@ fn layer_transport_fit(
     topology_to: &str,
     layer_from: usize,
     layer_to: usize,
+    pairs: &str,
 ) -> PyResult<Py<PyDict>> {
+    let pair_law = parse_pair_law(pairs)?;
     let from = coords_from.as_array();
     let to = coords_to.as_array();
     let topo_from = parse_chart_topology(topology_from, from)?;
     let topo_to = parse_chart_topology(topology_to, to)?;
     let report = gam::inference::layer_transport::fit_layer_transport(
-        layer_from, layer_to, from, to, topo_from, topo_to,
+        layer_from, layer_to, from, to, topo_from, topo_to, pair_law,
     )
     .map_err(PyValueError::new_err)?;
     Ok(layer_transport_report_to_pydict(py, &report)?.unbind())
@@ -2757,20 +2784,25 @@ impl PyFittedTransport {
 /// invertible [`PyFittedTransport`] (rather than the summary dict that
 /// [`layer_transport_fit`] returns). `coords_from[i]` and `coords_to[i]`
 /// coordinatize the same observation in the source and target charts;
-/// topologies are `"circle"` or `"interval"`.
-#[pyfunction(signature = (coords_from, coords_to, topology_from = "circle", topology_to = "circle"))]
+/// topologies are `"circle"` or `"interval"`; `pairs` is `"stochastic"` or
+/// `"deterministic"`.
+#[pyfunction(signature = (coords_from, coords_to, topology_from = "circle", topology_to = "circle", pairs = "stochastic"))]
 fn fit_transport(
     coords_from: PyReadonlyArray1<'_, f64>,
     coords_to: PyReadonlyArray1<'_, f64>,
     topology_from: &str,
     topology_to: &str,
+    pairs: &str,
 ) -> PyResult<PyFittedTransport> {
+    let pair_law = parse_pair_law(pairs)?;
     let from = coords_from.as_array();
     let to = coords_to.as_array();
     let topo_from = parse_chart_topology(topology_from, from)?;
     let topo_to = parse_chart_topology(topology_to, to)?;
-    let inner = gam::inference::layer_transport::fit_transport_map(from, to, topo_from, topo_to)
-        .map_err(PyValueError::new_err)?;
+    let inner = gam::inference::layer_transport::fit_transport_map(
+        from, to, topo_from, topo_to, pair_law,
+    )
+    .map_err(PyValueError::new_err)?;
     Ok(PyFittedTransport { inner })
 }
 
@@ -2779,14 +2811,17 @@ fn fit_transport(
 /// `h_{l→l+2} ≟ h_{l+1→l+2} ∘ h_{l→l+1}` attached (issue #1013). `coords` is
 /// a list of equal-length 1-D coordinate arrays (one per layer, same rows);
 /// `topology` applies to every chart; `layers` are optional labels
-/// (defaulting to `0..len`). Returns `{"adjacent": [...], "two_hop": [...]}`.
-#[pyfunction(signature = (coords, topology = "circle", layers = None))]
+/// (defaulting to `0..len`); `pairs` declares every pair's law. Returns
+/// `{"adjacent": [...], "two_hop": [...]}`.
+#[pyfunction(signature = (coords, topology = "circle", layers = None, pairs = "stochastic"))]
 fn layer_transport_ladder(
     py: Python<'_>,
     coords: &Bound<'_, PyList>,
     topology: &str,
     layers: Option<Vec<usize>>,
+    pairs: &str,
 ) -> PyResult<Py<PyDict>> {
+    let pair_law = parse_pair_law(pairs)?;
     use gam::inference::layer_transport::transport_ladder;
     let mut coord_vecs: Vec<ndarray::Array1<f64>> = Vec::with_capacity(coords.len());
     for item in coords.iter() {
@@ -2811,7 +2846,8 @@ fn layer_transport_ladder(
         topologies.push(parse_chart_topology(topology, coord.view())?);
     }
     let ladder =
-        transport_ladder(&layer_labels, &coord_vecs, &topologies).map_err(PyValueError::new_err)?;
+        transport_ladder(&layer_labels, &coord_vecs, &topologies, pair_law)
+        .map_err(PyValueError::new_err)?;
     let out = PyDict::new(py);
     let adjacent = PyList::empty(py);
     for report in &ladder.adjacent {
