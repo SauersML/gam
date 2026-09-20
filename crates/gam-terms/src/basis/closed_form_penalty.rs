@@ -1417,21 +1417,25 @@ pub(crate) fn radial_derivatives_of_isotropic_duchon(
 ///   * `p ≤ 2q`: the value diverges (a negative power of `R`, or `log R` at
 ///     `p = 2q`, which is always the log case), and no self-pair value exists.
 ///
+/// The argument holds verbatim for fractional `s`: `p` is then non-integer, so
+/// the kernel is the pure power `c · R^p` and the same `R^{p − 2q}` limit
+/// decides the value (a non-integer `p` can never equal `2q`).
+///
 /// `p > 2q` is the UV clause of `duchon_closed_form_operator_penalty_converges`,
 /// so every gated closed-form block has the zero self-pair.
 pub(crate) fn pure_duchon_self_pair_value(
     q: usize,
     d: usize,
     m: usize,
-    s: usize,
+    s: f64,
     eta: &[f64],
 ) -> Option<f64> {
-    if (q != 1 && q != 2) || eta.len() != d {
+    if (q != 1 && q != 2) || eta.len() != d || !s.is_finite() || s < 0.0 {
         return None;
     }
     // Exponent of R in the q = 0 pure-Duchon kernel.
-    let p = 4 * (m + s) as isize - d as isize;
-    (p > 2 * q as isize).then_some(0.0)
+    let p = 4.0 * (m as f64 + s) - d as f64;
+    (p > 2.0 * q as f64).then_some(0.0)
 }
 
 pub(crate) fn anisotropic_duchon_penalty_radial_with_powers(
@@ -2978,15 +2982,41 @@ mod tests {
     pub(crate) fn pure_duchon_self_pair_is_zero_above_the_uv_exponent_in_the_log_case_2469() {
         let eta = [0.0_f64; 6];
         // d = 6, m = 2, s = 1, q = 2: p = 6 > 4, even d, the log case.
-        assert_eq!(super::pure_duchon_self_pair_value(2, 6, 2, 1, &eta), Some(0.0));
+        assert_eq!(super::pure_duchon_self_pair_value(2, 6, 2, 1.0, &eta), Some(0.0));
         // d = 8, m = 2, s = 1, q = 2: p = 4 = 2q, the log divergence.
-        assert_eq!(super::pure_duchon_self_pair_value(2, 8, 2, 1, &[0.0_f64; 8]), None);
+        assert_eq!(super::pure_duchon_self_pair_value(2, 8, 2, 1.0, &[0.0_f64; 8]), None);
         // The κ = 0 radial chain approaches that zero from R > 0.
         let powers = super::AnisoMetricPowers::new(&eta);
         let magnitude_at = |r: f64| {
             let mut lag = [0.0_f64; 6];
             lag[0] = r;
             super::anisotropic_duchon_penalty_radial_with_powers(2, 2, 1.0, 0.0, &eta, &powers, &lag)
+                .abs()
+        };
+        let (coarse, middle, fine) = (magnitude_at(1.0e-2), magnitude_at(1.0e-3), magnitude_at(1.0e-4));
+        assert!(
+            fine < middle && middle < coarse,
+            "|g_2(R)| must shrink toward the zero self-pair: R=1e-2 {coarse:e}, 1e-3 {middle:e}, 1e-4 {fine:e}"
+        );
+    }
+
+    /// #3545: a fractional `s` makes `p = 4(m+s) − d` non-integer, so the kernel
+    /// is the pure power `c · R^p` and `(−Δ_B)^q f ∝ R^{p−2q}` has the exact
+    /// self-pair limit `0` whenever `p > 2q`. The self-pair used to be taken at
+    /// `R = 1e-6 · median lag` for every fractional `s` instead of this limit.
+    #[test]
+    pub(crate) fn pure_duchon_self_pair_is_exactly_zero_for_fractional_s_3545() {
+        let eta = [0.0_f64; 6];
+        // d = 6, m = 2, s = 1.5, q = 2: p = 8 > 4.
+        assert_eq!(super::pure_duchon_self_pair_value(2, 6, 2, 1.5, &eta), Some(0.0));
+        // d = 6, m = 2, s = 0.25, q = 2: p = 3 < 4, a negative power of R.
+        assert_eq!(super::pure_duchon_self_pair_value(2, 6, 2, 0.25, &eta), None);
+        // The κ = 0 radial chain approaches that zero from R > 0 (∝ R^4).
+        let powers = super::AnisoMetricPowers::new(&eta);
+        let magnitude_at = |r: f64| {
+            let mut lag = [0.0_f64; 6];
+            lag[0] = r;
+            super::anisotropic_duchon_penalty_radial_with_powers(2, 2, 1.5, 0.0, &eta, &powers, &lag)
                 .abs()
         };
         let (coarse, middle, fine) = (magnitude_at(1.0e-2), magnitude_at(1.0e-3), magnitude_at(1.0e-4));

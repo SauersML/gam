@@ -132,12 +132,22 @@ __device__ __forceinline__ bool is_finite_d(double v) {
     return isfinite(v);
 }
 
-// Normal CDF expressed through erfc for numerical stability on tails.
-__device__ __forceinline__ double phi_cdf(double x) {
-    if (isinf(x)) {
-        return x > 0.0 ? 1.0 : 0.0;
+// erf(zb) - erf(za) for za <= zb, with the host `truncated_gaussian_zeroth_moment`
+// branches: each tail is taken as a difference of the small complementary
+// masses, so a cell in either tail keeps its relative accuracy instead of
+// cancelling 1 - 1. erf/erfc are exact at +-inf, so infinite endpoints need no
+// special case.
+__device__ __forceinline__ double erf_interval(double za, double zb) {
+    if (za >= 0.0) {
+        return erfc(za) - erfc(zb);
     }
-    return 0.5 * erfc(-x * 0.70710678118654752440);
+    if (zb <= 0.0) {
+        return erfc(-zb) - erfc(-za);
+    }
+    if (zb <= 0.5 && -za <= 0.5) {
+        return erf(zb) + erf(-za);
+    }
+    return 2.0 - erfc(zb) - erfc(-za);
 }
 
 "#;
@@ -182,9 +192,8 @@ const KERNEL_BODY: &str = r#"    const double* __restrict__ cell_left,
                 local_status = STATUS_INVALID;
             }
         } else if (branch == BRANCH_AFFINE_TAIL) {
-            // Host classifier vets c2/c3 as structurally zero.
-            // Tails with any curvature never reach this kernel, so the device
-            // result matches `affine_anchor_moment_vector` byte-for-byte.
+            // Host classifier vets c2/c3 as structurally zero, so tails with
+            // any curvature never reach this kernel.
             if (!(R > L)) {
                 local_status = STATUS_INVALID;
             }
@@ -321,8 +330,10 @@ const KERNEL_BODY: &str = r#"    const double* __restrict__ cell_left,
         double argL = L_finite ? s * (L - mu) : -CUDART_INF;
         double argR = R_finite ? s * (R - mu) :  CUDART_INF;
         // M_0 = exp(-alpha^2 / (2*(1+beta^2))) / sqrt(1+beta^2) * sqrt(2*pi)
-        //       * [Phi(s*(R-mu)) - Phi(s*(L-mu))].
-        double m0 = prefactor * (phi_cdf(argR) - phi_cdf(argL));
+        //       * [Phi(s*(R-mu)) - Phi(s*(L-mu))]
+        //     = prefactor * 0.5 * [erf(argR/sqrt(2)) - erf(argL/sqrt(2))].
+        const double INV_SQRT_TWO = 0.70710678118654752440;
+        double m0 = prefactor * 0.5 * erf_interval(argL * INV_SQRT_TWO, argR * INV_SQRT_TWO);
 
         double moms[MOMENT_STRIDE];
         moms[0] = m0;
@@ -393,6 +404,25 @@ mod tests {
         assert!(src.contains("cubic_deriv_moments_d21("));
         assert!(src.contains("MAX_DEGREE 21"));
         assert!(src.contains("__shfl_xor_sync"));
+    }
+
+    #[test]
+    fn affine_tail_mass_uses_the_tail_stable_erf_interval() {
+        // Phi(argR) - Phi(argL) cancels to zero for a right-tail cell
+        // (Phi(8.5) rounds to 1), so M_0 must come from the complementary
+        // masses as in the host `truncated_gaussian_zeroth_moment`.
+        let src = build_cubic_deriv_moments_kernel_source(9);
+        assert!(src.contains("double erf_interval(double za, double zb)"));
+        assert!(src.contains("return erfc(za) - erfc(zb);"));
+        assert!(src.contains("return erfc(-zb) - erfc(-za);"));
+        assert!(src.contains("return erf(zb) + erf(-za);"));
+        assert!(src.contains("return 2.0 - erfc(zb) - erfc(-za);"));
+        assert!(
+            src.contains(
+                "prefactor * 0.5 * erf_interval(argL * INV_SQRT_TWO, argR * INV_SQRT_TWO)"
+            )
+        );
+        assert!(!src.contains("phi_cdf"));
     }
 
     #[test]

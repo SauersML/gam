@@ -351,3 +351,42 @@ fn block_frames(g: usize, b: usize, p: usize, seed: u64) -> Array2<f32> {
     }
     d
 }
+
+/// The linear lane reads gates in unit-atom units, so a decoder row off the unit sphere
+/// is refused rather than audited in its own scale: doubling one atom would double its
+/// gate and inflate `coherence_excess` with no change to the dictionary's geometry.
+#[test]
+fn a_non_unit_linear_decoder_row_is_refused() {
+    let (k, p) = (8, 32);
+    let decoder = unit_rows(k, p, 0x3F00_0001);
+    let residuals = unit_rows(16, p, 0x3F00_0002);
+    // Positive control: unit rows plus an exactly zero (dead) atom are accepted.
+    let mut with_dead = decoder.clone();
+    with_dead.row_mut(3).fill(0.0);
+    routability_audit(with_dead.view(), residuals.view(), 1, 0.05, &[0.5])
+        .expect("unit-norm rows with a dead atom are a valid linear decoder");
+    let mut scaled = decoder.clone();
+    scaled.row_mut(5).mapv_inplace(|v| v * 2.0);
+    let err = routability_audit(scaled.view(), residuals.view(), 1, 0.05, &[0.5])
+        .expect_err("a norm-2 atom must be refused");
+    assert!(err.contains("decoder atom 5"), "{err}");
+}
+
+/// Rows normalized in f32 arithmetic, as the linear lane's own gauge step does, sit inside
+/// the derived normalization band at a wide `P`, so the unit-norm contract never refuses
+/// a correctly normalized decoder.
+#[test]
+fn f32_normalized_rows_sit_inside_the_unit_atom_band() {
+    let (k, p) = (64, 4096);
+    let mut state = 0x3F00_0003_u64;
+    let mut decoder = Array2::<f32>::zeros((k, p));
+    for mut row in decoder.outer_iter_mut() {
+        for value in row.iter_mut() {
+            *value = gaussian(&mut state) as f32;
+        }
+        let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+        row.mapv_inplace(|v| v / norm);
+    }
+    crate::sparse_dict::require_unit_norm_atoms(decoder.view(), "f32-normalized decoder")
+        .expect("f32-normalized rows are unit norm to f32 rounding");
+}
