@@ -1,5 +1,5 @@
 //! Regression test for #1629: `matern(x1, x2)` recovered a fine 2-D surface
-//! ~6× worse than `thinplate()`/`tensor()`, and `k=` had no effect.
+//! ~6× worse than `thinplate()`/`te()`, and `k=` had no effect.
 //!
 //! ROOT CAUSE: the cold build evaluates the K Matérn kernel columns at the
 //! default seed length scale, realizes the design over the n data rows, and
@@ -115,10 +115,10 @@ fn matern_cold_design_does_not_collapse_and_k_has_effect_1629() {
          thinplate ({thinplate} cols), not a small fraction of it (#1629 6× gap)"
     );
 
-    // tensor() was the OTHER good reference in #1629 (matern 6× worse than BOTH
+    // te() was the OTHER good reference in #1629 (matern 6× worse than BOTH
     // thinplate AND tensor). It uses a different basis construction entirely, so
     // checking matern against it too guards against a thinplate-specific fluke.
-    let tensor = cold_design_cols("y ~ tensor(x1, x2)", &ds, &cfg);
+    let tensor = cold_design_cols("y ~ te(x1, x2)", &ds, &cfg);
     assert!(
         matern_default + 40 >= tensor,
         "matern(x1, x2) ({matern_default} cols) must resolve a basis comparable to \

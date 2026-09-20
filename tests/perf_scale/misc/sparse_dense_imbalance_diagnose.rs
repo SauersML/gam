@@ -159,7 +159,7 @@ fn diagnose_sparse_dense_imbalance() {
         // BC anchored ONLY left (sparse side)
         "y ~ s(x, bc_left=anchored, k=20)",
         // TPS
-        "y ~ s(x, type=tps, k=20)",
+        "y ~ s(x, bs=tps, k=20)",
         // Hypothesis: bc=anchored + 1st-derivative penalty (penalty_order=1)
         // damps the slope at the pin and should prevent the oscillation.
         "y ~ s(x, bc=anchored, k=20, penalty_order=1)",
