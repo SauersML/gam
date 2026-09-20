@@ -6983,7 +6983,9 @@ fn spatial_kappa_incumbent(
     // So: κ free ⇒ both coordinates from the profile. κ pinned, range free ⇒ the
     // range alone, at that κ, from the SAME inner solve. Range pinned ⇒ neither.
     // The pinned-κ arm is skipped rather than refused when the profile's
-    // Gaussian-identity/unit-weight precondition does not hold: the range is a
+    // preconditions do not hold (Gaussian identity, unit weights, and — since
+    // the profile's design is `[1 | curv block]` alone — a model that is
+    // exactly `y ~ curv(...)`, gam#3763): the range is a
     // nuisance coordinate there and the auto `ℓ_ref` is a valid fallback, while
     // for a free κ the profile IS the estimand and there is nothing to fall back
     // to.
@@ -6999,26 +7001,40 @@ fn spatial_kappa_incumbent(
                     && !constant_curvature_length_scale_is_fixed(&resolvedspec, term_idx)
             })
             .collect();
-    if !free_curvature_terms.is_empty() {
-        validate_constant_curvature_profile_inputs(weights.view(), offset.view(), &family)?;
+    for &term_idx in &free_curvature_terms {
+        validate_constant_curvature_profile_inputs(
+            &resolvedspec,
+            term_idx,
+            weights.view(),
+            offset.view(),
+            &family,
+        )?;
     }
-    if !pinned_kappa_free_range_terms.is_empty()
-        && validate_constant_curvature_profile_inputs(weights.view(), offset.view(), &family)
+    let pinned_kappa_free_range_terms: Vec<usize> = pinned_kappa_free_range_terms
+        .into_iter()
+        .filter(|&term_idx| {
+            validate_constant_curvature_profile_inputs(
+                &resolvedspec,
+                term_idx,
+                weights.view(),
+                offset.view(),
+                &family,
+            )
             .is_ok()
-    {
-        for term_idx in pinned_kappa_free_range_terms {
-            let length_scale_hat =
-                constant_curvature_range_only_optimum(data, y.view(), &resolvedspec, term_idx)?;
-            if let Some(SmoothBasisSpec::ConstantCurvature { spec: cc, .. }) = resolvedspec
-                .smooth_terms
-                .get_mut(term_idx)
-                .map(|term| &mut term.basis)
-            {
-                // `length_scale_fixed` stays as the user left it, for the same
-                // reason the free-κ arm leaves it alone: a realized value frozen
-                // into the spec must not be mistaken for a pin on a later fit.
-                cc.length_scale = length_scale_hat;
-            }
+        })
+        .collect();
+    for term_idx in pinned_kappa_free_range_terms {
+        let length_scale_hat =
+            constant_curvature_range_only_optimum(data, y.view(), &resolvedspec, term_idx)?;
+        if let Some(SmoothBasisSpec::ConstantCurvature { spec: cc, .. }) = resolvedspec
+            .smooth_terms
+            .get_mut(term_idx)
+            .map(|term| &mut term.basis)
+        {
+            // `length_scale_fixed` stays as the user left it, for the same
+            // reason the free-κ arm leaves it alone: a realized value frozen
+            // into the spec must not be mistaken for a pin on a later fit.
+            cc.length_scale = length_scale_hat;
         }
     }
     for term_idx in free_curvature_terms {

@@ -763,11 +763,42 @@ fn constant_curvature_range_only_optimum(
     Ok(length_scale_hat)
 }
 
+/// The preconditions under which the profile criterion IS the fitted model's
+/// criterion for the curvature and range of `curv(...)` term `term_idx`.
+///
+/// The profile's design is `[1 | curv block]` and nothing else (see
+/// [`constant_curvature_psi_profile_value`]). A κ̂ and ℓ̂ selected on it, and
+/// the CI and flatness p-value read off it, describe the fitted model only
+/// when that model is exactly the intercept plus this one term. Any other
+/// parametric, random-effect or smooth term (or a removed intercept) makes
+/// them estimates for a model the fit does not realize, which is the same
+/// reason `ConstantCurvatureProfile::new` refuses `double_penalty=` (gam#3763).
 fn validate_constant_curvature_profile_inputs(
+    resolvedspec: &TermCollectionSpec,
+    term_idx: usize,
     weights: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
     family: &LikelihoodSpec,
 ) -> Result<(), EstimationError> {
+    let sole_curvature_term = resolvedspec.linear_terms.is_empty()
+        && resolvedspec.random_effect_terms.is_empty()
+        && resolvedspec.smooth_terms.len() == 1
+        && term_idx == 0
+        && matches!(resolvedspec.level, gam_terms::smooth::ModelLevel::Intercept);
+    if !sole_curvature_term {
+        crate::bail_invalid_estim!(
+            "curvature-as-an-estimand profile for term {term_idx} requires the model to be \
+             exactly `y ~ curv(...)` (intercept plus this one term): its criterion carries \
+             only the intercept and the curvature block, so with {} linear, {} random-effect \
+             and {} smooth terms (level {:?}) the κ̂, ℓ̂, CI and flatness p-value would \
+             describe a model the fit does not realize. Pin `kappa=` and `length_scale=` \
+             to take fixed geometry inside a larger model.",
+            resolvedspec.linear_terms.len(),
+            resolvedspec.random_effect_terms.len(),
+            resolvedspec.smooth_terms.len(),
+            resolvedspec.level,
+        );
+    }
     if *family != LikelihoodSpec::gaussian_identity() {
         crate::bail_invalid_estim!(
             "curvature-as-an-estimand profile currently requires Gaussian identity likelihood"
