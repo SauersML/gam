@@ -298,12 +298,10 @@ where
                     initial_lm_lambda: config.initial_lm_lambda,
                     max_iterations,
                     convergence_tolerance: config.convergence_tolerance,
-                    linear_constraints: None,
                     qs: qs_view,
                     reparam_result: reparam_for_dispatch,
                     x_transformed_design,
                     coordinate_frame,
-                    edf: None,
                     exported_curvature: exported_curvature_kind,
                 };
                 if let Some(result) = try_gpu_pirls_loop_dispatch(dispatch) {
