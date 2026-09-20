@@ -442,17 +442,12 @@ fn compare_routes_at_state(
         !geometry.orbit_generators.is_empty(),
         "premise: the dense route integrates the orbits"
     );
-    let lambda_smooth = anchor.lambda_smooth_vec().expect("smoothing strengths");
-    let solver = state
-        .outer_gradient_arrow_solver(&cache, &lambda_smooth)
-        .expect("dense outer gradient solver");
     let dense = state
         .analytic_outer_rho_gradient_components_with_bundle(
             target.view(),
             anchor,
             &loss,
             &cache,
-            &solver,
             None,
             None,
             Some(&geometry),
@@ -473,14 +468,12 @@ fn compare_routes_at_state(
     let mut arrow_geometry = state
         .arrow_orbit_geometry(anchor, target.view(), &cache, generators)
         .expect("the arrow orbit lane certifies the converged state");
-    let plain = DeflatedArrowSolver::plain(&cache);
     let arrow = state
         .analytic_outer_rho_gradient_components_arrow_orbit(
             target.view(),
             anchor,
             &loss,
             &cache,
-            &plain,
             &arrow_geometry,
         )
         .expect("arrow orbit gradient components");
@@ -494,7 +487,6 @@ fn compare_routes_at_state(
             anchor,
             &loss,
             &cache,
-            &plain,
             &arrow_geometry,
         )
         .expect("mutant gradient components");

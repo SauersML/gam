@@ -13,6 +13,7 @@
 use super::construction::{AtomThirdJet, ThirdJetUnavailable};
 use super::tests::*;
 use super::tests_isometry_exact_hvp_majorizer_457::build_isometry_atom_for_evaluator;
+use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
 use super::*;
 use gam_solve::arrow_schur::ArrowSchurError;
 use ndarray::{Array4, Array5, array};

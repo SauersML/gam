@@ -10,6 +10,9 @@ use super::asymptote_certificate::{
 use super::rail_face::{
     RailFaceLimitOutcome, RailFaceProof, RailFaceVerdict, certify_rail_face,
 };
+use super::zero_smoothing_face::{
+    ZeroSmoothingFaceOutcome, ZeroSmoothingProof, certify_zero_smoothing_face,
+};
 
 pub(crate) const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
 
@@ -583,6 +586,10 @@ impl OuterProblem {
         self.max_iter = n;
         self
     }
+    /// The outer iteration budget this problem declares.
+    pub fn max_iter(&self) -> usize {
+        self.max_iter
+    }
     pub fn with_bounds(mut self, lo: Array1<f64>, hi: Array1<f64>) -> Self {
         self.bounds = Some((lo, hi));
         self
@@ -877,6 +884,7 @@ impl OuterProblem {
             fixed_point_certificate_fn: None,
             exact_polish_fn: None,
             rail_face_limit_fn: None,
+            zero_smoothing_face_fn: None,
             criterion_invariance_fn: None,
             criterion_rank_fn: None,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
@@ -917,6 +925,7 @@ impl OuterProblem {
             fixed_point_certificate_fn: None,
             exact_polish_fn: None,
             rail_face_limit_fn: None,
+            zero_smoothing_face_fn: None,
             criterion_invariance_fn: None,
             criterion_rank_fn: None,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
@@ -2559,7 +2568,7 @@ pub(crate) fn adjudicate_negative_curvature(
     //
     // is therefore the exact end of the claim's FALSIFIABLE RANGE — derived
     // from the eigenvalue in dispute and the same criterion resolution
-    // (`outer_criterion_resolution`) the rail and cost-stall machinery already use, with no
+    // (`decrement_bands::outer_resolution`) the rail and cost-stall machinery already use, with no
     // constant chosen here. Probing from `1` down to it and finding no descent
     // in either sign is a measurement of the criterion that contradicts the
     // matrix; stopping earlier would only have been a statement about the
@@ -3944,6 +3953,15 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             StationarityStandard::NoComparison,
         )
     })?;
+    // The criterion's resolution at the certified value (#3286): its statistical
+    // resolution less the value's own band, or on a route that declares no size, that
+    // band itself. Every rung below that compares a decrease with the criterion's
+    // resolution reads this one number, and a comparison of two values charges both
+    // values' bands.
+    let tau_stat = outer_criterion_resolution(config);
+    let point_band =
+        super::decrement_bands::outer_value_band(config, evaluation.cost, Some(&terminal_evidence));
+    let point_resolution = super::decrement_bands::outer_resolution(tau_stat, point_band);
 
     let analytic_lane_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
     if !analytic_lane_inner_converged {
@@ -4398,7 +4416,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         && let Some(predicted_decrease) = newton_predicted_decrease_at_resolution(
             hessian,
             &projected_gradient,
-            criterion_curvature_resolution(outer_criterion_resolution(config)),
+            criterion_curvature_resolution(point_resolution),
         )
         && predicted_decrease.is_finite()
         && predicted_decrease > 0.0
@@ -4406,7 +4424,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         // The criterion's resolution, the SAME one the cost-stall guard declares
         // the criterion stalled at (run_plan.rs), so certification asserts
         // nothing tighter than the loop already proved about this surface.
-        let objective_tol = outer_criterion_resolution(config);
+        let objective_tol = point_resolution;
         let curvature_grad_bound =
             projected_grad_norm * (objective_tol / predicted_decrease).sqrt();
         if curvature_grad_bound.is_finite() && curvature_grad_bound > stationarity_bound {
@@ -4536,7 +4554,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // with outward pull (`grad_norm` above the stationarity bound) and an analytic
     // Hessian: a well-conditioned interior fit, or a coordinate merely resting near a
     // bound with a vanishing gradient, probes nothing and keeps its ordinary verdict.
-    let asymptote_objective_tol = outer_criterion_resolution(config);
+    let asymptote_objective_tol = point_resolution;
     let rail_outcome = match analytic_hessian.as_ref() {
         Some(hessian) if !certificate_railed.is_empty() && grad_norm > stationarity_bound => {
             Some(try_certify_asymptote_rail(
@@ -4671,8 +4689,15 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         let null_curvature_threshold = f64::EPSILON.sqrt() * max_diag.max(1.0);
         // The SAME criterion resolution the cost-stall guard and both widenings
         // above use: certification asserts nothing tighter about this surface's
-        // macroscopic flatness than the loop already proved.
-        let objective_tol = outer_criterion_resolution(config);
+        // macroscopic flatness than the loop already proved. Each probe compares two
+        // values, so its tolerance charges both bands (#3286).
+        let objective_tol = point_resolution;
+        let probe_tol = |probe: f64| {
+            super::decrement_bands::outer_resolution(
+                tau_stat,
+                point_band + super::decrement_bands::value_representation_band(probe),
+            )
+        };
         // One e-fold in log-λ per coordinate (ρ IS log-λ): the +δ/−δ pair spans e²
         // in λ, a macroscopic move across which no genuine descent slope can hide.
         const LARGE_STEP_DELTA: f64 = 1.0;
@@ -4706,7 +4731,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             }
             let up = (cost_plus - evaluation.cost).abs();
             let down = (cost_minus - evaluation.cost).abs();
-            if up <= objective_tol && down <= objective_tol {
+            if up <= probe_tol(cost_plus) && down <= probe_tol(cost_minus) {
                 saturated_flat.push(k);
                 probe_reports.push(format!(
                     "k={} |ΔV|+={up:.3e} |ΔV|-={down:.3e}",
@@ -5547,6 +5572,70 @@ fn try_certify_asymptote_rail(
         );
     }
 
+    // Which rail each coordinate sits on: the box endpoint it is nearest.
+    // `Upper` is λ → ∞ (the penalty pins the model), `Lower` is λ → 0 (the
+    // penalty leaves it). The two ends are different limits with different
+    // laws, so the face is proven at one end or the other, never across both.
+    let mut upper_face: Vec<usize> = Vec::with_capacity(tail_railed.len());
+    let mut lower_face: Vec<usize> = Vec::new();
+    for &k in tail_railed.iter() {
+        if k >= rho.len() || k >= lower.len() || k >= upper.len() {
+            return Ok(Err(format!(
+                "railed coordinate {} outside the box layout",
+                native_coordinate(inputs.native_coordinate_order, k)
+            )));
+        }
+        if (upper[k] - rho[k]).abs() <= (rho[k] - lower[k]).abs() {
+            upper_face.push(k);
+        } else {
+            lower_face.push(k);
+        }
+    }
+
+    // #2348 Inc 5 — the λ → 0 end. A covered zero-smoothing face is ANALYTIC
+    // in λ, so its first-order law is exact and the face is proven from the
+    // signs of the slopes `c′_j = ∂V/∂λ_j`. There is no measured fallback:
+    // probing a λ → 0 tail never minted a rail (0 of 11 measured attempts
+    // across the regression suite), and a coordinate the law refuses is on a
+    // barrier, an exact fit, or outside the closed form — none of which a
+    // tail measurement can turn into a minimizer.
+    if !lower_face.is_empty() {
+        if !upper_face.is_empty() {
+            return Ok(Err(format!(
+                "the face spans both ends of the box: coordinate(s) {:?} rail at λ → ∞ and {:?} \
+                 at λ → 0, and no closed form expands the criterion jointly at that corner",
+                native_coordinates(inputs.native_coordinate_order, &upper_face),
+                native_coordinates(inputs.native_coordinate_order, &lower_face),
+            )));
+        }
+        return match try_certify_zero_smoothing_face_analytically(
+            obj,
+            inputs,
+            &lower_face,
+            estimand_tol,
+        )? {
+            Ok((rails, proof)) => {
+                log::debug!(
+                    "[CERTIFICATE] {}: analytic λ=0 face proof on {} coordinate(s): binding \
+                     slope c'={:.6e} > band {:.3e}, remaining value gap {:.3e}, estimand \
+                     travel {:.3e}",
+                    inputs.context,
+                    rails.len(),
+                    proof.statistic,
+                    proof.band,
+                    proof.value_gap,
+                    proof.estimand_travel,
+                );
+                Ok(Ok((
+                    interior_projected_grad_norm,
+                    effective_interior_bound,
+                    rails,
+                )))
+            }
+            Err(reason) => Ok(Err(reason)),
+        };
+    }
+
     // #2348 Inc 5 — the ANALYTIC face proof, first resort.
     //
     // Measuring a tail beside the ρ box asks the criterion for derivative
@@ -5561,7 +5650,7 @@ fn try_certify_asymptote_rail(
     // by a sound lower bound on that law over the whole release simplex. When
     // the objective cannot form that limit, or the proof does not hold, the
     // measured-tail path below is unchanged.
-    match try_certify_face_analytically(obj, inputs, &tail_railed, estimand_tol)? {
+    match try_certify_face_analytically(obj, inputs, &upper_face, estimand_tol)? {
         Ok((rails, proof)) => {
             log::debug!(
                 "[CERTIFICATE] {}: analytic λ=∞ face proof on {} coordinate(s) via {:?}: \
@@ -5592,27 +5681,15 @@ fn try_certify_asymptote_rail(
     let mut rails: Vec<RailCoordinate> = Vec::new();
     let mut decline: Option<String> = None;
     let mut probed_any = false;
-    for &k in tail_railed.iter() {
-        if k >= rho.len() || k >= lower.len() || k >= upper.len() {
-            decline = Some(format!(
-                "railed coordinate {} outside the box layout",
-                native_coordinate(inputs.native_coordinate_order, k)
-            ));
-            break;
-        }
-        // Which rail: the box endpoint the coordinate sits nearest. `Upper`
-        // (λ → ∞) probes step ρ downward into the tail; `Lower` (λ → 0) step up.
-        let side = if (upper[k] - rho[k]).abs() <= (rho[k] - lower[k]).abs() {
-            AsymptoteSide::Upper
-        } else {
-            AsymptoteSide::Lower
-        };
+    for &k in upper_face.iter() {
+        // Every coordinate here rails at λ → ∞: the probes step ρ downward
+        // into the tail.
         probed_any = true;
         match build_and_assess_rail_coordinate(
             obj,
             rho,
             k,
-            side,
+            AsymptoteSide::Upper,
             &tol,
             (lower[k], upper[k]),
             native_coordinate(inputs.native_coordinate_order, k),
@@ -5667,27 +5744,12 @@ fn try_certify_asymptote_rail(
 fn try_certify_face_analytically(
     obj: &mut dyn OuterObjective,
     inputs: &AsymptoteRailInputs<'_>,
-    tail_railed: &[usize],
+    upper_face: &[usize],
     estimand_tol: f64,
 ) -> Result<Result<(Vec<RailCoordinate>, RailFaceProof), String>, EstimationError> {
-    let rho = inputs.rho;
-    let (lower, upper) = inputs.bounds;
-    // The analytic limit is the INFINITE-smoothing face. A coordinate railed at
-    // the zero-smoothing bound is the opposite limit (the penalty leaves the
-    // model rather than pinning it) and belongs to the measured-tail path.
-    for &k in tail_railed.iter() {
-        if k >= rho.len() || k >= lower.len() || k >= upper.len() {
-            return Ok(Err("railed coordinate outside the box layout".to_string()));
-        }
-        if (upper[k] - rho[k]).abs() > (rho[k] - lower[k]).abs() {
-            return Ok(Err(format!(
-                "coordinate {} rails at the zero-smoothing bound; the analytic face limit \
-                 covers λ→∞ only",
-                native_coordinate(inputs.native_coordinate_order, k)
-            )));
-        }
-    }
-    let limit = match obj.rail_face_limit(rho, tail_railed)? {
+    // `upper_face` rails at the INFINITE-smoothing bound only; the caller
+    // routes the zero-smoothing end to its own law.
+    let limit = match obj.rail_face_limit(inputs.rho, upper_face)? {
         RailFaceLimitOutcome::Available(limit) => *limit,
         // The decline is typed, and the distinction is worth carrying into the
         // refusal: "outside this closed form" invites a different one, while
@@ -5734,6 +5796,64 @@ fn try_certify_face_analytically(
             // floor, and not a quantity comparable with one.
             evidence: RailTailEvidence::AnalyticFaceProof {
                 route: proof.route,
+                statistic: proof.statistic,
+                band: proof.band,
+            },
+        })
+        .collect();
+    Ok(Ok((rails, proof)))
+}
+
+/// Prove a zero-smoothing rail face analytically (#2348 Inc 5, lower face):
+/// ask the objective for the exact first-order law at `λ_face = 0`, require
+/// every slope to clear its rounding band, and mint the rails from it.
+///
+/// Like the λ=∞ route this spends no criterion evaluation; the law's fidelity
+/// to the criterion production minimizes is pinned by the gradient-domain
+/// tests beside `RemlState::zero_smoothing_face`.
+fn try_certify_zero_smoothing_face_analytically(
+    obj: &mut dyn OuterObjective,
+    inputs: &AsymptoteRailInputs<'_>,
+    lower_face: &[usize],
+    estimand_tol: f64,
+) -> Result<Result<(Vec<RailCoordinate>, ZeroSmoothingProof), String>, EstimationError> {
+    let law = match obj.zero_smoothing_face(inputs.rho, lower_face)? {
+        ZeroSmoothingFaceOutcome::Available(law) => *law,
+        ZeroSmoothingFaceOutcome::OutsideClosedForm { reason } => {
+            return Ok(Err(format!(
+                "outside the zero-smoothing closed form: {reason}"
+            )));
+        }
+        ZeroSmoothingFaceOutcome::FaceUnavailable { reason } => {
+            return Ok(Err(format!("the λ=0 face is unavailable: {reason}")));
+        }
+    };
+    let proof = match certify_zero_smoothing_face(&law) {
+        Ok(proof) => proof,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    if !(proof.estimand_travel <= estimand_tol) {
+        return Ok(Err(format!(
+            "λ=0 face proven, but the shipped fit has not reached it: coefficient travel \
+             {:.3e} > estimand tolerance {estimand_tol:.3e}",
+            proof.estimand_travel
+        )));
+    }
+    let rails: Vec<RailCoordinate> = law
+        .face
+        .iter()
+        .zip(law.face_rho.iter())
+        .zip(law.slopes.iter())
+        .map(|((&index, &rho_k), &slope)| RailCoordinate {
+            index,
+            side: AsymptoteSide::Lower,
+            // On the lower rail the pencil constant is `ĉ = e^{−ρ}·∂V/∂ρ`,
+            // which at `λ → 0` is exactly the slope `c′_k = ∂V/∂λ_k`.
+            tail_constant: slope,
+            value_gap: slope * rho_k.exp(),
+            estimand_travel_bound: proof.estimand_travel,
+            evidence: RailTailEvidence::AnalyticFaceProof {
+                route: FacePositivityRoute::CoveredZeroSmoothing,
                 statistic: proof.statistic,
                 band: proof.band,
             },
@@ -7355,11 +7475,7 @@ pub(crate) fn is_per_atom_efs_frontier(cap: &OuterCapability) -> bool {
 /// Builds the same bounded seed and tolerance/budget the standard plan path
 /// uses, takes the same single derived start (initial-ρ if supplied, else the
 /// commensurate-curvature start — the per-atom fixed point is a contraction
-/// near the optimum), then drives the per-atom EFS loop. The shared-border
-/// topology defaults to disjoint (every atom owns a private penalty block — the
-/// common ARD-per-atom case); callers with a known arrow-border overlap can run
-/// the module's `run_per_atom_efs` directly with a populated
-/// `SharedBorderTopology`.
+/// near the optimum), then drives the per-atom EFS loop.
 ///
 /// Additive: this function neither mutates nor bypasses the dense path; it is
 /// the pre-dispatch shortcut [`run_outer`] calls before the dense ladder.
@@ -7401,12 +7517,10 @@ pub(crate) fn run_per_atom_efs_if_frontier(
         lower,
         upper,
     );
-    let topology = crate::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
 
     obj.reset();
     install_matching_initial_inner_seed(obj, config, &seed, context)?;
-    let result =
-        crate::estimate::reml::per_atom_efs::run_per_atom_efs(obj, &seed, &pa_cfg, &topology)?;
+    let result = crate::estimate::reml::per_atom_efs::run_per_atom_efs(obj, &seed, &pa_cfg)?;
     Ok(Some(result.into_outer_result(the_plan)))
 }
 
@@ -7559,25 +7673,29 @@ pub(crate) fn fixed_point_step_resolution(config: &OuterConfig, n_params: usize)
     f64::EPSILON.sqrt() * (n_params.max(1) as f64).sqrt() * (1.0 + box_scale)
 }
 
-/// The criterion's resolution in its own absolute units: the statistical
-/// resolution `τ_stat = 1/(2n)` over the declared observations
+/// The criterion's statistical resolution in its own absolute units, `τ_stat =
+/// 1/(2n)` over the declared observations
 /// ([`OuterProblemSize::statistical_resolution`], C3).
 ///
-/// Every judgement of "the criterion cannot tell these apart" reads this one
-/// number: the cost-stall guard's no-improvement test where the evaluations
-/// carry no objective band, the ARC online stop and the matrix-free model
-/// decrement, the curvature-resolvability and gradient-reproducibility rungs,
-/// the asymptote-rail and large-step flatness certificates, and the
-/// negative-curvature adjudication's falsifiable range. A decrease below
+/// It is never a resolution by itself. Every test of the decrease left combines it
+/// with the band of the values it judges, through
+/// [`outer_resolution`](super::decrement_bands::outer_resolution) (#3286): the ARC
+/// online stop and the matrix-free model decrement, the curvature-resolvability
+/// rung, the asymptote-rail and large-step flatness certificates, and the
+/// negative-curvature adjudication's falsifiable range. One
+/// step's decrease is not the decrease left: the cost-stall guard's
+/// resolved-descent test charges each value its resolution
+/// ([`sample_resolution`](super::bridges::sample_resolution)), and the fixed-point
+/// walk each value its own rounding (#3176). A decrease below
 /// `τ_stat` moves no reported quantity by more than the `n^{-1/2}` sampling
 /// error the inference built on the optimum already carries; it does not move
 /// with the units of `y` or with an additive constant in `V`, which the
 /// `rel·(1 + |V|)` floor it replaces did, and it shrinks as `n` grows (#2954).
 ///
 /// `0.0` when the route declares no observation count: such a criterion has no
-/// statistical resolution, so nothing is waived as unresolvable — a tolerance
-/// test `x ≤ 0` passes only on exact equality and the rung it gates does not
-/// fire.
+/// statistical slack, so it decides at the arithmetic's own resolution, the
+/// compared values' bands. Read bare, the `0` resolved every difference and
+/// switched both of ARC's stops off (#3286).
 pub(crate) fn outer_criterion_resolution(config: &OuterConfig) -> f64 {
     config
         .problem_size
@@ -7591,7 +7709,8 @@ pub(crate) fn outer_criterion_resolution(config: &OuterConfig) -> f64 {
 pub(crate) const NEGATIVE_CURVATURE_LADDER_LARGEST_STEP: f64 = 1.0;
 
 /// The criterion's curvature resolution `2·τ` over its objective resolution
-/// `τ` ([`outer_criterion_resolution`]; #1082, #2817).
+/// `τ` at the evaluated value
+/// ([`outer_resolution`](super::decrement_bands::outer_resolution); #1082, #2817, #3286).
 ///
 /// Along an eigenvector of `λ < 0` at a stationary point the quadratic model
 /// predicts the decrease `½|λ|α²`. The largest step the negative-curvature
@@ -8206,7 +8325,6 @@ pub(crate) fn run_fixed_point_outer_solver(
         barrier_config,
         config,
         evaluated_inner_seed: Arc::clone(&evaluated_inner_seed),
-        consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::clone(&recurrent_incumbent_exit),
         // The same criterion resolution the gradient routes' cost-stall guard
