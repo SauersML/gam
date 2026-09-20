@@ -2,13 +2,13 @@ use super::*;
 // #2598 — `construction_quasi_laplace.rs` interpolates the refusal markers into
 // its ρ-local refusals instead of restating them, so the classifier and the
 // producer cannot disagree about the phrase again.
+use super::fit_drivers::GaugeOrbitDescent;
 use super::outer_objective::ProbeRefusalKind;
 use crate::identifiability::{
     FrameColumnLayout, OutputBlockRootAccumulator, ResidualGaugeCurvature,
     TriangularRootAccumulator,
 };
 use gam_linalg::faer_ndarray::FaerEigh;
-use super::fit_drivers::GaugeOrbitDescent;
 
 /// #2822 — a term's tier-0 fit frame: the shared column mean μ and the per-column scale σ.
 ///
@@ -953,30 +953,23 @@ impl SaeManifoldTerm {
 
     /// Apply the FFI-facing [`SaeFitConfig`] as the source of truth for this fit.
     ///
-    /// Distributes the config to its two authorities: the barrier strength override
-    /// onto the term (read by `separation_barrier_strength`), and the ordered Beta--Bernoulli-α
-    /// override onto the assignment (read by
-    /// `SaeAssignment::ordered_beta_bernoulli_prior_parameters`). A `None` field selects the canonical
-    /// data-derived or assignment-mode default. Call this after building the term
-    /// and before fitting; distinct terms remain isolated by construction.
+    /// Installs the barrier strength override onto the term (read by
+    /// `separation_barrier_strength`) and the backend policy. A `None` override selects the
+    /// canonical data-derived strengths. The ordered Beta--Bernoulli concentration is a
+    /// property of the [`AssignmentMode`] the term is built with, so it has no per-fit
+    /// override. Call this after building the term and before fitting; distinct terms remain
+    /// isolated by construction.
     pub fn set_fit_config(&mut self, config: SaeFitConfig) {
         self.separation_barrier_strength_override = config.separation_barrier_strength_override;
         self.gpu_policy = config.gpu_policy;
-        self.assignment.set_ordered_beta_bernoulli_alpha_override(
-            config.ordered_beta_bernoulli_alpha_override,
-        );
     }
 
-    /// #1777 — the per-fit configuration currently in force on this term,
-    /// reconstructed from its two authorities (the term's barrier override and the
-    /// assignment's α override). Round-trips with [`Self::set_fit_config`].
+    /// #1777 — the per-fit configuration currently in force on this term. Round-trips with
+    /// [`Self::set_fit_config`].
     #[must_use]
     pub fn fit_config(&self) -> SaeFitConfig {
         SaeFitConfig {
             separation_barrier_strength_override: self.separation_barrier_strength_override,
-            ordered_beta_bernoulli_alpha_override: self
-                .assignment
-                .ordered_beta_bernoulli_alpha_override,
             gpu_policy: self.gpu_policy,
         }
     }
@@ -1948,7 +1941,8 @@ impl SaeManifoldTerm {
                 ref dense_rows,
                 root_rows,
             } => {
-                let operator = super::streamed_frame_curvature::StreamedFrameCurvatureOperator::new(
+                let operator =
+                    super::streamed_frame_curvature::StreamedFrameCurvatureOperator::new(
                     self,
                     &certificate_model.metric,
                     layout,
@@ -1993,8 +1987,7 @@ impl SaeManifoldTerm {
         // defect). Always populated (one entry per atom, `None` for non-`d = 1`
         // charts), never dispersion-gated: coordinate quality does not depend on the
         // reconstruction dispersion the incoherence report needs.
-        let coordinate_fidelity =
-            atom_certificates_in_parallel(k_atoms, |atom_idx| {
+        let coordinate_fidelity = atom_certificates_in_parallel(k_atoms, |atom_idx| {
                 atom_coordinate_fidelity(self, atom_idx)
             })
             .into_iter()
@@ -2007,8 +2000,7 @@ impl SaeManifoldTerm {
         // that sees it. One entry per atom, `None` for atoms outside the `d = 1`
         // periodic family, and — like the fidelity report — a pure read that
         // feeds nothing back into the loss or criterion.
-        let decoder_embeddedness =
-            atom_certificates_in_parallel(k_atoms, |atom_idx| {
+        let decoder_embeddedness = atom_certificates_in_parallel(k_atoms, |atom_idx| {
                 atom_decoder_embeddedness(self, atom_idx)
             })
             .into_iter()
@@ -2018,8 +2010,7 @@ impl SaeManifoldTerm {
         // `None` for caller-supplied or under-sampled atoms). A pure read of the
         // fitted decoder image and shared soft support measure; never gated by a flag and
         // feeds nothing back into the loss/criterion.
-        let topology_persistence =
-            atom_certificates_in_parallel(k_atoms, |atom_idx| {
+        let topology_persistence = atom_certificates_in_parallel(k_atoms, |atom_idx| {
                 atom_topology_persistence(self, atom_idx)
             });
 
@@ -2456,11 +2447,8 @@ impl SaeManifoldTerm {
         // of such a row fills in every block). The reduction counts the sum's
         // eigenvalues above any shift exactly, by inertia, so nothing is
         // approximated by carrying them separately.
-        let curvature_source = self.residual_gauge_curvature_source(
-            &metric,
-            &layout,
-            isometry_penalty_root.clone(),
-        )?;
+        let curvature_source =
+            self.residual_gauge_curvature_source(&metric, &layout, isometry_penalty_root.clone())?;
 
         Ok((
             FittedSaeManifold {
@@ -3408,7 +3396,10 @@ impl SaeManifoldTerm {
                         left
                     })
             } else {
-                chunks.into_iter().map(chunk_block).reduce(|mut left, right| {
+                chunks
+                    .into_iter()
+                    .map(chunk_block)
+                    .reduce(|mut left, right| {
                     left += &right;
                     left
                 })
@@ -5666,8 +5657,9 @@ impl SaeManifoldTerm {
         );
         let retained: Vec<usize> = (0..m).filter(|&i| evals[i] > threshold).collect();
         let values = retained.iter().map(|&i| evals[i]).collect();
-        let vectors =
-            Array2::from_shape_fn((m, retained.len()), |(row, col)| evecs[[row, retained[col]]]);
+        let vectors = Array2::from_shape_fn((m, retained.len()), |(row, col)| {
+            evecs[[row, retained[col]]]
+        });
         Ok((values, vectors))
     }
 
@@ -5680,7 +5672,9 @@ impl SaeManifoldTerm {
     /// uses the *effective* penalty rank rather than the ambient basis size
     /// (a thin-plate / B-spline penalty has a non-trivial null space).
     pub(crate) fn symmetric_rank(s: &Array2<f64>) -> Result<usize, String> {
-        Ok(Self::symmetric_positive_eigenspace(s, "symmetric_rank")?.0.len())
+        Ok(Self::symmetric_positive_eigenspace(s, "symmetric_rank")?
+            .0
+            .len())
     }
 
     /// Rank and log pseudo-determinant `log|S|_+ = Σ_{σ_i > threshold} ln σ_i` of a
@@ -5706,10 +5700,8 @@ impl SaeManifoldTerm {
                 s.dim()
             ));
         }
-        let (values, vectors) = Self::symmetric_positive_eigenspace(
-            s,
-            "symmetric_log_pseudodeterminant_differential",
-        )?;
+        let (values, vectors) =
+            Self::symmetric_positive_eigenspace(s, "symmetric_log_pseudodeterminant_differential")?;
         let mut acc = 0.0_f64;
         for (col, &value) in values.iter().enumerate() {
             let u = vectors.column(col);

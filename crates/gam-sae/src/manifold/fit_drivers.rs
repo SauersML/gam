@@ -9040,14 +9040,10 @@ impl SaeManifoldTerm {
         // Carry the assignment-defining metadata that `with_mode` resets to
         // defaults, so the chunk computes the SAME model as the resident term.
         // Without this the streaming/chunked path silently diverges from the dense
-        // path: frozen routing thaws back to the free logits (#1033), and the per-fit
-        // truncated-ordered Beta--Bernoulli α override is dropped (#1777). Both change the
-        // forward gate map, hence the loss, gradient, and log-det.
-        //   * `ordered_beta_bernoulli_alpha_override` is scalar — row-independent.
-        //   * frozen routing is per-row (n×K) — the caller slices it to the chunk's
-        //     rows and passes it as `chunk_frozen_logits`.
-        assignment.ordered_beta_bernoulli_alpha_override =
-            self.assignment.ordered_beta_bernoulli_alpha_override;
+        // path: frozen routing thaws back to the free logits (#1033), which changes
+        // the forward gate map, hence the loss, gradient, and log-det. Frozen routing
+        // is per-row (n×K): the caller slices it to the chunk's rows and passes it as
+        // `chunk_frozen_logits`.
         if let Some(frozen) = chunk_frozen_logits {
             if frozen.dim() != (n_chunk, k_atoms) {
                 return Err(format!(

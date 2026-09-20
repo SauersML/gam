@@ -691,8 +691,11 @@ pub struct SaeManifoldTerm {
     /// and carries them onto every materialized chunk. When this flag is `true` the
     /// per-chunk assembly SKIPS its own gate refresh and uses the carried global
     /// gate, so the reduced β-Newton step and line-search objective are
-    /// chunk-size invariant. Default `false` (the dense/full-batch path refreshes
-    /// per assembly, bit-for-bit unchanged). Transient (Clone starts `false`).
+    /// chunk-size invariant. Default `false`: a term with no declared gates
+    /// refreshes them per assembly. A successful quasi-Laplace pricing leaves the
+    /// gates its value read declared (`true`), and a minted fit keeps them, so
+    /// re-pricing a priced state prices the same objective (#2933 F05).
+    /// Transient (Clone starts `false`).
     pub(crate) streaming_gates_frozen: bool,
     /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
     /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit
@@ -819,9 +822,6 @@ pub struct SaeFitConfig {
     /// Per-fit separation-barrier strength `μ_C`. `Some` bypasses the #1610
     /// evidence-derived per-pair strengths (`0.0` = conditioner off).
     pub separation_barrier_strength_override: Option<f64>,
-    /// Per-fit truncated-ordered Beta--Bernoulli concentration `α`. `Some` bypasses the mode's own
-    /// `α` / learnable schedule.
-    pub ordered_beta_bernoulli_alpha_override: Option<f64>,
     /// Backend selection for this fit and every nested arrow-Schur solve.
     pub gpu_policy: gam_gpu::GpuPolicy,
 }
@@ -856,18 +856,23 @@ impl Clone for SaeManifoldTerm {
             best_fit_incumbent: None,
             structural_cocollapse_reseeds: self.structural_cocollapse_reseeds,
             evidence_root_telemetry: self.evidence_root_telemetry.clone(),
-            // Transient per-assembly frozen gate — rebuilt at the next assembly.
-            decoder_repulsion_gate: None,
-            // #1625 — transient per-assembly frozen barrier coactivation; rebuilt
-            // at the next assembly, exactly like the repulsion gate above.
-            barrier_coactivation_gate: None,
-            // #2343 — transient per-assembly frozen amplitude-barrier turn-on
-            // radius; rebuilt at the next assembly like the gates above.
-            amplitude_barrier_gate: None,
-            // #1801 — transient streaming gate-freeze flag; a fresh clone refreshes
-            // its gates per assembly like the dense path until a streaming fit
-            // re-arms it.
-            streaming_gates_frozen: false,
+            // #2933 F05 — declared (frozen) collapse-prevention gates are part of the
+            // objective a term is priced under, so a clone of such a term prices the
+            // same criterion. Unfrozen gates are transient per-assembly state; a
+            // clone rebuilds them at its next assembly.
+            decoder_repulsion_gate: self
+                .streaming_gates_frozen
+                .then(|| self.decoder_repulsion_gate.clone())
+                .flatten(),
+            barrier_coactivation_gate: self
+                .streaming_gates_frozen
+                .then(|| self.barrier_coactivation_gate.clone())
+                .flatten(),
+            amplitude_barrier_gate: self
+                .streaming_gates_frozen
+                .then_some(self.amplitude_barrier_gate)
+                .flatten(),
+            streaming_gates_frozen: self.streaming_gates_frozen,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),
             oos_linear_images: self.oos_linear_images.clone(),
