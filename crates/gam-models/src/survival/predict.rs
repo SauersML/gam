@@ -236,6 +236,7 @@ impl SurvivalPredictionCovarianceMode {
 }
 
 /// Inputs to the unified survival predict pipeline.
+#[derive(Clone, Copy)]
 pub struct SurvivalPredictRequest<'a> {
     pub model: &'a SavedModel,
     pub data: ArrayView2<'a, f64>,
@@ -1192,20 +1193,69 @@ impl SurvivalPosteriorIntegration {
 /// [`SurvivalPosteriorIntegration::ExactAnchor`] and
 /// [`SurvivalPosteriorIntegration::TruncatedLaw`] are refused for a model they do
 /// not cover.
+///
+/// The published point is always the conditional-posterior mean
+/// `E[S | D, ρ̂]`, exactly as on the competing-risks and standard-family paths:
+/// `covariance_mode` governs only the reported uncertainty, so requesting an
+/// interval (or a covariance definition for it) never moves the point
+/// (gam#398, gam#3421). A smoothing-corrected band integrates its second
+/// moments under the corrected law in a separate pass over the same rule.
 pub fn predict_survival_posterior_mean_with(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
     integration: SurvivalPosteriorIntegration,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    predict_survival_posterior_mean_integrated(req, covariance_mode, integration, integration)
+}
+
+/// [`predict_survival_posterior_mean_with`] with the point's conditional law
+/// integrated by `point_integration` and a smoothing-corrected band's law by
+/// `band_integration`.
+fn predict_survival_posterior_mean_integrated(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+    point_integration: SurvivalPosteriorIntegration,
+    band_integration: SurvivalPosteriorIntegration,
+) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    let point_request = SurvivalPredictRequest {
+        with_uncertainty: false,
+        ..req
+    };
+    let (mut result, point) = survival_posterior_moments(
+        point_request,
+        SurvivalPredictionCovarianceMode::Conditional,
+        point_integration,
+    )?;
+    let band = match (req.with_uncertainty, covariance_mode) {
+        (false, _) => None,
+        (true, SurvivalPredictionCovarianceMode::Conditional) => None,
+        (true, SurvivalPredictionCovarianceMode::SmoothingCorrected) => Some(
+            survival_posterior_moments(point_request, covariance_mode, band_integration)?.1,
+        ),
+    };
+    let uncertainty = req
+        .with_uncertainty
+        .then(|| (band.as_ref().unwrap_or(&point), covariance_mode));
+    publish_survival_posterior_moments(&mut result, &point, uncertainty)?;
+    Ok(result)
+}
+
+/// The plug-in prediction beside the posterior moments of every cell under
+/// the `covariance_mode` coefficient law, integrated by `integration`.
+fn survival_posterior_moments(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+    integration: SurvivalPosteriorIntegration,
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     match integration {
         SurvivalPosteriorIntegration::SigmaPoint => {
-            predict_survival_sigma_point_posterior_mean(req, covariance_mode)
+            survival_sigma_point_posterior_moments(req, covariance_mode)
         }
         SurvivalPosteriorIntegration::ExactAnchor => {
-            predict_survival_exact_anchor_posterior_mean(req, covariance_mode)
+            survival_exact_anchor_posterior_moments(req, covariance_mode)
         }
         SurvivalPosteriorIntegration::TruncatedLaw => {
-            predict_survival_truncated_law_posterior_mean(req, covariance_mode)
+            survival_truncated_law_posterior_moments(req, covariance_mode)
         }
     }
 }
@@ -1214,8 +1264,21 @@ fn predict_survival_posterior_mean(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let integration = SurvivalPosteriorIntegration::default_for(req.model, covariance_mode)?;
-    predict_survival_posterior_mean_with(req, covariance_mode, integration)
+    // Each law takes the integration that covers it: the cone truncates only
+    // the conditional posterior (gam#3038), so a truncated location-scale
+    // point integrates the truncated law while its smoothing-corrected band
+    // integrates the corrected normal.
+    let point_integration = SurvivalPosteriorIntegration::default_for(
+        req.model,
+        SurvivalPredictionCovarianceMode::Conditional,
+    )?;
+    let band_integration = SurvivalPosteriorIntegration::default_for(req.model, covariance_mode)?;
+    predict_survival_posterior_mean_integrated(
+        req,
+        covariance_mode,
+        point_integration,
+        band_integration,
+    )
 }
 
 /// First and second posterior moments of a single-event survival prediction,
@@ -1249,30 +1312,32 @@ impl SurvivalPosteriorMoments {
 /// predictive law's own hazard; the posterior mean of the hazard, `E_θ[f/S]`,
 /// is a different quantity wherever `S` varies across the posterior and is
 /// never published (`hazard_mean` only tells a zero hazard from an infinite
-/// one where `S̄ = 0`). Posterior standard deviations are added when uncertainty
-/// was requested, and the plug-in survival is kept by name in `survival_plugin`.
+/// one where `S̄ = 0`). When `uncertainty` names the band's moments and their
+/// covariance definition, the posterior standard deviations under that law are
+/// added; the plug-in survival is kept by name in `survival_plugin`.
 fn publish_survival_posterior_moments(
     result: &mut SurvivalPredictResult,
     moments: &SurvivalPosteriorMoments,
-    with_uncertainty: bool,
-    covariance_mode: SurvivalPredictionCovarianceMode,
+    uncertainty: Option<(&SurvivalPosteriorMoments, SurvivalPredictionCovarianceMode)>,
 ) -> Result<(), SurvivalPredictError> {
     let (n_rows, n_times) = result.survival.dim();
-    if moments.survival_mean.dim() != (n_rows, n_times) || moments.eta_mean.len() != n_rows {
-        return Err(SurvivalPredictError::IncompatibleSchema {
-            reason: format!(
-                "posterior survival moments have shape {:?}, but the prediction is {n_rows}x{n_times}",
-                moments.survival_mean.dim()
-            ),
-        });
+    for published in std::iter::once(moments).chain(uncertainty.map(|(band, _)| band)) {
+        if published.survival_mean.dim() != (n_rows, n_times)
+            || published.eta_mean.len() != n_rows
+        {
+            return Err(SurvivalPredictError::IncompatibleSchema {
+                reason: format!(
+                    "posterior survival moments have shape {:?}, but the prediction is {n_rows}x{n_times}",
+                    published.survival_mean.dim()
+                ),
+            });
+        }
     }
     let SurvivalPosteriorMoments {
         survival_mean,
-        survival_second,
         density_mean,
         hazard_mean,
-        eta_mean,
-        eta_second,
+        ..
     } = moments;
     // `result` is the plug-in prediction and the loop below overwrites its
     // surfaces with the posterior means, so the plug-in survival is taken
@@ -1305,21 +1370,21 @@ fn publish_survival_posterior_moments(
             };
         }
     }
-    result.survival_se = with_uncertainty.then(|| {
+    result.survival_se = uncertainty.map(|(band, _)| {
         Array2::from_shape_fn((n_rows, n_times), |(row, time)| {
-            (survival_second[[row, time]] - survival_mean[[row, time]] * survival_mean[[row, time]])
+            let mean = band.survival_mean[[row, time]];
+            (band.survival_second[[row, time]] - mean * mean)
                 .max(0.0)
                 .sqrt()
         })
     });
-    result.eta_se = with_uncertainty.then(|| {
+    result.eta_se = uncertainty.map(|(band, _)| {
         Array1::from_shape_fn(n_rows, |row| {
-            (eta_second[row] - eta_mean[row] * eta_mean[row])
-                .max(0.0)
-                .sqrt()
+            let mean = band.eta_mean[row];
+            (band.eta_second[row] - mean * mean).max(0.0).sqrt()
         })
     });
-    result.covariance_source = with_uncertainty.then_some(covariance_mode);
+    result.covariance_source = uncertainty.map(|(_, covariance_mode)| covariance_mode);
     result.survival_plugin = Some(survival_plugin);
     Ok(())
 }
@@ -1540,17 +1605,16 @@ impl ExactAnchorPosterior {
     }
 }
 
-fn predict_survival_exact_anchor_posterior_mean(
+fn survival_exact_anchor_posterior_moments(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let with_uncertainty = req.with_uncertainty;
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let (_, active_covariance, _) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
     let posterior = ExactAnchorPosterior {
         covariance: active_covariance,
     };
-    let (mut result, moments) = predict_survival_surfaces(
+    let (result, moments) = predict_survival_surfaces(
         SurvivalPredictRequest {
             with_uncertainty: false,
             estimand: SurvivalPredictEstimand::Plugin,
@@ -1566,8 +1630,7 @@ fn predict_survival_exact_anchor_posterior_mean(
     // (`survival_plugin`), so its curve is held to the same domain as when it
     // is published alone.
     refuse_decreasing_survival(&result)?;
-    publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
-    Ok(result)
+    Ok((result, moments))
 }
 
 /// The cone-truncated coefficient posterior of a location-scale fit under
@@ -1591,11 +1654,10 @@ fn truncated_survival_posterior_draws(
         .map_err(|reason| SurvivalPredictError::PosteriorCovariance { reason })
 }
 
-fn predict_survival_truncated_law_posterior_mean(
+fn survival_truncated_law_posterior_moments(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let with_uncertainty = req.with_uncertainty;
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let draws = truncated_survival_posterior_draws(req.model, covariance_mode)?.ok_or_else(|| {
         SurvivalPredictError::UnsupportedConfiguration {
             reason: format!(
@@ -1605,7 +1667,7 @@ fn predict_survival_truncated_law_posterior_mean(
             ),
         }
     })?;
-    let (mut result, moments) = predict_survival_surfaces(
+    let (result, moments) = predict_survival_surfaces(
         SurvivalPredictRequest {
             with_uncertainty: false,
             estimand: SurvivalPredictEstimand::Plugin,
@@ -1618,17 +1680,16 @@ fn predict_survival_truncated_law_posterior_mean(
         "internal error: the truncated-law survival pass returned no posterior moments".to_string()
     })?;
     refuse_decreasing_survival(&result)?;
-    publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
-    Ok(result)
+    Ok((result, moments))
 }
 
-fn predict_survival_sigma_point_posterior_mean(
+fn survival_sigma_point_posterior_moments(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let (posterior_mean, active_covariance, cone_coords) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
-    let mut result = predict_survival(
+    let result = predict_survival(
         SurvivalPredictRequest {
             model: req.model,
             data: req.data,
@@ -1702,8 +1763,7 @@ fn predict_survival_sigma_point_posterior_mean(
         Ok(())
     })?;
 
-    publish_survival_posterior_moments(&mut result, &moments, req.with_uncertainty, covariance_mode)?;
-    Ok(result)
+    Ok((result, moments))
 }
 
 fn predict_competing_risks_with_posterior(
@@ -1711,16 +1771,20 @@ fn predict_competing_risks_with_posterior(
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<CompetingRisksPredictResult, SurvivalPredictError> {
     let posterior_mean_estimand = req.estimand == SurvivalPredictEstimand::PosteriorMean;
+    // The public posterior-mean point is always the conditional-posterior
+    // estimand. `covariance_mode` governs only the reported uncertainty,
+    // exactly as on the single-event and standard-family paths, so a request
+    // without uncertainty integrates the conditional law whatever mode it
+    // names, and a smoothing-corrected interval computes the conditional point
+    // once and the corrected second moments separately (gam#3421).
+    let covariance_mode = if req.with_uncertainty {
+        covariance_mode
+    } else {
+        SurvivalPredictionCovarianceMode::Conditional
+    };
     let (posterior_mean, active_covariance, cone_coords) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
-    // The public posterior-mean point is always the conditional-posterior
-    // estimand. A smoothing-corrected interval changes only its reported
-    // uncertainty, exactly as on the standard-family path. If corrected
-    // covariance becomes available for this model class, compute the
-    // conditional point once and the corrected second moments separately;
-    // never silently change the point estimand with the interval mode.
     let separate_conditional_point = posterior_mean_estimand
-        && req.with_uncertainty
         && covariance_mode == SurvivalPredictionCovarianceMode::SmoothingCorrected;
     let mut result = if separate_conditional_point {
         predict_competing_risks_with_posterior(
@@ -2082,54 +2146,125 @@ impl CompetingRisksPredictResult {
 
 /// Harrell's concordance index (C-index) of a survival risk score against
 /// held-out outcomes. A larger `risk[i]` must predict a SHORTER survival time
-/// (higher hazard). Over every orderable pair — pairs whose earlier observed
-/// time is a genuine event, so the failure ordering is observed — a pair is
-/// concordant when the earlier-failing subject carries the larger risk; equal
-/// risks score half credit. `C = (concordant + 0.5·tied) / comparable`.
-/// `C = 0.5` is random ranking, `C = 1.0` a perfect ordering.
+/// (higher hazard). A pair is comparable exactly when its failure ordering is
+/// observed: subject `a` had an event (`event[a] > 0.5`) and subject `b` was
+/// still at risk afterwards — either `time[b] > time[a]`, or `time[b] ==
+/// time[a]` with `b` censored (a censoring recorded at a death time happened
+/// after the death). Two events at the same time are NOT comparable: neither
+/// failed first, so the pair carries no ordering information. A comparable pair
+/// is concordant when the earlier-failing subject carries the larger risk;
+/// equal risks score half credit. `C = (concordant + 0.5·tied_risk) /
+/// comparable`. `C = 0.5` is random ranking, `C = 1.0` a perfect ordering.
 ///
-/// This is the standard discrimination metric (`survival::concordance`,
-/// `lifelines.utils.concordance_index`, scikit-survival `concordance_index_censored`).
+/// These are the pair rules of `survival::concordance`,
+/// `lifelines.utils.concordance_index` and scikit-survival
+/// `concordance_index_censored`.
+///
+/// Evaluated in `O(n log n)`: subjects are swept in descending time order one
+/// tie block at a time against a Fenwick tree of the risk ranks of every subject
+/// observed strictly later. A block's censored subjects enter the tree before
+/// its events are queried (they are comparable partners of those events) and
+/// its events enter after (tied events are not partners of each other). Counts
+/// are exact integers, so the value equals the pair-loop definition exactly.
+///
 /// `time`, `event` (1 = event, 0 = censored), and `risk` must share length `n`.
-/// Returns `None` if there are no comparable pairs (e.g. all rows censored).
+/// Returns `None` on a length mismatch, on any non-finite `time`, `event` or
+/// `risk` (the ordering of such a row is undefined), or when there are no
+/// comparable pairs
+/// (e.g. all rows censored).
 pub fn harrell_concordance(time: &[f64], event: &[f64], risk: &[f64]) -> Option<f64> {
     let n = time.len();
     if n != event.len() || n != risk.len() {
         return None;
     }
-    let mut comparable = 0.0_f64;
-    let mut concordant = 0.0_f64;
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let (early, late) = if time[i] < time[j] {
-                (i, j)
-            } else if time[j] < time[i] {
-                (j, i)
-            } else {
-                // Tied times are comparable only if both failed; such a pair is a
-                // pure tie (no strict outcome ordering).
-                if event[i] > 0.5 && event[j] > 0.5 {
-                    comparable += 1.0;
-                    concordant += 0.5;
-                }
-                continue;
-            };
-            if event[early] < 0.5 {
-                // The earlier subject was censored: the true ordering is unknown.
-                continue;
-            }
-            comparable += 1.0;
-            if risk[early] > risk[late] {
-                concordant += 1.0;
-            } else if risk[early] == risk[late] {
-                concordant += 0.5;
-            }
-        }
-    }
-    if comparable == 0.0 {
+    if time
+        .iter()
+        .chain(event)
+        .chain(risk)
+        .any(|value| !value.is_finite())
+    {
         return None;
     }
-    Some(concordant / comparable)
+    let mut levels = risk.to_vec();
+    levels.sort_by(f64::total_cmp);
+    levels.dedup();
+    let rank_of = |value: f64| levels.partition_point(|&level| level < value);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| time[a].total_cmp(&time[b]));
+
+    let mut later = RiskRankCounts::new(levels.len());
+    let mut comparable: u64 = 0;
+    // Twice the concordance numerator: 2 per concordant pair, 1 per risk tie.
+    let mut concordant_halves: u64 = 0;
+    let mut block_end = n;
+    while block_end > 0 {
+        let block_time = time[order[block_end - 1]];
+        let mut block_start = block_end - 1;
+        while block_start > 0 && time[order[block_start - 1]] == block_time {
+            block_start -= 1;
+        }
+        let block = &order[block_start..block_end];
+        for &row in block {
+            if event[row] <= 0.5 {
+                later.insert(rank_of(risk[row]));
+            }
+        }
+        for &row in block {
+            if event[row] > 0.5 {
+                let rank = rank_of(risk[row]);
+                let below = later.count_below(rank);
+                let tied = later.count_below(rank + 1) - below;
+                comparable += later.total;
+                concordant_halves += 2 * below + tied;
+            }
+        }
+        for &row in block {
+            if event[row] > 0.5 {
+                later.insert(rank_of(risk[row]));
+            }
+        }
+        block_end = block_start;
+    }
+    if comparable == 0 {
+        return None;
+    }
+    Some(concordant_halves as f64 / (2.0 * comparable as f64))
+}
+
+/// Fenwick (binary indexed) tree counting inserted risk ranks, for
+/// [`harrell_concordance`].
+struct RiskRankCounts {
+    tree: Vec<u64>,
+    total: u64,
+}
+
+impl RiskRankCounts {
+    fn new(levels: usize) -> Self {
+        Self {
+            tree: vec![0; levels + 1],
+            total: 0,
+        }
+    }
+
+    fn insert(&mut self, rank: usize) {
+        self.total += 1;
+        let mut node = rank + 1;
+        while node < self.tree.len() {
+            self.tree[node] += 1;
+            node += node & node.wrapping_neg();
+        }
+    }
+
+    /// Number of inserted entries whose rank is strictly below `rank`.
+    fn count_below(&self, rank: usize) -> u64 {
+        let mut node = rank;
+        let mut sum = 0;
+        while node > 0 {
+            sum += self.tree[node];
+            node &= node - 1;
+        }
+        sum
+    }
 }
 
 /// IPCW (inverse-probability-of-censoring-weighted) Brier score of a predicted
@@ -7499,6 +7634,91 @@ mod tests {
         assert_eq!(g.on_grid(&probe), mapped);
         assert_eq!(g.at(f64::NAN), 1.0);
         assert_eq!(g.at(f64::INFINITY), 0.0);
+    }
+
+    /// The pair-loop definition of Harrell's C, written independently of the
+    /// Fenwick sweep: a pair is comparable when one subject had an event and the
+    /// other was observed strictly later, or at the same time but censored.
+    fn harrell_concordance_by_pairs(time: &[f64], event: &[f64], risk: &[f64]) -> Option<f64> {
+        let mut comparable = 0.0_f64;
+        let mut concordant = 0.0_f64;
+        for i in 0..time.len() {
+            for j in 0..time.len() {
+                let i_fails_first = event[i] > 0.5
+                    && (time[j] > time[i] || (time[j] == time[i] && event[j] <= 0.5));
+                if !i_fails_first {
+                    continue;
+                }
+                comparable += 1.0;
+                if risk[i] > risk[j] {
+                    concordant += 1.0;
+                } else if risk[i] == risk[j] {
+                    concordant += 0.5;
+                }
+            }
+        }
+        if comparable > 0.0 {
+            Some(concordant / comparable)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn harrell_concordance_tie_rules_match_hand_count() {
+        // Tied block at t=2: two events (rows 1, 2) and one censoring (row 3).
+        // Comparable pairs (early, late): row 0 with all four later rows
+        // (risk 5 beats 4, 1, 3, 2: 4 concordant); rows 1 and 2 with the tied
+        // censoring row 3 (4>3 concordant, 1<3 discordant) and with row 4
+        // (4>2 concordant, 1<2 discordant). The tied event pair (1, 2) is not
+        // comparable, and row 3 (censored) orders nothing after it.
+        // C = (4 + 1 + 1) / (4 + 2 + 2) = 0.75.
+        let time = [1.0, 2.0, 2.0, 2.0, 3.0];
+        let event = [1.0, 1.0, 1.0, 0.0, 0.0];
+        let risk = [5.0, 4.0, 1.0, 3.0, 2.0];
+        assert_eq!(harrell_concordance(&time, &event, &risk), Some(0.75));
+
+        // Two events at the same time are not comparable: nothing is orderable.
+        assert_eq!(harrell_concordance(&[2.0, 2.0], &[1.0, 1.0], &[1.0, 0.0]), None);
+        // An event tied with a censoring is comparable; the censored subject
+        // outlived the death, so the larger risk on the event is concordant.
+        assert_eq!(harrell_concordance(&[2.0, 2.0], &[0.0, 1.0], &[1.0, 3.0]), Some(1.0));
+        // Equal risks score half credit.
+        assert_eq!(harrell_concordance(&[1.0, 2.0], &[1.0, 1.0], &[7.0, 7.0]), Some(0.5));
+        // All censored: no comparable pair.
+        assert_eq!(harrell_concordance(&[1.0, 2.0], &[0.0, 0.0], &[1.0, 2.0]), None);
+        // Non-finite inputs have no defined ordering.
+        assert_eq!(harrell_concordance(&[1.0, f64::NAN], &[1.0, 1.0], &[1.0, 2.0]), None);
+        assert_eq!(harrell_concordance(&[1.0, 2.0], &[1.0, 1.0], &[f64::NAN, 2.0]), None);
+        // Length mismatch.
+        assert_eq!(harrell_concordance(&[1.0, 2.0], &[1.0], &[1.0, 2.0]), None);
+    }
+
+    #[test]
+    fn harrell_concordance_sweep_equals_pair_definition_under_heavy_ties() {
+        // Coarse integer times and risks force many tied time blocks and tied
+        // risks; the O(n log n) sweep must reproduce the pair loop exactly.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |modulus: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % modulus
+        };
+        for trial in 0..200 {
+            let n = (next(40) + 1) as usize;
+            let time: Vec<f64> = (0..n).map(|_| (next(6) + 1) as f64).collect();
+            let event: Vec<f64> = (0..n)
+                .map(|_| if next(5) < 3 { 1.0 } else { 0.0 })
+                .collect();
+            let risk: Vec<f64> = (0..n).map(|_| next(5) as f64 - 2.0).collect();
+            let sweep = harrell_concordance(&time, &event, &risk);
+            let pairs = harrell_concordance_by_pairs(&time, &event, &risk);
+            // Both are one correctly rounded division of the same exact rational
+            // (the numerators are integer and half-integer counts), so they are
+            // bitwise equal, not merely close.
+            assert_eq!(sweep, pairs, "trial {trial}");
+        }
     }
 
     #[test]

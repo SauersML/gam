@@ -224,9 +224,37 @@ metric. Every loss is printed, and none is hidden or skipped.
   libraries are ok. A difference larger than 2 SE is a **LOSS** or a WIN.
   Anything smaller is "worse n.s." or "better n.s.". With a single seed there is
   no SE, so the sign alone decides, and the verdict says so.
+- **Coverage.** Calibration is judged on each library's mean coverage over the
+  paired seeds, `|mean cov - 0.95|`, not on per-seed `|cov - 0.95|`. One fit's
+  intervals move together with that fit's error, so even an exactly calibrated
+  interval scatters per seed, and a per-seed score would rank an interval that
+  over-covers every seed above it. Over-coverage is miscalibration, exactly
+  like under-coverage. Seed `s` contributes
+  `side_g (g_s - 0.95) - side_c (c_s - 0.95)`, with each side fixed at
+  `sign(mean - 0.95)`. These terms average to the mean-level difference, and
+  their spread gives its SE for the same 2 SE rule.
 - **Status.** If gamfit has fewer ok reps than the comparator in a cell, that is
   **LOSS(status)**. If the comparator reports a metric and gamfit does not, that
   is **LOSS(missing)**.
+
+## Predictive-interval coverage
+
+`conformal_coverage.py` is a separate scenario set. It measures how often each
+method's 90% predictive interval (`alpha = 0.1`) covers a fresh response,
+comparing pyGAM `prediction_intervals` with three gamfit routes: the posterior
+observation interval, exact full conformal (`training_data=`) and split
+conformal (`calibration=`). It covers six DGPs (correct, misspecified mean,
+heteroscedastic, heavy tails, binomial, Poisson) at n ∈ {30, 100, 1000}.
+
+```bash
+python -m bench.pygam_compare.conformal_coverage --reps 1000
+```
+
+It writes the table to `bench/pygam_audit/conformal_coverage.md`.
+The module docstring defines the DGPs, the width measure and the **nominal**
+band, `0.9 - 2 MCSE <= coverage <= 0.9 + 1/(n_cal + 1) + 2 MCSE`. The report
+ends with the cells where pyGAM misses that band and gamfit full conformal's
+verdict in each.
 
 ## Safety net, not a budget
 
