@@ -2584,6 +2584,7 @@ pub(crate) fn remove_atoms(
     term.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
     term.decoder_repulsion_gate = None;
     term.barrier_coactivation_gate = None;
+    term.decoder_incoherence_gate = None;
     term.streaming_gates_frozen = false;
     term.curvature_walk_report = None;
     term.dictionary_cocollapse_reseeds = 0;

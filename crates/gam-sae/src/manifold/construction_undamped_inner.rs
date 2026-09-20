@@ -52,13 +52,20 @@ impl SaeManifoldTerm {
     /// The list is exhaustive against its consumer by construction: this is the
     /// only producer, `assemble_arrow_schur_scaled`'s `if !streaming_gates_frozen`
     /// block is the only consumer, and a gate added to one without the other is a
-    /// gate whose frozen value is not the entry state's.
-    fn freeze_collapse_prevention_gates(&mut self) -> bool {
+    /// gate whose frozen value is not the entry state's. #3515 added the fourth,
+    /// the decoder-incoherence co-activation weights `W_jk`, which is why the
+    /// freeze needs the registry: the gate exists only for a registered
+    /// `DecoderIncoherence` penalty.
+    fn freeze_collapse_prevention_gates(
+        &mut self,
+        registry: Option<&AnalyticPenaltyRegistry>,
+    ) -> bool {
         let gates_were_frozen = self.streaming_gates_frozen;
         if !gates_were_frozen {
             self.refresh_decoder_repulsion_gate();
             self.refresh_barrier_coactivation_gate();
             self.refresh_amplitude_barrier_gate();
+            self.refresh_decoder_incoherence_gate(registry);
             self.streaming_gates_frozen = true;
         }
         gates_were_frozen
@@ -98,7 +105,7 @@ impl SaeManifoldTerm {
         // the pricing criterion leaves its gates declared on success and this
         // converge-only scope, with no priced value to declare them for, hands
         // back the gate state it was given.
-        let gates_were_frozen = self.freeze_collapse_prevention_gates();
+        let gates_were_frozen = self.freeze_collapse_prevention_gates(registry);
         let out = self.converge_inner_for_undamped_logdet_gate_frozen(
             target,
             rho,

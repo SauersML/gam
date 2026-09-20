@@ -680,6 +680,15 @@ pub struct SaeManifoldTerm {
     /// dictionary the discrete reseed owns, not this term). Transient: not part of
     /// the persisted term identity (Clone starts `None`, rebuilt next assembly).
     pub(crate) amplitude_barrier_gate: Option<f64>,
+    /// #3515 — the user `DecoderIncoherence` penalty's FROZEN routing coactivation
+    /// `W_jk = (1/n)·Σ_i a_ij·a_ik` (sparse `(j, k, W_jk)`, `j < k`, co-firing pairs
+    /// only), the analog of [`Self::barrier_coactivation_gate`] for that penalty.
+    /// Its β-gradient and PSD β-curvature read `W` as a constant, so the line-search
+    /// value must read the same `W` rather than re-derive it from the trial logits.
+    /// Refreshed at the same chokepoint as the other gates, and only when the
+    /// registry carries the penalty; `None` means no refresh ran (standalone calls
+    /// then read the live coactivation). Transient like the other gates.
+    pub(crate) decoder_incoherence_gate: Option<Vec<(usize, usize, f64)>>,
     /// #1801 — STREAMING gate-freeze flag. The collapse-prevention gates
     /// ([`Self::decoder_repulsion_gate`], [`Self::barrier_coactivation_gate`]) are
     /// GLOBAL dictionary properties: their per-pair strength `μ_jk` inverts the
@@ -871,6 +880,10 @@ impl Clone for SaeManifoldTerm {
             amplitude_barrier_gate: self
                 .streaming_gates_frozen
                 .then_some(self.amplitude_barrier_gate)
+                .flatten(),
+            decoder_incoherence_gate: self
+                .streaming_gates_frozen
+                .then(|| self.decoder_incoherence_gate.clone())
                 .flatten(),
             streaming_gates_frozen: self.streaming_gates_frozen,
             hybrid_split_report: self.hybrid_split_report.clone(),
