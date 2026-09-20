@@ -1560,10 +1560,10 @@ pub fn solve_dense_block_system(
 mod certified_inverse_tests {
     use super::{
         CertifiedSymmetricSolveError, certified_spd_factorize, certified_spd_inverse,
-        certified_symmetric_solve, positive_ulp, rank_certified_psd_pseudoinverse,
-        validate_finite_symmetric_matrix,
+        certified_symmetric_solve, certify_linear_system_residual, positive_ulp,
+        rank_certified_psd_pseudoinverse, validate_finite_symmetric_matrix,
     };
-    use ndarray::array;
+    use ndarray::{Array1, Array2, array};
 
     /// The symmetry allowance must be read at the scale the entry's
     /// accumulation ran at (Cauchy-Schwarz, `sqrt(A_ii*A_jj)`), not at the
