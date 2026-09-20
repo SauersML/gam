@@ -1796,11 +1796,69 @@ fn selected_gpu_consumers_cannot_retry_on_cpu_932() {
     let cache_source = include_str!("exact_eval_cache.rs");
     let dense_source = include_str!("row_primary_hessian.rs");
     let device_source = include_str!("gpu/row.rs");
+    let host_row_source = include_str!("../gpu_kernels/row_hessian_ops.rs");
 
+    // Every selected-GPU consumer, named by the operation it passes, and the
+    // file that owns its fail-closed contract.
+    // - axis_direction_search.rs owns two things:
+    //   - the joint-Hessian HVP/diagonal dispatches, including the raced HVP,
+    //     where a device executor error ends the race (gam#3024);
+    //   - the joint-gradient and dense cache-boundary adapters, which forward
+    //     their caller's label.
+    // - The host-resident row-Hessian matvec/diagonal dispatches go through
+    //   the one row-kernel decision in row_hessian_ops.rs (gam#3410). They
+    //   forward their caller's label, and nothing in the axis search launches
+    //   them directly.
+    let consumers = |source: &str| {
+        let mut labels: Vec<String> = source
+            .split("require_selected_gpu_result(")
+            .skip(1)
+            .map(|call| {
+                call.split(',')
+                    .next()
+                    .expect("operation argument")
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        labels.sort_unstable();
+        labels
+    };
     assert_eq!(
-        axis_source.matches("require_selected_gpu_result(").count(),
-        9,
-        "seven HVP/diagonal dispatches plus the joint-gradient and dense cache-boundary adapters must share the fail-closed contract"
+        consumers(axis_source),
+        [
+            "\"joint-Hessian HVP\"",
+            "\"joint-Hessian diagonal\"",
+            "\"raced joint-Hessian HVP\"",
+            "operation",
+            "operation",
+        ],
+        "every joint-Hessian dispatch and cache-boundary adapter must share the fail-closed contract"
+    );
+    assert_eq!(
+        consumers(host_row_source),
+        ["operation", "operation"],
+        "the host row-Hessian matvec and diagonal each own one fail-closed device executor"
+    );
+    assert!(!axis_source.contains("launch_row_hessian_matvec("));
+    assert!(!axis_source.contains("launch_row_hessian_diag("));
+    let mut host_row_consumers: Vec<&str> = axis_source
+        .split("row_hessian_ops::row_hessian_matvec(")
+        .chain(axis_source.split("row_hessian_ops::row_hessian_diag("))
+        .filter_map(|call| call.trim_start().strip_prefix('"'))
+        .map(|call| call.split('"').next().expect("operation label"))
+        .collect();
+    host_row_consumers.sort_unstable();
+    assert_eq!(
+        host_row_consumers,
+        [
+            "batched tiled row-Hessian matvec",
+            "host-pin row-Hessian diagonal",
+            "host-pin row-Hessian matvec",
+            "tiled row-Hessian diagonal",
+            "tiled row-Hessian matvec",
+        ],
+        "every host row-Hessian consumer must go through the measured row-kernel decision"
     );
     assert_eq!(
         workspace_source

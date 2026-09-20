@@ -6,7 +6,7 @@
 //! kills it.
 //!
 //! The original failure: `gam fit` on the n=30 wine fold (`family=gaussian`,
-//! 5 `s(., type=ps, knots=7, double_penalty=true)` smooths → `rho_dim=10`)
+//! 5 `s(., bs=ps, knots=7, double_penalty=true)` smooths → `rho_dim=10`)
 //! performed ~850,000 cost-only outer evaluations and never satisfied its
 //! stopping criterion. The inner P-IRLS converged instantly every time; the
 //! defect was purely in the outer smoothing-parameter optimizer's
@@ -53,11 +53,11 @@ fn build_data(n: usize, sigma: f64, seed: u64) -> gam::data::EncodedDataset {
 
 /// The exact wine_gamair Rust formula shape: 5 `ps` smooths, knots=7, double
 /// penalty on each (rho_dim = 10, p ≈ 51).
-const WINE_SHAPED_FORMULA: &str = "y ~ s(x0, type=ps, knots=7, double_penalty=true) \
-     + s(x1, type=ps, knots=7, double_penalty=true) \
-     + s(x2, type=ps, knots=7, double_penalty=true) \
-     + s(x3, type=ps, knots=7, double_penalty=true) \
-     + s(x4, type=ps, knots=7, double_penalty=true)";
+const WINE_SHAPED_FORMULA: &str = "y ~ s(x0, bs=ps, knots=7, double_penalty=true) \
+     + s(x1, bs=ps, knots=7, double_penalty=true) \
+     + s(x2, bs=ps, knots=7, double_penalty=true) \
+     + s(x3, bs=ps, knots=7, double_penalty=true) \
+     + s(x4, bs=ps, knots=7, double_penalty=true)";
 
 fn gaussian_cfg() -> FitConfig {
     FitConfig {

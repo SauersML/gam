@@ -715,7 +715,6 @@ fn the_inner_fit_never_exits_with_material_decrease_left_in_the_removed_span_276
         outcome_fit.termination,
         JointFitTermination::Stationary { .. }
             | JointFitTermination::NonFinitePreStep
-            | JointFitTermination::ObjectiveStall
             | JointFitTermination::ProximalCorrectionFailed
             | JointFitTermination::NoStrictDecrease
             | JointFitTermination::Frozen

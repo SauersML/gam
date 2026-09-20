@@ -96,12 +96,16 @@
 //! constant, `span F ⊋ span(φ¹ ⊗ φ²)` and the alternative is the full
 //! space. Per output dimension the statistic is exactly `F(k, ν)`,
 //! `ν = n − rank F`; the edge-level statistic is Wilks' `Λ` over all output
-//! dimensions jointly, whose exact null law is evaluated in closed form.
+//! dimensions jointly, whose exact null law is evaluated in closed form, or
+//! as a certified one-dimensional convolution when the output count and the
+//! interaction rank are both odd.
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use gam_linalg::roundoff::factor_singular_band;
-use gam_math::probability::fisher_snedecor_sf;
+use gam_math::probability::{fisher_snedecor_sf, ln_regularized_beta_lower_from_log_x};
+use gam_math::special::gauss_legendre;
+use statrs::function::beta::ln_beta;
 
 /// Which binding notion a carve report speaks about (see module docs).
 ///
@@ -278,13 +282,6 @@ pub enum BindingTestUnavailable {
     /// is a linear combination of the others in the residual), so Wilks'
     /// `Λ` is undefined.
     ResidualCovarianceRankDeficient { residual_df: usize, dims: usize },
-    /// Wilks' `Λ` with an odd number of outputs AND an odd interaction rank,
-    /// both at least 3: the one case whose exact null law is not a finite
-    /// sum of exponentials, which this module does not evaluate.
-    OddWilksParameters {
-        dims: usize,
-        interaction_rank: usize,
-    },
 }
 
 /// One output dimension's exact nested-model F test of the interaction:
@@ -1513,17 +1510,14 @@ fn wilks_test(
         .svd(false, false)
         .map_err(|e| format!("InteractionTest: canonical SVD failed: {e:?}"))?;
     let neg_log_lambda: f64 = canonical.iter().map(|&value| (value * value).ln_1p()).sum();
-    Ok(
-        wilks_survival(neg_log_lambda, dims, interaction_rank, residual_df).map(|p_value| {
-            EdgeBindingTest::Wilks(WilksTest {
-                neg_log_lambda,
-                dims,
-                interaction_rank,
-                residual_df,
-                p_value,
-            })
-        }),
-    )
+    let p_value = wilks_survival(neg_log_lambda, dims, interaction_rank, residual_df)?;
+    Ok(Ok(EdgeBindingTest::Wilks(WilksTest {
+        neg_log_lambda,
+        dims,
+        interaction_rank,
+        residual_df,
+        p_value,
+    })))
 }
 
 /// `P(−ln Λ > t)` for `Λ ~ Λ(D, ν, k) = Π_{i=1}^{D} Beta((ν−i+1)/2, k/2)`
@@ -1532,9 +1526,11 @@ fn wilks_test(
 /// Four parameter lines reduce to an F law exactly (Rao): `k = 1` and `D = 1`
 /// through `1/Λ − 1`, `k = 2` and `D = 2` through `1/√Λ − 1` (the `k` lines by
 /// the symmetry `Λ(D, ν, k) = Λ(k, ν + k − D, D)`). Otherwise `−ln Λ` is a sum
-/// of independent exponentials whenever `k` or `D` is even
-/// ([`wilks_exponential_rates`]), evaluated by [`hypoexponential_survival`].
-fn wilks_survival(t: f64, dims: usize, k: usize, nu: usize) -> Result<f64, BindingTestUnavailable> {
+/// of independent exponentials whenever `k` or `D` is even, evaluated by
+/// [`hypoexponential_survival`], and that sum plus one `−ln Beta(c, ½)` when
+/// both are odd ([`WilksLaw`]), evaluated by
+/// [`hypoexponential_log_beta_half_survival`].
+fn wilks_survival(t: f64, dims: usize, k: usize, nu: usize) -> Result<f64, String> {
     let (d, kf, nuf) = (dims as f64, k as f64, nu as f64);
     if k == 1 {
         return Ok(fisher_snedecor_sf(
@@ -1560,41 +1556,201 @@ fn wilks_survival(t: f64, dims: usize, k: usize, nu: usize) -> Result<f64, Bindi
             2.0 * (nuf - 1.0),
         ));
     }
-    let rates =
-        wilks_exponential_rates(dims, k, nu).ok_or(BindingTestUnavailable::OddWilksParameters {
-            dims,
-            interaction_rank: k,
-        })?;
-    Ok(hypoexponential_survival(&rates, t))
+    let law = WilksLaw::new(dims, k, nu);
+    match law.half_beta_shape {
+        None => Ok(hypoexponential_survival(&law.rates, t)),
+        Some(shape) => hypoexponential_log_beta_half_survival(&law.rates, shape, t),
+    }
 }
 
-/// Exponential rates whose independent sum is `−ln Λ(D, ν, k)`, with
-/// `a_i = (ν − i + 1)/2`:
+/// The null law of `−ln Λ(D, ν, k)` as an independent sum `H + L`: `H` a sum
+/// of exponentials with `rates`, and `L = −ln Beta(c, ½)` when
+/// `half_beta_shape = Some(c)`, which is exactly when `D` and `k` are both
+/// odd. With `a_i = (ν − i + 1)/2`:
 ///
 /// - `k` even: `−ln Beta(a, m) = Σ_{j<m} Exp(a + j)` for integer `m` (the
 ///   Mellin transforms agree: `E[Bˢ] = Π_{j<m} (a + j)/(a + j + s)`), so the
 ///   rates are `a_i + j`, `i = 1..D`, `j < k/2`.
-/// - `D` even: consecutive factors pair by Legendre duplication,
+/// - `k` odd: consecutive factors pair by Legendre duplication,
 ///   `Beta(α + ½, β)·Beta(α, β) = Beta(2α, 2β)²` in law, so with `α = a_{2l}`,
 ///   `β = k/2` each pair is `2·(−ln Beta(2a_{2l}, k)) = Σ_{j<k} Exp(a_{2l} + j/2)`.
+///   An odd `D` leaves `Beta(a_D, m + ½)`, `m = (k − 1)/2`, unpaired; the
+///   product rule `Beta(α, β)·Beta(α + β, γ) = Beta(α, β + γ)` in law splits
+///   it into `Beta(a_D, m)`, rates `a_D + j` for `j < m`, and `Beta(a_D + m, ½)`.
+struct WilksLaw {
+    rates: Vec<f64>,
+    half_beta_shape: Option<f64>,
+}
+
+impl WilksLaw {
+    fn new(dims: usize, k: usize, nu: usize) -> Self {
+        let a = |i: usize| (nu as f64 - i as f64 + 1.0) / 2.0;
+        if k % 2 == 0 {
+            return Self {
+                rates: (1..=dims)
+                    .flat_map(|i| (0..k / 2).map(move |j| a(i) + j as f64))
+                    .collect(),
+                half_beta_shape: None,
+            };
+        }
+        let mut rates: Vec<f64> = (1..=dims / 2)
+            .flat_map(|l| (0..k).map(move |j| a(2 * l) + 0.5 * j as f64))
+            .collect();
+        if dims % 2 == 0 {
+            return Self {
+                rates,
+                half_beta_shape: None,
+            };
+        }
+        let half_rank = (k - 1) / 2;
+        rates.extend((0..half_rank).map(|j| a(dims) + j as f64));
+        Self {
+            rates,
+            half_beta_shape: Some(a(dims) + half_rank as f64),
+        }
+    }
+}
+
+/// Gauss–Legendre order of each panel rule in
+/// [`hypoexponential_log_beta_half_survival`].
+const CONVOLUTION_PANEL_ORDER: usize = 16;
+
+/// Panel count at which [`hypoexponential_log_beta_half_survival`] refuses
+/// instead of returning an unconverged value.
+const CONVOLUTION_MAX_PANELS: usize = 1 << 12;
+
+/// One panel `[left, right]` of the convolution integral, priced by the panel
+/// rule on the panel and on its two halves. The halves' sum is kept; the
+/// difference is its indicator.
+struct ConvolutionPanel {
+    left: f64,
+    right: f64,
+    mass: f64,
+    gap: f64,
+}
+
+/// `P(H + L > t)` for independent `H = Σ_i Exp(rates[i])` (`rates` not empty)
+/// and `L = −ln B`, `B ~ Beta(c, ½)`.
 ///
-/// `None` when `D` and `k` are both odd.
-fn wilks_exponential_rates(dims: usize, k: usize, nu: usize) -> Option<Vec<f64>> {
-    let a = |i: usize| (nu as f64 - i as f64 + 1.0) / 2.0;
-    if k % 2 == 0 {
-        Some(
-            (1..=dims)
-                .flat_map(|i| (0..k / 2).map(move |j| a(i) + j as f64))
-                .collect(),
-        )
-    } else if dims % 2 == 0 {
-        Some(
-            (1..=dims / 2)
-                .flat_map(|l| (0..k).map(move |j| a(2 * l) + 0.5 * j as f64))
-                .collect(),
-        )
-    } else {
-        None
+/// Conditioning on `L`: `P(H + L > t) = P(L > t) + E[S_H(t − L); L ≤ t]`,
+/// with `P(L > t) = I_{e^{−t}}(c, ½)` and `S_H` the survival
+/// [`hypoexponential_survival`] evaluates. `L` has density
+/// `e^{−cs}(1 − e^{−s})^{−½}/B(c, ½)`, whose `s^{−½}` endpoint the substitution
+/// `s = r²` removes:
+///
+/// ```text
+/// E[S_H(t − L); L ≤ t] = (2/B(c, ½)) ∫_0^{√t} e^{−c r²} (r²/(1 − e^{−r²}))^{½} S_H(t − r²) dr.
+/// ```
+///
+/// `S_H` is entire (exponentials times polynomials) and `r²/(1 − e^{−r²})` is
+/// analytic on the real line, so the integrand is analytic on the closed
+/// interval, and it is positive, so the quadrature sums without cancellation.
+/// Every factor is a combination of `e^{±λ r²}` with `λ` at most `q`, the
+/// largest of `c` and the rates, so the first panels are at most `1/√q` wide and
+/// already resolve each factor at `r = 0`. Each panel carries the 16-point
+/// rule on its two halves, with the difference from the whole-panel rule as
+/// its indicator. For an integrand analytic around a panel, halving the panel
+/// scales the rule's error by roughly `2^{−32}`, so indicators summing below
+/// `√ε` of the survival leave an error far below `ε` of it. The panel with the
+/// largest indicator is bisected until then; exhausting
+/// [`CONVOLUTION_MAX_PANELS`] is a refusal, not a value. When the Chernoff
+/// bound `e^{−θt}·Π r_i/(r_i − θ)·B(c − θ, ½)/B(c, ½)`, at
+/// `θ = max(0, ρ − (R + 1)/t)` with `ρ` the smallest of `c` and the rates and
+/// `R` the rate count, underflows, the survival is below every positive double
+/// and is 0.
+fn hypoexponential_log_beta_half_survival(
+    rates: &[f64],
+    shape: f64,
+    t: f64,
+) -> Result<f64, String> {
+    if !(t > 0.0) {
+        return Ok(1.0);
+    }
+    if t == f64::INFINITY {
+        return Ok(0.0);
+    }
+    let log_beta = ln_beta(shape, 0.5);
+    let floor = rates.iter().fold(shape, |acc, &r| acc.min(r));
+    let theta = (floor - (rates.len() as f64 + 1.0) / t).max(0.0);
+    let log_bound = -theta * t - rates.iter().map(|&r| (-theta / r).ln_1p()).sum::<f64>()
+        + ln_beta(shape - theta, 0.5)
+        - log_beta;
+    if log_bound.exp() == 0.0 {
+        return Ok(0.0);
+    }
+    let tail = ln_regularized_beta_lower_from_log_x(-t, shape, 0.5).exp();
+    let log_scale = std::f64::consts::LN_2 - log_beta;
+    let integrand = |r: f64| {
+        let s = r * r;
+        let jacobian = if s == 0.0 {
+            1.0
+        } else {
+            (-s / (-s).exp_m1()).sqrt()
+        };
+        (log_scale - shape * s).exp() * jacobian * hypoexponential_survival(rates, t - s)
+    };
+    let (nodes, weights) = gauss_legendre(CONVOLUTION_PANEL_ORDER);
+    let rule = |left: f64, right: f64| {
+        let centre = 0.5 * (left + right);
+        let half = 0.5 * (right - left);
+        half * nodes
+            .iter()
+            .zip(&weights)
+            .map(|(node, weight)| weight * integrand(centre + half * node))
+            .sum::<f64>()
+    };
+    let priced = |left: f64, right: f64| -> Result<ConvolutionPanel, String> {
+        let middle = 0.5 * (left + right);
+        if !(middle > left && middle < right) {
+            return Err(format!(
+                "Wilks survival: convolution panel [{left}, {right}] cannot be halved at \
+                 t={t}, c={shape}"
+            ));
+        }
+        let mass = rule(left, middle) + rule(middle, right);
+        Ok(ConvolutionPanel {
+            left,
+            right,
+            mass,
+            gap: (rule(left, right) - mass).abs(),
+        })
+    };
+    let upper = t.sqrt();
+    let fastest = rates.iter().fold(shape, |acc, &r| acc.max(r));
+    // Equal panels no wider than `1/√q`, the last ending exactly at `√t`.
+    let count = (upper * fastest.sqrt()).ceil().max(1.0) as usize;
+    let cut = |i: usize| upper * i as f64 / count as f64;
+    let mut panels = (0..count)
+        .map(|i| priced(cut(i), cut(i + 1)))
+        .collect::<Result<Vec<_>, _>>()?;
+    loop {
+        let survival = tail + panels.iter().map(|panel| panel.mass).sum::<f64>();
+        let gap: f64 = panels.iter().map(|panel| panel.gap).sum();
+        if !survival.is_finite() {
+            return Err(format!(
+                "Wilks survival: non-finite convolution {survival} at t={t}, c={shape}"
+            ));
+        }
+        if gap <= f64::EPSILON.sqrt() * survival {
+            return Ok(survival);
+        }
+        if panels.len() >= CONVOLUTION_MAX_PANELS {
+            return Err(format!(
+                "Wilks survival did not converge within {CONVOLUTION_MAX_PANELS} panels at \
+                 t={t}, c={shape}: relative indicator {:.3e}",
+                gap / survival
+            ));
+        }
+        let mut worst = 0;
+        for (index, panel) in panels.iter().enumerate() {
+            if panel.gap > panels[worst].gap {
+                worst = index;
+            }
+        }
+        let panel = panels.swap_remove(worst);
+        let middle = 0.5 * (panel.left + panel.right);
+        panels.push(priced(panel.left, middle)?);
+        panels.push(priced(middle, panel.right)?);
     }
 }
 
@@ -2015,6 +2171,19 @@ mod tests {
         assert_null_calibration(1, 1, 3, 1, 0x3182_0004, "k=1, D=3");
     }
 
+    /// `k = 3`, `D = 3` (#3423): one pair plus the unpaired half-integer Beta
+    /// factor, through the certified convolution.
+    #[test]
+    fn interaction_test_is_calibrated_odd_outputs_odd_rank() {
+        assert_null_calibration(1, 3, 3, 3, 0x3423_0001, "k=3, D=3");
+    }
+
+    /// `k = 3`, `D = 5` (#3423): two pairs plus the unpaired factor.
+    #[test]
+    fn interaction_test_is_calibrated_five_outputs_odd_rank() {
+        assert_null_calibration(1, 3, 5, 3, 0x3423_0002, "k=3, D=5");
+    }
+
     /// The test reads only `span W` and `span F`: mixing either factor basis by
     /// an invertible map changes neither the rank nor any statistic.
     #[test]
@@ -2060,6 +2229,16 @@ mod tests {
         assert!(close(lhs.p_value(), rhs.p_value()), "{lhs:?} vs {rhs:?}");
     }
 
+    /// The rates of a Wilks law that is a pure sum of exponentials.
+    fn exponential_rates(dims: usize, k: usize, nu: usize) -> Vec<f64> {
+        let law = WilksLaw::new(dims, k, nu);
+        assert!(
+            law.half_beta_shape.is_none(),
+            "Λ({dims}, {nu}, {k}) is not a pure exponential sum"
+        );
+        law.rates
+    }
+
     /// `hypoexponential_survival` against closed forms. Each exponential law
     /// below equals a Beta or F law exactly, so the two evaluations may differ
     /// only by rounding: the uniformization sums at most a few hundred positive
@@ -2086,14 +2265,14 @@ mod tests {
             let nuf = nu as f64;
             let scale = t / 4.0;
             // D = 1, k = 6: F(6, ν) through 1/Λ − 1.
-            let rates = wilks_exponential_rates(1, 6, nu).expect("even k");
+            let rates = exponential_rates(1, 6, nu);
             close(
                 hypoexponential_survival(&rates, scale),
                 fisher_snedecor_sf(scale.exp_m1() * nuf / 6.0, 6.0, nuf),
                 "D=1",
             );
             // D = 2, k = 4: Rao through 1/√Λ − 1.
-            let rates = wilks_exponential_rates(2, 4, nu).expect("even k");
+            let rates = exponential_rates(2, 4, nu);
             close(
                 hypoexponential_survival(&rates, scale),
                 fisher_snedecor_sf(
@@ -2104,7 +2283,7 @@ mod tests {
                 "D=2",
             );
             // k = 2, D = 5: the symmetric Rao line.
-            let rates = wilks_exponential_rates(5, 2, nu).expect("even k");
+            let rates = exponential_rates(5, 2, nu);
             close(
                 hypoexponential_survival(&rates, scale),
                 fisher_snedecor_sf(
@@ -2115,15 +2294,15 @@ mod tests {
                 "k=2",
             );
             // k = 1, D = 4: the pairing against Hotelling's F(D, ν − D + 1).
-            let rates = wilks_exponential_rates(4, 1, nu).expect("even D");
+            let rates = exponential_rates(4, 1, nu);
             close(
                 hypoexponential_survival(&rates, scale),
                 fisher_snedecor_sf(scale.exp_m1() * (nuf - 3.0) / 4.0, 4.0, nuf - 3.0),
                 "k=1",
             );
             // D = 4, k = 3 pairing against its symmetric Λ(3, ν − 1, 4), even k.
-            let paired = wilks_exponential_rates(4, 3, nu).expect("even D");
-            let symmetric = wilks_exponential_rates(3, 4, nu - 1).expect("even k");
+            let paired = exponential_rates(4, 3, nu);
+            let symmetric = exponential_rates(3, 4, nu - 1);
             close(
                 hypoexponential_survival(&paired, scale),
                 hypoexponential_survival(&symmetric, scale),
@@ -2133,14 +2312,98 @@ mod tests {
         assert_eq!(hypoexponential_survival(&[1.0, 2.0], 0.0), 1.0);
         assert_eq!(hypoexponential_survival(&[1.0, 2.0], f64::INFINITY), 0.0);
         assert_eq!(hypoexponential_survival(&[1.0, 2.0], 1e6), 0.0);
-        assert!(wilks_exponential_rates(3, 3, 20).is_none());
-        assert_eq!(
-            wilks_survival(1.0, 3, 3, 20),
-            Err(BindingTestUnavailable::OddWilksParameters {
-                dims: 3,
-                interaction_rank: 3
-            })
-        );
+    }
+
+    /// #3423: the convolution for odd `D` and odd `k` against laws known in
+    /// closed form. On `D = 1` (odd `k`) and on `k = 1` (odd `D`) the same
+    /// split — pairs, `Beta(a_D, m)` as exponentials, and `Beta(a_D + m, ½)`
+    /// — must reproduce Snedecor's F exactly, and `Λ(3, ν, 5)` must equal its
+    /// symmetric `Λ(5, ν + 2, 3)`, which the split decomposes differently
+    /// (one pair and `Beta(a_3, 5/2)` against two pairs and `Beta(a'_5, 3/2)`).
+    /// The quadrature's error is far below its `√ε` indicator and the
+    /// uniformization's is `steps·ε`, so `1e-10` leaves two orders of margin;
+    /// `t` reaches survivals near `1e−14`, so the upper tail is checked
+    /// relatively, not only near one.
+    #[test]
+    fn odd_wilks_convolution_matches_closed_forms_3423() {
+        let close = |a: f64, b: f64, label: &str| {
+            assert!(
+                (a - b).abs() <= 1e-10 * a.abs().max(b.abs()),
+                "{label}: {a:e} vs {b:e}"
+            )
+        };
+        let convolved = |dims: usize, k: usize, nu: usize, t: f64| {
+            let law = WilksLaw::new(dims, k, nu);
+            let shape = law.half_beta_shape.expect("odd D and odd k");
+            hypoexponential_log_beta_half_survival(&law.rates, shape, t).expect("converges")
+        };
+        let nu = 23usize;
+        let nuf = nu as f64;
+        for &t in &[0.01, 0.1, 0.5, 1.0, 2.0, 3.5] {
+            for &k in &[3usize, 5, 7] {
+                let kf = k as f64;
+                close(
+                    convolved(1, k, nu, t),
+                    fisher_snedecor_sf(t.exp_m1() * nuf / kf, kf, nuf),
+                    &format!("D=1, k={k}, t={t}"),
+                );
+            }
+            for &dims in &[3usize, 5] {
+                let d = dims as f64;
+                close(
+                    convolved(dims, 1, nu, t),
+                    fisher_snedecor_sf(t.exp_m1() * (nuf - d + 1.0) / d, d, nuf - d + 1.0),
+                    &format!("k=1, D={dims}, t={t}"),
+                );
+            }
+            close(
+                wilks_survival(t, 3, 5, nu).expect("survival"),
+                wilks_survival(t, 5, 3, nu + 2).expect("survival"),
+                &format!("symmetry, t={t}"),
+            );
+        }
+        assert!(fisher_snedecor_sf(3.5_f64.exp_m1() * nuf / 7.0, 7.0, nuf) < 1e-12);
+        assert_eq!(convolved(3, 3, nu, 0.0), 1.0);
+        assert_eq!(convolved(3, 3, nu, f64::INFINITY), 0.0);
+        assert_eq!(convolved(3, 3, nu, 1e6), 0.0);
+    }
+
+    /// #3423: the whole odd-`D`, odd-`k` law through its Mellin transform,
+    /// `E[Λˢ] = Π_i Π_{j<s} (a_i + j)/(a_i + k/2 + j)`, which is
+    /// `1 − s·∫₀^∞ e^{−st}·P(−ln Λ > t) dt` for the survival evaluated here.
+    /// The integral is taken with `t = x²` (the survival is `1 − O(x^{Dk})`
+    /// at the origin) by 16-point panels of width `1/4` up to `x = 6`, past
+    /// which `e^{−st}` is below `ε`.
+    #[test]
+    fn odd_wilks_survival_matches_its_mellin_transform_3423() {
+        let (nodes, weights) = gauss_legendre(16);
+        for &(dims, k, nu) in &[(3usize, 3usize, 20usize), (3, 5, 9), (5, 3, 12)] {
+            for s in 1..=2usize {
+                let sf = s as f64;
+                let mut integral = 0.0;
+                for panel in 0..24 {
+                    let (left, right) = (0.25 * panel as f64, 0.25 * (panel + 1) as f64);
+                    let (centre, half) = (0.5 * (left + right), 0.5 * (right - left));
+                    for (node, weight) in nodes.iter().zip(&weights) {
+                        let x = centre + half * node;
+                        let t = x * x;
+                        let survival = wilks_survival(t, dims, k, nu).expect("survival");
+                        integral += half * weight * 2.0 * x * (-sf * t).exp() * survival;
+                    }
+                }
+                let exact: f64 = (1..=dims)
+                    .flat_map(|i| {
+                        let a = (nu as f64 - i as f64 + 1.0) / 2.0;
+                        (0..s).map(move |j| (a + j as f64) / (a + 0.5 * k as f64 + j as f64))
+                    })
+                    .product();
+                let transform = 1.0 - sf * integral;
+                assert!(
+                    (transform - exact).abs() <= 1e-10 * exact,
+                    "Λ({dims}, {nu}, {k}), s={s}: {transform:e} vs {exact:e}"
+                );
+            }
+        }
     }
 
     /// END-TO-END (#993 items 1+2+4): fit_tensor_surface recovers a

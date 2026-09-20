@@ -1978,7 +1978,7 @@ pub(crate) fn build_marginal_blockspec_bms(
         // marginal columns first and routes any cross-block alias drop into
         // slope.  Equal priorities (the previous default of 100/100)
         // produced a same-priority `hard_alias_pair` whenever a
-        // high-dimensional smooth — e.g. `s(x, type=duchon, centers>=6)`
+        // high-dimensional smooth — e.g. `s(x, bs=duchon, centers>=6)`
         // in the location block — accidentally spanned the slope basis
         // direction, leaving the joint Hessian with a structural null and
         // the spectral Newton solve refusing to step.  The values mirror
