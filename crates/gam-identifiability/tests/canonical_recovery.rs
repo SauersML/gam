@@ -65,6 +65,36 @@ fn canonical_dead_column_callback_block_is_not_reduced_1590() {
     assert_eq!(lifted, coefficients);
 }
 
+/// A plain single-channel block and a two-channel callback block are independent
+/// in the fitted geometry, where the plain block drives channel 0: its column
+/// is `(a_i, 0)` per observation `i`, and the callback's is
+/// `(a_{2i}, a_{2i+1})` on the first half of the observations and zero after.
+/// Packing only the callback's rows observation-interleaved (`i·k + r`) while
+/// the plain block sits at rows `0..n` makes the two columns identical, a false
+/// unpenalised null direction the MAP-uniqueness check then refuses.
+#[test]
+fn map_uniqueness_packs_plain_and_multi_channel_blocks_on_the_same_rows() {
+    let n = 64;
+    let a = Array1::linspace(-1.0_f64, 1.0, n);
+    let plain = spec_from_dense("plain", a.clone().insert_axis(ndarray::Axis(1)));
+    let mut full = Array2::<f64>::zeros((2 * n, 1));
+    for i in 0..n / 2 {
+        full[[i, 0]] = a[2 * i];
+        full[[n + i, 0]] = a[2 * i + 1];
+    }
+    let mut pair = spec_from_dense("pair", full.slice(s![..n, ..]).to_owned());
+    pair.jacobian_callback = Some(Arc::new(FixedTwoChannelJacobian { full, n }));
+    let canonical = canonicalize_for_identifiability_with_operating_scalars(
+        &[plain, pair],
+        &[CoefficientCoordinate::Spanning; 2],
+        None,
+    )
+    .expect("independent columns in the fitted geometry have a unique MAP");
+    assert!(canonical.used_channel_aware_audit);
+    assert_eq!(canonical.reduced_specs[0].design.ncols(), 1);
+    assert_eq!(canonical.reduced_specs[1].design.ncols(), 1);
+}
+
 struct FixedTwoChannelJacobian {
     full: Array2<f64>,
     n: usize,

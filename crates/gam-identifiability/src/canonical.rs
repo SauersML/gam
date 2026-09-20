@@ -1416,10 +1416,15 @@ fn canonicalize_for_identifiability_inner(
             match spec.effective_jacobian_at("canonicalize_rank_check", &state) {
                 Ok(j_b) => {
                     // j_b is channel-major (k_b·n_rows, p_b): row `r·n_rows + i`
-                    // carries observation `i`'s channel-`r` row Jacobian. A
-                    // single-channel plain block (k_b == 1) packs at its native
-                    // `n_rows` rows, as in the joint audit; a genuinely multi-
-                    // channel block keeps its own channel-major rows.
+                    // carries observation `i`'s channel-`r` row Jacobian. Every
+                    // block packs at these native rows, as in the joint audit, so
+                    // a row of `j_pre` is one (observation, channel) pair in every
+                    // column: a single-channel plain block fills channel 0 (rows
+                    // `..n_rows`) and a stacked block its `[entry; exit; deriv]`
+                    // bands. Interleaving only the multi-channel blocks (`i·k + r`)
+                    // would pair a plain block's observation `i` with another
+                    // observation's channel, and `JᵀJ` would carry cross-block
+                    // terms of a geometry the fit never sees.
                     let k_b = j_b.nrows() / n_rows;
                     if k_b <= 1 {
                         for i in 0..n_rows.min(r_map) {
@@ -1432,10 +1437,9 @@ fn canonicalize_for_identifiability_inner(
                         for r in 0..r_max {
                             let src_row_base = r * n_rows;
                             for i in 0..n_rows {
-                                let dst_row = i * k + r;
-                                let src_row = src_row_base + i;
+                                let row = src_row_base + i;
                                 for j in 0..p_b {
-                                    j_pre[[dst_row, col_off + j]] = j_b[[src_row, j]];
+                                    j_pre[[row, col_off + j]] = j_b[[row, j]];
                                 }
                             }
                         }
