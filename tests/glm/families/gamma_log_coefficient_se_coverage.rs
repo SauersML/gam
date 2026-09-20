@@ -43,7 +43,11 @@ fn true_eta(x: f64, z: f64) -> f64 {
 
 /// One replicate: simulate a Gamma(log) dataset, fit the parametric model, and
 /// return the per-eval-point `(η̂, SE(η̂))` on the shared frozen basis.
-fn fit_and_predict_eta(seed: u64, n: usize, eval: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
+///
+/// Every step must succeed. A three-coefficient Gamma(log) GLM on n = 250
+/// iid-uniform covariates with strictly positive responses has a unique finite
+/// MLE, so a refusal is an engine regression, not a replicate to drop.
+fn fit_and_predict_eta(seed: u64, n: usize, eval: &[(f64, f64)]) -> Vec<(f64, f64)> {
     let mut rng = StdRng::seed_from_u64(seed);
     let ux = Uniform::new(-1.0_f64, 1.0_f64).expect("uniform -1..1");
 
@@ -62,15 +66,17 @@ fn fit_and_predict_eta(seed: u64, n: usize, eval: &[(f64, f64)]) -> Option<Vec<(
         z.push(zi);
         y.push(yi);
     }
-    if !y.iter().all(|&v| v > 0.0 && v.is_finite()) {
-        return None;
-    }
+    assert!(
+        y.iter().all(|&v| v > 0.0 && v.is_finite()),
+        "seed {seed}: Gamma draws must be finite and positive"
+    );
 
     let headers: Vec<String> = ["y", "x", "z"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| StringRecord::from(vec![y[i].to_string(), x[i].to_string(), z[i].to_string()]))
         .collect();
-    let ds = encode_recordswith_inferred_schema(headers, rows).ok()?;
+    let ds = encode_recordswith_inferred_schema(headers, rows)
+        .unwrap_or_else(|e| panic!("seed {seed}: encode failed: {e}"));
     let col = ds.column_map();
     let x_idx = col["x"];
     let z_idx = col["z"];
@@ -79,8 +85,10 @@ fn fit_and_predict_eta(seed: u64, n: usize, eval: &[(f64, f64)]) -> Option<Vec<(
         family: Some("gamma".to_string()),
         ..FitConfig::default()
     };
-    let FitResult::Standard(fit) = fit_from_formula("y ~ x + z", &ds, &cfg).ok()? else {
-        return None;
+    let FitResult::Standard(fit) = fit_from_formula("y ~ x + z", &ds, &cfg)
+        .unwrap_or_else(|e| panic!("seed {seed}: parametric Gamma(log) fit refused: {e}"))
+    else {
+        panic!("seed {seed}: parametric Gamma(log) fit must be a Standard fit");
     };
 
     // Build gam's frozen design at the fixed evaluation points (log link: η = Xβ).
@@ -90,7 +98,8 @@ fn fit_and_predict_eta(seed: u64, n: usize, eval: &[(f64, f64)]) -> Option<Vec<(
         grid[[i, x_idx]] = xi;
         grid[[i, z_idx]] = zi;
     }
-    let design = build_term_collection_design(grid.view(), &fit.resolvedspec).ok()?;
+    let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+        .unwrap_or_else(|e| panic!("seed {seed}: eval design failed: {e:?}"));
     let dense = design.design.to_dense();
 
     let gamma_log = LikelihoodSpec::new(
@@ -115,11 +124,11 @@ fn fit_and_predict_eta(seed: u64, n: usize, eval: &[(f64, f64)]) -> Option<Vec<(
             ..PredictUncertaintyOptions::default()
         },
     )
-    .ok()?;
+    .unwrap_or_else(|e| panic!("seed {seed}: prediction with uncertainty failed: {e:?}"));
 
     let eta_hat = pred.eta.to_vec();
     let eta_se = pred.eta_standard_error.to_vec();
-    Some(eta_hat.into_iter().zip(eta_se).collect())
+    eta_hat.into_iter().zip(eta_se).collect()
 }
 
 #[test]
@@ -146,20 +155,19 @@ fn gamma_log_eta_wald_intervals_have_nominal_coverage() {
 
     let mut covered = 0usize;
     let mut total = 0usize;
-    let mut usable_replicates = 0usize;
 
     for r in 0..replicates {
         // Distinct, well-separated seeds per replicate.
         let seed = 0x5eed_0000u64 + (r as u64) * 2_654_435_761;
-        let Some(results) = fit_and_predict_eta(seed, n, &eval) else {
-            continue;
-        };
-        usable_replicates += 1;
+        let results = fit_and_predict_eta(seed, n, &eval);
         for (i, &(xi, zi)) in eval.iter().enumerate() {
             let (eta_hat, se) = results[i];
-            if !(se > 0.0 && se.is_finite() && eta_hat.is_finite()) {
-                continue;
-            }
+            // Every eval point has positive leverage under a full-rank
+            // three-column design, so SE(η̂) is strictly positive and finite.
+            assert!(
+                se > 0.0 && se.is_finite() && eta_hat.is_finite(),
+                "replicate {r} eval ({xi}, {zi}): eta_hat={eta_hat} se={se} must be finite with se > 0"
+            );
             let truth = true_eta(xi, zi);
             let lo = eta_hat - z975 * se;
             let hi = eta_hat + z975 * se;
@@ -170,12 +178,7 @@ fn gamma_log_eta_wald_intervals_have_nominal_coverage() {
         }
     }
 
-    assert!(
-        usable_replicates >= replicates * 9 / 10,
-        "too many replicates failed to fit ({usable_replicates}/{replicates}); \
-         coverage estimate would be unreliable"
-    );
-    assert!(total > 0, "no usable coverage trials");
+    assert_eq!(total, replicates * eval.len());
 
     let coverage = covered as f64 / total as f64;
 
@@ -186,7 +189,7 @@ fn gamma_log_eta_wald_intervals_have_nominal_coverage() {
     let buggy_coverage = 2.0 * gam_math::probability::normal_cdf(shrink * z975) - 1.0;
 
     eprintln!(
-        "gamma(log) η Wald coverage: replicates={usable_replicates} trials={total} \
+        "gamma(log) η Wald coverage: replicates={replicates} trials={total} \
          empirical={coverage:.4} (nominal 0.95; #679 double-count would give \
          ~{buggy_coverage:.4})"
     );
