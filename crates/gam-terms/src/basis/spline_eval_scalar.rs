@@ -1187,7 +1187,15 @@ mod ispline_exterior_derivative_2695_tests {
         let growth = gam_linalg::roundoff::accumulation_growth(6 * bs_degree + db.ncols() + 1);
         let mut any_positive = false;
         for (row, &x) in grid.iter().enumerate() {
-            let magnitude: f64 = db.row(row).iter().map(|v| v.abs()).sum();
+            // Each `B′_m = k·(B_{m,k−1}/Δ_m − B_{m+1,k−1}/Δ_{m+1})` is itself a
+            // difference, so its evaluation error scales with its two terms,
+            // not with `|B′_m|`. Summed over m those terms are `2·Σ M ≤ k·Σ|B′|`:
+            // at most `k` M-splines are non-zero at x, and the total variation
+            // `Σ|B′|` of the M-sequence, which starts and ends at zero, is at
+            // least twice its maximum. So `k·Σ|B′|` bounds the magnitude both
+            // the suffix sum's accumulation and every term's evaluation round.
+            let magnitude: f64 =
+                bs_degree as f64 * db.row(row).iter().map(|v| v.abs()).sum::<f64>();
             let mut running = 0.0_f64;
             for j in (1..db.ncols()).rev() {
                 running += db[[row, j]];

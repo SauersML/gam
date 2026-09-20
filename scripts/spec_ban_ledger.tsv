@@ -52,13 +52,10 @@ magic	crates/gam-models/src/inference/saved_summary.rs	< -1e-6	https://github.co
 magic	crates/gam-models/src/inference/saved_summary.rs	> 1e-6	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/latent_outer.rs	> 1.0e-6	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/latent_outer.rs	> 1.0e-6	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/survival/construction.rs	< -1e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/construction.rs	< 1e-15	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/construction.rs	< 1e-15	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/construction.rs	< 1e-15	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/construction.rs	< 1e-8	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/survival/construction.rs	> 1e-15	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/survival/construction.rs	> 1e-15	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/latent/survival/mod.rs	<= 1e-15	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/marginal_slope/feasibility.rs	> 1e-24	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/marginal_slope/fit_entry.rs	<= 1e-10	https://github.com/SauersML/gam/issues/2469
