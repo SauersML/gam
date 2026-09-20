@@ -4672,5 +4672,80 @@
     },
     "reason": "gam#3018: CostStallGuard takes each sample's evaluation resolution in a StallSample (sample_resolution over #3186's outer_objective_band) instead of a band staged beside it, so objective_band and stage_objective_band have no caller; observe_second_order folds into observe(StallSample, predicted_decrease), whose sample carries the curvature verdict it used to take.",
     "evidence": "public_api_census.py with this entry passed at base 94e6a59c5b (13652 public function declarations before, 13669 after); the tip check reruns it at this base. bridges.rs declares none of the three names in the landing tree (git grep -w). Gate on the landing tree (gate5, acn112, base 94e6a59c5b): workspace lib (ban scanner) and workspace check green; gam-solve 2101 of 2104 distinct tests pass, and the 3 reds also fail at base; the gam-models separation, multinomial and stall receipts pass 63 of 67, and the 4 reds also fail at base with the same messages."
+  },
+  {
+    "base": "96a81f3bca96c060ec79f9c0d52158e9e2389ed5",
+    "removed": {
+      "crates/gam-sae/src/manifold/tests.rs::assignment_logit_step_cap_bounds_single_iteration_gate_motion": 1
+    },
+    "reason": "#2902: the test pinned SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS, a +-4 tau hand box on each accepted Newton step of the assignment logits (SPEC 18-22). The cap is deleted (the Armijo line search on the realised objective globalises the step), so the test that asserted the clamp retires with it.",
+    "evidence": "Replaced by manifold::tests::assignment_logit_newton_step_is_realised_unboxed, which asserts the realised within-row logit move equals step_size * delta for a 1e3 tau raw delta; it fails on main f4db2a2b (the cap realises 4 tau instead of 500 tau) and passes on this branch."
+  },
+  {
+    "base": "f9f0a6e6ecd0b6c3306926064d7d48ecc86219fa",
+    "removed": {
+      "crates/gam-solve/src/reml/per_atom_efs.rs::sanitize_step": 1
+    },
+    "reason": "#2902: the per-atom EFS primary boxed each coordinate's log-lambda step to +-5 (PER_ATOM_MAX_STEP), stopped halving after a fixed 8 (PER_ATOM_MAX_BACKTRACK), accepted cost increases up to 1e-12 relative (PER_ATOM_COST_DESCENT_TOL), and zeroed non-finite step components (sanitize_step) so the infinity-norm test could certify an unresolved coordinate (SPEC 18-22). The step is now taken as eval_efs produced it; halving runs while 2^-k*|step|_inf >= tolerance; acceptance uses the two costs' rounding bands gamma_1*(|f|+|f'|); finite_step refuses a non-finite component.",
+    "evidence": "git grep finds no remaining use of the three constants or sanitize_step. New tests in crates/gam-solve/src/reml/per_atom_efs.rs: decoupled_step_is_realised_without_a_per_coordinate_box (2 iterations; main 5), backtracking_halves_until_the_step_is_unresolvable (alpha 2^-9; main stalls), backtracking_refuses_a_resolvable_cost_increase (main accepts +5e-13), non_finite_decoupled_step_is_refused_not_zeroed (main reports converged) -- all four fail on main and pass on the branch. cargo test -p gam-solve --lib -- rho_optimizer reml: 968 passed, 0 failed."
+  },
+  {
+    "base": "da88d1a69574d571d8439ccc1c978bf483b0b225",
+    "removed": {
+      "crates/gam-solve/src/inference/residual_factor.rs::bic_penalized_log_likelihood": 1
+    },
+    "reason": "#2901/#2902 (lane bic-removal, SPEC R11/R18/R23): the structured residual model's BIC rank ladder is replaced by the Laplace marginal likelihood of every identifiable rank (residual_factor/evidence.rs). The ladder's alternating fixed-rank fit (fit_fixed_rank with its ALTERNATION_MAX_SWEEPS cap and the DIAGONAL_REL_FLOOR / SCALE_REL_FLOOR clamps), its BIC scorer (gaussian_bic_log_likelihood[_with_band], bic_penalized_log_likelihood) and its moment helpers (column_variances, scaled_second_moment[_chunk], factor_coordinates, moving_average_3, is_finite) have no remaining caller. The tests of the removed internals (hoisted_gram_matches_naive_per_row_rebuild with its naive_* oracles, occupancy_scale_improves_second_moment_reconstruction) go with them; evidence_ladder_prefers_planted_rank_one is superseded by evidence_prefers_planted_rank_one on the same planted DGP.",
+    "evidence": "Replacement: evidence::fit_rank and StructuredResidualModel::log_evidence in crates/gam-solve/src/inference/residual_factor*. The only external reader of bic_penalized_log_likelihood (gam-sae fit_entry.rs StructuredResidualPassDiagnostic and its pyffi dict key) now reads log_evidence. cargo test -p gam-solve --lib residual_factor: 9/9 pass, including the null (rank 0 on three seeds, p = 6) and the planted rank-1 and rank-2 recoveries."
+  },
+  {
+    "base": "fd03e8ce9d4971a33c568de620d551a50ed505f5",
+    "removed": {
+      "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs::with_flex_third_jet_arena": 1
+    },
+    "reason": "#3266: the survival FLEX jet arenas move out of two per-worker thread-locals into one fit-owned GovernedScratchPool<DynamicJetArena>, the SurvivalMarginalSlopeFamily field flex_jet_arenas made by new_flex_jet_arena_pool on the process MemoryGovernor. This is the survival twin of the BMS scratch fix a6d77058e6 (#2989). Each thread-local kept its worker's largest arena for the life of the process, where no ledger saw it. The two helpers become one method, SurvivalMarginalSlopeFamily::with_flex_jet_arena, which checks an arena out of the family's pool, resets it and checks it back in. An idle arena stays only while the governor admits its retained bytes, and the pool drops with the fit's families. Every caller now calls the method: the four in contracted.rs, the two timepoint builders in flex_jet.rs and three flex_jet tests. The statics FLEX_THIRD_JET_ARENA and FLEX_TIMEPOINT_JET_ARENA are deleted with the helpers.",
+    "evidence": "At this base, public_api_census.py with the landing commit as head reports exactly this identity. git grep -w with_flex_third_jet_arena finds 0 hits under crates, src or tests in the head tree. Its replacement, SurvivalMarginalSlopeFamily::with_flex_jet_arena, is declared in flex_jet.rs. Gate direct-dy6-w2smb-3266-g4.log (acl42) runs flex_jet_arenas_are_charged_and_end_with_the_family_3266 and the flex third/fourth/fifth contraction witnesses through it."
+  },
+  {
+    "base": "a924471b61fe2b7ab2d27d1d4c9c63d7bfc936b0",
+    "removed": {
+      "crates/gam-math/src/bivariate_normal.rs::bivariate_normal_cdf_with_complement_bounded": 1
+    },
+    "reason": "#3253: one route for Φ₂. bivariate_normal_cdf_with_complement now evaluates the apex tree and returns its BoundedProbability, so the separate bounded entry is the same function under a second name and is deleted. Its callers (gaussian_activation, the bivariate normal tests, positive_form_tests) call bivariate_normal_cdf_with_complement.",
+    "evidence": "Gate dy5 w2slb-bvn-g1 at 94e6a59c5b (direct-dy5-w2slb-bvn-g1.log): the census lists exactly this removal, 13652 -> 13651 public function declarations. In the landing tree the name occurs 0 times (git grep -w -c). Final gate dy5 w2slb-bvn-g5 at 96a81f3bca (tree 0a497192f7): census 0 with this entry."
+  },
+  {
+    "base": "11e49efecf7669ee10f880fa2801d312aa4acfe0",
+    "removed": {
+      "crates/gam-models/src/gamlss/binomial/location_scale.rs::dense_block_designs": 1,
+      "crates/gam-models/src/gamlss/binomial/location_scale.rs::dense_block_designs_fromspecs": 1,
+      "crates/gam-models/src/gamlss/binomial/location_scale.rs::exact_newton_block_diagonal_hessians_from_design_matrices": 1,
+      "crates/gam-models/src/gamlss/binomial/wiggle.rs::assemble_block_diagonals": 1,
+      "crates/gam-models/src/gamlss/binomial/wiggle.rs::dense_block_designs_fromspecs": 1,
+      "crates/gam-models/src/gamlss/gaussian/wiggle.rs::dense_block_designs_fromspecs": 1,
+      "crates/gam-models/src/gamlss/tests_wiggle_ls.rs::nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_are_present": 1
+    },
+    "reason": "#3015: every location-scale family resolves the designs of its exact joint calculus through one rule, exact_joint_locscale_block_designs, which makes the specs it is handed authoritative: the identifiability audit can drop columns and the solve then runs in the specs' coordinates. The binomial location-scale family's dense_block_designs/dense_block_designs_fromspecs and the dense_block_designs_fromspecs of the binomial and Gaussian location-scale wiggle families were that rule's two halves in each family, with the stored pre-audit design read first; the shared rule replaces them. The binomial families' evaluate() returns NaturalDiagonal working sets (row score and within-block curvature, contracted by the caller with the designs it solves on), so exact_newton_block_diagonal_hessians_from_design_matrices and the wiggle family's assemble_block_diagonals, which built those blocks from the stored designs, have no caller. The test nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_are_present asserted the retired representation; it is restated as nonwiggle_family_evaluate_block_curvature_is_the_joint_hessians_principal_block, and the_binomial_location_scale_family_computes_on_the_specs_it_is_handed_3015 pins the reduced-width contract.",
+    "evidence": "Lane gate ls-surv (acn112 60-63). Lane commit c93dda4199 on 700c8e6300: source_removal_guard.py and public_api_census.py name exactly these removals without this entry; cargo check --workspace --all-targets (root ban scanner, 0 rows) and cargo check -p gam-pyffi --all-targets exit 0. Each of three mutants (surv-ls-lead's i3015-mut-all, i3015-mut-owned and i3015-mut-eval patches: the stored designs first in exact_joint_locscale_block_designs, the stored designs first in exact_joint_block_designs_owned, and evaluate() building ExactNewton blocks from the stored designs) fails the_binomial_location_scale_family_computes_on_the_specs_it_is_handed_3015. Re-run at base 990d8e0b93c55f834d5b27a7aa69487c3e2096ae: the guards pass with this entry, and git grep -w finds no caller of a removed item; the remaining same-name hits are the Gaussian and binomial wiggle families' own dense_block_designs (a different item, kept for their spec-less per-block hook) and error-message strings in gamlss/errors.rs."
+  },
+  {
+    "base": "135c578e1613f68909f5d8a2504044bcfadec474",
+    "removed": {
+      "crates/gam-model-kernels/src/scale_design.rs::build_scale_deviation_transform": 1,
+      "crates/gam-model-kernels/src/scale_design.rs::build_scale_deviation_transform_design": 1,
+      "crates/gam-models/src/gamlss/builders.rs::identified_binomial_log_sigma_design": 1,
+      "crates/gam-models/src/gamlss/builders.rs::prepared_gaussian_log_sigma_design": 1
+    },
+    "reason": "#3015: no location-scale family residualizes its log-sigma design. location_scale_log_sigma_design (the raw noise design, row-checked) replaces prepared_gaussian_log_sigma_design for Gaussian and identified_binomial_log_sigma_design for binomial: the binomial likelihood sees the blocks only through q = -eta_t*exp(-eta_sigma), whose tangent null space is {d eta_t = eta_t * d eta_sigma}, so a log-sigma column the threshold spans is identified wherever the threshold varies, and residualizing it erased that scale effect before the audit dropped the zeroed column. The saved-model builder no longer derives a transform (LocationScaleResponse::Binomial carries only its link), so the transform-fitting route in gam-model-kernels scale_design.rs (build_scale_deviation_transform, build_scale_deviation_transform_design, build_scale_deviation_transform_impl, solve_scale_projection, build_weighted_primary_design, choose_scale_projection_ridge_alpha, SCALE_PROJECTION_REPLAY_RCOND_FLOOR) has no caller and is deleted; saved models that carry a transform still replay it through scale_transform_from_payload and build_scale_deviation_operator. The three tests of the deleted fitting code go with it; scale_transform_payload_round_trips_alpha is restated on a hand-built transform as scale_transform_payload_round_trips_every_field.",
+    "evidence": "Lane gate ls-surv (acn112 60-63). Lane commit c14fde8317 on c93dda4199: the guards name exactly these removals without this entry; cargo check --workspace --all-targets (root ban scanner, 0 rows) and the gam-pyffi check exit 0. Lane probe on gamfit's #3015 truth (log-sigma slope 0.3 on x3, which the threshold's duchon(x2, x3) spans): the fitted slope is 0.257 +- 0.059 at n = 2000 and 0.277 +- 0.029 at n = 20000; the residualized design zeroed and dropped that column (log-likelihood -11782.10 against -11738.08 at n = 20000). a_saved_scale_transform_replays_its_noise_design_bit_for_bit pins the replay of a saved transform. Re-run at base ac93f7247f402591f76e040bd2bf94342ee753e4: the guards pass with this entry and git grep -w finds none of the removed names under crates/."
+  },
+  {
+    "base": "fc7e17b7b3644b88ef26d2de092a186b5d5a3087",
+    "removed": {
+      "crates/gam-predict/src/lib.rs::family_response_variance": 1,
+      "crates/gam-predict/src/interval_policy.rs::response_support": 1,
+      "crates/gam-spec/src/lib.rs::response_support_bounds": 1
+    },
+    "reason": "#3140: family_predictive_variance replaces family_response_variance (the total predictive variance as a sum of non-negative terms, no floored m(1-m) - v), and the observation-band support clamp is deleted from both band drivers, which leaves ResponseBounds::response_support and ResponseFamily::response_support_bounds without a reader.",
+    "evidence": "git grep at 4d529db085e4eb5925afb3057c584afeab57b2dd: family_response_variance's only callers are the six skew arms of family_observation_band and the conformal predictive_standard_error in crates/gam-predict/src/lib.rs; response_support's only callers are the two band clamps at crates/gam-predict/src/lib.rs:2328 and :2651; response_support_bounds's only callers are response_support and its three unit tests in crates/gam-spec/src/lib.rs. The landing tree names none of the three."
   }
 ]

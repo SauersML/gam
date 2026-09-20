@@ -3509,6 +3509,7 @@ fn assert_production_kappa_route_psi_gradient_matches_its_value(
         family,
         &fit_opts,
         &kappa_options,
+        None,
     )
     .unwrap_or_else(|e| panic!("{label}: incumbent failed: {e:?}"))
     else {
@@ -3732,12 +3733,12 @@ fn iso_kappa_gradient_is_certified_six_e_folds_past_the_box_2461() {
 /// Why this direction is the one worth pinning. Every rail path in
 /// `rho_optimizer::run` decides by asking whether `ĉ = −e^ρ·∂V/∂ρ` is CONSTANT
 /// over a probe run (`try_certify_asymptote_rail` #2348 Inc 1,
-/// `try_tail_snap_to_rail`, `detect_wrong_rail_pullback` #2392). That law is a
+/// `detect_wrong_rail_pullback` #2392). That law is a
 /// statement about a REML/LAML criterion, whose λ=∞ face gives
 /// `∂V/∂ρ = O(e^{−ρ})`. A ρ-prior whose gradient survives into the tail makes
 /// `ĉ` divergent and no coordinate can ever be certified at an asymptote — one
-/// `Default` disabled the face certificate, the tail snap, AND the pullback
-/// that repairs a coordinate stuck on the wrong bound.
+/// `Default` disabled the face certificate AND the pullback that repairs a
+/// coordinate stuck on the wrong bound.
 ///
 /// Measured under the fixed default (same fixture, same ladder, A10):
 ///

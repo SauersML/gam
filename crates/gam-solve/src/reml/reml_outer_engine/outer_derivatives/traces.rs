@@ -357,16 +357,15 @@ pub(crate) fn trace_logdet_hessian_cross_dense_drift(
     }
 }
 
+/// Every logdet cross trace over the ρ drifts `rho_drifts` (in order) followed
+/// by the ext drifts, through [`DenseSpectralOperator::trace_logdet_hessian_crosses`].
 pub(crate) fn trace_logdet_hessian_crosses_dense_spectral_drifts(
     dense_hop: &DenseSpectralOperator,
-    dense_drifts: &[&Array2<f64>],
+    rho_drifts: Vec<EigenbasisDrift<'_>>,
     ext_drifts: &[DriftDerivResult],
 ) -> Array2<f64> {
-    let total = dense_drifts.len() + ext_drifts.len();
-    let mut rotated = Vec::with_capacity(total);
-    for &matrix in dense_drifts {
-        rotated.push(dense_hop.rotate_to_eigenbasis(matrix));
-    }
+    let mut drifts = rho_drifts;
+    drifts.reserve(ext_drifts.len());
 
     // Batch the projected_operator calls for implicit operator drifts so the
     // chunked design sweep (kernel scalars + GEMMs) is traversed once and
@@ -395,8 +394,10 @@ pub(crate) fn trace_logdet_hessian_crosses_dense_spectral_drifts(
         }
     }
     for r in ext_rotated {
-        rotated.push(r.expect("every ext drift contributes a rotation"));
+        drifts.push(EigenbasisDrift::Rotated(
+            r.expect("every ext drift contributes a rotation"),
+        ));
     }
 
-    dense_hop.trace_logdet_hessian_crosses_rotated(&rotated)
+    dense_hop.trace_logdet_hessian_crosses(drifts)
 }

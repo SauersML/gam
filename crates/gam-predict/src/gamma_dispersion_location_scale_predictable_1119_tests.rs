@@ -543,18 +543,19 @@ fn gamma_dispersion_posterior_mean_observation_band_is_per_row_not_scalar() {
     //     The error shrinks monotonically in k, so across k ≳ 1.35 it stays
     //     under ~0.5% -- an order of magnitude inside the 5% bar.
     //
-    //     V is reconstructed exactly as the band builds it. `observation_noise`
-    //     returns √(integrated_response_variance), the SAME array the band
-    //     consumes as `response_var`, and the band lifts it by the law of total
-    //     variance (Gamma: (m² + v)/ν = plug + v/ν) before adding Var(μ̂):
-    //         V = SE² + (σ² + SE²/ν),   ν recovered per row from σ = μ/√ν.
-    //     Both SE-dependent terms are O(SE²/σ²) here, so the assertion is
-    //     driven by the band's SHAPE, which is the per-row wiring under test.
+    //     V is reconstructed as the band builds it. `observation_noise` returns
+    //     √(integrated_response_variance), the SAME array the band consumes as
+    //     `E[Var(Y | μ, φ)]`, already integrated over the joint posterior, so the
+    //     law of total variance adds only Var(μ) (#3140):
+    //         V = Var(μ) + σ².
+    //     Var(μ) is read here as the delta-method SE², which differs from the
+    //     band's log-normal posterior variance by O(SE⁴); the SE term is
+    //     O(SE²/σ²) of V here, so the assertion is driven by the band's SHAPE,
+    //     which is the per-row wiring under test.
     for i in 0..grid_n {
         let sigma = per_row_noise[i];
         let v = mean_se[i] * mean_se[i];
-        let nu = (pm.mean[i] / sigma.max(1e-12)).powi(2);
-        let total_var = v + sigma * sigma + v / nu.max(1e-12);
+        let total_var = v + sigma * sigma;
         let k = (pm.mean[i] * pm.mean[i] / total_var.max(1e-30)).max(1e-6);
         // Wilson–Hilferty: Q_k/k ≈ (1 − 1/(9k) + z/(3√k))³.
         let wh = 1.0 - 1.0 / (9.0 * k) + z / (3.0 * k.sqrt());
