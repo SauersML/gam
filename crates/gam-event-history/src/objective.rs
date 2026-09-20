@@ -3,6 +3,16 @@ use super::*;
 use crate::scalar::{Rows, TANGENT_WIDTH};
 use gam_model_api::families::custom_family::ExactNewtonJointHessianWorkspace;
 use gam_problem::EvalMode;
+use std::ops::Range;
+
+/// One block pair of [`EventHistoryFamily::coordinate_hessian`]: the value,
+/// the gradient along the column block and the row-major second-derivative
+/// block between the row and column blocks.
+struct BlockPair<S> {
+    value: S,
+    gradient: Vec<S>,
+    block: Vec<S>,
+}
 
 impl EventHistoryFamily {
     fn reference_values<S: JetField>(
@@ -87,16 +97,24 @@ impl EventHistoryFamily {
         }).collect();
         let normalisers = if let (Some(tables), true) = (self.reference.as_ref(), self.atoms > 0) {
             let values = self.reference_values(beta, loadings, &rates)?;
-            Some(tables.carry_to_nodes(&values.log_normaliser, marks, self.nodes.total_nodes)?)
+            tables.check_carry(values.log_normaliser.len(), marks, self.nodes.total_nodes)?;
+            Some((tables, values.log_normaliser))
         } else { None };
         let results: Result<Vec<S>, EventHistoryError> = self.nodes.subjects.par_iter().map(|subject| {
             let first = subject.first_row;
+            let held = normalisers.as_ref().map(|(tables, held)|
+                tables.carry_rows(held, marks, first..first + subject.len()));
             let mut eta0 = Vec::with_capacity(subject.len() * marks);
             for row in first..first + subject.len() {
                 for d in 0..marks {
+                    // Every channel of the running sum is nonzero or +0 (a sum
+                    // is −0 only when both addends are), so the signed zero a
+                    // zero design entry adds is the identity: skipping it is exact.
                     let mut eta = beta[0].constant_like(0.0);
                     for (j, x) in self.designs[d].row(row).iter().enumerate() {
-                        eta = eta.add(&beta[offsets[d] + j].scale(*x));
+                        if *x != 0.0 {
+                            eta = eta.add(&beta[offsets[d] + j].scale(*x));
+                        }
                     }
                     eta0.push(eta.with_value(states[d].eta[row]));
                 }
@@ -105,8 +123,7 @@ impl EventHistoryFamily {
                 nodes: subject, eta0: &eta0, loadings, rates: &rates,
                 time_scale: self.time_scale, gh: &self.gh, continuation_gap: 0.0,
                 designs: None,
-                log_normaliser: normalisers.as_ref().map(|values|
-                    &values[first * marks..(first + subject.len()) * marks]),
+                log_normaliser: held.as_deref(),
             };
             subject_marginal(&inputs, false).map(|result| result.loglik)
         }).collect();
@@ -136,35 +153,84 @@ impl EventHistoryFamily {
         let mut value = zero.clone();
         let mut gradient = vec![zero.clone(); width];
         let mut hessian = vec![zero; width * width];
-        let tangents = |q: usize, start: usize| -> [f64; TANGENT_WIDTH] {
-            std::array::from_fn(|k| f64::from(coordinates.get(start + k) == Some(&q)))
-        };
-        for a in 0..width.div_ceil(TANGENT_WIDTH) {
-            let rows = a * TANGENT_WIDTH;
-            for b in 0..=a {
-                let columns = b * TANGENT_WIDTH;
-                let seeded: Vec<Rows<Rows<S, TANGENT_WIDTH>, TANGENT_WIDTH>> = beta.iter().enumerate()
-                    .map(|(q, coefficient)| Rows::seed(
-                        Rows::seed(coefficient.clone(), tangents(q, columns)), tangents(q, rows)))
-                    .collect();
-                let result = self.path_value(states, &seeded)?;
-                for l in 0..TANGENT_WIDTH.min(width - columns) {
-                    gradient[columns + l] = result.base.rows[l].clone();
-                }
-                for k in 0..TANGENT_WIDTH.min(width - rows) {
-                    let i = rows + k;
-                    // Within a diagonal block only `j ≤ i` is read, so each
-                    // mirrored pair comes from one channel.
-                    for l in 0..TANGENT_WIDTH.min(width - columns).min(i + 1 - columns) {
-                        let j = columns + l;
-                        hessian[i * width + j] = result.rows[k].rows[l].clone();
-                        hessian[j * width + i] = result.rows[k].rows[l].clone();
-                    }
-                }
-                value = result.base.base;
+        let blocks: Vec<Range<usize>> = (0..width).step_by(TANGENT_WIDTH)
+            .map(|start| start..(start + TANGENT_WIDTH).min(width))
+            .collect();
+        // The block pairs are independent path evaluations, run together so
+        // one pair's serial reference evolution overlaps the others' work.
+        let pairs: Vec<(Range<usize>, Range<usize>)> = blocks.iter().enumerate()
+            .flat_map(|(a, rows)| blocks[..=a].iter().map(move |columns| (rows.clone(), columns.clone())))
+            .collect();
+        let results: Vec<Result<BlockPair<S>, EventHistoryError>> = pairs.par_iter()
+            .map(|(rows, columns)| self.block_pair(states, beta, coordinates, rows.clone(), columns.clone()))
+            .collect();
+        for ((rows, columns), result) in pairs.iter().zip(results) {
+            let result = result?;
+            for (l, j) in columns.clone().enumerate() {
+                gradient[j] = result.gradient[l].clone();
             }
+            for (k, i) in rows.clone().enumerate() {
+                // Within a diagonal block only `j ≤ i` is read, so each
+                // mirrored pair comes from one channel.
+                for (l, j) in columns.clone().take_while(|&j| j <= i).enumerate() {
+                    let entry = &result.block[k * columns.len() + l];
+                    hessian[i * width + j] = entry.clone();
+                    hessian[j * width + i] = entry.clone();
+                }
+            }
+            value = result.value;
         }
         Ok((value, gradient, hessian))
+    }
+
+    /// One block pair of [`Self::coordinate_hessian`] on the narrowest jet
+    /// widths holding it. Only the last block is shorter than
+    /// `TANGENT_WIDTH`, so a pair is (full, full), (short, full) or
+    /// (short, short); a short block runs on the narrowest of 1, 2 and 4 that
+    /// holds it. A channel seeded with no coordinate is identically zero, each
+    /// level of `Rows<Rows<S, C>, R>` costs `1 + W` channels, and any width
+    /// gives the same entries bit for bit ([`TANGENT_WIDTH`]).
+    fn block_pair<S: JetField + Send + Sync>(
+        &self, states: &[ParameterBlockState], beta: &[S], coordinates: &[usize],
+        rows: Range<usize>, columns: Range<usize>,
+    ) -> Result<BlockPair<S>, EventHistoryError> {
+        const FULL: usize = TANGENT_WIDTH;
+        let args = (states, beta, coordinates, rows.clone(), columns.clone());
+        match (rows.len(), columns.len() == FULL) {
+            (1, true) => self.block_pair_at::<S, 1, FULL>(args),
+            (2, true) => self.block_pair_at::<S, 2, FULL>(args),
+            (3 | 4, true) => self.block_pair_at::<S, 4, FULL>(args),
+            (_, true) => self.block_pair_at::<S, FULL, FULL>(args),
+            (1, false) => self.block_pair_at::<S, 1, 1>(args),
+            (2, false) => self.block_pair_at::<S, 2, 2>(args),
+            (3 | 4, false) => self.block_pair_at::<S, 4, 4>(args),
+            (_, false) => self.block_pair_at::<S, FULL, FULL>(args),
+        }
+    }
+
+    /// [`Self::block_pair`] over `Rows<Rows<S, C>, R>`: the outer level
+    /// carries the `rows` coordinates, the inner level the `columns`.
+    fn block_pair_at<S: JetField + Send + Sync, const R: usize, const C: usize>(
+        &self,
+        (states, beta, coordinates, rows, columns): (
+            &[ParameterBlockState], &[S], &[usize], Range<usize>, Range<usize>),
+    ) -> Result<BlockPair<S>, EventHistoryError> {
+        fn tangents<const W: usize>(coordinates: &[usize], block: &Range<usize>, q: usize) -> [f64; W] {
+            std::array::from_fn(|k| f64::from(coordinates[block.clone()].get(k) == Some(&q)))
+        }
+        let seeded: Vec<Rows<Rows<S, C>, R>> = beta.iter().enumerate()
+            .map(|(q, coefficient)| Rows::seed(
+                Rows::seed(coefficient.clone(), tangents::<C>(coordinates, &columns, q)),
+                tangents::<R>(coordinates, &rows, q)))
+            .collect();
+        let result = self.path_value(states, &seeded)?;
+        Ok(BlockPair {
+            gradient: result.base.rows[..columns.len()].to_vec(),
+            block: result.rows[..rows.len()].iter()
+                .flat_map(|row| row.rows[..columns.len()].iter().cloned())
+                .collect(),
+            value: result.base.base,
+        })
     }
 
     /// The value, the gradient and `H v` of the computed log-likelihood along
@@ -187,13 +253,20 @@ impl EventHistoryFamily {
         let mut value = 0.0;
         let mut gradient = vec![0.0; total];
         let mut product = vec![0.0; total];
-        for start in (0..total).step_by(TANGENT_WIDTH) {
-            let seeded: Vec<Rows<Rows<f64, 1>, TANGENT_WIDTH>> = values.iter().zip(v).enumerate()
-                .map(|(q, (coefficient, along))| Rows::seed(
-                    Rows::seed(*coefficient, [*along]),
-                    std::array::from_fn(|k| f64::from(q == start + k))))
-                .collect();
-            let result = self.path_value(states, &seeded)?;
+        // Independent block evaluations, run together as in
+        // [`Self::coordinate_hessian`].
+        let starts: Vec<usize> = (0..total).step_by(TANGENT_WIDTH).collect();
+        let results: Vec<Result<Rows<Rows<f64, 1>, TANGENT_WIDTH>, EventHistoryError>> =
+            starts.par_iter().map(|&start| {
+                let seeded: Vec<Rows<Rows<f64, 1>, TANGENT_WIDTH>> = values.iter().zip(v).enumerate()
+                    .map(|(q, (coefficient, along))| Rows::seed(
+                        Rows::seed(*coefficient, [*along]),
+                        std::array::from_fn(|k| f64::from(q == start + k))))
+                    .collect();
+                self.path_value(states, &seeded)
+            }).collect();
+        for (&start, result) in starts.iter().zip(results) {
+            let result = result?;
             for k in 0..TANGENT_WIDTH.min(total - start) {
                 gradient[start + k] = result.rows[k].base;
                 product[start + k] = result.rows[k].rows[0];
@@ -201,6 +274,60 @@ impl EventHistoryFamily {
             value = result.base.base;
         }
         Ok((value, gradient, product))
+    }
+
+    /// `trace(Fᵀ (D_β H[u_i] + D²_β H[d_a, d_b]) F)` of the negative
+    /// log-likelihood Hessian `H` for each `u_i`, column `i` of `second_modes`,
+    /// at `(a, b) = pairs[i]` over the columns of `directions` (gam#2922).
+    ///
+    /// The trace is `Σ_c f_cᵀ (·) f_c` over the columns `f_c` of `F`, and each
+    /// term is one path evaluation over `Rows<Rows<TwoSeed<0>, 1>, 1>`: both
+    /// levels carry `f_c`, so the mixed channel is `f_cᵀ ∇²ℓ f_c`, and the
+    /// hyper-dual seed `β + ε d_a + δ d_b + εδ u_i` makes its `εδ` coefficient
+    /// `f_cᵀ (D²∇²ℓ[d_a, d_b] + D∇²ℓ[u_i]) f_c`. A term costs sixteen channels,
+    /// where the drift it replaces costs a full block sweep of `TwoSeed<0>`
+    /// and one of `OneSeed<0>`, `b(b + 1)/2` evaluations each over
+    /// `b = ⌈p / TANGENT_WIDTH⌉` blocks at up to `4 (1 + TANGENT_WIDTH)²`
+    /// channels (#3322). The value is the exact derivative of the same computed
+    /// path, summed over the columns in order.
+    pub(super) fn second_correction_traces(
+        &self, states: &[ParameterBlockState], factor: &Array2<f64>, second_modes: &Array2<f64>,
+        directions: &Array2<f64>, pairs: &[(usize, usize)],
+    ) -> Result<Vec<f64>, String> {
+        self.validate_states(states)?;
+        let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
+        let total = values.len();
+        if factor.nrows() != total || second_modes.nrows() != total || directions.nrows() != total
+            || second_modes.ncols() != pairs.len()
+            || pairs.iter().any(|&(a, b)| a >= directions.ncols() || b >= directions.ncols())
+        {
+            return Err("event-history second correction traces: inconsistent shapes".to_string());
+        }
+        if [factor, second_modes, directions].iter().any(|m| m.iter().any(|x| !x.is_finite())) {
+            return Err("event-history second correction traces: non-finite input".to_string());
+        }
+        let columns = factor.ncols();
+        let jobs: Vec<(usize, usize)> = (0..pairs.len())
+            .flat_map(|i| (0..columns).map(move |c| (i, c)))
+            .collect();
+        let terms: Vec<Result<f64, EventHistoryError>> = jobs.par_iter().map(|&(i, c)| {
+            let (a, b) = pairs[i];
+            let seeded: Vec<Rows<Rows<TwoSeed<0>, 1>, 1>> = (0..total).map(|q| {
+                let coefficient = TwoSeed {
+                    base: scalar0(values[q]),
+                    eps: scalar0(directions[[q, a]]),
+                    del: scalar0(directions[[q, b]]),
+                    eps_del: scalar0(second_modes[[q, i]]),
+                };
+                Rows::seed(Rows::seed(coefficient, [factor[[q, c]]]), [factor[[q, c]]])
+            }).collect();
+            Ok(self.path_value(states, &seeded)?.rows[0].rows[0].eps_del())
+        }).collect();
+        let mut traces = vec![0.0; pairs.len()];
+        for (&(i, _), term) in jobs.iter().zip(terms) {
+            traces[i] -= term?;
+        }
+        Ok(traces)
     }
 
     pub(super) fn computed_joint<S: Directional>(
@@ -305,6 +432,15 @@ impl ExactNewtonJointHessianWorkspace for ComputedHessianWorkspace {
         &self, arr: &Array1<f64>, arr2: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(self.family.second_directional_hessian(&self.states, arr, arr2)?))
+    }
+
+    fn projected_second_correction_traces(
+        &self, factor: &Array2<f64>, second_modes: &Array2<f64>, directions: &Array2<f64>,
+        pairs: &[(usize, usize)],
+    ) -> Result<Option<Array1<f64>>, String> {
+        self.family.clear_reference_refusal();
+        Ok(Some(Array1::from(self.family.second_correction_traces(
+            &self.states, factor, second_modes, directions, pairs)?)))
     }
 }
 
@@ -980,5 +1116,42 @@ mod tests {
             workspace.hessian_source_preference_for_intent(MaterializationIntent::InnerSolve),
             JointHessianSourcePreference::Dense
         );
+    }
+
+    /// The row-kernel traces are `trace(Fᵀ (D_β H[u_i] + D²_β H[d_a, d_b]) F)`
+    /// of the drifts the workspace materialises (#3322). Both are exact
+    /// derivatives of the same computed path and differ only in where the
+    /// contraction with `F` happens, so they agree to rounding: a relative
+    /// `1e-9` of the absolute contraction `Σ_c |f_c|ᵀ |C| |f_c|` leaves four
+    /// orders of magnitude above the `~10⁴ ε` a path's accumulated rounding
+    /// reaches, and a dropped term, a sign slip or a swapped seed moves a trace
+    /// by the size of one of its parts.
+    #[test]
+    fn the_second_correction_traces_contract_the_materialised_drifts_3322() {
+        let (family, states) = wide_reference_family(4);
+        let total = family.total_width();
+        assert!(family.differentiates_the_computed_path());
+        let workspace = ComputedHessianWorkspace::new(family.clone(), states.clone());
+        let column = |scale: f64, shift: usize| -> Array1<f64> {
+            Array1::from_iter((0..total).map(|q| scale * (((q + shift) % 5) as f64 - 1.5)))
+        };
+        let factor = Array2::from_shape_fn((total, 3), |(q, c)| 0.3 * ((q * (c + 2)) % 7) as f64 - 0.8);
+        let directions = ndarray::stack(ndarray::Axis(1), &[column(0.4, 0).view(), column(-0.25, 2).view()]).unwrap();
+        let pairs = [(0, 0), (1, 0), (1, 1)];
+        let second_modes = ndarray::stack(ndarray::Axis(1),
+            &[column(0.7, 1).view(), column(0.2, 3).view(), column(-0.5, 4).view()]).unwrap();
+        let traces = workspace.projected_second_correction_traces(&factor, &second_modes, &directions, &pairs)
+            .unwrap().expect("the computed path has a row kernel");
+        for (i, &(a, b)) in pairs.iter().enumerate() {
+            let drift = family.directional_hessian(&states, &second_modes.column(i).to_owned()).unwrap()
+                + family.second_directional_hessian(&states,
+                    &directions.column(a).to_owned(), &directions.column(b).to_owned()).unwrap();
+            let oracle = (factor.t().dot(&drift).dot(&factor)).diag().sum();
+            let magnitude = (factor.mapv(f64::abs).t().dot(&drift.mapv(f64::abs)).dot(&factor.mapv(f64::abs)))
+                .diag().sum();
+            assert!(oracle.abs() > 1e-3 * magnitude, "trace {i} must be material");
+            assert!((traces[i] - oracle).abs() <= 1e-9 * magnitude,
+                "trace {i}: {} against the materialised {oracle}", traces[i]);
+        }
     }
 }
