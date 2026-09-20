@@ -2825,8 +2825,9 @@ pub(crate) fn build_smooth_basis(
         // All factor-smooth flavours (`fs`, `sz`, `re`) place their per-level
         // marginal on the SAME penalized B-spline (P-spline) basis. The flavours
         // differ ONLY in their penalty/constraint structure (handled below) —
-        // sz: zero-sum deviation blocks with the per-level null space left
-        // unpenalized; fs: random-effect double penalty; re: identity ridge.
+        // sz: zero-sum deviation blocks with per-level curvature penalties and
+        // pooled null ridges; fs: random-effect double penalty; re: identity
+        // ridge.
         //
         // `sz` USED to route its default-degree marginal to a NATURAL cubic
         // regression spline (`cr`), on the belief that mgcv's `bs="sz"` does the
@@ -2867,18 +2868,17 @@ pub(crate) fn build_smooth_basis(
             degree: effective_degree,
             penalty_order,
             knotspec: marginal_knotspec,
-            // mgcv's `bs="fs"` is a random-effect-style smooth: EVERY per-level
-            // coefficient, including the marginal null space, is penalized so
-            // unobserved groups can be predicted — so `fs` keeps the null-space
-            // (double) penalty. mgcv's `bs="sz"` is a pure across-level
-            // *deviation* smooth that, under the default `select=FALSE`, leaves
-            // the per-level null space UNPENALIZED; carrying the double penalty
-            // there shrinks the genuine deviation signal and over-smooths the
-            // recovered curves relative to mgcv (gam#700). `re` carries its own
-            // identity ridge below and ignores this flag. Honour an explicit
-            // user `double_penalty=` either way.
-            double_penalty: option_bool(options, "double_penalty")?
-                .unwrap_or(type_opt.as_str() != "sz"),
+            // The null space of every per-level curve is penalized by default
+            // for both `fs` and `sz`. `fs` is a random-effect-style smooth whose
+            // per-level coefficients, null space included, are all shrunk. For
+            // `sz`, an unpenalized {const, linear} deviation null space lets the
+            // curvature λ absorb the per-group intercept/slope variance and
+            // over-smooths the deviations (#1605), so `sz` carries pooled
+            // zero-sum null ridges; this flag is their single switch (#3969).
+            // `re` carries its own identity ridge below and ignores this flag.
+            // An explicit user `double_penalty=false` turns the null-space
+            // penalty off for either flavour.
+            double_penalty: option_bool(options, "double_penalty")?.unwrap_or(true),
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
             boundary: OneDimensionalBoundary::Open,
