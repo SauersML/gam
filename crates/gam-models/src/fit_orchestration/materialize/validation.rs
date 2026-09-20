@@ -319,6 +319,36 @@ pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     y.iter().all(|&v| v == 0.0 || v == 1.0)
 }
 
+/// Judge the response column against the family's support and degeneracy
+/// rules over the rows that enter the likelihood (positive prior weight).
+///
+/// Both rules are owned by [`ResponseFamily`] so the formula materializers
+/// and the external-design path share one definition; this adapter only
+/// attaches the column name and routes the violation to
+/// [`WorkflowError::InvalidData`], the data-error class, because the fault is
+/// in the supplied values rather than in the model configuration.
+pub(super) fn validate_response_against_family(
+    family: &LikelihoodSpec,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    response: &str,
+) -> Result<(), WorkflowError> {
+    family
+        .response
+        .validate_response_support(y, weights)
+        .map_err(|violation| WorkflowError::InvalidData {
+            column: response.to_string(),
+            problem: violation.problem(),
+        })?;
+    family
+        .response
+        .validate_response_degeneracy(y, weights)
+        .map_err(|degeneracy| WorkflowError::InvalidData {
+            column: response.to_string(),
+            problem: degeneracy.problem(),
+        })
+}
+
 #[cfg(test)]
 mod binary_response_tests {
     use super::is_binary_response;
