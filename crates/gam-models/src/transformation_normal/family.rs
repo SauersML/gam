@@ -8,6 +8,31 @@ pub(crate) fn beta_bits_match(cached: &Array1<f64>, candidate: &Array1<f64>) -> 
             .all(|(&left, &right)| left.to_bits() == right.to_bits())
 }
 
+/// Declared null dimension of one CTN tensor penalty (#3023).
+///
+/// Every CTN penalty is `A ⊗ B` for symmetric PSD factors (covariate roughness
+/// `G_y ⊗ S_x`, response roughness `S_y ⊗ G_x`, the shape ridge
+/// `P_shape ⊗ I`), whose spectrum is the products of the factors' spectra, so
+/// `nullity(A ⊗ B) = p_a·p_b − rank(A)·rank(B)`. Resolving each small factor
+/// separately keeps the declaration exact where the assembled product's
+/// spectrum would multiply two resolution errors together.
+fn tensor_penalty_nullity(penalty: &PenaltyMatrix, index: usize) -> Result<usize, String> {
+    match penalty {
+        PenaltyMatrix::KroneckerFactored { left, right } => {
+            crate::survival::time_margin_metric::kronecker_nullspace_dimension(left, right)
+        }
+        PenaltyMatrix::Fixed { inner, .. } | PenaltyMatrix::Labeled { inner, .. } => {
+            tensor_penalty_nullity(inner, index)
+        }
+        PenaltyMatrix::Dense(_) | PenaltyMatrix::Diagonal(_) | PenaltyMatrix::Blockwise { .. } => {
+            Err(format!(
+                "transformation tensor penalty {index} is not Kronecker-factored, so its null \
+                 dimension cannot be declared from its factors"
+            ))
+        }
+    }
+}
+
 /// Per-observation location and scale that seed the transformation model's affine
 /// coefficients (see `estimate_default_warm_start`).
 #[derive(Clone, Debug)]
@@ -655,12 +680,18 @@ impl TransformationNormalFamily {
         gam_problem::validate_log_strengths(initial_log_lambdas.iter().copied())
             .map_err(|error| format!("invalid transformation smoothing strength: {error}"))?;
         let offset = self.offset.as_ref() + self.response_floor_offset.as_ref();
+        let nullspace_dims = self
+            .tensor_penalties
+            .iter()
+            .enumerate()
+            .map(|(index, penalty)| tensor_penalty_nullity(penalty, index))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(ParameterBlockSpec {
             name: self.block_name.clone(),
             design: DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(self.x_val_kron.clone()))),
             offset,
             penalties: self.tensor_penalties.clone(),
-            nullspace_dims: vec![],
+            nullspace_dims,
             initial_log_lambdas: initial_log_lambdas.clone(),
             initial_beta: Some(self.initial_beta.clone()),
             gauge_priority: 100,

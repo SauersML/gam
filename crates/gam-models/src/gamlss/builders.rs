@@ -4210,7 +4210,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                         .iter()
                         .map(crate::model_types::PenaltySpec::from_blockwise_ref)
                         .collect(),
-                    nullspace_dims: vec![],
+                    nullspace_dims: pilot_design.nullspace_dims.clone(),
                     initial_log_lambdas: Some(fitted_log_lambdas(
                         &pilot_fit.lambdas,
                         "binomial mean-wiggle pilot lambda",
@@ -4276,7 +4276,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                     .iter()
                     .map(crate::model_types::PenaltySpec::from_blockwise_ref)
                     .collect(),
-                nullspace_dims: vec![],
+                nullspace_dims: baseline_design.nullspace_dims.clone(),
                 initial_log_lambdas: Some(fitted_log_lambdas(
                     &pilot_fit.lambdas,
                     "binomial mean-wiggle pilot lambda",
@@ -4465,6 +4465,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         frozen_warp_basis.as_ref().clone(),
     ));
     let wiggle_offset = Array1::<f64>::zeros(frozen_warp_basis.nrows());
+    // The frozen warp keeps the selected basis's coefficient coordinate, and
+    // its penalties are that basis's full-width matrices, so their declared
+    // nullities carry unchanged (#3023).
+    let wiggle_nullspace_dims = wiggle_block.nullspace_dims.clone();
     let wiggle_penalties: Vec<crate::model_types::PenaltySpec> = wiggle_block
         .penalties
         .iter()
@@ -4531,7 +4535,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 design: design.design.clone(),
                 offset: design.affine_offset.clone(),
                 penalties: design.penalties_as_penalty_matrix(),
-                nullspace_dims: vec![],
+                nullspace_dims: design.nullspace_dims.clone(),
                 initial_log_lambdas: theta.slice(s![0..eta_penalty_count]).to_owned(),
                 initial_beta: Some(pilot_beta.clone()),
                 // The warp block here is the RESIDUAL `B_perp`, so precedence
@@ -4570,7 +4574,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                         })
                         .collect()
                 },
-                nullspace_dims: vec![],
+                nullspace_dims: wiggle_nullspace_dims.clone(),
                 initial_log_lambdas: theta.slice(s![eta_penalty_count..rho_dim]).to_owned(),
                 initial_beta: wiggle_initial_beta.clone(),
                 gauge_priority: DEALIASED_WARP_GAUGE_PRIORITY,
@@ -4818,7 +4822,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                     .iter()
                     .map(crate::model_types::PenaltySpec::from_blockwise_ref)
                     .collect(),
-                nullspace_dims: vec![],
+                nullspace_dims: design.nullspace_dims.clone(),
                 initial_log_lambdas: Some(theta_star.slice(s![0..eta_penalty_count]).to_owned()),
                 initial_beta: Some(pilot_beta),
             },
@@ -4826,7 +4830,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 design: wiggle_design,
                 offset: wiggle_offset,
                 penalties: wiggle_penalties,
-                nullspace_dims: vec![],
+                nullspace_dims: wiggle_nullspace_dims.clone(),
                 initial_log_lambdas: Some(
                     theta_star.slice(s![eta_penalty_count..rho_dim]).to_owned(),
                 ),

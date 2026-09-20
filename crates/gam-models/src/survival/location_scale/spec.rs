@@ -76,6 +76,10 @@ pub struct TimeDependentCovariateBlockInput {
     pub time_basis_derivative_exit: Array2<f64>,
     /// Combined Kronecker penalties for the tensor product.
     pub penalties: Vec<PenaltyMatrix>,
+    /// Structural nullspace dimension of each full-width Kronecker penalty
+    /// (same length as `penalties`). Empty means "use eigenvalue-based rank
+    /// detection."
+    pub nullspace_dims: Vec<usize>,
     pub initial_log_lambdas: Option<Array1<f64>>,
     pub initial_beta: Option<Array1<f64>>,
     pub offset: Array1<f64>,
