@@ -2524,6 +2524,13 @@ impl WorkingModelSurvival {
         // residual accurate enough for the outer LAML envelope check.
         let mut grad = Array1::<f64>::zeros(p);
         let mut grad_comp = Array1::<f64>::zeros(p);
+        // The score is the difference of two sums that each keep the data's
+        // magnitude at the optimum: the cumulative-hazard (risk-set) term
+        // `X_exitᵀw_exit − X_entryᵀw_entry` and the event term
+        // `X_exitᵀw_event + X_derivᵀ(w_event/η′)`. Their norms, not the
+        // cancelled score's, are the certificate's natural scale (gam#3451).
+        let mut interval_score = Array1::<f64>::zeros(p);
+        let mut event_score = Array1::<f64>::zeros(p);
         let mut row_exit = vec![0.0_f64; p];
         let mut row_entry = vec![0.0_f64; p];
         let mut row_derivative = vec![0.0_f64; p];
@@ -2543,10 +2550,13 @@ impl WorkingModelSurvival {
             self.fill_entry_row(i, &mut row_entry);
             self.fill_derivative_row(i, &mut row_derivative);
             for j in 0..p {
-                let contribution = w_interval_exit * row_exit[j]
-                    - w_interval_entry * row_entry[j]
-                    - w_event_exit * row_exit[j]
-                    - w_event_derivative * row_derivative[j];
+                let interval_part =
+                    w_interval_exit * row_exit[j] - w_interval_entry * row_entry[j];
+                let event_part =
+                    w_event_exit * row_exit[j] + w_event_derivative * row_derivative[j];
+                interval_score[j] += interval_part;
+                event_score[j] += event_part;
+                let contribution = interval_part - event_part;
                 let t = grad[j] + contribution;
                 if grad[j].abs() >= contribution.abs() {
                     grad_comp[j] += (grad[j] - t) + contribution;
@@ -2560,10 +2570,9 @@ impl WorkingModelSurvival {
 
         h += &self.derivative_xt_diag_x(w_event_outer);
 
-        // Norm of the unpenalized score, captured before adding the penalty
-        // contribution, for the scale-invariant convergence certificate
-        // (||score||_2 + ||S*beta||_2).
-        let score_norm = array1_l2_norm(&grad);
+        // The score's operands, for the scale-invariant convergence
+        // certificate (||interval||_2 + ||event||_2 + ||S*beta||_2).
+        let score_operand_norm = array1_l2_norm(&interval_score) + array1_l2_norm(&event_score);
 
         let penaltygrad = self.penalties.gradient(beta);
         // The WorkingState contract (`gam_solve::pirls::WorkingState`) defines
@@ -2602,7 +2611,7 @@ impl WorkingModelSurvival {
             penalty_term: penalty_quadratic_form,
             firth: gam_solve::pirls::FirthDiagnostics::Inactive,
             hessian_curvature: gam_solve::pirls::HessianCurvatureKind::Observed,
-            gradient_natural_scale: score_norm + penaltygrad_norm,
+            gradient_natural_scale: score_operand_norm + penaltygrad_norm,
         })
     }
 
