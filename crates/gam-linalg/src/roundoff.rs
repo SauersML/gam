@@ -153,6 +153,77 @@ pub fn factor_singular_band(rows: usize, cols: usize, sigma_max: f64) -> f64 {
     rows.max(cols) as f64 * f64::EPSILON * sigma_max
 }
 
+/// Rounded operations one Householder reflector commits on a length-`rows`
+/// column, as the `c` of `γ_c` in `fl(P̂b) = (P + ΔP)b`, `‖ΔP‖_F ≤ γ_c`, with `P`
+/// the exact reflector of the exact column (Higham, *ASNA* 2nd ed., Lemmas
+/// 19.2–19.3).
+///
+/// The count follows the reflector faer builds (`make_householder_in_place`)
+/// and applies (the column-pivoted QR update), `P = I − vvᵀ/τ` with `v₀ = 1`.
+/// It uses `m = rows` and Higham's Lemma 3.3: `γ_a + γ_b + γ_aγ_b ≤ γ_{a+b}`
+/// and `cγ_a ≤ γ_{ca}`.
+///
+/// - **The norm.** `‖x_tail‖₂` is an `m`-term sum of squares, the combination
+///   of its scaled accumulators and a square root: `γ_{m+2}`. `hypot` with the
+///   head adds 2: `γ_{m+4}`.
+/// - **The vector.** `h = x₀ + sign(x₀)‖x‖` (no cancellation) adds 1, `1/h`
+///   adds 1, and `v_i = x_i·(1/h)` adds 1, so `|Δv_i| ≤ γ_{m+7}|v_i|`.
+/// - **The scalar.** `τ = (1 + (‖x_tail‖·|1/h|)²)/2` is a product (`γ_{2m+9}`),
+///   a square and a rounding (`γ_{4m+19}`), and an add (`γ_{4m+20}`). The halving
+///   is exact, and `1/τ` adds 1, giving `γ_{4m+21}`.
+/// - **The rank-one term.** `v_iv_j/τ` carries `v`'s error twice and `1/τ`'s
+///   once, `γ_{6m+35}`. The exact term has `‖|v||v|ᵀ/τ‖_F = vᵀv/τ = 2`, so its
+///   error is at most `2γ_{6m+35}`.
+/// - **The application.** `b_i − v_i·((vᵀb)/τ)` is an `m`-term inner product,
+///   a multiply and a fused multiply-add: `γ_{m+2}`. It acts on
+///   `|b| + |v̂||v̂|ᵀ|b|/τ̂`, whose norm is at most `(3 + 2γ_{6m+35})‖b‖`.
+///
+/// In total, `2γ_{6m+35} + 3γ_{m+2} + 2γ_{m+2}γ_{6m+35} ≤ 2γ_{7m+37} + γ_{m+2}`,
+/// which is at most `γ_{15m+76}`.
+pub const fn householder_reflector_roundings(rows: usize) -> usize {
+    rows.saturating_mul(15).saturating_add(76)
+}
+
+/// Roundings the column-pivoted QR adds outside its reflectors. It scales the
+/// input by the rounded reciprocal of its largest column norm (two roundings
+/// per entry, a relative backward perturbation of each column) and scales `R̂`
+/// back (one rounding per entry, `‖ΔR‖_F ≤ u‖R‖_F`, which is `QΔR` on the
+/// matrix). The power-of-two pre-scaling is exact.
+const PIVOTED_QR_SCALING_ROUNDINGS: usize = 3;
+
+/// Normwise backward-error band of this crate's column-pivoted Householder QR
+/// of a `rows × cols` matrix whose computed `R̂` has Frobenius norm
+/// `r_frobenius` (#4045).
+///
+/// Householder QR is backward stable. The computed `R̂` is the exact triangular
+/// factor of `(A + ΔA)Π = QR̂`, where `Q` is exactly orthogonal and
+/// `‖Δa_j‖₂ ≤ γ_K‖a_j‖₂` for every column (Higham, *ASNA* 2nd ed., Thm 19.4,
+/// with Lemma 3.7 for the product of the reflectors). Here `K` is the reflector
+/// count `min(rows, cols)` times [`householder_reflector_roundings`], plus the
+/// three scaling roundings. Column pivoting only reorders the columns, so the
+/// bound is unchanged. Summing the columns gives `‖ΔA‖_F ≤ γ_K‖A‖_F`.
+///
+/// Since `Q` is orthogonal, `‖R̂‖_F = ‖A + ΔA‖_F ≥ ‖A‖_F − ‖ΔA‖_F`, and so
+/// `‖ΔA‖_F ≤ γ_K/(1 − γ_K)·‖R̂‖_F`. That is the band returned, read off the
+/// factor the caller already holds.
+///
+/// Modified Gram–Schmidt on an `m × n` matrix is numerically equivalent to
+/// Householder QR on `[0_n; A]` (Björck & Paige, 1992). Its band is therefore
+/// this one with `rows = m + n`, which also covers MGS's own (fewer) roundings.
+///
+/// Returns `+∞` once `K·u ≥ 1`, where the bound says nothing.
+pub fn householder_qr_backward_band(rows: usize, cols: usize, r_frobenius: f64) -> f64 {
+    let operations = rows
+        .min(cols)
+        .saturating_mul(householder_reflector_roundings(rows))
+        .saturating_add(PIVOTED_QR_SCALING_ROUNDINGS);
+    let gamma = accumulation_growth(operations);
+    if !(gamma < 1.0) {
+        return f64::INFINITY;
+    }
+    gamma / (1.0 - gamma) * r_frobenius
+}
+
 /// Rank partition of a quadratic `S = AᵀA`, read off its energy factor `A`.
 ///
 /// `λᵢ(S) = σᵢ(A)²`, so `A` carries `S`'s spectrum at `A`'s own conditioning, and
