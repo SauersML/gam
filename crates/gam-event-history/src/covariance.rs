@@ -374,11 +374,7 @@ fn trapezoidal_moments(
 /// far below roundoff, and it extends to where the integrand has fallen
 /// sixty nats below its peak, which is `e⁻⁶⁰` of it. The sums are formed in
 /// log space.
-pub(crate) fn quartic_direction_moments(
-    mu: f64,
-    information: f64,
-    lambda: f64,
-) -> DirectionMoments {
+pub(crate) fn quartic_direction_moments(mu: f64, information: f64, lambda: f64) -> DirectionMoments {
     let a = mu - lambda;
     let j = information;
     let g = |t: f64| 0.5 * a * t * t - 0.25 * j * t * t * t * t;
@@ -706,7 +702,8 @@ pub(crate) fn ridge_profile(
         if i == 0 {
             top_mode = likelihood.mode;
         }
-        let spread = |moments: &DirectionMoments| moments.fourth - moments.second * moments.second;
+        let spread =
+            |moments: &DirectionMoments| moments.fourth - moments.second * moments.second;
         let slope = 0.5 * lambda * (likelihood.second - prior.second);
         value += prior.log_integral - likelihood.log_integral;
         d_rho += slope;

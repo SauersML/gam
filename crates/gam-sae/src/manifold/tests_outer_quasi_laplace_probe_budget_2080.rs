@@ -24,9 +24,7 @@ use super::tests::{deterministic_circle_noise, global_ev};
 use super::*;
 use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisSecondJet};
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_atb};
-use gam_solve::rho_optimizer::{
-    OuterEval, OuterEvalOrder, OuterObjective, OuterProblem, OuterResult,
-};
+use gam_solve::rho_optimizer::{OuterEval, OuterEvalOrder, OuterObjective, OuterProblem, OuterResult};
 use ndarray::{Array1, Array2, ArrayView2, array, s};
 use std::sync::Arc;
 
@@ -239,7 +237,8 @@ pub(super) fn two_circle_periodic_term(
     let p = z.ncols();
     let dim = 1usize;
     let num_basis = 1 + 2 * harmonics;
-    let evaluator: Arc<dyn SaeBasisSecondJet> = Arc::new(
+    let evaluator: Arc<dyn SaeBasisSecondJet> =
+        Arc::new(
         PeriodicHarmonicEvaluator::new(num_basis)
             .expect("num_basis = 1 + 2*harmonics is a valid odd periodic basis width"),
     );
@@ -254,8 +253,8 @@ pub(super) fn two_circle_periodic_term(
     for atom_idx in 0..k {
         let coords = seed_coords.slice(s![atom_idx, .., 0..dim]).to_owned();
         let (phi, jet) = evaluator
-            .evaluate(coords.view())
-            .expect("the seeded coords lie in the periodic chart domain");
+        .evaluate(coords.view())
+        .expect("the seeded coords lie in the periodic chart domain");
         let mm = phi.ncols();
         let mut xtx = fast_atb(&phi, &phi);
         for i in 0..mm {
@@ -263,9 +262,9 @@ pub(super) fn two_circle_periodic_term(
         }
         let xtz = fast_atb(&phi, &z.to_owned());
         let decoder = xtx
-            .cholesky(Side::Lower)
-            .expect("phi^T phi + 1e-8 I is positive definite")
-            .solve_mat(&xtz);
+        .cholesky(Side::Lower)
+        .expect("phi^T phi + 1e-8 I is positive definite")
+        .solve_mat(&xtz);
         let fitted = phi.dot(&decoder);
         for row in 0..n {
             for col in 0..p {
@@ -483,9 +482,7 @@ fn run_wide_outer_fit(
     let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]; k])
         .seed_scaled_by_dispersion_for_assignment(seed_dispersion, &term.assignment)
         .expect("seed dispersion is finite and strictly positive");
-    let seed = init_rho
-        .to_flat(&term.assignment)
-        .expect("the seed rho is bound to the term's assignment");
+    let seed = init_rho.to_flat(&term.assignment).expect("the seed rho is bound to the term's assignment");
     let n_params = seed.len();
     let mut objective =
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
@@ -550,11 +547,7 @@ impl LivelockRecorder<'_> {
         }
         // A continuation waypoint installs a new temperature without moving the
         // coefficients, and prices a different objective at the same ρ.
-        term.assignment
-            .mode
-            .temperature()
-            .to_bits()
-            .hash(&mut state);
+        term.assignment.mode.temperature().to_bits().hash(&mut state);
         let key = (
             rho.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
             kind.clone(),
@@ -562,9 +555,7 @@ impl LivelockRecorder<'_> {
         );
         self.ledger.evals += 1;
         if !self.ledger.seen.insert(key) {
-            self.ledger
-                .repeats
-                .push((self.ledger.evals, rho.to_vec(), kind));
+            self.ledger.repeats.push((self.ledger.evals, rho.to_vec(), kind));
         }
     }
 }
@@ -640,10 +631,7 @@ impl OuterObjective for LivelockRecorder<'_> {
         self.inner.begin_reactive_domain_waypoint()
     }
 
-    fn commit_reactive_domain_waypoint(
-        &mut self,
-        rho: &Array1<f64>,
-    ) -> Result<(), EstimationError> {
+    fn commit_reactive_domain_waypoint(&mut self, rho: &Array1<f64>) -> Result<(), EstimationError> {
         self.inner.commit_reactive_domain_waypoint(rho)
     }
 
@@ -667,10 +655,7 @@ fn run_k1_generated_seed_outer_fit(
     let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
         .seed_scaled_by_dispersion_for_assignment(seed_dispersion, &term.assignment)
         .expect("seed dispersion is finite and strictly positive");
-    let n_params = init_rho
-        .to_flat(&term.assignment)
-        .expect("the seed rho is bound to the term's assignment")
-        .len();
+    let n_params = init_rho.to_flat(&term.assignment).expect("the seed rho is bound to the term's assignment").len();
     let mut objective =
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
     let mut ledger = LivelockLedger::default();
@@ -786,9 +771,7 @@ fn outer_run_live_lock_symptoms(
             let rho_displacement = l2_norm(&(&result.rho - seed));
             (
                 Some(rho_displacement.is_finite() && rho_displacement <= cfg.step_collapse_radius),
-                Some(
-                    final_grad_norm.is_finite() && final_grad_norm >= cfg.huge_final_gradient_floor,
-                ),
+                Some(final_grad_norm.is_finite() && final_grad_norm >= cfg.huge_final_gradient_floor),
             )
         }
         Err(..) => (None, None),
@@ -808,9 +791,7 @@ fn seeded_k1_circle_objective(
     let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
         .seed_scaled_by_dispersion_for_assignment(seed_dispersion, &term.assignment)
         .expect("seed dispersion is finite and strictly positive");
-    let seed = init_rho
-        .to_flat(&term.assignment)
-        .expect("the seed rho is bound to the term's assignment");
+    let seed = init_rho.to_flat(&term.assignment).expect("the seed rho is bound to the term's assignment");
     let objective = SaeManifoldOuterObjective::new(
         term,
         z.clone(),
@@ -1073,10 +1054,11 @@ fn ceiling_vs_pathology_outer_reml_instrument_2156() {
 fn outer_error_yields_no_live_lock_verdict_2156() {
     let cfg = CeilingPathologyConfig::default();
     let seed = Array1::<f64>::zeros(2);
-    let run: Result<OuterResult, EstimationError> =
-        Err(EstimationError::ParameterConstraintViolation(
+    let run: Result<OuterResult, EstimationError> = Err(
+        EstimationError::ParameterConstraintViolation(
             "#2156 control: a typed outer error".to_string(),
-        ));
+        ),
+    );
     let (step_collapsed, huge_final_gradient) = outer_run_live_lock_symptoms(&run, &seed, cfg);
     assert_eq!(
         (step_collapsed, huge_final_gradient),
@@ -1212,9 +1194,7 @@ fn entangled_two_circle_outer_reml_separates_2080() {
     let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]; k])
         .seed_scaled_by_dispersion_for_assignment(seed_dispersion, &term.assignment)
         .expect("seed dispersion is finite and strictly positive");
-    let seed = init_rho
-        .to_flat(&term.assignment)
-        .expect("the seed rho is bound to the term's assignment");
+    let seed = init_rho.to_flat(&term.assignment).expect("the seed rho is bound to the term's assignment");
     let n_params = seed.len();
     let mut objective =
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
@@ -1310,9 +1290,12 @@ fn small_fold_high_rank_circle_inner_solve_converges_2138() {
         }
     }
     let evaluator: Arc<dyn SaeBasisSecondJet> =
-        Arc::new(PeriodicHarmonicEvaluator::new(m).expect("m is a valid odd periodic basis width"));
-    let seed_coords = sae_pca_seed_initial_coords(z.view(), &[SaeAtomBasisKind::Periodic], &[1])
-        .expect("one periodic basis kind and one dim for the single atom");
+        Arc::new(
+        PeriodicHarmonicEvaluator::new(m).expect("m is a valid odd periodic basis width"),
+    );
+    let seed_coords =
+        sae_pca_seed_initial_coords(z.view(), &[SaeAtomBasisKind::Periodic], &[1])
+            .expect("one periodic basis kind and one dim for the single atom");
     let coords = seed_coords.slice(s![0, .., 0..1]).to_owned();
     let (phi, jet) = evaluator
         .evaluate(coords.view())
@@ -1391,9 +1374,7 @@ fn small_fold_high_rank_circle_inner_solve_converges_2138() {
         //
         // The reference state is the seed coordinates with the closed-form ridge decoder
         // `(DᵀD + λS)⁻¹DᵀZ`, `D = gate·Φ(seed)`: the decoder block optimum at the seed.
-        let lambda = r
-            .lambda_smooth_vec()
-            .expect("one smoothing block for the single atom")[0];
+        let lambda = r.lambda_smooth_vec().expect("one smoothing block for the single atom")[0];
         let penalty = base.atoms[0].smooth_penalty();
         let mut design = Array2::<f64>::zeros((n, m));
         for row in 0..n {
@@ -1444,8 +1425,7 @@ fn small_fold_high_rank_circle_inner_solve_converges_2138() {
         let resolution =
             SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + reference_objective.abs());
         assert!(
-            converged_objective.is_finite()
-                && converged_objective <= reference_objective + resolution,
+            converged_objective.is_finite() && converged_objective <= reference_objective + resolution,
             "#2138: at smoothing={smooth} the converged penalized objective \
              {converged_objective:.9e} is above the seed block optimum {reference_objective:.9e} \
              (seed coordinates, closed-form ridge decoder), so the inner solve ended in a worse \
@@ -1607,10 +1587,7 @@ fn saturating_gate_specimen_prices_a_finite_root_2080() {
         root_log_det.is_finite(),
         "the specimen's exact-A log-determinant must be finite, got {root_log_det}"
     );
-    eprintln!(
-        "[#2080 saturating-gate pin] root ½log|A| {:.12e}",
-        0.5 * root_log_det
-    );
+    eprintln!("[#2080 saturating-gate pin] root ½log|A| {:.12e}", 0.5 * root_log_det);
 
     let gate_jacobian_curvature = crate::assignment::gate_logit_jacobian_grad_hdiag_weighted(
         &root.assignment,
@@ -2254,11 +2231,9 @@ fn zz_measure_k2_wide_p_gradient_arm_vs_solver_arm_2080() {
             // here is an invariant failure of this harness's own snapshot, not a
             // recoverable condition -- and `let _ok = ...` is banned in this
             // workspace for exactly that reason.
-            arm_b
-                .restore_mutable_state(&snapshot)
-                .unwrap_or_else(|error| {
-                    panic!("B-arm snapshot restore after a failed line search: {error:?}")
-                });
+            arm_b.restore_mutable_state(&snapshot).unwrap_or_else(|error| {
+                panic!("B-arm snapshot restore after a failed line search: {error:?}")
+            });
             eprintln!("[2080-AB] B/gradient line search found no acceptable step at iter={iter}");
             // The arm stops here, so its reading at the stopping iterate IS the B side
             // of the comparison: a steepest-descent arm that cannot take a step has
@@ -2342,8 +2317,8 @@ fn zz_measure_k2_wide_p_residual_block_split_2080() {
         let beta_sq = sys.gb.iter().map(|&v| v * v).sum::<f64>();
         let total = SaeManifoldTerm::system_grad_norm_sq(&sys);
         // The split must BE the norm, or the shares below describe nothing.
-        let partition_gap =
-            (logit_sq + coord_sq + beta_sq - total).abs() / total.max(f64::MIN_POSITIVE);
+        let partition_gap = (logit_sq + coord_sq + beta_sq - total).abs()
+            / total.max(f64::MIN_POSITIVE);
         assert!(
             partition_gap <= 1.0e-12,
             "[2080-BLK] warmup={warmup}: the three-way split is not a partition of ‖g‖² \
@@ -2968,11 +2943,14 @@ fn zz_measure_wide_p_cost_exponent_2080() {
             if rep == 0 {
                 // What the production route does with those spectra, as a
                 // READING: `Ok` or the typed refusal, never a gate.
-                criterion_note[wi] =
-                    match term.exact_observed_information_log_dets(&rho_fixed, z.view(), &cache) {
-                        Ok(joint) => format!("log_det ok joint={joint:.6e}"),
-                        Err(error) => format!("log_dets refused: {error}"),
-                    };
+                criterion_note[wi] = match term.exact_observed_information_log_dets(
+                    &rho_fixed,
+                    z.view(),
+                    &cache,
+                ) {
+                    Ok(joint) => format!("log_det ok joint={joint:.6e}"),
+                    Err(error) => format!("log_dets refused: {error}"),
+                };
 
                 // The `off + basis*chan + channel` layout is `chan == p` only
                 // when no factored frame is engaged; a framed decoder narrows the
@@ -3001,8 +2979,10 @@ fn zz_measure_wide_p_cost_exponent_2080() {
                             let mut lo = f64::INFINITY;
                             let mut hi = f64::NEG_INFINITY;
                             for c1 in 0..stride {
-                                let same = a_dense
-                                    [[total_t + b1 * stride + c1, total_t + b2 * stride + c1]];
+                                let same = a_dense[[
+                                    total_t + b1 * stride + c1,
+                                    total_t + b2 * stride + c1,
+                                ]];
                                 block_max = block_max.max(same.abs());
                                 lo = lo.min(same);
                                 hi = hi.max(same);
@@ -3010,8 +2990,10 @@ fn zz_measure_wide_p_cost_exponent_2080() {
                                     if c1 == c2 {
                                         continue;
                                     }
-                                    let off = a_dense
-                                        [[total_t + b1 * stride + c1, total_t + b2 * stride + c2]];
+                                    let off = a_dense[[
+                                        total_t + b1 * stride + c1,
+                                        total_t + b2 * stride + c2,
+                                    ]];
                                     block_max = block_max.max(off.abs());
                                     cross_channel = cross_channel.max(off.abs());
                                 }
@@ -3043,10 +3025,7 @@ fn zz_measure_wide_p_cost_exponent_2080() {
             warm[wi].iter().copied().fold(f64::INFINITY, f64::min),
             assemble[wi].iter().copied().fold(f64::INFINITY, f64::min),
             newton[wi].iter().copied().fold(f64::INFINITY, f64::min),
-            materialize[wi]
-                .iter()
-                .copied()
-                .fold(f64::INFINITY, f64::min),
+            materialize[wi].iter().copied().fold(f64::INFINITY, f64::min),
             eigh[wi].iter().copied().fold(f64::INFINITY, f64::min),
         );
         eprintln!(
@@ -3127,8 +3106,7 @@ fn zz_measure_wide_p_cost_exponent_2080() {
     // wide-`p` hang someone has to re-diagnose.
     for wi in 1..nw {
         assert_eq!(
-            shape[wi],
-            shape[0],
+            shape[wi], shape[0],
             "the exact-A route's operator dimension must not depend on the ambient width: \
              p={} gives (total_t, k, dim) = ({}, {}, {}) but p={} gives ({}, {}, {})",
             widths[0],
@@ -3335,11 +3313,7 @@ fn value_lane_prices_at_shared_fixed_point_2228() {
         let evaluated = stepped
             .penalized_quasi_laplace_criterion_with_cache(z.view(), &rho, None, imi, lr, re, rb)
             .expect("re-pricing one exact Newton step toward the root evaluates");
-        (
-            evaluated.0,
-            gradient.dot(&gradient).sqrt(),
-            delta.dot(&delta).sqrt(),
-        )
+        (evaluated.0, gradient.dot(&gradient).sqrt(), delta.dot(&delta).sqrt())
     };
     eprintln!(
         "[#2228] priced state ‖g‖={priced_gate:.6e} exact Newton ‖Δ‖={newton_norm:.6e}: \
@@ -3515,8 +3489,7 @@ fn k1_checkpoint_evaluations_price_exact_certified_states_3327() {
         }
     }
     for (label, rho) in &probes {
-        obj.eval(rho)
-            .unwrap_or_else(|err| panic!("{label} eval at {rho}: {err}"));
+        obj.eval(rho).unwrap_or_else(|err| panic!("{label} eval at {rho}: {err}"));
         if let Err(state) = installed_state_certifies_3327(&obj) {
             panic!("{label} eval at {rho} priced a state the exact information refuses: {state}");
         }

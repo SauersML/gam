@@ -1076,9 +1076,10 @@ mod tests {
         let mut covariance = constraint.dot(&readout);
         symmetrize_in_place(&mut covariance);
         let covariance_spectrum = spectrum_extremes(&covariance);
-        let covariance_assembly =
-            2.0 * gamma(p + 1) * frobenius(&constraint.mapv(f64::abs).dot(&readout.mapv(f64::abs)))
-                + frobenius(constraint) * readout_error;
+        let covariance_assembly = 2.0
+            * gamma(p + 1)
+            * frobenius(&constraint.mapv(f64::abs).dot(&readout.mapv(f64::abs)))
+            + frobenius(constraint) * readout_error;
         let weights = covariance
             .cholesky(Side::Lower)
             .expect("fixture constraint covariance is SPD")
@@ -1119,9 +1120,7 @@ mod tests {
         let noisy_model =
             GaussianMarginalModel::new(constraint.view(), value.view(), noise.view(), prior.view())
                 .expect("noisy model");
-        let noisy = noisy_model
-            .evidence_primal()
-            .expect("noisy primal evidence");
+        let noisy = noisy_model.evidence_primal().expect("noisy primal evidence");
         let noisy_bands = bands(&noisy_model, &noise);
         let quadratic_band = exact_bands.quadratic + noisy_bands.primal_quadratic;
         let log_det_band = exact_bands.log_det + noisy_bands.primal_log_det;
@@ -1149,9 +1148,7 @@ mod tests {
             prior.view(),
         )
         .expect("coarse model");
-        let coarse = coarse_model
-            .evidence_primal()
-            .expect("coarse primal evidence");
+        let coarse = coarse_model.evidence_primal().expect("coarse primal evidence");
         let coarse_band = exact_bands.log_det + bands(&coarse_model, &coarse_noise).primal_log_det;
         assert!(
             coarse.log_det - exact.log_det > coarse_band,
@@ -1164,13 +1161,10 @@ mod tests {
     fn exact_constraint_covariance_annihilates_the_constraint() {
         let (constraint, value, prior) = constraint_fixture();
         let (n, p) = constraint.dim();
-        let posterior =
-            condition_on_exact_constraint(constraint.view(), value.view(), prior.view())
-                .expect("exact constraint");
+        let posterior = condition_on_exact_constraint(constraint.view(), value.view(), prior.view())
+            .expect("exact constraint");
         let unit = Array2::<f64>::eye(p);
-        let covariance = posterior
-            .covariance_times(&unit)
-            .expect("covariance columns");
+        let covariance = posterior.covariance_times(&unit).expect("covariance columns");
         let annihilated = constraint.dot(&covariance);
 
         // With ĉ = V̂⁻¹ẐᵀB and AQ⁻¹ = Zᵀ exactly:
@@ -1208,8 +1202,7 @@ mod tests {
             + cholesky_backward_band(n, exact_bands.covariance_spectrum.1) * correction_norm
             + exact_bands.covariance_assembly * correction_norm
             + frobenius(&constraint)
-                * (gamma(n + 1) * product_terms
-                    + gamma(1) * (frobenius(&prior_part) + product_terms))
+                * (gamma(n + 1) * product_terms + gamma(1) * (frobenius(&prior_part) + product_terms))
             + gamma(p + 1)
                 * frobenius(
                     &abs_constraint

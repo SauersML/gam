@@ -534,8 +534,7 @@ pub(crate) fn xt_diag_x_symmetric(
             // same at every pool width. (Chunks sized from the pool width made
             // them follow `RAYON_NUM_THREADS`.)
             let avg_row_nnz = vals.len().checked_div(n).unwrap_or(0);
-            let min_parallel_work =
-                super::SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
+            let min_parallel_work = super::SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
             let acc = match crate::parallel::row_reduction_chunk_rows(
                 n,
                 avg_row_nnz.saturating_mul(avg_row_nnz),
@@ -904,6 +903,7 @@ mod tests {
         }
     }
 
+
     // ── symmetrization_defect_2norm (#2748) ──────────────────────────────────
 
     /// An exactly symmetric matrix has no defect: the measurement must read
@@ -1003,7 +1003,8 @@ mod tests {
         let got = xt_diag_x_symmetric(&design, &w)
             .expect("xt_diag_x_symmetric should assemble X^T W X for SPD weights")
             .to_dense();
-        let wx = ndarray::Array2::from_shape_fn((x.nrows(), x.ncols()), |(i, j)| w[i] * x[[i, j]]);
+        let wx =
+            ndarray::Array2::from_shape_fn((x.nrows(), x.ncols()), |(i, j)| w[i] * x[[i, j]]);
         let expected = x.t().dot(&wx);
 
         let mut max_sym_err: f64 = 0.0;

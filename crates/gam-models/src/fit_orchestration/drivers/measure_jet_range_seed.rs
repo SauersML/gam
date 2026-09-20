@@ -93,8 +93,8 @@ fn measure_jet_range_screen_jet(
     // Enrols the `ln ℓ` coordinate in the jet producer. The realized basis is
     // the same either way.
     screen.learn_length_scale = true;
-    let basis =
-        gam_terms::basis::build_measure_jet_basis(data, &screen).map_err(EstimationError::from)?;
+    let basis = gam_terms::basis::build_measure_jet_basis(data, &screen)
+        .map_err(EstimationError::from)?;
     if basis.active_penalties.len() != 1 {
         crate::bail_invalid_estim!(
             "measure-jet range screen expected one active penalty; got {}",
@@ -298,17 +298,9 @@ fn screen_measure_jet_range(
     // count the engine sizes its resolution by is fixed across the window.
     let p_coefficients = {
         let mut sizing = spec.clone();
-        sizing.length_scale = bracket
-            .nodes
-            .iter()
-            .copied()
-            .find(|node| node.is_finite() && *node > 0.0)?;
+        sizing.length_scale = bracket.nodes.iter().copied().find(|node| node.is_finite() && *node > 0.0)?;
         sizing.double_penalty = false;
-        gam_terms::basis::build_measure_jet_basis(data, &sizing)
-            .ok()?
-            .design
-            .ncols()
-            + 1
+        gam_terms::basis::build_measure_jet_basis(data, &sizing).ok()?.design.ncols() + 1
     };
     let mut best: Option<(f64, f64)> = None;
     for &node in &bracket.nodes {
@@ -419,7 +411,8 @@ pub(crate) fn marginal_slope_screen_response(
             / total
     };
     let (y_bar, z_bar) = (mean(y), mean(z));
-    let surrogate = Array1::from_iter((0..n).map(|i| (y[i] - y_bar) * (z[i] - z_bar)));
+    let surrogate =
+        Array1::from_iter((0..n).map(|i| (y[i] - y_bar) * (z[i] - z_bar)));
     // A degenerate driver (no variation left after centering) carries no
     // slope signal at all; screening on a constant would rank every span
     // identically and is better declined than reported. The surrogate mean is
@@ -618,8 +611,9 @@ mod marginal_slope_screen_response_tests {
         let weights = Array1::<f64>::ones(N);
         let y = Array1::from(ys.clone());
         let z = Array1::from(zs.clone());
-        let surrogate = marginal_slope_screen_response(y.view(), z.view(), weights.view())
-            .expect("a non-degenerate driver must produce a surrogate");
+        let surrogate =
+            marginal_slope_screen_response(y.view(), z.view(), weights.view())
+                .expect("a non-degenerate driver must produce a surrogate");
         assert_eq!(surrogate.len(), N);
 
         // Bin by x and average, so what is compared is the CONDITIONAL mean the

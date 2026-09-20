@@ -242,7 +242,9 @@ impl<'a> RemlState<'a> {
     /// inner solve) near `ρ̂` plus a fresh ρ-Hessian, `M` the 2155 draws at
     /// which PSIS is reliable for a tail shape at the escalation cutoff; the
     /// returned fit does not need it, so the caller runs it only when
-    /// ρ-posterior inference was requested. When the diagnostic grades the
+    /// ρ-posterior inference was requested (`skip_rho_posterior_inference =
+    /// false`, #3010); a default fit publishes `NotComputed(InferenceNotRequested)`
+    /// and never evaluates the criterion here. When the diagnostic grades the
     /// plug-in [`Escalate`], the tiers (#938) run HERE, against the same live objective — Tier 1
     /// quadrature or Tier 2 NUTS with the exact LAML `ρ`-gradient
     /// (`Self::compute_gradient`), whichever needs fewer criterion evaluations,
@@ -254,12 +256,24 @@ impl<'a> RemlState<'a> {
     ///
     /// `continuation` carries the box the outer arm searched and certified
     /// against (the #2812 resolvability domain). That box is a numerical device,
-    /// not the support of `π(ρ|y)`: a draw outside it is still a model, the one
-    /// its saturated terms' limit fits give, and carries its mass. Such a draw
-    /// is valued by the criterion's affine continuation from the face
-    /// ([`CriterionContinuation`]), so the inner solve is only ever asked for
-    /// `ρ` inside the box, where P-IRLS has a resolvable minimum to report. A
-    /// draw past a literal face, or one the criterion cannot value, refuses the
+    /// not the support of `π(ρ|y)`: a draw past a saturated face is still a
+    /// model, the one its saturated terms' limit fits give, and carries its
+    /// mass. Such a draw is valued by the criterion's affine continuation from
+    /// the face ([`CriterionContinuation`]), so the inner solve is only ever
+    /// asked for `ρ` inside the box, where P-IRLS has a resolvable minimum to
+    /// report. Past a literal face the criterion has no value (past the
+    /// representable log-strength cut `ρ` is not a model; past the precision
+    /// box of a term without penalty geometry it is not computed), so the
+    /// Tier-0 proposal is truncated there, its target is `π(ρ|y)` restricted
+    /// to that support, and no draw reaches one.
+    ///
+    /// `railed_rho` names the coordinates the certificate railed. The Tier-0
+    /// proposal holds them, and every coordinate with `ρ̂` on a face of the box,
+    /// at `ρ̂`: that is the face-reduced model, and a railed coordinate's
+    /// Laplace proposal is near-flat, so drawing it would spread the proposal
+    /// hundreds of log-units along a direction the criterion no longer
+    /// resolves. The rest are drawn from the Laplace approximation conditioned
+    /// on them (#3010). A draw the criterion cannot value refuses the
     /// diagnostic (or fails the escalation tier) with its reason; no draw is
     /// dropped.
     ///
@@ -268,6 +282,7 @@ impl<'a> RemlState<'a> {
         &self,
         final_rho: &Array1<f64>,
         continuation: &crate::estimate::rho_domain::CriterionContinuation,
+        railed_rho: &[usize],
     ) -> (
         gam_problem::rho_posterior::RhoPosteriorOutcome,
         Option<gam_problem::rho_posterior::RhoPosteriorEscalation>,
@@ -317,18 +332,20 @@ impl<'a> RemlState<'a> {
             self.without_persistent_warm_start_store(|| self.compute_cost_and_gradient(rho))
                 .map_err(|error| error.to_string())
         };
-        let outcome = match escalator.rho_posterior_adequacy(final_rho, &outer_hessian, &|rho| {
-            continuation.value(rho, cost, cost_and_gradient)
-        }) {
+        let outcome = match escalator.rho_posterior_adequacy(
+            final_rho,
+            &outer_hessian,
+            &continuation.posterior_support(),
+            &continuation.held_at(final_rho, railed_rho),
+            &|rho| continuation.value(rho, cost, cost_and_gradient),
+        ) {
             Ok(Some(adequacy)) => RhoPosteriorOutcome::Assessed(adequacy),
             Ok(None) => RhoPosteriorOutcome::NotApplicable,
             // The grade is a post-fit diagnostic of a fit the outer
             // optimizer already certified, so a refusal publishes the fit and
             // carries its typed reason with it.
             Err(refusal) => {
-                log::debug!(
-                    "rho-posterior adequacy diagnostic refused at the converged rho: {refusal}"
-                );
+                log::debug!("rho-posterior adequacy diagnostic refused at the converged rho: {refusal}");
                 RhoPosteriorOutcome::Refused(refusal)
             }
         };
@@ -368,18 +385,22 @@ impl<'a> RemlState<'a> {
                 // #3293 — the tiers are then placed on the density they
                 // sample, not on the criterion's: see
                 // `sampled_density_laplace_geometry`.
-                let geometry = sampled_density_laplace_geometry(final_rho, &outer_hessian, |rho| {
-                    let (laml, gradient) =
-                        continuation.value_and_gradient(rho, cost_and_gradient)?;
-                    let correction = self
-                        .rho_prior_distribution_correction(rho)
-                        .map_err(|error| error.to_string())?;
-                    Ok((
-                        laml + correction.cost,
-                        gradient + &correction.gradient,
-                        correction.hessian_diagonal,
-                    ))
-                });
+                let geometry = sampled_density_laplace_geometry(
+                    final_rho,
+                    &outer_hessian,
+                    |rho| {
+                        let (laml, gradient) =
+                            continuation.value_and_gradient(rho, cost_and_gradient)?;
+                        let correction = self
+                            .rho_prior_distribution_correction(rho)
+                            .map_err(|error| error.to_string())?;
+                        Ok((
+                            laml + correction.cost,
+                            gradient + &correction.gradient,
+                            correction.hessian_diagonal,
+                        ))
+                    },
+                );
                 Some(match geometry {
                     Ok((mode, hessian)) => escalator.escalate_rho_posterior(
                         &mode,
@@ -452,12 +473,10 @@ impl<'a> RemlState<'a> {
             caller_measured_hessian_error,
         );
         let outcome = match first_order.status {
-            SmoothingCorrectionStatus::Unavailable(reason) => {
-                SmoothingCorrectionOutcome::Unavailable {
-                    reason,
-                    rho_covariance: first_order.rho_covariance,
-                }
-            }
+            SmoothingCorrectionStatus::Unavailable(reason) => SmoothingCorrectionOutcome::Unavailable {
+                reason,
+                rho_covariance: first_order.rho_covariance,
+            },
             _ => {
                 let method = first_order.factor.as_ref().map(|_| {
                     SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
@@ -544,9 +563,7 @@ fn sampled_density_laplace_geometry(
     let (mut cost, mut gradient, mut correction_curvature) = density(rho_hat)
         .map_err(|detail| format!("the sampled density is unavailable at rho_hat: {detail}"))?;
     if !cost.is_finite() || gradient.iter().any(|g| !g.is_finite()) {
-        return Err(format!(
-            "the sampled density at rho_hat is {cost} with gradient {gradient}"
-        ));
+        return Err(format!("the sampled density at rho_hat is {cost} with gradient {gradient}"));
     }
     let mut rho = rho_hat.clone();
     loop {
@@ -861,11 +878,9 @@ mod smoothing_correction_outcome_tests {
                 "an identified stationary ρ̂ must yield the analytic first-order \
                  correction; got {outcome_description}"
             );
-            crate::estimate::smoothing_correction::smoothing_correction_gram(
-                &factor.unwrap_or_else(|| {
-                    panic!("first-order outcome carries no matrix: {outcome_description}")
-                }),
-            )
+            crate::estimate::smoothing_correction::smoothing_correction_gram(&factor.unwrap_or_else(
+                || panic!("first-order outcome carries no matrix: {outcome_description}"),
+            ))
         };
 
         let c = 1000.0_f64;
@@ -881,11 +896,7 @@ mod smoothing_correction_outcome_tests {
             frob1.is_finite() && frob1 > 0.0,
             "scale-1 correction must be finite and non-zero (‖corr‖={frob1:.3e})"
         );
-        assert_eq!(
-            corr1.dim(),
-            corrc.dim(),
-            "correction shape mismatch across scales"
-        );
+        assert_eq!(corr1.dim(), corrc.dim(), "correction shape mismatch across scales");
 
         // Property under test: every entry scales by exactly c² (never c⁴).
         let mut worst_rel = 0.0_f64;

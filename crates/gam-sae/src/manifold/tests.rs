@@ -809,11 +809,7 @@ pub(crate) fn shared_ard_flat_index_aliases_in_bounds_1026() {
     );
 
     let per_atom = SaeManifoldRho::new(0.0, 0.0, vec![array![0.1_f64], array![0.2_f64]]);
-    assert_eq!(
-        per_atom.flat_coordinates().len(),
-        5,
-        "per-atom flat len = 1+K+Σ d_k"
-    );
+    assert_eq!(per_atom.flat_coordinates().len(), 5, "per-atom flat len = 1+K+Σ d_k");
     assert_eq!(per_atom.ard_flat_index(0, 0), 3);
     assert_eq!(
         per_atom.ard_flat_index(1, 0),
@@ -1042,12 +1038,9 @@ pub(crate) fn topk_joint_chart_gauges_restrict_132_to_84_with_rank_two_2653() {
     )
     .unwrap()
     .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
-    let logits = Array2::<f64>::from_shape_fn(
-        (n, 2),
-        |(row, atom)| {
-            if row % 2 == atom { 1.0 } else { -1.0 }
-        },
-    );
+    let logits = Array2::<f64>::from_shape_fn((n, 2), |(row, atom)| {
+        if row % 2 == atom { 1.0 } else { -1.0 }
+    });
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,
         vec![coords0, coords1],
@@ -1080,11 +1073,7 @@ pub(crate) fn topk_joint_chart_gauges_restrict_132_to_84_with_rank_two_2653() {
             "topk_joint_chart_gauges_restrict_132_to_84_with_rank_two_2653",
         )
         .expect("dense chart gauges map into the exact compact arrow chart");
-    assert_eq!(
-        compact.len(),
-        2,
-        "the mapped gauge span must retain rank two"
-    );
+    assert_eq!(compact.len(), 2, "the mapped gauge span must retain rank two");
     assert!(compact.iter().all(|gauge| gauge.len() == 84));
     for i in 0..compact.len() {
         for j in 0..compact.len() {
@@ -1298,12 +1287,10 @@ impl SaeBasisSecondJet for SnapshotLinearSecondJet2521 {
         center: ndarray::ArrayView1<'_, f64>,
         radius: f64,
     ) -> Result<crate::basis::SaeBasisJetBallCapability, String> {
-        Ok(crate::basis::SaeBasisJetBallCapability::Unavailable(
-            format!(
-                "SnapshotLinearSecondJet2521 is a snapshot test basis and declares no bound \
+        Ok(crate::basis::SaeBasisJetBallCapability::Unavailable(format!(
+            "SnapshotLinearSecondJet2521 is a snapshot test basis and declares no bound \
              on the ball of radius {radius} around {center}"
-            ),
-        ))
+        )))
     }
 }
 
@@ -2529,10 +2516,7 @@ fn a_multi_atom_separable_gate_seed_carries_the_full_dispersion_shift_on_clean_d
             .map(|atom| array![0.2 - 0.1 * atom as f64, -0.4])
             .collect();
         let rho = SaeManifoldRho::new(0.7_f64.ln(), 1.3_f64.ln(), ard);
-        for mode in [
-            AssignmentMode::softmax(1.0),
-            AssignmentMode::threshold_gate(1.0, 0.0),
-        ] {
+        for mode in [AssignmentMode::softmax(1.0), AssignmentMode::threshold_gate(1.0, 0.0)] {
             for dispersion in [1.0e-4_f64, 1.0e-2, 4.0] {
                 let shift = dispersion.ln();
                 let bound = rho.clone().for_assignment(&assignment_for(mode.clone(), k));
@@ -2855,9 +2839,7 @@ pub(crate) fn planted_circle_ordered_beta_bernoulli_n40_sigma018_reaches_high_ev
     let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
         .seed_scaled_by_dispersion_for_assignment(seed_dispersion, &term.assignment)
         .unwrap();
-    let init_rho_flat = init_rho
-        .to_flat(&term.assignment)
-        .expect("the seed rho is bound to the term's assignment");
+    let init_rho_flat = init_rho.to_flat(&term.assignment).expect("the seed rho is bound to the term's assignment");
     let n_params = init_rho_flat.len();
     let mut objective =
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 50, 0.04, 1.0e-6, 1.0e-6);
@@ -2894,11 +2876,12 @@ pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionles
                 let (term, seed_dispersion) = planted_circle_seed_term(z.view(), assignment_mode);
                 let seed_ev = global_ev(z.view(), term.fitted().view());
                 let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]])
-                    .seed_scaled_by_dispersion_for_assignment(seed_dispersion, &term.assignment)
+                    .seed_scaled_by_dispersion_for_assignment(
+                        seed_dispersion,
+                        &term.assignment,
+                    )
                     .unwrap();
-                let init_rho_flat = init_rho
-                    .to_flat(&term.assignment)
-                    .expect("the seed rho is bound to the term's assignment");
+                let init_rho_flat = init_rho.to_flat(&term.assignment).expect("the seed rho is bound to the term's assignment");
                 let n_params = init_rho_flat.len();
                 let mut objective = SaeManifoldOuterObjective::new(
                     term,
@@ -3163,7 +3146,13 @@ pub(crate) fn refine_iteration_limit_probe_budget_never_extends() {
     // Probe policy: base == progress, so even perfect progress cannot
     // extend past the base work budget.
     assert_eq!(
-        SaeManifoldTerm::refine_iteration_limit(probe_base, probe_base, probe_base, Some(1.0), 0.5),
+        SaeManifoldTerm::refine_iteration_limit(
+            probe_base,
+            probe_base,
+            probe_base,
+            Some(1.0),
+            0.5
+        ),
         probe_base
     );
     let accepted_base = 64usize;
@@ -3737,16 +3726,14 @@ fn two_floor_overlap_predicate_detects_both_crossings_2673() {
         "#2673 control: the other two directions must be priced"
     );
     assert_eq!(
-        report.value_gauge_gradient_resolved,
-        1,
+        report.value_gauge_gradient_resolved, 1,
         "#2673 control: the predicate must DETECT a gauge direction the gradient resolves \
          (λ={:.3e} inside floor {floor:.3e}, μ={:.3e} above {mu_floor:.3e})",
         lambdas[0],
         lambdas[0] / vbvs[0]
     );
     assert_eq!(
-        report.value_priced_gradient_projected,
-        1,
+        report.value_priced_gradient_projected, 1,
         "#2673 control: the predicate must DETECT a priced direction the gradient projects \
          out (λ={:.3e} above floor {floor:.3e}, μ={:.3e} below {mu_floor:.3e})",
         lambdas[1],
@@ -4059,9 +4046,7 @@ fn the_classification_is_invariant_under_a_reparametrization_2673() {
         d[index] = scale;
     }
     let congruent = |m: &Array2<f64>| -> Array2<f64> {
-        Array2::from_shape_fn((dim, dim), |(row, column)| {
-            d[row] * m[[row, column]] * d[column]
-        })
+        Array2::from_shape_fn((dim, dim), |(row, column)| d[row] * m[[row, column]] * d[column])
     };
     let a_scaled = congruent(&state.a);
     let b_scaled = congruent(&state.b);
@@ -4121,32 +4106,35 @@ fn the_classification_is_invariant_under_a_reparametrization_2673() {
     // 3. And the flipped directions are exactly the crossing: the value calls
     //    them gauge, the gradient keeps their A⁻¹ response. Meanwhile the
     //    SHIPPED rule pins nothing in either frame, direction by direction.
-    let shipped_pinned =
-        |eigs: &Array1<f64>, vecs: &Array2<f64>, b: &Array2<f64>, label: &str| -> (usize, usize) {
-            let norm = eigs.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
-            let arithmetic = (dim as f64) * f64::EPSILON * norm;
-            let mut pinned = 0usize;
-            let mut arithmetic_binds = 0usize;
-            let mut worst_margin = f64::INFINITY;
-            for index in 0..dim {
-                let v = vecs.column(index);
-                let vbv = v.dot(&b.dot(&v));
-                let floor = arithmetic.max(identifiability * vbv);
-                if eigs[index].abs() <= floor {
-                    pinned += 1;
-                }
-                if arithmetic > identifiability * vbv {
-                    arithmetic_binds += 1;
-                    worst_margin = worst_margin.min(eigs[index].abs() / arithmetic);
-                }
+    let shipped_pinned = |eigs: &Array1<f64>,
+                          vecs: &Array2<f64>,
+                          b: &Array2<f64>,
+                          label: &str|
+     -> (usize, usize) {
+        let norm = eigs.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+        let arithmetic = (dim as f64) * f64::EPSILON * norm;
+        let mut pinned = 0usize;
+        let mut arithmetic_binds = 0usize;
+        let mut worst_margin = f64::INFINITY;
+        for index in 0..dim {
+            let v = vecs.column(index);
+            let vbv = v.dot(&b.dot(&v));
+            let floor = arithmetic.max(identifiability * vbv);
+            if eigs[index].abs() <= floor {
+                pinned += 1;
             }
-            println!(
-                "[#2673 INVARIANCE] shipped rule on the {label} frame: pins {pinned} of {dim}; the \
+            if arithmetic > identifiability * vbv {
+                arithmetic_binds += 1;
+                worst_margin = worst_margin.min(eigs[index].abs() / arithmetic);
+            }
+        }
+        println!(
+            "[#2673 INVARIANCE] shipped rule on the {label} frame: pins {pinned} of {dim}; the \
              arithmetic term binds on {arithmetic_binds} (there |λ| still clears it by \
              {worst_margin:.3e}x, so the verdict is the identifiability verdict)"
-            );
-            (pinned, arithmetic_binds)
-        };
+        );
+        (pinned, arithmetic_binds)
+    };
     let (plain_pinned, _) = shipped_pinned(&a_eigs, &a_vecs, &state.b, "plain");
     let (scaled_pinned, scaled_arithmetic_binds) =
         shipped_pinned(&scaled_eigs, &scaled_vecs, &b_scaled, "rescaled");
@@ -4235,7 +4223,8 @@ fn two_floors_overlap_region_direction_count_2673() {
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
     let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
-    let (_dt, _db, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
+    let (_dt, _db, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
 
     // Dense `A` (the operator BOTH floors classify) and dense `B` (the metric the
     // second floor measures in), materialised column by column through the SAME
@@ -4254,13 +4243,9 @@ fn two_floors_overlap_region_direction_count_2673() {
         } else {
             vb[col - total_t] = 1.0;
         }
-        let (out_t, out_b) = gam_solve::arrow_schur::matrix_free_arrow_operator_apply(
-            &sys,
-            &cache,
-            vt.view(),
-            vb.view(),
-        )
-        .expect("majorizer apply");
+        let (out_t, out_b) =
+            gam_solve::arrow_schur::matrix_free_arrow_operator_apply(&sys, &cache, vt.view(), vb.view())
+                .expect("majorizer apply");
         for row in 0..total_t {
             b[[row, col]] = out_t[row];
         }
@@ -4351,11 +4336,7 @@ fn two_floors_overlap_region_direction_count_2673() {
     // The comparison must be WELL POSED, which is what this test owns. The count
     // itself is the measurement and is reported, not asserted: asserting zero
     // would assert the defect absent.
-    assert_eq!(
-        a_eigs.len(),
-        dim,
-        "#2673: the A spectrum must span every direction"
-    );
+    assert_eq!(a_eigs.len(), dim, "#2673: the A spectrum must span every direction");
     assert!(
         a_eigs.iter().all(|v| v.is_finite()),
         "#2673: every A eigenvalue must be finite, or the classification is undefined"
@@ -4450,7 +4431,8 @@ fn exact_a_ard_operator_derivative_is_the_unmajorized_hessian_2515() {
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
     let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
-    let (_dt, _db, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
+    let (_dt, _db, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
 
     // FACT 1 — the exact/majorizer split is exact by construction, per row.
     let alpha = term.validated_ard_precisions(&rho).unwrap()[0][0];
@@ -4503,8 +4485,8 @@ fn exact_a_ard_operator_derivative_is_the_unmajorized_hessian_2515() {
                 continue;
             }
             let w_row = row_weights.as_ref().map_or(1.0, |w| w[row]);
-            let expected = w_row
-                * ArdAxisPrior::eval(alpha, coords[[row, 0]], period).negative_hessian_remainder();
+            let expected =
+                w_row * ArdAxisPrior::eval(alpha, coords[[row, 0]], period).negative_hessian_remainder();
             let actual = delta[[base + local, base + local]];
             assert!(
                 (actual - expected).abs() <= 1.0e-12 * expected.abs().max(1.0),
@@ -4583,7 +4565,8 @@ fn from_probes_exact_a_theta_adjoint_matches_dense_2515() {
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
     let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
-    let (_dt, _db, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
+    let (_dt, _db, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
 
     // Full-basis probes with exact S^-1 e_j: no stochastic error in the comparison,
     // so a disagreement is an operator-mismatch defect and not probe noise.
@@ -4604,10 +4587,24 @@ fn from_probes_exact_a_theta_adjoint_matches_dense_2515() {
     let solver = DeflatedArrowSolver::plain(&cache);
     let inv = term.materialize_joint_inverse(&cache, &solver).unwrap();
     let dense_exact = term
-        .logdet_theta_adjoint_dense(&rho, &cache, &inv, true, true, None)
+        .logdet_theta_adjoint_dense(
+            &rho,
+            &cache,
+            &inv,
+            true,
+            true,
+            None,
+        )
         .expect("dense exact-A theta adjoint");
     let dense_majorizer = term
-        .logdet_theta_adjoint_dense(&rho, &cache, &inv, true, false, None)
+        .logdet_theta_adjoint_dense(
+            &rho,
+            &cache,
+            &inv,
+            true,
+            false,
+            None,
+        )
         .expect("dense majorizer-B theta adjoint");
 
     // NON-VACUITY — the exact-A and majorizer-B adjoints must genuinely differ on
@@ -4784,8 +4781,10 @@ fn solve_exact_stationarity_is_self_adjoint_2080() {
          IFT identity): ⟨A⁺u,v⟩={lhs} vs ⟨u,A⁺v⟩={rhs}"
     );
     // Non-vacuity: at least one projected response must be genuinely resolved.
-    let response_norm_sq =
-        a_u.t.dot(&a_u.t) + a_u.beta.dot(&a_u.beta) + a_v.t.dot(&a_v.t) + a_v.beta.dot(&a_v.beta);
+    let response_norm_sq = a_u.t.dot(&a_u.t)
+        + a_u.beta.dot(&a_u.beta)
+        + a_v.t.dot(&a_v.t)
+        + a_v.beta.dot(&a_v.beta);
     assert!(
         response_norm_sq.is_finite() && response_norm_sq.sqrt() > f64::EPSILON.sqrt(),
         "self-adjoint pin must have a non-trivial finite quotient response: \
@@ -6413,9 +6412,7 @@ impl PencilOracle {
             "the evidence factor must be positive definite"
         );
         let inverse_root = phi_vectors
-            .dot(&Array2::from_diag(
-                &phi_values.mapv(|value| 1.0 / value.sqrt()),
-            ))
+            .dot(&Array2::from_diag(&phi_values.mapv(|value| 1.0 / value.sqrt())))
             .dot(&phi_vectors.t());
         let whitened = inverse_root.dot(&operator).dot(&inverse_root);
         let whitened = (&whitened + &whitened.t()) * 0.5;
@@ -6423,8 +6420,7 @@ impl PencilOracle {
             .eigh(Side::Lower)
             .expect("whitened pencil eigendecomposition");
         let vectors = inverse_root.dot(&rotation);
-        let frobenius =
-            |matrix: &Array2<f64>| matrix.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let frobenius = |matrix: &Array2<f64>| matrix.iter().map(|value| value * value).sum::<f64>().sqrt();
         let operator_frobenius = frobenius(&operator);
         let metric_frobenius = frobenius(&phi);
         let floors = (0..dim)

@@ -408,8 +408,7 @@ impl BlockEffectiveJacobian for BoundedEffectiveJacobian {
             } else {
                 state.beta[term.col_idx]
             };
-            let (_, _, db_dtheta, _, _, _, _) =
-                bounded_latent_derivatives(term.logit(theta), term.min, term.max);
+            let (_, _, db_dtheta, _, _, _, _) = bounded_latent_derivatives(term.logit(theta), term.min, term.max);
             if !(db_dtheta.is_finite() && db_dtheta > 0.0) {
                 return Err(format!(
                     "BoundedEffectiveJacobian::effective_jacobian_at: bounded column {} has unrepresentable derivative {db_dtheta} at theta={theta}",
@@ -721,15 +720,7 @@ fn bounded_latent_derivatives(
     let d3b_dtheta3 = width * jet.d3;
     let d4b_dtheta4 = width * jet.d4;
     let d5b_dtheta5 = width * jet.d5;
-    (
-        beta,
-        z,
-        db_dtheta,
-        d2b_dtheta2,
-        d3b_dtheta3,
-        d4b_dtheta4,
-        d5b_dtheta5,
-    )
+    (beta, z, db_dtheta, d2b_dtheta2, d3b_dtheta3, d4b_dtheta4, d5b_dtheta5)
 }
 
 /// The Beta shapes `(a, b)` of a bounded coefficient's prior on the normalized
@@ -796,13 +787,7 @@ fn bounded_prior_terms(
     let neghess = (a + b) * jet.d1;
     let neghess_derivative = (a + b) * jet.d2;
     let neghess_second_derivative = (a + b) * jet.d3;
-    let terms = (
-        logp,
-        grad,
-        neghess,
-        neghess_derivative,
-        neghess_second_derivative,
-    );
+    let terms = (logp, grad, neghess, neghess_derivative, neghess_second_derivative);
     if [terms.0, terms.1, terms.2, terms.3, terms.4]
         .iter()
         .any(|value| !value.is_finite())
@@ -843,6 +828,7 @@ impl ExactStandardObservationRow {
     }
 }
 
+
 #[inline]
 fn certify_bounded_row(
     row: usize,
@@ -865,9 +851,7 @@ fn certify_bounded_row(
         ("bounded-family log likelihood", state.log_likelihood),
     ] {
         if !value.is_finite() {
-            return Err(EstimationError::pirls_row_geometry_unrepresentable(
-                row, quantity, eta, value,
-            ));
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(row, quantity, eta, value));
         }
     }
     if !state.neghessian_eta_third_derivative.is_finite() {
@@ -1093,12 +1077,7 @@ fn validate_bounded_observation_inputs(
             continue;
         }
         if !eta[i].is_finite() {
-            return Err(EstimationError::pirls_row_geometry_unrepresentable(
-                i,
-                "linear predictor",
-                eta[i],
-                eta[i],
-            ));
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "linear predictor", eta[i], eta[i]));
         }
         if !y[i].is_finite() {
             return Err(EstimationError::pirls_row_geometry_unrepresentable(
@@ -1124,12 +1103,7 @@ fn validate_bounded_observation_inputs(
             | ResponseFamily::RoystonParmar => false,
         };
         if !valid {
-            return Err(EstimationError::pirls_row_geometry_unrepresentable(
-                i,
-                "bounded-family response",
-                eta[i],
-                yi,
-            ));
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "bounded-family response", eta[i], yi));
         }
     }
     Ok(resolved_scale)
@@ -1157,9 +1131,7 @@ fn power_variance_dispersion(
         ),
     };
     if !(phi.is_finite() && phi > 0.0) {
-        crate::bail_invalid_estim!(
-            "bounded-family dispersion phi must be finite and > 0; got {phi}"
-        );
+        crate::bail_invalid_estim!("bounded-family dispersion phi must be finite and > 0; got {phi}");
     }
     Ok((power, phi))
 }
@@ -1209,7 +1181,8 @@ fn exact_reciprocal_power_observation_row(
     let log_likelihood = if p == 2.0 {
         (weight / phi) * (-y * eta.powf(a) + a * eta.ln())
     } else {
-        (weight / phi) * (y * eta.powf(alpha + 1.0) / (1.0 - p) - eta.powf(beta + 1.0) / (2.0 - p))
+        (weight / phi)
+            * (y * eta.powf(alpha + 1.0) / (1.0 - p) - eta.powf(beta + 1.0) / (2.0 - p))
     };
     let fisherweight = c * a * eta.powf(beta - 1.0);
     if !(fisherweight.is_finite() && fisherweight > 0.0) {
@@ -1315,9 +1288,7 @@ fn exact_standard_observation_row(
                 family.link.link_function().name()
             );
         }
-        ResponseFamily::Gamma
-            if !matches!(family.link, InverseLink::Standard(StandardLink::Log)) =>
-        {
+        ResponseFamily::Gamma if !matches!(family.link, InverseLink::Standard(StandardLink::Log)) => {
             crate::bail_invalid_estim!(
                 "bounded Gamma rows are defined for the log and inverse links, got {}",
                 family.link.link_function().name()
@@ -1327,12 +1298,7 @@ fn exact_standard_observation_row(
             let scaled_weight = match resolved_scale {
                 gam_spec::ResolvedLikelihoodScale::ProfiledGaussian => weight,
                 gam_spec::ResolvedLikelihoodScale::FixedGaussian { phi } => {
-                    gam_math::special::scaled_positive_product_quotient(
-                        weight,
-                        1.0,
-                        1.0,
-                        phi.value(),
-                    )
+                    gam_math::special::scaled_positive_product_quotient(weight, 1.0, 1.0, phi.value())
                 }
                 _ => {
                     crate::bail_invalid_estim!(
@@ -1500,13 +1466,16 @@ fn exact_standard_observation_row(
                 -weighted_product3(weight * (p - 1.0).powi(2), y, a)
                     + weight * (2.0 - p).powi(2) * b
             };
-            let observed_second_derivative_unit = (p - 1.0).powi(3) * y * a + (2.0 - p).powi(3) * b;
+            let observed_second_derivative_unit =
+                (p - 1.0).powi(3) * y * a + (2.0 - p).powi(3) * b;
             let neghessian_eta_second_derivative = if observed_second_derivative_unit.is_finite() {
                 weight * observed_second_derivative_unit
             } else {
-                weighted_product3(weight * (p - 1.0).powi(3), y, a) + weight * (2.0 - p).powi(3) * b
+                weighted_product3(weight * (p - 1.0).powi(3), y, a)
+                    + weight * (2.0 - p).powi(3) * b
             };
-            let observed_third_derivative_unit = -(p - 1.0).powi(4) * y * a + (2.0 - p).powi(4) * b;
+            let observed_third_derivative_unit =
+                -(p - 1.0).powi(4) * y * a + (2.0 - p).powi(4) * b;
             let neghessian_eta_third_derivative = if observed_third_derivative_unit.is_finite() {
                 weight * observed_third_derivative_unit
             } else {
@@ -1575,8 +1544,7 @@ fn exact_standard_observation_row(
             let neghessian_eta = observed_y + observed_theta;
             let neghessian_eta_derivative = neghessian_eta * (r - q);
             // d(qr)/dδ = qr(r - q) and d(r - q)/dδ = -2qr.
-            let neghessian_eta_second_derivative =
-                neghessian_eta * ((r - q) * (r - q) - 2.0 * q * r);
+            let neghessian_eta_second_derivative = neghessian_eta * ((r - q) * (r - q) - 2.0 * q * r);
             // d/dδ of W·((r − q)² − 2qr) = W(r − q)((r − q)² − 2qr) − 6W·qr(r − q).
             let neghessian_eta_third_derivative =
                 neghessian_eta * (r - q) * ((r - q) * (r - q) - 8.0 * q * r);
@@ -1820,11 +1788,8 @@ impl BoundedLinearFamily {
                     term.col_idx, term.min, term.max
                 ));
             }
-            let (beta, _, db_dtheta, d2b_dtheta2, d3b_dtheta3, _, _) = bounded_latent_derivatives(
-                term.logit(latent_beta[term.col_idx]),
-                term.min,
-                term.max,
-            );
+            let (beta, _, db_dtheta, d2b_dtheta2, d3b_dtheta3, _, _) =
+                bounded_latent_derivatives(term.logit(latent_beta[term.col_idx]), term.min, term.max);
             if [beta, db_dtheta, d2b_dtheta2, d3b_dtheta3]
                 .iter()
                 .any(|value| !value.is_finite())
@@ -1993,8 +1958,7 @@ impl BoundedLinearFamily {
                 bounded_latent_derivatives(term.logit(latent_beta[col]), term.min, term.max);
             fourth_diag[col] = d4b_dtheta4;
             fifth_diag[col] = d5b_dtheta5;
-            prior_fifth[col] =
-                bounded_prior_neghess_third_derivative(term.logit(latent_beta[col]), &term.prior)?;
+            prior_fifth[col] = bounded_prior_neghess_third_derivative(term.logit(latent_beta[col]), &term.prior)?;
         }
         let scaled_bounded_columns = |scale: &dyn Fn(usize) -> f64| {
             let mut out = Array2::<f64>::zeros(x_eff.raw_dim());
@@ -2037,33 +2001,21 @@ impl BoundedLinearFamily {
             let dx_w =
                 scaled_bounded_columns(&|col| if col == axis { second_diag[col] } else { 0.0 });
             let ddx_uw = scaled_bounded_columns(&|col| {
-                if col == axis {
-                    third_diag[col] * u[col]
-                } else {
-                    0.0
-                }
+                if col == axis { third_diag[col] * u[col] } else { 0.0 }
             });
             let ddx_vw = scaled_bounded_columns(&|col| {
-                if col == axis {
-                    third_diag[col] * v[col]
-                } else {
-                    0.0
-                }
+                if col == axis { third_diag[col] * v[col] } else { 0.0 }
             });
             let dddx_uvw = scaled_bounded_columns(&|col| {
-                if col == axis {
-                    fourth_diag[col] * u[col] * v[col]
-                } else {
-                    0.0
-                }
+                if col == axis { fourth_diag[col] * u[col] * v[col] } else { 0.0 }
             });
             let ddeta_uw = dx_w.dot(u);
             let ddeta_vw = dx_w.dot(v);
             let dddeta_uvw = ddx_vw.dot(u);
             let second_first_sum =
                 &(&(&ddeta_uv * &deta_w) + &(&ddeta_uw * &deta_v)) + &(&ddeta_vw * &deta_u);
-            let d3w =
-                &(&(w3 * &(&deta_uv * &deta_w)) + &(w2 * &second_first_sum)) + &(w1 * &dddeta_uvw);
+            let d3w = &(&(w3 * &(&deta_uv * &deta_w)) + &(w2 * &second_first_sum))
+                + &(w1 * &dddeta_uvw);
             let d2w_vw = &(w2 * &(&deta_v * &deta_w)) + &(w1 * &ddeta_vw);
             let d2w_uw = &(w2 * &(&deta_u * &deta_w)) + &(w1 * &ddeta_uw);
             let dw_w = w1 * &deta_w;
@@ -2090,8 +2042,9 @@ impl BoundedLinearFamily {
             let d_score_w = -(w * &deta_w);
             let dd_score_uw = -(w1 * &(&deta_u * &deta_w)) - &(w * &ddeta_uw);
             let dd_score_vw = -(w1 * &(&deta_v * &deta_w)) - &(w * &ddeta_vw);
-            let ddd_score =
-                -(w2 * &(&deta_uv * &deta_w)) - &(w1 * &second_first_sum) - &(w * &dddeta_uvw);
+            let ddd_score = -(w2 * &(&deta_uv * &deta_w))
+                - &(w1 * &second_first_sum)
+                - &(w * &dddeta_uvw);
             for term in &self.bounded_terms {
                 let col = term.col_idx;
                 let x_b = self.design.column(col);
@@ -2601,10 +2554,10 @@ fn trace_of_factored_product(
 ) -> Result<f64, String> {
     let m = covariance.nrows();
     if m != covariance.ncols() {
-        return Err(SmoothError::dimension_mismatch(
-            "trace_of_factored_product needs a square covariance",
-        )
-        .into());
+        return Err(
+            SmoothError::dimension_mismatch("trace_of_factored_product needs a square covariance")
+                .into(),
+        );
     }
     if penalty_root.ncols() != m {
         return Err(SmoothError::dimension_mismatch(
@@ -2634,9 +2587,7 @@ fn trace_of_factored_product(
     let mut covariance_factor = eigenvectors;
     for (col, eigenvalue) in eigenvalues.iter().enumerate() {
         let scale = eigenvalue.max(0.0).sqrt();
-        covariance_factor
-            .column_mut(col)
-            .mapv_inplace(|v| v * scale);
+        covariance_factor.column_mut(col).mapv_inplace(|v| v * scale);
     }
     let scaled = penalty_root.dot(&covariance_factor);
     let mut trace = gam_linalg::utils::KahanSum::default();
@@ -2765,9 +2716,8 @@ fn exact_bounded_edf(
                 // `spectral_tolerance` at `n·1e-10·λmax`, a factor of 4.5e5 — so
                 // adopting the root's rank here would silently move published
                 // per-block EDF, which is a separate, measured increment (#2469).
-                let penalty_root =
-                    gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root(local)
-                        .map_err(EstimationError::InvalidInput)?;
+                let penalty_root = gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root(local)
+                    .map_err(EstimationError::InvalidInput)?;
                 let trace_k = lambda_k
                     * trace_of_factored_product(&penalty_root, &cov_block.to_owned())
                         .map_err(EstimationError::InvalidInput)?;
@@ -2787,9 +2737,8 @@ fn exact_bounded_edf(
                 let penalty_rank = p.saturating_sub(estimate_penalty_nullity(m).map_err(|e| {
                     EstimationError::InvalidInput(format!("bounded EDF rank failed: {e}"))
                 })?);
-                let penalty_root =
-                    gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root(m)
-                        .map_err(EstimationError::InvalidInput)?;
+                let penalty_root = gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root(m)
+                    .map_err(EstimationError::InvalidInput)?;
                 let trace_k = lambda_k
                     * trace_of_factored_product(&penalty_root, latent_cov)
                         .map_err(EstimationError::InvalidInput)?;
@@ -3002,8 +2951,7 @@ fn fit_bounded_term_collection_with_design(
         .penalties
         .iter()
         .map(|bp| {
-            let latent_block =
-                bp.col_range.len() == 1 && shrinkage_cols.contains(&bp.col_range.start);
+            let latent_block = bp.col_range.len() == 1 && shrinkage_cols.contains(&bp.col_range.start);
             if latent_block {
                 PenaltySpec::from_blockwise(bp.clone())
             } else {
@@ -3112,44 +3060,43 @@ fn fit_bounded_term_collection_with_design(
         bounded_terms: bounded_terms.clone(),
         jeffreys_armed: true,
     };
-    let blockspec =
-        |initial_log_lambdas: Array1<f64>, initial_beta: Array1<f64>| ParameterBlockSpec {
-            name: "eta".to_string(),
-            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-                designzeroed.clone(),
-            )),
-            offset: offset.to_owned(),
-            penalties: fit_penalties
-                .iter()
-                .map(|ps| match ps {
-                    PenaltySpec::Block {
-                        local, col_range, ..
-                    } => PenaltyMatrix::Blockwise {
-                        local: local.clone(),
-                        col_range: col_range.clone(),
-                        total_dim: design.design.ncols(),
-                    },
-                    PenaltySpec::Dense(m) | PenaltySpec::DenseWithMean { matrix: m, .. } => {
-                        PenaltyMatrix::Dense(m.clone())
-                    }
-                })
-                .collect(),
-            nullspace_dims: design.nullspace_dims.clone(),
-            initial_log_lambdas,
-            initial_beta: Some(initial_beta),
-            gauge_priority: 100,
-            // Report the true β-dependent Jacobian (bounded columns scaled by
-            // dβ/dθ) to the identifiability audit so it does not mistake the
-            // deliberately-zeroed placeholder columns for a structural rank
-            // deficiency. The inner solve still drives η through the family
-            // adapter, so this does not affect the fit geometry.
-            jacobian_callback: Some(Arc::new(BoundedEffectiveJacobian {
-                design: fit_design.clone(),
-                bounded_terms: bounded_terms.clone(),
-            })),
-            stacked_design: None,
-            stacked_offset: None,
-        };
+    let blockspec = |initial_log_lambdas: Array1<f64>, initial_beta: Array1<f64>| ParameterBlockSpec {
+        name: "eta".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            designzeroed.clone(),
+        )),
+        offset: offset.to_owned(),
+        penalties: fit_penalties
+            .iter()
+            .map(|ps| match ps {
+                PenaltySpec::Block {
+                    local, col_range, ..
+                } => PenaltyMatrix::Blockwise {
+                    local: local.clone(),
+                    col_range: col_range.clone(),
+                    total_dim: design.design.ncols(),
+                },
+                PenaltySpec::Dense(m) | PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                    PenaltyMatrix::Dense(m.clone())
+                }
+            })
+            .collect(),
+        nullspace_dims: design.nullspace_dims.clone(),
+        initial_log_lambdas,
+        initial_beta: Some(initial_beta),
+        gauge_priority: 100,
+        // Report the true β-dependent Jacobian (bounded columns scaled by
+        // dβ/dθ) to the identifiability audit so it does not mistake the
+        // deliberately-zeroed placeholder columns for a structural rank
+        // deficiency. The inner solve still drives η through the family
+        // adapter, so this does not affect the fit geometry.
+        jacobian_callback: Some(Arc::new(BoundedEffectiveJacobian {
+            design: fit_design.clone(),
+            bounded_terms: bounded_terms.clone(),
+        })),
+        stacked_design: None,
+        stacked_offset: None,
+    };
     let fit_options = BlockwiseFitOptions {
         inner_tol: options.tol,
         outer_max_iter: options.max_iter,
@@ -3281,11 +3228,7 @@ fn fit_bounded_term_collection_with_design(
             )
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
             let warm_log_lambdas = warm.fit.log_lambdas.mapv(|rho| rho + warm.u - u);
-            let fit = run_fit(
-                &adapter,
-                warm_log_lambdas,
-                warm.fit.block_states[0].beta.clone(),
-            )?;
+            let fit = run_fit(&adapter, warm_log_lambdas, warm.fit.block_states[0].beta.clone())?;
             measure(phi, fit, adapter)
         };
         let mut near = measure(1.0, fit, family_adapter.clone())?;
@@ -3523,10 +3466,8 @@ fn fit_bounded_term_collection_with_design(
     // conditional covariance's own congruence. It carries no dispersion factor,
     // because `∂θ̂/∂ρ` has none. A fit that selects no lambda has `Vp = Vb`
     // exactly; a penalized fit whose correction was refused keeps the typed absence.
-    let smoothing_corrected = match (
-        fit.smoothing_correction(),
-        fit.smoothing_correction_method(),
-    ) {
+    let smoothing_corrected = match (fit.smoothing_correction(), fit.smoothing_correction_method())
+    {
         (Some(latent_correction), Some(method)) => Some((
             bounded_latent_bilinear_to_user(latent_correction, &jac_diag, &conditioning)?,
             method,
@@ -3580,9 +3521,7 @@ fn fit_bounded_term_collection_with_design(
                 smoothing_correction: smoothing_corrected
                     .as_ref()
                     .map(|(correction, _)| correction.clone()),
-                smoothing_correction_method: smoothing_corrected
-                    .as_ref()
-                    .map(|(_, method)| *method),
+                smoothing_correction_method: smoothing_corrected.as_ref().map(|(_, method)| *method),
                 smoothing_correction_first_order: smoothing_corrected
                     .as_ref()
                     .map(|(correction, _)| correction.clone()),
@@ -4518,9 +4457,10 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
     }
 
     if let Some(gauge) = smooth_term.collection_gauge.as_ref() {
-        let projector =
-            FixedRowSpaceProjector::from_constraint_block(gauge.constraint_block.view())
-                .map_err(EstimationError::from)?;
+        let projector = FixedRowSpaceProjector::from_constraint_block(
+            gauge.constraint_block.view(),
+        )
+        .map_err(EstimationError::from)?;
         for matrix in aniso_result
             .design_first
             .iter_mut()
@@ -4908,36 +4848,16 @@ mod glm_eta_observation_fd_tests {
     #[test]
     fn reciprocal_and_inverse_gaussian_rows_are_the_exact_derivative_tower() {
         let cases = [
-            (
-                ResponseFamily::InverseGaussian,
-                StandardLink::InverseSquared,
-                0.7,
-                1.3,
-                0.45,
-            ),
-            (
-                ResponseFamily::InverseGaussian,
-                StandardLink::Log,
-                0.7,
-                1.3,
-                0.2,
-            ),
+            (ResponseFamily::InverseGaussian, StandardLink::InverseSquared, 0.7, 1.3, 0.45),
+            (ResponseFamily::InverseGaussian, StandardLink::Log, 0.7, 1.3, 0.2),
             (ResponseFamily::Gamma, StandardLink::Inverse, 0.4, 2.1, 0.6),
-            (
-                ResponseFamily::Gaussian,
-                StandardLink::Inverse,
-                0.3,
-                1.7,
-                0.8,
-            ),
+            (ResponseFamily::Gaussian, StandardLink::Inverse, 0.3, 1.7, 0.8),
         ];
         let h = 1e-5;
         for (response, link, phi, y, eta) in cases {
             let label = format!("{} / {}", response.name(), link.name());
             let scale = match response {
-                ResponseFamily::Gamma => {
-                    gam_spec::LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 / phi }
-                }
+                ResponseFamily::Gamma => gam_spec::LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 / phi },
                 _ => gam_spec::LikelihoodScaleMetadata::EstimatedDispersion { phi },
             };
             let likelihood = gam_spec::GlmLikelihoodSpec {
@@ -4960,11 +4880,7 @@ mod glm_eta_observation_fd_tests {
                     "{label}: {what} {analytic} vs FD {numeric}"
                 );
             };
-            close(
-                s0.score[0],
-                fd(sp.log_likelihood, sm.log_likelihood),
-                "score",
-            );
+            close(s0.score[0], fd(sp.log_likelihood, sm.log_likelihood), "score");
             close(s0.neghessian_eta[0], -fd(sp.score[0], sm.score[0]), "H");
             close(
                 s0.neghessian_eta_derivative[0],
@@ -4973,10 +4889,7 @@ mod glm_eta_observation_fd_tests {
             );
             close(
                 s0.neghessian_eta_second_derivative[0],
-                fd(
-                    sp.neghessian_eta_derivative[0],
-                    sm.neghessian_eta_derivative[0],
-                ),
+                fd(sp.neghessian_eta_derivative[0], sm.neghessian_eta_derivative[0]),
                 "H''",
             );
             close(
@@ -5012,9 +4925,7 @@ mod glm_eta_observation_fd_tests {
                         Err(EstimationError::InverseLinkDomainViolation { link: name, .. }) => {
                             assert_eq!(name, link.name(), "{label}")
                         }
-                        other => {
-                            panic!("{label}: eta = {outside} must leave the domain, got {other:?}")
-                        }
+                        other => panic!("{label}: eta = {outside} must leave the domain, got {other:?}"),
                     }
                 }
             }
@@ -5096,9 +5007,7 @@ mod refit_seed_2902_tests {
                             num_internal_knots: 8,
                         },
                         double_penalty: false,
-                        identifiability: BSplineIdentifiability::WeightedSumToZero {
-                            weights: None,
-                        },
+                        identifiability: BSplineIdentifiability::WeightedSumToZero { weights: None },
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
                     },

@@ -135,10 +135,9 @@ pub(crate) fn outer_start_point(
         model_domain_bounds.1.iter().copied(),
     )?;
     Ok(match config.heuristic_log_lambdas.as_deref() {
-        Some(heuristic) if heuristic.len() == n_params => heuristic
-            .iter()
-            .map(|&value| envelope.clamp(value))
-            .collect(),
+        Some(heuristic) if heuristic.len() == n_params => {
+            heuristic.iter().map(|&value| envelope.clamp(value)).collect()
+        }
         _ => Array1::from_elem(n_params, envelope.clamp(0.0)),
     })
 }
@@ -185,13 +184,7 @@ fn eval_seed_restoring_rays(
     domain: RayRestorationDomain<'_>,
     context: &str,
     seed_idx: usize,
-) -> Result<
-    (
-        OuterEval,
-        crate::estimate::outer_eval_capture::CertificateEvidence,
-    ),
-    EstimationError,
-> {
+) -> Result<(OuterEval, crate::estimate::outer_eval_capture::CertificateEvidence), EstimationError> {
     let RayRestorationDomain { upper, rho_dim } = domain;
     let mut restorations = 0usize;
     loop {
@@ -920,14 +913,11 @@ pub(crate) fn run_outer_with_plan(
                     config,
                     seed,
                     OuterEvalOrder::ValueGradientHessian,
-                    RayRestorationDomain {
-                        upper: &bounds_template.1,
-                        rho_dim: layout.rho_dim(),
-                    },
+                    RayRestorationDomain { upper: &bounds_template.1, rho_dim: layout.rho_dim() },
                     context,
                     seed_idx,
                 )
-                .map_err(|err| into_objective_error("outer eval failed", err));
+                    .map_err(|err| into_objective_error("outer eval failed", err));
                 let (seed_eval, seed_evidence) = match seed_eval {
                     Ok(evaluated) => evaluated,
                     Err(err) if err.is_recoverable() => {
@@ -1257,11 +1247,7 @@ pub(crate) fn run_outer_with_plan(
                         // message, so the bridge's stop slot is what tells the
                         // guard's unprogressing stop from a genuine failure.
                         OptimizationStatus::ObjectiveFailed => {
-                            match unprogressing_stop
-                                .lock()
-                                .ok()
-                                .and_then(|mut slot| slot.take())
-                            {
+                            match unprogressing_stop.lock().ok().and_then(|mut slot| slot.take()) {
                                 Some(exit) => {
                                     let mut result = outer_result_with_gradient_norm(
                                         exit.rho,
@@ -1288,8 +1274,7 @@ pub(crate) fn run_outer_with_plan(
                         OptimizationStatus::NumericalFailure
                         | OptimizationStatus::LineSearchFailed => {
                             Err(EstimationError::RemlOptimizationFailed(format!(
-                                "matrix-free TR solver failed with status={:?}",
-                                report.status
+                                "matrix-free TR solver failed with status={:?}", report.status
                             )))
                         }
                     }
@@ -1318,14 +1303,16 @@ pub(crate) fn run_outer_with_plan(
                     // the stall guard. The guard must know whether its incumbent
                     // is a second-order point: repeated infeasible trials cannot
                     // justify halting at a certified strict saddle.
-                    let seed_hessian =
-                        build_bridge_hessian_for_source(hessian_source, seed_eval.hessian)
-                            .map_err(|err| {
-                                EstimationError::fatal_objective_evaluation(
-                                    "outer ARC seed Hessian preparation",
-                                    err,
-                                )
-                            })?;
+                    let seed_hessian = build_bridge_hessian_for_source(
+                        hessian_source,
+                        seed_eval.hessian,
+                    )
+                    .map_err(|err| {
+                        EstimationError::fatal_objective_evaluation(
+                            "outer ARC seed Hessian preparation",
+                            err,
+                        )
+                    })?;
                     // Same rail-relaxed box the guard's later curvature reads
                     // use (#2412); the seed must not be judged against a
                     // different critical cone than the iterates that follow it.
@@ -1381,39 +1368,39 @@ pub(crate) fn run_outer_with_plan(
                     let accepted_steps: Arc<AcceptedStepLedger> = Arc::default();
                     let objective = RetainingObjective::new(
                         OuterSecondOrderBridge {
-                            obj,
-                            layout,
-                            hessian_source,
-                            eval_count: 0,
-                            outer_inner_cap: config.outer_inner_cap.clone(),
-                            g_norm_initial: None,
-                            last_g_norm: None,
-                            last_value_grad_rho: None,
-                            cost_stall: Some(cost_stall_guard),
-                            cost_stall_bounds: Some((lo.clone(), hi.clone())),
-                            // #2817 — the search stops on the test that judges it.
-                            // The certificate accepts a point whose Newton
-                            // decrement ½gᵀH⁻¹g is at or below the criterion's
-                            // statistical resolution `τ_stat = 1/(2n)`; the dense ARC
-                            // route was driven instead to an absolute
-                            // projected-gradient band, which on a flat REML valley
-                            // is a far stricter and unrelated standard, so no seed
-                            // could stop itself and every fit ran to its iteration
-                            // cap. Handing the bridge the same resolution the
-                            // certificate uses makes the stopping rule and the
-                            // acceptance rule one standard. The matrix-free route
-                            // already does this through opt's own decrement rung
-                            // (`with_model_decrement_tolerance` above); this is the
-                            // dense route's half of the same repair.
-                            curvature_stationary_resolution: Some(cost_stall_resolution),
-                            accepted_trials: AcceptedTrialGate::new(Arc::clone(&accepted_steps)),
-                            // #2954 — and on the rung it judges on. Where the route
-                            // declares its size the certificate decides on the
-                            // Newton-decrement verdict on rounding bands, not on
-                            // a relative `(1 + |V|)` rung; without the config the loop kept
-                            // stopping on the older rung at points the certificate
-                            // then refused.
-                            decrement_verdict_config: Some(config),
+                        obj,
+                        layout,
+                        hessian_source,
+                        eval_count: 0,
+                        outer_inner_cap: config.outer_inner_cap.clone(),
+                        g_norm_initial: None,
+                        last_g_norm: None,
+                        last_value_grad_rho: None,
+                        cost_stall: Some(cost_stall_guard),
+                        cost_stall_bounds: Some((lo.clone(), hi.clone())),
+                        // #2817 — the search stops on the test that judges it.
+                        // The certificate accepts a point whose Newton
+                        // decrement ½gᵀH⁻¹g is at or below the criterion's
+                        // statistical resolution `τ_stat = 1/(2n)`; the dense ARC
+                        // route was driven instead to an absolute
+                        // projected-gradient band, which on a flat REML valley
+                        // is a far stricter and unrelated standard, so no seed
+                        // could stop itself and every fit ran to its iteration
+                        // cap. Handing the bridge the same resolution the
+                        // certificate uses makes the stopping rule and the
+                        // acceptance rule one standard. The matrix-free route
+                        // already does this through opt's own decrement rung
+                        // (`with_model_decrement_tolerance` above); this is the
+                        // dense route's half of the same repair.
+                        curvature_stationary_resolution: Some(cost_stall_resolution),
+                        accepted_trials: AcceptedTrialGate::new(Arc::clone(&accepted_steps)),
+                        // #2954 — and on the rung it judges on. Where the route
+                        // declares its size the certificate decides on the
+                        // Newton-decrement verdict on rounding bands, not on
+                        // a relative `(1 + |V|)` rung; without the config the loop kept
+                        // stopping on the older rung at points the certificate
+                        // then refused.
+                        decrement_verdict_config: Some(config),
                         },
                         Arc::clone(&last_objective_error),
                     );
@@ -1566,7 +1553,8 @@ pub(crate) fn run_outer_with_plan(
                                         false,
                                         *the_plan,
                                     );
-                                    result.origin = OuterResultOrigin::ArcInfeasibleStallCheckpoint;
+                                    result.origin =
+                                        OuterResultOrigin::ArcInfeasibleStallCheckpoint;
                                     // The stall window's evidence travels with the
                                     // checkpoint as reported text only (#2817).
                                     result.cost_stall_probe_scale = exit.probe_scale;
@@ -1637,7 +1625,8 @@ pub(crate) fn run_outer_with_plan(
                                         exit.converged,
                                         *the_plan,
                                     );
-                                    result.origin = OuterResultOrigin::ArcCurvatureStationaryStop;
+                                    result.origin =
+                                        OuterResultOrigin::ArcCurvatureStationaryStop;
                                     Ok(result)
                                 }
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(
@@ -1705,18 +1694,15 @@ pub(crate) fn run_outer_with_plan(
                     // only need the wrapper for its bail-on-invalid behaviour.
                     outer_max_iterations(config.max_iter)?;
                     let seed_eval_dev = match eval_seed_restoring_rays(
-                        obj,
-                        config,
-                        seed,
-                        OuterEvalOrder::ValueAndGradient,
-                        RayRestorationDomain {
-                            upper: &bounds_template.1,
-                            rho_dim: layout.rho_dim(),
-                        },
-                        context,
-                        seed_idx,
-                    )
-                    .map_err(|err| into_objective_error("outer eval failed", err))
+                            obj,
+                            config,
+                            seed,
+                            OuterEvalOrder::ValueAndGradient,
+                            RayRestorationDomain { upper: &bounds_template.1, rho_dim: layout.rho_dim() },
+                            context,
+                            seed_idx,
+                        )
+                        .map_err(|err| into_objective_error("outer eval failed", err))
                     {
                         Ok((e, _)) => e,
                         Err(err) if err.is_recoverable() => {
@@ -1816,18 +1802,15 @@ pub(crate) fn run_outer_with_plan(
                             // existing branch will re-validate it and
                             // proceed.
                             let seed_eval = eval_seed_restoring_rays(
-                                obj,
-                                config,
-                                seed,
-                                OuterEvalOrder::ValueAndGradient,
-                                RayRestorationDomain {
-                                    upper: &bounds_template.1,
-                                    rho_dim: layout.rho_dim(),
-                                },
-                                context,
-                                seed_idx,
-                            )
-                            .map_err(|err| into_objective_error("outer eval failed", err));
+                            obj,
+                            config,
+                            seed,
+                            OuterEvalOrder::ValueAndGradient,
+                            RayRestorationDomain { upper: &bounds_template.1, rho_dim: layout.rho_dim() },
+                            context,
+                            seed_idx,
+                        )
+                                .map_err(|err| into_objective_error("outer eval failed", err));
                             let seed_eval = match seed_eval {
                                 Ok((eval, _)) => eval,
                                 Err(eval_error) if eval_error.is_recoverable() => {
@@ -1870,18 +1853,15 @@ pub(crate) fn run_outer_with_plan(
                     }
                 } else {
                     let seed_eval = eval_seed_restoring_rays(
-                        obj,
-                        config,
-                        seed,
-                        OuterEvalOrder::ValueAndGradient,
-                        RayRestorationDomain {
-                            upper: &bounds_template.1,
-                            rho_dim: layout.rho_dim(),
-                        },
-                        context,
-                        seed_idx,
-                    )
-                    .map_err(|err| into_objective_error("outer eval failed", err));
+                            obj,
+                            config,
+                            seed,
+                            OuterEvalOrder::ValueAndGradient,
+                            RayRestorationDomain { upper: &bounds_template.1, rho_dim: layout.rho_dim() },
+                            context,
+                            seed_idx,
+                        )
+                        .map_err(|err| into_objective_error("outer eval failed", err));
                     let (seed_eval, seed_evidence) = match seed_eval {
                         Ok(evaluated) => evaluated,
                         Err(err) if err.is_recoverable() => {
@@ -1937,9 +1917,7 @@ pub(crate) fn run_outer_with_plan(
                          |g|={:.6e} rho={:?}",
                         seed_eval.cost,
                         seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt(),
-                        seed.iter()
-                            .map(|r| (r * 1e6).round() / 1e6)
-                            .collect::<Vec<_>>(),
+                        seed.iter().map(|r| (r * 1e6).round() / 1e6).collect::<Vec<_>>(),
                     );
                     // #2765: the criterion prices `½·log|ZᵀMZ|₊` over a kept rank that moves
                     // where the inner mode changes face, and two ranks price two criteria. So
@@ -1979,12 +1957,8 @@ pub(crate) fn run_outer_with_plan(
                         // projected gradient at its best iterate is inside the
                         // band the terminal certificate applies at that value
                         // (`CostStallGuard::stationarity_band`, #2817).
-                        let seed_grad_norm = stratum_eval
-                            .gradient
-                            .iter()
-                            .map(|g| g * g)
-                            .sum::<f64>()
-                            .sqrt();
+                        let seed_grad_norm =
+                            stratum_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
                         let mut cost_stall_guard = CostStallGuard::new(
                             super::run::outer_criterion_resolution(config),
                             config,
@@ -2154,18 +2128,12 @@ pub(crate) fn run_outer_with_plan(
                             }
                         }
                         if !installed_initial_metric {
-                            let g0_norm = stratum_eval
-                                .gradient
-                                .iter()
-                                .map(|g| g * g)
-                                .sum::<f64>()
-                                .sqrt();
+                            let g0_norm = stratum_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
                             // `H_0^{-1} = I/‖g₀‖` makes the first trial step unit length in
                             // ρ; a norm with no finite positive reciprocal keeps opt's default.
                             let scale = 1.0 / g0_norm;
                             if scale.is_finite() && scale > 0.0 {
-                                optimizer =
-                                    optimizer.with_initial_metric(InitialMetric::Scalar(scale));
+                                optimizer = optimizer.with_initial_metric(InitialMetric::Scalar(scale));
                             }
                         }
                         // The observer is installed UNCONDITIONALLY on this route
@@ -2207,30 +2175,23 @@ pub(crate) fn run_outer_with_plan(
                                 )
                             });
                         let crossing_eval = crossing_eval
-                            .map_err(|err| into_objective_error("outer eval failed", err))
-                            .and_then(|eval| {
-                                finite_outer_first_order_eval_or_error(
-                                    "outer eval failed",
-                                    layout,
-                                    eval,
-                                )
-                            });
+                        .map_err(|err| into_objective_error("outer eval failed", err))
+                        .and_then(|eval| {
+                            finite_outer_first_order_eval_or_error("outer eval failed", layout, eval)
+                        });
                         match crossing_eval {
                             Ok(eval) if eval.cost < final_value - resolution => {
                                 log::debug!(
                                     "[OUTER] {context}: seed {seed_idx} crosses from kept rank \
                                      {from_rank} to {} at criterion {:.6e} -> {:.6e} (delta {:.3e}) \
                                      and restarts BFGS there (#2765)",
-                                    obj.criterion_rank().map_or_else(
-                                        || "none".to_string(),
-                                        |rank| rank.to_string()
-                                    ),
+                                    obj.criterion_rank()
+                                        .map_or_else(|| "none".to_string(), |rank| rank.to_string()),
                                     final_value,
                                     eval.cost,
                                     eval.cost - final_value,
                                 );
-                                crossed_iterations =
-                                    crossed_iterations.saturating_add(run_iterations);
+                                crossed_iterations = crossed_iterations.saturating_add(run_iterations);
                                 stratum_start = probe.rho;
                                 stratum_eval = eval;
                                 stratum_evidence = crossing_evidence;
@@ -2461,10 +2422,8 @@ pub(crate) fn run_outer_with_plan(
                             request.refusal,
                         );
                         // The attempt's earlier seeds spent iterations too (#2817).
-                        request.checkpoint.iterations = request
-                            .checkpoint
-                            .iterations
-                            .saturating_add(spent_seed_iterations);
+                        request.checkpoint.iterations =
+                            request.checkpoint.iterations.saturating_add(spent_seed_iterations);
                         return Ok(PlanRunOutcome::FixedPointContinuationRequested(request));
                     }
                     Err(FixedPointOuterRunError::ImmediateFallback(request)) => {
@@ -2517,10 +2476,8 @@ pub(crate) fn run_outer_with_plan(
                             request.refusal,
                         );
                         // The attempt's earlier seeds spent iterations too (#2817).
-                        request.checkpoint.iterations = request
-                            .checkpoint
-                            .iterations
-                            .saturating_add(spent_seed_iterations);
+                        request.checkpoint.iterations =
+                            request.checkpoint.iterations.saturating_add(spent_seed_iterations);
                         return Ok(PlanRunOutcome::FixedPointContinuationRequested(request));
                     }
                     Err(FixedPointOuterRunError::ImmediateFallback(request)) => {
@@ -2749,10 +2706,7 @@ pub(crate) fn run_outer_with_plan(
                     ));
                 }
                 Ok(outcome) => {
-                    return Ok(with_enclosing_attempt_ledger(
-                        outcome,
-                        spent_seed_iterations,
-                    ));
+                    return Ok(with_enclosing_attempt_ledger(outcome, spent_seed_iterations));
                 }
                 Err(retry_error) => {
                     log::debug!(
@@ -2862,10 +2816,7 @@ pub(crate) fn run_outer_with_plan(
         obj.reset();
         match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
             Ok(outcome) => {
-                return Ok(with_enclosing_attempt_ledger(
-                    outcome,
-                    spent_seed_iterations,
-                ));
+                return Ok(with_enclosing_attempt_ledger(outcome, spent_seed_iterations));
             }
             Err(retry_error) => {
                 log::debug!(
@@ -2886,8 +2837,13 @@ pub(crate) fn run_outer_with_plan(
         // One start was generated and screened; it either reached a rejection
         // site in this attempt or started the solver.
         let n_exact_validated = seed_rejections.len() + started_seeds;
-        let stats =
-            StartupStats::from_rejections(1, 1, n_exact_validated, started_seeds, &seed_rejections);
+        let stats = StartupStats::from_rejections(
+            1,
+            1,
+            n_exact_validated,
+            started_seeds,
+            &seed_rejections,
+        );
         let structural = uniform_structural_key(&seed_rejections, 1);
         if started_seeds == 0 {
             EstimationError::StartupSeedsRefused(format_no_seeds_passed(
@@ -2906,8 +2862,13 @@ pub(crate) fn run_outer_with_plan(
                  exact_validated={}, solver_started={}",
                 stats.generated, stats.screened, stats.exact_validated, stats.solver_started,
             );
-            let body =
-                format_no_seeds_passed(context, &stats, &seed_rejections, structural.as_ref(), "");
+            let body = format_no_seeds_passed(
+                context,
+                &stats,
+                &seed_rejections,
+                structural.as_ref(),
+                "",
+            );
             EstimationError::RemlOptimizationFailed(format!("{header}\n{body}"))
         }
     })
@@ -2999,9 +2960,13 @@ fn claim_prior_terminal_certificate(
     if config.initial_rho.as_ref() != Some(seed) {
         return None;
     }
-    let eval =
-        eval_seed_at_full_inner_fidelity(obj, config, seed, OuterEvalOrder::ValueAndGradient)
-            .ok()?;
+    let eval = eval_seed_at_full_inner_fidelity(
+                            obj,
+                            config,
+                            seed,
+                            OuterEvalOrder::ValueAndGradient,
+                        )
+        .ok()?;
     if !eval.cost.is_finite() || eval.gradient.iter().any(|value| !value.is_finite()) {
         return None;
     }
@@ -3069,10 +3034,11 @@ pub(crate) fn resume_prior_certificate(
     let bounds_template = outer_search_bounds_template(config, cap.n_params);
     obj.reset();
     install_matching_initial_inner_seed(obj, config, &seed, context)?;
-    let cost = claim_prior_terminal_certificate(obj, config, &seed, &bounds_template, 0, context)
-        .ok_or_else(|| {
-        declined("the point is not certified for this search's criterion".to_string())
-    })?;
+    let cost =
+        claim_prior_terminal_certificate(obj, config, &seed, &bounds_template, 0, context)
+            .ok_or_else(|| {
+                declined("the point is not certified for this search's criterion".to_string())
+            })?;
     let mut candidate = OuterResult::new(seed, cost, 0, true, the_plan);
     candidate.origin = OuterResultOrigin::SeedAcceptedWithoutIteration;
     let result = CertifiedOuterCandidate::from_solver_claim(obj, config, context, candidate)

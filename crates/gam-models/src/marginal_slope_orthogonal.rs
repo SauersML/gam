@@ -708,7 +708,8 @@ mod tests {
         // Manual: scale rows, then residualize.
         let jac = jac_from(raw_jac.clone());
         let z_infl = influence_block_design(&jac, &pilot, s_f);
-        let expected = residualize_influence_columns(&z_infl, m.view(), &w).expect("projection");
+        let expected =
+            residualize_influence_columns(&z_infl, m.view(), &w).expect("projection");
 
         assert_eq!(out, expected);
         // And the result is W-orthogonal to the marginal span.

@@ -259,10 +259,7 @@ impl fmt::Display for StateBlockError {
             Self::EmptyFamily => write!(formatter, "state blocks: the family has no maps"),
             Self::ZeroDimension => write!(formatter, "state blocks: the state has dimension zero"),
             Self::NotSquare { map, rows, cols } => {
-                write!(
-                    formatter,
-                    "state blocks: map {map} is {rows}x{cols}, not square"
-                )
+                write!(formatter, "state blocks: map {map} is {rows}x{cols}, not square")
             }
             Self::DimensionMismatch {
                 map,
@@ -280,10 +277,7 @@ impl fmt::Display for StateBlockError {
                 "state blocks: eigendecomposition of {context} failed: {source}"
             ),
             Self::InconsistentStructure { context } => {
-                write!(
-                    formatter,
-                    "state blocks: inconsistent stable structure: {context}"
-                )
+                write!(formatter, "state blocks: inconsistent stable structure: {context}")
             }
         }
     }
@@ -364,10 +358,7 @@ impl Refinement {
                 return Err(StateBlockError::NonFinite { map });
             }
         }
-        let norms: Vec<f64> = maps
-            .iter()
-            .map(|matrix| frobenius(&matrix.view()))
-            .collect();
+        let norms: Vec<f64> = maps.iter().map(|matrix| frobenius(&matrix.view())).collect();
         // Each entry of `AAᵀ` is a length-`d` inner product in error by at most
         // `γ_d (|A||A|ᵀ)_ij`, whose spectral norm is at most `‖A‖_F²`. The `2m`
         // pre-formed terms add `2m − 1` more roundings.
@@ -431,8 +422,8 @@ impl Refinement {
             }
             for map in 0..self.maps.len() {
                 let own = self.block(map, target, target);
-                let assembly = self.block_error(map, target, target)
-                    + accumulation_growth(2) * frobenius(&own);
+                let assembly =
+                    self.block_error(map, target, target) + accumulation_growth(2) * frobenius(&own);
                 if let Some(split) = non_scalar_split(
                     &symmetric_part(&own),
                     assembly,
@@ -470,8 +461,8 @@ impl Refinement {
         let range = self.clusters[index].range.clone();
         let angle = self.clusters[index].angle;
         let size = range.len();
-        let arithmetic =
-            self.clusters[index].arithmetic + accumulation_growth(2 * size) * size as f64;
+        let arithmetic = self.clusters[index].arithmetic
+            + accumulation_growth(2 * size) * size as f64;
         let rotated = fast_ab(&self.basis.slice(s![.., range.clone()]), &split.vectors);
         self.basis.slice_mut(s![.., range.clone()]).assign(&rotated);
         for map in &mut self.maps {
@@ -549,18 +540,10 @@ impl Refinement {
             // `A_{target,source}` maps the source cluster into the target one,
             // and so does the transposed map's block `A_{source,target}ᵀ`.
             let forward = self.block_scale(map, target, source).map(|scale| {
-                (
-                    scale,
-                    self.block(map, target, source).mapv(|value| value / scale),
-                )
+                (scale, self.block(map, target, source).mapv(|value| value / scale))
             });
             let backward = self.block_scale(map, source, target).map(|scale| {
-                (
-                    scale,
-                    self.block(map, source, target)
-                        .t()
-                        .mapv(|value| value / scale),
-                )
+                (scale, self.block(map, source, target).t().mapv(|value| value / scale))
             });
             for (scale, isometry) in forward.into_iter().chain(backward) {
                 let stronger = strongest.as_ref().map_or(true, |best| scale > best.0);
@@ -596,12 +579,11 @@ impl Refinement {
                         context: "a certified nonzero block joins clusters of unequal dimension",
                     });
                 }
-                let (parent, parent_error) =
-                    transports[current]
-                        .as_ref()
-                        .ok_or(StateBlockError::InconsistentStructure {
-                            context: "a transport was read before it was built",
-                        })?;
+                let (parent, parent_error) = transports[current].as_ref().ok_or(
+                    StateBlockError::InconsistentStructure {
+                        context: "a transport was read before it was built",
+                    },
+                )?;
                 let transport = fast_ab(&isometry, parent);
                 let transport_error =
                     parent_error + error + product_band(&[(1.0, 0.0), (1.0, 0.0)], size);
@@ -636,10 +618,8 @@ impl Refinement {
                     let Some(scale) = self.block_scale(map, target, source) else {
                         continue;
                     };
-                    let (
-                        Some((target_transport, target_error)),
-                        Some((source_transport, source_error)),
-                    ) = (transports[target].as_ref(), transports[source].as_ref())
+                    let (Some((target_transport, target_error)), Some((source_transport, source_error))) =
+                        (transports[target].as_ref(), transports[source].as_ref())
                     else {
                         return Err(StateBlockError::InconsistentStructure {
                             context: "a component cluster has no transport",
@@ -654,7 +634,8 @@ impl Refinement {
                         + target_error
                         + source_error
                         + product_band(&[(1.0, 0.0), (1.0, 0.0), (1.0, 0.0)], size);
-                    let assembly = error + accumulation_growth(2) * frobenius(&generator.view());
+                    let assembly =
+                        error + accumulation_growth(2) * frobenius(&generator.view());
                     if let Some(split) = non_scalar_split(
                         &symmetric_part(&generator.view()),
                         assembly,

@@ -345,11 +345,7 @@ pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisA
         input.design_gram,
     )?;
     let rank = geometry.basis.ncols();
-    let statistic = geometry
-        .projected
-        .iter()
-        .map(|value| value * value)
-        .sum::<f64>();
+    let statistic = geometry.projected.iter().map(|value| value * value).sum::<f64>();
     let statistic = statistic / input.dispersion;
     if !statistic.is_finite() || statistic < 0.0 {
         return None;
@@ -668,11 +664,7 @@ pub fn conditional_basis_adequacy_test(
     let third = &null_fit.third;
     let fourth = &null_fit.fourth;
     // `h = diag(H)` and `A_d = diag(LLᵀ)`, `H = X̄X̄ᵀ = X G⁻ Xᵀ`.
-    let leverage: Array1<f64> = whitened
-        .rows()
-        .into_iter()
-        .map(|row| row.dot(&row))
-        .collect();
+    let leverage: Array1<f64> = whitened.rows().into_iter().map(|row| row.dot(&row)).collect();
     let enrichment_leverage: Array1<f64> = basis_rows
         .rows()
         .into_iter()
@@ -688,11 +680,7 @@ pub fn conditional_basis_adequacy_test(
     // `D₁ − D₂ = Lᵀ diag(W₂∘h − W₁∘H(W₁∘h)) L`.
     let diagonal_weight = &(fourth * &leverage) - &(third * &smoothed_skew);
     let mut weighted_rows = basis_rows.clone();
-    for (mut row, &weight) in weighted_rows
-        .rows_mut()
-        .into_iter()
-        .zip(diagonal_weight.iter())
-    {
+    for (mut row, &weight) in weighted_rows.rows_mut().into_iter().zip(diagonal_weight.iter()) {
         row.iter_mut().for_each(|value| *value *= weight);
     }
     let mut curvature = basis_rows.t().dot(&weighted_rows);
@@ -894,7 +882,9 @@ fn enrichment_geometry(
         residualized -= &design
             .slice(ndarray::s![start..stop, ..])
             .dot(&coefficient_shift);
-        u += &residualized.t().dot(&score.slice(ndarray::s![start..stop]));
+        u += &residualized
+            .t()
+            .dot(&score.slice(ndarray::s![start..stop]));
         let mut weighted = residualized.clone();
         for local in 0..rows {
             let weight = score_weights[start + local];
@@ -1153,10 +1143,12 @@ impl DesignGramFactor {
                 root[(row, slot)] = eigenvectors[(row, index)] * scale;
             }
         }
-        root.iter().all(|value| value.is_finite()).then_some(Self {
-            kind: DesignGramFactorKind::SpectralPseudoInverse(root),
-            dimension,
-        })
+        root.iter()
+            .all(|value| value.is_finite())
+            .then_some(Self {
+                kind: DesignGramFactorKind::SpectralPseudoInverse(root),
+                dimension,
+            })
     }
 
     /// Side length of the factored Gram, i.e. the design's column count.
@@ -1962,10 +1954,7 @@ mod tests {
         );
         let count = p_values.len() as f64;
         let ks = kolmogorov_smirnov_uniform_p_value(p_values);
-        assert!(
-            ks > 1e-3,
-            "{label}: KS p = {ks:.3e} against U(0,1) over {count} replicates"
-        );
+        assert!(ks > 1e-3, "{label}: KS p = {ks:.3e} against U(0,1) over {count} replicates");
         for level in [0.01, 0.05, 0.10] {
             let size = p_values.iter().filter(|&&value| value <= level).count() as f64 / count;
             let standard_error = (level * (1.0 - level) / count).sqrt();
@@ -2159,11 +2148,7 @@ mod tests {
             let mut rng = Lcg(20_260_921);
             let response = harness.draw(&missing, &mut rng);
             let out = harness.p_value(&response).expect("measured");
-            assert!(
-                out.p_value < 1e-8,
-                "{family:?}: p = {:.3e} under a missing sin(20x)",
-                out.p_value
-            );
+            assert!(out.p_value < 1e-8, "{family:?}: p = {:.3e} under a missing sin(20x)", out.p_value);
         }
     }
 
@@ -2190,23 +2175,22 @@ mod tests {
         )
         .expect("interior MLE");
         let gradient = harness.design.t().dot(&fit.score);
-        let scale = harness
-            .design
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f64, f64::max);
+        let scale = harness.design.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
         assert!(
-            gradient
-                .iter()
-                .all(|value| value.abs() < 1e-6 * scale * 300.0),
+            gradient.iter().all(|value| value.abs() < 1e-6 * scale * 300.0),
             "score equation residual {gradient:?}"
         );
     }
 
     #[test]
     fn canonical_null_fit_refuses_inadmissible_responses() {
-        let harness =
-            CanonicalHarness::new(20, 2, 3, &[0.0], CanonicalExponentialFamily::PoissonLog);
+        let harness = CanonicalHarness::new(
+            20,
+            2,
+            3,
+            &[0.0],
+            CanonicalExponentialFamily::PoissonLog,
+        );
         let mut response = Array1::<f64>::ones(20);
         response[3] = -1.0;
         assert!(

@@ -210,8 +210,8 @@ pub(crate) fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
             // A split chain whose deviations sit inside its mean's rounding band
             // `γ_{n+1}·max|x|` is constant to working precision: it carries no
             // autocorrelation, and dividing by its variance would read arithmetic.
-            informative[sc] =
-                gamma0[sc].sqrt() > gam_linalg::roundoff::accumulation_growth(n + 1) * magnitude;
+            informative[sc] = gamma0[sc].sqrt()
+                > gam_linalg::roundoff::accumulation_growth(n + 1) * magnitude;
         }
         if !informative.iter().any(|&flag| flag) {
             return (m * n) as f64;
@@ -2014,11 +2014,7 @@ mod tests {
         .expect("pg gibbs should run");
         assert_eq!(out.samples.ncols(), 2);
         assert_eq!(out.samples.nrows(), cfg.n_samples * NUTS_CHAINS);
-        assert!(
-            out.warmup_transitions >= 4,
-            "burn-in ran {} sweeps",
-            out.warmup_transitions
-        );
+        assert!(out.warmup_transitions >= 4, "burn-in ran {} sweeps", out.warmup_transitions);
         assert!(out.samples.iter().all(|v| v.is_finite()));
         assert!(out.posterior_mean.iter().all(|v| v.is_finite()));
         assert!(
@@ -2099,16 +2095,10 @@ mod tests {
                 log_density[[a, b]] = loglik + 0.5 * (i00 * i11 - i01 * i01).ln();
             }
         }
-        let peak = log_density
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
+        let peak = log_density.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let mass = log_density.mapv(|v| (v - peak).exp());
         let total = mass.sum();
-        let marginals = [
-            mass.sum_axis(Axis(1)) / total,
-            mass.sum_axis(Axis(0)) / total,
-        ];
+        let marginals = [mass.sum_axis(Axis(1)) / total, mass.sum_axis(Axis(0)) / total];
         let grids = [g0, g1];
 
         let ess = out.ess;
@@ -2729,8 +2719,7 @@ mod tests {
             lambdas: array![2.0, 0.5],
             a: 0.0,
         };
-        let out =
-            super::block_quadrature_marginal_correction(&target, &[5, 5]).expect("correction");
+        let out = super::block_quadrature_marginal_correction(&target, &[5, 5]).expect("correction");
         assert!(
             out.value.abs() < 1e-12,
             "Gaussian block value {}",
@@ -2864,10 +2853,7 @@ mod tests {
             // The engine hands over the score it already evaluated at this node.
             let at_node = super::BlockExcessTarget::displaced_neg_score(self.block, &array![t])
                 .expect("the double's score");
-            assert_eq!(
-                displaced_neg_score, &at_node,
-                "score of another node at t = {t}"
-            );
+            assert_eq!(displaced_neg_score, &at_node, "score of another node at t = {t}");
             if self.block.root {
                 -0.5 / (t - self.block.lower)
             } else {
@@ -2896,11 +2882,7 @@ mod tests {
             "order-40 transported value {} vs {reference}",
             out.value
         );
-        assert!(
-            out.quadrature_error <= 1e-8,
-            "paired error {}",
-            out.quadrature_error
-        );
+        assert!(out.quadrature_error <= 1e-8, "paired error {}", out.quadrature_error);
         let whole_line = super::block_quadrature_marginal_correction(&block(false), &[40])
             .expect("whole-line correction");
         assert!(
@@ -2934,11 +2916,7 @@ mod tests {
             "order-60 transported value {} vs {reference}",
             out.value
         );
-        assert!(
-            out.quadrature_error <= 1e-11,
-            "paired error {}",
-            out.quadrature_error
-        );
+        assert!(out.quadrature_error <= 1e-11, "paired error {}", out.quadrature_error);
         let moments = out.moments.expect("moments");
         assert!(
             moments.e_neg_score[0].abs() <= 1e-8,
@@ -2975,8 +2953,7 @@ mod tests {
         let moments = out.moments.expect("moments");
         let lambda: f64 = 2.0;
         let integrand = |t: f64| {
-            (lambda / std::f64::consts::TAU).sqrt()
-                * (-0.5 * lambda * t * t - 0.05 * t.powi(4)).exp()
+            (lambda / std::f64::consts::TAU).sqrt() * (-0.5 * lambda * t * t - 0.05 * t.powi(4)).exp()
                 / out.value.exp()
         };
         let value_at = |lower: f64, upper: f64| {
@@ -2999,14 +2976,8 @@ mod tests {
             "upper end {injected_upper} vs {}",
             integrand(upper)
         );
-        assert!(
-            (injected_lower - fd_lower).abs() <= 1e-8,
-            "{injected_lower} vs FD {fd_lower}"
-        );
-        assert!(
-            (injected_upper - fd_upper).abs() <= 1e-8,
-            "{injected_upper} vs FD {fd_upper}"
-        );
+        assert!((injected_lower - fd_lower).abs() <= 1e-8, "{injected_lower} vs FD {fd_lower}");
+        assert!((injected_upper - fd_upper).abs() <= 1e-8, "{injected_upper} vs FD {fd_upper}");
         assert!(
             (moments.e_t_neg_score[(0, 0)] - moments.e_neg_score[0] * lower).abs() <= 1e-15,
             "lower end's t-moment"
@@ -3026,15 +2997,9 @@ mod tests {
         let rule =
             gam_math::quadrature::standard_normal_gauss_hermite_rule(5).expect("five-node rule");
         let mass: f64 = rule.iter().map(|&(_, weight)| weight).sum();
-        let eighth: f64 = rule
-            .iter()
-            .map(|&(node, weight)| weight * node.powi(8))
-            .sum();
+        let eighth: f64 = rule.iter().map(|&(node, weight)| weight * node.powi(8)).sum();
         assert!((mass - 1.0).abs() < 1e-14, "rule mass {mass}");
-        assert!(
-            (eighth - 105.0).abs() < 1e-11,
-            "E[z^8] by the rule {eighth}"
-        );
+        assert!((eighth - 105.0).abs() < 1e-11, "E[z^8] by the rule {eighth}");
     }
 
     #[test]
@@ -3080,10 +3045,7 @@ mod tests {
         )
         .expect("the quartic block resolves within the memory budget");
         let order = marginal.axis_orders[0];
-        assert!(
-            order > 4,
-            "a strongly quartic block must escalate past the starting order, latched {order}"
-        );
+        assert!(order > 4, "a strongly quartic block must escalate past the starting order, latched {order}");
         let resolution_target = marginal.value.abs().min(remainder);
         assert!(marginal.axis_quadrature_errors[0] < resolution_target);
         let lower = super::block_quadrature_marginal_correction(&target, &[order - 1])
@@ -3190,9 +3152,7 @@ mod tests {
             let delta = self.v_b.dot(t);
             let s = self.s_of(t);
             let rows = s.len();
-            let delta_max = delta
-                .iter()
-                .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+            let delta_max = delta.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
             let design_growth =
                 gam_linalg::roundoff::accumulation_growth(delta.len() * (t.len() + 1));
             let mut terms = 0.0_f64;
@@ -3399,10 +3359,7 @@ mod tests {
             ("e_t", moments.e_t.to_vec()),
             ("e_tt", moments.e_tt.iter().copied().collect()),
             ("e_neg_score", moments.e_neg_score.to_vec()),
-            (
-                "e_t_neg_score",
-                moments.e_t_neg_score.iter().copied().collect(),
-            ),
+            ("e_t_neg_score", moments.e_t_neg_score.iter().copied().collect()),
         ]
     }
 
@@ -3489,16 +3446,9 @@ mod tests {
             for chunk in chunks {
                 let streamed = evaluate(chunk);
                 assert_eq!(streamed.node_count, node_count);
-                assert_eq!(
-                    streamed.chunk_nodes, chunk,
-                    "the governor must admit a {chunk}-node chunk"
-                );
+                assert_eq!(streamed.chunk_nodes, chunk, "the governor must admit a {chunk}-node chunk");
                 let label = format!("{node_count}-node rule, chunk {chunk}");
-                assert_bitwise_equal(
-                    &format!("{label}: value"),
-                    &[streamed.value],
-                    &[reference_value],
-                );
+                assert_bitwise_equal(&format!("{label}: value"), &[streamed.value], &[reference_value]);
                 assert_bitwise_equal(
                     &format!("{label}: rho gradient"),
                     streamed.rho_gradient.as_slice().expect("contiguous"),
@@ -3637,11 +3587,7 @@ mod tests {
         )
         .expect("two quartic axes resolve");
         let steps = corrector.steps.into_inner().expect("step record");
-        assert!(
-            steps.len() >= 2,
-            "both axes start unresolved, got {} steps",
-            steps.len()
-        );
+        assert!(steps.len() >= 2, "both axes start unresolved, got {} steps", steps.len());
         assert_eq!(steps[0].raised_axis, 0, "first step: {}", steps[0]);
         assert_eq!(steps[1].raised_axis, 1, "second step: {}", steps[1]);
         let mut expected_orders = vec![4usize, 4];
@@ -3740,11 +3686,7 @@ mod tests {
             &self,
             step: &gam_problem::laplace_sampler_contract::BlockQuadratureOrderStep,
         ) {
-            assert_eq!(
-                step.axis_orders.len(),
-                1,
-                "the scripted corrector is one-axis"
-            );
+            assert_eq!(step.axis_orders.len(), 1, "the scripted corrector is one-axis");
         }
         fn is_representable_order(&self, order: usize) -> bool {
             self.representability_queries
@@ -3786,16 +3728,8 @@ mod tests {
         let max_order =
             gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order();
         let (outcome, requests) = scripted_search(vec![1e-2; max_order - 3], 1e-6);
-        assert_eq!(
-            requests.len(),
-            max_order - 3,
-            "one request per order 4..={max_order}"
-        );
-        assert_eq!(
-            requests.last(),
-            Some(&vec![max_order]),
-            "no request past the ceiling"
-        );
+        assert_eq!(requests.len(), max_order - 3, "one request per order 4..={max_order}");
+        assert_eq!(requests.last(), Some(&vec![max_order]), "no request past the ceiling");
         let refusal = outcome.expect_err("a non-contracting axis must be refused");
         assert_eq!(refusal.axis, 0);
         assert_eq!(refusal.axis_orders, vec![max_order]);
@@ -3816,7 +3750,7 @@ mod tests {
 
     #[test]
     fn an_axis_that_contracts_too_slowly_to_resolve_is_refused_at_the_largest_representable_order_784()
-     {
+    {
         // The paired difference contracts by 0.99 per order from 0.5, so at the largest
         // representable order it is still about 1e-2, far above 1e-6. The search raises the
         // axis to that order and refuses typed there; no rate is extrapolated on the way.
@@ -3827,11 +3761,7 @@ mod tests {
             .collect();
         let smallest = *script.last().expect("the script reaches the ceiling");
         let (outcome, requests) = scripted_search(script, 1e-6);
-        assert_eq!(
-            requests.len(),
-            max_order - 3,
-            "one request per order 4..={max_order}"
-        );
+        assert_eq!(requests.len(), max_order - 3, "one request per order 4..={max_order}");
         let refusal = outcome.expect_err("a too-slow axis must be refused");
         assert!(
             matches!(
@@ -3903,16 +3833,8 @@ mod tests {
         let mut script = vec![1e-2];
         script.resize(max_order - 3, 2e-2);
         let (outcome, requests) = scripted_search(script, 1e-6);
-        assert_eq!(
-            requests.len(),
-            max_order - 3,
-            "one request per order 4..={max_order}"
-        );
-        assert_eq!(
-            requests.last(),
-            Some(&vec![max_order]),
-            "no request past the ceiling"
-        );
+        assert_eq!(requests.len(), max_order - 3, "one request per order 4..={max_order}");
+        assert_eq!(requests.last(), Some(&vec![max_order]), "no request past the ceiling");
         let refusal = outcome.expect_err("a plateau above the running minimum must be refused");
         assert!(
             matches!(
@@ -3958,11 +3880,7 @@ mod tests {
         // Positive control: 1e-2, 1e-4, 1e-7. The axis resolves 1e-6 at order 6, the first
         // order it is judged at, so the stop never fires on a search that resolves.
         let (outcome, requests) = scripted_search(vec![1e-2, 1e-4, 1e-7], 1e-6);
-        assert_eq!(
-            requests,
-            vec![vec![4], vec![5], vec![6]],
-            "requests {requests:?}"
-        );
+        assert_eq!(requests, vec![vec![4], vec![5], vec![6]], "requests {requests:?}");
         let marginal = outcome.expect("a fast-contracting axis resolves");
         assert_eq!(marginal.axis_orders, vec![6]);
     }
@@ -3991,10 +3909,7 @@ mod tests {
         // before any node is evaluated.
         let max_order =
             gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order();
-        assert!(
-            max_order > 4,
-            "the ceiling {max_order} must sit above the starting order"
-        );
+        assert!(max_order > 4, "the ceiling {max_order} must sit above the starting order");
         let target = AnharmonicBlock {
             lambdas: array![2.0],
             a: 0.05,
@@ -4011,10 +3926,7 @@ mod tests {
                 past_ceiling,
                 Err(super::BlockQuadratureRefusal::UnrepresentableOrder { axis: 0, order })
                     if order == max_order + 1
-            ) || matches!(
-                past_ceiling,
-                Err(super::BlockQuadratureRefusal::Integration(_))
-            ),
+            ) || matches!(past_ceiling, Err(super::BlockQuadratureRefusal::Integration(_))),
             "order {} must be refused as unrepresentable, got {:?}",
             max_order + 1,
             past_ceiling.err()
@@ -4244,8 +4156,8 @@ mod tests {
             .chain(grad_unpenalized.iter())
             .fold(0.0_f64, |acc, v| acc.max(v.abs()));
         for (sampled, fitted) in prior_gradient.iter().zip(fitted_prior_gradient.iter()) {
-            let gradient_band =
-                gam_linalg::roundoff::accumulation_growth(4) * (gradient_magnitude + fitted.abs());
+            let gradient_band = gam_linalg::roundoff::accumulation_growth(4)
+                * (gradient_magnitude + fitted.abs());
             assert!(
                 (sampled - fitted).abs() <= gradient_band,
                 "the sampler's prior gradient {sampled:e} is not the fit's penalty gradient {fitted:e}"
@@ -4327,10 +4239,7 @@ mod tests {
             let state = objective
                 .update_state(&(&mode + &chol.dot(z)))
                 .expect("the fixture point lies inside the survival support");
-            (
-                value,
-                0.5 * state.deviance_magnitude + 0.5 * state.penalty_term,
-            )
+            (value, 0.5 * state.deviance_magnitude + 0.5 * state.penalty_term)
         };
 
         let z0 = array![0.1, -0.05];
@@ -4343,9 +4252,7 @@ mod tests {
         let beta0 = &mode + &chol.dot(&z0);
         // A prior counted twice in the value makes its derivative exceed v·g by v·Lᵀ(S_λβ); the
         // direction along Lᵀ(S_λβ) carries that gap undiluted, and seeded random directions follow.
-        let prior_gradient = chol
-            .t()
-            .dot(&PenaltyBlocks::new(vec![block()]).gradient(&beta0));
+        let prior_gradient = chol.t().dot(&PenaltyBlocks::new(vec![block()]).gradient(&beta0));
         let prior_gap = prior_gradient.dot(&prior_gradient).sqrt();
         let mut directions = vec![&prior_gradient / prior_gap];
         let mut rng = rand::rngs::StdRng::seed_from_u64(2627);
@@ -5013,9 +4920,13 @@ fn run_whitened_nuts_samples<Target>(
 where
     Target: HamiltonianTarget<Array1<f64>> + Sync + Send,
 {
-    let mut sampler =
-        GenericNUTS::new_with_mass_matrix(target, initial_positions, NUTS_TARGET_ACCEPT, mass_cfg)
-            .set_seed(nuts_transition_seed(config.seed, transition_seed_stream));
+    let mut sampler = GenericNUTS::new_with_mass_matrix(
+        target,
+        initial_positions,
+        NUTS_TARGET_ACCEPT,
+        mass_cfg,
+    )
+    .set_seed(nuts_transition_seed(config.seed, transition_seed_stream));
 
     let (samples_array, run_stats, warmup) = sampler
         .run_adaptive(config.n_samples, NUTS_CONVERGENCE)
@@ -5104,8 +5015,12 @@ where
         sampling_error_label,
     )?;
     let samples = unwhiten_samples(&samples_array, mode, chol, dim, 0);
-    let result =
-        summarize_unwhitened_nuts_samples(samples, &samples_array, empty_mean, warmup_transitions);
+    let result = summarize_unwhitened_nuts_samples(
+        samples,
+        &samples_array,
+        empty_mean,
+        warmup_transitions,
+    );
     Ok((result, run_stats))
 }
 
@@ -5587,8 +5502,11 @@ fn run_conjugate_gaussian_sampling(
     let mut samples = Array2::<f64>::zeros((total_samples, dim));
     let mut z = Array1::<f64>::zeros(dim);
     for chain in 0..NUTS_CHAINS {
-        let mut rng =
-            StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0x5C2E_9A41_D07B_36F1));
+        let mut rng = StdRng::seed_from_u64(chain_stream_seed(
+            config.seed,
+            chain,
+            0x5C2E_9A41_D07B_36F1,
+        ));
         for draw in 0..config.n_samples {
             for value in z.iter_mut() {
                 *value = sample_standard_normal(&mut rng);
@@ -5747,9 +5665,7 @@ where
     let cost_hat = match criterion_and_grad(&mode) {
         Ok((cost, _)) if cost.is_finite() => cost,
         Ok((cost, _)) => {
-            return Err(format!(
-                "rho-posterior NUTS: criterion at rho_hat is {cost}"
-            ));
+            return Err(format!("rho-posterior NUTS: criterion at rho_hat is {cost}"));
         }
         Err(detail) => {
             return Err(format!(
@@ -6718,7 +6634,8 @@ fn cubic_power_iteration_refinement(
 // constructs these types under their original names via this re-export.
 pub use gam_problem::laplace_sampler_contract::{
     BlockExcessTarget, BlockQuadratureMarginal, BlockQuadratureMoments, BlockQuadratureRefusal,
-    LaplaceTrustworthiness, laplace_skewness_threshold, laplace_trustworthiness_from_skewness,
+    LaplaceTrustworthiness, laplace_skewness_threshold,
+    laplace_trustworthiness_from_skewness,
 };
 
 /// Monolith (gam-inference-tier) implementor of the contract-downed
@@ -7035,12 +6952,11 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
 
     let mut log_rules: Vec<Vec<(f64, f64)>> = Vec::with_capacity(m);
     for (axis, &order) in axis_orders.iter().enumerate() {
-        let rule =
-            gam_math::quadrature::standard_normal_gauss_hermite_rule(order).map_err(|error| {
-                Integration(format!(
-                    "standard-normal Gauss–Hermite rule of order {order}: {error}"
-                ))
-            })?;
+        let rule = gam_math::quadrature::standard_normal_gauss_hermite_rule(order).map_err(|error| {
+            Integration(format!(
+                "standard-normal Gauss–Hermite rule of order {order}: {error}"
+            ))
+        })?;
         if rule.iter().any(|&(_, weight)| !(weight > 0.0)) {
             return Err(BlockQuadratureRefusal::UnrepresentableOrder { axis, order });
         }
@@ -7175,14 +7091,11 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
             )
         })
         .and_then(|bytes| {
-            bytes.checked_add(axis_transport.as_ref().map_or(
-                Some(0),
-                |(_, _, sensitivities)| {
-                    sensitivities
-                        .len()
-                        .checked_mul(std::mem::size_of::<(f64, f64)>())
-                },
-            )?)
+            bytes.checked_add(axis_transport.as_ref().map_or(Some(0), |(_, _, sensitivities)| {
+                sensitivities
+                    .len()
+                    .checked_mul(std::mem::size_of::<(f64, f64)>())
+            })?)
         })
         .ok_or_else(|| working_memory_refusal("the accumulators' working bytes overflow usize"))?;
     let governor = gam_runtime::resource::MemoryGovernor::global();

@@ -232,9 +232,7 @@ fn profiled_gaussian_reml_psi_jet(
     let b0 = fast_atv(&design.view(), &response);
 
     let s0 = sym(penalty.clone());
-    let s1: Vec<Array2<f64>> = (0..2)
-        .map(|a| sym(blocks.penalty_first[a].clone()))
-        .collect();
+    let s1: Vec<Array2<f64>> = (0..2).map(|a| sym(blocks.penalty_first[a].clone())).collect();
     let s2: Vec<Array2<f64>> = (0..3)
         .map(|s| sym(blocks.penalty_second[s].clone()))
         .collect();
@@ -255,9 +253,8 @@ fn profiled_gaussian_reml_psi_jet(
     let residual = &response - &design.dot(&beta0);
     let design_image1: Vec<Array1<f64>> =
         (0..2).map(|a| blocks.design_first[a].dot(&beta0)).collect();
-    let design_image2: Vec<Array1<f64>> = (0..3)
-        .map(|s| blocks.design_second[s].dot(&beta0))
-        .collect();
+    let design_image2: Vec<Array1<f64>> =
+        (0..3).map(|s| blocks.design_second[s].dot(&beta0)).collect();
     // `∂β/∂ψ_a = H⁻¹v_a`, with `v_a = X_aᵀr − XᵀX_aβ − λS_aβ` the ψ_a-derivative of
     // the normal equations' residual `Xᵀ(y − Xβ) − λSβ` at fixed `β`.
     let normal_residual1: Vec<Array1<f64>> = (0..2)
@@ -384,7 +381,8 @@ fn profiled_gaussian_reml_psi_jet(
     let dp_2: Vec<f64> = (0..3)
         .map(|s| {
             let (a, b) = pair(s);
-            2.0 * design_image1[a].dot(&design_image1[b]) - 2.0 * design_image2[s].dot(&residual)
+            2.0 * design_image1[a].dot(&design_image1[b])
+                - 2.0 * design_image2[s].dot(&residual)
                 + lambda * penalty_quadratic(&s2[s])
                 - 2.0 * normal_residual1[a].dot(&beta1[b])
         })
@@ -458,7 +456,9 @@ fn profiled_gaussian_reml_psi_jet(
         hessian[b][a] = entry;
     }
     let gradient = [f_1[0], f_1[1]];
-    if !gradient.iter().all(|v| v.is_finite()) || !hessian.iter().flatten().all(|v| v.is_finite()) {
+    if !gradient.iter().all(|v| v.is_finite())
+        || !hessian.iter().flatten().all(|v| v.is_finite())
+    {
         crate::bail_invalid_estim!(
             "constant-curvature profile ψ-jet produced a non-finite derivative"
         );

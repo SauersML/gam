@@ -1095,12 +1095,7 @@ struct ProfiledFloor {
 
 /// Range of `f` over the share interval `[lo, hi]`, from its endpoints and the
 /// listed stationary points that fall inside it.
-fn share_polynomial_range(
-    lo: f64,
-    hi: f64,
-    f: impl Fn(f64) -> f64,
-    stationary: &[f64],
-) -> (f64, f64) {
+fn share_polynomial_range(lo: f64, hi: f64, f: impl Fn(f64) -> f64, stationary: &[f64]) -> (f64, f64) {
     let (at_lo, at_hi) = (f(lo), f(hi));
     let mut range = (at_lo.min(at_hi), at_lo.max(at_hi));
     for &point in stationary {
@@ -1219,10 +1214,7 @@ impl DiagonalCriterion<'_> {
         &self,
         a: f64,
         b: f64,
-    ) -> Option<(
-        gam_math::score_opt::ClosedInterval,
-        gam_math::score_opt::ClosedInterval,
-    )> {
+    ) -> Option<(gam_math::score_opt::ClosedInterval, gam_math::score_opt::ClosedInterval)> {
         let (first, second, third) = self.natural_ranges(a, b)?;
         if !(b > a) {
             return Some((first, second));
@@ -1239,22 +1231,14 @@ impl DiagonalCriterion<'_> {
         let (bend_lo, bend_hi) = span(third.lo, third.hi, 0.5 * width * width);
         let (turn_lo, turn_hi) = span(third.lo, third.hi, width);
         let magnitude = [
-            at_a.lo,
-            at_a.hi,
-            at_b.lo,
-            at_b.hi,
-            curvature_a.lo,
-            curvature_a.hi,
-            curvature_b.lo,
+            at_a.lo, at_a.hi, at_b.lo, at_b.hi, curvature_a.lo, curvature_a.hi, curvature_b.lo,
             curvature_b.hi,
         ]
         .iter()
         .fold(0.0_f64, |m, v| m.max(v.abs()))
-            + [
-                rise_lo, rise_hi, tilt_a_lo, tilt_a_hi, tilt_b_lo, tilt_b_hi, turn_lo, turn_hi,
-            ]
-            .iter()
-            .fold(0.0_f64, |m, v| m.max(v.abs()))
+            + [rise_lo, rise_hi, tilt_a_lo, tilt_a_hi, tilt_b_lo, tilt_b_hi, turn_lo, turn_hi]
+                .iter()
+                .fold(0.0_f64, |m, v| m.max(v.abs()))
             + bend_lo.abs().max(bend_hi.abs());
         let band = gam_linalg::roundoff::accumulation_band(8, magnitude);
         let lo = first
@@ -1348,8 +1332,9 @@ impl DiagonalCriterion<'_> {
         let mut nu_order: Vec<usize> = (0..self.generalized.len())
             .filter(|&index| self.generalized[index] > 0.0)
             .collect();
-        nu_order
-            .sort_by(|&left, &right| self.generalized[left].total_cmp(&self.generalized[right]));
+        nu_order.sort_by(|&left, &right| {
+            self.generalized[left].total_cmp(&self.generalized[right])
+        });
         let mut mu_order: Vec<usize> = (0..self.occam.len())
             .filter(|&index| self.occam[index] > 0.0)
             .collect();
@@ -1361,8 +1346,7 @@ impl DiagonalCriterion<'_> {
             nu_paired[nu_order[index]] = true;
             mu_paired[mu_order[index]] = true;
         }
-        for (index, (&square, &nu)) in self.squares.iter().zip(self.generalized.iter()).enumerate()
-        {
+        for (index, (&square, &nu)) in self.squares.iter().zip(self.generalized.iter()).enumerate() {
             let (scaled_a, scaled_b) = (t_a * nu, t_b * nu);
             if !(scaled_a.is_finite() && scaled_b.is_finite()) {
                 return None;
@@ -1425,20 +1409,15 @@ impl DiagonalCriterion<'_> {
         }
         let share = |scaled: f64| scaled / (1.0 + scaled);
         for index in 0..pairs {
-            let (nu, mu) = (
-                self.generalized[nu_order[index]],
-                self.occam[mu_order[index]],
-            );
+            let (nu, mu) = (self.generalized[nu_order[index]], self.occam[mu_order[index]]);
             let (nu_lo, nu_hi) = (share(t_a * nu), share(t_b * nu));
             let (mu_lo, mu_hi) = (share(t_a * mu), share(t_b * mu));
             let (nu_spread_lo, nu_spread_hi) =
                 share_polynomial_range(nu_lo, nu_hi, spread, &spread_stationary);
             let (mu_spread_lo, mu_spread_hi) =
                 share_polynomial_range(mu_lo, mu_hi, spread, &spread_stationary);
-            let (nu_skew_lo, nu_skew_hi) =
-                share_polynomial_range(nu_lo, nu_hi, skew, &skew_stationary);
-            let (mu_skew_lo, mu_skew_hi) =
-                share_polynomial_range(mu_lo, mu_hi, skew, &skew_stationary);
+            let (nu_skew_lo, nu_skew_hi) = share_polynomial_range(nu_lo, nu_hi, skew, &skew_stationary);
+            let (mu_skew_lo, mu_skew_hi) = share_polynomial_range(mu_lo, mu_hi, skew, &skew_stationary);
             let gap = nu.ln() - mu.ln();
             let (span_lo, span_hi) = (share(t_a * nu.min(mu)), share(t_b * nu.max(mu)));
             let (_, spread_max) =
@@ -1450,10 +1429,7 @@ impl DiagonalCriterion<'_> {
             let slope_bound = gap.abs() * spread_max;
             let curvature_bound = gap.abs() * skew_min.abs().max(skew_max.abs());
             let torsion_bound = gap.abs() * torsion_min.abs().max(torsion_max.abs());
-            if !(slope_bound.is_finite()
-                && curvature_bound.is_finite()
-                && torsion_bound.is_finite())
-            {
+            if !(slope_bound.is_finite() && curvature_bound.is_finite() && torsion_bound.is_finite()) {
                 return None;
             }
             let (signed_lo, signed_hi) = if gap >= 0.0 {
@@ -1463,10 +1439,7 @@ impl DiagonalCriterion<'_> {
             };
             // Rounding can leave the two bounds a hair apart at a point cell; the
             // band added below covers that hair, so the pair keeps its hull.
-            let (pair_lo, pair_hi) = (
-                (nu_lo - mu_hi).max(signed_lo),
-                (nu_hi - mu_lo).min(signed_hi),
-            );
+            let (pair_lo, pair_hi) = ((nu_lo - mu_hi).max(signed_lo), (nu_hi - mu_lo).min(signed_hi));
             first_lo += pair_lo.min(pair_hi);
             first_hi += pair_lo.max(pair_hi);
             let (bent_lo, bent_hi) = (
@@ -1522,10 +1495,10 @@ impl DiagonalCriterion<'_> {
                 first_hi += multiplier * slope_hi;
                 second_lo += multiplier * (bend_lo - slope_hi * slope_hi);
                 second_hi += multiplier * (bend_hi - slope_lo * slope_lo);
-                third_lo +=
-                    multiplier * (twist_lo - 3.0 * cross_hi + 2.0 * slope_lo * slope_lo * slope_lo);
-                third_hi +=
-                    multiplier * (twist_hi - 3.0 * cross_lo + 2.0 * slope_hi * slope_hi * slope_hi);
+                third_lo += multiplier
+                    * (twist_lo - 3.0 * cross_hi + 2.0 * slope_lo * slope_lo * slope_lo);
+                third_hi += multiplier
+                    * (twist_hi - 3.0 * cross_lo + 2.0 * slope_hi * slope_hi * slope_hi);
                 // Relative to the magnitudes they are built from, the ratios
                 // carry the errors of both the sums and `a`, `len + 1` terms each,
                 // and the products and combination a handful more.
@@ -1535,9 +1508,7 @@ impl DiagonalCriterion<'_> {
                 first_magnitude += multiplier * slope_hi;
                 second_magnitude += multiplier * (bend_magnitude + slope_hi * slope_hi);
                 third_magnitude += multiplier
-                    * (twist_magnitude
-                        + 3.0 * cross_magnitude
-                        + 2.0 * slope_hi * slope_hi * slope_hi);
+                    * (twist_magnitude + 3.0 * cross_magnitude + 2.0 * slope_hi * slope_hi * slope_hi);
                 terms += 2 * self.squares.len() + 8;
             }
         }
@@ -1595,16 +1566,13 @@ impl DiagonalCriterion<'_> {
                     .ok_or_else(|| format!("criterion not evaluable at ln t = {log_t}"))
             },
             |left: ScoreSample, right: ScoreSample| {
-                let (first, second) = self.derivative_ranges(left.x, right.x).ok_or_else(|| {
-                    format!("criterion not evaluable on [{}, {}]", left.x, right.x)
-                })?;
+                let (first, second) = self
+                    .derivative_ranges(left.x, right.x)
+                    .ok_or_else(|| format!("criterion not evaluable on [{}, {}]", left.x, right.x))?;
                 let band_left = self.jet(left.x).map(|(_, band)| band);
                 let band_right = self.jet(right.x).map(|(_, band)| band);
                 let (Some(band_left), Some(band_right)) = (band_left, band_right) else {
-                    return Err(format!(
-                        "criterion not evaluable on [{}, {}]",
-                        left.x, right.x
-                    ));
+                    return Err(format!("criterion not evaluable on [{}, {}]", left.x, right.x));
                 };
                 let evaluation_error = band_left.max(band_right);
                 // Mean-value bound from either endpoint: the exact score over the
@@ -1938,11 +1906,7 @@ impl SmoothLrSelectionProfile {
             .ok_or(SmoothLrSelectionDecline::ProfileInconsistent)?;
         let unit = stratified_chi_square(self.residual_unit_dimension, geometry.dimension, draws);
         let other = stratified_chi_square(other, geometry.dimension + 1, draws);
-        let residual = unit
-            .iter()
-            .zip(other.iter())
-            .map(|(unit, other)| unit + other)
-            .collect();
+        let residual = unit.iter().zip(other.iter()).map(|(unit, other)| unit + other).collect();
         Ok(ProfiledResidualDraws {
             multiplier: (self.residual_unit_dimension + self.penalized_rank) as f64,
             unit,
@@ -1981,12 +1945,15 @@ impl SmoothLrSelectionReplay {
         observed_penalized_deviance: Option<f64>,
     ) -> SmoothLrSelection {
         if unit_penalties.is_empty() || unit_penalties.len() != log_lambda.len() {
-            return SmoothLrSelection::Declined(SmoothLrSelectionDecline::NoPenaltyComponents);
+            return SmoothLrSelection::Declined(
+                SmoothLrSelectionDecline::NoPenaltyComponents,
+            );
         }
         if whitener.ncols() == 0 {
             return SmoothLrSelection::Declined(SmoothLrSelectionDecline::NoInformation);
         }
-        let Some(geometry) = SelectionGeometry::whiten(whitener, unit_penalties, log_lambda) else {
+        let Some(geometry) = SelectionGeometry::whiten(whitener, unit_penalties, log_lambda)
+        else {
             return SmoothLrSelection::Declined(SmoothLrSelectionDecline::GeometryRefused);
         };
         let observed = match observed_score {
@@ -2033,7 +2000,9 @@ impl SmoothLrSelectionReplay {
         observed: Option<ObservedDraw<'_>>,
     ) -> SmoothLrSelection {
         if log_scale_windows.len() != geometry.roots.len() {
-            return SmoothLrSelection::Declined(SmoothLrSelectionDecline::NoPenaltyComponents);
+            return SmoothLrSelection::Declined(
+                SmoothLrSelectionDecline::NoPenaltyComponents,
+            );
         }
         // A profiled selection needs the observation's own deviance to select
         // it by the profiled rule; without it the observation cannot be scored
@@ -2068,13 +2037,7 @@ impl SmoothLrSelectionReplay {
                 Err(reason) => SmoothLrSelection::Declined(reason),
             };
         }
-        Self::generate_common_scale(
-            geometry,
-            log_scale_windows,
-            profile,
-            diagonal_draws,
-            observed,
-        )
+        Self::generate_common_scale(geometry, log_scale_windows, profile, diagonal_draws, observed)
     }
 
     /// The COMMON-SCALE replay: every scale moved together, `t_i ≡ t`.
@@ -2355,13 +2318,7 @@ impl SmoothLrSelectionReplay {
                 }
                 coordinates[column] = projection;
             }
-            Self::select_draw(
-                geometry,
-                log_scale_windows,
-                &coordinates,
-                residual,
-                &mut selected,
-            )?;
+            Self::select_draw(geometry, log_scale_windows, &coordinates, residual, &mut selected)?;
             if !factor.refactor(geometry, &selected) {
                 return Err(SmoothLrSelectionDecline::SelectionUnresolved);
             }
@@ -2421,11 +2378,7 @@ impl SmoothLrSelectionReplay {
             return Err(SmoothLrSelectionDecline::NoPenaltyComponents);
         }
         for (slot, &(low, high)) in selected.iter_mut().zip(log_scale_windows) {
-            *slot = if high > low {
-                0.0_f64.clamp(low, high)
-            } else {
-                0.0
-            };
+            *slot = if high > low { 0.0_f64.clamp(low, high) } else { 0.0 };
         }
         loop {
             let mut moved = false;
@@ -3072,8 +3025,7 @@ impl SmoothLrReferenceDf {
         let (shift, standard_error) = match self.profiled_scale.as_ref() {
             None => replay.tail_shift_at(statistic, observed_ratio * statistic),
             Some(scale) => {
-                let ratio =
-                    ((statistic - scale.deterministic_offset) / scale.observations).exp_m1();
+                let ratio = ((statistic - scale.deterministic_offset) / scale.observations).exp_m1();
                 if !(ratio > 0.0) {
                     // `conditional` is the certain `1` here (see
                     // `conditional_tail_with_bound`), and every draw of either
@@ -3256,10 +3208,7 @@ impl std::fmt::Display for SmoothLrUnavailable {
             }
             Self::FullRefitFailed(message) => write!(f, "full-model refit failed: {message}"),
             Self::NullFitNotConverged(message) => {
-                write!(
-                    f,
-                    "the reduced model (term fixed at zero) did not converge: {message}"
-                )
+                write!(f, "the reduced model (term fixed at zero) did not converge: {message}")
             }
             Self::NullFitUnsupported(message) => {
                 write!(f, "no nested reduced model for this term: {message}")
@@ -3311,10 +3260,7 @@ impl SmoothLrPValue {
 
 /// The weighted chi-square tail with its bound stated absolutely, the form the
 /// replay's shift is added to.
-fn tail_with_bound(
-    terms: &[gam_math::probability::WeightedChiSquareTerm],
-    statistic: f64,
-) -> (f64, f64) {
+fn tail_with_bound(terms: &[gam_math::probability::WeightedChiSquareTerm], statistic: f64) -> (f64, f64) {
     let tail = gam_math::probability::signed_weighted_chi_square_sf(terms, statistic);
     (tail.probability, tail.absolute_error())
 }
@@ -3613,13 +3559,12 @@ pub fn smooth_term_lr_inference_forspec(
         &s_lambda,
         p_total,
     )?;
-    let full_residual_df =
-        profiled_residual_shares
-            .as_ref()
-            .and(profiled_residual_degrees_of_freedom(
-                &full.fit,
-                profiled_observations,
-            ));
+    let full_residual_df = profiled_residual_shares
+        .as_ref()
+        .and(profiled_residual_degrees_of_freedom(
+            &full.fit,
+            profiled_observations,
+        ));
     // `(v, h)`: the non-trivial residual weights and the degrees of freedom of
     // the weight-one block. On the exact rung that block is the `n − p`
     // directions no column reaches; on the summary rung the whole residual law
@@ -3651,16 +3596,12 @@ pub fn smooth_term_lr_inference_forspec(
         let beta = full.fit.beta_flat();
         (beta.len() == s_lambda.nrows()).then(|| full.fit.deviance + beta.dot(&s_lambda.dot(&beta)))
     });
-    let profiled_residual =
-        profiled_residual_shares
-            .zip(full_residual_df)
-            .map(|(shares, residual_df)| match shares {
-                Some(spectrum) => (
-                    spectrum,
-                    profiled_observations.saturating_sub(p_total) as f64,
-                ),
-                None => (Vec::new(), residual_df),
-            });
+    let profiled_residual = profiled_residual_shares.zip(full_residual_df).map(
+        |(shares, residual_df)| match shares {
+            Some(spectrum) => (spectrum, profiled_observations.saturating_sub(p_total) as f64),
+            None => (Vec::new(), residual_df),
+        },
+    );
 
     // The nested null of every term is the full problem with one block fixed at
     // zero, solved at the full fit's `ρ̂` on the offset the full fit was solved
@@ -3804,12 +3745,13 @@ pub fn smooth_term_lr_inference_forspec(
             .iter()
             .zip(term_log_lambda.iter())
             .map(|(local, &rho)| {
-                let interval = gam_solve::estimate::rho_domain::penalty_range_gammas_from_gram(
-                    &block_gram,
-                    local,
-                )
-                .as_deref()
-                .and_then(gam_solve::estimate::rho_domain::resolvability_interval);
+                let interval =
+                    gam_solve::estimate::rho_domain::penalty_range_gammas_from_gram(
+                        &block_gram,
+                        local,
+                    )
+                    .as_deref()
+                    .and_then(gam_solve::estimate::rho_domain::resolvability_interval);
                 let (lo, hi) = gam_solve::estimate::rho_domain::coordinate_domain(interval, None);
                 (lo - rho, hi - rho)
             })
@@ -3855,8 +3797,7 @@ pub fn smooth_term_lr_inference_forspec(
                 // deviance, so the observation carries its own, in the same
                 // units as its score's squares.
                 if selection_profile.is_some() && unit_scale.is_finite() && unit_scale > 0.0 {
-                    observed_penalized_deviance =
-                        full_penalized_deviance.map(|deviance| deviance / unit_scale);
+                    observed_penalized_deviance = full_penalized_deviance.map(|deviance| deviance / unit_scale);
                 }
                 (unit_scale.is_finite() && unit_scale > 0.0)
                     .then(|| block_score.mapv(|value| value / unit_scale.sqrt()))
@@ -3901,15 +3842,11 @@ pub fn smooth_term_lr_inference_forspec(
         let null = match null_outcome {
             gam_solve::estimate::NestedFixedLambdaOutcome::Converged(null) => null,
             gam_solve::estimate::NestedFixedLambdaOutcome::NotConverged(message) => {
-                out.push(report(Err(SmoothLrUnavailable::NullFitNotConverged(
-                    message,
-                ))));
+                out.push(report(Err(SmoothLrUnavailable::NullFitNotConverged(message))));
                 continue;
             }
             gam_solve::estimate::NestedFixedLambdaOutcome::Unsupported(message) => {
-                out.push(report(Err(SmoothLrUnavailable::NullFitUnsupported(
-                    message,
-                ))));
+                out.push(report(Err(SmoothLrUnavailable::NullFitUnsupported(message))));
                 continue;
             }
         };
@@ -3936,7 +3873,8 @@ pub fn smooth_term_lr_inference_forspec(
             let observations = profiled_observations as f64;
             reference.profiled_scale = Some(SmoothLrProfiledScale {
                 observations,
-                deterministic_offset: observations * (full_df / null_df).ln() + (null_df - full_df),
+                deterministic_offset: observations * (full_df / null_df).ln()
+                    + (null_df - full_df),
                 residual_weights: residual_weights.clone(),
                 residual_unit_dimension: *residual_unit_dimension,
             });
@@ -4024,12 +3962,12 @@ pub fn smooth_term_lr_inference_forspec(
                 let factor_move = (bartlett_factor - 1.0).abs();
                 let p_denom = p_uncorrected.max(p_corrected);
                 // Two zero p-values have not moved.
-                let p_move =
-                    if p_uncorrected.is_finite() && p_corrected.is_finite() && p_denom > 0.0 {
-                        (p_corrected - p_uncorrected).abs() / p_denom
-                    } else {
-                        0.0
-                    };
+                let p_move = if p_uncorrected.is_finite() && p_corrected.is_finite() && p_denom > 0.0
+                {
+                    (p_corrected - p_uncorrected).abs() / p_denom
+                } else {
+                    0.0
+                };
                 factor_move > SMOOTH_LR_MATERIAL_THRESHOLD || p_move > SMOOTH_LR_MATERIAL_THRESHOLD
             }
             SmoothLrCorrection::None => false,
@@ -4125,10 +4063,7 @@ fn profiled_scale_residual_shares(
     let resolved = likelihood
         .resolved_scale()
         .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-    if !matches!(
-        resolved,
-        gam_spec::ResolvedLikelihoodScale::ProfiledGaussian
-    ) {
+    if !matches!(resolved, gam_spec::ResolvedLikelihoodScale::ProfiledGaussian) {
         return Ok(None);
     }
     Ok(Some(
@@ -4513,7 +4448,8 @@ fn lr_null_spectral_moments(
 #[cfg(test)]
 mod lr_null_reference_tests {
     use super::{
-        SmoothLrReferenceSource, lr_null_reference, lr_null_spectral_moments, lr_tested_block,
+        SmoothLrReferenceSource, lr_null_reference, lr_null_spectral_moments,
+        lr_tested_block,
     };
     use ndarray::Array2;
 
@@ -4610,10 +4546,11 @@ mod lr_null_reference_tests {
             let hessian_inverse = symmetric_inverse(&hessian);
             let influence = hessian_inverse.dot(&gram);
 
-            let weights = lr_tested_block(Some(&hessian_inverse), Some(&penalty), &(retained..p))
-                .map(|block| block.shares)
-                .map(|shares| shares.iter().map(|&q| 1.0 - q * q).collect::<Vec<f64>>())
-                .expect("spectrum available");
+            let weights =
+                lr_tested_block(Some(&hessian_inverse), Some(&penalty), &(retained..p))
+                    .map(|block| block.shares)
+                    .map(|shares| shares.iter().map(|&q| 1.0 - q * q).collect::<Vec<f64>>())
+                    .expect("spectrum available");
             let [mean, second] = lr_null_spectral_moments(Some(&influence), &(retained..p))
                 .expect("moments available");
             let spectrum_mean: f64 = weights.iter().sum();
@@ -4672,20 +4609,7 @@ mod lr_null_reference_tests {
         // No `H⁻¹` (or no penalty): the moments off `F`, and NO weights — which
         // is exactly the condition `tail_probability_with_bound` switches on.
         for degraded in [
-            lr_null_reference(
-                Some(&influence),
-                None,
-                Some(&penalty),
-                &(0..q),
-                2.0,
-                1,
-                WINDOW,
-                &[],
-                &[],
-                None,
-                None,
-                None,
-            ),
+            lr_null_reference(Some(&influence), None, Some(&penalty), &(0..q), 2.0, 1, WINDOW, &[], &[], None, None, None),
             lr_null_reference(
                 Some(&influence),
                 Some(&hessian_inverse),
@@ -4701,68 +4625,24 @@ mod lr_null_reference_tests {
                 None,
             ),
         ] {
-            assert_eq!(
-                degraded.source,
-                SmoothLrReferenceSource::SpectralMomentMatch
-            );
+            assert_eq!(degraded.source, SmoothLrReferenceSource::SpectralMomentMatch);
             assert!(degraded.weights.is_empty());
             assert!((degraded.mean - exact.mean).abs() < 1e-12);
         }
 
         // Nothing at all: the unit-weight shape with its `max(edf, null_dim, 1)`.
-        let fallback = lr_null_reference(
-            None,
-            None,
-            None,
-            &(0..q),
-            2.5,
-            1,
-            WINDOW,
-            &[],
-            &[],
-            None,
-            None,
-            None,
-        );
+        let fallback = lr_null_reference(None, None, None, &(0..q), 2.5, 1, WINDOW, &[], &[], None, None, None);
         assert_eq!(fallback.source, SmoothLrReferenceSource::UnitWeightFallback);
         assert!(fallback.weights.is_empty());
         assert_eq!(fallback.chi_square_df, 2.5);
         assert_eq!(fallback.scale, 1.0);
         // The `max(edf, null_dim, 1)` shape is retained only on this lane.
         assert_eq!(
-            lr_null_reference(
-                None,
-                None,
-                None,
-                &(0..4),
-                0.01,
-                3,
-                WINDOW,
-                &[],
-                &[],
-                None,
-                None,
-                None
-            )
-            .chi_square_df,
+            lr_null_reference(None, None, None, &(0..4), 0.01, 3, WINDOW, &[], &[], None, None, None).chi_square_df,
             3.0
         );
         assert_eq!(
-            lr_null_reference(
-                None,
-                None,
-                None,
-                &(0..4),
-                0.01,
-                0,
-                WINDOW,
-                &[],
-                &[],
-                None,
-                None,
-                None
-            )
-            .chi_square_df,
+            lr_null_reference(None, None, None, &(0..4), 0.01, 0, WINDOW, &[], &[], None, None, None).chi_square_df,
             1.0
         );
     }
@@ -4779,10 +4659,7 @@ mod profiled_scale_reference_tests {
 
     /// A reference carrying an explicit spectrum, no selection replay, and the
     /// strictest tail accuracy the clamp allows.
-    fn reference(
-        weights: Vec<f64>,
-        profiled_scale: Option<SmoothLrProfiledScale>,
-    ) -> SmoothLrReferenceDf {
+    fn reference(weights: Vec<f64>, profiled_scale: Option<SmoothLrProfiledScale>) -> SmoothLrReferenceDf {
         let mean: f64 = weights.iter().sum();
         let second_moment: f64 = weights.iter().map(|w| w * w).sum();
         SmoothLrReferenceDf {
@@ -4886,14 +4763,8 @@ mod profiled_scale_reference_tests {
         let mut previous = 1.0;
         for &statistic in &[-0.5_f64, -0.3, -0.1, -1e-3] {
             let (value, accuracy) = subject.tail_probability_with_bound(statistic);
-            assert!(
-                value.is_finite() && accuracy.is_finite(),
-                "W={statistic}: {value} ± {accuracy}"
-            );
-            assert!(
-                value > at_zero && value < previous,
-                "W={statistic}: {value} vs [{at_zero}, {previous}]"
-            );
+            assert!(value.is_finite() && accuracy.is_finite(), "W={statistic}: {value} ± {accuracy}");
+            assert!(value > at_zero && value < previous, "W={statistic}: {value} vs [{at_zero}, {previous}]");
             assert_eq!(
                 SmoothLrReferenceDf::typed_p_value(value, accuracy),
                 Some(SmoothLrPValue::Resolved(value))
@@ -4927,11 +4798,8 @@ mod profiled_scale_reference_tests {
         for &statistic in &[90.0_f64, 150.0, 400.0] {
             let (value, accuracy) = subject.tail_probability_with_bound(statistic);
             let ratio = (statistic / observations).exp_m1();
-            let exact = gam_math::probability::fisher_snedecor_sf(
-                ratio * nu / (scale * q as f64),
-                q as f64,
-                nu,
-            );
+            let exact =
+                gam_math::probability::fisher_snedecor_sf(ratio * nu / (scale * q as f64), q as f64, nu);
             assert!(exact > 0.0 && exact < 1e-16, "W={statistic}: {exact:.3e}");
             assert_eq!(
                 SmoothLrReferenceDf::typed_p_value(value, accuracy),
@@ -4964,10 +4832,7 @@ mod profiled_scale_reference_tests {
             SmoothLrReferenceDf::typed_p_value(0.0, 0.0),
             Some(SmoothLrPValue::UpperBound(f64::from_bits(1)))
         );
-        assert_eq!(
-            SmoothLrReferenceDf::typed_p_value(0.2, 1e-13),
-            Some(SmoothLrPValue::Resolved(0.2))
-        );
+        assert_eq!(SmoothLrReferenceDf::typed_p_value(0.2, 1e-13), Some(SmoothLrPValue::Resolved(0.2)));
         assert_eq!(SmoothLrReferenceDf::typed_p_value(f64::NAN, 0.0), None);
         assert_eq!(SmoothLrReferenceDf::typed_p_value(0.2, f64::NAN), None);
     }
@@ -5000,10 +4865,10 @@ mod profiled_scale_reference_tests {
 #[cfg(test)]
 mod selection_replay_tests {
     use super::{
-        AxisSlice, DiagonalCriterion, ObservedDraw, SMOOTH_LR_SELECTION_DRAWS, SelectionDrawStream,
-        SelectionFactor, SelectionGeometry, SmoothLrReferenceDf, SmoothLrReferenceSource,
-        SmoothLrSelection, SmoothLrSelectionDecline, SmoothLrSelectionProfile,
-        SmoothLrSelectionReplay, split_mix64, stratified_chi_square,
+        AxisSlice, DiagonalCriterion, ObservedDraw, SMOOTH_LR_SELECTION_DRAWS,
+        SelectionDrawStream, SelectionFactor, SelectionGeometry, SmoothLrSelection,
+        SmoothLrSelectionDecline, SmoothLrReferenceDf, SmoothLrReferenceSource,
+        SmoothLrSelectionProfile, SmoothLrSelectionReplay, split_mix64, stratified_chi_square,
     };
     use ndarray::Array2;
 
@@ -5067,10 +4932,7 @@ mod selection_replay_tests {
         }
         let (low, high) = (-8.0_f64, 8.0_f64);
         let selected = criterion.select(low, high).expect("certified selection");
-        assert!(
-            (low..=high).contains(&selected),
-            "selection {selected} left the window"
-        );
+        assert!((low..=high).contains(&selected), "selection {selected} left the window");
         let value = |u: f64| jet(u)[0];
         let selected_value = value(selected);
         for probe in [low, high, 0.0, selected - 1.0e-2, selected + 1.0e-2] {
@@ -5227,14 +5089,7 @@ mod selection_replay_tests {
     }
 
     fn replay_from(spectrum: &[f64], window: (f64, f64), draws: usize) -> SmoothLrSelectionReplay {
-        match SmoothLrSelectionReplay::from_geometry(
-            &diagonal(spectrum),
-            &[window],
-            None,
-            draws,
-            draws,
-            None,
-        ) {
+        match SmoothLrSelectionReplay::from_geometry(&diagonal(spectrum), &[window], None, draws, draws, None) {
             SmoothLrSelection::Replayed(replay) => replay,
             SmoothLrSelection::Declined(reason) => {
                 panic!("expected a replay, declined: {}", reason.label())
@@ -5246,7 +5101,8 @@ mod selection_replay_tests {
     /// the replay's own strata do not share (Box–Muller on SplitMix64 words).
     fn observation(rep: u64, dimension: usize) -> Vec<f64> {
         let unit = |counter: u64| {
-            ((split_mix64(0xC0FF_EE00_0000_0000 ^ counter) >> 11) as f64 + 0.5) * (-53.0_f64).exp2()
+            ((split_mix64(0xC0FF_EE00_0000_0000 ^ counter) >> 11) as f64 + 0.5)
+                * (-53.0_f64).exp2()
         };
         (0..dimension as u64)
             .map(|j| {
@@ -5385,17 +5241,10 @@ mod selection_replay_tests {
         for &k in &[1usize, 7, 40, 900] {
             let draws = stratified_chi_square(k, 3, 4096);
             let mean = draws.iter().sum::<f64>() / draws.len() as f64;
-            assert!(
-                (mean - k as f64).abs() < 1.0e-2 * k as f64,
-                "k={k}: mean {mean}"
-            );
+            assert!((mean - k as f64).abs() < 1.0e-2 * k as f64, "k={k}: mean {mean}");
             assert!(draws.iter().all(|value| value.is_finite() && *value > 0.0));
         }
-        assert!(
-            stratified_chi_square(0, 3, 64)
-                .iter()
-                .all(|value| *value == 0.0)
-        );
+        assert!(stratified_chi_square(0, 3, 64).iter().all(|value| *value == 0.0));
     }
 
     /// An estimated-scale family selects on the profiled criterion, so its
@@ -5429,10 +5278,7 @@ mod selection_replay_tests {
             residual_unit_dimension: 20,
             penalized_rank: geometry.rank + 3,
         }));
-        let unit = profiled
-            .residual_unit_sample
-            .as_ref()
-            .expect("profiled draws");
+        let unit = profiled.residual_unit_sample.as_ref().expect("profiled draws");
         assert_eq!(unit.len(), profiled.selection_sample.len());
         let mean = unit.iter().sum::<f64>() / unit.len() as f64;
         assert!((mean - 20.0).abs() < 0.5, "χ²_20 draws average {mean}");
@@ -5482,10 +5328,7 @@ mod selection_replay_tests {
         let second = replay_from(&spectrum(), (-8.0, 8.0), SMOOTH_LR_SELECTION_DRAWS);
         assert_eq!(first, second);
         for statistic in [0.05_f64, 0.5, 1.5, 4.0] {
-            assert_eq!(
-                first.tail_shift_at(statistic, statistic),
-                second.tail_shift_at(statistic, statistic)
-            );
+            assert_eq!(first.tail_shift_at(statistic, statistic), second.tail_shift_at(statistic, statistic));
         }
     }
 
@@ -5583,8 +5426,8 @@ mod selection_replay_tests {
     fn the_published_standard_error_covers_a_four_fold_draw_increase() {
         let coarse = replay_from(&spectrum(), (-10.0, 10.0), 4096);
         let fine = replay_from(&spectrum(), (-10.0, 10.0), 16384);
-        let conditional_mean =
-            coarse.conditional_sample.iter().sum::<f64>() / coarse.conditional_sample.len() as f64;
+        let conditional_mean = coarse.conditional_sample.iter().sum::<f64>()
+            / coarse.conditional_sample.len() as f64;
         for multiple in [0.5_f64, 1.0, 2.0, 4.0, 8.0] {
             let statistic = multiple * conditional_mean;
             let (coarse_shift, coarse_error) = coarse.tail_shift_at(statistic, statistic);
@@ -5601,8 +5444,7 @@ mod selection_replay_tests {
         // error that does not fall with the budget is not a standard error.
         let statistic = 2.0 * conditional_mean;
         assert!(
-            fine.tail_shift_at(statistic, statistic).1
-                < coarse.tail_shift_at(statistic, statistic).1,
+            fine.tail_shift_at(statistic, statistic).1 < coarse.tail_shift_at(statistic, statistic).1,
             "the reported standard error did not fall when the draws quadrupled"
         );
     }
@@ -5666,7 +5508,11 @@ mod selection_replay_tests {
         );
         // Both lanes publish the same generalized spectrum, because it is a
         // property of the term and not of which grid was affordable.
-        for (from_split, from_single) in split.generalized.iter().zip(single.generalized.iter()) {
+        for (from_split, from_single) in split
+            .generalized
+            .iter()
+            .zip(single.generalized.iter())
+        {
             assert!(
                 (from_split - from_single).abs() <= 1e-9 * from_single.abs().max(1.0),
                 "the two lanes publish different generalized spectra: {:?} vs {:?}",
@@ -5683,22 +5529,30 @@ mod selection_replay_tests {
         let information = Array2::<f64>::eye(3);
         let penalty = Array2::<f64>::eye(3);
         // One scale: the diagonal path is strictly better, so this declines.
-        let single =
-            SelectionGeometry::whiten(&information, std::slice::from_ref(&penalty), &[0.0])
-                .expect("single geometry");
+        let single = SelectionGeometry::whiten(
+            &information,
+            std::slice::from_ref(&penalty),
+            &[0.0],
+        )
+        .expect("single geometry");
         assert!(
-            SmoothLrSelectionReplay::generate_multiscale(&single, &[(-6.0, 6.0)], None, 256, None,)
-                .is_err()
+            SmoothLrSelectionReplay::generate_multiscale(
+                &single,
+                &[(-6.0, 6.0)],
+                None,
+                256,
+                None,
+            )
+            .is_err()
         );
         // Five scales: no bracket budget caps the axes any more, so the
         // multi-scale lane serves every one of them.
         let many = vec![penalty.clone(); 5];
         let windows = vec![(-6.0, 6.0); 5];
-        let crowded =
-            SelectionGeometry::whiten(&information, &many, &[0.0; 5]).expect("crowded geometry");
+        let crowded = SelectionGeometry::whiten(&information, &many, &[0.0; 5])
+            .expect("crowded geometry");
         assert!(
-            SmoothLrSelectionReplay::generate_multiscale(&crowded, &windows, None, 256, None)
-                .is_ok(),
+            SmoothLrSelectionReplay::generate_multiscale(&crowded, &windows, None, 256, None).is_ok(),
             "a term with five scales is replayed over all five"
         );
         assert!(
@@ -5761,8 +5615,7 @@ mod selection_replay_tests {
         let geometry = diagonal(&spectrum());
         for window in [(4.0_f64, -4.0_f64), (f64::NAN, 1.0)] {
             assert_eq!(
-                SmoothLrSelectionReplay::from_geometry(&geometry, &[window], None, 256, 256, None)
-                    .decline(),
+                SmoothLrSelectionReplay::from_geometry(&geometry, &[window], None, 256, 256, None).decline(),
                 Some(SmoothLrSelectionDecline::WindowClosed),
                 "a closed window must decline with a NAMED reason"
             );
@@ -5809,10 +5662,7 @@ mod selection_replay_tests {
         let second = generate();
         assert_eq!(first, second);
         for statistic in [0.05_f64, 0.5, 1.5, 4.0] {
-            assert_eq!(
-                first.tail_shift_at(statistic, statistic),
-                second.tail_shift_at(statistic, statistic)
-            );
+            assert_eq!(first.tail_shift_at(statistic, statistic), second.tail_shift_at(statistic, statistic));
         }
     }
 
@@ -5864,11 +5714,8 @@ mod selection_replay_tests {
                 // The eigen route's criterion from its own spectrum: the Occam term
                 // `log|I + T| − log|T|₊` over the structural rank, then the data
                 // operator `f_j = e_j/(1 + e_j)` on each squared coordinate.
-                let log_det_hessian: f64 = evaluated
-                    .eigenvalues
-                    .iter()
-                    .map(|value| value.ln_1p())
-                    .sum();
+                let log_det_hessian: f64 =
+                    evaluated.eigenvalues.iter().map(|value| value.ln_1p()).sum();
                 let log_det_penalty: f64 = evaluated.eigenvalues[..geometry.rank]
                     .iter()
                     .map(|value| value.ln())
@@ -5895,7 +5742,8 @@ mod selection_replay_tests {
                         .map(|row| draw[row] * geometry.range_basis[[row, column]])
                         .sum();
                 }
-                let (fast_criterion, fast_statistic) = factor.score(&coordinates, norm_squared);
+                let (fast_criterion, fast_statistic) =
+                    factor.score(&coordinates, norm_squared);
                 assert!(
                     (fast_criterion - criterion).abs() <= 1e-8 * criterion.abs().max(1.0),
                     "separation {separation}, ln t = {log_t:?}: criterion {fast_criterion} \
@@ -6022,9 +5870,12 @@ mod selection_replay_tests {
             SelectionGeometry::whiten(&Array2::eye(q), &[bending, ridge], &[12.0, -12.0])
                 .expect("separable geometry");
         let (information, dense_bending, dense_ridge, _) = dense_pair();
-        let coupled =
-            SelectionGeometry::whiten(&information, &[dense_bending, dense_ridge], &[9.0, -9.0])
-                .expect("coupled geometry");
+        let coupled = SelectionGeometry::whiten(
+            &information,
+            &[dense_bending, dense_ridge],
+            &[9.0, -9.0],
+        )
+        .expect("coupled geometry");
         let windows = [(-42.0_f64, 18.0_f64), (-18.0, 42.0)];
         let mut state = 0x2902_0004_u64;
         let mut uniform = move || {
@@ -6413,24 +6264,8 @@ mod lr_null_spectrum_moment_tests {
         let f = ndarray::array![[0.5_f64, 40.0], [40.0, 0.5]];
         let [mean, _] = lr_null_spectral_moments(Some(&f), &(0..2)).unwrap();
         assert!(mean < 0.0, "the corrupted block's first moment is {mean}");
-        let reference = lr_null_reference(
-            Some(&f),
-            None,
-            None,
-            &(0..2),
-            1.0,
-            1,
-            WINDOW,
-            &[],
-            &[],
-            None,
-            None,
-            None,
-        );
-        assert_eq!(
-            reference.source,
-            SmoothLrReferenceSource::UnitWeightFallback
-        );
+        let reference = lr_null_reference(Some(&f), None, None, &(0..2), 1.0, 1, WINDOW, &[], &[], None, None, None);
+        assert_eq!(reference.source, SmoothLrReferenceSource::UnitWeightFallback);
         assert_eq!(reference.chi_square_df, 1.0);
         assert_eq!(reference.scale, 1.0);
     }
@@ -6452,21 +6287,7 @@ mod lr_null_spectrum_moment_tests {
             [0.0, 0.0]
         );
         assert_eq!(
-            lr_null_reference(
-                Some(&zero),
-                None,
-                None,
-                &(0..2),
-                0.0,
-                0,
-                WINDOW,
-                &[],
-                &[],
-                None,
-                None,
-                None
-            )
-            .source,
+            lr_null_reference(Some(&zero), None, None, &(0..2), 0.0, 0, WINDOW, &[], &[], None, None, None).source,
             SmoothLrReferenceSource::UnitWeightFallback
         );
     }

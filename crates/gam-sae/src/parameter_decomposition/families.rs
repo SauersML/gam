@@ -104,7 +104,7 @@ use super::codec::{
 };
 use super::field::{FieldCoefficient, MatrixParameterField, ParameterFamily};
 use super::precision::{
-    DeclaredPrecision, DecodableArtifact, DecodedFidelity, LatticeCode, decode_then_evaluate,
+    DecodableArtifact, DecodedFidelity, DeclaredPrecision, LatticeCode, decode_then_evaluate,
 };
 use super::supports::EvidenceStatus;
 use crate::basis::{EuclideanPatchEvaluator, SaeBasisEvaluator};
@@ -223,9 +223,8 @@ impl FamilyPartition {
         }
         let mut assigned = vec![false; components];
         for (index, family) in families.iter().enumerate() {
-            check_members(&family.members, components).map_err(|reason| {
-                FamilyError::InvalidPartition(format!("family {index}: {reason}"))
-            })?;
+            check_members(&family.members, components)
+                .map_err(|reason| FamilyError::InvalidPartition(format!("family {index}: {reason}")))?;
             if family.dimension >= family.members.len() {
                 return Err(FamilyError::InvalidPartition(format!(
                     "family {index} has {} members, which span at most {} label dimensions, not {}",
@@ -288,12 +287,7 @@ impl FamilyPartition {
 
     /// Share: families `first` and `second` become one family at label dimension
     /// `dimension`.
-    pub fn share(
-        &self,
-        first: usize,
-        second: usize,
-        dimension: usize,
-    ) -> Result<Self, FamilyError> {
+    pub fn share(&self, first: usize, second: usize, dimension: usize) -> Result<Self, FamilyError> {
         if first == second {
             return Err(FamilyError::InvalidPartition(format!(
                 "family {first} cannot be shared with itself"
@@ -597,8 +591,7 @@ pub fn encode_families(
         }
         encode_subset(&mut message, remaining.len() - 1, &positions).map_err(code_error)?;
         encode_prefix_integer(&mut message, family.dimension as u64 + 1).map_err(code_error)?;
-        let field =
-            principal_field_of_class(components, rows, cols, &family.members, family.dimension)?;
+        let field = principal_field_of_class(components, rows, cols, &family.members, family.dimension)?;
         let mut coefficients: Vec<f64> = Vec::with_capacity((family.dimension + 1) * rows * cols);
         coefficients.extend(field.center.iter());
         for direction in &field.directions {
@@ -724,10 +717,7 @@ fn affine_parameter_family(
         Arc::new(EuclideanPatchEvaluator::new(dimension, 1).map_err(FamilyError::Field)?);
     let field = MatrixParameterField::new(
         basis,
-        coefficients
-            .into_iter()
-            .map(FieldCoefficient::Dense)
-            .collect(),
+        coefficients.into_iter().map(FieldCoefficient::Dense).collect(),
     )
     .map_err(FamilyError::Field)?;
     let weights = ndarray::Array1::from_elem(labels.nrows(), 1.0);
@@ -818,11 +808,7 @@ fn decode_families(artifact: &FamilyArtifact) -> Result<DecodedFamilies, FamilyE
             )));
         }
         let dimension = announced_dimension as usize;
-        let overflow = || {
-            FamilyError::Code(format!(
-                "the family led by component {first} overflows usize"
-            ))
-        };
+        let overflow = || FamilyError::Code(format!("the family led by component {first} overflows usize"));
         let coefficient_count = (dimension + 1).checked_mul(entries).ok_or_else(overflow)?;
         let label_count = members.len().checked_mul(dimension).ok_or_else(overflow)?;
         let values = read_reals(&mut reader, coefficient_count, &mut precision)?;
@@ -915,10 +901,10 @@ mod tests {
     use crate::parameter_decomposition::codec::{
         code_saving_at_proven_fidelity, prefix_integer_len_bits, subset_code_len_bits,
     };
+    use crate::parameter_decomposition::precision::FidelityVerdict;
     use crate::parameter_decomposition::fit::{
         ProposalAcceptance, ProposalKind, ProposalRejection, decide_proposal,
     };
-    use crate::parameter_decomposition::precision::FidelityVerdict;
     use crate::parameter_decomposition::supports::ExactBasis;
     use gam_linalg::roundoff::{UNIT_ROUNDOFF, symmetric_spectrum_rounding_band};
     use ndarray::Array1;
@@ -946,10 +932,7 @@ mod tests {
     }
 
     fn views(components: &[Array2<f64>]) -> Vec<ArrayView2<'_, f64>> {
-        components
-            .iter()
-            .map(|component| component.view())
-            .collect()
+        components.iter().map(|component| component.view()).collect()
     }
 
     /// Six components on a planted two-dimensional affine field `B_0 + z_1 U_1 + z_2 U_2`.
@@ -974,9 +957,7 @@ mod tests {
             .map(|c| {
                 let angle = std::f64::consts::PI * c as f64 / instances as f64;
                 let direction = [angle.cos(), angle.sin()];
-                Array2::from_shape_fn((2, 2), |(r, k)| {
-                    2.0 / instances as f64 * direction[r] * direction[k]
-                })
+                Array2::from_shape_fn((2, 2), |(r, k)| 2.0 / instances as f64 * direction[r] * direction[k])
             })
             .collect()
     }
@@ -1045,20 +1026,13 @@ mod tests {
             let mut magnitude = x.mapv(f64::abs);
             for a in 0..dimension {
                 residual.scaled_add(-field.labels[[i, a]], &field.directions[a]);
-                magnitude.scaled_add(
-                    field.labels[[i, a]].abs(),
-                    &direction_magnitude(field, bands, a),
-                );
+                magnitude.scaled_add(field.labels[[i, a]].abs(), &direction_magnitude(field, bands, a));
             }
             squared += residual.iter().map(|value| value * value).sum::<f64>();
-            formation += magnitude
-                .iter()
-                .map(|value| (growth * value).powi(2))
-                .sum::<f64>();
+            formation += magnitude.iter().map(|value| (growth * value).powi(2)).sum::<f64>();
         }
         let sum_growth = 1.0 + accumulation_growth(n * field.center.len());
-        let bound =
-            sum_growth * ((2.0 * (n - dimension) as f64 * bands.beta).sqrt() + formation.sqrt());
+        let bound = sum_growth * ((2.0 * (n - dimension) as f64 * bands.beta).sqrt() + formation.sqrt());
         (squared.sqrt(), bound)
     }
 
@@ -1073,11 +1047,7 @@ mod tests {
     /// `|<X_c, U_a> - z_ca| <= beta / sqrt(lambda_a)`. Each inner product adds the
     /// rounding of forming its factors and summing its `m` products, at most
     /// `m + n + 6` operations against the magnitudes of the terms.
-    fn assert_isometric_labels(
-        components: &[Array2<f64>],
-        members: &[usize],
-        field: &PrincipalField,
-    ) -> bool {
+    fn assert_isometric_labels(components: &[Array2<f64>], members: &[usize], field: &PrincipalField) -> bool {
         let bands = bands(components, members, field);
         let dimension = field.directions.len();
         let growth = accumulation_growth(field.center.len() + members.len() + 6);
@@ -1110,8 +1080,7 @@ mod tests {
                      (bound {bound:e})"
                 );
                 let uncentered_inner = frobenius(&components[member], &field.directions[a]);
-                let uncentered_band =
-                    bound + growth * frobenius(&components[member].mapv(f64::abs), &magnitudes[a]);
+                let uncentered_band = bound + growth * frobenius(&components[member].mapv(f64::abs), &magnitudes[a]);
                 uncentered_refuted |= (label - uncentered_inner).abs() > uncentered_band;
             }
         }
@@ -1133,14 +1102,7 @@ mod tests {
         // the positive control.
         let refused = principal_field(&view, &everyone, 3);
         assert!(
-            matches!(
-                refused,
-                Err(FamilyError::UnresolvedDimension {
-                    first_member: 0,
-                    dimension: 3,
-                    resolved: 2
-                })
-            ),
+            matches!(refused, Err(FamilyError::UnresolvedDimension { first_member: 0, dimension: 3, resolved: 2 })),
             "got {refused:?}"
         );
         assert!(
@@ -1154,8 +1116,7 @@ mod tests {
         );
         // Negative control: one label dimension fewer discards a direction the members use.
         let reduced = principal_field(&view, &everyone, 1).expect("d = 1 is resolved");
-        let (reduced_residual, reduced_bound) =
-            reproduction(&reduced, &bands(&components, &everyone, &reduced));
+        let (reduced_residual, reduced_bound) = reproduction(&reduced, &bands(&components, &everyone, &reduced));
         assert!(
             reduced_residual > reduced_bound,
             "the d = 1 field must miss the members: residual {reduced_residual:e}, bound {reduced_bound:e}"
@@ -1167,8 +1128,7 @@ mod tests {
         let components = random_components();
         let view = views(&components);
         let everyone: Vec<usize> = (0..MEMBERS).collect();
-        let full = principal_field(&view, &everyone, MEMBERS - 1)
-            .expect("every centered direction is resolved");
+        let full = principal_field(&view, &everyone, MEMBERS - 1).expect("every centered direction is resolved");
         assert_eq!(
             full.resolved_dimension,
             MEMBERS - 1,
@@ -1187,8 +1147,7 @@ mod tests {
         );
         // A shared field through a random initialization needs n - 1 directions: one
         // fewer misses the members.
-        let truncated =
-            principal_field(&view, &everyone, MEMBERS - 2).expect("n - 2 directions are resolved");
+        let truncated = principal_field(&view, &everyone, MEMBERS - 2).expect("n - 2 directions are resolved");
         let (truncated_residual, truncated_bound) =
             reproduction(&truncated, &bands(&components, &everyone, &truncated));
         assert!(
@@ -1209,8 +1168,7 @@ mod tests {
         let components = projector_components(instances);
         let view = views(&components);
         let everyone: Vec<usize> = (0..instances).collect();
-        let field =
-            principal_field(&view, &everyone, 2).expect("the projector family is an affine field");
+        let field = principal_field(&view, &everyone, 2).expect("the projector family is an affine field");
         assert_eq!(
             field.resolved_dimension, 2,
             "the centered projectors span the two traceless symmetric directions: eigenvalues \
@@ -1228,8 +1186,7 @@ mod tests {
             "the d = 2 field misses the projectors by {residual:e}, above {bound:e}"
         );
         let line = principal_field(&view, &everyone, 1).expect("d = 1 is resolved");
-        let (line_residual, line_bound) =
-            reproduction(&line, &bands(&components, &everyone, &line));
+        let (line_residual, line_bound) = reproduction(&line, &bands(&components, &everyone, &line));
         assert!(
             line_residual > line_bound,
             "one label dimension must miss the projectors: residual {line_residual:e}, bound {line_bound:e}"
@@ -1244,10 +1201,7 @@ mod tests {
         assert!(principal_field(&view, &[0, 2, 4], 1).is_ok());
         for members in [&[][..], &[2, 0][..], &[0, 6][..], &[1, 1][..]] {
             assert!(
-                matches!(
-                    principal_field(&view, members, 0),
-                    Err(FamilyError::InvalidPartition(..))
-                ),
+                matches!(principal_field(&view, members, 0), Err(FamilyError::InvalidPartition(..))),
                 "members {members:?} were admitted"
             );
         }
@@ -1257,10 +1211,7 @@ mod tests {
         non_finite[1][[0, 0]] = f64::NAN;
         for refused in [views(&misshapen), views(&non_finite), Vec::new()] {
             assert!(
-                matches!(
-                    principal_field(&refused, &[0, 1], 0),
-                    Err(FamilyError::InvalidComponents(..))
-                ),
+                matches!(principal_field(&refused, &[0, 1], 0), Err(FamilyError::InvalidComponents(..))),
                 "malformed components were admitted"
             );
         }
@@ -1279,32 +1230,16 @@ mod tests {
             shared.families(),
             &[family(&[0, 2], 1), family(&[1], 0), family(&[3], 0)]
         );
-        assert_eq!(
-            shared.split(0, 2, 0).expect("split component 2 back out"),
-            literal
-        );
+        assert_eq!(shared.split(0, 2, 0).expect("split component 2 back out"), literal);
         assert!(shared.with_dimension(0, 0).is_ok());
-        assert!(
-            shared.with_dimension(0, 2).is_err(),
-            "two members span one label dimension"
-        );
-        assert!(
-            literal.share(1, 1, 0).is_err(),
-            "a family is not shared with itself"
-        );
+        assert!(shared.with_dimension(0, 2).is_err(), "two members span one label dimension");
+        assert!(literal.share(1, 1, 0).is_err(), "a family is not shared with itself");
         assert!(literal.share(1, 4, 0).is_err(), "there is no fifth family");
-        assert!(
-            shared.split(1, 1, 0).is_err(),
-            "a literal family has nothing to split off"
-        );
-        assert!(
-            shared.split(0, 3, 0).is_err(),
-            "component 3 is not in family 0"
-        );
+        assert!(shared.split(1, 1, 0).is_err(), "a literal family has nothing to split off");
+        assert!(shared.split(0, 3, 0).is_err(), "component 3 is not in family 0");
 
         // Positive control: families given out of order are accepted in canonical order.
-        let reordered =
-            FamilyPartition::new(3, vec![family(&[2], 0), family(&[0, 1], 1)]).expect("a cover");
+        let reordered = FamilyPartition::new(3, vec![family(&[2], 0), family(&[0, 1], 1)]).expect("a cover");
         assert_eq!(reordered.families()[0].members, vec![0, 1]);
         for (components, families) in [
             (3, vec![family(&[0, 1], 0), family(&[1, 2], 0)]),
@@ -1327,9 +1262,7 @@ mod tests {
     }
 
     fn declared_inputs(cols: usize) -> Vec<Array1<f64>> {
-        (0..3)
-            .map(|seed| Array1::from(entries(90 + seed, cols)))
-            .collect()
+        (0..3).map(|seed| Array1::from(entries(90 + seed, cols))).collect()
     }
 
     /// Which masks a readout executes, as a function of the component count.
@@ -1416,8 +1349,7 @@ mod tests {
         family: MaskFamily,
         inputs: &[Array1<f64>],
     ) -> Result<Executed, String> {
-        let mut instances: Vec<Option<(Array2<f64>, Array2<f64>)>> =
-            vec![None; decoded.components()];
+        let mut instances: Vec<Option<(Array2<f64>, Array2<f64>)>> = vec![None; decoded.components()];
         let mut formation = 0;
         for decoded_family in decoded.families() {
             let dimension = decoded_family.labels.ncols();
@@ -1436,9 +1368,7 @@ mod tests {
         let instances = instances
             .into_iter()
             .enumerate()
-            .map(|(component, slot)| {
-                slot.ok_or_else(|| format!("component {component} was not decoded"))
-            })
+            .map(|(component, slot)| slot.ok_or_else(|| format!("component {component} was not decoded")))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(execute(&instances, formation, family, inputs))
     }
@@ -1472,8 +1402,7 @@ mod tests {
                 distortion = gap;
                 witness = index;
             }
-            roundoff =
-                roundoff.max(band + reference_band + UNIT_ROUNDOFF * (gap + band + reference_band));
+            roundoff = roundoff.max(band + reference_band + UNIT_ROUNDOFF * (gap + band + reference_band));
         }
         EvidenceStatus::exact(
             distortion,
@@ -1545,18 +1474,8 @@ mod tests {
         .expect("the literals encode");
         let family = encode_families(&view, &one_family(components.len(), dimension), precision())
             .expect("the family encodes");
-        let literal_score = score(
-            &literal,
-            MaskFamily::AllOnAndSingleDeletions,
-            inputs,
-            &native,
-        );
-        let family_score = score(
-            &family,
-            MaskFamily::AllOnAndSingleDeletions,
-            inputs,
-            &native,
-        );
+        let literal_score = score(&literal, MaskFamily::AllOnAndSingleDeletions, inputs, &native);
+        let family_score = score(&family, MaskFamily::AllOnAndSingleDeletions, inputs, &native);
         (literal, literal_score, family, family_score)
     }
 
@@ -1566,8 +1485,7 @@ mod tests {
         // Positive control: the planted field is shorter than its literals at the declared
         // fidelity.
         let planted = planted_components();
-        let (literal, literal_score, shared, shared_score) =
-            literal_and_family_scores(&planted, 2, &inputs);
+        let (literal, literal_score, shared, shared_score) = literal_and_family_scores(&planted, 2, &inputs);
         let saving = code_saving_at_proven_fidelity(pair(&literal_score), pair(&shared_score));
         assert!(
             matches!(saving, Ok(bits) if bits > 0 && bits == i128::from(literal.code_bits()) - i128::from(shared.code_bits())),
@@ -1580,10 +1498,7 @@ mod tests {
         let (reduced_literal, reduced_literal_score, reduced, reduced_score) =
             literal_and_family_scores(&planted, 1, &inputs);
         assert!(reduced.code_bits() < shared.code_bits());
-        assert_eq!(
-            reduced_literal, literal,
-            "the literals do not depend on the family"
-        );
+        assert_eq!(reduced_literal, literal, "the literals do not depend on the family");
         assert_eq!(
             reduced_score.1.verdict(),
             FidelityVerdict::Violates,
@@ -1596,17 +1511,9 @@ mod tests {
             MaskFamily::AllOnAndSingleDeletions,
             &inputs,
         );
-        let rescored = score(
-            &reduced,
-            MaskFamily::AllOnAndSingleDeletions,
-            &inputs,
-            &planted_native,
-        );
+        let rescored = score(&reduced, MaskFamily::AllOnAndSingleDeletions, &inputs, &planted_native);
         assert_eq!(rescored, reduced_score);
-        assert!(
-            code_saving_at_proven_fidelity(pair(&reduced_literal_score), pair(&reduced_score))
-                .is_err()
-        );
+        assert!(code_saving_at_proven_fidelity(pair(&reduced_literal_score), pair(&reduced_score)).is_err());
 
         // Random-init control: the full-dimension family meets the tolerance, so both are
         // at equal fidelity, and it loses on code.
@@ -1626,8 +1533,7 @@ mod tests {
         assert_eq!(truncated_literal, random_literal);
         assert!(truncated.code_bits() < full.code_bits());
         assert!(
-            code_saving_at_proven_fidelity(pair(&truncated_literal_score), pair(&truncated_score))
-                .is_err(),
+            code_saving_at_proven_fidelity(pair(&truncated_literal_score), pair(&truncated_score)).is_err(),
             "a truncated field through random components must miss the tolerance: {truncated_score:?}"
         );
     }
@@ -1637,8 +1543,7 @@ mod tests {
         let instances = 16;
         let inputs = declared_inputs(2);
         let components = projector_components(instances);
-        let (literal, literal_score, shared, shared_score) =
-            literal_and_family_scores(&components, 2, &inputs);
+        let (literal, literal_score, shared, shared_score) = literal_and_family_scores(&components, 2, &inputs);
         let saving = code_saving_at_proven_fidelity(pair(&literal_score), pair(&shared_score));
         assert!(
             matches!(saving, Ok(bits) if bits > 0),
@@ -1657,12 +1562,7 @@ mod tests {
         .expect("the identity encodes");
         let native_all_on = execute(&native_instances(&identity), 0, MaskFamily::AllOn, &inputs);
         let shared_all_on = score(&shared, MaskFamily::AllOn, &inputs, &native_all_on);
-        let identity_score = score(
-            &identity_artifact,
-            MaskFamily::AllOn,
-            &inputs,
-            &native_all_on,
-        );
+        let identity_score = score(&identity_artifact, MaskFamily::AllOn, &inputs, &native_all_on);
         assert_eq!(
             (shared_all_on.1.verdict(), identity_score.1.verdict()),
             (FidelityVerdict::Meets, FidelityVerdict::Meets),
@@ -1680,21 +1580,13 @@ mod tests {
                 let upper = exact
                     .upper_bound()
                     .ok_or_else(|| "an exact figure has an upper bound".to_string())?;
-                EvidenceStatus::uniform_bound(
-                    upper,
-                    0.0,
-                    "declared masks x inputs x output coordinates",
-                )
-                .map_err(|error| error.to_string())
+                EvidenceStatus::uniform_bound(upper, 0.0, "declared masks x inputs x output coordinates")
+                    .map_err(|error| error.to_string())
             },
             TOLERANCE,
         );
-        assert!(
-            restated.is_err(),
-            "a uniform bound must not stand in for the largest distortion"
-        );
-        let identity_saving =
-            code_saving_at_proven_fidelity(pair(&shared_all_on), pair(&identity_score));
+        assert!(restated.is_err(), "a uniform bound must not stand in for the largest distortion");
+        let identity_saving = code_saving_at_proven_fidelity(pair(&shared_all_on), pair(&identity_score));
         assert!(
             matches!(identity_saving, Ok(bits) if bits > 0),
             "identity ({} bits) must be the short program against the family ({} bits), got {identity_saving:?}",
@@ -1728,18 +1620,11 @@ mod tests {
             members: members.to_vec(),
             dimension,
         };
-        let partition = FamilyPartition::new(
-            5,
-            vec![family(&[3], 0), family(&[0, 2, 4], 1), family(&[1], 0)],
-        )
-        .expect("a partition");
-        let artifact =
-            encode_families(&view, &partition, precision()).expect("the partition encodes");
+        let partition = FamilyPartition::new(5, vec![family(&[3], 0), family(&[0, 2, 4], 1), family(&[1], 0)])
+            .expect("a partition");
+        let artifact = encode_families(&view, &partition, precision()).expect("the partition encodes");
         let decoded = artifact.decode().expect("the message decodes");
-        assert_eq!(
-            decoded.partition().expect("a valid decoded partition"),
-            partition
-        );
+        assert_eq!(decoded.partition().expect("a valid decoded partition"), partition);
         assert_eq!(decoded.shape(), (rows, cols));
         assert_eq!(decoded.precision(), precision());
 
@@ -1748,29 +1633,22 @@ mod tests {
         let mut expected_bits = prefix_integer_len_bits(6).expect("count codeword");
         let mut unassigned = 5_usize;
         for spec in partition.families() {
-            let field =
-                principal_field(&view, &spec.members, spec.dimension).expect("the family's field");
-            expected_bits += subset_code_len_bits(unassigned - 1, spec.members.len() - 1)
-                .expect("subset codeword")
+            let field = principal_field(&view, &spec.members, spec.dimension).expect("the family's field");
+            expected_bits += subset_code_len_bits(unassigned - 1, spec.members.len() - 1).expect("subset codeword")
                 + prefix_integer_len_bits(spec.dimension as u64 + 1).expect("dimension codeword");
             let mut coefficients: Vec<f64> = field.center.iter().copied().collect();
             for direction in &field.directions {
                 coefficients.extend(direction.iter());
             }
-            let coefficient_code =
-                LatticeCode::encode(&coefficients, precision()).expect("coefficients encode");
+            let coefficient_code = LatticeCode::encode(&coefficients, precision()).expect("coefficients encode");
             let mut coefficient_message = BitString::new();
-            coefficient_code
-                .write(&mut coefficient_message)
-                .expect("coefficients write");
+            coefficient_code.write(&mut coefficient_message).expect("coefficients write");
             expected_bits += coefficient_message.len_bits();
             let blocks: Vec<Array2<f64>> = coefficient_code
                 .decode()
                 .expect("coefficients decode")
                 .chunks(rows * cols)
-                .map(|chunk| {
-                    Array2::from_shape_vec((rows, cols), chunk.to_vec()).expect("block shape")
-                })
+                .map(|chunk| Array2::from_shape_vec((rows, cols), chunk.to_vec()).expect("block shape"))
                 .collect();
             let labels = if spec.dimension == 0 {
                 Array2::<f64>::zeros((spec.members.len(), 0))
@@ -1805,23 +1683,13 @@ mod tests {
         // A trailing bit and a missing bit are refused.
         let mut trailing = artifact.message().clone();
         trailing.push_bit(false);
-        assert!(
-            FamilyArtifact::from_message(rows, cols, trailing)
-                .expect("shape")
-                .decode()
-                .is_err()
-        );
+        assert!(FamilyArtifact::from_message(rows, cols, trailing).expect("shape").decode().is_err());
         let mut short = BitString::new();
         let mut reader = artifact.message().reader();
         for _ in 1..artifact.code_bits() {
             short.push_bit(reader.read_bit().expect("inside the message"));
         }
-        assert!(
-            FamilyArtifact::from_message(rows, cols, short)
-                .expect("shape")
-                .decode()
-                .is_err()
-        );
+        assert!(FamilyArtifact::from_message(rows, cols, short).expect("shape").decode().is_err());
 
         // One component spans no label direction: dimension 1 is refused, while dimension
         // 0 with its twelve reals reads back.
@@ -1834,18 +1702,10 @@ mod tests {
                 .expect("reals encode")
                 .write(&mut message)
                 .expect("reals write");
-            FamilyArtifact::from_message(rows, cols, message)
-                .expect("shape")
-                .decode()
+            FamilyArtifact::from_message(rows, cols, message).expect("shape").decode()
         };
-        assert!(
-            lone(0).is_ok(),
-            "positive control: a literal component reads back"
-        );
-        assert!(
-            lone(1).is_err(),
-            "a lone component announcing a label dimension must be refused"
-        );
+        assert!(lone(0).is_ok(), "positive control: a literal component reads back");
+        assert!(lone(1).is_err(), "a lone component announcing a label dimension must be refused");
 
         // A header announcing 2^62 components is refused before anything is allocated.
         let mut huge = BitString::new();
@@ -1860,11 +1720,7 @@ mod tests {
     /// `field`'s instance `sum_j s_j B'_j` of `member`, read through the anchor at the mask
     /// selecting that member with the residual removed:
     /// `s = sum_k (m_k - m_Delta) w_k phi(z_k)`.
-    fn field_instance(
-        family: &ParameterFamily,
-        member: usize,
-        shape: (usize, usize),
-    ) -> Array2<f64> {
+    fn field_instance(family: &ParameterFamily, member: usize, shape: (usize, usize)) -> Array2<f64> {
         let mut mask = Array1::<f64>::zeros(family.labels().nrows());
         mask[member] = 1.0;
         let weights = family
@@ -1888,12 +1744,9 @@ mod tests {
         let components = planted_components();
         let view = views(&components);
         let everyone: Vec<usize> = (0..MEMBERS).collect();
-        let principal =
-            principal_field(&view, &everyone, 2).expect("the planted field is resolved");
+        let principal = principal_field(&view, &everyone, 2).expect("the planted field is resolved");
         let dimension = principal.directions.len();
-        let family = principal
-            .parameter_family()
-            .expect("the planted field converts");
+        let family = principal.parameter_family().expect("the planted field converts");
         assert_eq!(family.field().coefficients().len(), dimension + 1);
         // Both sides form `B_0 + sum_a z_a U_a`. The field side scales by n and 1/n, forms
         // `phi_j w`, the product with `B'_j` and the d + 1 accumulations, at most d + 5
@@ -1905,9 +1758,7 @@ mod tests {
             exchanged.labels[[0, a]] = principal.labels[[1, a]];
             exchanged.labels[[1, a]] = principal.labels[[0, a]];
         }
-        let exchanged_family = exchanged
-            .parameter_family()
-            .expect("exchanged labels convert");
+        let exchanged_family = exchanged.parameter_family().expect("exchanged labels convert");
         let mut exchanged_refuted = false;
         for member in 0..MEMBERS {
             let mut reference = principal.center.clone();
@@ -1921,9 +1772,7 @@ mod tests {
             }
             let value = field_instance(&family, member, (ROWS, COLS));
             let moved = field_instance(&exchanged_family, member, (ROWS, COLS));
-            for ((index, &field_entry), &reference_entry) in
-                value.indexed_iter().zip(reference.iter())
-            {
+            for ((index, &field_entry), &reference_entry) in value.indexed_iter().zip(reference.iter()) {
                 let band = 2.0 * growth * magnitude[index];
                 assert!(
                     (field_entry - reference_entry).abs() <= band,
@@ -1933,27 +1782,16 @@ mod tests {
                 exchanged_refuted |= (moved[index] - reference_entry).abs() > band;
             }
         }
-        assert!(
-            exchanged_refuted,
-            "negative control: exchanged labels must move some instance"
-        );
+        assert!(exchanged_refuted, "negative control: exchanged labels must move some instance");
 
         // The decoded family is field instances too, at the reals the message carries.
-        let partition = FamilyPartition::new(
-            MEMBERS,
-            vec![FamilySpec {
-                members: everyone.clone(),
-                dimension,
-            }],
-        )
-        .expect("one family");
+        let partition = FamilyPartition::new(MEMBERS, vec![FamilySpec { members: everyone.clone(), dimension }])
+            .expect("one family");
         let decoded = encode_families(&view, &partition, precision())
             .expect("the family encodes")
             .decode()
             .expect("the message decodes");
-        let decoded_family = decoded.families()[0]
-            .parameter_family()
-            .expect("the decoded family converts");
+        let decoded_family = decoded.families()[0].parameter_family().expect("the decoded family converts");
         for member in 0..MEMBERS {
             let rebuilt = decoded.instance(member).expect("a decoded member");
             let mut magnitude = decoded.families()[0].coefficients[0].mapv(f64::abs);
@@ -1964,8 +1802,7 @@ mod tests {
                 );
             }
             let value = field_instance(&decoded_family, member, (ROWS, COLS));
-            for ((index, &field_entry), &rebuilt_entry) in value.indexed_iter().zip(rebuilt.iter())
-            {
+            for ((index, &field_entry), &rebuilt_entry) in value.indexed_iter().zip(rebuilt.iter()) {
                 assert!(
                     (field_entry - rebuilt_entry).abs() <= 2.0 * growth * magnitude[index],
                     "decoded member {member} entry {index:?}: field instance {field_entry} against \
@@ -1976,10 +1813,7 @@ mod tests {
 
         // Guard: a literal family is a native tensor, not a field (positive control above).
         let literal = principal_field(&view, &[3], 0).expect("a literal family");
-        assert!(matches!(
-            literal.parameter_family(),
-            Err(FamilyError::Field(..))
-        ));
+        assert!(matches!(literal.parameter_family(), Err(FamilyError::Field(..))));
         let literal_decoded = encode_families(
             &view,
             &FamilyPartition::literal(MEMBERS).expect("literal partition"),
@@ -2008,12 +1842,8 @@ mod tests {
     }
 
     fn encode_one_family(components: &[Array2<f64>], dimension: usize) -> FamilyArtifact {
-        encode_families(
-            &views(components),
-            &one_family(components.len(), dimension),
-            precision(),
-        )
-        .expect("the family encodes")
+        encode_families(&views(components), &one_family(components.len(), dimension), precision())
+            .expect("the family encodes")
     }
 
     fn encode_literals(components: &[Array2<f64>]) -> FamilyArtifact {
@@ -2036,17 +1866,10 @@ mod tests {
         let planted_native = execute(&native_instances(&planted), 0, deletions, &inputs);
         let literal = encode_literals(&planted);
         let shared = encode_one_family(&planted, 2);
-        let (literal_score, literal_status) =
-            score_and_status(&literal, deletions, &inputs, &planted_native);
-        let (shared_score, shared_status) =
-            score_and_status(&shared, deletions, &inputs, &planted_native);
+        let (literal_score, literal_status) = score_and_status(&literal, deletions, &inputs, &planted_native);
+        let (shared_score, shared_status) = score_and_status(&shared, deletions, &inputs, &planted_native);
         let expected_saving = i128::from(literal.code_bits()) - i128::from(shared.code_bits());
-        let accepted = decide_proposal(
-            ProposalKind::Share,
-            pair(&literal_score),
-            pair(&shared_score),
-            shared_status,
-        );
+        let accepted = decide_proposal(ProposalKind::Share, pair(&literal_score), pair(&shared_score), shared_status);
         assert!(
             matches!(
                 &accepted,
@@ -2057,28 +1880,17 @@ mod tests {
         );
         // Reduce d from 2 to 1: shorter, but its exhaustive status refutes the tolerance.
         let reduced = encode_one_family(&planted, 1);
-        let (reduced_score, reduced_status) =
-            score_and_status(&reduced, deletions, &inputs, &planted_native);
+        let (reduced_score, reduced_status) = score_and_status(&reduced, deletions, &inputs, &planted_native);
         assert!(reduced.code_bits() < shared.code_bits());
         assert_eq!(reduced_score.1.verdict(), FidelityVerdict::Violates);
-        let refuted = decide_proposal(
-            ProposalKind::Reduce,
-            pair(&shared_score),
-            pair(&reduced_score),
-            reduced_status,
-        );
+        let refuted = decide_proposal(ProposalKind::Reduce, pair(&shared_score), pair(&reduced_score), reduced_status);
         assert!(
             matches!(refuted, Err(ProposalRejection::FidelityRefuted(..))),
             "a dropped label dimension must be refuted, got {refuted:?}"
         );
         // Split back into the literals: they are proven within the tolerance and longer, so
         // the verdict is on code.
-        let split = decide_proposal(
-            ProposalKind::Split,
-            pair(&shared_score),
-            pair(&literal_score),
-            literal_status,
-        );
+        let split = decide_proposal(ProposalKind::Split, pair(&shared_score), pair(&literal_score), literal_status);
         assert!(
             matches!(split, Err(ProposalRejection::NoShorterCode { saving_bits }) if saving_bits < 0),
             "splitting the planted field into literals must lose on code, got {split:?}"
@@ -2093,16 +1905,10 @@ mod tests {
             score_and_status(&random_literal, deletions, &inputs, &random_native);
         let (full_score, full_status) = score_and_status(&full, deletions, &inputs, &random_native);
         assert!(
-            random_literal_status.certifies_at_most(TOLERANCE)
-                && full_status.certifies_at_most(TOLERANCE),
+            random_literal_status.certifies_at_most(TOLERANCE) && full_status.certifies_at_most(TOLERANCE),
             "both artifacts are proven within the tolerance: equal fidelity"
         );
-        let lost = decide_proposal(
-            ProposalKind::Share,
-            pair(&random_literal_score),
-            pair(&full_score),
-            full_status,
-        );
+        let lost = decide_proposal(ProposalKind::Share, pair(&random_literal_score), pair(&full_score), full_status);
         assert!(
             matches!(lost, Err(ProposalRejection::NoShorterCode { saving_bits }) if saving_bits < 0),
             "a field through random components must lose on code at equal fidelity, got {lost:?}"
@@ -2113,27 +1919,13 @@ mod tests {
         let instances = 16;
         let projectors = projector_components(instances);
         let projector_inputs = declared_inputs(2);
-        let projector_native = execute(
-            &native_instances(&projectors),
-            0,
-            deletions,
-            &projector_inputs,
-        );
+        let projector_native = execute(&native_instances(&projectors), 0, deletions, &projector_inputs);
         let projector_literal = encode_literals(&projectors);
         let projector_family = encode_one_family(&projectors, 2);
-        let projector_literal_score = score_and_status(
-            &projector_literal,
-            deletions,
-            &projector_inputs,
-            &projector_native,
-        )
-        .0;
-        let (projector_family_score, projector_family_status) = score_and_status(
-            &projector_family,
-            deletions,
-            &projector_inputs,
-            &projector_native,
-        );
+        let projector_literal_score =
+            score_and_status(&projector_literal, deletions, &projector_inputs, &projector_native).0;
+        let (projector_family_score, projector_family_status) =
+            score_and_status(&projector_family, deletions, &projector_inputs, &projector_native);
         let projector_share = decide_proposal(
             ProposalKind::Share,
             pair(&projector_literal_score),
@@ -2146,30 +1938,13 @@ mod tests {
         );
         let identity = vec![Array2::<f64>::eye(2)];
         let identity_artifact = encode_literals(&identity);
-        let native_all_on = execute(
-            &native_instances(&identity),
-            0,
-            MaskFamily::AllOn,
-            &projector_inputs,
-        );
-        let (family_all_on, family_all_on_status) = score_and_status(
-            &projector_family,
-            MaskFamily::AllOn,
-            &projector_inputs,
-            &native_all_on,
-        );
-        let (identity_score, identity_status) = score_and_status(
-            &identity_artifact,
-            MaskFamily::AllOn,
-            &projector_inputs,
-            &native_all_on,
-        );
-        let reduce_to_identity = decide_proposal(
-            ProposalKind::Reduce,
-            pair(&family_all_on),
-            pair(&identity_score),
-            identity_status,
-        );
+        let native_all_on = execute(&native_instances(&identity), 0, MaskFamily::AllOn, &projector_inputs);
+        let (family_all_on, family_all_on_status) =
+            score_and_status(&projector_family, MaskFamily::AllOn, &projector_inputs, &native_all_on);
+        let (identity_score, identity_status) =
+            score_and_status(&identity_artifact, MaskFamily::AllOn, &projector_inputs, &native_all_on);
+        let reduce_to_identity =
+            decide_proposal(ProposalKind::Reduce, pair(&family_all_on), pair(&identity_score), identity_status);
         assert!(
             matches!(
                 &reduce_to_identity,
@@ -2177,12 +1952,8 @@ mod tests {
             ),
             "identity must be the short program, got {reduce_to_identity:?}"
         );
-        let expose = decide_proposal(
-            ProposalKind::Expose,
-            pair(&identity_score),
-            pair(&family_all_on),
-            family_all_on_status,
-        );
+        let expose =
+            decide_proposal(ProposalKind::Expose, pair(&identity_score), pair(&family_all_on), family_all_on_status);
         assert!(
             matches!(expose, Err(ProposalRejection::NoShorterCode { saving_bits }) if saving_bits < 0),
             "exposing the smooth family from identity must lose on code, got {expose:?}"

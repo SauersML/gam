@@ -1897,10 +1897,7 @@ fn solve_identity_minus_product_in_place(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ALO_EXACT_SCALAR_MAX_ITERS, AloExactScalarError, alo_eta_exact_frozen_curvature,
-        alo_eta_updatewith_offset, finite_weighted_square_sum, spd_quadratic_after_certified_solve,
-    };
+    use super::{ALO_EXACT_SCALAR_MAX_ITERS, AloExactScalarError, alo_eta_exact_frozen_curvature, alo_eta_updatewith_offset, finite_weighted_square_sum, spd_quadratic_after_certified_solve};
 
     #[test]
     fn alo_offset_update_matches_centered_algebra() {

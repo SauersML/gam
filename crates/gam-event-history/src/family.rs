@@ -7,7 +7,8 @@
 
 use super::chain::{GaussHermite, product_grid_size};
 use super::cohort::{
-    CohortNodes, EventHistoryCohort, EventHistoryError, MarkKind, design_rows, expand_nodes,
+    CohortNodes, EventHistoryCohort, EventHistoryError, MarkKind,
+    design_rows, expand_nodes,
 };
 use super::covariance::{
     DirectionEvidence, DirectionProfile, NewAtom, SubjectResiduals, best_new_atom,
@@ -20,14 +21,14 @@ use super::marginal::{
 use super::preserve::{ReferenceGrid, ReferenceStrata, stratum_normalisers};
 use super::scalar::{Tangent, add_real, recip};
 use gam_custom_family::fit_custom_family;
-use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
-use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
-use gam_math::nested_dual::JetField;
 use gam_model_api::families::custom_family::{
     BlockwiseFitOptions, CustomFamily, ExactNewtonJointGradientEvaluation, FamilyEvaluation,
 };
-use gam_problem::CoefficientCoordinate;
 use gam_problem::{BlockWorkingSet, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix};
+use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
+use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
+use gam_math::nested_dual::JetField;
+use gam_problem::CoefficientCoordinate;
 use gam_solve::model_types::UnifiedFitResult;
 use gam_terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
@@ -172,16 +173,10 @@ impl RiskSetCentring {
     /// grid it returns; the grid is certified in the coefficients' units
     /// ([`reference_tail`]), and nothing gates on this.
     fn discrepancy(&self, refined: &Self, marks: usize) -> Result<f64, EventHistoryError> {
-        if self.coefficients != refined.coefficients
-            || self.profiles != refined.profiles
-            || self.mask_of_mark != refined.mask_of_mark
-            || self.masks != refined.masks
-        {
-            return Err(EventHistoryError::InvalidInput {
-                reason:
-                    "reference refinement requires identical coefficients, profiles, and risk masks"
-                        .to_string(),
-            });
+        if self.coefficients != refined.coefficients || self.profiles != refined.profiles
+            || self.mask_of_mark != refined.mask_of_mark || self.masks != refined.masks {
+            return Err(EventHistoryError::InvalidInput { reason:
+                "reference refinement requires identical coefficients, profiles, and risk masks".to_string() });
         }
         let mut gap = 0.0_f64;
         for (a, b, width) in [
@@ -190,12 +185,9 @@ impl RiskSetCentring {
         ] {
             if a.len() != self.profiles.nrows() * self.grid.len() * width
                 || b.len() != refined.profiles.nrows() * refined.grid.len() * width
-                || a.iter().chain(b).any(|x| !x.is_finite())
-            {
-                return Err(EventHistoryError::NumericalFailure {
-                    reason: "reference refinement has invalid or non-finite risk moments"
-                        .to_string(),
-                });
+                || a.iter().chain(b).any(|x| !x.is_finite()) {
+                return Err(EventHistoryError::NumericalFailure { reason:
+                    "reference refinement has invalid or non-finite risk moments".to_string() });
             }
             for s in 0..self.profiles.nrows() {
                 for (n, &time) in refined.grid.times.iter().enumerate() {
@@ -203,11 +195,8 @@ impl RiskSetCentring {
                     for d in 0..width {
                         let left = a[(s * self.grid.len() + low) * width + d];
                         let right = a[(s * self.grid.len() + low + 1) * width + d];
-                        gap = gap.max(
-                            (left + weight * (right - left)
-                                - b[(s * refined.grid.len() + n) * width + d])
-                                .abs(),
-                        );
+                        gap = gap.max((left + weight * (right - left)
+                            - b[(s * refined.grid.len() + n) * width + d]).abs());
                     }
                 }
             }
@@ -231,12 +220,7 @@ impl ReferenceTables {
 
     /// Whether a held normaliser of `held` entries is conformable with these
     /// tables and a node set of `total_nodes` nodes.
-    pub(crate) fn check_carry(
-        &self,
-        held: usize,
-        marks: usize,
-        total_nodes: usize,
-    ) -> Result<(), EventHistoryError> {
+    pub(crate) fn check_carry(&self, held: usize, marks: usize, total_nodes: usize) -> Result<(), EventHistoryError> {
         let nodes = self.grid.len();
         let expected = self.strata * nodes * marks;
         if held != expected {
@@ -261,12 +245,7 @@ impl ReferenceTables {
     /// [`Self::carry_to_nodes`] for the node rows `rows` alone, on tables
     /// [`Self::check_carry`] accepted: a subject reads its own rows where it
     /// is evaluated instead of every subject's being formed up front.
-    pub(crate) fn carry_rows<S: JetField>(
-        &self,
-        held: &[S],
-        marks: usize,
-        rows: std::ops::Range<usize>,
-    ) -> Vec<S> {
+    pub(crate) fn carry_rows<S: JetField>(&self, held: &[S], marks: usize, rows: std::ops::Range<usize>) -> Vec<S> {
         let nodes = self.grid.len();
         let mut out = Vec::with_capacity(rows.len() * marks);
         for row in rows {
@@ -376,10 +355,7 @@ impl EventHistoryFamily {
     }
 
     /// The reference law at exactly the supplied coefficient state.
-    pub(crate) fn refresh_normaliser(
-        &self,
-        states: &[ParameterBlockState],
-    ) -> Result<RiskSetCentring, EventHistoryError> {
+    pub(crate) fn refresh_normaliser(&self, states: &[ParameterBlockState]) -> Result<RiskSetCentring, EventHistoryError> {
         self.computed_reference(states)
     }
 
@@ -392,10 +368,7 @@ impl EventHistoryFamily {
 
     /// The reference refusal of the evaluation that just failed, taken.
     fn take_reference_refusal(&self) -> Option<EventHistoryError> {
-        self.reference_refusal
-            .lock()
-            .ok()
-            .and_then(|mut refusal| refusal.take())
+        self.reference_refusal.lock().ok().and_then(|mut refusal| refusal.take())
     }
 
     /// Per atom, the offset within the latent block of its rate coefficient,
@@ -794,31 +767,17 @@ impl EventHistoryFamily {
         // Independent sweeps, run together so one sweep's serial reference
         // evolution overlaps the others' work.
         let starts: Vec<usize> = (0..values.len()).step_by(W).collect();
-        let results: Vec<Result<Tangent<W>, EventHistoryError>> = starts
-            .par_iter()
-            .map(|&start| {
-                let beta: Vec<Tangent<W>> = values
-                    .iter()
-                    .enumerate()
-                    .map(|(q, value)| {
-                        let mut grad = [0.0; W];
-                        if q >= start && q < start + W {
-                            grad[q - start] = 1.0;
-                        }
-                        Tangent::seeded(*value, grad)
-                    })
-                    .collect();
-                self.path_value(states, &beta)
-            })
-            .collect();
+        let results: Vec<Result<Tangent<W>, EventHistoryError>> = starts.par_iter().map(|&start| {
+            let beta: Vec<Tangent<W>> = values.iter().enumerate().map(|(q, value)| {
+                let mut grad = [0.0; W];
+                if q >= start && q < start + W { grad[q - start] = 1.0; }
+                Tangent::seeded(*value, grad)
+            }).collect();
+            self.path_value(states, &beta)
+        }).collect();
         for (&start, result) in starts.iter().zip(results) {
             let result = result?;
-            for (slot, value) in result
-                .grad
-                .iter()
-                .enumerate()
-                .take((values.len() - start).min(W))
-            {
+            for (slot, value) in result.grad.iter().enumerate().take((values.len() - start).min(W)) {
                 gradient[start + slot] = *value;
             }
         }
@@ -841,11 +800,8 @@ impl EventHistoryFamily {
                 reason: "invalid event-history derivative direction".to_string(),
             });
         }
-        let beta: Vec<Tangent<1>> = values
-            .iter()
-            .enumerate()
-            .map(|(q, value)| Tangent::seeded(*value, [direction[q]]))
-            .collect();
+        let beta: Vec<Tangent<1>> = values.iter().enumerate().map(|(q, value)|
+            Tangent::seeded(*value, [direction[q]])).collect();
         let result = self.path_value(states, &beta)?;
         Ok((result.value, result.grad[0]))
     }
@@ -873,14 +829,10 @@ impl EventHistoryFamily {
         let rates: Vec<f64> = self.atom_rates(latent);
         let centring = if let Some(reference) = self.reference.as_ref() {
             let values = self.refresh_normaliser(states)?;
-            Some(
-                reference
-                    .carry_to_nodes(&values.log_normaliser, self.marks(), self.nodes.total_nodes)
-                    .map_err(|error| error.to_string())?,
-            )
-        } else {
-            None
-        };
+            Some(reference.carry_to_nodes(
+                &values.log_normaliser, self.marks(), self.nodes.total_nodes)
+                .map_err(|error| error.to_string())?)
+        } else { None };
         let held = centring.as_deref();
         let gh = &self.gh;
         let time_scale = self.time_scale;
@@ -919,9 +871,7 @@ impl EventHistoryFamily {
                         &pass.predicted[node],
                         &eta0[node * marks..(node + 1) * marks],
                         &loadings,
-                        normaliser
-                            .as_ref()
-                            .map(|m| &m[node * marks..(node + 1) * marks]),
+                        normaliser.as_ref().map(|m| &m[node * marks..(node + 1) * marks]),
                         marks,
                         atoms,
                     );
@@ -962,13 +912,8 @@ impl EventHistoryFamily {
         {
             return Ok(Arc::clone(value));
         }
-        let (loglik, computed_gradient, hessian) =
-            self.evaluate_generic::<f64>(states, None, None, true)?;
-        let gradient = if self.reference.is_some() && self.atoms > 0 {
-            computed_gradient
-        } else {
-            self.exact_gradient(states)?
-        };
+        let (loglik, computed_gradient, hessian) = self.evaluate_generic::<f64>(states, None, None, true)?;
+        let gradient = if self.reference.is_some() && self.atoms > 0 { computed_gradient } else { self.exact_gradient(states)? };
         let total = self.total_width();
         let mut negative_hessian = Array2::<f64>::zeros((total, total));
         for i in 0..total {
@@ -1135,18 +1080,12 @@ impl CustomFamily for EventHistoryFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-    ) -> Result<
-        Option<Arc<dyn gam_model_api::families::custom_family::ExactNewtonJointHessianWorkspace>>,
-        String,
-    > {
+    ) -> Result<Option<Arc<dyn gam_model_api::families::custom_family::ExactNewtonJointHessianWorkspace>>, String> {
         if !self.inner_coefficient_hessian_hvp_available(specs) {
             return Ok(None);
         }
         self.validate_states(block_states)?;
-        Ok(Some(Arc::new(objective::ComputedHessianWorkspace::new(
-            self.clone(),
-            block_states.to_vec(),
-        ))))
+        Ok(Some(Arc::new(objective::ComputedHessianWorkspace::new(self.clone(), block_states.to_vec()))))
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {
@@ -1389,26 +1328,17 @@ impl EventHistoryFit {
     /// `log M_d(t)` for one stratum at an arbitrary time, by the same linear
     /// interpolation in the log of the normaliser the fit used. Empty when
     /// the baselines are centred on the stationary prior.
-    pub fn risk_set_normaliser_at(
-        &self,
-        stratum: usize,
-        t: f64,
-    ) -> Result<Vec<f64>, EventHistoryError> {
+    pub fn risk_set_normaliser_at(&self, stratum: usize, t: f64) -> Result<Vec<f64>, EventHistoryError> {
         let marks = self.marks();
         let Some(snapshot) = self.centring.as_ref() else {
             if stratum != 0 {
-                return Err(EventHistoryError::InvalidInput {
-                    reason: "a model without reference strata requires stratum zero".to_string(),
-                });
+                return Err(EventHistoryError::InvalidInput { reason: "a model without reference strata requires stratum zero".to_string() });
             }
             return Ok(Vec::new());
         };
         if stratum >= snapshot.profiles.nrows() {
             return Err(EventHistoryError::InvalidInput {
-                reason: format!(
-                    "reference stratum {stratum} is outside 0..{}",
-                    snapshot.profiles.nrows()
-                ),
+                reason: format!("reference stratum {stratum} is outside 0..{}", snapshot.profiles.nrows()),
             });
         }
         let grid = &snapshot.grid;
@@ -1434,9 +1364,7 @@ impl EventHistoryFit {
     /// The growth the rank path could not resolve, when it stopped for that
     /// reason rather than on the evidence.
     pub fn unresolved_growth(&self) -> Option<&UnresolvedGrowth> {
-        self.rank_path
-            .last()
-            .and_then(|step| step.growth_unresolved.as_ref())
+        self.rank_path.last().and_then(|step| step.growth_unresolved.as_ref())
     }
 
     /// `C(Δ) = Σ_k E[a_k a_kᵀ] e^{−r_k |Δ|}`: the latent covariance across a
@@ -1928,10 +1856,7 @@ pub struct UnresolvedGrowth {
 
 /// The number of intervals of the reference grid at `refinement`: the
 /// quadrature order's cells, halved `refinement` times.
-fn reference_intervals(
-    quadrature_order: usize,
-    refinement: usize,
-) -> Result<usize, EventHistoryError> {
+fn reference_intervals(quadrature_order: usize, refinement: usize) -> Result<usize, EventHistoryError> {
     u32::try_from(refinement)
         .ok()
         .and_then(|shift| 1usize.checked_shl(shift))
@@ -2056,10 +1981,7 @@ pub(crate) fn refinement_shift(
 ///   zero: certified at zero.
 /// - A first step within its rounding band leaves the ratio unresolved: a
 ///   typed refusal, not a certificate.
-pub(crate) fn reference_tail(
-    first: Shift,
-    second: Shift,
-) -> Result<Option<f64>, EventHistoryError> {
+pub(crate) fn reference_tail(first: Shift, second: Shift) -> Result<Option<f64>, EventHistoryError> {
     if first.value == 0.0 && second.value == 0.0 {
         return Ok(Some(0.0));
     }
@@ -2076,9 +1998,7 @@ pub(crate) fn reference_tail(
     if !(ratio < 1.0) {
         return Ok(None);
     }
-    Ok(Some(
-        first.value + first.band + (second.value + second.band) / (1.0 - ratio),
-    ))
+    Ok(Some(first.value + first.band + (second.value + second.band) / (1.0 - ratio)))
 }
 
 /// The coarsest reference grid from `refinement` up whose certificate is
@@ -2167,41 +2087,21 @@ fn reference_tables(
     // Each grid row holds its covariate profile and time, then every mark's
     // design row; the times and gaps are two more columns of the one stratum.
     let rows = strata.strata().checked_mul(intervals + 1);
-    let columns = widths
-        .iter()
-        .try_fold(cohort.covariates.ncols() + 3, |sum, width| {
-            sum.checked_add(*width)
-        });
-    let bytes = rows
-        .zip(columns)
-        .and_then(|(rows, columns)| rows.checked_mul(columns)?.checked_mul(size_of::<f64>()));
-    let budget =
-        gam_runtime::resource::ResourcePolicy::default_library().max_single_materialization_bytes;
+    let columns = widths.iter().try_fold(cohort.covariates.ncols() + 3, |sum, width| sum.checked_add(*width));
+    let bytes = rows.zip(columns).and_then(|(rows, columns)| rows.checked_mul(columns)?.checked_mul(size_of::<f64>()));
+    let budget = gam_runtime::resource::ResourcePolicy::default_library().max_single_materialization_bytes;
     if bytes.is_none_or(|bytes| bytes > budget) {
         return Err(EventHistoryError::NumericalFailure {
             reason: format!(
                 "the reference grid at refinement {refinement} ({intervals} intervals over {} strata) needs {} bytes of tables, above this machine's {budget}-byte materialisation budget",
                 strata.strata(),
-                bytes.map_or_else(
-                    || "more than a machine word of".to_string(),
-                    |bytes| bytes.to_string()
-                )
+                bytes.map_or_else(|| "more than a machine word of".to_string(), |bytes| bytes.to_string())
             ),
         });
     }
-    let times: Vec<f64> = (0..=intervals)
-        .map(|n| {
-            if n == intervals {
-                exit
-            } else {
-                entry + (exit - entry) * n as f64 / intervals as f64
-            }
-        })
-        .collect();
-    let grid = ReferenceGrid {
-        gaps: times.windows(2).map(|w| w[1] - w[0]).collect(),
-        times,
-    };
+    let times: Vec<f64> = (0..=intervals).map(|n|
+        if n == intervals { exit } else { entry + (exit - entry) * n as f64 / intervals as f64 }).collect();
+    let grid = ReferenceGrid { gaps: times.windows(2).map(|w| w[1] - w[0]).collect(), times };
     if let Some(n) = grid.gaps.iter().position(|gap| !(*gap > 0.0)) {
         return Err(EventHistoryError::NumericalFailure {
             reason: format!(
@@ -2210,25 +2110,20 @@ fn reference_tables(
             ),
         });
     }
-    let mut node_data =
-        Array2::<f64>::zeros((strata.strata() * grid.len(), cohort.covariates.ncols() + 1));
+    let mut node_data = Array2::<f64>::zeros((strata.strata() * grid.len(), cohort.covariates.ncols() + 1));
     for (s, &profile) in strata.rows.iter().enumerate() {
         for (n, &time) in grid.times.iter().enumerate() {
             let row = s * grid.len() + n;
-            for c in 0..cohort.covariates.ncols() {
-                node_data[[row, c]] = cohort.covariates[[profile, c]];
-            }
+            for c in 0..cohort.covariates.ncols() { node_data[[row, c]] = cohort.covariates[[profile, c]]; }
             node_data[[row, cohort.covariates.ncols()]] = time;
         }
     }
     let mut designs = Vec::with_capacity(marks);
     let mut offsets = Vec::with_capacity(marks);
     for d in 0..marks {
-        let design =
-            build_term_collection_design(node_data.view(), &frozen_specs[d]).map_err(|error| {
-                EventHistoryError::Fit {
-                    reason: format!("reference design for mark {d}: {error}"),
-                }
+        let design = build_term_collection_design(node_data.view(), &frozen_specs[d])
+            .map_err(|error| EventHistoryError::Fit {
+                reason: format!("reference design for mark {d}: {error}"),
             })?;
         let dense = design
             .design
@@ -2378,10 +2273,7 @@ pub(crate) fn fit_at_rank(
                 cohort,
                 strata,
                 &frozen_specs,
-                &dense
-                    .iter()
-                    .map(|design| design.ncols())
-                    .collect::<Vec<_>>(),
+                &dense.iter().map(|design| design.ncols()).collect::<Vec<_>>(),
                 spec.quadrature_order,
                 reference_refinement,
                 &nodes,
@@ -2521,11 +2413,7 @@ pub(crate) fn fit_at_rank(
                         });
                     }
                     let raised = if atoms > 0 {
-                        positivity_raise(
-                            order,
-                            built.nodes.max_subject_nodes(),
-                            spec.quadrature_tolerance,
-                        )
+                        positivity_raise(order, built.nodes.max_subject_nodes(), spec.quadrature_tolerance)
                     } else {
                         None
                     };
@@ -2834,9 +2722,7 @@ fn assemble(
     } = built;
     let centring = if family.reference.is_some() {
         Some(family.refresh_normaliser(&fit.block_states)?)
-    } else {
-        None
-    };
+    } else { None };
     Ok(EventHistoryFit {
         nodes,
         family,
@@ -2874,41 +2760,22 @@ fn assemble(
 }
 
 /// Construct the enlarged model with a zero new loading and fixed rates.
-fn added_atom_probe(
-    fit: &EventHistoryFit,
-    log_rate: f64,
-) -> Result<(EventHistoryFamily, Vec<ParameterBlockState>), EventHistoryError> {
+fn added_atom_probe(fit: &EventHistoryFit, log_rate: f64) -> Result<(EventHistoryFamily, Vec<ParameterBlockState>), EventHistoryError> {
     let marks = fit.marks();
     let atoms = fit.rank() + 1;
-    preflight(
-        fit.family.gh.order,
-        atoms,
-        fit.nodes.max_subject_nodes(),
-        marks,
-        fit.family.block_offsets()[marks] + marks * atoms,
-    )?;
+    preflight(fit.family.gh.order, atoms, fit.nodes.max_subject_nodes(), marks,
+        fit.family.block_offsets()[marks] + marks * atoms)?;
     let mut rates: Vec<Option<f64>> = fit.log_rates.iter().map(|r| Some(r.exp())).collect();
     rates.push(Some(log_rate.exp()));
-    let probe = EventHistoryFamily::new(
-        fit.nodes.clone(),
-        fit.family.designs.clone(),
-        atoms,
-        fit.family.gh.order,
-        fit.time_scale,
-        rates,
-    )?
-    .with_reference(fit.family.reference.clone());
+    let probe = EventHistoryFamily::new(fit.nodes.clone(), fit.family.designs.clone(),
+        atoms, fit.family.gh.order, fit.time_scale, rates)?
+        .with_reference(fit.family.reference.clone());
     let mut states = fit.fit.block_states[..marks].to_vec();
     let mut loadings = Array1::zeros(marks * atoms);
     for d in 0..marks {
-        for k in 0..fit.rank() {
-            loadings[d * atoms + k] = fit.loadings[[d, k]];
-        }
+        for k in 0..fit.rank() { loadings[d * atoms + k] = fit.loadings[[d, k]]; }
     }
-    states.push(ParameterBlockState {
-        beta: loadings,
-        eta: Array1::zeros(fit.nodes.total_nodes),
-    });
+    states.push(ParameterBlockState { beta: loadings, eta: Array1::zeros(fit.nodes.total_nodes) });
     Ok((probe, states))
 }
 
@@ -2950,10 +2817,7 @@ fn added_atom_probe_on_mesh(
             cohort,
             strata,
             &fit.frozen_specs,
-            &dense
-                .iter()
-                .map(|design| design.ncols())
-                .collect::<Vec<_>>(),
+            &dense.iter().map(|design| design.ncols()).collect::<Vec<_>>(),
             spec.quadrature_order,
             reference_refinement,
             &nodes,
@@ -2971,13 +2835,7 @@ fn added_atom_probe_on_mesh(
         rates,
     )?
     .with_reference(reference);
-    preflight(
-        fit.family.gh.order,
-        atoms,
-        nodes.max_subject_nodes(),
-        marks,
-        probe.total_width(),
-    )?;
+    preflight(fit.family.gh.order, atoms, nodes.max_subject_nodes(), marks, probe.total_width())?;
     let mut loadings = Array1::zeros(marks * atoms);
     for d in 0..marks {
         for k in 0..fit.rank() {
@@ -3006,11 +2864,7 @@ struct CurvaturePair {
 /// product of filtered residual means, this integrates the existing process
 /// under the full observation law and differentiates reference centring too.
 /// `None` where no ladder rung remains to check it against.
-fn added_atom_curvature(
-    fit: &EventHistoryFit,
-    log_rate: f64,
-    tolerance: f64,
-) -> Result<Option<CurvaturePair>, EventHistoryError> {
+fn added_atom_curvature(fit: &EventHistoryFit, log_rate: f64, tolerance: f64) -> Result<Option<CurvaturePair>, EventHistoryError> {
     let (probe, states) = added_atom_probe(fit, log_rate)?;
     added_factor_curvature_pair(&probe, &states, tolerance)
 }
@@ -3018,20 +2872,13 @@ fn added_atom_curvature(
 /// The curvature over the added atom's loadings, one per mark: the block of
 /// the computed Hessian those coordinates span, from block sweeps rather than
 /// one path evaluation per pair of marks (#2965).
-fn loading_curvature(
-    probe: &EventHistoryFamily,
-    states: &[ParameterBlockState],
-) -> Result<Array2<f64>, EventHistoryError> {
+fn loading_curvature(probe: &EventHistoryFamily, states: &[ParameterBlockState]) -> Result<Array2<f64>, EventHistoryError> {
     let marks = probe.marks();
     let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
     let offset = probe.block_offsets()[marks];
-    let coordinates: Vec<usize> = (0..marks)
-        .map(|d| offset + d * probe.atoms + probe.atoms - 1)
-        .collect();
+    let coordinates: Vec<usize> = (0..marks).map(|d| offset + d * probe.atoms + probe.atoms - 1).collect();
     let (_, _, hessian) = probe.coordinate_hessian(states, &values, &coordinates)?;
-    Ok(Array2::from_shape_fn((marks, marks), |(d, e)| {
-        hessian[d * marks + e]
-    }))
+    Ok(Array2::from_shape_fn((marks, marks), |(d, e)| hessian[d * marks + e]))
 }
 
 /// A correct derivative of an unresolved integral is still unresolved, so the
@@ -3053,21 +2900,13 @@ fn added_factor_curvature_pair(
         return Ok(None);
     }
     let coarse = loading_curvature(probe, states)?;
-    preflight(
-        next_order,
-        probe.atoms,
-        probe.nodes.max_subject_nodes(),
-        probe.marks(),
-        probe.total_width(),
-    )?;
+    preflight(next_order, probe.atoms, probe.nodes.max_subject_nodes(), probe.marks(), probe.total_width())?;
     let mut fine = probe.clone();
     fine.gh = Arc::new(GaussHermite::new(next_order)?);
     let refined = loading_curvature(&fine, states)?;
     if coarse.iter().chain(refined.iter()).any(|x| !x.is_finite()) {
         return Err(EventHistoryError::NumericalFailure {
-            reason: format!(
-                "added-factor curvature is not finite at Gauss-Hermite order {order} or {next_order}"
-            ),
+            reason: format!("added-factor curvature is not finite at Gauss-Hermite order {order} or {next_order}"),
         });
     }
     Ok(Some(CurvaturePair {
@@ -3105,9 +2944,7 @@ fn proposal_start_shift(
 ) -> f64 {
     let (coarse_values, coarse_vectors) = coarse;
     let (refined_values, refined_vectors) = refined;
-    if spreads.len() != coarse_vectors.ncols()
-        || spreads.iter().any(|s| !(s.is_finite() && *s > 0.0))
-    {
+    if spreads.len() != coarse_vectors.ncols() || spreads.iter().any(|s| !(s.is_finite() && *s > 0.0)) {
         return f64::INFINITY;
     }
     let top = coarse_vectors.column(0);
@@ -3157,9 +2994,7 @@ fn propose_atom(
             return Ok(Proposal::Unresolved(
                 DecisionIntegral::AddedFactorCurvature,
                 Rung::GaussHermite,
-                format!(
-                    "no Gauss-Hermite rung above order {order} checks the added-factor curvature"
-                ),
+                format!("no Gauss-Hermite rung above order {order} checks the added-factor curvature"),
             ));
         }
         Err(EventHistoryError::LostPositivity { reason }) => {
@@ -3212,8 +3047,7 @@ fn propose_atom(
         .map(|d| {
             let mut along = atom.clone();
             along.direction = vectors.column(d).to_vec();
-            along.ridge.mode_scale =
-                (atom.ridge.mode_scale.powi(2) + 1.0 / (1.0 + values[d].abs())).sqrt();
+            along.ridge.mode_scale = (atom.ridge.mode_scale.powi(2) + 1.0 / (1.0 + values[d].abs())).sqrt();
             along
         })
         .collect();
@@ -3310,9 +3144,7 @@ fn propose_atom(
             return Ok(Proposal::Unresolved(
                 DecisionIntegral::AddedFactorCurvature,
                 Rung::Mesh,
-                format!(
-                    "no mesh rung above refinement {refinement} checks the added-factor curvature"
-                ),
+                format!("no mesh rung above refinement {refinement} checks the added-factor curvature"),
             ));
         }
         let (probe, states) = added_atom_probe_on_mesh(
@@ -3415,8 +3247,7 @@ fn direction_profile(
             order,
             time_scale,
             held.clone(),
-        )
-        .map(|family| family.with_reference(fit.family.reference.clone()))
+        ).map(|family| family.with_reference(fit.family.reference.clone()))
     };
     let probe = build(fit.family.gh.order)?;
     let width = probe.latent_width();
@@ -3532,10 +3363,7 @@ fn fit_event_history_on_grid(
     let mut atom_evidence: Vec<f64> = Vec::new();
     loop {
         let rank = fit.rank();
-        let pin = Some((
-            fit.quadrature.gauss_hermite_order,
-            fit.quadrature.mesh_refinement,
-        ));
+        let pin = Some((fit.quadrature.gauss_hermite_order, fit.quadrature.mesh_refinement));
         let residuals = fit
             .family
             .residuals(&fit.fit.block_states)
@@ -3556,14 +3384,7 @@ fn fit_event_history_on_grid(
         )? {
             Proposal::Resolved(atom) => atom,
             Proposal::Unresolved(integral, rung, reason) => {
-                match raise_incumbent(
-                    cohort,
-                    &mut rank_spec,
-                    &fit,
-                    rung,
-                    &reason,
-                    reference_refinement,
-                )? {
+                match raise_incumbent(cohort, &mut rank_spec, &fit, rung, &reason, reference_refinement)? {
                     Some(raised) => {
                         fit = raised;
                         continue;
@@ -3651,12 +3472,9 @@ fn fit_event_history_on_grid(
         match grown {
             Ok(candidate) => {
                 let criterion = |fit: &EventHistoryFit| -> Result<f64, EventHistoryError> {
-                    fit.fit
-                        .reml_score()
-                        .filter(|value| value.is_finite())
+                    fit.fit.reml_score().filter(|value| value.is_finite())
                         .ok_or_else(|| EventHistoryError::Fit {
-                            reason: "rank comparison requires a finite joint LAML criterion"
-                                .to_string(),
+                            reason: "rank comparison requires a finite joint LAML criterion".to_string(),
                         })
                 };
                 step.log_likelihood_gain = candidate.fit.log_likelihood - fit.fit.log_likelihood;
@@ -3746,12 +3564,8 @@ fn fit_event_history_on_grid(
                     "[event-history] rank {rank} → {}: the evidence accepted the atom but its model reached no certified optimum, refused ({error})",
                     rank + 1
                 );
-                return Err(EventHistoryError::Fit {
-                    reason: format!(
-                        "rank search unresolved at candidate rank {}: {error}",
-                        rank + 1
-                    ),
-                });
+                return Err(EventHistoryError::Fit { reason: format!(
+                    "rank search unresolved at candidate rank {}: {error}", rank + 1) });
             }
         }
     }
@@ -3765,9 +3579,7 @@ fn fit_event_history_on_grid(
 /// failure. Every evaluation clears the refusal on entry, so a refusal an
 /// earlier evaluation raised never types a later, unrelated failure.
 fn typed_failure(family: &EventHistoryFamily, reason: String) -> EventHistoryError {
-    family
-        .take_reference_refusal()
-        .unwrap_or(EventHistoryError::Fit { reason })
+    family.take_reference_refusal().unwrap_or(EventHistoryError::Fit { reason })
 }
 
 /// The model at `atoms` from `start`, certified by [`fit_at_rank`]'s refinement
@@ -3784,16 +3596,7 @@ fn certified_rank(
     reference_refinement: usize,
 ) -> Result<EventHistoryFit, EventHistoryError> {
     let started = std::time::Instant::now();
-    let fit = fit_at_rank(
-        cohort,
-        spec,
-        atoms,
-        start,
-        None,
-        admitted,
-        from_refinement,
-        reference_refinement,
-    )?;
+    let fit = fit_at_rank(cohort, spec, atoms, start, None, admitted, from_refinement, reference_refinement)?;
     log::debug!(
         "[event-history] rank {atoms}: certified at Gauss-Hermite order {}, mesh refinement {} ({:.2} s)",
         fit.quadrature.gauss_hermite_order,
@@ -3832,11 +3635,9 @@ fn raise_incumbent(
     let refinement = fit.quadrature.mesh_refinement;
     let from_refinement = match rung {
         Rung::GaussHermite => {
-            let Some(next_order) = positivity_raise(
-                order,
-                fit.nodes.max_subject_nodes(),
-                rank_spec.quadrature_tolerance,
-            ) else {
+            let Some(next_order) =
+                positivity_raise(order, fit.nodes.max_subject_nodes(), rank_spec.quadrature_tolerance)
+            else {
                 log::debug!(
                     "[event-history] rank {rank} → {}: the decision is unresolved at Gauss-Hermite order {order} ({reason}), the ladder's top certifiable rung: the path stops at the certified rank-{rank} model with growth unresolved",
                     rank + 1
@@ -3876,16 +3677,7 @@ fn raise_incumbent(
         fit.atom_log_lambdas.clone(),
         fit.rate_held.clone(),
     );
-    certified_rank(
-        cohort,
-        rank_spec,
-        rank,
-        Some(&start),
-        None,
-        from_refinement,
-        reference_refinement,
-    )
-    .map(Some)
+    certified_rank(cohort, rank_spec, rank, Some(&start), None, from_refinement, reference_refinement).map(Some)
 }
 
 /// Fit and select structure under one reference-normalised objective, then
@@ -3909,8 +3701,7 @@ fn raise_incumbent(
 /// evaluation's ([`preflight`]) refuses it, or where a step is no longer
 /// resolved above its rounding.
 pub(crate) fn fit_event_history(
-    cohort: &mut EventHistoryCohort,
-    spec: &EventHistorySpec,
+    cohort: &mut EventHistoryCohort, spec: &EventHistorySpec,
 ) -> Result<EventHistoryFit, EventHistoryError> {
     let mut shifts = Vec::new();
     let mut refinement = 2;
@@ -3920,69 +3711,41 @@ pub(crate) fn fit_event_history(
             // The reference midpoint map does not contract at this grid's step
             // length, and a finer grid shortens the step.
             Err(refusal @ EventHistoryError::ReferenceStep { .. }) => {
-                log::debug!(
-                    "[event-history] reference refinement {refinement}: {refusal}; refining the reference grid"
-                );
+                log::debug!("[event-history] reference refinement {refinement}: {refusal}; refining the reference grid");
                 refinement += 1;
                 continue;
             }
             Err(error) => return Err(error),
         };
-        let Some(strata) = spec.reference.as_ref() else {
-            return Ok(fit);
-        };
+        let Some(strata) = spec.reference.as_ref() else { return Ok(fit); };
         let started = std::time::Instant::now();
         let total = fit.family.total_width();
         let (covariance, sd) = posterior_scale(&fit.fit, total)?;
-        let widths: Vec<usize> = fit
-            .designs
-            .iter()
-            .map(|design| design.design.ncols())
-            .collect();
+        let widths: Vec<usize> = fit.designs.iter().map(|design| design.design.ncols()).collect();
         let states = &fit.fit.block_states;
-        let mut previous = fit
-            .family
-            .exact_gradient(states)
+        let mut previous = fit.family.exact_gradient(states)
             .map_err(|reason| typed_failure(&fit.family, reason))?;
         let mut next_grid = None;
-        let (chosen, certificate, steps) =
-            select_reference_grid(refinement, spec.quadrature_tolerance, |level| {
-                let finer = level + 1;
-                preflight(
-                    fit.family.gh.order,
-                    fit.rank(),
-                    reference_intervals(spec.quadrature_order, finer)? + 1,
-                    fit.marks(),
-                    total,
-                )?;
-                let tables = reference_tables(
-                    cohort,
-                    strata,
-                    &fit.frozen_specs,
-                    &widths,
-                    spec.quadrature_order,
-                    finer,
-                    &fit.nodes,
-                )?;
-                let family = fit.family.clone().with_reference(Some(Arc::new(tables)));
-                let gradient = family
-                    .exact_gradient(states)
-                    .map_err(|reason| typed_failure(&family, reason))?;
-                let step = refinement_shift(&covariance, &sd, &previous, &gradient)?;
-                previous = gradient;
-                if level == refinement {
-                    next_grid = Some(family);
-                }
-                Ok(step)
-            })?;
+        let (chosen, certificate, steps) = select_reference_grid(refinement, spec.quadrature_tolerance, |level| {
+            let finer = level + 1;
+            preflight(fit.family.gh.order, fit.rank(), reference_intervals(spec.quadrature_order, finer)? + 1,
+                fit.marks(), total)?;
+            let tables = reference_tables(cohort, strata, &fit.frozen_specs, &widths,
+                spec.quadrature_order, finer, &fit.nodes)?;
+            let family = fit.family.clone().with_reference(Some(Arc::new(tables)));
+            let gradient = family.exact_gradient(states).map_err(|reason| typed_failure(&family, reason))?;
+            let step = refinement_shift(&covariance, &sd, &previous, &gradient)?;
+            previous = gradient;
+            if level == refinement {
+                next_grid = Some(family);
+            }
+            Ok(step)
+        })?;
         shifts.push(steps[0].value);
         // The grid's own error in nats, beside the estimate that governs it.
-        let coarse = fit
-            .centring
-            .as_ref()
-            .ok_or_else(|| EventHistoryError::Fit {
-                reason: "reference fit is missing its centring values".to_string(),
-            })?;
+        let coarse = fit.centring.as_ref().ok_or_else(|| EventHistoryError::Fit {
+            reason: "reference fit is missing its centring values".to_string(),
+        })?;
         let next = next_grid.ok_or_else(|| EventHistoryError::Fit {
             reason: "the reference certificate read no finer grid".to_string(),
         })?;
