@@ -1587,65 +1587,39 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         if p_tw > 0 {
             if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
                 let p_m = marginal_design.design.ncols();
-                // Densify time designs (already densified earlier in the
-                // V+M-exact path; densify again cheaply here — or reuse
-                // if the earlier path failed and we are on the raw path).
-                let maybe_tw_jac: Option<(
-                    Arc<dyn crate::custom_family::BlockEffectiveJacobian>,
-                    Arc<dyn crate::custom_family::BlockEffectiveJacobian>,
-                )> = (|| {
-                    let d_entry = design_entry
-                        .try_to_dense_arc("build_blocks::tw_jac::entry")
-                        .ok()?;
-                    let d_exit = design_exit
-                        .try_to_dense_arc("build_blocks::tw_jac::exit")
-                        .ok()?;
-                    let d_deriv = design_derivative_exit
-                        .try_to_dense_arc("build_blocks::tw_jac::deriv")
-                        .ok()?;
-                    let d_marg = marginal_design
-                        .design
-                        .try_to_dense_arc("build_blocks::tw_jac::marginal")
-                        .ok()?;
-                    let knots = timewiggle.knots.clone();
-                    let degree = timewiggle.degree;
-                    let marginal_offset = Arc::new(spec.marginal_offset.clone());
-                    let time_jac = Arc::new(SmsTimewiggleTimeJacobian::new(
-                        Arc::clone(&d_entry),
-                        Arc::clone(&d_exit),
-                        Arc::clone(&d_deriv),
-                        Arc::clone(&d_marg),
-                        Arc::clone(&offset_entry),
-                        Arc::clone(&offset_exit),
-                        Arc::clone(&derivative_offset_exit),
-                        Arc::clone(&marginal_offset),
-                        knots.clone(),
-                        degree,
-                        p_tw,
-                        p_m,
-                    ))
-                        as Arc<dyn crate::custom_family::BlockEffectiveJacobian>;
-                    let marginal_jac = Arc::new(SmsTimewiggleMarginalJacobian::new(
-                        d_entry,
-                        d_exit,
-                        d_deriv,
-                        d_marg,
-                        Arc::clone(&offset_entry),
-                        Arc::clone(&offset_exit),
-                        Arc::clone(&derivative_offset_exit),
-                        marginal_offset,
-                        knots,
-                        degree,
-                        design_exit.ncols(),
-                        p_tw,
-                    ))
-                        as Arc<dyn crate::custom_family::BlockEffectiveJacobian>;
-                    Some((time_jac, marginal_jac))
-                })();
-                if let Some((time_jac, marginal_jac)) = maybe_tw_jac {
-                    blocks[0].jacobian_callback = Some(time_jac);
-                    blocks[1].jacobian_callback = Some(marginal_jac);
-                }
+                // The callbacks share the designs in the storage they already
+                // have and read them one row chunk at a time.
+                let knots = timewiggle.knots.clone();
+                let degree = timewiggle.degree;
+                let marginal_offset = Arc::new(spec.marginal_offset.clone());
+                blocks[0].jacobian_callback = Some(Arc::new(SmsTimewiggleTimeJacobian::new(
+                    &design_entry,
+                    &design_exit,
+                    &design_derivative_exit,
+                    &marginal_design.design,
+                    Arc::clone(&offset_entry),
+                    Arc::clone(&offset_exit),
+                    Arc::clone(&derivative_offset_exit),
+                    Arc::clone(&marginal_offset),
+                    knots.clone(),
+                    degree,
+                    p_tw,
+                    p_m,
+                )));
+                blocks[1].jacobian_callback = Some(Arc::new(SmsTimewiggleMarginalJacobian::new(
+                    &design_entry,
+                    &design_exit,
+                    &design_derivative_exit,
+                    &marginal_design.design,
+                    Arc::clone(&offset_entry),
+                    Arc::clone(&offset_exit),
+                    Arc::clone(&derivative_offset_exit),
+                    marginal_offset,
+                    knots,
+                    degree,
+                    design_exit.ncols(),
+                    p_tw,
+                )));
             }
         }
         Ok(blocks)
