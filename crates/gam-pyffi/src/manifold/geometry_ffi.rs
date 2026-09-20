@@ -327,7 +327,36 @@ fn sae_fit_admission<'py>(
     Ok(out.unbind())
 }
 
-#[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
+/// Assemble the fit-measured Theorem-4 coding ingredients from the optional
+/// scalar kwargs: all five supplied gives `Some`, none gives `None`, and a
+/// partial set is refused rather than silently dropped.
+fn measured_coding_from_kwargs(
+    d_eff_atom: Option<f64>,
+    n_eff: Option<f64>,
+    n_rows: Option<f64>,
+    k_bar: Option<f64>,
+    d_bar: Option<f64>,
+) -> PyResult<Option<gam::terms::sae::k_selection::MeasuredCoding>> {
+    match (d_eff_atom, n_eff, n_rows, k_bar, d_bar) {
+        (Some(d_eff_atom), Some(n_eff), Some(n_rows), Some(k_bar), Some(d_bar)) => {
+            Ok(Some(gam::terms::sae::k_selection::MeasuredCoding {
+                d_eff_atom,
+                n_eff,
+                n_rows,
+                k_bar,
+                d_bar,
+            }))
+        }
+        (None, None, None, None, None) => Ok(None),
+        _ => Err(py_value_error(
+            "the measured coding ingredients d_eff_atom, n_eff, n_rows, k_bar and d_bar \
+             must be supplied together or not at all"
+                .to_string(),
+        )),
+    }
+}
+
+#[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6, d_eff_atom = None, n_eff = None, n_rows = None, k_bar = None, d_bar = None))]
 fn sae_select_k(
     py: Python<'_>,
     points: Vec<(usize, f64)>,
@@ -335,6 +364,11 @@ fn sae_select_k(
     knee_slope_fraction: f64,
     complexity_penalty: f64,
     flat_span_tol: f64,
+    d_eff_atom: Option<f64>,
+    n_eff: Option<f64>,
+    n_rows: Option<f64>,
+    k_bar: Option<f64>,
+    d_bar: Option<f64>,
 ) -> PyResult<PyObject> {
     let curve = gam::terms::sae::k_selection::curve_from_pairs(&points).map_err(py_value_error)?;
     let config = gam::terms::sae::k_selection::KSelectionConfig {
@@ -342,11 +376,10 @@ fn sae_select_k(
         knee_slope_fraction,
         complexity_penalty,
         flat_span_tol,
-        // This scalar-curve FFI carries no fit-measured coding ingredients; a
-        // `MeasuredMdl` mode string falls back to Kneedle when this is `None`.
-        measured_coding: None,
+        measured_coding: measured_coding_from_kwargs(d_eff_atom, n_eff, n_rows, k_bar, d_bar)?,
     };
-    let selected = gam::terms::sae::k_selection::select_k(&curve, &config);
+    let selected =
+        gam::terms::sae::k_selection::select_k(&curve, &config).map_err(py_value_error)?;
     let out = PyDict::new(py);
     out.set_item("k", selected.k)?;
     out.set_item("ev", selected.ev)?;
@@ -356,7 +389,7 @@ fn sae_select_k(
     Ok(out.into())
 }
 
-#[pyfunction(signature = (manifold_points, linear_points, manifold_params_per_atom, linear_params_per_atom, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
+#[pyfunction(signature = (manifold_points, linear_points, manifold_params_per_atom, linear_params_per_atom, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6, d_eff_atom = None, n_eff = None, n_rows = None, k_bar = None, d_bar = None))]
 fn sae_auto_k_recommendation(
     py: Python<'_>,
     manifold_points: Vec<(usize, f64)>,
@@ -367,6 +400,11 @@ fn sae_auto_k_recommendation(
     knee_slope_fraction: f64,
     complexity_penalty: f64,
     flat_span_tol: f64,
+    d_eff_atom: Option<f64>,
+    n_eff: Option<f64>,
+    n_rows: Option<f64>,
+    k_bar: Option<f64>,
+    d_bar: Option<f64>,
 ) -> PyResult<PyObject> {
     let manifold =
         gam::terms::sae::k_selection::curve_from_pairs(&manifold_points).map_err(py_value_error)?;
@@ -377,9 +415,7 @@ fn sae_auto_k_recommendation(
         knee_slope_fraction,
         complexity_penalty,
         flat_span_tol,
-        // This scalar-curve FFI carries no fit-measured coding ingredients; a
-        // `MeasuredMdl` mode string falls back to Kneedle when this is `None`.
-        measured_coding: None,
+        measured_coding: measured_coding_from_kwargs(d_eff_atom, n_eff, n_rows, k_bar, d_bar)?,
     };
     // The manifold-vs-linear advantage is now measured in DECODER PARAMETERS, not
     // atom count: a manifold atom stores `basis_size·p` scalars, a linear atom
@@ -392,7 +428,8 @@ fn sae_auto_k_recommendation(
         &config,
         manifold_params_per_atom,
         linear_params_per_atom,
-    );
+    )
+    .map_err(py_value_error)?;
     let out = PyDict::new(py);
     out.set_item("k", rec.selection.k)?;
     out.set_item("ev", rec.selection.ev)?;
@@ -4937,10 +4974,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_concordance, module)?)?;
     module.add_function(wrap_pyfunction!(survival_score_grid_from_times, module)?)?;
     module.add_function(wrap_pyfunction!(survival_null_curve_from_train, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        survival_matrix_from_risk_calibration,
-        module
-    )?)?;
     module.add_function(wrap_pyfunction!(
         survival_lifted_metrics_from_predictions,
         module
