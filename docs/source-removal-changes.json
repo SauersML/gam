@@ -2745,7 +2745,23 @@
     "evidence": "At base b3832b92 each name has exactly one definition (rho_posterior.rs:136 SplitMix64::normal, bms/mod.rs:1938 signed_weighted_gram, bms/mod.rs:2039 weighted_ridge_sandwich_cov, families_bms_identifiability_rigid_tests.rs:7072 the test); at the head git grep -w 'fn <name>' finds none of them in those files, and the other fn normal hits are unrelated local RNGs in other files. cargo check --workspace --tests is clean; first_stage_variance_stage (4), murphy_topel (1), gam-inference lib, rho_domain and perf rho_posterior_tier0 pass on the head."
   },
   {
-    "base": "67f4a45953d307fda2e396182f4904deab842260",
+    "base": "bf410bb4622f23c2597aeeebfd5d9fa32d0c3193",
+    "items": [
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes_wrong_key_returns_none",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_count",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_count_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb_wrong_key_returns_none",
+      "crates/gam-runtime/src/warm_start/store.rs:fn:touch_lookup_hit"
+    ],
+    "reason": "#3882/#3885: the warm-start lookup fast path now re-reads and touches the cached meta itself and re-records the post-touch meta and key-directory stamps through remember_lookup, the one helper the slow path also uses, so the private wrapper touch_lookup_hit (read_meta + touch_lookup_meta, discarding the touched meta the row now needs) has no caller. #4073: process_monitor's three private /proc/self field parsers parse_status_kb, parse_status_count and parse_io_bytes were one rule (the integer after the key) written three times; they collapse into parse_proc_value, and the five unit tests that pinned the copies separately (parse_status_kb_valid_line, parse_status_kb_wrong_key_returns_none, parse_status_count_valid_line, parse_io_bytes_valid_line, parse_io_bytes_wrong_key_returns_none) are replaced by parse_proc_value_reads_the_number_before_a_unit, parse_proc_value_reads_a_bare_counter and parse_proc_value_wrong_key_returns_none, which cover the same lines plus an unanchored-key case.",
+    "evidence": "scripts/source_removal_guard.py with --base bf410bb4622f23c2597aeeebfd5d9fa32d0c3193 and head the change's commit lists exactly these removals. Read-proof at the head: git grep -w touch_lookup_hit finds no occurrence in the repository (it was a private method of WarmStartStore in crates/gam-runtime/src/warm_start/store.rs whose only call site was the lookup_with fast path rewritten here); git grep -w for parse_status_count and parse_io_bytes finds no occurrence, and parse_status_kb survives only as crates/gam-sae/examples/scale_k.rs's own unrelated local helper. All removed process_monitor functions were private and cfg(target_os = \"linux\"), called only from read_linux in the same file."
+  },
+  {
+    "base": "b6be6bb6ec166b7e98ee17e8aa77af19faa754d3",
     "items": [
       "crates/gam-sae/src/manifold/fit_seed.rs:const:SAE_SHARED_ARD_K_THRESHOLD",
       "crates/gam-sae/src/manifold/rho.rs:enum:ArdSharing",

@@ -4904,7 +4904,7 @@
     "evidence": "At base b3832b92 weighted_ridge_sandwich_cov is pub(crate) at bms/mod.rs:2039 with its callers in bms/mod.rs and one rigid test; at the head it is gone and stacked_first_stage_sandwich_cov (built on stacked_first_stage_inverse_bread) is the only first-stage covariance. cargo check --workspace --tests is clean."
   },
   {
-    "base": "67f4a45953d307fda2e396182f4904deab842260",
+    "base": "b6be6bb6ec166b7e98ee17e8aa77af19faa754d3",
     "removed": {
       "crates/gam-sae/src/manifold/rho.rs::ard_sharing": 1,
       "crates/gam-sae/src/manifold/rho.rs::max_ard_axes": 1,
