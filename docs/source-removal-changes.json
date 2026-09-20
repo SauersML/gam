@@ -2818,5 +2818,15 @@
     ],
     "reason": "#4161: add_analytic_penalty_hessian_to_eval assembled a wrong latent joint REML Hessian. It used hessian_diag (the exact diagonal, even for dense-Hessian penalties such as BlockOrthogonality, SoftmaxAssignmentSparsity and sheaf) as the whole t-t block and had no t-rho or rho-rho terms for learnable penalty rho, at O((n d)^2) HVP cost per outer evaluation. Its output was always discarded. add_analytic_penalty_objective_to_eval now declares its gradient-only contribution by downgrading an analytic Hessian to Unavailable itself.",
     "evidence": "git grep -w add_analytic_penalty_hessian_to_eval at the base finds only its definition (spatial_hyper_dirs.rs:974) and its one call (:1069) in add_analytic_penalty_objective_to_eval. That function's only caller, spatial_optimization.rs:6260, is always followed at :6268 by add_latent_id_objective_to_eval, which sets eval.2 = HessianValue::Unavailable whenever it is analytic (spatial_hyper_dirs.rs:907-909). So no Hessian value this helper wrote ever reached store_eval."
+  },
+  {
+    "base": "e3fbe9373038ccaee479c0aa87d85febd623cc56",
+    "items": [
+      "crates/gam-solve/src/reml/jeffreys_subspace.rs:fn:ramp_down",
+      "crates/gam-solve/src/reml/jeffreys_subspace.rs:fn:ramp_down_value_and_deriv",
+      "crates/gam-solve/src/reml/jeffreys_subspace.rs:fn:ramp_down_value_d1_d2"
+    ],
+    "reason": "The conditioning-gate value, gradient and Hessian each defined a private inner copy of the cubic smoothstep ramp (ramp_down, ramp_down_value_and_deriv, ramp_down_value_d1_d2) duplicating conditioning_ramp_down_derivatives, which the third and fourth partials already read. All orders now read both sub-weights through conditioning_sub_weight_derivatives over that one ramp, so the value and every partial select the active max-branch from the same numbers.",
+    "evidence": "Each removed inner fn was local to one function body (spectral_gate_weight, spectral_gate_weight_grad, spectral_gate_weight_hess) and called only there; the ramp arithmetic 1 - t^2(3 - 2t), -6t(1-t)/span, -6(1-2t)/span^2 is identical in conditioning_ramp_down_derivatives, so every gate value and partial is bit-identical. The other ramp_down occurrences the guard counts are the call sites inside these bodies and the explicit mixed trace weights stratum closure, which now also reads conditioning_sub_weight_derivatives."
   }
 ]
