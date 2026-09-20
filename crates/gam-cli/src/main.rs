@@ -10,8 +10,8 @@ pub(crate) use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8
 pub(crate) use csv::WriterBuilder;
 
 pub(crate) use gam::estimate::{
-    BlockRole, ContinuousSmoothnessOrderStatus, ModelSummary,
-    ParametricTermSummary, SummaryBlockOffset, UnifiedFitResult, smooth_term_summary_rows,
+    BlockRole, ContinuousSmoothnessOrderStatus, SummaryBlockOffset, UnifiedFitResult,
+    smooth_term_summary_rows,
 };
 
 pub(crate) use gam::families::survival::latent::fixed_latent_hazard_frailty;
@@ -52,22 +52,16 @@ pub(crate) use gam_predict::linalg::{PredictionCovarianceBackend, rowwise_local_
 pub(crate) use gam::matrix::{DesignMatrix, SymmetricMatrix};
 
 pub(crate) use gam_predict::{
-    FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod, PosteriorMeanOptions,
+    FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod,
     PredictInput, PredictUncertaintyOptions, PredictableModel, predict_gam,
     predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
 
 pub(crate) use gam::report;
 
-pub(crate) use gam::probability::{
-    inverse_gaussian_cdf, normal_cdf, normal_two_sided_probability, standard_normal_quantile,
-    student_t_two_sided_probability,
-};
+pub(crate) use gam::probability::{inverse_gaussian_cdf, standard_normal_quantile};
 
-pub(crate) use gam::smooth::{
-    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
-    SmoothTermSpec, TermCollectionSpec,
-};
+pub(crate) use gam::smooth::{SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
 // #1521: relocated DOWN into gam_terms::smooth (was families::...::drivers).
 pub(crate) use gam::terms::smooth::build_term_collection_design;
 
@@ -91,7 +85,6 @@ pub(crate) use gam::families::survival::location_scale::{
 };
 
 pub(crate) use gam::families::survival::predict::{
-    build_saved_survival_marginal_slope_predictor,
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
     resolve_saved_survival_time_columns, resolve_survival_inverse_link_from_saved,
     resolve_termspec_for_prediction, saved_baseline_timewiggle_components,

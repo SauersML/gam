@@ -1,5 +1,6 @@
+use gam::smooth::BoundedCoefficientPriorSpec;
 use super::{
-    BlockRole, BoundedCoefficientPriorSpec, CliError, CliFirthValidation,
+    BlockRole, CliError, CliFirthValidation,
     FamilyArg, FittedFamily, LikelihoodSpec, LinkChoice, LinkMode,
     ResponseFamily, SavedModel, SurvivalBaselineTarget,
     SurvivalLikelihoodMode, build_survival_time_basis,
@@ -5972,7 +5973,7 @@ fn saved_survival_flex_exit_helper_matches_rigid_when_deviations_absent() {
     for i in 0..q_exit.len() {
         let c = (1.0 + slope[i] * slope[i]).sqrt();
         let expected_eta = q_exit[i] * c + slope[i] * z[i];
-        let expected_mean = super::normal_cdf(expected_eta);
+        let expected_mean = normal_cdf(expected_eta);
         assert!(
             (eta[i] - expected_eta).abs() <= 1e-10,
             "row {i}: eta mismatch: got {}, expected {}",
@@ -6059,7 +6060,7 @@ fn saved_survival_flex_exit_helper_with_zero_scorewarp_matches_rigid() {
     for i in 0..q_exit.len() {
         let c = (1.0 + slope[i] * slope[i]).sqrt();
         let expected_eta = q_exit[i] * c + slope[i] * z[i];
-        let expected_mean = super::normal_cdf(expected_eta);
+        let expected_mean = normal_cdf(expected_eta);
         assert!((eta[i] - expected_eta).abs() <= 1e-10);
         assert!((mean[i] - expected_mean).abs() <= 1e-10);
     }
@@ -6090,7 +6091,7 @@ fn saved_survival_flex_exit_helper_matches_gaussian_frailty_rigid_formula() {
         let sb = scale * slope[i];
         let c = (1.0 + sb * sb).sqrt();
         let expected_eta = q_exit[i] * c + sb * z[i];
-        let expected_mean = super::normal_cdf(expected_eta);
+        let expected_mean = normal_cdf(expected_eta);
         assert!((eta[i] - expected_eta).abs() <= 1e-10);
         assert!((mean[i] - expected_mean).abs() <= 1e-10);
     }
@@ -6261,7 +6262,7 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
     let primary_offset = array![0.2, -0.15];
     let noise_offset = array![0.04, -0.01];
 
-    let (predictor, pred_input, _) = super::build_saved_survival_marginal_slope_predictor(
+    let (predictor, pred_input, _) = gam::families::survival::predict::build_saved_survival_marginal_slope_predictor(
         &model,
         &fit_saved,
         "z",
@@ -6480,7 +6481,7 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
     let primary_offset = array![0.0];
     let noise_offset = array![0.0];
 
-    let (predictor, pred_input, _) = super::build_saved_survival_marginal_slope_predictor(
+    let (predictor, pred_input, _) = gam::families::survival::predict::build_saved_survival_marginal_slope_predictor(
         &model,
         &fit_saved,
         "z",
@@ -6525,6 +6526,152 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved survival helper should evaluate", e));
     assert!((prediction.eta[0] - expected_eta[0]).abs() <= 1e-12);
     assert!((prediction.mean[0] - expected_mean[0]).abs() <= 1e-12);
+}
+
+/// gam#3316: `gam predict` on a survival marginal-slope model publishes the
+/// library's `predict_survival` posterior mean, not a probit-normal integral of
+/// a delta-method Gaussian for eta. The CLI columns must be the library's
+/// surfaces at each row's own exit time, band included.
+#[test]
+fn cli_survival_marginal_slope_predict_publishes_library_posterior_mean_3316() {
+    use gam::families::survival::predict::{
+        SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
+        predict_survival,
+    };
+    let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
+    let train_path = td.path().join("train.csv");
+    let model_path = td.path().join("model.json");
+    let pred_path = td.path().join("pred.csv");
+    let n = 80usize;
+    let mut csv = String::from("t0,t1,event,x,z\n");
+    let mut state: u64 = 0x3316;
+    let mut uniform = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    for i in 0..n {
+        let x = -1.0 + 2.0 * (i as f64 + 0.5) / n as f64;
+        let z = gam::probability::standard_normal_quantile(uniform())
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e));
+        // Probit survival S(t) = Phi(-(log t - 0.4 x - 0.5 z)): draw t from it.
+        let e = gam::probability::standard_normal_quantile(uniform())
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e));
+        let t = (0.4 * x + 0.5 * z + e).exp();
+        let censor = (1.5 * uniform()).exp();
+        let (time, event) = if t <= censor { (t, 1) } else { (censor, 0) };
+        csv.push_str(&format!("0,{time},{event},{x},{z}\n"));
+    }
+    fs::write(&train_path, csv)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival marginal-slope csv", e));
+
+    let mut args = location_scale_fit_args(
+        train_path.clone(),
+        model_path.clone(),
+        "Surv(t0, t1, event) ~ x",
+        "unused",
+    );
+    args.predict_noise = None;
+    args.slope_formula = Some("1".to_string());
+    args.z_column = Some("z".to_string());
+    args.survival_likelihood = Some("marginal-slope".to_string());
+    run_fit(args).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "survival marginal-slope fit should succeed", e
+        )
+    });
+
+    run_predict(PredictArgs {
+        model: model_path.clone(),
+        new_data: train_path.clone(),
+        out: pred_path.clone(),
+        offset_column: None,
+        noise_offset_column: None,
+        id_column: None,
+        uncertainty: true,
+        level: 0.9,
+        covariance_mode: Some(InferenceCovarianceMode::Conditional),
+        conformal: false,
+        calibration: None,
+        training_data: None,
+    })
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "survival marginal-slope predict should succeed", e
+        )
+    });
+
+    let model = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+    let dataset = load_dataset_projected(
+        &train_path,
+        &[
+            "t0".to_string(),
+            "t1".to_string(),
+            "event".to_string(),
+            "x".to_string(),
+            "z".to_string(),
+        ],
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "load survival dataset", e));
+    let col_map = dataset.column_map();
+    let zeros = Array1::<f64>::zeros(n);
+    let library = predict_survival(
+        SurvivalPredictRequest {
+            model: &model,
+            data: dataset.values.view(),
+            col_map: &col_map,
+            training_headers: model.payload().training_headers.as_ref(),
+            primary_offset: &zeros,
+            noise_offset: &zeros,
+            time_grid: None,
+            with_uncertainty: true,
+            estimand: SurvivalPredictEstimand::PosteriorMean,
+        },
+        SurvivalPredictionCovarianceMode::Conditional,
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "library survival predict", e));
+    let plugin = library
+        .survival_plugin
+        .as_ref()
+        .expect("the posterior-mean prediction keeps its plug-in by name");
+    let survival_se = library
+        .survival_se
+        .as_ref()
+        .expect("uncertainty was requested");
+    let eta_se = library.eta_se.as_ref().expect("uncertainty was requested");
+    let z = gam::probability::standard_normal_quantile(0.95)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e));
+    // The CSV writes every value with `{:.12}` fixed decimals, so a published
+    // cell differs from the library value by at most half a unit in the 12th
+    // decimal plus the parse's own rounding (one ulp of the value).
+    let assert_published = |column: &str, row: usize, expected: f64| {
+        let published = csv_value_at(&pred_path, row, column);
+        let bound = 0.5e-12 + f64::EPSILON * expected.abs().max(1.0);
+        assert!(
+            (published - expected).abs() <= bound,
+            "row {row} `{column}`: CSV published {published}, library {expected}"
+        );
+    };
+    let mut max_gap_to_delta = 0.0f64;
+    for i in 0..n {
+        let mean = library.survival[[i, 0]];
+        let sd = survival_se[[i, 0]];
+        assert_published("survival_prob", i, mean);
+        assert_published("survival_prob_plugin", i, plugin[[i, 0]]);
+        assert_published("eta", i, library.linear_predictor[i]);
+        assert_published("std_error", i, eta_se[i]);
+        assert_published("mean_lower", i, (mean - z * sd).clamp(0.0, 1.0));
+        assert_published("mean_upper", i, (mean + z * sd).clamp(0.0, 1.0));
+        let delta = normal_cdf(-library.linear_predictor[i] / (1.0 + eta_se[i] * eta_se[i]).sqrt());
+        max_gap_to_delta = max_gap_to_delta.max((mean - delta).abs());
+    }
+    eprintln!(
+        "[gam#3316] max |library posterior mean - delta-method Phi(-eta/sqrt(1+se^2))| = {max_gap_to_delta:.3e}"
+    );
 }
 
 #[test]

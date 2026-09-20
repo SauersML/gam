@@ -147,10 +147,20 @@ use std::path::Path;
 // scored but not a candidate. It carries a serde default, so an older payload loads with no
 // screen, which reads as the rule it was chosen by, where every arm was a candidate; a v31
 // binary refuses a v32 payload by version.
-pub const MODEL_PAYLOAD_VERSION: u32 = 32;
+// v33 records, beside the exact full-conformal frozen penalty, the fit's smoothing-parameter
+// count (`ExactFullConformalPenalty::penalty_count`, gam#3296), which decides whether the REML
+// re-selecting map is computable. It carries a serde default, so an older payload loads with no
+// count and its conformal rows are refused by name (`UnknownPenaltyStructure`); a v32 binary
+// refuses a v33 payload by version instead of publishing its frozen-λ set for a fit whose
+// selection it cannot see.
+pub const MODEL_PAYLOAD_VERSION: u32 = 33;
+
+/// The schema before the full-conformal penalty count (gam#3296), whose only difference
+/// is that field's absence.
+const CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION: u32 = 32;
 
 /// The schema before the moving-law arms' adequacy screens (gam#2926), whose only
-/// difference is that field's absence.
+/// difference from [`CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION`] is that field's absence.
 const MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION: u32 = 31;
 
 /// The schema before the Gaussian location-scale σ floor record, whose only difference
@@ -218,8 +228,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 15] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 16] = [
     MODEL_PAYLOAD_VERSION,
+    CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
     MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
     SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
     POLISH_STEP_BUDGET_PAYLOAD_VERSION,
@@ -7027,6 +7038,7 @@ mod tests {
                 jeffreys_arming_evidence: None,
                 improper_penalty_null_posterior: None,
                 outer_warm_start: None,
+                null_deviance: None,
                 coefficient_mode_selection:
                     gam_solve::model_types::CoefficientModeSelection::NotRecorded,
                 random_effect_tests: Vec::new(),
@@ -7920,6 +7932,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
             MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
             SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
             POLISH_STEP_BUDGET_PAYLOAD_VERSION,
@@ -7940,7 +7953,11 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
-        assert_eq!(MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(
+            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
+            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION - 1
+        );
         assert_eq!(
             SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
             MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION - 1

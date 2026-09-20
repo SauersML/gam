@@ -704,6 +704,10 @@ fn set_ok_glm_latent_items<'py>(
         "cache_coefficient_basis",
         Array2::<f64>::zeros((0, 0)).into_pyarray(py),
     )?;
+    out.set_item(
+        "cache_data_null_basis",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
     out.set_item("cache_xtwx_fingerprint", 0_u64)?;
     out.set_item("cache_penalty_fingerprint", 0_u64)?;
     out.set_item("cache_logdet_xtwx", f64::NAN)?;
@@ -1181,6 +1185,10 @@ fn set_ok_gaussian_reml_items<'py>(
         "cache_coefficient_basis",
         fit.cache.coefficient_basis.into_pyarray(py),
     )?;
+    out.set_item(
+        "cache_data_null_basis",
+        fit.cache.data_null_basis.into_pyarray(py),
+    )?;
     out.set_item("cache_xtwx_fingerprint", fit.cache.xtwx_fingerprint)?;
     out.set_item("cache_penalty_fingerprint", fit.cache.penalty_fingerprint)?;
     out.set_item("cache_logdet_xtwx", fit.cache.logdet_xtwx)?;
@@ -1218,6 +1226,11 @@ fn gaussian_reml_fit_state_from_pydict(
         .map_err(|err| err.to_string())?
         .as_array()
         .to_owned();
+    let data_null_basis = get(state, "cache_data_null_basis")?
+        .extract::<PyReadonlyArray2<'_, f64>>()
+        .map_err(|err| err.to_string())?
+        .as_array()
+        .to_owned();
     let coefficients = get(state, "coefficients")?
         .extract::<PyReadonlyArray2<'_, f64>>()
         .map_err(|err| err.to_string())?
@@ -1238,6 +1251,7 @@ fn gaussian_reml_fit_state_from_pydict(
         penalty_eigenvalues,
         eigenvectors,
         coefficient_basis,
+        data_null_basis,
         xtwx_fingerprint: get(state, "cache_xtwx_fingerprint")?
             .extract::<u64>()
             .map_err(|err| err.to_string())?,
@@ -1374,6 +1388,10 @@ fn batched_gaussian_reml_fits_from_pydict(
         .extract::<PyReadonlyArray3<'_, f64>>()
         .map_err(|err| err.to_string())?;
     let cache_coefficient_basis = cache_coefficient_basis.as_array();
+    let cache_data_null_basis = get(state, "cache_data_null_basis")?
+        .extract::<PyReadonlyArray3<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let cache_data_null_basis = cache_data_null_basis.as_array();
     let cache_xtwx_fingerprints = get(state, "cache_xtwx_fingerprints")?
         .extract::<PyReadonlyArray1<'_, u64>>()
         .map_err(|err| err.to_string())?;
@@ -1421,10 +1439,24 @@ fn batched_gaussian_reml_fits_from_pydict(
                 fitted.nrows()
             ));
         }
+        let p = cache_coefficient_basis.dim().1;
+        let data_rank = (rank + nullity) as usize;
+        if data_rank > p {
+            return Err(format!(
+                "forward_state cache_penalty_ranks[{b}] + cache_nullities[{b}] = {data_rank} exceeds p={p}"
+            ));
+        }
         let cache = gam::solver::gaussian_reml::GaussianRemlEigenCache {
-            penalty_eigenvalues: cache_penalty_eigenvalues.slice(s![b, ..]).to_owned(),
-            eigenvectors: cache_eigenvectors.slice(s![b, .., ..]).to_owned(),
-            coefficient_basis: cache_coefficient_basis.slice(s![b, .., ..]).to_owned(),
+            penalty_eigenvalues: cache_penalty_eigenvalues.slice(s![b, ..data_rank]).to_owned(),
+            eigenvectors: cache_eigenvectors
+                .slice(s![b, ..data_rank, ..data_rank])
+                .to_owned(),
+            coefficient_basis: cache_coefficient_basis
+                .slice(s![b, .., ..data_rank])
+                .to_owned(),
+            data_null_basis: cache_data_null_basis
+                .slice(s![b, .., ..p - data_rank])
+                .to_owned(),
             xtwx_fingerprint: cache_xtwx_fingerprints[b],
             penalty_fingerprint: cache_penalty_fingerprints[b],
             logdet_xtwx: cache_logdet_xtwx[b],
@@ -1453,37 +1485,6 @@ fn batched_gaussian_reml_fits_from_pydict(
     Ok(fits)
 }
 
-fn set_degenerate_gaussian_reml_items<'py>(
-    py: Python<'py>,
-    out: &Bound<'py, PyDict>,
-    n_rows: usize,
-    n_outputs: usize,
-    n_coefficients: usize,
-) -> PyResult<()> {
-    out.set_item("status", "degenerate")?;
-    out.set_item("lambda", f64::NAN)?;
-    out.set_item("rho", f64::NAN)?;
-    out.set_item("reml_score", f64::NAN)?;
-    out.set_item("reml_grad_lambda", f64::NAN)?;
-    out.set_item("reml_hess_lambda", f64::NAN)?;
-    out.set_item("reml_grad_rho", f64::NAN)?;
-    out.set_item("reml_hess_rho", f64::NAN)?;
-    out.set_item("edf", 0.0)?;
-    out.set_item(
-        "coefficients",
-        Array2::<f64>::zeros((n_coefficients, n_outputs)).into_pyarray(py),
-    )?;
-    out.set_item(
-        "fitted",
-        Array2::<f64>::zeros((n_rows, n_outputs)).into_pyarray(py),
-    )?;
-    out.set_item(
-        "sigma2",
-        Array1::<f64>::from_elem(n_outputs, f64::NAN).into_pyarray(py),
-    )?;
-    Ok(())
-}
-
 struct BatchedGaussianRemlResult {
     statuses: Vec<String>,
     lambdas: Array1<f64>,
@@ -1504,6 +1505,8 @@ struct BatchedGaussianRemlResult {
     cache_penalty_eigenvalues: Array2<f64>,
     cache_eigenvectors: Array3<f64>,
     cache_coefficient_basis: Array3<f64>,
+    /// Left-aligned: fit `b` of design rank `r` fills the first `p − r` columns.
+    cache_data_null_basis: Array3<f64>,
     cache_xtwx_fingerprints: Array1<u64>,
     cache_penalty_fingerprints: Array1<u64>,
     cache_logdet_xtwx: Array1<f64>,
@@ -1773,6 +1776,7 @@ fn gaussian_reml_fit_batched_impl(
     let mut cache_penalty_eigenvalues = Array2::<f64>::zeros((batch, p));
     let mut cache_eigenvectors = Array3::<f64>::zeros((batch, p, p));
     let mut cache_coefficient_basis = Array3::<f64>::zeros((batch, p, p));
+    let mut cache_data_null_basis = Array3::<f64>::zeros((batch, p, p));
     let mut cache_xtwx_fingerprints = Array1::<u64>::zeros(batch);
     let mut cache_penalty_fingerprints = Array1::<u64>::zeros(batch);
     let mut cache_logdet_xtwx = Array1::<f64>::zeros(batch);
@@ -1803,15 +1807,22 @@ fn gaussian_reml_fit_batched_impl(
                 .assign(&fit.coefficients);
             fitted.slice_mut(s![start..end, ..]).assign(&fit.fitted);
             sigma2.slice_mut(s![b, ..]).assign(&fit.sigma2);
+            // A design of rank `r < p` has an `r`-mode spectrum and `p − r` data-null
+            // modes (#3366); both are stored left-aligned in the `p`-wide stacks and
+            // the importer slices them back by `r = penalty_rank + nullity`.
+            let data_rank = fit.cache.coefficient_basis.ncols();
             cache_penalty_eigenvalues
-                .slice_mut(s![b, ..])
+                .slice_mut(s![b, ..data_rank])
                 .assign(&fit.cache.penalty_eigenvalues);
             cache_eigenvectors
-                .slice_mut(s![b, .., ..])
+                .slice_mut(s![b, ..data_rank, ..data_rank])
                 .assign(&fit.cache.eigenvectors);
             cache_coefficient_basis
-                .slice_mut(s![b, .., ..])
+                .slice_mut(s![b, .., ..data_rank])
                 .assign(&fit.cache.coefficient_basis);
+            cache_data_null_basis
+                .slice_mut(s![b, .., ..p - data_rank])
+                .assign(&fit.cache.data_null_basis);
             cache_xtwx_fingerprints[b] = fit.cache.xtwx_fingerprint;
             cache_penalty_fingerprints[b] = fit.cache.penalty_fingerprint;
             cache_logdet_xtwx[b] = fit.cache.logdet_xtwx;
@@ -1837,6 +1848,7 @@ fn gaussian_reml_fit_batched_impl(
         cache_penalty_eigenvalues,
         cache_eigenvectors,
         cache_coefficient_basis,
+        cache_data_null_basis,
         cache_xtwx_fingerprints,
         cache_penalty_fingerprints,
         cache_logdet_xtwx,
@@ -2563,6 +2575,7 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
     let mut cache_penalty_eigenvalues = Array2::<f64>::zeros((batch, p));
     let mut cache_eigenvectors = Array3::<f64>::zeros((batch, p, p));
     let mut cache_coefficient_basis = Array3::<f64>::zeros((batch, p, p));
+    let mut cache_data_null_basis = Array3::<f64>::zeros((batch, p, p));
     let mut cache_xtwx_fingerprints = Array1::<u64>::zeros(batch);
     let mut cache_penalty_fingerprints = Array1::<u64>::zeros(batch);
     let mut cache_logdet_xtwx = Array1::<f64>::zeros(batch);
@@ -2593,15 +2606,22 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
                 .assign(&fit.coefficients);
             fitted.slice_mut(s![start..end, ..]).assign(&fit.fitted);
             sigma2.slice_mut(s![b, ..]).assign(&fit.sigma2);
+            // A design of rank `r < p` has an `r`-mode spectrum and `p − r` data-null
+            // modes (#3366); both are stored left-aligned in the `p`-wide stacks and
+            // the importer slices them back by `r = penalty_rank + nullity`.
+            let data_rank = fit.cache.coefficient_basis.ncols();
             cache_penalty_eigenvalues
-                .slice_mut(s![b, ..])
+                .slice_mut(s![b, ..data_rank])
                 .assign(&fit.cache.penalty_eigenvalues);
             cache_eigenvectors
-                .slice_mut(s![b, .., ..])
+                .slice_mut(s![b, ..data_rank, ..data_rank])
                 .assign(&fit.cache.eigenvectors);
             cache_coefficient_basis
-                .slice_mut(s![b, .., ..])
+                .slice_mut(s![b, .., ..data_rank])
                 .assign(&fit.cache.coefficient_basis);
+            cache_data_null_basis
+                .slice_mut(s![b, .., ..p - data_rank])
+                .assign(&fit.cache.data_null_basis);
             cache_xtwx_fingerprints[b] = fit.cache.xtwx_fingerprint;
             cache_penalty_fingerprints[b] = fit.cache.penalty_fingerprint;
             cache_logdet_xtwx[b] = fit.cache.logdet_xtwx;
@@ -2627,6 +2647,7 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
         cache_penalty_eigenvalues,
         cache_eigenvectors,
         cache_coefficient_basis,
+        cache_data_null_basis,
         cache_xtwx_fingerprints,
         cache_penalty_fingerprints,
         cache_logdet_xtwx,
@@ -3765,11 +3786,16 @@ fn model_debiased_functional_dataset_json_impl(
     let saved_fit =
         gam::families::survival::predict::fit_result_from_saved_model_for_prediction(&model)
             .map_err(|e| format!("debiased_functional: {e}"))?;
-    let h = saved_fit.penalized_hessian().ok_or_else(|| {
-        "debiased_functional: model does not carry a dense penalized Hessian; \
-         refit with a smaller basis (dense fits only)"
-            .to_string()
-    })?;
+    // H and X'WX are read in the saved frame of beta and the rebuilt design
+    // (gam#3346).
+    let h = saved_fit
+        .saved_frame_penalized_hessian()
+        .map_err(|reason| format!("debiased_functional: penalized Hessian: {reason}"))?
+        .ok_or_else(|| {
+            "debiased_functional: model does not carry a dense penalized Hessian; \
+             refit with a smaller basis (dense fits only)"
+                .to_string()
+        })?;
     // Gaussian/identity is the only supported family (enforced below for the
     // score chain). Hoist that check here because the weighted-Gram fallback
     // (#1622) is only valid for the profiled-Gaussian weight convention.
@@ -3784,8 +3810,11 @@ fn model_debiased_functional_dataset_json_impl(
     // is added UNSCALED — see optimizer.rs `cov_scale` contract), so
     // X'WX = Xᵀ diag(w) X exactly and S(λ) = H − X'WX is recovered consistently
     // (for an unpenalized `y ~ x` this gives S(λ)=0, i.e. X'WX == H).
-    let xwx_owned: ndarray::Array2<f64> = match saved_fit.weighted_gram() {
-        Some(g) => g.clone(),
+    let saved_gram = saved_fit
+        .saved_frame_weighted_gram()
+        .map_err(|reason| format!("debiased_functional: weighted Gram: {reason}"))?;
+    let xwx_owned: ndarray::Array2<f64> = match saved_gram {
+        Some(g) => g.into_owned(),
         None => {
             if !is_gaussian_identity {
                 return Err(format!(
@@ -3823,7 +3852,7 @@ fn model_debiased_functional_dataset_json_impl(
     }
 
     // Penalty gradient S_lambda × beta = (H − X'WX) × beta.
-    let s_lambda = h.clone() - xwx.clone();
+    let s_lambda = &*h - xwx;
     let penalty_beta = s_lambda.dot(&beta);
 
     // Per-row score contributions ∂nll_i/∂β.
@@ -4253,7 +4282,16 @@ fn summary_estimator_text<'py>(
 
 #[pyfunction]
 fn summary_html(payload: &Bound<'_, PyDict>) -> PyResult<String> {
-    // Pure presentation layer; no math.
+    // Pure presentation layer; no math. A fitted model's summary carries the
+    // one rendered report, which the notebook shows verbatim.
+    if let Some(text) = payload.get_item("text")?
+        && !text.is_none()
+    {
+        return Ok(format!(
+            "<pre style='font-family: ui-monospace, monospace;'>{}</pre>",
+            summary_html_escape(&text.extract::<String>()?)
+        ));
+    }
     let mut rows = String::new();
     for (key, value) in payload.iter() {
         let key_text = key.str()?.extract::<String>()?;
