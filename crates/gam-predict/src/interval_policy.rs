@@ -945,11 +945,10 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
                     &z_row,
                     reference,
                     fit,
-                    // Generic transform posterior-mean band: analytic prior
-                    // weights (#2077) are threaded through the dedicated
-                    // full-uncertainty Gaussian path, not this driver (None ⇒
-                    // unchanged for the families reaching here).
-                    None,
+                    // #2077: a Gaussian response's band is `σ̂²/w_i + Var(μ_i)`
+                    // on every posterior-mean route; non-Gaussian families
+                    // ignore the weights inside the band builder.
+                    options.observation_prior_weights.as_ref(),
                 )?;
                 result.observation_lower = obs_lower;
                 result.observation_upper = obs_upper;
