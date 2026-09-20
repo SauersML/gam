@@ -44,7 +44,9 @@ pub struct ReportInput {
     /// snapshots aligned to fitted terms/blocks and expose the quantities that
     /// distinguish over-smoothing mechanisms without changing any fit math.
     pub smoothing_forensics: Vec<SmoothingForensicsRow>,
-    pub edf_total: f64,
+    /// Total effective degrees of freedom, `None` when the fit retained none
+    /// (#3978). The report prints the absence rather than a stand-in zero.
+    pub edf_total: Option<f64>,
     pub r_squared: Option<f64>,
     pub coefficients: Vec<CoefficientRow>,
     pub edf_blocks: Vec<EdfBlockRow>,
@@ -555,7 +557,13 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
     if let Some(r2) = input.r_squared {
         summary_pairs.push(("R-squared", format!("{:.6}", r2)));
     }
-    summary_pairs.push(("EDF (total)", format!("{:.4}", input.edf_total)));
+    summary_pairs.push((
+        "EDF (total)",
+        match input.edf_total {
+            Some(edf) => format!("{edf:.4}"),
+            None => "not retained by this fit".to_string(),
+        },
+    ));
     // Outer iterations, annotated with the cap when the solver did not
     // converge cleanly so "47" cannot be misread as "converged at 47".
     let iter_value = if input.converged {
@@ -1615,7 +1623,7 @@ mod tests {
             outer_gradient_norm: None,
             criterion_certificate: None,
             smoothing_forensics: vec![],
-            edf_total: 3.2,
+            edf_total: Some(3.2),
             r_squared: Some(0.85),
             coefficients: vec![CoefficientRow {
                 index: 0,
@@ -1653,6 +1661,27 @@ mod tests {
         assert!(
             html.contains("y ~ s(x)"),
             "formula not found in rendered HTML"
+        );
+    }
+
+    /// #3978: a fit that retained no total EDF prints the absence, not a zero
+    /// EDF that reads as a fit with no effective parameters.
+    #[test]
+    fn render_html_states_an_absent_total_edf_rather_than_zero() {
+        let label = "<span class=\"stat-label\">EDF (total)</span>";
+        let present = render_html(&minimal_input("y ~ s(x)")).unwrap();
+        assert!(
+            present.contains(&format!("{label}<span class=\"stat-value\">3.2000</span>")),
+            "a retained total EDF must be printed: {present}"
+        );
+        let mut input = minimal_input("y ~ s(x)");
+        input.edf_total = None;
+        let absent = render_html(&input).unwrap();
+        assert!(
+            absent.contains(&format!(
+                "{label}<span class=\"stat-value\">not retained by this fit</span>"
+            )),
+            "an absent total EDF must be stated as absent: {absent}"
         );
     }
 

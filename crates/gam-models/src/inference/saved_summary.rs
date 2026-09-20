@@ -1455,7 +1455,7 @@ pub fn saved_model_report_input(
     let edf_total = model
         .unified()
         .and_then(|unified| unified.edf_total())
-        .unwrap_or_else(|| fit.edf_total().unwrap_or(0.0));
+        .or_else(|| fit.edf_total());
     // Definition-consistent SE column (#2296): corrected-preferred, but never
     // an unlabeled mix of covariance definitions.
     let display_uncertainty = fit.display_coefficient_uncertainty();
@@ -1699,7 +1699,7 @@ fn spline_scan_report_input(
         outer_gradient_norm: None,
         criterion_certificate: None,
         smoothing_forensics: Vec::new(),
-        edf_total: scan.edf(),
+        edf_total: Some(scan.edf()),
         r_squared: None,
         coefficients: Vec::new(),
         edf_blocks: vec![EdfBlockRow {
@@ -1804,7 +1804,8 @@ fn residual_cascade_report_input(
         outer_gradient_norm: None,
         criterion_certificate: None,
         smoothing_forensics: Vec::new(),
-        edf_total: 0.0,
+        // The cascade computes no effective degrees of freedom (#3978).
+        edf_total: None,
         r_squared: None,
         coefficients: Vec::new(),
         edf_blocks: Vec::new(),

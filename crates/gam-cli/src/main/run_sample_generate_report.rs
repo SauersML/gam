@@ -874,7 +874,7 @@ fn observed_rows(
 fn report_residual_diagnostics(
     response: &ResponseFamily,
     rows: &ObservedRows,
-    edf_total: f64,
+    edf_total: Option<f64>,
     notes: &mut Vec<String>,
 ) -> Result<Option<report::ResidualDiagnostics>, String> {
     match report_family_residuals(response, rows, edf_total) {
@@ -914,7 +914,7 @@ fn report_residual_diagnostics(
 fn report_family_residuals(
     response: &ResponseFamily,
     rows: &ObservedRows,
-    edf_total: f64,
+    edf_total: Option<f64>,
 ) -> Result<FamilyResiduals, String> {
     use rand::RngExt;
     use statrs::distribution::{
@@ -926,15 +926,25 @@ fn report_family_residuals(
     if n == 0 {
         return Err("no observations".to_string());
     }
-    // Residual degrees of freedom for the Pearson dispersion estimates. With none
-    // left there is no residual scale to estimate, and the diagnostics are omitted
-    // rather than divided by a dof of one that the fit does not have.
-    let residual_dof = n as f64 - edf_total;
-    if !(residual_dof > 0.0) {
-        return Err(format!(
-            "no residual degrees of freedom to estimate a scale (n = {n}, edf = {edf_total})"
-        ));
-    }
+    // Residual degrees of freedom for the Pearson dispersion estimates, needed
+    // only by the families whose scale the saved model does not carry. A fit
+    // that retained no total EDF has no known n − edf, and a fit with none left
+    // has no residual scale to estimate: either way those diagnostics are
+    // omitted rather than divided by a dof the fit does not have (#3978).
+    let residual_dof = || -> Result<f64, String> {
+        let edf = edf_total.ok_or_else(|| {
+            "the fit retained no total EDF, so the residual degrees of freedom n − edf \
+             are unknown"
+                .to_string()
+        })?;
+        let dof = n as f64 - edf;
+        if !(dof > 0.0) {
+            return Err(format!(
+                "no residual degrees of freedom to estimate a scale (n = {n}, edf = {edf})"
+            ));
+        }
+        Ok(dof)
+    };
     let mut rng = StdRng::seed_from_u64(REPORT_RESIDUAL_SEED);
     // Predictive CDF value → normal scale. Only the exact endpoints have no
     // finite quantile, so u is held inside the representable open interval:
@@ -946,7 +956,7 @@ fn report_family_residuals(
     match response {
         ResponseFamily::Gaussian => {
             let ssr: f64 = (0..n).map(|i| w[i] * (y[i] - mu[i]).powi(2)).sum();
-            let sigma = (ssr / residual_dof).sqrt();
+            let sigma = (ssr / residual_dof()?).sqrt();
             if !(sigma.is_finite() && sigma > 0.0) {
                 return Err("Gaussian residual scale is zero or non-finite".to_string());
             }
@@ -1065,7 +1075,7 @@ fn report_family_residuals(
             let phi = (0..n)
                 .map(|i| w[i] * ((y[i] - mu[i]) / mu[i]).powi(2))
                 .sum::<f64>()
-                / residual_dof;
+                / residual_dof()?;
             if !(phi.is_finite() && phi > 0.0) {
                 return Err("Gamma dispersion estimate is not positive".to_string());
             }
@@ -1092,7 +1102,7 @@ fn report_family_residuals(
             let phi = (0..n)
                 .map(|i| w[i] * (y[i] - mu[i]).powi(2) / mu[i].powi(3))
                 .sum::<f64>()
-                / residual_dof;
+                / residual_dof()?;
             if !(phi.is_finite() && phi > 0.0) {
                 return Err("inverse-Gaussian dispersion estimate is not positive".to_string());
             }
@@ -1162,7 +1172,7 @@ fn report_family_residuals(
             let phi = (0..n)
                 .map(|i| w[i] * (y[i] - mu[i]).powi(2) / mu[i].powf(p))
                 .sum::<f64>()
-                / residual_dof;
+                / residual_dof()?;
             if !(phi.is_finite() && phi > 0.0) {
                 return Err("Tweedie dispersion estimate is not positive".to_string());
             }
