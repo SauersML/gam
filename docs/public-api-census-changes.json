@@ -4844,7 +4844,17 @@
     "evidence": "Gate direct-dy6-w2a-r0v5-gt.log, TIPCHECK at tip 988f269d7e (tip tree 9598a61a74): cargo check --workspace --all-targets RC 0 with SCANNER_ERRORS=0, gam-pyffi check RC 0, gam-terms 114 of 114; its source_removal_guard and public_api_census flagged exactly these items and nothing else. Read-proof: git grep -w for spatial_center_strategy_mut, cyclic_basis_dim_for_column and pilot_internal_knots_for_column at 988f269d7e finds only their definitions, the callers this landing rewrites, and a doc comment in basis/types.rs that this landing also rewrites."
   },
   {
-    "base": "69423631699ecb31ce83ca60556b254b16bf93c3",
+    "base": "33e71f2363e2b5b2cc64043c2a865d2247b59452",
+    "removed": {
+      "crates/gam-solve/src/rho_optimizer/run.rs::bfgs_axis_step_caps": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::with_bfgs_step_cap": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::with_bfgs_step_cap_psi": 1
+    },
+    "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
+    "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
+  },
+  {
+    "base": "920eb8df60126933f8607d7c76022515e531347b",
     "removed": {
       "crates/gam-models/src/survival/risk_calibration.rs::cox_calibrated_survival_matrix": 1,
       "crates/gam-models/src/survival/risk_calibration.rs::km_curve_on_grid": 1
