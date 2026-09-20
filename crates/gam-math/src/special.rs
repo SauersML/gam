@@ -1133,6 +1133,11 @@ mod exponential_family_kernel_tests {
         }
         assert_eq!(softplus(800.0), 800.0);
         assert_eq!(softplus(-800.0), 0.0);
+        assert_eq!(logistic(800.0), 1.0);
+        assert_eq!(logistic(-800.0), 0.0);
+        for &x in &[0.5_f64, 1.0, 2.0, 5.0, 40.0] {
+            assert!((logistic(x) + logistic(-x) - 1.0).abs() <= f64::EPSILON);
+        }
     }
 
     #[test]

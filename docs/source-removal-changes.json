@@ -2870,5 +2870,25 @@
     ],
     "reason": "IsometryDuchonRadialSource had no constructor anywhere in the workspace: IsometryPenalty::duchon_radial_source was set to None in new_euclidean and only ever cloned, so its Duchon Jacobian adapters (duchon_radial_jacobian_second/third), the target_matrix helper they read, and the jacobian_second/jacobian_third wrappers that fell back to them were dead, and every duchon_radial_source.is_none() guard was always true. The gradient, GN majorizer and exact HVP now read the installed H/K caches after the evaluation precondition, which already refuses a missing jet by name.",
     "evidence": "git grep on the base tree finds no struct literal or constructor of IsometryDuchonRadialSource and no assignment to duchon_radial_source other than `duchon_radial_source: None` in IsometryPenalty::new_euclidean and the field-wise clone; the same-named target_matrix/jacobian_second/jacobian_third occurrences the guard counts belong to other penalties (block_sparsity, nuclear_norm, orthogonality, row_precision) and to the deleted wrappers' own call sites in isometry.rs."
+  },
+  {
+    "base": "03f9a1216aae0cc61e83bf828877243b2bf6a425",
+    "items": [
+      "crates/gam-inference/src/hmc_io.rs:fn:log1pexp_is_finite_for_extreme_eta",
+      "crates/gam-inference/src/hmc_io.rs:fn:sigmoid_stable_behaves_at_extremes",
+      "crates/gam-linalg/src/utils.rs:fn:logistic_at_zero_is_half",
+      "crates/gam-linalg/src/utils.rs:fn:logistic_large_negative_approaches_zero",
+      "crates/gam-linalg/src/utils.rs:fn:logistic_large_positive_approaches_one",
+      "crates/gam-linalg/src/utils.rs:fn:logistic_symmetry_around_zero",
+      "crates/gam-linalg/src/utils.rs:fn:softplus_at_zero",
+      "crates/gam-linalg/src/utils.rs:fn:softplus_matches_naive_formula_at_moderate_x",
+      "crates/gam-linalg/src/utils.rs:fn:softplus_negative_large_approximates_zero",
+      "crates/gam-linalg/src/utils.rs:fn:softplus_positive_large_approximates_x",
+      "crates/gam-linalg/src/utils.rs:fn:stable_logistic",
+      "crates/gam-linalg/src/utils.rs:fn:stable_softplus",
+      "crates/gam-models/src/inference/full_conformal/honest.rs:fn:softplus"
+    ],
+    "reason": "#3735: the stable softplus/logistic kernels were implemented more than once in the Rust core. gam_math::special::{softplus, logistic} is canonical; gam_linalg::utils::{stable_softplus, stable_logistic} and the private honest.rs softplus re-derived the identical expressions (max(x,0)+ln1p(exp(-|x|)) and the sign-split logistic). SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'. The 10 removed tests re-tested the same kernel through the aliases; their tail and symmetry assertions move into gam-math's softplus_and_logistic_agree_with_their_definitions_away_from_the_tails. The gam-pyffi copy and its numerics_* pyfunctions stay for now, because open PR #3076 edits geometry_ffi.rs and the stubs.",
+    "evidence": "At head git grep -w finds no stable_softplus or stable_logistic anywhere; every former caller imports gam_math::special::{softplus, logistic}. The remaining softplus/sigmoid_stable name occurrences are other, untouched items."
   }
 ]

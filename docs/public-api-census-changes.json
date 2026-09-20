@@ -4929,5 +4929,14 @@
     },
     "reason": "#3878: saved_models_log_evidence_ratio is replaced by saved_models_evidence_ratio, which returns the ratio formed in Rust.",
     "evidence": "PR #3895."
+  },
+  {
+    "base": "03f9a1216aae0cc61e83bf828877243b2bf6a425",
+    "removed": {
+      "crates/gam-linalg/src/utils.rs::stable_logistic": 1,
+      "crates/gam-linalg/src/utils.rs::stable_softplus": 1
+    },
+    "reason": "#3735: gam_linalg::utils::{stable_softplus, stable_logistic} duplicated gam_math::special::{softplus, logistic} expression for expression. SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'. All callers now import the gam-math kernels.",
+    "evidence": "At head git grep -w finds no occurrence of stable_softplus or stable_logistic; every former caller (gam-model-kernels, gam-models, gam-sae, gam-solve, gam-terms, gam-inference, gam-pyffi) depends on gam-math directly."
   }
 ]

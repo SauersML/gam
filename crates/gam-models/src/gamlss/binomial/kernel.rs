@@ -191,8 +191,8 @@ pub(crate) fn binomial_location_scale_log_likelihood(
             Ok(weight * (y * normal_logcdf(q) + (1.0_f64 - y) * normal_logsf(q)))
         }
         InverseLink::Standard(StandardLink::Logit) => Ok(weight
-            * (-y * gam_linalg::utils::stable_softplus(-q)
-                - (1.0_f64 - y) * gam_linalg::utils::stable_softplus(q))),
+            * (-y * gam_math::special::softplus(-q)
+                - (1.0_f64 - y) * gam_math::special::softplus(q))),
         InverseLink::Standard(StandardLink::CLogLog) => {
             let z = q.exp();
             let log_p = if z == 0.0 {

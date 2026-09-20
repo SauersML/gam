@@ -837,7 +837,7 @@ impl<'a> ThreeClassConditionalIntegrand<'a> {
             let outer_eta = outer_mean + self.outer_standard_deviation * standard_normal;
             let conditioned_mean = self.active_mean[self.conditioned_class]
                 + self.conditional_regression * (outer_eta - outer_mean);
-            let scalar_location = conditioned_mean - gam_linalg::utils::stable_softplus(outer_eta);
+            let scalar_location = conditioned_mean - gam_math::special::softplus(outer_eta);
             let (selected_mean, selected_slope) =
                 gam_solve::quadrature::logit_posterior_meanwith_deriv(
                     scalar_location,
@@ -848,7 +848,7 @@ impl<'a> ThreeClassConditionalIntegrand<'a> {
                         "conditioned three-class scalar logistic-normal evaluation failed: {error}"
                     ))
                 })?;
-            let outer_share = (-gam_linalg::utils::stable_softplus(-outer_eta)).exp();
+            let outer_share = (-gam_math::special::softplus(-outer_eta)).exp();
             let reference_share = 1.0 - outer_share;
             let selected_second = selected_mean - selected_slope;
             let remainder_second = 1.0 - selected_mean - selected_slope;

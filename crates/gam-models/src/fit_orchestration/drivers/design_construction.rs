@@ -781,8 +781,8 @@ fn bounded_prior_terms(
     // log(1-sigmoid(theta)) = -softplus(theta).  Evaluating the prior on
     // these natural-coordinate tails keeps its value and derivative tower on
     // one surface even after `z` itself rounds to an endpoint.
-    let logp = -a * gam_linalg::utils::stable_softplus(-theta)
-        - b * gam_linalg::utils::stable_softplus(theta);
+    let logp = -a * gam_math::special::softplus(-theta)
+        - b * gam_math::special::softplus(theta);
     let grad = a - (a + b) * z;
     let neghess = (a + b) * jet.d1;
     let neghess_derivative = (a + b) * jet.d2;
@@ -931,7 +931,7 @@ fn exact_logit_observation_row(
         return Ok(ExactStandardObservationRow::zero_weight(mu));
     }
     let log_fisher =
-        -gam_linalg::utils::stable_softplus(eta) - gam_linalg::utils::stable_softplus(-eta);
+        -gam_math::special::softplus(eta) - gam_math::special::softplus(-eta);
     let fisherweight = weighted_positive_from_log(weight, log_fisher);
     if !(fisherweight.is_finite() && fisherweight > 0.0) {
         return Err(EstimationError::pirls_row_geometry_unrepresentable(
@@ -951,9 +951,9 @@ fn exact_logit_observation_row(
         y - mu
     };
     let log_likelihood_unit = if eta >= 0.0 {
-        -(1.0 - y) * eta - gam_linalg::utils::stable_softplus(-eta)
+        -(1.0 - y) * eta - gam_math::special::softplus(-eta)
     } else {
-        y * eta - gam_linalg::utils::stable_softplus(eta)
+        y * eta - gam_math::special::softplus(eta)
     };
     certify_bounded_row(
         row,
@@ -1522,8 +1522,8 @@ fn exact_standard_observation_row(
             let mu = inverse_link_jet_for_inverse_link(&family.link, eta)?.mu;
             let log_theta = theta.ln();
             let delta = eta - log_theta;
-            let log_q = -gam_linalg::utils::stable_softplus(-delta);
-            let log_r = -gam_linalg::utils::stable_softplus(delta);
+            let log_q = -gam_math::special::softplus(-delta);
+            let log_r = -gam_math::special::softplus(delta);
             let q = log_q.exp();
             let r = log_r.exp();
             let y_r = if y == 0.0 {
@@ -1549,9 +1549,9 @@ fn exact_standard_observation_row(
             let neghessian_eta_third_derivative =
                 neghessian_eta * (r - q) * ((r - q) * (r - q) - 8.0 * q * r);
             let softplus_tail = if delta >= 0.0 {
-                gam_linalg::utils::stable_softplus(-delta)
+                gam_math::special::softplus(-delta)
             } else {
-                gam_linalg::utils::stable_softplus(delta)
+                gam_math::special::softplus(delta)
             };
             let log_likelihood = if delta >= 0.0 {
                 -weighted_product3(weight, theta, delta)

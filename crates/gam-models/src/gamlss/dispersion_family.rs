@@ -250,7 +250,7 @@ fn validate_dispersion_row_geometry_inputs(
             require_positive("Gamma precision exp(eta_d)", eta_d, eta_d.exp())
         }
         DispersionFamilyKind::Beta => {
-            let mu = gam_linalg::utils::stable_logistic(eta_mu);
+            let mu = gam_math::special::logistic(eta_mu);
             if !mu.is_finite() || mu <= 0.0 || mu >= 1.0 {
                 return Err(GamlssError::row_geometry_unrepresentable(
                     row,
@@ -704,7 +704,7 @@ pub(crate) fn dispersion_row_loglik(
             dispersion_gamma_loglik(yi, y_pos, mu, nu, wi)
         }
         DispersionFamilyKind::Beta => {
-            let mu = gam_linalg::utils::stable_logistic(em);
+            let mu = gam_math::special::logistic(em);
             let phi = ed.exp();
             dispersion_beta_loglik(yi, mu, phi, wi)
         }
@@ -2996,7 +2996,7 @@ pub(crate) fn dispersion_location_scale_warm_start(
                 continue;
             }
             let mu = if kind.mean_is_logit() {
-                gam_linalg::utils::stable_logistic(mean_eta[i])
+                gam_math::special::logistic(mean_eta[i])
             } else {
                 mean_eta[i].exp()
             };
