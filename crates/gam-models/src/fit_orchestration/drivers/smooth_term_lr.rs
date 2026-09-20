@@ -1933,9 +1933,11 @@ impl SmoothLrSelection {
 /// this and the replay needs no profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SmoothLrSelectionProfile {
-    /// `h`, the residual directions no column reaches.
+    /// `h = (n − p)₊`, the residual directions no column reaches.
     pub(crate) residual_unit_dimension: usize,
-    /// `r`, the structural rank of the model's balanced penalty.
+    /// `r`, the penalized directions some row reaches: the structural rank of
+    /// the model's balanced penalty, less the `(p − n)₊` coefficient directions
+    /// no row reaches, so that `h + r = n − M_p`.
     pub(crate) penalized_rank: usize,
 }
 
@@ -3013,6 +3015,17 @@ pub struct SmoothLrReferenceDf {
 /// freedom, which is what keeps an `n`-sized reference the same cost as a
 /// `p`-sized one.
 ///
+/// When `n < p` the hat matrix is `n × n`, so `I − Ã` has `n` eigenvalues, not
+/// `p`: there is no weight-one block, and `p − n` of the coefficient-space
+/// shares belong to directions `u` with `X̃u = 0`, which no row reaches. Each of
+/// those has `Su = Hu`, so its share is exactly one, and at least `p − n` of
+/// the shares are. The spectrum is ascending, so the law keeps its first `n`
+/// shares and drops the last `p − n` (#3648):
+///
+/// ```text
+///   V ~ Σ_{i ≤ min(n, p)} p_i²·χ²_1  +  χ²_{(n−p)₊}.
+/// ```
+///
 /// # What is approximated, stated plainly
 ///
 /// Three things, all inherited rather than introduced, and none of them the
@@ -3038,10 +3051,10 @@ pub struct SmoothLrProfiledScale {
     /// It is NOT negligible and it is not the same sign as the rest: on the
     /// `n = 30` Gaussian cells it runs `−0.13` to `−0.61`.
     pub deterministic_offset: f64,
-    /// `p_i²` over the whole model's penalty shares — the non-trivial half of
-    /// the residual quadratic form's spectrum.
+    /// `p_i²` over the whole model's `min(n, p)` smallest penalty shares — the
+    /// non-trivial half of the residual quadratic form's spectrum.
     pub residual_weights: Vec<f64>,
-    /// `n − p`, the residual directions no design column reaches. Each carries
+    /// `(n − p)₊`, the residual directions no design column reaches. Each carries
     /// weight exactly one, so they are one term with this many degrees of
     /// freedom rather than this many terms.
     pub residual_unit_dimension: f64,
@@ -3635,6 +3648,7 @@ pub fn smooth_term_lr_inference_forspec(
         hessian_inverse.as_ref(),
         &s_lambda,
         p_total,
+        profiled_observations,
     )?;
     let full_residual_df = profiled_residual_shares
         .as_ref()
@@ -3660,6 +3674,17 @@ pub fn smooth_term_lr_inference_forspec(
                     .map(|block| (block.local.view(), block.col_range.clone())),
                 p_total,
             )?;
+            // When `n < p`, `p − n` coefficient directions are reached by no
+            // row. None lies in the penalty's null space (`H` would be
+            // singular there), so they come off the penalized rank, and
+            // `h + r` is the fit's own `ν = n − M_p` in both regimes (#3648).
+            let unreached = p_total.saturating_sub(profiled_observations);
+            let penalized_rank = penalized_rank.checked_sub(unreached).ok_or_else(|| {
+                EstimationError::InvalidInput(format!(
+                    "smooth LR: {profiled_observations} positive-weight rows cannot fit {p_total} \
+                     coefficients over a penalty of rank {penalized_rank}"
+                ))
+            })?;
             Some(SmoothLrSelectionProfile {
                 residual_unit_dimension: profiled_observations.saturating_sub(p_total),
                 penalized_rank,
@@ -4142,6 +4167,7 @@ fn profiled_scale_residual_shares(
     hessian_inverse: Option<&Array2<f64>>,
     penalty: &Array2<f64>,
     p_total: usize,
+    observations: usize,
 ) -> Result<Option<Option<Vec<f64>>>, EstimationError> {
     let resolved = likelihood
         .resolved_scale()
@@ -4151,8 +4177,19 @@ fn profiled_scale_residual_shares(
     }
     Ok(Some(
         lr_tested_block(hessian_inverse, Some(penalty), &(0..p_total))
-            .map(|block| block.shares.iter().map(|share| share * share).collect()),
+            .map(|block| residual_share_weights(&block.shares, observations)),
     ))
+}
+
+/// `p_i²` over the `min(n, p)` smallest of the ascending shares: the last
+/// `p − n` are the unit shares of coefficient directions no row reaches, which
+/// are not residual directions ([`SmoothLrProfiledScale`]).
+fn residual_share_weights(ascending_shares: &[f64], observations: usize) -> Vec<f64> {
+    ascending_shares
+        .iter()
+        .take(observations)
+        .map(|share| share * share)
+        .collect()
 }
 
 fn resolved_likelihood_for_fit(
@@ -4731,8 +4768,53 @@ mod lr_null_reference_tests {
 mod profiled_scale_reference_tests {
     use super::{
         SmoothLrProfiledScale, SmoothLrReferenceDf, SmoothLrReferenceSource, SmoothLrSelection,
-        SmoothLrSelectionDecline,
+        SmoothLrSelectionDecline, lr_tested_block, residual_share_weights,
     };
+    use ndarray::Array2;
+
+    /// #3648: with fewer rows than coefficients the residual law must be the
+    /// spectrum of `(I − X H⁻¹Xᵀ)²` itself, `n` weights and no weight-one block,
+    /// not `p` weights of which `p − n` are spurious unit components.
+    #[test]
+    fn the_residual_law_has_n_components_when_rows_are_fewer_than_coefficients() {
+        let (n, p) = (4usize, 7usize);
+        let x = Array2::from_shape_fn((n, p), |(i, j)| {
+            if j == 0 { 1.0 } else { ((i * p + j) as f64 * 0.37).sin() + 0.1 * j as f64 }
+        });
+        // The first column is unpenalized and reached by every row, so `H` is
+        // positive definite although `XᵀX` has rank `n < p`.
+        let penalty = Array2::from_shape_fn((p, p), |(i, j)| {
+            if i == j && i > 0 { 0.4 * i as f64 } else { 0.0 }
+        });
+        let hessian = x.t().dot(&x) + &penalty;
+        let (values, vectors) =
+            gam_linalg::faer_ndarray::strict_symmetric_eigh(&hessian, faer::Side::Lower)
+                .expect("symmetric eigendecomposition");
+        assert!(values.iter().all(|value| *value > 0.0), "H must be positive definite");
+        let inverse_values = Array2::from_diag(&values.mapv(f64::recip));
+        let hessian_inverse = vectors.dot(&inverse_values).dot(&vectors.t());
+        let block = lr_tested_block(Some(&hessian_inverse), Some(&penalty), &(0..p))
+            .expect("the whole-model block");
+        assert_eq!(block.shares.len(), p);
+        let weights = residual_share_weights(&block.shares, n);
+
+        let residual = Array2::<f64>::eye(n) - x.dot(&hessian_inverse).dot(&x.t());
+        let (residual_values, _) =
+            gam_linalg::faer_ndarray::strict_symmetric_eigh(&residual, faer::Side::Lower)
+                .expect("symmetric eigendecomposition");
+        let mut expected: Vec<f64> = residual_values.iter().map(|value| value * value).collect();
+        expected.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        assert_eq!(weights.len(), n, "one weight per residual direction");
+        for (got, want) in weights.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-10, "weights {weights:?} against spectrum {expected:?}");
+        }
+        // The dropped shares are the unit shares of the unreached directions.
+        for share in &block.shares[n..] {
+            assert!((share - 1.0).abs() < 1e-10, "dropped share {share} is not one");
+        }
+        // With `n ≥ p` nothing is dropped.
+        assert_eq!(residual_share_weights(&block.shares, p + 3).len(), p);
+    }
 
     /// A reference carrying an explicit spectrum, nothing selected (so the
     /// conditional law is the whole law), and the strictest tail accuracy the
