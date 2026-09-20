@@ -233,16 +233,14 @@ impl core::fmt::Display for FixedLambdaStallReason {
 /// Solver-native first-order residual carried by a fixed-lambda stall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FixedLambdaResidualKind {
-    /// Euclidean norm of the exact penalized likelihood gradient.
-    PenalizedGradientNorm,
-    /// Firth/Jeffreys Newton decrement `0.5 * |score' H^-1 score|`.
+    /// Half the squared Newton decrement `0.5 * score' H^+ score`, in
+    /// objective units (Firth/Jeffreys and penalized vector-GLM solves).
     NewtonDecrement,
 }
 
 impl core::fmt::Display for FixedLambdaResidualKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
-            Self::PenalizedGradientNorm => "penalized gradient norm",
             Self::NewtonDecrement => "Newton decrement",
         })
     }
@@ -624,23 +622,6 @@ pub enum EstimationError {
         rank: usize,
         num_unpenalized_columns: usize,
         min_eigenvalue: f64,
-        tolerance: f64,
-        column_indices: Vec<usize>,
-    },
-
-    #[error(
-        "Pre-fit near-degeneracy detected in the realized unpenalized design: the {num_unpenalized_columns} \
-        unpenalized columns span a numerically rank-degenerate direction (Gram condition number {condition_number:.3e} \
-        exceeds tolerance {tolerance:.3e}; min eigenvalue {min_eigenvalue:.3e}, max eigenvalue {max_eigenvalue:.3e}, \
-        columns {column_indices:?}). The unpenalized normal equations are effectively singular along this direction, \
-        so the fit would grind/diverge. Remove/reparameterize the near-aliased columns or add an explicit \
-        penalty/constraint before fitting."
-    )]
-    PrefitNearDegenerateDesignDetected {
-        num_unpenalized_columns: usize,
-        condition_number: f64,
-        min_eigenvalue: f64,
-        max_eigenvalue: f64,
         tolerance: f64,
         column_indices: Vec<usize>,
     },
@@ -1163,8 +1144,7 @@ impl EstimationError {
                  whole mean domain (the canonical link), or remove the predictor or rows \
                  that force the mean to the boundary."
             )),
-            Self::PrefitRankDeficientDesignDetected { column_indices, .. }
-            | Self::PrefitNearDegenerateDesignDetected { column_indices, .. } => Some(format!(
+            Self::PrefitRankDeficientDesignDetected { column_indices, .. } => Some(format!(
                 "Matrix conditioning issue in unpenalized columns {column_indices:?}. {CONDITIONING}"
             )),
             Self::ModelIsIllConditioned { .. }
@@ -1241,7 +1221,6 @@ impl EstimationError {
             | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
-            | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::HessianNotPositiveDefinite { .. }
             | Self::LaplacePrecisionIndefinite { .. }
             | Self::IdentifiedRankNotLocallyConstant { .. }
@@ -1340,7 +1319,13 @@ impl EstimationError {
                 reason: format!("{context}: {self}"),
             }
         } else {
-            Self::fatal_outer_evaluation(context, self)
+            // This operation adds context even if the source is already wrapped.
+            // The orchestration helper intentionally deduplicates fatal wrappers,
+            // so using it here would silently discard the new caller context.
+            Self::OuterObjectiveEvaluationFailed {
+                context: context.to_string(),
+                source: OuterObjectiveErrorSource::Estimation(Box::new(self)),
+            }
         }
     }
 
@@ -1442,7 +1427,6 @@ impl EstimationError {
             | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
-            | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::MultinomialSeparationDetected { .. }
             | Self::PredictiveIntervalsDeclined { .. }
             | Self::ModelIsIllConditioned { .. }
@@ -1531,9 +1515,6 @@ impl EstimationError {
             Self::PrefitRankDeficientDesignDetected { .. } => {
                 "EstimationError::PrefitRankDeficientDesignDetected"
             }
-            Self::PrefitNearDegenerateDesignDetected { .. } => {
-                "EstimationError::PrefitNearDegenerateDesignDetected"
-            }
             Self::MultinomialSeparationDetected { .. } => {
                 "EstimationError::MultinomialSeparationDetected"
             }
@@ -1567,8 +1548,12 @@ impl EstimationError {
             Self::ModelIsIllConditioned { .. } => "EstimationError::ModelIsIllConditioned",
             Self::InvalidInput(_) => "EstimationError::InvalidInput",
             Self::FitResultInvariantViolated(_) => "EstimationError::FitResultInvariantViolated",
-            Self::ProfiledResidualUnresolved { .. } => "EstimationError::ProfiledResidualUnresolved",
-            Self::InverseLinkDomainViolation { .. } => "EstimationError::InverseLinkDomainViolation",
+            Self::ProfiledResidualUnresolved { .. } => {
+                "EstimationError::ProfiledResidualUnresolved"
+            }
+            Self::InverseLinkDomainViolation { .. } => {
+                "EstimationError::InverseLinkDomainViolation"
+            }
             Self::LinkFeasibilityBoundaryOptimum { .. } => {
                 "EstimationError::LinkFeasibilityBoundaryOptimum"
             }
@@ -1672,7 +1657,7 @@ mod trial_point_classification_tests {
                 reason: FixedLambdaStallReason::IterationBudgetExhausted,
                 objective_value: 12.5,
                 stationarity: FixedLambdaStationarityEvidence {
-                    kind: FixedLambdaResidualKind::PenalizedGradientNorm,
+                    kind: FixedLambdaResidualKind::NewtonDecrement,
                     residual: 1.0e-3,
                     bound: 1.0e-8,
                 },
@@ -1972,6 +1957,44 @@ mod tests {
             wrapped.to_string().contains("lambda out of range"),
             "{wrapped}"
         );
+    }
+
+    #[test]
+    fn repeated_trial_context_preserves_typed_source_and_each_context() {
+        let wrapped = EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: -0.5,
+        }
+        .wrap_preserving_trial_point("row likelihood")
+        .wrap_preserving_trial_point("outer smoothing");
+        let message = wrapped.to_string();
+        assert!(message.contains("row likelihood"), "{message}");
+        assert!(message.contains("outer smoothing"), "{message}");
+        assert!(matches!(wrapped.innermost_estimation_error(),
+            EstimationError::HessianNotPositiveDefinite { min_eigenvalue } if *min_eigenvalue == -0.5));
+        assert_eq!(wrapped.failure_category(), FailureCategory::Numerical);
+        assert_eq!(
+            wrapped.variant_name(),
+            "EstimationError::HessianNotPositiveDefinite"
+        );
+        assert!(
+            wrapped
+                .advice()
+                .expect("typed advice")
+                .contains("conditioning")
+        );
+        assert!(std::error::Error::source(&wrapped).is_some());
+        assert!(!wrapped.is_trial_point_infeasible());
+
+        let refused = EstimationError::TrialPointRefused {
+            reason: "outside domain".into(),
+        }
+        .wrap_preserving_trial_point("row likelihood")
+        .wrap_preserving_trial_point("outer smoothing");
+        assert!(refused.is_trial_point_infeasible());
+        assert!(!refused.is_fatal_outer_evaluation());
+        for context in ["outside domain", "row likelihood", "outer smoothing"] {
+            assert!(refused.to_string().contains(context));
+        }
     }
 
     // ── error message content ─────────────────────────────────────────────────

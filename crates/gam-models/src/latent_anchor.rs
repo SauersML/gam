@@ -669,25 +669,50 @@ pub(crate) struct CalibrationTail {
     pub(crate) density_slope: Option<f64>,
     /// The terms summed into `tail`, for its rounding.
     pub(crate) summands: usize,
+    /// A bound on `tail`'s absolute error beyond the correctly rounded sum of
+    /// its terms (gam#3216, from PR #3374): the sum of the cell integrators'
+    /// own bounds on the de-nested route, zero on a finite law, whose terms
+    /// are each a positive probability to its own relative accuracy.
+    pub(crate) tail_rounding: f64,
 }
 
 impl CalibrationTail {
     /// The residual `log T − log Φ(∓q)` with its slopes: `T′ = ∓P′`,
     /// `F′ = T′/T`, and `F″ = T″/T − F′²` where `P″` was evaluated, else zero
-    /// so the solve takes Newton's step. A tail that has underflowed, or a
-    /// calibration that no longer moves with `a`, has no root to resolve and
-    /// is refused.
+    /// so the solve takes Newton's step. Its rounding is the tail's own bound
+    /// relative to it plus the logarithms' ([`anchor_residual_rounding`]).
+    ///
+    /// A tail that underflowed to zero is `log T = −∞` (gam#3216, from PR
+    /// #3374): the residual keeps its sign, which is all the bracket of
+    /// [`solve_log_tail_root`] reads from it, with no finite slope and an
+    /// unbounded rounding, and the solve never accepts it. A far probe of the
+    /// bracket search therefore narrows the bracket instead of ending the
+    /// solve. Only a non-finite tail, bound or slope, or a negative tail or
+    /// bound, is refused; the caller checks `P′ > 0` at the root it accepts.
     pub(crate) fn log_residual(
         &self,
         survival_side: bool,
         log_target: f64,
     ) -> Result<LogTailResidual, String> {
-        if !(self.tail.is_finite() && self.tail > 0.0 && self.density.is_finite() && self.density > 0.0)
+        if !(self.tail.is_finite()
+            && self.tail >= 0.0
+            && self.tail_rounding.is_finite()
+            && self.tail_rounding >= 0.0
+            && self.density.is_finite())
         {
             return Err(format!(
-                "calibration tail has no resolvable log residual: tail={:e}, density={:e}",
-                self.tail, self.density
+                "calibration tail has no resolvable log residual: tail={:e}, \
+                 tail_rounding={:e}, density={:e}",
+                self.tail, self.tail_rounding, self.density
             ));
+        }
+        if self.tail == 0.0 {
+            return Ok(LogTailResidual {
+                value: f64::NEG_INFINITY,
+                first: f64::NAN,
+                second: f64::NAN,
+                rounding: f64::INFINITY,
+            });
         }
         let sign = if survival_side { -1.0 } else { 1.0 };
         let first = sign * self.density / self.tail;
@@ -702,7 +727,8 @@ impl CalibrationTail {
             value: self.tail.ln() - log_target,
             first,
             second,
-            rounding: anchor_residual_rounding(log_target, self.summands),
+            rounding: self.tail_rounding / self.tail
+                + anchor_residual_rounding(log_target, self.summands),
         })
     }
 }
@@ -759,7 +785,9 @@ pub(crate) fn solve_log_tail_root(
             second,
             rounding,
         } = residual(alpha)?;
-        if value.abs() <= anchor_residual_resolution(alpha, first, rounding) {
+        // A residual that is not finite (an underflowed tail's `−∞`) carries a
+        // sign for the bracket and nothing to accept.
+        if value.is_finite() && value.abs() <= anchor_residual_resolution(alpha, first, rounding) {
             // The accepted `α` still carries a residual up to the tolerance,
             // and where it stops depends on the seed, so it moves irregularly
             // with the coefficients: summed over 3e5 rows it floored the inner
@@ -1349,6 +1377,94 @@ mod anchor_tests {
     use gam_math::jet_scalar::{JetScalar, Order2};
     use gam_math::jet_tower::Tower4;
     use gam_math::probability::{normal_cdf, normal_pdf};
+
+    // ── The smaller-tail log residual: its own rounding and underflow (gam#3216, PR #3374) ──
+
+    /// The survival-side calibration `T(α) = Φ(−α)` with root `α = q`, perturbed
+    /// by the factor `exp(±r)` on the side of the root it is evaluated on and
+    /// carrying `bound` as its rounding.
+    fn perturbed_survival_tail(alpha: f64, q: f64, r: f64, bound: f64) -> CalibrationTail {
+        let exact = normal_cdf(-alpha);
+        let above_target = exact.ln() > smaller_tail_log_target(q);
+        let factor = if above_target { r.exp() } else { (-r).exp() };
+        CalibrationTail {
+            tail: exact * factor,
+            density: normal_pdf(alpha),
+            density_slope: None,
+            summands: 1,
+            tail_rounding: bound * exact,
+        }
+    }
+
+    /// gam#3216 (a), from PR #3374: the tail's own rounding bound enters the
+    /// residual's resolution. A tail that is right only to a relative bound
+    /// `r` far above the logarithms' rounding can put the residual's sign
+    /// change across a jump of `2r`, as a sum of cell integrals that is not
+    /// correctly rounded can: here `T(α) = Φ(−α)·exp(±r)`, whose residual is at
+    /// least `r` on every float. Charged its bound, the solve accepts a float
+    /// at the jump; with the bound dropped it bisects down to adjacent floats
+    /// and refuses the root.
+    #[test]
+    fn a_tail_bound_above_the_logarithms_rounding_is_resolvable_3216() {
+        let q = 5.0;
+        let log_target = smaller_tail_log_target(q);
+        let r = 1e-10;
+        assert!(r > ANCHOR_LOG_RESIDUAL_TOL.max(anchor_residual_rounding(log_target, 1)));
+        let solve = |bound: f64| {
+            solve_log_tail_root(
+                q + 3.0,
+                true,
+                |alpha| perturbed_survival_tail(alpha, q, r, bound).log_residual(true, log_target),
+                "perturbed survival tail",
+                String::new,
+            )
+        };
+        let refused = solve(0.0).expect_err("uncharged, no float resolves the residual");
+        assert!(refused.contains("adjacent floats"), "{refused}");
+        // `|T − Φ(−α)| ≤ (e^r − 1)·Φ(−α)`, the bound the tail declares.
+        let (root, _) = solve(r.exp_m1()).expect("charged, the jump resolves");
+        // A float at the jump carries a residual within the tail's bound, so the
+        // root is within that bound's `α`-width of the true one.
+        let first = normal_pdf(q) / normal_cdf(-q);
+        assert!(
+            (root - q).abs() * first <= 2.0 * r.exp_m1(),
+            "root {root} vs {q}: residual width {:e} against the bound {:e}",
+            (root - q).abs() * first,
+            r.exp_m1()
+        );
+    }
+
+    /// gam#3216 (b), from PR #3374: a probe whose tail underflowed keeps its
+    /// residual's sign. With `T(α) = Φ(−α)` and the root at `α = 5`, a solve
+    /// seeded where `Φ(−α)` rounds to zero reads `log T = −∞`, which says the
+    /// root lies below, narrows its bracket and reaches the root; the old
+    /// residual refused the seed and ended the solve.
+    #[test]
+    fn a_far_probe_whose_tail_underflows_keeps_the_bracket_3216() {
+        let q = 5.0;
+        let seed = 60.0;
+        let log_target = smaller_tail_log_target(q);
+        assert_eq!(normal_cdf(-seed), 0.0, "the seed's tail must underflow");
+        let tail = |alpha: f64| perturbed_survival_tail(alpha, q, 0.0, 0.0);
+        let (root, evaluations) = solve_log_tail_root(
+            seed,
+            true,
+            |alpha| tail(alpha).log_residual(true, log_target),
+            "underflowing survival tail",
+            String::new,
+        )
+        .expect("the underflowed seed narrows the bracket instead of ending the solve");
+        let at_root = tail(root)
+            .log_residual(true, log_target)
+            .expect("finite residual at the root");
+        let root_resolution = 4.0 * at_root.rounding.max(ANCHOR_LOG_RESIDUAL_TOL) / at_root.first.abs();
+        assert!(
+            (root - q).abs() <= root_resolution,
+            "root {root} vs {q} after {evaluations} evaluations (resolution {root_resolution:e})"
+        );
+        let underflowed = tail(seed).log_residual(true, log_target).expect("a sign, not an error");
+        assert!(underflowed.value == f64::NEG_INFINITY && underflowed.rounding == f64::INFINITY);
+    }
 
     // ── The closed-form implicit derivatives the table's orders ≤ 3 are pinned against ──
 

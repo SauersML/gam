@@ -251,14 +251,6 @@ pub(crate) enum CostStallVerdict {
 /// it goes with the `opt` bump that brings the window-free stall rule (#3018).
 pub(crate) const COST_STALL_WINDOW: usize = 6;
 
-/// One sample the cost-stall guard judges (#3018).
-///
-/// `resolution` bounds the evaluation error of `value`, `|V̂ − V| ≤ resolution`:
-/// the objective band the evaluation's own evidence forms, or the criterion's
-/// resolution `τ` where it publishes none ([`sample_resolution`]).
-/// `grad_norm` is the bound-projected gradient norm. `trusted` is the inner
-/// solve's convergence flag for this sample (#1426). `curvature_psd` is its
-/// reduced-Hessian verdict, `Some(false)` for a certified strict saddle.
 /// Whether `value`, computed to within `resolution`, is resolvably below
 /// `reference`, computed to within `reference_resolution` (#3018).
 ///
@@ -283,8 +275,12 @@ pub(crate) fn resolvably_below(
 /// `R` on its evaluation error, `|V̂ − V| ≤ R`. It is the objective band the
 /// evaluation's own evidence forms
 /// ([`outer_objective_band`](super::decrement_bands::outer_objective_band)), and
-/// the criterion's resolution `tau` where it forms none
-/// ([`super::run::outer_criterion_resolution`]).
+/// where it forms none, the criterion's statistical resolution `tau`
+/// ([`super::run::outer_criterion_resolution`]) floored at the value's own
+/// representation error ([`value_representation_band`](super::decrement_bands::value_representation_band)).
+/// The floor is what a route that declares no size, `tau = 0`, is charged: its
+/// unbanded values used to carry a resolution of `0`, which reads every difference
+/// as resolved progress and so never stalled (#3286).
 pub(crate) fn sample_resolution(
     config: &OuterConfig,
     tau: f64,
@@ -295,9 +291,16 @@ pub(crate) fn sample_resolution(
         .ok()
         .map(|band| band.total())
         .filter(|band| band.is_finite())
-        .unwrap_or(tau)
+        .unwrap_or_else(|| tau.max(super::decrement_bands::value_representation_band(cost)))
 }
 
+/// One sample the cost-stall guard judges (#3018).
+///
+/// `resolution` bounds the evaluation error of `value`, `|V̂ − V| ≤ resolution`
+/// ([`sample_resolution`]). `grad_norm` is the bound-projected gradient norm.
+/// `trusted` is the inner solve's convergence flag for this sample (#1426).
+/// `curvature_psd` is its reduced-Hessian verdict, `Some(false)` for a certified
+/// strict saddle.
 pub(crate) struct StallSample<'a> {
     pub(crate) point: &'a Array1<f64>,
     pub(crate) value: f64,
@@ -397,9 +400,9 @@ pub(crate) struct CostStallGuard {
     /// `1e-3·(1 + |V|)` term and a probe-noise widening, none derived; a stall
     /// claimed points the certificate then refused.
     claim_config: OuterConfig,
-    /// The criterion's resolution `τ` ([`super::run::outer_criterion_resolution`]):
-    /// the resolution of a value whose evaluation forms no objective band
-    /// ([`Self::value_resolution`], #3018).
+    /// The criterion's statistical resolution `τ` ([`super::run::outer_criterion_resolution`]):
+    /// the resolution of a value whose evaluation forms no objective band, floored at
+    /// that value's own representation error ([`Self::value_resolution`], #3018, #3286).
     resolution: f64,
     /// Set when a replay cut proved that reopening the window replays a
     /// deterministic procedure from a bit-identical incumbent. From then on the
@@ -783,8 +786,8 @@ impl CostStallGuard {
     }
 
     /// The resolution of `cost` as its evaluation computed it (#3018): the
-    /// objective band its `evidence` forms, or the guard's `τ` where it forms none
-    /// ([`sample_resolution`]).
+    /// objective band its `evidence` forms, or the guard's `τ` floored at the value's
+    /// representation error where it forms none ([`sample_resolution`]).
     pub(crate) fn value_resolution(
         &self,
         cost: f64,
@@ -2626,10 +2629,12 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
     /// [`CostStallGuard`] stationarity test consumes. See the matching field on
     /// [`OuterFirstOrderBridge`].
     pub(crate) cost_stall_bounds: Option<(Array1<f64>, Array1<f64>)>,
-    /// The criterion's absolute resolution `τ`
+    /// The criterion's statistical resolution `τ_stat`
     /// ([`super::run::outer_criterion_resolution`]) for the online decrement
-    /// stop, or `None` on a route that does not apply it (which is every route
-    /// with no synchronized analytic Hessian at the evaluated point). See
+    /// stop, which decides at the resolution it and each evaluated value's band
+    /// give ([`outer_resolution`](super::decrement_bands::outer_resolution),
+    /// #3286), or `None` on a route that does not apply the stop (which is every
+    /// route with no synchronized analytic Hessian at the evaluated point). See
     /// [`ARC_CURVATURE_STATIONARY_SENTINEL`].
     pub(crate) curvature_stationary_resolution: Option<f64>,
     /// The last evaluated trial, held until `opt::Arc`'s ratio test decides it,
@@ -3054,7 +3059,17 @@ impl OuterSecondOrderBridge<'_> {
         evidence: Option<&crate::estimate::outer_eval_capture::CertificateEvidence>,
         criterion_stalled: bool,
     ) -> Option<ObjectiveEvalError> {
-        let resolution = self.curvature_stationary_resolution?;
+        let tau_stat = self.curvature_stationary_resolution?;
+        // The resolution at this point's own value (#3286): at a route that
+        // declares no size, its arithmetic resolution, never zero.
+        let resolution = super::decrement_bands::outer_resolution(
+            tau_stat,
+            super::decrement_bands::outer_value_band(
+                self.cost_stall.as_ref()?.claim_config(),
+                cost,
+                evidence,
+            ),
+        );
         if hessian_psd != Some(true)
             || !cost.is_finite()
             || !resolution.is_finite()
@@ -3217,9 +3232,12 @@ impl OuterSecondOrderBridge<'_> {
         &mut self,
         x: &Array1<f64>,
     ) -> Option<ObjectiveEvalError> {
-        let objective_resolution = self.curvature_stationary_resolution?;
+        let tau_stat = self.curvature_stationary_resolution?;
         let bounds = self.cost_stall_bounds.clone()?;
         let guard = self.cost_stall.as_mut()?;
+        // The resolution at the incumbent's own value (#3286).
+        let objective_resolution =
+            super::decrement_bands::outer_resolution(tau_stat, guard.best_resolution());
         if !guard.take_strict_saddle_refusal()
             || !(guard.best_grad_norm() <= guard.stationarity_band())
             || !guard.best_value().is_finite()
@@ -3500,7 +3518,20 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         // from. No resolution configured keeps the arithmetic shift alone.
         let curvature_resolution = self
             .curvature_stationary_resolution
-            .map_or(0.0, super::run::criterion_curvature_resolution);
+            .map_or(0.0, |tau_stat| {
+                // At this trial's own value (#3286).
+                let band = match self.cost_stall.as_ref() {
+                    Some(guard) => super::decrement_bands::outer_value_band(
+                        guard.claim_config(),
+                        eval.cost,
+                        Some(&evidence),
+                    ),
+                    None => super::decrement_bands::value_representation_band(eval.cost),
+                };
+                super::run::criterion_curvature_resolution(
+                    super::decrement_bands::outer_resolution(tau_stat, band),
+                )
+            });
         let hessian_psd = hessian.as_ref().and_then(|dense| {
             reduced_hessian_psd_at_point(
                 x,
@@ -4448,8 +4479,9 @@ pub(crate) fn rail_projected_gradient_norm(
 /// — the certificate's single owner of "resolvable curvature" (#2748) — rather
 /// than at the arithmetic shift alone (#1082).
 ///
-/// The search route passes `2·ε_f`, with `ε_f = τ`
-/// (`run::outer_criterion_resolution`) the criterion's own resolution. Along an eigenvector of `λ < 0` at a stationary
+/// The search route passes `2·ε_f`, with `ε_f` the criterion's own resolution at the
+/// evaluated value (`decrement_bands::outer_resolution`, #3286). Along an eigenvector
+/// of `λ < 0` at a stationary
 /// point the claim predicts the decrease `½|λ|α²`, and the largest step the
 /// negative-curvature adjudication takes is one e-fold of `log λ` (`α = 1`), so
 /// a direction with `½|λ| ≤ ε_f` predicts nothing the criterion can represent
@@ -5086,6 +5118,29 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             eval.psi_gradient.as_ref(),
             eval.cost,
         )?;
+        // The EFS step arrives whole, with no box on its length (#2902). The
+        // only bound on it is the outer domain, the same box opt's fixed-point
+        // loop projects every applied step onto, so the step is clipped to that
+        // domain here and the progress test, the resolution test and the cost
+        // line search all read the step that can actually be taken.
+        let raw_step = {
+            let (lower, upper) =
+                super::run::outer_search_bounds_template(self.config, self.layout.n_params);
+            if lower.len() != x.len() || upper.len() != x.len() {
+                return Err(ObjectiveEvalError::fatal(format!(
+                    "outer EFS eval failed: outer domain dimension mismatch \
+                     (parameters={}, lower={}, upper={})",
+                    x.len(),
+                    lower.len(),
+                    upper.len(),
+                )));
+            }
+            let mut clipped = raw_step;
+            for (i, delta) in clipped.iter_mut().enumerate() {
+                *delta = (x[i] + *delta).max(lower[i]).min(upper[i]) - x[i];
+            }
+            clipped
+        };
         let current_cost = eval.cost;
         // #2241 — an objective may certify that consecutive inner solves
         // returned to the same banked incumbent after non-monotone boundary

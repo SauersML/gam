@@ -2524,6 +2524,13 @@ impl WorkingModelSurvival {
         // residual accurate enough for the outer LAML envelope check.
         let mut grad = Array1::<f64>::zeros(p);
         let mut grad_comp = Array1::<f64>::zeros(p);
+        // The score is the difference of two sums that each keep the data's
+        // magnitude at the optimum: the cumulative-hazard (risk-set) term
+        // `X_exitᵀw_exit − X_entryᵀw_entry` and the event term
+        // `X_exitᵀw_event + X_derivᵀ(w_event/η′)`. Their norms, not the
+        // cancelled score's, are the certificate's natural scale (gam#3451).
+        let mut interval_score = Array1::<f64>::zeros(p);
+        let mut event_score = Array1::<f64>::zeros(p);
         let mut row_exit = vec![0.0_f64; p];
         let mut row_entry = vec![0.0_f64; p];
         let mut row_derivative = vec![0.0_f64; p];
@@ -2543,10 +2550,13 @@ impl WorkingModelSurvival {
             self.fill_entry_row(i, &mut row_entry);
             self.fill_derivative_row(i, &mut row_derivative);
             for j in 0..p {
-                let contribution = w_interval_exit * row_exit[j]
-                    - w_interval_entry * row_entry[j]
-                    - w_event_exit * row_exit[j]
-                    - w_event_derivative * row_derivative[j];
+                let interval_part =
+                    w_interval_exit * row_exit[j] - w_interval_entry * row_entry[j];
+                let event_part =
+                    w_event_exit * row_exit[j] + w_event_derivative * row_derivative[j];
+                interval_score[j] += interval_part;
+                event_score[j] += event_part;
+                let contribution = interval_part - event_part;
                 let t = grad[j] + contribution;
                 if grad[j].abs() >= contribution.abs() {
                     grad_comp[j] += (grad[j] - t) + contribution;
@@ -2560,10 +2570,9 @@ impl WorkingModelSurvival {
 
         h += &self.derivative_xt_diag_x(w_event_outer);
 
-        // Norm of the unpenalized score, captured before adding the penalty
-        // contribution, for the scale-invariant convergence certificate
-        // (||score||_2 + ||S*beta||_2).
-        let score_norm = array1_l2_norm(&grad);
+        // The score's operands, for the scale-invariant convergence
+        // certificate (||interval||_2 + ||event||_2 + ||S*beta||_2).
+        let score_operand_norm = array1_l2_norm(&interval_score) + array1_l2_norm(&event_score);
 
         let penaltygrad = self.penalties.gradient(beta);
         // The WorkingState contract (`gam_solve::pirls::WorkingState`) defines
@@ -2602,15 +2611,21 @@ impl WorkingModelSurvival {
             penalty_term: penalty_quadratic_form,
             firth: gam_solve::pirls::FirthDiagnostics::Inactive,
             hessian_curvature: gam_solve::pirls::HessianCurvatureKind::Observed,
-            gradient_natural_scale: score_norm + penaltygrad_norm,
+            gradient_natural_scale: score_operand_norm + penaltygrad_norm,
         })
     }
 
-    /// Compute the third-derivative correction matrix for a given mode response `u_k`.
-    ///
-    /// This is the directional derivative of the unpenalized NLL Hessian w.r.t.
-    /// beta along direction `u_k = -H^{-1} A_k beta_hat`. The returned matrix B
+    /// Directional derivative `D_β H[u_k]` of the unpenalized NLL Hessian along
+    /// the mode response `u_k = -H^{-1} A_k beta_hat`. The returned matrix B
     /// satisfies `dH/drho_k = A_k + B`.
+    ///
+    /// On the linear Royston-Parmar row
+    /// `w·[exp(η1) − 1{has_entry}·exp(η0) − δ·(η1 + log s)]` the Hessian is
+    /// `exp(η1)·a1a1ᵀ − 1{has_entry}·exp(η0)·a0a0ᵀ + δ·ddᵀ/s²`, so
+    /// `D H[u] = exp(η1)(a1ᵀu)·a1a1ᵀ − 1{has_entry}·exp(η0)(a0ᵀu)·a0a0ᵀ
+    /// − 2δ·(dᵀu)·ddᵀ/s³`. On the floored clamp branch (slope 0) the event
+    /// Hessian block is identically zero in a neighborhood of β, so its
+    /// directional derivative vanishes and the event term is absent.
     ///
     /// Called via [`SurvivalDerivProvider`] which adapts the sign convention
     /// from the unified `HessianDerivativeProvider` trait (positive `v_k`) to
@@ -2626,28 +2641,12 @@ impl WorkingModelSurvival {
         let eta_entry = self.entry_dot(beta) + &self.offset_eta_entry;
         let eta_exit = self.exit_dot(beta) + &self.offset_eta_exit;
         let deriv_raw = self.derivative_dot(beta) + &self.offset_derivative_exit;
-        let exp_entry = eta_entry.mapv(f64::exp);
-        let exp_exit = eta_exit.mapv(f64::exp);
         let guard = self.derivative_guard();
         let (_, _, derivative_band) = self.predictor_bands(beta);
-
-        let jac = Array1::<f64>::ones(p);
-        let curvature = Array1::<f64>::zeros(p);
-        let third = Array1::<f64>::zeros(p);
 
         let mut row_exit = vec![0.0_f64; p];
         let mut row_entry = vec![0.0_f64; p];
         let mut row_derivative = vec![0.0_f64; p];
-        let mut ge = vec![0.0_f64; p];
-        let mut gs = vec![0.0_f64; p];
-        let mut gsd = vec![0.0_f64; p];
-        let mut he = vec![0.0_f64; p];
-        let mut hs = vec![0.0_f64; p];
-        let mut hsd = vec![0.0_f64; p];
-        let mut te = vec![0.0_f64; p];
-        let mut ts = vec![0.0_f64; p];
-        let mut tsd = vec![0.0_f64; p];
-
         let mut b_dir = Array2::<f64>::zeros((p, p));
 
         for i in 0..n {
@@ -2655,56 +2654,17 @@ impl WorkingModelSurvival {
             if w_i <= 0.0 {
                 continue;
             }
-            let has_entry = !self.entry_at_origin[i];
-            let mut deta_e = 0.0_f64;
-            let mut deta_s = 0.0_f64;
-            let mut ds = 0.0_f64;
             self.fill_exit_row(i, &mut row_exit);
             self.fill_entry_row(i, &mut row_entry);
             self.fill_derivative_row(i, &mut row_derivative);
-            for j in 0..p {
-                ge[j] = row_exit[j] * jac[j];
-                gs[j] = row_entry[j] * jac[j];
-                gsd[j] = row_derivative[j] * jac[j];
-                he[j] = row_exit[j] * curvature[j];
-                hs[j] = row_entry[j] * curvature[j];
-                hsd[j] = row_derivative[j] * curvature[j];
-                te[j] = row_exit[j] * third[j];
-                ts[j] = row_entry[j] * third[j];
-                tsd[j] = row_derivative[j] * third[j];
-                deta_e += ge[j] * u_k[j];
-                if has_entry {
-                    deta_s += gs[j] * u_k[j];
-                }
-                ds += gsd[j] * u_k[j];
+
+            let exit_scale = w_i * eta_exit[i].exp() * survival_row_dot(&row_exit, u_k);
+            add_scaled_row_outer(&mut b_dir, &row_exit, exit_scale);
+            if !self.entry_at_origin[i] {
+                let entry_scale = w_i * eta_entry[i].exp() * survival_row_dot(&row_entry, u_k);
+                add_scaled_row_outer(&mut b_dir, &row_entry, -entry_scale);
             }
 
-            // Interval part: d/dbeta [ exp(eta) * (g g^T + diag(h)) ][u_k]
-            for r in 0..p {
-                let dge_r = he[r] * u_k[r];
-                let dgs_r = hs[r] * u_k[r];
-                let dhe_r = te[r] * u_k[r];
-                let dhs_r = ts[r] * u_k[r];
-                for c in 0..p {
-                    let dge_c = he[c] * u_k[c];
-                    let dgs_c = hs[c] * u_k[c];
-                    let mut d_h_rc =
-                        exp_exit[i] * (deta_e * ge[r] * ge[c] + dge_r * ge[c] + ge[r] * dge_c);
-                    if r == c {
-                        d_h_rc += exp_exit[i] * (deta_e * he[r] + dhe_r);
-                    }
-                    if has_entry {
-                        d_h_rc -=
-                            exp_entry[i] * (deta_s * gs[r] * gs[c] + dgs_r * gs[c] + gs[r] * dgs_c);
-                        if r == c {
-                            d_h_rc -= exp_entry[i] * (deta_s * hs[r] + dhs_r);
-                        }
-                    }
-                    b_dir[[r, c]] += w_i * d_h_rc;
-                }
-            }
-
-            // Event part: d/dbeta [ gsd gsd^T / s^2 - diag(he) - diag(hsd / s) ][u_k]
             let (s_i, s_slope) = self
                 .stabilized_structural_derivative(deriv_raw[i], derivative_band[i])
                 .unwrap_or((deriv_raw[i], 1.0));
@@ -2715,10 +2675,6 @@ impl WorkingModelSurvival {
                 )));
             }
             if self.event_target[i] > 0 && s_slope != 0.0 {
-                // On the floored clamp branch (slope 0) the event Hessian
-                // block is identically zero in a neighborhood of β, so its
-                // directional derivative vanishes and the whole event part is
-                // skipped.
                 if s_i < self.derivative_floor(true, derivative_band[i]) {
                     return Err(EstimationError::ParameterConstraintViolation(format!(
                         "survival monotonicity violated in unified trace contraction at row {i}: \
@@ -2727,23 +2683,9 @@ impl WorkingModelSurvival {
                     )));
                 }
                 let inv_s = 1.0 / s_i;
-                let inv_s2 = inv_s * inv_s;
-                let inv_s3 = inv_s2 * inv_s;
-                for r in 0..p {
-                    let dgd_r = hsd[r] * u_k[r];
-                    let dtsd_r = tsd[r] * u_k[r];
-                    let dte_r = te[r] * u_k[r];
-                    for c in 0..p {
-                        let dgd_c = hsd[c] * u_k[c];
-                        let mut d_h_rc = (dgd_r * gsd[c] + gsd[r] * dgd_c) * inv_s2
-                            - 2.0 * gsd[r] * gsd[c] * ds * inv_s3;
-                        if r == c {
-                            d_h_rc += -dte_r;
-                            d_h_rc += -(dtsd_r * inv_s - hsd[r] * ds * inv_s2);
-                        }
-                        b_dir[[r, c]] += w_i * d_h_rc;
-                    }
-                }
+                let event_scale =
+                    -2.0 * w_i * survival_row_dot(&row_derivative, u_k) * inv_s * inv_s * inv_s;
+                add_scaled_row_outer(&mut b_dir, &row_derivative, event_scale);
             }
         }
 
@@ -2779,21 +2721,6 @@ impl WorkingModelSurvival {
         let mut row_derivative = vec![0.0_f64; p];
         let mut d2h = Array2::<f64>::zeros((p, p));
 
-        let dot = |row: &[f64], direction: &Array1<f64>| {
-            row.iter().zip(direction.iter()).map(|(a, b)| a * b).sum::<f64>()
-        };
-        let add_scaled_outer = |target: &mut Array2<f64>, row: &[f64], scale: f64| {
-            for r in 0..p {
-                let scaled = scale * row[r];
-                if scaled == 0.0 {
-                    continue;
-                }
-                for c in 0..p {
-                    target[[r, c]] += scaled * row[c];
-                }
-            }
-        };
-
         for i in 0..n {
             let w_i = self.sampleweight[i];
             if w_i <= 0.0 {
@@ -2803,12 +2730,17 @@ impl WorkingModelSurvival {
             self.fill_entry_row(i, &mut row_entry);
             self.fill_derivative_row(i, &mut row_derivative);
 
-            let exit_scale = w_i * eta_exit[i].exp() * dot(&row_exit, u) * dot(&row_exit, v);
-            add_scaled_outer(&mut d2h, &row_exit, exit_scale);
+            let exit_scale = w_i
+                * eta_exit[i].exp()
+                * survival_row_dot(&row_exit, u)
+                * survival_row_dot(&row_exit, v);
+            add_scaled_row_outer(&mut d2h, &row_exit, exit_scale);
             if !self.entry_at_origin[i] {
-                let entry_scale =
-                    w_i * eta_entry[i].exp() * dot(&row_entry, u) * dot(&row_entry, v);
-                add_scaled_outer(&mut d2h, &row_entry, -entry_scale);
+                let entry_scale = w_i
+                    * eta_entry[i].exp()
+                    * survival_row_dot(&row_entry, u)
+                    * survival_row_dot(&row_entry, v);
+                add_scaled_row_outer(&mut d2h, &row_entry, -entry_scale);
             }
 
             let (s_i, s_slope) = self
@@ -2831,11 +2763,11 @@ impl WorkingModelSurvival {
                 let inv_s2 = 1.0 / (s_i * s_i);
                 let event_scale = 6.0
                     * w_i
-                    * dot(&row_derivative, u)
-                    * dot(&row_derivative, v)
+                    * survival_row_dot(&row_derivative, u)
+                    * survival_row_dot(&row_derivative, v)
                     * inv_s2
                     * inv_s2;
-                add_scaled_outer(&mut d2h, &row_derivative, event_scale);
+                add_scaled_row_outer(&mut d2h, &row_derivative, event_scale);
             }
         }
 
@@ -3488,9 +3420,52 @@ pub fn assemble_competing_risks_cif(
     })
 }
 
+/// Aalen-Johansen CIF assembly from per-endpoint cumulative hazards that carry
+/// no rounding band.
+///
+/// Without a band there is no scale on which a decrease could be rounding, so
+/// the check is exact: every value must be `>= 0` and every endpoint's
+/// cumulative hazard must be nondecreasing along each row, or the assembly is
+/// refused with [`SurvivalError::NonMonotoneCumulativeHazard`]. Plateaus
+/// (equal consecutive values) are accepted. A producer that knows the rounding
+/// of its own evaluations passes it to
+/// [`assemble_competing_risks_cif_from_endpoints_with_rounding`] instead.
 pub fn assemble_competing_risks_cif_from_endpoints(
     times: ArrayView1<'_, f64>,
     cumulative_hazards: &[Array2<f64>],
+) -> Result<CompetingRisksCifResult, SurvivalError> {
+    assemble_competing_risks_cif_banded(times, cumulative_hazards, None)
+}
+
+/// Aalen-Johansen CIF assembly from per-endpoint cumulative hazards, each entry
+/// carrying the producer's certified rounding band.
+///
+/// `rounding_bands[k][[row, j]] >= 0` bounds `|computed - exact|` for
+/// `cumulative_hazards[k][[row, j]]`. The exact cumulative hazard is
+/// nondecreasing, so two computed values can read as a decrease only by the
+/// sum of their bands. For one row and one endpoint, the value `H_j` is
+/// compared with the running maximum `H_m` (the value the recurrence carries
+/// forward) and refused when
+///
+/// ```text
+/// H_j - H_m < -(band_j + band_m)      or      H_j < -band_j
+/// ```
+///
+/// A decrease inside the band is clamped to a zero increment. The band is per
+/// entry, so whether one subject's curve is accepted never depends on the
+/// other subjects in the batch (#3529).
+pub fn assemble_competing_risks_cif_from_endpoints_with_rounding(
+    times: ArrayView1<'_, f64>,
+    cumulative_hazards: &[Array2<f64>],
+    rounding_bands: &[Array2<f64>],
+) -> Result<CompetingRisksCifResult, SurvivalError> {
+    assemble_competing_risks_cif_banded(times, cumulative_hazards, Some(rounding_bands))
+}
+
+fn assemble_competing_risks_cif_banded(
+    times: ArrayView1<'_, f64>,
+    cumulative_hazards: &[Array2<f64>],
+    rounding_bands: Option<&[Array2<f64>]>,
 ) -> Result<CompetingRisksCifResult, SurvivalError> {
     let n_endpoints = cumulative_hazards.len();
     if n_endpoints == 0 || times.is_empty() {
@@ -3519,11 +3494,28 @@ pub fn assemble_competing_risks_cif_from_endpoints(
         }
     }
 
-    let max_abs_hazard = cumulative_hazards
-        .iter()
-        .flat_map(|endpoint_hazard| endpoint_hazard.iter())
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    let monotone_tolerance = 1.0e-10_f64 * max_abs_hazard.max(1.0);
+    if let Some(bands) = rounding_bands {
+        if bands.len() != n_endpoints {
+            return Err(SurvivalError::DimensionMismatch);
+        }
+        for band in bands {
+            if band.dim() != (n_rows, n_times) {
+                return Err(SurvivalError::DimensionMismatch);
+            }
+            if band.iter().any(|value| !value.is_finite()) {
+                return Err(SurvivalError::NonFiniteInput);
+            }
+            if band.iter().any(|value| *value < 0.0) {
+                return Err(SurvivalError::InvalidInput {
+                    reason: "competing-risks cumulative-hazard rounding bands must be nonnegative"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    let band_at = |endpoint: usize, row: usize, time_idx: usize| -> f64 {
+        rounding_bands.map_or(0.0, |bands| bands[endpoint][[row, time_idx]])
+    };
     let mut cif: Vec<Array2<f64>> = (0..n_endpoints)
         .map(|_| Array2::<f64>::zeros((n_rows, n_times)))
         .collect();
@@ -3544,19 +3536,27 @@ pub fn assemble_competing_risks_cif_from_endpoints(
         let mut cif_flat = vec![0.0_f64; n_endpoints * n_times];
         let mut surv_row = vec![0.0_f64; n_times];
         let mut previous_cif = vec![0.0_f64; n_endpoints];
+        // `previous_cumulative` is the running maximum the recurrence carries
+        // forward (it starts at the exact origin `H(0) = 0`, band 0), and
+        // `previous_band` is the band of the entry that set it.
         let mut previous_cumulative = vec![0.0_f64; n_endpoints];
+        let mut previous_band = vec![0.0_f64; n_endpoints];
         let mut increments = vec![0.0_f64; n_endpoints];
         let mut previous_total_cumulative = 0.0_f64;
         for time_idx in 0..n_times {
             let mut total_increment = 0.0_f64;
             for endpoint in 0..n_endpoints {
                 let current = cumulative_hazards[endpoint][[row, time_idx]];
-                if current < -monotone_tolerance {
+                let band = band_at(endpoint, row, time_idx);
+                if current < -band {
                     return Err(SurvivalError::NonMonotoneCumulativeHazard);
                 }
                 let raw_increment = current - previous_cumulative[endpoint];
-                if raw_increment < -monotone_tolerance {
+                if raw_increment < -(band + previous_band[endpoint]) {
                     return Err(SurvivalError::NonMonotoneCumulativeHazard);
+                }
+                if raw_increment >= 0.0 {
+                    previous_band[endpoint] = band;
                 }
                 let increment = raw_increment.max(0.0);
                 increments[endpoint] = increment;
@@ -3698,6 +3698,24 @@ impl PirlsWorkingModel for WorkingModelSurvival {
                 state.hessian_curvature = gam_solve::pirls::HessianCurvatureKind::Fisher;
                 Ok(state)
             }
+        }
+    }
+}
+
+/// `rowᵀ direction` for one dense design row of the survival working model.
+fn survival_row_dot(row: &[f64], direction: &Array1<f64>) -> f64 {
+    row.iter().zip(direction.iter()).map(|(a, b)| a * b).sum::<f64>()
+}
+
+/// `target += scale · row rowᵀ` for one dense design row.
+fn add_scaled_row_outer(target: &mut Array2<f64>, row: &[f64], scale: f64) {
+    for (r, &row_r) in row.iter().enumerate() {
+        let scaled = scale * row_r;
+        if scaled == 0.0 {
+            continue;
+        }
+        for (c, &row_c) in row.iter().enumerate() {
+            target[[r, c]] += scaled * row_c;
         }
     }
 }
@@ -4422,6 +4440,95 @@ mod tests {
         let err = assemble_competing_risks_cif(times.view(), cumulative.view())
             .expect_err("nonmonotone cumulative hazard should be rejected");
         assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
+    }
+
+    /// #3529: whether a row's decrease is refused depends only on that row's
+    /// own values and bands. Row 0 carries `H ~ 1e3`, row 1 a genuine relative
+    /// decrease of `1e-5` at `H ~ 1e-3`. The old batch-wide tolerance
+    /// `1e-10 * max|H| = 1e-7` let row 1's `1e-8` decrease through as a zero
+    /// increment.
+    #[test]
+    fn competing_risks_cif_refuses_a_small_row_decrease_beside_a_large_row_3529() {
+        let times = array![1.0, 2.0, 3.0];
+        let row1_peak = 1.0e-3_f64;
+        let row1_after = row1_peak * (1.0 - 1.0e-5);
+        let cumulative = vec![array![[500.0, 900.0, 1000.0], [0.5e-3, row1_peak, row1_after]]];
+        let err = assemble_competing_risks_cif_from_endpoints(times.view(), &cumulative)
+            .expect_err("a 1e-5 relative decrease is not rounding");
+        assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
+
+        // Rounding bands of `8ε|H|` per entry, the scale of an f64 evaluation, sit
+        // far below the decrease, so the banded assembly refuses it too.
+        let bands = vec![cumulative[0].mapv(|value| 8.0 * f64::EPSILON * value.abs())];
+        let err = assemble_competing_risks_cif_from_endpoints_with_rounding(
+            times.view(),
+            &cumulative,
+            &bands,
+        )
+        .expect_err("a decrease above the entries' rounding bands is refused");
+        assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
+
+        // Removing row 1's decrease leaves row 0 unchanged and assembles.
+        let mut monotone = cumulative.clone();
+        monotone[0][[1, 2]] = row1_peak;
+        assemble_competing_risks_cif_from_endpoints(times.view(), &monotone)
+            .expect("nondecreasing rows assemble");
+    }
+
+    /// #3529: a decrease within the sum of the two entries' bands is rounding;
+    /// it is clamped to a zero increment, so the CIF is flat across it. The
+    /// same values without a band are refused, and a decrease just past the
+    /// band is refused with it.
+    #[test]
+    fn competing_risks_cif_clamps_a_decrease_inside_its_rounding_band_3529() {
+        let times = array![1.0, 2.0, 3.0, 4.0];
+        let peak = 0.25_f64;
+        let band_value = 4.0 * f64::EPSILON * peak;
+        let dip = peak - band_value;
+        let cumulative = vec![array![[0.1, peak, dip, 0.4]], array![[0.05, 0.1, 0.2, 0.3]]];
+        let bands: Vec<Array2<f64>> = cumulative
+            .iter()
+            .map(|hazard| hazard.mapv(|_| band_value))
+            .collect();
+
+        let result = assemble_competing_risks_cif_from_endpoints_with_rounding(
+            times.view(),
+            &cumulative,
+            &bands,
+        )
+        .expect("a decrease inside the rounding band assembles");
+        assert!(result.cif[0][[0, 2]] >= result.cif[0][[0, 1]]);
+        for time_idx in 0..times.len() {
+            let total = result.cif[0][[0, time_idx]]
+                + result.cif[1][[0, time_idx]]
+                + result.overall_survival[[0, time_idx]];
+            assert_eq!(total, 1.0, "closure at time_idx={time_idx}");
+        }
+
+        let err = assemble_competing_risks_cif_from_endpoints(times.view(), &cumulative)
+            .expect_err("without a band any strict decrease is refused");
+        assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
+
+        let mut past_band = cumulative.clone();
+        past_band[0][[0, 2]] = peak - 4.0 * band_value;
+        let err = assemble_competing_risks_cif_from_endpoints_with_rounding(
+            times.view(),
+            &past_band,
+            &bands,
+        )
+        .expect_err("a decrease past both bands is refused");
+        assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
+
+        let mut negative_band = bands.clone();
+        negative_band[1][[0, 0]] = -1.0;
+        assert!(
+            assemble_competing_risks_cif_from_endpoints_with_rounding(
+                times.view(),
+                &cumulative,
+                &negative_band,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5466,4 +5573,90 @@ mod tests {
         }
     }
 
+    /// gam#3451: at an interior optimum of an unpenalised survival fit the score
+    /// cancels to rounding, so a scale built from that score reads the certificate
+    /// as about 1 on a fully converged fit. The scale is the norm of the operands
+    /// the score is a difference of; the event operand's intercept entry alone is
+    /// the weighted event count, so the scale can never fall below it.
+    #[test]
+    fn unpenalised_survival_optimum_certifies_on_the_score_operands_3451() {
+        let age_entry = Array1::<f64>::zeros(10);
+        let age_exit = array![0.3_f64, 0.5, 0.7, 0.9, 1.1, 1.3, 1.6, 1.9, 2.2, 2.5];
+        let event_target = array![1u8, 1, 0, 1, 0, 1, 1, 0, 1, 1];
+        let event_competing = Array1::<u8>::zeros(10);
+        let sampleweight = Array1::<f64>::ones(10);
+        let rows = age_exit.len();
+        let mut x_entry = Array2::<f64>::zeros((rows, 2));
+        let mut x_exit = Array2::<f64>::zeros((rows, 2));
+        let mut x_derivative = Array2::<f64>::zeros((rows, 2));
+        for i in 0..rows {
+            x_exit[[i, 0]] = 1.0;
+            x_exit[[i, 1]] = age_exit[i].ln();
+            x_derivative[[i, 1]] = 1.0 / age_exit[i];
+        }
+        // No delayed entry: the entry rows are left at zero.
+        x_entry.fill(0.0);
+        let model = survival_model_with_offsets(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
+            None,
+            PenaltyBlocks::new(Vec::new()),
+            SurvivalMonotonicityPenalty { tolerance: 1e-8 },
+            SurvivalSpec::Net,
+        )
+        .expect("model build");
+
+        // Damped Newton on the (unpenalised) Weibull likelihood to its optimum.
+        let mut beta = array![0.0_f64, 1.0];
+        for _ in 0..100 {
+            let state = model.update_state(&beta).expect("state");
+            let h = state.hessian.to_dense();
+            let g = &state.gradient;
+            let det = h[[0, 0]] * h[[1, 1]] - h[[0, 1]] * h[[1, 0]];
+            let step = array![
+                (h[[1, 1]] * g[0] - h[[0, 1]] * g[1]) / det,
+                (h[[0, 0]] * g[1] - h[[1, 0]] * g[0]) / det,
+            ];
+            let mut t = 1.0_f64;
+            loop {
+                let trial = &beta - &(t * &step);
+                match model.update_state(&trial) {
+                    Ok(next) if next.deviance <= state.deviance => {
+                        beta = trial;
+                        break;
+                    }
+                    _ if t < f64::EPSILON => break,
+                    _ => t *= 0.5,
+                }
+            }
+        }
+
+        let state = model.update_state(&beta).expect("state at the optimum");
+        let g_norm = state.gradient.dot(&state.gradient).sqrt();
+        let weighted_events: f64 = event_target
+            .iter()
+            .zip(sampleweight.iter())
+            .map(|(&d, &w)| f64::from(d) * w)
+            .sum();
+        assert!(
+            state.gradient_natural_scale >= weighted_events,
+            "the stationarity scale {:.3e} fell below the weighted event count {weighted_events}: \
+             it is built from the cancelled score, not from its operands",
+            state.gradient_natural_scale
+        );
+        assert!(
+            state.certifies_kkt(g_norm, 1e-12),
+            "a converged unpenalised survival fit must certify: |g|={g_norm:.3e}, \
+             scale={:.3e}",
+            state.gradient_natural_scale
+        );
+    }
 }
