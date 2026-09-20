@@ -967,12 +967,13 @@ fn build_collapse_rescue_linear_image(
     // Top mass-weighted output direction `v` of the residual: the leading
     // eigenvector of `M = Σᵢ wᵢ yᵢyᵢᵀ` (p×p, never materialized), certified by
     // the full-reorthogonalization extreme Lanczos solve. Its step budget
-    // `min(p, n)` is exact, not a guess: `rank M ≤ min(p, n)`, so the Krylov
-    // space cannot grow past it, and a solve that does not certify within it
-    // errors, which refuses the rescue instead of persisting an unconverged
-    // direction. The start vector is the per-channel weighted energy, so the
-    // seed is deterministic (no RNG) and a rank-1 residual is exhausted in one
-    // step. `trace M = Σⱼ energyⱼ` is exact from that seed.
+    // `min(p, n + 1)` is exact, not a guess: every Krylov vector after the
+    // start lies in `range M`, and `rank M ≤ n`, so the Krylov space of any
+    // start has dimension at most `min(p, rank M + 1)`. A solve that does not
+    // certify within it errors, which refuses the rescue instead of persisting
+    // an unconverged direction. The start vector is the per-channel weighted
+    // energy, so the seed is deterministic (no RNG) and a rank-1 residual is
+    // exhausted in two steps. `trace M = Σⱼ energyⱼ` is exact from that seed.
     let apply_m = |x: &[f64], out: &mut [f64]| {
         out.fill(0.0);
         for i in 0..n {
@@ -1023,7 +1024,7 @@ fn build_collapse_rescue_linear_image(
         &seed,
         gam_linalg::lanczos::SymmetricExtremeLanczosOptions {
             target_rank: 1,
-            max_steps: p.min(n),
+            max_steps: p.min(n + 1),
             check_every: 10usize.min((p / 10).max(1)),
             relative_residual_tol: matvec_band,
             breakdown_tol: matvec_band,
