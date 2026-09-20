@@ -8,6 +8,7 @@ use super::tests_recovery_split_780::{
     FiniteDifferenceStratumCertificate, certified_central_logdet_difference,
     fixed_state_logdet_sample, gamma_fd_tiny_fixture,
 };
+use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
 use super::*;
 
 /// Deflation-derivative regression for a NON-α ρ-component. A row deflation

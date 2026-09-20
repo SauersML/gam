@@ -1,5 +1,6 @@
 use super::*;
 use crate::rho_optimizer::rail_face::RailFaceLimit;
+use crate::rho_optimizer::zero_smoothing_face::{ZeroSmoothingFace, ZeroSmoothingFaceOutcome};
 use ndarray::array;
 
 /// A proven λ=∞ face certifies on the proof alone, whatever the depth of the
@@ -96,6 +97,164 @@ fn proven_face_certifies_a_shallow_rail_without_a_value_probe() {
         obj.state.is_empty(),
         "the proof spends no criterion evaluation, but the criterion was evaluated at {:?}",
         obj.state
+    );
+}
+
+/// A one-coordinate objective whose criterion IS a covered zero-smoothing
+/// law, `V(ρ) = c′·e^{ρ}`, recording every criterion evaluation it is asked
+/// for. `law` installs the zero-smoothing hook; `None` leaves the objective
+/// without one.
+fn zero_smoothing_objective(
+    slope: f64,
+    law: Option<ZeroSmoothingFace>,
+) -> impl OuterObjective + HasEvaluationLog {
+    let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
+    let obj = problem.build_objective(
+        Vec::<f64>::new(),
+        move |seen: &mut Vec<f64>, rho: &Array1<f64>| {
+            seen.push(rho[0]);
+            Ok(slope * rho[0].exp())
+        },
+        move |seen: &mut Vec<f64>, rho: &Array1<f64>| {
+            seen.push(rho[0]);
+            Ok(OuterEval {
+                cost: slope * rho[0].exp(),
+                gradient: array![slope * rho[0].exp()],
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut Vec<f64>)>,
+        None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    match law {
+        Some(law) => obj.with_zero_smoothing_face(
+            move |_: &mut Vec<f64>, _: &Array1<f64>, face: &[usize]| {
+                assert_eq!(face, &[0]);
+                Ok(ZeroSmoothingFaceOutcome::Available(Box::new(law.clone())))
+            },
+        ),
+        None => obj,
+    }
+}
+
+trait HasEvaluationLog {
+    fn evaluations(&self) -> &[f64];
+}
+
+impl<Fc, Fe, Fr, Fefs, Feo, Fseed> HasEvaluationLog
+    for ClosureObjective<Vec<f64>, Fc, Fe, Fr, Fefs, Feo, Fseed>
+{
+    fn evaluations(&self) -> &[f64] {
+        &self.state
+    }
+}
+
+fn lower_rail_inputs<'a>(
+    rho: &'a Array1<f64>,
+    gradient: &'a Array1<f64>,
+    hessian: &'a Array2<f64>,
+    bounds: &'a (Array1<f64>, Array1<f64>),
+) -> AsymptoteRailInputs<'a> {
+    AsymptoteRailInputs {
+        rho,
+        projected_gradient: gradient,
+        railed: &[0],
+        layout: OuterThetaLayout::new(1, 0),
+        hessian,
+        bounds,
+        terminal_beta: None,
+        stationarity_bound: StationarityBound::from_ladder(1.0e-6, StationarityBoundSource::SolverBand),
+        objective_tol: 1.0e-10,
+        context: "zero-smoothing rail",
+        native_coordinate_order: None,
+    }
+}
+
+/// A proven λ=0 face certifies on its law alone (#2348 Inc 5, lower face).
+///
+/// The criterion is the covered first-order law `V = c′·λ` with `c′ = 3`,
+/// railed at `ρ̂ = −12`. The zero-smoothing face was previously declined by
+/// the analytic route ("covers λ→∞ only") and handed to the measured-tail
+/// ladder, which never minted a lower rail across the regression suite. The
+/// law must now mint a LOWER rail whose pencil constant is the slope itself,
+/// carrying the covered-zero-smoothing proof, without spending a criterion
+/// evaluation.
+#[test]
+fn proven_zero_smoothing_face_certifies_a_lower_rail_without_probing() {
+    let rho_hat = -12.0_f64;
+    let slope = 3.0_f64;
+    let law = ZeroSmoothingFace {
+        face: vec![0],
+        face_rho: vec![rho_hat],
+        slopes: vec![slope],
+        slope_bands: vec![1.0e-12],
+        limit_beta: Array1::zeros(0),
+        limit_dispersion: 1.0,
+        estimand_travel: 0.0,
+    };
+    let mut obj = zero_smoothing_objective(slope, Some(law));
+    let rho = array![rho_hat];
+    let gradient = array![0.0];
+    let hessian = array![[slope * rho_hat.exp()]];
+    let bounds = (array![-30.0], array![30.0]);
+    let inputs = lower_rail_inputs(&rho, &gradient, &hessian, &bounds);
+
+    let (_, _, rails) = try_certify_asymptote_rail(&mut obj, &inputs)
+        .expect("certification must not error")
+        .expect("a proven, reached λ=0 face must certify");
+    assert_eq!(rails.len(), 1);
+    assert_eq!(rails[0].side, AsymptoteSide::Lower);
+    assert!(
+        matches!(
+            rails[0].evidence,
+            RailTailEvidence::AnalyticFaceProof {
+                route: FacePositivityRoute::CoveredZeroSmoothing,
+                ..
+            }
+        ),
+        "the rail must carry the zero-smoothing proof: {:?}",
+        rails[0].evidence
+    );
+    assert!(rails[0].evidence.admits(rails[0].tail_constant));
+    assert_eq!(rails[0].tail_constant, slope);
+    let expected_gap = slope * rho_hat.exp();
+    assert!(
+        (rails[0].value_gap - expected_gap).abs() <= 1.0e-15 * expected_gap,
+        "the value gap is c′·λ = {expected_gap:.6e}, got {:.6e}",
+        rails[0].value_gap
+    );
+    assert!(
+        obj.evaluations().is_empty(),
+        "the proof spends no criterion evaluation, but the criterion was evaluated at {:?}",
+        obj.evaluations()
+    );
+}
+
+/// A zero-smoothing rail with no law is refused outright, without probing:
+/// a measured λ → 0 tail cannot turn a barrier, an exact fit, or a criterion
+/// outside the closed form into a minimizer, and it never minted a rail.
+#[test]
+fn zero_smoothing_rail_without_a_law_is_refused_without_probing() {
+    let rho_hat = -12.0_f64;
+    let mut obj = zero_smoothing_objective(3.0, None);
+    let rho = array![rho_hat];
+    let gradient = array![0.0];
+    let hessian = array![[3.0 * rho_hat.exp()]];
+    let bounds = (array![-30.0], array![30.0]);
+    let inputs = lower_rail_inputs(&rho, &gradient, &hessian, &bounds);
+
+    let refusal = try_certify_asymptote_rail(&mut obj, &inputs)
+        .expect("certification must not error")
+        .expect_err("a lower rail with no law has nothing to certify it");
+    assert!(
+        refusal.contains("zero-smoothing"),
+        "the refusal must name the missing law: {refusal}"
+    );
+    assert!(
+        obj.evaluations().is_empty(),
+        "no tail may be probed at the zero-smoothing end, but the criterion was evaluated at {:?}",
+        obj.evaluations()
     );
 }
 

@@ -668,6 +668,48 @@ pub enum ColumnKindTag {
     Categorical,
 }
 
+impl SchemaColumn {
+    /// The source label of one present encoded cell of this column: the level
+    /// name of a categorical code, `"0"`/`"1"` for a binary cell, the value
+    /// itself for a continuous one.
+    ///
+    /// Generic ingestion keeps an absent categorical or binary cell as NaN
+    /// because it cannot know whether the model consumes the column, and an
+    /// unseen level can be encoded one past the last level. Neither names a
+    /// label, so both are refused with the column and 1-based row instead of
+    /// being cast: `NaN as usize` is `0`, which relabels a missing cell as
+    /// the column's first level.
+    pub fn present_cell_label(&self, value: f64, row: usize) -> Result<String, String> {
+        let row = row + 1;
+        if !value.is_finite() {
+            return Err(format!(
+                "column '{}' has no value at row {row} (encoded {value})",
+                self.name
+            ));
+        }
+        match self.kind {
+            ColumnKindTag::Categorical => (value >= 0.0 && value.fract() == 0.0)
+                .then(|| self.levels.get(value as usize))
+                .flatten()
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "column '{}' has invalid category code {value} at row {row} ({} levels)",
+                        self.name,
+                        self.levels.len()
+                    )
+                }),
+            ColumnKindTag::Binary if value == 0.0 => Ok("0".to_string()),
+            ColumnKindTag::Binary if value == 1.0 => Ok("1".to_string()),
+            ColumnKindTag::Binary => Err(format!(
+                "column '{}' is binary but has value {value} at row {row}",
+                self.name
+            )),
+            ColumnKindTag::Continuous => Ok(format!("{value:?}")),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnseenCategoryPolicy {
     Error,
@@ -714,6 +756,11 @@ impl EncodedDataset {
     /// `consumed`, the columns the fit reads (`fit_required_columns`): a column
     /// no term, response, weight or offset reads cannot refuse, change or block
     /// a fit, just as `gam fit` never loads it.
+    ///
+    /// Missing values are rejected, not dropped: a NaN or infinite cell in a
+    /// consumed column is an error naming the column and its 1-based row, the
+    /// same policy scikit-learn applies. Silently dropping rows would change
+    /// which observations the fit describes without the caller saying so.
     ///
     /// Constancy is NOT a boundary rule: a constant column is legitimate input
     /// for many designs (an all-zero left-truncation entry time, an event
@@ -772,6 +819,13 @@ impl EncodedDataset {
             }
             let column = self.values.column(index);
             let finite_count = column.iter().filter(|value| value.is_finite()).count();
+            if finite_count == 0 {
+                return Err(DataError::DegenerateColumn {
+                    column: name.clone(),
+                    problem: "has no finite values (every value is NaN or infinite)"
+                        .to_string(),
+                });
+            }
             if finite_count == 1 && column.len() > 1 {
                 return Err(DataError::DegenerateColumn {
                     column: name.clone(),
@@ -1014,6 +1068,154 @@ pub fn load_datasetwith_schema_projected(
         }
     })
     .map_err(|error| error.with_source_path(path))
+}
+
+/// Read one column as text, one string per data row, with no kind inference.
+///
+/// This is for columns that are carried through rather than modelled, such as
+/// a row identifier echoed into prediction output. It must return the text the
+/// user wrote, not a re-rendering of a number. A numeric encoder would print
+/// the ID `00123` as `123`, collapse int64 IDs above 2^53 onto their neighbours,
+/// and refuse `NA`.
+///
+/// * CSV/TSV: each cell is returned trimmed, which is the text every loader
+///   here sees. Headers, duplicate or missing column names, and row widths are
+///   checked exactly as the inferred loader checks them.
+/// * Parquet: integers are exact; floats use the shortest text that
+///   round-trips the stored value; strings, dictionaries and every other Arrow
+///   type use Arrow's display formatting. A null is the empty string, which is
+///   how CSV writes an absent field.
+pub fn load_column_text(path: &Path, column: &str) -> Result<Vec<String>, DataError> {
+    (match detect_format(path)? {
+        DataFormat::Csv => load_delimited_column_text(path, b',', column),
+        DataFormat::Tsv => load_delimited_column_text(path, b'\t', column),
+        DataFormat::Parquet => load_parquet_column_text(path, column),
+    })
+    .map_err(|error| error.with_source_path(path))
+}
+
+fn load_delimited_column_text(
+    path: &Path,
+    delimiter: u8,
+    column: &str,
+) -> Result<Vec<String>, DataError> {
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .delimiter(delimiter)
+        .from_path(path)
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed to open '{}': {e}", path.display()),
+        })?;
+    let all_headers: Vec<String> = rdr
+        .headers()
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed to read headers: {e}"),
+        })?
+        .iter()
+        .map(|s| s.trim().to_string())
+        .collect();
+    let selected = resolve_requested_columns(&all_headers, &[column.to_string()])?;
+    let col_idx = selected[0];
+    let mut out = Vec::new();
+    let mut record = StringRecord::new();
+    while rdr
+        .read_record(&mut record)
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed reading row: {e}"),
+        })?
+    {
+        if record.len() != all_headers.len() {
+            return Err(DataError::SchemaMismatch {
+                reason: format!(
+                    "row width mismatch at row {}: got {} fields, expected {}",
+                    out.len() + 1,
+                    record.len(),
+                    all_headers.len()
+                ),
+            });
+        }
+        out.push(
+            record
+                .get(col_idx)
+                .expect("record width was checked against the header row above")
+                .trim()
+                .to_string(),
+        );
+    }
+    Ok(out)
+}
+
+fn load_parquet_column_text(path: &Path, column: &str) -> Result<Vec<String>, DataError> {
+    use arrow::array::{Float32Array, Float64Array};
+    use arrow::datatypes::DataType;
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+    use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
+
+    let file = std::fs::File::open(path).map_err(|e| DataError::ParseError {
+        reason: format!("failed to open parquet '{}': {e}", path.display()),
+    })?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| DataError::ParseError {
+            reason: format!("failed to read parquet metadata '{}': {e}", path.display()),
+        })?;
+    let all_headers: Vec<String> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let selected = resolve_requested_columns(&all_headers, &[column.to_string()])?;
+    let projection = ProjectionMask::roots(builder.parquet_schema(), selected.iter().copied());
+    let reader = builder
+        .with_projection(projection)
+        .build()
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed to build parquet reader: {e}"),
+        })?;
+    let options = FormatOptions::default();
+    let mut out = Vec::new();
+    for batch_result in reader {
+        let batch = batch_result.map_err(|e| DataError::ParseError {
+            reason: format!("failed to read parquet record batch: {e}"),
+        })?;
+        let col = batch.column(0).as_ref();
+        // Arrow's display writes a float with a trailing `.0`; the shortest
+        // round-trip text keeps an integral float ID such as `17` unchanged.
+        macro_rules! push_floats {
+            ($array_type:ty) => {{
+                let array = col
+                    .as_any()
+                    .downcast_ref::<$array_type>()
+                    .expect("array type is the one this `col.data_type()` arm matched");
+                out.extend(
+                    array
+                        .iter()
+                        .map(|value| value.map_or_else(String::new, |value| value.to_string())),
+                );
+            }};
+        }
+        match col.data_type() {
+            DataType::Float64 => push_floats!(Float64Array),
+            DataType::Float32 => push_floats!(Float32Array),
+            _ => {
+                let formatter =
+                    ArrayFormatter::try_new(col, &options).map_err(|e| DataError::InvalidValue {
+                        reason: format!("cannot render parquet column '{column}' as text: {e}"),
+                    })?;
+                for i in 0..col.len() {
+                    let row = out.len() + 1;
+                    out.push(formatter.value(i).try_to_string().map_err(|e| {
+                        DataError::InvalidValue {
+                            reason: format!(
+                                "cannot render parquet column '{column}' row {row} as text: {e}"
+                            ),
+                        }
+                    })?);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -2007,10 +2209,17 @@ fn write_arrow_numeric_values(
         }
         None => {
             for (batch_row, value) in values.into_iter().enumerate() {
-                let Some(value) = value.filter(|value| value.is_finite()) else {
+                // A null is missing (NaN); a non-finite value is kept as is, so
+                // the fit boundary names `inf` exactly as the CSV and NumPy
+                // ingestion paths do.
+                let Some(value) = value else {
                     output[batch_row] = f64::NAN;
                     continue;
                 };
+                if !value.is_finite() {
+                    output[batch_row] = value;
+                    continue;
+                }
                 *saw_numeric = true;
                 if !is_binary_value(value) {
                     *all_binary = false;
@@ -3321,6 +3530,71 @@ mod tests {
         )
     }
 
+    /// A missing categorical cell is NaN in the encoded table. It used to be
+    /// cast `NaN as usize == 0` by the row-id path, silently naming the row
+    /// after the column's first level; it must be refused, naming the row.
+    #[test]
+    fn present_cell_label_refuses_a_missing_or_invalid_cell() {
+        let categorical = SchemaColumn {
+            name: "id".to_string(),
+            kind: ColumnKindTag::Categorical,
+            levels: vec!["alice".to_string(), "bob".to_string()],
+        };
+        assert_eq!(categorical.present_cell_label(1.0, 0).expect("bob"), "bob");
+        let err = categorical
+            .present_cell_label(f64::NAN, 2)
+            .expect_err("a missing id cell names no level");
+        assert!(err.contains("column 'id'") && err.contains("row 3"), "{err}");
+        for code in [-0.5, 0.5, 2.0] {
+            let err = categorical
+                .present_cell_label(code, 0)
+                .expect_err("a fractional, negative or unseen code names no level");
+            assert!(err.contains("invalid category code"), "{err}");
+        }
+
+        let binary = SchemaColumn {
+            name: "flag".to_string(),
+            kind: ColumnKindTag::Binary,
+            levels: Vec::new(),
+        };
+        assert_eq!(binary.present_cell_label(0.0, 0).expect("zero"), "0");
+        assert_eq!(binary.present_cell_label(1.0, 0).expect("one"), "1");
+        // A missing binary cell used to render as "1".
+        assert!(binary.present_cell_label(f64::NAN, 0).is_err());
+        assert!(binary.present_cell_label(0.5, 0).is_err());
+
+        let continuous = SchemaColumn {
+            name: "x".to_string(),
+            kind: ColumnKindTag::Continuous,
+            levels: Vec::new(),
+        };
+        assert_eq!(continuous.present_cell_label(3.0, 0).expect("value"), "3.0");
+        assert!(continuous.present_cell_label(f64::INFINITY, 0).is_err());
+    }
+
+    /// End to end: an Arrow categorical column with a null cell keeps that
+    /// cell as NaN, and its label is refused instead of becoming level 0.
+    #[test]
+    fn a_null_arrow_categorical_cell_has_no_label() {
+        let array: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![
+            Some("alice"),
+            None,
+            Some("bob"),
+        ]));
+        let dataset = encode_single_arrow_array(array).expect("encode");
+        let column = &dataset.schema.columns[0];
+        assert_eq!(column.kind, ColumnKindTag::Categorical);
+        assert!(dataset.values[[1, 0]].is_nan());
+        let first = column
+            .present_cell_label(dataset.values[[0, 0]], 0)
+            .expect("present cell");
+        assert_eq!(first, "alice");
+        let err = column
+            .present_cell_label(dataset.values[[1, 0]], 1)
+            .expect_err("the null cell has no label");
+        assert!(err.contains("row 2"), "{err}");
+    }
+
     #[test]
     fn a_requested_column_the_file_lacks_is_a_typed_formula_error() {
         // A projected load (the CLI's `gam fit data.csv "y ~ absent"`) folded
@@ -3683,7 +3957,10 @@ mod tests {
             f64::NEG_INFINITY,
         ])))
         .expect("non-finite values should remain representable until model projection");
-        assert!(nonfinite.values.column(0).iter().all(|value| value.is_nan()));
+        let nonfinite_column = nonfinite.values.column(0);
+        assert!(nonfinite_column[0].is_nan());
+        assert_eq!(nonfinite_column[1], f64::INFINITY);
+        assert_eq!(nonfinite_column[2], f64::NEG_INFINITY);
         assert_eq!(
             nonfinite.column_kinds,
             vec![ColumnKindTag::Continuous],
@@ -4604,6 +4881,10 @@ mod tests {
                 vec![f64::NAN, 2.0, f64::NAN],
                 "has only one non-missing value",
             ),
+            (
+                vec![f64::NAN, f64::INFINITY, f64::NAN],
+                "has no finite values (every value is NaN or infinite)",
+            ),
         ];
         for (values, expected) in cases {
             let dataset = EncodedDataset {
@@ -4721,6 +5002,74 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "column 'x' has non-finite value NaN at row 2"
+        );
+    }
+
+    #[test]
+    fn load_column_text_returns_the_written_id_not_a_numeric_rerendering() {
+        // A pass-through ID column must come back as the text the user wrote:
+        // the numeric loader turns `00123` into 123, rounds an int64 key above
+        // 2^53 onto its neighbour, and has no value for `NA`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let csv_path = dir.path().join("ids.csv");
+        std::fs::write(
+            &csv_path,
+            "id,x\n00123,1\n 9007199254740993 ,2\nNA,3\n1.10,4\n",
+        )
+        .expect("write csv");
+        assert_eq!(
+            load_column_text(&csv_path, "id").expect("csv id column"),
+            vec!["00123", "9007199254740993", "NA", "1.10"]
+        );
+        assert!(load_column_text(&csv_path, "absent").is_err());
+
+        let tsv_path = dir.path().join("ids.tsv");
+        std::fs::write(&tsv_path, "x\tid\n1\t007\n2\tb\n").expect("write tsv");
+        assert_eq!(
+            load_column_text(&tsv_path, "id").expect("tsv id column"),
+            vec!["007", "b"]
+        );
+
+        use arrow::array::{Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::DataType;
+        use parquet::arrow::ArrowWriter;
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, true),
+            Field::new("score", DataType::Float64, true),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    Some(9_007_199_254_740_993),
+                    Some(-7),
+                    None,
+                ])),
+                Arc::new(Float64Array::from(vec![Some(17.0), Some(0.1), None])),
+                Arc::new(StringArray::from(vec![Some("007"), None, Some("b")])),
+            ],
+        )
+        .expect("record batch of id columns");
+        let parquet_path = dir.path().join("ids.parquet");
+        {
+            let file = std::fs::File::create(&parquet_path).expect("create parquet");
+            let mut writer =
+                ArrowWriter::try_new(file, arrow_schema, None).expect("arrow parquet writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+        assert_eq!(
+            load_column_text(&parquet_path, "key").expect("int64 id column"),
+            vec!["9007199254740993", "-7", ""]
+        );
+        assert_eq!(
+            load_column_text(&parquet_path, "score").expect("float64 id column"),
+            vec!["17", "0.1", ""]
+        );
+        assert_eq!(
+            load_column_text(&parquet_path, "label").expect("utf8 id column"),
+            vec!["007", "", "b"]
         );
     }
 }

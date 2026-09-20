@@ -1,5 +1,5 @@
-use crate::smooth::center_aniso_log_scales;
 use super::*;
+use crate::smooth::center_aniso_log_scales;
 
 pub(crate) fn build_duchon_collocation_operator_matrices(
     centers: ArrayView2<'_, f64>,
@@ -243,44 +243,43 @@ pub(crate) fn build_duchon_collocation_operator_matriceswithworkspace(
             // `r²·log r` second-derivative blow-up at exact r=0.
             let r_exact = r;
             let r = r.max(R_EPS);
-            let (phi, q, t) = if let (Some(length_scale), Some(coeffs)) =
-                (length_scale, coeffs.as_ref())
-            {
-                // The hybrid jets floor their own derivative core
-                // (`DUCHON_DERIVATIVE_R_FLOOR_REL`) and take the VALUE at the
-                // exact distance, where `r = 0` is a closed form. Handing them
-                // the `R_EPS` floor instead evaluated the stable integral at
-                // `r = 1e-10`, which for a large Bessel order (3-D, order 0,
-                // power 9: `b = p + s − d/2 = 8.5`) is not the collision value:
-                // the mass Gram of a collocation sample that lands on centers
-                // was 2.4% off its own definition, and its ψ-derivative 3.7×
-                // (gam#979 operator-penalty gate, `opers_3d_order0_power9`).
-                let jets = duchon_radial_jets(
-                    r_exact,
-                    length_scale,
-                    p_order,
-                    s_order as usize,
-                    dim,
-                    coeffs,
-                )?;
-                (jets.phi, jets.q, jets.t)
-            } else {
-                let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
-                    r,
-                    length_scale,
-                    p_order,
-                    s_order,
-                    dim,
-                    coeffs.as_ref(),
-                )?;
-                let q = if r > R_EPS { phi_r / r } else { phi_rr };
-                let t = if r > R_EPS {
-                    (phi_rr - q) / (r * r)
+            let (phi, q, t) =
+                if let (Some(length_scale), Some(coeffs)) = (length_scale, coeffs.as_ref()) {
+                    // The hybrid jets floor their own derivative core
+                    // (`DUCHON_DERIVATIVE_R_FLOOR_REL`) and take the VALUE at the
+                    // exact distance, where `r = 0` is a closed form. Handing them
+                    // the `R_EPS` floor instead evaluated the stable integral at
+                    // `r = 1e-10`, which for a large Bessel order (3-D, order 0,
+                    // power 9: `b = p + s − d/2 = 8.5`) is not the collision value:
+                    // the mass Gram of a collocation sample that lands on centers
+                    // was 2.4% off its own definition, and its ψ-derivative 3.7×
+                    // (gam#979 operator-penalty gate, `opers_3d_order0_power9`).
+                    let jets = duchon_radial_jets(
+                        r_exact,
+                        length_scale,
+                        p_order,
+                        s_order as usize,
+                        dim,
+                        coeffs,
+                    )?;
+                    (jets.phi, jets.q, jets.t)
                 } else {
-                    0.0
+                    let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
+                        r,
+                        length_scale,
+                        p_order,
+                        s_order,
+                        dim,
+                        coeffs.as_ref(),
+                    )?;
+                    let q = if r > R_EPS { phi_r / r } else { phi_rr };
+                    let t = if r > R_EPS {
+                        (phi_rr - q) / (r * r)
+                    } else {
+                        0.0
+                    };
+                    (phi, q, t)
                 };
-                (phi, q, t)
-            };
             if !phi.is_finite() || !q.is_finite() || !t.is_finite() {
                 crate::bail_invalid_basis!(
                     "non-finite Duchon collocation operator derivative at (colloc {i}, center {j}), r={r}"
@@ -1454,7 +1453,7 @@ pub(crate) fn duchon_matern_family_jets_with_ladder(
             }
             terms = next;
         }
-        let mut value = KahanSum::default();
+        let mut value = CompensatedSum::default();
         for term in &terms {
             if term.coeff == 0.0 {
                 continue;
@@ -1466,7 +1465,7 @@ pub(crate) fn duchon_matern_family_jets_with_ladder(
                     * ladder.k_abs(term.bessel_order.abs()),
             );
         }
-        *slot = value.sum();
+        *slot = value.value();
     }
     Ok(())
 }
@@ -1760,7 +1759,6 @@ pub(crate) fn duchon_hybrid_kernel_stable_integral(
     DuchonHybridEvaluator::new(kappa, p_order, s_order, k_dim)?.value(r)
 }
 
-
 /// The hybrid Duchon–Matérn kernel of one shape at one length scale, bound
 /// once for a whole sweep.
 ///
@@ -2009,7 +2007,7 @@ pub(crate) fn duchon_matern_kernel_general_from_distance(
             coeffs_ref,
         );
     }
-    let mut val = KahanSum::default();
+    let mut val = CompensatedSum::default();
     for (m, coeff) in coeffs_ref.a.iter().enumerate().skip(1) {
         if *coeff == 0.0 {
             continue;
@@ -2022,7 +2020,7 @@ pub(crate) fn duchon_matern_kernel_general_from_distance(
         }
         val.add(coeff * duchon_matern_block(r, kappa, n, k_dim)?);
     }
-    Ok(val.sum())
+    Ok(val.value())
 }
 
 pub(crate) fn duchon_hybrid_kernel_collision_value(
@@ -2044,8 +2042,8 @@ pub(crate) fn duchon_hybrid_kernel_collision_value(
     }
 
     let kappa = duchon_inverse_length_scale(length_scale, "Duchon hybrid collision value")?;
-    let mut pure = KahanSum::default();
-    let mut log_part = KahanSum::default();
+    let mut pure = CompensatedSum::default();
+    let mut log_part = CompensatedSum::default();
     for (m, &a_m) in coeffs.a.iter().enumerate().skip(1) {
         if a_m == 0.0 {
             continue;
@@ -2062,8 +2060,8 @@ pub(crate) fn duchon_hybrid_kernel_collision_value(
         pure.add(b_n * block_pure);
         log_part.add(b_n * block_log);
     }
-    let value = pure.sum();
-    let log_value = log_part.sum();
+    let value = pure.value();
+    let log_value = log_part.value();
     if log_value.abs() > 1e-8 * value.abs().max(1e-30) {
         crate::bail_invalid_basis!(
             "Duchon hybrid diagonal log terms did not cancel: log={log_value:.6e}, value={value:.6e}; p={p_order}, s={s_order}, d={k_dim}"
@@ -2303,7 +2301,6 @@ pub(crate) fn aniso_distance_and_components(
     let mut scaled_components = Vec::with_capacity(d);
     for a in 0..d {
         let h_a = data_row[a] - center[a];
-        // Clamp exp(2ψ) to avoid overflow/underflow: ψ in [-50, 50].
         let scale_a = aniso_axis_scale(eta[a], eta_mean);
         let scaled_h_a = scale_a * h_a;
         let s_a = scaled_h_a * scaled_h_a;
@@ -3481,7 +3478,14 @@ mod inverse_length_scale_tests {
     /// inverse for a legitimate one (#2469).
     #[test]
     fn inverse_length_scale_refuses_what_the_floor_used_to_swallow() {
-        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e-310] {
+        for bad in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1e-310,
+        ] {
             let refused = duchon_inverse_length_scale(bad, "test").is_err();
             assert!(refused, "length_scale {bad:e} must be refused, not floored");
         }

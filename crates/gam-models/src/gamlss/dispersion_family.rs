@@ -250,7 +250,7 @@ fn validate_dispersion_row_geometry_inputs(
             require_positive("Gamma precision exp(eta_d)", eta_d, eta_d.exp())
         }
         DispersionFamilyKind::Beta => {
-            let mu = gam_linalg::utils::stable_logistic(eta_mu);
+            let mu = gam_math::special::logistic(eta_mu);
             if !mu.is_finite() || mu <= 0.0 || mu >= 1.0 {
                 return Err(GamlssError::row_geometry_unrepresentable(
                     row,
@@ -565,7 +565,7 @@ mod test_support {
 fn dispersion_nb_loglik(yi: f64, mu: f64, theta: f64, wi: f64) -> f64 {
     let log_theta_share = log_positive_share(theta, mu);
     let log_mu_share = log_positive_share(mu, theta);
-    let s = ln_gamma(theta + yi) - ln_gamma(theta) - ln_gamma(yi + 1.0)
+    let s = gam_math::special::ln_gamma_shift_gap(theta, yi) - ln_gamma(yi + 1.0)
         + theta * log_theta_share
         + yi * log_mu_share;
     -(s * -wi)
@@ -597,7 +597,7 @@ fn positive_share(numerator: f64, other: f64) -> f64 {
 /// coordinates, `theta^2 I_theta`.  For large theta, expand
 /// `trigamma(x)-1/x` after the transformation so the representable O(1)
 /// result is never obtained by subtracting underflowed O(theta^-2) terms.
-/// `trigamma_theta` is `ψ′(θ)`, which the row's score stack already carries.
+/// `trigamma_theta` is `ψ′(θ)`.
 #[inline]
 fn nb_log_precision_fisher_jensen(mu: f64, theta: f64, trigamma_theta: f64) -> f64 {
     let r = positive_share(theta, mu);
@@ -704,7 +704,7 @@ pub(crate) fn dispersion_row_loglik(
             dispersion_gamma_loglik(yi, y_pos, mu, nu, wi)
         }
         DispersionFamilyKind::Beta => {
-            let mu = gam_linalg::utils::stable_logistic(em);
+            let mu = gam_math::special::logistic(em);
             let phi = ed.exp();
             dispersion_beta_loglik(yi, mu, phi, wi)
         }
@@ -721,16 +721,18 @@ pub(crate) fn dispersion_row_loglik(
 // third surface is that Hessian's directional derivative, so the link chains,
 // the mean/precision cross curvature and every product-rule term are generated
 // from the declaration. The caller supplies only one-variable derivative stacks
-// at the row: `ln Γ` through tetragamma, softplus for the negative binomial log
-// shares, the logistic mean link, the Tweedie mean's power terms `e^{(2−p)t}` and
-// `e^{(1−p)t}` with their coefficients, and `e^t` at `t = 0`. Each argument's
-// polygamma entries come from one walk of the recurrence
-// (`gam_math::special::polygamma_stack`), which divides once per step for every
-// order where the per-order scalars divide once each.
+// at the row: `ln Γ` through tetragamma, the negative binomial normalizer
+// `ln Γ(θ + y) − ln Γ(θ)` through its tetragamma gap, softplus for the negative
+// binomial log shares, the logistic mean link, the Tweedie mean's power terms
+// `e^{(2−p)t}` and `e^{(1−p)t}` with their coefficients, and `e^t` at `t = 0`.
+// Each argument's polygamma entries come from one walk of the recurrence
+// (`gam_math::special::polygamma_stack`, and `polygamma_shift_gap_stack` for the
+// gaps), which divides once per step for every order where the per-order scalars
+// divide once each.
 //
 // A supplied value that enters the result only through `add` or `scale` reaches
 // the value channel and nothing else. The production stacks supply zero for those
-// values (every `ln Γ` value, the negative binomial `−ln q`, the Tweedie density
+// values (every `ln Γ` value and gap, the negative binomial `−ln q`, the Tweedie density
 // normalizer), and the row log-likelihood comes from the plain-f64 functions
 // above. Values that multiply a jet (the negative binomial `−ln r`, the Beta mean,
 // the Tweedie deviance terms) are always supplied. The programs emit through
@@ -743,7 +745,11 @@ pub(crate) fn dispersion_row_loglik(
 // NB2: ℓ = ln Γ(θ + y) − ln Γ(θ) − ln Γ(y + 1) + θ ln r + y ln q, with
 // q = μ/(μ + θ) and r = θ/(μ + θ). In `x = η_μ − η_d`, `ln r = −softplus(x)` and
 // `ln q = −softplus(−x)`, whose stacks are the stable shares `q`, `r` and `qr`, so
-// `μ + θ` is never formed.
+// `μ + θ` is never formed. The normalizer `g(θ) = ln Γ(θ + y) − ln Γ(θ)` is one
+// leaf whose stack is the shift gap `[g, ψ(θ+y) − ψ(θ), …]`, never two `ln Γ`
+// jets subtracted: toward the Poisson limit each `ψ_k(θ + y) − ψ_k(θ)` is
+// `O(y θ^{−(k+1)})` against `ψ_k(θ) = O(θ^{−k})`, and the difference of two
+// stacks leaves the η_d score and curvature with no correct digits.
 row_program! {
     fn negative_binomial_row_program(
         delta_mu,
@@ -751,16 +757,11 @@ row_program! {
         theta,
         count,
         ln_gamma_count,
-        ln_gamma_total,
-        digamma_total,
-        trigamma_total,
-        tetragamma_total,
-        pentagamma_total,
-        ln_gamma_theta,
-        digamma_theta,
-        trigamma_theta,
-        tetragamma_theta,
-        pentagamma_theta,
+        ln_gamma_gap,
+        digamma_gap,
+        trigamma_gap,
+        tetragamma_gap,
+        pentagamma_gap,
         neg_log_theta_share,
         neg_log_mu_share,
         mu_share,
@@ -769,8 +770,7 @@ row_program! {
     emit [order2, third, fourth];
     leaves {
         unit_exponential => supplied,
-        ln_gamma_at_total => supplied,
-        ln_gamma_at_theta => supplied,
+        ln_gamma_gap_at_precision => supplied,
         softplus_at_log_ratio => supplied,
         softplus_at_negative_log_ratio => supplied,
     }
@@ -778,24 +778,14 @@ row_program! {
     {
         let precision_ratio = compose(unit_exponential, delta_d, 1.0, 1.0, 1.0, 1.0, 1.0);
         let precision = scale(precision_ratio, theta);
-        let total = add_constant(precision, count);
-        let ln_gamma_total_jet = compose(
-            ln_gamma_at_total,
-            total,
-            ln_gamma_total,
-            digamma_total,
-            trigamma_total,
-            tetragamma_total,
-            pentagamma_total
-        );
-        let ln_gamma_theta_jet = compose(
-            ln_gamma_at_theta,
+        let ln_gamma_ratio = compose(
+            ln_gamma_gap_at_precision,
             precision,
-            ln_gamma_theta,
-            digamma_theta,
-            trigamma_theta,
-            tetragamma_theta,
-            pentagamma_theta
+            ln_gamma_gap,
+            digamma_gap,
+            trigamma_gap,
+            tetragamma_gap,
+            pentagamma_gap
         );
         let spread = add(delta_mu, neg(delta_d));
         let theta_gap = compose(
@@ -817,7 +807,6 @@ row_program! {
             mu_share * theta_share * (mu_share - theta_share),
             mu_share * theta_share * (1.0 - 6.0 * mu_share * theta_share)
         );
-        let ln_gamma_ratio = add(ln_gamma_total_jet, neg(ln_gamma_theta_jet));
         let log_shares = add(mul(precision, theta_gap), scale(mu_gap, count));
         return add_constant(add(ln_gamma_ratio, neg(log_shares)), -ln_gamma_count);
     }
@@ -1054,16 +1043,11 @@ enum DispersionRowStacks {
         theta: f64,
         count: f64,
         ln_gamma_count: f64,
-        ln_gamma_total: f64,
-        digamma_total: f64,
-        trigamma_total: f64,
-        tetragamma_total: f64,
-        pentagamma_total: f64,
-        ln_gamma_theta: f64,
-        digamma_theta: f64,
-        trigamma_theta: f64,
-        tetragamma_theta: f64,
-        pentagamma_theta: f64,
+        ln_gamma_gap: f64,
+        digamma_gap: f64,
+        trigamma_gap: f64,
+        tetragamma_gap: f64,
+        pentagamma_gap: f64,
         neg_log_theta_share: f64,
         neg_log_mu_share: f64,
         mu_share: f64,
@@ -1142,8 +1126,7 @@ impl DispersionRowStacks {
                     yi,
                     mu,
                     theta,
-                    polygamma_stack(theta + yi, order),
-                    polygamma_stack(theta, order),
+                    gam_math::special::polygamma_shift_gap_stack(theta, yi, order),
                 )
             }
             DispersionFamilyKind::Gamma => {
@@ -1166,31 +1149,19 @@ impl DispersionRowStacks {
         }
     }
 
-    /// `total` and `precision` are the polygamma stacks at `θ + y` and `θ`.
+    /// `gap` is the shift-gap stack `[ψ(θ + y) − ψ(θ), ψ₁(θ + y) − ψ₁(θ), …]`.
     #[inline(always)]
-    fn negative_binomial(
-        yi: f64,
-        mu: f64,
-        theta: f64,
-        total: [f64; 5],
-        precision: [f64; 5],
-    ) -> Self {
-        let [digamma_total, trigamma_total, tetragamma_total, pentagamma_total, _] = total;
-        let [digamma_theta, trigamma_theta, tetragamma_theta, pentagamma_theta, _] = precision;
+    fn negative_binomial(yi: f64, mu: f64, theta: f64, gap: [f64; 5]) -> Self {
+        let [digamma_gap, trigamma_gap, tetragamma_gap, pentagamma_gap, _] = gap;
         Self::NegativeBinomial {
             theta,
             count: yi,
             ln_gamma_count: 0.0,
-            ln_gamma_total: 0.0,
-            digamma_total,
-            trigamma_total,
-            tetragamma_total,
-            pentagamma_total,
-            ln_gamma_theta: 0.0,
-            digamma_theta,
-            trigamma_theta,
-            tetragamma_theta,
-            pentagamma_theta,
+            ln_gamma_gap: 0.0,
+            digamma_gap,
+            trigamma_gap,
+            tetragamma_gap,
+            pentagamma_gap,
             neg_log_theta_share: -log_positive_share(theta, mu),
             neg_log_mu_share: 0.0,
             mu_share: positive_share(mu, theta),
@@ -1321,16 +1292,11 @@ impl DispersionRowStacks {
                 theta,
                 count,
                 ln_gamma_count,
-                ln_gamma_total,
-                digamma_total,
-                trigamma_total,
-                tetragamma_total,
-                pentagamma_total,
-                ln_gamma_theta,
-                digamma_theta,
-                trigamma_theta,
-                tetragamma_theta,
-                pentagamma_theta,
+                ln_gamma_gap,
+                digamma_gap,
+                trigamma_gap,
+                tetragamma_gap,
+                pentagamma_gap,
                 neg_log_theta_share,
                 neg_log_mu_share,
                 mu_share,
@@ -1341,16 +1307,11 @@ impl DispersionRowStacks {
                 theta,
                 count,
                 ln_gamma_count,
-                ln_gamma_total,
-                digamma_total,
-                trigamma_total,
-                tetragamma_total,
-                pentagamma_total,
-                ln_gamma_theta,
-                digamma_theta,
-                trigamma_theta,
-                tetragamma_theta,
-                pentagamma_theta,
+                ln_gamma_gap,
+                digamma_gap,
+                trigamma_gap,
+                tetragamma_gap,
+                pentagamma_gap,
                 neg_log_theta_share,
                 neg_log_mu_share,
                 mu_share,
@@ -1491,16 +1452,11 @@ impl DispersionRowStacks {
                 theta,
                 count,
                 ln_gamma_count,
-                ln_gamma_total,
-                digamma_total,
-                trigamma_total,
-                tetragamma_total,
-                pentagamma_total,
-                ln_gamma_theta,
-                digamma_theta,
-                trigamma_theta,
-                tetragamma_theta,
-                pentagamma_theta,
+                ln_gamma_gap,
+                digamma_gap,
+                trigamma_gap,
+                tetragamma_gap,
+                pentagamma_gap,
                 neg_log_theta_share,
                 neg_log_mu_share,
                 mu_share,
@@ -1511,16 +1467,11 @@ impl DispersionRowStacks {
                 theta,
                 count,
                 ln_gamma_count,
-                ln_gamma_total,
-                digamma_total,
-                trigamma_total,
-                tetragamma_total,
-                pentagamma_total,
-                ln_gamma_theta,
-                digamma_theta,
-                trigamma_theta,
-                tetragamma_theta,
-                pentagamma_theta,
+                ln_gamma_gap,
+                digamma_gap,
+                trigamma_gap,
+                tetragamma_gap,
+                pentagamma_gap,
                 neg_log_theta_share,
                 neg_log_mu_share,
                 mu_share,
@@ -1666,16 +1617,11 @@ impl DispersionRowStacks {
                 theta,
                 count,
                 ln_gamma_count,
-                ln_gamma_total,
-                digamma_total,
-                trigamma_total,
-                tetragamma_total,
-                pentagamma_total,
-                ln_gamma_theta,
-                digamma_theta,
-                trigamma_theta,
-                tetragamma_theta,
-                pentagamma_theta,
+                ln_gamma_gap,
+                digamma_gap,
+                trigamma_gap,
+                tetragamma_gap,
+                pentagamma_gap,
                 neg_log_theta_share,
                 neg_log_mu_share,
                 mu_share,
@@ -1686,16 +1632,11 @@ impl DispersionRowStacks {
                 theta,
                 count,
                 ln_gamma_count,
-                ln_gamma_total,
-                digamma_total,
-                trigamma_total,
-                tetragamma_total,
-                pentagamma_total,
-                ln_gamma_theta,
-                digamma_theta,
-                trigamma_theta,
-                tetragamma_theta,
-                pentagamma_theta,
+                ln_gamma_gap,
+                digamma_gap,
+                trigamma_gap,
+                tetragamma_gap,
+                pentagamma_gap,
                 neg_log_theta_share,
                 neg_log_mu_share,
                 mu_share,
@@ -2019,16 +1960,13 @@ pub(super) fn dispersion_row_kernel(
             } else {
                 mu / (1.0 + mu / theta)
             };
-            // The score reads ψ at θ + y and θ, and the precision information
-            // below reads ψ′ at θ, so θ's stack carries both from one recurrence.
-            // The score reads stack entries through the first.
-            let theta_stack = gam_math::special::polygamma_stack(theta, 2);
+            // The score reads the digamma gap ψ(θ + y) − ψ(θ), the first entry
+            // of the shift-gap stack.
             let [score_mu, score_eta] = DispersionRowStacks::negative_binomial(
                 yi,
                 mu,
                 theta,
-                gam_math::special::polygamma_stack(theta + yi, 1),
-                theta_stack,
+                gam_math::special::polygamma_shift_gap_stack(theta, yi, 1),
             )
             .order2()
             .1;
@@ -2065,11 +2003,12 @@ pub(super) fn dispersion_row_kernel(
             // Fisher scoring, which only re-conditions the inner solve and never
             // shifts the optimum. The observed channel `_info_theta_observed` is no
             // longer consumed for the weight.
-            // #1591-follow-up: the information reads ψ′(θ) off θ's score stack and
-            // evaluates only ψ′(θ+μ) itself; an earlier form built the full
-            // order-1..5 polygamma stack, read index 0 and discarded four of five
-            // per call (8 wasted polygamma evaluations per NB2 row).
-            let eta_information = nb_log_precision_fisher_jensen(mu, theta, theta_stack[1]);
+            // #1591-follow-up: the information evaluates only ψ′(θ) and ψ′(θ+μ);
+            // an earlier form built the full order-1..5 polygamma stack, read
+            // index 0 and discarded four of five per call (8 wasted polygamma
+            // evaluations per NB2 row).
+            let eta_information =
+                nb_log_precision_fisher_jensen(mu, theta, gam_math::special::trigamma(theta));
             let disp_weight = wi * eta_information;
             let disp_response = ed + score_eta / eta_information;
             DispersionRowKernel {
@@ -3057,7 +2996,7 @@ pub(crate) fn dispersion_location_scale_warm_start(
                 continue;
             }
             let mu = if kind.mean_is_logit() {
-                gam_linalg::utils::stable_logistic(mean_eta[i])
+                gam_math::special::logistic(mean_eta[i])
             } else {
                 mean_eta[i].exp()
             };
