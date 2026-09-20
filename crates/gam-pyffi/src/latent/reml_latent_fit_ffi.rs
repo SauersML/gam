@@ -48,12 +48,17 @@ fn sae_fit_error_to_pyerr(py: Python<'_>, err: gam::terms::sae::manifold::SaeFit
             }
             exc
         }
-        SaeFitError::OuterDidNotConverge { stage, result } => {
+        SaeFitError::OuterDidNotConverge {
+            stage,
+            result,
+            certification_refusal,
+        } => {
             let exc = RemlConvergenceError::new_err(message);
             let bound = exc.value(py);
             let attach_result: PyResult<()> = (|| {
                 bound.setattr("stage", stage.to_string())?;
                 bound.setattr("converged", false)?;
+                bound.setattr("certification_refusal", certification_refusal.as_deref())?;
                 bound.setattr("rho_checkpoint", result.rho.clone().into_pyarray(py))?;
                 bound.setattr("final_value", result.final_value)?;
                 bound.setattr("iterations", result.iterations)?;
