@@ -145,9 +145,11 @@ fn sphere_rejects_nan_y_clearly_at_encode() {
         msg.contains("non-finite") || msg.contains("nan") || msg.contains("finite"),
         "encoder NaN error must say finite/nan: {err:?}",
     );
-    // Must name the column so the user can find the bad row.
+    // Must name the column so the user can find the bad row. The encoder
+    // quotes the column name (`column 'y'`); a bare `y` substring matched
+    // words such as "only" in unrelated errors.
     assert!(
-        msg.contains("y"),
+        msg.contains("column 'y'"),
         "encoder NaN error must name the offending column: {err:?}",
     );
     eprintln!("[nan-y-encode] rejected: {err:?}");

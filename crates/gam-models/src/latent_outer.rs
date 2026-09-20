@@ -344,8 +344,10 @@ pub fn latent_periodic_seed_start(
     // A circle/torus axis needs two embedding modes (cos/sin); recover one angle
     // per axis. If the caller already supplied a *spread* warm start (not the
     // collapsed default), keep it — the optimizer can polish a good start, but it
-    // can never escape a collapsed one. "Spread" is measured per axis by the
-    // angular range the wrapped coordinates cover.
+    // can never escape a collapsed one. A collapsed start is one where every
+    // row sits at the same angle on every axis, the exact symmetric point
+    // whose gradient cannot separate the rows; any axis whose wrapped
+    // coordinates are not all equal already breaks that symmetry.
     let caller_spread = caller_t.len() == n_obs * latent_dim
         && (0..latent_dim).any(|a| {
             let mut lo = f64::INFINITY;
@@ -355,7 +357,7 @@ pub fn latent_periodic_seed_start(
                 lo = lo.min(v);
                 hi = hi.max(v);
             }
-            (hi - lo) > 1.0e-6
+            hi > lo
         });
     if caller_spread {
         return Ok(caller_t.to_owned());
@@ -420,7 +422,7 @@ pub fn latent_periodic_seed_start(
             lo = lo.min(v);
             hi = hi.max(v);
         }
-        if !(hi - lo > 1.0e-6) {
+        if !(hi > lo) {
             for n in 0..n_obs {
                 let frac = if n_obs > 0 {
                     n as f64 / n_obs as f64
@@ -649,6 +651,25 @@ mod latent_reml_tests {
             periodic: None,
         };
         (t, problem)
+    }
+
+    #[test]
+    fn periodic_seed_keeps_any_spread_start_and_replaces_only_a_collapsed_one_2469() {
+        let n = 3;
+        let y = Array2::from_shape_fn((n, 2), |(i, a)| (i + a) as f64);
+        // One row off the others by 2⁻³⁰ rad: not the symmetric point, so the
+        // caller's start is kept verbatim.
+        let spread = Array1::from_vec(vec![0.5, 0.5, 0.5 + 2.0_f64.powi(-30)]);
+        let kept = latent_periodic_seed_start(y.view(), n, 1, 2, spread.view()).unwrap();
+        assert_eq!(kept, spread);
+        // Every row at the same angle is the collapsed start; it is replaced
+        // by the equispaced sweep.
+        let collapsed = Array1::from_elem(n, 0.5);
+        let replaced = latent_periodic_seed_start(y.view(), n, 1, 2, collapsed.view()).unwrap();
+        let sweep = Array1::from_shape_fn(n, |i| {
+            wrap_to_pi(i as f64 / n as f64 * std::f64::consts::TAU)
+        });
+        assert_eq!(replaced, sweep);
     }
 
     #[test]
