@@ -48,12 +48,17 @@ fn sae_fit_error_to_pyerr(py: Python<'_>, err: gam::terms::sae::manifold::SaeFit
             }
             exc
         }
-        SaeFitError::OuterDidNotConverge { stage, result } => {
+        SaeFitError::OuterDidNotConverge {
+            stage,
+            result,
+            certification_refusal,
+        } => {
             let exc = RemlConvergenceError::new_err(message);
             let bound = exc.value(py);
             let attach_result: PyResult<()> = (|| {
                 bound.setattr("stage", stage.to_string())?;
                 bound.setattr("converged", false)?;
+                bound.setattr("certification_refusal", certification_refusal.as_deref())?;
                 bound.setattr("rho_checkpoint", result.rho.clone().into_pyarray(py))?;
                 bound.setattr("final_value", result.final_value)?;
                 bound.setattr("iterations", result.iterations)?;
@@ -3378,22 +3383,6 @@ fn posterior_draw_bands(
 }
 
 #[pyfunction]
-#[pyo3(signature = (eta, family_kind, level, link_spec=None))]
-fn posterior_eta_bands(
-    py: Python<'_>,
-    eta: PyReadonlyArray2<'_, f64>,
-    family_kind: String,
-    level: f64,
-    link_spec: Option<String>,
-) -> PyResult<Py<PyDict>> {
-    let eta = owned_row_major_f64(eta.as_array());
-    let payload = detach_py_result(py, "posterior_eta_bands", move || {
-        posterior_eta_bands_impl(eta, &family_kind, level, link_spec.as_deref())
-    })?;
-    posterior_bands_payload_to_py(py, payload)
-}
-
-#[pyfunction]
 fn posterior_credible_interval(
     py: Python<'_>,
     samples: PyReadonlyArray2<'_, f64>,
@@ -3486,11 +3475,9 @@ fn curvature_inference_json(
 }
 
 /// #1063 per-term LR significance report for every penalized smooth term:
-/// `statistic_lr`, `ref_df`, `bartlett_factor`,
-/// `bartlett_factor_conditional`, `rho_variation_shift`,
-/// `statistic_corrected`, `p_value_uncorrected`, `p_value_corrected`,
-/// `correction_provenance` (`"lawley_lr_estimated_lambda"` |
-/// `"lawley_lr_fixed_lambda"` | `"none"`), and exactly one of `p_value`,
+/// `statistic_lr`, `ref_df`, `bartlett_factor`, `statistic_corrected`,
+/// `p_value_uncorrected`, `p_value_corrected`, `correction_provenance`
+/// (`"lawley_lr_fixed_lambda"` | `"none"`), and exactly one of `p_value`,
 /// `p_value_upper_bound` or `unavailable_reason` (with `unavailable_message`).
 /// Every row carries every key.
 ///
@@ -3697,6 +3684,31 @@ fn debiased_query_design_full_schema(
     })
 }
 
+/// The optional per-row importance weights of an average functional. An
+/// absent `"weights"` means unweighted. A present value must be an
+/// array of numbers: a malformed entry is refused rather than replaced, which
+/// would report a different estimand than the one asked for (#4277).
+fn debiased_functional_weights(
+    spec_val: &serde_json::Value,
+) -> Result<Option<ndarray::Array1<f64>>, String> {
+    let entries = match spec_val.get("weights") {
+        None => return Ok(None),
+        Some(value) => value.as_array().ok_or_else(|| {
+            format!("debiased_functional: \"weights\" must be an array of numbers, got {value}")
+        })?,
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(row, value)| {
+            value.as_f64().ok_or_else(|| {
+                format!("debiased_functional: weights[{row}] must be a number, got {value}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|weights| Some(ndarray::Array1::from(weights)))
+}
+
 fn weighted_affine_mean(
     values: ndarray::ArrayView1<'_, f64>,
     weights: Option<ndarray::ArrayView1<'_, f64>>,
@@ -3762,7 +3774,12 @@ fn model_debiased_functional_dataset_json_impl(
     // offset in THIS layout. The `point`/`contrast` query design must be built
     // against the same full layout, not just the columns named in `x0` (#1621).
     let training_headers = dataset.headers.clone();
-    let fit_config = parse_fit_config(None)?;
+    // Replay the fit's own weight and offset columns. A default config
+    // materialized unit weights and a zero offset whatever the model was fit
+    // with, so `standard.weights` (the score weights and the Gram fallback's
+    // `W`) and `standard.offset` (the residual's `η`) described a different
+    // model than the saved `H` and `β` (#3542).
+    let fit_config = postfit_standard_materialization_config(model)?;
     let materialized = materialize(&formula, &dataset, &fit_config).map_err(|e| format!("{e}"))?;
     let standard = match materialized.request {
         FitRequest::Standard(req) => req,
@@ -3855,11 +3872,19 @@ fn model_debiased_functional_dataset_json_impl(
     let s_lambda = &*h - xwx;
     let penalty_beta = s_lambda.dot(&beta);
 
-    // Per-row score contributions ∂nll_i/∂β.
-    // For a Gaussian identity model: ∂nll_i/∂β = x_i · (η_i − y_i).
+    // Per-row score contributions of the objective `H` is the Hessian of.
+    // For a Gaussian identity model that objective is
+    // `½ Σ_i w_i (y_i − η_i)² + ½ βᵀS(λ)β` with `w` the PRIOR weights — the same
+    // `W` in `H = XᵀWX + S(λ)` above — so `s_i = w_i · x_i · (η_i − y_i)`.
+    // Dropping `w_i` pairs a weighted Hessian with unweighted scores: scaling
+    // every weight by `c` (a pure dispersion change, β̂ unmoved) scaled `H` by
+    // `c` and the influence values `ψ_i = −n sᵢᵀH⁻¹g` by `1/c`, so the reported
+    // SE moved by `1/c`, and non-uniform precision weights got the sandwich
+    // `H⁻¹ Σ x_i x_iᵀ r_i² H⁻¹` instead of `H⁻¹ Σ w_i² x_i x_iᵀ r_i² H⁻¹` (#3542).
     // Other families need their own derivative chain; currently restricted to
     // Gaussian/identity where the score is exact and the debiasing is cleanest.
     let y = standard.y.view();
+    let prior_weights = standard.weights.view();
     let n = x.nrows();
     let p = x.ncols();
     if !is_gaussian_identity {
@@ -3870,16 +3895,23 @@ fn model_debiased_functional_dataset_json_impl(
             family.pretty_name()
         ));
     }
+    if prior_weights.len() != n {
+        return Err(format!(
+            "debiased_functional: prior-weight length {} does not match design rows {n}",
+            prior_weights.len()
+        ));
+    }
     let effective_offset = design_built
         .compose_offset(standard.offset.view(), "debiased functional training design")
         .map_err(|error| error.to_string())?;
     let eta = x.as_ref().dot(&beta) + &effective_offset;
     let mut row_scores = ndarray::Array2::<f64>::zeros((n, p));
     for i in 0..n {
-        let residual = eta[i] - y[i]; // ∂nll_i/∂η = η_i − y_i for Gaussian/identity
+        // ∂/∂η of ½ w_i (y_i − η_i)² for Gaussian/identity.
+        let weighted_residual = prior_weights[i] * (eta[i] - y[i]);
         let x_row = x.row(i);
         for j in 0..p {
-            row_scores[[i, j]] = x_row[j] * residual;
+            row_scores[[i, j]] = x_row[j] * weighted_residual;
         }
     }
 
@@ -3935,15 +3967,7 @@ fn model_debiased_functional_dataset_json_impl(
         }
         "average_derivative" | "average_value" => {
             // Uses the full training design; optional per-row weights from spec.
-            let weights: Option<ndarray::Array1<f64>> = spec_val
-                .get("weights")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .map(|v| v.as_f64().unwrap_or(1.0))
-                        .collect::<Vec<_>>()
-                })
-                .map(ndarray::Array1::from);
+            let weights = debiased_functional_weights(&spec_val)?;
             let x_ref = x.as_ref();
             if target == "average_value" {
                 let gradient = SmoothFunctional::AverageValue {
@@ -4044,7 +4068,16 @@ fn resolve_average_derivative_column(
     dataset: &EncodedDataset,
     spec_val: &serde_json::Value,
 ) -> Result<usize, String> {
-    if let Some(name) = spec_val.get("deriv_var").and_then(|v| v.as_str()) {
+    let deriv_var = match spec_val.get("deriv_var") {
+        None => None,
+        Some(value) => Some(value.as_str().ok_or_else(|| {
+            format!(
+                "debiased_functional: average_derivative \"deriv_var\" must be a column \
+                 name string, got {value}"
+            )
+        })?),
+    };
+    if let Some(name) = deriv_var {
         return dataset.column_map().get(name).copied().ok_or_else(|| {
             format!(
                 "debiased_functional: average_derivative \"deriv_var\" '{name}' \
@@ -4458,13 +4491,43 @@ fn py_list_append_json_number(list: &Bound<'_, PyList>, value: serde_json::Numbe
     }
 }
 
+/// Marshalling for [`gam::inference::shared_precision::shared_precision_updates`]
+/// (#3523): `request_json` is `{"models": [key per model], "groups": [...]}`.
 #[pyfunction]
 fn cross_fit_shared_precision_groups_json(
     py: Python<'_>,
+    models: Vec<PyRef<'_, PyFittedModel>>,
     request_json: String,
 ) -> PyResult<String> {
+    let models = models
+        .iter()
+        .map(|model| Arc::clone(&model.model))
+        .collect::<Vec<_>>();
     detach_py_result(py, "cross_fit_shared_precision_groups_json", move || {
-        cross_fit_shared_precision_groups_json_impl(&request_json)
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            models: Vec<serde_json::Value>,
+            groups: Vec<gam::inference::shared_precision::SharedPrecisionGroup>,
+        }
+        let request: Request = serde_json::from_str(&request_json)
+            .map_err(|err| format!("failed to parse shared precision request json: {err}"))?;
+        if request.models.len() != models.len() {
+            return Err(format!(
+                "shared precision request names {} model key(s) for {} model(s)",
+                request.models.len(),
+                models.len()
+            ));
+        }
+        let fits = request
+            .models
+            .into_iter()
+            .zip(models.iter().map(|model| &**model))
+            .collect::<Vec<_>>();
+        let updates =
+            gam::inference::shared_precision::shared_precision_updates(&fits, &request.groups)?;
+        serde_json::to_string(&updates)
+            .map_err(|err| format!("failed to serialize shared precision result: {err}"))
     })
 }
 
@@ -4689,53 +4752,9 @@ fn survival_null_curve_from_train<'py>(
             train_events.len()
         )));
     }
-    let curve = gam::families::survival::risk_calibration::km_curve_on_grid(
-        &train_times,
-        &train_events,
-        &grid,
-    );
+    let curve = gam::families::survival::predict::KaplanMeier::fit(&train_times, &train_events)
+        .on_grid(&grid);
     Ok(Array1::from_vec(curve).into_pyarray(py).unbind())
-}
-
-/// Thin wrapper over
-/// [`gam::families::survival::risk_calibration::cox_calibrated_survival_matrix`],
-/// which owns the univariate Cox fit and the Breslow baseline. pyffi only maps
-/// the core error into a Python exception.
-fn benchmark_survival_matrix_from_risk(
-    train_times: &[f64],
-    train_events: &[f64],
-    train_risk: &[f64],
-    test_risk: &[f64],
-    grid: &[f64],
-) -> PyResult<Array2<f64>> {
-    gam::families::survival::risk_calibration::cox_calibrated_survival_matrix(
-        train_times,
-        train_events,
-        train_risk,
-        test_risk,
-        grid,
-    )
-    .map_err(PyValueError::new_err)
-}
-
-#[pyfunction]
-fn survival_matrix_from_risk_calibration<'py>(
-    py: Python<'py>,
-    train_times: Vec<f64>,
-    train_events: Vec<f64>,
-    train_risk: Vec<f64>,
-    test_risk: Vec<f64>,
-    grid: Vec<f64>,
-) -> PyResult<Py<PyArray2<f64>>> {
-    Ok(benchmark_survival_matrix_from_risk(
-        &train_times,
-        &train_events,
-        &train_risk,
-        &test_risk,
-        &grid,
-    )?
-    .into_pyarray(py)
-    .unbind())
 }
 
 #[pyfunction(signature = (event_times, events, grid, survival_matrix, null_survival_matrix = None))]
@@ -5746,5 +5765,125 @@ where
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             return Err(err);
         }
+    }
+}
+
+/// #4277: the average functionals' weights are the caller's values or an error.
+#[cfg(test)]
+mod debiased_functional_spec_tests {
+    use super::debiased_functional_weights;
+
+    #[test]
+    fn absent_weights_are_unweighted() {
+        assert_eq!(
+            debiased_functional_weights(&serde_json::json!({"target": "average_value"})),
+            Ok(None)
+        );
+        assert!(debiased_functional_weights(&serde_json::json!({"weights": null})).is_err());
+    }
+
+    #[test]
+    fn numeric_weights_are_kept_exactly() {
+        let weights = debiased_functional_weights(&serde_json::json!({"weights": [0.5, 2, 3.25]}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(weights.to_vec(), vec![0.5, 2.0, 3.25]);
+    }
+
+    #[test]
+    fn a_non_numeric_weight_is_refused_not_replaced_by_one() {
+        let err = debiased_functional_weights(&serde_json::json!({"weights": [1.0, null, 2.0]}))
+            .unwrap_err();
+        assert!(
+            err.contains("weights[1]"),
+            "the error must name the entry: {err}"
+        );
+    }
+
+    #[test]
+    fn a_weights_value_that_is_not_an_array_is_refused_not_dropped() {
+        let err = debiased_functional_weights(&serde_json::json!({"weights": 2.0})).unwrap_err();
+        assert!(err.contains("must be an array"), "{err}");
+    }
+
+    #[test]
+    fn malformed_optional_values_cannot_change_the_requested_estimand() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!({}),
+            serde_json::json!("1"),
+        ] {
+            assert!(debiased_functional_weights(&serde_json::json!({"weights": value})).is_err());
+            let error = debiased_functional_weights(&serde_json::json!({"weights": [1, value]}))
+                .unwrap_err();
+            assert!(error.contains("weights[1]"));
+        }
+        let values = ndarray::array![2.0, 10.0];
+        let parsed = debiased_functional_weights(&serde_json::json!({"weights": [1, 3]}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            super::weighted_affine_mean(values.view(), Some(parsed.view()), "test").unwrap(),
+            8.0
+        );
+        assert_eq!(
+            super::weighted_affine_mean(values.view(), None, "test").unwrap(),
+            6.0
+        );
+    }
+
+    #[test]
+    fn explicit_derivative_selector_is_resolved_or_refused() {
+        let dataset = gam::data::encode_recordswith_inferred_schema(
+            vec!["x".into(), "z".into()],
+            vec![
+                csv::StringRecord::from(vec!["1", "2"]),
+                csv::StringRecord::from(vec!["3", "4"]),
+            ],
+        )
+        .unwrap();
+        let spec: super::TermCollectionSpec = serde_json::from_value(serde_json::json!({
+            "linear_terms": [], "random_effect_terms": [], "smooth_terms": []
+        }))
+        .unwrap();
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(3),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let error = super::resolve_average_derivative_column(
+                &spec,
+                &dataset,
+                &serde_json::json!({"deriv_var": value}),
+            )
+            .unwrap_err();
+            assert!(error.contains("must be a column"), "{error}");
+        }
+        assert_eq!(
+            super::resolve_average_derivative_column(
+                &spec,
+                &dataset,
+                &serde_json::json!({"deriv_var": "z"})
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            super::resolve_average_derivative_column(
+                &spec,
+                &dataset,
+                &serde_json::json!({"deriv_var": "missing"})
+            )
+            .unwrap_err()
+            .contains("not a column")
+        );
+        assert!(
+            super::resolve_average_derivative_column(&spec, &dataset, &serde_json::json!({}))
+                .unwrap_err()
+                .contains("requires at least one smooth")
+        );
     }
 }

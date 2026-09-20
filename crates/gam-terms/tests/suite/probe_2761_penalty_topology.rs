@@ -1,6 +1,14 @@
-//! TEMPORARY probe: why does the active-penalty count of a 1-D measure-jet
-//! TERM COLLECTION change with the representer range? (`incremental realizer
-//! topology changed ... active_penalties=2, cached_penalties=1`)
+//! Representer-range invariance of a 1-D measure-jet term's penalty topology
+//! (#2761, #3884).
+//!
+//! The incremental realizer rebuilds a term at every outer ψ trial and refuses
+//! when the rebuilt penalty topology differs from the one the term collection
+//! cached (`incremental realizer topology changed ... active_penalties=2,
+//! cached_penalties=1`). #2761 made that topology ℓ-invariant by construction:
+//! the Primary's structural null frame is declared from the constraint
+//! transform `z` alone, and the double-penalty ridge's fate is decided in the
+//! local chart the same way the collection decides it. These tests sweep the
+//! representer range over a ladder and assert that invariant at every rung.
 
 use gam_data::{ColumnKindTag, DataSchema, EncodedDataset as Dataset, SchemaColumn};
 use gam_terms::basis::{
@@ -45,115 +53,95 @@ fn dataset_1d(n: usize) -> Dataset {
     }
 }
 
+/// The identity of a penalty block the incremental realizer aligns on: its
+/// term-local original index and its source.
+type PenaltyIdentity = (usize, String);
+
+/// Every rung of the representer-range ladder builds the collection with the
+/// same ordered penalty topology as the auto-range build.
 #[test]
-fn probe_term_collection_topology_versus_range() {
+fn term_collection_penalty_topology_is_invariant_to_the_representer_range() {
     let ds = dataset_1d(200);
     let col_map = ds.column_map();
     let parsed = parse_formula("y ~ s(x, bs=\"mjs\")").expect("parse");
-    let base = build_termspec(
-        &parsed.terms,
-        &ds,
-        &col_map,
-        &mut Vec::new(),
-    )
-    .expect("term spec");
+    let base = build_termspec(&parsed.terms, &ds, &col_map, &mut Vec::new()).expect("term spec");
     let feature = ds.values.clone();
 
     // The realized auto range, as the sentinel resolves it.
     let realized = build_term_collection_design(feature.view(), &base).expect("auto design");
-    println!(
-        "[coll] AUTO   penalties={} dropped={:?} p={} info={:?}",
-        realized.penalties.len(),
-        realized
-            .dropped_penaltyinfo
+    let topology = |penaltyinfo: &[gam_terms::smooth::PenaltyBlockInfo]| -> Vec<PenaltyIdentity> {
+        penaltyinfo
             .iter()
-            .map(|i| format!("{:?}/{:?}", i.penalty.source, i.penalty.reason))
-            .collect::<Vec<_>>(),
-        realized.design.ncols(),
-        realized
-            .penaltyinfo
-            .iter()
-            .map(|i| format!(
-                "{:?} rank={} frame={:?}",
-                i.penalty.source,
-                i.penalty.effective_rank,
-                i.penalty.structural_null_frame.as_ref().map(|f| f.ncols())
-            ))
-            .collect::<Vec<_>>()
-    );
-    let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &base.smooth_terms[0].basis else {
-        panic!("expected mjs");
+            .map(|i| (i.penalty.original_index, format!("{:?}", i.penalty.source)))
+            .collect()
     };
-    println!(
-        "[coll] spec: double_penalty={} learn_length_scale={} length_scale={} centers={:?}",
-        mj.double_penalty,
-        mj.learn_length_scale,
-        mj.length_scale,
-        gam_terms::basis::center_strategy_num_centers(&mj.center_strategy)
-    );
+    let auto_topology = topology(realized.penaltyinfo.as_slice());
+    assert_eq!(realized.penalties.len(), auto_topology.len());
 
+    let auto = {
+        let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &base.smooth_terms[0].basis else {
+            panic!("expected mjs");
+        };
+        let seeds = select_centers_by_strategy(feature.view(), &mj.center_strategy).expect("seeds");
+        let (nodes, _m) =
+            measure_jet_quadrature_nodes(feature.view(), seeds.view()).expect("nodes");
+        realized_measure_jet_length_scale(nodes.view(), 0.0).expect("auto")
+    };
+
+    let mut mismatches = Vec::new();
     for f in [0.5_f64, 1.0, 2.0, 4.0, 8.0, 16.0] {
         let mut spec = base.clone();
-        let auto = {
-            let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &spec.smooth_terms[0].basis else {
-                unreachable!()
-            };
-            let strategy = mj.center_strategy.clone();
-            let seeds = select_centers_by_strategy(feature.view(), &strategy).expect("seeds");
-            let (nodes, _m) =
-                measure_jet_quadrature_nodes(feature.view(), seeds.view()).expect("nodes");
-            realized_measure_jet_length_scale(nodes.view(), 0.0).expect("auto")
-        };
         if let SmoothBasisSpec::MeasureJet { spec: mj, .. } = &mut spec.smooth_terms[0].basis {
             mj.length_scale = auto * f;
         }
         match build_term_collection_design(feature.view(), &spec) {
             Ok(design) => {
-                let sources: Vec<String> = design
-                    .penaltyinfo
-                    .iter()
-                    .map(|i| format!("{:?}", i.penalty.source))
-                    .collect();
-                let dropped: Vec<String> = design
-                    .dropped_penaltyinfo
-                    .iter()
-                    .map(|i| format!("{:?}/{:?}", i.penalty.source, i.penalty.reason))
-                    .collect();
-                println!(
-                    "[coll] f={f:<5} ell={:.6} p={} penalties={} src={sources:?} dropped={dropped:?}",
-                    auto * f,
-                    design.design.ncols(),
-                    design.penalties.len()
-                );
+                let rung = topology(design.penaltyinfo.as_slice());
+                if design.penalties.len() != auto_topology.len() || rung != auto_topology {
+                    mismatches.push(format!(
+                        "f={f} ell={:.6}: penalties={} topology {rung:?} against auto {auto_topology:?}",
+                        auto * f,
+                        design.penalties.len()
+                    ));
+                }
             }
-            Err(e) => println!("[coll] f={f:<5} FAILED: {e}"),
+            Err(e) => mismatches.push(format!("f={f} ell={:.6}: build failed: {e}", auto * f)),
         }
     }
+    assert!(
+        mismatches.is_empty(),
+        "the collection's penalty topology changed with the representer range:\n{}",
+        mismatches.join("\n")
+    );
 }
 
-/// The chart the incremental realizer actually rebuilds in: the FROZEN composed
-/// transform the collection produced. Its local topology must equal the
-/// collection's cached one, at every range.
+/// The chart the incremental realizer actually rebuilds in is the FROZEN
+/// composed transform the collection produced. At every rung its local
+/// topology must equal the collection's cached one, which is the realizer's
+/// own check.
 #[test]
-fn probe_frozen_chart_local_topology_versus_range() {
+fn frozen_chart_local_penalty_topology_matches_the_cached_one_at_every_range() {
     use gam_terms::basis::{BasisMetadata, MeasureJetFrozenQuadrature};
 
     let ds = dataset_1d(200);
     let col_map = ds.column_map();
     let parsed = parse_formula("y ~ s(x, bs=\"mjs\")").expect("parse");
-    let base = build_termspec(
-        &parsed.terms,
-        &ds,
-        &col_map,
-        &mut Vec::new(),
-    )
-    .expect("term spec");
+    let base = build_termspec(&parsed.terms, &ds, &col_map, &mut Vec::new()).expect("term spec");
+    let SmoothBasisSpec::MeasureJet { spec: base_mj, .. } = &base.smooth_terms[0].basis else {
+        panic!("expected mjs");
+    };
     let feature = ds.values.clone();
     let realized = build_term_collection_design(feature.view(), &base).expect("auto design");
-    println!(
-        "[frozen] collection cached penalties = {}",
-        realized.penalties.len()
-    );
+    let identity = |penalties: &[gam_terms::basis::ActivePenalty]| -> Vec<PenaltyIdentity> {
+        let mut ids: Vec<PenaltyIdentity> = penalties
+            .iter()
+            .map(|p| (p.info.original_index, format!("{:?}", p.info.source)))
+            .collect();
+        ids.sort();
+        ids
+    };
+    let term = &realized.smooth.terms[0];
+    let cached = identity(term.active_penalties.as_slice());
     let BasisMetadata::MeasureJet {
         centers,
         length_scale,
@@ -168,19 +156,21 @@ fn probe_frozen_chart_local_topology_versus_range() {
         constraint_transform,
         sigma_coord,
         ..
-    } = &realized.smooth.terms[0].metadata
+    } = &term.metadata
     else {
         panic!("expected measure-jet metadata");
     };
+    // Replay the term that was built: its penalty switches come from the base
+    // spec, the rest from the collection's frozen metadata.
     let frozen = MeasureJetBasisSpec {
         center_strategy: CenterStrategy::UserProvided(centers.clone()),
         order_s: *order_s,
         alpha: *alpha,
         num_scales: eps_band.len(),
         length_scale: length_scale.standardized_value(),
-        double_penalty: true,
-        learn_length_scale: true,
-        multiscale: false,
+        double_penalty: base_mj.double_penalty,
+        learn_length_scale: base_mj.learn_length_scale,
+        multiscale: base_mj.multiscale,
         identifiability: MeasureJetIdentifiability::FrozenTransform {
             transform: constraint_transform.clone().expect("fit-time z"),
         },
@@ -197,22 +187,31 @@ fn probe_frozen_chart_local_topology_versus_range() {
     // The frozen replay evaluates on the SAME (standardized) coordinates the
     // centers live in, so feed the term its own feature column.
     let feature_col = feature.slice(ndarray::s![.., 1..2]).to_owned();
+    let mut mismatches = Vec::new();
     for f in [0.25_f64, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0] {
         let mut spec = frozen.clone();
         spec.length_scale = frozen.length_scale * f;
         match build_measure_jet_basis(feature_col.view(), &spec) {
-            Ok(built) => println!(
-                "[frozen] f={f:<5} ell={:.6} p={} local_penalties={} sources={:?}",
-                spec.length_scale,
-                built.design.ncols(),
-                built.active_penalties.len(),
-                built
-                    .active_penalties
-                    .iter()
-                    .map(|p| format!("{:?}", p.info.source))
-                    .collect::<Vec<_>>()
-            ),
-            Err(e) => println!("[frozen] f={f:<5} BUILD FAILED: {e}"),
+            Ok(built) => {
+                let local = identity(built.active_penalties.as_slice());
+                if built.active_penalties.len() != realized.penalties.len() || local != cached {
+                    mismatches.push(format!(
+                        "f={f} ell={:.6}: local_penalties={} {local:?} against cached {} {cached:?}",
+                        spec.length_scale,
+                        built.active_penalties.len(),
+                        realized.penalties.len()
+                    ));
+                }
+            }
+            Err(e) => mismatches.push(format!(
+                "f={f} ell={:.6}: build failed: {e}",
+                spec.length_scale
+            )),
         }
     }
+    assert!(
+        mismatches.is_empty(),
+        "the frozen chart's local penalty topology differs from the cached one:\n{}",
+        mismatches.join("\n")
+    );
 }

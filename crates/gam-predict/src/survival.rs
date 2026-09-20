@@ -420,13 +420,6 @@ impl PredictableModel for SurvivalPredictor {
         predict_posterior_mean_generic(self, input, fit, options)
     }
 
-    fn n_blocks(&self) -> usize {
-        2
-    }
-
-    fn block_roles(&self) -> Vec<BlockRole> {
-        vec![BlockRole::Threshold, BlockRole::Scale]
-    }
 }
 
 #[cfg(test)]

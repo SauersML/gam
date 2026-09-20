@@ -105,7 +105,7 @@ use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, FaerSvd, real_general_sp
 use gam_linalg::roundoff::{
     accumulation_band, accumulation_growth, compensated_band, factor_singular_band,
 };
-use gam_linalg::utils::KahanSum;
+use gam_math::sparse_grid::CompensatedSum;
 use ndarray::{Array2, ArrayView2, s};
 use std::f64::consts::SQRT_2;
 
@@ -145,7 +145,11 @@ impl std::fmt::Display for InvariantSubspaceError {
                 formatter,
                 "invariant-subspace recovery needs finite entries; entry ({row}, {col}) is not finite"
             ),
-            Self::BasisShape { rows, cols, dimension } => write!(
+            Self::BasisShape {
+                rows,
+                cols,
+                dimension,
+            } => write!(
                 formatter,
                 "a candidate basis needs {dimension} rows and 1 to {dimension} columns, got {rows}x{cols}"
             ),
@@ -158,7 +162,10 @@ impl std::fmt::Display for InvariantSubspaceError {
                 "the candidate basis resolves {resolved} of its {columns} columns above the SVD band"
             ),
             Self::Linalg(error) => {
-                write!(formatter, "invariant-subspace decomposition failed: {error}")
+                write!(
+                    formatter,
+                    "invariant-subspace decomposition failed: {error}"
+                )
             }
             Self::UnpairedComplexEigenvalue { index } => write!(
                 formatter,
@@ -331,7 +338,10 @@ pub fn certify_invariant_subspace(
         .iter()
         .fold(0.0_f64, |acc, &value| acc.max(value));
     let band = factor_singular_band(rows, cols, sigma_max);
-    let resolved = singular_values.iter().filter(|&&value| value > band).count();
+    let resolved = singular_values
+        .iter()
+        .filter(|&&value| value > band)
+        .count();
     if resolved < cols {
         return Err(InvariantSubspaceError::RankDeficientBasis {
             resolved,
@@ -504,8 +514,13 @@ fn propose_and_certify(
     matrix: ArrayView2<'_, f64>,
     estimates: &[(f64, f64)],
     cluster: &[usize],
-) -> Result<(Option<(InvariantSubspaceCertificate, InvariantBlockKind)>, f64), InvariantSubspaceError>
-{
+) -> Result<
+    (
+        Option<(InvariantSubspaceCertificate, InvariantBlockKind)>,
+        f64,
+    ),
+    InvariantSubspaceError,
+> {
     let columns = cluster.len();
     let (polynomial, degree) = cluster_polynomial(matrix, estimates, cluster);
     let mut power = polynomial.clone();
@@ -661,14 +676,14 @@ fn compensated_gram_defect(
     for left in 0..dimension {
         for right in left..dimension {
             let identity = if left == right { 1.0 } else { 0.0 };
-            let mut sum = KahanSum::default();
+            let mut sum = CompensatedSum::default();
             for (first, second) in frame.column(left).iter().zip(frame.column(right)) {
                 sum.add(first * second);
             }
             sum.add(-identity);
             let entry_band = compensated_band(1, absolute_gram[[left, right]] + identity);
             for (row, col) in [(left, right), (right, left)] {
-                defect[[row, col]] = sum.sum();
+                defect[[row, col]] = sum.value();
                 band[[row, col]] = entry_band;
             }
         }
@@ -689,11 +704,11 @@ fn compensated_similarity(
     let mut applied = Array2::<f64>::zeros((dimension, dimension));
     for (row, operator_row) in matrix.rows().into_iter().enumerate() {
         for col in 0..dimension {
-            let mut sum = KahanSum::default();
+            let mut sum = CompensatedSum::default();
             for (entry, basis) in operator_row.iter().zip(frame.column(col)) {
                 sum.add(entry * basis);
             }
-            applied[[row, col]] = sum.sum();
+            applied[[row, col]] = sum.value();
         }
     }
     let applied_band = majorant(matrix.mapv(f64::abs).dot(absolute_frame), dimension)
@@ -701,11 +716,11 @@ fn compensated_similarity(
     let mut reduced = Array2::<f64>::zeros((dimension, dimension));
     for left in 0..dimension {
         for col in 0..dimension {
-            let mut sum = KahanSum::default();
+            let mut sum = CompensatedSum::default();
             for (basis, entry) in frame.column(left).iter().zip(applied.column(col)) {
                 sum.add(basis * entry);
             }
-            reduced[[left, col]] = sum.sum();
+            reduced[[left, col]] = sum.value();
         }
     }
     let own_band = majorant(absolute_frame.t().dot(&applied.mapv(f64::abs)), dimension)
@@ -770,7 +785,10 @@ fn kronecker_column_ceiling(reduced: &Array2<f64>, columns: usize) -> f64 {
 /// This bound, and so every `Certified` verdict, rests on that declared assumption
 /// (#2951, mpd-verify batch 22 NOTE 2 and batch 23's SPEC-tension note). A counted
 /// band or an a posteriori SVD certificate is an owner change in gam-linalg.
-fn kronecker_separation(reduced: &Array2<f64>, columns: usize) -> Result<f64, InvariantSubspaceError> {
+fn kronecker_separation(
+    reduced: &Array2<f64>,
+    columns: usize,
+) -> Result<f64, InvariantSubspaceError> {
     let dimension = reduced.nrows();
     let complement = dimension - columns;
     let size = columns * complement;
@@ -861,16 +879,8 @@ fn plane_kind(restriction: &Array2<f64>, restriction_error: f64) -> InvariantBlo
     let trace_high = round_up(magnitude + trace_error, magnitude + trace_error, 1);
     let trace_low = round_down(magnitude - trace_error, magnitude + trace_error, 1).max(0.0);
     let determinant_absolute_sum = determinant.abs() + determinant_error;
-    let determinant_low = round_down(
-        determinant - determinant_error,
-        determinant_absolute_sum,
-        1,
-    );
-    let determinant_high = round_up(
-        determinant + determinant_error,
-        determinant_absolute_sum,
-        1,
-    );
+    let determinant_low = round_down(determinant - determinant_error, determinant_absolute_sum, 1);
+    let determinant_high = round_up(determinant + determinant_error, determinant_absolute_sum, 1);
     let square_high = round_up(trace_high * trace_high, trace_high * trace_high, 2);
     let square_low = round_down(trace_low * trace_low, trace_low * trace_low, 2);
     // `t^2 - 4 d` over `|t| in [trace_low, trace_high]`, `d in [determinant_low,
@@ -1071,7 +1081,12 @@ mod tests {
                 cosine_interval,
                 angle,
                 complex_structure,
-            } => (*modulus_interval, *cosine_interval, *angle, complex_structure),
+            } => (
+                *modulus_interval,
+                *cosine_interval,
+                *angle,
+                complex_structure,
+            ),
             other => panic!("expected a rotation-scaling, got {other:?}"),
         };
         // `real^2 + imaginary^2` is exact, and the correctly rounded root is within half
@@ -1329,7 +1344,10 @@ mod tests {
         // Outward rounding reaches the neighbouring floats, which enclose `1 ± e`.
         let lower = round_down(1.0 - e, 1.0 + e, 1);
         let upper = round_up(1.0 + e, 1.0 + e, 1);
-        assert!(lower < 1.0 && upper > 1.0, "outward endpoints {lower}, {upper}");
+        assert!(
+            lower < 1.0 && upper > 1.0,
+            "outward endpoints {lower}, {upper}"
+        );
         // A 1x1 restriction [1.0] with restriction error 2^-60.
         match block_kind(&Array2::<f64>::from_elem((1, 1), 1.0), e) {
             InvariantBlockKind::Real {
@@ -1384,14 +1402,22 @@ mod tests {
         let proposal = proposal_frame(&polynomial).expect("proposal");
         let certificate =
             certify_frame(operator.view(), &proposal, clusters[0].len()).expect("certificate");
-        assert!(matches!(certificate.verdict, SubspaceVerdict::Certified { .. }), "{certificate:?}");
+        assert!(
+            matches!(certificate.verdict, SubspaceVerdict::Certified { .. }),
+            "{certificate:?}"
+        );
         // The Wilkinson band of forming `Q^T T Q` as a naive product on that frame,
         // `γ_{2n} ||(|Q|^T |T| |Q|)||_F`, which the compensated sums replaced. The
         // certificate's whole similarity error, orthogonality defect included, lies
         // below that one term.
         let absolute = proposal.mapv(f64::abs);
         let wilkinson = accumulation_growth(2 * ORDER)
-            * frobenius_norm(absolute.t().dot(&operator.mapv(f64::abs).dot(&absolute)).view());
+            * frobenius_norm(
+                absolute
+                    .t()
+                    .dot(&operator.mapv(f64::abs).dot(&absolute))
+                    .view(),
+            );
         assert!(
             certificate.similarity_error < wilkinson,
             "similarity error {:e} not below the naive band {wilkinson:e}",
@@ -1401,12 +1427,20 @@ mod tests {
         // A planted plane, offered as its own columns of `H`, certifies and spans them.
         let basis = frame.slice(s![.., 0..2]);
         let planted = certify_invariant_subspace(operator.view(), basis).expect("certificate");
-        assert!(matches!(planted.verdict, SubspaceVerdict::Certified { .. }), "{planted:?}");
+        assert!(
+            matches!(planted.verdict, SubspaceVerdict::Certified { .. }),
+            "{planted:?}"
+        );
         assert_spans(&planted, basis);
 
         // Every planted plane is recovered and certified as a rotation-scaling.
         let recovery = recover_invariant_blocks(operator.view()).expect("recovery");
-        assert_eq!(recovery.blocks.len(), ORDER / 2, "{:?}", recovery.ambiguities());
+        assert_eq!(
+            recovery.blocks.len(),
+            ORDER / 2,
+            "{:?}",
+            recovery.ambiguities()
+        );
         assert!(
             recovery
                 .blocks
@@ -1436,9 +1470,18 @@ mod tests {
 
         // The planted plane: the bound admits it, and the SVD certifies it.
         let (planted, ceiling, singular, condition) = measure(frame.slice(s![.., 0..2]));
-        assert!(ceiling * ceiling > condition, "{ceiling:e}^2 <= {condition:e}");
-        assert!(singular <= ceiling, "SVD bound {singular:e} above the column bound {ceiling:e}");
-        assert!(planted.separation.is_finite() && planted.separation > 0.0, "{planted:?}");
+        assert!(
+            ceiling * ceiling > condition,
+            "{ceiling:e}^2 <= {condition:e}"
+        );
+        assert!(
+            singular <= ceiling,
+            "SVD bound {singular:e} above the column bound {ceiling:e}"
+        );
+        assert!(
+            planted.separation.is_finite() && planted.separation > 0.0,
+            "{planted:?}"
+        );
         assert!(matches!(planted.verdict, SubspaceVerdict::Certified { .. }));
 
         // A plane mixing the two planted planes: the bound refuses it with no SVD, and
@@ -1447,10 +1490,19 @@ mod tests {
         mixed.column_mut(0).assign(&frame.column(0));
         mixed.column_mut(1).assign(&frame.column(2));
         let (refused, ceiling, singular, condition) = measure(mixed.view());
-        assert!(ceiling * ceiling <= condition, "{ceiling:e}^2 > {condition:e}");
+        assert!(
+            ceiling * ceiling <= condition,
+            "{ceiling:e}^2 > {condition:e}"
+        );
         assert_eq!(refused.separation, f64::NEG_INFINITY, "{refused:?}");
-        assert!(matches!(refused.verdict, SubspaceVerdict::NotSeparated { .. }));
-        assert!(singular <= ceiling, "SVD bound {singular:e} above the column bound {ceiling:e}");
+        assert!(matches!(
+            refused.verdict,
+            SubspaceVerdict::NotSeparated { .. }
+        ));
+        assert!(
+            singular <= ceiling,
+            "SVD bound {singular:e} above the column bound {ceiling:e}"
+        );
         assert!(
             singular <= 0.0 || singular * singular <= condition,
             "the SVD would certify what the bound refused: {singular:e}^2 against {condition:e}"

@@ -333,6 +333,81 @@ fn replay_predictor<'a>(
     Ok(ReplayedPredictor { predictor, design })
 }
 
+/// Refuse a replayed design whose penalty blocks or coefficient columns do not
+/// line up with the fit's flat layout: every reader indexes the fit's λ, β and
+/// covariance by the replay's block-local positions shifted by the predictor's
+/// offset, so a rebuild with another block count would misread them.
+fn check_replayed_penalty_layout(
+    replayed: &ReplayedPredictor<'_>,
+    fit: &UnifiedFitResult,
+    context: &str,
+) -> Result<(), String> {
+    let predictor = &replayed.predictor;
+    let design = &replayed.design;
+    match predictor.block {
+        None => crate::inference::model::saved_lambdas_index_rebuilt_layout(
+            predictor.spec,
+            design.penalties.len(),
+            fit,
+            context,
+        )?,
+        Some(block) => {
+            if design.design.ncols() != block.beta.len()
+                || design.penalties.len() != block.lambdas.len()
+            {
+                return Err(format!(
+                    "{}: the rebuilt design has {} coefficients and {} penalty blocks but \
+                     the fit's {} block has {} coefficients and {} smoothing parameters",
+                    predictor.label(),
+                    design.design.ncols(),
+                    design.penalties.len(),
+                    block.role.name(),
+                    block.beta.len(),
+                    block.lambdas.len()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One predictor of a saved fit with its frozen basis replayed: the penalty
+/// blocks (`design.penalties`, parallel to `design.penaltyinfo`) and the
+/// coefficient columns they cover, placed in the fit's flat layouts by
+/// `offset`. Block-local column `j` is global coefficient
+/// `offset.coefficients + j`; penalty block `i` owns `fit.lambdas[offset.penalties + i]`.
+pub struct SavedPredictorDesign {
+    /// The predictor's name in a multi-predictor fit, `None` for a
+    /// single-predictor fit.
+    pub predictor: Option<&'static str>,
+    pub design: gam_terms::smooth::TermCollectionDesign,
+    pub offset: gam_solve::estimate::SummaryBlockOffset,
+}
+
+/// Replay every predictor of a saved fit from its frozen spec, checked against
+/// the fit's coefficient and penalty layout, so readers of the fitted penalty
+/// structure (`S_b`, its rank, its prior mean, its λ) share the one replay the
+/// summary tables use.
+pub fn saved_predictor_designs(
+    model: &FittedModel,
+    fit: &UnifiedFitResult,
+    context: &str,
+) -> Result<Vec<SavedPredictorDesign>, String> {
+    let ranges = summary_training_ranges(model)?;
+    summary_predictor_blocks(model, fit)?
+        .into_iter()
+        .map(|predictor| {
+            let replayed = replay_predictor(predictor, ranges)?;
+            check_replayed_penalty_layout(&replayed, fit, context)?;
+            Ok(SavedPredictorDesign {
+                predictor: replayed.predictor.predictor,
+                design: replayed.design,
+                offset: replayed.predictor.offset,
+            })
+        })
+        .collect()
+}
+
 fn parametric_rows(
     replayed: &ReplayedPredictor<'_>,
     fit: &UnifiedFitResult,
@@ -362,34 +437,10 @@ fn predictor_block_smooth_terms(
     fit: &UnifiedFitResult,
 ) -> Result<Vec<SummarySmoothTermRow>, String> {
     let predictor = &replayed.predictor;
-    let spec = predictor.spec;
     let design = &replayed.design;
-    let label = predictor.label();
     // The walk below reads the fit's per-penalty record by the rebuilt layout's
     // global index, so a rebuild with another block count would misread it.
-    match predictor.block {
-        None => crate::inference::model::saved_lambdas_index_rebuilt_layout(
-            spec,
-            design.penalties.len(),
-            fit,
-            "per-smooth summary",
-        )?,
-        Some(block) => {
-            if design.design.ncols() != block.beta.len()
-                || design.penalties.len() != block.lambdas.len()
-            {
-                return Err(format!(
-                    "{label}: the rebuilt design has {} coefficients and {} penalty blocks but \
-                     the fit's {} block has {} coefficients and {} smoothing parameters",
-                    design.design.ncols(),
-                    design.penalties.len(),
-                    block.role.name(),
-                    block.beta.len(),
-                    block.lambdas.len()
-                ));
-            }
-        }
-    }
+    check_replayed_penalty_layout(replayed, fit, "per-smooth summary")?;
 
     // The walk over the fit's flat penalty layout — the `LinearTermRidge`
     // prologue, the random-effect blocks that own no entry, the block-local →
@@ -1014,12 +1065,19 @@ pub fn compare_saved_models(
     gam_solve::evidence::compare_models(candidates)
 }
 
-/// Log Akaike evidence ratio of model `a` over model `b` on the corrected AIC,
-/// `½·(AIC_c(b) − AIC_c(a))`: the pairwise form of [`compare_saved_models`].
-pub fn saved_models_log_evidence_ratio(a: &FittedModel, b: &FittedModel) -> Result<f64, String> {
+/// Akaike evidence ratio of model `a` over model `b` on the corrected AIC,
+/// `exp(½·(AIC_c(b) − AIC_c(a)))`: the pairwise form of
+/// [`compare_saved_models`].
+///
+/// The exponential is rounded by IEEE arithmetic: a ratio above `f64::MAX`
+/// (log gap past ~709.78) is `+inf` and one below the smallest subnormal is
+/// `0`, which are the correctly rounded values of the true ratio. The
+/// `compare_models` table instead reports such a ratio as absent because its
+/// JSON transport cannot carry `inf`.
+pub fn saved_models_evidence_ratio(a: &FittedModel, b: &FittedModel) -> Result<f64, String> {
     let a = comparison_candidate("a".to_string(), saved_model_summary(a)?)?;
     let b = comparison_candidate("b".to_string(), saved_model_summary(b)?)?;
-    gam_solve::evidence::log_evidence_ratio(&a, &b)
+    Ok(gam_solve::evidence::log_evidence_ratio(&a, &b)?.exp())
 }
 
 #[derive(Serialize)]
@@ -1246,11 +1304,12 @@ pub struct SummaryPayload {
     pub information_criteria: SummaryInformationCriteria,
     pub lambdas: Vec<f64>,
     pub coefficients: Vec<SummaryCoefficientRow>,
-    /// The Wald reference of `parametric_terms`: `"t"` (Student-t on the
-    /// residual degrees of freedom) when the scale is estimated, `"z"` when it
-    /// is known.
+    /// The reference of `parametric_terms`: `"t"` (Student-t on the residual
+    /// degrees of freedom) when the scale is estimated, `"z"` when it is known.
     pub parametric_statistic: Option<&'static str>,
-    /// Intercept and linear-term coefficients with their Wald tests.
+    /// Intercept and linear-term coefficients with their tests: the Wald ratio
+    /// for an unpenalized coefficient, the recorded variance-component score
+    /// test for a ridged linear term (gam#3573).
     pub parametric_terms: Vec<SummaryParametricTermRow>,
     /// Why `parametric_terms` could not be built; the same causes as
     /// `smooth_terms_unavailable` short of the smoothing-parameter layout.
@@ -1452,10 +1511,7 @@ pub fn saved_model_report_input(
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     // Total EDF: shown on the summary card and used as the residual degrees
     // of freedom in the dispersion estimates behind the report residuals.
-    let edf_total = model
-        .unified()
-        .and_then(|unified| unified.edf_total())
-        .or_else(|| fit.edf_total());
+    let edf_total = fit.edf_total();
     // Definition-consistent SE column (#2296): corrected-preferred, but never
     // an unlabeled mix of covariance definitions.
     let display_uncertainty = fit.display_coefficient_uncertainty();
@@ -1804,7 +1860,6 @@ fn residual_cascade_report_input(
         outer_gradient_norm: None,
         criterion_certificate: None,
         smoothing_forensics: Vec::new(),
-        // The cascade computes no effective degrees of freedom (#3978).
         edf_total: None,
         r_squared: None,
         coefficients: Vec::new(),

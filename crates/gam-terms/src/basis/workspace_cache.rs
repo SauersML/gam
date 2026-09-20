@@ -227,7 +227,7 @@ pub(crate) fn kernel_constraint_nullspace(
 /// an already-centered caller then produce bit-identical `Z`. The mean is a
 /// fixed property of the (frozen `UserProvided`) centers, replayed identically
 /// at predict.
-fn mean_centered_centers(centers: ArrayView2<'_, f64>) -> Array2<f64> {
+pub(crate) fn mean_centered_centers(centers: ArrayView2<'_, f64>) -> Array2<f64> {
     let k = centers.nrows();
     let d = centers.ncols();
     let center_mean: Vec<f64> = (0..d)
@@ -284,10 +284,24 @@ pub fn duchon_kernel_constraint_nullspace(
     duchon_constraint_nullspace_of_centered(centers_centered.view(), order, effective_order)
 }
 
+/// Canonical thin-plate side-condition frame `Z = null(P(centers)ᵀ)`.
+///
+/// Mean-centers the centers before the RRQR, exactly like the Duchon
+/// [`kernel_constraint_nullspace`] (#1375). The dense thin-plate builder factors
+/// the knot-mean-centered knots (#1269) and freezes its radial reparam `V` in
+/// that `Z` frame, while every metadata consumer (the n-free penalty re-key, the
+/// ψ / log-κ design and penalty derivatives, the lazy chunked design) calls this
+/// function with the RAW frozen centers. Without the centering, a coordinate
+/// offset or scale changes the RRQR pivot order, so those consumers land on a
+/// rotated orthonormal basis `Z_raw = Z_centered·W` of the same null space and
+/// apply the frozen `V` in the wrong frame (`Vᵀ Wᵀ Ω W V ≠ Vᵀ Ω V`).
+/// Centering here makes a raw and an already-centered caller agree.
 pub(crate) fn thin_plate_kernel_constraint_nullspace(
     centers: ArrayView2<'_, f64>,
     cache: &mut BasisCacheContext,
 ) -> Result<Array2<f64>, BasisError> {
+    let centers_centered = mean_centered_centers(centers);
+    let centers = centers_centered.view();
     let key = ConstraintNullspaceCacheKey {
         centersrows: centers.nrows(),
         centers_cols: centers.ncols(),

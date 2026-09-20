@@ -161,12 +161,32 @@ pub fn penalty_root_gram(root: ArrayView2<'_, f64>) -> Array2<f64> {
 /// in the joint basis. For exact-joint multi-block paths that scaling is
 /// wasteful: the root is naturally block-local. This enum lets the unified
 /// evaluator consume both forms through one interface.
+///
+/// Every variant's penalty energy is `‖R_k β_block − c_k‖²`, and the variants
+/// differ only in how the anchor `c_k` is held: zero (`DenseRoot`,
+/// `BlockRoot`), the image `R_k μ_k` of a coefficient-space prior mean
+/// (`…Centered`), or a root-space offset with no coefficient-space preimage
+/// (`DenseRootOffset`). The anchor enters only the shifted channels
+/// ([`Self::shifted_quadratic`], [`Self::apply_shifted_penalty`]); every other
+/// operator is the curvature `S_k = R_kᵀR_k`, which the anchor does not change.
 #[derive(Clone, Debug)]
 pub enum PenaltyCoordinate {
     DenseRoot(Array2<f64>),
     DenseRootCentered {
         root: Array2<f64>,
         prior_mean: Array1<f64>,
+    },
+    /// `‖R β − c‖²` with `c` (length `rank`) held in the root's range space.
+    ///
+    /// This is what a penalty becomes when it is restricted onto an affine
+    /// constraint face ([`Self::project_into_subspace`]): the restricted
+    /// energy `‖R z β_f − R(μ − β_⊥)‖²` has a root `R z` whose range need not
+    /// contain `R(μ − β_⊥)`, so no reduced prior mean `μ_f` reproduces it —
+    /// the best one, `(R z)⁺ R(μ − β_⊥)`, drops a `λ`-scaled constant whose
+    /// `ρ`-derivative the outer gradient needs (gam#4170).
+    DenseRootOffset {
+        root: Array2<f64>,
+        root_offset: Array1<f64>,
     },
     BlockRoot {
         root: Array2<f64>,
@@ -194,6 +214,21 @@ impl PenaltyCoordinate {
             Self::DenseRoot(root)
         } else {
             Self::DenseRootCentered { root, prior_mean }
+        }
+    }
+
+    /// The penalty `‖R β − c‖²` with root-space offset `c`; a zero offset is
+    /// the plain `DenseRoot`.
+    pub fn from_dense_root_with_offset(root: Array2<f64>, root_offset: Array1<f64>) -> Self {
+        assert_eq!(
+            root.nrows(),
+            root_offset.len(),
+            "penalty root-space offset length must match the root's row count"
+        );
+        if root_offset.iter().all(|&value| value == 0.0) {
+            Self::DenseRoot(root)
+        } else {
+            Self::DenseRootOffset { root, root_offset }
         }
     }
 
@@ -256,6 +291,7 @@ impl PenaltyCoordinate {
         match self {
             Self::DenseRoot(root)
             | Self::DenseRootCentered { root, .. }
+            | Self::DenseRootOffset { root, .. }
             | Self::BlockRoot { root, .. }
             | Self::BlockRootCentered { root, .. } => root.nrows(),
         }
@@ -263,7 +299,9 @@ impl PenaltyCoordinate {
 
     pub fn dim(&self) -> usize {
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => root.ncols(),
+            Self::DenseRoot(root)
+            | Self::DenseRootCentered { root, .. }
+            | Self::DenseRootOffset { root, .. } => root.ncols(),
             Self::BlockRoot { total_dim, .. } | Self::BlockRootCentered { total_dim, .. } => {
                 *total_dim
             }
@@ -285,9 +323,9 @@ impl PenaltyCoordinate {
     /// squared Gram `RᵀR`, which can promote roundoff in a structural zero.
     pub fn block_local_root(&self) -> Option<(&Array2<f64>, usize, usize)> {
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
-                Some((root, 0, root.ncols()))
-            }
+            Self::DenseRoot(root)
+            | Self::DenseRootCentered { root, .. }
+            | Self::DenseRootOffset { root, .. } => Some((root, 0, root.ncols())),
             Self::BlockRoot {
                 root, start, end, ..
             }
@@ -332,11 +370,22 @@ impl PenaltyCoordinate {
     /// block-local and a dense coordinate is returned. A centered coordinate
     /// keeps its prior mean: the quadratic stays `‖R_kΠ(β − μ_k)‖²`.
     ///
+    /// A `DenseRootOffset` coordinate is refused: its anchor lives in root
+    /// space, so there is no `Π(β − μ)` to form, and it exists only as the
+    /// output of the constraint-face restriction, which runs after this
+    /// projection.
+    ///
     /// Returns `self` unchanged when `N` has no columns.
     pub fn project_out_null_directions(&self, null_basis: ArrayView2<'_, f64>) -> Self {
         if null_basis.ncols() == 0 {
             return self.clone();
         }
+        assert!(
+            !matches!(self, Self::DenseRootOffset { .. }),
+            "PenaltyCoordinate::project_out_null_directions: a root-space offset has no \
+             coefficient-space mean to project; apply the null split before the \
+             constraint-face restriction"
+        );
         assert_eq!(
             null_basis.nrows(),
             self.dim(),
@@ -385,27 +434,41 @@ impl PenaltyCoordinate {
         match self {
             Self::DenseRootCentered { prior_mean, .. }
             | Self::BlockRootCentered { prior_mean, .. } => Some(prior_mean.view()),
-            Self::DenseRoot(_) | Self::BlockRoot { .. } => None,
+            Self::DenseRoot(_) | Self::DenseRootOffset { .. } | Self::BlockRoot { .. } => None,
         }
     }
 
-    /// Restrict this penalty coordinate onto the free subspace spanned by the
-    /// orthonormal columns of `z` (shape `p × m`, `m ≤ p`, `zᵀz = I`).
+    /// Restrict this penalty coordinate onto the active constraint face through
+    /// `face_point`, parameterized by the orthonormal columns of `z` (shape
+    /// `p × m`, `m ≤ p`, `zᵀz = I`) spanning the face's directions.
     ///
     /// When a linear-inequality active set is non-empty, the inner solve and the
-    /// penalized Hessian are reduced to the free subspace `β = z β_f` of
-    /// dimension `m = p − active_set_size`. The penalty must move in lockstep:
-    /// the quadratic `βᵀ S_k β = β_fᵀ (zᵀ S_k z) β_f`, and since `S_k = R_kᵀ R_k`
-    /// the reduced root is `R_k z` (shape `rank_k × m`). For a block-local root
-    /// `R_k` acting on `β[start..end]` the same identity gives reduced dense root
-    /// `R_k · z[start..end, :]`, so the reduced coordinate is always a
-    /// (dimension-`m`) `DenseRoot` / `DenseRootCentered` — the block structure
-    /// does not survive an arbitrary subspace rotation. A centered mean `μ_k`
-    /// maps to `zᵀ μ_k`, the representation of `μ_k` in the free subspace.
+    /// penalized Hessian are reduced to the face coordinate `β_f = zᵀβ` of
+    /// dimension `m = p − active_set_size`. Every point of the face is
+    /// `β = z β_f + β_⊥` with the same `β_⊥ = (I − z zᵀ) face_point`, which is
+    /// non-zero whenever an active constraint has a non-zero right-hand side.
+    /// The penalty must move in lockstep, and its energy on the face is
+    ///
+    /// ```text
+    ///     ‖R_k(β − μ_k) − c_k‖² = ‖R_k z β_f − c_k'‖²,
+    ///     c_k' = c_k + R_k(μ_k − β_⊥)
+    /// ```
+    ///
+    /// (`μ_k`, `c_k` zero where the coordinate carries none). The reduced root
+    /// is `R_k z` (for a block-local root on `β[start..end]`, `R_k ·
+    /// z[start..end, :]`: the block structure does not survive an arbitrary
+    /// face rotation), and the anchor `c_k'` is a ROOT-SPACE offset: it lies
+    /// in `range(R_k z)` only when `μ_k − β_⊥` does not reach the constraint
+    /// normals through `S_k`, so it cannot be rewritten as a reduced prior mean
+    /// without dropping a `λ_k`-scaled constant from the value and a
+    /// `λ_k zᵀS_k(I − z zᵀ)(β̂ − μ_k)` term from the gradient (gam#4170). The
+    /// reduced coordinate evaluated at `zᵀβ` reproduces the full penalty at
+    /// `β` exactly, its shifted score is `zᵀ S_k(β − μ_k)`, and its curvature
+    /// is `zᵀ S_k z`.
     ///
     /// This keeps `dim()` equal to the reduced `beta.len()`, which
     /// `InnerSolutionBuilder::build` asserts.
-    pub fn project_into_subspace(&self, z: &Array2<f64>) -> Self {
+    pub fn project_into_subspace(&self, z: &Array2<f64>, face_point: ArrayView1<'_, f64>) -> Self {
         assert_eq!(
             z.nrows(),
             self.dim(),
@@ -413,41 +476,53 @@ impl PenaltyCoordinate {
             z.nrows(),
             self.dim()
         );
-        match self {
-            Self::DenseRoot(root) => Self::DenseRoot(root.dot(z)),
+        assert_eq!(
+            face_point.len(),
+            self.dim(),
+            "PenaltyCoordinate::project_into_subspace: face point length {} does not match coordinate dimension {}",
+            face_point.len(),
+            self.dim()
+        );
+        let (root, start, end, prior_mean, root_offset) = match self {
+            Self::DenseRoot(root) => (root, 0, root.ncols(), None, None),
             Self::DenseRootCentered { root, prior_mean } => {
-                Self::from_dense_root_with_mean(root.dot(z), z.t().dot(prior_mean))
+                (root, 0, root.ncols(), Some(prior_mean), None)
+            }
+            Self::DenseRootOffset { root, root_offset } => {
+                (root, 0, root.ncols(), None, Some(root_offset))
             }
             Self::BlockRoot {
                 root, start, end, ..
-            } => {
-                let z_block = z.slice(ndarray::s![*start..*end, ..]);
-                Self::DenseRoot(root.dot(&z_block))
-            }
+            } => (root, *start, *end, None, None),
             Self::BlockRootCentered {
                 root,
                 start,
                 end,
                 prior_mean,
                 ..
-            } => {
-                let z_block = z.slice(ndarray::s![*start..*end, ..]);
-                // Reduced mean: the block-local prior `μ_k` sits at
-                // `β[start..end]`; lift it into the full coordinate before
-                // projecting so the free-space mean is `zᵀ (E_block μ_k)`.
-                let z_block_owned = z_block.to_owned();
-                Self::from_dense_root_with_mean(
-                    root.dot(&z_block_owned),
-                    z_block_owned.t().dot(prior_mean),
-                )
-            }
+            } => (root, *start, *end, Some(prior_mean), None),
+        };
+        // `β_⊥ = (I − z zᵀ) face_point`, the component every face point shares.
+        let off_face = &face_point - &z.dot(&z.t().dot(&face_point));
+        let mut anchor = match prior_mean {
+            Some(mean) => mean.to_owned(),
+            None => Array1::<f64>::zeros(end - start),
+        };
+        anchor -= &off_face.slice(ndarray::s![start..end]);
+        let mut offset = root.dot(&anchor);
+        if let Some(existing) = root_offset {
+            offset += existing;
         }
+        let z_block = z.slice(ndarray::s![start..end, ..]);
+        Self::from_dense_root_with_offset(root.dot(&z_block), offset)
     }
 
     pub(crate) fn apply_root(&self, beta: &Array1<f64>) -> Array1<f64> {
         assert_eq!(beta.len(), self.dim());
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => root.dot(beta),
+            Self::DenseRoot(root)
+            | Self::DenseRootCentered { root, .. }
+            | Self::DenseRootOffset { root, .. } => root.dot(beta),
             Self::BlockRoot {
                 root, start, end, ..
             }
@@ -490,9 +565,12 @@ impl PenaltyCoordinate {
         match self {
             Self::DenseRoot(_)
             | Self::DenseRootCentered { .. }
+            | Self::DenseRootOffset { .. }
             | Self::BlockRoot { .. }
             | Self::BlockRootCentered { .. } => match self {
-                Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
+                Self::DenseRoot(root)
+                | Self::DenseRootCentered { root, .. }
+                | Self::DenseRootOffset { root, .. } => {
                     let mut root_beta = Array1::<f64>::zeros(root.nrows());
                     dense::matvec_into(root, beta, root_beta.view_mut());
                     dense::transpose_matvec_scaled_add_into(
@@ -534,6 +612,7 @@ impl PenaltyCoordinate {
         match self {
             Self::DenseRoot(_)
             | Self::DenseRootCentered { .. }
+            | Self::DenseRootOffset { .. }
             | Self::BlockRoot { .. }
             | Self::BlockRootCentered { .. } => {
                 let root_beta = self.apply_root(beta);
@@ -548,6 +627,12 @@ impl PenaltyCoordinate {
                 let centered = beta - prior_mean;
                 let root_beta = root.dot(&centered);
                 let mut out = root.t().dot(&root_beta);
+                out *= scale;
+                out
+            }
+            Self::DenseRootOffset { root, root_offset } => {
+                let residual = root.dot(beta) - root_offset;
+                let mut out = root.t().dot(&residual);
                 out *= scale;
                 out
             }
@@ -578,6 +663,10 @@ impl PenaltyCoordinate {
                 let root_beta = root.dot(&centered);
                 scale * root_beta.dot(&root_beta)
             }
+            Self::DenseRootOffset { root, root_offset } => {
+                let residual = root.dot(beta) - root_offset;
+                scale * residual.dot(&residual)
+            }
             Self::BlockRootCentered {
                 root,
                 start,
@@ -596,7 +685,9 @@ impl PenaltyCoordinate {
 
     pub fn scaled_dense_matrix(&self, scale: f64) -> Array2<f64> {
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
+            Self::DenseRoot(root)
+            | Self::DenseRootCentered { root, .. }
+            | Self::DenseRootOffset { root, .. } => {
                 let mut out = penalty_root_gram(root.view());
                 out *= scale;
                 out
@@ -629,7 +720,9 @@ impl PenaltyCoordinate {
     /// For DenseRoot (full-rank, no block structure), returns (matrix, 0, p).
     pub fn scaled_block_local(&self, scale: f64) -> (Array2<f64>, usize, usize) {
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
+            Self::DenseRoot(root)
+            | Self::DenseRootCentered { root, .. }
+            | Self::DenseRootOffset { root, .. } => {
                 let mut out = penalty_root_gram(root.view());
                 out *= scale;
                 let p = out.nrows();
@@ -674,9 +767,9 @@ impl PenaltyCoordinate {
         }
         let sqrt_scale = scale.sqrt();
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
-                Some((root * sqrt_scale, 0, root.ncols()))
-            }
+            Self::DenseRoot(root)
+            | Self::DenseRootCentered { root, .. }
+            | Self::DenseRootOffset { root, .. } => Some((root * sqrt_scale, 0, root.ncols())),
             Self::BlockRoot {
                 root, start, end, ..
             }
@@ -690,7 +783,9 @@ impl PenaltyCoordinate {
     /// For BlockRoot: extracts v[start..end], multiplies by local S_k, embeds result.
     pub fn scaled_matvec(&self, v: &Array1<f64>, scale: f64) -> Array1<f64> {
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
+            Self::DenseRoot(root)
+            | Self::DenseRootCentered { root, .. }
+            | Self::DenseRootOffset { root, .. } => {
                 let root_v = root.dot(v);
                 let mut out = root.t().dot(&root_v);
                 out *= scale;
@@ -755,6 +850,7 @@ impl PenaltyCoordinate {
         match self {
             Self::DenseRoot(root)
             | Self::DenseRootCentered { root, .. }
+            | Self::DenseRootOffset { root, .. }
             | Self::BlockRoot { root, .. }
             | Self::BlockRootCentered { root, .. } => {
                 // Tag the rooted family uniformly: placement (start/end/total)
@@ -1152,5 +1248,155 @@ mod tests {
             (got - expected).abs() <= 1e-12 * expected.abs().max(1.0),
             "shifted quadratic after projection = {got:.12e}, expected {expected:.12e}"
         );
+    }
+
+    // ─── gam#4170: constraint-face restriction keeps the face offset ────────
+
+    /// The face `aᵀβ = 0.9` (`a = (e0 + e1)/√2`), its orthonormal directions
+    /// `z`, and a face point whose off-face component `0.9 a` is non-zero.
+    fn affine_face_fixture() -> (Array2<f64>, Array1<f64>) {
+        let h = 1.0_f64 / 2.0_f64.sqrt();
+        let z = array![
+            [h, 0.0, 0.0],
+            [-h, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0]
+        ];
+        let normal = array![h, h, 0.0, 0.0];
+        let face_point = z.dot(&array![0.5_f64, -1.2, 0.8]) + &(&normal * 0.9);
+        (z, face_point)
+    }
+
+    fn max_abs_gap(left: &Array1<f64>, right: &Array1<f64>) -> f64 {
+        (left - right)
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+    }
+
+    /// Check that the face-reduced coordinate evaluated at `zᵀβ̂` reproduces
+    /// the full coordinate's shifted value, shifted score (through `zᵀ`) and
+    /// curvature `zᵀSz` exactly.
+    fn assert_face_reduction_is_exact(
+        full: &PenaltyCoordinate,
+        z: &Array2<f64>,
+        face_point: &Array1<f64>,
+    ) {
+        let reduced = full.project_into_subspace(z, face_point.view());
+        assert_eq!(reduced.dim(), z.ncols());
+        let beta_face = z.t().dot(face_point);
+        let scale = 2.5_f64;
+
+        let full_value = full.shifted_quadratic(face_point, scale);
+        let reduced_value = reduced.shifted_quadratic(&beta_face, scale);
+        assert!(
+            (reduced_value - full_value).abs() <= 1e-12 * full_value.abs().max(1.0),
+            "face-reduced shifted value {reduced_value:.15e} must equal the full \
+             penalty at the face point {full_value:.15e}"
+        );
+
+        let full_score = z.t().dot(&full.apply_shifted_penalty(face_point, scale));
+        let reduced_score = reduced.apply_shifted_penalty(&beta_face, scale);
+        let score_gap = max_abs_gap(&reduced_score, &full_score);
+        assert!(
+            score_gap <= 1e-12 * full_score.iter().fold(1.0_f64, |a, v| a.max(v.abs())),
+            "face-reduced shifted score {reduced_score:?} must equal zᵀ of the full \
+             shifted score {full_score:?} (gap {score_gap:e})"
+        );
+
+        let full_curvature = z.t().dot(&full.scaled_dense_matrix(1.0)).dot(z);
+        let curvature_gap = (&reduced.scaled_dense_matrix(1.0) - &full_curvature)
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!(curvature_gap <= 1e-12, "curvature gap {curvature_gap:e}");
+    }
+
+    #[test]
+    fn face_reduction_of_a_centered_dense_penalty_is_exact() {
+        let (z, face_point) = affine_face_fixture();
+        let root = array![
+            [1.0_f64, 2.0, 0.0, 0.5],
+            [0.0, 1.0, -1.0, 0.0],
+            [0.3, 0.0, 1.0, 2.0]
+        ];
+        let mean = array![0.4_f64, -0.1, 0.7, 0.2];
+        let full = PenaltyCoordinate::from_dense_root_with_mean(root, mean.clone());
+
+        // The fixture must exercise the term a reduced prior mean drops:
+        // `zᵀ S (I − z zᵀ)(β̂ − μ)` is the gradient piece gam#4170 lost.
+        let s = full.scaled_dense_matrix(1.0);
+        let centered = &face_point - &mean;
+        let off_face = &centered - &z.dot(&z.t().dot(&centered));
+        let dropped = z.t().dot(&s.dot(&off_face));
+        assert!(
+            dropped.iter().any(|value| value.abs() > 1e-2),
+            "fixture must couple the off-face component into the face score"
+        );
+
+        assert!(matches!(
+            full.project_into_subspace(&z, face_point.view()),
+            PenaltyCoordinate::DenseRootOffset { .. }
+        ));
+        assert_face_reduction_is_exact(&full, &z, &face_point);
+    }
+
+    #[test]
+    fn face_reduction_of_a_centered_block_penalty_is_exact() {
+        // The same face embedded in a five-coefficient model, the block on
+        // `β[1..3)` straddling the constraint normal's support.
+        let h = 1.0_f64 / 2.0_f64.sqrt();
+        let z = array![
+            [0.0_f64, 1.0, 0.0, 0.0],
+            [h, 0.0, 0.0, 0.0],
+            [-h, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ];
+        let normal = array![0.0_f64, h, h, 0.0, 0.0];
+        let face_point = z.dot(&array![0.5_f64, -0.3, 1.1, -0.4]) + &(&normal * -0.6);
+        let full = PenaltyCoordinate::from_block_root_with_mean(
+            array![[1.0_f64, 0.25], [0.5, -2.0]],
+            1,
+            3,
+            5,
+            array![0.3_f64, 0.8],
+        );
+        assert_face_reduction_is_exact(&full, &z, &face_point);
+
+        // An uncentred block penalty on a face through a non-zero right-hand
+        // side also acquires an offset: `β_⊥` alone moves the anchor.
+        let uncentred =
+            PenaltyCoordinate::from_block_root(array![[1.0_f64, 0.25], [0.5, -2.0]], 1, 3, 5);
+        assert!(matches!(
+            uncentred.project_into_subspace(&z, face_point.view()),
+            PenaltyCoordinate::DenseRootOffset { .. }
+        ));
+        assert_face_reduction_is_exact(&uncentred, &z, &face_point);
+    }
+
+    /// A face through the origin (every active right-hand side zero) leaves an
+    /// uncentred penalty uncentred: the restriction is the plain `R z`.
+    #[test]
+    fn face_reduction_through_the_origin_is_the_plain_root() {
+        let z = array![[1.0_f64, 0.0], [0.0, 0.0], [0.0, 1.0]];
+        let face_point = array![0.7_f64, 0.0, -1.9];
+        let root = array![[1.0_f64, 2.0, -0.5], [0.0, 1.5, 3.0]];
+        let reduced = PenaltyCoordinate::from_dense_root(root.clone())
+            .project_into_subspace(&z, face_point.view());
+        let PenaltyCoordinate::DenseRoot(reduced_root) = &reduced else {
+            panic!("a zero face offset must yield a plain dense root, got {reduced:?}");
+        };
+        assert_eq!(reduced_root, &root.dot(&z));
+    }
+
+    /// The null split must run before the face restriction; a root-space
+    /// offset has no coefficient-space mean for `Π` to act on.
+    #[test]
+    #[should_panic(expected = "root-space offset")]
+    fn null_split_refuses_a_face_offset_coordinate() {
+        let coord =
+            PenaltyCoordinate::from_dense_root_with_offset(array![[1.0_f64, 0.0]], array![0.5]);
+        let n = 1.0_f64 / 2.0_f64.sqrt();
+        let projected = coord.project_out_null_directions(array![[n], [n]].view());
+        panic!("null split unexpectedly returned {projected:?}");
     }
 }
