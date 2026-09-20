@@ -2220,7 +2220,6 @@ fn inner_fit(
     blocks: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, FitFailure> {
-    let mut options = options.clone();
     // The exact outer Hessian stays declared. Every custom-family search runs
     // gradient-only on the family's exact gradient (#2898,
     // `with_prefer_gradient_only`), so that Hessian is priced at the mint and
@@ -2229,8 +2228,7 @@ fn inner_fit(
     // verdict (#2954) is taken only where curvature is in hand. Disabling it
     // left the certificate a first-order band, on which gnomon#2359's ρ = −2
     // seed certified a saddle at 128.32 with descent left.
-    options.outer_tol = options.outer_tol.max(2.0e-5);
-    crate::custom_family::fit_custom_family(family, blocks, &options).map_err(FitFailure::from)
+    crate::custom_family::fit_custom_family(family, blocks, options).map_err(FitFailure::from)
 }
 
 fn inner_fit_from_certified_outer(
@@ -2243,7 +2241,6 @@ fn inner_fit_from_certified_outer(
 ) -> Result<UnifiedFitResult, FitFailure> {
     let mut options = crate::outer_subsample::exact_outer_options(options);
     options.use_outer_hessian = false;
-    options.outer_tol = options.outer_tol.max(2.0e-5);
     fit_custom_family_fixed_log_lambdas_from_mode_selection(
         family, blocks, &options, mode, theta, outer,
     )
