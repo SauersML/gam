@@ -28,8 +28,6 @@ box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_U_CLAMP)	https://g
 box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_U_CLAMP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/quadrature.rs	clamp(+-QUADRATURE_EXP_LOG_MAX)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/quadrature.rs	clamp(+-QUADRATURE_EXP_LOG_MAX)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-solve/src/reml/per_atom_efs.rs	clamp(+-PER_ATOM_MAX_STEP)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-solve/src/reml/per_atom_efs.rs	const PER_ATOM_MAX_STEP	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/reml_outer_engine/efs.rs	clamp(+-EFS_MAX_STEP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/reml_outer_engine/efs.rs	clamp(+-EFS_MAX_STEP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/reml_outer_engine/efs.rs	const EFS_MAX_STEP	https://github.com/SauersML/gam/issues/2902

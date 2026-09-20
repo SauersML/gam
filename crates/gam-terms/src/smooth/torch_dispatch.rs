@@ -10,8 +10,8 @@
 //! must have a matching variant here, so that dispatch never fails for a
 //! class the user can legitimately import. `TensorBSpline` (te tensor
 //! product), `Matern` (kernel-Gram penalty), and `Categorical` (sum-to-zero
-//! contrast with an identity ridge penalty — an i.i.d. Gaussian random
-//! effect, matching the Rust `RandomEffectTermSpec`) are now all fully wired
+//! contrast whose ridge prices the level effects — an i.i.d. Gaussian random
+//! effect restricted to sum-to-zero effects) are now all fully wired
 //! on the torch path. Every exported variant resolves to a `fit.py` branch
 //! that builds a concrete `(design, penalty)` tensor pair.
 
