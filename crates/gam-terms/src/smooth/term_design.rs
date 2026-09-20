@@ -618,6 +618,7 @@ pub fn build_term_collection_prediction_design(
         design,
         affine_offset,
         linear_ranges,
+        random_effect_ranges,
         smooth,
         ..
     } = build_term_collection_design_inner_with_policy_and_plan(
@@ -634,6 +635,7 @@ pub fn build_term_collection_prediction_design(
         design,
         affine_offset,
         linear_ranges,
+        random_effect_ranges,
         smooth_ranges: smooth
             .terms
             .into_iter()
@@ -646,14 +648,15 @@ pub fn build_term_collection_prediction_design(
     })
 }
 
-/// One linear or smooth term's design columns on new rows: the columns
-/// [`build_term_collection_prediction_design`] realizes over that term's range,
-/// built without realizing the terms its columns do not read.
+/// One linear, random-effect or smooth term's design columns on new rows: the
+/// columns [`build_term_collection_prediction_design`] realizes over that
+/// term's range, built without realizing the terms its columns do not read.
 ///
 /// A smooth's realized block reads the blocks of the smooths it is
 /// residualized against (the owners a frozen chart names, or the ownership
 /// hierarchy when nothing is frozen) and, under an automatic center strategy,
-/// the joint spatial center plan; everything else — random effects and every
+/// the joint spatial center plan; a random effect's indicator block reads only
+/// its own frozen levels. Everything else — the other random effects and every
 /// unrelated smooth — only widens the rows' design. The fixed affine channel is
 /// not a column, so it is not part of the result.
 pub fn build_term_prediction_columns(
@@ -662,15 +665,19 @@ pub fn build_term_prediction_columns(
     term: &str,
 ) -> Result<Array2<f64>, BasisError> {
     let is_linear = spec.linear_terms.iter().any(|linear| linear.name == term);
+    let random_effect = spec
+        .random_effect_terms
+        .iter()
+        .find(|effect| effect.name == term);
     let mut kept = vec![false; spec.smooth_terms.len()];
-    if !is_linear {
+    if !is_linear && random_effect.is_none() {
         let target = spec
             .smooth_terms
             .iter()
             .position(|smooth| smooth.name == term)
             .ok_or_else(|| {
                 BasisError::InvalidInput(format!(
-                    "term {term:?} is neither a linear nor a smooth term of this model"
+                    "term {term:?} is not a linear, random-effect or smooth term of this model"
                 ))
             })?;
         let auto_centered = |smooth: &SmoothTermSpec| {
@@ -720,22 +727,16 @@ pub fn build_term_prediction_columns(
     }
     let reduced = TermCollectionSpec {
         linear_terms: spec.linear_terms.clone(),
-        random_effect_terms: Vec::new(),
+        random_effect_terms: random_effect.into_iter().cloned().collect(),
         smooth_terms,
         level: spec.level,
     };
     let design = build_term_collection_prediction_design(data, &reduced)?;
-    let range = design
-        .linear_ranges
-        .iter()
-        .chain(&design.smooth_ranges)
-        .find(|(name, _)| name == term)
-        .map(|(_, range)| range.clone())
-        .ok_or_else(|| {
-            BasisError::InvalidInput(format!(
-                "term {term:?} has no columns in its restricted design"
-            ))
-        })?;
+    let range = design.term_range(term).ok_or_else(|| {
+        BasisError::InvalidInput(format!(
+            "term {term:?} has no columns in its restricted design"
+        ))
+    })?;
     Ok(design.design.extract_columns(&range.collect::<Vec<_>>()))
 }
 
@@ -2603,7 +2604,7 @@ fn penalty_candidates_under_collection_gauge(
             } else {
                 raw
             };
-            let (_, c_new) = normalize_penalty_in_constrained_space(restricted.dense());
+            let (_, c_new) = normalize_penalty_in_constrained_space(restricted.dense())?;
             let matrix = restricted.scaled(1.0 / c_new, "normalized global smooth penalty")?;
             Ok(PenaltyCandidate {
                 matrix,
@@ -2736,7 +2737,7 @@ fn penalty_candidates_under_collection_gauge(
                         full_factor,
                         "embedded global smooth null ridge",
                     )?;
-                    let (_, scale) = normalize_penalty_in_constrained_space(full.dense());
+                    let (_, scale) = normalize_penalty_in_constrained_space(full.dense())?;
                     candidate.matrix = full
                         .scaled(1.0 / scale, "normalized embedded global smooth null ridge")?;
                     candidate.normalization_scale = scale;
