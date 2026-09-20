@@ -689,134 +689,31 @@ pub(super) fn solve_newton_direction_dense(
     Ok(())
 }
 
-/// Solve `min_direction ||A direction + residual||` without assembling either
-/// `A' A` or the cancellation-prone normal-equation right-hand side
-/// `A' residual`. Householder QR sees condition `kappa(A)`, whereas forming
-/// the normal equations squares it and can erase stationarity digits when
-/// large score and penalty components cancel. When supplied, `firth_hessian`
-/// converts the Fisher direction to the exact objective direction through the
-/// same QR factor without reconstructing `A' A` or the cancelled score.
-pub(super) fn solve_newton_direction_from_root_with_firth_hessian(
-    root: &Array2<f64>,
-    root_residual: &Array1<f64>,
-    firth_hessian: Option<&Array2<f64>>,
-    direction_out: &mut Array1<f64>,
-) -> Result<f64, EstimationError> {
-    let p = root.ncols();
-    if root.nrows() < p || root_residual.len() != root.nrows() {
-        crate::bail_invalid_estim!(
-            "PIRLS square-root solve dimension mismatch: root={}x{}, residual={}",
-            root.nrows(),
-            p,
-            root_residual.len()
-        );
-    }
-    let (q, r) = root
-        .qr()
-        .map_err(EstimationError::LinearSystemSolveFailed)?;
-    if r.nrows() != p || r.ncols() != p {
-        crate::bail_invalid_estim!(
-            "PIRLS square-root QR produced non-square R={}x{} for p={p}",
-            r.nrows(),
-            r.ncols()
-        );
-    }
-
-    // R direction = -Q' residual. Applying Q before triangular substitution
-    // preserves the small projected residual directly; forming A' residual
-    // first would subtract the large score and penalty gradients in the least
-    // accurate coordinate frame.
-    let projected_residual = q.t().dot(root_residual);
-    if direction_out.len() != p {
-        *direction_out = Array1::zeros(p);
-    }
-    for reverse in 0..p {
-        let i = p - 1 - reverse;
-        let mut value = -projected_residual[i];
-        for k in (i + 1)..p {
-            value -= r[[i, k]] * direction_out[k];
-        }
-        let diagonal = r[[i, i]];
-        if !(diagonal.is_finite() && diagonal != 0.0) {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
-        }
-        direction_out[i] = value / diagonal;
-    }
-
-    // Least-squares stationarity certificate evaluated through A itself.
-    // `A' (A d + q)` must vanish; its denominator uses the unprojected residual
-    // scale, so the test remains meaningful without constructing a rounded
-    // Gram or treating a cancelled coefficient-space gradient as input data.
-    let mut least_squares_residual = root.dot(direction_out);
-    least_squares_residual += root_residual;
-    let normal_residual = root.t().dot(&least_squares_residual);
-    let residual_inf = inf_norm(normal_residual.iter().copied());
-    let root_inf = root
-        .rows()
-        .into_iter()
-        .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
-        .fold(0.0_f64, f64::max);
-    let root_transpose_inf = root
-        .columns()
-        .into_iter()
-        .map(|column| column.iter().map(|value| value.abs()).sum::<f64>())
-        .fold(0.0_f64, f64::max);
-    let direction_inf = inf_norm(direction_out.iter().copied());
-    let root_residual_inf = inf_norm(root_residual.iter().copied());
-    let scale = root_transpose_inf * (root_inf * direction_inf + root_residual_inf);
-    let backward_error = if scale > 0.0 {
-        residual_inf / scale
-    } else {
-        residual_inf
-    };
-    let tolerance = 256.0 * f64::EPSILON * root.nrows().max(p) as f64;
-    if !backward_error.is_finite() || backward_error > tolerance {
-        crate::bail_invalid_estim!(
-            "PIRLS square-root Newton direction failed its backward-error certificate: \
-             error {backward_error:.3e} exceeds {tolerance:.3e}"
-        );
-    }
-    if !array_is_finite(direction_out) {
-        crate::bail_invalid_estim!("PIRLS square-root Newton direction is non-finite");
-    }
-    if let Some(hphi) = firth_hessian {
-        let fisher_direction = direction_out.clone();
-        let lower = r.t().to_owned();
-        correct_fisher_direction_for_firth_hessian_from_root_factor(
-            &lower,
-            hphi,
-            &fisher_direction,
-            direction_out,
-        )?;
-    }
-    log::debug!(
-        "[STAGE] PIRLS dense newton solve backend=CPU p={} rows={} route=\"Householder QR of PSD root\" backward_error={:.3e} damped_decrement_sq={:.3e}",
-        p,
-        root.nrows(),
-        backward_error,
-        projected_residual.dot(&projected_residual),
-    );
-    Ok(projected_residual.dot(&projected_residual))
-}
-
-/// Blocked tall-skinny QR for an augmented least-squares root.
+/// Solve `min_direction ||A direction + residual||` for an augmented
+/// least-squares root `A` streamed one row at a time, without assembling
+/// either `A' A` or the cancellation-prone normal-equation right-hand side
+/// `A' residual`. Householder QR sees condition `kappa(A)`, whereas forming the
+/// normal equations squares it and can erase stationarity digits when large
+/// score and penalty components cancel.
 ///
-/// Every full block contains at most `p` original rows. Once a block fills,
-/// it is reduced together with the preceding `p × p` triangular factor:
+/// Rows are buffered into blocks of `block_rows ≥ p`. Once a block fills, it
+/// is reduced together with the preceding `p × p` triangular factor:
 ///
 /// ```text
 /// [R_previous] = Q [R_next]
 /// [A_block   ]     [   0  ]
 /// ```
 ///
-/// This is algebraically the same Householder QR used by the dense root path,
-/// but its peak storage is `O(p²)` instead of `O(rows × p)`. In particular,
-/// sparse-native PIRLS designs never become a dense `n × p` allocation merely
-/// because a stiff penalty requires the numerically safer square-root solve.
+/// The block reductions are orthogonal, so the final `R` and projected
+/// residual are those of a single Householder QR of the whole root, while the
+/// live storage is `O((block_rows + p) × p)` rather than `O(rows × p)`. No
+/// PIRLS design, dense or sparse, becomes an `n × p` root allocation merely
+/// because a stiff penalty or Firth requires the square-root solve. When
+/// supplied, `firth_hessian` converts the Fisher direction to the exact
+/// objective direction through the same triangular factor.
 pub(super) struct TallSkinnyQrLeastSquares {
     p: usize,
+    block_rows: usize,
     pending_root: Array2<f64>,
     pending_residual: Array1<f64>,
     pending_rows: usize,
@@ -829,14 +726,23 @@ pub(super) struct TallSkinnyQrLeastSquares {
 }
 
 impl TallSkinnyQrLeastSquares {
-    pub(super) fn new(p: usize) -> Result<Self, EstimationError> {
+    /// `block_rows` is the number of original rows reduced per Householder
+    /// block. It must be at least `p` so every block reduction has a full
+    /// column rank opportunity and the carried factor is square.
+    pub(super) fn new(p: usize, block_rows: usize) -> Result<Self, EstimationError> {
         if p == 0 {
             crate::bail_invalid_estim!("tall-skinny QR requires at least one coefficient");
         }
+        if block_rows < p {
+            crate::bail_invalid_estim!(
+                "tall-skinny QR block of {block_rows} rows is shorter than p={p}"
+            );
+        }
         Ok(Self {
             p,
-            pending_root: Array2::zeros((p, p).f()),
-            pending_residual: Array1::zeros(p),
+            block_rows,
+            pending_root: Array2::zeros((block_rows, p).f()),
+            pending_residual: Array1::zeros(block_rows),
             pending_rows: 0,
             triangular_root: None,
             projected_residual: Array1::zeros(p),
@@ -874,7 +780,7 @@ impl TallSkinnyQrLeastSquares {
         self.pending_residual[self.pending_rows] = root_residual;
         self.pending_rows += 1;
         self.total_rows += 1;
-        if self.pending_rows == self.p {
+        if self.pending_rows == self.block_rows {
             self.flush()?;
         }
         Ok(())
@@ -993,7 +899,7 @@ impl TallSkinnyQrLeastSquares {
             )?;
         }
         log::debug!(
-            "[STAGE] PIRLS tall-skinny newton solve backend=CPU p={} rows={} route=\"blocked Householder QR of sparse PSD root\" backward_error={:.3e} damped_decrement_sq={:.3e}",
+            "[STAGE] PIRLS tall-skinny newton solve backend=CPU p={} rows={} route=\"blocked Householder QR of PSD root\" backward_error={:.3e} damped_decrement_sq={:.3e}",
             self.p,
             self.total_rows,
             backward_error,
@@ -1097,17 +1003,28 @@ mod square_root_solve_tests {
     use super::*;
     use ndarray::array;
 
+    /// Stream every row of `root` through the blocked QR with the given block
+    /// height, exactly as the PIRLS square-root solve does.
+    fn solve_root_rows(
+        root: &Array2<f64>,
+        root_residual: &Array1<f64>,
+        block_rows: usize,
+        firth_hessian: Option<&Array2<f64>>,
+        direction_out: &mut Array1<f64>,
+    ) -> Result<f64, EstimationError> {
+        let mut qr = TallSkinnyQrLeastSquares::new(root.ncols(), block_rows)?;
+        for (row, &residual) in root.rows().into_iter().zip(root_residual.iter()) {
+            qr.push_row(row, residual)?;
+        }
+        qr.solve(firth_hessian, direction_out)
+    }
+
     fn solve_newton_direction_from_root(
         root: &Array2<f64>,
         root_residual: &Array1<f64>,
         direction_out: &mut Array1<f64>,
     ) -> Result<f64, EstimationError> {
-        solve_newton_direction_from_root_with_firth_hessian(
-            root,
-            root_residual,
-            None,
-            direction_out,
-        )
+        solve_root_rows(root, root_residual, root.nrows(), None, direction_out)
     }
 
     #[test]
@@ -1160,7 +1077,11 @@ mod square_root_solve_tests {
     }
 
     #[test]
-    fn tall_skinny_qr_matches_dense_qr_for_a_stiff_root() {
+    fn tall_skinny_qr_is_invariant_to_its_block_height() {
+        // Orthogonal block reductions leave the least-squares problem unchanged,
+        // so the minimal block (`p` rows, one carried factor per row pair) and
+        // a single block holding every row must both recover the exact
+        // minimiser of this stiff root.
         let root = array![
             [1.0e8, 1.0e8],
             [1.0, -1.0],
@@ -1170,28 +1091,25 @@ mod square_root_solve_tests {
         ];
         let expected = array![0.25, -0.25];
         let residual = -root.dot(&expected);
-        let mut dense_direction = Array1::<f64>::zeros(2);
-        let dense_decrement =
-            solve_newton_direction_from_root(&root, &residual, &mut dense_direction)
-                .expect("dense square-root solve");
+        let mut minimal_block = Array1::<f64>::zeros(2);
+        let minimal_decrement = solve_root_rows(&root, &residual, 2, None, &mut minimal_block)
+            .expect("minimal-block square-root solve");
+        let mut single_block = Array1::<f64>::zeros(2);
+        let single_decrement =
+            solve_root_rows(&root, &residual, root.nrows(), None, &mut single_block)
+                .expect("single-block square-root solve");
 
-        let mut blocked = TallSkinnyQrLeastSquares::new(2).expect("blocked QR");
-        for i in 0..root.nrows() {
-            blocked
-                .push_row(root.row(i), residual[i])
-                .expect("append augmented row");
+        for direction in [&minimal_block, &single_block] {
+            for (&actual, &target) in direction.iter().zip(expected.iter()) {
+                assert!((actual - target).abs() < 1.0e-10);
+            }
         }
-        let mut blocked_direction = Array1::<f64>::zeros(2);
-        let blocked_decrement = blocked
-            .solve(None, &mut blocked_direction)
-            .expect("blocked square-root solve");
+        assert!((minimal_decrement - single_decrement).abs() < 1.0e-8);
+    }
 
-        for (&blocked_value, &dense_value) in
-            blocked_direction.iter().zip(dense_direction.iter())
-        {
-            assert!((blocked_value - dense_value).abs() < 1.0e-10);
-        }
-        assert!((blocked_decrement - dense_decrement).abs() < 1.0e-8);
+    #[test]
+    fn tall_skinny_qr_rejects_a_block_shorter_than_p() {
+        assert!(TallSkinnyQrLeastSquares::new(3, 2).is_err());
     }
 
     #[test]
@@ -1203,9 +1121,10 @@ mod square_root_solve_tests {
         let firth_hessian = array![[0.20, 0.03], [0.03, 0.15]];
         let mut corrected = Array1::<f64>::zeros(2);
 
-        solve_newton_direction_from_root_with_firth_hessian(
+        solve_root_rows(
             &root,
             &root_residual,
+            root.ncols(),
             Some(&firth_hessian),
             &mut corrected,
         )

@@ -1208,14 +1208,16 @@ mod tests {
         assert_eq!(decision.reason, "constraints_present");
     }
 
-    /// Regression for #2401: the cancellation-safe PSD-root solve introduced
-    /// for stiff P-IRLS systems must accept the sparse-native coordinate frame.
-    /// Before the fix, the routing oracle correctly chose `SparseNative`, the
-    /// disparate penalty energies correctly chose the augmented root solve, and
-    /// `write_fisher_design_root` then aborted solely because those two valid
-    /// choices had no shared implementation.
-    #[test]
-    pub(crate) fn sparse_native_stiff_penalty_uses_psd_root_2401() {
+    /// Stiff two-penalty binomial fixture shared by the PSD-root regression
+    /// tests: a one-hot design with three rows per coefficient and penalty
+    /// energies whose ratio exceeds the square-root-solve stiffness threshold.
+    /// Returns the sparse design, the canonical penalties and the smoothing
+    /// parameters.
+    fn stiff_one_hot_binomial_fixture() -> (
+        SparseColMat<usize, f64>,
+        Vec<gam_terms::construction::CanonicalPenalty>,
+        Array1<f64>,
+    ) {
         use gam_terms::construction::CanonicalPenalty;
 
         let p = 64usize;
@@ -1223,7 +1225,6 @@ mod tests {
         let triplets: Vec<_> = (0..n).map(|row| Triplet::new(row, row / 3, 1.0)).collect();
         let x = SparseColMat::try_new_from_triplets(n, p, &triplets)
             .expect("one-hot sparse design should build");
-        let x_design = DesignMatrix::from(x.clone());
 
         let mut low_energy_root = Array2::<f64>::zeros((1, p));
         low_energy_root[[0, 0]] = 1.0;
@@ -1250,26 +1251,21 @@ mod tests {
 
         let rho = array![-12.0, 12.0];
         let lambdas = rho.mapv(f64::exp);
-        let weighted_penalty = &canonical[0].local * lambdas[0] + &canonical[1].local * lambdas[1];
-        let mut routing_workspace = PirlsWorkspace::new(n, p);
-        let decision = should_use_sparse_native_pirls(
-            &mut routing_workspace,
-            &x_design,
-            &weighted_penalty,
-            None,
-            None,
-        );
-        assert_eq!(
-            decision.path,
-            PirlsLinearSolvePath::SparseNative,
-            "fixture must exercise the sparse-native coordinate frame; reason={}",
-            decision.reason
-        );
         assert!(
             lambdas[1] / lambdas[0] > f64::EPSILON.sqrt().recip(),
             "fixture must exceed the PSD-root stiffness threshold"
         );
+        (x, canonical, rho)
+    }
 
+    fn fit_stiff_one_hot_binomial<X: Into<DesignMatrix> + Clone>(
+        x: X,
+        canonical: &[gam_terms::construction::CanonicalPenalty],
+        rho: &Array1<f64>,
+    ) -> Result<super::PirlsResult, EstimationError> {
+        let design: DesignMatrix = x.clone().into();
+        let n = design.nrows();
+        let p = canonical[0].total_dim;
         let y = Array1::from_shape_fn(n, |row| if row % 3 == 2 { 1.0 } else { 0.0 });
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
@@ -1285,7 +1281,7 @@ mod tests {
             initial_lm_lambda: None,
         };
 
-        let (fit, _) = fit_model_for_fixed_rho(
+        fit_model_for_fixed_rho(
             LogSmoothingParamsView::new(rho.view())
                 .expect("test rho lies in the smoothing-strength domain"),
             PirlsProblem {
@@ -1298,7 +1294,7 @@ mod tests {
                 glm_first_step_gram: None,
             },
             PenaltyConfig {
-                canonical_penalties: &canonical,
+                canonical_penalties: canonical,
                 reparam_invariant: None,
                 p,
                 coefficient_lower_bounds: None,
@@ -1307,11 +1303,85 @@ mod tests {
             &config,
             None,
         )
-        .expect("stiff sparse-native binomial P-IRLS fit must use the PSD root");
+        .map(|(fit, _)| fit)
+    }
+
+    /// Regression for #2401: the cancellation-safe PSD-root solve introduced
+    /// for stiff P-IRLS systems must accept the sparse-native coordinate frame.
+    /// Before the fix, the routing oracle correctly chose `SparseNative`, the
+    /// disparate penalty energies correctly chose the augmented root solve, and
+    /// the dense root writer then aborted solely because those two valid
+    /// choices had no shared implementation.
+    #[test]
+    pub(crate) fn sparse_native_stiff_penalty_uses_psd_root_2401() {
+        let (x, canonical, rho) = stiff_one_hot_binomial_fixture();
+        let p = x.ncols();
+        let n = x.nrows();
+        let x_design = DesignMatrix::from(x.clone());
+        let lambdas = rho.mapv(f64::exp);
+        let weighted_penalty = &canonical[0].local * lambdas[0] + &canonical[1].local * lambdas[1];
+        let mut routing_workspace = PirlsWorkspace::new(n, p);
+        let decision = should_use_sparse_native_pirls(
+            &mut routing_workspace,
+            &x_design,
+            &weighted_penalty,
+            None,
+            None,
+        );
+        assert_eq!(
+            decision.path,
+            PirlsLinearSolvePath::SparseNative,
+            "fixture must exercise the sparse-native coordinate frame; reason={}",
+            decision.reason
+        );
+
+        let fit = fit_stiff_one_hot_binomial(x, &canonical, &rho)
+            .expect("stiff sparse-native binomial P-IRLS fit must use the PSD root");
 
         assert!(
             fit.beta_transformed.iter().all(|value| value.is_finite()),
             "sparse-native PSD-root fit must return finite coefficients"
+        );
+    }
+
+    /// The same stiff system through a dense design streams its augmented
+    /// root through the blocked QR in design-row chunks instead of assembling
+    /// an `(n + rank + p) × p` dense root. The dense coordinate frame must
+    /// reach the same P-IRLS termination state as the sparse-native frame on
+    /// this identical penalized problem.
+    #[test]
+    pub(crate) fn dense_stiff_penalty_streams_psd_root_through_blocked_qr() {
+        let (x, canonical, rho) = stiff_one_hot_binomial_fixture();
+        let x_dense = DesignMatrix::from(x.clone()).to_dense();
+        let lambdas = rho.mapv(f64::exp);
+        let weighted_penalty = &canonical[0].local * lambdas[0] + &canonical[1].local * lambdas[1];
+        let mut routing_workspace = PirlsWorkspace::new(x_dense.nrows(), x_dense.ncols());
+        let decision = should_use_sparse_native_pirls(
+            &mut routing_workspace,
+            &DesignMatrix::from(x_dense.clone()),
+            &weighted_penalty,
+            None,
+            None,
+        );
+        assert_eq!(
+            decision.path,
+            PirlsLinearSolvePath::DenseTransformed,
+            "fixture must exercise the dense coordinate frame; reason={}",
+            decision.reason
+        );
+
+        let sparse_fit = fit_stiff_one_hot_binomial(x, &canonical, &rho)
+            .expect("stiff sparse-native binomial P-IRLS fit");
+        let dense_fit = fit_stiff_one_hot_binomial(x_dense, &canonical, &rho)
+            .expect("stiff dense binomial P-IRLS fit must stream the PSD root");
+
+        assert!(
+            dense_fit.beta_transformed.iter().all(|value| value.is_finite()),
+            "dense PSD-root fit must return finite coefficients"
+        );
+        assert_eq!(
+            dense_fit.status, sparse_fit.status,
+            "dense and sparse square-root fits must terminate in the same P-IRLS state"
         );
     }
 
