@@ -4,8 +4,7 @@
 //! explain almost no variance even when ablating it changes the downstream
 //! distribution sharply. This module keeps the two ledgers separate. The
 //! variance/rank-charge decision remains available, and a Fisher local-KL
-//! effect decision is added beside it. Realized intervention KL is retained as
-//! an empirical validation ledger, not as the derived Fisher effect weight.
+//! effect decision is added beside it.
 
 /// Per-atom evidence in the existing reconstruction currency.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -26,24 +25,6 @@ impl VarianceChargeEvidence {
     }
 }
 
-/// Empirical intervention KL ledger for one atom.
-///
-/// This is a validation report for executed Rung-3 interventions. It is not the
-/// Fisher effect weight used for retention, because measured realized KL can
-/// include finite-dose and measurement effects outside the local quadratic
-/// approximation.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RealizedKlValidationEvidence {
-    /// Atom index.
-    pub atom: usize,
-    /// Mean measured KL over non-control interventions for this atom.
-    pub mean_empirical_realized_kl_nats: f64,
-    /// Largest measured KL over non-control interventions for this atom.
-    pub max_empirical_realized_kl_nats: f64,
-    /// Number of non-control interventions that touched this atom.
-    pub n_interventions: usize,
-}
-
 /// Streaming Fisher local-KL evidence for one atom.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FisherEffectEvidence {
@@ -62,8 +43,6 @@ pub struct FisherEffectEvidence {
     /// Derived discovery threshold in nats. This is the one-degree BIC price for
     /// the firing sample size: 0.5 * ln(max(n_firings, 2)).
     pub threshold_nats: f64,
-    /// Optional measured-KL validation ledger for the same atom.
-    pub realized_kl_validation: Option<RealizedKlValidationEvidence>,
 }
 
 impl FisherEffectEvidence {
@@ -78,19 +57,14 @@ impl FisherEffectEvidence {
 
 /// Streaming per-firing Fisher accumulator.
 ///
-/// Callers may either pass an already-computed local quadratic KL term, or pass
-/// a score vector and an ablation vector. The latter streams the quadratic form
-/// without materializing any token-by-atom design matrix: each firing contributes
-/// `0.5 * (scoreᵀ Δθ)^2`, the empirical-score form of `0.5 * Δθᵀ I Δθ`.
+/// Each ablated firing contributes its already-computed local quadratic KL term
+/// `0.5 * Δθᵀ I Δθ`, so no token-by-atom design matrix is ever materialized.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StreamingFisherEffectAccumulator {
     atom_count: usize,
     fisher_sums: Vec<f64>,
     fisher_maxes: Vec<f64>,
     firing_counts: Vec<usize>,
-    realized_sums: Vec<f64>,
-    realized_maxes: Vec<f64>,
-    realized_counts: Vec<usize>,
 }
 
 impl StreamingFisherEffectAccumulator {
@@ -100,9 +74,6 @@ impl StreamingFisherEffectAccumulator {
             fisher_sums: vec![0.0; atom_count],
             fisher_maxes: vec![0.0; atom_count],
             firing_counts: vec![0; atom_count],
-            realized_sums: vec![0.0; atom_count],
-            realized_maxes: vec![0.0; atom_count],
-            realized_counts: vec![0; atom_count],
         }
     }
 
@@ -131,18 +102,6 @@ impl StreamingFisherEffectAccumulator {
                 out.push(None);
                 continue;
             }
-            let realized_kl_validation = if self.realized_counts[atom] == 0 {
-                None
-            } else {
-                let n_interventions = self.realized_counts[atom];
-                Some(RealizedKlValidationEvidence {
-                    atom,
-                    mean_empirical_realized_kl_nats: self.realized_sums[atom]
-                        / n_interventions as f64,
-                    max_empirical_realized_kl_nats: self.realized_maxes[atom],
-                    n_interventions,
-                })
-            };
             out.push(Some(FisherEffectEvidence {
                 atom,
                 mean_fisher_quadratic_kl_nats: self.fisher_sums[atom] / n_firings as f64,
@@ -150,7 +109,6 @@ impl StreamingFisherEffectAccumulator {
                 max_fisher_quadratic_kl_nats: self.fisher_maxes[atom],
                 n_firings,
                 threshold_nats: bic_one_degree_threshold_nats(n_firings),
-                realized_kl_validation,
             }));
         }
         out
@@ -216,8 +174,8 @@ pub fn effect_weighted_retention(
     Ok(out)
 }
 
-fn bic_one_degree_threshold_nats(n_interventions: usize) -> f64 {
-    0.5 * (n_interventions.max(2) as f64).ln()
+fn bic_one_degree_threshold_nats(n_firings: usize) -> f64 {
+    0.5 * (n_firings.max(2) as f64).ln()
 }
 
 fn validate_nonnegative_finite(caller: &str, name: &str, value: f64) -> Result<(), String> {
