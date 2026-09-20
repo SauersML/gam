@@ -1,4 +1,5 @@
 use crate::estimate::EstimationError;
+use crate::exact_jet_objective::certified_newton_minimum;
 use crate::rho_optimizer::{FallbackPolicy, OuterProblem};
 use faer::Side;
 use gam_linalg::faer_ndarray::{
@@ -13,23 +14,10 @@ use gam_terms::smooth::BlockwisePenalty;
 use ndarray::{
     Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s,
 };
+use opt::{DecrementBands, ObjectiveEvalError, SecondOrderSample};
 use rayon::prelude::*;
 
 const EIGEN_REL_TOL: f64 = 1.0e-10;
-/// Relative first-order convergence certificate for the block-orthogonal
-/// alternation: the largest per-block |dV/drho|, normalized by the score's
-/// natural magnitude `d * max(1, rank)`, must fall below this and the analytic
-/// profiled Hessian must be PSD before a fit is minted. See
-/// `gaussian_reml_blocks_orthogonal_shared_scale`.
-const BLOCK_ORTHOGONAL_SCORE_TOL: f64 = 1.0e-7;
-/// Exhaustion-escalation bound on outer alternation passes. It never selects
-/// the estimator: reaching it without the score/curvature certificate is a typed
-/// `BlockOrthogonalRemlDidNotConverge` error carrying the rho checkpoint.
-const BLOCK_ORTHOGONAL_MAX_OUTER_PASSES: usize = 200;
-/// Work allocated to each one-dimensional block polish within an outer pass.
-/// This is not a convergence criterion: the joint analytic score below is the
-/// only condition that can mint a fit.
-const BLOCK_ORTHOGONAL_BLOCK_UPDATES_PER_PASS: usize = 32;
 
 /// Canonical coefficient-domain contract for the raw multi-block Gaussian
 /// REML entry point.
@@ -833,23 +821,6 @@ pub fn gaussian_reml_fit_blocks_exact(
     })
 }
 
-#[derive(Clone, Copy)]
-struct BlockOrthogonalControls {
-    score_tol: f64,
-    max_outer_passes: usize,
-    block_updates_per_pass: usize,
-}
-
-impl Default for BlockOrthogonalControls {
-    fn default() -> Self {
-        Self {
-            score_tol: BLOCK_ORTHOGONAL_SCORE_TOL,
-            max_outer_passes: BLOCK_ORTHOGONAL_MAX_OUTER_PASSES,
-            block_updates_per_pass: BLOCK_ORTHOGONAL_BLOCK_UPDATES_PER_PASS,
-        }
-    }
-}
-
 /// Canonicalize a penalty matrix to its symmetric average.
 ///
 /// Closed-form Gaussian REML treats `S` as symmetric throughout — the
@@ -1590,9 +1561,12 @@ pub fn gaussian_reml_multi_closed_form_with_cache(
 struct BlockOrthogonalEval {
     beta: Array2<f64>,
     logdet: f64,
-    trace: f64,
-    trace_pair: f64,
-    fitted_energy: Array1<f64>,
+    /// `Σ v` over the penalty range, `rank − tr(H⁻¹λS)`, summed from its
+    /// non-negative modal terms so it keeps its relative precision where every
+    /// `v → 0` (`ρ → ∞`) instead of cancelling `rank` against the trace.
+    range_shrinkage: f64,
+    /// `Σ w = Σ uv`, `tr(H⁻¹λS) − tr((H⁻¹λS)²)`, summed the same way.
+    curvature_trace: f64,
     penalty_energy: Array1<f64>,
     curvature_energy: Array1<f64>,
     /// `Σ_i c²_i·u_i`: the block's share of the profiled residual deviance
@@ -1683,10 +1657,9 @@ fn block_orthogonal_eval(
     validate_initial_lambda(lambda)?;
     let outputs = projected_rhs.ncols();
     let mut logdet = cache.logdet_xtwx;
-    let mut trace = 0.0;
-    let mut trace_pair = 0.0;
+    let mut range_shrinkage = 0.0;
+    let mut curvature_trace = 0.0;
     let mut edf = 0.0;
-    let mut fitted_energy = Array1::<f64>::zeros(outputs);
     let mut penalty_energy = Array1::<f64>::zeros(outputs);
     let mut curvature_energy = Array1::<f64>::zeros(outputs);
     let mut penalized_residual = Array1::<f64>::zeros(outputs);
@@ -1695,12 +1668,13 @@ fn block_orthogonal_eval(
     for eig in 0..spectrum.len() {
         let mode = modal_kernels(rho, spectrum.get(eig));
         logdet += mode.log_one_plus_t;
-        trace += mode.u;
-        trace_pair += mode.u * mode.u;
+        if spectrum.get(eig) > 0.0 {
+            range_shrinkage += mode.v;
+        }
+        curvature_trace += mode.w;
         edf += mode.v;
         for output in 0..outputs {
             let c2 = projected_rhs[[eig, output]] * projected_rhs[[eig, output]];
-            fitted_energy[output] += c2 * mode.v;
             penalty_energy[output] += c2 * mode.w;
             curvature_energy[output] += c2 * mode.w * mode.u;
             penalized_residual[output] += c2 * mode.u;
@@ -1710,9 +1684,8 @@ fn block_orthogonal_eval(
     Ok(BlockOrthogonalEval {
         beta: dense_ab(cache.coefficient_basis.view(), shrunk.view()),
         logdet,
-        trace,
-        trace_pair,
-        fitted_energy,
+        range_shrinkage,
+        curvature_trace,
         penalty_energy,
         curvature_energy,
         penalized_residual,
@@ -1741,205 +1714,40 @@ fn block_orthogonal_profiled_residual(
     q
 }
 
-/// Block-orthogonal shared-scale REML objective VALUE together with its
-/// analytic ρ-gradient and ρ-Hessian.
-///
-/// Single source of truth: the value `½d·logdet − ½·fit − ½d·rank·ρ` and its
-/// ρ-derivatives are returned from ONE function body, so a future edit to the
-/// objective cannot leave the Newton gradient/Hessian (previously written at a
-/// physically separate site inside `solve_block_orthogonal_rho`) stale. This
-/// closes a genuine `(value_here, gradient_there)` loose pair. Mirrors the
-/// `PenaltyLogdetDerivs` single-source pattern; behavior is identical (the same
-/// closed-form formulas, reorganized).
+/// One block's analytic ρ-gradient and ρ-Hessian of the fixed-scale REML
+/// objective `½d·log|H| − ½ Σ_o w_o ⟨y_o, fit_o⟩ − ½d·rank·ρ`, from ONE function
+/// body over `eval`'s cached energies.
 struct BlockOrthogonalScaleDerivs {
-    value: f64,
-    /// Forward roundoff bound on `value`, i.e. the smallest value difference
-    /// this channel can still decide.
-    ///
-    /// `value` is a three-term sum whose terms individually reach `½·τ·⟨y,fit⟩`
-    /// — a quantity of order `n·τ` — while its ρ-variation near the optimum is
-    /// of order the score squared. A descent test on such a sum is meaningful
-    /// only while the step's predicted decrease exceeds this bound; below it,
-    /// `candidate_value < current_value` is decided by rounding rather than by
-    /// descent. `solve_block_orthogonal_rho` uses this to hand the endgame to
-    /// the certificate's own metric instead of walking on value noise.
-    value_roundoff: f64,
     grad: f64,
     hess: f64,
 }
 
 fn block_orthogonal_scale_objective(
     eval: &BlockOrthogonalEval,
-    rho: f64,
     scale_precision: ArrayView1<'_, f64>,
-    rank: usize,
 ) -> BlockOrthogonalScaleDerivs {
     let d = scale_precision.len() as f64;
-    let fit_term = scale_precision
-        .iter()
-        .zip(eval.fitted_energy.iter())
-        .map(|(scale, energy)| scale * energy)
-        .sum::<f64>();
-    // VALUE: ½d·log|H| − ½ Σ_o w_o ⟨y_o, fit_o⟩ − ½d·rank·ρ.
-    let logdet_term = 0.5 * d * eval.logdet;
-    let rank_term = 0.5 * d * (rank as f64) * rho;
-    let value = logdet_term - 0.5 * fit_term - rank_term;
-    // Standard forward bound for the three-term sum: no summation order can
-    // resolve a difference below the unit roundoff times the sum of the term
-    // magnitudes.
-    let value_roundoff =
-        f64::EPSILON * (logdet_term.abs() + 0.5 * fit_term.abs() + rank_term.abs());
-    // ρ-GRADIENT: d/dρ of the same scalar. The logdet term contributes
-    // ½d·(tr(H⁻¹λS) − rank); the (data-independent-at-fixed-β envelope) fit term
-    // contributes +½ Σ_o w_o βᵀ(λS)β. Both share `eval`'s cached energies.
-    let grad = 0.5 * d * (eval.trace - rank as f64)
+    // ρ-GRADIENT. The logdet term contributes ½d·(tr(H⁻¹λS) − rank) = −½d·Σv;
+    // the (data-independent-at-fixed-β envelope) fit term contributes
+    // +½ Σ_o w_o βᵀ(λS)β. Every term is a sum of non-negative modal terms, so
+    // the gradient keeps its relative precision as the block saturates.
+    let grad = -0.5 * d * eval.range_shrinkage
         + 0.5
             * scale_precision
                 .iter()
                 .zip(eval.penalty_energy.iter())
                 .map(|(scale, energy)| scale * energy)
                 .sum::<f64>();
-    // ρ-HESSIAN: d²/dρ². Logdet term: ½d·(tr(H⁻¹λS) − tr((H⁻¹λS)²)); penalty
+    // ρ-HESSIAN. Logdet term: ½d·(tr(H⁻¹λS) − tr((H⁻¹λS)²)) = ½d·Σw; penalty
     // term: ½ Σ_o w_o (βᵀλSβ − 2 βᵀλS H⁻¹ λS β).
-    let hess = 0.5 * d * (eval.trace - eval.trace_pair)
+    let hess = 0.5 * d * eval.curvature_trace
         + 0.5
             * scale_precision
                 .iter()
                 .zip(eval.penalty_energy.iter().zip(eval.curvature_energy.iter()))
                 .map(|(scale, (energy, curvature))| scale * (energy - 2.0 * curvature))
                 .sum::<f64>();
-    BlockOrthogonalScaleDerivs {
-        value,
-        value_roundoff,
-        grad,
-        hess,
-    }
-}
-
-/// One warm-started 1-D Newton polish of a single block's rho at fixed scale
-/// precisions. `max_iter` is a per-pass WORK bound, not a convergence
-/// selector: the caller (`gaussian_reml_blocks_orthogonal_shared_scale`)
-/// re-enters this solve every outer pass and certifies the joint fit by the
-/// analytic score residual, erroring typed if the certificate is never met —
-/// so an iterate returned at this cap never silently becomes the estimator.
-fn solve_block_orthogonal_rho(
-    cache: &GaussianRemlEigenCache,
-    projected_rhs: &Array2<f64>,
-    rho0: f64,
-    scale_precision: ArrayView1<'_, f64>,
-    rank: usize,
-    max_iter: usize,
-) -> Result<(f64, BlockOrthogonalEval), EstimationError> {
-    let mut rho = rho0;
-    let mut current = block_orthogonal_eval(cache, projected_rhs, rho)?;
-    for _ in 0..max_iter {
-        // Value, ρ-gradient, and ρ-Hessian all come from the SINGLE
-        // single-source objective evaluation — they cannot desync.
-        let derivs = block_orthogonal_scale_objective(&current, rho, scale_precision, rank);
-        let grad = derivs.grad;
-        let hess = derivs.hess;
-        if !(grad.is_finite() && hess.is_finite()) {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
-        }
-        if grad == 0.0 {
-            break;
-        }
-        // Positive curvature gives the Newton direction. Else use the exact
-        // negative-gradient direction, which is descending regardless of the
-        // local curvature. A representability-terminated backtracking search
-        // globalizes either direction; it has no arbitrary finite trial list,
-        // step clamp, or line-search iteration budget.
-        let direction = if hess > 0.0 { -grad / hess } else { -grad };
-        if !direction.is_finite() || grad * direction >= 0.0 {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
-        }
-        let current_value = derivs.value;
-        // Exact decrease the local quadratic model predicts for the FULL step:
-        // `−g·p − ½·h·p²`. For the Newton direction that is `g²/(2h)`; for the
-        // negative-gradient direction under nonpositive curvature it is at
-        // least `g²`. The value channel can only adjudicate a step whose
-        // predicted decrease exceeds the value's own forward roundoff — below
-        // that, `candidate_value < current_value` reports rounding, and
-        // accepting on it walks the iterate around on noise while |g| stands
-        // still. This is not a tolerance: it is the point where the comparison
-        // stops carrying information, computed from the value's own terms.
-        let model_decrease = -grad * direction - 0.5 * hess * direction * direction;
-        let value_decides = model_decrease.is_finite() && model_decrease > derivs.value_roundoff;
-        let accepted = if value_decides {
-            let mut step_scale = 1.0_f64;
-            loop {
-                let candidate_rho = rho + step_scale * direction;
-                if candidate_rho == rho {
-                    break None;
-                }
-                if let Ok(candidate_eval) =
-                    block_orthogonal_eval(cache, projected_rhs, candidate_rho)
-                {
-                    let candidate_value = block_orthogonal_scale_objective(
-                        &candidate_eval,
-                        candidate_rho,
-                        scale_precision,
-                        rank,
-                    )
-                    .value;
-                    if candidate_value.is_finite() && candidate_value < current_value {
-                        break Some((candidate_rho, candidate_eval));
-                    }
-                }
-                // Bisection is intrinsic to backtracking, not a tuned step-size
-                // schedule. Floating-point representability above is the stopping
-                // rule, so every feasible improving step remains reachable.
-                step_scale *= 0.5;
-            }
-        } else {
-            None
-        };
-        // Endgame: once the value channel cannot resolve the predicted decrease
-        // (and whenever it simply refused every representable step), judge by
-        // the certificate's own metric instead — accept a step that strictly
-        // shrinks |g|. In a positive-curvature 1-D basin a gradient-magnitude
-        // decrease is descent, and it stays measurable down to ulp(g) rather
-        // than ulp(V). This is the only channel that reaches the score
-        // tolerance the fit is certified against: on an `n`-row fit the value's
-        // roundoff already exceeds `g²/(2h)` at `|g| ≈ sqrt(2h·ulp(V))`, which
-        // is orders of magnitude ABOVE that tolerance.
-        let accepted = accepted.or_else(|| {
-            if hess <= 0.0 {
-                return None;
-            }
-            let mut step_scale = 1.0_f64;
-            loop {
-                let candidate_rho = rho + step_scale * direction;
-                if candidate_rho == rho {
-                    break None;
-                }
-                if let Ok(candidate_eval) =
-                    block_orthogonal_eval(cache, projected_rhs, candidate_rho)
-                {
-                    let candidate = block_orthogonal_scale_objective(
-                        &candidate_eval,
-                        candidate_rho,
-                        scale_precision,
-                        rank,
-                    );
-                    if candidate.grad.is_finite() && candidate.grad.abs() < grad.abs() {
-                        break Some((candidate_rho, candidate_eval));
-                    }
-                }
-                step_scale *= 0.5;
-            }
-        });
-        let Some((next_rho, next_eval)) = accepted else {
-            break;
-        };
-        rho = next_rho;
-        current = next_eval;
-    }
-    Ok((rho, current))
+    BlockOrthogonalScaleDerivs { grad, hess }
 }
 
 fn block_orthogonal_conditional_scale(
@@ -2010,12 +1818,6 @@ fn validate_weighted_block_orthogonality(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
-struct BlockOrthogonalProfileCurvature {
-    min_eigenvalue: f64,
-    roundoff: f64,
-}
-
 /// Analytic rho Hessian after profiling out the exact conditional scale.
 ///
 /// With `tau_o = nu / q_o` and `e_bo = beta_bo' lambda_b S_b beta_bo`,
@@ -2027,21 +1829,14 @@ struct BlockOrthogonalProfileCurvature {
 ///
 fn block_orthogonal_profile_hessian(
     evals: &[BlockOrthogonalEval],
-    rhos: ArrayView1<'_, f64>,
     scale_precision: ArrayView1<'_, f64>,
-    ranks: &[usize],
     nu: f64,
 ) -> Result<Array2<f64>, EstimationError> {
     let blocks = evals.len();
     let mut hessian = Array2::<f64>::zeros((blocks, blocks));
     for block in 0..blocks {
-        hessian[[block, block]] = block_orthogonal_scale_objective(
-            &evals[block],
-            rhos[block],
-            scale_precision.view(),
-            ranks[block],
-        )
-        .hess;
+        hessian[[block, block]] =
+            block_orthogonal_scale_objective(&evals[block], scale_precision.view()).hess;
     }
     for left in 0..blocks {
         for right in 0..=left {
@@ -2068,152 +1863,129 @@ fn block_orthogonal_profile_hessian(
     Ok(hessian)
 }
 
-/// Eigendecomposition of the analytic profiled Hessian.
+/// The scale-profiled REML objective at `rhos` with its exact gradient and
+/// Hessian, and the rounding bands its Newton-decrement certificate is decided
+/// against.
 ///
-/// One decomposition per outer pass serves both consumers: the curvature
-/// certificate (a first-order score can vanish at a REML maximum or saddle, so
-/// nonnegative curvature up to eigensolver roundoff is required before a fit is
-/// minted) and the profiled Newton direction that drives the score to that
-/// certificate.
-struct BlockOrthogonalProfileSpectrum {
-    curvature: BlockOrthogonalProfileCurvature,
-    eigenvalues: Array1<f64>,
-    eigenvectors: Array2<f64>,
+/// The value is `½d·Σ_b (log|H_b| − rank_b·ρ_b) + ½ν·Σ_o ln q_o`. The exact
+/// conditional scale `τ_o = ν/q_o` makes the scale block of the joint score
+/// vanish, so by the envelope theorem the profiled ρ-gradient is the partial
+/// ρ-gradient at that scale, and the profiled Hessian is the fixed-scale one
+/// less the Schur correction [`block_orthogonal_profile_hessian`] applies.
+///
+/// Every band is the growth factor `γ_m` (`accumulation_growth`) times the
+/// magnitude of the terms its quantity is summed from, at the longest
+/// accumulation any of them has: every block's modes and the unpenalized
+/// residual into one `q_o`, then the blocks and the outputs. A term is charged
+/// once per rounded factor it carries: `q_o` is a sum of non-negative terms, so
+/// `τ_o` and `ln q_o` inherit its relative rounding; a `τ·e` gradient term
+/// carries two factors and a `τ²·e·e/ν` Schur term four.
+struct BlockOrthogonalProfileJet {
+    sample: SecondOrderSample,
+    evals: Vec<BlockOrthogonalEval>,
 }
 
-fn block_orthogonal_profile_spectrum(
-    hessian: &Array2<f64>,
-) -> Result<BlockOrthogonalProfileSpectrum, EstimationError> {
-    let blocks = hessian.nrows();
-    let (eigenvalues, eigenvectors) =
-        hessian
-            .clone()
-            .eigh(Side::Lower)
-            .map_err(|_| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            })?;
-    let min_eigenvalue = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
-    let spectral_scale = eigenvalues
+fn block_orthogonal_profile_jet(
+    prepared: &BlockOrthogonalPrepared,
+    rhos: ArrayView1<'_, f64>,
+    ranks: &[usize],
+    nu: f64,
+    d: usize,
+) -> Result<BlockOrthogonalProfileJet, EstimationError> {
+    let evals = prepared
+        .caches
         .iter()
-        .copied()
-        .map(f64::abs)
-        .fold(0.0_f64, f64::max);
-    let roundoff = f64::EPSILON * blocks.max(1) as f64 * spectral_scale;
-    Ok(BlockOrthogonalProfileSpectrum {
-        curvature: BlockOrthogonalProfileCurvature {
-            min_eigenvalue,
-            roundoff,
-        },
-        eigenvalues,
-        eigenvectors,
-    })
-}
+        .zip(prepared.projected_rhs.iter())
+        .zip(rhos.iter())
+        .map(|((cache, projected_rhs), &rho)| block_orthogonal_eval(cache, projected_rhs, rho))
+        .collect::<Result<Vec<_>, _>>()?;
+    let unpenalized_residual = prepared.unpenalized_residual.view();
+    let scale_precision = block_orthogonal_conditional_scale(&evals, unpenalized_residual, nu)?;
+    let q = block_orthogonal_profiled_residual(&evals, unpenalized_residual);
+    let outputs = d as f64;
+    let modes = prepared
+        .caches
+        .iter()
+        .map(|cache| cache.penalty_eigenvalues.len())
+        .sum::<usize>();
+    let growth = accumulation_growth(modes + evals.len() + d + 1);
 
-impl BlockOrthogonalProfileSpectrum {
-    /// Exact Newton direction `−H⁻¹g` of the scale-profiled objective, or
-    /// `None` when the profiled Hessian is not positive definite (there the
-    /// alternation, which is descent under any curvature, owns the pass).
-    fn newton_direction(&self, gradient: ArrayView1<'_, f64>) -> Option<Array1<f64>> {
-        if self.curvature.min_eigenvalue.is_nan() || self.curvature.min_eigenvalue <= 0.0 {
-            return None;
-        }
-        let projected = self.eigenvectors.t().dot(&gradient);
-        let scaled = Array1::from_iter(
-            projected
-                .iter()
-                .zip(self.eigenvalues.iter())
-                .map(|(component, eigenvalue)| -component / eigenvalue),
-        );
-        let direction = self.eigenvectors.dot(&scaled);
-        direction
-            .iter()
-            .all(|value| value.is_finite())
-            .then_some(direction)
+    let mut determinant_term = 0.0_f64;
+    let mut determinant_magnitude = 0.0_f64;
+    for (block, (eval, cache)) in evals.iter().zip(prepared.caches.iter()).enumerate() {
+        let rank_term = ranks[block] as f64 * rhos[block];
+        determinant_term += 0.5 * outputs * (eval.logdet - rank_term);
+        // `log|H_b| = log|XᵀWX| + Σ log(1+t)` with every `log(1+t) ≥ 0`.
+        determinant_magnitude += 0.5
+            * outputs
+            * (cache.logdet_xtwx.abs() + (eval.logdet - cache.logdet_xtwx).abs() + rank_term.abs());
     }
-}
-
-/// The scale-profiled REML objective VALUE at `rhos`, with the forward roundoff
-/// bound of its own term sum.
-///
-/// This is the function whose gradient the score certificate measures (the
-/// exact conditional scale `τ_o = ν/q_o` makes the scale block of the joint
-/// score vanish, so the envelope theorem identifies the profiled ρ-derivative
-/// with the cached partial ρ-gradient) and whose Hessian
-/// `block_orthogonal_profile_hessian` returns. Line searches on the profiled
-/// objective compare against `roundoff` for the same reason
-/// `BlockOrthogonalScaleDerivs::value_roundoff` exists.
-struct BlockOrthogonalProfileValue {
-    value: f64,
-    roundoff: f64,
-}
-
-fn block_orthogonal_profile_value(
-    evals: &[BlockOrthogonalEval],
-    rhos: ArrayView1<'_, f64>,
-    ranks: &[usize],
-    unpenalized_residual: ArrayView1<'_, f64>,
-    nu: f64,
-    d: usize,
-) -> Option<BlockOrthogonalProfileValue> {
-    let q = block_orthogonal_profiled_residual(evals, unpenalized_residual);
-    if q.iter().any(|value| !value.is_finite() || *value <= 0.0) {
-        return None;
-    }
-    let determinant_term = 0.5
-        * d as f64
-        * evals
-            .iter()
-            .enumerate()
-            .map(|(block, eval)| eval.logdet - ranks[block] as f64 * rhos[block])
-            .sum::<f64>();
     let deviance_term = 0.5 * nu * q.iter().map(|value| value.ln()).sum::<f64>();
+    let deviance_magnitude = 0.5 * nu * q.iter().map(|value| value.ln().abs() + 1.0).sum::<f64>();
     let value = determinant_term + deviance_term;
-    if !value.is_finite() {
-        return None;
-    }
-    Some(BlockOrthogonalProfileValue {
-        value,
-        roundoff: f64::EPSILON * (determinant_term.abs() + deviance_term.abs()),
-    })
-}
 
-/// Everything the certificate and the profiled Newton step read at one
-/// `(rhos, evals, scale_precision)` state. Assembled once per evaluation so the
-/// certificate's score and the direction that chases it can never come from
-/// different points.
-struct BlockOrthogonalStateMeasurement {
-    score_residual: f64,
-    gradient: Array1<f64>,
-    spectrum: BlockOrthogonalProfileSpectrum,
-}
-
-fn measure_block_orthogonal_state(
-    evals: &[BlockOrthogonalEval],
-    rhos: ArrayView1<'_, f64>,
-    scale_precision: ArrayView1<'_, f64>,
-    ranks: &[usize],
-    nu: f64,
-    d: usize,
-) -> Result<BlockOrthogonalStateMeasurement, EstimationError> {
-    let mut gradient = Array1::<f64>::zeros(evals.len());
-    let mut score_residual = 0.0_f64;
+    let blocks = evals.len();
+    let mut gradient = Array1::<f64>::zeros(blocks);
+    let mut gradient_band = Array1::<f64>::zeros(blocks);
     for (block, eval) in evals.iter().enumerate() {
-        let derivs =
-            block_orthogonal_scale_objective(eval, rhos[block], scale_precision, ranks[block]);
-        let residual = derivs.grad.abs() / ((d as f64) * (ranks[block].max(1) as f64));
-        if !residual.is_finite() {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
-        }
-        gradient[block] = derivs.grad;
-        score_residual = score_residual.max(residual);
+        gradient[block] =
+            block_orthogonal_scale_objective(eval, scale_precision.view())
+                .grad;
+        let scaled_energy = scale_precision
+            .iter()
+            .zip(eval.penalty_energy.iter())
+            .map(|(scale, energy)| scale * energy)
+            .sum::<f64>();
+        gradient_band[block] = growth
+            * (0.5 * outputs * eval.range_shrinkage + scaled_energy);
     }
-    let hessian = block_orthogonal_profile_hessian(evals, rhos, scale_precision, ranks, nu)?;
-    Ok(BlockOrthogonalStateMeasurement {
-        score_residual,
-        gradient,
-        spectrum: block_orthogonal_profile_spectrum(&hessian)?,
+    let hessian =
+        block_orthogonal_profile_hessian(&evals, scale_precision.view(), nu)?;
+    let mut hessian_magnitude = Array2::<f64>::zeros((blocks, blocks));
+    for left in 0..blocks {
+        let fixed_scale = scale_precision
+            .iter()
+            .zip(
+                evals[left]
+                    .penalty_energy
+                    .iter()
+                    .zip(evals[left].curvature_energy.iter()),
+            )
+            .map(|(scale, (energy, curvature))| scale * (energy + 2.0 * curvature))
+            .sum::<f64>();
+        hessian_magnitude[[left, left]] +=
+            0.5 * outputs * evals[left].curvature_trace + fixed_scale;
+        for right in 0..blocks {
+            hessian_magnitude[[left, right]] += 2.0
+                * evals[left]
+                    .penalty_energy
+                    .iter()
+                    .zip(evals[right].penalty_energy.iter())
+                    .zip(scale_precision.iter())
+                    .map(|((left_energy, right_energy), scale)| {
+                        scale * scale * left_energy * right_energy / nu
+                    })
+                    .sum::<f64>();
+        }
+    }
+    let hessian_band = growth * hessian_magnitude.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let objective_band = growth * (determinant_magnitude + deviance_magnitude);
+    Ok(BlockOrthogonalProfileJet {
+        sample: SecondOrderSample {
+            value,
+            gradient,
+            hessian: Some(hessian),
+            // The certificate's bar is the profile's own rounding band: the
+            // decrement left to the minimum is certified once it is below what
+            // one evaluation of `V` can resolve.
+            decrement_bands: Some(DecrementBands {
+                objective: objective_band,
+                tolerance: objective_band,
+                gradient: gradient_band,
+                hessian: hessian_band,
+            }),
+        },
+        evals,
     })
 }
 
@@ -2223,24 +1995,6 @@ pub fn gaussian_reml_blocks_orthogonal_shared_scale(
     y: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
     init_rhos: Option<&[f64]>,
-) -> Result<GaussianRemlBlockOrthogonalResult, EstimationError> {
-    gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
-        designs,
-        penalties,
-        y,
-        weights,
-        init_rhos,
-        BlockOrthogonalControls::default(),
-    )
-}
-
-fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
-    designs: &[Array2<f64>],
-    penalties: &[Array2<f64>],
-    y: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-    init_rhos: Option<&[f64]>,
-    controls: BlockOrthogonalControls,
 ) -> Result<GaussianRemlBlockOrthogonalResult, EstimationError> {
     if designs.is_empty() {
         crate::bail_invalid_estim!("block-orthogonal Gaussian REML requires at least one block");
@@ -2305,228 +2059,32 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
         );
     }
     let nu = (n_effective - nullity_total) as f64;
-    let mut rhos = match init_rhos {
+    let seed = match init_rhos {
         Some(values) => Array1::from_vec(values.to_vec()),
         None => Array1::zeros(designs.len()),
     };
     // A rho checkpoint is sufficient to resume exactly because scale is a
-    // closed-form conditional block. Reconstruct that block from the supplied
-    // rhos before any new rho update instead of discarding it and restarting
-    // from the response-only scale.
-    let mut evals = (0..designs.len())
-        .map(|block| {
-            block_orthogonal_eval(
-                &prepared.caches[block],
-                &prepared.projected_rhs[block],
-                rhos[block],
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // closed-form conditional block, so the smoothing search runs on the
+    // scale-profiled objective alone. An infeasible seed is the caller's
+    // input error, reported as such before any search.
+    block_orthogonal_profile_jet(&prepared, seed.view(), &ranks, nu, d)?;
+    // The minimiser is `opt`'s Newton trust region on the exact profiled
+    // jet, certified by the Newton decrement against the jet's own rounding
+    // bands: no iteration budget, no step clamp, and anything short of a
+    // certified stationary point with non-negative curvature is a typed error
+    // carrying the last iterate, resumable through `init_rhos`.
+    let solution = certified_newton_minimum(seed.clone(), None, None, |rhos| {
+        block_orthogonal_profile_jet(&prepared, rhos.view(), &ranks, nu, d)
+            .map(|jet| jet.sample)
+            .map_err(|error| ObjectiveEvalError::recoverable(error.to_string()))
+    })
+    .map_err(|error| EstimationError::BlockOrthogonalRemlDidNotConverge {
+        rho_checkpoint: error.last_point().unwrap_or(&seed).to_vec(),
+        reason: error.to_string(),
+    })?;
+    let rhos = solution.final_point;
+    let evals = block_orthogonal_profile_jet(&prepared, rhos.view(), &ranks, nu, d)?.evals;
     let unpenalized_residual = prepared.unpenalized_residual.view();
-    let mut scale_precision =
-        block_orthogonal_conditional_scale(&evals, unpenalized_residual, nu)?;
-    // Convergence is certified by the analytic score of the joint REML
-    // objective, never by the iteration cap (SPEC rule 20). Each outer pass
-    // (a) solves every block's 1-D rho Newton at the current scale precisions
-    // and (b) applies the EXACT conditional-optimum scale update
-    // `scale_o = nu / q_o`, so at the post-update point the scale block of the
-    // joint score vanishes identically and — by the envelope theorem — the
-    // profiled objective's total rho-derivative equals the partial
-    // rho-gradient there. That gradient is available exactly from the cached
-    // block evaluations because `block_orthogonal_eval` depends only on rho,
-    // not on the scale precisions. First-order certification is therefore
-    // `max_b |dV/drho_b| / (d * max(1, rank_b)) <= BLOCK_ORTHOGONAL_SCORE_TOL`
-    // (the normalizer is the score's natural magnitude: every gradient term is
-    // a sum of `d * rank`-order quantities, making the test relative). The
-    // analytic Schur-profiled rho Hessian must additionally be PSD within its
-    // dimension-scaled eigensolver roundoff; score-zero maxima and saddles are
-    // not converged estimators.
-    //
-    // The alternation alone is block Gauss-Seidel on `(rho, scale)`: it is
-    // globally descending but only LINEARLY convergent, at the spectral radius
-    // of the Schur coupling the profiled Hessian already carries. That rate is
-    // data-dependent and can be arbitrarily close to one, so a pass budget can
-    // never bound how close it gets to the score certificate. Each pass
-    // therefore ends with an exact Newton step on the SCALE-PROFILED objective,
-    // whose gradient is the certificate's own score and whose Hessian is the
-    // matrix assembled for the curvature certificate — no extra derivative
-    // work. The alternation keeps the pass wherever that Hessian is not
-    // positive definite (it descends under any curvature); the Newton step owns
-    // the endgame, where it converges quadratically and lands the score orders
-    // of magnitude below the tolerance instead of within a factor of two of it.
-    //
-    // Exhausting the pass budget without the certificate is a typed error
-    // carrying the rho checkpoint, resumable through `init_rhos`.
-    let mut converged = false;
-    let mut cycle_detected = false;
-    let mut outer_passes = 0usize;
-    let mut last_score_residual = f64::INFINITY;
-    let mut last_min_profile_curvature = f64::NEG_INFINITY;
-    let mut last_profile_curvature_roundoff = 0.0_f64;
-    let mut last_scale_step = f64::INFINITY;
-    let mut recent_states: [Option<(Array1<f64>, Array1<f64>)>; 2] = [None, None];
-    while outer_passes < controls.max_outer_passes {
-        outer_passes += 1;
-        let scale_at_pass_start = scale_precision.clone();
-        evals.clear();
-        for block in 0..designs.len() {
-            let (rho, eval) = solve_block_orthogonal_rho(
-                &prepared.caches[block],
-                &prepared.projected_rhs[block],
-                rhos[block],
-                scale_precision.view(),
-                ranks[block],
-                controls.block_updates_per_pass,
-            )?;
-            rhos[block] = rho;
-            evals.push(eval);
-        }
-        scale_precision = block_orthogonal_conditional_scale(&evals, unpenalized_residual, nu)?;
-        let mut measured = measure_block_orthogonal_state(
-            &evals,
-            rhos.view(),
-            scale_precision.view(),
-            &ranks,
-            nu,
-            d,
-        )?;
-        // Profiled Newton step. Skipped once the alternation already certified,
-        // so a converged pass costs exactly what it did before.
-        let alternation_certified = measured.score_residual <= controls.score_tol
-            && measured.spectrum.curvature.min_eigenvalue >= -measured.spectrum.curvature.roundoff;
-        let newton_step = if alternation_certified {
-            None
-        } else {
-            measured
-                .spectrum
-                .newton_direction(measured.gradient.view())
-                .zip(block_orthogonal_profile_value(
-                    &evals,
-                    rhos.view(),
-                    &ranks,
-                    unpenalized_residual,
-                    nu,
-                    d,
-                ))
-        };
-        if let Some((direction, current_profile)) = newton_step {
-            // Decrease the quadratic model predicts for the full step,
-            // `−g'p − ½p'Hp = ½g'H⁻¹g`. The profiled value can only adjudicate
-            // a step larger than its own forward roundoff; below that the
-            // certificate's own score residual is the honest metric, exactly as
-            // in the one-dimensional block polish.
-            let model_decrease = -0.5 * measured.gradient.dot(&direction);
-            let value_decides =
-                model_decrease.is_finite() && model_decrease > current_profile.roundoff;
-            let mut step_scale = 1.0_f64;
-            let accepted = loop {
-                let candidate_rhos = &rhos + &direction.mapv(|value| step_scale * value);
-                if candidate_rhos == rhos {
-                    break None;
-                }
-                let candidate = (0..designs.len())
-                    .map(|block| {
-                        block_orthogonal_eval(
-                            &prepared.caches[block],
-                            &prepared.projected_rhs[block],
-                            candidate_rhos[block],
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .ok()
-                    .and_then(|candidate_evals| {
-                        let candidate_scale = block_orthogonal_conditional_scale(
-                            &candidate_evals,
-                            unpenalized_residual,
-                            nu,
-                        )
-                        .ok()?;
-                        let candidate_measured = measure_block_orthogonal_state(
-                            &candidate_evals,
-                            candidate_rhos.view(),
-                            candidate_scale.view(),
-                            &ranks,
-                            nu,
-                            d,
-                        )
-                        .ok()?;
-                        let improves = if value_decides {
-                            block_orthogonal_profile_value(
-                                &candidate_evals,
-                                candidate_rhos.view(),
-                                &ranks,
-                                unpenalized_residual,
-                                nu,
-                                d,
-                            )
-                            .is_some_and(|profile| profile.value < current_profile.value)
-                        } else {
-                            candidate_measured.score_residual < measured.score_residual
-                        };
-                        improves.then_some((candidate_evals, candidate_scale, candidate_measured))
-                    });
-                if let Some((candidate_evals, candidate_scale, candidate_measured)) = candidate {
-                    break Some((
-                        candidate_rhos,
-                        candidate_evals,
-                        candidate_scale,
-                        candidate_measured,
-                    ));
-                }
-                // Backtracking bisection, stopped by floating-point
-                // representability rather than a trial budget.
-                step_scale *= 0.5;
-            };
-            if let Some((next_rhos, next_evals, next_scale, next_measured)) = accepted {
-                rhos = next_rhos;
-                evals = next_evals;
-                scale_precision = next_scale;
-                measured = next_measured;
-            }
-        }
-        last_scale_step = scale_precision
-            .iter()
-            .zip(scale_at_pass_start.iter())
-            .map(|(next, old)| (next.ln() - old.ln()).abs())
-            .fold(0.0_f64, f64::max);
-        last_score_residual = measured.score_residual;
-        last_min_profile_curvature = measured.spectrum.curvature.min_eigenvalue;
-        last_profile_curvature_roundoff = measured.spectrum.curvature.roundoff;
-        if last_score_residual <= controls.score_tol
-            && last_min_profile_curvature >= -last_profile_curvature_roundoff
-        {
-            converged = true;
-            break;
-        }
-        // Cycle guard: one outer pass is a pure function of the state
-        // `(rhos, scale_precision)`. Revisiting a state from one or two passes
-        // ago (bitwise) means the alternation is in a floating-point limit
-        // cycle that can never certify, so stop escalating immediately instead
-        // of burning the remaining budget on the same orbit.
-        let state = (rhos.clone(), scale_precision.clone());
-        if recent_states
-            .iter()
-            .flatten()
-            .any(|prev| prev.0 == state.0 && prev.1 == state.1)
-        {
-            cycle_detected = true;
-            break;
-        }
-        recent_states[1] = recent_states[0].take();
-        recent_states[0] = Some(state);
-    }
-    if !converged {
-        return Err(EstimationError::BlockOrthogonalRemlDidNotConverge {
-            iterations: outer_passes,
-            max_score_residual: last_score_residual,
-            score_tol: controls.score_tol,
-            min_profile_curvature: last_min_profile_curvature,
-            profile_curvature_roundoff: last_profile_curvature_roundoff,
-            last_scale_step,
-            cycle_detected,
-            rho_checkpoint: rhos.to_vec(),
-        });
-    }
 
     let coefficients = evals
         .iter()
@@ -7076,25 +6634,222 @@ mod tests {
     }
 
     #[test]
-    fn block_orthogonal_score_matches_the_objective_derivative() {
-        let gram = array![[3.0, 0.4], [0.4, 2.0]];
-        let rhs = array![[1.2, -0.3], [0.6, 0.9]];
-        let penalty = array![[1.0, 0.2], [0.2, 0.8]];
-        let (cache, projected, _) = block_orthogonal_parts_from_gram(&gram, &rhs, &penalty);
-        let scale = array![1.3, 0.8];
-        let rho = 0.37;
-        let step = 1.0e-6;
-        let eval = block_orthogonal_eval(&cache, &projected, rho).unwrap();
-        let analytic = block_orthogonal_scale_objective(&eval, rho, scale.view(), 2).grad;
-        let value_at = |candidate_rho: f64| {
-            let candidate = block_orthogonal_eval(&cache, &projected, candidate_rho).unwrap();
-            block_orthogonal_scale_objective(&candidate, candidate_rho, scale.view(), 2).value
+    fn block_orthogonal_profile_jet_derivatives_match_its_value() {
+        let grams = [
+            array![[3.0, 0.4], [0.4, 2.0]],
+            array![[2.5, -0.2], [-0.2, 1.8]],
+        ];
+        let rhs = [
+            array![[1.2, -0.3], [0.6, 0.9]],
+            array![[0.5, 0.8], [-0.4, 0.7]],
+        ];
+        let penalties = [
+            array![[1.0, 0.2], [0.2, 0.8]],
+            array![[0.9, -0.1], [-0.1, 1.1]],
+        ];
+        let mut unpenalized_residual = array![8.0, 9.0];
+        let mut caches = Vec::new();
+        let mut projected_rhs = Vec::new();
+        for block in 0..2 {
+            let (cache, projected, energy) =
+                block_orthogonal_parts_from_gram(&grams[block], &rhs[block], &penalties[block]);
+            unpenalized_residual -= &energy;
+            caches.push(cache);
+            projected_rhs.push(projected);
+        }
+        let prepared = BlockOrthogonalPrepared {
+            caches,
+            projected_rhs,
+            unpenalized_residual,
         };
-        let numerical = (value_at(rho + step) - value_at(rho - step)) / (2.0 * step);
-        assert!(
-            (analytic - numerical).abs() <= 1.0e-7 * analytic.abs().max(1.0),
-            "analytic score {analytic:.12e} != objective derivative {numerical:.12e}"
-        );
+        let (ranks, nu, d) = ([2_usize, 2_usize], 7.0, 2_usize);
+        let jet = |rhos: &Array1<f64>| {
+            block_orthogonal_profile_jet(&prepared, rhos.view(), &ranks, nu, d)
+                .unwrap()
+                .sample
+        };
+        let rhos = array![0.37, -0.21];
+        let center = jet(&rhos);
+        let hessian = center.hessian.clone().unwrap();
+        let step = 1.0e-5;
+        for coordinate in 0..2 {
+            let mut plus = rhos.clone();
+            let mut minus = rhos.clone();
+            plus[coordinate] += step;
+            minus[coordinate] -= step;
+            let (upper, lower) = (jet(&plus), jet(&minus));
+            let slope = (upper.value - lower.value) / (2.0 * step);
+            assert!(
+                (center.gradient[coordinate] - slope).abs()
+                    <= 1.0e-7 * center.gradient[coordinate].abs().max(1.0),
+                "gradient[{coordinate}] {:.12e} != value slope {slope:.12e}",
+                center.gradient[coordinate]
+            );
+            for other in 0..2 {
+                let curvature =
+                    (upper.gradient[other] - lower.gradient[other]) / (2.0 * step);
+                assert!(
+                    (hessian[[other, coordinate]] - curvature).abs()
+                        <= 1.0e-6 * hessian[[other, coordinate]].abs().max(1.0),
+                    "hessian[{other},{coordinate}] {:.12e} != gradient slope {curvature:.12e}",
+                    hessian[[other, coordinate]]
+                );
+            }
+        }
+    }
+
+    /// One randomised block-orthogonal problem: one to three blocks of three
+    /// to seven orthonormal columns at scales `10^{±2}`, second-difference or
+    /// ridge penalties, one or two outputs at a response scale `10^{±4}`, and
+    /// a start drawn from `[−15, 15]` per block.
+    fn random_block_orthogonal_case(
+        seed: u64,
+    ) -> (Vec<Array2<f64>>, Vec<Array2<f64>>, Array2<f64>, Vec<f64>) {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(17);
+        let mut uniform = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let normal = |uniform: &mut dyn FnMut() -> f64| {
+            let u = uniform().max(1e-300);
+            let v = uniform();
+            (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+        };
+        let blocks = 1 + (uniform() * 3.0) as usize;
+        let sizes = (0..blocks)
+            .map(|_| 3 + (uniform() * 5.0) as usize)
+            .collect::<Vec<_>>();
+        let total = sizes.iter().sum::<usize>();
+        let n = total + 5 + (uniform() * 60.0) as usize;
+        let d = 1 + (uniform() * 2.0) as usize;
+        let scale = 10f64.powf(uniform() * 8.0 - 4.0);
+        let mut q = Array2::<f64>::zeros((n, total));
+        for j in 0..total {
+            for i in 0..n {
+                q[[i, j]] = normal(&mut uniform);
+            }
+            for _ in 0..2 {
+                for k in 0..j {
+                    let dot = (0..n).map(|i| q[[i, j]] * q[[i, k]]).sum::<f64>();
+                    for i in 0..n {
+                        q[[i, j]] -= dot * q[[i, k]];
+                    }
+                }
+            }
+            let norm = (0..n).map(|i| q[[i, j]] * q[[i, j]]).sum::<f64>().sqrt();
+            for i in 0..n {
+                q[[i, j]] /= norm;
+            }
+        }
+        let mut designs = Vec::new();
+        let mut penalties = Vec::new();
+        let mut offset = 0;
+        for &p in &sizes {
+            let column_scale = 10f64.powf(uniform() * 4.0 - 2.0);
+            designs.push(
+                q.slice(ndarray::s![.., offset..offset + p])
+                    .mapv(|v| v * column_scale),
+            );
+            penalties.push(if uniform() < 0.5 {
+                let mut difference = Array2::<f64>::zeros((p - 2, p));
+                for r in 0..p - 2 {
+                    difference[[r, r]] = 1.0;
+                    difference[[r, r + 1]] = -2.0;
+                    difference[[r, r + 2]] = 1.0;
+                }
+                difference.t().dot(&difference)
+            } else {
+                Array2::eye(p)
+            });
+            offset += p;
+        }
+        let mut y = Array2::<f64>::zeros((n, d));
+        for o in 0..d {
+            for (b, design) in designs.iter().enumerate() {
+                let strength = 10f64.powf(uniform() * 4.0 - 2.0) * (b as f64 + 1.0);
+                for j in 0..design.ncols() {
+                    let coef =
+                        strength * normal(&mut uniform) * (j as f64 / design.ncols() as f64);
+                    for i in 0..n {
+                        y[[i, o]] += coef * design[[i, j]];
+                    }
+                }
+            }
+            for i in 0..n {
+                y[[i, o]] = scale * (y[[i, o]] + 0.1 * normal(&mut uniform));
+            }
+        }
+        let start = (0..blocks)
+            .map(|_| uniform() * 30.0 - 15.0)
+            .collect::<Vec<_>>();
+        (designs, penalties, y, start)
+    }
+
+    /// Problems the hand-rolled block-orthogonal outer loop refused from both
+    /// the default start and a far one ("did not converge within N outer
+    /// passes": its clamped fixed-point steps stalled with the score residual
+    /// already at roundoff) are minimised by `opt`'s Newton trust region on
+    /// the exact profiled jet. Each fit is a stationary point the Newton
+    /// decrement certifies against the jet's own rounding bands, and both
+    /// starts reach the same score.
+    #[test]
+    fn block_orthogonal_fits_the_old_outer_loop_refused_are_certified_minima() {
+        for seed in [0u64, 1, 2, 3, 8, 12, 23, 27] {
+            let (designs, penalties, y, start) = random_block_orthogonal_case(seed);
+            let n = y.nrows();
+            let weight = Array1::<f64>::ones(n);
+            let prepared =
+                prepare_block_orthogonal(&designs, &penalties, weight.view(), y.view()).unwrap();
+            let ranks = prepared
+                .caches
+                .iter()
+                .map(|cache| cache.penalty_rank)
+                .collect::<Vec<_>>();
+            let nullity = prepared
+                .caches
+                .iter()
+                .map(|cache| cache.nullity)
+                .sum::<usize>();
+            let nu = (n - nullity) as f64;
+            let mut scores = Vec::new();
+            for init in [None, Some(start.as_slice())] {
+                let fit = gaussian_reml_blocks_orthogonal_shared_scale(
+                    &designs,
+                    &penalties,
+                    y.view(),
+                    None,
+                    init,
+                )
+                .unwrap_or_else(|error| panic!("seed {seed} from {init:?}: {error}"));
+                let jet = block_orthogonal_profile_jet(
+                    &prepared,
+                    fit.log_lambdas.view(),
+                    &ranks,
+                    nu,
+                    y.ncols(),
+                )
+                .unwrap()
+                .sample;
+                let verdict = opt::newton_decrement_verdict(
+                    jet.hessian.as_ref().unwrap(),
+                    &jet.gradient,
+                    None,
+                    jet.decrement_bands.as_ref().unwrap(),
+                );
+                assert!(
+                    verdict.is_certified(),
+                    "seed {seed} from {init:?}: {:?} is not certified: {verdict:?}",
+                    fit.log_lambdas
+                );
+                scores.push(fit.reml_score);
+            }
+            assert!(
+                (scores[0] - scores[1]).abs() <= 1e-9 * (1.0 + scores[0].abs()),
+                "seed {seed}: the two starts reach scores {scores:?}"
+            );
+        }
     }
 
     #[test]
@@ -7134,8 +6889,8 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let mut q = ywy.clone();
-            for eval in &evals {
-                q -= &eval.fitted_energy;
+            for (block, eval) in evals.iter().enumerate() {
+                q -= &(&rhs[block] * &eval.beta).sum_axis(Axis(0));
             }
             let determinant_term = evals
                 .iter()
@@ -7152,7 +6907,7 @@ mod tests {
         let scale =
             block_orthogonal_conditional_scale(&evals, unpenalized_residual.view(), nu).unwrap();
         let analytic =
-            block_orthogonal_profile_hessian(&evals, rhos.view(), scale.view(), &ranks, nu)
+            block_orthogonal_profile_hessian(&evals, scale.view(), nu)
                 .unwrap();
         let step = 1.0e-4;
         let center = profile_value(rhos.view());
@@ -7247,71 +7002,42 @@ mod tests {
             y.view(),
         )
         .expect("the orthogonal blocks factor");
-        let evals = (0..2)
-            .map(|block| {
-                block_orthogonal_eval(
-                    &prepared.caches[block],
-                    &prepared.projected_rhs[block],
-                    result.log_lambdas[block],
-                )
-                .expect("block eval at the minted rho")
-            })
-            .collect::<Vec<_>>();
-        let q = block_orthogonal_profiled_residual(&evals, prepared.unpenalized_residual.view())[0];
-        assert!(q > 0.0);
-        let scale = Array1::from_vec(vec![nu / q]);
-        for (block, eval) in evals.iter().enumerate() {
-            let derivs =
-                block_orthogonal_scale_objective(eval, result.log_lambdas[block], scale.view(), 2);
-            let residual = derivs.grad.abs() / 2.0;
-            assert!(
-                residual <= BLOCK_ORTHOGONAL_SCORE_TOL,
-                "block {block} score residual {residual:.3e} exceeds the certificate tolerance"
-            );
-        }
-        let curvature = block_orthogonal_profile_spectrum(
-            &block_orthogonal_profile_hessian(
-                &evals,
-                result.log_lambdas.view(),
-                scale.view(),
-                &[2, 2],
-                nu,
-            )
-            .unwrap(),
-        )
-        .unwrap()
-        .curvature;
+        let jet = block_orthogonal_profile_jet(&prepared, result.log_lambdas.view(), &[2, 2], nu, 1)
+            .expect("profiled jet at the minted rho");
+        let verdict = opt::newton_decrement_verdict(
+            jet.sample.hessian.as_ref().expect("exact Hessian"),
+            &jet.sample.gradient,
+            None,
+            jet.sample.decrement_bands.as_ref().expect("rounding bands"),
+        );
         assert!(
-            curvature.min_eigenvalue >= -curvature.roundoff,
-            "minted fit has negative profiled curvature {:.6e} beyond roundoff {:.3e}",
-            curvature.min_eigenvalue,
-            curvature.roundoff
+            verdict.is_certified(),
+            "minted fit is not a certified stationary point of the profiled REML: {verdict:?}"
         );
 
-        let err = gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
-            &[d1, d2],
-            &penalties,
-            y.view(),
-            None,
-            None,
-            BlockOrthogonalControls {
-                max_outer_passes: 0,
-                ..BlockOrthogonalControls::default()
-            },
-        )
-        .unwrap_err();
-        match err {
-            EstimationError::BlockOrthogonalRemlDidNotConverge {
-                iterations,
-                max_score_residual,
-                rho_checkpoint,
-                ..
-            } => {
-                assert_eq!(iterations, 0);
-                assert!(max_score_residual.is_infinite());
-                assert_eq!(rho_checkpoint, vec![0.0, 0.0]);
+        // The certificate is a property of the objective, not of the path: every
+        // seed mints the same smoothing parameters and score.
+        for seed in [[-12.0, 9.0], [7.5, -6.0], [15.0, 15.0]] {
+            let reseeded = gaussian_reml_blocks_orthogonal_shared_scale(
+                &[d1.clone(), d2.clone()],
+                &penalties,
+                y.view(),
+                None,
+                Some(&seed),
+            )
+            .expect("every seed reaches the certified optimum");
+            for block in 0..2 {
+                assert!(
+                    (reseeded.log_lambdas[block] - result.log_lambdas[block]).abs() <= 1e-6,
+                    "seed {seed:?} block {block}: rho {} vs {}",
+                    reseeded.log_lambdas[block],
+                    result.log_lambdas[block]
+                );
             }
-            other => panic!("expected typed block-orthogonal exhaustion, got {other}"),
+            assert!(
+                (reseeded.reml_score - result.reml_score).abs()
+                    <= 1e-12 * (1.0 + result.reml_score.abs())
+            );
         }
     }
 
@@ -10016,3 +9742,4 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
         );
     }
 }
+
