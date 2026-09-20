@@ -13,13 +13,17 @@
 //!
 //! Two arms:
 //!
-//! 1. **Heavy-tailed.** `e` is a Gaussian scale mixture (`σ² = 0.5286` w.p. 0.9,
-//!    `5.243` w.p. 0.1; `κ₄ = 9`). Every fit anchors on the equal-mass empirical
-//!    grid of the calibrated score (`GlobalEmpirical`), whose nodes are
-//!    standardized, so a first-stage shift or rescale moves the rows AND the grid.
-//!    Before gam#3452 the correction moved only the rows against a fixed grid and
-//!    left out the grid's own sampling error; the intercept's corrected variance
-//!    stood 41% above its sampling variance (outside the 99.9% band at B = 400).
+//! 1. **Heavy-tailed.** `e` is a Gaussian scale mixture (`σ² = 0.5/0.95` w.p.
+//!    0.95, `10` w.p. 0.05; kurtosis `3·E σ⁴ = 15.8`). Every fit anchors on the
+//!    equal-mass empirical grid of the calibrated score (`GlobalEmpirical`), whose
+//!    nodes are standardized, so a first-stage shift or rescale moves the rows AND
+//!    the grid. Before gam#3452 the correction moved only the rows against a fixed
+//!    grid and left out the grid's own sampling error, which runs against the
+//!    rows'; on this arm the intercept's corrected variance stood 1.40× its
+//!    sampling variance, outside the band (sampling 8.52e-4 against the band's
+//!    lower edge 9.08e-4). The grid's error grows with the tail: at kurtosis 9 the
+//!    same defect gave 1.29×, inside the band at B = 400, so the arm uses the
+//!    heavier tail.
 //! 2. **Gaussian control.** `e ~ N(0, 1)`; the fit anchors on the closed form, where
 //!    the correction was already exact. The arm pins that the fix leaves it so.
 //!
@@ -30,11 +34,11 @@
 
 use csv::StringRecord;
 use gam::families::bms::LatentMeasureKind;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use gam::utils::splitmix64;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 fn next_unit(state: &mut u64) -> f64 {
     ((splitmix64(state) >> 11) as f64 + 0.5) / (1u64 << 53) as f64
@@ -65,7 +69,7 @@ impl Law {
     fn components(self) -> &'static [(f64, f64)] {
         match self {
             Law::Gaussian => &[(1.0, 1.0)],
-            Law::ScaleMixture => &[(0.9, 0.5286), (0.1, 5.243)],
+            Law::ScaleMixture => &[(0.95, 0.5 / 0.95), (0.05, 10.0)],
         }
     }
 
@@ -225,8 +229,7 @@ fn assert_covariance_matches_sampling_variance(law: Law, seed: u64) {
             assert_eq!(p, p_marginal + fit.slope_design.design.ncols());
             let mut coefficients = fit.fit.beta.to_vec();
             coefficients[fit.marginal_design.intercept_range.start] += fit.baseline_marginal;
-            coefficients[p_marginal + fit.slope_design.intercept_range.start] +=
-                fit.baseline_slope;
+            coefficients[p_marginal + fit.slope_design.intercept_range.start] += fit.baseline_slope;
             (
                 coefficients,
                 (0..p).map(|j| covariance[[j, j]]).collect(),
@@ -235,8 +238,10 @@ fn assert_covariance_matches_sampling_variance(law: Law, seed: u64) {
         })
         .collect();
     let empirical_fits = fits.iter().filter(|(_, _, on_grid)| *on_grid).count();
-    let (betas, reported): (Vec<Vec<f64>>, Vec<Vec<f64>>) =
-        fits.into_iter().map(|(beta, variance, _)| (beta, variance)).unzip();
+    let (betas, reported): (Vec<Vec<f64>>, Vec<Vec<f64>>) = fits
+        .into_iter()
+        .map(|(beta, variance, _)| (beta, variance))
+        .unzip();
     let p = betas[0].len();
     assert!(betas.iter().all(|b| b.len() == p));
     // Two-sided, Bonferroni over the coefficients at α = 10⁻³.
