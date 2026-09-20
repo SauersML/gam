@@ -9,10 +9,7 @@ pub use normal_table::{
     NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, NORMAL_SCALED_TAIL_RELATIVE_ERROR, normal_cdf_and_pdf,
     normal_scaled_tail,
 };
-use statrs::function::{
-    beta::{beta_reg, inv_beta_reg, ln_beta},
-    gamma::gamma_ur,
-};
+use statrs::function::beta::{beta_reg, inv_beta_reg, ln_beta};
 
 const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
 const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
@@ -541,8 +538,12 @@ pub fn student_t_quantile(p: f64, degrees_of_freedom: f64) -> Result<f64, String
 
 /// Chi-squared survival probability `P(X_ν > statistic)`.
 ///
-/// Uses the regularized upper incomplete gamma directly instead of
-/// reconstructing a small tail as `1 − P(ν/2, statistic/2)`.
+/// This is `Q(ν/2, statistic/2)`, read directly from
+/// [`regularized_incomplete_gamma_pair`] rather than reconstructed as
+/// `1 − P`. It is the same pair [`chi_square_quantile`] inverts, so the
+/// p-value and the critical value agree at every `ν`. statrs' `gamma_ur` does
+/// not: at `ν = 2e12`, `statistic = ν + 4e6` it returns 0.02279 against the
+/// exact 0.0227501859391187.
 pub fn chi_square_sf(statistic: f64, degrees_of_freedom: f64) -> f64 {
     let half_df = 0.5 * degrees_of_freedom;
     if statistic.is_nan()
@@ -557,7 +558,7 @@ pub fn chi_square_sf(statistic: f64, degrees_of_freedom: f64) -> f64 {
     if statistic == f64::INFINITY {
         return 0.0;
     }
-    gamma_ur(half_df, 0.5 * statistic)
+    regularized_incomplete_gamma_pair(half_df, 0.5 * statistic).1
 }
 
 /// Quantile of `χ²_k` at lower-tail probability `p`: the `x` with
@@ -2339,6 +2340,34 @@ mod tests {
         assert!(chi_square_quantile(0.5, 0.0).is_nan());
     }
 
+    #[test]
+    fn chi_square_sf_at_huge_degrees_of_freedom_is_the_crate_gamma_tail() {
+        // The χ² survival at ν = 2e12, s = ν + 4e6 is Q(1e12, 1e12 + 2e6) =
+        // 0.022750185939118725 (a 50-digit mpmath reference). statrs `gamma_ur`
+        // returned 0.02279 here. The bar is the pair's own: 32 units of
+        // (1 + a·h)ε (gam-inference `incomplete_gamma_is_accurate_from_small_to_huge_shape`),
+        // with a·h ≈ a·μ²/2 = 2 at μ = x/a − 1 = 2e-6.
+        let (a, x) = (1.0e12_f64, 1.0e12 + 2.0e6);
+        let lambda = x / a;
+        let ah = a * (lambda - 1.0 - lambda.ln());
+        let got = chi_square_sf(2.0 * x, 2.0 * a);
+        let reference = 0.022_750_185_939_118_725;
+        let bar = 32.0 * (1.0 + ah) * f64::EPSILON;
+        assert!(rel_err(got, reference) <= bar, "got {got:e}, bar {bar:e}");
+        // Round trip through the quantile, which inverts the same pair. The
+        // inverse's target `1 − (1 − got)` differs from `got` by at most 2⁻⁵⁴
+        // (one rounding of `1 − got`), and together with the bar above that
+        // moves the gamma argument by (2⁻⁵⁴ + bar·Q)/density ≈ 1e-8, with a
+        // density of ≈ φ(2)/√a = 5.4e-8. That is far below one ulp of x
+        // (1.2e-4), so the inverse is fixed to the Halley loop's stationarity,
+        // which is a few ulp.
+        let quantile = chi_square_quantile(1.0 - got, 2.0 * a);
+        assert!(
+            ((quantile - 2.0 * x) / (2.0 * x)).abs() <= 4.0 * f64::EPSILON,
+            "quantile {quantile}"
+        );
+    }
+
     /// #4242: below the split `x < a + 1` with shape `a < 1`, `Q(a, x)` keeps
     /// relative accuracy as `a → 0`, where the complement `1 − P` it replaces
     /// has relative error ≈ ε·P/Q (1.9e5ε at `a = 1e-4`). The references are
@@ -2821,6 +2850,22 @@ mod tests {
             ((upper - UPPER) / UPPER).abs() <= 1.0e-11,
             "upper tail moved: {upper:e}, want {UPPER:e}"
         );
+    }
+
+    #[test]
+    fn chi_square_survival_matches_exact_even_degree_tails() {
+        for statistic in [0.0_f64, 1.0e-12, 0.5, 2.0, 10.0, 100.0, 1000.0] {
+            let half = statistic / 2.0;
+            let exponential = (-half).exp();
+            for (degrees, expected) in [(2.0, exponential), (4.0, exponential * (1.0 + half))] {
+                let got = chi_square_sf(statistic, degrees);
+                let band = crate::roundoff::accumulation_growth(16) * (1.0 + half);
+                assert!(
+                    rel_err(got, expected) <= band,
+                    "chi-square({degrees}), x={statistic}: {got:e} vs {expected:e}"
+                );
+            }
+        }
     }
 
     #[test]
