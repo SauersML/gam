@@ -45,36 +45,39 @@
 //! K = Σ_l K_l / t_l.
 //! ```
 //!
-//! `K_l` is read off the penalties themselves. Let `N_l` be an orthonormal
-//! basis of `null(Σ_{k≠l} S_k)`, the directions that `S_l` alone charges. When
-//! these subspaces together form a basis of the block, every `S_k` vanishes on
-//! `N_l` for `k ≠ l`, so the prior `βᵀ(Σ λ_l S_l)β` splits into one quadratic
-//! form per component at every `λ`, and the component covariances are exact:
+//! `K_l` is penalty `l`'s share of the prior covariance. With the penalties at
+//! the base precision `P = Σ_l a_l S_l`, `a_l = 1/tr(G_jj⁺ S_l)`, the prior
+//! covariance is `P⁻¹` and
 //!
 //! ```text
-//! K_l = N_l (N_lᵀ S_l N_l)⁻¹ N_lᵀ.
+//! K_l = P⁻¹ (a_l S_l) P⁻¹ = −∂(Σ_k λ_k S_k)⁻¹/∂ log λ_l  at λ = a,
 //! ```
 //!
-//! A smooth with its null-space penalty is this case whatever functional that
-//! penalty charges: the null-space penalty alone charges the wiggliness null
-//! space, and the wiggliness alone charges what the null-space penalty leaves
-//! free. `K_l` is then the covariance of the null functions themselves (a
-//! level-specific or varying-coefficient slope), and it transforms with any
-//! change of coefficient chart `β = T·γ`, so the test does not depend on the
-//! chart. The Euclidean pseudo-inverse `S_l⁺` is the same thing only when the
-//! ranges are orthogonal; for a ridge that charges a functional of the curve
-//! (the B-spline ridge charges the mean slope through the end values) it points
+//! so `Σ_l K_l = P⁻¹`. Every ingredient moves with a change of coefficient
+//! chart `β = T·γ` (`S_l → TᵀS_lT`, `G_jj → TᵀG_jjT`, `a_l` fixed, `P → TᵀPT`,
+//! `K_l → T⁻¹K_lT⁻ᵀ`, `s → Tᵀs`), so `sᵀK_ls` and `t_l` — and the test — do
+//! not depend on the chart. The base `a_l` puts every penalty on the scale of
+//! the data it penalizes. When the directions each penalty alone charges,
+//! `N_l = null(Σ_{k≠l} S_k)`, together make up the block (a smooth with its
+//! null-space penalty, whatever functional that penalty charges), `P` is block
+//! diagonal on them and `K_l = N_l(N_lᵀS_lN_l)⁻¹N_lᵀ / a_l`: the exact
+//! covariance of the component penalty `l` alone governs, whatever the base.
+//! The base only matters for genuinely overlapping penalties (a tensor product
+//! whose marginal penalties share directions), where no exact split exists and
+//! the derivative above is the local split at a data-scaled prior. The
+//! Euclidean pseudo-inverse `S_l⁺` is none of this once the ranges are not
+//! orthogonal: for a ridge that charges a functional of the curve (the
+//! B-spline ridge charges the mean slope through the end values) it points
 //! along the functional's row, a curve concentrated at the ends, and leaves a
-//! linear effect nearly invisible. When the subspaces do not form a basis (a
-//! tensor product whose marginal penalties overlap) no exact split exists, and
-//! `K_l = S_l⁺` is the additive working model.
+//! linear effect nearly invisible; and it moves with the chart.
 //!
 //! That choice does not depend on the scale any penalty was built at
-//! (rescaling `S_l` by `c` divides both `K_l` and `t_l` by `c`), and it gives
+//! (rescaling `S_l` by `c` divides `a_l` by `c` and leaves `a_l S_l`, and so
+//! `K_l`, unchanged), and it gives
 //! the null space the same standing as the wiggly part: an alternative that is
 //! linear in `x` enters through the null-space component with the same weight
-//! as a curve enters through the wiggly one. Summing the penalties first and
-//! inverting the sum does not: it weights directions by the reciprocal of the
+//! as a curve enters through the wiggly one. Taking the whole prior
+//! covariance `P⁻¹` as `K` does not: it weights directions by the reciprocal of the
 //! summed curvature, so the few smoothest wiggly directions dominate `K` and a
 //! null-space effect is nearly invisible to the test. Any fixed `K` gives an
 //! exact null law, so the choice decides power, never size.
@@ -220,7 +223,7 @@ pub fn smooth_score_test(
     }
     let mut kernel = Array2::<f64>::zeros((m, m));
     let mut identified = false;
-    for component in component_covariances(&ranges, m)? {
+    for component in component_covariances(&ranges, &g_jj)? {
         let null_mean = (&component * &score_cov).sum();
         let scale = (&component * &g_jj).sum();
         if null_mean > crate::basis::spectral_tolerance_for_dim(m, &Array1::from_elem(1, scale)) {
@@ -304,13 +307,6 @@ impl PenaltyRange {
         })
     }
 
-    /// `S / d_max`: every penalty at unit top curvature, so the rank decision
-    /// on a sum of penalties does not depend on the scale each was built at.
-    fn normalized(&self) -> Array2<f64> {
-        let top = self.values.iter().copied().fold(0.0_f64, f64::max);
-        &self.matrix / top
-    }
-
     fn pseudo_inverse(&self) -> Array2<f64> {
         let mut scaled = self.vectors.clone();
         for (mut column, &value) in scaled.columns_mut().into_iter().zip(self.values.iter()) {
@@ -320,81 +316,34 @@ impl PenaltyRange {
     }
 }
 
-/// The covariance direction `K_l` of each variance component; see the module
-/// docs. When the directions each penalty alone charges make up the block,
-/// the penalty separates on them and `K_l` is `S_l` inverted on its own
-/// subspace, which is exact and does not depend on the coefficient chart.
-/// Otherwise the penalties overlap and `K_l = S_l⁺` is the additive working
-/// model; the two agree whenever the ranges are orthogonal.
+/// Each variance component's covariance direction `K_l = P⁻¹(a_l S_l)P⁻¹` at
+/// the base precision `P = Σ_l a_l S_l`, `a_l = 1/tr(G_jj⁺ S_l)`; see the
+/// module docs. `P` is positive definite because the ranges cover the block.
 fn component_covariances(
     ranges: &[PenaltyRange],
-    m: usize,
+    g_jj: &Array2<f64>,
 ) -> Result<Vec<Array2<f64>>, SmoothScoreTestRefusal> {
-    match exclusive_subspaces(ranges, m)? {
-        Some(subspaces) => subspaces
-            .iter()
-            .zip(ranges)
-            .map(|(basis, range)| inverse_on_subspace(&range.matrix, basis))
-            .collect(),
-        None => Ok(ranges.iter().map(PenaltyRange::pseudo_inverse).collect()),
-    }
-}
-
-/// For each penalty, an orthonormal basis `N_l` of the directions no other
-/// penalty charges, `null(Σ_{k≠l} S_k)`, when these subspaces together are a
-/// basis of the block; `None` when they are not.
-///
-/// On such a basis every `S_k` vanishes on `N_l` for `k ≠ l`, so
-/// `βᵀ(Σ λ_k S_k)β = Σ λ_l a_lᵀ(N_lᵀ S_l N_l)a_l` for `β = Σ N_l a_l` at every
-/// `λ`: the components are independent under the prior and their covariances
-/// add. A double-penalty smooth is this case whatever functional its ridge
-/// charges: the ridge alone charges the wiggliness null space, and the
-/// wiggliness alone charges the ridge's null space.
-fn exclusive_subspaces(
-    ranges: &[PenaltyRange],
-    m: usize,
-) -> Result<Option<Vec<Array2<f64>>>, SmoothScoreTestRefusal> {
-    let mut subspaces = Vec::with_capacity(ranges.len());
-    for l in 0..ranges.len() {
-        let mut others = Array2::<f64>::zeros((m, m));
-        for (k, range) in ranges.iter().enumerate() {
-            if k != l {
-                others += &range.normalized();
-            }
+    let m = g_jj.nrows();
+    let data_covariance = PenaltyRange::of(g_jj)?.pseudo_inverse();
+    let mut scaled = Vec::with_capacity(ranges.len());
+    let mut precision = Array2::<f64>::zeros((m, m));
+    for range in ranges {
+        // A penalty whose range the term's own data never sees has no data
+        // scale, and its component no score.
+        let data_scale = (&data_covariance * &range.matrix).sum();
+        if !(data_scale.is_finite() && data_scale > 0.0) {
+            return Err(SmoothScoreTestRefusal::NotIdentified);
         }
-        let (evals, evecs) = others
-            .eigh(faer::Side::Lower)
-            .map_err(|_| SmoothScoreTestRefusal::InconsistentFit)?;
-        let tolerance = crate::basis::spectral_tolerance(&evals);
-        let null: Vec<usize> = (0..m).filter(|&i| evals[i] <= tolerance).collect();
-        subspaces.push(evecs.select(ndarray::Axis(1), &null));
+        let component = &range.matrix / data_scale;
+        precision += &component;
+        scaled.push(component);
     }
-    if subspaces.iter().map(|basis| basis.ncols()).sum::<usize>() != m {
-        return Ok(None);
-    }
-    let views: Vec<_> = subspaces.iter().map(|basis| basis.view()).collect();
-    let stacked = ndarray::concatenate(ndarray::Axis(1), &views)
-        .map_err(|_| SmoothScoreTestRefusal::InconsistentFit)?;
-    let (singular_sq, _) = stacked
-        .t()
-        .dot(&stacked)
-        .eigh(faer::Side::Lower)
-        .map_err(|_| SmoothScoreTestRefusal::InconsistentFit)?;
-    let tolerance = crate::basis::spectral_tolerance(&singular_sq);
-    Ok(singular_sq.iter().all(|&e| e > tolerance).then_some(subspaces))
-}
-
-/// `N (Nᵀ S N)⁻¹ Nᵀ`, the prior covariance direction of the component that
-/// lives on `span N` when `S` is its only penalty there.
-fn inverse_on_subspace(
-    penalty: &Array2<f64>,
-    basis: &Array2<f64>,
-) -> Result<Array2<f64>, SmoothScoreTestRefusal> {
-    let restricted = PenaltyRange::of(&basis.t().dot(&penalty.dot(basis)))?;
-    if restricted.values.len() != basis.ncols() {
+    let base = PenaltyRange::of(&precision)?;
+    if base.values.len() != m {
         return Err(SmoothScoreTestRefusal::UnpenalizedDirection);
     }
-    Ok(basis.dot(&restricted.pseudo_inverse().dot(&basis.t())))
+    let prior = base.pseudo_inverse();
+    Ok(scaled.iter().map(|component| symmetrized(&prior.dot(&component.dot(&prior)))).collect())
 }
 
 fn symmetrized(matrix: &Array2<f64>) -> Array2<f64> {
@@ -628,8 +577,8 @@ mod tests {
         assert!(rejections as f64 / reps as f64 >= 0.9, "power {rejections}/{reps}");
     }
 
-    /// Rescaling any one structural penalty rescales its pseudo-inverse and its
-    /// null mean together, so neither the p-value nor the reported statistic
+    /// Rescaling any one structural penalty rescales its data scale `a_l`
+    /// inversely, so its component `a_l S_l` and therefore neither the p-value nor the reported statistic
     /// moves, whatever scale each penalty was built at.
     #[test]
     fn the_test_does_not_depend_on_the_penalty_scales() {
@@ -721,6 +670,57 @@ mod tests {
         let b = test(&second, &fit(&second, &y), SmoothTestScale::Estimated);
         assert!((a.p_value - b.p_value).abs() <= 1e-9, "{a:?} vs {b:?}");
         assert!((a.statistic - b.statistic).abs() <= 1e-8 * a.statistic, "{a:?} vs {b:?}");
+    }
+
+    /// Penalties that share directions, as a tensor product's marginal
+    /// penalties do, admit no exact split into independent components, and
+    /// the test must still not depend on the chart. Here a first-difference
+    /// penalty overlaps the second-difference one on every wiggly direction.
+    /// The Euclidean pseudo-inverse of each penalty does not transform with
+    /// the chart; each penalty's share of the data-scaled prior covariance
+    /// does.
+    #[test]
+    fn overlapping_penalties_do_not_depend_on_the_coefficient_chart() {
+        let first = design(100);
+        let m = first.term.len();
+        let mut slope_penalty = Array2::<f64>::zeros((m, m));
+        for r in 0..m - 1 {
+            let d = [-1.0, 1.0];
+            for a in 0..2 {
+                for b in 0..2 {
+                    slope_penalty[[r + a, r + b]] += d[a] * d[b];
+                }
+            }
+        }
+        let chart = Array2::from_shape_fn((m, m), |(a, b)| match a.cmp(&b) {
+            std::cmp::Ordering::Equal => 1.0 + 0.1 * a as f64,
+            std::cmp::Ordering::Less => 0.4 / (b - a) as f64,
+            std::cmp::Ordering::Greater => 0.0,
+        });
+        let second = in_chart(&first, &chart);
+        let moved_slope_penalty = chart.t().dot(&slope_penalty.dot(&chart));
+        let mut rng = StdRng::seed_from_u64(0x0e71a9);
+        let mut y = null_response(&first, &mut rng);
+        for i in 0..y.len() {
+            y[i] += 0.2 * first.x[[i, 6]] - 0.15 * first.x[[i, 9]];
+        }
+        let a = test_with(
+            &first,
+            &fit(&first, &y),
+            SmoothTestScale::Estimated,
+            &[first.wiggle.clone(), slope_penalty, first.null_space.clone()],
+        )
+        .expect("the score test is defined");
+        let b = test_with(
+            &second,
+            &fit(&second, &y),
+            SmoothTestScale::Estimated,
+            &[second.wiggle.clone(), moved_slope_penalty, second.null_space.clone()],
+        )
+        .expect("the score test is defined");
+        assert!((a.p_value - b.p_value).abs() <= 1e-9, "{a:?} vs {b:?}");
+        assert!((a.statistic - b.statistic).abs() <= 1e-8 * a.statistic, "{a:?} vs {b:?}");
+        assert!((a.ref_df - b.ref_df).abs() <= 1e-8 * a.ref_df, "{a:?} vs {b:?}");
     }
 
     /// A null-space ridge charges functionals of the curve, and the row of a
