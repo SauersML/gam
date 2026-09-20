@@ -327,7 +327,36 @@ fn sae_fit_admission<'py>(
     Ok(out.unbind())
 }
 
-#[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
+/// Assemble the fit-measured Theorem-4 coding ingredients from the optional
+/// scalar kwargs: all five supplied gives `Some`, none gives `None`, and a
+/// partial set is refused rather than silently dropped.
+fn measured_coding_from_kwargs(
+    d_eff_atom: Option<f64>,
+    n_eff: Option<f64>,
+    n_rows: Option<f64>,
+    k_bar: Option<f64>,
+    d_bar: Option<f64>,
+) -> PyResult<Option<gam::terms::sae::k_selection::MeasuredCoding>> {
+    match (d_eff_atom, n_eff, n_rows, k_bar, d_bar) {
+        (Some(d_eff_atom), Some(n_eff), Some(n_rows), Some(k_bar), Some(d_bar)) => {
+            Ok(Some(gam::terms::sae::k_selection::MeasuredCoding {
+                d_eff_atom,
+                n_eff,
+                n_rows,
+                k_bar,
+                d_bar,
+            }))
+        }
+        (None, None, None, None, None) => Ok(None),
+        _ => Err(py_value_error(
+            "the measured coding ingredients d_eff_atom, n_eff, n_rows, k_bar and d_bar \
+             must be supplied together or not at all"
+                .to_string(),
+        )),
+    }
+}
+
+#[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6, d_eff_atom = None, n_eff = None, n_rows = None, k_bar = None, d_bar = None))]
 fn sae_select_k(
     py: Python<'_>,
     points: Vec<(usize, f64)>,
@@ -335,6 +364,11 @@ fn sae_select_k(
     knee_slope_fraction: f64,
     complexity_penalty: f64,
     flat_span_tol: f64,
+    d_eff_atom: Option<f64>,
+    n_eff: Option<f64>,
+    n_rows: Option<f64>,
+    k_bar: Option<f64>,
+    d_bar: Option<f64>,
 ) -> PyResult<PyObject> {
     let curve = gam::terms::sae::k_selection::curve_from_pairs(&points).map_err(py_value_error)?;
     let config = gam::terms::sae::k_selection::KSelectionConfig {
@@ -342,11 +376,10 @@ fn sae_select_k(
         knee_slope_fraction,
         complexity_penalty,
         flat_span_tol,
-        // This scalar-curve FFI carries no fit-measured coding ingredients; a
-        // `MeasuredMdl` mode string falls back to Kneedle when this is `None`.
-        measured_coding: None,
+        measured_coding: measured_coding_from_kwargs(d_eff_atom, n_eff, n_rows, k_bar, d_bar)?,
     };
-    let selected = gam::terms::sae::k_selection::select_k(&curve, &config);
+    let selected =
+        gam::terms::sae::k_selection::select_k(&curve, &config).map_err(py_value_error)?;
     let out = PyDict::new(py);
     out.set_item("k", selected.k)?;
     out.set_item("ev", selected.ev)?;
@@ -356,7 +389,7 @@ fn sae_select_k(
     Ok(out.into())
 }
 
-#[pyfunction(signature = (manifold_points, linear_points, manifold_params_per_atom, linear_params_per_atom, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
+#[pyfunction(signature = (manifold_points, linear_points, manifold_params_per_atom, linear_params_per_atom, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6, d_eff_atom = None, n_eff = None, n_rows = None, k_bar = None, d_bar = None))]
 fn sae_auto_k_recommendation(
     py: Python<'_>,
     manifold_points: Vec<(usize, f64)>,
@@ -367,6 +400,11 @@ fn sae_auto_k_recommendation(
     knee_slope_fraction: f64,
     complexity_penalty: f64,
     flat_span_tol: f64,
+    d_eff_atom: Option<f64>,
+    n_eff: Option<f64>,
+    n_rows: Option<f64>,
+    k_bar: Option<f64>,
+    d_bar: Option<f64>,
 ) -> PyResult<PyObject> {
     let manifold =
         gam::terms::sae::k_selection::curve_from_pairs(&manifold_points).map_err(py_value_error)?;
@@ -377,9 +415,7 @@ fn sae_auto_k_recommendation(
         knee_slope_fraction,
         complexity_penalty,
         flat_span_tol,
-        // This scalar-curve FFI carries no fit-measured coding ingredients; a
-        // `MeasuredMdl` mode string falls back to Kneedle when this is `None`.
-        measured_coding: None,
+        measured_coding: measured_coding_from_kwargs(d_eff_atom, n_eff, n_rows, k_bar, d_bar)?,
     };
     // The manifold-vs-linear advantage is now measured in DECODER PARAMETERS, not
     // atom count: a manifold atom stores `basis_size·p` scalars, a linear atom
@@ -392,7 +428,8 @@ fn sae_auto_k_recommendation(
         &config,
         manifold_params_per_atom,
         linear_params_per_atom,
-    );
+    )
+    .map_err(py_value_error)?;
     let out = PyDict::new(py);
     out.set_item("k", rec.selection.k)?;
     out.set_item("ev", rec.selection.ev)?;
@@ -496,7 +533,14 @@ fn format_g(x: f64) -> String {
 /// `amortization_horizon`, `bits_at_r2_{g}` / `code_bits_at_r2_{g}` /
 /// `resid_bits_at_r2_{g}` / `truncation_bits_at_r2_{g}` per target (truncation
 /// bits are the residual-coded atom modes beyond `code_dims`, already inside the
-/// residual bits), and `native_bits_per_token` when given.
+/// residual bits), `intrinsic_atoms` (how many atoms the callback priced by
+/// their chart), and `native_bits_per_token` when given.
+///
+/// `atom_contribution(atom, take)` returns either the `(|take|, d)` float64
+/// contribution matrix (ambient linear code) or a chart mapping `{"code":
+/// (|take|, k), "jacobian": (|take|, d, k), "axes": [...]}` with
+/// `k = code_dims[atom]`, priced by the intrinsic decoder-aware code
+/// (#2933 F17, #3437).
 #[pyfunction]
 #[pyo3(signature = (
     test_x, recon, gate, code_dims, dictionary_params, amortization_horizon,
@@ -527,23 +571,19 @@ fn sae_eq4_description_length<'py>(
     // propagates with its original type instead of being flattened to a
     // ValueError; the closure returns the message the core threads back.
     let callback_err: std::cell::RefCell<Option<PyErr>> = std::cell::RefCell::new(None);
-    let fetch = |atom: usize, take: &[usize]| -> Result<Array2<f64>, String> {
+    let fetch = |atom: usize, take: &[usize]| -> Result<AtomFiringCode, String> {
+        let keep = |e: PyErr| {
+            let message = e.to_string();
+            *callback_err.borrow_mut() = Some(e);
+            message
+        };
         let take_arr = take
             .iter()
             .map(|&i| i as i64)
             .collect::<Vec<i64>>()
             .into_pyarray(py);
-        let result = atom_contribution.call1((atom, take_arr)).map_err(|e| {
-            let message = e.to_string();
-            *callback_err.borrow_mut() = Some(e);
-            message
-        })?;
-        let array = result.extract::<PyReadonlyArray2<f64>>().map_err(|e| {
-            let message = format!("atom {atom} contribution must be a float64 matrix: {e}");
-            *callback_err.borrow_mut() = Some(PyErr::from(e));
-            message
-        })?;
-        Ok(array.as_array().to_owned())
+        let result = atom_contribution.call1((atom, take_arr)).map_err(keep)?;
+        eq4_atom_firing_code(atom, &result).map_err(keep)
     };
 
     let dl = gam::terms::sae::eq4_description_length::eq4_fixed_distortion_description_length(
@@ -581,8 +621,84 @@ fn sae_eq4_description_length<'py>(
     if let Some(native) = dl.native_bits_per_token {
         out.set_item("native_bits_per_token", native)?;
     }
+    out.set_item("intrinsic_atoms", dl.intrinsic_atoms)?;
     out.set_item("score_kind", dl.score_kind.as_str())?;
     Ok(out.into())
+}
+
+use gam::terms::sae::eq4_description_length::{AtomChart, AtomFiringCode, ChartAxis};
+
+/// Read one `atom_contribution` callback return: a float64 `(rows, d)`
+/// contribution matrix (the ambient code) or a chart mapping with `code`
+/// `(rows, k)`, `jacobian` `(rows, d, k)` and `axes` (one per chart coordinate:
+/// `"euclidean"`, `"amplitude"`, or a float period for a circle coordinate),
+/// priced by the intrinsic decoder-aware code (#3437).
+fn eq4_atom_firing_code<'py>(atom: usize, value: &Bound<'py, PyAny>) -> PyResult<AtomFiringCode> {
+    let Ok(chart) = value.cast::<PyDict>() else {
+        let contribution = value.extract::<PyReadonlyArray2<f64>>().map_err(|e| {
+            PyTypeError::new_err(format!(
+                "atom {atom} contribution must be a float64 (rows, d) matrix or a chart \
+                 mapping with code / jacobian / axes: {}",
+                PyErr::from(e)
+            ))
+        })?;
+        return Ok(AtomFiringCode::Ambient(contribution.as_array().to_owned()));
+    };
+    let entry = |name: &str| -> PyResult<Bound<'py, PyAny>> {
+        chart.get_item(name)?.ok_or_else(|| {
+            PyValueError::new_err(format!("atom {atom} chart mapping is missing `{name}`"))
+        })
+    };
+    let code = entry("code")?
+        .extract::<PyReadonlyArray2<f64>>()
+        .map_err(|e| {
+            PyTypeError::new_err(format!(
+                "atom {atom} chart `code` must be a float64 (rows, k) matrix: {}",
+                PyErr::from(e)
+            ))
+        })?
+        .as_array()
+        .to_owned();
+    let jacobian = entry("jacobian")?
+        .extract::<PyReadonlyArray3<f64>>()
+        .map_err(|e| {
+            PyTypeError::new_err(format!(
+                "atom {atom} chart `jacobian` must be a float64 (rows, d, k) array: {}",
+                PyErr::from(e)
+            ))
+        })?
+        .as_array()
+        .to_owned();
+    let mut axes = Vec::new();
+    for item in entry("axes")?.try_iter()? {
+        let item = item?;
+        let axis = match item.extract::<String>() {
+            Ok(tag) => match tag.as_str() {
+                "euclidean" => ChartAxis::Euclidean,
+                "amplitude" => ChartAxis::Amplitude,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "atom {atom} chart axis {other:?} is not \"euclidean\", \"amplitude\" \
+                         or a float period"
+                    )));
+                }
+            },
+            Err(_) => ChartAxis::Periodic {
+                period: item.extract::<f64>().map_err(|_| {
+                    PyTypeError::new_err(format!(
+                        "atom {atom} chart axes must be \"euclidean\", \"amplitude\" or a \
+                         float period"
+                    ))
+                })?,
+            },
+        };
+        axes.push(axis);
+    }
+    Ok(AtomFiringCode::Intrinsic(AtomChart {
+        code,
+        jacobian,
+        axes,
+    }))
 }
 
 #[pyfunction]
@@ -4936,10 +5052,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_concordance, module)?)?;
     module.add_function(wrap_pyfunction!(survival_score_grid_from_times, module)?)?;
     module.add_function(wrap_pyfunction!(survival_null_curve_from_train, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        survival_matrix_from_risk_calibration,
-        module
-    )?)?;
     module.add_function(wrap_pyfunction!(
         survival_lifted_metrics_from_predictions,
         module
