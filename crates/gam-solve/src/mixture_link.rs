@@ -602,7 +602,7 @@ fn taylor5_inv(a: &[f64; 5]) -> [f64; 5] {
 /// terms and a separately evaluated log weight. Direct complementary tails
 /// retain variance information after the reported mean rounds to an endpoint;
 /// each derivative is rescaled separately, including when W itself underflows.
-pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
+pub fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
     match link {
         StandardLink::Logit => {
             let jet = logit_inverse_link_jet5(eta);

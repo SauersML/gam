@@ -238,6 +238,8 @@ impl BinomialLocationScaleFamily {
                 let q = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
                 let (f, _, _) = binomial_expected_q_information_derivatives(
                     self.weights[i],
+                    core.q0[i],
+                    &self.link_kind,
                     core.mu[i],
                     core.dmu_dq[i],
                     core.d2mu_dq2[i],
@@ -320,6 +322,8 @@ impl BinomialLocationScaleFamily {
                 let u = nonwiggle_q_directional(q, d_eta_t[i], d_eta_ls[i]);
                 let (f, f1, _) = binomial_expected_q_information_derivatives(
                     self.weights[i],
+                    core.q0[i],
+                    &self.link_kind,
                     core.mu[i],
                     core.dmu_dq[i],
                     core.d2mu_dq2[i],
@@ -409,6 +413,8 @@ impl BinomialLocationScaleFamily {
                 let q = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
                 let (f, f1, f2) = binomial_expected_q_information_derivatives(
                     self.weights[i],
+                    core.q0[i],
+                    &self.link_kind,
                     core.mu[i],
                     core.dmu_dq[i],
                     core.d2mu_dq2[i],
@@ -514,6 +520,8 @@ impl BinomialLocationScaleFamily {
                 let q = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
                 let (f, f1, f2) = binomial_expected_q_information_derivatives(
                     self.weights[i],
+                    core.q0[i],
+                    &self.link_kind,
                     core.mu[i],
                     core.dmu_dq[i],
                     core.d2mu_dq2[i],

@@ -216,16 +216,51 @@ pub(crate) fn binomial_location_scale_log_likelihood(
     }
 }
 
+/// Expected Fisher information of one binomial row in the latent coordinate
+/// `q`, `f = w·μ′²/(μ(1−μ))`, with its first two `q`-derivatives `(f, f′, f″)`.
+///
+/// For the Bernoulli standard links, the weight jet comes from the single
+/// stable source `gam_solve::mixture_link::fisher_weight_jet5`. That source
+/// pairs the density with the small-tail complement (`Φ(−q)`, `σ(−q)`, …).
+/// Forming `μ(1−μ)` from the reported `μ` loses the survival probability to
+/// cancellation once `μ` nears 1. It then drops to exactly 0 once `μ` rounds
+/// to 1: probit q ≳ 8.3, logit q ≳ 36.7, cloglog q ≳ 3.6. The mirror lower
+/// tail keeps full precision. The expected information must respect the
+/// label swap `(y, q) → (1 − y, −q)` of the symmetric links, and that form
+/// broke it. Links without a closed-form complement (the mixture/SAS/
+/// beta-logistic families and the non-Bernoulli standard links) keep the
+/// `μ`-jet form, which is what `fisher_weight_jet5_for_inverse_link` does
+/// for them too.
 #[inline]
 pub(crate) fn binomial_expected_q_information_derivatives(
     weight: f64,
+    q: f64,
+    link_kind: &InverseLink,
     mu: f64,
     d1: f64,
     d2: f64,
     d3: f64,
 ) -> (f64, f64, f64) {
-    if weight == 0.0
-        || !mu.is_finite()
+    if weight == 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    if let InverseLink::Standard(
+        link @ (StandardLink::Logit
+        | StandardLink::Probit
+        | StandardLink::CLogLog
+        | StandardLink::LogLog
+        | StandardLink::Cauchit),
+    ) = link_kind
+    {
+        let (w0, w1, w2, _, _) = gam_solve::mixture_link::fisher_weight_jet5(*link, q);
+        let (f, f1, f2) = (weight * w0, weight * w1, weight * w2);
+        return if f.is_finite() && f1.is_finite() && f2.is_finite() {
+            (f, f1, f2)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+    }
+    if !mu.is_finite()
         || !d1.is_finite()
         || !d2.is_finite()
         || !d3.is_finite()
@@ -1187,5 +1222,96 @@ mod row_program_oracle_tests {
         assert!(!channel_agrees(f64::NAN, f64::NAN, majorant));
         assert!(!channel_agrees(f64::INFINITY, f64::INFINITY, majorant));
         assert!(!channel_agrees(f64::NEG_INFINITY, channel, majorant));
+    }
+}
+
+#[cfg(test)]
+mod expected_information_tail_tests {
+    use super::*;
+    use gam_problem::{InverseLink, StandardLink};
+
+    fn expected_information(link: StandardLink, q: f64) -> (f64, f64, f64) {
+        let link = InverseLink::Standard(link);
+        let jet = inverse_link_jet_for_inverse_link(&link, q).expect("inverse-link jet");
+        binomial_expected_q_information_derivatives(1.0, q, &link, jet.mu, jet.d1, jet.d2, jet.d3)
+    }
+
+    fn close(a: f64, b: f64, rel: f64) -> bool {
+        (a - b).abs() <= rel * a.abs().max(b.abs())
+    }
+
+    /// The Bernoulli model is invariant under `(y, q) → (1 − y, −q)` for a
+    /// link with `μ(−q) = 1 − μ(q)`, so the expected information is even in
+    /// `q`, with an odd first derivative and an even second derivative.
+    /// Forming `μ(1 − μ)` from the reported `μ` broke this in the upper tail:
+    /// at probit q = 8 it was 7% off, and from q ≈ 8.3 (logit q ≈ 36.7) it
+    /// was exactly 0, while the mirror row stayed exact.
+    #[test]
+    fn expected_information_is_even_under_the_label_swap_in_both_tails() {
+        let cases: [(StandardLink, &[f64]); 3] = [
+            (StandardLink::Probit, &[0.5, 5.0, 7.5, 8.0, 8.3, 9.0, 12.0]),
+            (StandardLink::Logit, &[0.5, 20.0, 30.0, 35.0, 36.5, 37.0]),
+            (StandardLink::Cauchit, &[0.5, 10.0, 1.0e4, 1.0e8]),
+        ];
+        for (link, qs) in cases {
+            for &q in qs {
+                let (f_hi, f1_hi, f2_hi) = expected_information(link, q);
+                let (f_lo, f1_lo, f2_lo) = expected_information(link, -q);
+                assert!(
+                    f_hi > 0.0 && f_lo > 0.0,
+                    "{link:?} q=±{q}: f=({f_hi}, {f_lo})"
+                );
+                // Both sides are evaluated in log scale from the same
+                // small-tail complement, so they agree to a few ulps of the
+                // O(q²) log-weight; 1e-12 leaves two orders of headroom.
+                assert!(
+                    close(f_hi, f_lo, 1e-12),
+                    "{link:?} q=±{q}: f {f_hi} vs {f_lo}"
+                );
+                assert!(
+                    close(f1_hi, -f1_lo, 1e-12),
+                    "{link:?} q=±{q}: f' {f1_hi} vs {f1_lo}"
+                );
+                assert!(
+                    close(f2_hi, f2_lo, 1e-12),
+                    "{link:?} q=±{q}: f'' {f2_hi} vs {f2_lo}"
+                );
+            }
+        }
+    }
+
+    /// 60-digit references for `W = μ′²/(μ(1−μ))` and its first two
+    /// q-derivatives, at upper-tail points where `μ` has rounded to 1.
+    #[test]
+    fn expected_information_matches_high_precision_references_past_mu_rounding_to_one() {
+        let references = [
+            (
+                StandardLink::Probit,
+                9.0,
+                [
+                    9.3633555091744174425e-18,
+                    -8.3254059169468431652e-17,
+                    7.3078037093236435736e-16,
+                ],
+            ),
+            (
+                StandardLink::Logit,
+                37.0,
+                [
+                    8.533047625744064338e-17,
+                    -8.5330476257440628818e-17,
+                    8.5330476257440599692e-17,
+                ],
+            ),
+        ];
+        for (link, q, expected) in references {
+            let (f, f1, f2) = expected_information(link, q);
+            for (got, want) in [f, f1, f2].into_iter().zip(expected) {
+                assert!(
+                    close(got, want, 1e-12),
+                    "{link:?} q={q}: got {got}, want {want}"
+                );
+            }
+        }
     }
 }
