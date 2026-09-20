@@ -1447,6 +1447,218 @@ fn block_orthogonality_rejects_groups_missing_an_axis() {
     );
 }
 
+// ----- BlockSparsityPenalty tests -----
+
+fn block_sparsity_test_target() -> Array1<f64> {
+    // n_eff = 2 rows, latent_dim = 3, row-major (row*d + axis):
+    // T = [[ 0.4, -0.3,  0.2],
+    //      [-0.1,  0.6,  0.5]]
+    // Group {0, 1} spans both rows (norm² 0.62), group {2} both rows (norm² 0.29).
+    array![0.4_f64, -0.3, 0.2, -0.1, 0.6, 0.5]
+}
+
+fn build_block_sparsity(learnable_weight: bool) -> BlockSparsityPenalty {
+    let t = block_sparsity_test_target();
+    BlockSparsityPenalty::new(
+        PsiSlice::full(t.len(), Some(3)),
+        vec![vec![0_usize, 1], vec![2]],
+        0.8,
+        2,
+        1e-2,
+        learnable_weight,
+    )
+    .expect("valid block sparsity penalty")
+}
+
+/// Smallest smoothed group norm `s_g = sqrt(‖T_g‖² + ε²)` of the fixture, and the
+/// largest `sqrt(|g|)` factor: the two numbers the finite-difference truncation bounds
+/// below read.
+fn block_sparsity_fixture_scales(penalty: &BlockSparsityPenalty, t: &Array1<f64>) -> (f64, f64) {
+    let d = t.len() / penalty.n_eff;
+    let mut min_norm = f64::INFINITY;
+    let mut max_size_factor = 0.0_f64;
+    for group in &penalty.groups {
+        let mut norm2 = penalty.smoothing_eps * penalty.smoothing_eps;
+        for row in 0..penalty.n_eff {
+            for &axis in group {
+                norm2 += t[row * d + axis] * t[row * d + axis];
+            }
+        }
+        min_norm = min_norm.min(norm2.sqrt());
+        max_size_factor = max_size_factor.max((group.len() as f64).sqrt());
+    }
+    (min_norm, max_size_factor)
+}
+
+/// The group-lasso gradient `w·sqrt(|g|)·t_i / s_g` is the derivative of the value.
+///
+/// Tolerance: a central difference with step `h` of a value `P` evaluated to relative
+/// accuracy `k·ε` (k = 32 bounds the rounded operations in one value: the squares and
+/// sums of a group norm, its square root, the `sqrt(|g|)` scaling and the group sum)
+/// errs by at most `k·ε·|P|/h` from rounding plus `h²/6·max|∂³P/∂t_i³|` from
+/// truncation. Along one coordinate `P` is `w·sqrt(|g|)·sqrt(x² + c)`, whose third
+/// derivative `-3xc/(x² + c)^{5/2}` is bounded by `3/s²`; at `h ≪ s_min` the bound
+/// holds at `s_min/2`, giving `h²/6·w·sqrt(|g|)·12/s_min²`.
+#[test]
+fn block_sparsity_grad_matches_finite_difference() {
+    let penalty = build_block_sparsity(false);
+    let t = block_sparsity_test_target();
+    let rho = Array1::<f64>::zeros(0);
+    let grad = penalty.grad_target(t.view(), rho.view());
+    let h = 1e-6;
+    let fd = gam_linalg_test_support::fd_checker::numerical_gradient_central_diff(
+        |tv| penalty.value(tv.view(), rho.view()),
+        &t,
+        h,
+    );
+    let (s_min, size_factor) = block_sparsity_fixture_scales(&penalty, &t);
+    let value = penalty.value(t.view(), rho.view());
+    let tol = 32.0 * f64::EPSILON * value.abs() / h
+        + h * h / 6.0 * penalty.weight * size_factor * 12.0 / (s_min * s_min);
+    for i in 0..t.len() {
+        assert!(
+            (grad[i] - fd[i]).abs() <= tol,
+            "grad[{i}] = {:.15e}, central difference {:.15e}, bound {tol:.3e}",
+            grad[i],
+            fd[i]
+        );
+    }
+}
+
+/// The closed-form Hessian-vector product `w·sqrt(|g|)·(v/s − t·(tᵀv)/s³)` is the
+/// directional derivative of the gradient.
+///
+/// Tolerance: the gradient is formed to relative accuracy `k·ε` (k = 32 as above), so
+/// the central difference of it along `v` rounds by at most `k·ε·‖∇P‖∞/h`. Its
+/// truncation is `h²/6` times the fourth directional derivative of the smoothed norm,
+/// bounded by `15·‖v‖³/s³` for `sqrt(‖x‖² + ε²)`; again evaluated at `s_min/2`.
+#[test]
+fn block_sparsity_hvp_matches_gradient_directional_derivative() {
+    let penalty = build_block_sparsity(false);
+    let t = block_sparsity_test_target();
+    let n = t.len();
+    let rho = Array1::<f64>::zeros(0);
+    let v: Array1<f64> = Array1::from_shape_fn(n, |i| 0.2 * ((i as f64) + 1.3).cos());
+    let hv = penalty.hvp(t.view(), rho.view(), v.view());
+    let h = 1e-5;
+    let tp = &t + &(&v * h);
+    let tm = &t - &(&v * h);
+    let gp = penalty.grad_target(tp.view(), rho.view());
+    let gm = penalty.grad_target(tm.view(), rho.view());
+    let grad = penalty.grad_target(t.view(), rho.view());
+    let grad_scale = grad.iter().fold(0.0_f64, |acc, &g| acc.max(g.abs()));
+    let v_norm = v.dot(&v).sqrt();
+    let (s_min, size_factor) = block_sparsity_fixture_scales(&penalty, &t);
+    let half = 0.5 * s_min;
+    let tol = 32.0 * f64::EPSILON * grad_scale / h
+        + h * h / 6.0 * penalty.weight * size_factor * 15.0 * v_norm.powi(3) / (half * half * half);
+    for i in 0..n {
+        let fd = (gp[i] - gm[i]) / (2.0 * h);
+        assert!(
+            (hv[i] - fd).abs() <= tol,
+            "hvp[{i}] = {:.15e}, directional difference {fd:.15e}, bound {tol:.3e}",
+            hv[i]
+        );
+    }
+}
+
+/// `as_dense` and `diag_target` feed the frozen operator's dense log-determinant and
+/// its diagonal. Each column of `as_dense` is the finite-difference-checked `hvp` of
+/// the matching unit vector, and `diag_target` is `as_dense`'s diagonal. The three
+/// evaluate the same closed form entry by entry, so they agree to the rounding of
+/// one entry, bounded by `32·ε` times the largest entry.
+#[test]
+fn block_sparsity_dense_hessian_and_diagonal_match_hvp() {
+    let penalty = build_block_sparsity(true);
+    let t = block_sparsity_test_target();
+    let n = t.len();
+    let rho = array![0.3_f64];
+    let dense = penalty.as_dense(t.view(), rho.view());
+    let diag = penalty.diag_target(t.view(), rho.view());
+    let scale = dense.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    assert!(scale > 0.0);
+    let tol = 32.0 * f64::EPSILON * scale;
+    for j in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[j] = 1.0;
+        let column = penalty.hvp(t.view(), rho.view(), e.view());
+        for i in 0..n {
+            assert!(
+                (dense[[i, j]] - column[i]).abs() <= tol,
+                "as_dense[{i}, {j}] = {:.15e}, hvp(e_{j})[{i}] = {:.15e}",
+                dense[[i, j]],
+                column[i]
+            );
+        }
+        assert!(
+            (diag[j] - dense[[j, j]]).abs() <= tol,
+            "diag_target[{j}] = {:.15e}, as_dense[{j}, {j}] = {:.15e}",
+            diag[j],
+            dense[[j, j]]
+        );
+    }
+}
+
+/// With a learnable weight `w·exp(ρ)`, `grad_rho` is the ρ-derivative of the value.
+///
+/// Tolerance: `P(ρ) = P(0)·exp(ρ)`, so the central difference rounds by at most
+/// `k·ε·|P|/h` and truncates by `h²/6·|∂³P/∂ρ³| = h²/6·|P|` (at `h ≪ 1`).
+#[test]
+fn block_sparsity_grad_rho_matches_finite_difference() {
+    let penalty = build_block_sparsity(true);
+    let t = block_sparsity_test_target();
+    let rho = array![0.3_f64];
+    let grad_rho = penalty.grad_rho(t.view(), rho.view());
+    assert_eq!(grad_rho.len(), 1);
+    let h = 1e-6;
+    let value = penalty.value(t.view(), rho.view());
+    let fd = (penalty.value(t.view(), array![0.3 + h].view())
+        - penalty.value(t.view(), array![0.3 - h].view()))
+        / (2.0 * h);
+    let tol = 32.0 * f64::EPSILON * value.abs() / h + h * h / 6.0 * value.abs();
+    assert!(
+        (grad_rho[0] - fd).abs() <= tol,
+        "grad_rho = {:.15e}, central difference {fd:.15e}, bound {tol:.3e}",
+        grad_rho[0]
+    );
+}
+
+/// `MechanismSparsityPenalty::as_dense` and `diag_target` feed the frozen operator
+/// like the block penalty's; each column of `as_dense` is the finite-difference-checked
+/// `hvp` of the matching unit vector and `diag_target` is its diagonal, to the rounding
+/// of one entry (`32·ε` times the largest entry).
+#[test]
+fn mechanism_sparsity_dense_hessian_and_diagonal_match_hvp() {
+    let penalty = build_mech_sparsity(0.5);
+    let t = mech_sparsity_test_target();
+    let n = t.len();
+    let rho = Array1::<f64>::zeros(0);
+    let dense = penalty.as_dense(t.view(), rho.view());
+    let diag = penalty.diag_target(t.view(), rho.view());
+    let scale = dense.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    assert!(scale > 0.0);
+    let tol = 32.0 * f64::EPSILON * scale;
+    for j in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[j] = 1.0;
+        let column = penalty.hvp(t.view(), rho.view(), e.view());
+        for i in 0..n {
+            assert!(
+                (dense[[i, j]] - column[i]).abs() <= tol,
+                "as_dense[{i}, {j}] = {:.15e}, hvp(e_{j})[{i}] = {:.15e}",
+                dense[[i, j]],
+                column[i]
+            );
+        }
+        assert!(
+            (diag[j] - dense[[j, j]]).abs() <= tol,
+            "diag_target[{j}] = {:.15e}, as_dense[{j}, {j}] = {:.15e}",
+            diag[j],
+            dense[[j, j]]
+        );
+    }
+}
+
 // ----- MechanismSparsityPenalty tests -----
 
 fn mech_sparsity_test_target() -> Array1<f64> {
