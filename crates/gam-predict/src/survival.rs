@@ -146,46 +146,68 @@ impl SurvivalPredictor {
         Ok((eta_threshold, eta_log_sigma, design_noise))
     }
 
-    /// Delta-method response-scale SE of the survival probability from an
-    /// explicit covariance `backend`, via the threshold/log-σ chain rule.
-    /// Shared by the full-uncertainty state and the posterior-mean pass so both
-    /// report a genuine probability-scale SE (never the threshold-scale η SE,
-    /// which lives in different units).
-    fn survival_mean_se_from_backend(
+    /// The response index `q0 = −η_t·e^{−η_σ}` with its posterior SD under
+    /// `backend`, and the survival probability's SE.
+    ///
+    /// `S = 1 − F(q0)` is a monotone map of the one index `q0`, so the band is
+    /// the image of `q0 ± z·SD(q0)` under that map (#3140) and
+    /// `SE(S) = F'(q0)·SD(q0)` exactly. The gradient of `q0` in
+    /// `(β_t, β_σ)` is `(−e^{−η_σ}·x_t, −q0·x_s)`. Shared by the
+    /// full-uncertainty state and the posterior-mean pass so both report a
+    /// genuine probability-scale SE (never the threshold-scale η SE, which
+    /// lives in different units).
+    fn survival_index_from_backend(
         &self,
         input: &PredictInput,
         backend: &PredictionCovarianceBackend<'_>,
         eta_threshold: &Array1<f64>,
         eta_log_sigma: &Array1<f64>,
         design_noise: &DesignMatrix,
-    ) -> Result<Array1<f64>, EstimationError> {
+    ) -> Result<(ResponseIndex, Array1<f64>), EstimationError> {
         let n = eta_threshold.len();
         let p_t = self.beta_threshold.len();
         let p_s = self.beta_log_sigma.len();
-        linear_predictor_se_from_backend(backend, n, |rows| {
+        let mut q0 = Array1::<f64>::zeros(n);
+        let mut inv_sigma = Array1::<f64>::zeros(n);
+        let mut failure_density = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let (q, s) = survival_q0_and_inverse_sigma(eta_threshold[i], eta_log_sigma[i]);
+            let (_, f) =
+                inverse_link_survival_tail_value_and_failure_density(&self.inverse_link, q)?;
+            q0[i] = q;
+            inv_sigma[i] = s;
+            failure_density[i] = f;
+        }
+        let index_se = linear_predictor_se_from_backend(backend, n, |rows| {
             let x_t = design_row_chunk(&input.design, rows.clone())?;
             let x_s = design_row_chunk(design_noise, rows.clone())?;
-            let eta_t_chunk = eta_threshold.slice(ndarray::s![rows.clone()]);
-            let eta_ls_chunk = eta_log_sigma.slice(ndarray::s![rows.clone()]);
-            let rows_in_chunk = eta_t_chunk.len();
+            let q0_chunk = q0.slice(ndarray::s![rows.clone()]);
+            let inv_sigma_chunk = inv_sigma.slice(ndarray::s![rows.clone()]);
+            let rows_in_chunk = q0_chunk.len();
             let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_t + p_s));
             for i in 0..rows_in_chunk {
-                let (q0, inv_sigma) =
-                    survival_q0_and_inverse_sigma(eta_t_chunk[i], eta_ls_chunk[i]);
-                let (_, failure_density) =
-                    inverse_link_survival_tail_value_and_failure_density(&self.inverse_link, q0)
-                        .map_err(|e| e.to_string())?;
-                let dsurv_deta_t = failure_density * inv_sigma;
-                let dsurv_deta_s = failure_density * q0;
                 for j in 0..p_t {
-                    grad[[i, j]] = dsurv_deta_t * x_t[[i, j]];
+                    grad[[i, j]] = -inv_sigma_chunk[i] * x_t[[i, j]];
                 }
                 for j in 0..p_s {
-                    grad[[i, p_t + j]] = dsurv_deta_s * x_s[[i, j]];
+                    grad[[i, p_t + j]] = -q0_chunk[i] * x_s[[i, j]];
                 }
             }
             Ok(vec![grad])
-        })
+        })?;
+        let mean_se = Array1::from_iter(
+            failure_density
+                .iter()
+                .zip(index_se.iter())
+                .map(|(&f, &sd)| f.abs() * sd),
+        );
+        Ok((
+            ResponseIndex {
+                index: q0,
+                index_se,
+            },
+            mean_se,
+        ))
     }
 
     /// Survival point + η/mean standard errors from an explicit covariance
@@ -209,8 +231,7 @@ impl SurvivalPredictor {
             "survival threshold uncertainty",
         )?;
 
-        // Delta-method SE for survival probability.
-        let mean_se_vec = self.survival_mean_se_from_backend(
+        let (response_index, mean_se) = self.survival_index_from_backend(
             input,
             backend,
             &eta_threshold,
@@ -221,8 +242,9 @@ impl SurvivalPredictor {
             eta: eta_threshold,
             mean: survival_prob,
             eta_se: Some(eta_se),
-            mean_se: Some(mean_se_vec),
+            mean_se: Some(mean_se),
             covariance_source: InferenceCovarianceMode::Conditional,
+            response_index: Some(response_index),
         })
     }
 
@@ -245,6 +267,7 @@ impl SurvivalPredictor {
                 eta_se: None,
                 mean_se: None,
                 covariance_source: InferenceCovarianceMode::Conditional,
+                response_index: None,
             })
         }
     }
@@ -275,10 +298,10 @@ impl PredictionTransform for SurvivalPredictor {
             }
             PredictPass::PosteriorMean => {
                 let (eta_threshold, eta_log_sigma, design_noise) = self.linear_predictors(input)?;
-                // The eta_se covers only the threshold block; the response-scale
-                // `mean_se` below carries the full threshold + log-σ delta-method
-                // propagation, so the collapsed-delta credible band is in genuine
-                // survival-probability units.
+                // The eta_se covers only the threshold block; the response
+                // index `q0` below carries the full threshold + log-σ
+                // propagation, so the credible band — the image of the `q0`
+                // interval — is in genuine survival-probability units.
                 //
                 // Validation target for this survival posterior-mean path:
                 // compare against 50K Monte Carlo draws from N(beta_hat, V) for a
@@ -335,7 +358,7 @@ impl PredictionTransform for SurvivalPredictor {
                         })
                         .collect::<Result<Vec<_>, _>>()?,
                 );
-                let mean_se = self.survival_mean_se_from_backend(
+                let (response_index, mean_se) = self.survival_index_from_backend(
                     input,
                     &backend,
                     &eta_threshold,
@@ -348,30 +371,29 @@ impl PredictionTransform for SurvivalPredictor {
                     eta_se: Some(eta_se),
                     mean_se: Some(mean_se),
                     covariance_source: InferenceCovarianceMode::Conditional,
+                    response_index: Some(response_index),
                 })
             }
         }
     }
 
-    fn response(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-        // The survival predictor never routes its interval through the response
-        // map (it uses the delta-method response SE), so this is unreachable in
-        // practice; kept total for trait completeness.
-        self.compute_survival(eta, &Array1::zeros(eta.len()))
+    /// The survival tail `S = 1 − F(q0)` of the response index `q0`, which
+    /// decreases in `q0`.
+    fn response(&self, q0: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+        q0.iter()
+            .map(|&q| {
+                inverse_link_survival_tail_value_and_failure_density(&self.inverse_link, q)
+                    .map(|(survival, _)| survival)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Array1::from_vec)
     }
 
-    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
-        match pass {
-            // Survival tail is a probability; the delta-method response interval
-            // is μ ± z·SE(μ) clamped to [0, 1] with a genuine threshold-scale η
-            // interval retained.
-            PredictPass::FullUncertainty => ResponseInterval::SymmetricDelta,
-            // The threshold-scale η interval is not directly meaningful on the
-            // survival-probability scale, so it is collapsed onto the point
-            // predictor and uncertainty flows through the delta-method response
-            // SE (here the threshold-only eta_se).
-            PredictPass::PosteriorMean => ResponseInterval::CollapsedDelta,
-        }
+    fn response_jacobian_rows(&self, _: PredictPass) -> Result<ResponseInterval, EstimationError> {
+        // The survival probability is a map of the two-block index `q0`, not
+        // of the threshold predictor alone, so both passes band `q0` and map
+        // its interval through the tail.
+        Ok(ResponseInterval::TransformIndex)
     }
 
     fn bounds(&self) -> ResponseBounds {

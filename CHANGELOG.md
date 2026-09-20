@@ -1,5 +1,31 @@
 ## Unreleased
 
+- **Every mean band is the image of an index interval, so it lies in the support
+  without a clamp** (#3140). The delta-method mean band `μ ± z·SE(μ)` and the
+  clamp that pulled it back into the support are deleted, together with
+  `MeanIntervalMethod` and `PredictUncertaintyOptions::mean_interval_method`.
+  Each band is now the image of `η ± z·SE(η)` under the monotone inverse link.
+  For a half-line link (log-binomial, identity/sqrt/inverse links on a positive
+  family) the η interval is cut at the feasible boundary, and that endpoint takes
+  the link's limit there. An inverse link whose η interval reaches 0 therefore
+  reports an unbounded upper mean. Two-block families use their scalar response
+  index. Survival bands are the image of `q0 ± z·SD(q0)` under the survival
+  tail. Binomial location-scale bands are the image of the link argument
+  `wiggle(−η_t·e^{−η_σ})`, and its SE is now reported as `eta_se`. Dispersion
+  location-scale full-uncertainty bands transform the mean-block η the same way
+  as the posterior-mean pass. The reported mean SEs are unchanged.
+
+- **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
+  `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
+  `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and
+  `C_κ = 0.125` and no derivation behind the inequality, and it published that as
+  `Verdict::Certified`. The verdict, both constants and its phase-diagram test are
+  deleted. The measurements stay, renamed `CertificateInputs` →
+  `DictionaryIncoherenceReport`: `μ̂`, per-atom `κ̂`, the activity floor and the SNR
+  proxy. The Python `incoherence_report` dict loses the `global_optimality`,
+  `global_optimality_certified` and `global_optimality_margin` keys, and the report
+  is no longer recorded in the certificate ledger.
+
 - **A learned Gaussian-shift frailty in survival marginal-slope is refused as not identified.**
   The likelihood reads σ only through the observed slope `s(σ)·g`, `s = 1/√(1+σ²)`, so with
   the default slope (an intercept in every slope surface and a constant or no offset) any σ

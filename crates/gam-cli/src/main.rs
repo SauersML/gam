@@ -52,9 +52,9 @@ pub(crate) use gam_predict::linalg::{PredictionCovarianceBackend, rowwise_local_
 pub(crate) use gam::matrix::{DesignMatrix, SymmetricMatrix};
 
 pub(crate) use gam_predict::{
-    FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod,
-    PredictInput, PredictUncertaintyOptions, PredictableModel, predict_gam,
-    predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
+    FittedModelPredictExt, InferenceCovarianceMode, PredictInput, PredictUncertaintyOptions,
+    PredictableModel, predict_gam, predict_gam_posterior_meanwith_backend,
+    predict_gamwith_uncertainty,
 };
 
 pub(crate) use gam::report;

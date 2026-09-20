@@ -5,7 +5,7 @@
 
 use crate::interval_policy::{PredictionRequest, resolve_prediction_request};
 use crate::{
-    ConformalCalibrationFold, FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod,
+    ConformalCalibrationFold, FittedModelPredictExt, InferenceCovarianceMode,
     PredictUncertaintyOptions, predict_full_uncertainty_conformal,
 };
 use gam_models::inference::model::{FittedModel, PredictModelClass};
@@ -107,8 +107,7 @@ pub fn full_conformal_prediction_columns(
             .try_to_dense_by_chunks(&format!("full conformal {what} design"))
     };
     let response_name = formula_response_column(&model.payload().formula).ok_or_else(|| {
-        "full conformal: could not resolve the response column from the saved formula"
-            .to_string()
+        "full conformal: could not resolve the response column from the saved formula".to_string()
     })?;
     let response_col = *labeled.col_map.get(&response_name).ok_or_else(|| {
         format!(
@@ -222,7 +221,6 @@ pub fn split_conformal_prediction_columns(
     let uncertainty_options = PredictUncertaintyOptions {
         confidence_level: conformal_level,
         covariance_mode,
-        mean_interval_method: MeanIntervalMethod::TransformEta,
         includeobservation_interval: observation_interval,
         conformal_level: Some(conformal_level),
         ..PredictUncertaintyOptions::default()

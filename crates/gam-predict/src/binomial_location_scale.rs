@@ -9,8 +9,10 @@ use super::*;
 ///   q0    = -eta_t / sigma
 ///   prob  = inverse_link(q0)
 ///
-/// Delta-method SEs propagate through the chain rule of q0 w.r.t. both
-/// linear predictors.
+/// The reported `eta` is the inverse-link argument `wiggle(q0)` (or `q0`
+/// without a wiggle), and its SE propagates through the chain rule of q0 with
+/// respect to both linear predictors and the wiggle coefficients. The
+/// probability band is the image of `eta ± z·SE(eta)` under the inverse link.
 pub(crate) struct BinomialLocationScalePredictor {
     pub beta_threshold: Array1<f64>,
     pub beta_noise: Array1<f64>,
@@ -94,31 +96,63 @@ impl BinomialLocationScalePredictor {
 
 impl BinomialLocationScalePredictor {
 
-    /// Plug-in probability point + (covariance-derived) response-scale SE via
-    /// the threshold/scale/wiggle chain rule. The η SE is reported equal to the
-    /// response SE because the threshold-scale η interval is not meaningful on
-    /// the probability scale and is collapsed onto the point predictor.
+    /// Plug-in probability point with the link-argument and probability SEs
+    /// from the predictor's stored conditional covariance, when it has one.
     fn plugin_state_from_covariance(
         &self,
         input: &PredictInput,
     ) -> Result<LinearState, EstimationError> {
-        let with_se = self.predict_with_uncertainty_inner(input)?;
+        match self.covariance.as_ref() {
+            Some(cov) => {
+                let backend = PredictionCovarianceBackend::from_dense(cov.view());
+                self.state_from_backend(input, &backend, InferenceCovarianceMode::Conditional)
+            }
+            None => {
+                let (q0_base, _, _) = self.compute_q0_and_sigma(input)?;
+                let (eta, prob) = self.apply_link(&q0_base)?;
+                Ok(LinearState {
+                    eta,
+                    mean: prob,
+                    eta_se: None,
+                    mean_se: None,
+                    response_index: None,
+                    covariance_source: InferenceCovarianceMode::Conditional,
+                })
+            }
+        }
+    }
+
+    /// Plug-in probability point, the SE of the inverse-link argument `eta`
+    /// under `backend`, and the probability SE `|dμ/dη|·SE(eta)`.
+    fn state_from_backend(
+        &self,
+        input: &PredictInput,
+        backend: &PredictionCovarianceBackend<'_>,
+        covariance_source: InferenceCovarianceMode,
+    ) -> Result<LinearState, EstimationError> {
+        let (q0_base, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
+        let (eta, prob, dmu_deta) = self.apply_link_with_d1(&q0_base)?;
+        let eta_se = self.link_argument_se_from_backend(input, backend, &q0_base, &sigma, &eta_t)?;
+        let mean_se = Array1::from_shape_fn(eta_se.len(), |i| dmu_deta[i].abs() * eta_se[i]);
         Ok(LinearState {
-            eta: with_se.eta,
-            mean: with_se.mean,
-            eta_se: with_se.mean_se.clone(),
-            mean_se: with_se.mean_se,
-            covariance_source: InferenceCovarianceMode::Conditional,
+            eta,
+            mean: prob,
+            eta_se: Some(eta_se),
+            mean_se: Some(mean_se),
+            response_index: None,
+            covariance_source,
         })
     }
-    fn response_se_from_backend(
+
+    /// Posterior SD of the inverse-link argument `eta = wiggle(q0)` under
+    /// `backend`, via the threshold/scale/wiggle chain rule.
+    fn link_argument_se_from_backend(
         &self,
         input: &PredictInput,
         backend: &PredictionCovarianceBackend<'_>,
         q0_base: &Array1<f64>,
         sigma: &Array1<f64>,
         eta_t: &Array1<f64>,
-        dmu_deta: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         let n = eta_t.len();
         let p_t = self.beta_threshold.len();
@@ -143,7 +177,6 @@ impl BinomialLocationScalePredictor {
             let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
             let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]);
             let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]);
-            let dmu_chunk = dmu_deta.slice(ndarray::s![rows.clone()]);
             let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
                 Some(runtime.design(&q0_chunk)?)
             } else {
@@ -157,7 +190,6 @@ impl BinomialLocationScalePredictor {
             let rows_in_chunk = q0_chunk.len();
             let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
             for i in 0..rows_in_chunk {
-                let dphi = dmu_chunk[i];
                 let scale = dq_dq0[i];
                 // The predicted value is built from the CLAMPED standardized
                 // argument (see `compute_q0_and_sigma`), so the differentiated
@@ -165,25 +197,25 @@ impl BinomialLocationScalePredictor {
                 // active the value is locally constant in both linear predictors
                 // and the chain factor `dq0/deta` is exactly zero; reporting the
                 // unclamped `-1/sigma` / `eta_t/sigma` factors there would make
-                // the delta-method SE describe a different function than the
-                // reported probability.
+                // the SE describe a different function than the reported
+                // link argument.
                 let raw_q0 = -eta_t_chunk[i] / sigma_chunk[i];
                 let dclamp = if raw_q0.abs() < SURVIVAL_STANDARDIZED_ARG_CLAMP {
                     1.0
                 } else {
                     0.0
                 };
-                let dprob_deta_t = dphi * scale * dclamp * (-1.0 / sigma_chunk[i]);
-                let dprob_deta_s = dphi * scale * dclamp * (eta_t_chunk[i] / sigma_chunk[i]);
+                let deta_deta_t = scale * dclamp * (-1.0 / sigma_chunk[i]);
+                let deta_deta_s = scale * dclamp * (eta_t_chunk[i] / sigma_chunk[i]);
                 for j in 0..p_t {
-                    grad[[i, j]] = dprob_deta_t * x_t[[i, j]];
+                    grad[[i, j]] = deta_deta_t * x_t[[i, j]];
                 }
                 for j in 0..p_s {
-                    grad[[i, p_t + j]] = dprob_deta_s * x_s[[i, j]];
+                    grad[[i, p_t + j]] = deta_deta_s * x_s[[i, j]];
                 }
                 if let Some(wd) = wiggle_design.as_ref() {
                     for j in 0..p_w {
-                        grad[[i, p_t + p_s + j]] = dphi * wd[[i, j]];
+                        grad[[i, p_t + p_s + j]] = wd[[i, j]];
                     }
                 }
             }
@@ -191,45 +223,9 @@ impl BinomialLocationScalePredictor {
         })
     }
 
-    /// Delta-method response-scale SE for the binomial-LS probability from an
-    /// arbitrary covariance `backend`, via the threshold/scale/wiggle chain
-    /// rule. Shared by the conditional point path and the mode-selecting
-    /// full-uncertainty path.
-    fn mean_se_from_backend(
-        &self,
-        input: &PredictInput,
-        backend: &PredictionCovarianceBackend<'_>,
-    ) -> Result<Array1<f64>, EstimationError> {
-        let (q0_base, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
-        let (_, _, dmu_deta) = self.apply_link_with_d1(&q0_base)?;
-        self.response_se_from_backend(input, backend, &q0_base, &sigma, &eta_t, &dmu_deta)
-    }
-
-    fn predict_with_uncertainty_inner(
-        &self,
-        input: &PredictInput,
-    ) -> Result<PredictionWithSE, EstimationError> {
-        let (q0_base, _, _) = self.compute_q0_and_sigma(input)?;
-        let (eta, prob, _) = self.apply_link_with_d1(&q0_base)?;
-
-        let mean_se = if let Some(ref cov) = self.covariance {
-            let backend = PredictionCovarianceBackend::from_dense(cov.view());
-            Some(self.mean_se_from_backend(input, &backend)?)
-        } else {
-            None
-        };
-
-        Ok(PredictionWithSE {
-            eta,
-            mean: prob,
-            eta_se: None,
-            mean_se,
-        })
-    }
-
-    /// The coefficient-uncertainty-integrated posterior-mean probability + the
-    /// response-scale SE, via the projected bivariate GHQ over the
-    /// threshold/log-σ posterior. Used by the posterior-mean pass.
+    /// The coefficient-uncertainty-integrated posterior-mean probability, via
+    /// the projected bivariate GHQ over the threshold/log-σ posterior, with the
+    /// link-argument and probability SEs. Used by the posterior-mean pass.
     fn posterior_mean_state(
         &self,
         input: &PredictInput,
@@ -264,7 +260,8 @@ impl BinomialLocationScalePredictor {
         )?;
 
         let eta_se =
-            self.response_se_from_backend(input, &backend, &q0_base, &sigma, &eta_t, &dmu_deta)?;
+            self.link_argument_se_from_backend(input, &backend, &q0_base, &sigma, &eta_t)?;
+        let mean_se = Array1::from_shape_fn(eta_se.len(), |i| dmu_deta[i].abs() * eta_se[i]);
 
         let mean = if self.link_wiggle.is_none() {
             let (var_t, var_s, cov_ts) = project_two_block_linear_predictor_covariance(
@@ -446,17 +443,14 @@ impl BinomialLocationScalePredictor {
             }
             out
         };
-        // Binomial location-scale eta_se is response-scale (dprob/dθ chain
-        // rule), so bounds are mean ± z·se clamped to [0, 1]. The threshold-scale
-        // η interval is not meaningful, so it is collapsed onto the point
-        // predictor and uncertainty flows through the delta-method response SE.
-        // The response-scale `eta_se` is reported as both the η and mean SE so
-        // the collapsed-delta policy carries it through unchanged.
+        // `eta` is the inverse-link argument at the mode and `eta_se` its SD;
+        // the band is their inverse-link image, inside `[0, 1]` by construction.
         Ok(LinearState {
             eta,
             mean,
-            eta_se: Some(eta_se.clone()),
-            mean_se: Some(eta_se),
+            eta_se: Some(eta_se),
+            mean_se: Some(mean_se),
+            response_index: None,
             covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
@@ -477,7 +471,7 @@ impl PredictionTransform for BinomialLocationScalePredictor {
     ) -> Result<LinearState, EstimationError> {
         match pass {
             PredictPass::FullUncertainty => {
-                // Build the response-scale SE from the requested covariance mode
+                // Build the link-argument SE from the requested covariance mode
                 // and report which covariance was used. The full-uncertainty
                 // path always has a fit (with at least a conditional backend);
                 // when no covariance can be formed at all this surfaces a clean
@@ -490,42 +484,32 @@ impl PredictionTransform for BinomialLocationScalePredictor {
                     covariance_mode,
                     "binomial location-scale",
                 )?;
-                let (q0_base, _, _) = self.compute_q0_and_sigma(input)?;
-                let (eta, prob) = self.apply_link(&q0_base)?;
-                let response_se = self.mean_se_from_backend(input, &backend)?;
-                Ok(LinearState {
-                    eta,
-                    mean: prob,
-                    eta_se: Some(response_se.clone()),
-                    mean_se: Some(response_se),
-                    covariance_source,
-                })
+                self.state_from_backend(input, &backend, covariance_source)
             }
             PredictPass::PosteriorMean => self.posterior_mean_state(input, fit),
         }
     }
 
     fn response(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
-        // Binomial LS forms its response interval by the delta method, not by
-        // transforming η endpoints, so this maps the wiggle-applied η through
-        // the inverse link for completeness only.
-        let (_, prob) = self.apply_link(eta)?;
-        Ok(prob)
+        // `eta` is the inverse-link argument (the wiggle already sits inside
+        // it), so the response is the base inverse link alone.
+        eta.iter()
+            .map(|&e| {
+                gam_solve::mixture_link::inverse_link_jet_for_inverse_link(&self.inverse_link, e)
+                    .map(|jet| jet.mu)
+            })
+            .collect::<Result<Vec<f64>, _>>()
+            .map(Array1::from_vec)
     }
 
-    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
-        match pass {
-            // Probability already evaluated post-transformation, on BOTH
-            // passes: the threshold-scale η interval is not meaningful on the
-            // response scale, so it collapses onto the point predictor and the
-            // response interval comes from the delta-method mean SE. Contrast
-            // `DispersionLocationScalePredictor`, whose posterior-mean pass
-            // transforms the η endpoints — sound only when the response is a
-            // monotone inverse-link image of η, which this one is not.
-            PredictPass::FullUncertainty | PredictPass::PosteriorMean => {
-                ResponseInterval::CollapsedDelta
-            }
-        }
+    fn response_jacobian_rows(&self, _: PredictPass) -> Result<ResponseInterval, EstimationError> {
+        // The probability is a monotone inverse-link image of the link
+        // argument `eta = wiggle(-eta_t·e^{-eta_s})` on both passes, so the
+        // band is the image of `eta ± z·SE(eta)` and lies in `[0, 1]`.
+        Ok(ResponseInterval::TransformEta(EtaDomain::of_spec(&LikelihoodSpec {
+            response: ResponseFamily::Binomial,
+            link: self.inverse_link.clone(),
+        })?))
     }
 
     fn bounds(&self) -> ResponseBounds {
@@ -551,7 +535,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
         &self,
         input: &PredictInput,
     ) -> Result<PredictionWithSE, EstimationError> {
-        self.predict_with_uncertainty_inner(input)
+        predict_with_uncertainty_generic(self, input)
     }
 
     fn predict_full_uncertainty(

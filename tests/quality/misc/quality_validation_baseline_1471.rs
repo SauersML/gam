@@ -73,7 +73,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
+    InferenceCovarianceMode, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };
 use ndarray::{Array1, Array2};
@@ -869,8 +869,8 @@ fn covered(lower: &[f64], upper: &[f64], truth: &[f64]) -> usize {
 
 /// A 95% confidence interval is only correct if it covers the truth ~95% of the
 /// time. The existing Gaussian-identity coverage test exercises the trivial
-/// Jacobian (dμ/dη ≡ 1); this arm exercises the NON-trivial log-link delta
-/// method under a discrete Poisson response, where a wrong response-scale SE
+/// Jacobian (dμ/dη ≡ 1); this arm exercises the NON-trivial log-link image
+/// band under a discrete Poisson response, where a wrong response-scale
 /// transform would silently mis-cover. We draw many Poisson replicates around a
 /// KNOWN log-mean, form gam's 95% response-scale mean intervals, and measure
 /// empirical coverage against the truth — then assert (a) gam is calibrated to
@@ -942,7 +942,6 @@ fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
             &PredictUncertaintyOptions {
                 confidence_level: nominal,
                 covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
-                mean_interval_method: MeanIntervalMethod::Delta,
                 includeobservation_interval: false,
                 edgeworth_one_sided: false,
                 boundary_correction: false,
@@ -999,7 +998,7 @@ fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
 
     // PRIMARY: gam's own response-scale Poisson intervals are calibrated. The
     // band (±0.07) is slightly looser than the Gaussian-identity case because
-    // the log-link delta method plus the discrete Poisson draw add MC noise.
+    // the log-link transform plus the discrete Poisson draw add MC noise.
     assert!(
         gam_err <= 0.07,
         "gam 95% response-scale Poisson CI miscalibrated: empirical coverage \

@@ -14,7 +14,7 @@
 //! ROOT CAUSE: `run_predict_unified` in `run_predict.rs` computed
 //! `let nonlinear = model.prediction_uses_posterior_mean();` but the
 //! `--uncertainty` arm ignored it, unconditionally building
-//! `PredictUncertaintyOptions { mean_interval_method: TransformEta, .. }` and
+//! `PredictUncertaintyOptions` and
 //! calling `predict_full_uncertainty`, which reports the plug-in
 //! `apply_family_inverse_link(&eta, ..)` as `mean`. The no-interval arm instead
 //! routes through `predict_posterior_mean` when `nonlinear`.

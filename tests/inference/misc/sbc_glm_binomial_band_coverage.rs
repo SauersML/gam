@@ -37,8 +37,7 @@ use csv::StringRecord;
 use gam_data::{EncodedDataset, encode_recordswith_inferred_schema};
 use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
-    predict_gamwith_uncertainty,
+    InferenceCovarianceMode, PredictUncertaintyOptions, predict_gamwith_uncertainty,
 };
 use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
 use ndarray::Array1;
@@ -145,7 +144,6 @@ fn response_band(fit: &FitResult, level: f64) -> (Array1<f64>, Array1<f64>) {
     let options = PredictUncertaintyOptions {
         confidence_level: level,
         covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
-        mean_interval_method: MeanIntervalMethod::TransformEta,
         includeobservation_interval: false,
         edgeworth_one_sided: false,
         boundary_correction: false,

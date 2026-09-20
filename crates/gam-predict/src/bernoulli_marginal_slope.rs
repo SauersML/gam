@@ -188,6 +188,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
             mean,
             eta_se,
             mean_se,
+            response_index: None,
             covariance_source: InferenceCovarianceMode::Conditional,
         })
     }
@@ -218,6 +219,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                     mean,
                     eta_se: Some(eta_se),
                     mean_se: Some(mean_se),
+                    response_index: None,
                     covariance_source,
                 })
             }
@@ -249,6 +251,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                     mean,
                     eta_se: Some(eta_se),
                     mean_se: Some(mean_se),
+                    response_index: None,
                     covariance_source: InferenceCovarianceMode::Conditional,
                 })
             }
@@ -259,15 +262,17 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
         self.mean_from_eta(eta)
     }
 
-    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
+    fn response_jacobian_rows(
+        &self,
+        pass: PredictPass,
+    ) -> Result<ResponseInterval, EstimationError> {
         match pass {
             // Both passes push the η endpoints through the marginal-slope
-            // response map: the response is the same smooth image of η either
-            // way, so neither pass has its own delta-method row set. Spelled
-            // out per pass so a new one has to state its policy here rather
-            // than inherit this one silently.
+            // response map `Φ(η)`, defined on the whole line. Spelled out per
+            // pass so a new one has to state its policy here rather than
+            // inherit this one silently.
             PredictPass::FullUncertainty | PredictPass::PosteriorMean => {
-                ResponseInterval::TransformEta
+                Ok(ResponseInterval::TransformEta(EtaDomain::Unrestricted))
             }
         }
     }
