@@ -29,7 +29,7 @@ def main() -> None:
     )
     model = gamfit.fit(
         {"y": y},
-        "y ~ s(t, type='duchon', centers=24)",
+        "y ~ s(t, bs='duchon', centers=24)",
         latents={
             "t": gamfit.smooth.LatentCoord(n=n, d=2, init=aux[:, :2], aux_prior={"u": aux}),
         },

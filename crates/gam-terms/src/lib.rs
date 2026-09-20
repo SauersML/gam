@@ -49,6 +49,7 @@ pub mod inference;
 mod isotropic_scale;
 pub mod latent;
 pub mod penalty_spec;
+mod removed_spellings;
 pub mod smooth;
 pub mod smooth_overrides;
 pub mod structure;

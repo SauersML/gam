@@ -45,6 +45,12 @@ python -m bench.pvalue_calibration.run quick --out /tmp/pv_quick
 python -m bench.pvalue_calibration.report /tmp/pv_quick --out /tmp/pv_quick/report.md
 ```
 
+On GitHub Actions, the `p-value calibration` workflow
+(`.github/workflows/pvalue-calibration.yml`) builds a release wheel and runs
+one plan. You pick the plan when you dispatch it, and the weekly schedule runs
+`ci`. The workflow publishes `report.md` as the job summary and uploads every
+output as an artifact.
+
 `run` writes three files, including `report.md`, so the second command is only
 needed to merge several runs. The outputs are:
 
