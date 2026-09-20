@@ -421,7 +421,7 @@ fn symmetric_eigen(
 
 /// Eigenvalues of `Ḡ^{1/2} Σ Ḡ^{1/2}`, computed as those of the similar
 /// `Σ^{1/2} Ḡ Σ^{1/2}` so a measured-rank-deficient `Σ` needs no inverse.
-fn output_metric_spectrum(
+pub(crate) fn output_metric_spectrum(
     source: &str,
     covariance: &Array2<f64>,
     metric: &Array2<f64>,
@@ -863,7 +863,7 @@ fn minimum_variance_wraps(canonical: &[f64], period: f64) -> Vec<bool> {
     wraps
 }
 
-fn unwrap_circle_values(values: &mut [f64], period: f64) {
+pub(crate) fn unwrap_circle_values(values: &mut [f64], period: f64) {
     let canonical: Vec<f64> = values
         .iter()
         .map(|&value| canonical_phase(value, period).0)

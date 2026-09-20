@@ -52,9 +52,9 @@ pub(super) fn calculate_edfwithworkspace_from_factor(
                 && workspace.final_aug_matrix.ncols() == r
                 && array_is_finite(&workspace.final_aug_matrix)
             {
-                return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {
+                return edf_from_solution(p, r, mp, e_transformed, |i, j| {
                     workspace.final_aug_matrix[(i, j)]
-                }));
+                });
             }
             Err(EstimationError::ModelIsIllConditioned {
                 condition_number: f64::INFINITY,
@@ -104,9 +104,9 @@ pub(super) fn calculate_edf_from_sparse_factor(
     let sol = gam_linalg::sparse_exact::solve_sparse_spdmulti(factor, &rhs_arr)
         .map_err(|_| ill_conditioned())?;
     if sol.nrows() == p && sol.ncols() == r && sol.iter().all(|v| v.is_finite()) {
-        return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {
+        return edf_from_solution(p, r, mp, e_transformed, |i, j| {
             sol[[i, j]]
-        }));
+        });
     }
     Err(ill_conditioned())
 }
@@ -136,9 +136,9 @@ pub(super) fn calculate_edf(
             condition_number: f64::INFINITY,
         })?;
     if sol.nrows() == p && sol.ncols() == r && sol.iter().all(|v| v.is_finite()) {
-        return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {
+        return edf_from_solution(p, r, mp, e_transformed, |i, j| {
             sol[[i, j]]
-        }));
+        });
     }
 
     Err(EstimationError::ModelIsIllConditioned {
@@ -190,9 +190,9 @@ pub(super) fn calculate_edfwithworkspace(
         && workspace.final_aug_matrix.ncols() == r
         && array_is_finite(&workspace.final_aug_matrix)
     {
-        return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {
+        return edf_from_solution(p, r, mp, e_transformed, |i, j| {
             workspace.final_aug_matrix[(i, j)]
-        }));
+        });
     }
 
     Err(EstimationError::ModelIsIllConditioned {
@@ -219,7 +219,7 @@ pub(super) fn edf_from_solution<F>(
     mp: f64,
     e_transformed: &Array2<f64>,
     solved_at: F,
-) -> f64
+) -> Result<f64, EstimationError>
 where
     F: Fn(usize, usize) -> f64,
 {
@@ -229,7 +229,14 @@ where
             tr += solved_at(i, j) * e_transformed[(j, i)];
         }
     }
-    (p as f64 - tr).clamp(mp, p as f64)
+    // `clamp` passes NaN through, so a non-finite trace must be refused here:
+    // there is no EDF to report when tr(H⁻¹S) is not a number.
+    if !tr.is_finite() {
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
+    }
+    Ok((p as f64 - tr).clamp(mp, p as f64))
 }
 
 #[cfg(test)]

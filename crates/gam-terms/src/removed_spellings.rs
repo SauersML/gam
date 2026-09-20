@@ -249,7 +249,7 @@ mod tests {
             &[("bs", "c('cyclic','ps')"), ("penalty_order", "2")][..],
             &[("method", "sobolev"), ("bc", "[periodic, open]")][..],
         ] {
-            reject_removed_smooth_spellings("s", &opts(pairs)).unwrap();
+            assert_eq!(reject_removed_smooth_spellings("s", &opts(pairs)), Ok(()));
         }
     }
 }

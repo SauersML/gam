@@ -8,8 +8,9 @@
 use crate::effects::{
     self, BandOptions, CovarianceSource, PointwiseBandOptions, SimultaneousBandOptions,
 };
+use crate::interval_reference::IntervalReference;
 use gam_data::{ColumnKindTag, DataSchema};
-use gam_terms::smooth::TermCollectionSpec;
+use gam_terms::smooth::{TermCollectionSpec, term_collection_has_global_intercept};
 use ndarray::{Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -55,6 +56,10 @@ pub struct DifferenceSmoothInputs<'a> {
     pub beta: ArrayView1<'a, f64>,
     pub covariance: ArrayView2<'a, f64>,
     pub covariance_source: CovarianceSource,
+    /// Law of the standardized band pivot, from [`IntervalReference::of_fit`]:
+    /// Student-t on `n − edf` when `covariance` carries an estimated
+    /// dispersion, normal otherwise.
+    pub reference: IntervalReference,
 }
 
 pub fn difference_smooth_report(
@@ -166,7 +171,11 @@ pub fn difference_smooth_report(
     let band_options = if request.simultaneous {
         BandOptions::Simultaneous(SimultaneousBandOptions {
             level,
-            simulations: request.n_sim.unwrap_or(effects::DEFAULT_SIMULATIONS),
+            simulations: match request.n_sim {
+                Some(simulations) => simulations,
+                None => effects::simultaneous_band_simulations(level)
+                    .map_err(|error| error.to_string())?,
+            },
             seed: request.seed.unwrap_or(effects::DEFAULT_SIMULATION_SEED),
         })
     } else {
@@ -206,6 +215,7 @@ pub fn difference_smooth_report(
             inputs.covariance,
             contrast.view(),
             band_options,
+            inputs.reference,
         )
         .map_err(|error| error.to_string())?;
         for (index, &x) in grid.iter().enumerate() {
@@ -292,7 +302,13 @@ fn random_effect_ranges(
     termspec: &TermCollectionSpec,
     group: &str,
 ) -> Result<(Vec<(usize, usize)>, Vec<(usize, usize)>), String> {
-    let mut column = 1 + termspec.linear_terms.len();
+    // Global layout is [intercept | linear | RE_0 | RE_1 | ... | smooth], and the
+    // intercept column exists only when the design authority says so (it is
+    // absent for `NoIntercept` formulas and when an anchored B-spline gauges the
+    // level). Deriving the offset from the same predicate the design builder
+    // uses keeps these ranges aligned with the realized columns (#3530).
+    let mut column =
+        usize::from(term_collection_has_global_intercept(termspec)) + termspec.linear_terms.len();
     let mut all = Vec::with_capacity(termspec.random_effect_terms.len());
     let mut selected = Vec::new();
     for term in &termspec.random_effect_terms {
@@ -356,6 +372,7 @@ fn zero_ranges(design: &mut Array2<f64>, ranges: &[(usize, usize)]) -> Result<()
 mod tests {
     use super::*;
     use gam_data::SchemaColumn;
+    use gam_terms::smooth::{ModelLevel, RandomEffectTermSpec};
     use ndarray::{Array1, array};
 
     #[test]
@@ -403,6 +420,7 @@ mod tests {
                 beta: beta.view(),
                 covariance: covariance.view(),
                 covariance_source: CovarianceSource::Conditional,
+                reference: IntervalReference::Normal,
             },
             request,
             |_, rows| {
@@ -420,5 +438,42 @@ mod tests {
         .expect("difference report");
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| (row.diff - 1.5).abs() < 1.0e-12));
+    }
+
+    fn random_effect_spec(name: &str, feature_col: usize, levels: usize) -> RandomEffectTermSpec {
+        RandomEffectTermSpec {
+            name: name.to_string(),
+            feature_col,
+            frozen_levels: Some((0..levels).map(|level| (level as f64).to_bits()).collect()),
+            lenient_unseen: true,
+        }
+    }
+
+    #[test]
+    fn random_effect_ranges_follow_the_design_intercept_gauge() {
+        // The design is [intercept? | linear | RE_g(3) | RE_h(2) | smooth]; the
+        // intercept column exists only for `ModelLevel::Intercept`, so the RE
+        // ranges must start at column 1 with it and column 0 without it.
+        let random_effect_terms =
+            vec![random_effect_spec("g", 0, 3), random_effect_spec("h", 1, 2)];
+        let with_intercept = TermCollectionSpec {
+            linear_terms: Vec::new(),
+            smooth_terms: Vec::new(),
+            random_effect_terms: random_effect_terms.clone(),
+            level: ModelLevel::Intercept,
+        };
+        let (all, selected) = random_effect_ranges(&with_intercept, "h").expect("ranges");
+        assert_eq!(all, vec![(1, 4), (4, 6)]);
+        assert_eq!(selected, vec![(4, 6)]);
+
+        let without_intercept = TermCollectionSpec {
+            linear_terms: Vec::new(),
+            smooth_terms: Vec::new(),
+            random_effect_terms,
+            level: ModelLevel::NoIntercept,
+        };
+        let (all, selected) = random_effect_ranges(&without_intercept, "g").expect("ranges");
+        assert_eq!(all, vec![(0, 3), (3, 5)]);
+        assert_eq!(selected, vec![(0, 3)]);
     }
 }
