@@ -8,9 +8,20 @@
 //!     t_{l+1} = h_{l→l+1}(t_l)
 //! ```
 //!
-//! fitted as a small penalized GAM with the engine's Gaussian REML machinery
-//! (exact 1-D criterion, no GCV per policy). Three questions are answered with
-//! evidence:
+//! estimated under the pair law the caller declares ([`PairLaw`]):
+//!
+//! * **Deterministic** pairs (each target coordinate is one function of its
+//!   source coordinate) get the minimum-curvature interpolant through the
+//!   distinct sites. It has no smoothing parameter and no sampling law, so its
+//!   bands are exact zeros.
+//! * **Stochastic** pairs (the target scatters about the map) get a Gaussian
+//!   REML smooth (exact 1-D criterion, no GCV per policy) on a resolution
+//!   ladder of uniform spaces. Each rung doubles the segment count, and the
+//!   ladder stops at the first rung whose spacing `h` resolves the fitted
+//!   penalty, `max span count · h³ ≤ π⁴·λ̂`, or when the space has as many
+//!   coefficients as distinct sites.
+//!
+//! Three questions are answered with evidence:
 //!
 //! 1. **Topology compatibility** — does `h` preserve the chart topology
 //!    (circle→circle degree-±1 covering, i.e. a homeomorphism of `S¹`) or
@@ -61,6 +72,7 @@
 //! string DSL.
 
 use crate::chart_canonicalization::CanonicalChartTopology;
+use gam_linalg::faer_ndarray::FaerLblt;
 use gam_math::probability::normal_two_sided_probability;
 use gam_solve::gaussian_reml::gaussian_reml_closed_form_with_nullspace_dim;
 use gam_terms::basis::{
@@ -77,15 +89,6 @@ const TRANSPORT_SPLINE_DEGREE: usize = 3;
 /// unpenalized on a circle; the open variant leaves affine maps unpenalized on
 /// an interval — exactly the isometry-adjacent null spaces.
 const TRANSPORT_PENALTY_ORDER: usize = 2;
-/// Target observations per basis function when auto-sizing the basis.
-const OBS_PER_BASIS: usize = 8;
-/// Periodic basis size bounds (auto-derived from `n`, never a caller knob).
-const MIN_PERIODIC_BASIS: usize = 8;
-const MAX_PERIODIC_BASIS: usize = 20;
-/// Open-interval internal-knot bounds.
-const MIN_OPEN_INTERNAL_KNOTS: usize = 4;
-const MAX_OPEN_INTERNAL_KNOTS: usize = 12;
-
 /// Topology of a one-dimensional concept chart.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ChartTopology {
@@ -101,6 +104,14 @@ impl ChartTopology {
         match self {
             ChartTopology::Circle => "circle",
             ChartTopology::Interval { .. } => "interval",
+        }
+    }
+
+    /// The source domain `[lo, hi]`: one turn `[0, 2π]` on a circle.
+    fn domain(&self) -> (f64, f64) {
+        match *self {
+            ChartTopology::Circle => (0.0, TAU),
+            ChartTopology::Interval { lo, hi } => (lo, hi),
         }
     }
 
@@ -145,6 +156,24 @@ impl From<CanonicalChartTopology> for ChartTopology {
     }
 }
 
+/// How the paired coordinates handed to [`fit_transport_map`] were produced.
+///
+/// The caller declares it, because the pairs cannot: a smooth deterministic map
+/// sampled at `n` points and the same map observed with small noise differ only
+/// in what an estimator is allowed to assume about the residual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairLaw {
+    /// Each target coordinate is one deterministic function of its source
+    /// coordinate (a held executed transport, a synthetic noise-free map). The
+    /// estimator is the minimum-curvature interpolant `argmin ∫h″²` through the
+    /// pairs; there is no observation noise, so no sampling covariance.
+    Deterministic,
+    /// The target coordinates scatter about a smooth map (estimated chart
+    /// coordinates, resampled other state). The estimator is the Gaussian-REML
+    /// penalized spline on a data-resolved knot spacing.
+    Stochastic,
+}
+
 /// Wrap an angle into `[0, 2π)`.
 fn wrap_tau(x: f64) -> f64 {
     x.rem_euclid(TAU)
@@ -186,59 +215,65 @@ fn resultant_length(angles: &[f64]) -> f64 {
 }
 
 /// Domain-side basis carrier: periodic cardinal B-splines on a circle, open
-/// B-splines on an interval. Both reuse the existing basis constructors
-/// directly (no string DSL round-trip).
+/// clamped B-splines on an interval or, seamed, on one turn of a circle. All
+/// reuse the existing basis constructors directly (no string DSL round-trip).
 #[derive(Debug, Clone)]
 enum DomainBasis {
     Periodic(PeriodicBSplineBasisSpec),
-    Open { knots: Array1<f64>, degree: usize },
+    /// Clamped B-splines on `knots`. `seamed` marks a circle domain `[0, 2π]`
+    /// whose coefficients the caller constrains to a `C^{degree−1}` seam, so an
+    /// evaluation point is wrapped onto the turn rather than clamped.
+    Open {
+        knots: Array1<f64>,
+        degree: usize,
+        seamed: bool,
+    },
 }
 
 impl DomainBasis {
-    fn build(topology: ChartTopology, coords: ArrayView1<'_, f64>) -> Result<Self, String> {
-        let n = coords.len();
+    /// The uniform cubic space with `segments` equal polynomial pieces over the
+    /// source domain: periodic cardinal B-splines on a circle (`segments ≥
+    /// degree + 1` periodized shifts), clamped B-splines with `segments − 1`
+    /// equally spaced interior knots on an interval.
+    fn uniform(topology: ChartTopology, segments: usize) -> Self {
         match topology {
-            ChartTopology::Circle => {
-                let num_basis = (n / OBS_PER_BASIS).clamp(MIN_PERIODIC_BASIS, MAX_PERIODIC_BASIS);
-                Ok(DomainBasis::Periodic(PeriodicBSplineBasisSpec {
-                    degree: TRANSPORT_SPLINE_DEGREE,
-                    num_basis,
-                    period: TAU,
-                    origin: 0.0,
-                    penalty_order: TRANSPORT_PENALTY_ORDER,
-                }))
-            }
+            ChartTopology::Circle => DomainBasis::Periodic(PeriodicBSplineBasisSpec {
+                degree: TRANSPORT_SPLINE_DEGREE,
+                num_basis: segments,
+                period: TAU,
+                origin: 0.0,
+                penalty_order: TRANSPORT_PENALTY_ORDER,
+            }),
             ChartTopology::Interval { lo, hi } => {
-                let num_internal =
-                    (n / OBS_PER_BASIS).clamp(MIN_OPEN_INTERNAL_KNOTS, MAX_OPEN_INTERNAL_KNOTS);
-                let (seed, knots) = create_basis::<Dense>(
-                    coords.mapv(|v| v.clamp(lo, hi)).view(),
-                    KnotSource::Generate {
-                        data_range: (lo, hi),
-                        num_internal_knots: num_internal,
-                    },
-                    TRANSPORT_SPLINE_DEGREE,
-                    BasisOptions::value(),
-                )
-                .map_err(|e| format!("layer transport open basis construction failed: {e}"))?;
-                if seed.nrows() != n {
-                    return Err(format!(
-                        "layer transport open basis returned {} rows for {n} inputs",
-                        seed.nrows()
-                    ));
-                }
-                Ok(DomainBasis::Open {
-                    knots,
+                let interior = (1..segments).map(|k| lo + (hi - lo) * k as f64 / segments as f64);
+                DomainBasis::Open {
+                    knots: clamped_knots(lo, hi, interior),
                     degree: TRANSPORT_SPLINE_DEGREE,
-                })
+                    seamed: false,
+                }
             }
+        }
+    }
+
+    /// The cubic space with one knot at every distinct interior data site
+    /// (`sites` sorted, distinct, already projected onto the domain). It holds
+    /// the minimum-curvature interpolant through those sites: the natural cubic
+    /// spline on an interval, and — under the seam constraints — the periodic
+    /// cubic spline on a circle.
+    fn at_sites(topology: ChartTopology, sites: &[f64]) -> Self {
+        let (lo, hi) = topology.domain();
+        let interior = sites.iter().copied().filter(|&site| site > lo && site < hi);
+        DomainBasis::Open {
+            knots: clamped_knots(lo, hi, interior),
+            degree: TRANSPORT_SPLINE_DEGREE,
+            seamed: matches!(topology, ChartTopology::Circle),
         }
     }
 
     fn num_basis(&self) -> usize {
         match self {
             DomainBasis::Periodic(spec) => spec.num_basis,
-            DomainBasis::Open { knots, degree } => knots.len() - degree - 1,
+            DomainBasis::Open { knots, degree, .. } => knots.len() - degree - 1,
         }
     }
 
@@ -271,7 +306,7 @@ impl DomainBasis {
                 TRANSPORT_PENALTY_ORDER,
             )
             .map_err(|e| format!("cyclic transport roughness failed: {e}")),
-            DomainBasis::Open { knots, degree } => {
+            DomainBasis::Open { knots, degree, .. } => {
                 bspline_derivative_penalty_matrix(knots.view(), *degree, TRANSPORT_PENALTY_ORDER)
                     .map_err(|e| format!("open transport roughness failed: {e}"))
             }
@@ -281,8 +316,8 @@ impl DomainBasis {
     /// Clamp/wrap an evaluation point into the basis domain.
     fn project(&self, t: f64) -> f64 {
         match self {
-            DomainBasis::Periodic(_) => wrap_tau(t),
-            DomainBasis::Open { knots, degree } => {
+            DomainBasis::Periodic(_) | DomainBasis::Open { seamed: true, .. } => wrap_tau(t),
+            DomainBasis::Open { knots, degree, .. } => {
                 let lo = knots[*degree];
                 let hi = knots[knots.len() - 1 - degree];
                 t.clamp(lo, hi)
@@ -295,7 +330,7 @@ impl DomainBasis {
         match self {
             DomainBasis::Periodic(spec) => build_periodic_bspline_basis_1d(projected.view(), spec)
                 .map_err(|e| format!("periodic transport basis evaluation failed: {e}")),
-            DomainBasis::Open { knots, degree } => {
+            DomainBasis::Open { knots, degree, .. } => {
                 let (rows, used_knots) = create_basis::<Dense>(
                     projected.view(),
                     KnotSource::Provided(knots.view()),
@@ -339,7 +374,7 @@ impl DomainBasis {
                     .map(|k| spec.origin + spec.period * k as f64 / n_seg as f64)
                     .collect()
             }
-            DomainBasis::Open { knots, degree } => {
+            DomainBasis::Open { knots, degree, .. } => {
                 let lo = knots[*degree];
                 let hi = knots[knots.len() - 1 - degree];
                 let mut breaks: Vec<f64> = Vec::with_capacity(knots.len());
@@ -377,7 +412,7 @@ impl DomainBasis {
                 .map_err(|e| format!("periodic transport derivative failed: {e}"))?;
                 Ok(jet.index_axis(Axis(2), 0).to_owned())
             }
-            DomainBasis::Open { knots, degree } => {
+            DomainBasis::Open { knots, degree, .. } => {
                 let (rows, used_knots) = create_basis::<Dense>(
                     projected.view(),
                     KnotSource::Provided(knots.view()),
@@ -391,6 +426,264 @@ impl DomainBasis {
                 Ok(rows.as_ref().to_owned())
             }
         }
+    }
+}
+
+/// Clamped knot vector on `[lo, hi]`: each end repeated `degree + 1` times
+/// around the supplied interior knots.
+fn clamped_knots(lo: f64, hi: f64, interior: impl Iterator<Item = f64>) -> Array1<f64> {
+    let ends = TRANSPORT_SPLINE_DEGREE + 1;
+    let mut knots: Vec<f64> = std::iter::repeat_n(lo, ends).collect();
+    knots.extend(interior);
+    knots.extend(std::iter::repeat_n(hi, ends));
+    Array1::from_vec(knots)
+}
+
+/// Rows `(left, right)` with `left·β = g^{(k)}(lo)` and `right·β = g^{(k)}(hi)`
+/// for `k = 0, …, degree − 1`, for the clamped spline `g = Σ βⱼBⱼ` on `knots`.
+///
+/// The `k`-th derivative of a degree-`p` spline is the degree-`(p − k)` spline
+/// on the inner knots whose coefficients follow by de Boor's differencing,
+/// `c⁽ᵏ⁾ᵢ = (p − k + 1)(c⁽ᵏ⁻¹⁾ᵢ₊₁ − c⁽ᵏ⁻¹⁾ᵢ)/(t_{i+p+1} − t_{i+k})`, and a clamped
+/// spline takes its first coefficient at `lo` and its last at `hi`. The jets are
+/// therefore exact linear functionals of `β`, read without evaluating the basis
+/// at an endpoint.
+fn clamped_end_jets(knots: ArrayView1<'_, f64>, degree: usize) -> Vec<(Array1<f64>, Array1<f64>)> {
+    let m = knots.len() - degree - 1;
+    let mut coefficients: Vec<Array1<f64>> = (0..m)
+        .map(|i| {
+            let mut unit = Array1::<f64>::zeros(m);
+            unit[i] = 1.0;
+            unit
+        })
+        .collect();
+    let mut jets = Vec::with_capacity(degree);
+    jets.push((coefficients[0].clone(), coefficients[m - 1].clone()));
+    for order in 1..degree {
+        let factor = (degree - order + 1) as f64;
+        coefficients = (0..coefficients.len() - 1)
+            .map(|i| {
+                let width = knots[i + degree + 1] - knots[i + order];
+                (&coefficients[i + 1] - &coefficients[i]) * (factor / width)
+            })
+            .collect();
+        jets.push((coefficients[0].clone(), coefficients[coefficients.len() - 1].clone()));
+    }
+    jets
+}
+
+/// Project source coordinates onto the domain: wrapped onto one turn on a
+/// circle, clamped into `[lo, hi]` on an interval.
+fn project_onto_domain(topology: ChartTopology, coords: ArrayView1<'_, f64>) -> Vec<f64> {
+    let (lo, hi) = topology.domain();
+    coords
+        .iter()
+        .map(|&t| match topology {
+            ChartTopology::Circle => wrap_tau(t),
+            ChartTopology::Interval { .. } => t.clamp(lo, hi),
+        })
+        .collect()
+}
+
+/// The minimum-curvature interpolant `argmin ∫g″²` through deterministic pairs.
+///
+/// Among all functions through the pairs, the one with least `∫g″²` is the
+/// natural cubic spline on an interval and the periodic cubic spline on a
+/// circle, with knots at the distinct data sites (Holladay). Both live in the
+/// clamped cubic space of [`DomainBasis::at_sites`] — on a circle once its
+/// coefficients carry the `C²` seam `g^{(k)}(0) = g^{(k)}(2π)`, `k < 3` — whose
+/// exact `∫g″²` Gram `S` is the roughness. The interpolant is the solution of
+/// the KKT system
+///
+/// ```text
+///     [ S  Aᵀ ] [β]   [0]
+///     [ A  0  ] [μ] = [b]
+/// ```
+///
+/// with `A` the value rows at the sites stacked on the seam rows, and `b` the
+/// responses stacked on zeros. `S` is positive definite on `ker A`: `S`
+/// annihilates only affine maps, and an affine map through two sites, or a
+/// periodic one through one, is zero. The system is then nonsingular with
+/// inertia `(m, p, 0)`, which the Bunch–Kaufman factor certifies before its
+/// solution is used. Scaling `S` by its largest entry and each constraint row
+/// by its own changes neither the argmin nor the constraint set; it only
+/// equilibrates the factor.
+///
+/// A deterministic map has no observation noise, so the fit carries no
+/// sampling law: covariance, dispersion and row influence are exact zeros,
+/// `λ = 0` is the interpolation limit of the smoothing family, and the
+/// effective degrees of freedom are the distinct sites it reproduces. Pairs that
+/// assign two responses to one source coordinate are not a function and are
+/// refused.
+fn fit_interpolant(
+    topology: ChartTopology,
+    coords: ArrayView1<'_, f64>,
+    response: ArrayView1<'_, f64>,
+) -> Result<(DomainBasis, Penalized1dFit), String> {
+    let n = coords.len();
+    let projected = project_onto_domain(topology, coords);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| projected[a].total_cmp(&projected[b]));
+    let mut sites: Vec<f64> = Vec::with_capacity(n);
+    let mut values: Vec<f64> = Vec::with_capacity(n);
+    for &row in &order {
+        match (sites.last(), values.last()) {
+            (Some(&site), Some(&value)) if site == projected[row] => {
+                if response[row] != value {
+                    return Err(format!(
+                        "deterministic transport pairs are not a function of the source \
+                         coordinate: t = {site} carries responses {value} and {}; declare the \
+                         pairs stochastic",
+                        response[row]
+                    ));
+                }
+            }
+            _ => {
+                sites.push(projected[row]);
+                values.push(response[row]);
+            }
+        }
+    }
+    // The penalty's null space after the constraints the domain imposes:
+    // affine maps on an interval, constants under a circle's seam.
+    let pinned_null_dim = match topology {
+        ChartTopology::Circle => 1,
+        ChartTopology::Interval { .. } => TRANSPORT_PENALTY_ORDER,
+    };
+    if sites.len() < pinned_null_dim {
+        return Err(format!(
+            "the minimum-curvature interpolant needs {pinned_null_dim} distinct source \
+             coordinates to pin the unpenalized maps, got {}",
+            sites.len()
+        ));
+    }
+
+    let basis = DomainBasis::at_sites(topology, &sites);
+    let DomainBasis::Open {
+        knots,
+        degree,
+        seamed,
+    } = &basis
+    else {
+        return Err("the interpolating transport space must be clamped B-splines".to_string());
+    };
+    let m = basis.num_basis();
+    let site_rows = basis.value_rows(ArrayView1::from(sites.as_slice()))?;
+    let mut constraints: Vec<(Array1<f64>, f64)> = site_rows
+        .outer_iter()
+        .zip(values.iter())
+        .map(|(row, &value)| (row.to_owned(), value))
+        .collect();
+    if *seamed {
+        for (left, right) in clamped_end_jets(knots.view(), *degree) {
+            constraints.push((&left - &right, 0.0));
+        }
+    }
+    let p = constraints.len();
+
+    let penalty = basis.penalty()?;
+    let penalty_scale = penalty.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    if !(penalty_scale.is_finite() && penalty_scale > 0.0) {
+        return Err(format!(
+            "the interpolating transport roughness Gram has no finite positive scale: \
+             {penalty_scale}"
+        ));
+    }
+    let mut kkt = faer::Mat::<f64>::zeros(m + p, m + p);
+    let mut rhs = faer::Mat::<f64>::zeros(m + p, 1);
+    for i in 0..m {
+        for j in 0..m {
+            kkt[(i, j)] = penalty[[i, j]] / penalty_scale;
+        }
+    }
+    for (r, (row, value)) in constraints.iter().enumerate() {
+        let row_scale = row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        if !(row_scale.is_finite() && row_scale > 0.0) {
+            return Err(format!(
+                "interpolation constraint {r} has no finite nonzero entry: scale {row_scale}"
+            ));
+        }
+        for j in 0..m {
+            kkt[(m + r, j)] = row[j] / row_scale;
+            kkt[(j, m + r)] = row[j] / row_scale;
+        }
+        rhs[(m + r, 0)] = value / row_scale;
+    }
+    let factor = FaerLblt::new(kkt.as_ref(), faer::Side::Lower);
+    let inertia = factor.inertia();
+    if inertia.positive != m || inertia.negative != p || inertia.zero != 0 {
+        return Err(format!(
+            "the minimum-curvature interpolant is not unique: the KKT system of {m} \
+             coefficients and {p} constraints has inertia (+{}, −{}, 0×{}), not (+{m}, −{p}, 0×0)",
+            inertia.positive, inertia.negative, inertia.zero
+        ));
+    }
+    let solution = factor.solve(rhs.as_ref());
+    let beta = Array1::from_iter((0..m).map(|j| solution[(j, 0)]));
+    if beta.iter().any(|v| !v.is_finite()) {
+        return Err("the minimum-curvature interpolant has non-finite coefficients".to_string());
+    }
+
+    let fitted = basis.value_rows(coords)?.dot(&beta);
+    let rss: f64 = (0..n).map(|i| (response[i] - fitted[i]).powi(2)).sum();
+    let fit = Penalized1dFit {
+        beta,
+        covariance: Array2::zeros((m, m)),
+        lambda: 0.0,
+        edf: sites.len() as f64,
+        sigma2: 0.0,
+        residual_rms: (rss / n as f64).sqrt(),
+        coefficient_score_influence: Array2::zeros((m, n)),
+    };
+    Ok((basis, fit))
+}
+
+/// Gaussian-REML smooth of stochastic pairs on a data-resolved knot spacing.
+///
+/// The spaces are the uniform cubic splines of [`DomainBasis::uniform`], from the
+/// coarsest (`m = degree + 1` coefficients) through halvings of the knot spacing
+/// `h`; they nest, and each carries the exact `∫g″²` Gram. A penalized spline
+/// with criterion `‖y − Xβ‖² + λ∫g″²` acts on data of local density `ρ` rows
+/// per unit length as the equivalent kernel of bandwidth `b = (λ/ρ)^{1/4}`
+/// (Silverman), whose transfer `1/(1 + (bω)⁴)` passes frequencies below `1/b`.
+/// The knot grid resolves every frequency below its Nyquist `π/h`, so the space
+/// resolves the smoother once `π/h ≥ 1/b` in every segment. With `c` rows in a
+/// segment of width `h`, `ρ = c/h` and the condition is `c·h³ ≤ π⁴·λ̂`, taken at
+/// the busiest segment. Refinement also stops once the space has as many
+/// coefficients as distinct source coordinates: the hat matrix has rank at most
+/// that count, so a finer space adds no resolution the data can use.
+fn fit_resolved_smooth(
+    topology: ChartTopology,
+    coords: ArrayView1<'_, f64>,
+    response: ArrayView1<'_, f64>,
+) -> Result<(DomainBasis, Penalized1dFit), String> {
+    let (lo, hi) = topology.domain();
+    let projected = project_onto_domain(topology, coords);
+    let distinct = {
+        let mut sorted = projected.clone();
+        sorted.sort_by(f64::total_cmp);
+        sorted.dedup();
+        sorted.len()
+    };
+    let mut segments = match topology {
+        ChartTopology::Circle => TRANSPORT_SPLINE_DEGREE + 1,
+        ChartTopology::Interval { .. } => 1,
+    };
+    loop {
+        let basis = DomainBasis::uniform(topology, segments);
+        let design = basis.value_rows(coords)?;
+        let penalty = basis.penalty()?;
+        let fit = fit_penalized_1d(&design, &penalty, response, None, basis.penalty_rank())?;
+        let width = (hi - lo) / segments as f64;
+        let mut counts = vec![0usize; segments];
+        for &t in &projected {
+            counts[(((t - lo) / width) as usize).min(segments - 1)] += 1;
+        }
+        let busiest = counts.iter().copied().max().unwrap_or(0) as f64;
+        if basis.num_basis() >= distinct || busiest * width.powi(3) <= PI.powi(4) * fit.lambda {
+            return Ok((basis, fit));
+        }
+        segments *= 2;
     }
 }
 
@@ -536,6 +829,8 @@ fn fit_penalized_1d(
 pub struct FittedTransport {
     pub topology_from: ChartTopology,
     pub topology_to: ChartTopology,
+    /// The law the pairs were declared under, which chose the estimator.
+    pub pair_law: PairLaw,
     /// Winding degree of the map (circle→circle charts only).
     pub degree: Option<i32>,
     /// Mean resultant length of the de-wound residual at the selected degree
@@ -917,6 +1212,7 @@ impl FittedTransport {
             layer_to,
             topology_from: self.topology_from,
             topology_to: self.topology_to,
+            pair_law: self.pair_law,
             topology_preserved: self.topology_preserved,
             degree: self.degree,
             degree_concentration: self.degree_concentration,
@@ -944,6 +1240,8 @@ pub struct LayerTransportReport {
     pub layer_to: usize,
     pub topology_from: ChartTopology,
     pub topology_to: ChartTopology,
+    /// The law the pairs were declared under.
+    pub pair_law: PairLaw,
     /// Degree-±1 fold-free circle cover (or fold-free interval homeo).
     pub topology_preserved: bool,
     /// Estimated winding degree (circle→circle only).
@@ -1002,6 +1300,7 @@ pub fn fit_transport_map(
     coords_to: ArrayView1<'_, f64>,
     topology_from: ChartTopology,
     topology_to: ChartTopology,
+    pair_law: PairLaw,
 ) -> Result<FittedTransport, String> {
     let n = coords_from.len();
     if coords_to.len() != n {
@@ -1071,17 +1370,11 @@ pub fn fit_transport_map(
         (_, ChartTopology::Interval { .. }) => (None, None, 0.0, coords_to.to_owned()),
     };
 
-    // --- REML residual smooth on the source chart ---------------------------
-    let basis = DomainBasis::build(topology_from, coords_from)?;
-    let design = basis.value_rows(coords_from)?;
-    let penalty = basis.penalty()?;
-    let fit = fit_penalized_1d(
-        &design,
-        &penalty,
-        response.view(),
-        None,
-        basis.penalty_rank(),
-    )?;
+    // --- residual map on the source chart, under the declared pair law -------
+    let (basis, fit) = match pair_law {
+        PairLaw::Deterministic => fit_interpolant(topology_from, coords_from, response.view())?,
+        PairLaw::Stochastic => fit_resolved_smooth(topology_from, coords_from, response.view())?,
+    };
 
     // --- isometry defect under the empirical density -------------------------
     let slope = degree.map_or(0.0, f64::from);
@@ -1124,6 +1417,7 @@ pub fn fit_transport_map(
     let mut fitted = FittedTransport {
         topology_from,
         topology_to,
+        pair_law,
         degree,
         degree_concentration,
         rotation_offset,
@@ -1164,9 +1458,10 @@ pub fn fit_layer_transport(
     coords_to: ArrayView1<'_, f64>,
     topology_from: ChartTopology,
     topology_to: ChartTopology,
+    pair_law: PairLaw,
 ) -> Result<LayerTransportReport, String> {
     Ok(
-        fit_transport_map(coords_from, coords_to, topology_from, topology_to)?
+        fit_transport_map(coords_from, coords_to, topology_from, topology_to, pair_law)?
             .report(layer_from, layer_to),
     )
 }
@@ -1284,13 +1579,30 @@ fn monomial_critical_points(coeffs: &[f64]) -> Result<Vec<f64>, String> {
     }
 }
 
-/// Uniform evaluation grid over a chart domain.
-fn domain_grid(topology: ChartTopology, n: usize) -> Array1<f64> {
-    match topology {
-        ChartTopology::Circle => Array1::from_iter((0..n).map(|i| TAU * i as f64 / n as f64)),
-        ChartTopology::Interval { lo, hi } => {
-            Array1::from_iter((0..n).map(|i| lo + (hi - lo) * i as f64 / (n - 1).max(1) as f64))
-        }
+/// Evaluation grid that fixes every polynomial piece of `basis`: the midpoints
+/// of `degree + 1` equal cells in each span between its breakpoints. A cubic
+/// piece is determined by that many values, and a midpoint never lands on the
+/// knot where two pieces meet.
+fn piece_grid(basis: &DomainBasis) -> Array1<f64> {
+    let cells = TRANSPORT_SPLINE_DEGREE + 1;
+    let breaks = basis.derivative_breakpoints();
+    let mut grid = Vec::with_capacity(cells * breaks.len());
+    for window in breaks.windows(2) {
+        let (a, b) = (window[0], window[1]);
+        let step = (b - a) / cells as f64;
+        grid.extend((0..cells).map(|i| a + (i as f64 + 0.5) * step));
+    }
+    Array1::from_vec(grid)
+}
+
+/// Observed approximation resolution of a fit, the floor its composition
+/// contrasts are studentized against: the residual RMS of a stochastic smooth,
+/// and zero for a deterministic interpolant, which reproduces its pairs and
+/// carries no observation law — its residual is rounding, not resolution.
+fn approximation_resolution(fit: &FittedTransport) -> f64 {
+    match fit.pair_law {
+        PairLaw::Deterministic => 0.0,
+        PairLaw::Stochastic => fit.residual_rms,
     }
 }
 
@@ -1304,9 +1616,9 @@ fn domain_grid(topology: ChartTopology, n: usize) -> Array1<f64> {
 /// observed residual scales, propagated through the composition by Minkowski's
 /// inequality, and the grid is tested by a Bonferroni max statistic.
 ///
-/// The grid samples every segment of the finer of the two source-domain
-/// splines (`h_ab`, `h_ac`) with `degree + 1` points, the number that fixes one
-/// polynomial piece. A denser grid adds only dependent contrasts that inflate
+/// The grid samples every polynomial piece of the finer of the two
+/// source-domain splines (`h_ab`, `h_ac`) at `degree + 1` cell midpoints, the
+/// number that fixes one piece. A denser grid adds only dependent contrasts that inflate
 /// the Bonferroni family; a sparser one cannot see a piece.
 pub fn composition_defect(
     h_ab: &FittedTransport,
@@ -1328,9 +1640,13 @@ pub fn composition_defect(
         ));
     }
 
-    let n_grid =
-        (TRANSPORT_SPLINE_DEGREE + 1) * h_ab.basis.num_segments().max(h_ac.basis.num_segments());
-    let grid = domain_grid(h_ab.topology_from, n_grid);
+    let finer = if h_ab.basis.num_segments() >= h_ac.basis.num_segments() {
+        &h_ab.basis
+    } else {
+        &h_ac.basis
+    };
+    let grid = piece_grid(finer);
+    let n_grid = grid.len();
     let direct = h_ac.eval(grid.view())?;
     let mid = h_ab.eval(grid.view())?;
     let composed = h_bc.eval(mid.view())?;
@@ -1378,8 +1694,8 @@ pub fn composition_defect(
     // the intended test: cleaner data can look more significantly inconsistent.
     //
     // Do not hide the problem behind a fixed coordinate-scale tolerance. Each
-    // fitted map already measures its own approximation resolution as residual
-    // RMS. For e_ac - e_bc - h_bc' e_ab, Minkowski's inequality gives the
+    // stochastic map already measures its own approximation resolution as
+    // residual RMS; a deterministic interpolant has none to measure. For e_ac - e_bc - h_bc' e_ab, Minkowski's inequality gives the
     // data-derived envelope
     //
     //   ||e_ac||₂ + ||e_bc||₂ + |h_bc'| ||e_ab||₂.
@@ -1388,8 +1704,9 @@ pub fn composition_defect(
     // adapts to topology/scale/basis complexity, and has no calibration knob.
     let mut calibrated_variance = variance;
     for i in 0..n_grid {
-        let approximation_sd =
-            h_ac.residual_rms + h_bc.residual_rms + mid_slope[i].abs() * h_ab.residual_rms;
+        let approximation_sd = approximation_resolution(h_ac)
+            + approximation_resolution(h_bc)
+            + mid_slope[i].abs() * approximation_resolution(h_ab);
         calibrated_variance[i] = calibrated_variance[i].max(approximation_sd * approximation_sd);
     }
     let max_var = calibrated_variance.iter().copied().fold(0.0_f64, f64::max);
@@ -1470,6 +1787,7 @@ pub fn transport_ladder(
     layers: &[usize],
     coords: &[Array1<f64>],
     topologies: &[ChartTopology],
+    pair_law: PairLaw,
 ) -> Result<TransportLadderReport, String> {
     let depth = layers.len();
     if coords.len() != depth || topologies.len() != depth {
@@ -1491,6 +1809,7 @@ pub fn transport_ladder(
             coords[k + 1].view(),
             topologies[k],
             topologies[k + 1],
+            pair_law,
         )
         .map_err(|e| {
             format!(
@@ -1510,6 +1829,7 @@ pub fn transport_ladder(
             coords[k + 2].view(),
             topologies[k],
             topologies[k + 2],
+            pair_law,
         )
         .map_err(|e| {
             format!(
@@ -1630,6 +1950,7 @@ mod invert_tests {
             to.view(),
             interval(0.0, 1.0),
             interval(0.0, 1.0),
+            PairLaw::Deterministic,
         )
         .expect("fit");
         assert!(
@@ -1663,15 +1984,15 @@ mod invert_tests {
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
         let to: Array1<f64> = from.mapv(|t| 1.0 - 0.5 * t - 0.5 * t * t);
         let quadratic = fitted_from_target(from.view(), to.view(), 0.0, 1.0);
-        // Keep a fitted, orientation-reversing arm as well. This nonpolynomial
-        // map has h′ in [-1.25, -0.75] and nonzero spline approximation residual,
-        // so the Gaussian REML scale is identified without artificial noise.
+        // Keep a fitted, orientation-reversing arm as well: the minimum-curvature
+        // interpolant of a nonpolynomial map with h′ in [-1.25, -0.75].
         let nonlinear = from.mapv(|t| 1.0 - t - 0.25 * (TAU * t).sin() / TAU);
         let fitted = fit_transport_map(
             from.view(),
             nonlinear.view(),
             interval(0.0, 1.0),
             interval(0.0, 1.0),
+            PairLaw::Deterministic,
         )
         .expect("fit decreasing nonlinear map");
         let probe = Array1::from_iter((1..10).map(|i| i as f64 / 10.0));
@@ -1701,6 +2022,7 @@ mod invert_tests {
             to.view(),
             ChartTopology::Circle,
             ChartTopology::Circle,
+            PairLaw::Deterministic,
         )
         .expect("fit");
         assert!(ft.topology_preserved, "degree {:?}", ft.degree);
@@ -1725,19 +2047,19 @@ mod invert_tests {
         assert!(ft.invert(Array1::from_elem(1, 0.9).view()).is_err());
     }
 
-    /// Build a `FittedTransport` on an interval whose pre-wrap map interpolates
-    /// `h` by an unpenalized least-squares spline fit. Exact affine/quadratic
-    /// targets do not identify a positive residual variance for Gaussian REML;
-    /// these fixtures test the inverse geometry of a specified map (#2822).
-    /// Unpenalized QR also preserves deliberately narrow folds without a ridge
-    /// perturbing their location. Inference-only fields are placeholders.
+    /// Build a `FittedTransport` on an interval whose pre-wrap map reproduces a
+    /// polynomial target of degree at most three by an unpenalized least-squares
+    /// fit in the one-piece cubic space, which holds such a target exactly. These
+    /// fixtures test the inverse geometry of a specified map (#2822), and the
+    /// exact reproduction keeps a deliberately narrow fold where the target puts
+    /// it. Inference-only fields are placeholders.
     fn fitted_from_target(
         from: ArrayView1<'_, f64>,
         target: ArrayView1<'_, f64>,
         lo: f64,
         hi: f64,
     ) -> FittedTransport {
-        let basis = DomainBasis::build(interval(lo, hi), from).expect("basis");
+        let basis = DomainBasis::uniform(interval(lo, hi), 1);
         let design = basis.value_rows(from).expect("design");
         let m = design.ncols();
         let (q, r) = design.qr().expect("fixture QR");
@@ -1759,6 +2081,7 @@ mod invert_tests {
         let mut fitted = FittedTransport {
             topology_from: interval(lo, hi),
             topology_to: interval(lo, hi),
+            pair_law: PairLaw::Deterministic,
             degree: None,
             degree_concentration: None,
             rotation_offset: 0.0,
@@ -1802,7 +2125,7 @@ mod invert_tests {
 
         // Confirm the fold is genuinely between the samples of the historical
         // 512-point grid, and exposed by a 10× denser one.
-        let grid = domain_grid(interval(0.0, 1.0), 512);
+        let grid = Array1::linspace(0.0, 1.0, 512);
         let grid_d = ft.derivative(grid.view()).expect("grid deriv");
         let mean = grid_d.iter().sum::<f64>() / grid_d.len() as f64;
         let orientation = if mean < 0.0 { -1.0 } else { 1.0 };
@@ -1853,6 +2176,7 @@ mod invert_tests {
             to.view(),
             interval(0.0, 1.0),
             interval(0.0, 1.0),
+            PairLaw::Stochastic,
         )
         .expect_err("exact interpolation cannot identify a positive Gaussian scale");
         assert!(
@@ -1911,6 +2235,7 @@ mod invert_tests {
             to.view(),
             ChartTopology::Circle,
             ChartTopology::Circle,
+            PairLaw::Deterministic,
         )
         .expect("fit");
         assert_eq!(ft.degree, Some(-1), "expected a degree −1 cover");
@@ -1937,6 +2262,7 @@ mod invert_tests {
             to.view(),
             ChartTopology::Circle,
             ChartTopology::Circle,
+            PairLaw::Deterministic,
         )
         .expect("fit");
         assert_eq!(ft.degree, Some(3), "expected winding degree 3, got {:?}", ft.degree);
@@ -1953,6 +2279,7 @@ mod invert_tests {
             to.view(),
             ChartTopology::Circle,
             ChartTopology::Circle,
+            PairLaw::Deterministic,
         )
         .expect("fit");
         assert!(ft.topology_preserved);
@@ -1974,6 +2301,7 @@ mod invert_tests {
             ito.view(),
             interval(0.0, 1.0),
             interval(0.0, 1.0),
+            PairLaw::Deterministic,
         )
         .expect("fit");
         let raw_lo = ift.raw_at(0.0).expect("raw lo");
