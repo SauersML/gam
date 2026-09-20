@@ -243,7 +243,6 @@ impl BernoulliMarginalSlopeFamily {
         out: &mut Array1<f64>,
     ) -> Result<(), String> {
         let slices = &cache.slices;
-        let primary = &cache.primary;
         let n = self.y.len();
 
         out.fill(0.0);
@@ -325,6 +324,49 @@ impl BernoulliMarginalSlopeFamily {
                 return Ok(());
             }
         }
+
+        // A racing inner step applies both executors' states and returns the
+        // CPU executor's image; the race times each (gam#3024).
+        #[cfg(target_os = "linux")]
+        if let Some(racing) = cache.row_primary_hessians.race() {
+            let direction_slice = direction.as_slice().expect("direction is contiguous");
+            return racing.race.apply(
+                || {
+                    self.exact_newton_joint_hessian_matvec_host_into(
+                        direction,
+                        block_states,
+                        cache,
+                        out,
+                    )
+                },
+                || {
+                    crate::bms::gpu::flex::require_selected_gpu_result(
+                        "raced joint-Hessian HVP",
+                        crate::bms::gpu::row::launch_bms_flex_row_hvp(
+                            &racing.device,
+                            direction_slice,
+                        ),
+                    )
+                    .map(|_| ())
+                },
+            );
+        }
+        self.exact_newton_joint_hessian_matvec_host_into(direction, block_states, cache, out)
+    }
+
+    /// The host executor's joint-Hessian HVP over the flexible row-primary
+    /// cache: its host pin, its tiles, or rows lowered as they stream. `out`
+    /// is zero on entry.
+    fn exact_newton_joint_hessian_matvec_host_into(
+        &self,
+        direction: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        out: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let n = self.y.len();
 
         // Host-pin shortcut: when the per-row Hessian is materialised on host
         // (the legacy path before Phase 3), build the joint-β image by

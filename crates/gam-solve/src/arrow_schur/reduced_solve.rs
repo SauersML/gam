@@ -774,98 +774,6 @@ pub(crate) fn build_dense_schur_sqrt_ba_under_cap<B: BatchedBlockSolver + Sync>(
     Ok(schur)
 }
 
-/// Certified Carson–Higham mixed-precision solve of the reduced dense Schur
-/// system `S Δβ = rhs` (#1014), specialized to the streaming/residency path.
-///
-/// Returns `Some(Δβ)` when certified mixed precision is enabled AND the κ gate
-/// admits the f32 factorization AND the f64 backward-error certificate closes;
-/// `None` in every other case so the caller falls back to the exact f64
-/// triangular solve. The f64 `factor` (whose diagonal carries the exact
-/// `log|S|`) is supplied by the caller and never re-derived here — the logdet
-/// the evidence path reads stays f64 by construction.
-///
-/// Method: store the f64 Cholesky factor as f32, solve in f32, then refine with
-/// residuals `r = rhs − S·x` computed in f64 against the f64 `S`. With
-/// `κ(S)·u_f32 < margin` the refinement contracts at rate `κ·u`, and the
-/// terminating certificate is the normwise backward error
-/// `‖r‖∞ / (‖S‖∞‖x‖∞ + ‖rhs‖∞) ≤ tol`. A non-decreasing residual or an
-/// unmet certificate after `max_refinement_steps` returns `None`.
-pub(crate) fn mixed_precision_reduced_beta(
-    schur: &Array2<f64>,
-    factor: &Array2<f64>,
-    rhs: &Array1<f64>,
-    options: &ArrowSolveOptions,
-) -> Option<Array1<f64>> {
-    let ArrowSolvePrecisionPolicy::CertifiedMixed {
-        max_refinement_steps,
-        residual_relative_tolerance,
-        kappa_unit_roundoff_margin,
-    } = options.solve_precision
-    else {
-        return None;
-    };
-    // The reduced-system mixed-precision path is the dense reduced solve only;
-    // a trust-region-truncated step takes the Steihaug branch below in f64.
-    if options.trust_region.radius.is_finite() {
-        return None;
-    }
-    let n = schur.nrows();
-    if n == 0 {
-        return None;
-    }
-
-    // κ gate: the f32 factorization is only admissible when κ(S)·u_f32 leaves
-    // the refinement contraction headroom the certificate needs.
-    let kappa = cholesky_factor_kappa_estimate(factor);
-    if !kappa.is_finite() || kappa * F32_UNIT_ROUNDOFF >= kappa_unit_roundoff_margin {
-        return None;
-    }
-
-    let factor_f32 = factor.mapv(|v| v as f32);
-    let s_inf = matrix_inf_norm(schur);
-    let rhs_inf = rhs.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let certificate_tol = residual_relative_tolerance
-        .max(MIXED_PRECISION_CERTIFICATE_EPSILON_MULTIPLIER * f64::EPSILON);
-
-    // f32 solve of the seed system, then f64-residual refinement steps.
-    let mut x = cholesky_solve_lower_f32(&factor_f32, &rhs.mapv(|v| v as f32)).mapv(|v| v as f64);
-    let mut last_residual = f64::INFINITY;
-    for _ in 0..=max_refinement_steps {
-        // Residual r = rhs − S·x in f64 against the f64 model.
-        let sx = schur.dot(&x);
-        let mut r = rhs.clone();
-        r -= &sx;
-        let r_inf = r.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-        let x_inf = x.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-        let denom = s_inf * x_inf + rhs_inf;
-        let backward_error = if denom > 0.0 { r_inf / denom } else { 0.0 };
-        if backward_error <= certificate_tol {
-            return Some(x);
-        }
-        // Refinement must make monotone progress, else hand back to f64.
-        if !(r_inf < last_residual) {
-            return None;
-        }
-        last_residual = r_inf;
-        // Correction solve in f32 against the f32 factor: S·δ = r.
-        let delta = cholesky_solve_lower_f32(&factor_f32, &r.mapv(|v| v as f32)).mapv(|v| v as f64);
-        x += &delta;
-    }
-    None
-}
-
-/// Infinity norm (max absolute row sum) of a dense matrix.
-pub(crate) fn matrix_inf_norm(a: &Array2<f64>) -> f64 {
-    let mut max_row = 0.0_f64;
-    for row in a.rows() {
-        let s: f64 = row.iter().map(|v| v.abs()).sum();
-        if s > max_row {
-            max_row = s;
-        }
-    }
-    max_row
-}
-
 /// Spectral positive-definiteness floor for the reduced Schur complement
 /// `S` (#1026 SAE co-collapse SOLVE-path cure).
 ///
@@ -898,8 +806,8 @@ pub(crate) fn spectral_pd_floored_schur(
 
 /// Shared body for [`spectral_pd_floored_schur`]: symmetrise, eigendecompose,
 /// condition the spectrum, and return BOTH
-/// the conditioned matrix `Σ λ̃_i v_i v_iᵀ` (consumed by Steihaug / matvec /
-/// mixed-precision refinement) and its lower Cholesky factor.
+/// the conditioned matrix `Σ λ̃_i v_i v_iᵀ` (consumed by Steihaug / matvec)
+/// and its lower Cholesky factor.
 ///
 /// The factor is built DIRECTLY from the conditioned spectral form — QR of
 /// `W = diag(√λ̃)·Vᵀ` gives `A = WᵀW = RᵀR`, so `L = Rᵀ` — never by
@@ -1762,7 +1670,7 @@ pub(crate) fn factor_dense_reduced_schur_with_exact_a(
         Err(e) => {
             // #1026/#1038 — every dense reduced-Schur factorization in the SAE
             // path must honor the same opt-in spectral floor. Otherwise
-            // auxiliary entry points (mixed precision and cross-row ordered Beta--Bernoulli
+            // auxiliary entry points (cross-row ordered Beta--Bernoulli
             // preconditioning) can reject the collapsed dead-atom subspace even
             // though the main direct solve would floor it and continue.
             //
@@ -1835,8 +1743,7 @@ pub(crate) fn solve_dense_reduced_system(
         beta_conditioning: _,
     } = factor_dense_reduced_schur(schur, policy)?;
     if let Some(floored) = floored_schur {
-        let direct = mixed_precision_reduced_beta(&floored, &factor, rhs_beta, options)
-            .unwrap_or_else(|| cholesky_solve_vector(&factor, rhs_beta));
+        let direct = cholesky_solve_vector(&factor, rhs_beta);
         if step_inside_trust_region(direct.view(), options.trust_region.radius) {
             return Ok((direct, Some(factor), ArrowPcgDiagnostics::default()));
         }
@@ -1881,8 +1788,7 @@ pub(crate) fn solve_dense_reduced_system(
             && let Some((floored, floored_factor)) =
                 spectral_pd_floored_schur(schur, relative_floor)
         {
-            let direct = mixed_precision_reduced_beta(&floored, &floored_factor, rhs_beta, options)
-                .unwrap_or_else(|| cholesky_solve_vector(&floored_factor, rhs_beta));
+            let direct = cholesky_solve_vector(&floored_factor, rhs_beta);
             if step_inside_trust_region(direct.view(), options.trust_region.radius)
             {
                 return Ok((direct, Some(floored_factor), ArrowPcgDiagnostics::default()));
@@ -1900,14 +1806,9 @@ pub(crate) fn solve_dense_reduced_system(
             ),
         });
     }
-    // Reduced-system solve. The f64 `factor` is always retained and returned —
-    // its diagonal is the EXACT `log|S|` the evidence path reads, so the logdet
-    // stays f64 regardless of how Δβ is computed (#1014 invariant). When the
-    // streaming/residency path enabled certified mixed precision, the Δβ solve
-    // itself runs f32-then-f64-refined (κ-gated, with the f64 triangular solve
-    // as the automatic fallback); the certificate is the f64 backward error.
-    let direct = mixed_precision_reduced_beta(schur, &factor, rhs_beta, options)
-        .unwrap_or_else(|| cholesky_solve_vector(&factor, rhs_beta));
+    // Reduced-system solve. The f64 `factor` is retained and returned — its
+    // diagonal is the EXACT `log|S|` the evidence path reads.
+    let direct = cholesky_solve_vector(&factor, rhs_beta);
     if step_inside_trust_region(direct.view(), options.trust_region.radius) {
         return Ok((direct, Some(factor), ArrowPcgDiagnostics::default()));
     }
