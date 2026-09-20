@@ -3829,36 +3829,14 @@ where
             );
             match smoothing_outcome {
                 super::reml::eval::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
-                    // The only typed absence is an outer Hessian with no
-                    // analytic form for this fit at all (a non-canonical Firth
-                    // link, routed to BFGS): nothing about the optimum is
-                    // suspect, the correction simply cannot be formed, and the
-                    // fit was accepted with that link on purpose (#2158).
+                    // Every Firth link carries its analytic outer ρ-Hessian
+                    // (#3203), so an unavailable correction is a real defect.
                     // Railed coordinates are not a reason: the correction
                     // excludes them exactly as the certificate did, so a
                     // refusal on a railed fit is a real defect like any other.
-                    if !matches!(
-                        reason,
-                        crate::estimate::smoothing_correction::SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { .. }
-                    ) {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "exact smoothing-corrected covariance unavailable: {reason:?}"
-                        )));
-                    }
-                    log::debug!(
-                        "[SMOOTHING-CORRECTION] typed-unavailable on a non-analytic-outer-Hessian \
-                         fit ({reason:?}); shipping the plug-in covariance without a smoothing correction"
-                    );
-                    smoothing_correction_absence = Some(
-                        crate::model_types::SmoothingCorrectionAbsence::OuterHessianNotAnalytic {
-                            detail: format!("{reason:?}"),
-                        },
-                    );
-                    rho_covariance = None;
-                    smoothing_correction = None;
-                    smoothing_correction_method = None;
-                    smoothing_correction_first_order = None;
-                    smoothing_correction_method_first_order = None;
+                    return Err(EstimationError::InvalidInput(format!(
+                        "exact smoothing-corrected covariance unavailable: {reason:?}"
+                    )));
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
