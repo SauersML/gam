@@ -248,6 +248,9 @@ fn observed_information_matches_the_ratio_tower_3317() {
         InverseLink::Sas(sas),
         InverseLink::BetaLogistic(beta_logistic),
         InverseLink::Mixture(mixture),
+        InverseLink::LatentCLogLog(
+            gam_problem::LatentCLogLogState::new(0.8).expect("0.8 is a valid latent SD"),
+        ),
     ];
     let (phi, prior_weight) = (1.0, 1.7);
     let mut failures = Vec::new();
@@ -316,4 +319,50 @@ fn observed_information_matches_the_ratio_tower_3317() {
         }
     }
     assert!(failures.is_empty(), "#3317:\n  {}", failures.join("\n  "));
+}
+
+#[test]
+fn latent_cloglog_binomial_takes_the_observed_information_3802() {
+    use gam_problem::{GlmLikelihoodSpec, LatentCLogLogState, LikelihoodSpec, ResponseFamily};
+
+    // `fit.rs` upgrades a Binomial cloglog fit with `latent_cloglog` set to
+    // this link, so this is the spec the PIRLS working model gates on.
+    let link =
+        InverseLink::LatentCLogLog(LatentCLogLogState::new(0.8).expect("0.8 is a valid latent SD"));
+    let likelihood =
+        GlmLikelihoodSpec::canonical(LikelihoodSpec::new(ResponseFamily::Binomial, link.clone()));
+    assert!(
+        supports_observed_hessian_curvature_for_likelihood(&likelihood, &link),
+        "#3802: the latent-cloglog Binomial fit must price its LAML with the observed information"
+    );
+
+    // `μ(η) = E[1 − exp(−Z e^η)]` is not the canonical Bernoulli link, so the
+    // observed information `W_F − (y − μ)·B` depends on the response through
+    // `B ≠ 0`. It is linear in `y` and equals the Fisher weight
+    // `μ'²/(μ(1−μ))` at `y = μ`, and `w(1) − w(0) = −B` must stand clear of
+    // rounding.
+    for eta in [-2.0, -0.4, 0.9] {
+        let jet = crate::mixture_link::inverse_link_jet_for_inverse_link(&link, eta)
+            .expect("the latent-cloglog jet is defined");
+        let complement =
+            crate::mixture_link::inverse_link_complement_for_inverse_link(&link, eta, jet.mu);
+        let fisher = jet.d1 * jet.d1 / (jet.mu * complement);
+        let at = |y: f64| {
+            bernoulli_observed_information_jet(&link, eta, y, 1.0, 1.0)
+                .expect("the observed information is defined")[0]
+        };
+        let (w_mean, w0, w1) = (at(jet.mu), at(0.0), at(1.0));
+        // Each side is a sum of a few `O(fisher)` density ratios, so the
+        // agreement at `y = μ` is to rounding times that scale.
+        let rounding = 64.0 * f64::EPSILON * (fisher + w0.abs() + w1.abs());
+        assert!(
+            (w_mean - fisher).abs() <= rounding,
+            "#3802 eta={eta}: observed information at y = mu is {w_mean:e}, Fisher {fisher:e}"
+        );
+        assert!(
+            (w1 - w0).abs() > rounding,
+            "#3802 eta={eta}: the observed information does not depend on y \
+             (w(0) = {w0:e}, w(1) = {w1:e}), so the link would be canonical"
+        );
+    }
 }
