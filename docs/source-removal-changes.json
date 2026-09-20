@@ -2393,7 +2393,7 @@
     "evidence": "source_removal_guard.py with base 9af3c66f1b and head the merge commit refused exactly these seven items. crates/gam-models/src/inference/summary_text.rs defines significance_stars, format_p_value, the_summary_names_an_uncertified_terms_edf_label_2901 and the_summary_names_a_withheld_shape_pvalue. git grep -w finds no remaining reference to ModelSummary or build_model_summary (other than one historical doc sentence). The fmt removed is ModelSummary's own Display impl (the other production occurrences are other fmt fns). crates/gam-models/tests/suite/bms_per_smooth_summary_2997.rs pins both predictors' smooth and parametric rows through the replacement."
   },
   {
-    "base": "fb8743205e07b99be01514dd7ae14e4fbddafc85",
+    "base": "7d1708414bac49eb54960180cbccb36a42df2d3b",
     "items": [
       "crates/gam-terms/src/basis/center_selection.rs:const:LOWER_MASK",
       "crates/gam-terms/src/basis/center_selection.rs:const:M",
