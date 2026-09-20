@@ -4877,5 +4877,24 @@
     },
     "reason": "#4155: seven GPU backends hand-rolled the OnceLock<Result<_, GpuError>> probe-once protocol that gam_gpu::backend_probe::CachedBackend already provides, and three hand-rolled keyed module caches duplicating gam_gpu::device_cache::KeyedPtxModuleCache. Each backend is now a static CachedBackend read through get_or_probe(label, build), and the cubic_cell, pirls_row and sphere per-key caches are KeyedPtxModuleCache. That makes the per-backend probe_linux helpers (bms flex, cubic_cell, pirls_row, sphere) the build closures of get_or_probe; probe_backend_with_compile (build(&probe_cuda_backend(label)?), whose only callers were the two hand-rolled row.rs caches) has no caller; PirlsRowBackend::compiled had no caller; and sphere's S2ModuleCacheKey and cc() existed only to key the cache on the compute capability of the one device the process-wide backend is bound to, so the key is now lmax alone.",
     "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base f10039cc745a25ab816b20958151e1d5e629289d and head the change's commit list exactly these removals. Read-proof at the head: git grep -w finds 0 occurrences of probe_backend_with_compile, S2ModuleCacheKey and PirlsRowBackend::compiled in crates/ tests/ examples/ python/, and no `static BACKEND: OnceLock<Result<` remains in crates/; before the change git grep -n -w compiled found no caller of PirlsRowBackend::compiled and git grep -n probe_backend_with_compile found only its definition and the two row.rs calls."
+  },
+  {
+    "base": "88af7f36c95adcede13b6507ad702acc78ab4bd0",
+    "removed": {
+      "crates/gam-gpu/src/solver.rs::cholesky_logdet": 1,
+      "crates/gam-gpu/src/solver.rs::cholesky_logdet_from_col_major": 1,
+      "crates/gam-gpu/src/solver.rs::cholesky_solve_gpu": 1,
+      "crates/gam-gpu/src/solver.rs::iterative_refinement_cholesky_solve": 1
+    },
+    "reason": "#3547/#3548: fp32 + fp64-residual refinement now returns a solution only once its residual reaches the attainable band, and GpuDispatchPolicy keeps only fields a dispatch reads. cholesky_solve_gpu returned (solution, logdet) through iterative_refinement_cholesky_solve's need_logdet branch, whose extra fp64 POTRF was cuda::cholesky_logdet; no production code called it (its only callers were three arrow_gpu tests, now on cholesky_solve_only_gpu), so cholesky_solve_only_gpu is the single entry point and folds iterative_refinement_cholesky_solve in. The fp64 device solve no longer downloads its factor for a logdet nobody reads, so cholesky_logdet_from_col_major has no caller. GpuMixedPrecisionPolicy's Off and Never variants were unreachable (no code built a policy with them) and Refinement was the only live value, so the enum and the mixed_precision field go, with the two unit tests that pinned the unreachable variants (off_policy_never_attempts_refinement, never_policy_never_attempts_refinement); iterative_refinement_should_attempt is now an associated fn of p.",
+    "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base 88af7f36c95adcede13b6507ad702acc78ab4bd0 (main after the #3547 certificate landed) and head the change's commit list exactly these removals. Read-proof at the head: git grep -w -c finds 0 occurrences of GpuMixedPrecisionPolicy, cholesky_solve_gpu, iterative_refinement_cholesky_solve and the two test names anywhere in crates/ tests/ examples/; cholesky_logdet survives only as gam-terms grid_spline_2d::cholesky_logdet (a different function) and its users; cholesky_logdet_from_col_major only in a historical doc sentence in gam-solve pirls_gpu.rs. Before the change git grep -n cholesky_solve_gpu on main found callers only in tests/arrow_gpu (gpu_solver_dimension_mismatch_returns_error.rs, gpu_solver_matches_cpu_on_small_spd_system.rs, misc/owed_1412.rs)."
+  },
+  {
+    "base": "9e4544cb8f0785925cdca5cc448efcb22afd9fb8",
+    "removed": {
+      "crates/gam-models/src/bms/block_specs.rs::learned_frailty_scale_is_identified": 1
+    },
+    "reason": "gam#2938 commit 2 (gam#3059): the Bernoulli marginal-slope fit asks the shared identification rule crate::survival::lognormal_kernel::frailty_identification (landed in dc80110867) instead of its own pub(crate) copy learned_frailty_scale_is_identified, which is deleted. The same entry is in docs/source-removal-changes.json.",
+    "evidence": "public_api_census.py with base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate refuses exactly this identity (13820 -> 13819 public function declarations). In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences."
   }
 ]
