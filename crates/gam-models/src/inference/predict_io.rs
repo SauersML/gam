@@ -4,6 +4,7 @@ use crate::bms::{
     bernoulli_marginal_link_map, empirical_intercept, replay_saved_bernoulli_marginal_slope_alo,
 };
 use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
+use crate::latent_anchor::{CalibrationTail, smaller_tail_log_target, solve_log_tail_root};
 use crate::marginal_slope_shared::{
     ObservedDenestedCellPartials, eval_coeff4_at,
     probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
@@ -1253,18 +1254,22 @@ impl BernoulliMarginalSlopePredictor {
         Ok(cells)
     }
 
-    fn evaluate_denested_calibration(
+    /// The calibration `P(a) = Σ_cells ∫φ(z)Φ(η(z)) dz` under the standard
+    /// normal latent law, read on its smaller tail exactly as the fit reads it
+    /// (gam#3216, gam#3333): on the survival side each cell is evaluated with
+    /// its index negated, whose value is `∫φ(z)Φ(−η(z)) dz`, and whose moments
+    /// are the cell's own, so they contract with the cell's `∂c/∂a` into `P′`
+    /// and `P″`.
+    fn evaluate_denested_calibration_tail(
         &self,
         a: f64,
-        marginal_eta: f64,
         slope: f64,
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
         score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
         link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
-    ) -> Result<(f64, f64, f64), EstimationError> {
-        let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
-            .map_err(EstimationError::InvalidInput)?;
+        survival_side: bool,
+    ) -> Result<CalibrationTail, EstimationError> {
         let cells = self.denested_partition_cells(
             a,
             slope,
@@ -1274,9 +1279,10 @@ impl BernoulliMarginalSlopePredictor {
             link_dev_correction_for_row,
         )?;
         let scale = self.probit_frailty_scale();
-        let mut f = -marginal.mu;
-        let mut f_a = 0.0;
-        let mut f_aa = 0.0;
+        let summands = cells.len() * crate::cubic_cell_kernel::TERMINAL_GL_ORDER;
+        let mut tail = 0.0;
+        let mut density = 0.0;
+        let mut density_slope = 0.0;
         for partition_cell in cells {
             let cell = partition_cell.cell;
             let (dc_da_raw, _) = crate::cubic_cell_kernel::denested_cell_coefficient_partials(
@@ -1301,15 +1307,22 @@ impl BernoulliMarginalSlopePredictor {
             let max_degree = crate::cubic_cell_kernel::cell_second_derivative_required_max_degree(
                 &dc_da, &dc_da, &d2c_da2,
             );
-            let state = crate::cubic_cell_kernel::evaluate_cell_moments(cell, max_degree)
-                .map_err(EstimationError::InvalidInput)?;
-            f += state.value;
-            f_a += crate::cubic_cell_kernel::cell_first_derivative_from_moments(
+            let state = crate::cubic_cell_kernel::evaluate_cell_moments(
+                if survival_side {
+                    cell.negated()
+                } else {
+                    cell
+                },
+                max_degree,
+            )
+            .map_err(EstimationError::InvalidInput)?;
+            tail += state.value;
+            density += crate::cubic_cell_kernel::cell_first_derivative_from_moments(
                 &dc_da,
                 &state.moments,
             )
             .map_err(EstimationError::InvalidInput)?;
-            f_aa += crate::cubic_cell_kernel::cell_second_derivative_from_moments(
+            density_slope += crate::cubic_cell_kernel::cell_second_derivative_from_moments(
                 cell,
                 &dc_da,
                 &dc_da,
@@ -1318,7 +1331,12 @@ impl BernoulliMarginalSlopePredictor {
             )
             .map_err(EstimationError::InvalidInput)?;
         }
-        Ok((f, f_a, f_aa))
+        Ok(CalibrationTail {
+            tail,
+            density,
+            density_slope: Some(density_slope),
+            summands,
+        })
     }
 
     fn observed_denested_cell_partials_at_z(
@@ -1392,22 +1410,23 @@ impl BernoulliMarginalSlopePredictor {
         })
     }
 
-    fn evaluate_empirical_denested_calibration(
+    /// The calibration `P(a) = Σ_k w_k Φ(η(a, z_k))` over an empirical latent
+    /// grid, read on its smaller tail `Σ_k w_k Φ(∓η_k)` (gam#3216, gam#3333).
+    fn evaluate_empirical_denested_calibration_tail(
         &self,
         a: f64,
-        marginal_eta: f64,
         slope: f64,
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
         grid: &EmpiricalZGrid,
         score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
         link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
-    ) -> Result<(f64, f64, f64), EstimationError> {
-        let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
-            .map_err(EstimationError::InvalidInput)?;
-        let mut f = -marginal.mu;
-        let mut f_a = 0.0;
-        let mut f_aa = 0.0;
+        survival_side: bool,
+    ) -> Result<CalibrationTail, EstimationError> {
+        let tail_sign = if survival_side { -1.0 } else { 1.0 };
+        let mut tail = 0.0;
+        let mut density = 0.0;
+        let mut density_slope = 0.0;
         for (node, weight) in grid.pairs() {
             let obs = self.observed_denested_cell_partials_at_z(
                 node,
@@ -1422,44 +1441,49 @@ impl BernoulliMarginalSlopePredictor {
             let eta_a = eval_coeff4_at(&obs.dc_da, node);
             let eta_aa = eval_coeff4_at(&obs.dc_daa, node);
             let pdf = normal_pdf(eta);
-            f += weight * normal_cdf(eta);
-            f_a += weight * pdf * eta_a;
-            f_aa += weight * pdf * (eta_aa - eta * eta_a * eta_a);
+            tail += weight * normal_cdf(tail_sign * eta);
+            density += weight * pdf * eta_a;
+            density_slope += weight * pdf * (eta_aa - eta * eta_a * eta_a);
         }
-        Ok((f, f_a, f_aa))
+        Ok(CalibrationTail {
+            tail,
+            density,
+            density_slope: Some(density_slope),
+            summands: grid.nodes.len(),
+        })
     }
 
-    fn evaluate_prediction_calibration(
+    fn evaluate_prediction_calibration_tail(
         &self,
         a: f64,
-        marginal_eta: f64,
         slope: f64,
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
         empirical_grid: Option<&EmpiricalZGrid>,
         score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
         link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
-    ) -> Result<(f64, f64, f64), EstimationError> {
+        survival_side: bool,
+    ) -> Result<CalibrationTail, EstimationError> {
         if let Some(grid) = empirical_grid {
-            self.evaluate_empirical_denested_calibration(
+            self.evaluate_empirical_denested_calibration_tail(
                 a,
-                marginal_eta,
                 slope,
                 beta_score_warp,
                 beta_link_dev,
                 grid,
                 score_warp_correction_for_row,
                 link_dev_correction_for_row,
+                survival_side,
             )
         } else {
-            self.evaluate_denested_calibration(
+            self.evaluate_denested_calibration_tail(
                 a,
-                marginal_eta,
                 slope,
                 beta_score_warp,
                 beta_link_dev,
                 score_warp_correction_for_row,
                 link_dev_correction_for_row,
+                survival_side,
             )
         }
     }
@@ -1690,8 +1714,7 @@ impl BernoulliMarginalSlopePredictor {
         Ok((marginal, slope, score_warp, link_dev))
     }
 
-    /// Safeguarded monotone root solve for the marginal intercept under the
-    /// de-nested flexible model
+    /// The marginal intercept under the de-nested flexible model
     ///   η(z) = a + b z + b Δ_h(z) + Δ_w(a + b z).
     fn solve_intercept_scalar(
         &self,
@@ -1706,20 +1729,6 @@ impl BernoulliMarginalSlopePredictor {
     ) -> Result<f64, EstimationError> {
         let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
             .map_err(EstimationError::InvalidInput)?;
-        let eval = |a: f64| -> Result<(f64, f64, f64), String> {
-            self.evaluate_prediction_calibration(
-                a,
-                marginal_eta,
-                slope,
-                score_warp_beta,
-                link_dev_beta,
-                empirical_grid,
-                score_warp_correction_for_row,
-                link_dev_correction_for_row,
-            )
-            .map_err(|err| err.to_string())
-        };
-
         let probit_scale = self.probit_frailty_scale();
         let a_rigid = self.rigid_intercept_from_marginal(marginal.q, slope);
         let mut intercept = a_rigid;
@@ -1745,28 +1754,33 @@ impl BernoulliMarginalSlopePredictor {
             }
         }
 
-        // The implicit-function gradients (`a_q`, `a_b`) read this root exactly as
-        // the fit's derivatives read the fitted one, so the saved model accepts it
-        // at the fit's residual contract. The root solver is driven to the same
-        // tolerance the acceptance check below uses.
-        let target = marginal.mu;
-        let abs_tol =
-            crate::bms::row_primary_hessian::bernoulli_intercept_residual_tolerance(target);
-
-        let (root, _, f_best) = crate::monotone_root::solve_monotone_root(
-            eval,
+        // The saved model solves the fit's equation, `log T(a) = log Φ(∓q)` on
+        // the smaller marginal tail, held to the same derived resolution, so
+        // the root it reads the implicit-function gradients (`a_q`, `a_b`) at
+        // is the fitted one to rounding, whatever the seed (gam#3333).
+        let survival_side = marginal.q >= 0.0;
+        let log_target = smaller_tail_log_target(marginal.q);
+        let (root, _) = solve_log_tail_root(
             intercept,
-            "saved bernoulli intercept",
-            abs_tol,
-            64,
-            48,
-        )?;
-
-        if f_best.abs() > abs_tol {
-            return Err(EstimationError::InvalidInput(format!(
-                "saved bernoulli marginal-slope intercept solve failed: residual={f_best:.3e} at a={root:.6}, target mu={target:.6}"
-            )));
-        }
+            survival_side,
+            |a| {
+                self.evaluate_prediction_calibration_tail(
+                    a,
+                    slope,
+                    score_warp_beta,
+                    link_dev_beta,
+                    empirical_grid,
+                    score_warp_correction_for_row,
+                    link_dev_correction_for_row,
+                    survival_side,
+                )
+                .map_err(|err| err.to_string())?
+                .log_residual(survival_side, log_target)
+            },
+            "saved bernoulli marginal-slope intercept",
+            || format!("q={}, b={slope}", marginal.q),
+        )
+        .map_err(EstimationError::InvalidInput)?;
         Ok(root)
     }
 
@@ -2143,16 +2157,18 @@ impl BernoulliMarginalSlopePredictor {
                     }
 
                     let intercept = intercepts_view[local_row];
-                    let (_, m_a, _) = self.evaluate_prediction_calibration(
+                    let m_a = self
+                        .evaluate_prediction_calibration_tail(
                         intercept,
-                        q,
                         slope,
                         score_warp_beta_owned.as_ref(),
                         link_dev_beta_owned.as_ref(),
                         empirical_grid.as_ref(),
                         score_corr_row,
                         link_corr_row,
-                    )?;
+                        false,
+                    )?
+                        .density;
                     // ∂a/∂θ = −F_θ/F_a by the implicit function theorem. The
                     // calibration F is increasing in a, so F_a is positive unless
                     // every quadrature density has underflowed; the intercept then
@@ -2768,16 +2784,18 @@ impl BernoulliMarginalSlopePredictor {
                         score_corr_row,
                         link_corr_row,
                     )?;
-                    let (_, m_a, _) = self.evaluate_prediction_calibration(
+                    let m_a = self
+                        .evaluate_prediction_calibration_tail(
                         intercept,
-                        q,
                         slope,
                         self.beta_score_warp.as_ref(),
                         self.beta_link_dev.as_ref(),
                         empirical_grid.as_ref(),
                         score_corr_row,
                         link_corr_row,
-                    )?;
+                        false,
+                    )?
+                        .density;
                     // ∂a/∂θ = −F_θ/F_a: a non-positive F_a leaves the intercept
                     // with no finite gradient, so the row is refused.
                     if !(m_a > 0.0 && m_a.is_finite()) {
