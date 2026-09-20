@@ -646,48 +646,71 @@ def test_smooth_significance_auto_applies_lawley_and_surfaces_material_flag():
     assert row["material"] == bool(factor_move > 0.10 or p_move > 0.10)
 
 
-def test_glm_full_conformal_bernoulli_reaches_python_and_covers():
-    # #942: the exact full-conformal engine for a canonical-link GLM. The
-    # Bernoulli support {0,1} is exhaustive, so the returned set is the exact
-    # full-conformal set with finite-sample coverage >= 1 - alpha.
-    rng = np.random.default_rng(7)
-    p = 2
-    s_lambda = np.eye(p)  # ridge-penalized logistic; frozen smoothing.
-    x_star = np.array([1.0, 0.6])
-    alpha = 0.2
+def _in_set(intervals: list[tuple[float, float]], value: float) -> bool:
+    return any(lo <= value <= hi for lo, hi in intervals)
 
-    # Structural reachability + the conservative tie convention on a small fit.
+
+def test_glm_full_conformal_reaches_python_with_the_route_engine() -> None:
+    # #942: the public instrument is the certified engine of the predict route.
+    rng = np.random.default_rng(7)
     n = 24
     x = np.column_stack([np.ones(n), rng.normal(size=n)])
     eta = x @ np.array([0.3, 1.1])
     y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
-    out = gamfit.inference.glm_full_conformal(x, y, s_lambda, x_star, "bernoulli", alpha)
+    out = gamfit.inference.glm_full_conformal(
+        x, y, np.eye(2), np.array([1.0, 0.6]), "bernoulli", 0.2
+    )
     assert out["n_augmented"] == n + 1
-    assert set(out["candidates"]) == {0.0, 1.0}
-    # p-values are honest conformal p-values in (0, 1]; membership = p > alpha.
-    for z, pv in zip(out["candidates"], out["p_values"]):
-        assert 0.0 < pv <= 1.0
-        assert (z in out["members"]) == (pv > alpha)
-    # The exactness witness is finite (homotopy certified or cold-refit).
-    assert math.isfinite(out["max_beta_error_bound"])
-    assert out["max_beta_error_bound"] >= 0.0
+    assert out["alpha"] == 0.2
+    pieces = [tuple(piece) for piece in out["intervals"]]
+    for lo, hi in pieces:
+        # Bernoulli pieces are integer runs inside the support {0, 1}.
+        assert 0.0 <= lo <= hi <= 1.0
+        assert lo in (0.0, 1.0) and hi in (0.0, 1.0)
+    assert pieces == sorted(pieces)
 
-    # OBJECTIVE finite-sample coverage: over many independent draws of a
-    # (training set, fresh test outcome) pair, the exact set covers the held-out
-    # outcome at >= 1 - alpha. Full conformal's guarantee is finite-sample, so
-    # this must hold at the modest n below where split conformal would not.
-    trials = 300
-    n_small = 12
-    beta_true = np.array([0.2, 0.9])
+    counts = rng.poisson(3.0, size=n).astype(float)
+    with pytest.raises(ValueError, match="theta"):
+        gamfit.inference.glm_full_conformal(
+            x, counts, np.eye(2), np.array([1.0, 0.0]), "negative_binomial", 0.2
+        )
+    with pytest.raises(ValueError, match="theta"):
+        gamfit.inference.glm_full_conformal(
+            x, counts, np.eye(2), np.array([1.0, 0.0]), "poisson", 0.2, theta=2.0
+        )
+
+
+@pytest.mark.parametrize("family", ["bernoulli", "poisson"])
+def test_glm_full_conformal_covers_exactly_under_exchangeability(family: str) -> None:
+    # The n + 1 rows (covariates included) are drawn i.i.d., which is the
+    # exchangeability the full-conformal guarantee needs. alpha * (n + 1) = 4 is
+    # an integer, and the discrete families break ties with the randomized
+    # smoothed p-value, so the marginal coverage is EXACTLY 1 - alpha: both
+    # under- and over-coverage are defects. The band is three binomial standard
+    # errors of a coverage indicator whose success probability is 1 - alpha.
+    # The Poisson penalty leaves the intercept column unpenalized, which is what
+    # lets the engine certify the count tail rather than ask for a window.
+    rng = np.random.default_rng(20260920)
+    n = 19
+    alpha = 0.2
+    trials = 1500
+    s_lambda = np.diag([0.0, 1.0])
     covered = 0
     for _ in range(trials):
-        xt = np.column_stack([np.ones(n_small), rng.normal(size=n_small)])
-        et = xt @ beta_true
-        yt = (rng.uniform(size=n_small) < 1.0 / (1.0 + np.exp(-et))).astype(float)
-        p_star = 1.0 / (1.0 + np.exp(-(x_star @ beta_true)))
-        y_star = float(rng.uniform() < p_star)
-        res = gamfit.inference.glm_full_conformal(xt, yt, s_lambda, x_star, "bernoulli", alpha)
-        if y_star in res["members"]:
-            covered += 1
-    # Allow a small Monte-Carlo slack below the nominal 1 - alpha = 0.8.
-    assert covered / trials >= 0.8 - 3.0 * math.sqrt(0.8 * 0.2 / trials)
+        x = np.column_stack([np.ones(n + 1), rng.normal(size=n + 1)])
+        if family == "bernoulli":
+            eta = x @ np.array([0.2, 0.9])
+            y = (rng.uniform(size=n + 1) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
+        else:
+            y = rng.poisson(np.exp(x @ np.array([1.0, 0.5]))).astype(float)
+        out = gamfit.inference.glm_full_conformal(
+            x[:n], y[:n], s_lambda, x[n], family, alpha
+        )
+        pieces = [tuple(piece) for piece in out["intervals"]]
+        covered += _in_set(pieces, float(y[n]))
+    coverage = covered / trials
+    band = 3.0 * math.sqrt(alpha * (1.0 - alpha) / trials)
+    assert abs(coverage - (1.0 - alpha)) <= band, (
+        f"{family}: full-conformal coverage {coverage:.4f} is outside "
+        f"{1.0 - alpha} +/- {band:.4f}"
+    )

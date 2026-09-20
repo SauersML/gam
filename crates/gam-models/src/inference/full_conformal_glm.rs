@@ -115,9 +115,30 @@ use gam_spec::FamilySpecKind;
 use opt::{BacktrackConfig, backtracking_line_search};
 
 use super::full_conformal::{
-    ConformalCertificate, ConformalInterval, ConformalRefusal, GLM_ARMIJO_C1, GLM_CONVERGENCE_RTOL,
-    GLM_NEWTON_MAX_BACKTRACKS, GLM_NEWTON_MAX_ITERS, conformal_rank_threshold, vec_norm,
+    ConformalCertificate, ConformalInterval, ConformalRefusal, conformal_rank_threshold,
 };
+
+/// Maximum damped-Newton iterations for a cold augmented GLM fit.
+const GLM_NEWTON_MAX_ITERS: usize = 200;
+
+/// Maximum Armijo backtracking halvings per cold Newton iteration.
+const GLM_NEWTON_MAX_BACKTRACKS: usize = 60;
+
+/// Strict scale-invariant KKT tolerance declaring convergence, applied to the
+/// RAW penalized gradient (dimension-scaled OR natural-scale relative — the
+/// same certificate the main P-IRLS solver uses). NOT a tolerance on the
+/// preconditioned Newton step.
+const GLM_CONVERGENCE_RTOL: f64 = 1e-12;
+
+/// Armijo sufficient-decrease constant for the cold-fit line search —
+/// sourced from the shared optimizer constants so the workspace has exactly
+/// one `c₁`.
+const GLM_ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
+
+#[inline]
+fn vec_norm(v: &Array1<f64>) -> f64 {
+    v.dot(v).sqrt()
+}
 
 /// A non-Gaussian family the certified full-conformal set supports. Each has a
 /// negative log-likelihood convex in `η` whose curvature satisfies
