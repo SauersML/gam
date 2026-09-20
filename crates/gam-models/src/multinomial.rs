@@ -84,11 +84,13 @@ use gam_problem::{
     FixedLambdaCheckpoint, FixedLambdaResidualKind, FixedLambdaSolverStage, FixedLambdaStallReason,
     FixedLambdaStationarityEvidence, ResponseColumnKind,
 };
+use gam_solve::estimate::SmoothPValueUnavailable;
 /// The covariance-definition axis, re-exported so a caller of this module's
 /// predict surface names the same enum `gam-predict` and the CLI do rather than
 /// reaching across crates for it.
 pub use gam_solve::model_types::InferenceCovarianceMode;
 use gam_terms::inference::formula_dsl::parse_formula;
+use gam_terms::inference::smooth_test::SmoothTestResult;
 use gam_terms::smooth::{
     PenaltyBlockInfo, TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
 };
@@ -1795,11 +1797,12 @@ pub struct MultinomialSavedModel {
     /// row-major over the `(P·M)×(P·M)` matrix. `None` when unavailable.
     #[serde(default)]
     pub coefficient_influence_flat: Option<Vec<f64>>,
-    /// Per-(active class, smooth term) coefficient column range and unpenalized
-    /// nullspace dimension within the `P`-wide class block (#1101). Parallel to
+    /// Per-smooth-term coefficient column range within the `P`-wide class
+    /// block and the term's structural penalties (#1101, #3569). Parallel to
     /// the smooth terms the design produced; replicated across classes by the
-    /// shared-design architecture. Drives the Wald smooth-term table in
-    /// `summary()`. Empty for a wholly parametric (no-smooth) model.
+    /// shared-design architecture. Drives the score-test smooth-term table of
+    /// [`Self::smooth_significance`]. Empty for a wholly parametric (no-smooth)
+    /// model.
     #[serde(default)]
     pub smooth_term_spans: Vec<MultinomialSmoothTermSpan>,
     /// Training design in the RAW basis, flattened row-major over `(n, P)`.
@@ -1852,10 +1855,11 @@ pub struct MultinomialSavedModel {
     pub lambda_labels: Vec<String>,
 }
 
-/// One smooth term's coefficient span within a class block, plus its
-/// unpenalized nullspace dimension and a display label (#1101). The Wald
-/// smooth-significance test in `summary()` slices the joint covariance /
-/// influence at `a·P + col_start .. a·P + col_end` for active class `a`.
+/// One smooth term's coefficient span within a class block, its structural
+/// penalties and a display label (#1101). The score test of
+/// [`MultinomialSavedModel::smooth_significance`] tests active class `a`'s
+/// copy of the term at `a·P + col_start .. a·P + col_end`, and all classes'
+/// copies together for the joint row (#3569).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultinomialSmoothTermSpan {
     /// Human-readable term label (the smooth's formula token), for the table.
@@ -1864,8 +1868,35 @@ pub struct MultinomialSmoothTermSpan {
     pub col_start: usize,
     /// End column (exclusive) of the term within the per-class block.
     pub col_end: usize,
-    /// Leading unpenalized (polynomial nullspace) dimension within the term.
-    pub nullspace_dim: usize,
+    /// The term's structural penalties `S_l`, one per penalty component the
+    /// design placed on exactly this span, each `w × w` row-major with
+    /// `w = col_end − col_start`, at the scale the basis built them. They are
+    /// the variance-component directions the score test refers the term's
+    /// score to; the fitted `λ` are not part of them.
+    pub structural_penalties: Vec<Vec<f64>>,
+}
+
+impl MultinomialSmoothTermSpan {
+    fn width(&self) -> usize {
+        self.col_end - self.col_start
+    }
+
+    /// [`Self::structural_penalties`] as `w × w` matrices.
+    fn structural_penalty_matrices(&self) -> Result<Vec<Array2<f64>>, EstimationError> {
+        let width = self.width();
+        self.structural_penalties
+            .iter()
+            .map(|flat| {
+                Array2::from_shape_vec((width, width), flat.clone()).map_err(|error| {
+                    EstimationError::InvalidInput(format!(
+                        "multinomial smooth term {:?} structural penalty is not {width}x{width}: \
+                         {error}",
+                        self.label
+                    ))
+                })
+            })
+            .collect()
+    }
 }
 
 /// Descriptive label for one penalty *component* (one λ) within a class block,
@@ -2105,6 +2136,31 @@ impl MultinomialSavedModel {
                 "multinomial saved training payload is non-finite at combined index \
                  {index}: {value}"
             );
+        }
+        for span in &self.smooth_term_spans {
+            if span.col_start >= span.col_end || span.col_end > self.p_per_class {
+                crate::bail_invalid_estim!(
+                    "multinomial smooth term {:?} spans columns {}..{} outside the {}-wide \
+                     class block",
+                    span.label,
+                    span.col_start,
+                    span.col_end,
+                    self.p_per_class,
+                );
+            }
+            let cells = span.width() * span.width();
+            if span.structural_penalties.is_empty()
+                || span.structural_penalties.iter().any(|penalty| {
+                    penalty.len() != cells || penalty.iter().any(|value| !value.is_finite())
+                })
+            {
+                crate::bail_invalid_estim!(
+                    "multinomial smooth term {:?} must carry at least one finite {w}x{w} \
+                     structural penalty",
+                    span.label,
+                    w = span.width(),
+                );
+            }
         }
         Ok(())
     }
@@ -2533,86 +2589,155 @@ impl MultinomialSavedModel {
         model.predictive_moments(mode.view(), x_new, want_second_moments)
     }
 
-    /// Wood (2013) rank-truncated Wald smooth-significance test per
-    /// `(active class, smooth term)` (#1101), reusing the exact scalar-summary
-    /// kernel [`gam_terms::inference::smooth_test::wood_smooth_test`]. For active
-    /// class `a` and term span `[c0, c1)` within the class block, the global
-    /// coefficient range is `a·P + c0 .. a·P + c1`; the joint covariance and
-    /// influence are sliced there. The term EDF is the influence-block trace
-    /// `tr(F_jj)` (when present) and the reference d.f. uses `tr(F_jj)²/tr(F_jj²)`,
-    /// exactly as the scalar path. The multinomial softmax is a known-dispersion
-    /// family, so the χ²_{ref_df} branch applies. Returns one row per
-    /// `(class label, term label, edf, ref_df, statistic, p_value)`; empty when
-    /// no covariance/smooth terms are available.
-    pub fn smooth_significance(&self) -> Vec<MultinomialSmoothSignificance> {
-        let mut out = Vec::new();
+    /// The variance-component score test of every smooth term (#1101, #3569).
+    ///
+    /// A term enters the model once per active class, `f_a = X_j·β_{j,a}`
+    /// against the reference class, and the table has two kinds of row:
+    ///
+    /// - one per `(active class a, term)`, testing `f_a ≡ 0` (the term does not
+    ///   move class `a`'s log-odds against the reference), with the term's other
+    ///   class copies and every other coefficient as nuisance;
+    /// - one joint row per term when `K ≥ 3`, testing `f_a ≡ 0` for every `a`
+    ///   together (the covariate moves no class probability). At `K = 2` the
+    ///   single class row is that test.
+    ///
+    /// Each row is Lin's `sᵀKs` score test of
+    /// [`gam_terms::inference::smooth_score_test`] on the stacked softmax score.
+    /// It never reads the tested term's own `λ`, so it has no `λ → ∞` atom at
+    /// `p = 1`, and the coupled `Σλ‖f_c − f̄‖²` penalty (#1587) enters only
+    /// through the nuisance fit at `β_j = 0`, which is the null the row tests.
+    ///
+    /// The score is formed at the published mode `θ̂` from the working score
+    /// `b = Gθ̂ + ∇ℓ(θ̂) = XᵀWz`, with `G = XᵀW(θ̂)X` the softmax information and
+    /// `H = G + S_λ`. Reading `b` as `Hθ̂` would be wrong for a fit that armed
+    /// the Jeffreys/Firth prior (#2612), whose mode is not stationary for
+    /// `ℓ − ½θᵀS_λθ`.
+    ///
+    /// The joint row's variance component is `(I_M − 11ᵀ/K) ⊗ S_l`, the
+    /// structure of the fitted penalty itself, whose inverse `(I_M + 11ᵀ) ⊗ S_l⁻`
+    /// is the covariance of the reference contrasts `f_a − f_K` of `K` iid class
+    /// effects. Relabelling the reference class maps that covariance to itself,
+    /// so the joint statistic and its null law do not depend on which class is
+    /// the reference.
+    ///
+    /// The softmax is a known-dispersion family, so every reference law is the
+    /// exact weighted `χ²₁` sum. A row the test cannot be formed for carries the
+    /// typed [`SmoothPValueUnavailable`] reason.
+    pub fn smooth_significance(
+        &self,
+    ) -> Result<Vec<MultinomialSmoothSignificance>, EstimationError> {
+        use gam_terms::inference::smooth_score_test::{
+            SmoothScoreTestInput, smooth_score_test_at_working_score,
+        };
+        use gam_terms::inference::smooth_test::SmoothTestScale;
+
+        if self.smooth_term_spans.is_empty() {
+            return Ok(Vec::new());
+        }
         let p = self.p_per_class;
         let m = self.n_active_classes;
-        let Ok(cov) = self.coefficient_covariance() else {
-            return out;
-        };
-        if self.smooth_term_spans.is_empty() {
-            return out;
-        }
-        let Ok(beta) = self.coefficients_active() else {
-            return out;
-        };
-        // Block-ordered θ = [β_0; …; β_{M-1}], θ[a·P + i] = β[i, a].
+        let k = self.class_levels.len();
         let d = p * m;
-        let mut theta = Array1::<f64>::zeros(d);
-        for a in 0..m {
-            for i in 0..p {
-                theta[a * p + i] = beta[[i, a]];
-            }
-        }
+        let design = self.training_design()?;
+        let penalty = self.joint_penalty()?;
+        let weights = Array1::from(self.training_weights.clone());
+        let theta = self.stacked_mode()?;
+        let model = self.predictive_model(design.view(), weights.view(), penalty.view(), None);
+        let theta_slice = theta.as_slice().ok_or_else(|| {
+            EstimationError::InvalidInput("multinomial stacked mode is not contiguous".to_string())
+        })?;
+        let (gradient, information) = model.likelihood_gradient_and_information(theta_slice);
+        let hessian = &information + &penalty;
+        let working_score = information.dot(&theta) + &gradient;
         let influence = self.coefficient_influence();
-        for a in 0..m {
-            let class_label = self
-                .class_levels
-                .get(a)
-                .cloned()
-                .unwrap_or_else(|| format!("class{a}"));
-            let base = a * p;
-            for span in &self.smooth_term_spans {
-                if span.col_end > p {
-                    continue;
-                }
-                let start = base + span.col_start;
-                let end = base + span.col_end;
-                // Term EDF = tr(F_jj); without an influence matrix fall back to
-                // the block coefficient count (full-rank Wald on the span).
-                let block_len = (span.col_end - span.col_start) as f64;
-                let edf = influence
-                    .as_ref()
-                    .map(|f| (start..end).map(|i| f[[i, i]]).sum::<f64>())
-                    .filter(|v| v.is_finite() && *v > 0.0)
-                    .unwrap_or(block_len);
-                let result = gam_terms::inference::smooth_test::wood_smooth_test(
-                    gam_terms::inference::smooth_test::SmoothTestInput {
-                        beta: theta.view(),
-                        covariance: &cov,
-                        influence_matrix: influence.as_ref(),
-                        whitening_gram: None,
-                        coeff_range: start..end,
-                        edf,
-                        nullspace_dim: span.nullspace_dim,
-                        residual_df: None,
-                        scale: gam_terms::inference::smooth_test::SmoothTestScale::Known,
-                    },
-                );
-                if let Some(res) = result {
-                    out.push(MultinomialSmoothSignificance {
-                        class_label: class_label.clone(),
-                        term_label: span.label.clone(),
-                        edf,
-                        ref_df: res.ref_df,
-                        statistic: res.statistic,
-                        p_value: res.p_value,
-                    });
-                }
+        let edf_over = |indices: &mut dyn Iterator<Item = usize>| {
+            influence
+                .as_ref()
+                .map(|f| indices.map(|i| f[[i, i]]).sum::<f64>())
+        };
+        let test = |beta: ArrayView1<'_, f64>,
+                    hessian: &Array2<f64>,
+                    information: &Array2<f64>,
+                    working_score: ArrayView1<'_, f64>,
+                    coeff_range: std::ops::Range<usize>,
+                    structural_penalties: &[Array2<f64>]| {
+            smooth_score_test_at_working_score(
+                SmoothScoreTestInput {
+                    beta,
+                    penalized_hessian: hessian,
+                    weighted_gram: information,
+                    coeff_range,
+                    structural_penalties,
+                    covariance_scale: 1.0,
+                    residual_df: None,
+                    scale: SmoothTestScale::Known,
+                },
+                working_score,
+            )
+            .map_err(SmoothPValueUnavailable::from)
+        };
+
+        let mut out = Vec::new();
+        for span in &self.smooth_term_spans {
+            let structural = span.structural_penalty_matrices()?;
+            let width = span.width();
+            for a in 0..m {
+                let range = a * p + span.col_start..a * p + span.col_end;
+                out.push(MultinomialSmoothSignificance {
+                    contrast: MultinomialSmoothContrast::Class(self.class_levels[a].clone()),
+                    term_label: span.label.clone(),
+                    edf: edf_over(&mut range.clone()),
+                    test: test(
+                        theta.view(),
+                        &hessian,
+                        &information,
+                        working_score.view(),
+                        range,
+                        &structural,
+                    ),
+                });
             }
+            if m < 2 {
+                continue;
+            }
+            // Gather the term's copies in every class into one trailing block,
+            // class-major, so the joint test sees one contiguous range.
+            let term_columns: Vec<usize> = (0..m)
+                .flat_map(|a| (a * p + span.col_start)..(a * p + span.col_end))
+                .collect();
+            let order: Vec<usize> = (0..d)
+                .filter(|i| !(span.col_start..span.col_end).contains(&(i % p)))
+                .chain(term_columns.iter().copied())
+                .collect();
+            let permute_vector =
+                |v: &Array1<f64>| order.iter().map(|&i| v[i]).collect::<Array1<f64>>();
+            let permute_matrix = |matrix: &Array2<f64>| {
+                Array2::from_shape_fn((d, d), |(r, c)| matrix[[order[r], order[c]]])
+            };
+            let class_contrast = Array2::from_shape_fn((m, m), |(a, b)| {
+                f64::from(u8::from(a == b)) - 1.0 / k as f64
+            });
+            let joint_structural: Vec<Array2<f64>> = structural
+                .iter()
+                .map(|local| kronecker(&class_contrast, local))
+                .collect();
+            let joint_theta = permute_vector(&theta);
+            let joint_score = permute_vector(&working_score);
+            out.push(MultinomialSmoothSignificance {
+                contrast: MultinomialSmoothContrast::Joint,
+                term_label: span.label.clone(),
+                edf: edf_over(&mut term_columns.iter().copied()),
+                test: test(
+                    joint_theta.view(),
+                    &permute_matrix(&hessian),
+                    &permute_matrix(&information),
+                    joint_score.view(),
+                    d - m * width..d,
+                    &joint_structural,
+                ),
+            });
         }
-        out
+        Ok(out)
     }
 
     /// Draw `n_draws` posterior-predictive replicate class assignments at fresh
@@ -2721,23 +2846,37 @@ impl MultinomialSavedModel {
                 bits.join(", ")
             ));
         }
-        let significance = self.smooth_significance();
+        let significance = self.smooth_significance()?;
         if !significance.is_empty() {
-            lines.push("  smooth terms (Wood rank-truncated Wald):".to_string());
+            lines.push("  smooth terms (variance-component score test):".to_string());
             lines.push(
-                "    class                 term            edf   ref.df    chi.sq   p-value"
+                "    class                 term            edf   ref.df     score   p-value"
                     .to_string(),
             );
             for row in significance {
-                let class: String = row.class_label.chars().take(20).collect();
+                let class: String = match &row.contrast {
+                    MultinomialSmoothContrast::Class(label) => label.chars().take(20).collect(),
+                    MultinomialSmoothContrast::Joint => "(all classes)".to_string(),
+                };
                 let term: String = row.term_label.chars().take(14).collect();
-                lines.push(format!(
-                    "    {class:<20} {term:<14} {:>6} {:>7} {:>9} {:>9}",
-                    format_g(row.edf, 3),
-                    format_g(row.ref_df, 3),
-                    format_g(row.statistic, 4),
-                    format_g(row.p_value, 3),
-                ));
+                let edf = row
+                    .edf
+                    .map_or_else(|| "-".to_string(), |edf| format_g(edf, 3));
+                match &row.test {
+                    Ok(test) => lines.push(format!(
+                        "    {class:<20} {term:<14} {edf:>6} {:>7} {:>9} {:>9}",
+                        format_g(test.ref_df, 3),
+                        format_g(test.statistic, 4),
+                        format_g(test.p_value, 3),
+                    )),
+                    Err(reason) => lines.push(format!(
+                        "    {class:<20} {term:<14} {edf:>6} {:>7} {:>9} {:>9}  ({})",
+                        "-",
+                        "-",
+                        "-",
+                        reason.label(),
+                    )),
+                }
             }
         }
         Ok(lines.join("\n"))
@@ -2783,9 +2922,12 @@ fn format_g(value: f64, significant: usize) -> String {
 /// the tag without a scattered string literal.
 pub const MULTINOMIAL_MODEL_CLASS: &str = "multinomial";
 /// Exact multinomial persistence schema. Version 2 requires the canonical
-/// per-component lambda labels and training-table provenance; successful
-/// deserialization therefore yields a complete current model without repair.
-pub(crate) const MULTINOMIAL_MODEL_FORMAT_VERSION: u32 = 2;
+/// per-component lambda labels and training-table provenance; version 3 adds
+/// each smooth term's structural penalties, which the score test of
+/// [`MultinomialSavedModel::smooth_significance`] is referred to (#3569).
+/// Successful deserialization therefore yields a complete current model
+/// without repair.
+pub(crate) const MULTINOMIAL_MODEL_FORMAT_VERSION: u32 = 3;
 
 /// Round-trip persistence envelope for a fitted multinomial model. The
 /// `model_class` discriminator lets a loader tell a multinomial payload apart
@@ -2902,16 +3044,38 @@ mod multinomial_persistence_contract_tests {
     }
 }
 
-/// One row of the multinomial smooth-significance table (#1101): the Wood
-/// rank-truncated Wald test for one `(active class, smooth term)` pair.
+/// Which class effects a [`MultinomialSmoothSignificance`] row tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultinomialSmoothContrast {
+    /// The term's effect on this active class's log-odds against the
+    /// reference class.
+    Class(String),
+    /// The term's effect on every class at once: the reference-invariant test
+    /// that the covariate moves no class probability.
+    Joint,
+}
+
+/// One row of the multinomial smooth-significance table (#1101, #3569): the
+/// variance-component score test of one smooth term for one contrast.
 #[derive(Debug, Clone)]
 pub struct MultinomialSmoothSignificance {
-    pub class_label: String,
+    pub contrast: MultinomialSmoothContrast,
     pub term_label: String,
-    pub edf: f64,
-    pub ref_df: f64,
-    pub statistic: f64,
-    pub p_value: f64,
+    /// `tr(F)` over the tested coefficients, `F = H⁻¹XᵀWX` the fit's influence
+    /// matrix; `None` when the saved fit carries no influence matrix. Display
+    /// only: the test does not use it.
+    pub edf: Option<f64>,
+    /// The score test, or why this row has none.
+    pub test: Result<SmoothTestResult, SmoothPValueUnavailable>,
+}
+
+/// `A ⊗ B` for dense matrices.
+fn kronecker(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+    let (ar, ac) = a.dim();
+    let (br, bc) = b.dim();
+    Array2::from_shape_fn((ar * br, ac * bc), |(r, c)| {
+        a[[r / br, c / bc]] * b[[r % br, c % bc]]
+    })
 }
 
 /// One-hot-encode the categorical response column and return both the
@@ -4369,8 +4533,9 @@ pub fn fit_penalized_multinomial_formula(
     };
 
     // Per-(smooth term) coefficient span within a single class block, deduped by
-    // col_range (the #561 double-penalty migration emits two penalty blocks per
-    // term sharing one col_range; the Wald test covers the whole term block once).
+    // col_range: the #561 double-penalty migration emits two penalty blocks per
+    // term sharing one col_range, and both are the term's structural penalties,
+    // one variance component each in the score test.
     let mut smooth_term_spans: Vec<MultinomialSmoothTermSpan> = Vec::new();
     for (pen_idx, bp) in design.penalties.iter().enumerate() {
         let col_start = bp.col_range.start;
@@ -4378,10 +4543,24 @@ pub fn fit_penalized_multinomial_formula(
         if col_start >= col_end || col_end > p_per_class {
             continue;
         }
-        if smooth_term_spans
-            .iter()
-            .any(|s| s.col_start == col_start && s.col_end == col_end)
+        let width = col_end - col_start;
+        let local = if bp.local.dim() == (width, width) {
+            bp.local.clone()
+        } else {
+            match &bp.op {
+                Some(op) if op.dim() == width => op.as_dense(),
+                _ => crate::bail_invalid_estim!(
+                    "multinomial penalty {pen_idx} on columns {col_start}..{col_end} is neither a \
+                     {width}x{width} block nor an operator of that dimension"
+                ),
+            }
+        };
+        let structural: Vec<f64> = local.iter().copied().collect();
+        if let Some(span) = smooth_term_spans
+            .iter_mut()
+            .find(|s| s.col_start == col_start && s.col_end == col_end)
         {
+            span.structural_penalties.push(structural);
             continue;
         }
         let label = design
@@ -4389,17 +4568,11 @@ pub fn fit_penalized_multinomial_formula(
             .get(pen_idx)
             .and_then(|info| info.termname.clone())
             .unwrap_or_else(|| format!("s{pen_idx}"));
-        let nullspace_dim = design
-            .nullspace_dims
-            .get(pen_idx)
-            .copied()
-            .unwrap_or(0)
-            .min(col_end - col_start);
         smooth_term_spans.push(MultinomialSmoothTermSpan {
             label,
             col_start,
             col_end,
-            nullspace_dim,
+            structural_penalties: vec![structural],
         });
     }
 

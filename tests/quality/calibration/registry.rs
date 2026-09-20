@@ -22,8 +22,11 @@
 //! the registry is the single index of what is audited and by which gate, not a
 //! second copy of those gates.
 
-use gam::families::multinomial::{MultinomialPredictionIntervals, MultinomialSmoothSignificance};
+use gam::families::multinomial::{
+    MultinomialPredictionIntervals, MultinomialSmoothContrast, MultinomialSmoothSignificance,
+};
 use gam::families::survival::predict::SurvivalPredictResult;
+use gam::terms::inference::smooth_test::SmoothTestResult;
 use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult,
     PredictUncertaintyResult,
@@ -250,18 +253,21 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test \
                          + sbc_wood_smooth_test_family_size_curve",
         },
-        // Multinomial per-class Wood smooth test (#1891 follow-up): the SAME
-        // shared `wood_smooth_test` primitive as `wood_smooth_test_pvalue`
-        // above, but reached through `gam-models::multinomial`'s own
-        // block-ordered coefficient/EDF/covariance-slice plumbing — a
-        // completeness sweep found `MultinomialSmoothSignificance` unregistered.
+        // Multinomial smooth-term score test (#1891 follow-up, #3569): the
+        // shared variance-component score primitive evaluated at the softmax
+        // working score of the fitted multinomial model, one row per active
+        // class plus a joint (all classes) row — reached through
+        // `gam-models::multinomial`'s own class-major block plumbing.
         CalibrationTarget {
             name: "multinomial_smooth_test_pvalue",
             kind: SurfaceKind::TestPValue,
             mode: AuditMode::TestSizeCurve,
-            guards: &[1891],
+            guards: &[1891, 3569],
             audited_by: "sbc_multinomial_smooth_significance_size_curve \
-                         (multinomial_smooth_significance_pvalue_is_not_oversized_under_the_null)",
+                         (multinomial_binary_smooth_score_row_is_two_tailed_calibrated_under_the_null \
+                         + multinomial_three_class_smooth_score_rows_are_calibrated_under_the_global_null \
+                         + multinomial_class_row_is_calibrated_when_only_another_class_moves \
+                         + multinomial_joint_row_is_invariant_to_the_reference_class)",
         },
         // ---- Posterior surfaces ------------------------------------------
         // The ρ-posterior (smoothing-hyperparameter) adequacy diagnostic is a posterior
@@ -526,33 +532,33 @@ fn multinomial_smooth_significance_field_audits(
     payload: &MultinomialSmoothSignificance,
 ) -> Vec<FieldAudit> {
     let MultinomialSmoothSignificance {
-        class_label,
+        contrast,
         term_label,
         edf,
-        ref_df,
-        statistic,
-        p_value,
+        test,
     } = payload;
-    std::hint::black_box((class_label, term_label, edf, ref_df, statistic, p_value));
+    std::hint::black_box((contrast, term_label, edf, test));
     vec![
-        FieldAudit::point("class_label"),
+        FieldAudit::point("contrast"),
         FieldAudit::point("term_label"),
         FieldAudit::point("edf"),
-        FieldAudit::point("ref_df"),
-        FieldAudit::point("statistic"),
-        FieldAudit::audited("p_value", "multinomial_smooth_test_pvalue"),
+        // The test result carries the score statistic, its reference df and
+        // the p-value; the p-value is the calibrated surface.
+        FieldAudit::audited("test", "multinomial_smooth_test_pvalue"),
     ]
 }
 
 /// A minimal well-formed `MultinomialSmoothSignificance` probe.
 fn multinomial_smooth_significance_probe() -> MultinomialSmoothSignificance {
     MultinomialSmoothSignificance {
-        class_label: "class0".to_string(),
+        contrast: MultinomialSmoothContrast::Class("class0".to_string()),
         term_label: "s(x)".to_string(),
-        edf: 3.0,
-        ref_df: 3.0,
-        statistic: 1.0,
-        p_value: 0.5,
+        edf: Some(3.0),
+        test: Ok(SmoothTestResult {
+            statistic: 1.0,
+            ref_df: 3.0,
+            p_value: 0.5,
+        }),
     }
 }
 

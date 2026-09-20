@@ -717,27 +717,54 @@ fn posterior_predict_multinomial_pyfunc<'py>(
     Ok(out.unbind())
 }
 
-/// Wood rank-truncated Wald smooth-significance table for a saved multinomial
-/// model (#1101). Returns a list of dicts, one per `(active class, smooth term)`:
-/// `class`, `term`, `edf`, `ref_df`, `statistic`, `p_value`. Empty when the
-/// model has no smooth terms or no stored covariance.
+/// Variance-component score-test smooth-significance table for a saved
+/// multinomial model (#1101, #3569). Returns a list of dicts, one per
+/// `(active class, smooth term)` plus one joint row per term when `K ≥ 3`:
+/// `contrast` (`"class"` or `"joint"`), `class` (the active class label, `None`
+/// on a joint row), `term`, `edf` (`None` without a stored influence matrix),
+/// `ref_df`, `statistic`, `p_value`, and `p_value_unavailable`, the typed
+/// reason when the row has no test (its numeric fields are then `None`).
 #[pyfunction(signature = (model_bytes))]
 fn multinomial_smooth_significance_pyfunc<'py>(
     py: Python<'py>,
     model_bytes: Vec<u8>,
 ) -> PyResult<Py<pyo3::types::PyList>> {
+    use gam::families::multinomial::MultinomialSmoothContrast;
     let envelope = MultinomialModelEnvelope::from_json_bytes(&model_bytes)
         .map_err(estimation_error_to_pyerr)?;
-    let rows = envelope.saved.smooth_significance();
+    let rows = envelope
+        .saved
+        .smooth_significance()
+        .map_err(estimation_error_to_pyerr)?;
     let list = pyo3::types::PyList::empty(py);
     for r in rows {
         let row = PyDict::new(py);
-        row.set_item("class", r.class_label)?;
+        match r.contrast {
+            MultinomialSmoothContrast::Class(label) => {
+                row.set_item("contrast", "class")?;
+                row.set_item("class", label)?;
+            }
+            MultinomialSmoothContrast::Joint => {
+                row.set_item("contrast", "joint")?;
+                row.set_item("class", py.None())?;
+            }
+        }
         row.set_item("term", r.term_label)?;
         row.set_item("edf", r.edf)?;
-        row.set_item("ref_df", r.ref_df)?;
-        row.set_item("statistic", r.statistic)?;
-        row.set_item("p_value", r.p_value)?;
+        match r.test {
+            Ok(test) => {
+                row.set_item("ref_df", test.ref_df)?;
+                row.set_item("statistic", test.statistic)?;
+                row.set_item("p_value", test.p_value)?;
+                row.set_item("p_value_unavailable", py.None())?;
+            }
+            Err(reason) => {
+                row.set_item("ref_df", py.None())?;
+                row.set_item("statistic", py.None())?;
+                row.set_item("p_value", py.None())?;
+                row.set_item("p_value_unavailable", reason.label())?;
+            }
+        }
         list.append(row)?;
     }
     Ok(list.unbind())

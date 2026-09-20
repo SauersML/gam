@@ -142,7 +142,31 @@ pub enum SmoothScoreTestRefusal {
 pub fn smooth_score_test(
     input: SmoothScoreTestInput<'_>,
 ) -> Result<SmoothTestResult, SmoothScoreTestRefusal> {
+    if input.penalized_hessian.dim() != (input.beta.len(), input.beta.len()) {
+        return Err(SmoothScoreTestRefusal::InconsistentFit);
+    }
+    let working_score = input.penalized_hessian.dot(&input.beta);
+    smooth_score_test_at_working_score(input, working_score.view())
+}
+
+/// [`smooth_score_test`] with the working score `b = XᵀWz` supplied rather
+/// than read off the fit as `H·β̂`.
+///
+/// `H·β̂ = XᵀWz` is the penalized stationarity condition, so the two agree at
+/// an exact mode of `ℓ − ½βᵀS(λ)β`. A fit whose published mode maximizes a
+/// different objective (a Jeffreys/Firth prior added to the penalized
+/// likelihood) is not stationary for that one, and there the identity is off
+/// by the prior's gradient. A caller that holds the likelihood gradient `∇ℓ(β̂)`
+/// forms `b = Gβ̂ + ∇ℓ(β̂)` exactly, whatever objective produced `β̂`; that is
+/// the linearization the score's reference law is derived at.
+pub fn smooth_score_test_at_working_score(
+    input: SmoothScoreTestInput<'_>,
+    working_score: ArrayView1<'_, f64>,
+) -> Result<SmoothTestResult, SmoothScoreTestRefusal> {
     let p = input.beta.len();
+    if working_score.len() != p || working_score.iter().any(|v| !v.is_finite()) {
+        return Err(SmoothScoreTestRefusal::InconsistentFit);
+    }
     let range = input.coeff_range.clone();
     let m = range.len();
     let h = input.penalized_hessian;
@@ -167,7 +191,7 @@ pub fn smooth_score_test(
 
     let other: Vec<usize> = (0..p).filter(|i| !range.contains(i)).collect();
     let term: Vec<usize> = range.collect();
-    let b = h.dot(&input.beta);
+    let b = working_score.to_owned();
     let b_j = select_vector(&b, &term);
     let g_jj = select(g, &term, &term);
     let (score, score_cov) = if other.is_empty() {

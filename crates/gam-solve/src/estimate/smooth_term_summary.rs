@@ -47,9 +47,7 @@ use crate::estimate::summary::{
 use crate::model_types::result_types::UnifiedFitResult;
 use gam_terms::basis::{BasisMetadata, PenaltySource};
 use gam_terms::inference::random_effect_test::RandomEffectTestOutcome;
-use gam_terms::inference::smooth_score_test::{
-    SmoothScoreTestInput, SmoothScoreTestRefusal, smooth_score_test,
-};
+use gam_terms::inference::smooth_score_test::{SmoothScoreTestInput, smooth_score_test};
 use gam_terms::inference::smooth_test::{SmoothTestResult, SmoothTestScale};
 use gam_terms::smooth::{
     BOUNDED_SHRINKAGE_PENALTY_SOURCE, ShapeSpec, SmoothTerm, TermCollectionDesign,
@@ -357,21 +355,7 @@ impl<'a> ScoreTestFit<'a> {
             residual_df: self.residual_df,
             scale: self.scale,
         })
-        .map_err(|refusal| match refusal {
-            SmoothScoreTestRefusal::InconsistentFit => {
-                SmoothPValueUnavailable::FitCurvatureUnavailable
-            }
-            SmoothScoreTestRefusal::UnpenalizedDirection => {
-                SmoothPValueUnavailable::UnpenalizedDirection
-            }
-            SmoothScoreTestRefusal::NotIdentified => SmoothPValueUnavailable::NotIdentified,
-            SmoothScoreTestRefusal::IndefiniteCurvature => {
-                SmoothPValueUnavailable::IndefiniteCurvature
-            }
-            SmoothScoreTestRefusal::ResidualDfUnavailable => {
-                SmoothPValueUnavailable::ResidualDfUnavailable
-            }
-        })
+        .map_err(SmoothPValueUnavailable::from)
     }
 }
 
