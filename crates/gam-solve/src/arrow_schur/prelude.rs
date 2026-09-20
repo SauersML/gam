@@ -44,19 +44,6 @@ pub(crate) const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
 /// representable decrease (`certified_shift`, #2627).
 pub const DEFAULT_PROXIMAL_INITIAL_RIDGE: f64 = 1e-8;
 
-pub(crate) const F32_UNIT_ROUNDOFF: f64 = (f32::EPSILON as f64) * 0.5;
-
-pub(crate) const DEFAULT_MIXED_PRECISION_MAX_REFINEMENTS: usize = 6;
-
-pub(crate) const DEFAULT_MIXED_PRECISION_CERTIFICATE_TOLERANCE: f64 = 1e-11;
-
-pub(crate) const DEFAULT_MIXED_PRECISION_KAPPA_MARGIN: f64 = 0.5;
-
-/// Backward-error certificate floor, expressed as a small multiple of f64 epsilon.
-pub(crate) const MIXED_PRECISION_CERTIFICATE_EPSILON_MULTIPLIER: f64 = 64.0;
-
-/// User-supplied kappa margins above this are no stricter than the unit gate.
-pub(crate) const MIXED_PRECISION_KAPPA_MARGIN_CEILING: f64 = 1.0;
 /// Geometric ratio between consecutive proximal-ridge rungs, and the `Default`
 /// for `ArrowSolveOptions::ridge_growth`. One decade per rejection. It is a cost
 /// trade-off, not a derivation: it changes how many rungs a ladder takes to reach

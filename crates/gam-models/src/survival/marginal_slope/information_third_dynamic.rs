@@ -4,7 +4,7 @@
 //! The event Jacobian also depends on the slope rate; its log derivative is a
 //! finite Taylor composition in (q, qdot, g, gdot), including the q*gdot term.
 
-use super::information_third::{FACTORIAL, PrimaryThirdDirections, mixed_fifth, static_row_fifth};
+use super::information_third::{FACTORIAL, PrimaryThirdDirections, mixed_fifth};
 use super::*;
 
 // Base-six indexing makes multiplication an index addition when total degree
@@ -116,7 +116,7 @@ fn log_derivative_coefficients(
     logarithm
 }
 
-fn dynamic_row_fifth(
+pub(super) fn dynamic_row_fifth(
     primaries: &[f64; DYNAMIC_SLOPE_PRIMARIES],
     inputs: &RigidRowInputs,
 ) -> Result<[[[[[f64; 6]; 6]; 6]; 6]; 6], String> {
@@ -253,39 +253,8 @@ impl SurvivalMarginalSlopeRowKernel<DYNAMIC_SLOPE_PRIMARIES, DynamicSlopeGeometr
     }
 }
 
-impl SurvivalMarginalSlopeFamily {
-    /// `Σ_{cde} ℓ_{abcde} u_c v_d (e_k)_e` of row `row` for every primary axis `k`, from the
-    /// closed-form fifth likelihood derivatives of the rigid row program in the family's own slope
-    /// frame. It is the rigid counterpart of `row_flex_fifth_contract_all_primary_axes_from_base`,
-    /// which the time-wiggle ζ composition reads (gam#2893).
-    pub(crate) fn rigid_row_fifth_contract_all_primary_axes(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        dir_u: &Array1<f64>,
-        dir_v: &Array1<f64>,
-    ) -> Result<Vec<Array2<f64>>, String> {
-        let inputs = rigid_row_inputs(self, block_states, row, "rigid fifth contraction")?;
-        if self.slope_is_follow_up_varying() {
-            let primaries = rigid_row_kernel_primaries::<DYNAMIC_SLOPE_PRIMARIES, DynamicSlopeGeometry>(
-                self,
-                block_states,
-                row,
-            )?;
-            contract_fifth_all_primary_axes(&dynamic_row_fifth(&primaries, &inputs)?, dir_u, dir_v)
-        } else {
-            let primaries = rigid_row_kernel_primaries::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>(
-                self,
-                block_states,
-                row,
-            )?;
-            contract_fifth_all_primary_axes(&static_row_fifth(&primaries, &inputs)?, dir_u, dir_v)
-        }
-    }
-}
-
 /// `{Σ_{cd} T_{abcdk} u_c v_d}` along every axis `k` of a fifth likelihood derivative tensor.
-fn contract_fifth_all_primary_axes<const P: usize>(
+pub(super) fn contract_fifth_all_primary_axes<const P: usize>(
     fifth: &[[[[[f64; P]; P]; P]; P]; P],
     dir_u: &Array1<f64>,
     dir_v: &Array1<f64>,
