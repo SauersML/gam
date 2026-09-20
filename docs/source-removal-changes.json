@@ -3003,5 +3003,14 @@
     ],
     "reason": "#4380: cgroup charge and inactive-file statistics are separately sampled. The shared constructor retains the raw counters while assigning no reclaim credit when inactive_file exceeds the charge, preserving limit-current headroom. Both v1/v2 probes and simulated observations use it; the obsolete inconsistent-counters refusal and constructor are removed.",
     "evidence": "MSI complete runtime unit binary compiles with warnings denied in3.38sec. Nine span tests, eight cgroup tests and26 downstream resource-policy tests pass, including adjacent-float interval membership and216 wide-integer counter combinations. All27 production crates compile coherently on main6f9de4f plus revised4378/4382; complete model unit-source metadata is checked separately. Source census finds no remaining calls to the retired constructor, refusal variant or span wrapper."
+  },
+  {
+    "base": "b83e3e65cffafbc23d6f08ccc5f93c780008feb6",
+    "items": [
+      "crates/gam-models/src/bms/deviation_runtime.rs:fn:span_index_for",
+      "crates/gam-runtime/src/span.rs:fn:internal_breakpoints_use_right_hand_span"
+    ],
+    "reason": "#4376: the canonical breakpoint search owns the left-span convention already required by both cubic deviation runtimes. Remove the unused right-span wrapper and duplicated post-adjustments. The retired right-span-only test is replaced by left-span and independent interval-membership tests.",
+    "evidence": "MSI complete runtime unit binary compiles with warnings denied in3.38sec. Nine span tests, eight cgroup tests and26 downstream resource-policy tests pass, including adjacent-float interval membership and216 wide-integer counter combinations. All27 production crates compile coherently on main6f9de4f plus revised4378/4382; complete model unit-source metadata is checked separately. Source census finds no remaining calls to the retired constructor, refusal variant or span wrapper."
   }
 ]
