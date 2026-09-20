@@ -218,6 +218,7 @@ fn bessel_ascending_series(ax: f64) -> BesselAscending {
     BesselAscending {
         i0_minus_one,
         i1: half * sum_i1,
+        i1_over_argument: 0.5 * sum_i1,
         i0_minus_i1,
     }
 }
@@ -228,6 +229,9 @@ struct BesselAscending {
     i0_minus_one: f64,
     /// `I1(x)`.
     i1: f64,
+    /// `I1(x)/x`, read off the `I1` series before its `x/2` factor, so it holds
+    /// its `½` limit at `x = 0` instead of becoming `0/0`.
+    i1_over_argument: f64,
     /// `I0(x) − I1(x)`, summed termwise rather than by subtracting the two.
     i0_minus_i1: f64,
 }
@@ -257,6 +261,14 @@ struct BesselAsymptotic {
     /// argument. It carries the largest power of the sums, so it is the scale
     /// the truncation test measures every increment against.
     n_scaled_derivative: f64,
+    /// `P1 = Σ_{k≥1} k·c_k x^{−k} = −x·S0′`.
+    first_moment: f64,
+    /// `P2 = Σ_{k≥1} k(k+1)·c_k x^{−k} = x²·S0″`.
+    ///
+    /// With `log I0 = x − ½ log(2πx) + log S0`, these two give the curvature
+    /// `x²·(I1/I0)′ = ½ + P2/S0 − (P1/S0)²` with the `½` separated
+    /// symbolically, the same way `N` separates the `−½` of `d1`.
+    second_moment: f64,
 }
 
 fn bessel_asymptotic_series(ax: f64) -> BesselAsymptotic {
@@ -268,6 +280,8 @@ fn bessel_asymptotic_series(ax: f64) -> BesselAsymptotic {
         s1: 1.0,
         n: 0.0,
         n_scaled_derivative: 0.0,
+        first_moment: 0.0,
+        second_moment: 0.0,
     };
     // `x^{−(k−2)}` and `x^{−(k−1)}` at the current `k`, carried as their own
     // running products so that a power which has overflowed is never multiplied
@@ -295,6 +309,8 @@ fn bessel_asymptotic_series(ax: f64) -> BesselAsymptotic {
         acc.s0 += term_c;
         acc.s1 += b * power;
         acc.n += difference * power_one_back;
+        acc.first_moment += kf * term_c;
+        acc.second_moment += kf * (kf + 1.0) * term_c;
         if k >= 2 {
             acc.n_scaled_derivative -= curvature_term;
         }
@@ -318,38 +334,101 @@ fn bessel_asymptotic_series(ax: f64) -> BesselAsymptotic {
 /// `x·0` after the ordinary ratio rounds to one. Centering the logarithm by its
 /// leading `x` term likewise prevents catastrophic cancellation.
 pub fn bessel_i0_centered_terms(eta: f64) -> (f64, f64, f64) {
+    let jet = bessel_i0_centered_jet(eta);
+    (jet.centered_log, jet.ratio, jet.scaled_derivative)
+}
+
+/// Centered `log I0` through its second derivative, for `x = |eta|`.
+///
+/// Every field is a function of `x`, and every derivative is taken in `x`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CenteredBesselI0Jet {
+    /// `log I0(x) − x`.
+    pub centered_log: f64,
+    /// `A = I1(x)/I0(x)`.
+    pub ratio: f64,
+    /// `d1 = x·(A − 1) = x·d/dx[log I0(x) − x]`; tends to `−½`.
+    pub scaled_derivative: f64,
+    /// `A′(x) = 1 − A/x − A²`, the curvature of `log I0`; `½` at `x = 0`.
+    pub ratio_derivative: f64,
+    /// `x·d1′(x) = x²·A′ + d1`; `0` at `x = 0`, `~1/(8x)` for large `x`.
+    pub scaled_derivative_slope: f64,
+}
+
+/// Overflow-free centered Bessel jet: [`bessel_i0_centered_terms`] plus the
+/// curvature `A′` and the slope `x·d1′` a Newton step on a Bessel likelihood
+/// needs.
+///
+/// Both extra terms are small differences of order-one quantities if formed
+/// from `A` and `d1` (`A′ = 1 − A/x − A²` loses the whole factor `2x²` at
+/// large `x`, where `A′ ≈ 1/(2x²)`), so each branch reads them off sums it
+/// already accumulates:
+///
+/// * below the crossover, `A′ = (1 − A)(1 + A) − A/x` with `1 − A` taken from
+///   the paired difference series `(I0 − I1)/I0` and `A/x` from the `I1`
+///   series before its `x/2` factor. The two terms still cancel toward the
+///   crossover (by `≈ 77×` at `x = 20`), which is the documented cost of this
+///   branch and is what the reference test measures against;
+/// * above it, `x²·A′ = ½ + P2/S0 − (P1/S0)²` and
+///   `x·d1′ = (x²N′/x + N·P1/S0)/S0`, where the `½` limit is separated
+///   symbolically and nothing near-equal is subtracted.
+pub fn bessel_i0_centered_jet(eta: f64) -> CenteredBesselI0Jet {
     let ax = eta.abs();
     if ax.is_nan() {
-        return (f64::NAN, f64::NAN, f64::NAN);
+        return CenteredBesselI0Jet {
+            centered_log: f64::NAN,
+            ratio: f64::NAN,
+            scaled_derivative: f64::NAN,
+            ratio_derivative: f64::NAN,
+            scaled_derivative_slope: f64::NAN,
+        };
     }
     if ax.is_infinite() {
-        // `−½ log(2πx) → −∞`, `I1/I0 → 1`, and the centered log-derivative
-        // holds its exact `−½` limit.
-        return (f64::NEG_INFINITY, 1.0, -0.5);
+        // `−½ log(2πx) → −∞`, `I1/I0 → 1`, the centered log-derivative holds
+        // its exact `−½` limit, and `A′ ~ 1/(2x²)`, `x·d1′ ~ 1/(8x)` vanish.
+        return CenteredBesselI0Jet {
+            centered_log: f64::NEG_INFINITY,
+            ratio: 1.0,
+            scaled_derivative: -0.5,
+            ratio_derivative: 0.0,
+            scaled_derivative_slope: 0.0,
+        };
     }
     if ax < BESSEL_ASYMPTOTIC_THRESHOLD {
         let series = bessel_ascending_series(ax);
         let i0 = 1.0 + series.i0_minus_one;
+        let ratio = series.i1 / i0;
+        let one_minus_ratio = series.i0_minus_i1 / i0;
         // `d1 = x(I1/I0 − 1) = −x·(I0 − I1)/I0`, taken from the difference the
         // series accumulated itself. Forming `ax * (ratio - 1.0)` here instead
         // would reintroduce the very `2x` cancellation the large-argument branch
         // is careful to avoid, and would leave a visible accuracy seam at the
         // crossover: `1 − ratio` is `0.025` at `x = 20`, so a correctly rounded
         // `ratio` still pins `d1` no tighter than `4e−15`.
-        return (
-            series.i0_minus_one.ln_1p() - ax,
-            series.i1 / i0,
-            -ax * (series.i0_minus_i1 / i0),
-        );
+        let scaled_derivative = -ax * one_minus_ratio;
+        let ratio_derivative = one_minus_ratio * (1.0 + ratio) - series.i1_over_argument / i0;
+        return CenteredBesselI0Jet {
+            centered_log: series.i0_minus_one.ln_1p() - ax,
+            ratio,
+            scaled_derivative,
+            ratio_derivative,
+            scaled_derivative_slope: ax * ax * ratio_derivative + scaled_derivative,
+        };
     }
     let series = bessel_asymptotic_series(ax);
-    (
+    let first = series.first_moment / series.s0;
+    let curvature = 0.5 + series.second_moment / series.s0 - first * first;
+    CenteredBesselI0Jet {
         // `log I0(x) − x = −½ log(2πx) + log S0`. The `2πx` product is split so
         // it cannot overflow just short of the largest finite argument.
-        series.s0.ln() - 0.5 * (std::f64::consts::TAU.ln() + ax.ln()),
-        series.s1 / series.s0,
-        series.n / series.s0,
-    )
+        centered_log: series.s0.ln() - 0.5 * (std::f64::consts::TAU.ln() + ax.ln()),
+        ratio: series.s1 / series.s0,
+        scaled_derivative: series.n / series.s0,
+        // Divided in two steps so `x²` never overflows before the quotient
+        // would underflow anyway.
+        ratio_derivative: curvature / ax / ax,
+        scaled_derivative_slope: (series.n_scaled_derivative / ax + series.n * first) / series.s0,
+    }
 }
 
 /// Stable centered Bessel terms when only `log(|eta|)` is representable.
@@ -1452,6 +1531,95 @@ mod tests {
                 "η(I1/I0 − 1) at {eta}: got {d1:.17e}, want {want_d1:.17e}"
             );
         }
+    }
+
+    /// The curvature terms of [`bessel_i0_centered_jet`] against the same kind
+    /// of independent reference: `A′ = 1 − A/x − A²` and `x·d1′ = x²A′ + d1`
+    /// evaluated from `mpmath.besseli` at 120 decimal digits (the large-`x`
+    /// rows cancel `x²A′ ≈ ½` against `d1 ≈ −½`, so 60 digits is not enough
+    /// there), rounded to `f64`.
+    #[test]
+    fn bessel_jet_curvature_matches_independent_high_precision_reference() {
+        // (η, A′(η), η·d1′(η))
+        const REFERENCE: [[f64; 3]; 25] = [
+            [1e-06, 0.4999999999998125, -9.99999e-07],
+            [0.001, 0.4999998125000521, -0.00099900000025],
+            [0.05, 0.4995315753251209, -0.04750156152399669],
+            [0.25, 0.4884816827302773, -0.18846151934987648],
+            [0.5, 0.4561947127365571, -0.2647015155254598],
+            [1.0, 0.35434603245035623, -0.19926400165310923],
+            [2.0, 0.1642231977212077, 0.05244210681284669],
+            [3.75, 0.04458804459582181, 0.0764086000777509],
+            [5.0, 0.0231899430364522, 0.0466642611317311],
+            [8.0, 0.008430134951567575, 0.02141258513583364],
+            [12.0, 0.0036390608204939835, 0.01260162289404047],
+            [17.0, 0.001786133112084778, 0.008361475455484893],
+            [19.5, 0.0013515552125644113, 0.007160287955186735],
+            [19.999999, 0.0012838757855640661, 0.006960420318717729],
+            [20.0, 0.0012838756553350688, 0.006960419930170057],
+            [20.000001, 0.0012838755251060915, 0.006960419541622429],
+            [25.0, 0.0008170495273215196, 0.005442291838848013],
+            [30.0, 0.0005653130416681776, 0.004468398461442669],
+            [64.0, 0.00012304709722759283, 0.002016497368136742],
+            [150.0, 2.2297047507199428e-05, 0.0008446213361703931],
+            [900.0, 6.176274590315073e-07, 0.0001391983371050074],
+            [10000.0, 5.0002500375078146e-09, 1.2502500586100053e-05],
+            [1000000.0, 5.00000250000375e-13, 1.2500025000058594e-07],
+            [1000000000000.0, 5.0000000000025e-25, 1.2500000000025e-13],
+            [1000000000000000.0, 5.000000000000002e-31, 1.2500000000000026e-16],
+        ];
+
+        // Sized from the arithmetic. Below the crossover each term is a
+        // combination of the ascending sums, which `bessel_primitives_match_…`
+        // pins to `4e−15` relative, so the admissible error is that band times
+        // the MAGNITUDE of what is combined: `(1 − A)(1 + A) + A/x` for `A′`,
+        // and `x²·that + |d1|` for `x·d1′`. Above it nothing cancels (the two
+        // terms of `x·d1′` are `3/(16x)` and `−1/(16x)`, a factor 2), and the
+        // added band is the optimal-truncation remainder of the weighted sums:
+        // the smallest term is below `e^{−2x}` and the heaviest weight, the
+        // `(k−1)·x^{2}` of `x²N′` at the stopping index `k ≈ 2x`, is below
+        // `(2x)³` — so `(2x)³e^{−2x}`, which is `3e−13` at the crossover and
+        // below `1e−16` from `x = 25` on.
+        const TERM_TOL: f64 = 4.0e-15;
+        for [eta, want_ratio_derivative, want_slope] in REFERENCE {
+            let jet = bessel_i0_centered_jet(eta);
+            let (ratio_band, slope_band) = if eta < BESSEL_ASYMPTOTIC_THRESHOLD {
+                let combined = (1.0 - jet.ratio) * (1.0 + jet.ratio) + jet.ratio / eta;
+                (
+                    TERM_TOL * combined,
+                    TERM_TOL * (eta * eta * combined + jet.scaled_derivative.abs()),
+                )
+            } else {
+                let truncation = (2.0 * eta).powi(3) * (-2.0 * eta).exp();
+                (
+                    TERM_TOL * want_ratio_derivative + truncation / (eta * eta),
+                    2.0 * TERM_TOL * want_slope + truncation,
+                )
+            };
+            assert!(
+                (jet.ratio_derivative - want_ratio_derivative).abs() <= ratio_band,
+                "A′({eta}): got {:.17e}, want {want_ratio_derivative:.17e}",
+                jet.ratio_derivative
+            );
+            assert!(
+                (jet.scaled_derivative_slope - want_slope).abs() <= slope_band,
+                "η·d1′({eta}): got {:.17e}, want {want_slope:.17e}",
+                jet.scaled_derivative_slope
+            );
+        }
+
+        let origin = bessel_i0_centered_jet(0.0);
+        assert_eq!(origin.ratio_derivative, 0.5);
+        assert_eq!(origin.scaled_derivative_slope, 0.0);
+        assert_eq!(
+            (origin.centered_log, origin.ratio, origin.scaled_derivative),
+            bessel_i0_centered_terms(0.0)
+        );
+        let infinite = bessel_i0_centered_jet(f64::INFINITY);
+        assert_eq!(infinite.ratio_derivative, 0.0);
+        assert_eq!(infinite.scaled_derivative_slope, 0.0);
+        assert_eq!(infinite.scaled_derivative, -0.5);
+        assert!(bessel_i0_centered_jet(f64::NAN).ratio_derivative.is_nan());
     }
 
     /// The three returned terms are computed from DIFFERENT representations on

@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use crate::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_linalg::pairwise_reduce::{pairwise_sum, pairwise_sum_max_depth};
-use gam_math::special::bessel_i0_log_minus_abs_and_ratio;
+use gam_math::special::{bessel_i0_centered_jet, bessel_i0_log_minus_abs_and_ratio};
 
 // ---------------------------------------------------------------------------
 // Topology candidate enum and selection result
@@ -2416,7 +2416,9 @@ pub(crate) fn fit_ring_gaussian_mixture(
 /// Unlike a Gaussian density assigned directly to the nonnegative radius, this
 /// density is normalized on the plane, remains finite at the center, and has no
 /// artificial `1/r` singularity. The center is fitted jointly with `(R, s)` by
-/// latent-angle EM instead of being frozen at the coordinate mean.
+/// projected Newton ascent on the exact likelihood Hessian, certified by its
+/// Newton decrement, instead of being frozen at the coordinate mean; the
+/// `R = 0` boundary is resolved in closed form by its fourth-order test.
 #[derive(Debug, Clone, Copy)]
 pub struct CircularGaussianFit2d {
     center: [f64; 2],
@@ -2500,6 +2502,29 @@ impl CircularGaussianFit2d {
             mean[0] += point[0];
             mean[1] += point[1];
         }
+        // Three distinct points determine a circle. Data at only two locations
+        // lie on every circle through both with zero residual, so the
+        // likelihood rises without bound as `s → 0` along a one-parameter
+        // family of circles. On the variance floor that family is told apart
+        // only by the `O(1)` Bessel normalization, `O(ε)` relative to the
+        // `O(n/s)` curvature across it, which is below what the f64 Hessian
+        // resolves: no point of it is a certifiable maximum. The nonzero
+        // extent checked above guarantees a second location.
+        let first_location = points[0];
+        let second_location = points
+            .iter()
+            .copied()
+            .find(|point| *point != first_location)
+            .unwrap_or(first_location);
+        if !points
+            .iter()
+            .any(|point| *point != first_location && *point != second_location)
+        {
+            return Err(
+                "circular Gaussian requires training points at three or more distinct locations"
+                    .to_string(),
+            );
+        }
         let count = rows.len() as f64;
         mean[0] /= count;
         mean[1] /= count;
@@ -2534,95 +2559,156 @@ impl CircularGaussianFit2d {
         // positive with no floor.
         let variance_floor =
             gam_linalg::roundoff::accumulation_growth(6 * points.len()) * mean_squared_radius;
-        let radius_squared = (mean_squared_radius * mean_squared_radius - squared_radius_variance)
-            .max(0.0)
-            .sqrt();
-        let mut radius = radius_squared.sqrt();
-        let mut noise_variance = (0.5 * (mean_squared_radius - radius_squared)).max(variance_floor);
-        let mut center = mean;
+        let radius_fourth = mean_squared_radius * mean_squared_radius - squared_radius_variance;
 
-        // Exact EM for the latent circle angle. Given current parameters, the
-        // conditional mean of U is A(kappa) * (x-c)/||x-c|| with
-        // A=I1/I0 and kappa=R||x-c||/s. Solving the joint quadratic M-step for
-        // center and radius avoids the biased `center = sample mean` plug-in.
-        const MAX_EM_ITERATIONS: usize = 4096;
-        const EM_TOLERANCE: f64 = 2.0e-12;
-        let mut posterior_means = vec![[0.0_f64; 2]; points.len()];
-        let mut converged = false;
-        for _ in 0..MAX_EM_ITERATIONS {
-            let mut posterior_mean = [0.0_f64; 2];
-            for (point, latent_mean) in points.iter().zip(&mut posterior_means) {
-                let dx = point[0] - center[0];
-                let dy = point[1] - center[1];
-                let observed_radius = dx.hypot(dy);
-                if observed_radius == 0.0 || radius == 0.0 {
-                    *latent_mean = [0.0, 0.0];
-                } else {
-                    let (_, bessel_ratio) =
-                        circular_gaussian_bessel_terms(radius, observed_radius, noise_variance);
-                    if !(bessel_ratio.is_finite() && (0.0..=1.0).contains(&bessel_ratio)) {
-                        return Err("circular Gaussian Bessel ratio left [0, 1]".to_string());
-                    }
-                    let multiplier = bessel_ratio / observed_radius;
-                    *latent_mean = [multiplier * dx, multiplier * dy];
+        // The `R ≥ 0` boundary. At `R = 0` the density is `N(c, sI)`, whose
+        // maximizer is `c = mean`, `s = E q / 2` in closed form. The likelihood
+        // is even in `R`, so its `R²` coefficient there vanishes identically
+        // (`−n/s + Σq/(2s²) = 0` at that `s`), and the first nonzero term of the
+        // profile likelihood in `R` is `n·(2(E q)² − E q²)/(4 (E q)⁴)·R⁴`. With
+        // `E q² = (E q)² + Var q`, its sign is the sign of
+        // `(E q)² − Var q = R⁴_moment`. So `R⁴_moment < 0` is exactly the
+        // second-order (KKT) plus fourth-order condition for `R = 0` to be a
+        // strict local maximum, and the boundary point is the certified fit;
+        // at `R⁴_moment = 0` the moment estimate is itself the boundary.
+        if radius_fourth <= 0.0 {
+            return Self::from_chart(
+                anchor,
+                scale,
+                mean,
+                0.0,
+                (0.5 * mean_squared_radius).max(variance_floor),
+            );
+        }
+        let radius_squared = radius_fourth.sqrt();
+        let log_variance_floor = variance_floor.ln();
+        let mut theta = [
+            mean[0],
+            mean[1],
+            radius_squared.sqrt(),
+            (0.5 * (mean_squared_radius - radius_squared))
+                .max(variance_floor)
+                .ln(),
+        ];
+
+        // Projected Newton ascent on `θ = (c_x, c_y, R, u = ln s)` with the
+        // exact gradient and Hessian, on `u ≥ ln(variance_floor)`. The floor
+        // coordinate is held (active) only while it sits on the floor and the
+        // likelihood still pushes it down; every other coordinate is free.
+        //
+        // The free Hessian block is Jacobi-scaled by `√|H_jj|` before its
+        // eigendecomposition, so that the spectral rounding band compares
+        // eigenvalues of commensurate coordinates rather than letting a
+        // noise-free ring's `1/s`-sized center curvature swamp the order-`n`
+        // curvature of `u`. Each eigen-direction is ascended with the
+        // magnitude of its curvature (saddle-free Newton): at a concave point
+        // this is exactly the Newton step, and at a saddle it still moves
+        // uphill along the positive-curvature directions.
+        //
+        // Convergence is certified, not declared by a step size: the free
+        // block is negative definite beyond its spectral rounding band, and
+        // the Newton decrement `½ gᵀ|H|⁻¹g` — the quadratic model's predicted
+        // gain — is inside the rounding band of the log-likelihood itself.
+        // That band is Higham's `γ_d·Σ|terms|` for the pairwise sum of the `n`
+        // per-point terms (`d` its depth), plus the eight roundings that form
+        // each term, measured against the per-point magnitude bound the local
+        // model returns. Once the model's predicted gain is below what the
+        // objective can resolve, no step can be verified to improve it.
+        let pairwise_depth = pairwise_sum_max_depth(points.len());
+        let mut model = circular_gaussian_local_model(&points, theta)?;
+        loop {
+            let value_band = gam_linalg::roundoff::accumulation_growth(pairwise_depth + 8)
+                * model.rounding_magnitude;
+            let floor_active = theta[3] <= log_variance_floor && model.gradient[3] < 0.0;
+            let free: &[usize] = if floor_active { &[0, 1, 2] } else { &[0, 1, 2, 3] };
+            let width = free.len();
+            let jacobi: Vec<f64> = free
+                .iter()
+                .map(|&coordinate| {
+                    let diagonal = model.hessian[coordinate][coordinate].abs().sqrt();
+                    if diagonal > 0.0 { diagonal } else { 1.0 }
+                })
+                .collect();
+            let mut negated_hessian = Array2::<f64>::zeros((width, width));
+            for a in 0..width {
+                for b in 0..width {
+                    negated_hessian[[a, b]] =
+                        -model.hessian[free[a]][free[b]] / (jacobi[a] * jacobi[b]);
                 }
-                posterior_mean[0] += latent_mean[0];
-                posterior_mean[1] += latent_mean[1];
             }
-            posterior_mean[0] /= count;
-            posterior_mean[1] /= count;
-
-            let denominator =
-                1.0 - posterior_mean[0] * posterior_mean[0] - posterior_mean[1] * posterior_mean[1];
-            if !(denominator.is_finite() && denominator > 0.0) {
-                return Err("circular Gaussian EM radius update is singular".to_string());
+            let (eigenvalues, eigenvectors) = negated_hessian.eigh(Side::Lower).map_err(|error| {
+                format!("circular Gaussian Hessian eigendecomposition failed: {error}")
+            })?;
+            let eigenvalues = eigenvalues.to_vec();
+            let spectrum_band =
+                gam_linalg::roundoff::symmetric_spectrum_rounding_band(&eigenvalues);
+            let negative_definite = eigenvalues.iter().all(|&value| value > spectrum_band);
+            let mut step = [0.0_f64; 4];
+            let mut decrement = 0.0_f64;
+            for (k, &curvature) in eigenvalues.iter().enumerate() {
+                if curvature.abs() <= spectrum_band {
+                    continue;
+                }
+                let mut projection = 0.0_f64;
+                for a in 0..width {
+                    projection += eigenvectors[[a, k]] * model.gradient[free[a]] / jacobi[a];
+                }
+                let coefficient = projection / curvature.abs();
+                decrement += 0.5 * projection * coefficient;
+                for a in 0..width {
+                    step[free[a]] += eigenvectors[[a, k]] * coefficient / jacobi[a];
+                }
             }
-            let mut radius_numerator = 0.0_f64;
-            for (point, latent_mean) in points.iter().zip(&posterior_means) {
-                radius_numerator +=
-                    latent_mean[0] * (point[0] - mean[0]) + latent_mean[1] * (point[1] - mean[1]);
+            if !(decrement.is_finite() && value_band.is_finite()) {
+                return Err("circular Gaussian Newton model is not finite".to_string());
             }
-            let next_radius = (radius_numerator / (count * denominator)).max(0.0);
-            let next_center = [
-                mean[0] - next_radius * posterior_mean[0],
-                mean[1] - next_radius * posterior_mean[1],
-            ];
-
-            // Evaluate E||X-c-RU||^2 in an explicitly nonnegative form to
-            // avoid catastrophic cancellation on a very thin ring.
-            let mut residual_sum = 0.0_f64;
-            for (point, latent_mean) in points.iter().zip(&posterior_means) {
-                let dx = point[0] - next_center[0];
-                let dy = point[1] - next_center[1];
-                let ex = dx - next_radius * latent_mean[0];
-                let ey = dy - next_radius * latent_mean[1];
-                let latent_norm_squared =
-                    latent_mean[0] * latent_mean[0] + latent_mean[1] * latent_mean[1];
-                residual_sum += ex * ex
-                    + ey * ey
-                    + next_radius * next_radius * (1.0 - latent_norm_squared).max(0.0);
-            }
-            let next_noise_variance = (residual_sum / (2.0 * count)).max(variance_floor);
-
-            let parameter_change = (next_center[0] - center[0])
-                .hypot(next_center[1] - center[1])
-                .max((next_radius - radius).abs())
-                .max(
-                    (next_noise_variance - noise_variance).abs()
-                        / (next_noise_variance + noise_variance),
-                );
-            center = next_center;
-            radius = next_radius;
-            noise_variance = next_noise_variance;
-            if parameter_change <= EM_TOLERANCE {
-                converged = true;
+            if negative_definite && decrement <= value_band {
                 break;
             }
-        }
-        if !converged {
-            return Err("circular Gaussian maximum-likelihood fit did not converge".to_string());
+
+            // Backtrack until the likelihood strictly increases. The trial is
+            // projected onto the variance floor and reflected onto `R ≥ 0`,
+            // which is exact because the likelihood is even in `R`. Halving
+            // ends either at an accepted ascent or at a step too small to move
+            // `θ` at all, and the latter is an honest failure: the model
+            // promises a gain above the objective's resolution that no
+            // representable step realizes.
+            let mut fraction = 1.0_f64;
+            loop {
+                let mut trial = theta;
+                for (coordinate, value) in trial.iter_mut().enumerate() {
+                    *value += fraction * step[coordinate];
+                }
+                trial[2] = trial[2].abs();
+                trial[3] = trial[3].max(log_variance_floor);
+                if trial == theta {
+                    return Err(format!(
+                        "circular Gaussian Newton ascent stalled: decrement {decrement:.3e} \
+                         exceeds the likelihood rounding band {value_band:.3e} but no \
+                         representable step increases the likelihood"
+                    ));
+                }
+                let trial_model = circular_gaussian_local_model(&points, trial)?;
+                if trial_model.log_likelihood > model.log_likelihood {
+                    theta = trial;
+                    model = trial_model;
+                    break;
+                }
+                fraction *= 0.5;
+            }
         }
 
+        Self::from_chart(anchor, scale, [theta[0], theta[1]], theta[2], theta[3].exp())
+    }
+
+    /// Map a fit in the dimensionless chart back to data coordinates.
+    fn from_chart(
+        anchor: [f64; 2],
+        scale: f64,
+        center: [f64; 2],
+        radius: f64,
+        noise_variance: f64,
+    ) -> Result<Self, String> {
         let fitted_noise_sd = scale * noise_variance.sqrt();
         Self::from_parameters(
             [anchor[0] + scale * center[0], anchor[1] + scale * center[1]],
@@ -2730,6 +2816,139 @@ fn circular_gaussian_bessel_terms(
         return bessel_i0_log_minus_abs_and_ratio(log_kappa.exp());
     }
     (-0.5 * (std::f64::consts::TAU.ln() + log_kappa), 1.0)
+}
+
+/// The circular-Gaussian log-likelihood at `θ = (c_x, c_y, R, u = ln s)` in
+/// the fitting chart, with its exact gradient and Hessian.
+struct CircularGaussianLocalModel {
+    log_likelihood: f64,
+    /// `Σ_i M_i`, a bound on the magnitudes whose rounding forms each term.
+    rounding_magnitude: f64,
+    gradient: [f64; 4],
+    hessian: [[f64; 4]; 4],
+}
+
+/// Per point, `ℓ = −ln 2π − u − ρ²/(2s) + L(κ)` with `r = ‖x − c‖`,
+/// `ρ = r − R`, `κ = R r/s` and `L = log I0 − κ` (the centered form keeps the
+/// `κ` growth cancelled analytically). The derivatives are taken in `(r, R, u)`
+/// from the centered Bessel jet and chained to the center through
+/// `∂r/∂c = −r̂` and `∂²r/∂c² = (I − r̂r̂ᵀ)/r`:
+///
+/// * `ℓ_r = (−ρ + (A−1)R)/s`, `ℓ_R = (ρ + (A−1)r)/s`, `ℓ_u = ρ²/(2s) − d1 − 1`;
+/// * `ℓ_rr = −1/s + A′R²/s²`, `ℓ_RR = −1/s + A′r²/s²`, `ℓ_rR = (A + A′κ)/s`;
+/// * `ℓ_ru = (ρ − R·w/κ)/s`, `ℓ_Ru = −(ρ + r·w/κ)/s`, `ℓ_uu = −ρ²/(2s) + w`,
+///   with `w = κ·d1′(κ)`;
+/// * `ℓ_r/r = −1/s + (A/κ)·R²/s²`, which is the transverse center curvature.
+///
+/// Every quantity is read from a jet term that holds its own limit
+/// (`d1/κ → −1`, `A/κ → ½`, `w/κ → −1` at `κ = 0`), so no combination
+/// cancels. Forming the center curvature from `1 − B·R²/s` and
+/// `2B − 1 + A²` instead loses `κ²` relative digits and made the Hessian of
+/// a three-point circumcircle indefinite.
+///
+/// `rounding_magnitude` sums, per point, the sizes of the rounded quantities
+/// the term is assembled from: `ρ²/(2s)` carries the rounding of `r` and `R`
+/// through `(r + R + |ρ|)·|ρ|/s`; the constants, `u` and `L` their own
+/// magnitudes; and the rounding of `κ` enters `L` through `|L′κ| = |d1|`.
+fn circular_gaussian_local_model(
+    points: &[[f64; 2]],
+    theta: [f64; 4],
+) -> Result<CircularGaussianLocalModel, String> {
+    let [center_x, center_y, radius, log_variance] = theta;
+    let variance = log_variance.exp();
+    let log_tau = std::f64::consts::TAU.ln();
+    let mut values = Vec::with_capacity(points.len());
+    let mut magnitudes = Vec::with_capacity(points.len());
+    let mut gradient = [0.0_f64; 4];
+    let mut hessian = [[0.0_f64; 4]; 4];
+    for point in points {
+        let dx = point[0] - center_x;
+        let dy = point[1] - center_y;
+        let observed = dx.hypot(dy);
+        let residual = observed - radius;
+        let kappa = radius * observed / variance;
+        if !kappa.is_finite() {
+            return Err("circular Gaussian Bessel argument is not finite".to_string());
+        }
+        let jet = bessel_i0_centered_jet(kappa);
+        let (ratio_minus_one, ratio_over_kappa, slope_over_kappa) = if kappa > 0.0 {
+            (
+                jet.scaled_derivative / kappa,
+                jet.ratio / kappa,
+                jet.scaled_derivative_slope / kappa,
+            )
+        } else {
+            (-1.0, 0.5, -1.0)
+        };
+        let half_scaled_square = 0.5 * residual * residual / variance;
+        values.push(-log_tau - log_variance - half_scaled_square + jet.centered_log);
+        magnitudes.push(
+            (observed + radius + residual.abs()) * residual.abs() / variance
+                + log_variance.abs()
+                + log_tau
+                + jet.centered_log.abs()
+                + jet.scaled_derivative.abs(),
+        );
+
+        let curvature = jet.ratio_derivative;
+        let slope = jet.scaled_derivative_slope;
+        let variance_squared = variance * variance;
+        let d_r = (-residual + ratio_minus_one * radius) / variance;
+        let d_radius = (residual + ratio_minus_one * observed) / variance;
+        let d_u = half_scaled_square - jet.scaled_derivative - 1.0;
+        let d_rr = -1.0 / variance + curvature * radius * radius / variance_squared;
+        let d_radius_radius =
+            -1.0 / variance + curvature * observed * observed / variance_squared;
+        let d_r_radius = (jet.ratio + curvature * kappa) / variance;
+        let d_r_u = (residual - radius * slope_over_kappa) / variance;
+        let d_radius_u = -(residual + observed * slope_over_kappa) / variance;
+        let d_uu = -half_scaled_square + slope;
+        let transverse =
+            -1.0 / variance + ratio_over_kappa * radius * radius / variance_squared;
+        // At `r = 0` every direction is radial and `ℓ_r = 0`, so any unit
+        // vector serves.
+        let direction = if observed > 0.0 {
+            [dx / observed, dy / observed]
+        } else {
+            [1.0, 0.0]
+        };
+
+        for a in 0..2 {
+            gradient[a] -= d_r * direction[a];
+            for b in 0..2 {
+                let identity = if a == b { 1.0 } else { 0.0 };
+                let outer = direction[a] * direction[b];
+                hessian[a][b] += d_rr * outer + transverse * (identity - outer);
+            }
+            hessian[a][2] -= d_r_radius * direction[a];
+            hessian[a][3] -= d_r_u * direction[a];
+        }
+        gradient[2] += d_radius;
+        gradient[3] += d_u;
+        hessian[2][2] += d_radius_radius;
+        hessian[2][3] += d_radius_u;
+        hessian[3][3] += d_uu;
+    }
+    for a in 0..4 {
+        for b in 0..a {
+            hessian[a][b] = hessian[b][a];
+        }
+    }
+    let log_likelihood = pairwise_sum(&values);
+    let rounding_magnitude = pairwise_sum(&magnitudes);
+    if !(log_likelihood.is_finite()
+        && rounding_magnitude.is_finite()
+        && gradient.iter().all(|value| value.is_finite())
+        && hessian.iter().flatten().all(|value| value.is_finite()))
+    {
+        return Err("circular Gaussian likelihood model is not finite".to_string());
+    }
+    Ok(CircularGaussianLocalModel {
+        log_likelihood,
+        rounding_magnitude,
+        gradient,
+        hessian,
+    })
 }
 //
 // A *union* candidate is a small FIXED composite of named component structures
@@ -4236,6 +4455,175 @@ mod tests {
             - noise_variance.ln()
             - 0.5 * (fit.radius() / noise_variance.sqrt()).powi(2);
         assert_eq!(center_log_density, expected_center);
+    }
+
+    /// SplitMix64 standard normals by Box–Muller, so the circular Gaussian
+    /// fixtures are reproducible without a random-number crate.
+    fn splitmix_normal_pairs(seed: u64, count: usize) -> Vec<[f64; 2]> {
+        let mut state = seed;
+        let mut uniform = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            ((z >> 11) as f64 + 0.5) / (1_u64 << 53) as f64
+        };
+        (0..count)
+            .map(|_| {
+                let modulus = (-2.0 * uniform().ln()).sqrt();
+                let angle = std::f64::consts::TAU * uniform();
+                [modulus * angle.cos(), modulus * angle.sin()]
+            })
+            .collect()
+    }
+
+    fn coordinate_matrix(points: &[[f64; 2]]) -> Array2<f64> {
+        let mut coords = Array2::<f64>::zeros((points.len(), 2));
+        for (row, point) in points.iter().enumerate() {
+            coords[[row, 0]] = point[0];
+            coords[[row, 1]] = point[1];
+        }
+        coords
+    }
+
+    /// #4003 — an isotropic blob whose moment radius is positive. Its
+    /// likelihood is nearly flat in `R` there: the previous EM needed about
+    /// 95 000 iterations on this fixture against its 4096-iteration budget, so
+    /// `fit` errored and aborted the whole shape race. The certified Newton fit must return a local maximum: every
+    /// one-coordinate move of a thousandth of a noise SD (or of the variance
+    /// by a thousandth) lowers the likelihood.
+    #[test]
+    fn circular_gaussian_fit_certifies_a_flat_blob_maximum_4003() {
+        let points: Vec<[f64; 2]> = splitmix_normal_pairs(BLOB_SEED_4003, 2000)
+            .into_iter()
+            .map(|normal| [3.0 + normal[0], -2.0 + normal[1]])
+            .collect();
+        let coords = coordinate_matrix(&points);
+        let rows = (0..points.len()).collect::<Vec<_>>();
+        let fit = CircularGaussianFit2d::fit(coords.view(), &rows).unwrap();
+        assert!(fit.radius() > 0.0, "fixture must take the Newton branch");
+        let fitted = fit.log_likelihood(coords.view(), &rows).unwrap();
+        let step = 1.0e-3 * fit.noise_variance().sqrt();
+        let center = fit.center();
+        let perturbed = [
+            ([center[0] + step, center[1]], fit.radius(), fit.noise_variance()),
+            ([center[0] - step, center[1]], fit.radius(), fit.noise_variance()),
+            ([center[0], center[1] + step], fit.radius(), fit.noise_variance()),
+            ([center[0], center[1] - step], fit.radius(), fit.noise_variance()),
+            (center, fit.radius() + step, fit.noise_variance()),
+            (center, fit.radius() - step, fit.noise_variance()),
+            (center, fit.radius(), fit.noise_variance() * (1.0 + 1.0e-3)),
+            (center, fit.radius(), fit.noise_variance() * (1.0 - 1.0e-3)),
+        ];
+        for (center, radius, noise_variance) in perturbed {
+            let moved = CircularGaussianFit2d::from_parameters(center, radius, noise_variance)
+                .unwrap()
+                .log_likelihood(coords.view(), &rows)
+                .unwrap();
+            assert!(
+                moved < fitted,
+                "fit is not a local maximum: {moved} >= {fitted} at {center:?} R={radius} s={noise_variance}"
+            );
+        }
+    }
+
+    /// Seed of the `n = 2000` blob in the test above.
+    const BLOB_SEED_4003: u64 = 14;
+
+    /// A noisy ring far from the origin is recovered within five sampling
+    /// standard errors: `σ√(2/n)` per center coordinate, `σ/√n` for the
+    /// radius and `s/√n` for the variance (two noise dimensions per point).
+    #[test]
+    fn circular_gaussian_fit_recovers_a_translated_noisy_ring() {
+        let n = 720;
+        let sd = 0.05;
+        let noise = splitmix_normal_pairs(11, n);
+        let points: Vec<[f64; 2]> = (0..n)
+            .map(|row| {
+                let angle = std::f64::consts::TAU * (row as f64 + 0.5) / n as f64;
+                [
+                    1.0e3 + 2.0 * angle.cos() + sd * noise[row][0],
+                    -2.0e3 + 2.0 * angle.sin() + sd * noise[row][1],
+                ]
+            })
+            .collect();
+        let coords = coordinate_matrix(&points);
+        let rows = (0..n).collect::<Vec<_>>();
+        let fit = CircularGaussianFit2d::fit(coords.view(), &rows).unwrap();
+        let nf = n as f64;
+        let center_band = 5.0 * sd * (2.0 / nf).sqrt();
+        assert!((fit.center()[0] - 1.0e3).abs() < center_band, "{:?}", fit.center());
+        assert!((fit.center()[1] + 2.0e3).abs() < center_band, "{:?}", fit.center());
+        assert!((fit.radius() - 2.0).abs() < 5.0 * sd / nf.sqrt(), "R={}", fit.radius());
+        assert!(
+            (fit.noise_variance() - sd * sd).abs() < 5.0 * sd * sd / nf.sqrt(),
+            "s={}",
+            fit.noise_variance()
+        );
+    }
+
+    /// Three points lie on one circle, so the fit sits on the variance floor
+    /// and passes through every point within one fitted noise SD.
+    #[test]
+    fn circular_gaussian_fit_of_three_points_is_their_circumcircle() {
+        let points = [[0.3, -1.2], [2.1, 0.4], [-0.7, 1.9]];
+        let coords = coordinate_matrix(&points);
+        let fit = CircularGaussianFit2d::fit(coords.view(), &[0, 1, 2]).unwrap();
+        let noise_sd = fit.noise_variance().sqrt();
+        for point in points {
+            let residual =
+                (point[0] - fit.center()[0]).hypot(point[1] - fit.center()[1]) - fit.radius();
+            assert!(residual.abs() <= noise_sd, "residual {residual} vs sd {noise_sd}");
+        }
+    }
+
+    /// When the fourth-order test puts the maximum on `R = 0`, the fit is the
+    /// closed-form isotropic Gaussian: the sample mean and half the mean
+    /// squared distance from it.
+    #[test]
+    fn circular_gaussian_fit_resolves_the_zero_radius_boundary_in_closed_form() {
+        let points: Vec<[f64; 2]> = splitmix_normal_pairs(2, 2000)
+            .into_iter()
+            .map(|normal| [3.0 + normal[0], -2.0 + normal[1]])
+            .collect();
+        let coords = coordinate_matrix(&points);
+        let rows = (0..points.len()).collect::<Vec<_>>();
+        let fit = CircularGaussianFit2d::fit(coords.view(), &rows).unwrap();
+        assert_eq!(fit.radius(), 0.0);
+        let nf = points.len() as f64;
+        let mean = [
+            points.iter().map(|point| point[0]).sum::<f64>() / nf,
+            points.iter().map(|point| point[1]).sum::<f64>() / nf,
+        ];
+        let half_mean_square = 0.5
+            * points
+                .iter()
+                .map(|point| (point[0] - mean[0]).powi(2) + (point[1] - mean[1]).powi(2))
+                .sum::<f64>()
+            / nf;
+        // Both sides are sums of `n` terms of size `O(1)` formed in different
+        // charts; their rounding is `γ_n` of the absolute sums.
+        let band = gam_linalg::roundoff::accumulation_growth(4 * points.len()) * 5.0;
+        assert!((fit.center()[0] - mean[0]).abs() <= band, "{:?} vs {mean:?}", fit.center());
+        assert!((fit.center()[1] - mean[1]).abs() <= band, "{:?} vs {mean:?}", fit.center());
+        assert!(
+            (fit.noise_variance() - half_mean_square).abs() <= band,
+            "{} vs {half_mean_square}",
+            fit.noise_variance()
+        );
+    }
+
+    /// Data at two locations lie on a one-parameter family of zero-residual
+    /// circles, so no maximizer is resolvable; the fit says so instead of
+    /// returning a floor artifact.
+    #[test]
+    fn circular_gaussian_fit_refuses_two_locations() {
+        let points = [[0.5, 0.5], [0.5, 0.5], [1.5, -0.25], [0.5, 0.5], [1.5, -0.25]];
+        let coords = coordinate_matrix(&points);
+        let error = CircularGaussianFit2d::fit(coords.view(), &[0, 1, 2, 3, 4])
+            .expect_err("two locations do not determine a circle");
+        assert!(error.contains("three or more distinct locations"), "{error}");
     }
 
     #[test]
