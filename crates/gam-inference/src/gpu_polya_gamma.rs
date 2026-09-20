@@ -380,8 +380,8 @@ pub(crate) fn draw_batch(input: PolyaGammaBatchInput<'_>) -> Result<Array1<f64>,
     } else {
         gam_gpu::GpuEligibility::BackendNotCompiled
     };
-    let decision = gam_gpu::decide(gam_gpu::GpuKernel::PolyaGammaBatch, eligibility)
-        .map_err(String::from)?;
+    let decision =
+        gam_gpu::decide(gam_gpu::GpuKernel::PolyaGammaBatch, eligibility).map_err(String::from)?;
     decision.clone().log();
     decision.require_supported()?;
 
