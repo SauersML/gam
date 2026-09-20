@@ -175,6 +175,7 @@ use faer::sparse::{SparseColMat, SymbolicSparseColMat};
 use gam_linalg::packed_symmetric_spectrum::{
     packed_symmetric_spectrum_with_probe, packed_upper_len, packed_upper_row_offset,
 };
+use gam_math::quadrature::symmetric_tridiagonal_eigen_first_components;
 use gam_math::score_opt::{
     AffineRemlProfile, ScoreJet, certified_ln_positive,
 };
@@ -1211,7 +1212,7 @@ struct CascadeSpectralMode {
 ///
 /// See [`Core::schur_lanczos`]. `alpha` and `beta` are `T_m`'s diagonal and
 /// off-diagonal, with `beta.len() == alpha.len() - 1` whenever `alpha` is
-/// non-empty, which is the shape [`symmetric_tridiagonal_eigen`] reads.
+/// non-empty, which is the shape [`symmetric_tridiagonal_eigen_first_components`] reads.
 struct SchurLanczos {
     /// `alpha_1..alpha_m` — the diagonal of `T_m`.
     alpha: Vec<f64>,
@@ -2311,7 +2312,8 @@ impl Core {
                 start_norm_sq,
                 ..
             } = self.schur_lanczos(null_chol, &probe_vector, steps, rank)?;
-            let (eigenvalues, first_components) = symmetric_tridiagonal_eigen(&alpha, &beta)?;
+            let (eigenvalues, first_components) =
+                symmetric_tridiagonal_eigen_first_components(&alpha, &beta)?;
             let scale = eigenvalues
                 .iter()
                 .copied()
@@ -2433,7 +2435,7 @@ impl Core {
         measure_mass: f64,
     ) -> Result<ResidualGaussRule, String> {
         let steps = steps.min(run.alpha.len());
-        let (ritz, first_components) = symmetric_tridiagonal_eigen(
+        let (ritz, first_components) = symmetric_tridiagonal_eigen_first_components(
             &run.alpha[..steps],
             &run.beta[..steps.saturating_sub(1)],
         )?;
@@ -3252,7 +3254,7 @@ impl Core {
                 }
             }
             beta.truncate(alpha.len().saturating_sub(1));
-            let (theta, tau) = symmetric_tridiagonal_eigen(&alpha, &beta)?;
+            let (theta, tau) = symmetric_tridiagonal_eigen_first_components(&alpha, &beta)?;
             let mut quad = 0.0;
             for (&t, &w0) in theta.iter().zip(tau.iter()) {
                 // A Ritz value of an SPD operator is positive; a non-positive one
@@ -3411,81 +3413,6 @@ impl Core {
         }
         r
     }
-}
-
-// ──────────────────── symmetric tridiagonal eigensolver ─────────────────────
-
-/// Eigenvalues and FIRST eigenvector components of a symmetric tridiagonal
-/// matrix (diag `d`, off-diagonal `e`), by implicit-shift QL with the
-/// first-row vector carried through the rotations — exactly what Lanczos
-/// quadrature needs.
-fn symmetric_tridiagonal_eigen(d: &[f64], e: &[f64]) -> Result<(Vec<f64>, Vec<f64>), String> {
-    let n = d.len();
-    if n == 0 {
-        return Ok((Vec::new(), Vec::new()));
-    }
-    let mut diag = d.to_vec();
-    let mut off = vec![0.0; n];
-    off[..n - 1].copy_from_slice(&e[..n - 1]);
-    let mut first = vec![0.0; n];
-    first[0] = 1.0;
-    for l in 0..n {
-        let mut iter = 0;
-        loop {
-            // Find a negligible off-diagonal to split at.
-            let mut msplit = n - 1;
-            for mm in l..n - 1 {
-                let dd = diag[mm].abs() + diag[mm + 1].abs();
-                if off[mm].abs() <= f64::EPSILON * dd {
-                    msplit = mm;
-                    break;
-                }
-            }
-            if msplit == l {
-                break;
-            }
-            iter += 1;
-            if iter > 60 {
-                return Err("residual cascade: tridiagonal QL failed to converge".into());
-            }
-            let mut g = (diag[l + 1] - diag[l]) / (2.0 * off[l]);
-            let mut r = g.hypot(1.0);
-            g = diag[msplit] - diag[l] + off[l] / (g + r.copysign(g));
-            let (mut s, mut c) = (1.0, 1.0);
-            let mut p = 0.0;
-            let mut broke_early = false;
-            for i in (l..msplit).rev() {
-                let mut f = s * off[i];
-                let b = c * off[i];
-                r = f.hypot(g);
-                off[i + 1] = r;
-                if r == 0.0 {
-                    diag[i + 1] -= p;
-                    off[msplit] = 0.0;
-                    broke_early = true;
-                    break;
-                }
-                s = f / r;
-                c = g / r;
-                g = diag[i + 1] - p;
-                r = (diag[i] - g) * s + 2.0 * c * b;
-                p = s * r;
-                diag[i + 1] = g + p;
-                g = c * r - b;
-                // Carry the first-row eigenvector components.
-                f = first[i + 1];
-                first[i + 1] = s * first[i] + c * f;
-                first[i] = c * first[i] - s * f;
-            }
-            if broke_early {
-                continue;
-            }
-            diag[l] -= p;
-            off[l] = g;
-            off[msplit] = 0.0;
-        }
-    }
-    Ok((diag, first))
 }
 
 // ───────────────────────────── net construction ─────────────────────────────
@@ -8046,7 +7973,8 @@ mod refinement_decision_tests {
         // The same run, with ONLY the eigenvalue floor — what the weight floor is
         // being charged against.
         let (ritz, first) =
-            symmetric_tridiagonal_eigen(&run.alpha, &run.beta[..steps - 1]).expect("eigen");
+            symmetric_tridiagonal_eigen_first_components(&run.alpha, &run.beta[..steps - 1])
+                .expect("eigen");
         let scale = ritz.iter().copied().map(f64::abs).fold(0.0, f64::max);
         let eigenvalue_floor = f64::EPSILON * steps as f64 * scale;
         let mut eigenvalue = Vec::with_capacity(steps);

@@ -122,7 +122,7 @@ const QL_SWEEPS_PER_DIMENSION: usize = 30;
 /// `Q[0, i]` in matching (not necessarily sorted) order.  This is precisely the
 /// spectral information used by Golub-Welsch and Lanczos quadrature: it is
 /// [`symmetric_tridiagonal_eigen_with_probe`] with the probe `e₁`.
-pub(crate) fn symmetric_tridiagonal_eigen_first_components(
+pub fn symmetric_tridiagonal_eigen_first_components(
     diagonal: &[f64],
     off_diagonal: &[f64],
 ) -> Result<(Vec<f64>, Vec<f64>), QuadratureError> {
