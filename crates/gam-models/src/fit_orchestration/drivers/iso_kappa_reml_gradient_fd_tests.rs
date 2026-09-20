@@ -3487,6 +3487,7 @@ fn assert_production_kappa_route_psi_gradient_matches_its_value(
         family,
         &fit_opts,
         &kappa_options,
+        None,
     )
     .unwrap_or_else(|e| panic!("{label}: incumbent failed: {e:?}"))
     else {

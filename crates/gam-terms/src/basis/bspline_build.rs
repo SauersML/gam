@@ -1611,19 +1611,14 @@ pub(crate) fn project_penalty_to_psd_cone(matrix: &Array2<f64>) -> Array2<f64> {
     if min_ev >= 0.0 {
         return sym;
     }
-    let mut clamped = sym.clone();
-    for i in 0..n {
-        for j in 0..n {
-            let mut acc = 0.0_f64;
-            for k in 0..evals.len() {
-                let lam = evals[k];
-                if lam > 0.0 {
-                    acc += lam * evecs[[i, k]] * evecs[[j, k]];
-                }
-            }
-            clamped[[i, j]] = acc;
-        }
+    // `Σ_{λ_k > 0} λ_k v_k v_kᵀ` as one GEMM over the kept eigenvectors.
+    let kept: Vec<usize> = (0..evals.len()).filter(|&k| evals[k] > 0.0).collect();
+    let kept_vecs = evecs.select(ndarray::Axis(1), &kept);
+    let mut weighted = kept_vecs.clone();
+    for (mut column, &k) in weighted.columns_mut().into_iter().zip(&kept) {
+        column *= evals[k];
     }
+    let mut clamped = gam_linalg::faer_ndarray::fast_ab(&weighted, &kept_vecs.t());
     // Final symmetrize to wipe any reconstruction asymmetry at the noise floor.
     for i in 0..n {
         for j in 0..i {
@@ -4344,5 +4339,54 @@ mod anchor_offset_tests {
             max_abs < 1e-9,
             "min-norm offset should be orthogonal to Z, got {max_abs}"
         );
+    }
+}
+
+#[cfg(test)]
+mod psd_cone_projection_tests {
+    use super::project_penalty_to_psd_cone;
+    use gam_linalg::faer_ndarray::FaerEigh;
+    use ndarray::Array2;
+
+    /// The cone projection keeps exactly the positive part of the spectrum:
+    /// `Σ_{λ_k > 0} λ_k v_k v_kᵀ`. Build a symmetric matrix with a known
+    /// eigenbasis and two negative eigenvalues, and check the projection is the
+    /// positive-part reconstruction, symmetric, and leaves a PSD input unchanged.
+    #[test]
+    fn keeps_exactly_the_positive_spectrum() {
+        let n = 7;
+        let seed = Array2::from_shape_fn((n, n), |(i, j)| {
+            ((i * 13 + j * 7) % 11) as f64 - 5.0 + if i == j { 3.0 } else { 0.0 }
+        });
+        let (_, basis) = FaerEigh::eigh(&(&seed + &seed.t()), faer::Side::Lower).unwrap();
+        let spectrum = [4.0, 2.5, 1.0, 0.5, 0.0, -0.3, -1.2];
+        let build = |values: &[f64]| {
+            let mut out = Array2::<f64>::zeros((n, n));
+            for (k, &value) in values.iter().enumerate() {
+                let v = basis.column(k);
+                for i in 0..n {
+                    for j in 0..n {
+                        out[[i, j]] += value * v[i] * v[j];
+                    }
+                }
+            }
+            out
+        };
+        let indefinite = build(&spectrum);
+        let expected = build(&spectrum.map(|value: f64| value.max(0.0)));
+        let projected = project_penalty_to_psd_cone(&indefinite);
+        for (got, want) in projected.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+        }
+        for i in 0..n {
+            for j in 0..n {
+                assert_eq!(projected[[i, j]], projected[[j, i]]);
+            }
+        }
+        let psd = build(&[3.0, 2.0, 1.0, 1.0, 0.5, 0.25, 0.1]);
+        let sym = (&psd + &psd.t()) * 0.5;
+        for (got, want) in project_penalty_to_psd_cone(&psd).iter().zip(sym.iter()) {
+            assert!((got - want).abs() < 1e-14, "{got} vs {want}");
+        }
     }
 }
