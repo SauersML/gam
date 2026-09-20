@@ -664,7 +664,7 @@ impl LatentCoordDesignDerivative {
                 None,
                 Some(&coeffs),
                 None,
-            )
+            )?
             .amplification;
             (
                 RadialScalarKind::Duchon {
@@ -690,7 +690,7 @@ impl LatentCoordDesignDerivative {
                 None,
                 None,
                 Some(&pure_poly_coeff),
-            )
+            )?
             .amplification;
             (
                 RadialScalarKind::PureDuchon {
@@ -3488,8 +3488,9 @@ impl ImplicitDesignPsiDerivative {
 /// The kernel chart a design ψ-derivative builder must differentiate under
 /// (gam#979): the amplitude `scale` the forward basis multiplies into the
 /// kernel block, and the center pair whose kernel magnitude defines it.
-/// `scale == 1.0` is the identity chart (Matérn, thin-plate, sphere, and any
-/// Duchon block whose kernel did not underflow).
+/// `reference_pair == None` is a ψ-constant chart (the identity chart of
+/// Matérn, thin-plate and sphere, or the degenerate all-zero Duchon block);
+/// every other Duchon block is charted to `1/max|K_CC|` (gam#3556).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DesignKernelChart {
     pub scale: f64,
@@ -3535,14 +3536,13 @@ pub(crate) fn design_chart_jets(
     per_axis: bool,
     share_c: f64,
 ) -> Result<Option<DesignChartJets>, BasisError> {
-    if chart.scale == 1.0 {
-        return Ok(None);
-    }
+    // The chart's ψ-dependence lives entirely in its reference pair: a chart
+    // without one (the identity chart of Matérn / thin-plate / sphere, or the
+    // degenerate all-zero Duchon block) has a ψ-constant scale. The scale value
+    // itself is never the test — an unconditional Duchon chart (gam#3556) can
+    // land on exactly `1.0` and still move with ψ.
     let Some((i, j)) = chart.reference_pair else {
-        return Err(BasisError::InvalidInput(format!(
-            "design kernel chart is amplified (scale={}) but names no reference center pair",
-            chart.scale
-        )));
+        return Ok(None);
     };
     let dim = centers.ncols();
     let metric =

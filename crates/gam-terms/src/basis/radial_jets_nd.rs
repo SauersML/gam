@@ -509,7 +509,7 @@ pub fn duchon_sae_atom_basis_with_jet(
         None,
         None,
         Some(&pure_poly_coeff),
-    );
+    )?;
 
     // Forward radial kernel block `(Φ_radial · α) · Z`.
     let n_rows = t.nrows();
@@ -645,7 +645,7 @@ pub fn duchon_sae_atom_jet_ball_bound(
         None,
         None,
         Some(&pure_poly_coeff),
-    );
+    )?;
     let (c, p) = (pure_poly_coeff.c, pure_poly_coeff.power);
     // `(e, a, b)` of each radial term, `r^e (a + b ln r)`, for the kernel `φ`, `φ'`,
     // `φ''`, `φ'/r`, `β = (φ'' − φ'/r)/r` and `φ''' − 3β`.
@@ -794,7 +794,7 @@ pub fn duchon_sae_atom_penalty(
         None,
         None,
         Some(&pure_poly_coeff),
-    );
+    )?;
     // Center-to-center reproducing kernel Gram `K_CC[i,j] = φ(|c_i − c_j|)`.
     let n_centers = centers.nrows();
     let mut k_cc = Array2::<f64>::zeros((n_centers, n_centers));
@@ -867,7 +867,7 @@ pub fn duchon_sae_atom_second_jet(
         None,
         None,
         Some(&pure_poly_coeff),
-    );
+    )?;
 
     let n_rows = t.nrows();
 
@@ -1009,7 +1009,7 @@ pub fn duchon_sae_atom_third_jet(
         None,
         None,
         Some(&pure_poly_coeff),
-    );
+    )?;
 
     let n_rows = t.nrows();
     let poly_block_t_cols = polynomial_block_from_order(t, effective_order).ncols();
@@ -1269,7 +1269,7 @@ pub fn build_duchon_basis_design_and_jets(
             None,
             coeffs.as_ref(),
             pure_poly_coeff.as_ref(),
-        )
+        )?
     };
 
     // --------------------------------------------------- radial value block

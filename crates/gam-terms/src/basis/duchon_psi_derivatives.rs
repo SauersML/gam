@@ -1421,7 +1421,7 @@ pub(crate) fn build_duchon_design_psi_derivativeswithworkspace(
         spec.aniso_log_scales.as_deref(),
         Some(&coeffs),
         None,
-    )
+    )?
     .design_chart();
     build_scalar_design_psi_derivatives_shared(
         data,
@@ -1520,7 +1520,7 @@ pub fn build_duchon_basis_log_kappa_aniso_derivativeswith_collocationwithworkspa
         Some(eta.as_slice()),
         Some(&coeffs),
         None,
-    )
+    )?
     .design_chart();
     let mut result = build_aniso_design_psi_derivatives_shared(
         data,
@@ -1683,23 +1683,8 @@ pub fn build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
     })
 }
 
-/// Multiplicative amplification factor that lifts an underflowing Duchon
-/// kernel back into a representable range. Probes max|K_CC| (the kernel at
-/// every center pair) and returns `1/max` when the kernel collapses to the
-/// double-precision noise floor; otherwise returns `1.0`.
-///
-/// **Why**: in high d with a small length scale the spectral normalization
-/// `c = κ^{d/2-n} / ((2π)^{d/2}·2^{n-1}·Γ(n))` of the Matérn block is `~1e-14`,
-/// driving every `K(r) = c · r^ν · K_ν(κr)` to `~1e-16`. Downstream
-/// `B^T B` is then at `~1e-32` — below `eps²` — and the spectral frame
-/// truncates everything as noise, even though the basis is mathematically
-/// well-defined.
-///
-/// Rescaling the basis by α = 1/max|K_CC| produces the same predictions
-/// (β rescales by α, REML's λ adapts). Since the probe is computed from
-/// `centers + kernel parameters` which are stored verbatim in
-/// `BasisMetadata::Duchon`, prediction recomputes an identical α — so
-/// fit-time and predict-time bases share a single coefficient frame.
+/// The kernel amplitude `α = 1/max|K_CC|` every realized Duchon kernel block is
+/// charted to (gam#979, gam#3556). See [`duchon_kernel_chart`].
 pub(crate) fn duchon_kernel_amplification(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
@@ -1709,8 +1694,8 @@ pub(crate) fn duchon_kernel_amplification(
     aniso_log_scales: Option<&[f64]>,
     coeffs: Option<&DuchonPartialFractionCoeffs>,
     pure_poly_coeff: Option<&PolyharmonicBlockCoeff>,
-) -> f64 {
-    duchon_kernel_chart(
+) -> Result<f64, BasisError> {
+    Ok(duchon_kernel_chart(
         centers,
         length_scale,
         p_order,
@@ -1719,28 +1704,53 @@ pub(crate) fn duchon_kernel_amplification(
         aniso_log_scales,
         coeffs,
         pure_poly_coeff,
-    )
-    .amplification
+    )?
+    .amplification)
 }
 
-/// The numerical chart of one realized Duchon kernel block (gam#979).
+/// The numerical chart of one realized Duchon kernel block (gam#979, gam#3556).
 ///
-/// [`duchon_kernel_amplification`] is the amplitude `α` the forward basis
-/// multiplies into every kernel value; `α` is `1/|K(r*)|` at the center pair
-/// `(i*, j*)` carrying the largest kernel magnitude whenever that magnitude
-/// has underflowed, and `1` otherwise. Because `K` moves with the length
-/// scale and the anisotropy, so does `α` — the design the criterion is built
-/// on is `α(ψ)·K(ψ)`, and a ψ-derivative of the design that differentiates
-/// `K` alone is a derivative of something the fit never evaluates. The
-/// derivative builders read the reference pair from here and form the exact
-/// ψ-jets of `ln α` from the SAME radial jets they use for every other pair,
-/// so the charted derivative is the derivative of the charted kernel.
+/// Every Duchon kernel block ships as `α·K`, with `α = 1/|K(r*)|` at the
+/// center pair `(i*, j*)` carrying the largest kernel magnitude over all
+/// center pairs, so the realized block has unit max-magnitude at every
+/// hyperparameter value.
+///
+/// **Why a chart at all**: in high d with a small length scale the spectral
+/// normalization `c = κ^{d/2-n} / ((2π)^{d/2}·2^{n-1}·Γ(n))` of the Matérn
+/// block is `~1e-14`, driving every `K(r)` to `~1e-16`; `B^T B` then sits
+/// below `eps²` and the spectral frame truncates a well-defined basis as
+/// noise. In low d the same normalization can be astronomically large.
+///
+/// **Why unconditionally** (gam#3556): an amplitude applied only below a
+/// cut-off makes the design jump by the factor `1/max|K_CC|` the instant the
+/// length scale or anisotropy carries `max|K_CC|` across the cut-off — a
+/// discontinuous `2 ln α` shift of the effective `log λ` inside the outer
+/// optimization. With `α` defined on every chart the realized block is a
+/// continuous function of ψ; the only non-smooth points are where the argmax
+/// pair switches, and there `α` is still continuous (the two pairs carry the
+/// same magnitude).
+///
+/// Rescaling the basis by `α` yields the same fitted function (β rescales by
+/// `1/α`, REML's λ adapts). Since `α` is computed from `centers + kernel
+/// parameters`, which are stored verbatim in `BasisMetadata::Duchon`,
+/// prediction recomputes an identical `α` — so fit-time and predict-time bases
+/// share one coefficient frame. Because `K` moves with the length scale and the
+/// anisotropy, so does `α`: the derivative builders read the reference pair
+/// from here and form the exact ψ-jets of `ln α` from the SAME radial jets they
+/// use for every other pair (`design_chart_jets`), so the charted derivative
+/// is the derivative of the charted kernel.
+///
+/// The only chart without a reference pair is the degenerate one whose kernel
+/// vanishes at every center pair (e.g. a single center under a pure
+/// polyharmonic kernel, `K(0) = 0`): there is no magnitude to normalize and
+/// the block is used as-is (`α = 1`). Any kernel evaluation failure, and any
+/// non-finite kernel magnitude, is an error — never a skipped pair.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DuchonKernelChart {
-    /// `α`: `1/|K(r*)|` when amplified, `1.0` otherwise.
+    /// `α = 1/|K(r*)|`, or `1.0` for the degenerate all-zero kernel block.
     pub(crate) amplification: f64,
     /// The `(i*, j*)` center pair whose kernel magnitude defines `α`; `None`
-    /// when the chart is not amplified (`amplification == 1.0`).
+    /// only for the degenerate all-zero kernel block.
     pub(crate) reference_pair: Option<(usize, usize)>,
 }
 
@@ -1767,17 +1777,15 @@ pub(crate) fn duchon_kernel_chart(
     aniso_log_scales: Option<&[f64]>,
     coeffs: Option<&DuchonPartialFractionCoeffs>,
     pure_poly_coeff: Option<&PolyharmonicBlockCoeff>,
-) -> DuchonKernelChart {
+) -> Result<DuchonKernelChart, BasisError> {
     let k = centers.nrows();
     if k == 0 {
-        return DuchonKernelChart::IDENTITY;
+        return Ok(DuchonKernelChart::IDENTITY);
     }
     let axis_scales = aniso_log_scales.map(aniso_axis_scales);
     // One bound evaluator for the whole k² sweep (the chart is rebuilt for
     // every κ trial).
-    let hybrid = duchon_hybrid_evaluator(length_scale, p_order, s_order, d)
-        .ok()
-        .flatten();
+    let hybrid = duchon_hybrid_evaluator(length_scale, p_order, s_order, d)?;
     let mut max_abs = 0.0_f64;
     let mut reference_pair = None;
     for i in 0..k {
@@ -1790,40 +1798,42 @@ pub(crate) fn duchon_kernel_chart(
             let val = if let Some(ppc) = pure_poly_coeff {
                 ppc.eval(r)
             } else if let Some(hybrid) = hybrid.as_ref() {
-                match hybrid.value(r) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                }
+                hybrid.value(r)?
             } else {
-                match duchon_matern_kernel_general_from_distance(
+                duchon_matern_kernel_general_from_distance(
                     r,
                     length_scale,
                     p_order,
                     s_order,
                     d,
                     coeffs,
-                ) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                }
+                )?
             };
+            if !val.is_finite() {
+                crate::bail_invalid_basis!(
+                    "Duchon kernel chart: non-finite kernel value {val} at center pair \
+                     ({i}, {j}), distance {r}"
+                );
+            }
             if val.abs() > max_abs {
                 max_abs = val.abs();
                 reference_pair = Some((i, j));
             }
         }
     }
-    // Only amplify when the kernel has underflowed. The 1e-10 threshold is
-    // well above any meaningful smoothing-relevant kernel scale yet far from
-    // 1.0, so well-conditioned kernels pass through unchanged (α = 1).
-    if max_abs > 0.0 && max_abs < 1e-10 {
-        DuchonKernelChart {
-            amplification: 1.0 / max_abs,
-            reference_pair,
-        }
-    } else {
-        DuchonKernelChart::IDENTITY
+    if max_abs == 0.0 {
+        return Ok(DuchonKernelChart::IDENTITY);
     }
+    let amplification = 1.0 / max_abs;
+    if !amplification.is_finite() {
+        crate::bail_invalid_basis!(
+            "Duchon kernel chart: max|K_CC| = {max_abs:e} has no finite reciprocal"
+        );
+    }
+    Ok(DuchonKernelChart {
+        amplification,
+        reference_pair,
+    })
 }
 
 /// Scalar kernel amplification `α` that [`build_duchon_basis`] applies to the
@@ -1846,10 +1856,10 @@ pub fn duchon_pure_kernel_amplification(
     centers: ArrayView2<'_, f64>,
     order: DuchonNullspaceOrder,
     power: f64,
-) -> f64 {
+) -> Result<f64, BasisError> {
     let dim = centers.ncols();
     if dim == 0 || centers.nrows() == 0 {
-        return 1.0;
+        return Ok(1.0);
     }
     let effective_order = duchon_effective_nullspace_order(centers, order);
     let p_order = duchon_p_from_nullspace_order(effective_order);
@@ -2022,7 +2032,7 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
         aniso_log_scales,
         coeffs.as_ref(),
         pure_poly_coeff.as_ref(),
-    );
+    )?;
     // Certified radial value profile for the hybrid path (#979): one exact
     // hybrid-Duchon kernel value costs microseconds across its
     // partial-fraction blocks, and this n·k materialization loop runs on
@@ -2344,7 +2354,7 @@ pub fn create_duchon_basis_1d_derivative_dense_with_radial_reparam(
         None,
         None,
         Some(&pure_coeff),
-    );
+    )?;
 
     let mut raw_kernel = Array2::<f64>::zeros((t.len(), centers.len()));
     for i in 0..t.len() {

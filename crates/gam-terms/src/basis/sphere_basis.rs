@@ -2062,7 +2062,7 @@ pub(crate) fn build_duchon_operator_penalty_psi_derivatives_in_directions(
         None,
         Some(&coeffs),
         None,
-    );
+    )?;
     let kernel_amplification = kernel_chart.amplification;
     let amp2 = kernel_amplification * kernel_amplification;
     // The amplitude multiplies the KERNEL block only. With a polynomial block
@@ -2730,7 +2730,7 @@ pub(crate) fn build_duchon_native_penalty_psi_derivatives_in_directions(
         spec.aniso_log_scales.as_deref(),
         Some(&coeffs),
         None,
-    );
+    )?;
     let aniso = spec.aniso_log_scales.as_deref();
     let axis_scales = aniso.map(aniso_axis_scales);
     let n_centers = centers.nrows();

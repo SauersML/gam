@@ -139,7 +139,8 @@ pub fn latent_input_location_jet(
                 centers,
                 resolved_nullspace,
                 resolved_power as f64,
-            );
+            )
+            .map_err(|e| e.to_string())?;
             let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
             for axis in 0..dim {
                 let projected = radial_jet.index_axis(Axis(2), axis).dot(&radial_transform);

@@ -14,9 +14,11 @@
 //!
 //! The gate differences the FORWARD design the basis actually ships, through
 //! its own frozen chart, against the operator's materialized first and second
-//! ψ-derivatives. The low-dimensional control has `α = 1` and pins that the
-//! chart is inert there; the 16-D fixture asserts `α ≠ 1` so it cannot pass
-//! vacuously.
+//! ψ-derivatives. Since gam#3556 every Duchon block is charted (`α` is never
+//! gated on an underflow cut-off), so the low-dimensional control pins the
+//! same jets on a kernel whose raw scale sits well above the historical
+//! cut-off, and the 3556 gate pins that the shipped design and penalties are
+//! continuous in ψ where the raw kernel crosses that cut-off.
 
 #![cfg(test)]
 
@@ -120,6 +122,7 @@ fn chart_amplification(data: ArrayView2<'_, f64>, spec: &DuchonBasisSpec) -> f64
         Some(&coeffs),
         None,
     )
+    .expect("Duchon kernel chart")
     .amplification
 }
 
@@ -143,8 +146,8 @@ use ndarray::s;
 // quadratures now carry the chart amplitude `α` like the design does, and
 // `build_duchon_operator_penalty_psi_derivatives` mirrors it. The gate
 // differences the forward's NORMALIZED penalties along ψ against the analytic
-// normalized first jets, per penalty source, at the benchmark shape (α ≫ 1)
-// and at the 3-D sibling (α = 1).
+// normalized first jets, per penalty source, at the benchmark shape (raw
+// kernel underflowing, α ≫ 1) and at the 3-D sibling (raw kernel well-scaled).
 // ---------------------------------------------------------------------------
 
 fn fixture_collocation_points(data: ArrayView2<'_, f64>, spec: &DuchonBasisSpec) -> Array2<f64> {
@@ -205,7 +208,8 @@ fn mass_reconstruction(
         None,
         Some(&coeffs),
         None,
-    );
+    )
+    .expect("Duchon kernel amplification");
     let mut workspace = BasisWorkspace::default();
     let z = duchon_frozen_radial_chart(
         kernel_constraint_nullspace(centers.view(), order, &mut workspace.cache)
@@ -479,12 +483,130 @@ fn duchon_operator_penalty_psi_jets_match_the_forward_16d_linear_power9() {
     assert_operator_penalty_gaps(&gaps, "opers_16d_linear_power9");
 }
 
-/// The un-amplified sibling: the same jets with `α = 1`, so a gap here is a
-/// formula gap and not a scale one.
+/// The well-scaled sibling: the same jets on a raw kernel far above the
+/// historical underflow cut-off, so a gap here is a formula gap and not a
+/// scale one.
 #[test]
 fn duchon_operator_penalty_psi_jets_match_the_forward_3d_order0_power9() {
     let (data, spec) = frozen_hybrid_fixture(3, 160, 10, DuchonNullspaceOrder::Zero, 9.0);
-    assert_eq!(chart_amplification(data.view(), &spec), 1.0, "3-D order-0 power-9 is not amplified");
+    assert!(
+        1.0 / chart_amplification(data.view(), &spec) > OLD_UNDERFLOW_CUTOFF,
+        "3-D order-0 power-9 must sit above the historical underflow cut-off"
+    );
     let gaps = operator_penalty_gaps(data.view(), &spec, "opers_3d_order0_power9");
     assert_operator_penalty_gaps(&gaps, "opers_3d_order0_power9");
+}
+
+// ---------------------------------------------------------------------------
+// gam#3556 — the chart is continuous in ψ.
+//
+// The historical rule charted the block only while `max|K_CC| < 1e-10` and
+// shipped the raw kernel otherwise, so the realized design jumped by the factor
+// `1/max|K_CC|` (≈ 1e10) — a `2 ln α` step in the effective `log λ` — at the ψ
+// where the raw kernel crossed the cut-off, and the non-uniform operator
+// penalties (null space `Linear` and above) jumped with it. The gate locates
+// that crossing ψ₀ for a frozen fixture and compares the realized design and
+// every active penalty across it against the same-width differences on either
+// side: a continuous build moves by `≈ h·|∂M/∂ψ|` over each of the three
+// intervals, a jump puts an `O(|M|)` step into the middle one only.
+// ---------------------------------------------------------------------------
+
+/// The cut-off below which the pre-gam#3556 rule charted the kernel block.
+const OLD_UNDERFLOW_CUTOFF: f64 = 1e-10;
+
+/// `ln max|K_CC| − ln(cut-off)` at ψ: positive while the raw kernel sits above
+/// the historical cut-off.
+fn log_raw_scale_above_cutoff(data: ArrayView2<'_, f64>, spec: &DuchonBasisSpec, psi: f64) -> f64 {
+    -chart_amplification(data, &spec_at_psi(spec, psi)).ln() - OLD_UNDERFLOW_CUTOFF.ln()
+}
+
+/// The realized design and active penalties (by source) at ψ.
+fn realized_at_psi(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    psi: f64,
+) -> Vec<(String, Array2<f64>)> {
+    let built = build_duchon_basis(data, &spec_at_psi(spec, psi)).expect("frozen build");
+    let mut out = vec![("design".to_string(), built.design.to_dense())];
+    out.extend(
+        built
+            .active_penalties
+            .iter()
+            .map(|penalty| (format!("{:?}", penalty.info.source), penalty.matrix.clone())),
+    );
+    out
+}
+
+#[test]
+fn duchon_chart_design_and_penalties_are_continuous_across_the_old_cutoff_3556() {
+    // `Linear` so the operator-penalty Grams `[α·K·Z | P]ᵀ[α·K·Z | P]` are NOT
+    // uniform multiples of a ψ-independent matrix: under the old rule they
+    // jumped along with the design.
+    let (data, spec) = frozen_hybrid_fixture(3, 160, 10, DuchonNullspaceOrder::Linear, 9.0);
+    let side = |psi: f64| log_raw_scale_above_cutoff(data.view(), &spec, psi) > 0.0;
+
+    // Bracket the crossing by unit steps in ψ (the raw kernel scales like
+    // `κ^{d − 2(p+s)}`, a power law in `κ = e^ψ`), then bisect it.
+    let start_side = side(0.0);
+    let direction = if start_side { 1.0 } else { -1.0 };
+    let mut bracket = None;
+    let mut previous = 0.0_f64;
+    for step in 1..=64 {
+        let psi = direction * step as f64;
+        if side(psi) != start_side {
+            bracket = Some((previous, psi));
+            break;
+        }
+        previous = psi;
+    }
+    let (mut lo, mut hi) = bracket.expect("the raw kernel scale must cross the old cut-off in ψ");
+    let lo_side = side(lo);
+    for _ in 0..64 {
+        let mid = 0.5 * (lo + hi);
+        if side(mid) == lo_side {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let psi0 = 0.5 * (lo + hi);
+
+    let h = 1.0e-3;
+    let points: Vec<Vec<(String, Array2<f64>)>> = [-1.5, -0.5, 0.5, 1.5]
+        .iter()
+        .map(|&k| realized_at_psi(data.view(), &spec, psi0 + k * h))
+        .collect();
+    assert_ne!(
+        side(psi0 - 0.5 * h),
+        side(psi0 + 0.5 * h),
+        "the middle interval must straddle the old cut-off (ψ₀ = {psi0:.12})"
+    );
+    let names: Vec<&String> = points[0].iter().map(|(name, _)| name).collect();
+    for p in &points[1..] {
+        let other: Vec<&String> = p.iter().map(|(name, _)| name).collect();
+        assert_eq!(names, other, "the active penalty layout must not change across ψ₀");
+    }
+    assert!(
+        names.iter().any(|name| name.starts_with("Operator")),
+        "the fixture must realize non-uniform operator penalties: {names:?}"
+    );
+    for (index, name) in names.iter().enumerate() {
+        let m = |slot: usize| &points[slot][index].1;
+        let scale = frobenius(m(1)).max(frobenius(m(2)));
+        let left = frobenius(&(m(1) - m(0)));
+        let cross = frobenius(&(m(2) - m(1)));
+        let right = frobenius(&(m(3) - m(2)));
+        eprintln!(
+            "[3556] {name} psi0={psi0:.9} |M|={scale:.6e} left={left:.6e} cross={cross:.6e} right={right:.6e}"
+        );
+        // A continuously differentiable `M(ψ)` gives `cross` within `O(h²)`
+        // relative of the mean of its neighbours; `sqrt(ε)·|M|` is the floor
+        // below which a difference of two independent rebuilds is rounding.
+        // The historical jump was `O(|M|)` (the design: `≈ 1e10·|M|`).
+        assert!(
+            cross <= 1.01 * left.max(right) + f64::EPSILON.sqrt() * scale,
+            "{name} is discontinuous in ψ at the old cut-off ψ₀ = {psi0:.9}: \
+             |ΔM| across ψ₀ = {cross:.3e} vs {left:.3e} / {right:.3e} on either side (|M| = {scale:.3e})"
+        );
+    }
 }

@@ -701,7 +701,7 @@ fn build_duchon_basis_uncached(
             aniso.as_deref(),
             coeffs.as_ref(),
             pure_poly_coeff.as_ref(),
-        );
+        )?;
         // Build the same kernel evaluator for the raw-Gram pass and the final
         // operator.  The evaluator owns its anisotropic metric weights, so the
         // two streamed passes share the exact function without sharing mutable

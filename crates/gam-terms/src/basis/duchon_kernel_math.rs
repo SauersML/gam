@@ -162,7 +162,7 @@ pub(crate) fn build_duchon_collocation_operator_matriceswithworkspace(
         aniso_log_scales,
         coeffs.as_ref(),
         pure_poly_coeff.as_ref(),
-    );
+    )?;
     let row_scales = if let Some(w) = collocationweights {
         if w.len() != p_colloc {
             crate::bail_dim_basis!(

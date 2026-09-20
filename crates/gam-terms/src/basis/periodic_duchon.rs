@@ -1101,7 +1101,7 @@ pub(crate) fn build_periodic_duchon_basis_1d(
         None,
         coeffs.as_ref(),
         pure_poly_coeff.as_ref(),
-    );
+    )?;
     // Step 1: build the N×K raw kernel matrix in parallel (each row is
     // independent; no shared writes). Step 2: design[:, :kernel_cols] =
     // K @ z via fast_ab (BLAS), which beats a hand-rolled per-row matvec
@@ -1744,7 +1744,7 @@ pub(crate) fn duchon_center_kernel_value_matrix(
         aniso_log_scales,
         coeffs.as_ref(),
         pure_poly_coeff.as_ref(),
-    );
+    )?;
     let axis_scales = aniso_log_scales.map(aniso_axis_scales);
 
     // K_CC: kernel value at every center pair (anisotropic distance when set).
