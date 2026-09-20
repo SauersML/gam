@@ -92,6 +92,13 @@ pub enum JeffreysArmingEvidence {
         column_indices: Vec<usize>,
         min_signed_margin: f64,
     },
+    /// The Bernoulli marginal-slope pre-fit certificate found a threshold on
+    /// the latent score `z` that separates the binary outcomes, so the pooled
+    /// probit likelihood of `y` on `z` (the rigid pilot) has no finite mode.
+    PrefitLatentScoreSeparation {
+        threshold: f64,
+        positive_above_threshold: bool,
+    },
 }
 
 impl JeffreysArmingEvidence {
@@ -110,6 +117,15 @@ impl JeffreysArmingEvidence {
                 format!(
                     "separation: design column {column_index} puts every success {side} \
                      {threshold:.6e}"
+                )
+            }
+            Self::PrefitLatentScoreSeparation {
+                threshold,
+                positive_above_threshold,
+            } => {
+                let side = if *positive_above_threshold { "above" } else { "below" };
+                format!(
+                    "separation: the latent score puts every success {side} {threshold:.6e}"
                 )
             }
             Self::PrefitLinearSeparation {
@@ -178,6 +194,13 @@ impl crate::EstimationError {
             } => Some(JeffreysArmingEvidence::PrefitLinearSeparation {
                 column_indices: column_indices.clone(),
                 min_signed_margin: *min_signed_margin,
+            }),
+            Self::PrefitLatentScoreSeparationDetected {
+                threshold,
+                positive_above_threshold,
+            } => Some(JeffreysArmingEvidence::PrefitLatentScoreSeparation {
+                threshold: *threshold,
+                positive_above_threshold: *positive_above_threshold,
             }),
             Self::DominatedCertifiedPlateau {
                 terminal_refusal, ..

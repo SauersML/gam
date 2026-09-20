@@ -331,6 +331,7 @@ fn a_latched_block_correction_without_a_hessian_refuses_with_its_reason_784() {
         .block_correction_axis_orders
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(super::BlockQuadratureLatch {
+        block_positions: vec![0],
         pieces: vec![super::LatchedPieceRule::GaussHermite {
             axis_orders: vec![8],
             certified_axis_errors: vec![0.0],

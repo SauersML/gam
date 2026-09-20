@@ -1631,8 +1631,8 @@ pub(crate) struct OneBlockIdentityFamily;
 #[test]
 pub(crate) fn large_scale_shape_margslope_flex_cycle0_bounds_cg_by_the_dense_route_cost() {
     // p = 51, n = 320k: the dense route builds n·p² and factors p³/3 while one
-    // product streams 2·n·p, so the cycle-0 CG attempt hands the step to the dense
-    // route after 25 products, not after the historical 4·p = 204.
+    // product streams 2·n·p, so a step takes CG only when its iteration bound
+    // costs fewer than 25 products, not the historical 4·p = 204 (gam#3285).
     let total_p = 51;
     let total_n = 320_000;
     assert_eq!(JOINT_PCG_MAX_ITER_MULTIPLIER * total_p, 204);
@@ -4518,7 +4518,11 @@ fn outer_jeffreys_geometry_is_derivative_order_invariant() {
         .expect("Jeffreys term")
         .expect("active Jeffreys term");
     assert!(completion.is_some());
-    assert_eq!(information_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        information_calls.load(Ordering::Relaxed),
+        1,
+        "H_Phi and its second-order completion share one materialized information",
+    );
     assert_eq!(axis_batch_calls.load(Ordering::Relaxed), 1);
     assert_eq!(completion_calls.load(Ordering::Relaxed), 1);
 
@@ -4530,7 +4534,7 @@ fn outer_jeffreys_geometry_is_derivative_order_invariant() {
     );
     assert_eq!(
         information_calls.load(Ordering::Relaxed),
-        3,
+        2,
         "lazy drift construction must materialize the information matrix exactly once",
     );
     assert_eq!(
@@ -4791,7 +4795,6 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("completion")
     .expect("completion present");
@@ -4814,7 +4817,6 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("half-strength completion")
     .expect("half-strength completion present");
@@ -4826,10 +4828,9 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
     );
 }
 
-/// gam#1020: for an expected-information family without a contracted hook, exact
-/// assembly dispatches to the mathematically identical pairwise second-directional
-/// path. The contracted-only policy must decline because that family contract is
-/// absent.
+/// gam#1020: for an expected-information family without a contracted hook, the
+/// completion dispatches to the mathematically identical pairwise second-directional
+/// path.
 #[derive(Clone)]
 struct PairwiseJeffreysSeamFamily;
 
@@ -4896,7 +4897,6 @@ pub(crate) fn jeffreys_second_order_completion_exact_pairwise_when_hook_absent()
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("completion")
     .expect("completion present");
@@ -4919,20 +4919,6 @@ pub(crate) fn jeffreys_second_order_completion_exact_pairwise_when_hook_absent()
     assert!(
         completion.iter().any(|value| value.abs() > 0.0),
         "pairwise completion should be nonzero on this gated fixture"
-    );
-
-    let contracted_only = custom_family_joint_jeffreys_second_order_completion(
-        &family,
-        &states,
-        &specs,
-        &h_joint,
-        &z_joint,
-        JeffreysCompletionAssembly::Contracted,
-    )
-    .expect("contracted-only completion");
-    assert!(
-        contracted_only.is_none(),
-        "contracted-only assembly must decline when the family has no contracted hook"
     );
 }
 
@@ -5044,7 +5030,6 @@ pub(crate) fn jeffreys_second_order_completion_exact_contracts_span_directions_2
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("completion")
     .expect("completion present");
@@ -8112,15 +8097,10 @@ fn outer_jeffreys_hphi_drift_matches_a_central_difference_of_hphi_2765() {
 
     let hphi_at = |t: f64| -> Array2<f64> {
         let states = vec![jeffreys_seam_state(&beta + &(&direction * t))];
-        let (_, hphi, completion) =
-            custom_family_outer_jeffreys_hphi(&family, &states, &specs, &ranges)
-                .expect("Jeffreys term")
-                .expect("the small information keeps the conditioning gate active");
-        assert!(
-            completion.is_none(),
-            "this fixture declares no contracted-trace completion, so the drift it \
-             differences is the bare divided-difference H_Phi"
-        );
+        // The drift is `D_β H_Φ`; the mode-response completion does not enter it.
+        let (_, hphi, _) = custom_family_outer_jeffreys_hphi(&family, &states, &specs, &ranges)
+            .expect("Jeffreys term")
+            .expect("the small information keeps the conditioning gate active");
         hphi
     };
 

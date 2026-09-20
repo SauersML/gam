@@ -18,7 +18,7 @@ use crate::basis::{
     OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
     SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
     auto_spatial_center_strategy, count_unique_coordinate_rows, default_num_centers,
-    default_spatial_center_strategy, default_spherical_harmonic_degree,
+    default_spatial_center_strategy, provisioned_spherical_harmonic_degree,
     SPHERICAL_HARMONIC_MAX_DEGREE, penalized_resolution_rank,
     select_r_uniform_subsample_centers,
     starting_num_centers, thin_plate_penalty_order,
@@ -405,7 +405,7 @@ fn encoded_levels_for_column(ds: &Dataset, col: ColIdx) -> Vec<(u64, String)> {
 /// (radial center counts, spatial plans) must size from. A factor-by smooth
 /// expands into per-level blocks that each see ONLY their level's rows, so
 /// sizing the default from the pooled row count over-provisions every level —
-/// measured on the #1561 by-group location-scale fixture: `s(x, bs='tp',
+/// measured on the #1561 by-group location-scale fixture: `s(x, bs='tps',
 /// by=group)` at n=200 (100/group) got ~50 centers PER LEVEL, an
 /// ill-conditioned 100-column mean block whose truth-recovery floor (0.111)
 /// no λ could beat, while the same smooth sized for the level's own 100 rows
@@ -516,7 +516,7 @@ pub fn build_termspec(
     // constant all span it, and then the model keeps its intercept: the column
     // space is the one the formula asked for, the constant is the one free
     // direction, and every other direction keeps its default penalty. A
-    // genuine random effect (`group(g)`, `re(g)`) never spans it: its levels
+    // genuine random effect (`group(g)`) never spans it: its levels
     // are deviations with mean zero.
     let no_intercept = terms.iter().any(|t| matches!(t, ParsedTerm::NoIntercept));
     let is_categorical = |name: &str| {
@@ -672,7 +672,7 @@ pub fn build_termspec(
                     frozen_levels: None,
                     // Unseen-level policy is fixed by the wrapper the user wrote
                     // (`formula_dsl`): a genuine random effect
-                    // (`group(g)`/`re(g)`/`s(g, bs="re")`) shrinks a held-out
+                    // (`group(g)`/`s(g, bs="re")`) shrinks a held-out
                     // group to the population mean and so tolerates unseen
                     // levels; a fixed `factor(g)`, like a bare `+ g` categorical
                     // main effect, must reject an unseen level rather than
@@ -1423,7 +1423,7 @@ fn parse_option_list(raw: &str) -> Vec<String> {
     // Accept both the Python/JSON list form `[a, b]` and mgcv's R vector form
     // `c(a, b)` (and a bare `(a, b)`) as the bracketed wrapper around a
     // comma-separated option list. mgcv writes per-margin options as
-    // `bs=c('tp','tp')` / `m=c(2,2)`, so the `c(...)` form must round-trip
+    // `bs=c('tps','tps')` / `m=c(2,2)`, so the `c(...)` form must round-trip
     // through the same splitter the `[...]` form uses.
     let inner = trimmed
         .strip_prefix('[')
@@ -1676,14 +1676,14 @@ fn parse_periodic_axes(
         let boundary = parse_option_list(raw);
         if boundary.len() == dim {
             for (axis, value) in boundary.iter().enumerate() {
-                if matches!(value.as_str(), "periodic" | "cyclic" | "cc") {
+                if value == "periodic" {
                     axes[axis] = true;
                 }
             }
         } else if dim == 1
             && matches!(
                 boundary.first().map(String::as_str),
-                Some("periodic" | "cyclic" | "cc")
+                Some("periodic")
             )
         {
             axes[0] = true;
@@ -1820,7 +1820,7 @@ fn parse_period_origins(
 ///   repeated 0/1 value), and
 /// - `periodic=[0, 2, ...]` (axis indices that are periodic; others are not).
 ///
-/// `boundary=[..., "periodic"/"cyclic"/"cc", ...]` may also flip individual
+/// `boundary=[..., "periodic", ...]` may also flip individual
 /// axes on; non-matching tokens leave the existing flag unchanged.
 fn parse_tensor_periodic_axes(
     options: &BTreeMap<String, String>,
@@ -1895,31 +1895,31 @@ fn parse_tensor_periodic_axes(
         // A scalar token applies to every margin; `validate_tensor_boundary_tokens`
         // has already refused any other length (#2782).
         if boundary.len() == 1 {
-            if matches!(boundary[0].as_str(), "periodic" | "cyclic" | "cc") {
+            if boundary[0] == "periodic" {
                 axes.fill(true);
             }
         } else if boundary.len() == dim {
             for (axis, value) in boundary.iter().enumerate() {
-                if matches!(value.as_str(), "periodic" | "cyclic" | "cc") {
+                if value == "periodic" {
                     axes[axis] = true;
                 }
             }
         }
     }
-    // A per-margin basis vector (`bs=c('cc','ps')` / `type=[...]`) declares each
-    // margin's basis family, and a cyclic family (`cc`/`cp`/`cyclic`) makes THAT
-    // margin periodic — exactly as the 1-D `s(x, bs='cc')` smooth wraps its lone
-    // axis. Without this, the per-margin `cc` token was validated but discarded:
-    // every `bs=c(...)` spelling collapsed to the same open B-spline tensor
-    // (#1752). Only honor the vector form here; a scalar `bs='cc'` on a tensor is
-    // ambiguous about which margins wrap, so it does not flip any axis on.
-    if let Some(raw) = options.get("bs").or_else(|| options.get("type"))
+    // A per-margin basis vector (`bs=c('cyclic','ps')`) declares each margin's
+    // basis family, and a `cyclic` margin is periodic — exactly as the 1-D
+    // `s(x, bs='cyclic')` smooth wraps its lone axis. Without this, the
+    // per-margin `cyclic` token was validated but discarded: every `bs=c(...)`
+    // spelling collapsed to the same open B-spline tensor (#1752). Only honor
+    // the vector form here; a scalar `bs='cyclic'` on a tensor is ambiguous
+    // about which margins wrap, so it does not flip any axis on.
+    if let Some(raw) = options.get("bs")
         && bs_selector_is_vector(raw)
     {
         let per_margin = parse_option_list(raw);
         if per_margin.len() == dim {
             for (axis, margin_bs) in per_margin.iter().enumerate() {
-                if matches!(canonicalize_smooth_type(margin_bs), "cc" | "cp" | "cyclic") {
+                if margin_bs == "cyclic" {
                     axes[axis] = true;
                 }
             }
@@ -1952,8 +1952,8 @@ fn parse_tensor_periodic_axes(
 /// "non-periodic / clamped … free at the two ends, no wrap"). It is therefore an
 /// inert marker here, not a zero-derivative endpoint reparameterization: a
 /// cylinder `te(theta, z, boundary=['periodic','clamped'], …)` is a cyclic θ
-/// margin tensor-producted with an ordinary open z margin, the direct analog of
-/// mgcv `te(bs=c("cc","ps"))` / `te(bs=c("cc","cr"))`.
+/// margin tensor-producted with an ordinary open z margin, the same tensor as
+/// `te(theta, z, bs=c("cyclic","ps"))`.
 ///
 /// The periodic selectors and the inert non-periodic markers
 /// (`clamped`/`open`/`natural`/`free`/`none`/empty) are accepted; anything else
@@ -1986,13 +1986,13 @@ fn validate_tensor_boundary_tokens(
     for (axis, value) in entries.iter().enumerate() {
         let inert = matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "clamped" | "open" | "natural" | "free" | "none" | "" | "periodic" | "cyclic" | "cc"
+            "clamped" | "open" | "natural" | "free" | "none" | "" | "periodic"
         );
         if !inert {
             return Err(TermBuilderError::unsupported_feature(format!(
                 "tensor smooth margin {axis} boundary token '{value}' is not supported \
                  (got bc/boundary={raw:?} on a {dim}-D tensor); tensor margins accept the periodic \
-                 selectors (periodic/cyclic/cc) or the non-periodic markers (clamped/open/natural/free). \
+                 selector (periodic) or the non-periodic markers (clamped/open/natural/free). \
                  Apply anchored/zero-value endpoint constraints with a 1-D s(x, bc=...) term instead."
             ))
             .to_string());
@@ -2084,15 +2084,11 @@ fn parse_tensor_k_list(
         axis_values[axis] = Some(k);
     }
 
-    let raw = options
-        .get("k")
-        .or_else(|| options.get("basis_dim"))
-        .or_else(|| options.get("basis-dim"))
-        .or_else(|| options.get("basisdim"));
+    let raw = options.get("k");
     if saw_axis_alias {
         if raw.is_some() {
             return Err(
-                "tensor k axis aliases cannot be combined with k= or basis_dim=".to_string(),
+                "tensor k axis aliases cannot be combined with k=".to_string(),
             );
         }
         if let Some(missing_axis) = axis_values.iter().position(Option::is_none) {
@@ -2175,8 +2171,7 @@ fn parse_tensor_identifiability(
 }
 
 /// Parse the `identifiability=` option for every 1-D B-spline family arm —
-/// `s()` / `bs='ps'|'bspline'|'cr'|'cs'` and the cyclic `cc`/`cp`/`periodic`
-/// selector.
+/// `s()` / `bs='ps'|'bspline'|'cr'` and the `cyclic` selector.
 ///
 /// Returns `Ok(None)` when the option is absent so each arm can keep applying
 /// its own *structural* default: an anchored endpoint is already the model's
@@ -2241,7 +2236,7 @@ struct BSplineIdentifiabilityContext {
     /// The basis wraps, so no aperiodic (constant + linear) chart applies.
     periodic: bool,
     /// The basis is a natural cubic regression spline indexed by value-at-knot
-    /// (`bs="cr"`/`"cs"`), which carries no B-spline knot/degree geometry for a
+    /// (`bs="cr"`), which carries no B-spline knot/degree geometry for a
     /// Greville-abscissae chart to be built from.
     natural_cubic_regression: bool,
 }
@@ -2268,7 +2263,7 @@ struct BSplineIdentifiabilityContext {
 ///   periodic function, so it is not in the span of a cyclic basis at all: the
 ///   constraint is ill-posed there, and the transform would in any case be
 ///   derived from the wrong knot geometry.
-/// * **`bs="cr"`/`"cs"` + `linear`.** The natural cubic regression basis is
+/// * **`bs="cr"` + `linear`.** The natural cubic regression basis is
 ///   parameterized by function values at its knots, so a Greville-based linear
 ///   removal would be applied to the wrong coordinates.
 ///   [`crate::basis::build_cubic_regression_basis_1d`] refuses this too; doing
@@ -2302,7 +2297,7 @@ fn resolve_bspline_identifiability(
         if context.natural_cubic_regression {
             return Err(TermBuilderError::incompatible_config(
                 "identifiability='linear' needs B-spline knot/degree geometry, which the natural \
-                 cubic regression basis (bs='cr'/'cs') does not carry; use 'none' or 'sum_tozero', \
+                 cubic regression basis (bs='cr') does not carry; use 'none' or 'sum_tozero', \
                  or switch to bs='ps'",
             )
             .to_string());
@@ -2318,68 +2313,25 @@ fn bspline_boundary_declares_periodic_axis(options: &BTreeMap<String, String>) -
         .map(|raw| {
             parse_option_list(raw)
                 .into_iter()
-                .any(|value| matches!(value.as_str(), "periodic" | "cyclic" | "cc"))
+                .any(|value| value == "periodic")
         })
         .unwrap_or(false)
-}
-
-/// Canonical-name lookup for the `bs=`/`type=` smooth selector.
-///
-/// User-facing names — including mgcv-compatible spellings whose semantics
-/// match an existing gamfit smooth exactly — collapse to the engine-internal
-/// canonical names used by the dispatch in `build_smooth_basis`. Adding a
-/// new exactly-equivalent alias is a one-line entry here; the match arms
-/// below remain the single dispatch site.
-///
-/// Aliases listed here MUST be true semantic equivalents of the canonical
-/// target, not approximations. mgcv names whose semantics differ from any
-/// gamfit smooth (e.g. `bs="ts"` shrinkage thin-plate, `bs="ad"` adaptive)
-/// are intentionally NOT mapped here — they should reach the unsupported-type
-/// path so users get a real diagnostic instead of a silent semantic
-/// substitution. mgcv's `bs="cr"`/`"cs"` (cubic regression and its shrinkage
-/// twin) are handled directly in the `build_smooth_basis` dispatch — they
-/// are not aliased here because the `cr`/`cs` distinction controls a default
-/// (`double_penalty`) that the canonical-name layer cannot see.
-///
-/// Unrecognised inputs pass through unchanged so the dispatch can produce its
-/// usual "unsupported smooth type" error, preserving the existing diagnostic
-/// surface for genuine typos.
-pub(crate) fn canonicalize_smooth_type(raw: &str) -> &str {
-    match raw {
-        // Thin-plate spline. mgcv `bs="tp"` is the default thin-plate
-        // regression spline — exact semantic equivalent of gamfit's `"tps"`.
-        "tp" => "tps",
-        // Gaussian process / Matérn. mgcv `bs="gp"` defaults to a Matérn
-        // covariance kernel with REML smoothing parameter selection, which
-        // matches gamfit's `"matern"` exactly (same kernel-Gram identity,
-        // same REML route).
-        "gp" => "matern",
-        // Constant-curvature (M_κ) geodesic-kernel smooth (#944). All aliases
-        // collapse to one canonical type so `bs="curv"`/`bs="mkappa"` cannot
-        // diverge from `curv(...)`.
-        "curv" | "constant_curvature" | "mkappa" => "curvature",
-        // Measure-jet spline: multiscale local-jet-residual energy of the
-        // empirical measure. No mgcv equivalent (mgcv has no measure-learned
-        // geometry smooth), so no mgcv alias is mapped.
-        "mjs" | "measure_jet" | "web" => "measurejet",
-        other => other,
-    }
 }
 
 /// Is `margin_bs` a per-margin basis name that the tensor builder realizes as a
 /// penalized 1-D B-spline margin?
 ///
-/// gam's tensor product is built from penalized B-spline marginals. mgcv's
-/// thin-plate (`tp`/`tps`), P-spline (`ps`), B-spline (`bs`), cubic-regression
-/// (`cr`/`cs`), and cyclic (`cc`/`cp`/`cyclic`) marginals are all penalized
+/// gam's tensor product is built from penalized B-spline marginals. The
+/// thin-plate (`tps`), P-spline (`ps`), B-spline (`bs`/`bspline`),
+/// cubic-regression (`cr`) and cyclic (`cyclic`) marginals are all penalized
 /// splines spanning the same per-axis smoothing space, so a B-spline margin
 /// reproduces the same tensor smoothing class. Margin kinds with fundamentally
 /// different structure (adaptive, random-effect, sphere) are NOT accepted as
 /// tensor margins.
 pub(crate) fn tensor_margin_bs_is_supported(margin_bs: &str) -> bool {
     matches!(
-        canonicalize_smooth_type(margin_bs),
-        "tps" | "ps" | "bs" | "bspline" | "cr" | "cs" | "cc" | "cp" | "cyclic"
+        margin_bs,
+        "tps" | "ps" | "bs" | "bspline" | "cr" | "cyclic"
     )
 }
 
@@ -2420,7 +2372,6 @@ fn default_shaped_tensor_margins(
 ) {
     if !matches!(kind, SmoothKind::Te | SmoothKind::Ti)
         || options.contains_key("bs")
-        || options.contains_key("type")
     {
         return;
     }
@@ -2433,22 +2384,13 @@ fn default_shaped_tensor_margins(
     options.insert("bs".to_string(), format!("[{}]", vec!["ps"; dim].join(", ")));
 }
 
-/// Resolve the canonical engine-internal smooth-type name for a term.
+/// Is the raw `bs=` selector a vector literal (`c('tps','tps')`,
+/// `['tps','tps']`, `(tps, tps)`) rather than a scalar smooth-type name?
 ///
-/// Reads the user-facing `type=`/`bs=` selector and collapses mgcv-compatible
-/// aliases (`tp`→`tps`, `gp`→`matern`) via [`canonicalize_smooth_type`], or
-/// derives the default from the smooth kind/arity when no selector is given.
-/// This is the single source of truth for the dispatch in
-/// `build_smooth_basis`; other call sites (e.g. predictor-specific basis
-/// policy) use it so the classification never drifts from the dispatch.
-/// Is the raw `bs=`/`type=` selector a vector literal (`c('tp','tp')`,
-/// `['tp','tp']`, `(tp, tp)`) rather than a scalar smooth-type name?
-///
-/// mgcv's tensor smooths take a *per-margin* basis vector
-/// (`te(x1, x2, bs=c('tp','tp'))`). Such a value is not a scalar canonical
-/// type and must not be fed through [`canonicalize_smooth_type`] — it has to be
-/// recognized as a tensor request and split into per-margin types. A scalar
-/// selector (`bs="tp"`) is left untouched.
+/// Tensor smooths take a *per-margin* basis vector
+/// (`te(x1, x2, bs=c('tps','tps'))`). Such a value is not a scalar smooth
+/// type — it has to be recognized as a tensor request and split into
+/// per-margin types. A scalar selector (`bs="tps"`) is left untouched.
 pub(crate) fn bs_selector_is_vector(raw: &str) -> bool {
     let trimmed = raw.trim();
     let bracketed = (trimmed.starts_with('[') && trimmed.ends_with(']'))
@@ -2549,6 +2491,13 @@ fn level_code_index(code: f64) -> Option<usize> {
     (code.is_finite() && code >= 0.0 && code.fract() == 0.0).then_some(code as usize)
 }
 
+/// Resolve the engine-internal smooth-type name for a term.
+///
+/// Reads the user-facing `bs=` selector, or derives the default from the
+/// smooth kind/arity when no selector is given. This is the single source of
+/// truth for the dispatch in `build_smooth_basis`; other call sites (e.g.
+/// predictor-specific basis policy) use it so the classification never drifts
+/// from the dispatch.
 pub fn resolve_smooth_type_name(
     kind: SmoothKind,
     n_cols: usize,
@@ -2561,9 +2510,8 @@ pub fn resolve_smooth_type_name(
         return "tensor".to_string();
     }
     options
-        .get("type")
-        .or_else(|| options.get("bs"))
-        .map(|s| canonicalize_smooth_type(&s.to_ascii_lowercase()).to_string())
+        .get("bs")
+        .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| match kind {
             SmoothKind::Te | SmoothKind::Ti | SmoothKind::T2 => "tensor".to_string(),
             SmoothKind::S if n_cols == 1 => "bspline".to_string(),
@@ -2611,6 +2559,9 @@ pub(crate) fn build_smooth_basis(
         }
         None => (options, ds.values.nrows()),
     };
+    // One spelling per behavior: a removed alias key or value is refused here
+    // with the canonical spelling named, whichever entry point built `options`.
+    crate::removed_spellings::reject_removed_smooth_spellings("s", options)?;
     // Fail fast on degenerate input: a smooth whose (non-categorical) coordinate
     // columns collapse to a SINGLE distinct point can only ever fit the response
     // mean — its design matrix is rank-1. For a UNIVARIATE smooth this is exactly
@@ -2799,20 +2750,19 @@ pub(crate) fn build_smooth_basis(
             option_usize(options, "degree")?.unwrap_or(DEFAULT_BSPLINE_DEGREE)
         };
         // For a factor smooth every group's curve is fit from THAT group's rows
-        // alone, so the default marginal is the univariate `s()` default applied
-        // to the least-informed group: its pilot is the penalized resolution
-        // rank of the smallest group's row count (`pilot_internal_knots`, the
-        // same rate rule as a univariate `s()`), and it is held to the least
-        // per-group distinct-value support by the same rank bound a univariate
-        // `s()` obeys (`support_capped_bspline_dimension`). A group with `u`
-        // distinct covariate values gives its block of the marginal design rank
-        // at most `u`, so a marginal with more functions has directions in that
-        // group identified by the penalty alone. Inside that bound the penalty
-        // and REML, not the basis size, decide the effective degrees of freedom,
-        // and the adaptive formula workflow grows the shared marginal only while
-        // the fit's REML evidence prefers it. The explicit `re` random-effect
-        // form takes neither rule: it is a raw linear `[1, x]` random effect
-        // (0 internal knots), handled in the branch below.
+        // alone, so the marginal is held to the least per-group distinct-value
+        // support by the same rank bound a univariate `s()` obeys
+        // (`support_capped_bspline_dimension`): a group with `u` distinct
+        // covariate values gives its block of the marginal design rank at most
+        // `u`, so a marginal with more functions has directions in that group
+        // identified by the penalty alone. Inside that bound the default is the
+        // provisioned pooled count held at the provisioned factor-smooth
+        // marginal; the standard formula workflow instead starts it at the
+        // univariate `s()` pilot of the least-informed group
+        // (`factor_smooth_pilot_internal_knots`) and grows it only while the
+        // fit's REML evidence prefers it (#3149, #3264). The explicit `re`
+        // random-effect form takes neither rule: it is a raw linear `[1, x]`
+        // random effect (0 internal knots), handled in the branch below.
         let group_column = ds.values.column(cols[group_idx]);
         let min_group_resolution = min_per_group_unique_count(ds.values.column(c), group_column);
         let default_internal = if type_opt == "re" {
@@ -2830,14 +2780,10 @@ pub(crate) fn build_smooth_basis(
             // raw linear basis is both the correct `re` semantics and fast.
             0
         } else {
-            let marginal_penalty_order = parse_penalty_order_alias(options)?
-                .unwrap_or(DEFAULT_PENALTY_ORDER)
-                .min(degree)
-                .max(1);
-            pilot_internal_knots(
-                min_per_group_row_count(group_column),
-                degree,
-                marginal_penalty_order,
+            provisioned_internal_knots_for_column(ds.values.column(c)).min(
+                FACTOR_SMOOTH_PROVISIONED_BASIS_DIM
+                    .saturating_sub(degree + 1)
+                    .max(1),
             )
         };
         let (mut n_knots, knots_inferred, mut effective_degree) =
@@ -2846,12 +2792,12 @@ pub(crate) fn build_smooth_basis(
             (n_knots, effective_degree) =
                 support_capped_bspline_dimension(n_knots, effective_degree, min_group_resolution);
         }
-        // `m=` is mgcv's spelling of `penalty_order=` and is resolved as its
-        // alias here (#2791). It used to be read further down as a boolean gate
-        // on the `Fs` null-penalty path instead, which made every value >= 1 the
-        // same model and dropped the key entirely on `sz`.
+        // `penalty_order=` is resolved here (#2791). An earlier `m=` key was read
+        // further down as a boolean gate on the `Fs` null-penalty path instead,
+        // which made every value >= 1 the same model and dropped the key
+        // entirely on `sz`; `m=` is now refused and names `penalty_order=`.
         let penalty_order = resolve_spline_penalty_order(
-            parse_penalty_order_alias(options)?,
+            parse_penalty_order(options)?,
             effective_degree,
             Some(DegreeReduction::BasisDimension {
                 requested: degree,
@@ -2949,14 +2895,9 @@ pub(crate) fn build_smooth_basis(
     }
 
     match type_opt.as_str() {
-        // `periodic` is the generic spelling for a periodic (wrap-continuous)
-        // B-spline; it names the SAME `SmoothBasisSpec::BSpline1D {
-        // PeriodicUniform }` the mgcv-style cyclic selectors (`cc`/`cp`/`cyclic`)
-        // build, and is already recognized as that basis kind by the JSON /
-        // override path (`smooth_overrides`) and accepted by the formula parser.
-        // Route it through the cyclic arm so the formula path agrees with the
-        // rest of the codebase instead of rejecting it as an unsupported type.
-        "cyclic" | "cc" | "cp" | "cyclic-ps" | "periodic" => {
+        // `bs="cyclic"`: the periodic (wrap-continuous) B-spline
+        // `SmoothBasisSpec::BSpline1D { PeriodicUniform }`.
+        "cyclic" => {
             if options.contains_key("domain") {
                 return Err(periodic_domain_error());
             }
@@ -2972,21 +2913,14 @@ pub(crate) fn build_smooth_basis(
             let degree = option_usize(options, "degree")?.unwrap_or(DEFAULT_BSPLINE_DEGREE);
             validate_spline_degree("degree", degree)?;
             let penalty_order =
-                resolve_spline_penalty_order(parse_penalty_order_alias(options)?, degree, None)?;
-            // A periodic spline has no free endpoints: the wrap constraint
-            // leaves only the constant unpenalized, so its pilot is that
-            // one-dimensional null space plus the penalized resolution rank of
-            // the rows (never below one full polynomial piece, `degree + 1`).
-            // The penalty, not the basis size, controls smoothness; the adaptive
-            // formula workflow grows the periodic basis while the fit's REML
-            // evidence prefers the richer one. More functions than distinct
-            // covariate values cannot be resolved, so the pilot is held to that
-            // support.
-            let unique = unique_count_column(ds.values.column(c));
-            let default_basis = pilot_cyclic_basis_dim(sizing_rows, degree, penalty_order)
-                .min(unique.max(degree + 1));
+                resolve_spline_penalty_order(parse_penalty_order(options)?, degree, None)?;
+            // The provisioned periodic default. The standard formula workflow
+            // instead starts it at its pilot (`pilot_cyclic_basis_dim`) and
+            // grows it while the fit's REML evidence prefers the richer basis
+            // (#3149).
+            let default_basis = provisioned_cyclic_basis_dim(ds.values.column(c), degree);
             let requested_basis =
-                option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])?;
+                option_usize(options, "k")?;
             let adaptive = requested_basis.is_none();
             let num_basis = requested_basis.unwrap_or(default_basis);
             if num_basis < degree + 1 {
@@ -3010,14 +2944,14 @@ pub(crate) fn build_smooth_basis(
             let periodic_axes = [true];
             let periods = parse_periods(options, &periodic_axes)?;
             let origins = parse_period_origins(options, &periodic_axes)?;
-            // Distinguish a *cyclic basis selector* (`bs='cc'`/`cp'`/`cyclic`,
+            // Distinguish a *cyclic basis selector* (`bs='cyclic'`,
             // this whole arm) from a generic B-spline forced periodic by a
             // `periodic=`/`boundary=` flag (the `ps`/`bspline` arm). Only the
             // latter carries the sample-dependent off-by-ε seam that #1771's
             // guard in `parse_periodic_domain_1d` requires an explicit period
-            // to avoid. A bare `s(x, bs='cc')` opts INTO mgcv's `bs="cc"`
+            // to avoid. A bare `s(x, bs='cyclic')` opts INTO cyclic
             // semantics — the wrap IS the observed data range — exactly like
-            // the tensor cc-margin fallback (`te(x, z, bs=c('cc','cc'))`). The
+            // the tensor cyclic-margin fallback (`te(x, z, bs=c('cyclic','cyclic'))`). The
             // cyclic arm was left routing through the now-strict helper when
             // #1771 tightened it, so a bare cyclic smooth hard-errored with
             // "periodic B-spline smooth requires an explicit period" even
@@ -3075,24 +3009,15 @@ pub(crate) fn build_smooth_basis(
                 },
             })
         }
-        "bspline" | "ps" | "p-spline" | "cr" | "cs" => {
-            // mgcv's `bs="cr"` (cubic regression spline) and `bs="cs"` (its
-            // shrinkage twin) are penalized cubic-regression smooths that span
-            // the same per-axis function space as gamfit's `bspline` (cubic
-            // B-spline, second-derivative penalty). Route both through the
-            // 1-D B-spline arm. Both recover unsupported null-space effects by
-            // default; `double_penalty=false` is the explicit unpenalized
-            // opt-out. Without this route, a stand-alone
-            // `s(x, bs='cr')` (which is otherwise a routine 1-D smooth in
-            // mgcv-compatible formulae) reached the dispatch's default arm
-            // and aborted the whole fit with `unsupported smooth type 'cr'`,
-            // even though the same name was already recognized as a tensor
-            // margin (`tensor_margin_bs_is_supported`).
-            let validation_name = match type_opt.as_str() {
-                "cr" => "cr",
-                "cs" => "cs",
-                _ => "bspline",
-            };
+        "bspline" | "ps" | "p-spline" | "cr" => {
+            // `bs="cr"` (natural cubic regression spline) is a penalized cubic
+            // smooth spanning the same per-axis function space as `bspline`
+            // (cubic B-spline, second-derivative penalty), so it is routed
+            // through the 1-D B-spline arm. It recovers unsupported null-space
+            // effects by default; `double_penalty=false` is the explicit
+            // unpenalized opt-out. The same name is also a tensor margin
+            // (`tensor_margin_bs_is_supported`).
+            let validation_name = if type_opt == "cr" { "cr" } else { "bspline" };
             validate_known_options(validation_name, options, BSPLINE_SMOOTH_OPTION_KEYS)?;
             if cols.len() != 1 {
                 return Err(TermBuilderError::incompatible_config(format!(
@@ -3104,14 +3029,9 @@ pub(crate) fn build_smooth_basis(
             let c = cols[0];
             let (minv, maxv) = col_minmax(ds.values.column(c))?;
             let degree = option_usize(options, "degree")?.unwrap_or(DEFAULT_BSPLINE_DEGREE);
-            let default_internal = pilot_internal_knots(
-                sizing_rows,
-                degree,
-                parse_penalty_order_alias(options)?
-                    .unwrap_or(DEFAULT_PENALTY_ORDER)
-                    .min(degree)
-                    .max(1),
-            );
+            // The provisioned default; the standard formula workflow starts a
+            // default it grows at its pilot instead (#3149).
+            let default_internal = provisioned_internal_knots_for_column(ds.values.column(c));
             let (mut n_knots, inferred, mut effective_degree) =
                 parse_ps_internal_knots(options, degree, default_internal)?;
             let periodic_axes = parse_periodic_axes(options, 1).map_err(|e| e.to_string())?;
@@ -3178,8 +3098,7 @@ pub(crate) fn build_smooth_basis(
                 BSplineIdentifiabilityContext {
                     has_anchor: boundary_conditions.has_anchor(),
                     periodic: periodic_axes[0],
-                    natural_cubic_regression: !periodic_axes[0]
-                        && (type_opt == "cr" || type_opt == "cs"),
+                    natural_cubic_regression: !periodic_axes[0] && type_opt == "cr",
                 },
             )?;
             let periods = parse_periods(options, &periodic_axes).map_err(|e| e.to_string())?;
@@ -3211,13 +3130,13 @@ pub(crate) fn build_smooth_basis(
                         },
                     )
                 }
-            } else if type_opt == "cr" || type_opt == "cs" {
-                // mgcv `bs="cr"`/`"cs"`: a natural cubic regression spline whose
+            } else if type_opt == "cr" {
+                // `bs="cr"`: a natural cubic regression spline whose
                 // basis is indexed by `k` values at quantile-placed knots (#1074),
                 // NOT a B-spline knot vector. Match gam's `k=` convention by
                 // requesting the same total basis size the B-spline arm would
                 // produce (`n_knots` internal + degree + 1), floored at the cr
-                // minimum of 3 knots. `cr` vs `cs` (shrinkage) is carried by the
+                // minimum of 3 knots. Null-space shrinkage is carried by the
                 // `double_penalty` flag resolved below, which the cr builder reads.
                 //
                 // Cap that request to the covariate's data support (#1541): a cr
@@ -3283,7 +3202,7 @@ pub(crate) fn build_smooth_basis(
                 }
             };
             let penalty_order = resolve_spline_penalty_order(
-                parse_penalty_order_alias(options)?,
+                parse_penalty_order(options)?,
                 effective_degree,
                 Some(reduction),
             )?;
@@ -3390,8 +3309,7 @@ pub(crate) fn build_smooth_basis(
                 || options.contains_key("max_degree")
                 || options.contains_key("max-degree");
             let kernel = options
-                .get("kernel")
-                .or_else(|| options.get("method"))
+                .get("method")
                 .map(|raw| strip_quotes(raw).trim().to_ascii_lowercase())
                 .unwrap_or_else(|| {
                     if degree_requested {
@@ -3401,18 +3319,12 @@ pub(crate) fn build_smooth_basis(
                     }
                 });
             let (method, wahba_kernel) = match kernel.as_str() {
-                "sobolev" | "wahba" | "wahba_sobolev" | "wahba-sobolev" => {
-                    (SphereMethod::Wahba, SphereWahbaKernel::Sobolev)
-                }
-                "pseudo" | "mgcv" | "sos" | "wahba_pseudo" | "wahba-pseudo" => {
-                    (SphereMethod::Wahba, SphereWahbaKernel::Pseudo)
-                }
-                "harmonic" | "spherical_harmonic" | "spherical-harmonic" => {
-                    (SphereMethod::Harmonic, SphereWahbaKernel::Sobolev)
-                }
+                "sobolev" => (SphereMethod::Wahba, SphereWahbaKernel::Sobolev),
+                "pseudo" => (SphereMethod::Wahba, SphereWahbaKernel::Pseudo),
+                "harmonic" => (SphereMethod::Harmonic, SphereWahbaKernel::Sobolev),
                 other => {
                     return Err(format!(
-                        "unsupported sphere kernel '{other}'; expected sobolev, pseudo, or harmonic"
+                        "unsupported sphere method '{other}'; expected sobolev, pseudo, or harmonic"
                     ));
                 }
             };
@@ -3429,7 +3341,7 @@ pub(crate) fn build_smooth_basis(
                 Some(_) if matches!(method, SphereMethod::Harmonic) => {
                     return Err(
                         "sphere smooth: lmax= states the truncation of a Wahba reproducing kernel \
-                         and does not apply to kernel=harmonic; use degree=/max_degree= to set the \
+                         and does not apply to method=harmonic; use degree=/max_degree= to set the \
                          harmonic degree"
                             .to_string(),
                     );
@@ -3456,7 +3368,7 @@ pub(crate) fn build_smooth_basis(
                 }
             };
             let penalty_order =
-                parse_penalty_order_alias(options)?.unwrap_or(DEFAULT_PENALTY_ORDER);
+                parse_penalty_order(options)?.unwrap_or(DEFAULT_PENALTY_ORDER);
             // `true` when nobody chose the harmonic truncation: the degree is
             // the penalized-resolution pilot the formula workflow refines.
             let mut adaptive_degree = false;
@@ -3468,10 +3380,7 @@ pub(crate) fn build_smooth_basis(
                     };
                 let degree = match explicit_degree {
                     Some(degree) => degree,
-                    None => match option_usize_any(
-                        options,
-                        &["k", "basis_dim", "basis-dim", "basisdim"],
-                    )? {
+                    None => match option_usize_any(options, &["k"])? {
                         // The least degree whose harmonic span `L(L + 2)` holds
                         // the requested dimension.
                         Some(k) => (1usize..)
@@ -3479,7 +3388,7 @@ pub(crate) fn build_smooth_basis(
                             .unwrap_or(k),
                         None => {
                             adaptive_degree = true;
-                            default_spherical_harmonic_degree(sizing_rows, penalty_order)
+                            provisioned_spherical_harmonic_degree(sizing_rows)
                         }
                     },
                 };
@@ -3497,16 +3406,16 @@ pub(crate) fn build_smooth_basis(
                 None
             };
             let center_strategy = if matches!(method, SphereMethod::Wahba) {
-                // Pilot Wahba center count: the kernel's constant null space
-                // (removed by the center sum-to-zero constraint) plus the
-                // directions an order-`m` penalty resolves on the 2-D sphere.
-                // Nobody chose it, so it is `Auto`: the formula workflow refines
-                // it on the fit's own REML evidence.
-                let pilot_centers = 1usize
-                    .saturating_add(penalized_resolution_rank(sizing_rows, 2, penalty_order.max(1)))
-                    .min(sizing_rows)
-                    .max(1);
-                let centers = parse_countwith_basis_alias(options, "centers", pilot_centers)?;
+                // Provisioned Wahba center count, the generic spatial count
+                // (an order-4 penalty's kernel needs at least its provisioned
+                // floor). Nobody chose it, so it is `Auto`: the formula workflow
+                // starts it at its pilot and refines it on the fit's own REML
+                // evidence (#3149).
+                let mut default_centers = default_num_centers(sizing_rows, cols.len());
+                if penalty_order >= 4 {
+                    default_centers = default_centers.max(WAHBA_ORDER4_PROVISIONED_CENTERS);
+                }
+                let centers = parse_countwith_basis_alias(options, "centers", default_centers)?;
                 let strategy = CenterStrategy::FarthestPoint {
                     num_centers: centers,
                 };
@@ -3533,7 +3442,7 @@ pub(crate) fn build_smooth_basis(
                 },
             })
         }
-        "curvature" => {
+        "curv" => {
             // Constant-curvature (M_κ) geodesic-kernel smooth (#944): the
             // κ-generic sibling of the intrinsic S² smooth above. The feature
             // columns are κ-stereographic chart coordinates and the geometry
@@ -3543,7 +3452,7 @@ pub(crate) fn build_smooth_basis(
             // (`Sᵈ` for κ>0, `ℝᵈ` for κ=0, `Hᵈ` for κ<0) and is honoured verbatim
             // by the fit; OMITTING `kappa=` leaves κ free for the #944/#1464
             // outer ψ-coordinate estimation, seeded at the flat default 0.
-            validate_known_options("curvature", options, CURVATURE_SMOOTH_OPTION_KEYS)?;
+            validate_known_options("curv", options, CURVATURE_SMOOTH_OPTION_KEYS)?;
             // `kappa=` follows the mgcv-`sp=` convention: an EXPLICIT value pins
             // the sectional curvature (fixed geometry, honoured verbatim by the
             // fit — gam#2152); an OMITTED `kappa=` leaves κ free for the
@@ -3602,13 +3511,13 @@ pub(crate) fn build_smooth_basis(
                 },
             })
         }
-        "measurejet" => {
+        "mjs" => {
             // Measure-jet spline: multiscale local-jet-residual energy of the
             // empirical measure. The feature columns are ambient coordinates
             // of data concentrated near an unknown low-dimensional set; the
             // geometry (centers, masses, scale band) is read off the measure
             // at build time — magic by default, every option optional.
-            validate_known_options("measurejet", options, MEASURE_JET_SMOOTH_OPTION_KEYS)?;
+            validate_known_options("mjs", options, MEASURE_JET_SMOOTH_OPTION_KEYS)?;
             let order_s = option_f64(options, "s")?.unwrap_or(0.0);
             // 0.0 = auto sentinel; explicit values must sit inside the
             // admissible order interval of the affine-jet (r = 2) energy.
@@ -3694,7 +3603,7 @@ pub(crate) fn build_smooth_basis(
             // #1867: spline-equivalent floor so a 1-D radial basis is not
             // dimensioned coarser than the competing `s(x)` on identical data.
             let univariate_floor = if cols.len() == 1 {
-                univariate_spline_basis_dim(ds.values.column(cols[0]), sizing_rows)
+                univariate_spline_basis_dim(ds.values.column(cols[0]))
             } else {
                 0
             };
@@ -3888,7 +3797,7 @@ pub(crate) fn build_smooth_basis(
             // #1867: spline-equivalent floor so a 1-D radial basis is not
             // dimensioned coarser than the competing `s(x)` on identical data.
             let univariate_floor = if cols.len() == 1 {
-                univariate_spline_basis_dim(ds.values.column(cols[0]), sizing_rows)
+                univariate_spline_basis_dim(ds.values.column(cols[0]))
             } else {
                 0
             };
@@ -4073,16 +3982,16 @@ pub(crate) fn build_smooth_basis(
             // below), exactly as mgcv's `te()` does — one smoothing parameter per
             // margin, a marginal-Kronecker-sum penalty, and a separate default
             // function-space ridge on the joint polynomial null space. A margin
-            // vector `bs=c('tp','tp')` requests a thin-plate FUNCTION SPACE per
+            // vector `bs=c('tps','tps')` requests a thin-plate FUNCTION SPACE per
             // axis; the tensor realizes each axis as a 1-D penalized B-spline
             // margin spanning that same per-axis space (tp/ps/cr/bs/cc all share
             // it). We deliberately do NOT silently swap the requested tensor for a
-            // single multi-D ISOTROPIC thin-plate radial smooth (`s(x,y,bs='tp')`):
+            // single multi-D ISOTROPIC thin-plate radial smooth (`s(x,y,bs='tps')`):
             // that is a different model — one isotropic smoothing parameter, no
             // per-margin anisotropy — and substituting it while the user wrote a
             // tensor formula is dishonest. A user who genuinely wants the isotropic
-            // radial smooth asks for it directly with `s(x1, x2, bs='tp')`.
-            // Per-margin basis vector (`bs=c('tp','tp')` / `bs=['ps','cr']`):
+            // radial smooth asks for it directly with `s(x1, x2, bs='tps')`.
+            // Per-margin basis vector (`bs=c('tps','tps')` / `bs=['ps','cr']`):
             // validate each requested margin is a penalized-spline basis that
             // the tensor product realizes as a 1-D B-spline margin. mgcv's
             // `tp`/`ps`/`cr`/`bs`/`cc` margins are all penalized splines over
@@ -4092,7 +4001,7 @@ pub(crate) fn build_smooth_basis(
             // silently substituted.
             // A scalar `bs=cr` is the same request broadcast to every margin, so
             // it is validated the same way.
-            if let Some(raw) = options.get("bs").or_else(|| options.get("type")) {
+            if let Some(raw) = options.get("bs") {
                 let per_margin = if bs_selector_is_vector(raw) {
                     parse_option_list(raw)
                 } else {
@@ -4111,7 +4020,7 @@ pub(crate) fn build_smooth_basis(
                     if !tensor_margin_bs_is_supported(margin_bs) {
                         return Err(TermBuilderError::unsupported_feature(format!(
                             "tensor smooth margin {axis} basis '{margin_bs}' is not a supported penalized-spline margin; \
-                             tensor margins accept tp/tps/ps/bs/cr/cc"
+                             tensor margins accept tps/ps/bs/bspline/cr/cyclic"
                         ))
                         .to_string());
                     }
@@ -4131,7 +4040,7 @@ pub(crate) fn build_smooth_basis(
                 .find(|key| options.contains_key(**key))
             {
                 return Err(TermBuilderError::invalid_option(format!(
-                    "tensor(): `{key}=` declares one axis's periodic domain and has no per-margin \
+                    "te(): `{key}=` declares one axis's periodic domain and has no per-margin \
                      form; on a tensor smooth give periods=[...] (with origins=[...] for the \
                      domain start), which name their margin"
                 ))
@@ -4177,7 +4086,7 @@ pub(crate) fn build_smooth_basis(
             // regression builder (`NaturalCubicRegression` knotspec), keeping
             // explicit `ps`/`bs`/`bspline` on the B-spline margin.
             let per_axis_bs: Vec<Option<String>> =
-                match options.get("bs").or_else(|| options.get("type")) {
+                match options.get("bs") {
                     Some(raw) if bs_selector_is_vector(raw) => {
                         let list = parse_option_list(raw);
                         (0..dim).map(|a| list.get(a).cloned()).collect()
@@ -4193,14 +4102,14 @@ pub(crate) fn build_smooth_basis(
                     None => vec![None; dim],
                 };
             // A margin is realized as a natural cubic regression spline when it
-            // is the (unset) mgcv default, an explicit `cr`/`cs`, or a
-            // `tp`/`tps` (same per-axis penalized-spline space). Explicit
+            // is unset (the default margin), an explicit `cr`, or `tps` (same
+            // per-axis penalized-spline space). Explicit
             // B-spline-family margins (`ps`/`bs`/`bspline`/`p-spline`) keep the
             // open B-spline margin.
             let margin_wants_cr = |bs: &Option<String>| -> bool {
                 matches!(
                     bs.as_deref(),
-                    None | Some("cr") | Some("cs") | Some("tp") | Some("tps")
+                    None | Some("cr") | Some("tps")
                 )
             };
             let requested_knot_placement = explicit_knot_placement(options)?;
@@ -4240,7 +4149,7 @@ pub(crate) fn build_smooth_basis(
                     log::debug!(
                         "tensor smooth: margin axis {axis} requested k={k_requested}, but the \
                          covariate has only {n_distinct_axis} distinct value(s); reducing this \
-                         margin to k={k_axis} (mgcv-style data-support cap on the per-axis basis)."
+                         margin to k={k_axis} (data-support cap on the per-axis basis)."
                     );
                 }
                 // Per-axis effective spline degree. The B-spline basis with `k`
@@ -4274,22 +4183,19 @@ pub(crate) fn build_smooth_basis(
                     }),
                 )
                 .map_err(|e| format!("tensor margin {axis}: {e}"))?;
-                // A `cc`/`cp`/`cyclic` per-margin basis declares periodicity
-                // without necessarily supplying a `period=`: mgcv's `bs="cc"`
-                // wraps at the covariate's observed data range. Mirror the 1-D
-                // cyclic fallback (`parse_periodic_domain_1d`) here so a bare
-                // `te(x, z, bs=c('cc','cc'))` wraps each margin on its own
-                // [min, max] span instead of hard-erroring (#1752).
-                let margin_is_cc = matches!(
-                    canonicalize_smooth_type(per_axis_bs[axis].as_deref().unwrap_or("")),
-                    "cc" | "cp" | "cyclic"
-                );
+                // A `cyclic` per-margin basis declares periodicity without
+                // necessarily supplying a `period=`; it wraps at the
+                // covariate's observed data range. Mirror the 1-D cyclic
+                // fallback (`parse_periodic_domain_1d`) here so a bare
+                // `te(x, z, bs=c('cyclic','cyclic'))` wraps each margin on its
+                // own [min, max] span instead of hard-erroring (#1752).
+                let margin_is_cc = per_axis_bs[axis].as_deref() == Some("cyclic");
                 let (knotspec, boundary, axis_period) = if periodic_axes[axis] {
-                    // A `cc`/`cp`/`cyclic` per-margin basis declares periodicity
+                    // A `cyclic` per-margin basis declares periodicity
                     // without necessarily supplying a `period=`; in that case wrap
                     // at the covariate's observed [min, max] span, mirroring the
                     // 1-D cyclic fallback (`parse_periodic_domain_1d`) so a bare
-                    // `te(x, z, bs=c('cc','cc'))` wraps each margin on its own
+                    // `te(x, z, bs=c('cyclic','cyclic'))` wraps each margin on its own
                     // range instead of hard-erroring (#1752). An axis made
                     // periodic by an explicit `periodic=`/`boundary=` selector
                     // (not a cyclic margin basis) still requires an explicit
@@ -4482,7 +4388,7 @@ pub(crate) fn build_smooth_basis(
                 )
                 .to_string());
             };
-            let k = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])?
+            let k = option_usize_any(options, &["k"])?
                 .unwrap_or(0);
             let chunk_size = option_usize(options, "chunk_size")?.unwrap_or(DEFAULT_PCA_CHUNK_SIZE);
             Ok(SmoothBasisSpec::Pca {
@@ -4494,10 +4400,18 @@ pub(crate) fn build_smooth_basis(
                 chunk_size,
             })
         }
-        other => Err(TermBuilderError::unsupported_feature(format!(
-            "unsupported smooth type '{other}'"
-        ))
-        .to_string()),
+        other => Err(
+            match crate::removed_spellings::canonical_for(
+                crate::removed_spellings::SMOOTH_TYPES,
+                other,
+            ) {
+                Some(canonical) => crate::removed_spellings::smooth_type_error(other, canonical),
+                None => TermBuilderError::unsupported_feature(format!(
+                    "unsupported smooth type '{other}'"
+                ))
+                .to_string(),
+            },
+        ),
     }
 }
 
@@ -4506,7 +4420,7 @@ pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
     for smooth in spec.smooth_terms.iter_mut() {
         // A multi-axis thin-plate term cannot carry per-axis anisotropy on its
         // single curvature penalty, so `scale_dimensions` was historically a
-        // silent no-op for `bs="tp"` (gam#1676). Rewrite it to the
+        // silent no-op for `bs="tps"` (gam#1676). Rewrite it to the
         // mathematically-equivalent anisotropic s=0 Duchon spline first; the
         // Duchon arm below then sees an already-seeded `aniso_log_scales` and
         // leaves it untouched.
@@ -4561,7 +4475,7 @@ pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
 /// penalty — the exact `∫|Dᵐ f|²` reproducing-kernel Gram. That penalty has no
 /// per-axis structure to make one direction more or less relevant than another,
 /// so per-axis anisotropy (`scale_dimensions`) cannot be expressed on it. The
-/// flag was therefore a silent no-op for `bs="tp"` while it engaged for
+/// flag was therefore a silent no-op for `bs="tps"` while it engaged for
 /// `duchon()`/`matern()`.
 ///
 /// The thin-plate kernel `r^{2m−d}` (the `r²·log r` log-case in even `d`) is
@@ -4751,7 +4665,7 @@ fn capped_cr_marginal_knotspec(
     let k_cr = k_cr_requested.min(n_distinct);
     if k_cr < CR_MIN_KNOTS {
         inference_notes.advise(format!(
-            "Smooth '{label}': cubic-regression ('cr'/'cs'/'sz') basis requested k={k_cr_requested}, \
+            "Smooth '{label}': cubic-regression ('cr'/'sz') basis requested k={k_cr_requested}, \
              but the covariate has only {n_distinct} distinct value(s) — too few to support a cubic \
              regression spline (needs >= {CR_MIN_KNOTS} distinct values). Degraded to the linear \
              B-spline marginal the default basis builds on the same data."
@@ -4760,9 +4674,9 @@ fn capped_cr_marginal_knotspec(
     }
     if k_cr < k_cr_requested {
         inference_notes.advise(format!(
-            "Smooth '{label}': cubic-regression ('cr'/'cs'/'sz') basis reduced from k={k_cr_requested} \
-             to k={k_cr} to match the covariate's {n_distinct} distinct value(s) (mgcv-style \
-             data-support cap; a cr basis cannot place more value-knots than the data has)."
+            "Smooth '{label}': cubic-regression ('cr'/'sz') basis reduced from k={k_cr_requested} \
+             to k={k_cr} to match the covariate's {n_distinct} distinct value(s) (data-support \
+             cap; a cr basis cannot place more value-knots than the data has)."
         ));
     }
     let cr_knots = crate::basis::select_cr_knots(col, k_cr).map_err(|e| e.to_string())?;
@@ -4809,6 +4723,84 @@ fn min_per_group_row_count(group_col: ArrayView1<'_, f64>) -> usize {
     per_group.values().copied().min().unwrap_or(1).max(1)
 }
 
+/// Internal-knot cap of the provisioned default univariate B-spline
+/// ([`provisioned_internal_knots_for_column`]).
+const PROVISIONED_INTERNAL_KNOTS_CAP: usize = 8;
+
+/// Internal-knot floor of the provisioned default univariate B-spline, so a
+/// non-trivial smooth is representable at all.
+const PROVISIONED_INTERNAL_KNOTS_FLOOR: usize = 4;
+
+/// Provisioned default basis dimension of a one-dimensional cyclic cubic
+/// P-spline. Periodic smooths spend no coefficients on free endpoints, so they
+/// do not inherit the larger open B-spline count.
+const CYCLIC_PROVISIONED_BASIS_DIM: usize = 12;
+
+/// Provisioned default shared-marginal basis dimension of a `bs="fs"`/`"sz"`
+/// factor smooth: a factor smooth shares one marginal across all levels, and a
+/// modest marginal recovers the shared signal without fitting each group's
+/// within-group noise (gam#903).
+const FACTOR_SMOOTH_PROVISIONED_BASIS_DIM: usize = 10;
+
+/// Provisioned default center floor of an order-4 Wahba sphere penalty.
+const WAHBA_ORDER4_PROVISIONED_CENTERS: usize = 30;
+
+/// Internal-knot count of the provisioned default univariate B-spline on
+/// `col`: `unique/4`, held between [`PROVISIONED_INTERNAL_KNOTS_FLOOR`] and
+/// [`PROVISIONED_INTERNAL_KNOTS_CAP`].
+///
+/// A formula default is built at this provisioned size. Only a basis the
+/// standard formula workflow grows starts at its penalized-resolution pilot
+/// instead (`smooth::starting_resolution`), because only there does the
+/// converged fit's own evidence refine it; every other route (a raw
+/// `materialize`, a location-scale, marginal-slope, survival, transformation or
+/// multinomial fit, a position basis) keeps the basis it is given, so its
+/// default is sized to be adequate without growth. These constants are the
+/// pre-#3191 defaults those routes had, restored because #3191's pilot
+/// replaced them there with nothing to grow it (a location-scale `s(x)` at
+/// n = 1000 got 6 functions instead of 12; #3149). Each route retires its
+/// provisioned default when its fit joins the loop.
+pub(crate) fn provisioned_internal_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
+    let unique = unique_count_column(col);
+    (unique / 4).clamp(PROVISIONED_INTERNAL_KNOTS_FLOOR, PROVISIONED_INTERNAL_KNOTS_CAP)
+}
+
+/// The provisioned default basis dimension of a degree-`degree` cyclic
+/// B-spline on `col`: its open counterpart's
+/// [`provisioned_internal_knots_for_column`] basis, capped at
+/// [`CYCLIC_PROVISIONED_BASIS_DIM`] (never below `degree + 1`).
+pub(crate) fn provisioned_cyclic_basis_dim(col: ArrayView1<'_, f64>, degree: usize) -> usize {
+    (provisioned_internal_knots_for_column(col) + degree + 1)
+        .min(CYCLIC_PROVISIONED_BASIS_DIM.max(degree + 1))
+}
+
+/// Provisioned default center cap of a Duchon smooth of dimension `d`,
+/// `10 · 3^(d - 1)` (30 in 2-D): Duchon fits rotate their constrained radial
+/// block through its center Gram and several operator penalties, so a default
+/// that no loop grows is held to this low-rank size (#1757).
+fn provisioned_duchon_center_cap(d: usize) -> usize {
+    let exponent = u32::try_from(d.saturating_sub(1)).unwrap_or(u32::MAX);
+    10usize.saturating_mul(3usize.saturating_pow(exponent))
+}
+
+/// Pilot internal-knot count of a factor smooth's shared degree-`degree`
+/// marginal on `feature_col` grouped by `group_col`: the univariate `s()`
+/// pilot of the least-populated group's row count (every group's curve is fit
+/// from its own rows alone), held to the least per-group distinct-value
+/// support by the rank bound (#3264).
+pub(crate) fn factor_smooth_pilot_internal_knots(
+    feature_col: ArrayView1<'_, f64>,
+    group_col: ArrayView1<'_, f64>,
+    degree: usize,
+    penalty_order: usize,
+) -> usize {
+    let pilot = pilot_internal_knots(min_per_group_row_count(group_col), degree, penalty_order.max(1));
+    match min_per_group_unique_count(feature_col, group_col) {
+        support if support >= 2 => pilot.min(support.saturating_sub(degree + 1)),
+        _ => pilot,
+    }
+}
+
 /// Pilot basis dimension of a default univariate penalized spline with an
 /// `nullspace_dim`-dimensional unpenalized space and an order-`penalty_order`
 /// roughness penalty, fitted on `n` rows:
@@ -4837,17 +4829,6 @@ pub(crate) fn pilot_internal_knots(n: usize, degree: usize, penalty_order: usize
     pilot_spline_basis_dim(n, penalty_order, penalty_order).saturating_sub(degree + 1)
 }
 
-/// Pilot internal-knot count of the formula-default open cubic `s(x)` on the
-/// column `col` ([`pilot_internal_knots`] with the default degree and penalty
-/// order at the column's row count).
-pub(crate) fn pilot_internal_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
-    pilot_internal_knots(
-        col.len(),
-        DEFAULT_BSPLINE_DEGREE,
-        DEFAULT_PENALTY_ORDER.min(DEFAULT_BSPLINE_DEGREE),
-    )
-}
-
 /// Cap a default open B-spline `(internal_knots, degree)` so its basis
 /// dimension `internal_knots + degree + 1` does not exceed the covariate's
 /// `unique` distinct values (`unique >= 2`).
@@ -4873,15 +4854,22 @@ pub(crate) fn support_capped_bspline_dimension(
     (unique.saturating_sub(degree + 1), degree)
 }
 
-/// #1867: the basis dimension the default open cubic `s(x)` gets on `col`
-/// (after its distinct-value support cap), the floor under a 1-D radial
-/// smooth's default so it is not dimensioned coarser than the spline it
-/// competes with on the same data.
-///
-/// #3179: `sizing_rows` is the row count the competing `s(x)` is sized from
-/// — the smallest level of a categorical `by=`, otherwise every row — so the
-/// floor tracks the spline's pilot exactly instead of the full column length.
-pub(crate) fn univariate_spline_basis_dim(col: ArrayView1<'_, f64>, sizing_rows: usize) -> usize {
+/// #1867: the basis dimension the provisioned default open cubic `s(x)` gets
+/// on `col`, the floor under a 1-D radial smooth's default so it is not
+/// dimensioned coarser than the spline it competes with on the same data.
+pub(crate) fn univariate_spline_basis_dim(col: ArrayView1<'_, f64>) -> usize {
+    provisioned_internal_knots_for_column(col).saturating_add(DEFAULT_BSPLINE_DEGREE + 1)
+}
+
+/// #1867 on a route whose loop grows the basis: the pilot open cubic `s(x)`
+/// dimension on `col` (after its distinct-value support cap), the floor under
+/// a 1-D radial smooth's pilot. `sizing_rows` is the row count the competing
+/// `s(x)` pilot is sized from — a by-level's own rows, otherwise every row
+/// (#3179) — so the floor tracks that spline's pilot exactly.
+pub(crate) fn pilot_univariate_spline_basis_dim(
+    col: ArrayView1<'_, f64>,
+    sizing_rows: usize,
+) -> usize {
     let dim = pilot_internal_knots(
         sizing_rows,
         DEFAULT_BSPLINE_DEGREE,
@@ -4983,15 +4971,6 @@ pub(crate) fn tensor_margin_sizes(caps: &[usize], budget: usize) -> Vec<usize> {
 /// the `degree + 1` functions a periodic degree-`degree` basis needs to wrap.
 pub(crate) fn pilot_cyclic_basis_dim(n: usize, degree: usize, penalty_order: usize) -> usize {
     pilot_spline_basis_dim(n, 1, penalty_order).max(degree + 1)
-}
-
-/// Default periodic basis dimension of a degree-`degree` cyclic spline on
-/// `col` with the default penalty order: the rate pilot
-/// [`pilot_cyclic_basis_dim`] held to the column's distinct values (the same
-/// rule the formula `s(x, bs="cc")` arm applies).
-pub(crate) fn cyclic_basis_dim_for_column(col: ArrayView1<'_, f64>, degree: usize) -> usize {
-    pilot_cyclic_basis_dim(col.len(), degree, DEFAULT_PENALTY_ORDER.min(degree).max(1))
-        .min(unique_count_column(col).max(degree + 1))
 }
 
 // ---------------------------------------------------------------------------
@@ -5192,7 +5171,7 @@ fn parse_ps_internal_knots(
     } else {
         option_usize(options, "knots")?
     };
-    let basis_dim = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])?;
+    let basis_dim = option_usize_any(options, &["k"])?;
     if knots_internal.is_some() && basis_dim.is_some() {
         return Err(TermBuilderError::incompatible_config(
             "ps/bspline smooth: specify either knots=<internal_knots> or k=<basis_dim> (not both)",
@@ -5412,7 +5391,7 @@ fn resolve_nonperiodic_bspline_knotspec(
     use crate::basis::{BSplineKnotPlacement, clamped_knot_vector_from_internal_positions};
     let knot_range = domain.unwrap_or(data_range);
     if let Some(positions) = parse_explicit_internal_knots(options)? {
-        if option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])?.is_some()
+        if option_usize_any(options, &["k"])?.is_some()
         {
             return Err(TermBuilderError::incompatible_config(
                 "ps/bspline smooth: specify either explicit knots=[...] positions or \
@@ -5473,19 +5452,14 @@ fn resolve_nonperiodic_bspline_knotspec(
 /// `bs='re'` used to share this list even though it builds no spline at all;
 /// see [`RANDOM_EFFECT_SMOOTH_OPTION_KEYS`] and #2791.
 pub(crate) const FACTOR_SMOOTH_OPTION_KEYS: &[&str] = &[
-    "type",
     "bs",
     "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
     "knots",
     "knot_placement",
     "knot-placement",
     "knotplacement",
     "degree",
     "penalty_order",
-    "m",
     "double_penalty",
     "ordered",
 ];
@@ -5498,23 +5472,19 @@ pub(crate) const FACTOR_SMOOTH_OPTION_KEYS: &[&str] = &[
 /// penalty, so none of the basis-shaping keys of
 /// [`FACTOR_SMOOTH_OPTION_KEYS`] can be honoured — and until #2791 all ten of
 /// them were accepted and silently discarded.
-pub(crate) const RANDOM_EFFECT_SMOOTH_OPTION_KEYS: &[&str] = &["type", "bs", "ordered"];
+pub(crate) const RANDOM_EFFECT_SMOOTH_OPTION_KEYS: &[&str] = &["bs", "ordered"];
 
 /// The keys `bs='re'` refuses with a reason rather than a bare "unknown
 /// option": they are all spelled correctly and all valid on `bs='fs'`, so the
 /// user's mistake is the flavour, not the spelling.
 const RANDOM_EFFECT_UNSHAPEABLE_OPTION_KEYS: &[&str] = &[
     "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
     "knots",
     "knot_placement",
     "knot-placement",
     "knotplacement",
     "degree",
     "penalty_order",
-    "m",
     "double_penalty",
 ];
 
@@ -5539,13 +5509,9 @@ fn validate_random_effect_smooth_options(options: &BTreeMap<String, String>) -> 
 }
 
 pub(crate) const CYCLIC_SMOOTH_OPTION_KEYS: &[&str] = &[
-    "type",
     "bs",
     "by",
     "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
     "degree",
     "penalty_order",
     "period",
@@ -5565,13 +5531,9 @@ pub(crate) const CYCLIC_SMOOTH_OPTION_KEYS: &[&str] = &[
 ];
 
 pub(crate) const BSPLINE_SMOOTH_OPTION_KEYS: &[&str] = &[
-    "type",
     "bs",
     "by",
     "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
     "knots",
     "knot_placement",
     "knot-placement",
@@ -5608,15 +5570,11 @@ pub(crate) const BSPLINE_SMOOTH_OPTION_KEYS: &[&str] = &[
 ];
 
 pub(crate) const THINPLATE_SMOOTH_OPTION_KEYS: &[&str] = &[
-    "type",
     "bs",
     "by",
     "length_scale",
     "centers",
     "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
     "knots",
     "include_intercept",
     "double_penalty",
@@ -5630,20 +5588,14 @@ pub(crate) const THINPLATE_SMOOTH_OPTION_KEYS: &[&str] = &[
 ];
 
 pub(crate) const SPHERE_SMOOTH_OPTION_KEYS: &[&str] = &[
-    "type",
     "bs",
     "by",
     "centers",
     "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
     "knots",
     "penalty_order",
-    "m",
     "double_penalty",
     "id",
-    "kernel",
     "method",
     "radians",
     "units",
@@ -5657,14 +5609,10 @@ pub(crate) const SPHERE_SMOOTH_OPTION_KEYS: &[&str] = &[
 ];
 
 pub(crate) const CURVATURE_SMOOTH_OPTION_KEYS: &[&str] = &[
-    "type",
     "bs",
     "by",
     "centers",
     "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
     "knots",
     "kappa",
     "length_scale",
@@ -5673,14 +5621,10 @@ pub(crate) const CURVATURE_SMOOTH_OPTION_KEYS: &[&str] = &[
 ];
 
 pub(crate) const MEASURE_JET_SMOOTH_OPTION_KEYS: &[&str] = &[
-    "type",
     "bs",
     "by",
     "centers",
     "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
     "knots",
     "s",
     "alpha",
@@ -5693,16 +5637,12 @@ pub(crate) const MEASURE_JET_SMOOTH_OPTION_KEYS: &[&str] = &[
 ];
 
 pub(crate) const MATERN_SMOOTH_OPTION_KEYS: &[&str] = &[
-    "type",
     "bs",
     "by",
     "nu",
     "length_scale",
     "centers",
     "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
     "knots",
     "include_intercept",
     "double_penalty",
@@ -5717,15 +5657,11 @@ pub(crate) const MATERN_SMOOTH_OPTION_KEYS: &[&str] = &[
 ];
 
 pub(crate) const DUCHON_SMOOTH_OPTION_KEYS: &[&str] = &[
-    "type",
     "bs",
     "by",
     "length_scale",
     "centers",
     "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
     "knots",
     "rank",
     "power",
@@ -5744,13 +5680,9 @@ pub(crate) const DUCHON_SMOOTH_OPTION_KEYS: &[&str] = &[
 ];
 
 pub(crate) const TENSOR_SMOOTH_OPTION_KEYS: &[&str] = &[
-    "type",
     "bs",
     "by",
     "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
     "knot_placement",
     "knot-placement",
     "knotplacement",
@@ -5776,13 +5708,9 @@ pub(crate) const TENSOR_SMOOTH_OPTION_KEYS: &[&str] = &[
 ];
 
 pub(crate) const PCA_SMOOTH_OPTION_KEYS: &[&str] = &[
-    "type",
     "bs",
     "by",
     "k",
-    "basis_dim",
-    "basis-dim",
-    "basisdim",
     "lazy_path",
     "path",
     "pca_basis_path",
@@ -5923,15 +5851,13 @@ pub(crate) fn default_duchon_center_count(
 ) -> usize {
     // #1757: Duchon fits pay a larger setup cost than Matérn/TPS because the
     // constrained radial block is rotated through its center Gram and several
-    // operator-collocation penalties, so the default must not hand a cold fit
-    // far more centers than the data can resolve. The implicit count is the
-    // rate-derived pilot `starting_num_centers(n, d, polynomial_cols)`: the
-    // polynomial null space plus the penalized resolution rank of the minimal
-    // embedding order at `n` rows. The penalty sets smoothness; the adaptive
-    // formula workflow refines the centers while the fit's REML evidence
-    // prefers the richer basis. An explicit `centers=`/`k=` request still takes
-    // full effect upstream, and the polynomial null space must still fit, so
-    // tiny high-order bases are raised to the smallest admissible count.
+    // operator-collocation penalties, so a default no loop grows is the generic
+    // spatial count held to the low-rank `provisioned_duchon_center_cap`. The
+    // standard formula workflow instead starts it at its pilot
+    // ([`pilot_duchon_center_count`]) and grows it on the fit's REML evidence
+    // (#3149). An explicit `centers=`/`k=` request still takes full effect
+    // upstream, and the polynomial null space must still fit, so tiny
+    // high-order bases are raised to the smallest admissible count.
     let low_n_floor = (polynomial_cols + 1).min(n).max(1);
     // #1867: a 1-D radial basis must not be dimensioned coarser than the
     // univariate spline the competing `s(x)` gets on the SAME data, or
@@ -5939,6 +5865,25 @@ pub(crate) fn default_duchon_center_count(
     // d>1) carries that spline-equivalent basis dimension and floors the 1-D
     // default, bounded by n; smoothness is set by the REML penalty, not the raw
     // count. Explicit `k`/`centers` still override upstream.
+    default_num_centers(n, d)
+        .min(provisioned_duchon_center_cap(d))
+        .max(low_n_floor)
+        .max(univariate_floor.min(n))
+}
+
+/// The pilot center count of a default Duchon smooth the standard workflow
+/// grows: the rate-derived `starting_num_centers(n, d, polynomial_cols)`, the
+/// polynomial null space plus the penalized resolution rank of the minimal
+/// embedding order at `n` rows, under the same identifiability and #1867
+/// floors as [`default_duchon_center_count`] (`univariate_floor` is the pilot
+/// `s(x)`'s, [`pilot_univariate_spline_basis_dim`]).
+pub(crate) fn pilot_duchon_center_count(
+    n: usize,
+    d: usize,
+    polynomial_cols: usize,
+    univariate_floor: usize,
+) -> usize {
+    let low_n_floor = (polynomial_cols + 1).min(n).max(1);
     starting_num_centers(n, d, polynomial_cols)
         .max(low_n_floor)
         .max(univariate_floor.min(n))
@@ -5954,10 +5899,7 @@ pub(crate) fn parse_countwith_basis_alias(
     // to the default. Without this the user gets the auto-inferred count
     // silently and never realizes their explicit option was ignored.
     let primary = option_usize(options, primarykey)?;
-    let basis_dim = option_usize_any(
-        options,
-        &["k", "basis_dim", "basis-dim", "basisdim", "knots"],
-    )?;
+    let basis_dim = option_usize_any(options, &["k", "knots"])?;
     if primary.is_some() && basis_dim.is_some() {
         return Err(TermBuilderError::incompatible_config(format!(
             "specify either {}=<count> or k=<basis_dim> (not both)",
@@ -5968,32 +5910,14 @@ pub(crate) fn parse_countwith_basis_alias(
     Ok(primary.or(basis_dim).unwrap_or(default_count))
 }
 
-/// Resolve the wiggliness penalty's derivative/difference order from its two
-/// documented spellings.
+/// The wiggliness penalty's derivative/difference order, `penalty_order=`.
 ///
-/// `penalty_order=` and `m=` name the SAME knob here and in mgcv. Reading one
-/// and falling through to the other (`option_usize(.., "penalty_order")
-/// .or_else(|| option_usize(.., "m"))`) silently drops the loser when both are
-/// given. This refuses the conflict the way `parse_countwith_basis_alias`
-/// refuses `centers=` together with `k=`, and parses strictly so `m=1.5` is a
-/// user mistake rather than "m not specified".
-pub(crate) fn parse_penalty_order_alias(
+/// Parsed strictly so `penalty_order=1.5` is a user mistake rather than "not
+/// specified".
+pub(crate) fn parse_penalty_order(
     options: &BTreeMap<String, String>,
 ) -> Result<Option<usize>, String> {
-    let primary = option_usize(options, "penalty_order")?;
-    let alias = option_usize(options, "m")?;
-    match (primary, alias) {
-        (Some(primary), Some(alias)) if primary != alias => {
-            Err(TermBuilderError::incompatible_config(format!(
-                "penalty_order={primary} and m={alias} are two spellings of the same \
-                 option (the order of the penalised derivative), so they cannot disagree; \
-                 specify one of them"
-            ))
-            .to_string())
-        }
-        (Some(primary), _) => Ok(Some(primary)),
-        (None, alias) => Ok(alias),
-    }
+    option_usize(options, "penalty_order")
 }
 
 /// Reject a B-spline-family degree that cannot carry a roughness penalty.
@@ -6085,9 +6009,7 @@ pub fn has_explicit_countwith_basis_alias(
     primarykey: &str,
 ) -> bool {
     options.contains_key(primarykey)
-        || ["k", "basis_dim", "basis-dim", "basisdim", "knots"]
-            .iter()
-            .any(|alias| options.contains_key(*alias))
+        || ["k", "knots"].iter().any(|alias| options.contains_key(*alias))
 }
 
 pub(crate) fn parse_cyclic_boundary(

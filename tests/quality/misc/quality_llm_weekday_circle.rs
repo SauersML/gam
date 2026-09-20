@@ -28,8 +28,8 @@
 //!           independent atoms, the additive split is lossless.
 //!         * **Binding world** — weekday and month act *jointly* (a genuine
 //!           `a(w)·b(m)` interaction on top of the additive part). The carve
-//!           must REFUSE to fission and its gauge-projected Wald binding test
-//!           must REJECT with a small p-value — "weekday is bound to month".
+//!           must REFUSE to fission and its sample-space binding test must
+//!           REJECT with a small p-value — "weekday is bound to month".
 //!
 //! Per suite policy (objective-quality, never reference-matching) this test
 //! asserts *structure recovery against the planted truth*, not reproduction of
@@ -44,7 +44,6 @@
 //! are exercised end-to-end on CPU exactly as they would be on the harvested
 //! cloud.
 
-use gam::inference::smooth_test::SmoothTestScale;
 use gam::terms::structure::anova_atom::{BindingNotion, CarveInput, carve, fit_tensor_surface};
 use ndarray::{Array1, Array2};
 
@@ -146,12 +145,14 @@ fn weekday_month_coeffs(interaction: f64) -> (Array2<f64>, Array2<f64>) {
 ///
 /// `with_covariance` controls the carve channel:
 ///   * `true` — the scale-included posterior covariance + joint covariance
-///     are supplied, so the gauge-projected Wald binding test runs, and a
-///     split is certified when the discarded interaction energy lies inside
-///     the carve's resolution band: its rounding floor plus the posterior's
-///     α-level bound (#2946). This channel carries both verdicts.
+///     are supplied, so a split is certified when the discarded interaction
+///     energy lies inside the carve's resolution band: its rounding floor plus
+///     the posterior's α-level bound (#2946).
 ///   * `false` (bare) — no covariance: only the rounding floor can certify a
 ///     split, so a noisy estimate stays whole and contested.
+///
+/// Both channels carry the fit's exact sample-space binding test (Rao's F for
+/// the two readout outputs), which is what supplies `edge_p_value`.
 fn carve_weekday_month(
     interaction: f64,
     noise: f64,
@@ -179,16 +180,12 @@ fn carve_weekday_month(
         coeff_band: &fit.coeff_band,
         coeff_covariance: with_covariance.then_some(fit.coeff_covariance.as_slice()),
         joint_coeff_covariance: with_covariance.then_some(&joint),
-        kernel_a: None,
-        kernel_b: None,
-        edf: None,
-        residual_df: fit.residual_df,
-        scale: SmoothTestScale::Estimated,
+        interaction_test: Some(&fit.interaction_test),
         notion: BindingNotion::Representational,
     };
     let report = carve(&input, 0.05).expect("carve must run");
     (
-        report.edge_p_value,
+        report.edge_p_value().ok(),
         report.interaction_fraction,
         report.fission.is_some(),
     )
@@ -223,11 +220,10 @@ fn weekday_is_bound_to_month_when_planted_jointly_and_fissions_when_additive() {
 
     // --- Binding world: weekday × month act JOINTLY ----------------------
     // A genuine rank-1 interaction on top of the additive part: the carve
-    // must REFUSE to fission and the gauge-projected Wald binding test must
-    // REJECT — "weekday is bound to month". Run on the covariance channel so
-    // the joint Wald test populates edge_p_value.
+    // must REFUSE to fission and the joint binding test over both readout
+    // outputs must REJECT — "weekday is bound to month".
     let (bind_p, bind_frac, bind_fissions) = carve_weekday_month(2.0, 1e-3, true, 7);
-    let p = bind_p.expect("binding-world carve must run the joint Wald test");
+    let p = bind_p.expect("binding-world carve must run the joint binding test");
     assert!(
         p < 1e-3,
         "planted weekday×month binding must reject the additive null, p={p}",
@@ -244,7 +240,7 @@ fn weekday_is_bound_to_month_when_planted_jointly_and_fissions_when_additive() {
 
     println!(
         "weekday×month binding verdict: additive world fissions \
-         (interaction_fraction={:.4}); binding world refuses with Wald p={:.2e} \
+         (interaction_fraction={:.4}); binding world refuses with binding p={:.2e} \
          (interaction_fraction={:.4})",
         add_frac, p, bind_frac,
     );

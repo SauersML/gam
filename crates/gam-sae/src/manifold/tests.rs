@@ -2496,6 +2496,62 @@ pub(crate) fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() 
 }
 
 #[test]
+fn a_multi_atom_separable_gate_seed_carries_the_full_dispersion_shift_on_clean_data_3233() {
+    // #3233: the seed rule is one map, λ → λ·φ, at every K. A clamp of the
+    // smoothness/ARD shift at max(ln φ, 0) for K > 1 changed the seed
+    // discontinuously between K = 1 and K = 2 and left clean-data (φ < 1)
+    // multi-atom fits at an underived strength.
+    let assignment_for = |mode: AssignmentMode, k: usize| {
+        SaeAssignment::from_blocks_with_mode_and_manifolds(
+            ndarray::Array2::<f64>::zeros((1, k)),
+            vec![ndarray::Array2::<f64>::zeros((1, 1)); k],
+            vec![LatentManifold::Euclidean; k],
+            mode,
+        )
+        .expect("one logit column, coordinate block and manifold per atom")
+    };
+    for k in [1_usize, 2, 4] {
+        let ard: Vec<Array1<f64>> = (0..k)
+            .map(|atom| array![0.2 - 0.1 * atom as f64, -0.4])
+            .collect();
+        let rho = SaeManifoldRho::new(0.7_f64.ln(), 1.3_f64.ln(), ard);
+        for mode in [AssignmentMode::softmax(1.0), AssignmentMode::threshold_gate(1.0, 0.0)] {
+            for dispersion in [1.0e-4_f64, 1.0e-2, 4.0] {
+                let shift = dispersion.ln();
+                let bound = rho.clone().for_assignment(&assignment_for(mode.clone(), k));
+                let scaled = rho
+                    .seed_scaled_by_dispersion_for_assignment(
+                        dispersion,
+                        &assignment_for(mode.clone(), k),
+                    )
+                    .unwrap();
+                for atom in 0..k {
+                    assert_eq!(
+                        scaled.log_lambda_smooth[atom],
+                        bound.log_lambda_smooth[atom] + shift,
+                        "K={k} φ={dispersion} {mode:?}: smoothness atom {atom}"
+                    );
+                    for axis in 0..bound.log_ard[atom].len() {
+                        assert_eq!(
+                            scaled.log_ard[atom][axis],
+                            bound.log_ard[atom][axis] + shift,
+                            "K={k} φ={dispersion} {mode:?}: ARD atom {atom} axis {axis}"
+                        );
+                    }
+                }
+                if bound.sparse_flat_index().is_some() {
+                    assert_eq!(
+                        scaled.log_lambda_sparse,
+                        bound.log_lambda_sparse + shift,
+                        "K={k} φ={dispersion} {mode:?}: gate strength"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 pub(crate) fn fit_data_collapse_records_terminal_event_for_active_atom() {
     let coords = array![[0.0], [0.25], [0.5], [0.75]];
     let (phi, jet) = periodic_basis(&coords);

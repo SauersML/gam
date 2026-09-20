@@ -205,12 +205,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
-        let decision = self.selecthessian_strategy_policy(&bundle);
-        let hessian = match decision.strategy {
-            super::inner_strategy::HessianEvalStrategyKind::SpectralExact => {
-                self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
-            }
-        };
+        let hessian = self.compute_lamlhessian_exact_from_bundle(rho, &bundle);
         // Read after the evaluation: a first evaluation is what latches the
         // #784 block, and with it whether `Δ_b` has a closed-form ρ-Hessian.
         if let Some(reason) = self.block_correction_hessian_refusal() {
@@ -244,12 +239,14 @@ impl<'a> RemlState<'a> {
     /// an error.
     ///
     /// The Tier-0 diagnostic costs `M` outer-criterion evaluations (each an
-    /// inner solve) near `ρ̂` plus a fresh ρ-Hessian, and the returned fit does
-    /// not need it, so the caller runs it only when ρ-posterior inference was
-    /// requested. When the diagnostic grades the plug-in [`Escalate`], the
-    /// tiers (#938) run HERE, against the same live objective — Tier 1
-    /// quadrature for `K ≤ 4`, Tier 2 NUTS with the exact LAML `ρ`-gradient
-    /// (`Self::compute_gradient`) for `K ≤ 16`, honest `Unavailable` beyond.
+    /// inner solve) near `ρ̂` plus a fresh ρ-Hessian, `M` the 2155 draws at
+    /// which PSIS is reliable for a tail shape at the escalation cutoff; the
+    /// returned fit does not need it, so the caller runs it only when
+    /// ρ-posterior inference was requested. When the diagnostic grades the
+    /// plug-in [`Escalate`], the tiers (#938) run HERE, against the same live objective — Tier 1
+    /// quadrature or Tier 2 NUTS with the exact LAML `ρ`-gradient
+    /// (`Self::compute_gradient`), whichever needs fewer criterion evaluations,
+    /// with an honest `Unavailable` when the chosen tier fails.
     /// Post-hoc escalation after the `RemlState` is gone would need an owned
     /// rebuild recipe; running at the live seam avoids that entirely.
     ///
@@ -271,7 +268,6 @@ impl<'a> RemlState<'a> {
         &self,
         final_rho: &Array1<f64>,
         continuation: &crate::estimate::rho_domain::CriterionContinuation,
-        n_samples: Option<usize>,
     ) -> (
         gam_problem::rho_posterior::RhoPosteriorOutcome,
         Option<gam_problem::rho_posterior::RhoPosteriorEscalation>,
@@ -325,7 +321,6 @@ impl<'a> RemlState<'a> {
             final_rho,
             &outer_hessian,
             &|rho| continuation.value(rho, cost, cost_and_gradient),
-            n_samples,
         ) {
             Ok(Some(adequacy)) => RhoPosteriorOutcome::Assessed(adequacy),
             Ok(None) => RhoPosteriorOutcome::NotApplicable,
@@ -369,27 +364,57 @@ impl<'a> RemlState<'a> {
                 // adequate, which is a question about the object the fit
                 // reports, and moving it is a separate decision recorded on
                 // #2450.
-                Some(escalator.escalate_rho_posterior(
+                //
+                // #3293 — the tiers are then placed on the density they
+                // sample, not on the criterion's: see
+                // `sampled_density_laplace_geometry`.
+                let geometry = sampled_density_laplace_geometry(
                     final_rho,
                     &outer_hessian,
-                    // The prior is analytic in ρ, so it is read at the draw
-                    // itself; only the LAML part is continued from the face.
-                    &mut |rho| {
-                        let laml = continuation.value(rho, cost, cost_and_gradient)?;
-                        let (prior_cost, _) = self
-                            .rho_prior_distribution_correction(rho)
-                            .map_err(|error| error.to_string())?;
-                        Ok(laml + prior_cost)
-                    },
-                    &mut |rho| {
+                    |rho| {
                         let (laml, gradient) =
                             continuation.value_and_gradient(rho, cost_and_gradient)?;
-                        let (prior_cost, prior_gradient) = self
+                        let correction = self
                             .rho_prior_distribution_correction(rho)
                             .map_err(|error| error.to_string())?;
-                        Ok((laml + prior_cost, gradient + prior_gradient))
+                        Ok((
+                            laml + correction.cost,
+                            gradient + &correction.gradient,
+                            correction.hessian_diagonal,
+                        ))
                     },
-                ))
+                );
+                Some(match geometry {
+                    Ok((mode, hessian)) => escalator.escalate_rho_posterior(
+                        &mode,
+                        &hessian,
+                        // The prior is analytic in ρ, so it is read at the draw
+                        // itself; only the LAML part is continued from the face.
+                        &mut |rho| {
+                            let laml = continuation.value(rho, cost, cost_and_gradient)?;
+                            let correction = self
+                                .rho_prior_distribution_correction(rho)
+                                .map_err(|error| error.to_string())?;
+                            Ok(laml + correction.cost)
+                        },
+                        &mut |rho| {
+                            let (laml, gradient) =
+                                continuation.value_and_gradient(rho, cost_and_gradient)?;
+                            let correction = self
+                                .rho_prior_distribution_correction(rho)
+                                .map_err(|error| error.to_string())?;
+                            Ok((laml + correction.cost, gradient + &correction.gradient))
+                        },
+                    ),
+                    Err(reason) => {
+                        gam_problem::rho_posterior::RhoPosteriorEscalation::Unavailable {
+                            n_params: final_rho.len(),
+                            reason: format!(
+                                "the sampled rho density has no Laplace geometry: {reason}"
+                            ),
+                        }
+                    }
+                })
             }
             _ => None,
         };
@@ -451,19 +476,7 @@ impl<'a> RemlState<'a> {
         };
         match &outcome {
             SmoothingCorrectionOutcome::FirstOrder { method, .. } => {
-                log::info!("[smoothing-correction] branch=first-order method={method:?}");
-            }
-            SmoothingCorrectionOutcome::Unavailable {
-                reason: SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { error },
-                ..
-            } => {
-                // Structural, not numerical: no analytic outer Hessian exists
-                // for this fit, so the counter of numerical failures does not
-                // move.
-                log::debug!(
-                    "[smoothing-correction] branch=unavailable reason=outer-hessian-not-analytic \
-                     ({error})"
-                );
+                log::debug!("[smoothing-correction] branch=first-order method={method:?}");
             }
             SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
                 SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -474,6 +487,166 @@ impl<'a> RemlState<'a> {
             }
         }
         outcome
+    }
+}
+
+/// #3293 — THE ESCALATION TIERS ARE PLACED ON THE DENSITY THEY SAMPLE.
+///
+/// The tiers sample `exp(−(LAML(ρ) + c(ρ)))`, where `c` is the distribution
+/// correction of #2450, and both whiten by a centre and a curvature: `ρ = m +
+/// L z` with `L Lᵀ = H⁻¹`. Handing them the criterion's own `(ρ̂, H_LAML(ρ̂))`
+/// describes a different density. The two part exactly where the LAML is
+/// nearly flat, which is where the correction decides the shape: measured on
+/// the block-corrected Poisson `te` fit of #3293, `H_LAML` has diagonal entries
+/// `0.0096` and `0.0027` (whitened scales 10 and 19 in `ρ`) while the sampled
+/// density's mode in those coordinates sits six units below `ρ̂`, where the PC
+/// curvature `(θ/4)e^{−ρ/2}` gives it a scale near 2. NUTS then adapts its step
+/// to the exponential lower wall of the correction and walks the mis-scaled
+/// directions at that step, doubling its tree to the depth cap on every draw.
+///
+/// So the centre is the sampled density's mode and the curvature is its
+/// Hessian there: `H_LAML + diag(c″)`, with the correction's exact analytic
+/// curvature read at the point and the LAML part read at `ρ̂`, the one point
+/// where the fit certified it (past a saturated face the continued LAML is
+/// affine and contributes none). The mode is found by Newton on the exact
+/// value and gradient of the sampled density with that curvature, which is SPD
+/// by construction (`H_LAML` SPD, `c″ ≥ 0`), and an Armijo backtracking line
+/// search, so every accepted step lowers the density's cost. It stops when the
+/// Newton model's predicted decrease `½ gᵀH⁻¹g` falls below the rounding
+/// resolution of the cost it would lower, or when no step along the Newton
+/// direction lowers the cost at all: either way no further descent is
+/// resolvable. The correction makes the sampled density proper (#2450), so its
+/// cost is bounded below and the descent ends. A trial point the density cannot
+/// value is contracted toward the current iterate, as for any line search. The
+/// draws stay exact for the
+/// sampled density whatever the geometry; the geometry decides only how fast
+/// the tiers reach them.
+///
+/// `density` returns the sampled density's cost, its gradient and the
+/// correction's curvature diagonal at `ρ`, or why it cannot value `ρ`.
+fn sampled_density_laplace_geometry(
+    rho_hat: &Array1<f64>,
+    laml_hessian: &Array2<f64>,
+    mut density: impl FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>, Array1<f64>), String>,
+) -> Result<(Array1<f64>, Array2<f64>), String> {
+    use opt::{BacktrackConfig, backtracking_line_search, constants::ARMIJO_C1};
+    let curvature_at = |correction_curvature: &Array1<f64>| {
+        let mut hessian = laml_hessian.clone();
+        for (index, &c) in correction_curvature.iter().enumerate() {
+            hessian[[index, index]] += c;
+        }
+        hessian
+    };
+    let (mut cost, mut gradient, mut correction_curvature) = density(rho_hat)
+        .map_err(|detail| format!("the sampled density is unavailable at rho_hat: {detail}"))?;
+    if !cost.is_finite() || gradient.iter().any(|g| !g.is_finite()) {
+        return Err(format!("the sampled density at rho_hat is {cost} with gradient {gradient}"));
+    }
+    let mut rho = rho_hat.clone();
+    loop {
+        let hessian = curvature_at(&correction_curvature);
+        let factor = gam_linalg::utils::certified_spd_factorize(
+            &hessian,
+            "sampled rho density Laplace curvature",
+        )
+        .map_err(|error| error.to_string())?;
+        let step = -factor
+            .solve(&gradient)
+            .map_err(|error| error.to_string())?
+            .into_solution();
+        let decrement = -gradient.dot(&step);
+        if 0.5 * decrement <= f64::EPSILON * cost.abs() {
+            break;
+        }
+        let accepted = backtracking_line_search::<_, std::convert::Infallible>(
+            BacktrackConfig::default(),
+            |t| {
+                let mut trial = rho.clone();
+                trial.scaled_add(t, &step);
+                Ok(match density(&trial) {
+                    Ok((c, g, h))
+                        if c.is_finite()
+                            && g.iter().all(|v| v.is_finite())
+                            && h.iter().all(|v| v.is_finite() && *v >= 0.0) =>
+                    {
+                        Some((c, (trial, g, h)))
+                    }
+                    _ => None,
+                })
+            },
+            |t, trial_cost| trial_cost <= cost - ARMIJO_C1 * t * decrement,
+        );
+        let Some(accepted) = (match accepted {
+            Ok(accepted) => accepted,
+            Err(never) => match never {},
+        }) else {
+            break;
+        };
+        cost = accepted.value;
+        (rho, gradient, correction_curvature) = accepted.payload;
+    }
+    Ok((rho, curvature_at(&correction_curvature)))
+}
+
+#[cfg(test)]
+mod sampled_density_laplace_geometry_tests {
+    use super::sampled_density_laplace_geometry;
+    use crate::estimate::reml::outer_eval::{
+        RHO_DISTRIBUTION_PC_TAIL_PROB, RHO_DISTRIBUTION_PC_UPPER,
+    };
+    use crate::rho_prior_eval::{pc_prior_rate, pc_prior_terms};
+    use ndarray::{Array1, Array2, array};
+
+    /// The #3293 geometry: a LAML quadratic at `ρ̂` that is nearly flat in its
+    /// last two coordinates, plus the default PC distribution correction on
+    /// every coordinate. The geometry must land on the sampled density's own
+    /// stationary point, far below `ρ̂` in the flat coordinates, and carry
+    /// the density's exact curvature there.
+    #[test]
+    fn geometry_is_the_sampled_density_mode_and_curvature_3293() {
+        let rho_hat = array![7.80, 7.93, 1.85, 4.33, 4.90];
+        let laml_diagonal = array![6.08, 6.13, 0.209, 0.00957, 0.00268];
+        let laml_hessian = Array2::from_diag(&laml_diagonal);
+        let theta = pc_prior_rate(RHO_DISTRIBUTION_PC_UPPER, RHO_DISTRIBUTION_PC_TAIL_PROB);
+        let density = |rho: &Array1<f64>| {
+            let delta = rho - &rho_hat;
+            let mut cost = 0.5 * delta.dot(&laml_hessian.dot(&delta));
+            let mut gradient = laml_hessian.dot(&delta);
+            let mut curvature = Array1::zeros(rho.len());
+            for (index, &r) in rho.iter().enumerate() {
+                let (c, g, h) = pc_prior_terms(theta, r);
+                cost += c;
+                gradient[index] += g;
+                curvature[index] = h;
+            }
+            Ok((cost, gradient, curvature))
+        };
+        let (mode, hessian) =
+            sampled_density_laplace_geometry(&rho_hat, &laml_hessian, density).expect("geometry");
+        for index in 0..mode.len() {
+            let r = mode[index];
+            let (_, prior_gradient, prior_curvature) = pc_prior_terms(theta, r);
+            let stationarity = laml_diagonal[index] * (r - rho_hat[index]) + prior_gradient;
+            let curvature = laml_diagonal[index] + prior_curvature;
+            // Newton's decrement in this coordinate, `g²/H`, is the squared
+            // distance to the mode in the density's own standard deviations.
+            assert!(
+                stationarity * stationarity / curvature <= 1e-12,
+                "coordinate {index} is not stationary: gradient {stationarity} at {r}"
+            );
+            assert!(
+                (hessian[[index, index]] - curvature).abs() <= 1e-12 * curvature,
+                "coordinate {index} curvature {} vs the density's {curvature}",
+                hessian[[index, index]]
+            );
+        }
+        // The flat coordinates are where the two densities part.
+        assert!(
+            rho_hat[4] - mode[4] > 5.0,
+            "the correction must move the flat coordinate's mode: {} vs {}",
+            mode[4],
+            rho_hat[4]
+        );
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! # The question this answers
 //!
-//! A `group(g)`/`re(g)` term is `η = Xβ + X_R b` with `b ~ N(0, σ²_b Σ_b)` and a
+//! A `group(g)` term is `η = Xβ + X_R b` with `b ~ N(0, σ²_b Σ_b)` and a
 //! ridge penalty on `b`. "Does this term matter?" is `H₀: σ²_b = 0`, and that
 //! null sits on the BOUNDARY of the parameter space. None of the reference laws
 //! the smooth table uses are valid there:
@@ -118,6 +118,9 @@ pub enum RandomEffectTestUnavailable {
     NoResidualDegreesOfFreedom,
     /// The reference tail could not be resolved to any accuracy.
     TailUnresolved,
+    /// The scale is known, but the fit publishes no finite positive dispersion
+    /// to scale the score's variance by.
+    KnownScaleUnavailable,
 }
 
 impl RandomEffectTestUnavailable {
@@ -129,6 +132,7 @@ impl RandomEffectTestUnavailable {
             Self::NoEstimableDirection => "random_effect_no_estimable_direction",
             Self::NoResidualDegreesOfFreedom => "random_effect_no_residual_degrees_of_freedom",
             Self::TailUnresolved => "random_effect_tail_unresolved",
+            Self::KnownScaleUnavailable => "random_effect_known_scale_unavailable",
         }
     }
 
@@ -148,6 +152,9 @@ impl RandomEffectTestUnavailable {
                 "the scale is estimated but the unpenalized model leaves no residual degrees of freedom"
             }
             Self::TailUnresolved => "the reference tail probability could not be resolved",
+            Self::KnownScaleUnavailable => {
+                "the scale is known but the fit publishes no finite positive dispersion"
+            }
         }
     }
 }

@@ -54,10 +54,11 @@ use super::chain::{
     interpolate_at_inner_points, log_sum_exp, normal_density,
 };
 use super::cohort::{EventHistoryError, SubjectNodes};
-use super::scalar::{add_real, exp, ln, recip, sqrt, square};
+use super::scalar::{add_real, div, exp, ln, recip, sqrt, square};
 use gam_math::nested_dual::JetField;
 use ndarray::ArrayView2;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Everything one subject's marginal needs, in the caller's scalar type.
 pub(crate) struct SubjectInputs<'a, S> {
@@ -413,22 +414,37 @@ pub(crate) fn node_likelihood<S: JetField>(
                 .collect()
         });
         for i in 0..size {
-            if y != 0.0 {
-                let mut eta = base.clone();
-                for (k, a) in loadings_d.iter().enumerate() {
-                    eta = eta.add(&a.mul(grid.coordinate(i, k)));
+            // The tables hold exactly the products `a_k z_k` the linear
+            // predictor sums, in the same order, so a node with exposure reads
+            // `η` from them instead of forming every product a second time.
+            let eta = match &latent {
+                Some(tables) => {
+                    let mut eta = base.clone();
+                    for (k, table) in tables.iter().enumerate() {
+                        eta = eta.add(&table[grid.index(i, k)]);
+                    }
+                    Some(eta)
                 }
-                ell[i] = ell[i].add(&eta.scale(y));
+                None => None,
+            };
+            if y != 0.0 {
+                let term = match &eta {
+                    Some(eta) => eta.scale(y),
+                    None => {
+                        let mut eta = base.clone();
+                        for (k, a) in loadings_d.iter().enumerate() {
+                            eta = eta.add(&a.mul(grid.coordinate(i, k)));
+                        }
+                        eta.scale(y)
+                    }
+                };
+                ell[i] = ell[i].add(&term);
             }
             // A mark with no exposure at this node has no compensator and so
             // no curvature: its intensity is never formed, which is the work
             // the risk sets save.
-            match &latent {
-                Some(tables) => {
-                    let mut log_c = base.clone();
-                    for (k, table) in tables.iter().enumerate() {
-                        log_c = log_c.add(&table[grid.index(i, k)]);
-                    }
+            match eta {
+                Some(log_c) => {
                     let c = exp(&add_real(&log_c, exposure.ln()));
                     ell[i] = ell[i].sub(&c);
                     if derivatives {
@@ -436,7 +452,7 @@ pub(crate) fn node_likelihood<S: JetField>(
                         curvature.push(c);
                     }
                 }
-                _ => {
+                None => {
                     if derivatives {
                         score.push(zero.constant_like(y));
                         curvature.push(zero.clone());
@@ -545,7 +561,8 @@ pub(crate) fn condition<S: JetField>(
 /// One filtered node: its grid, the operators that reached it, the predicted
 /// and filtered densities on it, and the node's likelihood pieces.
 pub(crate) struct FilteredNode<S> {
-    pub grid: Grid<S>,
+    /// Shared, not copied: a static frailty's nodes all live on one grid.
+    pub grid: Arc<Grid<S>>,
     /// Transitions across the gap that led here; empty at the first node.
     pub transitions: Vec<AtomTransition<S>>,
     /// Forward operators from the previous grid; empty at the first node.
@@ -591,35 +608,23 @@ pub(crate) fn filter_start<S: JetField>(
 ) -> Result<FilteredNode<S>, EventHistoryError> {
     let zero: Vec<S> = (0..atoms).map(|_| like.constant_like(0.0)).collect();
     let unit: Vec<S> = (0..atoms).map(|_| like.constant_like(1.0)).collect();
-    let prior_density = |grid: &Grid<S>| -> Vec<S> {
-        (0..grid.size())
-            .map(|i| {
-                let mut density = like.constant_like(1.0);
-                for k in 0..atoms {
-                    density =
-                        density.mul(&normal_density(grid.coordinate(i, k), &zero[k], &unit[k]));
-                }
-                density
-            })
-            .collect()
-    };
     let prior_grid = Grid::new(gh, &zero, &unit, like);
     let rough = node_terms(&prior_grid, false);
     let (rough_alpha, _) = condition(
         &prior_grid,
-        &prior_density(&prior_grid),
+        &prior_density(&prior_grid, like),
         &rough.ell,
         rough.shift,
         label,
     )?;
     let (means, _) = posterior_moments(&prior_grid, &rough_alpha, label)?;
     let grid = Grid::new(gh, &means, &unit, like);
-    let predicted = prior_density(&grid);
+    let predicted = prior_density(&grid, like);
     let likelihood = node_terms(&grid, derivatives);
     let (alpha, normaliser) =
         condition(&grid, &predicted, &likelihood.ell, likelihood.shift, label)?;
     Ok(FilteredNode {
-        grid,
+        grid: Arc::new(grid),
         transitions: Vec::new(),
         forward: OperatorFamily {
             per_axis: Vec::new(),
@@ -630,6 +635,20 @@ pub(crate) fn filter_start<S: JetField>(
         normaliser,
         likelihood,
     })
+}
+
+/// The stationary prior `N(0, I)` of the latent state at every point of
+/// `grid`: the predicted density of the first node.
+fn prior_density<S: JetField>(grid: &Grid<S>, like: &S) -> Vec<S> {
+    let zero = like.constant_like(0.0);
+    let unit = like.constant_like(1.0);
+    (0..grid.size())
+        .map(|i| {
+            (0..grid.dimension()).fold(unit.clone(), |density, k| {
+                density.mul(&normal_density(grid.coordinate(i, k), &zero, &unit))
+            })
+        })
+        .collect()
 }
 
 /// The predictive grid across one gap (centre `φ · mean`, spread
@@ -683,7 +702,7 @@ pub(crate) fn filter_step<S: JetField>(
         let likelihood = node_terms(previous_grid, derivatives);
         let (alpha, normaliser) = condition(previous_grid, previous_alpha, &likelihood.ell,
             likelihood.shift, label)?;
-        return Ok(FilteredNode { grid: previous_grid.clone(), transitions,
+        return Ok(FilteredNode { grid: Arc::new(previous_grid.clone()), transitions,
             forward: OperatorFamily { per_axis: Vec::new(), order: gh.order },
             predicted: previous_alpha.to_vec(), alpha, normaliser, likelihood });
     }
@@ -710,7 +729,7 @@ pub(crate) fn filter_step<S: JetField>(
     let (alpha, normaliser) =
         condition(&grid, &predicted, &likelihood.ell, likelihood.shift, label)?;
     Ok(FilteredNode {
-        grid,
+        grid: Arc::new(grid),
         transitions,
         forward,
         predicted,
@@ -836,15 +855,20 @@ pub(crate) fn subject_marginal<S: JetField>(
     // `static_state::filter`, with no gap between nodes to score.
     let is_static = crate::static_state::is_static(inputs.rates);
     let n_gaps = n_nodes.saturating_sub(1);
-    let Smoothed {
-        marginals: smoothed_all,
-        innovation_moments,
-    } = backward_smoother(inputs, &filtered, &counts_rows, &exposure_rows, !is_static)?;
+    let smoothed_chain =
+        backward_smoother(inputs, &filtered, &counts_rows, &exposure_rows, !is_static)?;
 
     // ---- forward sweep: Fisher mean and Louis second moment ---------------
     // `carried[q * size + i]` is `C_m(z_i)[q]`, the conditional expectation
     // given `z_m = z_i` and the data up to `m` of the complete-data score
-    // accumulated over the nodes and gaps before `m`. `mean` is `E[g | y]`
+    // accumulated over the nodes and gaps before `m`, on node `m`'s filtered
+    // grid; `carried_smoothed` is the same function on the node's smoothed
+    // grid, where it has one (see [`backward_smoother`]). Every expectation
+    // of node `m` is a sum over the smoothed grid, so it contracts against
+    // `carried_smoothed`; `carried` is what moves to the next node, because
+    // `C_{m+1} = F[α_m C_m] / p̂_{m+1}` needs its operand beside `α_m`, and
+    // the forward operator then evaluates it on both of node `m+1`'s grids.
+    // Neither is ever interpolated without the filtered envelope. `mean` is `E[g | y]`
     // and `second` is `E[g gᵀ | y]`, both in coefficient space; `curvature`
     // is `E[∂²L_c | y]`, accumulated as each term is met.
     //
@@ -884,26 +908,18 @@ pub(crate) fn subject_marginal<S: JetField>(
     } else {
         Vec::new()
     };
-    // Reused by every node and mark: the grid's size is `order^atoms`, the
-    // same at every node, so this is one allocation rather than one per mark
-    // per node of a vector as wide as the grid.
-    let mut weighted: Vec<S> = vec![zero.clone(); filtered[0].grid.size()];
-    for m in 0..n_nodes {
-        let grid = &filtered[m].grid;
-        let size = grid.size();
-        let smoothed = &smoothed_all[m];
-        // `W(i) = w_i s(i)`: the smoothed probability of grid point `i`.
-        let w: Vec<S> = (0..size)
-            .map(|i| grid.weights[i].mul(&smoothed[i]))
-            .collect();
-        let rows: Vec<Vec<(usize, f64)>> = (0..marks).map(|d| design_row(m, d)).collect();
-        // Centred coordinates `ζ_{dk}(i) = ∂η_d/∂a_{dk}` per mark and atom.
-        let centred: Vec<Vec<Vec<S>>> = (0..marks)
+    let mut carried_smoothed: Option<Vec<S>> = smoothed_chain.grids[0]
+        .as_ref()
+        .filter(|_| latent_variance)
+        .map(|grid| vec![zero.clone(); p_total * grid.size()]);
+    // `ζ_{dk}(i) = ∂η_d/∂a_{dk}` per mark and atom at every point of a grid.
+    let centred_on = |grid: &Grid<S>| -> Vec<Vec<Vec<S>>> {
+        (0..marks)
             .map(|d| {
                 (0..atoms)
                     .map(|k| {
                         let a = &inputs.loadings[d * atoms + k];
-                        (0..size)
+                        (0..grid.size())
                             .map(|i| {
                                 let z = grid.coordinate(i, k);
                                 if prior_centred { z.sub(a) } else { z.clone() }
@@ -912,10 +928,71 @@ pub(crate) fn subject_marginal<S: JetField>(
                     })
                     .collect()
             })
+            .collect()
+    };
+    // Powers `z_k^a`, `a ≤ 4`, of each atom's coordinate at every point of a grid.
+    let powers_on = |grid: &Grid<S>| -> Vec<Vec<Vec<S>>> {
+        (0..atoms)
+            .map(|k| {
+                (0..=4usize)
+                    .map(|a| {
+                        (0..grid.size())
+                            .map(|i| {
+                                let z = grid.coordinate(i, k);
+                                let mut v = like.constant_like(1.0);
+                                for _ in 0..a {
+                                    v = v.mul(z);
+                                }
+                                v
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    // Node `d`'s functions join a carried vector on `grid`: `s_d x` in every
+    // design slot and `s_d ζ_{dk}` in every loading slot.
+    let absorb = |target: &mut [S], rows: &[Vec<(usize, f64)>], likelihood: &NodeLikelihood<S>,
+                  centred: &[Vec<Vec<S>>], size: usize| {
+        for d in 0..marks {
+            let scores = &likelihood.score[d * size..(d + 1) * size];
+            for &(col, x) in &rows[d] {
+                let row = &mut target[col * size..(col + 1) * size];
+                for i in 0..size {
+                    row[i] = row[i].add(&scores[i].scale(x));
+                }
+            }
+            for k in 0..atoms {
+                let col = layout.a(d, k);
+                let row = &mut target[col * size..(col + 1) * size];
+                for i in 0..size {
+                    row[i] = row[i].add(&scores[i].mul(&centred[d][k][i]));
+                }
+            }
+        }
+    };
+    // Reused by every node and mark: the grid's size is `order^atoms`, the
+    // same at every node, so this is one allocation rather than one per mark
+    // per node of a vector as wide as the grid.
+    let mut weighted: Vec<S> = vec![zero.clone(); filtered[0].grid.size()];
+    for m in 0..n_nodes {
+        let grid = smoothed_chain.grid(m, &filtered);
+        let size = grid.size();
+        let smoothed = &smoothed_chain.marginals[m];
+        // `W(i) = w_i s(i)`: the smoothed probability of grid point `i`.
+        let w: Vec<S> = (0..size)
+            .map(|i| grid.weights[i].mul(&smoothed[i]))
             .collect();
+        let rows: Vec<Vec<(usize, f64)>> = (0..marks).map(|d| design_row(m, d)).collect();
+        let centred = centred_on(grid);
         // The node's score and curvature in every mark's `η`, formed once
-        // with the node factor itself.
-        let node = &filtered[m].likelihood;
+        // with the node factor itself, on the smoothed grid.
+        let own_likelihood = smoothed_chain.grids[m].as_ref().map(|grid| {
+            subject_node_likelihood(inputs, &counts_rows, &exposure_rows, grid, m, true)
+        });
+        let node = own_likelihood.as_ref().unwrap_or(&filtered[m].likelihood);
+        let contracted: &[S] = carried_smoothed.as_deref().unwrap_or(&carried);
         let scores: Vec<&[S]> = (0..marks)
             .map(|d| &node.score[d * size..(d + 1) * size])
             .collect();
@@ -939,7 +1016,7 @@ pub(crate) fn subject_marginal<S: JetField>(
                 // atom contractions, which is the same arithmetic in the same
                 // order with the product taken once instead of once per atom.
                 for q in 0..p_total {
-                    let row = &carried[q * size..(q + 1) * size];
+                    let row = &contracted[q * size..(q + 1) * size];
                     let mut acc = zero.clone();
                     for i in 0..size {
                         weighted[i] = ws[i].mul(&row[i]);
@@ -1077,20 +1154,16 @@ pub(crate) fn subject_marginal<S: JetField>(
                 }
             }
         }
-        // ---- pass 3: the node's functions join the carried vector ----------
-        for d in 0..if latent_variance { marks } else { 0 } {
-            for &(col, x) in &rows[d] {
-                let row = &mut carried[col * size..(col + 1) * size];
-                for i in 0..size {
-                    row[i] = row[i].add(&scores[d][i].scale(x));
+        // ---- pass 3: the node's functions join the carried vectors ---------
+        if latent_variance {
+            match carried_smoothed.as_mut() {
+                Some(on_smoothed) => {
+                    absorb(on_smoothed, &rows, node, &centred, size);
+                    let filtered_grid = &filtered[m].grid;
+                    absorb(&mut carried, &rows, &filtered[m].likelihood,
+                        &centred_on(filtered_grid), filtered_grid.size());
                 }
-            }
-            for k in 0..atoms {
-                let col = layout.a(d, k);
-                let row = &mut carried[col * size..(col + 1) * size];
-                for i in 0..size {
-                    row[i] = row[i].add(&scores[d][i].mul(&centred[d][k][i]));
-                }
+                None => absorb(&mut carried, &rows, node, &centred, size),
             }
         }
         if m == n_gaps {
@@ -1107,9 +1180,8 @@ pub(crate) fn subject_marginal<S: JetField>(
         }
         // ---- gap m: (m, m+1) ------------------------------------------------
         let next = &filtered[m + 1];
-        let next_size = next.grid.size();
         let transitions = &next.transitions;
-        let backward_moments = &innovation_moments[m];
+        let backward_moments = &smoothed_chain.innovation_moments[m];
         let polys: Vec<(GapPolynomial<S>, GapPolynomial<S>)> = (0..atoms)
             .map(|k| gap_score_polynomials(&transitions[k], like))
             .collect();
@@ -1118,25 +1190,10 @@ pub(crate) fn subject_marginal<S: JetField>(
             e[k] = b;
             e
         };
-        // Powers of the start coordinate of each atom on grid m.
-        let powers: Vec<Vec<Vec<S>>> = (0..atoms)
-            .map(|k| {
-                (0..=4usize)
-                    .map(|a| {
-                        (0..size)
-                            .map(|i| {
-                                let z = grid.coordinate(i, k);
-                                let mut v = like.constant_like(1.0);
-                                for _ in 0..a {
-                                    v = v.mul(z);
-                                }
-                                v
-                            })
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
+        // Powers of the start coordinate of each atom on node m's smoothed
+        // grid, where the gap's expectations are taken.
+        let powers = powers_on(grid);
+        let contracted: &[S] = carried_smoothed.as_deref().unwrap_or(&carried);
         // Σ_{a,b} c[a][b] z_k^a E[u_k^b | z, data] on grid m.
         let start_function = |k: usize, poly: &GapPolynomial<S>, max_degree: usize| -> Vec<S> {
             let mut out = vec![zero.clone(); size];
@@ -1174,7 +1231,7 @@ pub(crate) fn subject_marginal<S: JetField>(
             // E[C_m t_k]: the gap score against everything carried so far
             // (nodes ≤ m and gaps < m), by the Markov property through z_m.
             for q in 0..p_total {
-                let row = &carried[q * size..(q + 1) * size];
+                let row = &contracted[q * size..(q + 1) * size];
                 let mut acc = zero.clone();
                 for i in 0..size {
                     acc = acc.add(&w[i].mul(&tk[i]).mul(&row[i]));
@@ -1224,64 +1281,84 @@ pub(crate) fn subject_marginal<S: JetField>(
                 second[rj * p_total + rk] = second[rj * p_total + rk].add(&value);
             }
         }
-        // ---- propagate the carried vector to grid m+1 -------------------------
+        // ---- propagate the carried vector to node m+1's grids ------------------
         // C_{m+1}(z') = F[α_m C_m](z') / p̂_{m+1}(z'), plus the gap score's own
         // forward-smoothed expectation E[t_g | z', y_{≤ m+1}] = ã / p̂ in its
         // log-rate slot. Where the predicted density is below its noise floor
-        // no ratio is formed; the smoothed marginal has no mass there.
-        let floor = density_floor(&next.predicted);
-        let inverse_predicted: Vec<Option<S>> = next
-            .predicted
-            .iter()
-            .map(|density| {
-                if density.value() > floor {
-                    Some(recip(density))
-                } else {
-                    None
-                }
+        // no ratio is formed; the smoothed marginal has no mass there. The
+        // operand lives on node m's filtered grid, and `forward` evaluates it
+        // on whichever grid of node m+1 it was built for.
+        let alpha = &filtered[m].alpha;
+        let filtered_size = filtered[m].grid.size();
+        let filtered_powers = match smoothed_chain.grids[m] {
+            Some(_) => powers_on(&filtered[m].grid),
+            None => powers,
+        };
+        let operands: Vec<Vec<S>> = (0..p_total)
+            .map(|q| {
+                let row = &carried[q * filtered_size..(q + 1) * filtered_size];
+                (0..filtered_size).map(|i| alpha[i].mul(&row[i])).collect()
             })
             .collect();
-        let alpha = &filtered[m].alpha;
-        let mut propagated = vec![zero.clone(); p_total * next_size];
-        for q in 0..p_total {
-            let row = &carried[q * size..(q + 1) * size];
-            let weighted: Vec<S> = (0..size).map(|i| alpha[i].mul(&row[i])).collect();
-            let moved = next.forward.plain(&weighted);
-            let out = &mut propagated[q * next_size..(q + 1) * next_size];
-            for i in 0..next_size {
-                if let Some(inverse) = &inverse_predicted[i] {
-                    out[i] = moved[i].mul(inverse);
-                }
-            }
-        }
-        for k in 0..atoms {
-            let (t, _) = &polys[k];
-            // Ã on grid m+1: Σ_{a,b} c[a][b] ∫ A(z'|z) u^b z^a α(z) dz.
-            let mut a_tilde = vec![zero.clone(); next_size];
-            for a in 0..=2usize {
-                for b in 0..=2usize {
-                    if t.absent(a, b) {
-                        continue;
+        let propagate = |forward: &OperatorFamily<S>, predicted: &[S]| -> Vec<S> {
+            let target_size = predicted.len();
+            let floor = density_floor(predicted);
+            let inverse_predicted: Vec<Option<S>> = predicted
+                .iter()
+                .map(|density| {
+                    if density.value() > floor {
+                        Some(recip(density))
+                    } else {
+                        None
                     }
-                    let coefficient = t.get(a, b);
-                    let e = unit(k, b as u8);
-                    let zk_power: Vec<S> =
-                        (0..size).map(|i| alpha[i].mul(&powers[k][a][i])).collect();
-                    let moment = next.forward.apply(&e, &zk_power);
-                    for i in 0..next_size {
-                        a_tilde[i] = a_tilde[i].add(&coefficient.mul(&moment[i]));
+                })
+                .collect();
+            let mut propagated = vec![zero.clone(); p_total * target_size];
+            for q in 0..p_total {
+                let moved = forward.plain(&operands[q]);
+                let out = &mut propagated[q * target_size..(q + 1) * target_size];
+                for i in 0..target_size {
+                    if let Some(inverse) = &inverse_predicted[i] {
+                        out[i] = moved[i].mul(inverse);
                     }
                 }
             }
-            let rho = layout.rho(k);
-            let out = &mut propagated[rho * next_size..(rho + 1) * next_size];
-            for i in 0..next_size {
-                if let Some(inverse) = &inverse_predicted[i] {
-                    out[i] = out[i].add(&a_tilde[i].mul(inverse));
+            for k in 0..atoms {
+                let (t, _) = &polys[k];
+                // Ã on the target grid: Σ_{a,b} c[a][b] ∫ A(z'|z) u^b z^a α(z) dz.
+                let mut a_tilde = vec![zero.clone(); target_size];
+                for a in 0..=2usize {
+                    for b in 0..=2usize {
+                        if t.absent(a, b) {
+                            continue;
+                        }
+                        let coefficient = t.get(a, b);
+                        let e = unit(k, b as u8);
+                        let zk_power: Vec<S> = (0..filtered_size)
+                            .map(|i| alpha[i].mul(&filtered_powers[k][a][i]))
+                            .collect();
+                        let moment = forward.apply(&e, &zk_power);
+                        for i in 0..target_size {
+                            a_tilde[i] = a_tilde[i].add(&coefficient.mul(&moment[i]));
+                        }
+                    }
+                }
+                let rho = layout.rho(k);
+                let out = &mut propagated[rho * target_size..(rho + 1) * target_size];
+                for i in 0..target_size {
+                    if let Some(inverse) = &inverse_predicted[i] {
+                        out[i] = out[i].add(&a_tilde[i].mul(inverse));
+                    }
                 }
             }
-        }
-        carried = propagated;
+            propagated
+        };
+        carried_smoothed = smoothed_chain.grids[m + 1].as_ref().map(|target| {
+            let forward = forward_operators(inputs.gh, &filtered[m].grid, target, transitions, 2);
+            let predicted = forward.plain(alpha);
+            propagate(&forward, &predicted)
+        });
+        carried = propagate(&next.forward, &next.predicted);
     }
 
     // ---- assemble ----------------------------------------------------------
@@ -1349,6 +1426,32 @@ pub(crate) fn subject_marginal<S: JetField>(
     })
 }
 
+/// Node `n`'s likelihood pieces on `grid`, for one subject.
+fn subject_node_likelihood<S: JetField>(
+    inputs: &SubjectInputs<'_, S>,
+    counts_rows: &[Vec<f64>],
+    exposure_rows: &[Vec<f64>],
+    grid: &Grid<S>,
+    n: usize,
+    derivatives: bool,
+) -> NodeLikelihood<S> {
+    let marks = inputs.nodes.counts.ncols();
+    node_likelihood(
+        grid,
+        &inputs.eta0[n * marks..(n + 1) * marks],
+        inputs.loadings,
+        &counts_rows[n],
+        &exposure_rows[n],
+        None,
+        inputs
+            .log_normaliser
+            .map(|m| &m[n * marks..(n + 1) * marks]),
+        marks,
+        inputs.rates.len(),
+        derivatives,
+    )
+}
+
 /// The forward filter over every node of a subject, each node keeping the
 /// operators that reached it so a backward pass can be run on the result.
 /// With `derivatives` the forward operators carry the innovation powers the
@@ -1367,35 +1470,23 @@ fn filter_nodes<S: JetField>(
     let like = &inputs.eta0[0];
     if crate::static_state::is_static(inputs.rates) {
         // Every node shares the one whole-history grid of `static_state::filter`,
-        // so a node's scores live on the grid the carried vector already lives on.
-        let pass = crate::static_state::filter(inputs, None, &vec![true; marks])?;
-        return Ok((0..n_nodes).map(|n| {
-            let likelihood = node_likelihood(&pass.grids[n], &inputs.eta0[n * marks..(n + 1) * marks],
-                inputs.loadings, &counts_rows[n], &exposure_rows[n], None,
-                inputs.log_normaliser.map(|m| &m[n * marks..(n + 1) * marks]), marks, atoms, derivatives);
-            FilteredNode { grid: pass.grids[n].clone(), transitions: Vec::new(),
+        // so a node's scores live on the grid the carried vector already lives on,
+        // and the likelihood the pass conditioned on is the node's own.
+        let (pass, likelihoods) =
+            crate::static_state::conditioned(inputs, None, &vec![true; marks], derivatives)?;
+        let ForwardPass { grids, alpha, predicted, log_normalisers } = pass;
+        return Ok(grids.into_iter().zip(alpha).zip(predicted).zip(log_normalisers).zip(likelihoods)
+            .map(|((((grid, alpha), predicted), log_normaliser), likelihood)| FilteredNode {
+                grid, transitions: Vec::new(),
                 forward: OperatorFamily { per_axis: Vec::new(), order: gh.order },
-                predicted: pass.predicted[n].clone(), alpha: pass.alpha[n].clone(),
-                normaliser: exp(&add_real(&pass.log_normalisers[n], -likelihood.shift)), likelihood }
-        }).collect());
+                predicted, alpha,
+                normaliser: exp(&add_real(&log_normaliser, -likelihood.shift)), likelihood })
+            .collect());
     }
     let mut filtered: Vec<FilteredNode<S>> = Vec::with_capacity(n_nodes);
     let forward_power: u8 = if derivatives { 2 } else { 0 };
     let node_terms = |grid: &Grid<S>, n: usize, store: bool| -> NodeLikelihood<S> {
-        node_likelihood(
-            grid,
-            &inputs.eta0[n * marks..(n + 1) * marks],
-            inputs.loadings,
-            &counts_rows[n],
-            &exposure_rows[n],
-            None,
-            inputs
-                .log_normaliser
-                .map(|m| &m[n * marks..(n + 1) * marks]),
-            marks,
-            atoms,
-            store,
-        )
+        subject_node_likelihood(inputs, counts_rows, exposure_rows, grid, n, store)
     };
     filtered.push(filter_start(
         gh,
@@ -1423,12 +1514,64 @@ fn filter_nodes<S: JetField>(
     Ok(filtered)
 }
 
-/// What the backward pass yields: the smoothed marginal on every node's
-/// grid (normalised to a probability), and the smoothed innovation moments
-/// of every gap when they were asked for.
+/// What the backward pass yields: the grid every node's smoothed marginal
+/// lives on, that marginal (normalised to a probability), and the smoothed
+/// innovation moments of every gap when they were asked for, on the grid of
+/// the gap's start node.
 struct Smoothed<S> {
+    /// A node's own smoothed grid, or `None` where the smoothed marginal
+    /// lives on the node's filtered grid: the last node, whose smoothed
+    /// marginal is its filtered one, and every node of a static chain.
+    grids: Vec<Option<Grid<S>>>,
     marginals: Vec<Vec<S>>,
     innovation_moments: Vec<HashMap<Vec<u8>, Vec<S>>>,
+}
+
+impl<S> Smoothed<S> {
+    /// The grid node `n`'s smoothed marginal lives on.
+    fn grid<'a>(&'a self, n: usize, filtered: &'a [FilteredNode<S>]) -> &'a Grid<S> {
+        self.grids[n].as_ref().unwrap_or(&filtered[n].grid)
+    }
+}
+
+/// A density `raw · exp(log β)` on `grid`, normalised to a probability.
+///
+/// `β` alone overflows on a wide hull (it is a future-likelihood ratio,
+/// astronomically large where `raw` is astronomically small), so it is never
+/// exponentiated on its own: the product is formed in log space, a point
+/// whose `raw` density is below the noise floor carries no mass, and the
+/// result is renormalised so every expectation under it is under a
+/// probability.
+fn smoothed_marginal<S: JetField>(
+    grid: &Grid<S>,
+    raw: &[S],
+    log_beta: &[S],
+    label: &str,
+) -> Result<Vec<S>, EventHistoryError> {
+    let floor = density_floor(raw);
+    let mut smoothed: Vec<S> = raw
+        .iter()
+        .zip(log_beta.iter())
+        .map(|(a, log_b)| {
+            if a.value() > floor {
+                exp(&ln(a).add(log_b))
+            } else {
+                a.constant_like(0.0)
+            }
+        })
+        .collect();
+    let mass = weighted_sum(&grid.weights, &smoothed);
+    if !(mass.value() > 0.0) || !mass.value().is_finite() {
+        return Err(numerical(format!(
+            "{label}: smoothed marginal has mass {} on the grid",
+            mass.value()
+        )));
+    }
+    let inverse = recip(&mass);
+    for s in smoothed.iter_mut() {
+        *s = s.mul(&inverse);
+    }
+    Ok(smoothed)
 }
 
 /// The backward pass over a filtered chain.
@@ -1437,36 +1580,50 @@ struct Smoothed<S> {
 /// after an event, so it is never interpolated as a value: its logarithm
 /// is interpolated (relative accuracy), and what is carried backward is
 /// `log β_n = log E[lik_{n+1} β_{n+1} / c_{n+1} | z_n]`, a bounded smooth
-/// function, plus — for the derivatives — the smoothed innovation moments
+/// function, plus — with `derivatives` — the smoothed innovation moments
 /// `E[Π_k u_k^{e_k} | z_n, data]` of every gap, which the gap scores need.
 /// Kernel rows are streamed and reduced to those moments; no `S × S`
 /// allocation is formed.
 ///
-/// `β` alone overflows on a wide hull (it is a future-likelihood ratio,
-/// astronomically large where the filtered density is astronomically
-/// small), so it is never exponentiated on its own: the smoothed marginal
-/// `α β` is formed in log space, a point whose filtered density is below
-/// the noise floor carries no smoothed mass, and the result is renormalised
-/// so every expectation under it is under a probability.
+/// Each node's smoothed marginal gets a grid of its own. The filtered grid
+/// is placed where the data up to the node put the state; the smoothed
+/// marginal is where the whole history puts it, and for a slow atom the two
+/// part: the filtered density at an early node is as wide as the prior, the
+/// smoothed one is as narrow as every later event makes it, and a
+/// degree-`G−1` interpolant on the filtered grid resolves that narrow bump
+/// only at high order. So the node's smoothed grid is placed one-shot at the
+/// Rauch-Tung-Striebel moments — the node's filtered moments `m_f, v_f`
+/// combined with the next node's smoothed moments `m', v'` through the gap's
+/// `φ, q`:
+///   `v̂ = φ² v_f + q`,  `J = φ v_f / v̂`,
+///   `m_s = m_f + J (m' − φ m_f)`,  `v_s = v_f q / v̂ + J² v'`,
+/// exact for a Gaussian chain and a close envelope otherwise. The density
+/// `p̂_n lik_n β_n` is then evaluated on it: `p̂_n` through the forward
+/// operator from the previous node's filtered grid (the prior at the first
+/// node), `lik_n` exactly, and `β_n` by the inner Gauss-Hermite rule over
+/// the innovation, with `log β_{n+1}` interpolated on the next node's
+/// smoothed grid. The last node's smoothed marginal is its filtered one.
 fn backward_smoother<S: JetField>(
     inputs: &SubjectInputs<'_, S>,
     filtered: &[FilteredNode<S>],
     counts_rows: &[Vec<f64>],
     exposure_rows: &[Vec<f64>],
-    with_innovation_moments: bool,
+    derivatives: bool,
 ) -> Result<Smoothed<S>, EventHistoryError> {
     let n_nodes = filtered.len();
+    let last = &filtered[n_nodes - 1];
     if crate::static_state::is_static(inputs.rates) {
-        if with_innovation_moments { return Err(numerical("static frailties have no innovation scores")); }
-        return Ok(Smoothed { marginals: vec![filtered[n_nodes - 1].alpha.clone(); n_nodes],
-            innovation_moments: Vec::new() });
+        if derivatives { return Err(numerical("static frailties have no innovation scores")); }
+        return Ok(Smoothed { grids: vec![None; n_nodes],
+            marginals: vec![last.alpha.clone(); n_nodes], innovation_moments: Vec::new() });
     }
     let marks = inputs.nodes.counts.ncols();
     let atoms = inputs.rates.len();
     let gh = inputs.gh;
-    let zero = inputs.eta0[0].constant_like(0.0);
+    let like = &inputs.eta0[0];
+    let zero = like.constant_like(0.0);
     let n_gaps = n_nodes.saturating_sub(1);
-    let inner_count = filtered[0].grid.size();
+    let inner_count = last.grid.size();
     let log_inner_weights: Vec<f64> = (0..inner_count)
         .map(|l| {
             let mut rest = l;
@@ -1489,7 +1646,7 @@ fn backward_smoother<S: JetField>(
         acc
     };
     let mut innovation_exponents: Vec<Vec<u8>> = Vec::new();
-    if with_innovation_moments {
+    if derivatives {
         for k in 0..atoms {
             for b in 0..=4u8 {
                 let mut e = vec![0u8; atoms];
@@ -1508,18 +1665,57 @@ fn backward_smoother<S: JetField>(
             }
         }
     }
+    let mut grids: Vec<Option<Grid<S>>> = vec![None; n_nodes];
+    let mut marginals: Vec<Vec<S>> = vec![Vec::new(); n_nodes];
     let mut log_beta: Vec<Vec<S>> = vec![Vec::new(); n_nodes];
-    log_beta[n_nodes - 1] = vec![zero.clone(); filtered[n_nodes - 1].grid.size()];
+    log_beta[n_nodes - 1] = vec![zero.clone(); last.grid.size()];
+    marginals[n_nodes - 1] = smoothed_marginal(&last.grid, &last.alpha, &log_beta[n_nodes - 1],
+        &format!("node {}", n_nodes - 1))?;
     let mut innovation_moments: Vec<HashMap<Vec<u8>, Vec<S>>> = vec![HashMap::new(); n_gaps];
     for n in (0..n_gaps).rev() {
-        let grid = &filtered[n].grid;
-        let next = &filtered[n + 1].grid;
-        let size = grid.size();
+        let label = format!("node {n}");
         let transitions = &filtered[n + 1].transitions;
+        let next = grids[n + 1].as_ref().unwrap_or(&filtered[n + 1].grid);
+        // ---- the node's smoothed grid, at the Rauch-Tung-Striebel moments --
+        let (filtered_means, filtered_variances) =
+            posterior_moments(&filtered[n].grid, &filtered[n].alpha, &label)?;
+        let (next_means, next_variances) = posterior_moments(next, &marginals[n + 1], &label)?;
+        let mut centres = Vec::with_capacity(atoms);
+        let mut scales = Vec::with_capacity(atoms);
+        for k in 0..atoms {
+            let phi = &transitions[k].phi;
+            let q = &transitions[k].innovation;
+            let v_f = &filtered_variances[k];
+            let predictive = square(phi).mul(v_f).add(q);
+            let gain = div(&phi.mul(v_f), &predictive);
+            centres.push(filtered_means[k].add(
+                &gain.mul(&next_means[k].sub(&phi.mul(&filtered_means[k]))),
+            ));
+            scales.push(sqrt(
+                &div(&v_f.mul(q), &predictive).add(&square(&gain).mul(&next_variances[k])),
+            ));
+        }
+        let grid = Grid::new(gh, &centres, &scales, like);
+        let size = grid.size();
+        // ---- `p̂_n lik_n` on it -------------------------------------------
+        let predicted = if n == 0 {
+            prior_density(&grid, like)
+        } else {
+            forward_operators(gh, &filtered[n - 1].grid, &grid, &filtered[n].transitions, 0)
+                .plain(&filtered[n - 1].alpha)
+        };
+        let likelihood =
+            subject_node_likelihood(inputs, counts_rows, exposure_rows, &grid, n, false);
+        let raw: Vec<S> = predicted
+            .iter()
+            .zip(likelihood.ell.iter())
+            .map(|(p, e)| p.mul(&exp(&add_real(e, -likelihood.shift))))
+            .collect();
+        // ---- `log β_n` on it ----------------------------------------------
         // The node's log-likelihood is an explicit formula, so it is
         // evaluated exactly at every inner point; only the smoother residual
         // `log β_{n+1}` is interpolated.
-        let bases = backward_axis_bases(gh, grid, next, transitions);
+        let bases = backward_axis_bases(gh, &grid, next, transitions);
         let log_c = ln(&filtered[n + 1].normaliser);
         let shift = filtered[n + 1].likelihood.shift;
         let node_log_lik = |zeta: &[S]| -> S {
@@ -1575,7 +1771,7 @@ fn backward_smoother<S: JetField>(
                 })
                 .collect();
             let log_total = log_sum_exp(&terms);
-            if with_innovation_moments {
+            if derivatives {
                 let weights: Vec<S> = terms
                     .iter()
                     .map(|term| exp(&term.sub(&log_total)))
@@ -1595,39 +1791,13 @@ fn backward_smoother<S: JetField>(
             }
             log_beta_n.push(log_total);
         }
+        marginals[n] = smoothed_marginal(&grid, &raw, &log_beta_n, &label)?;
         log_beta[n] = log_beta_n;
         innovation_moments[n] = moments;
+        grids[n] = Some(grid);
     }
-    let marginals: Vec<Vec<S>> = (0..n_nodes)
-        .map(|n| {
-            let alpha = &filtered[n].alpha;
-            let floor = density_floor(alpha);
-            let mut smoothed: Vec<S> = alpha
-                .iter()
-                .zip(log_beta[n].iter())
-                .map(|(a, log_b)| {
-                    if a.value() > floor {
-                        exp(&ln(a).add(log_b))
-                    } else {
-                        zero.clone()
-                    }
-                })
-                .collect();
-            let mass = weighted_sum(&filtered[n].grid.weights, &smoothed);
-            if !(mass.value() > 0.0) || !mass.value().is_finite() {
-                return Err(numerical(format!(
-                    "node {n}: smoothed marginal has mass {} on the grid",
-                    mass.value()
-                )));
-            }
-            let inverse = recip(&mass);
-            for s in smoothed.iter_mut() {
-                *s = s.mul(&inverse);
-            }
-            Ok(smoothed)
-        })
-        .collect::<Result<_, _>>()?;
     Ok(Smoothed {
+        grids,
         marginals,
         innovation_moments,
     })
@@ -1635,7 +1805,7 @@ fn backward_smoother<S: JetField>(
 
 /// The posterior mean and covariance of the latent state at every node of a
 /// subject given its whole history: the moments of the smoothed marginal on
-/// each node's grid. Per node, the mean over the atoms and the row-major
+/// each node's smoothed grid. Per node, the mean over the atoms and the row-major
 /// `atoms × atoms` covariance.
 pub(crate) fn latent_state_moments(
     inputs: &SubjectInputs<'_, f64>,
@@ -1658,11 +1828,12 @@ pub(crate) fn latent_state_moments(
     let exposure_rows: Vec<Vec<f64>> = (0..n_nodes).map(|n| nodes.exposure_row(n)).collect();
     let filtered = filter_nodes(inputs, false, &counts_rows, &exposure_rows)?;
     let smoothed = backward_smoother(inputs, &filtered, &counts_rows, &exposure_rows, false)?;
-    Ok(filtered
+    Ok(smoothed
+        .marginals
         .iter()
-        .zip(smoothed.marginals.iter())
-        .map(|(node, density)| {
-            let grid = &node.grid;
+        .enumerate()
+        .map(|(n, density)| {
+            let grid = smoothed.grid(n, &filtered);
             let mut mean = vec![0.0; atoms];
             for i in 0..grid.size() {
                 let w = grid.weights[i] * density[i];
@@ -1692,7 +1863,7 @@ pub(crate) fn latent_state_moments(
 /// across the nodes (`super::static_state`): only its total and its final
 /// state are resolved, so chronological quantities come from [`spells`].
 pub(crate) struct ForwardPass<S> {
-    pub grids: Vec<Grid<S>>,
+    pub grids: Vec<Arc<Grid<S>>>,
     pub alpha: Vec<Vec<S>>,
     pub predicted: Vec<Vec<S>>,
     pub log_normalisers: Vec<S>,
@@ -1720,7 +1891,7 @@ pub(crate) fn forward_filter<S: JetField>(
         return crate::static_state::filter(inputs, initial, compensated);
     }
     let like = &inputs.eta0[0];
-    let mut grids: Vec<Grid<S>> = Vec::with_capacity(n_nodes);
+    let mut grids: Vec<Arc<Grid<S>>> = Vec::with_capacity(n_nodes);
     let mut alpha: Vec<Vec<S>> = Vec::with_capacity(n_nodes);
     let mut predicted: Vec<Vec<S>> = Vec::with_capacity(n_nodes);
     let mut log_normalisers: Vec<S> = Vec::with_capacity(n_nodes);
@@ -2017,5 +2188,149 @@ mod tests {
         }
         eprintln!("compared {compared} grid positions and weights");
         assert!(compared > 0, "no grid was compared");
+    }
+
+    /// A slow atom's first smoothed marginal is resolved at the forward
+    /// filter's own accuracy (#3013). The fixture is the issue's: 41 evenly
+    /// spaced recurrent events on [0, 6], η = 0.53, loading 0.845, rate
+    /// 2.6e-3. Node 0's filtered density there is essentially the N(0, 1)
+    /// prior, while its smoothed marginal has seen every event and sits near
+    /// z ≈ 1.95 with σ ≈ 0.21, two filtered σ off centre and five times
+    /// narrower. The reference is a dense forward-backward pass on a uniform
+    /// grid; the trapezoid rule is spectrally accurate for these analytic
+    /// integrands, and the reference's own error is measured by doubling
+    /// its spacing.
+    ///
+    /// The bar is derived, not chosen. The smoothed marginal at node 0 is
+    /// built from the forward filter, whose own error at order G is visible
+    /// at the last node, where smoothed and filtered coincide. So at every
+    /// order node 0's smoothed mean and standard deviation must be within the
+    /// larger of that last-node error and the reference's own error. On the
+    /// filtered grid (the smoother before this issue) node 0 misses by
+    /// orders of magnitude more than the filter's error.
+    #[test]
+    fn slow_atom_first_smoothed_marginal_is_resolved_at_the_filter_accuracy_3013() {
+        use ndarray::Array2;
+        let n_nodes = 41;
+        let spacing = 0.15;
+        let rate = 2.6e-3;
+        let loading = 0.845;
+        let eta0_value = 0.53;
+        let times: Vec<f64> = (0..n_nodes).map(|n| n as f64 * spacing).collect();
+        let nodes = SubjectNodes {
+            first_row: 0,
+            times: times.clone(),
+            gaps: times.windows(2).map(|w| w[1] - w[0]).collect(),
+            weights: vec![spacing; n_nodes],
+            exposures: Array2::from_elem((n_nodes, 1), spacing),
+            counts: Array2::from_elem((n_nodes, 1), 1.0),
+            covariate_rows: vec![0; n_nodes],
+        };
+        let eta0 = vec![eta0_value; n_nodes];
+        let loadings = [loading];
+        let rates = [rate];
+        let phi = (-rate * spacing).exp();
+        let q = 1.0 - phi * phi;
+        // (mean, sd) of node 0's smoothed marginal and of the last node's
+        // filtered one, by dense forward-backward at spacing `h` over ±8.
+        let dense = |h: f64| -> [(f64, f64); 2] {
+            let half = (8.0 / h).round() as i64;
+            let zs: Vec<f64> = (-half..=half).map(|i| i as f64 * h).collect();
+            let size = zs.len();
+            let likelihood: Vec<f64> = {
+                let log: Vec<f64> = zs
+                    .iter()
+                    .map(|&z| {
+                        let eta = log_intensity(&eta0_value, &loadings, &[z], None);
+                        eta - spacing * eta.exp()
+                    })
+                    .collect();
+                let top = log.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                log.iter().map(|l| (l - top).exp()).collect()
+            };
+            let normalise = |v: Vec<f64>| -> Vec<f64> {
+                let top = v.iter().cloned().fold(0.0_f64, f64::max);
+                v.into_iter().map(|x| x / top).collect()
+            };
+            // The kernel is negligible past 12 innovation σ.
+            let reach = (12.0 * q.sqrt() / h).ceil() as i64;
+            let kernel = |from: f64, to: f64| (-(to - phi * from).powi(2) / (2.0 * q)).exp();
+            let moments = |density: &[f64]| -> (f64, f64) {
+                let mass: f64 = density.iter().sum();
+                let mean = density.iter().zip(&zs).map(|(d, z)| d * z).sum::<f64>() / mass;
+                let variance = density
+                    .iter()
+                    .zip(&zs)
+                    .map(|(d, z)| d * (z - mean).powi(2))
+                    .sum::<f64>()
+                    / mass;
+                (mean, variance.sqrt())
+            };
+            let first: Vec<f64> = zs
+                .iter()
+                .zip(&likelihood)
+                .map(|(&z, l)| (-0.5 * z * z).exp() * l)
+                .collect();
+            let mut forward = normalise(first.clone());
+            let mut beta = vec![1.0; size];
+            for _ in 1..n_nodes {
+                // Forward: from `from` to every `to` in reach of φ·from.
+                let mut predicted = vec![0.0; size];
+                // Backward: to every `from` whose φ·from reaches `to`.
+                let carried: Vec<f64> = likelihood.iter().zip(&beta).map(|(l, b)| l * b).collect();
+                let mut backward = vec![0.0; size];
+                for i in 0..size {
+                    let centre = (phi * zs[i] / h).round() as i64 + half;
+                    let lo = (centre - reach).max(0) as usize;
+                    let hi = ((centre + reach) as usize).min(size - 1);
+                    for j in lo..=hi {
+                        let k = kernel(zs[i], zs[j]);
+                        predicted[j] += forward[i] * k;
+                        backward[i] += k * carried[j];
+                    }
+                }
+                forward = normalise(predicted.iter().zip(&likelihood).map(|(p, l)| p * l).collect());
+                beta = normalise(backward);
+            }
+            let smoothed: Vec<f64> = first.iter().zip(&beta).map(|(a, b)| a * b).collect();
+            [moments(&smoothed), moments(&forward)]
+        };
+        let [smoothed, last] = dense(0.002);
+        let [coarse_smoothed, coarse_last] = dense(0.004);
+        let reference_error = [
+            (smoothed.0 - coarse_smoothed.0).abs(),
+            (smoothed.1 - coarse_smoothed.1).abs(),
+            (last.0 - coarse_last.0).abs(),
+            (last.1 - coarse_last.1).abs(),
+        ]
+        .into_iter()
+        .fold(0.0_f64, f64::max);
+        eprintln!(
+            "dense: node 0 smoothed N({:.8}, {:.8}²), last filtered N({:.8}, {:.8}²), reference error {reference_error:.2e}",
+            smoothed.0, smoothed.1, last.0, last.1
+        );
+        assert!(smoothed.0 > 1.5, "the fixture's smoothed marginal must sit off the prior");
+        for order in [9, 17, 33] {
+            let gh = GaussHermite::new(order).unwrap();
+            let inputs = SubjectInputs {
+                nodes: &nodes, eta0: &eta0, loadings: &loadings, rates: &rates, time_scale: 1.0,
+                gh: &gh, continuation_gap: 0.0, designs: None, log_normaliser: None,
+            };
+            let moments = latent_state_moments(&inputs).unwrap();
+            let node_0 = (moments[0].0[0], moments[0].1[0].sqrt());
+            let final_node = (moments[n_nodes - 1].0[0], moments[n_nodes - 1].1[0].sqrt());
+            let filter_error = (final_node.0 - last.0).abs().max((final_node.1 - last.1).abs());
+            let bar = filter_error.max(reference_error);
+            let (mean_error, sd_error) = (node_0.0 - smoothed.0, node_0.1 - smoothed.1);
+            eprintln!(
+                "order {order}: node 0 mean error {mean_error:+.3e}, sd error {sd_error:+.3e}; bar {bar:.3e} (filter error {filter_error:.3e})"
+            );
+            assert!(
+                mean_error.abs() <= bar && sd_error.abs() <= bar,
+                "order {order}: node 0's smoothed marginal N({:.6}, {:.6}²) misses the dense N({:.6}, {:.6}²) by \
+                 ({mean_error:+.3e}, {sd_error:+.3e}), past the forward filter's own error {bar:.3e}",
+                node_0.0, node_0.1, smoothed.0, smoothed.1
+            );
+        }
     }
 }

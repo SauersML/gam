@@ -1,4 +1,4 @@
-"""#1379 — univariate ``matern(x)`` / ``s(x, bs="gp")`` must fit ordinary 1-D
+"""#1379 — univariate ``matern(x)`` / ``s(x, bs="matern")`` must fit ordinary 1-D
 data instead of deterministically aborting at n=200 on >50% of datasets.
 
 Root cause: during the REML / spatial-κ optimization the per-penalty smoothing
@@ -60,9 +60,9 @@ def test_univariate_matern_smooth_fits_ordinary_1d_data():
     assert min(corrs) > 0.9, dict(zip(_FAILING_SEEDS, corrs))
 
 
-def test_univariate_gp_basis_alias_fits_ordinary_1d_data():
-    # `s(x, bs="gp")` is the alias for `matern(x)` and shared the same abort.
-    corrs = [_fit_recovery('s(x, bs="gp")', seed) for seed in _FAILING_SEEDS]
+def test_univariate_matern_basis_selector_fits_ordinary_1d_data():
+    # `s(x, bs="matern")` builds the same smooth as `matern(x)` and shared the same abort.
+    corrs = [_fit_recovery('s(x, bs="matern")', seed) for seed in _FAILING_SEEDS]
     assert min(corrs) > 0.9, dict(zip(_FAILING_SEEDS, corrs))
 
 

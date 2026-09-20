@@ -59,21 +59,31 @@ fn stopped_run_checkpoint(
                 last_solution.final_value,
                 best.value,
             );
-            let mut result = outer_result_with_gradient_norm(
-                best.rho,
-                best.value,
-                // The run spent its whole budget; `best.iterations` is only the index of
-                // the iterate adopted here.
-                last_solution.iterations,
-                Some(best.grad_norm),
-                false,
-                the_plan,
-            );
-            result.origin = OuterResultOrigin::ArcBestIterateSubstitution;
-            result
+            // The run spent its whole budget; `best.iterations` is only the index of
+            // the iterate adopted here.
+            best_iterate_checkpoint(best, last_solution.iterations, the_plan)
         }
         _ => solution_into_outer_result(last_solution, false, the_plan),
     }
+}
+
+/// The cost-stall guard's best feasible accepted iterate as a non-converged
+/// checkpoint of a run that spent `iterations`.
+fn best_iterate_checkpoint(
+    best: CostStallExit,
+    iterations: usize,
+    the_plan: OuterPlan,
+) -> OuterResult {
+    let mut result = outer_result_with_gradient_norm(
+        best.rho,
+        best.value,
+        iterations,
+        Some(best.grad_norm),
+        false,
+        the_plan,
+    );
+    result.origin = OuterResultOrigin::ArcBestIterateSubstitution;
+    result
 }
 
 /// A one-shot reseed retry returns its own outcome, and that outcome knows only
@@ -1412,7 +1422,32 @@ pub(crate) fn run_outer_with_plan(
                         optimizer = optimizer.with_fallback_policy(OptFallbackPolicy::Never);
                     }
                     match optimizer.run() {
-                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                        Ok(sol) => {
+                            // #3279 — opt's ARC ends on a trial whose projected gradient
+                            // clears its tolerance before that trial meets the ratio test,
+                            // so the point it returns can sit above the iterate the run
+                            // stood on. On the λ→∞ face of a REML criterion the gradient
+                            // vanishes at any height: the enriched Duchon fit stepped from
+                            // an accepted 7857.5 onto the face at 26383.9 and returned it
+                            // as its optimum. The claim stays a claim, but the lower
+                            // iterate the guard kept is an evaluated state of this attempt,
+                            // so it is the attempt's checkpoint, and the dominated-plateau
+                            // adjudication below declines a claim it beats (#2596, #2627)
+                            // and continues the search from it.
+                            let best_exit =
+                                cost_stall_exit.lock().ok().and_then(|slot| slot.clone());
+                            if let Some(best) = best_exit.filter(|best| {
+                                best.value.is_finite()
+                                    && (!sol.final_value.is_finite()
+                                        || best.value < sol.final_value)
+                            }) {
+                                retain_best_outer_checkpoint(
+                                    &mut best_checkpoint,
+                                    best_iterate_checkpoint(best, sol.iterations, *the_plan),
+                                );
+                            }
+                            Ok(solution_into_outer_result(sol, true, *the_plan))
+                        }
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
                             log::debug!(
                                 "[OUTER warning] {context}: ARC hit max_iter={} at final_value={:.6e} |g|={:.3e} | {}",
@@ -1642,7 +1677,6 @@ pub(crate) fn run_outer_with_plan(
                     // the device input below carries it as a raw `usize`, so we
                     // only need the wrapper for its bail-on-invalid behaviour.
                     outer_max_iterations(config.max_iter)?;
-                    let axis_caps_dev = bfgs_axis_step_caps(config, layout);
                     let seed_eval_dev = match eval_seed_restoring_rays(
                             obj,
                             config,
@@ -1689,7 +1723,6 @@ pub(crate) fn run_outer_with_plan(
                         // the terminal certificate judges the point it stops at
                         // regardless (#2817).
                         cost_stall_projected_grad_tol: grad_tol_dev.abs,
-                        axis_step_caps: axis_caps_dev,
                         admission,
                         seed_objective: seed_eval_dev.cost,
                         seed_gradient: seed_eval_dev.gradient.clone(),
@@ -2073,9 +2106,6 @@ pub(crate) fn run_outer_with_plan(
                             if scale.is_finite() && scale > 0.0 {
                                 optimizer = optimizer.with_initial_metric(InitialMetric::Scalar(scale));
                             }
-                        }
-                        if let Some(caps) = bfgs_axis_step_caps(config, layout) {
-                            optimizer = optimizer.with_axis_step_caps(caps);
                         }
                         // The observer is installed UNCONDITIONALLY on this route
                         // (#2613). It used to be gated on `outer_inner_cap`, the

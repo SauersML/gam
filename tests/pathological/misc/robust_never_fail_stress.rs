@@ -219,7 +219,7 @@ fn run_battery() -> Vec<(&'static str, Path)> {
         ),
         (
             "near_zero_cases",
-            classify("y ~ s(x, bs='tp', k=8)", "binomial", &nzc),
+            classify("y ~ s(x, bs='tps', k=8)", "binomial", &nzc),
         ),
         (
             "rank_deficient_design",
@@ -227,7 +227,7 @@ fn run_battery() -> Vec<(&'static str, Path)> {
         ),
         (
             "indefinite_multimodal",
-            classify("y ~ s(x, bs='tp', k=6)", "binomial", &mm),
+            classify("y ~ s(x, bs='tps', k=6)", "binomial", &mm),
         ),
     ]
 }

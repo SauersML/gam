@@ -2234,34 +2234,6 @@
     "evidence": "At the base both names occur only in inner_blockwise_fit.rs (the call, the fn, and the const inside it); at the head git grep -w finds neither under crates, src or tests. inner_blockwise_fit.rs at this base is byte-identical to the polishdel gate parent 148435843c (blob 210f50eece), where gam-custom-family check --all-targets, the lib suite (365/366, the one red is the main red a_refusal_with_evidence_refits_armed_once_and_publishes_it_2995), laml_inner_accuracy_2668, cargo check --workspace --all-targets and cargo build --workspace --lib all passed. Every helper the deleted body called keeps another caller."
   },
   {
-    "base": "5834fb219dc1bd35dd82a4fd874d8f6fd3e95e46",
-    "items": [
-      "crates/gam-solve/src/arrow_schur/newton_step.rs:enum:MixedPrecisionAttempt",
-      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:arrow_factor_slab_to_f32",
-      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:arrow_rhs",
-      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:cholesky_solve_lower_f32",
-      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:mixed_precision_kappa_gate_failure",
-      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:solve_arrow_system_f32",
-      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:try_mixed_precision_arrow_solve",
-      "crates/gam-solve/src/arrow_schur/prelude.rs:const:DEFAULT_MIXED_PRECISION_CERTIFICATE_TOLERANCE",
-      "crates/gam-solve/src/arrow_schur/prelude.rs:const:DEFAULT_MIXED_PRECISION_KAPPA_MARGIN",
-      "crates/gam-solve/src/arrow_schur/prelude.rs:const:DEFAULT_MIXED_PRECISION_MAX_REFINEMENTS",
-      "crates/gam-solve/src/arrow_schur/prelude.rs:const:F32_UNIT_ROUNDOFF",
-      "crates/gam-solve/src/arrow_schur/prelude.rs:const:MIXED_PRECISION_CERTIFICATE_EPSILON_MULTIPLIER",
-      "crates/gam-solve/src/arrow_schur/prelude.rs:const:MIXED_PRECISION_KAPPA_MARGIN_CEILING",
-      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:matrix_inf_norm",
-      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:mixed_precision_reduced_beta",
-      "crates/gam-solve/src/arrow_schur/solve_options.rs:enum:ArrowSolvePrecisionPolicy",
-      "crates/gam-solve/src/arrow_schur/solve_options.rs:enum:MixedPrecisionStatus",
-      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:certified_mixed",
-      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:default",
-      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:is_enabled",
-      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:with_streaming_solve_precision_default"
-    ],
-    "reason": "#2946 census T10: the arrow-Schur CertifiedMixed solve factored in f64 (factor_dense_reduced_schur and the per-row H_tt factors), copied those factors to f32, and ran f32 triangular solves with f64-residual refinement until a normwise backward-error certificate closed. Because the f64 factor that answers the system in one triangular solve already existed, the f32 path was strictly more work, gated by chosen constants (6 refinements, 1e-11 certificate, kappa*u_f32 margin 0.5 / ceiling 1.0, 64*eps floor). SPEC: 'Unnecessary choices and options should be deleted, not included.' and 'Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible in production code.' Deleted: the policy enum and its Default impl, the status enum, both mixed solves, the kappa gate, the f32 helpers (slab copy, f32 arrow solve, f32 Cholesky solve), arrow_rhs and matrix_inf_norm (used only by the mixed path), the streaming default upgrade and the six constants.",
-    "evidence": "At base 5834fb219d source_removal_guard.py reports exactly these 21 identities. The removed `default` is the one `impl Default for ArrowSolvePrecisionPolicy`; the other Default impls in solve_options.rs are untouched. At head git grep finds no occurrence of ArrowSolvePrecisionPolicy, MixedPrecisionStatus, solve_precision, mixed_precision_status, try_mixed_precision_arrow_solve, mixed_precision_reduced_beta or F32_UNIT_ROUNDOFF outside CHANGELOG.md and the ledgers. Every former caller already fell back to the f64 cholesky_solve_vector / solve_dense_reduced_system on the same factor, which is now the only route. No test constructed CertifiedMixed or read mixed_precision_status. cargo check --workspace --tests rc 0."
-  },
-  {
     "base": "22739df0373c49b8015d7dace453729a89a0cd21",
     "items": [
       "crates/gam-inference/src/truncated_gaussian.rs:const:MAX_BOUNCES_BASE",
@@ -2325,5 +2297,321 @@
     ],
     "reason": "The terminal 384-point cubic-cell Gauss-Legendre rule is built once per process from gauss_legendre_certified(TERMINAL_GL_ORDER): the hand-transcribed GL_NODES/GL_WEIGHTS tables carried weights 3.05e-12 relative off the true rule, so they are deleted, and the GPU emitter reads the certified rule through gl_nodes_for_gpu_kernel()/gl_weights_for_gpu_kernel() in place of the GL_*_FOR_GPU_KERNEL re-exports.",
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3361 (fix-3315-certified-gl-rule, Fixes #3315) merged as b3fbbbab2e0eae7c217bc986ddf46c6e36754731 with no source-removal entry. scripts/source_removal_guard.py from b3fbbbab2e0eae7c217bc986ddf46c6e36754731's own tree, run with --base 3f1da8e8f0b878d9fd40f44a615880cde1f85ff4 --head b3fbbbab2e0eae7c217bc986ddf46c6e36754731, lists exactly these 4 guarded removals and fails without this entry (audit run 2026-09-20, /scratch.global/sauer354/w2slb/audit2). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. Read-proof: git grep -w -c <name> b3fbbbab2e0eae7c217bc986ddf46c6e36754731 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "265ec7bd81604ded27787776e4b0ddf6c60b216e",
+    "items": [
+      "crates/gam-custom-family/src/tests.rs:fn:custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898",
+      "crates/gam-custom-family/src/tests.rs:fn:evaluate",
+      "crates/gam-custom-family/src/tests.rs:fn:exact_newton_hessian_directional_derivative",
+      "crates/gam-custom-family/src/tests.rs:fn:exact_newton_hessian_second_directional_derivative",
+      "crates/gam-custom-family/src/tests.rs:fn:exact_newton_joint_hessian_beta_dependent",
+      "crates/gam-custom-family/src/tests.rs:struct:D2hCountingQuarticFamily"
+    ],
+    "reason": "The #2898 mint-once pin custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898 counted d2H calls across an unarmed custom-family quartic fit on the gradient-only BFGS plan. #3306 makes custom families search gradient-only only when joint_jeffreys_term_required() (the order-five Jeffreys curvature exists only when armed), so the unarmed quartic now runs exact-curvature ARC and legitimately assembles the outer Hessian per step; the pin therefore no longer described the plan it runs. The pin moved to the gam-solve gradient-only lifecycle test a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939, which asserts exactly one Hessian-order request, at the mint. D2hCountingQuarticFamily and its CustomFamily impl methods (evaluate, exact_newton_hessian_directional_derivative, exact_newton_hessian_second_directional_derivative, exact_newton_joint_hessian_beta_dependent) existed only for the removed pin.",
+    "evidence": "Backfill: PR #3405 (claude/fix-3306-fallback-incumbent, Fixes #3306) merged as eaf16b04947ee0c6cc9e7f735a16c141416cf5e7 with no source-removal entry; the removal is in its commit 2c69566f, whose message records the pin move. scripts/source_removal_guard.py run with --base 265ec7bd81604ded27787776e4b0ddf6c60b216e --head eaf16b04947ee0c6cc9e7f735a16c141416cf5e7 lists exactly these 6 guarded removals and fails without this entry. Read-proof: git grep -w -c for custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898 and D2hCountingQuarticFamily finds 1 file at the base and 0 at the merge; the other four names are trait methods still declared elsewhere (declaration count dropped by one each). The replacement pin lives at crates/gam-solve/src/rho_optimizer/run_plan_saddle_escape_tests.rs (#2898 assert in a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939)."
+  },
+  {
+    "base": "98e38107cebdf056bd726d03b0a7e2788e1b3ca6",
+    "items": [
+      "crates/gam-solve/src/estimate/smoothing_correction.rs:const:BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC",
+      "crates/gam-solve/src/reml/block_quadrature_correction.rs:fn:block_correction_latched",
+      "crates/gam-solve/src/reml/glm_outer_hessian_fd_tests.rs:fn:a_latched_block_correction_declares_no_outer_hessian_784"
+    ],
+    "reason": "The latched #784 block-local correction now carries its exact analytic rho-Hessian, so certified fits keep their smoothing-corrected covariance instead of shipping the plug-in V = H^-1. The refusal it replaces goes: BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC, the latch predicate block_correction_latched (replaced by block_correction_hessian_refusal, which names why a refused Hessian is absent), and the test that pinned a latched correction declaring no outer Hessian.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3204 (pygam-covariance-refusal, Fixes #3139 and #3198) merged as d4f20811be4720be65138012e033abcb05a91e42 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from d4f20811be4720be65138012e033abcb05a91e42's own tree with --base 98e38107cebdf056bd726d03b0a7e2788e1b3ca6 --head d4f20811be4720be65138012e033abcb05a91e42 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 3 items. Read-proof: git grep -w -c <name> d4f20811be4720be65138012e033abcb05a91e42 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "6dc41be97e6ad583601a08d993f49bcc275386ef",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/run_plan.rs:fn:certified_resume_is_already_stationary"
+    ],
+    "reason": "The certificate ladder's top is capped at the caller's |Pg| requirement, and a resumed terminal point is judged by the certificate: the zero-iteration shortcut certified_resume_is_already_stationary is replaced by claim_prior_terminal_certificate.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3429 (fix-3311-seed-certification, Fixes #3311 and #3312) merged as 1c84d2a44acd352c766a2d6b80e1b2d9a864c06b with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 1c84d2a44acd352c766a2d6b80e1b2d9a864c06b's own tree with --base 6dc41be97e6ad583601a08d993f49bcc275386ef --head 1c84d2a44acd352c766a2d6b80e1b2d9a864c06b (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 1 items. Read-proof: git grep -w -c <name> 1c84d2a44acd352c766a2d6b80e1b2d9a864c06b -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "661649e5fa830748952a78960e77b193fc6858a5",
+    "items": [
+      "crates/gam-pyffi/src/ffi/python_log.rs:fn:drain_pending_call",
+      "crates/gam-pyffi/src/ffi/python_log.rs:fn:lock_queue",
+      "crates/gam-pyffi/src/ffi/python_log.rs:fn:schedule_drain",
+      "crates/gam-pyffi/src/ffi/python_log.rs:static:DRAIN_SCHEDULED",
+      "crates/gam-pyffi/src/ffi/python_log.rs:type:PendingQueue"
+    ],
+    "reason": "Engine log records now stream to Python from one delivery thread that attaches whenever the GIL is free, instead of through Py_AddPendingCall, which CPython runs only on its main thread while it executes bytecode, so nothing was delivered during a detached fit. The pending-call machinery goes: drain_pending_call, schedule_drain, lock_queue, DRAIN_SCHEDULED and PendingQueue.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3378 (fix-3271-log-streaming, Fixes #3271) merged as c5eb78d6864c62efd309cf31043d55e891e7506e with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from c5eb78d6864c62efd309cf31043d55e891e7506e's own tree with --base 661649e5fa830748952a78960e77b193fc6858a5 --head c5eb78d6864c62efd309cf31043d55e891e7506e (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 5 items. Read-proof: git grep -w -c <name> c5eb78d6864c62efd309cf31043d55e891e7506e -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "c5eb78d6864c62efd309cf31043d55e891e7506e",
+    "items": [
+      "crates/gam-solve/src/model_types/result_types.rs:fn:weighted_gram"
+    ],
+    "reason": "X'WX stays beside H in the active frame and is read in the saved frame through the gauge, so lift_to_saved_frame no longer refuses a fit carrying a weighted Gram: the frame-ambiguous accessor weighted_gram() is replaced by saved_frame_weighted_gram().",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3389 (fix-3346-lift-weighted-gram, Fixes #3346) merged as ed78ff5628326615b5ca13682cb99e0935bb8d15 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from ed78ff5628326615b5ca13682cb99e0935bb8d15's own tree with --base c5eb78d6864c62efd309cf31043d55e891e7506e --head ed78ff5628326615b5ca13682cb99e0935bb8d15 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 1 items. Read-proof: git grep -w -c <name> ed78ff5628326615b5ca13682cb99e0935bb8d15 -- <its path> gives 0 for every item except weighted_gram (17, other uses of the same word)."
+  },
+  {
+    "base": "8256e9b70f568d96c311c361f4724ab8589e0be2",
+    "items": [
+      "crates/gam-cli/src/main/model_summary.rs:fn:build_model_summary",
+      "crates/gam-models/src/inference/saved_summary.rs:fn:summary_smooth_terms",
+      "crates/gam-solve/src/estimate/summary.rs:fn:fmt",
+      "crates/gam-solve/src/estimate/summary.rs:fn:format_pvalue",
+      "crates/gam-solve/src/estimate/summary.rs:fn:significance_stars",
+      "crates/gam-solve/src/estimate/summary.rs:fn:the_summary_names_a_withheld_shape_pvalue",
+      "crates/gam-solve/src/estimate/summary.rs:fn:the_summary_names_an_uncertified_terms_edf_label_2901",
+      "crates/gam-solve/src/estimate/summary.rs:struct:ModelSummary"
+    ],
+    "reason": "pyGAM audit F11/DOC-6/G1: the fitted-model summary text has exactly one renderer, gam_models::inference::summary_text::render_summary_text over the typed SummaryPayload, shared by `gam summary` and gamfit's Model.summary()/__str__. Removed as second implementations: the CLI's build_model_summary and gam_solve's ModelSummary with its Display fmt, format_pvalue and significance_stars (the renderer owns the p-value format and stars). the_summary_names_an_uncertified_terms_edf_label_2901 and the_summary_names_a_withheld_shape_pvalue moved under the same names to summary_text.rs's tests against the one renderer, which prints the #2901 EDF label and the shape-constrained p-value reason from the payload rows. The saved summary's per-predictor smooth builder `summary_smooth_terms` is replaced by `predictor_block_smooth_terms`, which reads the same predictor block from one replayed design shared with the parametric table instead of replaying it a second time.",
+    "evidence": "source_removal_guard.py with base 9af3c66f1b and head the merge commit refused exactly these seven items. crates/gam-models/src/inference/summary_text.rs defines significance_stars, format_p_value, the_summary_names_an_uncertified_terms_edf_label_2901 and the_summary_names_a_withheld_shape_pvalue. git grep -w finds no remaining reference to ModelSummary or build_model_summary (other than one historical doc sentence). The fmt removed is ModelSummary's own Display impl (the other production occurrences are other fmt fns). crates/gam-models/tests/suite/bms_per_smooth_summary_2997.rs pins both predictors' smooth and parametric rows through the replacement."
+  },
+  {
+    "base": "c7d45a067fb72352bc327b56741c4866536819e7",
+    "items": [
+      "crates/gam-inference/src/hmc_io.rs:const:HIGH_DIM_TARGET_ACCEPT_FLOOR",
+      "crates/gam-inference/src/hmc_io.rs:const:LOW_DIM_TARGET_ACCEPT_FLOOR",
+      "crates/gam-inference/src/hmc_io.rs:const:MAX_TARGET_ACCEPT",
+      "crates/gam-inference/src/hmc_io.rs:fn:robust_target_accept",
+      "crates/gam-inference/src/hmc_io.rs:fn:run_nuts_sampling_rejects_invalid_target_accept",
+      "crates/gam-inference/src/hmc_io.rs:fn:validate_nuts_target_accept",
+      "crates/gam-inference/src/rho_posterior.rs:const:DEFAULT_M",
+      "crates/gam-inference/src/rho_posterior.rs:const:ESCALATION_NUTS_SAMPLES",
+      "crates/gam-inference/src/rho_posterior.rs:const:TIER1_MAX_DIM",
+      "crates/gam-inference/src/rho_posterior.rs:const:TIER2_MAX_DIM"
+    ],
+    "reason": "#3187 / #3263: the rho-posterior tiers and NUTS tuning carried hand-set caps and knobs. TIER1_MAX_DIM / TIER2_MAX_DIM capped the escalation route by K; the route is now derived (quadrature iff nodes^K <= RHO_NUTS_MIN_EVALUATIONS = 2 * NUTS_CONVERGENCE.min_ess, else NUTS, no K cap). ESCALATION_NUTS_SAMPLES fixed the Tier-2 draw count; it is now the warmup transitions run_adaptive used. DEFAULT_M = 64 was the Tier-0 proposal draw count (callers could override it); it is now reliable_sample_size(ESCALATE_K_HAT) = 2155, the draws at which PSIS is reliable for a shape at the escalation cutoff (at M=100 a Cauchy-over-N(0,0.25) target, true k=1, read k<0.5 in 43.5% of 200 seeds, 13.5% at 2155). robust_target_accept and its floors/MAX_TARGET_ACCEPT clamped a user-tunable target_accept that no longer exists: NutsConfig.target_accept is deleted and NUTS uses NUTS_TARGET_ACCEPT = 0.9, so validate_nuts_target_accept and its rejects-invalid test have nothing to validate.",
+    "evidence": "At the head git grep -w finds none of these names under crates, src or tests. cargo check --workspace --tests passes on the merge of main into the branch; cargo test -p gam-inference --lib hmc_io 59/59 and rho_posterior (including the new escalation-routing test K=4 -> 81-node quadrature, K=5 and K=17 -> NUTS) pass; cargo test -p gam-solve --lib psis passes (reliable_sample_size S(0.5)=100, S(0.7)=2155). The Python sampling wrapper and its tests no longer pass target_accept."
+  },
+  {
+    "base": "1d02ffcb1218e325f5030aa3c767a7967264c05f",
+    "items": [
+      "crates/gam-sae/src/manifold/rho.rs:fn:seed_scaled_by_dispersion_with_sparse_policy"
+    ],
+    "reason": "A multi-atom separable-gate seed took only max(ln φ, 0) of the dispersion shift, a clamp nothing derives, so on clean data a K > 1 seed started 1/φ times stiffer than the construction value. The clamp and its scale_sparse policy flag go: seed_scaled_by_dispersion_with_sparse_policy is removed, and every scale-coupled log-strength takes the full ln φ at every K.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3357 (fix-3233-seed-dispersion-clamp, Fixes #3233) merged as 53dfd6479c37a261096d31a5bf0763668ca8a229 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 53dfd6479c37a261096d31a5bf0763668ca8a229's own tree with --base 1d02ffcb1218e325f5030aa3c767a7967264c05f --head 53dfd6479c37a261096d31a5bf0763668ca8a229 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly this 1 item. Read-proof: git grep -w -c <name> 53dfd6479c37a261096d31a5bf0763668ca8a229 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "53dfd6479c37a261096d31a5bf0763668ca8a229",
+    "items": [
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:inverse_i_plus_wt",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:linearized_fixed_point",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:log_det_i_plus_wt",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:normal_solves",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:posterior",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:quadratic_part",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:retained_normals",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:struct:SiteMotionSystem"
+    ],
+    "reason": "The cone normalizer's EP now runs over u = m0 + Bz in whichever is smaller, the rows or the supported columns (#3130's support-space EP, ported onto main), with rank-one site updates. It no longer Gauss-Jordan inverts the q x q (I + WT) on every evaluation. The q-row machinery goes with it: inverse_i_plus_wt, log_det_i_plus_wt, the row-space posterior and quadratic_part, the 2q x 2q SiteMotionSystem and its linearized_fixed_point, and the row-space accessors normal_solves (R = M^-1 A^T) and retained_normals (A^T).",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3392 (fix-3299-support-space-ep, Fixes #3299) merged as 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af's own tree with --base 53dfd6479c37a261096d31a5bf0763668ca8a229 --head 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 8 items. Read-proof: git grep -w -c <name> 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af -- <its path> gives 0 for every item except posterior (19, other uses of the same word)."
+  },
+  {
+    "base": "391a766e1012d99b0e0b43d8ff0b3db941b82523",
+    "items": [
+      "crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs:fn:set_degenerate_gaussian_reml_items"
+    ],
+    "reason": "#3310 (backfill for e8568910a9, PR #3367, which landed the removal without an entry): the single-smooth closed-form Gaussian REML entries gaussian_reml_fit and gaussian_reml_fit_positions mapped EstimationError::ModelIsIllConditioned to this payload (status 'degenerate', lambda NaN, edf 0, all-zero coefficients and fitted values), which no Python caller read as a failure. Both entries now propagate the engine's typed error, so a singular X'WX raises IllConditionedError, and the payload has no producer left.",
+    "evidence": "git grep -n -w set_degenerate_gaussian_reml_items at 391a766e10 finds its declaration in crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs and exactly two calls, the ModelIsIllConditioned arms of gaussian_reml_fit and gaussian_reml_fit_positions in crates/gam-pyffi/src/model/model_ffi.rs, which 8fae1cc34e removes. scripts/source_removal_guard.py --base 391a766e10 --head e8568910a9 names exactly this item (production_occurrences 3). The removal was measured independently by the direct gate run dy5 w2saeb-3310-g1 (direct-dy5-w2saeb-3310-g1.log), whose source-removal guard named the same item for an equivalent change."
+  },
+  {
+    "base": "801ff9f60defaf03e13a5e950f4e6e45b2d106c7",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/arc_curvature_stationary_2817_tests.rs:fn:a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817"
+    ],
+    "reason": "#3176: FixedPointProgress judges each evaluation on its own (a resolved improvement of the incumbent, charged each value's own rounding gamma_1*|V|, or a contraction of the step) instead of filling COST_STALL_WINDOW-evaluation windows, so a limit-cycling walk stops at its first unprogressing evaluation, not its second window. The pin restating the second-window stop is replaced by a_limit_cycling_fixed_point_walk_stops_at_its_first_unprogressing_evaluation_2817.",
+    "evidence": "At base 801ff9f60d source_removal_guard.py reports exactly this one guarded removal. The replacement pin and the restated contraction, improvement and below-tau-above-rounding pins pass in cargo test -p gam-solve --lib fixed_point_walk."
+  },
+  {
+    "base": "a3c531e53c2d6c97ad9d1fbc56989edb95f4cb3b",
+    "items": [
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_KS_TOL",
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_KURT_TOL",
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_MAX_ABS",
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_SKEW_TOL",
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_TAIL_FLOOR_INNER",
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_TAIL_FLOOR_OUTER",
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_TAIL_MASS_SLACK",
+      "tests/regressions/misc/bms_estimated_latent_law_2926.rs:const:ADEQUACY_SKEW_BOUND"
+    ],
+    "reason": "gam#2926 (017ee5ce8c, acknowledged here after it landed, since the guard's CI is disabled and it was pushed without this entry): the standard-normal adequacy screen's fixed bounds are replaced by the null quantiles of its own statistics at the sample's Kish effective size. AUTO_Z_NORMAL_SKEW_TOL (0.10), AUTO_Z_NORMAL_KURT_TOL (0.25), AUTO_Z_NORMAL_KS_TOL (0.025), AUTO_Z_NORMAL_MAX_ABS (8), AUTO_Z_NORMAL_TAIL_MASS_SLACK (2) and the tail floors AUTO_Z_NORMAL_TAIL_FLOOR_INNER (1e-5) and AUTO_Z_NORMAL_TAIL_FLOOR_OUTER (1e-8) were those fixed bounds; normal_screen_bounds derives each from AUTO_Z_NORMAL_SCREEN_ALPHA split over the eight clauses (two-sided normal quantiles over the exact normal-sample moments of the mean, sd, skewness and kurtosis, Kolmogorov's critical value in Stephens' form, the Poisson upper quantile of each tail count, and the level n draws exceed for max |z|). The regression fixture's ADEQUACY_SKEW_BOUND named the fixed 0.10 it aimed under; adequacy_skew_bound() now computes the derived bound at the fixture's n.",
+    "evidence": "At a3c531e53c the guard reports the seven constants public with production_occurrences 0, used only in latent_z_normal_adequacy's two return paths in crates/gam-models/src/bms/mod.rs, and ADEQUACY_SKEW_BOUND test_scoped with production_occurrences 0, used once in just_inside_fixture. In 017ee5ce8c git grep -w finds none of the eight names. Gate at 65cf920ce6 with the same bms/mod.rs (gateB1r, gateB1r4 on acl42): screen pins 4/4, bms and latent-law lib 342/342, root latent-law regressions 9/9, survival acceptance 8/8 and joint_latent_law_2929 6/6; at a3c531e53c, cargo check --workspace --all-targets RC 0."
+  },
+  {
+    "base": "81623168aa8f5acb6e51d9e2f28c83c05c14b684",
+    "items": [
+      "crates/gam-sae/src/certificate_impls.rs:fn:claim",
+      "crates/gam-sae/src/certificate_impls.rs:fn:evidence",
+      "crates/gam-sae/src/certificate_impls.rs:fn:verdict",
+      "crates/gam-sae/src/manifold/certificate.rs:const:SAE_CERT_CURVATURE_CONSTANT",
+      "crates/gam-sae/src/manifold/certificate.rs:const:SAE_CERT_INCOHERENCE_BUDGET",
+      "crates/gam-sae/src/manifold/certificate.rs:enum:GlobalOptimalityVerdict",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:curved_dictionary_global_optimality_verdict",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:healthy_regime_certifies_with_positive_margin",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:is_certified",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:margin",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:negative_snr_proxy_never_certifies",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:overflowing_certificate_budget_has_no_margin",
+      "crates/gam-sae/src/manifold/certificate.rs:fn:snr_at_or_below_one_does_not_certify",
+      "crates/gam-sae/src/manifold/certificate.rs:struct:CertificateInputs",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:const:A_FLOOR",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:const:K_ATOMS",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:fn:benign_corner_certifies_and_hard_corner_does_not",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:fn:certified_region_is_monotone_no_interior_hole",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:fn:certified_set_is_strict_subset_of_loose_recovery_boundary",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:fn:grid",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:fn:no_certified_cell_violates_a_precondition",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:fn:verdict",
+      "tests/sae/sae/sae_incoherence_phase_diagram.rs:struct:Cell"
+    ],
+    "reason": "#2946 census T1/C1: GlobalOptimalityVerdict::CertifiedGlobal published Verdict::Certified under the claim 'unique global optimum' from the sufficient condition mu_hat <= c0*a^2*(1-1/SNR)*(1-C_kappa*kappa)/K, whose inequality has no derivation and whose constants SAE_CERT_CURVATURE_CONSTANT=1.0 and SAE_CERT_INCOHERENCE_BUDGET=0.125 are chosen. SPEC: 'Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible in production code.' and 'Unnecessary choices and options should be deleted, not included.' The verdict, its margin/is_certified helpers, both constants, the curved_dictionary_global_optimality_verdict decision rule, the Certificate impl (claim/evidence/verdict) that recorded it in the certificate ledger, its four unit tests and the sae_incoherence_phase_diagram integration test (which only mapped where the underived verdict flipped) are deleted. The measurements survive unchanged as DictionaryIncoherenceReport (renamed from CertificateInputs): mu_hat, per-atom kappa_hat, peak activity floor and SNR proxy.",
+    "evidence": "At base 81623168aa source_removal_guard.py reports exactly these 23 identities. At head, git grep -w finds no occurrence of GlobalOptimalityVerdict, CertificateInputs, SAE_CERT_CURVATURE_CONSTANT, SAE_CERT_INCOHERENCE_BUDGET, curved_dictionary_global_optimality_verdict or global_optimality outside CHANGELOG.md and this ledger; no Python code read the removed global_optimality* dict keys (experiments and tests/fixtures/manifold_sae/generate_golden.py read only mu_hat/activity_floor). The removed claim/evidence/verdict are the one `impl Certificate for CertificateInputs` block; the other Certificate impls in the file are untouched. cargo check --workspace --tests rc 0; cargo test -p gam-sae --lib certificate passes."
+  },
+  {
+    "base": "c6b5984d83a5f95ee98709c7db830d32bfae4510",
+    "items": [
+      "crates/gam-terms/src/structure/anova_atom.rs:fn:binding_wald_test",
+      "crates/gam-terms/src/structure/anova_atom.rs:fn:gauge_directions_do_not_enter_the_binding_test",
+      "crates/gam-terms/src/structure/anova_atom.rs:fn:gauge_kron_rowmajor",
+      "crates/gam-terms/src/structure/anova_atom.rs:fn:gauge_projector",
+      "crates/gam-terms/src/structure/anova_atom.rs:fn:joint_binding_wald_test",
+      "crates/gam-terms/src/structure/anova_atom.rs:fn:planted_bound_torus_refuses_and_test_rejects"
+    ],
+    "reason": "The ANOVA atom carve's binding test was the legacy wood_smooth_test Wald over the gauge-projected interaction block, whose reference df fell back to edf.unwrap_or(quotient_rank) floored at 1 and which returned None on degeneracy. It is replaced by the exact sample-space nested-model test (an F test for one output, Wilks' Lambda jointly otherwise), which is gauge-free. The Wald machinery goes: binding_wald_test, joint_binding_wald_test, gauge_projector, gauge_kron_rowmajor and the two tests that pinned the Wald route.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3422 (fix-3182-anova-score-test, Fixes #3182) merged as c7d45a067fb72352bc327b56741c4866536819e7 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from c7d45a067fb72352bc327b56741c4866536819e7's own tree with --base c6b5984d83a5f95ee98709c7db830d32bfae4510 --head c7d45a067fb72352bc327b56741c4866536819e7 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 6 items. Read-proof: git grep -w -c <name> c7d45a067fb72352bc327b56741c4866536819e7 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "49a3379b27599965b5c5a52422737b4910758053",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/fit.rs:fn:certified_retry_or_original",
+      "crates/gam-models/src/fit_orchestration/fit.rs:fn:failed_retry_returns_original_evidence",
+      "crates/gam-models/src/fit_orchestration/fit.rs:fn:firth_rescue_evidence",
+      "crates/gam-models/src/fit_orchestration/fit.rs:fn:firth_rescue_has_compatible_outer_coordinates",
+      "crates/gam-models/src/fit_orchestration/fit.rs:fn:firth_retry_declines_every_link_parameter_outer_problem",
+      "crates/gam-models/src/fit_orchestration/fit.rs:fn:firth_retry_is_limited_to_proven_separation"
+    ],
+    "reason": "Firth becomes a pre-fit decision on the certified binomial separation (arm_jeffreys_on_prefit_binomial_separation in gam-solve prefit.rs). The reactive block in gam-models fit.rs, which fitted the flat prior and on a separation error retried once with Firth, is deleted with firth_rescue_evidence, firth_rescue_has_compatible_outer_coordinates, certified_retry_or_original and their three tests.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3386 (fix-3129-firth-prefit, Fixes #3129) merged as 2d4b9ce53a61db906be4977b1a4aab76c45d8d57 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 2d4b9ce53a61db906be4977b1a4aab76c45d8d57's own tree with --base 49a3379b27599965b5c5a52422737b4910758053 --head 2d4b9ce53a61db906be4977b1a4aab76c45d8d57 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 6 items. Read-proof: git grep -w -c <name> 2d4b9ce53a61db906be4977b1a4aab76c45d8d57 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "8195d75d0aebc3f4c886b20efd5ef0201ac719c7",
+    "items": [
+      "crates/gam-terms/src/structure/anova_atom.rs:fn:wilks_exponential_rates"
+    ],
+    "reason": "The Wilks law for the ANOVA carve's edge test is now evaluated exactly for odd output count and odd interaction rank, through the WilksLaw decomposition (a hypoexponential plus -ln Beta(c, 1/2)). wilks_exponential_rates, which returned None when D and k were both odd, is replaced by it, and the OddWilksParameters refusal goes.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3475 (fix-3423-odd-wilks-exact, Fixes #3423) merged as a5c3a5b6e7df11b78179fc274d6843687abe66a3 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from a5c3a5b6e7df11b78179fc274d6843687abe66a3's own tree with --base 8195d75d0aebc3f4c886b20efd5ef0201ac719c7 --head a5c3a5b6e7df11b78179fc274d6843687abe66a3 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly this 1 item. Read-proof: git grep -w -c <name> a5c3a5b6e7df11b78179fc274d6843687abe66a3 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "a5c3a5b6e7df11b78179fc274d6843687abe66a3",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/materialize/tests.rs:fn:resolve_family_accepts_mgcv_parenthesized_family_link_syntax",
+      "crates/gam-spec/src/lib.rs:fn:aliases",
+      "crates/gam-terms/src/inference/formula_dsl.rs:fn:parse_optional_f64_option_alias",
+      "crates/gam-terms/src/inference/formula_dsl.rs:fn:parses_cyclic_formula_aliases",
+      "crates/gam-terms/src/term_builder.rs:fn:canonicalize_smooth_type",
+      "crates/gam-terms/src/term_builder.rs:fn:parse_penalty_order_alias",
+      "crates/gam-terms/src/term_builder/tests.rs:fn:univariate_smooth_accepts_mgcv_cubic_regression_aliases",
+      "tests/identifiability/smooths/constant_curvature_smooth.rs:fn:curvature_aliases_all_dispatch_to_constant_curvature",
+      "tests/manifolds/smooths/sphere_both_kernels_fit_smooth_truth.rs:fn:sphere_method_aliases_route_to_correct_kernel",
+      "tests/misc/smooths/formula_dsl_new_smooth_aliases.rs:fn:periodic_alias_names_all_parse_to_cyclic_type",
+      "tests/misc/smooths/formula_dsl_new_smooth_aliases.rs:fn:sphere_method_aliases_parse_consistently",
+      "tests/quality/misc/mega_batch_k.rs:fn:sphere_with_method_mgcv_alias",
+      "tests/quality/misc/mega_batch_k.rs:fn:sphere_with_method_sos_alias",
+      "tests/regressions/misc/workflow_bug_hunt.rs:fn:resolve_family_accepts_binomial_logit_with_underscore_alias",
+      "tests/regressions/smooths/cyclic_period_option.rs:fn:cc_and_cp_aliases_honour_period_option",
+      "tests/src_modules/misc/cli_tests.rs:fn:parse_bounded_linear_termwith_center_pull"
+    ],
+    "reason": "One canonical spelling per behavior (SPEC: unnecessary choices and options are deleted). Alias spellings in the formula DSL and the family and link parsers now raise an error that names the canonical spelling, from one removed-spellings table per layer. The alias machinery goes: canonicalize_smooth_type, parse_penalty_order_alias, parse_optional_f64_option_alias, LinkFunction::aliases, and the tests that pinned alias spellings as accepted.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3144 (pygam-spec-aliases) merged as c663ba6dbaaaab008f9ec054a7ea349637fb649a with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from c663ba6dbaaaab008f9ec054a7ea349637fb649a's own tree with --base a5c3a5b6e7df11b78179fc274d6843687abe66a3 --head c663ba6dbaaaab008f9ec054a7ea349637fb649a (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 16 items. Read-proof: git grep -w -c <name> c663ba6dbaaaab008f9ec054a7ea349637fb649a -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "c663ba6dbaaaab008f9ec054a7ea349637fb649a",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/arc_curvature_stationary_2817_tests.rs:fn:a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817"
+    ],
+    "reason": "FixedPointProgress no longer uses a 6-evaluation window. Each evaluation is judged on a resolvable improvement of the incumbent, charged its own rounding, and on step contraction. a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817 pinned the removed window's second-window stop, so it goes with the window. The merge's own entry for it was keyed to 801ff9f60d, not to the merge's first parent.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3414 (fix-3176-fixed-point-progress, Fixes #3176) merged as d8e3e092b8dc86363d45b2315e99a80b3112b32b with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from d8e3e092b8dc86363d45b2315e99a80b3112b32b's own tree with --base c663ba6dbaaaab008f9ec054a7ea349637fb649a --head d8e3e092b8dc86363d45b2315e99a80b3112b32b (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly this 1 item. Read-proof: git grep -w -c <name> d8e3e092b8dc86363d45b2315e99a80b3112b32b -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "19964754761e66a86a1424011a2105795a7e4130",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/drivers/design_construction.rs:const:BOUNDED_GAUSSIAN_SCALE_MAX_ITER"
+    ],
+    "reason": "The bounded Gaussian profiled dispersion is now a certified bracketing root solve of h(u) = ln g(e^u) - u on u = ln phi, a stationary point of the profiled criterion. It replaces the phi <- RSS/(n - edf) substitution loop, whose 50-refit budget BOUNDED_GAUSSIAN_SCALE_MAX_ITER and beta-motion stop are deleted.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3478 (fix-3450-bounded-gaussian-scale, Fixes #3450) merged as 78f5819680029eb29d2769435211664cf28ff6b4 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 78f5819680029eb29d2769435211664cf28ff6b4's own tree with --base 19964754761e66a86a1424011a2105795a7e4130 --head 78f5819680029eb29d2769435211664cf28ff6b4 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly this 1 item. Read-proof: git grep -w -c <name> 78f5819680029eb29d2769435211664cf28ff6b4 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "d058855331e8384f91083846d36df994f5187d9b",
+    "items": [
+      "crates/gam-sae/src/manifold/minimal_seed.rs:const:RANDOM_STATE_LOGIT_JITTER",
+      "crates/gam-sae/src/manifold/seed_routing.rs:const:SAE_RANDOM_STATE_LOGIT_JITTER"
+    ],
+    "reason": "The cold SAE routing seed added a fixed 1e-3, random_state-keyed logit perturbation on top of the data-driven residual seed. Its own comment said it does not change which atom wins, so its only effect was to make the start depend on random_state. Both jitter constants are deleted: RANDOM_STATE_LOGIT_JITTER in minimal_seed.rs and SAE_RANDOM_STATE_LOGIT_JITTER in seed_routing.rs.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3352 (fix-3090-seed-logit-jitter, part of #3090) merged as 93285a585bf63554ef43831f1a7f4a4758115f98 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 93285a585bf63554ef43831f1a7f4a4758115f98's own tree with --base d058855331e8384f91083846d36df994f5187d9b --head 93285a585bf63554ef43831f1a7f4a4758115f98 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 2 items. Read-proof: git grep -w -c <name> 93285a585bf63554ef43831f1a7f4a4758115f98 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "5994ad54c4c39f086905591da98990d8a21a87dd",
+    "items": [
+      "crates/gam-predict/src/large_scale_reml_stress_tests.rs:const:NORMAL_95_TWO_SIDED_Z"
+    ],
+    "reason": "large_scale_reml_stress_coverage read the published interval's standard error as width / (2 * NORMAL_95_TWO_SIDED_Z). Since 698df1148d predict() builds an estimated-scale Gaussian interval on the Student-t reference on n - edf (IntervalReference::of_fit), so that read-back overstated the published variance by (t/z)^2 and the FirstOrderIdentifiedSubspace positive control refused a correct Vp. The test now takes one multiplier per replicate from IntervalReference::of_fit(&fit).central_multiplier(NOMINAL_COVERAGE), the one predict() uses, for the read-back and for the intervals it builds itself. The fixed normal quantile has no use left and is deleted.",
+    "evidence": "direct gate dy3 w2thb-g9pred (direct-dy3-w2thb-g9pred.log): TIPCHECK at 32560e9b3d, check --workspace --all-targets, pyffi, source-removal guard and census RC 0, large_scale_reml_stress_coverage PASS; mutant dy4 w2thb-m8pred arm mcov FIRED"
+  },
+  {
+    "base": "d91ee7df76138dce9bb5e0e1cade3b39ac1a2bea",
+    "items": [
+      "crates/gam-terms/src/smooth/term_specs_tests.rs:fn:non_materialized_penalty_falls_back_conservatively"
+    ],
+    "reason": "The te() joint-unpenalized-dimension guess is retired: joint_unpenalized_dim no longer reports 0 (or a single penalty's own null dim) for a penalty whose stored block is a Kronecker factor, it reads the materialized p_local x p_local block of every penalty. The removed test pinned that fallback, including a shape (a 1x1 factor for p_local = 2) the builder never produces now.",
+    "evidence": "tensor_product_penalties_read_the_materialized_kronecker_blocks replaces it in the same module: te(x, z) with 3x2 margins (S_x kron I and I kron S_z) has a 1-dimensional joint null space, null(S_x) kron null(S_z), which the retired fallback reported as 0. git grep -w finds no remaining reference to the removed name."
+  },
+  {
+    "base": "b3832b9299c77b4f036b06d88d10e5a988126257",
+    "items": [
+      "crates/gam-terms/src/inference/smooth_score_test.rs:fn:exclusive_subspaces",
+      "crates/gam-terms/src/inference/smooth_score_test.rs:fn:inverse_on_subspace",
+      "crates/gam-terms/src/inference/smooth_score_test.rs:fn:normalized"
+    ],
+    "reason": "Port of #3220 item (a): the smooth score test's component covariances are now K_l = P⁻¹(a_l S_l)P⁻¹ at P = Σ a_l S_l, a_l = 1/tr(G_jj⁺ S_l), for every penalty set. On complementary ranges this equals the exact N_l(N_lᵀS_lN_l)⁻¹N_lᵀ / a_l that exclusive_subspaces + inverse_on_subspace computed (a_l cancels in the per-component null-mean normalization), and on overlapping ranges it replaces the chart-dependent S_l⁺ fallback. PenaltyRange::normalized only served exclusive_subspaces' rank decision.",
+    "evidence": "All three were private to crates/gam-terms/src/inference/smooth_score_test.rs; after the change git grep -w finds none of exclusive_subspaces / inverse_on_subspace, and PenaltyRange::normalized has no caller (the 1054 production occurrences are other items named normalized). cargo test -p gam-terms --lib smooth_score_test: 11/11, including the new overlapping_penalties_do_not_depend_on_the_coefficient_chart, which fails under the old S_l⁺ fallback along with the two chart/functional-ridge tests; cargo check --workspace --tests RC 0."
+  },
+  {
+    "base": "3c2b08bc13124f15576fef1513960f97053c1647",
+    "items": [
+      "crates/gam-inference/src/effects.rs:const:DEFAULT_SIMULATIONS",
+      "crates/gam-inference/src/effects.rs:fn:default",
+      "crates/gam-inference/src/partial_dependence.rs:fn:a_block_spanning_every_level_and_an_unknown_term_are_refused_by_name",
+      "crates/gam-inference/src/partial_dependence.rs:fn:a_linear_interaction_holds_its_gate_and_a_two_axis_term_needs_a_grid",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:const:NONZERO_ANCHOR_DESIGN_ERROR",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:fn:model_partial_dependence",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:fn:model_partial_dependence_impl",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:fn:standard_mean_design",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:fn:standard_mean_prediction_design",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:fn:standard_mean_termspec",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:struct:PartialDependenceOutput"
+    ],
+    "reason": "PR #3076 replaces the dict-returning partial-dependence path with a typed Rust partial effect (gam_predict::partial_effect::partial_effect). (1) The pyffi model_partial_dependence / model_partial_dependence_impl / PartialDependenceOutput pyfunction is replaced by model_partial_effect, and gamfit.Model.partial_dependence calls that instead. (2) The standard-mean design helpers standard_mean_design, standard_mean_termspec, standard_mean_prediction_design and NONZERO_ANCHOR_DESIGN_ERROR move out of gam-pyffi geometry_ffi.rs into gam_predict::partial_effect, where the CLI partial-effect command and pyffi share them; the variance-share and difference-smooth callers now call gam_predict::partial_effect::standard_mean_design. (3) The simultaneous-band draw count is no longer the magic constant DEFAULT_SIMULATIONS = 10_000 behind impl Default for SimultaneousBandOptions. It is SimultaneousBandOptions::at_level(level), which draws simultaneous_band_simulations(level) = ceil(level/((1-level)*0.05^2)) samples, 7,600 at 0.95. (4) Two partial_dependence unit tests asserted refusals this PR turns into supported behaviour: a two-axis term with no grid now sweeps the product grid, and a block spanning every factor level now sweeps the factor as an axis. They are renamed to a_linear_interaction_holds_its_gate_and_a_two_axis_term_sweeps_a_product_grid and a_block_spanning_every_level_sweeps_the_factor_as_an_axis. The second still carries the unknown-term refusal assertion (\"available\" plus the term list).",
+    "evidence": "scripts/source_removal_guard.py --base 3c2b08bc13124f15576fef1513960f97053c1647 --head d91b01836688765aadbbed2aff2ef0f78d7e9d41 (the landing session's merge of main into claude/pygam-partial-effects) lists exactly these 11 guarded removals and fails without this entry. Read-proof, git grep -w -c over *.rs at that head: DEFAULT_SIMULATIONS 0, model_partial_dependence 0, model_partial_dependence_impl 0, PartialDependenceOutput 0; standard_mean_design is in gam-predict/src/partial_effect.rs (2), geometry_ffi.rs (1, the variance-share caller) and manifold_and_posterior_ffi.rs (1, the difference-smooth caller); standard_mean_termspec (3), standard_mean_prediction_design (2) and NONZERO_ANCHOR_DESIGN_ERROR (3) are all in gam-predict/src/partial_effect.rs; SimultaneousBandOptions::at_level appears 5 times in gam-inference/src/effects.rs, and main's whole-curve coverage test is ported to it. The renamed tests are each declared once in gam-inference/src/partial_dependence.rs."
+  },
+  {
+    "base": "41fbd6c3376037036ca93f1c5274575fef526dc0",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/materialize/terms.rs:fn:spatial_center_strategy_mut",
+      "crates/gam-terms/src/term_builder.rs:fn:cyclic_basis_dim_for_column",
+      "crates/gam-terms/src/term_builder.rs:fn:pilot_internal_knots_for_column",
+      "crates/gam-terms/src/term_builder/tests.rs:fn:multidimensional_duchon_default_uses_rate_derived_pilot_basis"
+    ],
+    "reason": "#3149 R0: formula defaults are built at their provisioned size on every route, and only the bases the standard workflow's resolution loop grows start at their penalized-resolution pilot, through the one rule gam_terms::smooth::starting_resolution. materialize/terms.rs spatial_center_strategy_mut served only the d>1 radial start special case that starting_resolution now owns; term_builder cyclic_basis_dim_for_column was the position basis's pilot cyclic default, now provisioned_cyclic_basis_dim; the test multidimensional_duchon_default_uses_rate_derived_pilot_basis is restated as multidimensional_duchon_default_is_provisioned_and_the_loop_starts_it_at_its_pilot (same fixture, both sizes asserted); term_builder pilot_internal_knots_for_column lost its last production caller (the position basis now takes the provisioned default, and the pilot floor sizes from the rows it is identified on, #3179), so its tests call pilot_internal_knots directly.",
+    "evidence": "Gate direct-dy6-w2a-r0v5-gt.log, TIPCHECK at tip 988f269d7e (tip tree 9598a61a74): cargo check --workspace --all-targets RC 0 with SCANNER_ERRORS=0, gam-pyffi check RC 0, gam-terms 114 of 114; its source_removal_guard and public_api_census flagged exactly these items and nothing else. Read-proof: git grep -w for spatial_center_strategy_mut, cyclic_basis_dim_for_column and pilot_internal_knots_for_column at 988f269d7e finds only their definitions, the callers this landing rewrites, and a doc comment in basis/types.rs that this landing also rewrites."
+  },
+  {
+    "base": "33e71f2363e2b5b2cc64043c2a865d2247b59452",
+    "items": [
+      "crates/gam-model-api/src/families/custom_family/options.rs:const:FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP",
+      "crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs:const:SPATIAL_PSI_BFGS_STEP_CAP",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:bfgs_axis_step_caps",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:with_bfgs_step_cap",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:with_bfgs_step_cap_psi"
+    ],
+    "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
+    "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
   }
 ]

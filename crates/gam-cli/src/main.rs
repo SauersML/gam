@@ -10,8 +10,8 @@ pub(crate) use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8
 pub(crate) use csv::WriterBuilder;
 
 pub(crate) use gam::estimate::{
-    BlockRole, ContinuousSmoothnessOrderStatus, ModelSummary,
-    ParametricTermSummary, SummaryBlockOffset, UnifiedFitResult, smooth_term_summary_rows,
+    BlockRole, ContinuousSmoothnessOrderStatus, SummaryBlockOffset, UnifiedFitResult,
+    smooth_term_summary_rows,
 };
 
 pub(crate) use gam::families::survival::latent::fixed_latent_hazard_frailty;
@@ -59,15 +59,9 @@ pub(crate) use gam_predict::{
 
 pub(crate) use gam::report;
 
-pub(crate) use gam::probability::{
-    inverse_gaussian_cdf, normal_two_sided_probability, standard_normal_quantile,
-    student_t_two_sided_probability,
-};
+pub(crate) use gam::probability::{inverse_gaussian_cdf, standard_normal_quantile};
 
-pub(crate) use gam::smooth::{
-    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
-    SmoothTermSpec, TermCollectionSpec,
-};
+pub(crate) use gam::smooth::{SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
 // #1521: relocated DOWN into gam_terms::smooth (was families::...::drivers).
 pub(crate) use gam::terms::smooth::build_term_collection_design;
 
@@ -169,6 +163,8 @@ mod run_parameter_decomposition;
 mod run_compare;
 #[path = "main/run_diagnose.rs"]
 mod run_diagnose;
+#[path = "main/run_partial_effect.rs"]
+mod run_partial_effect;
 #[path = "main/run_summary.rs"]
 mod run_summary;
 #[path = "main/run_fit.rs"]
@@ -196,6 +192,7 @@ pub(crate) use run_crosscoder::*;
 pub(crate) use run_parameter_decomposition::*;
 pub(crate) use run_compare::*;
 pub(crate) use run_diagnose::*;
+pub(crate) use run_partial_effect::*;
 pub(crate) use run_summary::*;
 pub(crate) use run_fit::*;
 pub(crate) use run_joint_events::*;
@@ -308,6 +305,7 @@ fn run() -> CliResult<()> {
         }
         Command::LatentResidual(args) => run_latent_residual(args),
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),
+        Command::PartialEffect(args) => run_partial_effect(args).map_err(CliError::from),
         Command::Residuals(args) => run_residuals(args).map_err(CliError::from),
         Command::Compare(args) => run_compare(args).map_err(CliError::from),
         Command::Sample(args) => run_sample(args).map_err(CliError::from),

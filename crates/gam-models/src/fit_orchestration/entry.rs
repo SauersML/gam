@@ -570,6 +570,9 @@ enum ExactGaussianVerdict {
     Ineligible,
     /// The realized design does not reproduce the response exactly.
     Interior(TermCollectionDesign),
+    /// The resource policy refused the dense certificate on the realized
+    /// design, so exactness is not decided.
+    Undecided(TermCollectionDesign),
     Boundary(ExactGaussianBoundary),
 }
 
@@ -693,7 +696,13 @@ fn deterministic_gaussian_standard_fit(
     // for `y ~ 1`. We assemble that bundle here at a fully-smoothed λ. Because the
     // residual is exactly zero the estimated dispersion φ̂ = 0, so every
     // coefficient covariance is exactly zero (no ill-conditioned inverse needed).
-    let x_dense = design.design.to_dense();
+    let x_dense = design
+        .design
+        .try_to_dense_arc_with_policy(
+            "deterministic Gaussian inference bundle",
+            &request.options.resource_policy,
+        )
+        .map_err(|reason| raised_fit_failure(FailureCategory::Input, reason))?;
     let weights = request.weights.as_ref().clone();
     let xtwx = gam_linalg::faer_ndarray::fast_xt_diag_x(&x_dense, &weights);
     let mut infinite_face_penalty = Array2::<f64>::zeros((p, p));
@@ -1147,7 +1156,10 @@ fn deterministic_gaussian_standard_fit(
         smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence,
-        weighted_gram: Some(xtwx),
+        // `X'WX` is stored beside `H` in the gauge's active frame (gam#3346).
+        // Every penalty vanishes on the tangent face, so there the Gram
+        // `Z'X'WX Z` is the penalized Hessian itself.
+        weighted_gram: Some(penalized_hessian.clone()),
         identified_subspace: None,
     };
     let geometry = Some(gam_solve::estimate::FitGeometry {
@@ -1387,15 +1399,20 @@ fn exact_gaussian_coefficients(
         if positive_rows.len() < reduced_p {
             return None;
         }
-        let positive_weight_reduced_x = Array2::from_shape_fn(
-            (positive_rows.len(), reduced_p),
-            |(weighted_row, column)| {
-                let row = positive_rows[weighted_row];
-                reduced_x[[row, column]]
-            },
-        );
+        // Every row already on the support needs no copy of the design.
+        let positive_weight_reduced_x = if positive_rows.len() == reduced_x.nrows() {
+            std::borrow::Cow::Borrowed(reduced_x)
+        } else {
+            std::borrow::Cow::Owned(Array2::from_shape_fn(
+                (positive_rows.len(), reduced_p),
+                |(weighted_row, column)| {
+                    let row = positive_rows[weighted_row];
+                    reduced_x[[row, column]]
+                },
+            ))
+        };
         let rank = gam_linalg::faer_ndarray::rrqr_with_permutation(
-            &positive_weight_reduced_x,
+            &*positive_weight_reduced_x,
             gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
         )
         .ok()?
@@ -1563,9 +1580,19 @@ fn exact_gaussian_boundary(
     {
         return Ok(ExactGaussianVerdict::Interior(design));
     }
-    let x = design.design.to_dense();
+    // The certificate factors the dense design, so it is admitted through the
+    // fit's own resource policy. A refusal leaves the question undecided; it
+    // is not evidence either way, and the iterative solver owns the fit.
+    let x = match design.design.try_to_dense_arc_with_policy(
+        "deterministic Gaussian boundary",
+        &request.options.resource_policy,
+    ) {
+        Ok(x) => x,
+        Err(_) => return Ok(ExactGaussianVerdict::Undecided(design)),
+    };
+    let x: &Array2<f64> = &x;
     let Some(beta) =
-        exact_gaussian_coefficients(&x, &adjusted_response, request.weights.as_ref(), None)
+        exact_gaussian_coefficients(x, &adjusted_response, request.weights.as_ref(), None)
     else {
         return Ok(ExactGaussianVerdict::Interior(design));
     };
@@ -1638,7 +1665,7 @@ fn exact_gaussian_boundary(
                     )
                 })?;
             exact_gaussian_coefficients(
-                &x,
+                x,
                 &adjusted_response,
                 request.weights.as_ref(),
                 Some((&null_basis, rotation_radius)),
@@ -1671,7 +1698,7 @@ fn exact_gaussian_boundary(
                 )
             })?;
         let Some(tangent_beta) = exact_gaussian_coefficients(
-            &x,
+            x,
             &adjusted_response,
             request.weights.as_ref(),
             Some((&joint_null_basis, joint_rotation_radius)),
@@ -1758,7 +1785,9 @@ fn try_deterministic_gaussian_standard_fit(
     }
     match exact_gaussian_boundary(request)? {
         ExactGaussianVerdict::Ineligible => Ok(GaussianStandardRoute::Iterative(None)),
-        ExactGaussianVerdict::Interior(design) => Ok(GaussianStandardRoute::Iterative(Some(design))),
+        ExactGaussianVerdict::Interior(design) | ExactGaussianVerdict::Undecided(design) => {
+            Ok(GaussianStandardRoute::Iterative(Some(design)))
+        }
         ExactGaussianVerdict::Boundary(boundary) => {
             deterministic_gaussian_standard_fit(request, Some(boundary))
         }
@@ -2546,16 +2575,26 @@ fn fit_materialized_once_with_notes(
     // from this same `SplineScanFit`.
     let mut realized_design = None;
     if let FitRequest::Standard(request) = &mat.request {
-        match try_deterministic_gaussian_standard_fit(request)? {
-            GaussianStandardRoute::Exact(result) => {
-                return Ok(attach_basis_adequacy(
-                    FitResult::Standard(result),
-                    standard_covariate_frame,
-                    inference_notes,
-                    unidentified_scalar_terms,
-                ));
+        // Route selection comes before the exact Gaussian boundary. The
+        // residual cascade below is a different estimator from the dense
+        // model, so whether the DENSE model reproduces `y` exactly is not its
+        // question, and asking it would build and factor the n×p dense design
+        // the cascade exists to avoid (#3472). Only a constant response, whose
+        // exactness is read off `y - offset` with no certificate, still takes
+        // the deterministic route ahead of the cascade.
+        let cascade_inputs = residual_cascade_fast_path(request);
+        if cascade_inputs.is_none() || gaussian_response_is_constant(request) {
+            match try_deterministic_gaussian_standard_fit(request)? {
+                GaussianStandardRoute::Exact(result) => {
+                    return Ok(attach_basis_adequacy(
+                        FitResult::Standard(result),
+                        standard_covariate_frame,
+                        inference_notes,
+                        unidentified_scalar_terms,
+                    ));
+                }
+                GaussianStandardRoute::Iterative(design) => realized_design = design,
             }
-            GaussianStandardRoute::Iterative(design) => realized_design = design,
         }
         if let Some(inputs) = spline_scan_fast_path(request) {
             let scan = gam_solve::spline_scan::fit_spline_scan(
@@ -2582,7 +2621,7 @@ fn fit_materialized_once_with_notes(
         // the typed reason automatic REML was unavailable. The save paths
         // build the persistence payload from this `ResidualCascadeFit`'s
         // `to_state` snapshot.
-        if let Some(inputs) = residual_cascade_fast_path(request) {
+        if let Some(inputs) = cascade_inputs {
             let coord_refs: Vec<&[f64]> = inputs.coords.iter().map(Vec::as_slice).collect();
             let fit = gam_solve::residual_cascade::fit_residual_cascade(
                 &coord_refs,
@@ -3376,7 +3415,7 @@ fn publish_expectile_sandwich_covariance(
 ///   through the scan would silently drop that penalty and select λ from the
 ///   bending penalty alone, which is exactly the EDF inflation #1266 reports.
 ///   Those fits fall through to the dense two-rho path, which owns both penalties
-///   jointly. Natural cubic regression (`bs="cr"`/`"cs"`) terms also fall
+///   jointly. Natural cubic regression (`bs="cr"`) terms also fall
 ///   through: their knot-value parameterization is a finite-rank regression
 ///   spline, not the scan's full smoothing-spline state-space posterior;
 /// - the offset is identically zero and every weight is finite and positive;
@@ -3474,7 +3513,7 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
             gam_terms::basis::BSplineKnotSpec::PeriodicUniform { .. }
                 | gam_terms::basis::BSplineKnotSpec::NaturalCubicRegression { .. }
         )
-        // mgcv `bs="cr"`/`"cs"` materialise a `NaturalCubicRegression` value-knot
+        // `bs="cr"` materialises a `NaturalCubicRegression` value-knot
         // spec: a Lancaster–Salkauskas cubic-regression basis whose columns
         // index `f(x*_i)` at `k` quantile knots — a genuinely DIFFERENT finite
         // basis (and hence a different penalized posterior) from the free
@@ -3541,17 +3580,20 @@ fn cascade_sobolev_order(requested: f64, d: usize) -> f64 {
     requested.clamp(lo + eps, hi)
 }
 
-/// Detection seam for the O(n log n) multiresolution residual-cascade fast path
-/// (issue #1032).
-///
-/// This mirrors [`spline_scan_fast_path`] in shape but carries one CRITICAL
-/// difference dictated by the issue: the cascade is **not** the same posterior
-/// as the Duchon/Matérn term it stands in for (a different finite basis — the
-/// multilevel Wendland frame, not the reduced-rank radial kernel). So unlike
-/// the 1-D scan, which silently swaps an identical posterior, this path must
-/// only fire as an explicit alternative estimator on the structural signature
-/// the issue names, never as a transparent replacement. It returns `Some` only
-/// when ALL of the following hold:
+/// Structural signature of a residual-cascade-eligible request: the scattered
+/// radial smooth's coordinate columns and the Sobolev order it requests
+/// (before the Wendland native-window clamp). Produced by
+/// [`residual_cascade_structural_signature`]; carries no size information.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResidualCascadeSignature {
+    pub feature_cols: Vec<usize>,
+    pub requested_sobolev_order: f64,
+}
+
+/// Pure structural predicate for the O(n log n) multiresolution
+/// residual-cascade fast path (issue #1032): every eligibility guard of
+/// [`residual_cascade_fast_path`] EXCEPT the dense-kernel size gate. It returns
+/// `Some` only when ALL of the following hold:
 /// - family is Gaussian + identity link (the scattered low-d smooth the
 ///   cascade solves);
 /// - none of the exotic-link / constraint / Firth / coefficient-group /
@@ -3560,20 +3602,15 @@ fn cascade_sobolev_order(requested: f64, d: usize) -> f64 {
 ///   effects, no by-variables;
 /// - that smooth is a scattered radial spatial smooth (`Duchon` or `Matern`)
 ///   over `d ∈ {2, 3}` coordinates with no shape constraint;
-/// - the offset is identically zero and every weight is finite and positive;
-/// - `n` is past the derived dense-kernel cliff
-///   (`past_dense_kernel_cliff`) — below it the dense radial path is both
-///   exact-posterior and cheap, so there is no reason to change estimators.
+/// - the offset is identically zero, every weight is finite and positive, and
+///   every coordinate and response value is finite.
 ///
-/// The returned [`ResidualCascadeInputs`] carry a unit per-axis metric (the
-/// spec's isotropic radial distance); the quasi-uniformity guard inside
-/// [`gam_solve::residual_cascade::fit_residual_cascade`] (issue caveat 2)
-/// is the no-regression gate that refuses the selected route when a
-/// near-degenerate metric would break the BPX iteration bound. That refusal is
-/// propagated; it never silently changes the estimator.
-pub fn residual_cascade_fast_path(
+/// Kept separate from the size gate so each structural guard is observable on
+/// its own at small `n` (issue #3550): below the cliff the full fast path is
+/// `None` for every input, which would mask a mis-firing structural guard.
+pub fn residual_cascade_structural_signature(
     request: &StandardFitRequest<'_>,
-) -> Option<ResidualCascadeInputs> {
+) -> Option<ResidualCascadeSignature> {
     if !request.family.is_gaussian_identity() {
         return None;
     }
@@ -3628,8 +3665,8 @@ pub fn residual_cascade_fast_path(
             feature_cols, spec, ..
         } => {
             // Matérn smoothness ν sets native Sobolev order ν + d/2; the cascade
-            // frame represents up to (d+3)/2, so the clamp below applies the
-            // ceiling. (d is known just below from feature_cols.)
+            // frame represents up to (d+3)/2, so the fast path's clamp applies
+            // the ceiling. (d is known just below from feature_cols.)
             let nu = spec.nu.half_integer_value();
             (feature_cols, nu + feature_cols.len() as f64 / 2.0)
         }
@@ -3645,28 +3682,63 @@ pub fn residual_cascade_fast_path(
     if request.weights.iter().any(|&v| !(v.is_finite() && v > 0.0)) {
         return None;
     }
-    let n = request.y.len();
-    if n != request.data.nrows() || feature_cols.iter().any(|&c| c >= request.data.ncols()) {
+    if request.y.len() != request.data.nrows()
+        || feature_cols.iter().any(|&c| c >= request.data.ncols())
+    {
         return None;
     }
-    if !past_dense_kernel_cliff(n, d) {
+    if feature_cols
+        .iter()
+        .any(|&c| request.data.column(c).iter().any(|v| !v.is_finite()))
+        || request.y.iter().any(|v| !v.is_finite())
+    {
         return None;
     }
-    let coords: Vec<Vec<f64>> = feature_cols
+    Some(ResidualCascadeSignature {
+        feature_cols: feature_cols.to_vec(),
+        requested_sobolev_order: requested_s,
+    })
+}
+
+/// Detection seam for the O(n log n) multiresolution residual-cascade fast path
+/// (issue #1032).
+///
+/// This mirrors [`spline_scan_fast_path`] in shape but carries one CRITICAL
+/// difference dictated by the issue: the cascade is **not** the same posterior
+/// as the Duchon/Matérn term it stands in for (a different finite basis — the
+/// multilevel Wendland frame, not the reduced-rank radial kernel). So unlike
+/// the 1-D scan, which silently swaps an identical posterior, this path must
+/// only fire as an explicit alternative estimator on the structural signature
+/// the issue names, never as a transparent replacement. It returns `Some` only
+/// when the request carries the structural signature
+/// ([`residual_cascade_structural_signature`]) AND `n` is past the derived
+/// dense-kernel cliff (`past_dense_kernel_cliff`) — below it the dense radial
+/// path is both exact-posterior and cheap, so there is no reason to change
+/// estimators.
+///
+/// The returned [`ResidualCascadeInputs`] carry a unit per-axis metric (the
+/// spec's isotropic radial distance); the quasi-uniformity guard inside
+/// [`gam_solve::residual_cascade::fit_residual_cascade`] (issue caveat 2)
+/// is the no-regression gate that refuses the selected route when a
+/// near-degenerate metric would break the BPX iteration bound. That refusal is
+/// propagated; it never silently changes the estimator.
+pub fn residual_cascade_fast_path(
+    request: &StandardFitRequest<'_>,
+) -> Option<ResidualCascadeInputs> {
+    let signature = residual_cascade_structural_signature(request)?;
+    let d = signature.feature_cols.len();
+    if !past_dense_kernel_cliff(request.y.len(), d) {
+        return None;
+    }
+    let coords: Vec<Vec<f64>> = signature
+        .feature_cols
         .iter()
         .map(|&c| request.data.column(c).iter().copied().collect())
         .collect();
     let y: Vec<f64> = request.y.iter().copied().collect();
     let w: Vec<f64> = request.weights.iter().copied().collect();
-    if coords
-        .iter()
-        .any(|axis| axis.iter().any(|v| !v.is_finite()))
-        || y.iter().any(|v| !v.is_finite())
-    {
-        return None;
-    }
     let metric = vec![1.0_f64; d];
-    let sobolev_s = cascade_sobolev_order(requested_s, d);
+    let sobolev_s = cascade_sobolev_order(signature.requested_sobolev_order, d);
     Some(ResidualCascadeInputs {
         coords,
         y,
