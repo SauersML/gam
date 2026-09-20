@@ -1639,7 +1639,6 @@ pub(crate) fn outer_result_to_native(mut result: OuterResult, perm: &[usize]) ->
         criterion_certificate_to_native(certificate, perm);
     }
     let reseeds = [
-        result.tail_snap_reseed.as_mut(),
         result.saddle_escape_reseed.as_mut(),
         result.wrong_rail_reseed.as_mut(),
     ];
