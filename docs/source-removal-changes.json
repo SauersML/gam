@@ -2393,7 +2393,24 @@
     "evidence": "source_removal_guard.py with base 9af3c66f1b and head the merge commit refused exactly these seven items. crates/gam-models/src/inference/summary_text.rs defines significance_stars, format_p_value, the_summary_names_an_uncertified_terms_edf_label_2901 and the_summary_names_a_withheld_shape_pvalue. git grep -w finds no remaining reference to ModelSummary or build_model_summary (other than one historical doc sentence). The fmt removed is ModelSummary's own Display impl (the other production occurrences are other fmt fns). crates/gam-models/tests/suite/bms_per_smooth_summary_2997.rs pins both predictors' smooth and parametric rows through the replacement."
   },
   {
-    "base": "7d1708414bac49eb54960180cbccb36a42df2d3b",
+    "base": "c7d45a067fb72352bc327b56741c4866536819e7",
+    "items": [
+      "crates/gam-inference/src/hmc_io.rs:const:HIGH_DIM_TARGET_ACCEPT_FLOOR",
+      "crates/gam-inference/src/hmc_io.rs:const:LOW_DIM_TARGET_ACCEPT_FLOOR",
+      "crates/gam-inference/src/hmc_io.rs:const:MAX_TARGET_ACCEPT",
+      "crates/gam-inference/src/hmc_io.rs:fn:robust_target_accept",
+      "crates/gam-inference/src/hmc_io.rs:fn:run_nuts_sampling_rejects_invalid_target_accept",
+      "crates/gam-inference/src/hmc_io.rs:fn:validate_nuts_target_accept",
+      "crates/gam-inference/src/rho_posterior.rs:const:DEFAULT_M",
+      "crates/gam-inference/src/rho_posterior.rs:const:ESCALATION_NUTS_SAMPLES",
+      "crates/gam-inference/src/rho_posterior.rs:const:TIER1_MAX_DIM",
+      "crates/gam-inference/src/rho_posterior.rs:const:TIER2_MAX_DIM"
+    ],
+    "reason": "#3187 / #3263: the rho-posterior tiers and NUTS tuning carried hand-set caps and knobs. TIER1_MAX_DIM / TIER2_MAX_DIM capped the escalation route by K; the route is now derived (quadrature iff nodes^K <= RHO_NUTS_MIN_EVALUATIONS = 2 * NUTS_CONVERGENCE.min_ess, else NUTS, no K cap). ESCALATION_NUTS_SAMPLES fixed the Tier-2 draw count; it is now the warmup transitions run_adaptive used. DEFAULT_M = 64 was the Tier-0 proposal draw count (callers could override it); it is now reliable_sample_size(ESCALATE_K_HAT) = 2155, the draws at which PSIS is reliable for a shape at the escalation cutoff (at M=100 a Cauchy-over-N(0,0.25) target, true k=1, read k<0.5 in 43.5% of 200 seeds, 13.5% at 2155). robust_target_accept and its floors/MAX_TARGET_ACCEPT clamped a user-tunable target_accept that no longer exists: NutsConfig.target_accept is deleted and NUTS uses NUTS_TARGET_ACCEPT = 0.9, so validate_nuts_target_accept and its rejects-invalid test have nothing to validate.",
+    "evidence": "At the head git grep -w finds none of these names under crates, src or tests. cargo check --workspace --tests passes on the merge of main into the branch; cargo test -p gam-inference --lib hmc_io 59/59 and rho_posterior (including the new escalation-routing test K=4 -> 81-node quadrature, K=5 and K=17 -> NUTS) pass; cargo test -p gam-solve --lib psis passes (reliable_sample_size S(0.5)=100, S(0.7)=2155). The Python sampling wrapper and its tests no longer pass target_accept."
+    },
+    {
+    "base": "80ab468ff39c082c07a472e84db4912e6c5a1beb",
     "items": [
       "crates/gam-terms/src/basis/center_selection.rs:const:LOWER_MASK",
       "crates/gam-terms/src/basis/center_selection.rs:const:M",
