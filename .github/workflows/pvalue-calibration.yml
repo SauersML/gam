@@ -1,0 +1,114 @@
+name: p-value calibration
+
+# Runs a named plan of the p-value calibration harness
+# (bench/pvalue_calibration) on a fresh release wheel. The job summary is the
+# plan's report.md, and the records are uploaded as an artifact. This is how
+# the p-values main publishes are checked for nominal size under their null,
+# beside pyGAM's: smooth, random-effect and ridged-slope rows of summary(), and
+# smooth_significance(). Conservative is a failure here just as
+# anti-conservative is. Without this workflow the harness had no runner (its
+# only reference was the disabled python-contracts.yml), and the committed
+# baseline behind docs/pvalues.md measured tests main no longer shipped
+# (gam#3722).
+#
+# Manual dispatch picks the plan. The weekly schedule runs `ci`: a few cheap
+# cells at 200 reps, gamfit only. `quick` regenerates the committed baseline;
+# commit its output and regenerate the docs table with bench.pvalue_calibration.report.
+# pyGAM comes from bench/pygam_compare/requirements.txt (bench-only; never a
+# runtime dependency of gamfit).
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan:
+        description: "Plan name from bench/pvalue_calibration/plans.py (ci, quick, nightly)"
+        required: true
+        default: ci
+      only_libs:
+        description: "Optional comma-separated subset of the plan's libs (e.g. gamfit)"
+        required: false
+        default: ""
+  schedule:
+    - cron: '23 5 * * 3'
+
+concurrency:
+  group: pvalue-calibration-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  pvalue-calibration:
+    name: p-value calibration (${{ inputs.plan || 'ci' }})
+    runs-on: ubuntu-latest
+    env:
+      PLAN: ${{ inputs.plan || 'ci' }}
+      ONLY_LIBS: ${{ inputs.only_libs || '' }}
+    # Harness safety net for the whole job, not a solver budget: per-chunk
+    # runaways are already bounded (and recorded as a status) by the plan's
+    # own timeout.
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # build.rs human-author gate needs the real last build.rs editor.
+          fetch-depth: 0
+
+      - name: Setup Rust CI
+        uses: ./.github/actions/setup-rust-ci
+        with:
+          free-disk-space: 'true'
+          cache-targets: 'true'
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Build and install gamfit wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip "maturin>=1.7,<2"
+          rm -rf dist
+          maturin build --release -i python3 -o dist
+          python -m pip install --force-reinstall dist/*.whl
+
+      - name: Install bench-only requirements (pyGAM)
+        run: python -m pip install -r bench/pygam_compare/requirements.txt
+
+      - name: Run plan
+        shell: bash
+        # PLAN and ONLY_LIBS come from the job environment, not interpolated
+        # into the script.
+        run: |
+          set -euo pipefail
+          args=("$PLAN" --out "$RUNNER_TEMP/pvalue_calibration" --quiet)
+          if [ -n "$ONLY_LIBS" ]; then
+            args+=(--only-libs "$ONLY_LIBS")
+          fi
+          python -m bench.pvalue_calibration.run "${args[@]}"
+
+      - name: Publish report to job summary
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/pvalue_calibration/report.md" ]; then
+            cat "$RUNNER_TEMP/pvalue_calibration/report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload records and report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pvalue-calibration-${{ env.PLAN }}
+          path: ${{ runner.temp }}/pvalue_calibration
+          if-no-files-found: warn

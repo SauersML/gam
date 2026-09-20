@@ -5,7 +5,6 @@ mod sae_audit_is_invoked;
 mod sae_curvature_estimand_sims;
 mod sae_ev_vs_k_frontier;
 mod sae_factored_frame_solve;
-mod sae_incoherence_phase_diagram;
 mod sae_manifold_circle_d2_ridge0_fits;
 mod sae_manifold_d1_ordered_beta_bernoulli_gate_cocollapse;
 mod sae_manifold_euclidean_k2_terminates;
