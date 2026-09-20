@@ -399,7 +399,9 @@ pub(crate) struct OuterConfig {
 ///   stuck-stall escapes, license another filled cost-stall window only after
 ///   resolved descent or a smaller incumbent residual
 ///   (`CostStallGuard::license_continuation`).
-/// - The fixed-point and per-atom walks carry `FixedPointProgress`.
+/// - The fixed-point and per-atom walks carry `FixedPointProgress`, which
+///   stops at an evaluation that buys neither a resolved improvement nor a
+///   contraction of its step (#3176).
 /// - The device BFGS walk carries opt's native cost stall.
 ///
 /// A stationary point stops on the certificate's own rungs. The 200-iteration
@@ -7574,7 +7576,6 @@ pub(crate) fn run_per_atom_efs_if_frontier(
         config.max_iter,
         lower,
         upper,
-        outer_criterion_resolution(config),
     );
     let topology = crate::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
 
@@ -8362,7 +8363,7 @@ pub(crate) fn run_fixed_point_outer_solver(
     // test, never stationarity (see the certificate after the walk), so a seed
     // that is already stationary is walked anyway: a smoothing parameter on its
     // rail keeps proposing an outward EFS step, and nothing short of the
-    // unprogressing-walk window ends it. On the ISLR `Default` logistic fit the
+    // unprogressing-walk stop ends it. On the ISLR `Default` logistic fit the
     // #784 corrected continuation starts from the certified Laplace optimum, which
     // is stationary under the correction too (the BFGS continuation later
     // certified it at zero iterations, |g| = 5.9e-6), yet the walk spent ~60
@@ -8407,7 +8408,7 @@ pub(crate) fn run_fixed_point_outer_solver(
         recurrent_incumbent_exit: Arc::clone(&recurrent_incumbent_exit),
         // The same criterion resolution the gradient routes' cost-stall guard
         // uses, and its first-order window.
-        progress: FixedPointProgress::new(outer_criterion_resolution(config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(),
         unprogressing_exit: Arc::clone(&unprogressing_exit),
     };
     let seed_sample = match objective.eval_step(seed) {
@@ -8496,11 +8497,12 @@ pub(crate) fn run_fixed_point_outer_solver(
                 };
                 return Ok(result);
             }
-            // The bridge stopped a walk that bought nothing since its previous
-            // window (#2817). That is no convergence claim: the best iterate the
+            // The bridge stopped a walk at an evaluation that bought neither a
+            // resolved improvement nor a contraction of its step (#2817, #3176).
+            // That is no convergence claim: the best iterate the
             // walk evaluated is the point it leaves behind. It is judged below
             // exactly as a step-norm stop is, because an unprogressing EFS walk
-            // is the same failure one window later: the ratio-of-traces map has
+            // is the same failure: the ratio-of-traces map has
             // stopped moving the criterion, which says nothing about the
             // gradient. On the K=1 generated-seed circle (#2153) the walk
             // stalled 32 iterations in at |g| = 7.3e-3, and publishing that
