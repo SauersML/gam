@@ -2169,12 +2169,13 @@ fn a_symmetry_the_certificate_is_not_given_is_refused_2576() {
 }
 
 /// #4006: a support-sparse sphere row certifies its coordinate block by the
-/// feasible-direction gradient `P g`, not the ambient one. Twelve planted rows on S²
-/// start 0.15 rad in latitude and 0.2 rad in longitude off a zero-residual fit; one
-/// row settles at a Riemannian stationary point that keeps a residual, where the
-/// ambient gradient is the constraint's normal multiplier. The frozen-decoder solve
-/// must certify it rather than refuse it as a stall, and both certificates must read
-/// the same tangent measure.
+/// feasible-direction gradient `P g`, not the ambient one. Eleven of twelve rows on S²
+/// sit at a zero-residual planted fit; row 10 sits at the Riemannian stationary point
+/// a tangent solve from 0.15 rad latitude / 0.2 rad longitude off its planted point
+/// reached, which keeps a residual. There the ambient gradient is the constraint's
+/// normal multiplier (`|g_z| = 1.40e-3`, tangent `6.0e-16` measured). The
+/// frozen-decoder solve must certify the state in place rather than refuse it as a
+/// stall, and the joint certificate must read the same tangent measure.
 #[test]
 fn sphere_rows_certify_the_tangent_coordinate_gradient_4006() {
     let n = 12usize;
@@ -2192,7 +2193,11 @@ fn sphere_rows_certify_the_tangent_coordinate_gradient_4006() {
             .collect()
     };
     let planted = rows(0.0, 0.0);
-    let start = rows(0.15, -0.2);
+    let stationary_row = 10usize;
+    let mut start = planted.clone();
+    let stationary = [0.0785431468_f64, -0.6221332895, 0.7789615807];
+    let radius = stationary.iter().map(|value| value * value).sum::<f64>().sqrt();
+    start[stationary_row] = stationary.iter().map(|value| value / radius).collect();
     let decoder = Array2::<f64>::from_shape_fn((width, p), |(basis, out)| {
         0.3 + 0.9 * ((3 * basis + 5 * out) as f64 * 0.7 + 0.2).sin()
     });
@@ -2220,7 +2225,7 @@ fn sphere_rows_certify_the_tangent_coordinate_gradient_4006() {
         }],
         vec![vec![0]; n],
         vec![vec![1.0]; n],
-        start,
+        start.clone(),
     )
     .expect("state");
     let mut term = SaeSupportSparseTerm::new(atoms, state).expect("term");
@@ -2230,6 +2235,13 @@ fn sphere_rows_certify_the_tangent_coordinate_gradient_4006() {
         .solve_coordinates_fixed_decoder(target.view(), &ard, tolerance, 0.25)
         .expect("a Riemannian stationary sphere row certifies");
     assert!(report.recurred, "the solve returns only a recurred state");
+    for row in 0..n {
+        assert_eq!(
+            term.assignment.coords_row(row),
+            start[row].as_slice(),
+            "row {row} is already certified and takes no step"
+        );
+    }
 
     let residual = term.raw_residual(target.view()).expect("residual");
     let kkt_scale = report.objective.abs().max(1.0);
@@ -2249,7 +2261,7 @@ fn sphere_rows_certify_the_tangent_coordinate_gradient_4006() {
     );
     assert!(stationarity.coordinate_scaled_max_abs.is_finite());
 
-    // The fixture must exercise the constrained case: some certified row keeps a
+    // The fixture must exercise the constrained case: the certified row keeps a
     // residual whose ambient gradient is its normal multiplier, far above tolerance.
     let solved = Array2::from_shape_fn((n, 3), |(row, axis)| term.assignment.coords_row(row)[axis]);
     let (_, jet) = evaluator
@@ -2292,6 +2304,6 @@ fn sphere_rows_certify_the_tangent_coordinate_gradient_4006() {
     }
     assert!(
         ambient_max > 1.0e3 * tolerance * kkt_scale,
-        "no row reaches a constrained stationary point with a residual (ambient KKT {ambient_max:.3e})"
+        "row {stationary_row} is not a constrained stationary point with a residual (ambient KKT {ambient_max:.3e})"
     );
 }
