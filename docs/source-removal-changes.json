@@ -2693,7 +2693,7 @@
     "evidence": "With base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate, source_removal_guard.py and public_api_census.py refuse exactly this identity: public true, production_occurrences 0, 13820 -> 13819 public function declarations. In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences. The three pins intercept_slope_with_constant_fixed_part_is_unidentified_3059, covariate_only_slope_with_constant_fixed_part_is_identified_3059 and slope_offset_inside_the_span_is_unidentified_3059 run on the replacement. test_census.py: 12708 -> 12708 tests."
   },
   {
-    "base": "a3875c0823b22810d92532c03baf4eecb37fc065",
+    "base": "b4b0ef17614582d86b30c8ad89e094bc3bca6a7c",
     "items": [
       "crates/gam-models/src/vector_response.rs:fn:grad_eta",
       "crates/gam-models/src/vector_response.rs:fn:hess_block",
