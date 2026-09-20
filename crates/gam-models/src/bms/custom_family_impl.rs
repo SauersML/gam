@@ -3009,6 +3009,38 @@ impl BernoulliMarginalSlopeFamily {
                 })
                 .collect();
         }
+        // The contraction is linear in its direction. Past the row's `r` axes,
+        // contract those once and read every direction off them, `T3[d] =
+        // Σ_a d_a·T3[e_a]`, the way the rigid path reads its directions off
+        // `rigid_third_full` (gam#2922).
+        if row_dirs.len() > r {
+            let axes = (0..r)
+                .map(|axis| {
+                    let mut unit = Array1::<f64>::zeros(r);
+                    unit[axis] = 1.0;
+                    unit
+                })
+                .collect::<Vec<_>>();
+            let axis_thirds = self.row_primary_third_contracted_many_with_moments(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &axes,
+            )?;
+            return Ok(row_dirs
+                .iter()
+                .map(|dir| {
+                    let mut out = Array2::<f64>::zeros((r, r));
+                    for (&weight, third) in dir.iter().zip(&axis_thirds) {
+                        if weight != 0.0 {
+                            out.scaled_add(weight, third);
+                        }
+                    }
+                    out
+                })
+                .collect());
+        }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
             return Err(
                 "non-finite flexible row context in batched third-order contraction".to_string(),
