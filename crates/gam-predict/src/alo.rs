@@ -32,7 +32,7 @@ use gam_solve::inference::alo::{
     compute_multiblock_alo,
 };
 use gam_solve::model_types::UnifiedFitResult;
-use gam_spec::{GlmLikelihoodSpec, LinkFunction};
+use gam_spec::GlmLikelihoodSpec;
 use gam_terms::basis::BasisOptions;
 use gam_terms::smooth::TermCollectionSpec;
 use ndarray::{Array1, Array2, s};
@@ -890,25 +890,29 @@ fn pullback_saved_coordinate_designs(
     Ok((active_designs, active_ranges))
 }
 
-fn standard_alo_dispersion(
+/// Coefficient-covariance scale for the saved single-block ALO replay.
+///
+/// The saved penalized Hessian is `H = XᵀWX + S_λ` with the replayed IRLS
+/// working weights `W`, so the only dispersion that `H⁻¹` does not already
+/// carry is the one `GlmLikelihoodSpec::coefficient_covariance_scale` restores:
+/// `σ̂²` for the scale-free profiled Gaussian and `1.0` for every family whose
+/// working weight already folds in `1/φ` (Gamma, inverse-Gaussian, fixed-φ
+/// Gaussian, Tweedie, …; see #679). `fit.standard_deviation` is `√φ` for every
+/// scalar-scale family, and the covariance-scale rule consults it only for the
+/// profiled Gaussian.
+fn standard_alo_covariance_scale(
+    likelihood: &GlmLikelihoodSpec,
     standard_deviation: f64,
-    link: LinkFunction,
 ) -> Result<f64, EstimationError> {
-    if link != LinkFunction::Identity {
-        return Ok(1.0);
-    }
-    if !standard_deviation.is_finite() || standard_deviation <= 0.0 {
+    let scale = likelihood
+        .coefficient_covariance_scale(standard_deviation * standard_deviation)
+        .map_err(|error| invalid(format!("saved standard ALO covariance scale: {error}")))?;
+    if !scale.is_finite() || scale <= 0.0 {
         return Err(invalid(format!(
-            "saved standard identity-link ALO requires a positive finite fitted residual standard deviation, got {standard_deviation}"
+            "saved standard ALO requires a positive finite coefficient-covariance scale, got {scale} (fitted sigma={standard_deviation})"
         )));
     }
-    let phi = standard_deviation * standard_deviation;
-    if !phi.is_finite() {
-        return Err(invalid(format!(
-            "saved standard identity-link ALO residual variance is outside f64 range: sigma={standard_deviation}"
-        )));
-    }
-    Ok(phi)
+    Ok(scale)
 }
 
 fn compute_saved_standard_alo(
@@ -1007,7 +1011,7 @@ fn compute_saved_standard_alo(
         &mut working_weights,
         &mut working_response,
     )?;
-    let phi = standard_alo_dispersion(fit.standard_deviation, likelihood.spec.link_function())?;
+    let cov_scale = standard_alo_covariance_scale(&likelihood, fit.standard_deviation)?;
     let (mut active_designs, active_ranges) = pullback_saved_coordinate_designs(
         class,
         geometry.gauge,
@@ -1028,7 +1032,7 @@ fn compute_saved_standard_alo(
         &dense_design,
         &eta,
         &input.offset,
-        phi,
+        cov_scale,
         &working_weights,
         &working_response,
     ))?;
@@ -1046,7 +1050,7 @@ fn compute_saved_standard_alo(
         .map(|standard_error| Array1::from_vec(vec![standard_error * standard_error]))
         .collect::<Vec<_>>();
     // Model-based posterior predictive variance: the scalar path's Bayesian
-    // SE squared (φ·x_iᵀH⁻¹x_i), the same quantity the multi-block core
+    // SE squared (cov_scale·x_iᵀH⁻¹x_i), the same quantity the multi-block core
     // surfaces as diag(A_i) (#2301).
     let predictive_variance = scalar
         .se_bayes
@@ -1057,7 +1061,12 @@ fn compute_saved_standard_alo(
     let mut cook_distance = Array1::<f64>::zeros(n);
     for row in 0..n {
         let deletion = scalar.eta_tilde[row] - eta[row];
-        let cook = phi * working_weights[row] * deletion * deletion;
+        // Cook-type influence Δηᵀ C_i Δη with C_i the row score covariance
+        // (Fisher information), matching the multi-block convention. The
+        // replayed working weight is that Fisher information up to the same
+        // covariance scale the Hessian omits: w_i/σ̂² for the scale-free
+        // profiled Gaussian, w_i itself when W already carries 1/φ.
+        let cook = working_weights[row] / cov_scale * deletion * deletion;
         if !cook.is_finite() || cook < 0.0 {
             return Err(invalid(format!(
                 "saved standard ALO Cook distance is invalid at row {row}: {cook}"
@@ -2814,35 +2823,19 @@ fn compute_saved_marginal_slope_survival_alo(
         ));
     }
 
-    let normalized_z = payload
-        .latent_z_normalization
-        .ok_or_else(|| {
-            invalid("saved survival marginal-slope ALO is missing latent-z normalization")
-        })?
-        .apply(&input.latent_z, "saved survival marginal-slope ALO")
-        .map_err(|error| invalid(error.to_string()))?;
     // gam#2768: the fitted coefficients are defined on the CALIBRATED latent
     // axis, so an ALO replay that stopped at the normalization would replay a
-    // different model than the one that was fitted. The conditioning span is the
-    // ALO input's own marginal design — the same block the fit regressed z on,
-    // and the same one the predictor slices out of its q-design.
-    let normalized_z = match payload.latent_z_rank_int_calibration.as_ref() {
-        Some(calibration) => Array1::from_iter(
-            normalized_z
-                .iter()
-                .map(|&value| calibration.apply_at_predict(value)),
-        ),
-        None => normalized_z,
-    };
-    let normalized_z = match payload.latent_z_conditional_calibration.as_ref() {
-        Some(calibration) => {
-            let a_block = input.marginal_design.to_dense();
-            calibration
-                .apply(normalized_z.view(), a_block.view())
-                .map_err(invalid)?
-        }
-        None => normalized_z,
-    };
+    // different model than the one that was fitted. The replay reads each row's
+    // score through the saved model's own map (gam#3016), with the conditioning
+    // span the ALO input's own marginal design — the same block the fit regressed
+    // z on, and the same one the predictor slices out of its q-design.
+    let normalized_z = model
+        .fitted_latent_score(
+            &input.latent_z,
+            &input.marginal_design,
+            "saved survival marginal-slope ALO",
+        )
+        .map_err(|error| invalid(error.to_string()))?;
     let time_wiggle_knots = payload
         .baseline_timewiggle_knots
         .as_ref()
@@ -3124,5 +3117,31 @@ mod tests {
 
         assert_eq!(active_ranges, vec![0..2]);
         assert_eq!(active_designs[0].to_dense(), expected);
+    }
+
+    #[test]
+    fn standard_alo_covariance_scale_restores_only_the_profiled_gaussian_scale() {
+        // The saved covariance is the unscaled inverse penalized Hessian; only
+        // a profiled Gaussian carries sigma^2 outside it. A fixed-shape Gamma
+        // folds its dispersion into the working weights, so its scale is 1.
+        let gaussian = GlmLikelihoodSpec::try_new(
+            gam_spec::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodScaleMetadata::ProfiledGaussian,
+        )
+        .expect("profiled Gaussian");
+        assert_eq!(
+            standard_alo_covariance_scale(&gaussian, 1.5).expect("scale"),
+            2.25
+        );
+        let gamma = GlmLikelihoodSpec::try_new(
+            gam_spec::LikelihoodSpec::gamma_log(),
+            gam_spec::LikelihoodScaleMetadata::FixedGammaShape { shape: 4.0 },
+        )
+        .expect("fixed-shape Gamma");
+        assert_eq!(
+            standard_alo_covariance_scale(&gamma, 1.5).expect("scale"),
+            1.0
+        );
+        assert!(standard_alo_covariance_scale(&gaussian, 0.0).is_err());
     }
 }
