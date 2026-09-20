@@ -2761,6 +2761,65 @@
     "evidence": "scripts/source_removal_guard.py with --base bf410bb4622f23c2597aeeebfd5d9fa32d0c3193 and head the change's commit lists exactly these removals. Read-proof at the head: git grep -w touch_lookup_hit finds no occurrence in the repository (it was a private method of WarmStartStore in crates/gam-runtime/src/warm_start/store.rs whose only call site was the lookup_with fast path rewritten here); git grep -w for parse_status_count and parse_io_bytes finds no occurrence, and parse_status_kb survives only as crates/gam-sae/examples/scale_k.rs's own unrelated local helper. All removed process_monitor functions were private and cfg(target_os = \"linux\"), called only from read_linux in the same file."
   },
   {
+    "base": "b6be6bb6ec166b7e98ee17e8aa77af19faa754d3",
+    "items": [
+      "crates/gam-sae/src/manifold/fit_seed.rs:const:SAE_SHARED_ARD_K_THRESHOLD",
+      "crates/gam-sae/src/manifold/rho.rs:enum:ArdSharing",
+      "crates/gam-sae/src/manifold/rho.rs:fn:ard_sharing",
+      "crates/gam-sae/src/manifold/rho.rs:fn:max_ard_axes",
+      "crates/gam-sae/src/manifold/rho.rs:fn:new_shared_ard",
+      "crates/gam-sae/src/manifold/tests.rs:fn:shared_ard_flat_index_aliases_in_bounds_1026",
+      "tests/sae/sae/owed_1026.rs:fn:shared_ard_collapses_outer_param_count_at_large_k",
+      "tests/sae/sae/owed_1026.rs:fn:shared_ard_is_a_convergent_outer_coordinate_1026"
+    ],
+    "reason": "#3824: the SAE coordinate prior switched from per-atom ARD to one ARD precision per axis index broadcast to every atom once K >= SAE_SHARED_ARD_K_THRESHOLD = 256, so the prior family and the REML/LAML criterion changed at an arbitrary atom count. Per-atom ARD costs 1+K+sum_k d_k outer coordinates against 1+K+max_d, both Theta(K), and the per-(k,j) energies were already assembled, so no derived crossover exists. The threshold, ArdSharing, the ard_sharing accessor, SaeManifoldRho::new_shared_ard and max_ard_axes go, with the tests that pinned the shared mode (shared_ard_flat_index_aliases_in_bounds_1026, shared_ard_collapses_outer_param_count_at_large_k, shared_ard_is_a_convergent_outer_coordinate_1026).",
+    "evidence": "manifold::tests::ard_flat_index_is_unique_per_atom_axis_3824 and sae owed_1026::ard_outer_coordinates_are_per_atom_at_every_k_3824: for K in {2,255,256,1000} the flat length is 1+K+K and every (k,j) index is distinct; a heterogeneous d=[2,1,2] from_flat round trip is exact."
+  },
+  {
+    "base": "dcae5aa879ffe746b86288b27cda3b89de428ead",
+    "items": [
+      "crates/gam-terms/tests/suite/probe_2761_penalty_topology.rs:fn:probe_frozen_chart_local_topology_versus_range",
+      "crates/gam-terms/tests/suite/probe_2761_penalty_topology.rs:fn:probe_term_collection_topology_versus_range"
+    ],
+    "reason": "#3884: the print-only probes are replaced by asserting tests (term_collection_penalty_topology_is_invariant_to_the_representer_range, frozen_chart_local_penalty_topology_matches_the_cached_one_at_every_range) that pin the same topology invariants.",
+    "evidence": "The two probe fns only printed penalty counts/ranks and asserted nothing; the replacement tests in the same file assert the invariants each probe printed."
+  },
+  {
+    "base": "e5e926b4bfc6f5f3b77b314c8f0b66f5c4e2769b",
+    "items": [
+      "crates/gam-sae/src/parameter_decomposition/lift.rs:fn:forward",
+      "crates/gam-sae/src/parameter_decomposition/lift.rs:fn:vjp",
+      "crates/gam-sae/src/parameter_decomposition/lift.rs:trait:ParameterExecutor",
+      "crates/gam-solve/src/constrained_posterior/cone_laplace.rs:fn:retained_normals"
+    ],
+    "reason": "#4485: ParameterExecutor had no implementor, bound or caller anywhere (its doc claimed a native Rust implementation and a Python wrapper that do not exist); executed rows are built directly as ExecutedExperiment. ConeLaplace::retained_normals (A^T) had no caller; its cone_normalizer twin was already deleted as dead.",
+    "evidence": "At this base, source_removal_guard.py with the landing commit as head reports exactly these identities. git grep -w finds no ParameterExecutor or retained_normals under crates, src, tests or python in the head tree."
+  },
+  {
+    "base": "0b9dc2c6b850eff58b11003192136420ef7233e7",
+    "items": [
+      "crates/gam-models/src/test_support.rs:const:PI_QUARTER_INV"
+    ],
+    "reason": "#4522: gauss_hermite_probabilists was a line-for-line Numerical Recipes gauher transcription (asymptotic seeds, orthonormal recurrence, 200-step Newton); it is now a split of gam_math::quadrature::standard_normal_gauss_hermite_rule, the workspace's one standard-normal Gauss-Hermite rule. PI_QUARTER_INV (pi^-1/4, the recurrence seed) was a local constant of the deleted transcription.",
+    "evidence": "At this base, source_removal_guard.py with the landing commit as head reports exactly this identity. git grep -w PI_QUARTER_INV finds none under crates, src or tests in the head tree."
+  },
+  {
+    "base": "c78ebbfb47498180e00fa0b6721359b1ff02948c",
+    "items": [
+      "crates/gam-math/src/paired_timing.rs:fn:quantile_sorted"
+    ],
+    "reason": "#3877: paired_timing quantiles route through the shared gam_math::quantile::quantile_from_sorted; the private duplicate is deleted.",
+    "evidence": "PR #3887; quantile_from_sorted returns NaN on empty input exactly like the removed helper."
+  },
+  {
+    "base": "e3fbe9373038ccaee479c0aa87d85febd623cc56",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/drivers/spatial_hyper_dirs.rs:fn:add_analytic_penalty_hessian_to_eval"
+    ],
+    "reason": "#4161: add_analytic_penalty_hessian_to_eval assembled a wrong latent joint REML Hessian. It used hessian_diag (the exact diagonal, even for dense-Hessian penalties such as BlockOrthogonality, SoftmaxAssignmentSparsity and sheaf) as the whole t-t block and had no t-rho or rho-rho terms for learnable penalty rho, at O((n d)^2) HVP cost per outer evaluation. Its output was always discarded. add_analytic_penalty_objective_to_eval now declares its gradient-only contribution by downgrading an analytic Hessian to Unavailable itself.",
+    "evidence": "git grep -w add_analytic_penalty_hessian_to_eval at the base finds only its definition (spatial_hyper_dirs.rs:974) and its one call (:1069) in add_analytic_penalty_objective_to_eval. That function's only caller, spatial_optimization.rs:6260, is always followed at :6268 by add_latent_id_objective_to_eval, which sets eval.2 = HessianValue::Unavailable whenever it is analytic (spatial_hyper_dirs.rs:907-909). So no Hessian value this helper wrote ever reached store_eval."
+  },
+  {
     "base": "e3fbe9373038ccaee479c0aa87d85febd623cc56",
     "items": [
       "crates/gam-solve/src/reml/jeffreys_subspace.rs:fn:ramp_down",

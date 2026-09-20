@@ -4080,7 +4080,7 @@ impl SaeManifoldTerm {
             // at (near-)equal EV, breaks the tie on coordinate uniformity: EV
             // provably does not certify the coordinate, so a reseed that ties on EV
             // but reads a more uniform angle is the better basin.
-            let candidate_uniformity = self.coordinate_uniformity_aggregate();
+            let candidate_uniformity = self.coordinate_uniformity_aggregate()?;
             let prefer = match self.best_cocollapse_incumbent.as_ref() {
                 None => ev.is_finite(),
                 Some((best_ev, best_uniformity, _)) => prefer_candidate_basin(
@@ -4135,7 +4135,7 @@ impl SaeManifoldTerm {
                     // #2081 — restore the incumbent when it is the better basin under
                     // the same EV-then-uniformity ordering used to bank it: strictly
                     // higher EV, or (near-)equal EV with a more uniform coordinate.
-                    let current_uniformity = self.coordinate_uniformity_aggregate();
+                    let current_uniformity = self.coordinate_uniformity_aggregate()?;
                     if prefer_candidate_basin(
                         best_ev,
                         best_uniformity,
@@ -4256,7 +4256,7 @@ impl SaeManifoldTerm {
                 let incumbent_uniformity = *incumbent_uniformity;
                 let reseeded_ev =
                     self.dictionary_reconstruction_ev_maybe(target, rho, target_col_stats)?;
-                let reseeded_uniformity = self.coordinate_uniformity_aggregate();
+                let reseeded_uniformity = self.coordinate_uniformity_aggregate()?;
                 !prefer_candidate_basin(
                     reseeded_ev,
                     reseeded_uniformity,
@@ -6898,7 +6898,7 @@ impl SaeManifoldTerm {
         // EV so the keep-best can break (near-)equal-objective ties on coordinate
         // fidelity.
         let mut best_reconstruction_uniformity = if initial_reconstruction_is_structurally_healthy {
-            self.coordinate_uniformity_aggregate()
+            self.coordinate_uniformity_aggregate()?
         } else {
             None
         };
@@ -8015,7 +8015,7 @@ impl SaeManifoldTerm {
                 let collapse = self.structural_coherence_collapse_detected()?;
                 tail_marks.push(("ev_coherence", iteration_started.elapsed().as_secs_f64()));
                 if collapse.is_none() {
-                    let candidate_uniformity = self.coordinate_uniformity_aggregate();
+                    let candidate_uniformity = self.coordinate_uniformity_aggregate()?;
                     tail_marks.push(("ev_uniformity", iteration_started.elapsed().as_secs_f64()));
                     let candidate_obj = boundary_obj;
                     if prefer_candidate_state(

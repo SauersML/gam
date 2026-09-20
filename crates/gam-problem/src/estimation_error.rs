@@ -627,23 +627,6 @@ pub enum EstimationError {
     },
 
     #[error(
-        "Pre-fit near-degeneracy detected in the realized unpenalized design: the {num_unpenalized_columns} \
-        unpenalized columns span a numerically rank-degenerate direction (Gram condition number {condition_number:.3e} \
-        exceeds tolerance {tolerance:.3e}; min eigenvalue {min_eigenvalue:.3e}, max eigenvalue {max_eigenvalue:.3e}, \
-        columns {column_indices:?}). The unpenalized normal equations are effectively singular along this direction, \
-        so the fit would grind/diverge. Remove/reparameterize the near-aliased columns or add an explicit \
-        penalty/constraint before fitting."
-    )]
-    PrefitNearDegenerateDesignDetected {
-        num_unpenalized_columns: usize,
-        condition_number: f64,
-        min_eigenvalue: f64,
-        max_eigenvalue: f64,
-        tolerance: f64,
-        column_indices: Vec<usize>,
-    },
-
-    #[error(
         "Perfect or quasi-perfect separation detected during multinomial fitting at iteration {iteration}. \
         The active class-{active_class_index} logit against the reference class is saturated at training row {row_index}, \
         so the unpenalized softmax MLE is not finite in that direction. \
@@ -1161,8 +1144,7 @@ impl EstimationError {
                  whole mean domain (the canonical link), or remove the predictor or rows \
                  that force the mean to the boundary."
             )),
-            Self::PrefitRankDeficientDesignDetected { column_indices, .. }
-            | Self::PrefitNearDegenerateDesignDetected { column_indices, .. } => Some(format!(
+            Self::PrefitRankDeficientDesignDetected { column_indices, .. } => Some(format!(
                 "Matrix conditioning issue in unpenalized columns {column_indices:?}. {CONDITIONING}"
             )),
             Self::ModelIsIllConditioned { .. }
@@ -1239,7 +1221,6 @@ impl EstimationError {
             | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
-            | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::HessianNotPositiveDefinite { .. }
             | Self::LaplacePrecisionIndefinite { .. }
             | Self::IdentifiedRankNotLocallyConstant { .. }
@@ -1431,7 +1412,6 @@ impl EstimationError {
             | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
-            | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::MultinomialSeparationDetected { .. }
             | Self::PredictiveIntervalsDeclined { .. }
             | Self::ModelIsIllConditioned { .. }
@@ -1519,9 +1499,6 @@ impl EstimationError {
             }
             Self::PrefitRankDeficientDesignDetected { .. } => {
                 "EstimationError::PrefitRankDeficientDesignDetected"
-            }
-            Self::PrefitNearDegenerateDesignDetected { .. } => {
-                "EstimationError::PrefitNearDegenerateDesignDetected"
             }
             Self::MultinomialSeparationDetected { .. } => {
                 "EstimationError::MultinomialSeparationDetected"
