@@ -4411,28 +4411,29 @@ impl<'a> RemlState<'a> {
                     key.clone(),
                     rows,
                     decision.clone(),
-                ) {
-                    Ok(bundle) => Ok(bundle),
-                    Err(err) => {
-                        log::debug!(
-                            "[reml-geometry] sparse_exact_spd failed ({}); falling back to dense spectral",
-                            err
-                        );
+                )? {
+                    Some(bundle) => Ok(bundle),
+                    None => {
+                        // P-IRLS routes its own linear solve and returned its
+                        // mode outside the sparse-native frame, so the sparse
+                        // exact system has no coordinates to be assembled in.
+                        // This is the only way the sparse builder declines. Every
+                        // error it raises (an inner-solve retreat, a non-SPD
+                        // factorization) propagates, so the outer loop sees it
+                        // instead of a second solve on another surface (#3636).
+                        //
                         // The bundle records the geometry it was BUILT with,
                         // and here that is not the routing verdict: the
                         // structural quantities still say sparse was the right
                         // route, so the label must carry the reason it was not
-                        // taken (#2465). A bundle stamped `sparse_exact_spd`
-                        // while holding a dense factorization, or stamped
-                        // `penalized_hessian_too_dense` when the density is
-                        // below the threshold, would both be labels that
-                        // contradict their own basis.
-                        let fallback = SparseRemlDecision {
+                        // taken (#2465).
+                        let rerouted = SparseRemlDecision {
                             geometry: RemlGeometry::DenseSpectral,
-                            reason: "sparse_exact_spd_assembly_failed",
+                            reason: "pirls_frame_not_sparse_native",
                             ..decision
                         };
-                        self.prepare_dense_eval_bundlewithkey(rho, key, rows, fallback)
+                        log::debug!("[reml-geometry] dense_spectral {}", rerouted.basis());
+                        self.prepare_dense_eval_bundlewithkey(rho, key, rows, rerouted)
                     }
                 }
             }
@@ -6557,21 +6558,24 @@ impl<'a> RemlState<'a> {
         })
     }
 
+    /// The sparse exact-SPD bundle at `rho`, or `None` when the inner solve
+    /// returned its mode outside the sparse-native frame. P-IRLS routes its own
+    /// linear solve, so such a mode has no sparse exact system to assemble.
+    /// Every other failure is an error of this evaluation and is returned as one
+    /// (#3636).
     pub(super) fn prepare_sparse_eval_bundlewithkey(
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
         rows: BundleRows,
         decision: SparseRemlDecision,
-    ) -> Result<EvalShared, EstimationError> {
+    ) -> Result<Option<EvalShared>, EstimationError> {
         let (pirls_result, rows) = self.execute_pirls_if_needed(rho, rows)?;
         if !matches!(
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::OriginalSparseNative
         ) {
-            crate::bail_invalid_estim!(
-                "sparse exact geometry requires sparse-native PIRLS coordinates"
-            );
+            return Ok(None);
         }
         let x_sparse = self.x().as_sparse().ok_or_else(|| {
             EstimationError::InvalidInput(
@@ -6597,17 +6601,6 @@ impl<'a> RemlState<'a> {
                 cp.accumulate_weighted(&mut s_lambda, lambdas[k]);
             }
         }
-        // Add log-barrier Hessian diagonal for monotonicity-constrained
-        // coefficients (sparse path uses original coordinates).
-        if let Some(ref lin) = self.linear_constraints
-            && let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin)
-        {
-            let beta_orig = self.sparse_exact_beta_original(pirls_result.as_ref());
-            if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut s_lambda, &beta_orig) {
-                log::debug!("Sparse barrier Hessian diagonal skipped: {e}");
-            }
-        }
-
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p);
         // Gaussian-Identity fast path: reuse the per-RemlState `XᵀWX` cache
         // built once from constant weights. The outer REML loop never
@@ -6668,7 +6661,7 @@ impl<'a> RemlState<'a> {
             None
         };
 
-        Ok(EvalShared {
+        Ok(Some(EvalShared {
             key,
             pirls_result,
             rows,
@@ -6714,7 +6707,7 @@ impl<'a> RemlState<'a> {
             },
             penalty_scores_at_mode: std::sync::OnceLock::new(),
             block_local_correction: Default::default(),
-        })
+        }))
     }
 
     /// The inner P-IRLS iteration budget in force for one solve: the configured
