@@ -13,14 +13,12 @@ mod cuda {
     use cudarc::cublas::{CudaBlas, Gemv, GemvConfig};
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
     use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
-    use faer::MatRef;
-    use gam_linalg::faer_ndarray::cholesky_factor_logdet;
     use ndarray::{Array2, ArrayView2};
 
     pub(super) fn cholesky_solve(
         hessian: ArrayView2<'_, f64>,
         rhs: ArrayView2<'_, f64>,
-    ) -> Result<(Array2<f64>, f64), String> {
+    ) -> Result<Array2<f64>, String> {
         let (_, stream) = context_and_stream()?;
         let (p, p2) = hessian.dim();
         if p == 0 || p != p2 || rhs.nrows() != p {
@@ -34,39 +32,11 @@ mod cuda {
         let mut rhs_dev = pinned_htod(&stream, &rhs_col)?;
         potrf_in_place(&solver, &stream, p, &mut h_dev)?;
         potrs_in_place(&solver, &stream, p, nrhs, &h_dev, &mut rhs_dev)?;
-        let factor_col = stream
-            .clone_dtoh(&h_dev)
-            .map_err(|e| format!("download Cholesky factor: {e}"))?;
         let out_col = stream
             .clone_dtoh(&rhs_dev)
             .map_err(|e| format!("download solution: {e}"))?;
-        let solved =
-            from_col_major(&out_col, p, nrhs).ok_or("solution layout conversion failed")?;
-        Ok((solved, cholesky_logdet_from_col_major(&factor_col, p)))
-    }
-
-    /// fp64 log-determinant of an SPD matrix via POTRF only.
-    ///
-    /// This is [`cholesky_solve`] stripped of the triangular solve (POTRS) and
-    /// the solution download/layout conversion: the log-determinant depends
-    /// solely on the Cholesky factor's diagonal, so when a caller already holds
-    /// the solution (e.g. from fp32 + iterative refinement) and needs *only* an
-    /// accurate fp64 logdet, doing a full solve here would burn an O(p²·nrhs)
-    /// POTRS plus a host round-trip on a solution that is immediately discarded.
-    pub(super) fn cholesky_logdet(hessian: ArrayView2<'_, f64>) -> Result<f64, String> {
-        let (_, stream) = context_and_stream()?;
-        let (p, p2) = hessian.dim();
-        if p == 0 || p != p2 {
-            return Err("Cholesky logdet dimension mismatch".to_string());
-        }
-        let solver = DnHandle::new(stream.clone()).map_err(|e| format!("cusolver init: {e}"))?;
-        let h_col = to_col_major(&hessian);
-        let mut h_dev = pinned_htod(&stream, &h_col)?;
-        potrf_in_place(&solver, &stream, p, &mut h_dev)?;
-        let factor_col = stream
-            .clone_dtoh(&h_dev)
-            .map_err(|e| format!("download Cholesky factor: {e}"))?;
-        Ok(cholesky_logdet_from_col_major(&factor_col, p))
+        from_col_major(&out_col, p, nrhs)
+            .ok_or_else(|| "solution layout conversion failed".to_string())
     }
 
     pub(super) fn cholesky_lower_on_ordinal(
@@ -505,17 +475,20 @@ mod cuda {
     /// 1. Cast `A` (f64) to f32 on device. Factor in fp32 (POTRF).
     /// 2. Cast `b` (f64) to f32. Solve `A x = b` in fp32 (POTRS). Lift `x`
     ///    to f64.
-    /// 3. Loop up to `max_steps`:
-    ///    a. `r = b − A·x` accumulated in fp64 (cuBLAS Dgemv).
-    ///    b. `‖r‖ ≤ γ_{p+1}·(‖A‖_F‖x‖ + ‖b‖)`, the residual's own rounding
-    ///       band → converged, break.
-    ///    c. Residual did not drop below previous step → bail, return `Err`.
-    ///    d. Cast `r` to f32. Solve `A e = r` in fp32. `x += e` (f64).
-    /// 4. Return `x`.
+    /// 3. `r = b − A·x` accumulated in fp64 (cuBLAS Dgemv), then
+    ///    `refine_to_certificate`: up to `max_steps` corrections
+    ///    (cast `r` to f32, solve `A e = r` in fp32, `x += e` in f64, recompute
+    ///    the fp64 residual) until `‖r‖ ≤ γ_{p+1}·(‖A‖_F‖x‖ + ‖b‖)`, the
+    ///    residual's own rounding band.
+    /// 4. Return `x` only when that certificate holds.
     ///
-    /// Returns `Err` when the fp32 POTRF fails (not SPD at f32) or when the
-    /// residual does not decrease monotonically (κ(A)·u_f32 ≥ 1 regime).
-    /// Callers should fall back to fp64 POTRF on `Err`.
+    /// Returns `Err` when the fp32 POTRF fails (not SPD at f32), when the
+    /// residual does not decrease monotonically (κ(A)·u_f32 ≥ 1 regime), or
+    /// when `max_steps` corrections end with the residual still above its
+    /// rounding band (the fp32 factor contracts too slowly to certify this
+    /// system within the step budget). `Ok` therefore always carries a solution
+    /// whose fp64 residual is inside its own rounding. Callers use fp64 POTRF
+    /// on `Err`.
     pub(super) fn iterative_refinement_solve_impl(
         hessian: ArrayView2<'_, f64>,
         rhs: &[f64],
@@ -566,53 +539,174 @@ mod cuda {
             growth * (hessian_frobenius * x.iter().map(|v| v * v).sum::<f64>().sqrt() + norm_b)
         };
 
-        let mut x_dev_f64 = pinned_htod(&stream, &x).map_err(|e| format!("upload f64 x: {e}"))?;
+        let x_dev_f64 = pinned_htod(&stream, &x).map_err(|e| format!("upload f64 x: {e}"))?;
         let (r0, norm_r0) = residual_norm_and_vec(&blas, &stream, p, &a_dev_f64, &x_dev_f64, rhs)?;
 
-        // Early exit: already converged after initial solve.
-        if norm_r0 <= attainable(&x) {
-            return Ok(ndarray::Array1::from_vec(x));
+        refine_to_certificate(
+            &mut x,
+            r0,
+            norm_r0,
+            max_steps,
+            attainable,
+            |r| {
+                // Cast residual to f32, solve A e = r with the fp32 factor, lift e to f64.
+                let r_f32: Vec<f32> = r.iter().map(|&v| v as f32).collect();
+                let mut e_dev_f32 = pinned_htod(&stream, &r_f32)
+                    .map_err(|e| format!("upload f32 residual: {e}"))?;
+                spotrs_in_place(&solver, &stream, p, 1, &a_dev_f32, &mut e_dev_f32)?;
+                let e_f32 = stream
+                    .clone_dtoh(&e_dev_f32)
+                    .map_err(|e| format!("download f32 e: {e}"))?;
+                Ok(e_f32.iter().map(|&v| v as f64).collect())
+            },
+            |x| {
+                let x_dev =
+                    pinned_htod(&stream, x).map_err(|e| format!("upload refined x: {e}"))?;
+                residual_norm_and_vec(&blas, &stream, p, &a_dev_f64, &x_dev, rhs)
+            },
+        )?;
+
+        Ok(ndarray::Array1::from_vec(x))
+    }
+
+    /// Drive fp32-factor iterative refinement of `x` until its fp64 residual is
+    /// certified, or report why it cannot be.
+    ///
+    /// `r`/`norm_r` are the fp64 residual `b − A·x` of the incoming `x` and its
+    /// 2-norm. `attainable(x)` is the residual's own rounding band
+    /// `γ_{p+1}·(‖A‖_F‖x‖ + ‖b‖)`; `correct(r)` solves `A e = r` with the fp32
+    /// factor; `residual(x)` recomputes `b − A·x` in fp64.
+    ///
+    /// With a fixed fp32 factor the refinement contracts the error LINEARLY, by
+    /// about `κ(A)·u_f32` per correction, so reaching the band may need more
+    /// corrections than `max_steps` allows. Exhausting the budget is therefore
+    /// an `Err`, never an uncertified `Ok`: `Ok(())` means the final residual is
+    /// inside its rounding band. A correction that does not reduce the residual
+    /// (the `κ(A)·u_f32 ≥ 1` regime, where the fp32 factor cannot contract) is
+    /// also an `Err`.
+    fn refine_to_certificate(
+        x: &mut [f64],
+        mut r: Vec<f64>,
+        mut norm_r: f64,
+        max_steps: usize,
+        attainable: impl Fn(&[f64]) -> f64,
+        mut correct: impl FnMut(&[f64]) -> Result<Vec<f64>, String>,
+        mut residual: impl FnMut(&[f64]) -> Result<(Vec<f64>, f64), String>,
+    ) -> Result<(), String> {
+        let mut band = attainable(&*x);
+        if norm_r <= band {
+            return Ok(());
         }
-
-        let mut r = r0;
-        let mut prev_norm_r = norm_r0;
-
         for _ in 0..max_steps {
-            // Cast residual to f32, solve A e = r in fp32.
-            let r_f32: Vec<f32> = r.iter().map(|&v| v as f32).collect();
-            let mut e_dev_f32 =
-                pinned_htod(&stream, &r_f32).map_err(|e| format!("upload f32 residual: {e}"))?;
-            spotrs_in_place(&solver, &stream, p, 1, &a_dev_f32, &mut e_dev_f32)?;
-
-            // x += e in f64.
-            let e_f32 = stream
-                .clone_dtoh(&e_dev_f32)
-                .map_err(|e| format!("download f32 e: {e}"))?;
-            for (xi, ei) in x.iter_mut().zip(e_f32.iter()) {
-                *xi += *ei as f64;
+            let e = correct(r.as_slice())?;
+            for (xi, ei) in x.iter_mut().zip(e.iter()) {
+                *xi += *ei;
             }
-
-            // Reupload x_dev_f64 and compute new residual.
-            x_dev_f64 = pinned_htod(&stream, &x).map_err(|e| format!("upload refined x: {e}"))?;
-            let (r_new, norm_r_new) =
-                residual_norm_and_vec(&blas, &stream, p, &a_dev_f64, &x_dev_f64, rhs)?;
-
-            // Check monotone decrease. Non-monotone → κ(A)·u ≥ 1.
-            if norm_r_new >= prev_norm_r {
+            let (r_new, norm_r_new) = residual(&*x)?;
+            if norm_r_new >= norm_r {
                 return Err(format!(
-                    "iterative refinement: residual not decreasing ({norm_r_new:.3e} ≥ {prev_norm_r:.3e}); \
+                    "iterative refinement: residual not decreasing ({norm_r_new:.3e} ≥ {norm_r:.3e}); \
                      κ(A)·u_f32 ≥ 1, cannot refine"
                 ));
             }
-            prev_norm_r = norm_r_new;
             r = r_new;
+            norm_r = norm_r_new;
+            band = attainable(&*x);
+            if norm_r <= band {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "iterative refinement: residual {norm_r:.3e} still above its rounding band {band:.3e} \
+             after {max_steps} corrections; the fp32 factor does not certify this solve"
+        ))
+    }
 
-            if norm_r_new <= attainable(&x) {
-                break;
+    #[cfg(test)]
+    mod refine_to_certificate_tests {
+        use super::refine_to_certificate;
+
+        // A = diag(1, 2, 3, 4), b = 1. The residual is evaluated exactly as
+        // b − A∘x, and the "fp32 factor" is modelled as a solve whose error
+        // contracts by a fixed ratio ρ per correction: e = (1 − ρ)·r / a.
+        const A: [f64; 4] = [1.0, 2.0, 3.0, 4.0];
+        const B: [f64; 4] = [1.0, 1.0, 1.0, 1.0];
+
+        fn residual(x: &[f64]) -> Result<(Vec<f64>, f64), String> {
+            let r: Vec<f64> = B
+                .iter()
+                .zip(A.iter())
+                .zip(x)
+                .map(|((b, a), x)| b - a * x)
+                .collect();
+            let n = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+            Ok((r, n))
+        }
+
+        fn attainable(x: &[f64]) -> f64 {
+            let p = A.len();
+            let a_frob = A.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let norm_x = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let norm_b = B.iter().map(|v| v * v).sum::<f64>().sqrt();
+            gam_linalg::roundoff::accumulation_growth(p + 1) * (a_frob * norm_x + norm_b)
+        }
+
+        fn run(rho: f64, max_steps: usize) -> (Vec<f64>, Result<(), String>) {
+            let mut x = vec![0.0; A.len()];
+            let (r0, n0) = residual(&x).unwrap();
+            let out = refine_to_certificate(
+                &mut x,
+                r0,
+                n0,
+                max_steps,
+                attainable,
+                |r| {
+                    Ok(r.iter()
+                        .zip(A.iter())
+                        .map(|(ri, ai)| (1.0 - rho) * ri / ai)
+                        .collect())
+                },
+                residual,
+            );
+            (x, out)
+        }
+
+        /// Regression for #3547: a slowly contracting factor (ρ = 0.5, i.e. the
+        /// large-κ regime) leaves the residual far above its rounding band after
+        /// the step budget. That must be an `Err`, not an uncertified `Ok`.
+        #[test]
+        fn refine_exhausted_budget_is_an_error_not_an_uncertified_solution() {
+            let (x, out) = run(0.5, 3);
+            let (_, norm_r) = residual(&x).unwrap();
+            assert!(
+                norm_r > attainable(&x),
+                "precondition: band not reached ({norm_r:e})"
+            );
+            let err = out.expect_err("uncertified refinement must not return Ok");
+            assert!(err.contains("rounding band"), "unexpected error: {err}");
+        }
+
+        /// A fast-contracting factor certifies within the budget and the
+        /// returned `x` then solves the system to rounding.
+        #[test]
+        fn refine_certifies_when_contraction_is_fast() {
+            let (x, out) = run(1e-8, 3);
+            out.expect("fast contraction must certify");
+            let (_, norm_r) = residual(&x).unwrap();
+            assert!(norm_r <= attainable(&x));
+            for (xi, (b, a)) in x.iter().zip(B.iter().zip(A.iter())) {
+                assert!((xi - b / a).abs() <= 1e-14, "x = {xi}, want {}", b / a);
             }
         }
 
-        Ok(ndarray::Array1::from_vec(x))
+        /// A correction that over-shoots (ρ = −2, so ‖r‖ doubles) is the
+        /// κ(A)·u_f32 ≥ 1 regime and must be reported, not iterated.
+        #[test]
+        fn refine_non_decreasing_residual_is_an_error() {
+            let (_, out) = run(-2.0, 3);
+            let err = out.expect_err("non-contracting refinement must not return Ok");
+            assert!(err.contains("not decreasing"), "unexpected error: {err}");
+        }
     }
 
     /// Bind a specific device ordinal's cached context on the calling thread and
@@ -837,11 +931,6 @@ mod cuda {
         }
     }
 
-    pub fn cholesky_logdet_from_col_major(factor: &[f64], p: usize) -> f64 {
-        let factor = MatRef::from_column_major_slice(factor, p, p);
-        cholesky_factor_logdet(factor)
-    }
-
     fn check_cusolver(
         status: cusolver_sys::cusolverStatus_t,
         label: &'static str,
@@ -867,45 +956,35 @@ mod cuda {
 pub(crate) use cuda::potrf_in_place_generic;
 #[cfg(target_os = "linux")]
 pub use cuda::{
-    check_deferred_potrf_info, check_deferred_potrs_info, cholesky_logdet_from_col_major,
-    context_and_stream, pinned_htod, potrf_in_place, potrf_in_place_reuse, potrf_query_lwork,
-    potrs_in_place, potrs_in_place_reuse,
+    check_deferred_potrf_info, check_deferred_potrs_info, context_and_stream, pinned_htod,
+    potrf_in_place, potrf_in_place_reuse, potrf_query_lwork, potrs_in_place, potrs_in_place_reuse,
 };
 
-/// Solve `A x = b` with fp32 Cholesky factorization + fp64-residual iterative
-/// refinement, automatically falling back to fp64 when the policy rejects the
-/// attempt or when the fp32 path fails / diverges.
+/// Solve `A x = b` on the device: fp32 Cholesky factorization + fp64-residual
+/// iterative refinement when that path applies, the fp64 Cholesky solve
+/// otherwise. There is no user-facing knob; the `p` floor and the correction
+/// budget are `GpuDispatchPolicy` constants. The decision path is:
 ///
-/// The `p` threshold and maximum step count come from `GpuDispatchPolicy`
-/// constants — there is no user-facing knob. The decision path is:
+/// 1. Multi-column RHS, or `GpuDispatchPolicy::iterative_refinement_should_attempt(p)`
+///    false → fp64 POTRF + POTRS.
+/// 2. Otherwise fp32 POTRF + up to `REFINEMENT_MAX_STEPS` fp64-residual
+///    corrections. The refined `x` is returned only when its residual reaches
+///    the attainable band `γ_{p+1}(‖A‖_F‖x‖ + ‖b‖)`; an fp32 POTRF failure, a
+///    non-monotone residual, or an exhausted budget sends the solve to fp64
+///    POTRF + POTRS instead.
 ///
-/// 1. `policy.iterative_refinement_should_attempt(p)` → `false` or
-///    multi-column RHS: skip to the fp64 Cholesky path.
-/// 2. Attempt fp32 POTRF + up to `REFINEMENT_MAX_STEPS` residual-correction
-///    steps. Falls back to fp64 on:
-///    - fp32 POTRF info ≠ 0 (A is not SPD at f32 precision),
-///    - non-monotone residual (κ(A)·u_fp32 ≥ 1 regime).
-/// 3. On fp32 success the logdet is computed from the fp64 Cholesky factor —
-///    BUT only when `need_logdet` is true. The fp64 POTRF is an O(p³)
-///    factorization that fully negates the mixed-precision speedup (the whole
-///    point is to do the expensive factor in fp32), so a caller that only needs
-///    the *solution* (e.g. the PIRLS Newton direction solve, which discards the
-///    logdet) passes `need_logdet = false` and the redundant fp64 POTRF is
-///    skipped entirely — the returned logdet is `NaN` in that case. The solution
-///    is always full-fp64-accurate via the residual refinement regardless.
-///
-/// Returns `(solution, logdet)`. When `need_logdet` is false and the fp32 path
-/// succeeds, the logdet is `NaN`.
-pub(crate) fn iterative_refinement_cholesky_solve(
+/// Either way the returned solution is fp64-accurate. The expensive O(p³)
+/// factor stays fp32 on the refinement path, which is the point of mixed
+/// precision; no fp64 factor (and so no log-determinant) is produced there.
+pub fn cholesky_solve_only_gpu(
     hessian: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,
-    need_logdet: bool,
-) -> Result<(Array2<f64>, f64), String> {
+) -> Result<Array2<f64>, String> {
     #[cfg(not(target_os = "linux"))]
     {
         let (rows, cols) = hessian.dim();
         return Err(format!(
-            "CUDA support not compiled; hessian={rows}x{cols}, rhs={}x{}, need_logdet={need_logdet}",
+            "CUDA support not compiled; hessian={rows}x{cols}, rhs={}x{}",
             rhs.nrows(),
             rhs.ncols()
         ));
@@ -913,7 +992,8 @@ pub(crate) fn iterative_refinement_cholesky_solve(
 
     #[cfg(target_os = "linux")]
     {
-        let runtime = super::device_runtime::GpuRuntime::require().map_err(|error| {
+        use crate::policy::GpuDispatchPolicy;
+        super::device_runtime::GpuRuntime::require().map_err(|error| {
             let (rows, cols) = hessian.dim();
             format!(
                 "CUDA runtime unavailable; hessian={rows}x{cols}, rhs={}x{}: {error}",
@@ -923,63 +1003,17 @@ pub(crate) fn iterative_refinement_cholesky_solve(
         })?;
         let p = hessian.nrows();
 
-        // Attempt fp32 + refinement only for single-column RHS with p large
-        // enough that the fp64 GEMV residual cost is amortised.
-        if rhs.ncols() == 1 && runtime.policy.iterative_refinement_should_attempt(p) {
-            let rhs_col = rhs.column(0);
-            let rhs_slice: Vec<f64> = rhs_col.iter().copied().collect();
+        if rhs.ncols() == 1 && GpuDispatchPolicy::iterative_refinement_should_attempt(p) {
+            let rhs_slice: Vec<f64> = rhs.column(0).iter().copied().collect();
             if let Ok(solution) = cuda::iterative_refinement_solve_impl(hessian, &rhs_slice) {
-                // fp32 + refinement succeeded; the refined solution is full
-                // fp64 accuracy. The logdet, however, needs the fp64 Cholesky
-                // factor (the fp32 diagonal is only fp32-accurate, and the
-                // logdet feeds the REML criterion / EDF). Run the fp64 POTRF
-                // ONLY when the caller actually consumes the logdet: otherwise
-                // that O(p³) factorization is pure overhead that cancels the
-                // mixed-precision win (the expensive factor would then run in
-                // BOTH precisions). A solution-only caller (PIRLS Newton
-                // direction, which discards the logdet) gets the genuine
-                // fp32-factor speedup; logdet is reported as NaN.
                 let mut sol = Array2::<f64>::zeros((p, 1));
                 sol.column_mut(0).assign(&solution);
-                if !need_logdet {
-                    return Ok((sol, f64::NAN));
-                }
-                if let Ok(logdet) = cuda::cholesky_logdet(hessian) {
-                    return Ok((sol, logdet));
-                }
-                // fp64 logdet failed (theoretically impossible for SPD A);
-                // fall through to plain fp64 path.
+                return Ok(sol);
             }
-            // fp32 path failed (not SPD at f32, or residual non-monotone) →
-            // fall through to fp64.
         }
 
         cuda::cholesky_solve(hessian, rhs)
     }
-}
-
-pub fn cholesky_solve_gpu(
-    hessian: ArrayView2<'_, f64>,
-    rhs: ArrayView2<'_, f64>,
-) -> Result<(Array2<f64>, f64), String> {
-    // Route through iterative refinement. The function falls back to fp64
-    // internally, so callers always get a valid result. This wrapper returns
-    // the logdet, so it must request it (`need_logdet`).
-    iterative_refinement_cholesky_solve(hessian, rhs, /*need_logdet=*/ true)
-}
-
-/// Solution-only mixed-precision solve: like [`cholesky_solve_gpu`] but skips
-/// the redundant fp64 POTRF when the fp32 + refinement path succeeds, since the
-/// caller does not consume the log-determinant. This is the path that delivers
-/// the full mixed-precision speedup (expensive O(p³) factor stays fp32) for the
-/// PIRLS Newton direction solve, where the logdet is discarded. The solution is
-/// full fp64 accuracy via iterative refinement.
-pub fn cholesky_solve_only_gpu(
-    hessian: ArrayView2<'_, f64>,
-    rhs: ArrayView2<'_, f64>,
-) -> Result<Array2<f64>, String> {
-    let result = iterative_refinement_cholesky_solve(hessian, rhs, /*need_logdet=*/ false)?;
-    Ok(result.0)
 }
 
 #[cfg(target_os = "linux")]
