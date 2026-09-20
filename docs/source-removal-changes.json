@@ -2857,5 +2857,18 @@
     ],
     "reason": "#3878: the evidence ratio is exponentiated in Rust; the log-ratio entry points are replaced by saved_models_evidence_ratio and the pyffi evidence_ratio.",
     "evidence": "PR #3895; Model.evidence_ratio_vs no longer overflows in Python."
+  },
+  {
+    "base": "e3fbe9373038ccaee479c0aa87d85febd623cc56",
+    "items": [
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:duchon_radial_jacobian_second",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:duchon_radial_jacobian_third",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:jacobian_second",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:jacobian_third",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:target_matrix",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:struct:IsometryDuchonRadialSource"
+    ],
+    "reason": "IsometryDuchonRadialSource had no constructor anywhere in the workspace: IsometryPenalty::duchon_radial_source was set to None in new_euclidean and only ever cloned, so its Duchon Jacobian adapters (duchon_radial_jacobian_second/third), the target_matrix helper they read, and the jacobian_second/jacobian_third wrappers that fell back to them were dead, and every duchon_radial_source.is_none() guard was always true. The gradient, GN majorizer and exact HVP now read the installed H/K caches after the evaluation precondition, which already refuses a missing jet by name.",
+    "evidence": "git grep on the base tree finds no struct literal or constructor of IsometryDuchonRadialSource and no assignment to duchon_radial_source other than `duchon_radial_source: None` in IsometryPenalty::new_euclidean and the field-wise clone; the same-named target_matrix/jacobian_second/jacobian_third occurrences the guard counts belong to other penalties (block_sparsity, nuclear_norm, orthogonality, row_precision) and to the deleted wrappers' own call sites in isometry.rs."
   }
 ]
