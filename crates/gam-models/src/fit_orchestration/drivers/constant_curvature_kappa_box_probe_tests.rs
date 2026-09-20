@@ -653,6 +653,53 @@ mod constant_curvature_kappa_range_identification_tests {
         }
     }
 
+    /// #3201: the κ profile hands the search its exact `d²V_p/dκ²` with every
+    /// gradient, so the planner must route it to ARC on that curvature, not to
+    /// the gradient-only BFGS arm.
+    #[test]
+    fn the_kappa_search_runs_on_its_exact_curvature_3201() {
+        use gam_solve::rho_optimizer::{HessianSource, OuterObjective, Solver, plan};
+        let n = 120usize;
+        let centers = 6usize;
+        let seed = 0x5EED_3201_0000_0001_u64;
+        let (probe_feats, _) = dataset_in_span(n, 0.0, 0.6, 1.0, centers, 0.0, seed);
+        let (_, cap) = seed_range_and_box(&probe_feats, centers);
+        let (feats, y) = dataset_in_span(n, 0.5, 0.6, 1.0, centers, 0.05, seed);
+        let profile =
+            ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
+                .expect("profile is constructible on the fixture");
+        let problem =
+            constant_curvature_kappa_problem(n, &profile, &FitOptions::default(), -cap, cap);
+        let objective = problem.build_objective(
+            profile,
+            |profile: &mut ConstantCurvatureProfile<'_>, theta: &Array1<f64>| {
+                profile.evaluate(theta[0]).map(|(value, _, _)| value)
+            },
+            |profile: &mut ConstantCurvatureProfile<'_>, theta: &Array1<f64>| {
+                let (cost, derivative, curvature) = profile.evaluate(theta[0])?;
+                Ok(gam_problem::OuterEval {
+                    cost,
+                    gradient: Array1::from_vec(vec![derivative]),
+                    hessian: gam_problem::HessianValue::Dense(Array2::from_elem((1, 1), curvature)),
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut ConstantCurvatureProfile<'_>)>,
+            None::<
+                fn(
+                    &mut ConstantCurvatureProfile<'_>,
+                    &Array1<f64>,
+                ) -> Result<gam_problem::EfsEval, EstimationError>,
+            >,
+        );
+        let route = plan(&objective.capability());
+        assert_eq!(
+            (route.solver, route.hessian_source),
+            (Solver::Arc, HessianSource::Analytic),
+            "the κ search must run ARC on the profile's exact second derivative"
+        );
+    }
+
     /// At the canonical `tol = 1e-10`, with the floor gone, the κ solve still
     /// reaches a converged optimum with an interior κ̂. The floor was not what
     /// made the route converge.
