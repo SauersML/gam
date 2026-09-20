@@ -2206,5 +2206,14 @@
     ],
     "reason": "#3180: the P-IRLS box path's second activity rule for lower bounds (1e-6 relative + 1e-10 absolute) is deleted with the duplicate path it guarded. A lower bound is the unit row beta_i >= lb_i of the inequality system, whose one activity rule is active_set::row_is_active (scaled slack <= PRIMAL_FEASIBILITY_TOL), already applied to the same rows by active_face for the exact face decrement and the geometric KKT channels. projected_gradient_norm and the bound QP's warm-start seed now read it through newton_solve.rs lower_bound_binds.",
     "evidence": "In the landing tree ACTIVE_BOUND_REL_TOL and ACTIVE_BOUND_ABS_TOL occur 0 times (git grep -c); both were pub(crate) and read only at newton_solve.rs projected_gradient_norm and solve_newton_directionwith_lower_bounds. gam-solve all targets at the candidate: the new pins projected_gradient_reports_an_interior_point_short_of_its_bound_3180 and box_bounds_bind_exactly_where_the_active_face_is_active_3180 pass, and the only reds are the four also red at base."
+  },
+  {
+    "base": "b7f57a0fd4754157b2068201f65d69b8ea35b192",
+    "items": [
+      "crates/gam-custom-family/src/assembly.rs:fn:outerobjectivegradienthessian_internal",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:outerobjectivegradienthessian_labeled"
+    ],
+    "reason": "#3173: every production outer evaluation of a custom family now goes through evaluate_on_branch, which solves a certified mode from each start (correct_labeled_laplace_mode, or the branch continuation for the incumbent) and prices only the mode the lowest-penalized-objective rule selects (outerobjective_from_coefficient_mode_labeled). The single-seed evaluators outerobjectivegradienthessian_labeled and outerobjectivegradienthessian_internal were the solve-and-price route that evaluation used; they have no production caller left and move verbatim into the cfg(test) test_support module, where tests that price the criterion at a mode they chose still call them.",
+    "evidence": "At the gate base 4b87357bf0 source_removal_guard.py and public_api_census.py report exactly these two identities (production_occurrences 0 for both). At the head tree git grep -w finds both names only in crates/gam-custom-family/src/test_support.rs (the moved definitions) and in test modules. cargo check --workspace --all-targets rc 0 and cargo build --workspace --lib rc 0 at the gate; the gam-custom-family lib suite passes except the main red a_double_well_fit_publishes_its_uncertified_trace_2901, identical at base."
   }
 ]

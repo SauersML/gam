@@ -3,6 +3,7 @@
 //! as `#[cfg(test)] mod tests;`; reaches the FD helper via `super::test_support`.
 
 use super::*;
+use crate::test_support::outerobjectivegradienthessian_labeled;
 
 pub(crate) fn test_design_hyper_layout(
     design_derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,

@@ -2731,6 +2731,77 @@ pub(crate) fn evaluate_custom_family_hyper_from_coefficient_mode<
     )
 }
 
+/// Certify a solved coefficient mode as a mode of the trial point's posterior, and refresh its
+/// block predictors: the solve converged, and the family does not prove the converged point is no
+/// mode of this posterior (gam#3003). Every published mode passes this one certificate, whichever
+/// start it was solved from (gam#3173).
+pub(crate) fn certify_inner_mode<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    inner: &mut BlockwiseInnerResult,
+    rho_dim: usize,
+    psi_dim: usize,
+) -> Result<(), CustomFamilyError> {
+    // The coefficient solver owns convergence, including curvature and
+    // constraint checks. A small residual alone cannot turn an unfinished
+    // solve (possibly at a saddle) into a Laplace mode.
+    if !inner.converged {
+        let theta_dim = rho_dim + psi_dim;
+        // #2553: the fact that matters is "this trial point is
+        // infeasible", and it belongs in the variant rather than the
+        // message. `UnsupportedConfiguration` MEANS the configuration is
+        // structurally unsupported — a fatal claim — so encoding a
+        // recoverable per-theta condition in it forced every downstream
+        // consumer to recover the distinction from prose, and two of them
+        // reached opposite verdicts.
+        return Err(CustomFamilyError::InnerSolveNotConverged {
+            cycles: inner.cycles,
+            // Carry the quantity the verdict was taken on. `inner.kkt_residual`
+            // is live here and was previously dropped, so the refusal could say
+            // only how many cycles ran — which cannot tell a budget-limited
+            // solve apart from a stalled one.
+            kkt_residual: inner
+                .kkt_residual
+                .as_ref()
+                .map(ProjectedKktResidual::inf_norm),
+            kkt_tol: inner
+                .kkt_residual
+                .as_ref()
+                .and_then(ProjectedKktResidual::residual_tol),
+            // `kkt_residual` is `None` off a converged iterate BY DESIGN — no
+            // caller may trust an IFT correction at a non-KKT point, so that
+            // field stays empty here and cannot be the diagnostic. The decision
+            // variables the loop's verdict was actually taken on can be
+            // reported, and they are what separates "needs more cycles" from
+            // "the exact joint stationarity gate is the blocker".
+            terminal: inner.terminal_convergence_state.clone(),
+            theta_dim,
+            rho_dim,
+            psi_dim,
+            cycle_budget: Some(options.inner_max_cycles.max(1)),
+            carrying_block: inner.terminal_carrying_block.clone(),
+        });
+    }
+
+    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    // gam#3003: a converged mode the family proves is not a mode of this trial
+    // point's posterior refuses the trial point, as an unconverged one does.
+    if let Some(reason) = family
+        .coefficient_mode_refusal(
+            specs,
+            &inner.block_states,
+            inner.log_likelihood,
+            inner.penalty_value,
+            &inner.s_lambdas,
+        )
+        .map_err(CustomFamilyError::from)?
+    {
+        return Err(CustomFamilyError::TrialPointRefused { reason });
+    }
+    Ok(())
+}
+
 fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -2795,62 +2866,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             psi_safe_warm_start.as_ref().or(warm_start),
         )?,
     };
-    // The coefficient solver owns convergence, including curvature and
-    // constraint checks. A small residual alone cannot turn an unfinished
-    // solve (possibly at a saddle) into a Laplace mode.
-    if !inner.converged {
-        let theta_dim = rho_dim + psi_dim;
-        // #2553: the fact that matters is "this trial point is
-        // infeasible", and it belongs in the variant rather than the
-        // message. `UnsupportedConfiguration` MEANS the configuration is
-        // structurally unsupported — a fatal claim — so encoding a
-        // recoverable per-theta condition in it forced every downstream
-        // consumer to recover the distinction from prose, and two of them
-        // reached opposite verdicts.
-        return Err(CustomFamilyError::InnerSolveNotConverged {
-            cycles: inner.cycles,
-            // Carry the quantity the verdict was taken on. `inner.kkt_residual`
-            // is live here and was previously dropped, so the refusal could say
-            // only how many cycles ran — which cannot tell a budget-limited
-            // solve apart from a stalled one.
-            kkt_residual: inner
-                .kkt_residual
-                .as_ref()
-                .map(ProjectedKktResidual::inf_norm),
-            kkt_tol: inner
-                .kkt_residual
-                .as_ref()
-                .and_then(ProjectedKktResidual::residual_tol),
-            // `kkt_residual` is `None` off a converged iterate BY DESIGN — no
-            // caller may trust an IFT correction at a non-KKT point, so that
-            // field stays empty here and cannot be the diagnostic. The decision
-            // variables the loop's verdict was actually taken on can be
-            // reported, and they are what separates "needs more cycles" from
-            // "the exact joint stationarity gate is the blocker".
-            terminal: inner.terminal_convergence_state.clone(),
-            theta_dim,
-            rho_dim,
-            psi_dim,
-            cycle_budget: Some(options.inner_max_cycles.max(1)),
-            carrying_block: inner.terminal_carrying_block.clone(),
-        });
-    }
-
-    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-    // gam#3003: a converged mode the family proves is not a mode of this trial
-    // point's posterior refuses the trial point, as an unconverged one does.
-    if let Some(reason) = family
-        .coefficient_mode_refusal(
-            specs,
-            &inner.block_states,
-            inner.log_likelihood,
-            inner.penalty_value,
-            &inner.s_lambdas,
-        )
-        .map_err(CustomFamilyError::from)?
-    {
-        return Err(CustomFamilyError::TrialPointRefused { reason });
-    }
+    certify_inner_mode(family, specs, options, &mut inner, rho_dim, psi_dim)?;
     // gam#2765: the constrained Laplace normalizer's inputs at this mode.
     inner.cone_normalizer = custom_family_cone_normalizer_input(family, specs, options, &inner)?;
     let ranges = block_param_ranges(specs);
@@ -4177,9 +4193,11 @@ fn mode_profile_exhausted_error(
 /// derivatives for every candidate.
 ///
 /// Every candidate is solved once at the requested derivative quality while
-/// assembling only its value. The finite objective winner (candidate order
-/// breaks exact ties) owns the exact [`BlockwiseInnerResult`] used for that
-/// value; requested derivatives are assembled directly from that same mode.
+/// assembling only its value. The winner is the certified candidate with the
+/// lowest penalized objective, the published-mode rule of gam#3173
+/// ([`lowest_penalized_index`]: candidate order keeps ties within rounding). It owns the
+/// exact [`BlockwiseInnerResult`] used for that value; requested derivatives are
+/// assembled directly from that same mode.
 /// If the winning branch cannot provide the requested derivative payload, the
 /// evaluation errors instead of silently changing the profiled objective by
 /// selecting a worse coefficient basin.
@@ -4202,6 +4220,7 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
     }
 
     let mut screened_objectives = vec![None; candidates.len()];
+    let mut penalized_objectives: Vec<Option<PenalizedObjective>> = vec![None; candidates.len()];
     let mut rejected_candidates = vec![None; candidates.len()];
     // Whether each candidate's rejection is a property of THIS theta. The two
     // in-loop rejections below (non-convergence, non-finite objective) are
@@ -4212,6 +4231,18 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         (0..candidates.len()).map(|_| None).collect();
     let penalty_counts = validate_blockspecs(specs)?;
     let has_psi_derivatives = !hyper_layout.is_empty();
+    // The penalty roots at this θ, for comparing candidates' penalized objectives (#2954,
+    // gam#3173). One candidate is its own selection.
+    let roots = if candidates.len() > 1 {
+        let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
+        Some(BlockPenaltyRoots::new(
+            specs,
+            &per_block,
+            options.joint_penalties.as_deref(),
+        )?)
+    } else {
+        None
+    };
     for (candidate_idx, warm_start) in candidates.iter().enumerate() {
         let (eval_options, strict_warm_start) = derivative_quality_options_and_warm_start(
             options,
@@ -4257,32 +4288,34 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
                 Some("profile objective was non-finite".to_string());
             continue;
         }
+        if let Some(roots) = roots.as_ref() {
+            match penalized_objective_at_mode(family, specs, roots, &candidate.inner) {
+                Ok(penalized) => penalized_objectives[candidate_idx] = Some(penalized),
+                Err(error) => {
+                    rejection_is_rho_local[candidate_idx] = error.is_trial_point_infeasible();
+                    rejected_candidates[candidate_idx] =
+                        Some(format!("penalized objective unavailable: {error}"));
+                    continue;
+                }
+            }
+        }
         screened_objectives[candidate_idx] = Some(candidate.objective);
         screened_results[candidate_idx] = Some(candidate);
     }
 
-    let mut ranked_candidates: Vec<usize> = screened_objectives
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, objective)| objective.map(|_| idx))
-        .collect();
-    ranked_candidates.sort_by(|left, right| {
-        screened_objectives[*left]
-            .expect("ranked candidate has a finite objective")
-            .total_cmp(
-                &screened_objectives[*right].expect("ranked candidate has a finite objective"),
-            )
-            .then_with(|| left.cmp(right))
-    });
-    if ranked_candidates.is_empty() {
+    let selected = if roots.is_some() {
+        lowest_penalized_index(&penalized_objectives)
+    } else {
+        screened_objectives.iter().position(Option::is_some)
+    };
+    let Some(selected_candidate) = selected else {
         return Err(mode_profile_exhausted_error(
             &rejected_candidates,
             &rejection_is_rho_local,
         ));
-    }
+    };
 
     if matches!(eval_mode, EvalMode::ValueOnly) {
-        let selected_candidate = ranked_candidates[0];
         let owned = outer_eval_result_into_joint_hyper_owned_result(
             screened_results[selected_candidate]
                 .take()
@@ -4297,7 +4330,6 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         });
     }
 
-    let selected_candidate = ranked_candidates[0];
     let screened_winner = screened_results[selected_candidate]
         .take()
         .expect("ranked candidate retains its screened result");
