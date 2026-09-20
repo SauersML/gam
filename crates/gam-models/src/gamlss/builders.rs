@@ -2942,7 +2942,6 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mean_penalty_count = builder.mean_penalty_count(&mean_boot_design);
     let noise_penalty_count = builder.noise_penalty_count(&noise_boot_design);
 
-
     // Macro to invoke the exact-joint spatial optimizer with shared closures.
     // The exact path evaluates the full profiled/Laplace objective over
     // theta = [rho, psi] with the real joint Hessian required by NewtonTR/ARC.

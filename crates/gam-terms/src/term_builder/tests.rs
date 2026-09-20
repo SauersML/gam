@@ -1655,7 +1655,7 @@ fn one_dimensional_duchon_length_scale_opts_into_hybrid_mode() {
     let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
         panic!("expected Duchon term");
     };
-    assert_eq!(spec.length_scale, Some(0.25));
+    assert_eq!(spec.length_scale, Some(crate::basis::MaternLengthScale::fixed(0.25)));
 }
 
 /// A default 2-D Duchon is built at the provisioned low-rank default, the

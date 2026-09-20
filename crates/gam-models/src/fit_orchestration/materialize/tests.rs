@@ -1860,7 +1860,7 @@ fn materialize_standard_duchon_length_scale_opts_into_hybrid_basis() {
     let SmoothBasisSpec::Duchon { spec, .. } = &request.spec.smooth_terms[0].basis else {
         panic!("expected Duchon smooth");
     };
-    assert_eq!(spec.length_scale, Some(1.0));
+    assert_eq!(spec.length_scale, Some(gam_terms::basis::MaternLengthScale::fixed(1.0)));
     assert_eq!(spec.nullspace_order, DuchonNullspaceOrder::Linear);
     // The hybrid Matérn-blended kernel requires an INTEGER power. The cubic
     // structural default's fractional s=(d-1)/2 = 0.5 (d=2) is resolved at the
