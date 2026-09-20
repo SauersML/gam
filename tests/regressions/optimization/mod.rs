@@ -9,6 +9,7 @@ mod nonnegative_constraint_kkt_abort_with_free_term;
 mod nonnegative_constraint_kkt_scale_invariant;
 mod outer_certify_cv_folds;
 mod outer_strategy_persistent_warm_start;
+mod quantile_knot_outer_certification_4024;
 mod reml_laml_rho_derivatives_fd_bug_hunt;
 mod reml_runtime_bug_hunt_ift_dispatch;
 mod reml_unified_2_3;
