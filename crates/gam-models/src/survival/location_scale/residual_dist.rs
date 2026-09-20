@@ -1,5 +1,5 @@
 use super::*;
-use gam_math::probability::{normal_cdf, normal_logcdf_derivatives, normal_pdf};
+use gam_math::probability::{normal_cdf, normal_logcdf_derivatives};
 
 // Layer 2 defense (canonical implementation lives beside the σ-link in
 // `gam_model_kernels::sigma_link` so the fit engine and the prediction
@@ -100,112 +100,63 @@ pub trait ResidualDistributionOps {
     fn pdffourth_derivative(&self, z: f64) -> f64;
 }
 
+impl ResidualDistribution {
+    /// The inverse-link component whose CDF is this residual law.
+    #[inline]
+    fn link_component(self) -> gam_problem::LinkComponent {
+        match self {
+            ResidualDistribution::Gaussian => gam_problem::LinkComponent::Probit,
+            ResidualDistribution::Gumbel => gam_problem::LinkComponent::CLogLog,
+            ResidualDistribution::Logistic => gam_problem::LinkComponent::Logit,
+        }
+    }
+
+    #[inline]
+    fn jet(self, z: f64) -> gam_solve::mixture_link::InverseLinkJet {
+        component_inverse_link_jet(self.link_component(), z)
+    }
+}
+
+/// Every residual law is the CDF of a standard inverse link, so each
+/// derivative is read from the shared inverse-link jet and dispatchers in
+/// `gam_solve::mixture_link` (the tail-stable closed forms the row kernel
+/// already uses), never from a second hand-written copy here.
 impl ResidualDistributionOps for ResidualDistribution {
     fn cdf(&self, z: f64) -> f64 {
-        match self {
-            ResidualDistribution::Gaussian => normal_cdf(z),
-            ResidualDistribution::Gumbel => {
-                component_inverse_link_jet(gam_problem::LinkComponent::CLogLog, z).mu
-            }
-            ResidualDistribution::Logistic => {
-                component_inverse_link_jet(gam_problem::LinkComponent::Logit, z).mu
-            }
-        }
+        self.jet(z).mu
     }
 
     fn pdf(&self, z: f64) -> f64 {
-        match self {
-            ResidualDistribution::Gaussian => normal_pdf(z),
-            ResidualDistribution::Gumbel => {
-                component_inverse_link_jet(gam_problem::LinkComponent::CLogLog, z).d1
-            }
-            ResidualDistribution::Logistic => {
-                component_inverse_link_jet(gam_problem::LinkComponent::Logit, z).d1
-            }
-        }
+        self.jet(z).d1
     }
 
     fn pdf_derivative(&self, z: f64) -> f64 {
-        match self {
-            ResidualDistribution::Gaussian => -z * normal_pdf(z),
-            ResidualDistribution::Gumbel => {
-                component_inverse_link_jet(gam_problem::LinkComponent::CLogLog, z).d2
-            }
-            ResidualDistribution::Logistic => {
-                component_inverse_link_jet(gam_problem::LinkComponent::Logit, z).d2
-            }
-        }
+        self.jet(z).d2
     }
 
     fn pdfsecond_derivative(&self, z: f64) -> f64 {
-        match self {
-            ResidualDistribution::Gaussian => {
-                let f = normal_pdf(z);
-                (z * z - 1.0) * f
-            }
-            ResidualDistribution::Gumbel => {
-                component_inverse_link_jet(gam_problem::LinkComponent::CLogLog, z).d3
-            }
-            ResidualDistribution::Logistic => {
-                component_inverse_link_jet(gam_problem::LinkComponent::Logit, z).d3
-            }
-        }
+        self.jet(z).d3
     }
 
     fn pdfthird_derivative(&self, z: f64) -> f64 {
-        match self {
-            ResidualDistribution::Gaussian => {
-                let f = normal_pdf(z);
-                -(z * z * z - 3.0 * z) * f
-            }
-            ResidualDistribution::Gumbel => inverse_link_pdfthird_derivative_for_inverse_link(
-                &InverseLink::Standard(StandardLink::CLogLog),
-                z,
-            )
-            .expect("standard cloglog inverse-link third derivative should evaluate"),
-            ResidualDistribution::Logistic => inverse_link_pdfthird_derivative_for_inverse_link(
-                &InverseLink::Standard(StandardLink::Logit),
-                z,
-            )
-            .expect("standard logit inverse-link third derivative should evaluate"),
-        }
+        inverse_link_pdfthird_derivative_for_inverse_link(
+            &residual_distribution_inverse_link(*self),
+            z,
+        )
+        .expect("standard residual inverse-link third derivative is total")
     }
 
     /// Fourth derivative of the residual-distribution PDF.
     ///
-    /// # Derivations
-    ///
-    /// **Gaussian**: f(z) = φ(z). The n-th derivative of the Gaussian PDF is
-    /// (-1)^n He_n(z) φ(z) where He_n is the probabilist's Hermite polynomial.
-    /// He_4(z) = z⁴ - 6z² + 3, so f''''(z) = (z⁴ - 6z² + 3) φ(z).
-    ///
-    /// **Logistic**: f(z) = s(1-s) with s = σ(z). The k-th derivative of f is
-    /// f · P_k(s) where P_k satisfies the Euler-polynomial recurrence
-    /// P_{k+1}(s) = (1-2s) P_k(s) + s(1-s) P_k'(s).
-    /// P_4(s) = 1 - 30s + 150s² - 240s³ + 120s⁴.
-    ///
-    /// **Gumbel**: f(z) = exp(z - e^z). Let e = e^z. The k-th derivative of f
-    /// is f · Q_k(e) where Q_k satisfies Q_{k+1}(e) = (1-e) Q_k(e) + e Q_k'(e).
-    /// Q_4(e) = 1 - 15e + 25e² - 10e³ + e⁴.
+    /// Gaussian: `(z⁴ − 6z² + 3) φ(z)` (probabilist's Hermite `He_4`).
+    /// Logistic: `f · (1 − 30s + 150s² − 240s³ + 120s⁴)` with `s = σ(z)`.
+    /// Gumbel: `f · (1 − 15e + 25e² − 10e³ + e⁴)` with `e = exp(z)`.
     fn pdffourth_derivative(&self, z: f64) -> f64 {
-        match self {
-            ResidualDistribution::Gaussian => {
-                let f = normal_pdf(z);
-                let z2 = z * z;
-                // He_4(z) = z^4 - 6z^2 + 3
-                (z2 * z2 - 6.0 * z2 + 3.0) * f
-            }
-            ResidualDistribution::Gumbel => inverse_link_pdffourth_derivative_for_inverse_link(
-                &InverseLink::Standard(StandardLink::CLogLog),
-                z,
-            )
-            .expect("standard cloglog inverse-link fourth derivative should evaluate"),
-            ResidualDistribution::Logistic => inverse_link_pdffourth_derivative_for_inverse_link(
-                &InverseLink::Standard(StandardLink::Logit),
-                z,
-            )
-            .expect("standard logit inverse-link fourth derivative should evaluate"),
-        }
+        inverse_link_pdffourth_derivative_for_inverse_link(
+            &residual_distribution_inverse_link(*self),
+            z,
+        )
+        .expect("standard residual inverse-link fourth derivative is total")
     }
 }
 
@@ -236,40 +187,5 @@ pub fn residual_distribution_from_inverse_link(link: &InverseLink) -> Option<Res
         InverseLink::Standard(StandardLink::CLogLog) => Some(ResidualDistribution::Gumbel),
         InverseLink::Standard(StandardLink::Logit) => Some(ResidualDistribution::Logistic),
         _ => None,
-    }
-}
-
-/// Fourth derivative of the inverse-link PDF (= 5th derivative of the CDF).
-///
-/// This is the f'''' quantity used in the 4th derivative of log f(u), which
-/// in turn enters the m4 ingredient of the Arbogast chain rule for
-/// the outer REML Hessian Q[v_k, v_l] term.
-///
-/// For the three standard survival residual distributions (Probit, Logit,
-/// CLogLog), uses the closed-form ResidualDistribution implementations.
-/// For all other inverse links (SAS, BetaLogistic, Mixture), delegates
-/// to the generic `inverse_link_pdffourth_derivative_for_inverse_link`
-/// dispatcher in mixture_link.rs.
-pub(crate) fn inverse_link_pdffourth_derivative(
-    inverse_link: &InverseLink,
-    eta: f64,
-) -> Result<f64, SurvivalLocationScaleError> {
-    match inverse_link {
-        InverseLink::Standard(StandardLink::Probit) => {
-            Ok(ResidualDistribution::Gaussian.pdffourth_derivative(eta))
-        }
-        InverseLink::Standard(StandardLink::Logit) => {
-            Ok(ResidualDistribution::Logistic.pdffourth_derivative(eta))
-        }
-        InverseLink::Standard(StandardLink::CLogLog) => {
-            Ok(ResidualDistribution::Gumbel.pdffourth_derivative(eta))
-        }
-        _ => gam_solve::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
-            inverse_link,
-            eta,
-        )
-        .map_err(|e| SurvivalLocationScaleError::NumericalFailure {
-            reason: format!("inverse link fourth-derivative evaluation failed at eta={eta}: {e}"),
-        }),
     }
 }
