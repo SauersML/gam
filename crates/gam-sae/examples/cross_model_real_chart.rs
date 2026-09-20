@@ -24,7 +24,7 @@ use gam_sae::inference::cross_model_transport::{
 use gam_sae::inference::layer_transport::ChartTopology;
 use gam_sae::manifold::{
     LatentManifold, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho,
-    SaeManifoldTerm,
+    SaeManifoldTerm, SaeOuterRun,
 };
 use gam_solve::rho_optimizer::OuterProblem;
 use ndarray::{Array1, Array2, ArrayView2, s};
@@ -323,15 +323,25 @@ fn fit_real_chart(
         1.0e-6,
         1.0e-6,
     );
-    let result = OuterProblem::new(n_params)
+    let problem = OuterProblem::new(n_params)
         .with_problem_size(post_peel.len(), p_beta)
         .with_initial_rho(seed)
-        .with_max_iter(outer_iters)
-        .run(&mut objective, label)
-        .map_err(|err| format!("{label}: outer fit failed: {err}"))?;
-    objective
-        .certify_outer_result(&result)
-        .map_err(|err| format!("{label}: outer fit certificate rejected: {err}"))?;
+        .with_max_iter(outer_iters);
+    let result = match objective
+        .run_to_certificate(&problem, label)
+        .map_err(|err| format!("{label}: outer fit failed: {err}"))?
+    {
+        SaeOuterRun::Certified(result) => result,
+        SaeOuterRun::Unconverged(result) => {
+            return Err(format!(
+                "{label}: outer fit did not converge in {} iterations",
+                result.iterations
+            ));
+        }
+        SaeOuterRun::Refused { reason, .. } => {
+            return Err(format!("{label}: outer fit certificate rejected: {reason}"));
+        }
+    };
     let telemetry = objective.probe_telemetry();
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let final_term = fitted.term;
