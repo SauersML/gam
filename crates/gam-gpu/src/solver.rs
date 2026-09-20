@@ -37,7 +37,8 @@ mod cuda {
         let out_col = stream
             .clone_dtoh(&rhs_dev)
             .map_err(|e| format!("download solution: {e}"))?;
-        from_col_major(&out_col, p, nrhs).ok_or_else(|| "solution layout conversion failed".to_string())
+        from_col_major(&out_col, p, nrhs)
+            .ok_or_else(|| "solution layout conversion failed".to_string())
     }
 
     pub(super) fn cholesky_lower_on_ordinal(
@@ -1126,7 +1127,10 @@ mod tests {
             let fp64_solve = (p * p * p) as f64 / 3.0 + 2.0 * p2;
             let k = refinement_step_budget(p);
             assert!(4.0 * p2 * k as f64 <= fp64_solve, "p = {p}, budget {k}");
-            assert!(4.0 * p2 * (k + 1) as f64 > fp64_solve, "p = {p}, budget {k}");
+            assert!(
+                4.0 * p2 * (k + 1) as f64 > fp64_solve,
+                "p = {p}, budget {k}"
+            );
         }
     }
 
@@ -1144,14 +1148,21 @@ mod tests {
         // A band six corrections away is refused as soon as the contraction
         // predicts it, without spending the budget first.
         let (verdict, steps) = refine_linearly(6e-3, 1e-13, budget);
-        assert!(matches!(verdict, RefinementVerdict::Refuse(_)), "{verdict:?}");
+        assert!(
+            matches!(verdict, RefinementVerdict::Refuse(_)),
+            "{verdict:?}"
+        );
         assert_eq!(steps, 1);
         // Every budget ends in a certified solution or a refusal.
         for budget in 1..=12 {
             let (verdict, steps) = refine_linearly(0.5, 1e-12, budget);
             assert!(steps <= budget);
             let converged = verdict == RefinementVerdict::Converged;
-            assert_eq!(converged, 0.5_f64.powi(steps as i32) <= 1e-12, "{verdict:?}");
+            assert_eq!(
+                converged,
+                0.5_f64.powi(steps as i32) <= 1e-12,
+                "{verdict:?}"
+            );
         }
     }
 
