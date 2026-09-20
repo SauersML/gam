@@ -1,8 +1,8 @@
 """PyTorch adapter for the Sinkhorn-barycenter kernel.
 
 Exposes a :class:`torch.autograd.Function` whose backward pass calls
-the Rust VJP for the same finite-iteration Sinkhorn map used in the
-forward pass.
+the Rust implicit-function-theorem VJP of the certified fixed point the
+forward pass returns.
 
 Importing this module raises a clear :class:`ImportError` if PyTorch
 is not installed.
@@ -32,7 +32,8 @@ class _SinkhornBarycenterFn(torch.autograd.Function):
     """Differentiable Sinkhorn-barycenter ``torch.autograd.Function``.
 
     Forward: ``(K, M) atoms, (K,) weights -> (M,) barycenter``.
-    Backward: finite-iteration VJP from the Rust extension.
+    Backward: the fixed point's implicit-function-theorem VJP from the Rust
+    extension.
     """
 
     @staticmethod
@@ -42,18 +43,16 @@ class _SinkhornBarycenterFn(torch.autograd.Function):
         weights: torch.Tensor,
         cost: torch.Tensor | ArrayLike,
         eps: float,
-        n_iter: int,
     ) -> torch.Tensor:
         atoms_np = atoms.detach().cpu().double().numpy()
         weights_np = weights.detach().cpu().double().numpy()
         cost_np = cost.detach().cpu().double().numpy() if isinstance(cost, torch.Tensor) else np.asarray(cost, dtype=np.float64)
         bary_np = _kernels.sinkhorn_barycenter(
-            atoms_np, weights_np, cost_np, eps=float(eps), n_iter=int(n_iter)
+            atoms_np, weights_np, cost_np, eps=float(eps)
         )
         ctx.save_for_backward(atoms.detach(), weights.detach())
         ctx._cost = cost_np
         ctx._eps = float(eps)
-        ctx._n_iter = int(n_iter)
         ctx._device = atoms.device
         ctx._dtype = atoms.dtype
         return torch.from_numpy(bary_np).to(device=atoms.device, dtype=atoms.dtype)
@@ -61,18 +60,18 @@ class _SinkhornBarycenterFn(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx: Any, grad_output: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, None, None, None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, None, None]:
         atoms, weights = ctx.saved_tensors
         atoms_np = atoms.cpu().double().numpy()
         weights_np = weights.cpu().double().numpy()
         cot_np = grad_output.detach().cpu().double().numpy()
         d_atoms_np, d_weights_np = _kernels.sinkhorn_barycenter_vjp(
-            atoms_np, weights_np, ctx._cost, ctx._eps, ctx._n_iter, cot_np
+            atoms_np, weights_np, ctx._cost, ctx._eps, cot_np
         )
         d_atoms = torch.from_numpy(d_atoms_np).to(device=ctx._device, dtype=ctx._dtype)
         d_weights = torch.from_numpy(d_weights_np).to(device=ctx._device, dtype=ctx._dtype)
-        # cost, eps, n_iter are non-differentiable.
-        return d_atoms, d_weights, None, None, None
+        # cost and eps are non-differentiable.
+        return d_atoms, d_weights, None, None
 
 
 def sinkhorn_barycenter(
@@ -80,13 +79,12 @@ def sinkhorn_barycenter(
     weights: Optional["torch.Tensor"] = None,
     cost: Optional["torch.Tensor"] = None,
     eps: float = 0.01,
-    n_iter: int = 20,
 ) -> "torch.Tensor":
     """Differentiable Sinkhorn Wasserstein barycenter (PyTorch).
 
     Same semantics as :func:`gamfit.kernels.sinkhorn_barycenter` with
-    PyTorch tensors. Backward uses the Rust finite-iteration VJP, so
-    gradients match the forward result at the same ``n_iter``.
+    PyTorch tensors. Backward uses the Rust implicit-function-theorem VJP
+    of the certified fixed point the forward pass returns.
     """
     if not isinstance(atoms, torch.Tensor):
         raise TypeError("atoms must be a torch.Tensor")
@@ -99,7 +97,7 @@ def sinkhorn_barycenter(
         cost = torch.from_numpy(_kernels.circular_cost(m)).to(
             device=atoms.device, dtype=atoms.dtype
         )
-    out: torch.Tensor = _SinkhornBarycenterFn.apply(atoms, weights, cost, eps, n_iter)
+    out: torch.Tensor = _SinkhornBarycenterFn.apply(atoms, weights, cost, eps)
     return out
 
 
