@@ -2683,5 +2683,13 @@
     ],
     "reason": "#3641: the assembled-operator cache keyed an Operator-source joint Hessian on a 64-bit hash of its diagonal plus (rho, beta-hat, penalties, knobs) and folded the pseudo-logdet mode to mode == Smooth, so fits sharing the process-global cache could be handed another matrix's operator. The key is now the assembled symmetrized J itself plus the PseudoLogdetMode, compared by exact element equality; the fingerprint and its f64 hashing helper have no remaining caller.",
     "evidence": "assembly::assembled_operator_cache_tests::same_diagonal_different_curvature_never_shares_an_operator_3641: [[2,0],[0,2]] and [[2,1],[1,2]] (same diagonal) are priced ln 4 and ln 3 under Smooth, HardPseudo and PositiveDefinite; the_cache_key_is_the_exact_matrix_and_mode_3641: a different mode or a one-ulp entry change misses, -0.0 hits +0.0."
+  },
+  {
+    "base": "9e4544cb8f0785925cdca5cc448efcb22afd9fb8",
+    "items": [
+      "crates/gam-models/src/bms/block_specs.rs:fn:learned_frailty_scale_is_identified"
+    ],
+    "reason": "gam#2938 commit 2 (gam#3059): the Bernoulli marginal-slope fit now asks the one identification rule both marginal-slope families share, crate::survival::lognormal_kernel::frailty_identification (landed in dc80110867), instead of its own copy. learned_frailty_scale_is_identified was that copy: the same span test (is the slope's fixed part o = baseline + slope_offset in the slope design's span?), decided against a band max(n, p + 1)·ε with no rank decision. The shared rule reads the rank from factor_singular_band, compares the distance with the projector error bar at the rank gap plus the rounding of forming it, and reports an unseparated rank boundary as Undecided instead of guessing. The one caller in fit_bernoulli_marginal_slope_terms_under moves onto it: NotIdentified keeps the #3059 refusal text word for word, IdentifiedByOffset continues, and Undecided is a new named refusal. The three #3059 pins keep their names and call frailty_identification through a local identified() helper.",
+    "evidence": "With base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate, source_removal_guard.py and public_api_census.py refuse exactly this identity: public true, production_occurrences 0, 13820 -> 13819 public function declarations. In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences. The three pins intercept_slope_with_constant_fixed_part_is_unidentified_3059, covariate_only_slope_with_constant_fixed_part_is_identified_3059 and slope_offset_inside_the_span_is_unidentified_3059 run on the replacement. test_census.py: 12708 -> 12708 tests."
   }
 ]
