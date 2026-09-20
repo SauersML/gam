@@ -2552,29 +2552,26 @@ fn consumed_coordinates(dimension: usize, profiled: bool) -> usize {
 /// rather than the `√(p(1−p)/N)` of either term alone. Empty is `(0, 0)`: no
 /// replay, no shift.
 ///
-/// The spread is accumulated CENTRED (Welford): `M₂ = Σ (dᵢ − d̄)²` grows by
-/// `(d − d̄_old)(d − d̄_new)`, and `d̄_new = d̄_old + (d − d̄_old)/i` is the
-/// rounding of a point between `d̄_old` and `d`, so it lies in that closed
-/// interval and both factors carry the same sign. Every increment is therefore
-/// `≥ 0` in floating point, a constant sample gives exactly `M₂ = 0`, and no
-/// clamp is needed. The
-/// one-pass `Σd²/N − d̄²` it replaces differences two quantities of size `d̄²`
-/// and resolves the variance only in steps of `ulp(d̄²)`, reporting a positive
-/// error on a draw set that is constant (#4086).
+/// The spread is accumulated in two passes about the sample's own mean:
+/// `M₂ = Σ (dᵢ − d̄)²` is a sum of squares, so it is `≥ 0` in floating point
+/// with no clamp. The mean is read pivoted on the first draw,
+/// `d̄ = d₁ + Σ (dᵢ − d₁)/N`, so a constant sample has every pivoted
+/// difference exactly zero and reports `d̄ = d₁` and `M₂ = 0` exactly. Any
+/// rounding left in `d̄` enters `M₂` only at second order, since
+/// `Σ (dᵢ − m)² = Σ (dᵢ − d̄)² + N (d̄ − m)²`. The one-pass `Σd²/N − d̄²`
+/// it replaces differences two quantities of size `d̄²`, so it resolves the
+/// variance only in steps of `ulp(d̄²)` and reports a positive error on a
+/// draw set that is constant (#4086). A running (Welford) mean does not
+/// fix this either: on an ordered sample it drifts by `ulp(d̄)` per step,
+/// which is not small beside a spread far below `|d̄|`.
 fn paired_mean_with_error(differences: impl Iterator<Item = f64>) -> (f64, f64) {
-    let mut count = 0usize;
-    let mut shift = 0.0_f64;
-    let mut centred_squares = 0.0_f64;
-    for difference in differences {
-        count += 1;
-        let before = difference - shift;
-        shift += before / count as f64;
-        centred_squares += before * (difference - shift);
-    }
-    if count == 0 {
+    let sample: Vec<f64> = differences.collect();
+    let Some(&pivot) = sample.first() else {
         return (0.0, 0.0);
-    }
-    let count = count as f64;
+    };
+    let count = sample.len() as f64;
+    let shift = pivot + sample.iter().map(|d| d - pivot).sum::<f64>() / count;
+    let centred_squares: f64 = sample.iter().map(|d| (d - shift) * (d - shift)).sum();
     (shift, (centred_squares / count / count).sqrt())
 }
 
@@ -4867,8 +4864,8 @@ mod selection_replay_tests {
     };
     use ndarray::Array2;
 
-    /// #4086 sibling: the paired-difference spread is centred, so it cannot
-    /// cancel. Half the draws at `c + s`, half at `c − s` (`c = 0.75`, `s` a
+    /// #4086 sibling: the paired-difference spread is two-pass centred, so it
+    /// cannot cancel. Half the draws at `c + s`, half at `c − s` (`c = 0.75`, `s` a
     /// power of two) have mean exactly `c` and population variance exactly
     /// `s²`, so the reference is exact with no second implementation. The
     /// retired one-pass `Σd²/N − d̄²` is evaluated alongside to show this is
