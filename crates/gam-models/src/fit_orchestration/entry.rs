@@ -948,6 +948,19 @@ fn deterministic_gaussian_standard_fit(
         let z = &infinite_null_basis;
         let u = &infinite_range_basis;
         let free_dim = z.ncols();
+        // A zero face is a REML optimum only because the criterion is
+        // unbounded there: the response lies exactly in a column space of
+        // dimension `free_dim` that the data could have missed. That needs more
+        // supported rows than free directions. With `free_dim >= n+` the free
+        // columns span every supported response, so the exact fit is automatic
+        // interpolation, the profiled criterion stays bounded, and certifying
+        // phi = 0 with zero covariance would be wrong. The square case
+        // `free_dim == n+` has a nonsingular `A` and would pass the
+        // factorization below, so it is declined here.
+        let supported_rows = request.weights.iter().filter(|&&w| w > 0.0).count();
+        if free_dim >= supported_rows {
+            return Ok(GaussianStandardRoute::Iterative(Some(design)));
+        }
         let raw_free_information = z.t().dot(&xtwx.dot(z));
         let free_information =
             (&raw_free_information + &raw_free_information.t().to_owned()) * 0.5;
@@ -1525,6 +1538,72 @@ mod exact_gaussian_boundary_design_reuse_tests {
         assert_eq!(on_design.fit.log_lambdas, fresh.fit.log_lambdas);
         assert_eq!(on_design.fit.beta, fresh.fit.beta);
         assert_eq!(on_design.design.design.to_dense(), fresh.design.design.to_dense());
+    }
+}
+
+#[cfg(test)]
+mod square_exact_gaussian_design_tests {
+    use super::*;
+    use csv::StringRecord;
+    use gam_data::encode_recordswith_inferred_schema;
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+
+    const N: usize = 8;
+
+    fn noisy_curve() -> Dataset {
+        let mut rng = StdRng::seed_from_u64(4127);
+        let headers: Vec<String> = ["x", "y"].iter().map(|h| h.to_string()).collect();
+        let rows = (0..N)
+            .map(|i| {
+                let x = i as f64 / (N - 1) as f64;
+                let noise: f64 = rng.random::<f64>() - 0.5;
+                let y = (2.0 * std::f64::consts::PI * x).sin() + 0.6 * noise;
+                StringRecord::from(vec![x.to_string(), y.to_string()])
+            })
+            .collect();
+        encode_recordswith_inferred_schema(headers, rows).expect("encode")
+    }
+
+    fn standard_request<'a>(data: &'a Dataset) -> StandardFitRequest<'a> {
+        let config = FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        };
+        match materialize("y ~ s(x, bs='cr', k=8)", data, &config)
+            .expect("materialize")
+            .request
+        {
+            FitRequest::Standard(request) => request,
+            _ => panic!("a Gaussian s() formula materializes a standard request"),
+        }
+    }
+
+    /// With as many coefficients as rows, the design interpolates any
+    /// response, so the exact fit carries no evidence of a zero residual
+    /// variance. The shortcut must decline it instead of reporting phi = 0.
+    #[test]
+    fn square_design_interpolation_is_not_a_deterministic_fit() {
+        let data = noisy_curve();
+        let request = standard_request(&data);
+        assert!(
+            matches!(
+                exact_gaussian_boundary(&request).expect("boundary check"),
+                ExactGaussianVerdict::Boundary(_)
+            ),
+            "precondition: a square full-rank design certifies an exact boundary"
+        );
+        match try_deterministic_gaussian_standard_fit(&request).expect("route") {
+            GaussianStandardRoute::Iterative(Some(design)) => {
+                assert_eq!(design.design.ncols(), N, "the design is square");
+            }
+            GaussianStandardRoute::Iterative(None) => {
+                panic!("the declined route must hand over its realized design")
+            }
+            GaussianStandardRoute::Exact(_) => {
+                panic!("square-design interpolation was certified as an exact fit")
+            }
+        }
     }
 }
 
