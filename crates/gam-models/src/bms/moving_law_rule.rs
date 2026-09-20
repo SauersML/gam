@@ -48,8 +48,10 @@
 //! err independently; rows that share a held-out law share its error, which only
 //! the fold means see (at n = 1 000 they were 1.5 times the row-level error on the
 //! local arm, gam#2926 diag16), and the larger of the two can only favour the
-//! simpler arm. The width, context count and grid of each arm are fixed, never
-//! tuned by this loss.
+//! simpler arm. No arm is tuned by this loss: the context count and grid of each
+//! arm are fixed, and the local arm's kernel width and pooled share minimise the
+//! cross-fitted CRPS of the score under the same held-out laws
+//! ([`super::local_law_resolution`]), a different loss on a different quantity.
 //!
 //! Cross-fitting builds each law on nine tenths of the rows. That handicaps the
 //! arms that estimate more — the local arm most — so the rule errs toward the
@@ -721,7 +723,7 @@ struct FoldLaws {
     /// The fold's pooled law of the score on its own axis.
     pooled: EmpiricalZGrid,
     /// The fold's local law at the full-data law's context count, read at the
-    /// fold's rows.
+    /// fold's rows at [`MovingLawCandidates::resolution`].
     local: estimated_latent_law::HeldOutLocalLaw,
 }
 
@@ -763,6 +765,9 @@ pub(crate) struct MovingLawCandidates {
     pooled: EmpiricalZGrid,
     local: LatentMeasureKind,
     contexts: usize,
+    /// The local law's kernel width and pooled share, chosen on the held-out
+    /// local laws and shared by them and the full-data law.
+    resolution: estimated_latent_law::LocalLawResolution,
 }
 
 fn probabilists_gauss_hermite(nodes: usize) -> Result<EmpiricalZGrid, MovingLawError> {
@@ -858,7 +863,6 @@ impl MovingLawCandidates {
             estimated_latent_law::local_law_parts(z, weights, local_context, grid_size, None)
                 .map_err(law("local law"))?;
         let contexts = local_parts.contexts();
-        let local = local_parts.into_kind().map_err(law("local law"))?;
 
         let folds = MovingLawFolds::from_data(
             z.view().insert_axis(ndarray::Axis(1)),
@@ -939,6 +943,18 @@ impl MovingLawCandidates {
                 local,
             });
         }
+        let held_out_local: Vec<_> = fold_laws
+            .iter()
+            .zip(scored_rows.iter())
+            .map(|(laws, rows)| (&laws.local, rows.as_slice()))
+            .collect();
+        let resolution = local_law_resolution::select_local_law_resolution(
+            z.view(),
+            weights,
+            &held_out_local,
+        )
+        .map_err(law("local law resolution"))?;
+        let local = local_parts.into_kind(resolution).map_err(law("local law"))?;
         Ok(Self {
             evidence,
             gaussian_screen,
@@ -956,6 +972,7 @@ impl MovingLawCandidates {
             pooled,
             local,
             contexts,
+            resolution,
         })
     }
 
@@ -1086,9 +1103,13 @@ impl MovingLawCandidates {
                     on_fitted_axis(&laws.residual.nodes, &laws.residual.weights, shift, scale)
                 }
                 MovingLawArm::Local => {
-                    let grid = fold.local.grid(self.position[row]).map_err(|reason| {
-                        MovingLawError::Law { what: "held-out local law", reason }
-                    })?;
+                    let grid = fold
+                        .local
+                        .grid(self.position[row], self.resolution)
+                        .map_err(|reason| MovingLawError::Law {
+                            what: "held-out local law",
+                            reason,
+                        })?;
                     on_fitted_axis(&grid.nodes, &grid.weights, 0.0, 1.0)
                 }
             })
