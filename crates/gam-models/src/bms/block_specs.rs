@@ -556,6 +556,13 @@ fn build_reduced_slope_reparam(
              terms or supply covariates that separate them from the marginal index."
                 .to_string(),
         ),
+        ReducedSlopeOutcome::VanishingMetric => Err(
+            "BMS score-slope confound audit has no geometry: the rigid pilot's probit row \
+             metric vanishes on every row where the marginal or score-slope design is \
+             supported, so neither surface is measured at the pilot and no confound between \
+             them can be decided."
+                .to_string(),
+        ),
     }
 }
 
@@ -653,6 +660,10 @@ pub(crate) enum ReducedSlopeOutcome {
     /// `r == 0`: the entire effective slope image is W-explained by the
     /// effective marginal span — the block is unidentified.
     FullyConfounded,
+    /// Neither effective image has a nonzero column: the row metric vanishes
+    /// wherever either design is supported, so the audit has no geometry to
+    /// compare the two spans in. Not a confound: nothing is measured (#3217).
+    VanishingMetric,
 }
 
 /// Build the reduced slope basis `T` (p_g × r) from the EFFECTIVE BMS pilot
@@ -664,7 +675,9 @@ pub(crate) enum ReducedSlopeOutcome {
 /// [`ReducedSlopeOutcome::FullyConfounded`] when the entire effective
 /// slope image collapses into the effective marginal span (`r == 0`), so the
 /// caller can refuse the unidentified block instead of conflating the two
-/// cases.
+/// cases. When the row metric leaves both effective images empty it returns
+/// [`ReducedSlopeOutcome::VanishingMetric`]: that is the metric's degeneracy,
+/// not a confound.
 ///
 /// At the rigid pilot the effective Jacobians are
 ///     M_eff = diag(c) · M,   c_i = sqrt(1 + (s·g_i)²)
@@ -755,6 +768,11 @@ pub(crate) fn reduced_slope_transform_effective(
     let (slope_basis, slope_coefficients) =
         equilibrated_range_basis(&g_eff, factor_singular_band(n, p_g, 1.0))?;
     if slope_basis.ncols() == 0 {
+        // With the marginal image empty too, the metric measured neither
+        // surface: an empty span is not a confound between two (#3217).
+        if marginal_basis.ncols() == 0 {
+            return Ok(ReducedSlopeOutcome::VanishingMetric);
+        }
         // Every effective slope direction has `C v = 0`: no curvature at all.
         return Ok(ReducedSlopeOutcome::FullyConfounded);
     }
@@ -1369,6 +1387,7 @@ mod runaway_tests {
                 match other {
                     ReducedSlopeOutcome::FullRank => "FullRank",
                     ReducedSlopeOutcome::FullyConfounded => "FullyConfounded",
+                    ReducedSlopeOutcome::VanishingMetric => "VanishingMetric",
                     ReducedSlopeOutcome::Reduced(_) => unreachable!(),
                 }
             ),
@@ -1428,6 +1447,42 @@ mod runaway_tests {
         assert!(
             matches!(outcome, ReducedSlopeOutcome::FullyConfounded),
             "fully effective-confounded slope must surface the distinct FullyConfounded outcome"
+        );
+    }
+
+    // #3217: a separated pilot's row metric underflows to zero on every row.
+    // The confounded fixture above then measures neither surface, and the audit
+    // must say the metric vanished rather than report the spans confounded;
+    // a metric live on one row still decides the confound.
+    #[test]
+    pub(crate) fn effective_reduction_on_a_vanished_metric_is_not_a_confound_3217() {
+        let m = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 1.0, 1.0]).unwrap();
+        let g = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
+        let z = Array1::from_vec(vec![1.0, 0.5, 1.0 / 3.0]);
+        let zero = Array1::<f64>::zeros(3);
+        let audit = |w: &Array1<f64>| {
+            reduced_slope_transform_effective(
+                m.view(),
+                g.view(),
+                &z,
+                w,
+                &zero,
+                &zero,
+                0.0,
+                0.0,
+                1.0,
+            )
+            .expect("effective reduction must succeed")
+        };
+        let vanished = audit(&zero);
+        assert!(
+            matches!(vanished, ReducedSlopeOutcome::VanishingMetric),
+            "a zero metric must surface VanishingMetric, got {vanished:?}"
+        );
+        let one_row = audit(&Array1::from_vec(vec![0.0, 1.0, 0.0]));
+        assert!(
+            matches!(one_row, ReducedSlopeOutcome::FullyConfounded),
+            "a metric live on one row measures both surfaces, got {one_row:?}"
         );
     }
 
@@ -2542,7 +2597,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
     armed: bool,
     search_refusal: &RefCell<Option<JeffreysArmingEvidence>>,
 ) -> Result<CertifiedFit, FitFailure> {
-    use gam_problem::FailureCategory;
+    use gam_problem::{EstimationError, FailureCategory};
     search_refusal.replace(None);
     let mut spec = spec;
     let data_view = data;
@@ -2916,11 +2971,25 @@ fn fit_bernoulli_marginal_slope_terms_under(
             Some(Arc::new(runtime))
         }
     };
-    // Unclassified by name (#2937): the pooled pilot refuses the data (a
-    // length mismatch, no positive weight, one outcome carrying all of it) and
-    // reports its own Newton solve's failure in the same text.
-    let pilot_baseline = pooled_probit_baseline(&spec.y, z_train, &spec.weights)
-        .map_err(|reason| FitFailure::raised(FailureCategory::Unclassified, reason))?;
+    // Unarmed, a latent score that separates the outcomes gives the pooled
+    // probit no finite mode: its certificate is typed arming evidence, so the
+    // route re-solves armed, where the pilot is the Jeffreys-penalized mode
+    // (#3217). Every other refusal is Unclassified by name (#2937): the pilot
+    // refuses the data (a length mismatch, no positive weight, one outcome
+    // carrying all of it) and reports its own Newton solve's failure in the
+    // same text.
+    let pilot_baseline = pooled_probit_baseline(&spec.y, z_train, &spec.weights, armed)
+        .map_err(|refusal| match refusal {
+            PooledPilotRefusal::Separated(separation) => {
+                FitFailure::from(EstimationError::PrefitLatentScoreSeparationDetected {
+                    threshold: separation.threshold,
+                    positive_above_threshold: separation.positive_above_threshold,
+                })
+            }
+            PooledPilotRefusal::Refused(reason) => {
+                FitFailure::raised(FailureCategory::Unclassified, reason)
+            }
+        })?;
     // The probit marginal index is the pilot's own probit intercept: `q = η`
     // exactly (gam#2978), with no probability formed and inverted.
     require_probit_marginal_slope_link(&spec.base_link, "bernoulli marginal-slope baseline")
