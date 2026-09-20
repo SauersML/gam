@@ -109,6 +109,16 @@ where
             x.ncols(),
         );
     }
+    // Every per-row input must describe the same observations as the design.
+    if y.len() != x.nrows() || weights.len() != x.nrows() || offset.len() != x.nrows() {
+        crate::bail_invalid_estim!(
+            "per-row input length mismatch: design has {} rows but y has {}, weights has {}, offset has {}",
+            x.nrows(),
+            y.len(),
+            weights.len(),
+            offset.len(),
+        );
+    }
     // `p >= n` is not saturation for a penalized fit: REML/LAML keep the
     // `n - M_p` residual contrasts of the unpenalized space, and
     // `reject_prefit_unidentifiable_unpenalized_space` refuses the fits where
@@ -232,14 +242,15 @@ where
         Some(opts.firth_bias_reduction),
     )?;
     // Per-family response-support validation, owned by the family type.
-    // Gamma `y > 0`, Poisson / NegativeBinomial / Tweedie `y ≥ 0`, Beta
-    // `y ∈ (0, 1)`. Centralising the rule on `ResponseFamily` means the
+    // Gamma `y > 0`, Poisson / NegativeBinomial non-negative integer counts,
+    // Tweedie `y ≥ 0`, Beta `y ∈ (0, 1)`, judged over positive-weight rows
+    // (a zero weight excludes its row from the likelihood). Centralising the rule on `ResponseFamily` means the
     // external-design GLM path and the formula path share the same
     // family-owned domain rule, while this external path appends the routing
     // context the formula path does not have. The response column name is
     // unknown on the external-design path (the caller passes a bare
     // `y: ArrayView1<f64>`) so we surface it as the generic "y".
-    if let Err(violation) = resolved_family.response.validate_response_support(y.view()) {
+    if let Err(violation) = resolved_family.response.validate_response_support(y.view(), weights.view()) {
         crate::bail_invalid_estim!(
             "{}; external-design GLM routing accepted the family/link, but the response values are outside that GLM family's support",
             violation
