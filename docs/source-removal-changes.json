@@ -2774,5 +2774,14 @@
     ],
     "reason": "#3824: the SAE coordinate prior switched from per-atom ARD to one ARD precision per axis index broadcast to every atom once K >= SAE_SHARED_ARD_K_THRESHOLD = 256, so the prior family and the REML/LAML criterion changed at an arbitrary atom count. Per-atom ARD costs 1+K+sum_k d_k outer coordinates against 1+K+max_d, both Theta(K), and the per-(k,j) energies were already assembled, so no derived crossover exists. The threshold, ArdSharing, the ard_sharing accessor, SaeManifoldRho::new_shared_ard and max_ard_axes go, with the tests that pinned the shared mode (shared_ard_flat_index_aliases_in_bounds_1026, shared_ard_collapses_outer_param_count_at_large_k, shared_ard_is_a_convergent_outer_coordinate_1026).",
     "evidence": "manifold::tests::ard_flat_index_is_unique_per_atom_axis_3824 and sae owed_1026::ard_outer_coordinates_are_per_atom_at_every_k_3824: for K in {2,255,256,1000} the flat length is 1+K+K and every (k,j) index is distinct; a heterogeneous d=[2,1,2] from_flat round trip is exact."
+  },
+  {
+    "base": "dcae5aa879ffe746b86288b27cda3b89de428ead",
+    "items": [
+      "crates/gam-terms/tests/suite/probe_2761_penalty_topology.rs:fn:probe_frozen_chart_local_topology_versus_range",
+      "crates/gam-terms/tests/suite/probe_2761_penalty_topology.rs:fn:probe_term_collection_topology_versus_range"
+    ],
+    "reason": "#3884: the print-only probes are replaced by asserting tests (term_collection_penalty_topology_is_invariant_to_the_representer_range, frozen_chart_local_penalty_topology_matches_the_cached_one_at_every_range) that pin the same topology invariants.",
+    "evidence": "The two probe fns only printed penalty counts/ranks and asserted nothing; the replacement tests in the same file assert the invariants each probe printed."
   }
 ]
