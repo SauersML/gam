@@ -2325,7 +2325,7 @@ pub(crate) fn binomial_location_scale_many_smoothing_params_keeps_second_order_o
             )),
             offset: Array1::zeros(n),
             penalties: (0..k)
-                .map(|_| PenaltyMatrix::Dense(identity_penalty(p)))
+                .map(|_| PenaltyMatrix::Dense(Array2::eye(p)))
                 .collect(),
             nullspace_dims: vec![0; k],
             initial_log_lambdas: Array1::zeros(k),
@@ -2372,7 +2372,7 @@ pub(crate) fn binomial_location_scale_term_builder_requires_exact_spatial_joint_
         weights: Array1::from_elem(n, 1.0),
         link_kind: InverseLink::Standard(StandardLink::Probit),
         meanspec: simple_matern_term_collection(&[0, 1], 0.4),
-        noisespec: simple_matern_term_collection(&[0, 1], 0.75),
+        noisespec: binomial_log_sigma_gauge_spec(simple_matern_term_collection(&[0, 1], 0.75)),
         mean_offset: Array1::zeros(n),
         noise_offset: Array1::zeros(n),
     };
@@ -2410,7 +2410,7 @@ pub(crate) fn binomial_location_scale_builder_populateswarm_start_betas() {
         weights,
         link_kind: InverseLink::Standard(StandardLink::Probit),
         meanspec: simple_matern_term_collection(&[0, 1], 0.45),
-        noisespec: simple_matern_term_collection(&[0, 1], 0.8),
+        noisespec: binomial_log_sigma_gauge_spec(simple_matern_term_collection(&[0, 1], 0.8)),
     };
     let mean_design =
         build_term_collection_design(data.view(), builder.meanspec()).expect("mean design");
@@ -2443,7 +2443,7 @@ pub(crate) fn binomial_location_scale_exact_newton_spatial_joint_hyper_returns_f
     let y = Array1::from_iter((0..n).map(|i| if i % 3 == 0 || i % 5 == 0 { 1.0 } else { 0.0 }));
     let weights = Array1::from_elem(n, 1.0);
     let meanspec = simple_matern_term_collection(&[0, 1], 0.45);
-    let noisespec = simple_matern_term_collection(&[0, 1], 0.8);
+    let noisespec = binomial_log_sigma_gauge_spec(simple_matern_term_collection(&[0, 1], 0.8));
     let builder = BinomialLocationScaleTermBuilder {
         mean_offset: Array1::zeros(y.len()),
         noise_offset: Array1::zeros(y.len()),
@@ -3074,6 +3074,9 @@ pub(crate) fn binomial_location_scale_termswith_matern_spatial_blocks_fit_finite
     .expect("binomial location-scale spatial fit");
     assert!(fit.fit.penalized_objective().is_some_and(f64::is_finite));
     assert_eq!(fit.fit.block_states.len(), 2);
+    // An intercept-only log-σ formula carries only the `q = −η_t·e^{−η_σ}`
+    // gauge constant, which the builder removes (#3879): σ ≡ e^{offset}.
+    assert_eq!(fit.fit.block_states[1].beta.len(), 0);
 }
 
 #[test]

@@ -36,6 +36,17 @@ fn normal(state: &mut u64) -> f64 {
 /// Rows of `(y, x1, x2, x3, x4)` with independent standard-normal covariates and
 /// `P(y = 1) = probability(x)`.
 fn table(rows: usize, probability: impl Fn(&[f64]) -> f64) -> gam_data::EncodedDataset {
+    table_with_x4_unit(rows, 1.0, probability)
+}
+
+/// [`table`] with the `x4` column recorded in units `x4_unit` times smaller: the
+/// response is drawn from the standard-normal `x4`, and the column holds
+/// `x4_unit·x4`.
+fn table_with_x4_unit(
+    rows: usize,
+    x4_unit: f64,
+    probability: impl Fn(&[f64]) -> f64,
+) -> gam_data::EncodedDataset {
     let mut state = 3015u64;
     let headers = ["y", "x1", "x2", "x3", "x4"].map(String::from).to_vec();
     let records = (0..rows)
@@ -43,7 +54,10 @@ fn table(rows: usize, probability: impl Fn(&[f64]) -> f64) -> gam_data::EncodedD
             let x: Vec<f64> = (0..4).map(|_| normal(&mut state)).collect();
             let y = if uniform(&mut state) < probability(&x) { 1.0 } else { 0.0 };
             let mut row = vec![format!("{y}")];
-            row.extend(x.iter().map(|v| format!("{v:.17e}")));
+            row.extend(x.iter().enumerate().map(|(j, v)| {
+                let recorded = if j == 3 { x4_unit * v } else { *v };
+                format!("{recorded:.17e}")
+            }));
             csv::StringRecord::from(row)
         })
         .collect();
@@ -118,12 +132,13 @@ fn a_scale_effect_on_a_threshold_column_is_recovered_3015() {
     let log_sigma = unified.beta_log_sigma();
     assert_eq!(
         log_sigma.len(),
-        2,
-        "#3015: the log-σ block carries its intercept and the x3 slope the noise formula names"
+        1,
+        "#3015: the log-σ block carries the x3 slope the noise formula names and no \
+         intercept (σ = 1 at the reference pins the q = −η_t·e^{{−η_σ}} gauge, #3879)"
     );
     let covariance = unified.beta_covariance().expect("posterior covariance");
-    let slope = log_sigma[1];
-    let sd = covariance[[threshold_width + 1, threshold_width + 1]].sqrt();
+    let slope = log_sigma[0];
+    let sd = covariance[[threshold_width, threshold_width]].sqrt();
     assert!(
         sd.is_finite() && sd > 0.0,
         "#3015: the x3 log-σ slope has posterior standard deviation {sd}"
@@ -131,5 +146,70 @@ fn a_scale_effect_on_a_threshold_column_is_recovered_3015() {
     assert!(
         (slope - SLOPE).abs() <= 3.0 * sd && slope > 3.0 * sd,
         "#3015: fitted log-σ slope on x3 {slope} (posterior sd {sd}) against the truth {SLOPE}"
+    );
+}
+
+/// gam#3879: the binomial location-scale fit must not depend on the units of a
+/// log-σ covariate. Recording `x4` as `1000·x4` is an exact reparametrization of the
+/// linear log-σ block (`γ·x4 = (γ/1000)·(1000·x4)`), and the likelihood, the
+/// threshold penalty and the REML criterion (whose log-determinant moves by a
+/// ρ-independent constant) are all invariant under it, so both fits share one optimum:
+/// the slope scales by exactly 1/1000 and every threshold coefficient is unchanged. A
+/// full-span identity ridge on the raw log-σ coefficients charged the same σ(x) as
+/// `λγ²` in one unit and `λ(γ/1000)²` in the other, and so fitted two different
+/// models. The two solves differ only by their convergence tolerances, so they must
+/// agree to a small fraction of each coefficient's own posterior standard deviation:
+/// a difference far below the statistical resolution of the fit.
+#[test]
+fn the_fit_is_invariant_to_the_units_of_a_log_sigma_covariate_3879() {
+    const UNIT: f64 = 1000.0;
+    const SLOPE: f64 = 0.4;
+    let probability = |x: &[f64]| {
+        let threshold = 0.3 - 0.5 * x[0] - x[1].sin();
+        gam_math::probability::normal_cdf(-threshold * (-SLOPE * x[3]).exp())
+    };
+    let native = fit(&table_with_x4_unit(2_000, 1.0, probability), "x4");
+    let scaled = fit(&table_with_x4_unit(2_000, UNIT, probability), "x4");
+
+    let width = native.beta_flat().len();
+    assert_eq!(scaled.beta_flat().len(), width, "#3879: both fits carry the same layout");
+    let threshold_width = native.beta_threshold().len();
+    assert_eq!(
+        native.beta_log_sigma().len(),
+        1,
+        "#3879: the log-σ block is the x4 slope alone, with no gauge intercept"
+    );
+    let native_cov = native.beta_covariance().expect("native posterior covariance");
+    let scaled_cov = scaled.beta_covariance().expect("scaled posterior covariance");
+
+    // Coefficient j of the native chart equals `unit_j` times coefficient j of the
+    // scaled chart: 1 for every threshold coefficient, UNIT for the x4 slope.
+    let native_beta = native.beta_flat();
+    let scaled_beta = scaled.beta_flat();
+    for j in 0..width {
+        let unit = if j < threshold_width { 1.0 } else { UNIT };
+        let sd = native_cov[[j, j]].sqrt();
+        assert!(sd.is_finite() && sd > 0.0, "#3879: coefficient {j} has posterior sd {sd}");
+        let gap = (native_beta[j] - unit * scaled_beta[j]).abs();
+        assert!(
+            gap <= 1e-2 * sd,
+            "#3879: coefficient {j} moved with the units of x4: native {} vs rescaled {} \
+             (gap {gap:.3e}, posterior sd {sd:.3e})",
+            native_beta[j],
+            unit * scaled_beta[j]
+        );
+        let scaled_sd = unit * scaled_cov[[j, j]].sqrt();
+        assert!(
+            (scaled_sd - sd).abs() <= 1e-2 * sd,
+            "#3879: the posterior sd of coefficient {j} moved with the units of x4: \
+             native {sd:.6e} vs rescaled {scaled_sd:.6e}"
+        );
+    }
+    let slope = native.beta_log_sigma()[0];
+    let slope_sd = native_cov[[threshold_width, threshold_width]].sqrt();
+    assert!(
+        (slope - SLOPE).abs() <= 3.0 * slope_sd,
+        "#3879: fitted log-σ slope on x4 {slope} (posterior sd {slope_sd}) against the truth \
+         {SLOPE}"
     );
 }
