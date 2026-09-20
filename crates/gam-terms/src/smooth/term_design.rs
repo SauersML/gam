@@ -3102,16 +3102,46 @@ fn map_identifiability_transform(
             identifiability_transform,
             input_scale,
             aniso_log_scales,
-        } => Ok(BasisMetadata::Matern {
-            centers: centers.clone(),
-            length_scale: *length_scale,
-            periodic: periodic.clone(),
-            nu: *nu,
-            include_intercept: *include_intercept,
-            identifiability_transform: chart(identifiability_transform.as_ref())?,
-            input_scale: *input_scale,
-            aniso_log_scales: aniso_log_scales.clone(),
-        }),
+        } => {
+            // Every consumer of the Matérn chart applies it to the KERNEL
+            // columns only: the design rebuild, the operator-penalty triplet
+            // and predict each form `K·Z` and append the `include_intercept`
+            // constant after it, as `[K·Z | 1]`. A collection transform is
+            // expressed on the realized `[K·Z | 1]` columns, so it composes
+            // with `Z` only when no column is appended. With one appended, no
+            // kernel-only chart reproduces it. The composition then either
+            // fails on shape, or it matches `Z`'s shape when the transform
+            // removes exactly one column, and is silently taken for `Z`. The
+            // penalty is then built one column wider than the design (#3632).
+            //
+            // A centered term always gets such a transform: it centers the
+            // appended constant away against the model's constant. An
+            // uncentered one (`identifiability=none`) gets one only when its
+            // joint penalty has a null space, and the joint-null rotation then
+            // acts on all realized columns. When the penalties jointly have
+            // full rank (the double penalty shrinks the constant), no
+            // transform arrives and `[K·Z | 1]` is realized as is.
+            if *include_intercept && chart(None)?.is_some() {
+                crate::bail_invalid_basis!(
+                    "matern include_intercept=true appends a constant column after the kernel \
+                     chart, but this term collection transforms the term's realized columns: it \
+                     centers the term against the model's constant, or it rotates the term's \
+                     joint penalty null space into the parametric block. The Matérn chart acts \
+                     on the kernel columns alone, so it cannot carry that transform. The \
+                     model's intercept already spans the constant; drop include_intercept=true"
+                );
+            }
+            Ok(BasisMetadata::Matern {
+                centers: centers.clone(),
+                length_scale: *length_scale,
+                periodic: periodic.clone(),
+                nu: *nu,
+                include_intercept: *include_intercept,
+                identifiability_transform: chart(identifiability_transform.as_ref())?,
+                input_scale: *input_scale,
+                aniso_log_scales: aniso_log_scales.clone(),
+            })
+        }
         BasisMetadata::Duchon {
             centers,
             length_scale,

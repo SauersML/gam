@@ -533,7 +533,14 @@ fn format_g(x: f64) -> String {
 /// `amortization_horizon`, `bits_at_r2_{g}` / `code_bits_at_r2_{g}` /
 /// `resid_bits_at_r2_{g}` / `truncation_bits_at_r2_{g}` per target (truncation
 /// bits are the residual-coded atom modes beyond `code_dims`, already inside the
-/// residual bits), and `native_bits_per_token` when given.
+/// residual bits), `intrinsic_atoms` (how many atoms the callback priced by
+/// their chart), and `native_bits_per_token` when given.
+///
+/// `atom_contribution(atom, take)` returns either the `(|take|, d)` float64
+/// contribution matrix (ambient linear code) or a chart mapping `{"code":
+/// (|take|, k), "jacobian": (|take|, d, k), "axes": [...]}` with
+/// `k = code_dims[atom]`, priced by the intrinsic decoder-aware code
+/// (#2933 F17, #3437).
 #[pyfunction]
 #[pyo3(signature = (
     test_x, recon, gate, code_dims, dictionary_params, amortization_horizon,
@@ -564,23 +571,19 @@ fn sae_eq4_description_length<'py>(
     // propagates with its original type instead of being flattened to a
     // ValueError; the closure returns the message the core threads back.
     let callback_err: std::cell::RefCell<Option<PyErr>> = std::cell::RefCell::new(None);
-    let fetch = |atom: usize, take: &[usize]| -> Result<Array2<f64>, String> {
+    let fetch = |atom: usize, take: &[usize]| -> Result<AtomFiringCode, String> {
+        let keep = |e: PyErr| {
+            let message = e.to_string();
+            *callback_err.borrow_mut() = Some(e);
+            message
+        };
         let take_arr = take
             .iter()
             .map(|&i| i as i64)
             .collect::<Vec<i64>>()
             .into_pyarray(py);
-        let result = atom_contribution.call1((atom, take_arr)).map_err(|e| {
-            let message = e.to_string();
-            *callback_err.borrow_mut() = Some(e);
-            message
-        })?;
-        let array = result.extract::<PyReadonlyArray2<f64>>().map_err(|e| {
-            let message = format!("atom {atom} contribution must be a float64 matrix: {e}");
-            *callback_err.borrow_mut() = Some(PyErr::from(e));
-            message
-        })?;
-        Ok(array.as_array().to_owned())
+        let result = atom_contribution.call1((atom, take_arr)).map_err(keep)?;
+        eq4_atom_firing_code(atom, &result).map_err(keep)
     };
 
     let dl = gam::terms::sae::eq4_description_length::eq4_fixed_distortion_description_length(
@@ -618,8 +621,84 @@ fn sae_eq4_description_length<'py>(
     if let Some(native) = dl.native_bits_per_token {
         out.set_item("native_bits_per_token", native)?;
     }
+    out.set_item("intrinsic_atoms", dl.intrinsic_atoms)?;
     out.set_item("score_kind", dl.score_kind.as_str())?;
     Ok(out.into())
+}
+
+use gam::terms::sae::eq4_description_length::{AtomChart, AtomFiringCode, ChartAxis};
+
+/// Read one `atom_contribution` callback return: a float64 `(rows, d)`
+/// contribution matrix (the ambient code) or a chart mapping with `code`
+/// `(rows, k)`, `jacobian` `(rows, d, k)` and `axes` (one per chart coordinate:
+/// `"euclidean"`, `"amplitude"`, or a float period for a circle coordinate),
+/// priced by the intrinsic decoder-aware code (#3437).
+fn eq4_atom_firing_code<'py>(atom: usize, value: &Bound<'py, PyAny>) -> PyResult<AtomFiringCode> {
+    let Ok(chart) = value.cast::<PyDict>() else {
+        let contribution = value.extract::<PyReadonlyArray2<f64>>().map_err(|e| {
+            PyTypeError::new_err(format!(
+                "atom {atom} contribution must be a float64 (rows, d) matrix or a chart \
+                 mapping with code / jacobian / axes: {}",
+                PyErr::from(e)
+            ))
+        })?;
+        return Ok(AtomFiringCode::Ambient(contribution.as_array().to_owned()));
+    };
+    let entry = |name: &str| -> PyResult<Bound<'py, PyAny>> {
+        chart.get_item(name)?.ok_or_else(|| {
+            PyValueError::new_err(format!("atom {atom} chart mapping is missing `{name}`"))
+        })
+    };
+    let code = entry("code")?
+        .extract::<PyReadonlyArray2<f64>>()
+        .map_err(|e| {
+            PyTypeError::new_err(format!(
+                "atom {atom} chart `code` must be a float64 (rows, k) matrix: {}",
+                PyErr::from(e)
+            ))
+        })?
+        .as_array()
+        .to_owned();
+    let jacobian = entry("jacobian")?
+        .extract::<PyReadonlyArray3<f64>>()
+        .map_err(|e| {
+            PyTypeError::new_err(format!(
+                "atom {atom} chart `jacobian` must be a float64 (rows, d, k) array: {}",
+                PyErr::from(e)
+            ))
+        })?
+        .as_array()
+        .to_owned();
+    let mut axes = Vec::new();
+    for item in entry("axes")?.try_iter()? {
+        let item = item?;
+        let axis = match item.extract::<String>() {
+            Ok(tag) => match tag.as_str() {
+                "euclidean" => ChartAxis::Euclidean,
+                "amplitude" => ChartAxis::Amplitude,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "atom {atom} chart axis {other:?} is not \"euclidean\", \"amplitude\" \
+                         or a float period"
+                    )));
+                }
+            },
+            Err(_) => ChartAxis::Periodic {
+                period: item.extract::<f64>().map_err(|_| {
+                    PyTypeError::new_err(format!(
+                        "atom {atom} chart axes must be \"euclidean\", \"amplitude\" or a \
+                         float period"
+                    ))
+                })?,
+            },
+        };
+        axes.push(axis);
+    }
+    Ok(AtomFiringCode::Intrinsic(AtomChart {
+        code,
+        jacobian,
+        axes,
+    }))
 }
 
 #[pyfunction]
@@ -1423,7 +1502,6 @@ fn sinkhorn_barycenter_forward<'py>(
     weights: PyReadonlyArray1<'py, f64>,
     cost: PyReadonlyArray2<'py, f64>,
     eps: f64,
-    n_iter: usize,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let atoms_owned = atoms.as_array().to_owned();
     let weights_owned = weights.as_array().to_owned();
@@ -1434,7 +1512,6 @@ fn sinkhorn_barycenter_forward<'py>(
             weights_owned.view(),
             cost_owned.view(),
             eps,
-            n_iter,
         )
     })?;
     Ok(out.into_pyarray(py).unbind())
@@ -1447,7 +1524,6 @@ fn sinkhorn_barycenter_vjp<'py>(
     weights: PyReadonlyArray1<'py, f64>,
     cost: PyReadonlyArray2<'py, f64>,
     eps: f64,
-    n_iter: usize,
     cotangent: PyReadonlyArray1<'py, f64>,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray1<f64>>)> {
     let atoms_owned = atoms.as_array().to_owned();
@@ -1460,7 +1536,6 @@ fn sinkhorn_barycenter_vjp<'py>(
             weights_owned.view(),
             cost_owned.view(),
             eps,
-            n_iter,
             cot_owned.view(),
         )
     })?;
@@ -4631,13 +4706,12 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(flat_to_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(extract_row_ids, module)?)?;
-    module.add_function(wrap_pyfunction!(default_survival_time_grid, module)?)?;
     module.add_function(wrap_pyfunction!(torch_from_fitted, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
     module.add_class::<PyFittedModel>()?;
     module.add_function(wrap_pyfunction!(compile_model, module)?)?;
-    module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
+    module.add_function(wrap_pyfunction!(evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_kind, module)?)?;
     module.add_function(wrap_pyfunction!(write_saved_model_file, module)?)?;
@@ -4721,6 +4795,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(duchon_function_norm_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_operator_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis, module)?)?;
+    module.add_function(wrap_pyfunction!(sphere_basis_size, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis_with_centers, module)?)?;
     module.add_function(wrap_pyfunction!(
         sphere_select_farthest_point_centers,
@@ -4928,7 +5003,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_bands_table, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_draw_bands, module)?)?;
-    module.add_function(wrap_pyfunction!(posterior_eta_bands, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_credible_interval, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_coefficient_names_json, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_trace_selection_json, module)?)?;
@@ -4974,10 +5048,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_concordance, module)?)?;
     module.add_function(wrap_pyfunction!(survival_score_grid_from_times, module)?)?;
     module.add_function(wrap_pyfunction!(survival_null_curve_from_train, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        survival_matrix_from_risk_calibration,
-        module
-    )?)?;
     module.add_function(wrap_pyfunction!(
         survival_lifted_metrics_from_predictions,
         module
@@ -5549,20 +5619,38 @@ fn linear_dictionary_error_to_pyerr(py: Python<'_>, error: LinearDictionaryError
 }
 
 /// Out-of-sample encode: route held-out rows `x` (`M x P`) through a fitted
-/// linear dictionary `atoms` (`K x P`) via the Rust top-`top_k` ridge solve,
-/// returning the `(M, K)` code matrix.
-#[pyfunction(signature = (x, atoms, top_k, code_ridge = 1.0e-8))]
+/// linear dictionary `atoms` (`K x P`) with the fitted model's assignment rule
+/// (`"top_k"` ridge solve or `"softmax"` at `temperature`), returning the
+/// `(M, K)` code matrix.
+#[pyfunction(signature = (
+    x,
+    atoms,
+    top_k,
+    code_ridge = 1.0e-8,
+    assignment = "top_k",
+    temperature = 0.25
+))]
 fn linear_dictionary_transform_ffi<'py>(
     py: Python<'py>,
     x: PyReadonlyArray2<'py, f64>,
     atoms: PyReadonlyArray2<'py, f64>,
     top_k: usize,
     code_ridge: f64,
+    assignment: &str,
+    temperature: f64,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let x_values = x.as_array().to_owned();
     let atoms_values = atoms.as_array().to_owned();
+    let assignment_kind = LinearDictionaryAssignment::parse(assignment).map_err(py_value_error)?;
     let codes = detach_py_result(py, "linear_dictionary_transform", move || {
-        linear_dictionary_transform(x_values.view(), atoms_values.view(), top_k, code_ridge)
+        linear_dictionary_transform(
+            x_values.view(),
+            atoms_values.view(),
+            top_k,
+            assignment_kind,
+            temperature,
+            code_ridge,
+        )
     })?;
     Ok(codes.into_pyarray(py).unbind())
 }

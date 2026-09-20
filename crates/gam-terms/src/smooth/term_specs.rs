@@ -2498,6 +2498,31 @@ impl TermCollectionDesign {
         Ok(self.design.apply(&beta.to_owned()) + &self.affine_offset)
     }
 
+    /// The linear terms whose coefficient carries the REML-selected
+    /// `LinearTermRidge` (`double_penalty=true`), as `(name, block-local range)`
+    /// entries of `linear_ranges`.
+    ///
+    /// Read off the recorded `penaltyinfo` — the block this build actually
+    /// emitted, whose `original_index` is the term's position in
+    /// `linear_ranges` — rather than re-derived from the spec. A ridged slope
+    /// is a variance component with its null on the boundary, so its
+    /// significance is the variance-component score test
+    /// (`inference::random_effect_test`), never a Wald ratio of the shrunk
+    /// estimate.
+    pub fn ridged_linear_ranges(&self) -> Vec<(String, Range<usize>)> {
+        self.penaltyinfo
+            .iter()
+            .filter(|info| {
+                matches!(
+                    &info.penalty.source,
+                    crate::basis::PenaltySource::Other(source) if source == "LinearTermRidge"
+                )
+            })
+            .filter_map(|info| self.linear_ranges.get(info.penalty.original_index))
+            .cloned()
+            .collect()
+    }
+
     /// Number of global penalty blocks that precede the smooth-term penalty
     /// blocks in the flat smoothing-parameter / EDF-trace layout.
     ///
@@ -7007,6 +7032,8 @@ fn pca_function_mass_penalty(
     mut raw_score_gram: Array2<f64>,
     n_rows: usize,
 ) -> Result<Array2<f64>, BasisError> {
+    use gam_linalg::faer_ndarray::FaerEigh;
+
     let k = raw_score_gram.ncols();
     if raw_score_gram.nrows() != k {
         crate::bail_dim_basis!(
@@ -7032,22 +7059,41 @@ fn pca_function_mass_penalty(
         crate::bail_invalid_basis!("Pca score design produced a non-finite function Gram");
     }
 
-    // Use the same design-rank convention as the global identifiability audit.
-    // `rrqr_from_gram_with_permutation` recovers the column-pivoted QR verdict
-    // from Z^T Z while retaining the tall design's row-count-aware tolerance.
-    let rrqr = gam_linalg::faer_ndarray::rrqr_from_gram_with_permutation(
-        &raw_score_gram,
-        n_rows,
-        gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
-    )
-    .map_err(BasisError::LinalgError)?;
-    if rrqr.rank != k {
-        let redundant_columns = &rrqr.column_permutation[rrqr.rank..];
+    // Rank of the realized score design, read off the Gram's spectrum against
+    // the Gram's own resolution. `G = ZᵀZ` is accumulated over `n_rows` rows,
+    // each entry product rounding at most twice (the streamed operator forms
+    // `x·w·x`), so its formation error is bounded in spectral norm by
+    // `γ_{n+1}·tr G` ([`gam_linalg::roundoff::weighted_gram_assembly_band`]);
+    // the eigensolver adds its own `k·ε·λ_max`. An eigenvalue inside that band
+    // is not resolved from zero: an exactly dependent score column lands there.
+    //
+    // The pivot magnitudes of a column-pivoted QR run on the Gram's eigen square
+    // root cannot make this call. Squaring floors a true zero singular value at
+    // the Gram's rounding, `≈ ε·σ_max²`, and the square root resurrects it as a
+    // pivot of order `√ε·σ_max`, far above that QR's `O(n·ε)·|R₀₀|` cutoff, so a
+    // duplicated component would pass as full rank whenever its computed
+    // eigenvalue rounded positive.
+    let (eigenvalues, _) = FaerEigh::eigh(&raw_score_gram, faer::Side::Lower)
+        .map_err(BasisError::LinalgError)?;
+    let eigenvalues = eigenvalues.to_vec();
+    let trace: f64 = raw_score_gram.diag().iter().sum();
+    let formation_band = gam_linalg::roundoff::weighted_gram_assembly_band(n_rows, 2, trace);
+    let rank = gam_linalg::roundoff::resolved_eigenvalue_count(&eigenvalues, formation_band);
+    if rank != k {
+        // Name the columns the pivoted order places last: the pivot sequence
+        // depends only on the column geometry, never on a rank cutoff.
+        let pivoted = gam_linalg::faer_ndarray::rrqr_from_gram_with_permutation(
+            &raw_score_gram,
+            n_rows,
+            gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
+        )
+        .map_err(BasisError::LinalgError)?;
+        let redundant_columns = &pivoted.column_permutation[rank..];
         crate::bail_invalid_basis!(
-            "Pca score design is rank deficient under canonical RRQR: rank {} < {} (tolerance {:.6e}); redundant score columns {:?}; remove zero or dependent components instead of stabilizing them with a coefficient ridge",
-            rrqr.rank,
+            "Pca score design is rank deficient: rank {} < {} (score Gram eigenvalues at or below the resolution band {:.6e}); redundant score columns {:?}; remove zero or dependent components instead of stabilizing them with a coefficient ridge",
+            rank,
             k,
-            rrqr.rank_tol,
+            gam_linalg::roundoff::resolved_eigenvalue_band(&eigenvalues, formation_band),
             redundant_columns
         );
     }
@@ -8281,22 +8327,42 @@ pub(crate) fn build_single_local_smooth_term_for(
                     term.name
                 );
             }
-            // Split the marginal penalty's null space into its function
-            // components BEFORE the penalty vector is rebuilt below; the
-            // sum-to-zero null-space ridges replicate these into the contrast
-            // space.
+            // The marginal's `double_penalty=` decides whether the deviation
+            // null space is penalized, and that null penalty has exactly ONE
+            // representation here: the pooled `(I + 11ᵀ) ⊗ R_k` ridges below
+            // (#3969). The marginal's own null-space ridge `R` is therefore
+            // never replicated per level. Its function components satisfy
+            // `Σ_k R_k = R` and the per-level structures `E_k` satisfy
+            // `Σ_k E_k = I + 11ᵀ`, so carrying both `E_k ⊗ R` and
+            // `(I + 11ᵀ) ⊗ R_k` would make the total null penalty
+            // `Σ_{k,j} (μ_k + ν_j) E_k ⊗ R_j`, whose smoothing parameters
+            // cannot be identified (`μ_k += c`, `ν_j -= c` leaves it unchanged).
+            let null_space_penalized = inner_built
+                .active_penalties
+                .iter()
+                .any(|penalty| {
+                    matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace)
+                });
+            // Split the marginal curvature penalty's null space into its
+            // function components BEFORE the penalty vector is rebuilt below;
+            // the sum-to-zero null-space ridges replicate these into the
+            // contrast space.
             let inner_degree = match inner.as_ref() {
                 SmoothBasisSpec::BSpline1D { spec, .. } => Some(spec.degree),
                 _ => None,
             };
-            let inner_null_components = match inner_built.active_penalties.first() {
-                Some(penalty) => factor_smooth_null_component_penalties(
+            let inner_primary = inner_built
+                .active_penalties
+                .iter()
+                .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary));
+            let inner_null_components = match (null_space_penalized, inner_primary) {
+                (true, Some(penalty)) => factor_smooth_null_component_penalties(
                     &penalty.matrix,
                     &inner_built.metadata,
                     inner_degree,
                     &term.name,
                 )?,
-                None => Vec::new(),
+                _ => Vec::new(),
             };
             let base = inner_built
                 .design
@@ -8395,8 +8461,15 @@ pub(crate) fn build_single_local_smooth_term_for(
                     }
                     s_big
                 };
-            for base_penalty in &inner_built.active_penalties {
-                // Emit `L` independent per-level blocks for this marginal penalty.
+            let curvature_penalties = inner_built
+                .active_penalties
+                .iter()
+                .filter(|penalty| {
+                    !matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace)
+                });
+            for base_penalty in curvature_penalties {
+                // Emit `L` independent per-level blocks for this marginal
+                // curvature penalty (the null-space ridge is pooled below).
                 for which_level in 0..=l_minus_one {
                     let raw = stz_per_group_penalty(&base_penalty.matrix, which_level);
                     let (s_big, group_scale) = normalize_penalty_in_constrained_space(&raw)?;
@@ -8427,7 +8500,10 @@ pub(crate) fn build_single_local_smooth_term_for(
             // contrast space, so the constraint (and the identifiability of `sz`
             // vs `fs`) is preserved. The split is made with the marginal's
             // function metric, so which deviations each `λ` shrinks does not
-            // depend on the coefficient chart (SPEC rule 5).
+            // depend on the coefficient chart (SPEC rule 5). The components are
+            // empty unless the marginal requests its null-space penalty
+            // (`double_penalty=`, on by default), so `double_penalty=false`
+            // really leaves the deviation null space unpenalized.
             for p_k in &inner_null_components {
                 // Null ridges stay POOLED (the `(I + 11ᵀ) ⊗ R_k` form): each is
                 // one shared variance for that null component of every level's

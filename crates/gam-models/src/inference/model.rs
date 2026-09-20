@@ -12,7 +12,7 @@ use crate::wiggle::{
     WigglePenaltyMetadata, canonical_wiggle_function_penalties,
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
-use gam_linalg::faer_ndarray::{FaerCholesky, array2_to_nested_vec};
+use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::matrix::DesignMatrix;
 use gam_problem::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily, SasLinkSpec,
@@ -158,14 +158,20 @@ use std::path::Path;
 // whose decision is now the null tail against its design rate instead of the sign of
 // `D̂`. All three carry serde defaults, so a v33 or older payload loads with none
 // recorded, its decision as it was made; a v33 binary refuses a v34 payload by version.
-// v35 freezes a gauged smooth's term-local chart and its joint-null rotation `Q` apart, and
+// v35 carries the constant variance stage in the latent-Z calibration's first-stage
+// covariance (`theta1_cov`, gam#3030): a fit whose variance stage does not fire now
+// records the `(p+2)²` joint covariance, with the variance row and column, where v34
+// recorded `(p+1)²`. A v34 payload still loads and predicts; its generated-regressor
+// correction refuses the narrower covariance by name, so no interval is published
+// without the stage.
+// v36 freezes a gauged smooth's term-local chart and its joint-null rotation `Q` apart, and
 // records the collection chart `T` on the term's parametric residualization chart
 // (`ParametricResidualizationChart::coefficient_transform`, #3001), so the replay forms
 // `((B·z_local)·Q)·T − C·R` in the fit's own order instead of `B·(z_local·Q·T) − C·R`, which
 // moved μ by up to 2 ulp. An older payload froze the composed chart and no `T`, so it cannot
-// be replayed in that order: every older version is refused by name, and a v34 binary refuses
-// a v35 payload by version.
-pub const MODEL_PAYLOAD_VERSION: u32 = 35;
+// be replayed in that order: every older version is refused by name, and a v35 binary refuses
+// a v36 payload by version.
+pub const MODEL_PAYLOAD_VERSION: u32 = 36;
 
 /// Every payload version this binary reads. Each older schema froze a gauged smooth's
 /// composed chart without the collection chart `T` its replay now applies (#3001), so a
@@ -608,15 +614,9 @@ pub struct FittedModelPayload {
     pub data_schema: Option<DataSchema>,
     pub link: Option<InverseLink>,
     #[serde(default)]
-    pub mixture_link_param_covariance: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
-    pub sas_param_covariance: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
     pub formula_noise: Option<String>,
     #[serde(default)]
     pub slope_formula: Option<String>,
-    #[serde(default)]
-    pub slope_formulas: Option<Vec<String>>,
     #[serde(default)]
     pub offset_column: Option<String>,
     #[serde(default)]
@@ -627,8 +627,6 @@ pub struct FittedModelPayload {
     /// `sigma_i = sigma_hat / sqrt(w_i)` (#2025). `None` for an unweighted fit.
     #[serde(default)]
     pub weight_column: Option<String>,
-    #[serde(default)]
-    pub beta_noise: Option<Vec<f64>>,
     #[serde(default)]
     pub noise_projection: Option<Vec<Vec<f64>>>,
     #[serde(default)]
@@ -689,8 +687,6 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub latent_z_normalization: Option<SavedLatentZNormalization>,
     #[serde(default)]
-    pub latent_score_contract: Option<SavedLatentScoreContract>,
-    #[serde(default)]
     pub latent_measure: Option<LatentMeasureKind>,
     /// The declared atoms of a survival marginal-slope fit anchored on the
     /// certified compression of its declared law (gam#2928). `latent_measure`
@@ -738,8 +734,6 @@ pub struct FittedModelPayload {
     pub marginal_baseline: Option<f64>,
     #[serde(default)]
     pub baseline_slope: Option<f64>,
-    #[serde(default)]
-    pub baseline_slopes: Option<Vec<f64>>,
     /// Resolved follow-up time margin of the survival marginal-slope slope
     /// block (gam#2765, gam#2767). `None` is the time-constant slope every model
     /// saved before this existed carries.
@@ -1042,16 +1036,6 @@ pub fn append_deployment_extension_columns(
     Ok(out)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SavedLatentScoreContract {
-    pub semantics: String,
-    pub source_transform_id: Option<String>,
-    pub normalization_mean: f64,
-    pub normalization_sd: f64,
-    pub clip_eps: Option<f64>,
-    pub conditioning_columns: Vec<String>,
-}
-
 impl FittedModelPayload {
     pub fn new(
         version: u32,
@@ -1078,15 +1062,11 @@ impl FittedModelPayload {
             residual_cascade: None,
             data_schema: None,
             link: None,
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
             formula_noise: None,
             slope_formula: None,
-            slope_formulas: None,
             offset_column: None,
             noise_offset_column: None,
             weight_column: None,
-            beta_noise: None,
             noise_projection: None,
             noise_center: None,
             noise_scale: None,
@@ -1108,7 +1088,6 @@ impl FittedModelPayload {
             z_column: None,
             z_columns: None,
             latent_z_normalization: None,
-            latent_score_contract: None,
             latent_measure: None,
             declared_latent_law: None,
             declared_latent_law_compression: None,
@@ -1118,7 +1097,6 @@ impl FittedModelPayload {
             latent_law_consumed: None,
             marginal_baseline: None,
             baseline_slope: None,
-            baseline_slopes: None,
             slope_time_basis: None,
             score_warp_runtime: None,
             link_deviation_runtime: None,
@@ -3047,6 +3025,60 @@ fn re_factor_smooth_group_col(basis: &gam_terms::smooth::SmoothBasisSpec) -> Opt
     }
 }
 
+/// Collect the factor columns a smooth basis estimates a per-level CURVE for:
+/// a factor `by=` level smooth (`s(x, by=g)`, stored as one `ByVariable`
+/// `Level` term per level, or as a `BySmooth` `Factor`), a sum-to-zero factor
+/// smooth, and the `fs`/`sz` factor smooths. None of them has a population
+/// curve that an unseen level could fall back to. The `by=` level gate reads
+/// an out-of-vocabulary code as "no level matches", so the row's curve would be
+/// silently zero; the `fs`/`sz` operators refuse such a row. Either way the
+/// held-out-group policy does not apply to the column, even when a
+/// `group(g)` on the same column is itself a genuine random effect
+/// (see [`FittedModel::random_effect_group_columns`]).
+fn collect_per_level_curve_group_cols(
+    basis: &gam_terms::smooth::SmoothBasisSpec,
+    out: &mut HashSet<usize>,
+) {
+    use gam_terms::smooth::{ByVarKind, ByVariableSpec, FactorSmoothFlavour, SmoothBasisSpec};
+    match basis {
+        SmoothBasisSpec::ByVariable {
+            inner, by_col, by, ..
+        } => {
+            if matches!(by, ByVariableSpec::Level { .. }) {
+                out.insert(*by_col);
+            }
+            collect_per_level_curve_group_cols(inner, out);
+        }
+        SmoothBasisSpec::FactorSumToZero { inner, by_col, .. } => {
+            out.insert(*by_col);
+            collect_per_level_curve_group_cols(inner, out);
+        }
+        SmoothBasisSpec::BySmooth { smooth, by_kind } => {
+            if let ByVarKind::Factor { feature_col, .. } = by_kind {
+                out.insert(*feature_col);
+            }
+            collect_per_level_curve_group_cols(smooth, out);
+        }
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            if !matches!(spec.flavour, FactorSmoothFlavour::Re) {
+                out.insert(spec.group_col);
+            }
+        }
+        // Leaf bases read no grouping column. Enumerated rather than
+        // wildcarded so a newly added per-level basis breaks this match
+        // instead of silently inheriting the lenient held-out-group policy.
+        SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::ThinPlate { .. }
+        | SmoothBasisSpec::Sphere { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Matern { .. }
+        | SmoothBasisSpec::MeasureJet { .. }
+        | SmoothBasisSpec::Duchon { .. }
+        | SmoothBasisSpec::Pca { .. }
+        | SmoothBasisSpec::TensorBSpline { .. } => {}
+    }
+}
+
 /// Recursively collect the feature columns of a smooth basis whose out-of-hull
 /// evaluation is bounded, so they can be exempted from the predict-time axis
 /// clip (see [`FittedModel::training_smooth_extrapolation_axes`]). Wrapper bases
@@ -3175,6 +3207,116 @@ fn collect_by_variable_numeric_axes(
         | SmoothBasisSpec::Duchon { .. }
         | SmoothBasisSpec::Pca { .. }
         | SmoothBasisSpec::TensorBSpline { .. } => {}
+    }
+}
+
+/// Recursively collect the periodic feature columns of a smooth basis — sphere
+/// longitude, a periodic 1D B-spline axis, periodic tensor-B-spline margins —
+/// so they can be exempted from the predict-time axis clip (see
+/// [`FittedModel::training_periodic_axes`]). Wrapper bases (`by=`,
+/// sum-to-zero) delegate to the inner smooth they modulate / replicate: the
+/// wrapper changes how the inner design is gated or scaled, never the
+/// coordinate the inner basis is evaluated at, so a periodic axis stays
+/// periodic when wrapped. Returned indices reference the training headers.
+fn collect_periodic_axes(
+    basis: &gam_terms::smooth::SmoothBasisSpec,
+    n_training_headers: usize,
+    out: &mut std::collections::HashSet<usize>,
+) {
+    use gam_terms::basis::BSplineKnotSpec;
+    use gam_terms::smooth::SmoothBasisSpec;
+    match basis {
+        // Sphere terms: longitude (second feature col) is always periodic and
+        // exempt from clipping. Latitude is not periodic but is a
+        // closed-manifold coordinate, so it is clipped to the manifold's
+        // intrinsic bounds rather than the sampled range — see
+        // `collect_sphere_latitude_bounds`.
+        SmoothBasisSpec::Sphere { feature_cols, .. } => {
+            if let Some(&lon_col) = feature_cols.get(1)
+                && lon_col < n_training_headers
+            {
+                out.insert(lon_col);
+            }
+        }
+        // 1D periodic B-spline: the single feature column is periodic.
+        SmoothBasisSpec::BSpline1D { feature_col, spec } => {
+            if matches!(spec.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
+                && *feature_col < n_training_headers
+            {
+                out.insert(*feature_col);
+            }
+        }
+        // Tensor B-spline: each axis whose marginal knotspec is
+        // PeriodicUniform is periodic; mark those columns.
+        SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
+            for (i, marginal) in spec.marginalspecs.iter().enumerate() {
+                if matches!(marginal.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
+                    && let Some(&col) = feature_cols.get(i)
+                    && col < n_training_headers
+                {
+                    out.insert(col);
+                }
+            }
+        }
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            collect_periodic_axes(inner, n_training_headers, out)
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            collect_periodic_axes(smooth, n_training_headers, out)
+        }
+        // Leaf bases with no wrap-around coordinate. Enumerated rather than
+        // wildcarded so a newly added periodic basis breaks this match instead
+        // of silently having its axis clipped.
+        SmoothBasisSpec::FactorSmooth { .. }
+        | SmoothBasisSpec::ThinPlate { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Matern { .. }
+        | SmoothBasisSpec::MeasureJet { .. }
+        | SmoothBasisSpec::Duchon { .. }
+        | SmoothBasisSpec::Pca { .. } => {}
+    }
+}
+
+/// Recursively collect the manifold-intrinsic clip bounds of every sphere
+/// latitude column in a smooth basis (see
+/// [`FittedModel::training_sphere_latitude_bounds`]), descending through
+/// `by=` / sum-to-zero wrappers exactly as [`collect_periodic_axes`] does.
+fn collect_sphere_latitude_bounds(
+    basis: &gam_terms::smooth::SmoothBasisSpec,
+    n_training_headers: usize,
+    out: &mut std::collections::HashMap<usize, (f64, f64)>,
+) {
+    use gam_terms::smooth::SmoothBasisSpec;
+    match basis {
+        SmoothBasisSpec::Sphere { feature_cols, spec } => {
+            if let Some(&lat_col) = feature_cols.first()
+                && lat_col < n_training_headers
+            {
+                let bound = if spec.radians {
+                    std::f64::consts::FRAC_PI_2
+                } else {
+                    90.0
+                };
+                out.insert(lat_col, (-bound, bound));
+            }
+        }
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            collect_sphere_latitude_bounds(inner, n_training_headers, out)
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            collect_sphere_latitude_bounds(smooth, n_training_headers, out)
+        }
+        SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::TensorBSpline { .. }
+        | SmoothBasisSpec::FactorSmooth { .. }
+        | SmoothBasisSpec::ThinPlate { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Matern { .. }
+        | SmoothBasisSpec::MeasureJet { .. }
+        | SmoothBasisSpec::Duchon { .. }
+        | SmoothBasisSpec::Pca { .. } => {}
     }
 }
 
@@ -3316,71 +3458,20 @@ impl FittedModel {
     /// Collect the set of training-column indices that are periodic axes —
     /// i.e. features for which a periodic basis (sphere longitude, periodic
     /// B-spline 1D, periodic tensor margin) must be allowed to take any
-    /// real value at predict time and not be clamped to the training range.
-    /// Returned indices reference `self.training_headers` (training-time
-    /// layout), matching the iteration in `axis_clip_to_training_ranges`.
+    /// real value at predict time and not be clamped to the training range —
+    /// on *any* modelled surface (mean, noise/scale, slope), including a
+    /// periodic basis nested inside a `by=` / sum-to-zero wrapper (see
+    /// [`collect_periodic_axes`]). Returned indices reference
+    /// `self.training_headers` (training-time layout), matching the iteration
+    /// in `axis_clip_to_training_ranges`.
     fn training_periodic_axes(
         &self,
         training_headers: &[String],
     ) -> std::collections::HashSet<usize> {
-        use gam_terms::basis::BSplineKnotSpec;
-        use gam_terms::smooth::SmoothBasisSpec;
         let mut out: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let Some(spec) = self.resolved_termspec.as_ref() else {
-            return out;
-        };
-        for term in &spec.smooth_terms {
-            match &term.basis {
-                // Sphere terms: longitude (second feature col) is always
-                // periodic and exempt from clipping. Latitude is not periodic
-                // but is a closed-manifold coordinate, so it is clipped to the
-                // manifold's intrinsic bounds rather than the sampled range —
-                // see `training_sphere_latitude_bounds`.
-                SmoothBasisSpec::Sphere { feature_cols, .. } => {
-                    if let Some(&lon_col) = feature_cols.get(1)
-                        && lon_col < training_headers.len()
-                    {
-                        out.insert(lon_col);
-                    }
-                }
-                // 1D periodic B-spline: the single feature column is periodic.
-                SmoothBasisSpec::BSpline1D { feature_col, spec } => {
-                    if matches!(spec.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
-                        && *feature_col < training_headers.len()
-                    {
-                        out.insert(*feature_col);
-                    }
-                }
-                // Tensor B-spline: each axis whose marginal knotspec is
-                // PeriodicUniform is periodic; mark those columns.
-                SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
-                    for (i, marginal) in spec.marginalspecs.iter().enumerate() {
-                        if matches!(marginal.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
-                            && let Some(&col) = feature_cols.get(i)
-                            && col < training_headers.len()
-                        {
-                            out.insert(col);
-                        }
-                    }
-                }
-                // No periodic axis is exempted for these. The leaf bases have
-                // no wrap-around coordinate at all; the three wrappers
-                // (`ByVariable`, `BySmooth`, `FactorSumToZero`) are matched at
-                // top level only and are deliberately not descended into here,
-                // so a periodic marginal nested inside one stays subject to the
-                // training-range clip. Enumerated rather than wildcarded so a
-                // newly added periodic basis breaks this match instead of
-                // silently having its axis clipped.
-                SmoothBasisSpec::ByVariable { .. }
-                | SmoothBasisSpec::BySmooth { .. }
-                | SmoothBasisSpec::FactorSumToZero { .. }
-                | SmoothBasisSpec::FactorSmooth { .. }
-                | SmoothBasisSpec::ThinPlate { .. }
-                | SmoothBasisSpec::ConstantCurvature { .. }
-                | SmoothBasisSpec::Matern { .. }
-                | SmoothBasisSpec::MeasureJet { .. }
-                | SmoothBasisSpec::Duchon { .. }
-                | SmoothBasisSpec::Pca { .. } => {}
+        for spec in self.saved_term_specs() {
+            for term in &spec.smooth_terms {
+                collect_periodic_axes(&term.basis, training_headers.len(), &mut out);
             }
         }
         out
@@ -3511,30 +3602,20 @@ impl FittedModel {
     /// (single-valued in longitude) while still mapping any out-of-domain
     /// latitude onto the manifold boundary. Longitude needs no entry here: it
     /// is periodic and already exempted from clipping entirely
-    /// (`training_periodic_axes`). Returned indices reference
-    /// `self.training_headers`, matching the iteration in
-    /// `axis_clip_to_training_ranges`.
+    /// (`training_periodic_axes`). Like the periodic set, this covers a sphere
+    /// on *any* modelled surface (mean, noise/scale, slope) and a sphere nested
+    /// inside a `by=` / sum-to-zero wrapper (see [`collect_sphere_latitude_bounds`]).
+    /// Returned indices reference `self.training_headers`, matching the
+    /// iteration in `axis_clip_to_training_ranges`.
     fn training_sphere_latitude_bounds(
         &self,
         training_headers: &[String],
     ) -> std::collections::HashMap<usize, (f64, f64)> {
-        use gam_terms::smooth::SmoothBasisSpec;
         let mut out: std::collections::HashMap<usize, (f64, f64)> =
             std::collections::HashMap::new();
-        let Some(spec) = self.resolved_termspec.as_ref() else {
-            return out;
-        };
-        for term in &spec.smooth_terms {
-            if let SmoothBasisSpec::Sphere { feature_cols, spec } = &term.basis
-                && let Some(&lat_col) = feature_cols.first()
-                && lat_col < training_headers.len()
-            {
-                let bound = if spec.radians {
-                    std::f64::consts::FRAC_PI_2
-                } else {
-                    90.0
-                };
-                out.insert(lat_col, (-bound, bound));
+        for spec in self.saved_term_specs() {
+            for term in &spec.smooth_terms {
+                collect_sphere_latitude_bounds(&term.basis, training_headers.len(), &mut out);
             }
         }
         out
@@ -3674,10 +3755,11 @@ impl FittedModel {
                     );
                 }
             }
-            FittedLinkState::Sas { state, covariance } => {
+            // The link-parameter covariance stays on `fit_result.fitted_link`,
+            // its single serialized home; only the point state has a family slot.
+            FittedLinkState::Sas { state, .. } => {
                 if likelihood.is_binomial_sas() {
                     *sas_state = Some(*state);
-                    payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
                 } else {
                     log::debug!(
                         "fitted SAS link state discarded: likelihood {likelihood:?} is not \
@@ -3685,10 +3767,9 @@ impl FittedModel {
                     );
                 }
             }
-            FittedLinkState::BetaLogistic { state, covariance } => {
+            FittedLinkState::BetaLogistic { state, .. } => {
                 if likelihood.is_binomial_beta_logistic() {
                     *sas_state = Some(*state);
-                    payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
                 } else {
                     log::debug!(
                         "fitted beta-logistic link state discarded: likelihood {likelihood:?} is \
@@ -3696,11 +3777,9 @@ impl FittedModel {
                     );
                 }
             }
-            FittedLinkState::Mixture { state, covariance } => {
+            FittedLinkState::Mixture { state, .. } => {
                 if likelihood.is_binomial_mixture() {
                     *mixture_state = Some(state.clone());
-                    payload.mixture_link_param_covariance =
-                        covariance.as_ref().map(array2_to_nested_vec);
                 } else {
                     log::debug!(
                         "fitted mixture link state discarded: likelihood {likelihood:?} is not a \
@@ -5206,10 +5285,29 @@ impl FittedModel {
     /// averaged to the factor's centering point (#2102/#2137). Such terms carry
     /// `lenient_unseen == false` and are excluded here so they hit the strict
     /// `UnseenCategoryPolicy::Error` arm.
+    ///
+    /// A column is lenient only if EVERY term that reads it tolerates an unseen
+    /// level. `y ~ s(x, by=g) + group(g)` pairs a genuine random intercept with
+    /// per-level curves `f_g(x)`. The random intercept has a population
+    /// fallback, but the curves do not: the `by=` level gate would read the
+    /// out-of-vocabulary code as "no level matches" and silently drop
+    /// `f_g(x)` from the prediction, its standard error and its band. Such a
+    /// column is therefore removed from the whitelist, so an unseen level hits
+    /// the strict schema encode (see [`collect_per_level_curve_group_cols`]).
     pub fn random_effect_group_columns(&self) -> HashSet<String> {
         let Some(training_headers) = self.training_headers.as_ref() else {
             return HashSet::new();
         };
+        let mut per_level_curve_cols = HashSet::<usize>::new();
+        for spec in self.saved_term_specs() {
+            for term in &spec.smooth_terms {
+                collect_per_level_curve_group_cols(&term.basis, &mut per_level_curve_cols);
+            }
+        }
+        let per_level_curve_names: HashSet<&String> = per_level_curve_cols
+            .iter()
+            .filter_map(|&col| training_headers.get(col))
+            .collect();
         let mut out = HashSet::<String>::new();
         for spec in self.saved_term_specs() {
             for term in &spec.random_effect_terms {
@@ -5234,6 +5332,7 @@ impl FittedModel {
                 }
             }
         }
+        out.retain(|name| !per_level_curve_names.contains(name));
         out
     }
 
@@ -6253,9 +6352,6 @@ impl FittedModel {
             }
         }
 
-        if let Some(v) = self.beta_noise.as_ref() {
-            validate_all_finite("beta_noise", v.iter().copied()).map_err(corrupt)?;
-        }
         if let Some(v) = self.noise_projection.as_ref() {
             validate_all_finite("noise_projection", v.iter().flatten().copied())
                 .map_err(corrupt)?;
@@ -6317,14 +6413,6 @@ impl FittedModel {
         }
         if let Some(v) = self.survival_beta_log_sigma.as_ref() {
             validate_all_finite("survival_beta_log_sigma", v.iter().copied()).map_err(corrupt)?;
-        }
-        if let Some(v) = self.mixture_link_param_covariance.as_ref() {
-            validate_all_finite("mixture_link_param_covariance", v.iter().flatten().copied())
-                .map_err(corrupt)?;
-        }
-        if let Some(v) = self.sas_param_covariance.as_ref() {
-            validate_all_finite("sas_param_covariance", v.iter().flatten().copied())
-                .map_err(corrupt)?;
         }
         Ok(())
     }
@@ -7326,7 +7414,6 @@ mod tests {
         payload.resolved_termspec = Some(empty_termspec());
         payload.resolved_termspec_noise = Some(empty_termspec());
         payload.formula_noise = Some("x".to_string());
-        payload.beta_noise = Some(vec![0.0]);
         payload.link = Some(InverseLink::Standard(StandardLink::Log));
         payload
     }
@@ -7432,6 +7519,88 @@ mod tests {
             None,
             "numeric group labels must reach RandomEffectOperator as unseen levels, not be clipped to boundary seen levels"
         );
+    }
+
+    /// A `sphere(lat, lon)` smooth must get the same predict-time axis
+    /// treatment wherever it sits: on the mean surface, on the noise/scale
+    /// surface, or wrapped in a numeric `by=`. Longitude is periodic and is
+    /// never clipped; latitude is clipped to the manifold bounds `[-90, 90]`,
+    /// not to the sampled latitude range. The periodic and latitude collectors
+    /// used to read only the bare mean-surface smooths, so a noise-surface or
+    /// `by=`-wrapped sphere had both axes clamped to the training box.
+    #[test]
+    fn axis_clip_treats_noise_and_by_wrapped_sphere_like_a_mean_sphere() {
+        use gam_terms::basis::SphericalSplineBasisSpec;
+        use gam_terms::smooth::{ByVarKind, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
+        let sphere = SmoothBasisSpec::Sphere {
+            feature_cols: vec![0, 1],
+            spec: SphericalSplineBasisSpec::default(),
+        };
+        let single_smooth = |basis: SmoothBasisSpec| TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                frozen_parametric_residualization: None,
+                name: "sphere(lat, lon)".to_string(),
+                basis,
+                shape: ShapeConstraint::None.into(),
+                joint_null_rotation: None,
+            }],
+            level: Default::default(),
+        };
+        let headers = ["lat", "lon", "z"];
+        let data = array![[85.0, 170.0, 0.5], [-95.0, -175.0, -0.5], [20.0, 10.0, 0.0]];
+        let col_map: HashMap<String, usize> = headers
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.to_string(), i))
+            .collect();
+        let mut base = standard_gaussian_payload();
+        base.data_schema = Some(DataSchema {
+            columns: headers
+                .iter()
+                .map(|name| SchemaColumn {
+                    name: name.to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                })
+                .collect(),
+        });
+        base.set_training_feature_metadata(
+            headers.iter().map(|name| name.to_string()).collect(),
+            vec![(-10.0, 40.0), (-20.0, 60.0), (-1.0, 1.0)],
+        );
+        base.resolved_termspec = Some(empty_termspec());
+
+        let mut mean_surface = base.clone();
+        mean_surface.resolved_termspec = Some(single_smooth(sphere.clone()));
+        let mut noise_surface = base.clone();
+        noise_surface.resolved_termspec_noise = Some(single_smooth(sphere.clone()));
+        let mut by_wrapped = base;
+        by_wrapped.resolved_termspec = Some(single_smooth(SmoothBasisSpec::BySmooth {
+            smooth: Box::new(sphere),
+            by_kind: ByVarKind::Numeric { feature_col: 2 },
+        }));
+
+        for (label, payload) in [
+            ("mean-surface sphere", mean_surface),
+            ("noise-surface sphere", noise_surface),
+            ("by=-wrapped sphere", by_wrapped),
+        ] {
+            let clipped = FittedModel::from_payload(payload)
+                .axis_clip_to_training_ranges(data.view(), &col_map)
+                .unwrap_or_else(|| panic!("{label}: the -95 latitude must clip to the pole"));
+            assert_eq!(
+                clipped.column(0).to_vec(),
+                vec![85.0, -90.0, 20.0],
+                "{label}: latitude must clip to [-90, 90], not the sampled [-10, 40]"
+            );
+            assert_eq!(
+                clipped.column(1).to_vec(),
+                vec![170.0, -175.0, 10.0],
+                "{label}: periodic longitude must never be clipped"
+            );
+        }
     }
 
     /// #2102/#2137: a FIXED categorical factor — a bare `y ~ g` or an explicit
@@ -7568,6 +7737,133 @@ mod tests {
                 panic!("`{formula}` must tolerate an unseen level, got: {err}")
             });
         }
+    }
+
+    /// `y ~ s(x, by=g) + group(g)`: the random intercept alone would tolerate
+    /// an unseen `g`, but the per-level curves `f_g(x)` have no population
+    /// fallback. The `by=` level gate reads an out-of-vocabulary code as "no
+    /// level matches", so the lenient encode silently dropped `f_g(x)` from the
+    /// prediction. Such a column must reach the strict schema encode. A
+    /// `group(g)` whose column carries no per-level curve stays lenient.
+    #[test]
+    fn group_column_with_per_level_curves_is_not_lenient_on_unseen_levels() {
+        use csv::StringRecord;
+        use gam_data::{UnseenCategoryPolicy, encode_recordswith_schema};
+        use gam_terms::basis::SphericalSplineBasisSpec;
+        use gam_terms::smooth::{
+            BySmoothKind, ByVarKind, ByVariableSpec, RandomEffectTermSpec, ShapeConstraint,
+            SmoothBasisSpec, SmoothTermSpec,
+        };
+        let headers = ["x", "g", "h"];
+        let levels = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let schema = DataSchema {
+            columns: headers
+                .iter()
+                .map(|name| SchemaColumn {
+                    name: name.to_string(),
+                    kind: if *name == "x" {
+                        ColumnKindTag::Continuous
+                    } else {
+                        ColumnKindTag::Categorical
+                    },
+                    levels: if *name == "x" { vec![] } else { levels.clone() },
+                })
+                .collect(),
+        };
+        // The inner basis is irrelevant to the whitelist; only the wrapper's
+        // grouping column is read.
+        let inner = SmoothBasisSpec::Sphere {
+            feature_cols: vec![0, 0],
+            spec: SphericalSplineBasisSpec::default(),
+        };
+        let level_curve = |by_col: usize| SmoothBasisSpec::ByVariable {
+            inner: Box::new(inner.clone()),
+            by_col,
+            kind: BySmoothKind::Level {
+                level_bits: 0.0_f64.to_bits(),
+            },
+            by: ByVariableSpec::Level {
+                value_bits: 0.0_f64.to_bits(),
+                label: "a".to_string(),
+            },
+        };
+        let model_with = |curve: SmoothBasisSpec| -> FittedModel {
+            let mut payload = standard_gaussian_payload();
+            payload.data_schema = Some(schema.clone());
+            payload.set_training_feature_metadata(
+                headers.iter().map(|name| name.to_string()).collect(),
+                vec![(0.0, 1.0), (0.0, 2.0), (0.0, 2.0)],
+            );
+            payload.resolved_termspec = Some(TermCollectionSpec {
+                linear_terms: vec![],
+                random_effect_terms: vec![RandomEffectTermSpec {
+                    name: "g".to_string(),
+                    feature_col: 1,
+                    frozen_levels: None,
+                    lenient_unseen: true,
+                }],
+                smooth_terms: vec![SmoothTermSpec {
+                    frozen_parametric_residualization: None,
+                    name: "s(x):by".to_string(),
+                    basis: curve,
+                    shape: ShapeConstraint::None.into(),
+                    joint_null_rotation: None,
+                }],
+                level: Default::default(),
+            });
+            FittedModel::from_payload(payload)
+        };
+        let g_schema = DataSchema {
+            columns: vec![SchemaColumn {
+                name: "g".to_string(),
+                kind: ColumnKindTag::Categorical,
+                levels: levels.clone(),
+            }],
+        };
+        let encode_unseen_g = |model: &FittedModel| {
+            encode_recordswith_schema(
+                vec!["g".to_string()],
+                vec![StringRecord::from(vec!["NEW"])],
+                &g_schema,
+                UnseenCategoryPolicy::encode_unknown_for_columns(
+                    model.random_effect_group_columns(),
+                ),
+            )
+        };
+
+        for (label, curve) in [
+            ("by=g level smooth", level_curve(1)),
+            (
+                "BySmooth factor by=g",
+                SmoothBasisSpec::BySmooth {
+                    smooth: Box::new(inner.clone()),
+                    by_kind: ByVarKind::Factor {
+                        feature_col: 1,
+                        frozen_levels: None,
+                        ordered: false,
+                    },
+                },
+            ),
+        ] {
+            let model = model_with(curve);
+            assert!(
+                !model.random_effect_group_columns().contains("g"),
+                "{label}: g carries per-level curves, so it must not be lenient"
+            );
+            let err = encode_unseen_g(&model)
+                .expect_err("an unseen g must be refused when g carries per-level curves");
+            assert!(
+                err.contains("unseen level"),
+                "{label}: expected an unseen-level schema mismatch, got: {err}"
+            );
+        }
+
+        let model = model_with(level_curve(2));
+        assert!(
+            model.random_effect_group_columns().contains("g"),
+            "a group(g) whose column carries no per-level curve keeps the held-out-group policy"
+        );
+        encode_unseen_g(&model).expect("group(g) alone tolerates an unseen level");
     }
 
     #[test]

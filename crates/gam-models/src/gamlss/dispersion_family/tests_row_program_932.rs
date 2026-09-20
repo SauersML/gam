@@ -551,17 +551,17 @@ fn corrupted(mut stacks: DispersionRowStacks) -> DispersionRowStacks {
     let bump = 1.0 + 1e-6;
     match &mut stacks {
         DispersionRowStacks::NegativeBinomial {
-            digamma_total,
-            trigamma_total,
-            tetragamma_total,
+            digamma_gap,
+            trigamma_gap,
+            tetragamma_gap,
             neg_log_theta_share,
             mu_share,
             theta_share,
             ..
         } => {
-            *digamma_total *= bump;
-            *trigamma_total *= bump;
-            *tetragamma_total *= bump;
+            *digamma_gap *= bump;
+            *trigamma_gap *= bump;
+            *tetragamma_gap *= bump;
             *neg_log_theta_share *= bump;
             *mu_share *= bump;
             *theta_share *= bump;
@@ -646,14 +646,12 @@ fn with_values(mut stacks: DispersionRowStacks, row: Row) -> DispersionRowStacks
             theta,
             count,
             ln_gamma_count,
-            ln_gamma_total,
-            ln_gamma_theta,
+            ln_gamma_gap,
             neg_log_mu_share,
             ..
         } => {
             *ln_gamma_count = ln_gamma(*count + 1.0);
-            *ln_gamma_total = ln_gamma(*theta + *count);
-            *ln_gamma_theta = ln_gamma(*theta);
+            *ln_gamma_gap = gam_math::special::ln_gamma_shift_gap(*theta, *count);
             *neg_log_mu_share = -log_positive_share(row.eta_mu.exp(), *theta);
         }
         DispersionRowStacks::Gamma {

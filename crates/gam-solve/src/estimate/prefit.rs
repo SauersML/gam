@@ -34,14 +34,6 @@ pub(crate) enum PrefitRegularityDiagnostic {
         tolerance: f64,
         column_indices: Vec<usize>,
     },
-    NearDegenerate {
-        num_unpenalized_columns: usize,
-        condition_number: f64,
-        min_eigenvalue: f64,
-        max_eigenvalue: f64,
-        tolerance: f64,
-        column_indices: Vec<usize>,
-    },
 }
 
 fn prefit_binary_response_classes(
@@ -186,10 +178,8 @@ pub(crate) fn detect_prefit_unpenalized_rank_deficiency_in_design(
     // term; the spectral perturbation bound is `O(active_rows · eps ·
     // λ_max(Gram))`. A looser cutoff (the previous `1e-10 · λ_max`) demotes
     // genuine full-rank-but-ill-conditioned designs as rank-deficient — e.g.
-    // two columns differing by a 1e-7 input perturbation yield λ_min ≈ 1e-14,
-    // well above the noise floor but inside the old 1e-10 cutoff. Such cases
-    // must be classified as NearDegenerate via the condition-number branch
-    // below, not as exact rank loss.
+    // two columns differing by a 1e-6 input perturbation yield λ_min ≈ 1e-12,
+    // well above the noise floor but inside the old 1e-10 cutoff.
     let tolerance = (active_rows.max(q) as f64) * f64::EPSILON * spectral_scale;
     let rank = eigenvalues
         .iter()
@@ -206,33 +196,14 @@ pub(crate) fn detect_prefit_unpenalized_rank_deficiency_in_design(
         }));
     }
 
-    // Full numeric rank, but the unpenalized normal equations may still be
-    // near-singular along a direction (quasi-/near-degenerate). The condition
-    // number of the unpenalized Gram is a cheap, principled upfront signal:
-    // beyond CONDITION_TOL the unpenalized solve loses too many digits and the
-    // fit grinds/diverges instead of converging. CONDITION_TOL is a Gram
-    // condition number (≈ design condition squared); 1e12 corresponds to a
-    // design condition ≈ 1e6, strictly looser than the noise-floor exact-rank
-    // tolerance above so the two checks are nested and consistent.
-    const CONDITION_TOL: f64 = 1e12;
-    let max_eigenvalue = eigenvalues
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
-    if min_eigenvalue.is_finite() && min_eigenvalue > 0.0 && max_eigenvalue.is_finite() {
-        let condition_number = max_eigenvalue / min_eigenvalue;
-        if condition_number.is_finite() && condition_number > CONDITION_TOL {
-            return Ok(Some(PrefitRegularityDiagnostic::NearDegenerate {
-                num_unpenalized_columns: q,
-                condition_number,
-                min_eigenvalue,
-                max_eigenvalue,
-                tolerance: CONDITION_TOL,
-                column_indices,
-            }));
-        }
-    }
-
+    // Every eigenvalue clears the noise floor, so the Gram resolves every
+    // unpenalized direction. However large its condition number is, that
+    // number does not make the model unfittable. The solve's forward error
+    // along the weakest direction grows like `ε · cond(Gram)`, but the
+    // statistical standard error along that direction is `σ / √λ_min`, and
+    // that is equally large. A poorly identified direction gets wide
+    // intervals, not a refusal. Whether the fit converges is certified by the
+    // solver that runs it, never by a guessed condition-number cutoff here.
     Ok(None)
 }
 
@@ -307,21 +278,6 @@ pub(crate) fn reject_prefit_unpenalized_rank_deficiency(
             rank,
             num_unpenalized_columns,
             min_eigenvalue,
-            tolerance,
-            column_indices,
-        }),
-        Some(PrefitRegularityDiagnostic::NearDegenerate {
-            num_unpenalized_columns,
-            condition_number,
-            min_eigenvalue,
-            max_eigenvalue,
-            tolerance,
-            column_indices,
-        }) => Err(EstimationError::PrefitNearDegenerateDesignDetected {
-            num_unpenalized_columns,
-            condition_number,
-            min_eigenvalue,
-            max_eigenvalue,
             tolerance,
             column_indices,
         }),

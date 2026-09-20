@@ -17,17 +17,20 @@ under the matched alternative, and fits every library to both. A rep records,
 per hypothesis, the p-value each library reports for the tested term on each
 surface it has:
 
-  gamfit.wald  ``summary().smooth_terms[...]["p_value"]``: Wood's rank-truncated
-               Wald test.
+  gamfit.wald  ``summary().smooth_terms[...]["p_value"]``, the headline
+               ``summary()`` p-value: for a penalized smooth the
+               variance-component score test of ``f = 0`` (Lin 1997; Zhang &
+               Lin 2003), for a random effect the variance-component score
+               test of ``sigma^2 = 0`` (Lin 1997), each referred to its exact
+               weighted chi-square law. The surface key predates the score
+               tests; it names the ``summary()`` table, not the statistic.
   gamfit.lr    ``smooth_significance(data)[...]["p_value_corrected"]``: the
                per-term likelihood-ratio test from a constrained null refit,
                the value that method documents as its headline.
-  gamfit.coef  the coefficient row's own ``p_value`` when it has one. gamfit
-               reports none today, so the harness reads the two-sided normal
-               tail of ``estimate / std_error`` from the same row and labels
-               the record ``coef_source = "z_from_std_error"``. That checks the
-               reported standard error, which is what such a p-value would be
-               built from. The row is located through ``model.term_blocks``.
+  gamfit.coef  ``summary().parametric_terms[...]["p_value"]``: the linear
+               term's reported test. A ridged slope (the default) reports the
+               variance-component score test of its ridge, not the shrunk
+               estimate's Wald ratio (gam#3573).
   pygam.wald   pyGAM's ``statistics_["p_values"]`` for the tested term, with
   pygam_gs.*   the default fixed lambda and with ``gridsearch`` respectively.
 
@@ -51,7 +54,7 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import special, stats
+from scipy import special
 
 LIBS = ("gamfit", "pygam", "pygam_gs")
 FAMILIES = ("gaussian", "binomial", "poisson", "gamma", "negbin")
@@ -224,7 +227,7 @@ def make_data(
 # --- gamfit ------------------------------------------------------------------
 
 # Name of the tested term's row in gamfit's tables (``summary().smooth_terms``,
-# ``smooth_significance`` and ``model.term_blocks``), per null structure.
+# ``smooth_significance`` and ``summary().parametric_terms``), per null structure.
 GAMFIT_TARGET = {
     "smooth": "s(x2)",
     "concurvity": "s(x2)",
@@ -245,15 +248,6 @@ def _row(rows: list[dict[str, Any]], target: str) -> dict[str, Any]:
         if _norm(str(row["name"])) == want:
             return row
     raise LookupError(f"no row named {target!r}; rows are {[r['name'] for r in rows]}")
-
-
-def _coefficient_row(model: Any, summary: Any, target: str) -> dict[str, Any]:
-    want = _norm(target)
-    blocks = [b for b in model.term_blocks if _norm(b.name) == want]
-    if len(blocks) != 1 or blocks[0].end - blocks[0].start != 1:
-        raise LookupError(f"no one-column term block named {target!r}: {model.term_blocks}")
-    (row,) = (r for r in summary.coefficients if r["index"] == blocks[0].start)
-    return dict(row)
 
 
 def gamfit_pvalues(
@@ -280,16 +274,9 @@ def gamfit_pvalues(
                 extra["lr_source"] = row.get("reference_source")
                 extra["lr_provenance"] = row.get("correction_provenance")
             else:
-                row = _coefficient_row(model, summary, target)
-                if row.get("p_value") is not None:
-                    p = row["p_value"]
-                    extra["coef_source"] = "reported"
-                else:
-                    se = row.get("std_error")
-                    if se is None or not se > 0:
-                        raise LookupError(f"coefficient row has std_error={se!r}")
-                    p = 2.0 * stats.norm.sf(abs(row["estimate"]) / se)
-                    extra["coef_source"] = "z_from_std_error"
+                row = _row(list(summary.parametric_terms), target)
+                extra["coef_statistic"] = row.get("statistic")
+                p = row.get("p_value")
         except Exception as exc:  # recorded, never dropped
             missing[surface] = f"{type(exc).__name__}: {exc}"[:500]
             continue
