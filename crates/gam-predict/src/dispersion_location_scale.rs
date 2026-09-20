@@ -31,6 +31,20 @@ pub(crate) struct DispersionLocationScalePredictor {
 }
 
 impl DispersionLocationScalePredictor {
+    /// The covariance backend of a fit-backed pass over the `[mean | noise]`
+    /// coefficient vector.
+    fn pass_backend<'a>(
+        &'a self,
+        covariance: PassCovariance<'a>,
+    ) -> Result<(PredictionCovarianceBackend<'a>, InferenceCovarianceMode), EstimationError> {
+        let p_total = self.beta_mu.len() + self.beta_noise.len();
+        let label = match covariance.pass {
+            PredictPass::FullUncertainty => "dispersion location-scale",
+            PredictPass::PosteriorMean => "dispersion location-scale posterior mean",
+        };
+        covariance.backend(self.covariance.as_ref(), p_total, label)
+    }
+
     fn strategy(&self) -> ResolvedFamilyStrategy {
         strategy_for_family(self.likelihood.clone(), self.inverse_link.as_ref())
     }
@@ -95,11 +109,13 @@ impl DispersionLocationScalePredictor {
     /// joint integral.
     ///
     /// Integrated with the same projected bivariate quadrature the posterior
-    /// means use, over the exact per-row 2×2 covariance of `(η_μ, η_d)`; with
-    /// no stored covariance the integral degenerates to the plug-in law.
+    /// means use, over the exact per-row 2×2 covariance of `(η_μ, η_d)` read
+    /// from `backend` — the covariance the band's `Var(μ̂)` came from, so both
+    /// terms of the law of total variance share one posterior (#4326).
     fn integrated_response_variance(
         &self,
         input: &PredictInput,
+        backend: &PredictionCovarianceBackend<'_>,
     ) -> Result<Array1<f64>, EstimationError> {
         let eta_mu = self.eta_mean(input);
         let eta_d = self.eta_precision(input)?;
@@ -113,26 +129,19 @@ impl DispersionLocationScalePredictor {
         let n = eta_mu.len();
         let response = &self.likelihood.response;
         let strategy = self.strategy();
-        let (var_mu, var_d, cov_md) = match self.covariance.as_ref() {
-            Some(covariance) => {
-                let design_noise = input.design_noise.as_ref().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "dispersion location-scale prediction requires noise design matrix"
-                            .to_string(),
-                    )
-                })?;
-                let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-                project_two_block_linear_predictor_covariance(
-                    &input.design,
-                    design_noise,
-                    &backend,
-                    self.beta_mu.len(),
-                    self.beta_noise.len(),
-                    "dispersion location-scale observation noise",
-                )?
-            }
-            None => (Array1::zeros(n), Array1::zeros(n), Array1::zeros(n)),
-        };
+        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "dispersion location-scale prediction requires noise design matrix".to_string(),
+            )
+        })?;
+        let (var_mu, var_d, cov_md) = project_two_block_linear_predictor_covariance(
+            &input.design,
+            design_noise,
+            backend,
+            self.beta_mu.len(),
+            self.beta_noise.len(),
+            "dispersion location-scale observation noise",
+        )?;
         let quadctx = gam_solve::quadrature::QuadratureContext::new();
         let mut variance = Array1::<f64>::zeros(n);
         for i in 0..n {
@@ -244,23 +253,11 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         pass: PredictPass,
         covariance_mode: InferenceCovarianceMode,
     ) -> Result<LinearState, EstimationError> {
-        let p_total = self.beta_mu.len() + self.beta_noise.len();
-        let (backend, covariance_source) = match pass {
-            PredictPass::FullUncertainty => fit.select_uncertainty_backend(
-                p_total,
-                covariance_mode,
-                "dispersion location-scale",
-            )?,
-            PredictPass::PosteriorMean => (
-                require_posterior_mean_backend(
-                    fit,
-                    self.covariance.as_ref(),
-                    p_total,
-                    "dispersion location-scale posterior mean",
-                )?,
-                InferenceCovarianceMode::Conditional,
-            ),
-        };
+        let (backend, covariance_source) = self.pass_backend(PassCovariance {
+            fit,
+            pass,
+            mode: covariance_mode,
+        })?;
         let (eta, plugin_mean, eta_se, mean_se) = self.state_from_backend(input, &backend)?;
         let mean = match pass {
             // Plug-in mean is correct for the symmetric-delta full-uncertainty
@@ -313,13 +310,17 @@ impl PredictionTransform for DispersionLocationScalePredictor {
     fn observation_noise(
         &self,
         input: &PredictInput,
+        covariance: PassCovariance<'_>,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
         // The predictive band needs `E[Var(Y|·)]` under the joint (η_μ, η_d)
-        // posterior, not the plug-in law — see `integrated_response_variance`.
+        // posterior, not the plug-in law — see `integrated_response_variance` —
+        // and under the same covariance the pass's `Var(μ̂)` came from (#4326).
         // The fitted noise *surface* (plug-in) remains available through
         // `predict_noise_scale`.
+        let (backend, _) = self.pass_backend(covariance)?;
         Ok(Some(
-            self.integrated_response_variance(input)?.mapv(f64::sqrt),
+            self.integrated_response_variance(input, &backend)?
+                .mapv(f64::sqrt),
         ))
     }
 
@@ -342,6 +343,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         eta_se: &Array1<f64>,
         z_lower: &Array1<f64>,
         z_upper: &Array1<f64>,
+        covariance: PassCovariance<'_>,
     ) -> Result<Option<(Array1<f64>, Array1<f64>)>, EstimationError> {
         let precision = self.precision(input)?;
         let response = &self.likelihood.response;
@@ -397,8 +399,10 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         };
         // `E[Var(Y | μ, φ)]` integrated over the joint (η_μ, η_d) posterior (see
         // `integrated_response_variance`; the plug-in law understates the band
-        // wherever the scale predictor is uncertain, audit finding 6).
-        let expected_response_var = self.integrated_response_variance(input)?;
+        // wherever the scale predictor is uncertain, audit finding 6), under the
+        // covariance `eta_se` came from (#4326).
+        let (backend, _) = self.pass_backend(covariance)?;
+        let expected_response_var = self.integrated_response_variance(input, &backend)?;
         family_observation_band_per_row(
             response,
             &mean,

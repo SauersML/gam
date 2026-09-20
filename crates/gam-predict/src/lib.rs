@@ -29,7 +29,8 @@ pub(crate) use crate::dispersion_location_scale::DispersionLocationScalePredicto
 use crate::gaussian_location_scale::GaussianLocationScalePredictor;
 pub use crate::interval_policy::IntervalReference;
 use crate::interval_policy::{
-    EtaInterval, LinearState, MeanBoundMethod, PredictPass, PredictionTransform, ResponseBounds,
+    EtaInterval, LinearState, MeanBoundMethod, PassCovariance, PredictPass, PredictionTransform,
+    ResponseBounds,
     ResponseInterval, assemble_posterior_mean_bounds, predict_full_uncertainty_generic,
     predict_plugin_response_generic, predict_posterior_mean_generic,
     predict_with_uncertainty_generic,
@@ -4409,6 +4410,99 @@ mod tests {
             fixed_outer.covariance_source,
             InferenceCovarianceMode::SmoothingCorrected
         );
+    }
+
+    /// #4326: the observation band's integrated noise `E[σ²]` must be taken
+    /// under the same covariance as its `Var(μ̂)` term. With a smoothing-
+    /// corrected Scale variance (0.5) larger than the predictor's stored
+    /// conditional one (0.1), both the full-uncertainty and the posterior-mean
+    /// SmoothingCorrected bands must read `v = 0.5`, i.e. the half-width is
+    /// `z·√(SE² + f² + 2f·e^{m+v/2} + e^{2m+2v})` at `m = 0`, `SE = 1`.
+    #[test]
+    fn gaussian_location_scale_observation_noise_follows_the_band_covariance_4326() {
+        let conditional = array![[1.0, 0.0], [0.0, 0.1]];
+        let corrected = array![[1.0, 0.0], [0.0, 0.5]];
+        let predictor = GaussianLocationScalePredictor {
+            beta_mu: array![0.0],
+            beta_noise: array![0.0],
+            sigma_floor: 0.01,
+            response_scale: 1.0,
+            covariance: Some(conditional.clone()),
+            link_wiggle: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let fit = gaussian_location_scale_fit_with_covariance_and_corrected(
+            array![0.0],
+            array![0.0],
+            conditional,
+            Some(corrected),
+        );
+        let floor = predictor.sigma_floor * predictor.response_scale;
+        let expected_half_over_z = |v: f64| {
+            let noise_sq = floor * floor + 2.0 * floor * (0.5 * v).exp() + (2.0 * v).exp();
+            (1.0 + noise_sq).sqrt()
+        };
+
+        let full = |mode| {
+            let options = PredictUncertaintyOptions {
+                covariance_mode: mode,
+                includeobservation_interval: true,
+                edgeworth_one_sided: false,
+                boundary_correction: false,
+                ood_inflation: false,
+                ..PredictUncertaintyOptions::default()
+            };
+            let out = predictor
+                .predict_full_uncertainty(&input, &fit, &options)
+                .expect("gaussian location-scale full uncertainty");
+            assert!((out.eta_standard_error[0] - 1.0).abs() <= 1e-12);
+            let z = (out.eta_upper[0] - out.eta[0]) / out.eta_standard_error[0];
+            let upper = out.observation_upper.expect("observation band")[0];
+            (upper - out.mean[0]) / z
+        };
+        let full_corrected = full(InferenceCovarianceMode::SmoothingCorrected);
+        let full_conditional = full(InferenceCovarianceMode::Conditional);
+        assert!(
+            (full_corrected - expected_half_over_z(0.5)).abs() <= 1e-12,
+            "SmoothingCorrected band must integrate σ under the corrected Scale variance: \
+             got {full_corrected}, want {}",
+            expected_half_over_z(0.5)
+        );
+        assert!((full_conditional - expected_half_over_z(0.1)).abs() <= 1e-12);
+        assert!(full_corrected > full_conditional);
+
+        let posterior = |mode| {
+            let options = PosteriorMeanOptions {
+                confidence_level: Some(0.95),
+                covariance_mode: mode,
+                include_observation_interval: true,
+                extrapolation_variance: None,
+            };
+            let out = predictor
+                .predict_posterior_mean(&input, &fit, &options)
+                .expect("gaussian location-scale posterior mean");
+            let mean_se = out.mean_standard_error.expect("mean SE")[0];
+            assert!((mean_se - 1.0).abs() <= 1e-12);
+            let z = (out.mean_upper.expect("mean band")[0] - out.mean[0]) / mean_se;
+            let upper = out.observation_upper.expect("observation band")[0];
+            (upper - out.mean[0]) / z
+        };
+        let posterior_corrected = posterior(InferenceCovarianceMode::SmoothingCorrected);
+        let posterior_conditional = posterior(InferenceCovarianceMode::Conditional);
+        assert!(
+            (posterior_corrected - expected_half_over_z(0.5)).abs() <= 1e-12,
+            "posterior-mean SmoothingCorrected band must integrate σ under the corrected \
+             Scale variance: got {posterior_corrected}, want {}",
+            expected_half_over_z(0.5)
+        );
+        assert!((posterior_conditional - expected_half_over_z(0.1)).abs() <= 1e-12);
     }
 
     #[test]

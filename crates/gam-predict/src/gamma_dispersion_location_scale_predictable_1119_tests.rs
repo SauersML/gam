@@ -350,7 +350,7 @@ fn gamma_dispersion_location_scale_assembles_covariance_and_is_predictable() {
 #[test]
 fn gamma_dispersion_posterior_mean_observation_band_is_per_row_not_scalar() {
     use crate::PredictUncertaintyOptions;
-    use crate::interval_policy::PredictionTransform;
+    use crate::interval_policy::{PassCovariance, PredictPass, PredictionTransform};
 
     init_parallelism();
     let n = 600usize;
@@ -438,7 +438,14 @@ fn gamma_dispersion_posterior_mean_observation_band_is_per_row_not_scalar() {
     // The per-row response-noise σ(x) the model actually implies — the exact
     // quantity the full-uncertainty band consumes.
     let per_row_noise = predictor
-        .observation_noise(&input)
+        .observation_noise(
+            &input,
+            PassCovariance {
+                fit: &fit.fit,
+                pass: PredictPass::PosteriorMean,
+                mode: InferenceCovarianceMode::Conditional,
+            },
+        )
         .expect("observation noise must be available")
         .expect("dispersion-LS exposes a per-row observation noise");
     assert_eq!(per_row_noise.len(), grid_n);

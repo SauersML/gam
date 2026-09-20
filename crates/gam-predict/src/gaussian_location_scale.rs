@@ -106,8 +106,16 @@ impl GaussianLocationScalePredictor {
     /// without covariance is refused, never read as `v = 0`. The SD is
     /// evaluated without forming an overflowing squared moment; `+inf` is
     /// returned only when the SD itself is outside the range.
-    fn integrated_noise_sd(&self, input: &PredictInput) -> Result<Array1<f64>, EstimationError> {
-        let (eta_noise, log_sigma_var) = self.log_sigma_posterior(input)?;
+    ///
+    /// `v` is read from `backend`, the covariance the band's `Var(μ̂)` came
+    /// from, so both terms of the law of total variance share one posterior
+    /// (#4326).
+    fn integrated_noise_sd(
+        &self,
+        input: &PredictInput,
+        backend: &PredictionCovarianceBackend<'_>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let (eta_noise, log_sigma_var) = self.log_sigma_posterior(input, backend)?;
         let scaled_floor = self.response_scale * self.sigma_floor;
         Ok(Array1::from_shape_fn(eta_noise.len(), |i| {
             shifted_lognormal_root_second_moment(eta_noise[i], log_sigma_var[i], scaled_floor)
@@ -122,7 +130,15 @@ impl GaussianLocationScalePredictor {
         &self,
         input: &PredictInput,
     ) -> Result<Array1<f64>, EstimationError> {
-        let (eta_noise, log_sigma_var) = self.log_sigma_posterior(input)?;
+        let covariance = self.covariance.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Gaussian location-scale posterior σ moments integrate the log-σ posterior, \
+                 but this model carries no coefficient covariance; refit with covariance"
+                    .to_string(),
+            )
+        })?;
+        let backend = PredictionCovarianceBackend::from_dense(covariance.view());
+        let (eta_noise, log_sigma_var) = self.log_sigma_posterior(input, &backend)?;
         let scaled_floor = self.response_scale * self.sigma_floor;
         Ok(Array1::from_shape_fn(eta_noise.len(), |i| {
             gam_model_kernels::sigma_link::logb_sigma_posterior_mean_with_floor_scalar(
@@ -133,13 +149,14 @@ impl GaussianLocationScalePredictor {
         }))
     }
 
-    /// Per-row log-σ posterior `(m, v)`: the linear predictor and its
-    /// conditional variance from the Scale block of the saved covariance. The
-    /// covariance is required: without it `v` does not exist, and reading it as
-    /// zero would silently report the plug-in σ as the posterior moment.
+    /// Per-row log-σ posterior `(m, v)`: the linear predictor and its variance
+    /// from the Scale block of `backend`. A covariance is required: without it
+    /// `v` does not exist, and reading it as zero would silently report the
+    /// plug-in σ as the posterior moment.
     fn log_sigma_posterior(
         &self,
         input: &PredictInput,
+        backend: &PredictionCovarianceBackend<'_>,
     ) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
         let design_noise = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
@@ -147,21 +164,13 @@ impl GaussianLocationScalePredictor {
             )
         })?;
         let eta_noise = self.eta_noise(design_noise, input.offset_noise.as_ref())?;
-        let covariance = self.covariance.as_ref().ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "Gaussian location-scale posterior σ moments integrate the log-σ posterior, \
-                 but this model carries no coefficient covariance; refit with covariance"
-                    .to_string(),
-            )
-        })?;
-        let backend = PredictionCovarianceBackend::from_dense(covariance.view());
         let p_mu = self.beta_mu.len();
         let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
         // Coefficient layout is `[mean | scale | wiggle]`, so the log-σ block
         // sits after the `p_mu` mean columns.
         let se = padded_design_standard_errors_from_backend(
             design_noise,
-            &backend,
+            backend,
             p_mu,
             p_w,
             "gaussian location-scale log-sigma uncertainty",
@@ -214,6 +223,22 @@ impl GaussianLocationScalePredictor {
 }
 
 impl GaussianLocationScalePredictor {
+    /// The covariance backend of a fit-backed pass over the full
+    /// `[mean | scale | wiggle]` coefficient vector.
+    fn pass_backend<'a>(
+        &'a self,
+        covariance: PassCovariance<'a>,
+    ) -> Result<(PredictionCovarianceBackend<'a>, InferenceCovarianceMode), EstimationError> {
+        let p_total = self.beta_mu.len()
+            + self.beta_noise.len()
+            + self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
+        let label = match covariance.pass {
+            PredictPass::FullUncertainty => "gaussian location-scale",
+            PredictPass::PosteriorMean => "gaussian location-scale posterior mean",
+        };
+        covariance.backend(self.covariance.as_ref(), p_total, label)
+    }
+
     /// Identity-link plug-in: η = X_μ β_μ (+ wiggle), mean == η.
     fn plugin_eta(&self, input: &PredictInput) -> Result<Array1<f64>, EstimationError> {
         let eta_base = input.design.dot(&self.beta_mu) + &input.offset;
@@ -274,23 +299,13 @@ impl PredictionTransform for GaussianLocationScalePredictor {
         let p_mu = self.beta_mu.len();
         let p_sigma = self.beta_noise.len();
         let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
-        let p_total = p_mu + p_sigma + p_w;
         // Full uncertainty honors the requested covariance mode; posterior-mean
         // integration uses the conditional posterior.
-        let (backend, covariance_source) = match pass {
-            PredictPass::FullUncertainty => {
-                fit.select_uncertainty_backend(p_total, covariance_mode, "gaussian location-scale")?
-            }
-            PredictPass::PosteriorMean => (
-                require_posterior_mean_backend(
-                    fit,
-                    self.covariance.as_ref(),
-                    p_total,
-                    "gaussian location-scale posterior mean",
-                )?,
-                InferenceCovarianceMode::Conditional,
-            ),
-        };
+        let (backend, covariance_source) = self.pass_backend(PassCovariance {
+            fit,
+            pass,
+            mode: covariance_mode,
+        })?;
         let eta_se =
             self.eta_standard_error_from_backend(input, &backend, eta.len(), p_mu, p_sigma, p_w)?;
         let mean = eta.clone();
@@ -331,11 +346,14 @@ impl PredictionTransform for GaussianLocationScalePredictor {
     fn observation_noise(
         &self,
         input: &PredictInput,
+        covariance: PassCovariance<'_>,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
         // The predictive band needs `E[σ²]` under the log-σ posterior, not the
-        // plug-in σ(m̂) — see `integrated_noise_sd`. The fitted σ *surface*
-        // (plug-in) remains available through `predict_noise_scale`.
-        self.integrated_noise_sd(input).map(Some)
+        // plug-in σ(m̂) — see `integrated_noise_sd` — and under the same
+        // covariance the pass's `Var(μ̂)` came from (#4326). The fitted σ
+        // *surface* (plug-in) remains available through `predict_noise_scale`.
+        let (backend, _) = self.pass_backend(covariance)?;
+        self.integrated_noise_sd(input, &backend).map(Some)
     }
 }
 
