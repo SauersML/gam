@@ -131,7 +131,9 @@ pub fn packed_symmetric_spectrum_with_probe(
     // overflow and its shifts/rotations do not underflow on a tiny matrix.
     // In particular, diag=(1e308,1e308), offdiag=5e307 must not deflate merely
     // because the two diagonal magnitudes sum to infinity.
-    let matrix_scale = packed.iter().fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    let matrix_scale = packed
+        .iter()
+        .fold(0.0_f64, |scale, value| scale.max(value.abs()));
     if matrix_scale == 0.0 {
         // The identity eigenbasis is a valid choice for the zero matrix.
         return Ok(vec![0.0; n]);
@@ -142,7 +144,9 @@ pub fn packed_symmetric_spectrum_with_probe(
     // A Householder update can overflow its intermediate dot product even
     // when every final coordinate of Qᵀw is finite. Normalize the probe
     // independently and restore its units after the same orthogonal maps.
-    let probe_scale = probe.iter().fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    let probe_scale = probe
+        .iter()
+        .fold(0.0_f64, |scale, value| scale.max(value.abs()));
     if probe_scale > 0.0 {
         for value in probe.iter_mut() {
             *value /= probe_scale;
@@ -173,7 +177,11 @@ pub fn packed_symmetric_spectrum_with_probe(
             *value *= probe_scale;
         }
     }
-    if diagonal.iter().chain(probe.iter()).any(|value| !value.is_finite()) {
+    if diagonal
+        .iter()
+        .chain(probe.iter())
+        .any(|value| !value.is_finite())
+    {
         return Err("packed symmetric spectrum: an eigenvalue or projected probe component is not representable as a finite f64".to_string());
     }
     Ok(diagonal)
@@ -554,8 +562,8 @@ mod tests {
         for scale in [1.0, 1.0e308, 1.0e-308, f64::from_bits(2)] {
             let mut packed = vec![scale, 0.5 * scale, scale];
             let mut probe = vec![3.0, 1.0];
-            let eigenvalues = packed_symmetric_spectrum_with_probe(2, &mut packed, &mut probe)
-                .unwrap();
+            let eigenvalues =
+                packed_symmetric_spectrum_with_probe(2, &mut packed, &mut probe).unwrap();
             for (actual, expected) in eigenvalues.iter().zip([0.5, 1.5]) {
                 assert!((actual / scale - expected).abs() < 4.0 * f64::EPSILON);
             }
@@ -572,8 +580,8 @@ mod tests {
             // (1,1,1)/√3. Check the total mass of the tied lower eigenspace.
             let mut packed = vec![2.0 * scale, scale, scale, 2.0 * scale, scale, 2.0 * scale];
             let mut probe = vec![1.0, 2.0, 3.0];
-            let eigenvalues = packed_symmetric_spectrum_with_probe(3, &mut packed, &mut probe)
-                .unwrap();
+            let eigenvalues =
+                packed_symmetric_spectrum_with_probe(3, &mut packed, &mut probe).unwrap();
             for (actual, expected) in eigenvalues.iter().zip([1.0, 1.0, 4.0]) {
                 assert!((actual / scale - expected).abs() < 2.0e-14);
             }
@@ -594,8 +602,10 @@ mod tests {
 
         let mut zero = vec![0.0; 6];
         let original = probe.clone();
-        assert_eq!(packed_symmetric_spectrum_with_probe(3, &mut zero, &mut probe).unwrap(),
-            vec![0.0; 3]);
+        assert_eq!(
+            packed_symmetric_spectrum_with_probe(3, &mut zero, &mut probe).unwrap(),
+            vec![0.0; 3]
+        );
         assert_eq!(probe, original);
     }
 
@@ -633,7 +643,10 @@ mod tests {
         }
         let probe: Vec<f64> = (0..m).map(|i| (0.13 * i as f64).cos()).collect();
         let at_width = |width: usize| {
-            let pool = rayon::ThreadPoolBuilder::new().num_threads(width).build().expect("pool");
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .expect("pool");
             pool.install(|| {
                 let mut product = vec![0.0; m];
                 packed_symmetric_matvec(m, &packed, &probe, &mut product);
@@ -651,7 +664,10 @@ mod tests {
         };
         let single = at_width(1);
         for width in [2, 3, 8] {
-            assert!(single == at_width(width), "pool width {width} changed the words");
+            assert!(
+                single == at_width(width),
+                "pool width {width} changed the words"
+            );
         }
     }
 }

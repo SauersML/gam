@@ -83,7 +83,8 @@ fn penalty() -> Array2<f64> {
 fn response(x: &Array2<f64>) -> Array2<f64> {
     let mut beta = Array1::<f64>::zeros(COEFFICIENTS);
     for index in 0..COEFFICIENTS {
-        beta[index] = 0.4 * (-(index as f64) * 0.35).exp() * if index % 2 == 0 { 1.0 } else { -1.0 };
+        beta[index] =
+            0.4 * (-(index as f64) * 0.35).exp() * if index % 2 == 0 { 1.0 } else { -1.0 };
     }
     let mut y = Array2::<f64>::zeros((ROWS, 1));
     for row in 0..ROWS {
@@ -244,7 +245,9 @@ fn penalty_gradient_does_not_read_an_eigenvalue_the_cache_classified_as_null() {
              boundary, not read by the pseudoinverse"
         ),
         Err(error) => assert!(
-            error.to_string().contains("null modes must be exactly zero"),
+            error
+                .to_string()
+                .contains("null modes must be exactly zero"),
             "the planted null eigenvalue must be refused by the cache null-mode invariant, got: \
              {error}"
         ),
@@ -299,8 +302,7 @@ fn penalty_gradient_refuses_a_cache_whose_rank_disagrees_with_its_own_spectrum()
         "the demotion must leave the declared rank untouched"
     );
     assert_eq!(
-        demoted.cache.nullity,
-        case.fit.cache.nullity,
+        demoted.cache.nullity, case.fit.cache.nullity,
         "the demotion must leave nullity untouched, so the deviance term cannot move"
     );
     let demoted_result = gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit(

@@ -1,7 +1,7 @@
 use crate::faer_ndarray::{
-    CrossprodAccum, CrossprodStructure, FaerArrayView, array2_to_matmut,
-    pool_parallelism, fast_ab, fast_atb, fast_atv, fast_atv_into, fast_av,
-    fast_av_into, fast_xt_diag_x, stream_weighted_crossprod_into,
+    CrossprodAccum, CrossprodStructure, FaerArrayView, array2_to_matmut, fast_ab, fast_atb,
+    fast_atv, fast_atv_into, fast_av, fast_av_into, fast_xt_diag_x, pool_parallelism,
+    stream_weighted_crossprod_into,
 };
 use faer::Accum;
 use faer::linalg::matmul::matmul;
@@ -122,7 +122,11 @@ fn governed_dense_operator_to_dense_by_chunks<O: DenseDesignOperator + ?Sized>(
     dense_operator_to_dense_by_chunks(op).map(|matrix| reservation.bind(matrix))
 }
 
-pub(crate) fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usize, String> {
+pub(crate) fn checked_dense_nbytes(
+    nrows: usize,
+    ncols: usize,
+    context: &str,
+) -> Result<usize, String> {
     nrows
         .checked_mul(ncols)
         .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
@@ -2453,7 +2457,6 @@ impl LinearOperator for RandomEffectOperator {
         Ok(diag)
     }
 
-
     // Restored: the dead-code sweep (d484a091a) deleted this override; it is
     // reached only through the trait, so the sweep fell back to the default.
     /// Fused X'WXβ + Sβ + ridge·β.  O(n + q).
@@ -4129,11 +4132,8 @@ pub trait LinearOperator {
             ));
         }
         let p = self.ncols();
-        let finite_weights = certify_signed_weights(
-            "solve_system_matrix_free_pcg_within",
-            weights,
-            self.nrows(),
-        )?;
+        let finite_weights =
+            certify_signed_weights("solve_system_matrix_free_pcg_within", weights, self.nrows())?;
         if !(baseridge.is_finite() && baseridge >= 0.0) {
             return Err(format!(
                 "matrix-free PCG ridge must be finite and non-negative, got {baseridge:?}"
@@ -4244,9 +4244,13 @@ pub trait LinearOperator {
         match work.pcg_attempt(p) {
             crate::pcg::PcgAttempt::Only => {
                 let max_products = MATRIX_FREE_PCG_MAX_ITER.max(4 * p);
-                return match self
-                    .solve_system_matrix_free_pcg_within(weights, rhs, penalty, ridge, max_products)?
-                {
+                return match self.solve_system_matrix_free_pcg_within(
+                    weights,
+                    rhs,
+                    penalty,
+                    ridge,
+                    max_products,
+                )? {
                     Some((solution, _)) => Ok(solution),
                     None => Err(format!(
                         "matrix-free PCG did not reach its roundoff floor for p={p} within \
@@ -4257,8 +4261,9 @@ pub trait LinearOperator {
             }
             crate::pcg::PcgAttempt::Budgeted { products } => {
                 if products > 0
-                    && let Some((solution, info)) = self
-                        .solve_system_matrix_free_pcg_within(weights, rhs, penalty, ridge, products)?
+                    && let Some((solution, info)) = self.solve_system_matrix_free_pcg_within(
+                        weights, rhs, penalty, ridge, products,
+                    )?
                 {
                     log::trace!(
                         "[normal-equations] route=pcg p={p} cg_iterations={} budget={products}",
@@ -4747,7 +4752,6 @@ impl LinearOperator for DenseRightProductView<'_> {
         Ok(gram)
     }
 
-
     // Restored: the dead-code sweep (d484a091a) deleted this override; it is
     // reached only through the trait, so the sweep fell back to the default.
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
@@ -4796,7 +4800,6 @@ impl LinearOperator for EmbeddedColumnBlock<'_> {
         .assign(&local);
         Ok(out)
     }
-
 
     // Restored: the dead-code sweep (d484a091a) deleted this override; it is
     // reached only through the trait, so the sweep fell back to the default.
@@ -4995,7 +4998,10 @@ impl DesignMatrix {
     /// is materialized with one [`Self::try_row_chunk`], so a contiguous list
     /// costs exactly one row-chunk read and an operator-backed design never
     /// materializes rows outside the list.
-    pub fn try_row_gather(&self, rows: &[usize]) -> Result<Array2<f64>, MatrixMaterializationError> {
+    pub fn try_row_gather(
+        &self,
+        rows: &[usize],
+    ) -> Result<Array2<f64>, MatrixMaterializationError> {
         let mut out = Array2::<f64>::zeros((rows.len(), self.ncols()));
         let mut run_start = 0;
         while run_start < rows.len() {
@@ -6195,7 +6201,10 @@ mod tests {
             "equal values must fingerprint equal wherever they live"
         );
         let one_ulp = array![[1.0, 2.0], [3.0, f64::from_bits(4.0_f64.to_bits() + 1)]];
-        assert_ne!(super::array2_bits_fingerprint(&a), super::array2_bits_fingerprint(&one_ulp));
+        assert_ne!(
+            super::array2_bits_fingerprint(&a),
+            super::array2_bits_fingerprint(&one_ulp)
+        );
         let signed_zero = array![[0.0, 2.0], [3.0, 4.0]];
         let negative_zero = array![[-0.0, 2.0], [3.0, 4.0]];
         assert_ne!(
@@ -6210,10 +6219,19 @@ mod tests {
         );
     }
 
-    use super::{BlockDesignOperator, CoefficientTransformOperator, ConditionedDesign, DenseDesignMatrix, DenseDesignOperator, DesignBlock, DesignMatrix, EmbeddedColumnBlock, FiniteSignedWeightsView, MultiChannelOperator, PsdWeightsView, RandomEffectOperator, ReparamOperator, RowwiseKroneckerOperator, SparseDesignMatrix, dense_operator_to_dense_by_chunks, dense_transpose_weighted_response, fast_atv, fast_av, streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view};
+    use super::{
+        BlockDesignOperator, CoefficientTransformOperator, ConditionedDesign, DenseDesignMatrix,
+        DenseDesignOperator, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
+        FiniteSignedWeightsView, MultiChannelOperator, PsdWeightsView, RandomEffectOperator,
+        ReparamOperator, RowwiseKroneckerOperator, SparseDesignMatrix,
+        dense_operator_to_dense_by_chunks, dense_transpose_weighted_response, fast_atv, fast_av,
+        streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view,
+    };
     use crate::matrix::LinearOperator;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
-    use gam_runtime::resource::{MaterializationPolicy, MatrixMaterializationError, ResourcePolicy};
+    use gam_runtime::resource::{
+        MaterializationPolicy, MatrixMaterializationError, ResourcePolicy,
+    };
     use ndarray::{Array1, Array2, ArrayViewMut2, Axis, array, s};
     use std::ops::Range;
     use std::sync::Arc;
@@ -7124,7 +7142,12 @@ mod tests {
     /// exactly one inner matvec through `T`, with no row chunks and no cached `X · T`.
     #[test]
     fn coefficient_transform_operator_takes_one_inner_matvec_per_outer_matvec() {
-        let values = array![[1.0, 0.0, 2.0], [0.0, -1.5, 0.5], [3.0, 0.25, 0.0], [0.0, 1.0, -2.0]];
+        let values = array![
+            [1.0, 0.0, 2.0],
+            [0.0, -1.5, 0.5],
+            [3.0, 0.25, 0.0],
+            [0.0, 1.0, -2.0]
+        ];
         let transform = array![[0.5, -1.0], [1.0, 0.25], [-0.75, 2.0]];
         let expected = values.dot(&transform);
         let inner = Arc::new(MatvecCountingOperator {
@@ -7133,8 +7156,11 @@ mod tests {
             apply_transpose_calls: AtomicUsize::new(0),
             row_chunk_calls: AtomicUsize::new(0),
         });
-        let op = CoefficientTransformOperator::new(DenseDesignMatrix::from(Arc::clone(&inner)), transform)
-            .expect("coefficient transform operator");
+        let op = CoefficientTransformOperator::new(
+            DenseDesignMatrix::from(Arc::clone(&inner)),
+            transform,
+        )
+        .expect("coefficient transform operator");
         let dense_design = DenseDesignMatrix::from(Arc::new(op));
 
         let beta = array![0.5, -2.0];
@@ -7218,7 +7244,11 @@ mod tests {
         // answer within its products. Whichever route answers must solve the system.
         let (n, p) = (8usize, 64usize);
         let x = Array2::from_shape_fn((n, p), |(i, j)| {
-            if (i & j).count_ones() % 2 == 0 { 1.0 } else { -1.0 }
+            if (i & j).count_ones() % 2 == 0 {
+                1.0
+            } else {
+                -1.0
+            }
         });
         let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone()));
         let weights = Array1::from_elem(n, 1.0);
@@ -7689,7 +7719,10 @@ mod tests {
             ..ResourcePolicy::default_library()
         };
         let reason = super::panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
-            "unit_test", 300, 12, &starved,
+            "unit_test",
+            300,
+            12,
+            &starved,
         )
         .expect_err("a zero cap must refuse a 28,800-byte design");
 
@@ -7714,7 +7747,10 @@ mod tests {
             ..ResourcePolicy::default_library()
         };
         super::panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
-            "unit_test", 300, 12, &roomy,
+            "unit_test",
+            300,
+            12,
+            &roomy,
         )
         .expect("a 28,800-byte design must be admitted under a 1 GiB cap");
 
@@ -7793,8 +7829,7 @@ mod tests {
 
     #[test]
     fn default_library_admits_small_dense_materialization() {
-        let policy =
-            ResourcePolicy::for_problem(gam_runtime::resource::ProblemHints::default());
+        let policy = ResourcePolicy::for_problem(gam_runtime::resource::ProblemHints::default());
         // Small dense block (1k rows * 50 cols * 8 B = 400 KiB) is well under the
         // single-materialization cap and the policy is permissive, so the guard
         // returns Ok.

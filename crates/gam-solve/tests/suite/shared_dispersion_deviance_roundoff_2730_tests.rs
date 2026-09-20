@@ -71,7 +71,8 @@ fn penalty() -> Array2<f64> {
 fn response(x: &Array2<f64>) -> Array2<f64> {
     let mut beta = Array1::<f64>::zeros(COEFFICIENTS);
     for index in 0..COEFFICIENTS {
-        beta[index] = 0.4 * (-(index as f64) * 0.35).exp() * if index % 2 == 0 { 1.0 } else { -1.0 };
+        beta[index] =
+            0.4 * (-(index as f64) * 0.35).exp() * if index % 2 == 0 { 1.0 } else { -1.0 };
     }
     let mut y = Array2::<f64>::zeros((ROWS, RESPONSES));
     for row in 0..ROWS {

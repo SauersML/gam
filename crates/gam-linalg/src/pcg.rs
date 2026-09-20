@@ -73,7 +73,9 @@ impl DenseRouteWork {
         }
         let factor = p.saturating_mul(p).saturating_mul(p) / 3;
         let dense_work = (self.build as u128).saturating_add(factor);
-        let products = dense_work.checked_div(self.apply as u128).unwrap_or(u128::MAX);
+        let products = dense_work
+            .checked_div(self.apply as u128)
+            .unwrap_or(u128::MAX);
         PcgAttempt::Budgeted {
             products: usize::try_from(products).unwrap_or(usize::MAX),
         }
@@ -1735,6 +1737,9 @@ mod dense_route_work_tests {
             work.pcg_attempt_under_cap(p, dense_bytes),
             PcgAttempt::Budgeted { products: 32 }
         );
-        assert_eq!(work.pcg_attempt_under_cap(p, dense_bytes - 1), PcgAttempt::Only);
+        assert_eq!(
+            work.pcg_attempt_under_cap(p, dense_bytes - 1),
+            PcgAttempt::Only
+        );
     }
 }

@@ -163,7 +163,10 @@ impl ReorthogonalizedRowBasis {
             return false;
         }
         // Column `k` of `Û` for `R̂_new = [[R̂, ĉ], [0, ρ̂]]` is `[−ŵ/ρ̂; 1/ρ̂]`.
-        let mut inverse_column: Vec<f64> = weights.iter().map(|weight| -weight / residual_norm).collect();
+        let mut inverse_column: Vec<f64> = weights
+            .iter()
+            .map(|weight| -weight / residual_norm)
+            .collect();
         inverse_column.push(1.0 / residual_norm);
         projections.push(residual_norm);
         self.factor_columns.push(projections);
@@ -188,11 +191,17 @@ mod tests {
     fn a_residual_above_its_band_joins_and_the_factor_reproduces_the_rows_2469() {
         let gap = 1.0e-14_f64;
         let band = gram_schmidt_residual_band(GRAM_SCHMIDT_PASSES, 1, 3, 1.0);
-        assert!(gap > band, "fixture premise: {gap:.1e} above the band {band:.3e}");
+        assert!(
+            gap > band,
+            "fixture premise: {gap:.1e} above the band {band:.3e}"
+        );
         let mut basis = ReorthogonalizedRowBasis::new();
         assert!(basis.admit(array![2.0_f64, 0.0, 0.0].view()));
         assert!(basis.admit(array![2.0_f64, 2.0 * gap, 0.0].view()));
-        assert!(!basis.admit(array![0.6_f64, 0.0, 0.0].view()), "a row in the span is dependent");
+        assert!(
+            !basis.admit(array![0.6_f64, 0.0, 0.0].view()),
+            "a row in the span is dependent"
+        );
         assert!(!basis.admit(array![0.0_f64, 0.0, 0.0].view()));
         assert!(!basis.admit(array![f64::NAN, 0.0, 0.0].view()));
         assert_eq!(basis.len(), 2);
@@ -200,7 +209,9 @@ mod tests {
         assert_eq!(factor[[1, 0]], 0.0);
         assert!((factor[[0, 0]] - 2.0).abs() <= 2.0 * f64::EPSILON);
         assert!((factor[[1, 1]] - 2.0 * gap).abs() <= band);
-        let rows = factor.t().dot(&Array2::from_shape_fn((2, 3), |(i, j)| basis.directions()[i][j]));
+        let rows = factor.t().dot(&Array2::from_shape_fn((2, 3), |(i, j)| {
+            basis.directions()[i][j]
+        }));
         assert!((rows[[1, 1]] - 2.0 * gap).abs() <= band);
         let inverse = Array2::from_shape_fn((2, 2), |(i, j)| {
             basis.inverse_columns[j].get(i).copied().unwrap_or(0.0)
@@ -247,7 +258,10 @@ mod tests {
         for index in 0..6 {
             assert!(basis.admit(rows.row(index)), "row {index} is independent");
         }
-        assert!(!basis.admit(rows.row(6)), "the fourth difference is in the span");
+        assert!(
+            !basis.admit(rows.row(6)),
+            "the fourth difference is in the span"
+        );
         assert_eq!(basis.len(), 6);
     }
 }

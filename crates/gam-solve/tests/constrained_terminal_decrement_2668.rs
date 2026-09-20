@@ -1,8 +1,8 @@
 use gam_linalg::matrix::SymmetricMatrix;
 use gam_problem::{Coefficients, EstimationError, LinearInequalityConstraints, LinearPredictor};
 use gam_solve::pirls::{
-    FirthDiagnostics, HessianCurvatureKind, PirlsStatus, WorkingModel,
-    WorkingModelPirlsOptions, WorkingState, runworking_model_pirls,
+    FirthDiagnostics, HessianCurvatureKind, PirlsStatus, WorkingModel, WorkingModelPirlsOptions,
+    WorkingState, runworking_model_pirls,
 };
 use ndarray::array;
 
@@ -43,7 +43,12 @@ impl WorkingModel for RoundedQuadratic {
 fn terminal_face_decrement_certifies_a_representable_quadratic_minimum() {
     gam_runtime::test_support::install_diagnostic_logger();
     for (name, lower_bounds, linear_constraints, expected_x) in [
-        ("lower bounds", Some(array![0.0, f64::NEG_INFINITY]), None, 0.0),
+        (
+            "lower bounds",
+            Some(array![0.0, f64::NEG_INFINITY]),
+            None,
+            0.0,
+        ),
         (
             "linear rows",
             None,

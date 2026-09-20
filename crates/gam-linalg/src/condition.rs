@@ -73,7 +73,11 @@ pub fn estimate_inverse_one_norm<E>(
                 largest = index;
             }
         }
-        let z_dot_x: f64 = z.iter().zip(x.iter()).map(|(left, right)| left * right).sum();
+        let z_dot_x: f64 = z
+            .iter()
+            .zip(x.iter())
+            .map(|(left, right)| left * right)
+            .sum();
         if !(z[largest].abs() > z_dot_x) {
             break;
         }
@@ -85,7 +89,11 @@ pub fn estimate_inverse_one_norm<E>(
         let mut alternating: Vec<f64> = (0..dimension)
             .map(|index| {
                 let magnitude = 1.0 + index as f64 / (n - 1.0);
-                if index % 2 == 0 { magnitude } else { -magnitude }
+                if index % 2 == 0 {
+                    magnitude
+                } else {
+                    -magnitude
+                }
             })
             .collect();
         solve(&mut alternating)?;
@@ -117,7 +125,13 @@ mod tests {
 
     fn exact_one_norm(matrix: &Array2<f64>) -> f64 {
         (0..matrix.ncols())
-            .map(|column| matrix.column(column).iter().map(|value| value.abs()).sum::<f64>())
+            .map(|column| {
+                matrix
+                    .column(column)
+                    .iter()
+                    .map(|value| value.abs())
+                    .sum::<f64>()
+            })
             .fold(0.0_f64, f64::max)
     }
 
@@ -141,8 +155,14 @@ mod tests {
         let exact = exact_one_norm(&inverse);
         let estimate =
             estimate_inverse_one_norm(3, inverse_solve(&inverse), inverse_solve(&inverse)).unwrap();
-        assert!(estimate <= exact * (1.0 + 3.0 * f64::EPSILON), "{estimate} above {exact}");
-        assert!((estimate - exact).abs() <= 3.0 * f64::EPSILON * exact, "{estimate} vs {exact}");
+        assert!(
+            estimate <= exact * (1.0 + 3.0 * f64::EPSILON),
+            "{estimate} above {exact}"
+        );
+        assert!(
+            (estimate - exact).abs() <= 3.0 * f64::EPSILON * exact,
+            "{estimate} vs {exact}"
+        );
     }
 
     /// A one-dimensional matrix has `‖A⁻¹‖₁ = 1/|a|`, and a failed solve is passed

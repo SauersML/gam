@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn the_configuration_and_the_state_width_are_validated() {
         assert!(AndersonAccelerator::new(0).is_err());
-                let mut accelerator = AndersonAccelerator::new(2).expect("accelerator");
+        let mut accelerator = AndersonAccelerator::new(2).expect("accelerator");
         assert!(accelerator.propose(&[], &[]).is_err());
         assert!(accelerator.propose(&[1.0], &[1.0, 2.0]).is_err());
         assert!(accelerator.propose(&[0.1, 0.2], &[0.0, 0.0]).is_ok());

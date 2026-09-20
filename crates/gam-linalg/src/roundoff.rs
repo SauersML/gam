@@ -211,7 +211,10 @@ pub fn factor_rank_partition(
     }
     let sigma_max = singular_values.first().copied().unwrap_or(0.0);
     let band = factor_singular_band(rows, cols, sigma_max);
-    let rank = singular_values.iter().filter(|&&value| value > band).count();
+    let rank = singular_values
+        .iter()
+        .filter(|&&value| value > band)
+        .count();
     Ok(FactorRankPartition {
         singular_values,
         right_vectors,
@@ -284,8 +287,8 @@ pub fn solved_penalty_trace_band(
             absolute_sum += (r * x).abs();
         }
         let charged_residual = residual_norm_sq.sqrt() + formation_norm_sq.sqrt();
-        solve_band +=
-            charged_residual * (solution_norm_sq.sqrt() + inverse_one_norm_estimate * charged_residual);
+        solve_band += charged_residual
+            * (solution_norm_sq.sqrt() + inverse_one_norm_estimate * charged_residual);
     }
     Ok(lambda.abs() * (solve_band + accumulation_growth(rows * columns) * absolute_sum))
 }
@@ -429,7 +432,10 @@ mod tests {
         assert_eq!(resolved_eigenvalue_count(&spectrum, 0.0), 2);
         assert_eq!(resolved_eigenvalue_count(&spectrum, 1.0e-7), 1);
         let band = symmetric_spectrum_rounding_band(&spectrum);
-        assert!(1.0e-17 <= band, "the roundoff pair must sit inside the eigensolver band");
+        assert!(
+            1.0e-17 <= band,
+            "the roundoff pair must sit inside the eigensolver band"
+        );
     }
 
     /// A graded factor whose small singular value is resolved from `A` though its

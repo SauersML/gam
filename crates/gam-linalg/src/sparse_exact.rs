@@ -42,6 +42,19 @@ impl SparseExactFactor {
         self.simplicial.l_values.len()
     }
 
+    /// The most stored entries in any one row of `L`. The recurrence for
+    /// `L_ij` (`j ≤ i`) sums `L_ik·L_jk` over `k < j`, and a product is nonzero
+    /// only where row `j` of `L` stores `k`, so no inner product the numeric
+    /// factorization forms has more terms than this. It is the length the
+    /// factor's componentwise backward error is charged at.
+    pub fn factor_max_row_nnz(&self) -> usize {
+        let mut counts = vec![0usize; self.n];
+        for &row in &self.simplicial.l_row_idx {
+            counts[row] += 1;
+        }
+        counts.into_iter().max().unwrap_or(0)
+    }
+
     /// Multiply-adds of the Takahashi recurrence on this factor: every pair of
     /// off-diagonal rows in a column of `L` costs one, so this is
     /// `Σ_j c_j²` over the off-diagonal counts `c_j`, the same order as the
@@ -1389,7 +1402,11 @@ mod tests {
                         .into_iter()
                         .flatten()
                         {
-                            triplets.push(Triplet::new(row.min(neighbour), row.max(neighbour), -1.0));
+                            triplets.push(Triplet::new(
+                                row.min(neighbour),
+                                row.max(neighbour),
+                                -1.0,
+                            ));
                         }
                     }
                 }
@@ -1429,11 +1446,18 @@ mod tests {
             }
             dense_to_sparse_symmetric_upper(&h, 0.0).expect("spline normal system")
         };
-        for (label, h) in [("laplacian side 12", laplacian(12)), ("laplacian side 20", laplacian(20)), ("spline normal system", spline)] {
+        for (label, h) in [
+            ("laplacian side 12", laplacian(12)),
+            ("laplacian side 20", laplacian(20)),
+            ("spline normal system", spline),
+        ] {
             let n = h.nrows();
             let rhs = Array1::from_iter((0..n).map(|i| ((i % 13) as f64) - 6.0));
             let words = |width: usize| {
-                let pool = rayon::ThreadPoolBuilder::new().num_threads(width).build().expect("pool");
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(width)
+                    .build()
+                    .expect("pool");
                 pool.install(|| {
                     let factor = factorize_sparse_spd(&h).expect("factor");
                     solve_sparse_spd(&factor, &rhs).expect("solve")
@@ -1442,7 +1466,10 @@ mod tests {
             let single = words(1);
             let wide = words(4);
             assert!(
-                single.iter().zip(wide.iter()).all(|(a, b)| a.to_bits() == b.to_bits()),
+                single
+                    .iter()
+                    .zip(wide.iter())
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
                 "{label}: pools of width 1 and 4 gave different words"
             );
             let upper = canonicalize_sparse_symmetric_upper(&h).expect("upper");
@@ -1462,7 +1489,10 @@ mod tests {
             let h_norm = row_sums.iter().copied().fold(0.0_f64, f64::max);
             let x_norm = single.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
             let scale = h_norm * x_norm + 6.0;
-            assert!(worst <= 1e-12 * scale, "{label}: residual {worst} against scale {scale}");
+            assert!(
+                worst <= 1e-12 * scale,
+                "{label}: residual {worst} against scale {scale}"
+            );
         }
     }
 
@@ -1698,5 +1728,4 @@ mod tests {
         approx_eq(block[[0, 2]], h_inv[[0, 2]], 1e-10);
         approx_eq(block[[2, 0]], h_inv[[2, 0]], 1e-10);
     }
-
 }
