@@ -374,21 +374,6 @@ impl std::fmt::Display for ConstrainedFixedPointCondition {
     }
 }
 
-/// The blockwise inner loop's terminal decision variables — the quantities its
-/// convergence verdict is actually taken on.
-///
-/// The loop certifies with
-/// `max_accepted_step <= step_tol && objective_change <= objective_tol`, and then
-/// `joint_stationarity_ok || max_proposed_step <= step_tol`. Reporting only the
-/// cycle count cannot say which of those four conjuncts failed, and they have
-/// different causes: steps still large means the solve needs more cycles, steps
-/// tiny with `joint_stationarity_ok == false` means the exact joint gate is the
-/// blocker rather than the budget, and an `objective_change` above tolerance
-/// means the iterate is still moving. This is deliberately NOT a KKT residual:
-/// `BlockwiseInnerResult::kkt_residual` is `None` off a converged iterate on
-/// purpose, because no caller may trust an IFT correction there, so the honest
-/// diagnostic is the decision variables themselves rather than a residual
-/// recomputed at a non-KKT point.
 /// The stationarity residual denominated the way its own gate denominates it.
 ///
 /// The inner joint-Newton gate is `R ≤ inner_tol · (1 + scale)` with
@@ -425,6 +410,21 @@ pub fn relative_stationarity(stationarity_residual: f64, stationarity_scale: f64
     stationarity_residual / (1.0 + stationarity_scale)
 }
 
+/// An inner loop's terminal decision variables — the quantities its
+/// convergence verdict is actually taken on.
+///
+/// The blockwise loop certifies with
+/// `max_accepted_step <= step_tol && objective_change <= objective_tol`, and then
+/// `joint_stationarity_ok || max_proposed_step <= step_tol`. Reporting only the
+/// cycle count cannot say which of those four conjuncts failed, and they have
+/// different causes: steps still large means the solve needs more cycles, steps
+/// tiny with `joint_stationarity_ok == false` means the exact joint gate is the
+/// blocker rather than the budget, and an `objective_change` above tolerance
+/// means the iterate is still moving. This is deliberately NOT a KKT residual:
+/// `BlockwiseInnerResult::kkt_residual` is `None` off a converged iterate on
+/// purpose, because no caller may trust an IFT correction there, so the honest
+/// diagnostic is the decision variables themselves rather than a residual
+/// recomputed at a non-KKT point.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InnerConvergenceTerminalState {
     /// The blockwise Gauss-Seidel route's terminal cycle.
