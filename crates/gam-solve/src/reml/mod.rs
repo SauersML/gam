@@ -467,29 +467,25 @@ mod tests {
         );
     }
 
-    /// The adaptive IFT step-cap controller belongs to the `RemlState` that
-    /// produced it, not to the ADDRESS that state happened to occupy.
+    /// The IFT trust radius belongs to the `RemlState` that measured it, not
+    /// to the ADDRESS that state happened to occupy.
     ///
-    /// It used to live in a process-global `HashMap` keyed by
-    /// `self as *const _ as usize`. Every constructing caller makes the state a
-    /// stack local, so two fits reached from the same call site land on the
-    /// same frame slot — and with no `Drop` to evict the entry, the second fit
-    /// read the first fit's quality history and shrunken step cap. That is a
-    /// silent cross-fit dependence: the same data fitted twice in one process
-    /// takes a different IFT step schedule the second time.
+    /// Its predecessor (a quality-history step-cap controller) lived in a
+    /// process-global `HashMap` keyed by `self as *const _ as usize`. Every
+    /// constructing caller makes the state a stack local, so two fits reached
+    /// from the same call site land on the same frame slot — and with no
+    /// `Drop` to evict the entry, the second fit read the first fit's history.
+    /// That is a silent cross-fit dependence: the same data fitted twice in
+    /// one process takes a different IFT step schedule the second time.
     ///
-    /// The probe builds a state, drives the controller off its defaults, drops
-    /// it, and builds a second state in the same slot. The second state must
-    /// see the documented defaults — the caller-supplied cap, and no flat
-    /// fallback.
+    /// The probe builds a state, measures a radius and stages a step on it,
+    /// drops it, and builds a second state in the same slot. The second state
+    /// must be unmeasured: no radius and no staged step.
     #[test]
     fn adaptive_ift_controller_does_not_survive_into_the_next_state_in_the_same_slot() {
-        // `default_cap` is deliberately a value the controller can never
-        // produce on its own, so reading it back is proof of a fresh slot
-        // rather than a coincidence.
-        const DEFAULT_CAP: f64 = 7.5;
+        use super::outer_eval::WarmStartPredictionSource;
 
-        fn probe(record: bool) -> (usize, f64, bool) {
+        fn probe(record: bool) -> (usize, Option<f64>, bool) {
             let y = array![0.2, -0.1, 0.3, 0.0];
             let w = Array1::<f64>::ones(y.len());
             let x = array![[1.0, -0.7], [1.0, -0.2], [1.0, 0.3], [1.0, 0.9]];
@@ -515,25 +511,25 @@ mod tests {
             .expect("state");
             let address = &state as *const RemlState<'_> as usize;
             if record {
-                // A prediction quality far above the flat-fallback band: the
-                // controller shrinks the cap and arms the flat fallback. This
-                // is precisely the state that used to be inherited.
-                let shrunk = state
-                    .record_ift_prediction_quality(1.0e3, 0.25)
-                    .expect("a finite quality and a positive cap must update the controller");
-                assert!(
-                    shrunk < 0.25,
-                    "a quality above the flat-fallback band must shrink the step cap; got {shrunk}"
+                // A unit step whose prediction missed by 10 against a flat
+                // miss of 1: the measured radius is 1·1/10.
+                let radius = state.record_warm_start_prediction_error(
+                    WarmStartPredictionSource::Ift,
+                    1.0,
+                    10.0,
+                    1.0,
                 );
-                return (address, shrunk, true);
+                assert_eq!(radius, Some(0.1));
+                state.stage_warm_start_prediction_step(WarmStartPredictionSource::Ift, 0.05);
+                return (address, radius, true);
             }
-            let cap = state.ift_quality_step_cap(DEFAULT_CAP);
-            let flat = state.take_ift_quality_flat_override();
-            (address, cap, flat)
+            let radius = state.warm_start_trust_radius(WarmStartPredictionSource::Ift);
+            let staged = state.take_staged_warm_start_prediction_step().is_some();
+            (address, radius, staged)
         }
 
         let (first_address, _, _) = probe(true);
-        let (second_address, cap, flat) = probe(false);
+        let (second_address, radius, staged) = probe(false);
 
         assert_eq!(
             first_address, second_address,
@@ -541,14 +537,76 @@ mod tests {
              both calls are to the same fn at the same depth, so the frame offsets must coincide"
         );
         assert_eq!(
-            cap, DEFAULT_CAP,
-            "a freshly built state must return the caller's default step cap, not the cap the \
-             previous state at this address shrank to"
+            radius, None,
+            "a freshly built state must be unmeasured, not carry the radius the previous state \
+             at this address measured"
         );
         assert!(
-            !flat,
-            "a freshly built state must not inherit the previous state's armed flat fallback"
+            !staged,
+            "a freshly built state must not inherit the previous state's staged prediction step"
         );
+    }
+
+    /// The warm-start trust radius is derived from one measurement, not
+    /// tuned: at step s the predictor's miss is E ≈ c₂s² and the flat seed's
+    /// miss is F ≈ c₁s, so the step at which they tie is R = s·F/E. A
+    /// predictor that hit exactly has no finite radius; a solve where both
+    /// seeds were exact, or where the inputs are not finite, measures
+    /// nothing; and the flat seed has no radius to measure (gam#2902).
+    #[test]
+    fn warm_start_trust_radius_is_the_step_where_the_predictor_ties_the_flat_seed() {
+        use super::outer_eval::WarmStartPredictionSource::{Flat, Ift, TangentLine};
+
+        let y = array![0.2, -0.1, 0.3, 0.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![[1.0, -0.7], [1.0, -0.2], [1.0, 0.3], [1.0, 0.9]];
+        let offset = Array1::<f64>::zeros(y.len());
+        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-10, false);
+        let p = x.ncols();
+        let canonical = vec![gam_terms::construction::CanonicalPenalty::from_dense_root(
+            array![[0.0, 1.0]],
+            p,
+        )];
+        let state = RemlState::newwith_offset(
+            y.view(),
+            x,
+            w.view(),
+            offset.view(),
+            canonical,
+            p,
+            &cfg,
+            Some(vec![1]),
+            None,
+            None,
+        )
+        .expect("state");
+
+        assert_eq!(state.warm_start_trust_radius(Ift), None);
+        assert_eq!(state.record_warm_start_prediction_error(Ift, 1.0, 0.5, 1.0), Some(2.0));
+        assert_eq!(state.warm_start_trust_radius(Ift), Some(2.0));
+        // The tangent radius is its own measurement.
+        assert_eq!(state.warm_start_trust_radius(TangentLine), None);
+        assert_eq!(
+            state.record_warm_start_prediction_error(TangentLine, 3.0, 2.0, 0.5),
+            Some(0.75)
+        );
+        assert_eq!(state.warm_start_trust_radius(Ift), Some(2.0));
+        // An exact prediction leaves no step at which the flat seed wins.
+        assert_eq!(
+            state.record_warm_start_prediction_error(Ift, 0.5, 0.0, 1.0),
+            Some(f64::INFINITY)
+        );
+        // Both seeds exact, or a non-finite input, measure nothing and keep
+        // the previous radius.
+        assert_eq!(state.record_warm_start_prediction_error(Ift, 0.5, 0.0, 0.0), None);
+        assert_eq!(state.record_warm_start_prediction_error(Ift, f64::NAN, 1.0, 1.0), None);
+        assert_eq!(state.record_warm_start_prediction_error(Ift, 1.0, -1.0, 1.0), None);
+        assert_eq!(state.warm_start_trust_radius(Ift), Some(f64::INFINITY));
+        assert_eq!(state.record_warm_start_prediction_error(Flat, 1.0, 0.5, 1.0), None);
+        assert_eq!(state.warm_start_trust_radius(Flat), None);
+        state.clear_warm_start_adaptive_signals();
+        assert_eq!(state.warm_start_trust_radius(Ift), None);
+        assert_eq!(state.warm_start_trust_radius(TangentLine), None);
     }
 
     #[test]
@@ -634,8 +692,8 @@ mod tests {
             let cfg = RemlConfig::external(likelihood, 1e-9, true).with_max_iterations(500);
             let state = build_logit_state(&y, &w, &x, &s, &cfg);
             assert!(
-                !state.analytic_outer_hessian_enabled(),
-                "{link:?} should use BFGS curvature until exact f_obs is available"
+                state.analytic_outer_hessian_enabled(),
+                "{link:?} Firth must carry its analytic TK outer Hessian (#3203)"
             );
 
             let bundle = state
@@ -1640,6 +1698,41 @@ mod tests {
 
     #[test]
     pub(crate) fn firth_outer_hessian_matches_gradient_finite_difference_with_tk_terms() {
+        assert_firth_outer_hessian_matches_gradient_finite_difference(
+            binomial_logit_glm_spec(),
+            2.0e-3,
+        );
+    }
+
+    /// #3203: non-canonical Firth links take `f = d⁴W_obs/dη⁴` from the
+    /// six-order Bernoulli log jet; the analytic TK outer ρ-Hessian must match
+    /// the central difference of the analytic gradient. The central-difference
+    /// truncation `δ²|∇³V|/6` is ~1e-10 at δ = 2e-5 and the inner-solve residual
+    /// at tol 1e-9 keeps every entry within 4e-8 of the difference, while
+    /// dropping the `f` term moves at least one entry per link by ≥ 1e-4, so the
+    /// 1e-6 band certifies the `f` carrier itself rather than only c/d/e.
+    #[test]
+    fn noncanonical_firth_outer_hessian_matches_gradient_finite_difference_3203() {
+        for link in [
+            StandardLink::Probit,
+            StandardLink::CLogLog,
+            StandardLink::LogLog,
+            StandardLink::Cauchit,
+        ] {
+            assert_firth_outer_hessian_matches_gradient_finite_difference(
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(link),
+                )),
+                1.0e-6,
+            );
+        }
+    }
+
+    fn assert_firth_outer_hessian_matches_gradient_finite_difference(
+        likelihood: GlmLikelihoodSpec,
+        rel_tol: f64,
+    ) {
         let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1654,8 +1747,8 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.1], [0.0, 0.1, 0.7],];
         let s1 = array![[0.0, 0.0, 0.0], [0.0, 0.4, -0.05], [0.0, -0.05, 0.9],];
-        let cfg =
-            RemlConfig::external(binomial_logit_glm_spec(), 1e-9, true).with_max_iterations(500);
+        let link_label = format!("{:?}", likelihood);
+        let cfg = RemlConfig::external(likelihood, 1e-9, true).with_max_iterations(500);
         let p_dim = x.ncols();
         use crate::estimate::PenaltySpec;
         let specs = vec![PenaltySpec::Dense(s0), PenaltySpec::Dense(s1)];
@@ -1677,6 +1770,10 @@ mod tests {
             None,
         )
         .expect("state");
+        assert!(
+            state.analytic_outer_hessian_enabled(),
+            "{link_label}: Firth must carry its analytic outer Hessian"
+        );
         let rho = array![0.15, -0.25];
         let eval = state
             .compute_outer_eval_with_order(
@@ -1715,8 +1812,8 @@ mod tests {
                 let an = h[[row, col]];
                 let rel = (fd - an).abs() / fd.abs().max(an.abs()).max(1e-6);
                 assert!(
-                    rel < 2.0e-3,
-                    "Hessian mismatch ({row},{col}): analytic={an:.9e}, fd={fd:.9e}, rel={rel:.3e}"
+                    rel < rel_tol,
+                    "{link_label}: Hessian mismatch ({row},{col}): analytic={an:.9e}, fd={fd:.9e}, rel={rel:.3e}"
                 );
             }
         }
@@ -4656,6 +4753,17 @@ pub(crate) struct FirthDirection {
     pub(crate) b_uvec: Array1<f64>,
 }
 
+/// Shared contractions of `D H_φ[u]` against one symmetric `Π`, built by
+/// `FirthDenseOperator::hphi_direction_trace_kernel`.
+pub(crate) struct FirthHphiTraceKernel {
+    /// `ℓ = diag(X Π Xᵀ)`.
+    pub(crate) leverage: Array1<f64>,
+    /// `v = ((M⊙M)⊙(X Π Xᵀ)) w'`.
+    pub(crate) hadamard_w1: Array1<f64>,
+    /// `R = Zᵀ diag(w') (M⊙X Π Xᵀ) diag(w') Z` in reduced coordinates.
+    pub(crate) reduced: Array2<f64>,
+}
+
 #[derive(Clone)]
 pub(crate) struct FirthTauPartialKernel {
     pub(super) deta_partial: Array1<f64>,
@@ -5697,20 +5805,21 @@ pub(crate) enum BlockCorrectionDecision {
 /// `Δ_b` has no closed-form ρ-Hessian on this fit, or `None` when the
 /// correction carries its exact ρ-Hessian into the criterion.
 ///
-/// `block_ranks` are the block's spectral positions: for each block axis, the
-/// rank of its curvature `λ_r` in the ascending spectrum of `H` (#3113). The
-/// block at every later ρ is the eigenpairs at those ranks, so each latched
-/// order stays on the direction it was certified on and the block moves with ρ
-/// as continuously as those eigenpairs do. A rank, not an index, because the
-/// criterion's eigensolver returns ascending pairs from `eigh` and descending
-/// ones from the stacked-root SVD (#2644).
+/// The block itself is latched as its SPECTRAL POSITIONS: the ranks, in the
+/// ascending eigenvalue order of the penalized Hessian, of the directions the
+/// admission integrated (a rank, so it does not depend on which order the
+/// criterion's eigensolver returns its pairs in). Each later ρ takes the eigenvectors at those
+/// positions, so axis `r`'s order stays attached to the direction it was
+/// certified on, and the block moves with ρ as continuously as the
+/// eigenvectors at those positions do (continuously away from an eigenvalue
+/// coincidence with a neighbouring position, steeply near an avoided one).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
+    pub(crate) block_positions: Vec<usize>,
     pub(crate) axis_orders: Vec<usize>,
     pub(crate) axis_quadrature_errors: Vec<f64>,
     pub(crate) axis_split: bool,
     pub(crate) hessian_refusal: Option<String>,
-    pub(crate) block_ranks: Vec<usize>,
 }
 
 pub(crate) struct RemlState<'a> {
@@ -5810,7 +5919,7 @@ pub(crate) struct RemlState<'a> {
     /// see each other, and no key can alias. They sit beside
     /// `ift_warm_start_cache` / `ift_cached_factor`, which were already
     /// per-state interior-mutability fields — these were the odd ones out.
-    pub(crate) ift_quality_runtime: std::sync::Mutex<outer_eval::IftQualityRuntimeState>,
+    pub(crate) warm_start_trust: std::sync::Mutex<outer_eval::WarmStartTrustState>,
     pub(crate) ift_mode_response_slot:
         std::sync::Mutex<Option<outer_eval::IftModeResponseRuntimeCache>>,
     pub(crate) ift_joint_mode_response_slot:
@@ -5959,12 +6068,9 @@ pub(crate) struct RemlState<'a> {
     /// NaN's self-inequality makes the sentinel unambiguous: any
     /// stored finite non-negative value is genuine signal.
     ///
-    /// Read by `predict_warm_start_beta_ift_with_outcome` to drive the adaptive
-    /// |Δρ| cap (`adaptive_ift_max_drho`): a small residual loosens
-    /// the cap, a large one tightens it. Replaces the previous
-    /// hardcoded `IFT_WARM_START_MAX_DRHO = 2.0` constant with a
-    /// data-driven policy, so the predictor adapts to the empirical
-    /// faithfulness of the linearization at this surface's scale.
+    /// Read by the outer loop's inner-iteration cap schedule and narrated in
+    /// the `[IFT-QUALITY]` bench log. The predictor's step admission does not
+    /// read it: that is the derived trust radius in `warm_start_trust`.
     /// Reset on `reset_surface` and on failed solves.
     pub(crate) last_ift_prediction_residual: Arc<AtomicU64>,
 

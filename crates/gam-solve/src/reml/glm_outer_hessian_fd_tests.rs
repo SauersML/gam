@@ -331,11 +331,11 @@ fn a_latched_block_correction_without_a_hessian_refuses_with_its_reason_784() {
         .block_correction_axis_orders
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(super::BlockQuadratureLatch {
+        block_positions: vec![0],
         axis_orders: vec![8],
         axis_quadrature_errors: vec![0.0],
         axis_split: false,
         hessian_refusal: Some(reason.to_string()),
-        block_ranks: vec![0],
     });
     reml.reset_outer_seed_state();
 

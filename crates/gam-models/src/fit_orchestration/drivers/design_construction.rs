@@ -2671,10 +2671,9 @@ fn certify_bounded_edf_interval(
     )
 }
 
-/// Refit budget for the bounded fit's profiled Gaussian dispersion.
-const BOUNDED_GAUSSIAN_SCALE_MAX_ITER: usize = 50;
-/// Fixed-point tolerance for the profiled dispersion, on `ln phi`, and for the
-/// latent coefficients, relative to `1 + |theta|`.
+/// Tolerance for the profiled dispersion's root on `ln phi`: the residual
+/// `|ln g(phi) - ln phi|` it accepts, and the width of the bracket that certifies
+/// the root to that resolution.
 const BOUNDED_GAUSSIAN_SCALE_TOL: f64 = 1e-8;
 
 /// `S_lambda = sum_k lambda_k S_k` over the bounded fit's penalties, as a dense
@@ -3159,9 +3158,9 @@ fn fit_bounded_term_collection_with_design(
     // criterion weighs the data against the prior at the dispersion it is
     // given: at sigma = 1 it chooses lambda as if the residual variance were 1
     // in the response's units, so the choice changes with the units of y. The
-    // dispersion is therefore profiled jointly with lambda: refit at the fixed
-    // dispersion `phi`, update `phi = RSS / (n - edf)`, the stationarity
-    // condition of the Laplace criterion in `phi`, and repeat to the fixed point.
+    // dispersion is therefore profiled jointly with lambda: the fit at the fixed
+    // dispersion `phi` must satisfy `phi = RSS / (n - edf)`, the stationarity
+    // condition of the Laplace criterion in `phi`, solved for below.
     let p_fit = fit_design.ncols();
     let profiles_gaussian_scale = matches!(
         resolved_likelihood_scale,
@@ -3180,18 +3179,44 @@ fn fit_bounded_term_collection_with_design(
     let mut fit_phi = 1.0_f64;
     let mut fit_adapter = family_adapter.clone();
     if profiles_gaussian_scale {
+        // The profiled dispersion is a root of `h(u) = ln g(e^u) - u` on
+        // `u = ln phi`, where `g(phi) = RSS / (n - edf)` is read off the fit run
+        // at the fixed dispersion `phi`. Along the profile the criterion's
+        // derivative is `(n - edf)/2 * (1 - e^h)`, so a root of `h` is a
+        // stationary point of the profiled criterion. `g` is bounded above (no
+        // fit leaves more residual than the one the prior shrinks fully, over at
+        // least `n - p` residual degrees of freedom), so `h -> -inf` as
+        // `u -> inf`; and unless the fit is exact, `g` stays positive as the
+        // prior's weight vanishes, so `h -> +inf` as `u -> -inf`. A sign change
+        // therefore exists on the side `h` points to. Iterating `phi <- g(phi)`
+        // is not a certified solve of that equation: `g` is read off a refit
+        // whose smoothing parameter is resolved only to the outer tolerance, so
+        // near a flat criterion `h` carries refit noise far above any fixed-point
+        // tolerance and the iteration never settles (gam#3450). The root is
+        // instead bracketed by forward steps that at least double, then
+        // narrowed by Illinois regula falsi until the bracket, which contains a
+        // sign change of `h`, is no wider than the tolerance on `ln phi`.
+        struct ScaleProbe {
+            phi: f64,
+            u: f64,
+            h: f64,
+            fit: UnifiedFitResult,
+            adapter: BoundedLinearFamily,
+        }
         let n_obs = y.len() as f64;
-        let mut profiled = false;
-        for _ in 0..BOUNDED_GAUSSIAN_SCALE_MAX_ITER {
-            let latent = fit.block_states[0].beta.clone();
-            let lambdas_unit = fit.lambdas.mapv(|lambda| lambda * fit_phi);
+        let measure = |phi: f64,
+                       fit: UnifiedFitResult,
+                       adapter: BoundedLinearFamily|
+         -> Result<ScaleProbe, EstimationError> {
+            let latent = &fit.block_states[0].beta;
+            let lambdas_unit = fit.lambdas.mapv(|lambda| lambda * phi);
             let (unit_state, _, _, _) = family_adapter
-                .evaluation_from_latent(&latent)
+                .evaluation_from_latent(latent)
                 .map_err(EstimationError::InvalidInput)?;
-            let (_, h_fit, _, _) = fit_adapter
-                .evaluation_from_latent(&latent)
+            let (_, h_fit, _, _) = adapter
+                .evaluation_from_latent(latent)
                 .map_err(EstimationError::InvalidInput)?;
-            let mut precision = h_fit * fit_phi;
+            let mut precision = h_fit * phi;
             precision += &bounded_penalty_sum(&fit_penalties, &lambdas_unit, p_fit);
             let cov = certified_bounded_posterior_covariance(
                 &precision,
@@ -3200,44 +3225,93 @@ fn fit_bounded_term_collection_with_design(
             let (_, _, edf) = exact_bounded_edf(&fit_penalties, &lambdas_unit, &cov)?;
             let rss = -2.0 * unit_state.log_likelihood;
             let sigma = certified_profiled_gaussian_scale(rss, n_obs - edf, "bounded Gaussian")?;
-            let phi_next = sigma * sigma;
-            // An exact fit leaves no residual variance to profile: the data
-            // outweigh any finite prior and the current fit is the answer.
-            if phi_next == 0.0 || (phi_next.ln() - fit_phi.ln()).abs() <= BOUNDED_GAUSSIAN_SCALE_TOL {
-                profiled = true;
-                break;
-            }
-            let scale = gam_spec::LikelihoodScaleMetadata::FixedDispersion { phi: phi_next };
-            fit_adapter.likelihood = gam_spec::GlmLikelihoodSpec::try_new(
+            let u = phi.ln();
+            Ok(ScaleProbe {
+                phi,
+                u,
+                h: (sigma * sigma).ln() - u,
+                fit,
+                adapter,
+            })
+        };
+        // An exact fit (`g = 0`, `h = -inf`) leaves no residual variance to
+        // profile: the data outweigh any finite prior and that fit is the answer.
+        let settled = |probe: &ScaleProbe| {
+            probe.h.abs() <= BOUNDED_GAUSSIAN_SCALE_TOL || probe.h == f64::NEG_INFINITY
+        };
+        // Refit at `u`, warm-started from the probe `warm`: the unit-dispersion
+        // lambdas `phi * lambda` carry over, so `rho` shifts by the change in `u`.
+        let probe_at = |u: f64, warm: &ScaleProbe| -> Result<ScaleProbe, EstimationError> {
+            let phi = u.exp();
+            let mut adapter = family_adapter.clone();
+            adapter.likelihood = gam_spec::GlmLikelihoodSpec::try_new(
                 glm_likelihood.spec.clone(),
-                scale,
+                gam_spec::LikelihoodScaleMetadata::FixedDispersion { phi },
             )
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-            let warm_log_lambdas = fit
-                .log_lambdas
-                .mapv(|rho| rho + fit_phi.ln() - phi_next.ln());
-            let next = run_fit(&fit_adapter, warm_log_lambdas, latent.clone())?;
-            let moved = next.block_states[0]
-                .beta
-                .iter()
-                .zip(latent.iter())
-                .any(|(a, b)| (a - b).abs() > BOUNDED_GAUSSIAN_SCALE_TOL * (1.0 + b.abs()));
-            fit = next;
-            fit_phi = phi_next;
-            // The coefficients no longer respond to the dispersion: the fixed
-            // point is reached even while `phi` itself still falls toward an
-            // exact fit's zero.
-            if !moved {
-                profiled = true;
-                break;
+            let warm_log_lambdas = warm.fit.log_lambdas.mapv(|rho| rho + warm.u - u);
+            let fit = run_fit(&adapter, warm_log_lambdas, warm.fit.block_states[0].beta.clone())?;
+            measure(phi, fit, adapter)
+        };
+        let mut near = measure(1.0, fit, family_adapter.clone())?;
+        let solved = if settled(&near) {
+            near
+        } else {
+            // Bracket. The first step is the substitution `u <- ln g`; each later
+            // one follows the secant through the last two probes when it points
+            // forward and reaches farther, and is otherwise the last step
+            // doubled, so the probes reach the sign change `h` must make.
+            let mut step = near.h;
+            let mut far = probe_at(near.u + step, &near)?;
+            while !settled(&far) && far.h.signum() == near.h.signum() {
+                let secant = -far.h * (far.u - near.u) / (far.h - near.h);
+                step = if secant.is_finite()
+                    && secant.signum() == step.signum()
+                    && secant.abs() > 2.0 * step.abs()
+                {
+                    secant
+                } else {
+                    2.0 * step
+                };
+                let next = probe_at(far.u + step, &far)?;
+                near = std::mem::replace(&mut far, next);
             }
-        }
-        if !profiled {
-            crate::bail_invalid_estim!(
-                "bounded Gaussian dispersion did not reach its profiled fixed point in \
-                 {BOUNDED_GAUSSIAN_SCALE_MAX_ITER} refits (last phi = {fit_phi})"
-            );
-        }
+            if settled(&far) {
+                far
+            } else {
+                // Illinois regula falsi on the bracket `[near, far]`, `far` the
+                // newest probe. `h_near` is halved each time the same end is
+                // retained, so both ends converge on the root.
+                let mut h_near = near.h;
+                let mut h_far = far.h;
+                while (far.u - near.u).abs() > BOUNDED_GAUSSIAN_SCALE_TOL {
+                    let u = (near.u * h_far - far.u * h_near) / (h_far - h_near);
+                    let next = probe_at(u, &far)?;
+                    if settled(&next) {
+                        far = next;
+                        break;
+                    }
+                    if next.h.signum() == h_far.signum() {
+                        h_near *= 0.5;
+                    } else {
+                        near = std::mem::replace(&mut far, next);
+                        h_near = h_far;
+                        h_far = far.h;
+                        continue;
+                    }
+                    h_far = next.h;
+                    far = next;
+                }
+                if settled(&far) || far.h.abs() <= near.h.abs() {
+                    far
+                } else {
+                    near
+                }
+            }
+        };
+        fit = solved.fit;
+        fit_phi = solved.phi;
+        fit_adapter = solved.adapter;
     }
     // The reported strengths are exactly `exp(log_lambdas)`, so the unit-dispersion
     // shift is taken on the log coordinate.
@@ -3484,6 +3558,7 @@ fn fit_bounded_term_collection_with_design(
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             };
             let covariance_conditional = beta_covariance;
             // Sealed `UnifiedFitResult`: existence certifies inner+outer

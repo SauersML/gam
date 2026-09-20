@@ -83,10 +83,7 @@ impl std::fmt::Display for StationarityRung {
 pub enum StationarityStandard {
     /// A stationarity residual measured at this point was weighed against
     /// `bound`, which `rung` derived from this point's own evidence.
-    Measured {
-        bound: f64,
-        rung: StationarityRung,
-    },
+    Measured { bound: f64, rung: StationarityRung },
     /// The refusal was decided without any stationarity comparison — the
     /// terminal evidence was rejected before a residual existed, or the
     /// predicate was an identity/existence check rather than a bound test. The
@@ -236,16 +233,14 @@ impl core::fmt::Display for FixedLambdaStallReason {
 /// Solver-native first-order residual carried by a fixed-lambda stall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FixedLambdaResidualKind {
-    /// Euclidean norm of the exact penalized likelihood gradient.
-    PenalizedGradientNorm,
-    /// Firth/Jeffreys Newton decrement `0.5 * |score' H^-1 score|`.
+    /// Half the squared Newton decrement `0.5 * score' H^+ score`, in
+    /// objective units (Firth/Jeffreys and penalized vector-GLM solves).
     NewtonDecrement,
 }
 
 impl core::fmt::Display for FixedLambdaResidualKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
-            Self::PenalizedGradientNorm => "penalized gradient norm",
             Self::NewtonDecrement => "Newton decrement",
         })
     }
@@ -413,7 +408,6 @@ impl OuterObjectiveErrorSource {
             Self::Objective(source) => source.downcast_ref::<EstimationError>(),
         }
     }
-
 }
 
 /// A comprehensive error type for the model estimation process.
@@ -499,37 +493,15 @@ pub enum EstimationError {
     },
 
     #[error(
-        "Block-orthogonal Gaussian REML did not converge within {iterations} outer passes: \
-         max relative rho-score residual {max_score_residual:.6e}/{score_tol:.3e}, \
-         minimum profiled curvature {min_profile_curvature:.6e} (negative allowance \
-         {profile_curvature_roundoff:.3e}; last scale fixed-point step \
-         {last_scale_step:.6e}{}). \
+        "Block-orthogonal Gaussian REML has no certified smoothing optimum: {reason}. \
          A fit is only minted from a converged optimization; resume from the \
-         checkpoint by passing `init_rhos` = {rho_checkpoint:?}.",
-        if *cycle_detected { ", deterministic limit cycle detected" } else { "" }
+         checkpoint by passing `init_rhos` = {rho_checkpoint:?}."
     )]
     BlockOrthogonalRemlDidNotConverge {
-        /// Outer alternation passes executed before exhaustion.
-        iterations: usize,
-        /// Largest per-block |dV/drho| at the final iterate, normalized by the
-        /// score's natural magnitude `d * max(1, rank)`.
-        max_score_residual: f64,
-        /// Tolerance the residual had to meet for the convergence certificate.
-        score_tol: f64,
-        /// Smallest eigenvalue of the analytic rho Hessian after profiling out
-        /// the exact conditional scale block.
-        min_profile_curvature: f64,
-        /// Dimension-scaled eigensolver roundoff allowed below zero when
-        /// certifying positive semidefiniteness.
-        profile_curvature_roundoff: f64,
-        /// Last max |Δ log scale-precision| fixed-point movement (evidence of
-        /// whether the alternation was still moving or had stalled).
-        last_scale_step: f64,
-        /// The alternation revisited an earlier `(rho, scale)` state exactly;
-        /// as a deterministic map it can never certify, so it stopped early.
-        cycle_detected: bool,
-        /// Per-block log-lambda iterates at exhaustion; feed back through the
-        /// entry point's `init_rhos` to resume rather than restart.
+        /// Why the certified Newton trust region on the scale-profiled
+        /// objective returned no stationary point.
+        reason: String,
+        /// Last iterate of the smoothing search, resumable through `init_rhos`.
         rho_checkpoint: Vec<f64>,
     },
 
@@ -613,6 +585,17 @@ pub enum EstimationError {
         min_signed_margin: f64,
         num_unpenalized_columns: usize,
         column_indices: Vec<usize>,
+    },
+
+    #[error(
+        "Pre-fit separation detected in the Bernoulli marginal-slope latent score: the threshold \
+        {threshold:.6e} on z separates the binary outcomes (positive_above_threshold={positive_above_threshold}), \
+        so the pooled probit likelihood of y on z has no finite mode. Enable Firth/Jeffreys bias \
+        reduction or supply a latent score that does not separate the outcomes."
+    )]
+    PrefitLatentScoreSeparationDetected {
+        threshold: f64,
+        positive_above_threshold: bool,
     },
 
     #[error(
@@ -820,7 +803,9 @@ pub enum EstimationError {
     /// it needed none. The sixth, a corrector that returns no gradient moments for a non-empty
     /// block, breaks the corrector's contract at every rho and stays fatal.
     #[error("#784 block-local quadrature correction refused: {stage}")]
-    BlockQuadratureCorrectionRefused { stage: BlockQuadratureCorrectionStage },
+    BlockQuadratureCorrectionRefused {
+        stage: BlockQuadratureCorrectionStage,
+    },
 
     #[error("Fatal outer-objective evaluation failure ({context}): {source}")]
     OuterObjectiveEvaluationFailed {
@@ -1158,8 +1143,7 @@ impl EstimationError {
             Self::OuterObjectiveEvaluationFailed { source, .. } => {
                 source.estimation_error().and_then(Self::advice)
             }
-            Self::PerfectSeparationDetected { .. }
-            | Self::MultinomialSeparationDetected { .. } => {
+            Self::PerfectSeparationDetected { .. } | Self::MultinomialSeparationDetected { .. } => {
                 Some(format!("Detected (quasi-)separation. {SEPARATION}"))
             }
             Self::PrefitPerfectSeparationDetected { column_index, .. } => Some(format!(
@@ -1167,6 +1151,9 @@ impl EstimationError {
             )),
             Self::PrefitLinearSeparationDetected { column_indices, .. } => Some(format!(
                 "Detected separation driven by unpenalized columns {column_indices:?}. {PREFIT_SEPARATION}"
+            )),
+            Self::PrefitLatentScoreSeparationDetected { .. } => Some(format!(
+                "Detected separation driven by the marginal-slope latent score. {SEPARATION}"
             )),
             Self::LinkFeasibilityBoundaryOptimum { link, .. } => Some(format!(
                 "The {link} link's range exceeds the family's mean domain and the data put \
@@ -1181,9 +1168,9 @@ impl EstimationError {
             Self::ModelIsIllConditioned { .. }
             | Self::HessianNotPositiveDefinite { .. }
             | Self::LinearSystemSolveFailed(_)
-            | Self::EigendecompositionFailed(_) => {
-                Some(format!("Matrix conditioning issue detected. {CONDITIONING}"))
-            }
+            | Self::EigendecompositionFailed(_) => Some(format!(
+                "Matrix conditioning issue detected. {CONDITIONING}"
+            )),
             _ => None,
         }
     }
@@ -1249,6 +1236,7 @@ impl EstimationError {
             | Self::BetaPrecisionRefinementDidNotConverge { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
@@ -1440,6 +1428,7 @@ impl EstimationError {
             | Self::LinkFeasibilityBoundaryOptimum { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
@@ -1522,6 +1511,9 @@ impl EstimationError {
             Self::PrefitLinearSeparationDetected { .. } => {
                 "EstimationError::PrefitLinearSeparationDetected"
             }
+            Self::PrefitLatentScoreSeparationDetected { .. } => {
+                "EstimationError::PrefitLatentScoreSeparationDetected"
+            }
             Self::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
                 "EstimationError::PrefitUnpenalizedSpaceExceedsObservations"
             }
@@ -1534,8 +1526,12 @@ impl EstimationError {
             Self::MultinomialSeparationDetected { .. } => {
                 "EstimationError::MultinomialSeparationDetected"
             }
-            Self::HessianNotPositiveDefinite { .. } => "EstimationError::HessianNotPositiveDefinite",
-            Self::LaplacePrecisionIndefinite { .. } => "EstimationError::LaplacePrecisionIndefinite",
+            Self::HessianNotPositiveDefinite { .. } => {
+                "EstimationError::HessianNotPositiveDefinite"
+            }
+            Self::LaplacePrecisionIndefinite { .. } => {
+                "EstimationError::LaplacePrecisionIndefinite"
+            }
             Self::PredictiveIntervalsDeclined { .. } => {
                 "EstimationError::PredictiveIntervalsDeclined"
             }
@@ -1553,9 +1549,7 @@ impl EstimationError {
                 "EstimationError::OuterObjectiveEvaluationFailed"
             }
             Self::RemlDidNotConverge { .. } => "EstimationError::RemlDidNotConverge",
-            Self::DominatedCertifiedPlateau { .. } => {
-                "EstimationError::DominatedCertifiedPlateau"
-            }
+            Self::DominatedCertifiedPlateau { .. } => "EstimationError::DominatedCertifiedPlateau",
             Self::FitDidNotConverge { .. } => "EstimationError::FitDidNotConverge",
             Self::GradientUnavailable { .. } => "EstimationError::GradientUnavailable",
             Self::LayoutError(_) => "EstimationError::LayoutError",
@@ -1576,7 +1570,9 @@ impl EstimationError {
             Self::DenseMaterializationRefused { .. } => {
                 "EstimationError::DenseMaterializationRefused"
             }
-            Self::LogStrengthDomainViolation { .. } => "EstimationError::LogStrengthDomainViolation",
+            Self::LogStrengthDomainViolation { .. } => {
+                "EstimationError::LogStrengthDomainViolation"
+            }
             Self::MonotoneRoot(_) => "EstimationError::MonotoneRoot",
             Self::CalibratorTrainingFailed(_) => "EstimationError::CalibratorTrainingFailed",
             Self::InvalidSpecification(_) => "EstimationError::InvalidSpecification",
@@ -1616,7 +1612,11 @@ mod advice_policy_tests {
         let advice = basis.advice().expect("basis advice");
         assert!(advice.contains("power"), "{advice}");
 
-        assert!(EstimationError::InvalidInput("dimension=16".into()).advice().is_none());
+        assert!(
+            EstimationError::InvalidInput("dimension=16".into())
+                .advice()
+                .is_none()
+        );
     }
 }
 
@@ -1661,7 +1661,7 @@ mod trial_point_classification_tests {
                 reason: FixedLambdaStallReason::IterationBudgetExhausted,
                 objective_value: 12.5,
                 stationarity: FixedLambdaStationarityEvidence {
-                    kind: FixedLambdaResidualKind::PenalizedGradientNorm,
+                    kind: FixedLambdaResidualKind::NewtonDecrement,
                     residual: 1.0e-3,
                     bound: 1.0e-8,
                 },
@@ -1819,10 +1819,7 @@ mod tests {
     fn the_bound_and_its_rung_are_one_field() {
         let standard = measured("solver-band", false);
         assert_eq!(standard.bound(), Some(1.0e-2));
-        assert_eq!(
-            standard.rung().map(|rung| rung.label),
-            Some("solver-band")
-        );
+        assert_eq!(standard.rung().map(|rung| rung.label), Some("solver-band"));
         assert_eq!(StationarityStandard::NoComparison.bound(), None);
         assert_eq!(StationarityStandard::NoComparison.rung(), None);
     }
@@ -2064,7 +2061,9 @@ mod tests {
 
     #[test]
     fn block_quadrature_correction_refusals_back_off_only_at_rho_local_stages_784() {
-        use crate::laplace_sampler_contract::{BlockQuadratureOrderRefusal, BlockQuadratureRefusal};
+        use crate::laplace_sampler_contract::{
+            BlockQuadratureOrderRefusal, BlockQuadratureRefusal,
+        };
         // The six stages that are facts about the trial point back the outer search off it,
         // as a convergence-class refusal (#784 ruling A).
         let rho_local = [
@@ -2179,8 +2178,8 @@ pub enum BlockQuadratureCorrectionStage {
     /// reserves an absent moment set for the empty block, so this is the corrector's defect at
     /// every rho, not a property of one.
     CorrectorReturnedNoMoments { block_dim: usize },
-    /// The admission latched a block dimension without the block's spectral ranks, or with
-    /// ranks outside this rho's spectrum. The admission and its block latch together, so this
+    /// The admission latched a block dimension without the block's spectral positions, or with
+    /// positions outside this rho's spectrum. The admission and its block latch together, so this
     /// is a broken latch at every rho, not a property of one.
     LatchedBlockUnavailable { block_dim: usize, spectrum_dim: usize },
     /// The penalized Hessian at this rho's mode has a non-positive or non-finite eigenvalue, so
@@ -2250,7 +2249,7 @@ impl std::fmt::Display for BlockQuadratureCorrectionStage {
                 spectrum_dim,
             } => write!(
                 f,
-                "the admission latched a {block_dim}-direction block whose spectral ranks are \
+                "the admission latched a {block_dim}-direction block whose spectral positions are \
                  absent or outside this rho's {spectrum_dim}-dimensional spectrum"
             ),
             Self::NonPositivePenalizedCurvature { min_eigenvalue } => write!(
@@ -2259,7 +2258,10 @@ impl std::fmt::Display for BlockQuadratureCorrectionStage {
                  {min_eigenvalue:.4e}, so the implicit mode response is undefined"
             ),
             Self::EigenpairResolutionUnavailable { reason } => {
-                write!(f, "the eigenpair residual bounds are unavailable at this rho: {reason}")
+                write!(
+                    f,
+                    "the eigenpair residual bounds are unavailable at this rho: {reason}"
+                )
             }
             Self::EigenframeNearDegeneracy {
                 block_eigenvalue,

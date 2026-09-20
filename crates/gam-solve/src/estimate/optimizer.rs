@@ -14,6 +14,7 @@ use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
 use gam_problem::OrderedRhoBounds;
+use gam_terms::inference::smooth_score_test::WorkingResidual;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -1173,8 +1174,9 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
 
     // The anchors are clamped into the envelope of the design's own #2812
     // resolvability domain, the domain the λ search then runs on (#2902 row 9).
-    // Past the ρ = 0 anchor they are tried only when its inner solve refused,
-    // and the search domain is then read at these same prior weights.
+    // Past the ρ = 0 anchor they are tried only when its inner solve refused.
+    // They are read at the prior weights: the start working weight carries the
+    // nuisance this freeze is about to fix, so it is not yet defined here.
     let (domain_lower, domain_upper) =
         crate::estimate::rho_domain::resolvability_domain_from_design(
             reml_state.weights,
@@ -1440,28 +1442,16 @@ where
     // from the conditioned design's Gram on that penalty's columns and the
     // penalty's spectrum, not the picked ±RHO_BOUND box (SPEC rule 20). The
     // Gram is the data curvature `XᵀWX` of the penalized Hessian, so `W` is the
-    // Fisher working weight of the canonical anchor's inner solve at ρ = 0 (the
-    // solve the nuisance freeze above ran, before any warm start): its scale
-    // follows the response's units (`μ³/4` for the inverse-Gaussian `1/μ²`
-    // link), and a prior-weight Gram leaves the domain fixed while `λ̂` moves
-    // with those units, off the domain's lower face in small units. When that
-    // solve returns a typed per-rho refusal (`is_trial_point_infeasible`) there
-    // is no fitted working weight at ρ = 0, and the Gram is read at the prior
-    // weights. Every other failure is not about ρ = 0 and is propagated.
+    // Fisher working weight at the cold P-IRLS start under the search's frozen
+    // nuisance: its scale follows the response's units (`μ³/4` for the
+    // inverse-Gaussian `1/μ²` link), and a prior-weight Gram leaves the domain
+    // fixed while `λ̂` moves with those units, off the domain's lower face in
+    // small units. It needs no inner solve, so it exists where the solve at the
+    // canonical anchor refuses.
     let domain_weights = if k == 0 {
         w_o.to_owned()
     } else {
-        match reml_state.data_curvature_weights(&Array1::zeros(k)) {
-            Ok(weights) => weights,
-            Err(error) if !error.is_trial_point_infeasible() => return Err(error),
-            Err(error) => {
-                log::debug!(
-                    "[OUTER] ρ-domain Gram read at the prior weights: the canonical anchor's \
-                     inner solve at ρ = 0 refused ({error})"
-                );
-                w_o.to_owned()
-            }
-        }
+        reml_state.start_curvature_weights()?
     };
     let rho_resolvability =
         crate::estimate::rho_domain::resolvability_domain_and_limit_faces_from_design(
@@ -1689,18 +1679,12 @@ where
                 Array1::from_iter(h.iter().map(|&v| start_bounds.clamp(v)))
             } else {
                 let anchor = Array1::from_elem(k, start_bounds.clamp(weight_log_geom_mean));
-                // The pilot P-IRLS solve behind the `initial.sp` point runs at
-                // `anchor`. A typed per-rho refusal there
-                // (`is_trial_point_infeasible`) leaves no working weight to
-                // balance against, so the search enters at `anchor` and steps
-                // past it exactly as it steps past any infeasible trial point.
-                // Every other failure is not about `anchor` and is propagated.
-                match reml_state.analytic_initial_sp_rho(&anchor, start_bounds) {
-                    Ok(Some(start)) => start,
-                    Ok(None) => anchor,
-                    Err(error) if error.is_trial_point_infeasible() => anchor,
-                    Err(error) => return Err(error),
-                }
+                // The `initial.sp` point balances each penalty against the
+                // working weight at the cold P-IRLS start, which needs no inner
+                // solve, so it exists even where the solve at `anchor` refuses.
+                reml_state
+                    .analytic_initial_sp_rho(&anchor, start_bounds)?
+                    .unwrap_or(anchor)
             };
             log::debug!(
                 "[OUTER] standard REML single start: {:?} (bounds {:.3}..{:.3})",
@@ -3180,14 +3164,10 @@ where
     //
     // The identity check is BITWISE on ρ, not a re-judged gradient norm: the
     // retained certificate is the analytic stationarity authority minted at
-    // `outer_result.rho` by the full certification machinery (noise-floor
-    // widenings, flatness probes, asymptote rails). In the deep-smoothing
-    // regime the analytic gradient is a noise instrument (|Pg| redraws across
-    // evaluations of the SAME point — the reproducibility floor exists because
-    // of it), so re-drawing it once here and comparing against the certified
-    // band refuses honest noise-band certificates with coin-flip probability
-    // while adding nothing to point-identity (which bit equality decides
-    // exactly). The evaluation itself is kept: it installs the inner state at
+    // `outer_result.rho` by the full certification machinery (derived bands,
+    // flatness probes, asymptote rails). Re-judging a second gradient here
+    // would add nothing to point-identity, which bit equality decides exactly.
+    // The evaluation itself is kept: it installs the inner state at
     // the shipped point and supplies the shipped value/gradient fields.
     let (final_value, finalgrad, finalgrad_norm) = if final_rho.is_empty() {
         (outer_result.final_value, Array1::zeros(0), 0.0)
@@ -3846,36 +3826,14 @@ where
             );
             match smoothing_outcome {
                 super::reml::eval::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
-                    // The only typed absence is an outer Hessian with no
-                    // analytic form for this fit at all (a non-canonical Firth
-                    // link, routed to BFGS): nothing about the optimum is
-                    // suspect, the correction simply cannot be formed, and the
-                    // fit was accepted with that link on purpose (#2158).
+                    // Every Firth link carries its analytic outer ρ-Hessian
+                    // (#3203), so an unavailable correction is a real defect.
                     // Railed coordinates are not a reason: the correction
                     // excludes them exactly as the certificate did, so a
                     // refusal on a railed fit is a real defect like any other.
-                    if !matches!(
-                        reason,
-                        crate::estimate::smoothing_correction::SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { .. }
-                    ) {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "exact smoothing-corrected covariance unavailable: {reason:?}"
-                        )));
-                    }
-                    log::debug!(
-                        "[SMOOTHING-CORRECTION] typed-unavailable on a non-analytic-outer-Hessian \
-                         fit ({reason:?}); shipping the plug-in covariance without a smoothing correction"
-                    );
-                    smoothing_correction_absence = Some(
-                        crate::model_types::SmoothingCorrectionAbsence::OuterHessianNotAnalytic {
-                            detail: format!("{reason:?}"),
-                        },
-                    );
-                    rho_covariance = None;
-                    smoothing_correction = None;
-                    smoothing_correction_method = None;
-                    smoothing_correction_first_order = None;
-                    smoothing_correction_method_first_order = None;
+                    return Err(EstimationError::InvalidInput(format!(
+                        "exact smoothing-corrected covariance unavailable: {reason:?}"
+                    )));
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
@@ -4238,6 +4196,19 @@ where
                 ))
             })?;
     }
+    // The working residual in its Pearson form: at the accepted step the score
+    // is `u = W_F(z − η)` with `W_F` the score-side Fisher weight, and the norm
+    // is `Σ u²/W_F`, each row of null mean `φ` (not `Σ u²/W_H` in the observed
+    // curvature `finalweights`, which is biased for a non-canonical link;
+    // gam#3832). The identity-link weighted RSS is that sum, formed from the
+    // response directly and snapped with the dispersion it sets.
+    let working_residual = if cfg.likelihood.spec.is_gaussian_identity() {
+        Some(WorkingResidual { weighted_norm: weighted_rss, rows: n as usize })
+    } else {
+        let scores = &pirls_res.solveweights
+            * &(&pirls_res.solveworking_response - &pirls_res.final_eta);
+        WorkingResidual::of(pirls_res.solveweights.view(), scores.view())
+    };
     let inference = opts.compute_inference.then(|| FitInference {
         edf_by_block,
         penalty_block_trace,
@@ -4257,6 +4228,7 @@ where
         coefficient_influence,
         weighted_gram,
         identified_subspace,
+        working_residual,
     });
 
     let pirls_status = pirls_res.status;
