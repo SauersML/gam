@@ -623,25 +623,142 @@ fn solve_anchor_with(
             "survival marginal-slope anchor requires finite q, slope and seed, got q={q}, b={observed_slope}, seed={seed}"
         ));
     }
-    let survival_side = q >= 0.0;
-    let log_target = if survival_side {
-        normal_logcdf(-q)
-    } else {
-        normal_logcdf(q)
-    };
+    let target = LogTailTarget::new(q);
+    let rounding = anchor_residual_rounding(target.log_target, grid.len());
     // `F` is strictly decreasing in `α` on the survival side and strictly
     // increasing on the complement side.
-    let increasing = !survival_side;
+    let root = solve_log_tail_root(seed, !target.survival_side, |alpha| {
+        let (value, first, second) =
+            residual(alpha, observed_slope, grid, target.survival_side, target.log_target)?;
+        Ok(LogTailSample {
+            value,
+            first,
+            second,
+            rounding,
+        })
+    })
+    .map_err(|failure| match failure {
+        LogTailRootFailure::Evaluation(reason) => reason,
+        LogTailRootFailure::AdjacentFloats { below, above } => format!(
+            "survival marginal-slope anchor bracketed its root between adjacent floats \
+             [{below:e}, {above:e}] without resolving the residual (q={q}, b={observed_slope})"
+        ),
+        LogTailRootFailure::Exhausted { below, above } => format!(
+            "survival marginal-slope anchor did not resolve its residual in {ANCHOR_SOLVE_MAX_EVALUATIONS} \
+             evaluations (q={q}, b={observed_slope}, seed={seed}, bracket [{below:e}, {above:e}])"
+        ),
+    })?;
+    Ok((root.polished, root.evaluations))
+}
+
+/// The smaller tail of a probit anchoring equation at marginal index `q`
+/// (gam#2978): the survival side `Φ(−q)` when `q ≥ 0`, else `Φ(q)`, and its
+/// logarithm. A residual `log T − log Φ(∓q)` on that side is the relative error
+/// of the anchored probability where relative error is the meaningful one, so
+/// it keeps its digits however deep the tail.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LogTailTarget {
+    pub(crate) survival_side: bool,
+    pub(crate) log_target: f64,
+}
+
+impl LogTailTarget {
+    pub(crate) fn new(q: f64) -> Self {
+        let survival_side = q >= 0.0;
+        Self {
+            survival_side,
+            log_target: normal_logcdf(if survival_side { -q } else { q }),
+        }
+    }
+
+    /// The residual `log T − log Φ(∓q)` and its `α`-derivatives from the tail
+    /// mass `tail` of the anchored probability `P(α)` on this side, `tail`'s
+    /// absolute rounding bound, `terms` the count of summed pieces, and
+    /// `(P′, P″)` of the anchored probability itself. On the survival side
+    /// `T = 1 − P`, so `T′ = −P′` and `T″ = −P″`; on the complement side
+    /// `T = P`. The rounding is the tail's own bound relative to it plus the
+    /// logarithms' ([`anchor_residual_rounding`]).
+    ///
+    /// A tail that underflowed to zero is `log T = −∞`: the residual keeps its
+    /// sign, which is all a bracket reads, and has no finite slope.
+    pub(crate) fn sample(
+        &self,
+        tail: f64,
+        tail_rounding: f64,
+        terms: usize,
+        probability_first: f64,
+        probability_second: f64,
+    ) -> LogTailSample {
+        if !(tail > 0.0) {
+            return LogTailSample {
+                value: f64::NEG_INFINITY,
+                first: f64::NAN,
+                second: f64::NAN,
+                rounding: f64::INFINITY,
+            };
+        }
+        let sign = if self.survival_side { -1.0 } else { 1.0 };
+        let first = sign * probability_first / tail;
+        LogTailSample {
+            value: tail.ln() - self.log_target,
+            first,
+            second: sign * probability_second / tail - first * first,
+            rounding: tail_rounding / tail + anchor_residual_rounding(self.log_target, terms),
+        }
+    }
+}
+
+/// One evaluation of a log-tail anchoring residual: its value, `α`-derivatives
+/// and a bound on the value's rounding.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LogTailSample {
+    pub(crate) value: f64,
+    pub(crate) first: f64,
+    pub(crate) second: f64,
+    pub(crate) rounding: f64,
+}
+
+/// A root of [`solve_log_tail_root`]: the evaluated point that met the
+/// resolution criterion, Newton's step from it (the accepted point where that
+/// step leaves Newton's model or the bracket), and the evaluations spent.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LogTailRoot {
+    pub(crate) accepted: f64,
+    pub(crate) polished: f64,
+    pub(crate) evaluations: usize,
+}
+
+/// Why [`solve_log_tail_root`] refused.
+#[derive(Clone, Debug)]
+pub(crate) enum LogTailRootFailure {
+    Evaluation(String),
+    AdjacentFloats { below: f64, above: f64 },
+    Exhausted { below: f64, above: f64 },
+}
+
+/// The root of a strictly monotone log-tail residual (gam#2928, gam#3216),
+/// held to [`anchor_residual_resolution`] at every evaluated point: it stops on
+/// that criterion or refuses, never on a bracket width, so every accepted point
+/// carries a residual the arithmetic cannot resolve further.
+pub(crate) fn solve_log_tail_root(
+    seed: f64,
+    increasing: bool,
+    mut residual: impl FnMut(f64) -> Result<LogTailSample, String>,
+) -> Result<LogTailRoot, LogTailRootFailure> {
     // The sign bracket: `below < root < above` once each side has been seen.
     let mut below = f64::NEG_INFINITY;
     let mut above = f64::INFINITY;
     let mut alpha = seed;
     let mut step_cap = (0.25 * (1.0 + seed.abs())).max(1.0);
     let mut last_step = f64::INFINITY;
-    let rounding = anchor_residual_rounding(log_target, grid.len());
     for evaluation in 0..ANCHOR_SOLVE_MAX_EVALUATIONS {
-        let (value, first, second) = residual(alpha, observed_slope, grid, survival_side, log_target)?;
-        if value.abs() <= anchor_residual_resolution(alpha, first, rounding) {
+        let LogTailSample {
+            value,
+            first,
+            second,
+            rounding,
+        } = residual(alpha).map_err(LogTailRootFailure::Evaluation)?;
+        if value.is_finite() && value.abs() <= anchor_residual_resolution(alpha, first, rounding) {
             // The accepted `α` still carries a residual up to the tolerance,
             // and where it stops depends on the seed, so it moves irregularly
             // with the coefficients: summed over 3e5 rows it floored the inner
@@ -653,14 +770,16 @@ fn solve_anchor_with(
             // bracket, else the accepted point stands.
             let polished = alpha - value / first;
             let in_model = (value * second).abs() <= first * first;
-            return Ok((
-                if in_model && polished.is_finite() && polished > below && polished < above {
+            return Ok(LogTailRoot {
+                accepted: alpha,
+                polished: if in_model && polished.is_finite() && polished > below && polished < above
+                {
                     polished
                 } else {
                     alpha
                 },
-                evaluation + 1,
-            ));
+                evaluations: evaluation + 1,
+            });
         }
         let root_is_above = if increasing { value < 0.0 } else { value > 0.0 };
         if root_is_above {
@@ -701,10 +820,7 @@ fn solve_anchor_with(
             };
             last_step = (next - alpha).abs();
             if !(next > below && next < above) {
-                return Err(format!(
-                    "survival marginal-slope anchor bracketed its root between adjacent floats \
-                     [{below:e}, {above:e}] without resolving the residual (q={q}, b={observed_slope})"
-                ));
+                return Err(LogTailRootFailure::AdjacentFloats { below, above });
             }
             next
         } else if step.abs() > step_cap {
@@ -717,10 +833,7 @@ fn solve_anchor_with(
         };
         alpha = next;
     }
-    Err(format!(
-        "survival marginal-slope anchor did not resolve its residual in {ANCHOR_SOLVE_MAX_EVALUATIONS} \
-         evaluations (q={q}, b={observed_slope}, seed={seed}, bracket [{below:e}, {above:e}])"
-    ))
+    Err(LogTailRootFailure::Exhausted { below, above })
 }
 
 /// Residual evaluations a solve may spend before it refuses: enough for a

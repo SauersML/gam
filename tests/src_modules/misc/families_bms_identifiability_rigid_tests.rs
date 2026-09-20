@@ -2589,18 +2589,20 @@ fn zero_deviation_intercept_fast_path_matches_denested_calibration() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "marginal map", e));
     let scale = family.probit_frailty_scale();
     let rigid_a = rigid_prescale_intercept_from_marginal(marginal.q, slope, scale);
-    let (f_rigid, f_a_rigid, _) = family
-        .evaluate_denested_calibration_newton(
+    let (rigid_sample, f_a_rigid) = family
+        .evaluate_calibration_log_tail(
+            0,
             rigid_a,
-            marginal_eta,
+            crate::latent_anchor::LogTailTarget::new(marginal.q),
             slope,
             Some(&beta_h),
             Some(&beta_w),
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "denested zero-deviation calibration", e));
     assert!(
-        f_rigid.abs() <= 5e-13,
-        "closed-form rigid intercept residual should be at machine epsilon, got {f_rigid}"
+        rigid_sample.value.abs() <= 5e-13,
+        "closed-form rigid intercept log-tail residual should be at machine epsilon, got {}",
+        rigid_sample.value
     );
     let analytic_deriv = rigid_prescale_intercept_derivative_abs(marginal.q, slope, scale);
     assert!(
