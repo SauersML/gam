@@ -3069,7 +3069,10 @@ fn matern_include_intercept_is_refused_whenever_the_collection_transforms_it() {
             format!("y ~ matern(x, zbig, include_intercept=true, centers={centers}, identifiability=none)");
         let design = build(&formula).unwrap_or_else(|err| panic!("`{formula}` builds: {err}"));
         assert_eq!(design.smooth.terms.len(), 1, "`{formula}`");
-        let columns = design.smooth.terms[0].coeff_range.clone();
+        // The smooth block follows the intercept; there are no linear terms.
+        let local = design.smooth.terms[0].coeff_range.clone();
+        let start = design.intercept_range.end;
+        let columns = start + local.start..start + local.end;
         assert_eq!(columns.len(), centers + 1, "`{formula}` realizes [K·Z | 1]");
         assert_eq!(columns.end, design.design.to_dense().ncols(), "`{formula}`");
         assert!(!design.penalties.is_empty(), "`{formula}`");
