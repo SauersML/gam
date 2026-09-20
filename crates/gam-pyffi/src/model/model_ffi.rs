@@ -353,7 +353,6 @@ struct SampleConfigPayload {
     n_samples: usize,
     n_warmup: usize,
     n_chains: usize,
-    target_accept: f64,
     seed: u64,
 }
 
@@ -2292,7 +2291,6 @@ fn sample_table(
     config.set_item("n_samples", payload.config.n_samples)?;
     config.set_item("n_warmup", payload.config.n_warmup)?;
     config.set_item("n_chains", payload.config.n_chains)?;
-    config.set_item("target_accept", payload.config.target_accept)?;
     config.set_item("seed", payload.config.seed)?;
     let out = PyDict::new(py);
     out.set_item("samples", payload.samples.into_pyarray(py))?;
@@ -2969,16 +2967,23 @@ fn basis_with_jet<'py>(
                             degree + 1
                         )));
                     }
-                    let interior = n_basis.saturating_sub(degree + 1);
-                    let total = interior + 2 * (degree + 1);
-                    let mut knots = Array1::<f64>::zeros(total);
-                    let inner = interior as f64 + 1.0;
-                    for i in 0..total {
-                        let raw = (i as f64) - (degree as f64);
-                        let clamped = raw.max(0.0).min(inner);
-                        knots[i] = clamped / inner;
+                    // `n_basis` means the same thing in both branches: the
+                    // number of design columns on the unit parameter domain.
+                    // A periodic basis takes its knots as the uniform lattice
+                    // `linspace(0, 1, n_basis + 1)` (one cyclic control per
+                    // interval, see `periodic_knot_domain`); an open basis
+                    // takes the canonical clamped uniform vector with
+                    // `n_basis - (degree + 1)` internal knots.
+                    if periodic {
+                        Array1::linspace(0.0, 1.0, n_basis + 1)
+                    } else {
+                        gam::terms::basis::generate_full_knot_vector(
+                            (0.0, 1.0),
+                            n_basis - (degree + 1),
+                            degree,
+                        )
+                        .map_err(basis_error_to_pyerr)?
                     }
-                    knots
                 }
             };
             let t_1d = coords.column(0).to_owned();
@@ -4653,9 +4658,9 @@ fn gaussian_reml_fit<'py>(
             x_values.nrows(),
         )
         .map_err(py_value_error)?;
-        // The closed form whitens by XᵀWX, so a design whose XᵀWX is singular
-        // (p > n, or rank-deficient) is refused with the engine's typed error
-        // rather than reported as a zero fit (gam#3310).
+        // A singular XᵀWX (p > n, or rank-deficient) is fit through the penalty
+        // pencil when the penalty identifies null(W½X) (gam#3366) and refused
+        // with the engine's typed error otherwise (gam#3310).
         gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
@@ -5759,6 +5764,10 @@ fn set_batched_gaussian_reml_dict_items<'py>(
         result.cache_coefficient_basis.into_pyarray(py),
     )?;
     out.set_item(
+        "cache_data_null_basis",
+        result.cache_data_null_basis.into_pyarray(py),
+    )?;
+    out.set_item(
         "cache_xtwx_fingerprints",
         result.cache_xtwx_fingerprints.into_pyarray(py),
     )?;
@@ -6012,7 +6021,8 @@ fn gaussian_reml_fit_positions<'py>(
             x.nrows(),
         )
         .map_err(py_value_error)?;
-        // A singular XᵀWX is refused with the engine's typed error (gam#3310).
+        // A singular XᵀWX is fit through the penalty pencil when the penalty
+        // identifies null(W½X) (gam#3366) and refused otherwise (gam#3310).
         let fit = gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),

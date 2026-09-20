@@ -2173,15 +2173,21 @@ impl<'a> RemlState<'a> {
         // the same value+gradient splicing contract as the TK correction so the
         // outer REML/LAML stays consistent. A no-op when every direction is
         // Laplace-trustworthy.
-        let block_terms = self.block_local_quadrature_correction(rho, bundle, assembly_ext_len)?;
+        let block_terms = self.block_local_quadrature_correction(
+            rho,
+            bundle,
+            assembly_ext_len,
+            mode == super::reml_outer_engine::EvalMode::ValueGradientHessian,
+        )?;
         let block_atom = super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms(
             "sampled_block_marginal",
             block_terms,
         );
         let mut result = self.apply_theta_correction_atom_to_result(result, &block_atom)?;
-        // A latched correction's `Δ_b` has no ρ-Hessian: the spliced criterion
-        // declares none rather than the Laplace Hessian without `∂²Δ_b`.
-        if self.block_correction_latched() {
+        // A latched correction whose `Δ_b` has no closed-form ρ-Hessian: the
+        // spliced criterion declares none rather than the Laplace Hessian
+        // without `∂²Δ_b`. Otherwise the atom carried `∂²(−Δ_b)` in.
+        if self.block_correction_hessian_refusal().is_some() {
             result.hessian = HessianValue::Unavailable;
         }
         let components = [
@@ -2299,14 +2305,15 @@ impl<'a> RemlState<'a> {
         // surface. The correction enters through the gradient channel exactly
         // like TK, which the universal EFS step already folds in. No-op when no
         // direction is non-Gaussian.
-        let block_terms = self.block_local_quadrature_correction(rho, bundle, assembly_ext_len)?;
+        let block_terms =
+            self.block_local_quadrature_correction(rho, bundle, assembly_ext_len, false)?;
         let block_atom = super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms(
             "sampled_block_marginal",
             block_terms,
         );
         let mut cost_result =
             self.apply_theta_correction_atom_to_result(cost_result, &block_atom)?;
-        if self.block_correction_latched() {
+        if self.block_correction_hessian_refusal().is_some() {
             cost_result.hessian = HessianValue::Unavailable;
         }
         crate::estimate::outer_eval_capture::record_outer_criterion_components(

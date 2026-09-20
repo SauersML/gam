@@ -173,8 +173,9 @@ impl<'a> RemlState<'a> {
             return false;
         }
         // A latched #784 block correction splices `Δ_b` with its exact
-        // gradient but no ρ-Hessian, so the criterion it defines has none.
-        !self.block_correction_latched()
+        // gradient and ρ-Hessian, unless `Δ_b` has no closed-form Hessian on
+        // this fit, when the criterion it defines has none.
+        self.block_correction_hessian_refusal().is_none()
     }
 
     /// Whether the exact analytic outer Hessian of the Tierney-Kadane
@@ -6416,7 +6417,7 @@ impl<'a> RemlState<'a> {
             criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
             applied_canonical_penalties: std::sync::OnceLock::new(),
             penalty_scores_at_mode: std::sync::OnceLock::new(),
-            block_local_correction: std::sync::OnceLock::new(),
+            block_local_correction: Default::default(),
         })
     }
 
@@ -6576,7 +6577,7 @@ impl<'a> RemlState<'a> {
                 cell
             },
             penalty_scores_at_mode: std::sync::OnceLock::new(),
-            block_local_correction: std::sync::OnceLock::new(),
+            block_local_correction: Default::default(),
         })
     }
 
@@ -7302,7 +7303,7 @@ impl<'a> RemlState<'a> {
             )?;
             self.frozen_dispersion_phi
                 .store(phi.to_bits(), Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[OUTER] dispersion λ-search φ frozen at {phi:.6e} (measured at the \
                  converged η); outer REML criterion now stationary in ρ"
             );
@@ -7683,14 +7684,14 @@ mod stateless_pirls_tests {
                 .collect::<Vec<_>>()
                 .join(",");
             match result {
-                Ok((ref res, ref wm)) => log::info!(
+                Ok((ref res, ref wm)) => log::debug!(
                     "[STAGE] stateless pirls solve rho=[{rho_text}] iters={} status={:?} max_eta={:.1} elapsed={:.3}s",
                     wm.iterations,
                     res.status,
                     res.max_abs_eta,
                     pirls_elapsed.as_secs_f64(),
                 ),
-                Err(ref error) => log::info!(
+                Err(ref error) => log::debug!(
                     "[STAGE] stateless pirls solve rho=[{rho_text}] FAILED in {:.3}s: {error}",
                     pirls_elapsed.as_secs_f64(),
                 ),
