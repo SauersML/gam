@@ -5476,6 +5476,10 @@ fn linear_dictionary_fit<'py>(
     out.set_item("convergence", convergence)?;
     out.set_item("assignment", fit.assignment.as_str())?;
     out.set_item("top_k", fit.top_k)?;
+    match fit.mean {
+        Some(mean) => out.set_item("mean", mean.into_pyarray(py))?,
+        None => out.set_item("mean", py.None())?,
+    }
     Ok(out.unbind())
 }
 
@@ -5512,20 +5516,29 @@ fn linear_dictionary_error_to_pyerr(py: Python<'_>, error: LinearDictionaryError
 }
 
 /// Out-of-sample encode: route held-out rows `x` (`M x P`) through a fitted
-/// linear dictionary `atoms` (`K x P`) via the Rust top-`top_k` ridge solve,
+/// linear dictionary `atoms` (`K x P`) with its affine origin `mean` (the fit's
+/// `"mean"`, `None` for a linear model) via the Rust top-`top_k` ridge solve,
 /// returning the `(M, K)` code matrix.
-#[pyfunction(signature = (x, atoms, top_k, code_ridge = 1.0e-8))]
+#[pyfunction(signature = (x, atoms, mean, top_k, code_ridge))]
 fn linear_dictionary_transform_ffi<'py>(
     py: Python<'py>,
     x: PyReadonlyArray2<'py, f64>,
     atoms: PyReadonlyArray2<'py, f64>,
+    mean: Option<PyReadonlyArray1<'py, f64>>,
     top_k: usize,
     code_ridge: f64,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let x_values = x.as_array().to_owned();
     let atoms_values = atoms.as_array().to_owned();
+    let mean_values = mean.map(|mean| mean.as_array().to_owned());
     let codes = detach_py_result(py, "linear_dictionary_transform", move || {
-        linear_dictionary_transform(x_values.view(), atoms_values.view(), top_k, code_ridge)
+        linear_dictionary_transform(
+            x_values.view(),
+            atoms_values.view(),
+            mean_values.as_ref().map(|mean| mean.view()),
+            top_k,
+            code_ridge,
+        )
     })?;
     Ok(codes.into_pyarray(py).unbind())
 }

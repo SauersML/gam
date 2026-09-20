@@ -44,13 +44,15 @@ class LinearDictionaryFit:
     top_k: int
     code_ridge: float
     training_data: np.ndarray
-    # When the K=1 centered-PCA-ceiling lane is active the model is AFFINE
-    # (mean + rank-1), so held-out transform/reconstruct must subtract/add the
-    # training column mean. `centered` is only true for the K=1 centered lane;
-    # for every other model it is False and `mean` is a zero vector, keeping the
-    # linear (mean-free) behavior byte-identical.
-    centered: bool = False
-    mean: np.ndarray | None = None
+    # The affine origin of the fitted model, exactly as the Rust fit returns it:
+    # the column means the centered K=1 lane built `fitted` from, or None for a
+    # linear model (`fitted = assignments @ atoms`).
+    mean: np.ndarray | None
+
+    @property
+    def centered(self) -> bool:
+        """Whether the fitted model is affine (``mean + assignments @ atoms``)."""
+        return self.mean is not None
 
     def reconstruct(self, assignments: Any | None = None) -> np.ndarray:
         codes = self.assignments if assignments is None else _as_2d_float(assignments, "assignments")
@@ -59,32 +61,22 @@ class LinearDictionaryFit:
                 f"assignments must have K={self.atoms.shape[0]} columns; got {codes.shape[1]}"
             )
         recon = codes @ self.atoms
-        if self.centered and self.mean is not None:
+        if self.mean is not None:
             recon = recon + self.mean
         return np.ascontiguousarray(recon)
 
     def transform(self, X: Any, top_k: int | None = None) -> np.ndarray:
         """Encode held-out rows ``X`` (``M x P``) against the fitted dictionary.
 
-        Routes the top-``top_k`` ridge least-squares encode through the Rust
-        core (``linear_dictionary_transform``); Python only applies the affine
-        centering used by the K=1 centered lane. Returns the ``M x K`` codes.
+        The encode (affine origin, top-``top_k`` ridge least-squares routing and
+        its input contract) runs in the Rust core
+        (``linear_dictionary_transform``). Returns the ``M x K`` codes.
         """
-        x = _as_2d_float(X, "X")
-        if x.shape[1] != self.atoms.shape[1]:
-            raise ValueError(
-                f"X must have p={self.atoms.shape[1]} columns; got {x.shape[1]}"
-            )
-        k_active = self.top_k if top_k is None else int(top_k)
-        if k_active < 1 or k_active > self.atoms.shape[0]:
-            raise ValueError(
-                f"top_k must be in [1, K={self.atoms.shape[0]}]; got {k_active}"
-            )
-        x_eff = x - self.mean if (self.centered and self.mean is not None) else x
         codes = rust_module().linear_dictionary_transform_ffi(
-            np.ascontiguousarray(x_eff, dtype=np.float64),
-            np.ascontiguousarray(self.atoms, dtype=np.float64),
-            int(k_active),
+            _as_2d_float(X, "X"),
+            self.atoms,
+            self.mean,
+            self.top_k if top_k is None else int(top_k),
             float(self.code_ridge),
         )
         return np.ascontiguousarray(codes)
@@ -115,10 +107,7 @@ def linear_dictionary_fit(
         center_rank_one=bool(center_rank_one),
     )
     data = dict(payload)
-    # The Rust centered lane only engages at K=1; mirror that so the affine
-    # (mean-aware) transform/reconstruct is used exactly when the fit is centered.
-    is_centered = bool(center_rank_one) and int(K) == 1
-    mean = x.mean(axis=0) if is_centered else np.zeros(x.shape[1], dtype=np.float64)
+    mean = data["mean"]
     return LinearDictionaryFit(
         atoms=np.ascontiguousarray(data["atoms"], dtype=np.float64),
         assignments=np.ascontiguousarray(data["assignments"], dtype=np.float64),
@@ -137,8 +126,7 @@ def linear_dictionary_fit(
         top_k=int(data["top_k"]),
         code_ridge=float(code_ridge),
         training_data=x,
-        centered=is_centered,
-        mean=np.ascontiguousarray(mean, dtype=np.float64),
+        mean=None if mean is None else np.ascontiguousarray(mean, dtype=np.float64),
     )
 
 

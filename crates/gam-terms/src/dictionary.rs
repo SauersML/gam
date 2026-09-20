@@ -184,6 +184,12 @@ pub struct LinearDictionaryFit {
     pub convergence: LinearDictionaryConvergence,
     pub assignment: LinearDictionaryAssignment,
     pub top_k: usize,
+    /// The origin of an AFFINE model, `fitted = mean + assignments·atoms`.
+    /// `Some` exactly when the fit is affine (the centered K=1 lane), holding the
+    /// same column means the lane built `fitted` from; `None` for every linear
+    /// model, where `fitted = assignments·atoms`. Held-out encodes and
+    /// reconstructions read the model's origin from here.
+    pub mean: Option<Array1<f64>>,
 }
 
 /// Fixed-point evidence attached to every converged [`LinearDictionaryFit`].
@@ -429,6 +435,7 @@ fn fit_multi_atom_dictionary(
                 },
                 assignment: config.assignment,
                 top_k,
+                mean: None,
             });
         }
         previous_ev = rerouted_ev;
@@ -651,6 +658,7 @@ fn fit_rank_one_pca_lane(
         },
         assignment: config.assignment,
         top_k: 1,
+        mean: None,
     })
 }
 
@@ -669,6 +677,7 @@ fn fit_rank_one_centered_lane(
         atom,
         codes,
         fitted,
+        mean,
         explained_variance: ev,
     } = centered_rank_one_components(x, config.code_ridge)?;
     let atoms = atom.insert_axis(Axis(0)).to_owned();
@@ -690,6 +699,7 @@ fn fit_rank_one_centered_lane(
         },
         assignment: config.assignment,
         top_k: 1,
+        mean: Some(mean),
     })
 }
 
@@ -702,6 +712,8 @@ struct CenteredRankOne {
     codes: Array1<f64>,
     /// Affine reconstruction `mean + code·atom` (shape `n × p`).
     fitted: Array2<f64>,
+    /// Column means of `x`, the affine origin `fitted` was built from (length `p`).
+    mean: Array1<f64>,
     /// EV of `fitted` against the crate's centered denominator.
     explained_variance: f64,
 }
@@ -742,6 +754,7 @@ fn centered_rank_one_components(
         atom,
         codes,
         fitted,
+        mean: means,
         explained_variance: ev,
     })
 }
@@ -884,12 +897,18 @@ fn top_k_assignments(
 /// (`K x P`) using the same top-`top_k` ridge least-squares routing the fit
 /// uses against its final atoms. Returns the `(M, K)` sparse code matrix.
 ///
+/// `mean` is the fitted model's affine origin ([`LinearDictionaryFit::mean`]):
+/// an affine model encodes `x - mean`, a linear one (`None`) encodes `x`.
+///
 /// This is the out-of-sample `transform`/encode step for a fitted linear
-/// dictionary; the math (top-k selection + active-set ridge solve) lives in
-/// the Rust core so the Python facade stays a thin wrapper.
+/// dictionary; the math (origin, top-k selection, active-set ridge solve) and
+/// the input contract live in the Rust core so the Python facade stays a thin
+/// wrapper. Out-of-range `top_k`, non-finite rows, and a malformed origin are
+/// refused, never clamped or propagated.
 pub fn linear_dictionary_transform(
     x: ArrayView2<'_, f64>,
     atoms: ArrayView2<'_, f64>,
+    mean: Option<ArrayView1<'_, f64>>,
     top_k: usize,
     code_ridge: f64,
 ) -> Result<Array2<f64>, String> {
@@ -904,8 +923,36 @@ pub fn linear_dictionary_transform(
             atoms.ncols()
         ));
     }
-    let effective_k = top_k.min(k).max(1);
-    top_k_assignments(x, atoms, effective_k, code_ridge)
+    if top_k == 0 || top_k > k {
+        return Err(format!(
+            "linear_dictionary_transform: top_k must be in [1, K={k}]; got {top_k}"
+        ));
+    }
+    if !(code_ridge.is_finite() && code_ridge > 0.0) {
+        return Err(format!(
+            "linear_dictionary_transform: code_ridge must be finite and positive; got {code_ridge}"
+        ));
+    }
+    if !x.iter().all(|value| value.is_finite()) {
+        return Err("linear_dictionary_transform: X must be finite".to_string());
+    }
+    match mean {
+        None => top_k_assignments(x, atoms, top_k, code_ridge),
+        Some(mean) => {
+            if mean.len() != atoms.ncols() {
+                return Err(format!(
+                    "linear_dictionary_transform: mean has length {} but atoms have P={}",
+                    mean.len(),
+                    atoms.ncols()
+                ));
+            }
+            if !mean.iter().all(|value| value.is_finite()) {
+                return Err("linear_dictionary_transform: mean must be finite".to_string());
+            }
+            let centered = &x - &mean;
+            top_k_assignments(centered.view(), atoms, top_k, code_ridge)
+        }
+    }
 }
 
 fn softmax_assignments(
@@ -1174,6 +1221,85 @@ mod tests {
             "expected EV > 0.95, got {}",
             fit.explained_variance
         );
+    }
+
+    /// #4064: an affine (centered K=1) fit carries its own origin, the linear lanes
+    /// carry none, and the held-out encode reads that origin and the input contract
+    /// from Rust instead of from a Python copy of the dispatch rule.
+    #[test]
+    fn affine_fit_carries_its_origin_and_transform_encodes_against_it_4064() {
+        let rows = 40usize;
+        let mut x = Array2::<f64>::zeros((rows, 3));
+        for row in 0..rows {
+            let t = row as f64 / rows as f64 - 0.5;
+            let wobble = ((row * 7) % 5) as f64 / 50.0;
+            x[[row, 0]] = 3.0 + 2.0 * t + wobble;
+            x[[row, 1]] = -1.5 + t - wobble;
+            x[[row, 2]] = 0.25 + 0.5 * t + 0.5 * wobble;
+        }
+        let centered_config = LinearDictionaryConfig {
+            center_rank_one: true,
+            ..LinearDictionaryConfig::new(1)
+        };
+        let fit = fit_linear_dictionary(x.view(), &centered_config).expect("centered K=1 fit");
+        let mean = fit.mean.as_ref().expect("the centered K=1 lane is affine");
+        // The origin is the one `fitted` was built from, bit for bit.
+        assert_eq!(fit.fitted, &fit.assignments.dot(&fit.atoms) + mean);
+
+        // Held-out encode against the origin is the encode of the pre-centered rows.
+        let codes = linear_dictionary_transform(
+            x.view(),
+            fit.atoms.view(),
+            Some(mean.view()),
+            1,
+            centered_config.code_ridge,
+        )
+        .expect("affine transform");
+        let pre_centered = &x - mean;
+        let linear_codes = linear_dictionary_transform(
+            pre_centered.view(),
+            fit.atoms.view(),
+            None,
+            1,
+            centered_config.code_ridge,
+        )
+        .expect("linear transform of the pre-centered rows");
+        assert_eq!(codes, linear_codes);
+        // And it reproduces the training codes. The fit forms `x_c·a/(1+ridge)` and
+        // the encode solves `(a·a + ridge) c = x_c·a`; the two differ only by the
+        // rounding of two length-p dot products and one 1x1 Cholesky solve, bounded
+        // by (2p + 4)·ε·‖x_c‖ for a unit atom.
+        let p = x.ncols() as f64;
+        for row in 0..rows {
+            let bound = (2.0 * p + 4.0)
+                * f64::EPSILON
+                * pre_centered.row(row).dot(&pre_centered.row(row)).sqrt();
+            let gap = (codes[[row, 0]] - fit.assignments[[row, 0]]).abs();
+            assert!(
+                gap <= bound,
+                "row {row}: encode gap {gap:e} exceeds its rounding bound {bound:e}"
+            );
+        }
+
+        // The linear lanes carry no origin.
+        let uncentered = fit_linear_dictionary(x.view(), &LinearDictionaryConfig::new(1))
+            .expect("uncentered K=1 fit");
+        assert!(uncentered.mean.is_none());
+
+        // The encode refuses out-of-range top_k, non-finite rows, and a malformed
+        // origin instead of clamping or propagating them.
+        let atoms = fit.atoms.view();
+        let ridge = centered_config.code_ridge;
+        assert!(linear_dictionary_transform(x.view(), atoms, Some(mean.view()), 0, ridge).is_err());
+        assert!(linear_dictionary_transform(x.view(), atoms, Some(mean.view()), 2, ridge).is_err());
+        let mut poisoned = x.clone();
+        poisoned[[3, 1]] = f64::NAN;
+        assert!(
+            linear_dictionary_transform(poisoned.view(), atoms, Some(mean.view()), 1, ridge)
+                .is_err()
+        );
+        let short_mean = mean.slice(s![..2]);
+        assert!(linear_dictionary_transform(x.view(), atoms, Some(short_mean), 1, ridge).is_err());
     }
 
     #[test]
