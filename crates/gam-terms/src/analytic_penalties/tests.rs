@@ -1169,6 +1169,161 @@ fn smooth_threshold_psd_majorizer_diag_is_psd_over_logit_sweep() {
     }
 }
 
+/// Checks `grad_target` against central differences of `value`, the Hessian
+/// `diag` against central differences of `grad_target`, and `grad_rho`
+/// against central differences of `value` in each ρ coordinate. The full FD
+/// Jacobian of the gradient is compared with `diag`, so the Hessian is also
+/// checked to be exactly diagonal.
+fn assert_diagonal_penalty_matches_central_differences(
+    pen: &dyn AnalyticPenalty,
+    t: &Array1<f64>,
+    rho: &Array1<f64>,
+    diag: &Array1<f64>,
+    tol: f64,
+) {
+    let h = 1e-5;
+    let n = t.len();
+    let worst = value_grad_fd_max_abs_error(pen, t.view(), rho.view(), h);
+    assert!(
+        worst <= tol,
+        "{} value -> grad FD max abs error = {worst:.3e}",
+        pen.name()
+    );
+    for i in 0..n {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let gp = pen.grad_target(tp.view(), rho.view());
+        let gm = pen.grad_target(tm.view(), rho.view());
+        for j in 0..n {
+            let expected = if i == j { diag[i] } else { 0.0 };
+            assert_abs_diff_eq!((gp[j] - gm[j]) / (2.0 * h), expected, epsilon = tol);
+        }
+    }
+    let gr = pen.grad_rho(t.view(), rho.view());
+    assert_eq!(gr.len(), rho.len());
+    for c in 0..rho.len() {
+        let mut rp = rho.clone();
+        let mut rm = rho.clone();
+        rp[c] += h;
+        rm[c] -= h;
+        let fd = (pen.value(t.view(), rp.view()) - pen.value(t.view(), rm.view())) / (2.0 * h);
+        assert_abs_diff_eq!(gr[c], fd, epsilon = tol);
+    }
+}
+
+/// Before this test the sparsity family's derivatives were checked only against
+/// re-typed closed forms, or not at all. Nothing tied the learnable-smoothing
+/// `grad_rho` coordinate (`log ε`, `log δ`), the dense Hoyer gradient and HVP,
+/// the smooth-threshold gradient, Hessian and per-axis `grad_rho`, or the TopK
+/// activation gradient and Hessian to the value. This pins all of them against
+/// central differences with `h = 1e-5`.
+///
+/// Tolerances. The stencil error is `h²/6 |f'''| + ε_mach |f| / h`, and the
+/// grad -> Hessian comparisons carry the largest truncation term.
+/// - Smoothed L¹ with `ε = 0.3`, `λ = e^{0.2}`: the third derivative of
+///   `λ x / sqrt(x² + ε²)` peaks at `3λ/ε³ ≈ 136` (at `x = 0`), which gives
+///   about `2.3e-9`.
+/// - Log with `δ = 0.5`, `λ = e^{−0.1}`: the third derivative of
+///   `2λx/(δ² + x²)` peaks at `12λ/δ⁴ ≈ 174`, which gives about `2.9e-9`.
+/// - Smooth threshold with `ε = 0.2`: the gradient is `wτ σ'(z)/ε` with
+///   `z = (x − τ)/ε`. Its third x-derivative is `wτ σ''''(z)/ε⁴`, and
+///   `|σ''''| ≤ 1/8`, `wτ ≤ 1.3 · 0.8 e^{−0.2}`, so it is at most about 66,
+///   which gives about `1.1e-9`.
+/// - Hoyer and TopK stay at least `0.05` from every kink and every magnitude
+///   tie, so the stencil never crosses one. Hoyer's terms are `O(1)`
+///   (about `2e-11`), and TopK's value is quadratic, which leaves pure
+///   roundoff.
+/// Every value/`grad_rho` term is `O(1)`, so its roundoff is at most about `1e-10`.
+/// A `1e-7` tolerance leaves at least 30× margin.
+#[test]
+fn sparsity_threshold_and_topk_derivatives_match_central_differences() {
+    let x = array![0.7_f64, -0.35, 0.05, -1.2, 0.4, -0.08];
+    let tol = 1e-7;
+
+    let smoothed_l1 = SparsityPenalty::smoothed_l1(PenaltyTier::Psi, 0.3)
+        .expect("smoothed L1")
+        .with_learnable_smoothing()
+        .expect("learnable eps");
+    let rho = array![0.2_f64, 0.3_f64.ln()];
+    smoothed_l1.validate_rho(rho.view()).expect("interior rho");
+    let diag = smoothed_l1
+        .hessian_diag(x.view(), rho.view())
+        .expect("smoothed L1 Hessian is diagonal");
+    assert_diagonal_penalty_matches_central_differences(&smoothed_l1, &x, &rho, &diag, tol);
+
+    let log = SparsityPenalty::log(PenaltyTier::Psi, 0.5)
+        .expect("log sparsity")
+        .with_learnable_smoothing()
+        .expect("learnable delta");
+    let rho = array![-0.1_f64, 0.5_f64.ln()];
+    log.validate_rho(rho.view()).expect("interior rho");
+    let diag = log
+        .hessian_diag(x.view(), rho.view())
+        .expect("log sparsity Hessian is diagonal");
+    assert!(
+        diag.iter().any(|&d| d < 0.0),
+        "the fixture must reach the nonconvex region |x| > delta"
+    );
+    assert_diagonal_penalty_matches_central_differences(&log, &x, &rho, &diag, tol);
+
+    let h = 1e-5;
+    let hoyer = SparsityPenalty::hoyer(PenaltyTier::Psi);
+    let rho = array![0.3_f64];
+    let worst = value_grad_fd_max_abs_error(&hoyer, x.view(), rho.view(), h);
+    assert!(
+        worst <= tol,
+        "Hoyer value -> grad FD max abs error = {worst:.3e}"
+    );
+    let v = Array1::from_shape_fn(x.len(), |i| 0.6 * (0.9 * i as f64 + 0.4).cos());
+    let hv = hoyer.hvp(x.view(), rho.view(), v.view());
+    let gp = hoyer.grad_target((&x + &(h * &v)).view(), rho.view());
+    let gm = hoyer.grad_target((&x - &(h * &v)).view(), rho.view());
+    for i in 0..x.len() {
+        assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
+    }
+    let gr = hoyer.grad_rho(x.view(), rho.view());
+    assert_eq!(gr.len(), 1);
+    let fd_rho = (hoyer.value(x.view(), array![0.3 + h].view())
+        - hoyer.value(x.view(), array![0.3 - h].view()))
+        / (2.0 * h);
+    assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+
+    let t = array![0.1_f64, 0.5, 0.3, 0.9, 0.45, 1.1];
+    let threshold = SmoothThresholdPenalty::new(
+        PsiSlice::full(t.len(), Some(2)),
+        array![0.25_f64, 0.8],
+        1.3,
+        0.2,
+    )
+    .expect("smooth threshold");
+    let rho = array![0.1_f64, -0.2];
+    threshold.validate_rho(rho.view()).expect("interior rho");
+    let diag = threshold
+        .hessian_diag(t.view(), rho.view())
+        .expect("smooth threshold Hessian is diagonal");
+    assert!(
+        diag.iter().any(|&d| d < 0.0) && diag.iter().any(|&d| d > 0.0),
+        "the fixture must straddle the gate inflection"
+    );
+    assert_diagonal_penalty_matches_central_differences(&threshold, &t, &rho, &diag, tol);
+
+    let t = array![0.9_f64, -0.2, 0.5, 0.1, -0.7, 0.4, 0.3, 0.6, -1.0];
+    let topk = TopKActivationPenalty::new(PsiSlice::full(t.len(), Some(3)), 2, 0.9)
+        .expect("topk activation");
+    let rho = Array1::<f64>::zeros(0);
+    let diag = topk
+        .hessian_diag(t.view(), rho.view())
+        .expect("topk Hessian is diagonal");
+    assert_eq!(
+        diag.iter().filter(|&&d| d > 0.0).count(),
+        6,
+        "two active axes per row"
+    );
+    assert_diagonal_penalty_matches_central_differences(&topk, &t, &rho, &diag, tol);
+}
+
 #[test]
 fn log_sparsity_hessian_is_exact_true_second_derivative() {
     // Log sparsifier  P(x) = λ·log(1 + x²/δ²),  P'(x) = 2λx/(δ²+x²).
