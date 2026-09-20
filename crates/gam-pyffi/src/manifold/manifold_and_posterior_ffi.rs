@@ -318,7 +318,6 @@ fn build_sample_payload(
             n_samples: cfg.n_samples,
             n_warmup: nuts.warmup_transitions,
             n_chains: gam::sample::NUTS_CHAINS,
-            target_accept: cfg.target_accept,
             seed: cfg.seed,
         },
         model_class: prediction_model_class_label(model),

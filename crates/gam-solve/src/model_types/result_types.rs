@@ -2530,6 +2530,14 @@ pub struct FitArtifacts {
     pub null_space_logdet: Option<f64>,
     #[serde(default)]
     pub null_space_dim: Option<usize>,
+    /// Deviance `D₀` of the intercept-only model on the training rows, weights
+    /// and family, the denominator of the reported deviance explained
+    /// `1 − D/D₀`. Recorded at fit time because a saved model keeps no response.
+    /// `None` when the fit has no single intercept or carries an offset (the
+    /// intercept-only reference would then not be nested in the fitted model),
+    /// or on a saved model that predates the field.
+    #[serde(default)]
+    pub null_deviance: Option<f64>,
     #[serde(default)]
     pub survival_link_wiggle_knots: Option<Array1<f64>>,
     #[serde(default)]
@@ -2550,9 +2558,9 @@ pub struct FitArtifacts {
     /// with the fit, so a reloaded model carries the same outcome.
     pub rho_posterior: gam_problem::rho_posterior::RhoPosteriorOutcome,
     /// Escalation outcome (#938) when the Tier-0 grade read `Escalate`:
-    /// the Tier-1 quadrature mixture (`K ≤ 4`), the Tier-2 NUTS draws
-    /// (`K ≤ 16`), or an honest `Unavailable` report. `None` whenever the
-    /// grade did not escalate (or was not formed). Computed at the same
+    /// the Tier-1 quadrature mixture or the Tier-2 NUTS draws (whichever tier
+    /// needs fewer criterion evaluations), or an honest `Unavailable` report.
+    /// `None` whenever the grade did not escalate (or was not formed). Computed at the same
     /// live-objective seam as the grade; re-derivable, not serialized.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub rho_posterior_escalation: Option<gam_problem::rho_posterior::RhoPosteriorEscalation>,
@@ -2857,6 +2865,7 @@ impl std::fmt::Debug for FitArtifacts {
             .field("pirls", &self.pirls.as_ref().map(|_| "..."))
             .field("null_space_logdet", &self.null_space_logdet)
             .field("null_space_dim", &self.null_space_dim)
+            .field("null_deviance", &self.null_deviance)
             .field(
                 "survival_link_wiggle_knots",
                 &self
