@@ -314,28 +314,43 @@ fn descriptor_temperature_schedule(
     descriptor: &serde_json::Map<String, JsonValue>,
     context: &str,
 ) -> Result<Option<GumbelTemperatureSchedule>, String> {
-    let Some(raw_schedule) = descriptor.get("temperature_schedule") else {
-        return Ok(None);
-    };
-    if raw_schedule.is_null() {
-        return Ok(None);
+    match descriptor_present(descriptor, "temperature_schedule") {
+        None => Ok(None),
+        Some(raw_schedule) => gumbel_temperature_schedule_from_json(
+            raw_schedule,
+            &format!("{context}.temperature_schedule"),
+        )
+        .map(Some),
     }
+}
+
+/// Parse a Gumbel temperature schedule descriptor object
+/// (`tau_start`, `tau_min` or its alias `tau_end`, `decay`, and `rate` or
+/// `steps` as the decay requires, plus an optional `iter_count`).
+///
+/// This is the single parser for the schedule descriptor: the analytic
+/// penalty registry reads `temperature_schedule` through it, and the Python
+/// bindings (`gumbel_schedule_tau` and the SAE `gumbel_schedule` argument)
+/// convert their dict to JSON and call it, so every surface accepts and
+/// refuses exactly the same schedules. `context` prefixes every error.
+pub fn gumbel_temperature_schedule_from_json(
+    raw_schedule: &JsonValue,
+    context: &str,
+) -> Result<GumbelTemperatureSchedule, String> {
     let schedule = raw_schedule
         .as_object()
-        .ok_or_else(|| format!("{context}.temperature_schedule must be an object"))?;
+        .ok_or_else(|| format!("{context} must be an object"))?;
     let tau_start = schedule
         .get("tau_start")
         .and_then(JsonValue::as_f64)
-        .ok_or_else(|| {
-            format!("{context}.temperature_schedule.tau_start must be a finite number")
-        })?;
+        .ok_or_else(|| format!("{context}.tau_start must be a finite number"))?;
     let tau_min_raw = match (
         descriptor_present(schedule, "tau_min"),
         descriptor_present(schedule, "tau_end"),
     ) {
         (Some(_), Some(_)) => {
             return Err(format!(
-                "{context}.temperature_schedule sets both tau_min and its alias tau_end; pass exactly one"
+                "{context} sets both tau_min and its alias tau_end; pass exactly one"
             ));
         }
         (Some(raw), None) | (None, Some(raw)) => Some(raw),
@@ -343,11 +358,11 @@ fn descriptor_temperature_schedule(
     };
     let tau_min = tau_min_raw
         .and_then(JsonValue::as_f64)
-        .ok_or_else(|| format!("{context}.temperature_schedule.tau_min must be a finite number"))?;
+        .ok_or_else(|| format!("{context}.tau_min must be a finite number"))?;
     let decay_name = schedule
         .get("decay")
         .and_then(JsonValue::as_str)
-        .ok_or_else(|| format!("{context}.temperature_schedule.decay is required"))?
+        .ok_or_else(|| format!("{context}.decay is required"))?
         .to_ascii_lowercase()
         .replace('-', "_");
     let decay = match decay_name.as_str() {
@@ -364,26 +379,21 @@ fn descriptor_temperature_schedule(
             ) {
                 (Some(_), Some(_)) => {
                     return Err(format!(
-                        "{context}.temperature_schedule sets both rate and steps for geometric decay; pass exactly one"
+                        "{context} sets both rate and steps for geometric decay; pass exactly one"
                     ));
                 }
                 (Some(raw_rate), None) => raw_rate.as_f64().ok_or_else(|| {
-                    format!("{context}.temperature_schedule.rate must be a finite number")
+                    format!("{context}.rate must be a finite number")
                 })?,
                 (None, Some(raw_steps)) => {
                     let steps = raw_steps.as_u64().ok_or_else(|| {
-                        format!("{context}.temperature_schedule.steps must be a positive integer")
+                        format!("{context}.steps must be a positive integer")
                     })?;
-                    let steps = json_positive_u64_to_usize(
-                        steps,
-                        &format!("{context}.temperature_schedule.steps"),
-                    )?;
+                    let steps = json_positive_u64_to_usize(steps, &format!("{context}.steps"))?;
                     ScheduleKind::geometric_rate_from_steps(tau_start, tau_min, steps)
                 }
                 (None, None) => {
-                    return Err(format!(
-                        "{context}.temperature_schedule requires rate or steps for geometric decay"
-                    ));
+                    return Err(format!("{context} requires rate or steps for geometric decay"));
                 }
             };
             ScheduleKind::Geometric { rate }
@@ -392,35 +402,28 @@ fn descriptor_temperature_schedule(
             let steps = schedule
                 .get("steps")
                 .and_then(JsonValue::as_u64)
-                .ok_or_else(|| {
-                    format!("{context}.temperature_schedule.steps is required for linear")
-                })?;
+                .ok_or_else(|| format!("{context}.steps is required for linear"))?;
             ScheduleKind::Linear {
-                steps: json_u64_to_usize(steps, &format!("{context}.temperature_schedule.steps"))?,
+                steps: json_u64_to_usize(steps, &format!("{context}.steps"))?,
             }
         }
         "reciprocal_iter" => ScheduleKind::ReciprocalIter,
         other => {
             return Err(format!(
-                "{context}.temperature_schedule.decay must be geometric, exponential, linear, or reciprocal_iter; got {other:?}"
+                "{context}.decay must be geometric, exponential, linear, or reciprocal_iter; got {other:?}"
             ));
         }
     };
     let mut parsed = GumbelTemperatureSchedule::new(tau_start, tau_min, decay)
-        .map_err(|err| format!("{context}.temperature_schedule: {err}"))?;
+        .map_err(|err| format!("{context}: {err}"))?;
     if let Some(iter_count) = schedule.get("iter_count") {
         let raw_iter_count = iter_count.as_u64().ok_or_else(|| {
-            format!("{context}.temperature_schedule.iter_count must be a non-negative integer")
+            format!("{context}.iter_count must be a non-negative integer")
         })?;
-        parsed.iter_count = json_u64_to_usize(
-            raw_iter_count,
-            &format!("{context}.temperature_schedule.iter_count"),
-        )?;
-        parsed
-            .validate()
-            .map_err(|err| format!("{context}.temperature_schedule: {err}"))?;
+        parsed.iter_count = json_u64_to_usize(raw_iter_count, &format!("{context}.iter_count"))?;
+        parsed.validate().map_err(|err| format!("{context}: {err}"))?;
     }
-    Ok(Some(parsed))
+    Ok(parsed)
 }
 
 fn descriptor_difference_op(
@@ -1836,5 +1839,30 @@ mod tests {
             }
             other => panic!("expected geometric decay, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shared_schedule_parser_refuses_rate_and_steps_together() {
+        // The Python `gumbel_schedule` surface parses through this function;
+        // it must refuse an over-specified geometric schedule instead of
+        // silently preferring one field, and prefix errors with its context.
+        let err = super::gumbel_temperature_schedule_from_json(
+            &json!({
+                "tau_start": 1.0,
+                "tau_min": 0.1,
+                "decay": "geometric",
+                "rate": 0.5,
+                "steps": 4
+            }),
+            "gumbel_schedule",
+        )
+        .expect_err("rate and steps together are ambiguous");
+        assert!(err.starts_with("gumbel_schedule sets both rate and steps"), "{err}");
+        let err = super::gumbel_temperature_schedule_from_json(
+            &json!({"tau_start": 1.0, "tau_min": 0.1, "decay": "geometric"}),
+            "gumbel_schedule",
+        )
+        .expect_err("geometric schedule without rate or steps has no decay law");
+        assert!(err.contains("requires rate or steps"), "{err}");
     }
 }

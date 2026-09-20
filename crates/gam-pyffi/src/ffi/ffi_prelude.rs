@@ -156,7 +156,7 @@ pub(crate) use gam::terms::sae::sparse_dict::{
 pub(crate) use gam::terms::sae::manifold::{
     AmbientSphereHarmonicEvaluator, GumbelTemperatureSchedule, SaeAtomGeometryPlan,
     SaeFisherRowMetricRequest, SaeFitAssignmentKind, SaeFitSeedReport, SaeFitSeedRequest,
-    SaeMinimalSeedReport, SaeMinimalSeedRequest, ScheduleKind, build_sae_fisher_row_metric,
+    SaeMinimalSeedReport, SaeMinimalSeedRequest, build_sae_fisher_row_metric,
     SaeBasisEvaluator, build_sae_fit_seed, build_sae_minimal_seed, sae_atom_basis_kind_name,
     sae_fitted_atom_plans,
 };
