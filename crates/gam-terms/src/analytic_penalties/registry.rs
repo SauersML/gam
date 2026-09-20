@@ -414,7 +414,14 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::HarmonicRoughness(p) => p
                 .psd_majorizer_diag(self.target.view(), self.rho.view())
                 .expect("HarmonicRoughness diag"),
-            AnalyticPenaltyKind::BlockOrthogonality(_) => self.diag_via_matvec(),
+            AnalyticPenaltyKind::BlockOrthogonality(p) => {
+                // `B = I_n ⊗ M`: the diagonal is `diag(M)` tiled over the rows.
+                let m = p
+                    .psd_majorizer_row_block(self.target.view(), self.rho.view())
+                    .expect("BlockOrthogonality PSD row-block majorizer");
+                let d = m.nrows();
+                Array1::from_shape_fn(self.target.len(), |i| m[[i % d, i % d]])
+            }
             AnalyticPenaltyKind::DecoderIncoherence(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::Orthogonality(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::NuclearNorm(_) => self.diag_via_matvec(),
@@ -467,8 +474,8 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
         // tridiagonal path-graph structure. Every other PSD penalty takes the
         // exact dense eigensolve at every dimension, admitted on the memory
         // governor's ledger. A 16-probe SLQ estimate used to replace it above
-        // dimension 1024 (#2900).
-        // Orthogonality is excluded because its exact Hessian is indefinite.
+        // dimension 1024 (#2900). Every arm reads the same PSD majorizer that
+        // `matvec`, `diag` and `as_dense` expose, never the exact Hessian.
         match &self.penalty {
             AnalyticPenaltyKind::Ard(_)
             | AnalyticPenaltyKind::TopKActivation(_)
@@ -500,11 +507,14 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                     || p.as_dense(self.target.view(), self.rho.view()),
                 ),
             },
-            AnalyticPenaltyKind::Orthogonality(_) => Err(
-                "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i cannot treat \
-                 OrthogonalityPenalty as PSD; its exact Hessian is indefinite"
-                    .to_string(),
-            ),
+            AnalyticPenaltyKind::BlockOrthogonality(p) => {
+                // `B = I_n ⊗ M`, so `log det(B + λI) = n · log det(M + λI)`: a
+                // `d × d` eigensolve instead of an `nd × nd` one.
+                let m = p.psd_majorizer_row_block(self.target.view(), self.rho.view())?;
+                let rows = self.target.len() / m.nrows();
+                let block = <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&m, lambda)?;
+                Ok(rows as f64 * block)
+            }
             AnalyticPenaltyKind::RowPrecisionPrior(p) => {
                 p.log_det_plus_lambda_i(self.rho.view(), lambda)
             }
@@ -518,7 +528,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::BlockSparsity(_)
             | AnalyticPenaltyKind::MechanismSparsity(_)
             | AnalyticPenaltyKind::IvaeRidgeMeanGauge(_)
-            | AnalyticPenaltyKind::BlockOrthogonality(_)
+            | AnalyticPenaltyKind::Orthogonality(_)
             | AnalyticPenaltyKind::DecoderIncoherence(_)
             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             | AnalyticPenaltyKind::Isometry(_)
@@ -541,7 +551,19 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
             AnalyticPenaltyKind::BlockOrthogonality(p) => {
-                return p.as_dense(self.target.view(), self.rho.view());
+                // `B = I_n ⊗ M`, the row-block PSD majorizer.
+                let m = p
+                    .psd_majorizer_row_block(self.target.view(), self.rho.view())
+                    .expect("BlockOrthogonality PSD row-block majorizer");
+                let d = m.nrows();
+                let n = self.target.len();
+                let mut dense = Array2::<f64>::zeros((n, n));
+                for row in 0..n / d {
+                    dense
+                        .slice_mut(s![row * d..(row + 1) * d, row * d..(row + 1) * d])
+                        .assign(&m);
+                }
+                return dense;
             }
             AnalyticPenaltyKind::RowPrecisionPrior(p) => {
                 return p.as_dense(self.target.view(), self.rho.view());
@@ -557,10 +579,11 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 let Some(t) = p.target_matrix(self.target.view()) else {
                     return Array2::<f64>::zeros((n, n));
                 };
-                let gram = OrthogonalityPenalty::gram_minus_identity(t.view());
+                let envelope = OrthogonalityPenalty::psd_majorizer_gram(t.view())
+                    .expect("Orthogonality PSD Gram envelope");
                 return p.as_dense_with_precomputed_m(
                     t.view(),
-                    gram.view(),
+                    envelope.view(),
                     p.scale(self.rho.view()),
                 );
             }
@@ -630,7 +653,10 @@ impl FrozenAnalyticPenaltyOp {
                     return Array1::<f64>::zeros(n);
                 };
                 let latent_dim = t.ncols();
-                let gram = OrthogonalityPenalty::gram_minus_identity(t.view());
+                // Diagonal of the PSD majorizer: `G = TᵀT − I` replaced by its
+                // certified PSD envelope, as in `psd_majorizer_hvp`.
+                let gram = OrthogonalityPenalty::psd_majorizer_gram(t.view())
+                    .expect("Orthogonality PSD Gram envelope");
                 let scale = p.scale(self.rho.view());
                 let factor = 2.0 * scale;
                 let mut diag = Array1::<f64>::zeros(n);
