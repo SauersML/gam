@@ -3085,5 +3085,14 @@
     ],
     "reason": "Remove unreachable principal-component seed accounting while correcting live structure-move classification. No production path constructs the removed PrincipalComponent variant; its counter, reporting field and assertions existed only to report zero or exercise a test-only artificial seed. Production births retain their residual/linear/curved provenance.",
     "evidence": "Complete Rust-source caller census found only the ledger definition/self-test, zero assertions, report formatting and documentation. All consumers are removed together. Three exact ledger module tests and a new full-production SAE fission/fusion/death integration test pass on MSI. Complete SAE unit-test metadata passes with warnings denied."
+  },
+  {
+    "base": "2d8ddcb048cb9eabe0b6d402697e69e7558bc2fd",
+    "items": [
+      "crates/gam-gpu/src/driver.rs:fn:append_versioned_linux_libcuda_candidates",
+      "crates/gam-gpu/src/driver.rs:static:KEEP_ALIVE"
+    ],
+    "reason": "#4390: a single live compute-library cache owns complete Result<Library,GpuError> entries, preserving opened handles and typed failure causes after mutex poison. The production preload helper preserves the platform loader diagnostic. The duplicated libcuda version walk and split KEEP_ALIVE static are replaced by their shared live owners.",
+    "evidence": "MSI complete gam-gpu unit binary compiles with warnings denied in 2.83 seconds. 43 focused CPU-side tests pass: 22 driver/cache/loader, 11 device-query and policy, 3 calibration, 7 device-pool. New controls exercise actual loader failure, success/error cache entries after poison, loader panic/retry, all eight attribute failures, name/memory failures, and exact successful values. GPU hardware execution is not claimed."
   }
 ]
