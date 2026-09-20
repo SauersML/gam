@@ -275,7 +275,7 @@ impl<'a> RandomEffectTestBasis<'a> {
         if let RandomEffectTestScale::Known { dispersion } = input.scale
             && !(dispersion.is_finite() && dispersion > 0.0)
         {
-            return Err(RandomEffectTestUnavailable::DesignUnavailable);
+            return Err(RandomEffectTestUnavailable::KnownScaleUnavailable);
         }
 
         let mut hessian_gram = Array2::<f64>::zeros((p, p));
@@ -881,6 +881,26 @@ mod tests {
         )
         .expect_err("no residual d.f.");
         assert_eq!(reason, RandomEffectTestUnavailable::NoResidualDegreesOfFreedom);
+    }
+
+    #[test]
+    fn unresolvable_known_dispersion_is_a_typed_known_scale_absence() {
+        let levels = 3;
+        let groups: Vec<usize> = (0..30).map(|i| i % levels).collect();
+        let design = intercept_and_groups(&groups, levels);
+        let y: Array1<f64> = groups.iter().map(|&g| g as f64).collect();
+        let beta = Array1::<f64>::zeros(design.ncols());
+        for dispersion in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let reason = gaussian_test(
+                &design,
+                &y,
+                &beta,
+                1..1 + levels,
+                RandomEffectTestScale::Known { dispersion },
+            )
+            .expect_err("no usable dispersion");
+            assert_eq!(reason, RandomEffectTestUnavailable::KnownScaleUnavailable);
+        }
     }
 
     #[test]
