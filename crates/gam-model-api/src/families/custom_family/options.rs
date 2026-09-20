@@ -376,21 +376,6 @@ pub fn block_offsets_from_specs(specs: &[ParameterBlockSpec]) -> Arc<[Range<usiz
     Arc::from(ranges.into_boxed_slice())
 }
 
-/// Local trust budget for first-order outer BFGS on log-smoothing parameters.
-///
-/// One unit in `rho = log(lambda)` is an `e`-fold smoothing-parameter change.
-/// Previously this cap was `1.0`, which throttled BFGS to ~1/5 of its
-/// quasi-Newton step on flat REML surfaces (the natural BFGS direction has
-/// `|d|_inf` of ~5 in log-λ for large-scale survival fits). Probes whose
-/// `step_inf > cap` are rejected for free in `OuterFirstOrderBridge::eval_cost`
-/// (returning `BFGS_LINE_SEARCH_REJECT_COST` without running an inner solve),
-/// so a larger cap costs nothing on rejection — it only lets Strong-Wolfe
-/// accept bigger steps that the inner-PIRLS divergence guard can already
-/// validate. `5.0` allows up to `e^5 ≈ 148`-fold smoothing-parameter change
-/// per accepted outer iter, which matches the typical quasi-Newton direction
-/// magnitude while still bounding pathological probes.
-pub const FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP: f64 = 5.0;
-
 /// A prior fit's certified outer point, handed to a new fit as its start
 /// (gam#3002). It is the one warm-start mechanism: every source (a saved model's
 /// `warm_start_from`) becomes this, and every outer search takes it through
