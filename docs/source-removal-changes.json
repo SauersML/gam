@@ -2340,7 +2340,60 @@
     "evidence": "Backfill: PR #3405 (claude/fix-3306-fallback-incumbent, Fixes #3306) merged as eaf16b04947ee0c6cc9e7f735a16c141416cf5e7 with no source-removal entry; the removal is in its commit 2c69566f, whose message records the pin move. scripts/source_removal_guard.py run with --base 265ec7bd81604ded27787776e4b0ddf6c60b216e --head eaf16b04947ee0c6cc9e7f735a16c141416cf5e7 lists exactly these 6 guarded removals and fails without this entry. Read-proof: git grep -w -c for custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898 and D2hCountingQuarticFamily finds 1 file at the base and 0 at the merge; the other four names are trait methods still declared elsewhere (declaration count dropped by one each). The replacement pin lives at crates/gam-solve/src/rho_optimizer/run_plan_saddle_escape_tests.rs (#2898 assert in a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939)."
   },
   {
-    "base": "1d02ffcb1218e325f5030aa3c767a7967264c05f",
+    "base": "98e38107cebdf056bd726d03b0a7e2788e1b3ca6",
+    "items": [
+      "crates/gam-solve/src/estimate/smoothing_correction.rs:const:BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC",
+      "crates/gam-solve/src/reml/block_quadrature_correction.rs:fn:block_correction_latched",
+      "crates/gam-solve/src/reml/glm_outer_hessian_fd_tests.rs:fn:a_latched_block_correction_declares_no_outer_hessian_784"
+    ],
+    "reason": "The latched #784 block-local correction now carries its exact analytic rho-Hessian, so certified fits keep their smoothing-corrected covariance instead of shipping the plug-in V = H^-1. The refusal it replaces goes: BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC, the latch predicate block_correction_latched (replaced by block_correction_hessian_refusal, which names why a refused Hessian is absent), and the test that pinned a latched correction declaring no outer Hessian.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3204 (pygam-covariance-refusal, Fixes #3139 and #3198) merged as d4f20811be4720be65138012e033abcb05a91e42 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from d4f20811be4720be65138012e033abcb05a91e42's own tree with --base 98e38107cebdf056bd726d03b0a7e2788e1b3ca6 --head d4f20811be4720be65138012e033abcb05a91e42 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 3 items. Read-proof: git grep -w -c <name> d4f20811be4720be65138012e033abcb05a91e42 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "6dc41be97e6ad583601a08d993f49bcc275386ef",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/run_plan.rs:fn:certified_resume_is_already_stationary"
+    ],
+    "reason": "The certificate ladder's top is capped at the caller's |Pg| requirement, and a resumed terminal point is judged by the certificate: the zero-iteration shortcut certified_resume_is_already_stationary is replaced by claim_prior_terminal_certificate.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3429 (fix-3311-seed-certification, Fixes #3311 and #3312) merged as 1c84d2a44acd352c766a2d6b80e1b2d9a864c06b with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 1c84d2a44acd352c766a2d6b80e1b2d9a864c06b's own tree with --base 6dc41be97e6ad583601a08d993f49bcc275386ef --head 1c84d2a44acd352c766a2d6b80e1b2d9a864c06b (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 1 items. Read-proof: git grep -w -c <name> 1c84d2a44acd352c766a2d6b80e1b2d9a864c06b -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "661649e5fa830748952a78960e77b193fc6858a5",
+    "items": [
+      "crates/gam-pyffi/src/ffi/python_log.rs:fn:drain_pending_call",
+      "crates/gam-pyffi/src/ffi/python_log.rs:fn:lock_queue",
+      "crates/gam-pyffi/src/ffi/python_log.rs:fn:schedule_drain",
+      "crates/gam-pyffi/src/ffi/python_log.rs:static:DRAIN_SCHEDULED",
+      "crates/gam-pyffi/src/ffi/python_log.rs:type:PendingQueue"
+    ],
+    "reason": "Engine log records now stream to Python from one delivery thread that attaches whenever the GIL is free, instead of through Py_AddPendingCall, which CPython runs only on its main thread while it executes bytecode, so nothing was delivered during a detached fit. The pending-call machinery goes: drain_pending_call, schedule_drain, lock_queue, DRAIN_SCHEDULED and PendingQueue.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3378 (fix-3271-log-streaming, Fixes #3271) merged as c5eb78d6864c62efd309cf31043d55e891e7506e with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from c5eb78d6864c62efd309cf31043d55e891e7506e's own tree with --base 661649e5fa830748952a78960e77b193fc6858a5 --head c5eb78d6864c62efd309cf31043d55e891e7506e (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 5 items. Read-proof: git grep -w -c <name> c5eb78d6864c62efd309cf31043d55e891e7506e -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "c5eb78d6864c62efd309cf31043d55e891e7506e",
+    "items": [
+      "crates/gam-solve/src/model_types/result_types.rs:fn:weighted_gram"
+    ],
+    "reason": "X'WX stays beside H in the active frame and is read in the saved frame through the gauge, so lift_to_saved_frame no longer refuses a fit carrying a weighted Gram: the frame-ambiguous accessor weighted_gram() is replaced by saved_frame_weighted_gram().",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3389 (fix-3346-lift-weighted-gram, Fixes #3346) merged as ed78ff5628326615b5ca13682cb99e0935bb8d15 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from ed78ff5628326615b5ca13682cb99e0935bb8d15's own tree with --base c5eb78d6864c62efd309cf31043d55e891e7506e --head ed78ff5628326615b5ca13682cb99e0935bb8d15 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 1 items. Read-proof: git grep -w -c <name> ed78ff5628326615b5ca13682cb99e0935bb8d15 -- <its path> gives 0 for every item except weighted_gram (17, other uses of the same word)."
+  },
+  {
+    "base": "8256e9b70f568d96c311c361f4724ab8589e0be2",
+    "items": [
+      "crates/gam-cli/src/main/model_summary.rs:fn:build_model_summary",
+      "crates/gam-models/src/inference/saved_summary.rs:fn:summary_smooth_terms",
+      "crates/gam-solve/src/estimate/summary.rs:fn:fmt",
+      "crates/gam-solve/src/estimate/summary.rs:fn:format_pvalue",
+      "crates/gam-solve/src/estimate/summary.rs:fn:significance_stars",
+      "crates/gam-solve/src/estimate/summary.rs:fn:the_summary_names_a_withheld_shape_pvalue",
+      "crates/gam-solve/src/estimate/summary.rs:fn:the_summary_names_an_uncertified_terms_edf_label_2901",
+      "crates/gam-solve/src/estimate/summary.rs:struct:ModelSummary"
+    ],
+    "reason": "pyGAM audit F11/DOC-6/G1: the fitted-model summary text has exactly one renderer, gam_models::inference::summary_text::render_summary_text over the typed SummaryPayload, shared by `gam summary` and gamfit's Model.summary()/__str__. Removed as second implementations: the CLI's build_model_summary and gam_solve's ModelSummary with its Display fmt, format_pvalue and significance_stars (the renderer owns the p-value format and stars). the_summary_names_an_uncertified_terms_edf_label_2901 and the_summary_names_a_withheld_shape_pvalue moved under the same names to summary_text.rs's tests against the one renderer, which prints the #2901 EDF label and the shape-constrained p-value reason from the payload rows. The saved summary's per-predictor smooth builder `summary_smooth_terms` is replaced by `predictor_block_smooth_terms`, which reads the same predictor block from one replayed design shared with the parametric table instead of replaying it a second time.",
+    "evidence": "source_removal_guard.py with base 9af3c66f1b and head the merge commit refused exactly these seven items. crates/gam-models/src/inference/summary_text.rs defines significance_stars, format_p_value, the_summary_names_an_uncertified_terms_edf_label_2901 and the_summary_names_a_withheld_shape_pvalue. git grep -w finds no remaining reference to ModelSummary or build_model_summary (other than one historical doc sentence). The fmt removed is ModelSummary's own Display impl (the other production occurrences are other fmt fns). crates/gam-models/tests/suite/bms_per_smooth_summary_2997.rs pins both predictors' smooth and parametric rows through the replacement."
+  },
+  {
+    "base": "18988e54f8b05c505e9da081b1dc5a8e57cc14d8",
     "items": [
       "crates/gam-inference/src/effects.rs:const:DEFAULT_SIMULATIONS",
       "crates/gam-inference/src/effects.rs:fn:default",
@@ -2355,6 +2408,6 @@
       "crates/gam-pyffi/src/manifold/geometry_ffi.rs:struct:PartialDependenceOutput"
     ],
     "reason": "PR #3076 replaces the dict-returning partial-dependence path with a typed Rust partial effect (gam_predict::partial_effect::partial_effect). (1) The pyffi model_partial_dependence / model_partial_dependence_impl / PartialDependenceOutput pyfunction is replaced by model_partial_effect, and gamfit.Model.partial_dependence calls that instead. (2) The standard-mean design helpers standard_mean_design, standard_mean_termspec, standard_mean_prediction_design and NONZERO_ANCHOR_DESIGN_ERROR move out of gam-pyffi geometry_ffi.rs into gam_predict::partial_effect, where the CLI partial-effect command and pyffi share them; the variance-share and difference-smooth callers now call gam_predict::partial_effect::standard_mean_design. (3) The simultaneous-band draw count is no longer the magic constant DEFAULT_SIMULATIONS = 10_000 behind impl Default for SimultaneousBandOptions. It is SimultaneousBandOptions::at_level(level), which draws simultaneous_band_simulations(level) = ceil(level/((1-level)*0.05^2)) samples, 7,600 at 0.95. (4) Two partial_dependence unit tests asserted refusals this PR turns into supported behaviour: a two-axis term with no grid now sweeps the product grid, and a block spanning every factor level now sweeps the factor as an axis. They are renamed to a_linear_interaction_holds_its_gate_and_a_two_axis_term_sweeps_a_product_grid and a_block_spanning_every_level_sweeps_the_factor_as_an_axis. The second still carries the unknown-term refusal assertion (\"available\" plus the term list).",
-    "evidence": "scripts/source_removal_guard.py --base 1d02ffcb1218e325f5030aa3c767a7967264c05f --head d91b01836688765aadbbed2aff2ef0f78d7e9d41 (the landing session's merge of main into claude/pygam-partial-effects) lists exactly these 11 guarded removals and fails without this entry. Read-proof, git grep -w -c over *.rs at that head: DEFAULT_SIMULATIONS 0, model_partial_dependence 0, model_partial_dependence_impl 0, PartialDependenceOutput 0; standard_mean_design is in gam-predict/src/partial_effect.rs (2), geometry_ffi.rs (1, the variance-share caller) and manifold_and_posterior_ffi.rs (1, the difference-smooth caller); standard_mean_termspec (3), standard_mean_prediction_design (2) and NONZERO_ANCHOR_DESIGN_ERROR (3) are all in gam-predict/src/partial_effect.rs; SimultaneousBandOptions::at_level appears 5 times in gam-inference/src/effects.rs, and main's whole-curve coverage test is ported to it. The renamed tests are each declared once in gam-inference/src/partial_dependence.rs."
+    "evidence": "scripts/source_removal_guard.py --base 18988e54f8b05c505e9da081b1dc5a8e57cc14d8 --head d91b01836688765aadbbed2aff2ef0f78d7e9d41 (the landing session's merge of main into claude/pygam-partial-effects) lists exactly these 11 guarded removals and fails without this entry. Read-proof, git grep -w -c over *.rs at that head: DEFAULT_SIMULATIONS 0, model_partial_dependence 0, model_partial_dependence_impl 0, PartialDependenceOutput 0; standard_mean_design is in gam-predict/src/partial_effect.rs (2), geometry_ffi.rs (1, the variance-share caller) and manifold_and_posterior_ffi.rs (1, the difference-smooth caller); standard_mean_termspec (3), standard_mean_prediction_design (2) and NONZERO_ANCHOR_DESIGN_ERROR (3) are all in gam-predict/src/partial_effect.rs; SimultaneousBandOptions::at_level appears 5 times in gam-inference/src/effects.rs, and main's whole-curve coverage test is ported to it. The renamed tests are each declared once in gam-inference/src/partial_dependence.rs."
   }
 ]

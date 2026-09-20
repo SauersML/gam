@@ -156,6 +156,7 @@ pub fn smooth_term_summary_rows(
         // double-counts shared coefficients and can exceed the model total.
         let edf = fit.per_term_edf(range.clone(), penalty_cursor, k_pen);
         let edf_rank_bound = edf_rank_bound_label(fit, penalty_cursor, k_pen);
+        let lambdas = term_lambdas(fit, penalty_cursor, k_pen);
         penalty_cursor += k_pen;
         // The variance component's null is on the boundary, so the row reports
         // the score test the fit recorded for this exact term — matched by name
@@ -193,6 +194,7 @@ pub fn smooth_term_summary_rows(
             continuous_order: None,
             basis_note: None,
             edf_rank_bound,
+            lambdas,
             pvalue_unavailable,
         });
     }
@@ -222,6 +224,7 @@ pub fn smooth_term_summary_rows(
             (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);
         let edf = fit.per_term_edf(global_range.clone(), penalty_cursor, k);
         let edf_rank_bound = edf_rank_bound_label(fit, penalty_cursor, k);
+        let lambdas = term_lambdas(fit, penalty_cursor, k);
         penalty_cursor += k;
         let smooth_test = match (smooth_pvalue_unavailable(&term.shape), &score_fit) {
             (Some(reason), _) => Err(reason),
@@ -255,6 +258,7 @@ pub fn smooth_term_summary_rows(
                 _ => None,
             },
             edf_rank_bound,
+            lambdas,
             pvalue_unavailable,
         });
     }
@@ -384,6 +388,16 @@ pub fn smooth_pvalue_unavailable(shape: &ShapeSpec) -> Option<SmoothPValueUnavai
     } else {
         Some(SmoothPValueUnavailable::ShapeConstrained)
     }
+}
+
+/// The smoothing parameters of the `count` penalty blocks a term owns from
+/// `start` in the fit's flat layout — the same window its EDF is read over.
+fn term_lambdas(fit: &UnifiedFitResult, start: usize, count: usize) -> Vec<f64> {
+    fit.lambdas
+        .as_slice()
+        .and_then(|all| all.get(start..start + count))
+        .map(<[f64]>::to_vec)
+        .unwrap_or_default()
 }
 
 /// The label a term's EDF carries when a penalty block among its `count` blocks from

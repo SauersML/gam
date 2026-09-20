@@ -7038,6 +7038,7 @@ mod tests {
                 jeffreys_arming_evidence: None,
                 improper_penalty_null_posterior: None,
                 outer_warm_start: None,
+                null_deviance: None,
                 coefficient_mode_selection:
                     gam_solve::model_types::CoefficientModeSelection::NotRecorded,
                 random_effect_tests: Vec::new(),
