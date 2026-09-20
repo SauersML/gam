@@ -5293,7 +5293,7 @@ impl FittedModel {
     ///
     /// This is the whitelist the predict/`check` encode paths pass to
     /// `UnseenCategoryPolicy::encode_unknown_for_columns`. It intentionally
-    /// covers ONLY genuine random effects (`group(g)`/`re(g)`/`s(g, bs="re")`).
+    /// covers ONLY genuine random effects (`group(g)`/`s(g, bs="re")`).
     /// A FIXED categorical factor — a bare `+ g` OR an explicit `factor(g)` —
     /// is auto-promoted to a penalized random block internally but is still a
     /// fixed parametric factor: an unseen level of it must reach the strict
@@ -7038,6 +7038,7 @@ mod tests {
                 jeffreys_arming_evidence: None,
                 improper_penalty_null_posterior: None,
                 outer_warm_start: None,
+                null_deviance: None,
                 coefficient_mode_selection:
                     gam_solve::model_types::CoefficientModeSelection::NotRecorded,
                 random_effect_tests: Vec::new(),
@@ -7532,9 +7533,9 @@ mod tests {
     /// `y ~ factor(g)` — must reach the strict schema encode and raise a
     /// `SchemaMismatch` on an unseen level; it must NOT be silently mapped to
     /// the factor's centering point (the across-level average). Only a genuine
-    /// random effect (`group(g)`/`re(g)`/`s(g, bs="re")`) is eligible for the
+    /// random effect (`group(g)`/`s(g, bs="re")`) is eligible for the
     /// lenient held-out-group policy, and it must stay lenient. `factor(g)`
-    /// shared the `group()`/`re()` parse arm and so wrongly inherited the
+    /// shared the `group()` parse arm and so wrongly inherited the
     /// lenient policy (#2137); it is now lowered as the fixed factor it is.
     ///
     /// This drives the real predict/`check` encode contract: it derives the
@@ -7650,8 +7651,8 @@ mod tests {
         );
 
         // Genuine random effects stay lenient (held-out group → population mean):
-        // group(g), its re(g) alias, and the mgcv s(g, bs="re") spelling.
-        for formula in ["y ~ group(g)", "y ~ re(g)", "y ~ s(g, bs=\"re\")"] {
+        // group(g) and the s(g, bs="re") basis.
+        for formula in ["y ~ group(g)", "y ~ s(g, bs=\"re\")"] {
             let grouped = model_for(formula);
             assert!(
                 grouped.random_effect_group_columns().contains("g"),

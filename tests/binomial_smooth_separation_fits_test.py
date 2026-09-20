@@ -4,15 +4,16 @@ A flat prior on the unpenalized block of a binomial smooth gives an improper
 posterior as soon as that block admits a (quasi-)separating direction, and the
 smooth's null-space shrinkage ridge does not cure it: REML drives the ridge's
 lambda to zero along the separating direction. The Jeffreys (Firth) prior makes
-the posterior proper, and the engine engages it when the flat-prior fit refuses.
+the posterior proper, and the engine arms it before the first solve when the
+realized design certifies separation.
 
 These fixtures used to fail: the perfectly separated step ground for more than
 20 minutes without returning, and the quasi-separated one raised
 ``RemlConvergenceError`` with the outer search stalled at ``|g| = 0.23``. Both
 came from the #784 block quadrature correction integrating the flat-prior
 posterior on a Firth fit, which is improper along the separating direction.
-The Firth rescue engages only on certified separation, and the quasi-separated
-fixture has no strict separator: its flat-prior fit returned an optimum with
+The Jeffreys prior is armed only on certified separation, and the
+quasi-separated fixture has no strict separator: its flat-prior fit returned an optimum with
 the null-space ridge's lambda railed at zero. So the pre-fit check also
 certifies quasi-complete separation along a null-space direction.
 
