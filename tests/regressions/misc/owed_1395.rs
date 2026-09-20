@@ -374,18 +374,13 @@ fn owed_1395_pseudo_laplace_rho_objective_matches_closed_form() {
 }
 
 // ---------------------------------------------------------------------------
-// gam#1395 — wide (dim > 64) coverage.
+// gam#1395 — wide coverage.
 //
 // The scalar fixtures above (and the in-suite autodiff guards) exercise dim=1.
-// The PRODUCTION structural guard in `assembly.rs::joint_outer_evaluate` only
-// rebuilds the ground-truth penalized Hessian and `assert!`s the assembled
-// `logdet()` for `dim <= JOINT_LOGDET_GUARD_MAX_DIM = 64` (the dimension where a
-// redundant dense eigendecomposition is affordable). Past that dimension nothing
-// in production cross-checks the assembled logdet or the outer ρ-gradient's
-// `0.5·tr(H⁻¹ ∂H/∂ρ)` term, yet both must be numerically exact, not
-// approximate. This fixture pins both to the closed-form / num-dual reference
-// for a genuinely wide (p = 512) custom-family joint system, closing the
-// dim > 64 coverage gap the dense guard does not reach. Its joint Hessian is
+// The assembled logdet and the outer ρ-gradient's `0.5·tr(H⁻¹ ∂H/∂ρ)` term
+// must be numerically exact, not approximate, at every width. This fixture
+// pins both to the closed-form / num-dual reference for a genuinely wide
+// (p = 512) custom-family joint system. Its joint Hessian is
 // materialized, so the outer evaluation factors it densely
 // (`joint_outer_matrix_free_route`). A `0.5·log|H|` collapse, a dropped
 // penalty-derivative trace term, or a stochastic logdet sneaking into this
@@ -405,8 +400,8 @@ const PSEUDO_LAPLACE_DIM: usize = 512;
 /// `p`-dimensional diagonal pseudo-Laplace family with a learnable `ρ`
 /// (`λ = eᵖ`). Joint Hessian is the constant `2·I_p`; `D_β H = 0`. This is the
 /// scalar ρ fixture replicated across `targets.len()` independent coordinates,
-/// which makes `total_p = p` wide enough (`p = 512`) to escape the dim ≤ 64
-/// logdet guard while keeping a clean per-coordinate closed form.
+/// which makes `total_p = p` wide (`p = 512`) while keeping a clean
+/// per-coordinate closed form.
 #[derive(Clone)]
 struct DiagonalPseudoLaplaceRhoFamily {
     targets: Vec<f64>,
@@ -504,7 +499,7 @@ fn diagonal_pseudo_laplace_rho_objective_numdual<D: DualNum<f64> + Copy>(
 fn diagonal_pseudo_laplace_rho_spec(p: usize) -> ParameterBlockSpec {
     // Design = I_p so each coordinate carries one observation (eta length = p),
     // and the per-coordinate data Hessian is exactly 2. A single block of width
-    // p gives total_p = p — the width past the dim ≤ 64 logdet guard.
+    // p gives total_p = p.
     ParameterBlockSpec {
         name: "diag_rho_block".to_string(),
         design: gam::matrix::DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(
@@ -525,10 +520,6 @@ fn diagonal_pseudo_laplace_rho_spec(p: usize) -> ParameterBlockSpec {
 #[test]
 fn owed_1395_wide_pseudo_laplace_rho_objective_matches_closed_form() {
     let p = PSEUDO_LAPLACE_DIM;
-    assert!(
-        p > 64,
-        "fixture must clear the dim <= 64 logdet guard (gam#1395 dim>64 coverage)"
-    );
     // Distinct, non-trivial targets so the quadratic term is genuinely
     // p-dependent (not a degenerate all-equal system).
     let targets: Vec<f64> = (0..p).map(|i| 0.5 + 0.013 * (i as f64)).collect();
