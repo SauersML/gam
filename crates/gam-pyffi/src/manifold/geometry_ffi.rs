@@ -220,9 +220,15 @@ fn sae_observe_atlas_topology<'py>(
     signed_betti.set_item("b1", invariants.signed_subcomplex_betti.b1)?;
     signed_betti.set_item("b2", invariants.signed_subcomplex_betti.b2)?;
     invariant_block.set_item("signed_subcomplex_betti", signed_betti)?;
-    invariant_block.set_item("incoherent_overlap_pairs", invariants.incoherent_overlap_pairs)?;
+    invariant_block.set_item(
+        "incoherent_overlap_pairs",
+        invariants.incoherent_overlap_pairs,
+    )?;
     invariant_block.set_item("max_cover_multiplicity", invariants.max_cover_multiplicity)?;
-    invariant_block.set_item("mean_cover_multiplicity", invariants.mean_cover_multiplicity)?;
+    invariant_block.set_item(
+        "mean_cover_multiplicity",
+        invariants.mean_cover_multiplicity,
+    )?;
     invariant_block.set_item("chart_count", invariants.chart_count)?;
     invariant_block.set_item("dropped_center_count", invariants.dropped_center_count)?;
     invariant_block.set_item(
@@ -461,8 +467,14 @@ pub(crate) fn manifold_description_length_to_pydict<'py>(
     out.set_item("dict_bits_per_token", dl.dict_bits_per_token)?;
     out.set_item("coordinate_rate_bits", dl.coordinate_rate_bits)?;
     out.set_item("atom_occupancy", dl.atom_occupancy.clone())?;
-    out.set_item("atom_code_bits_per_token", dl.atom_code_bits_per_token.clone())?;
-    out.set_item("gate_amplitude_bits_per_token", dl.gate_amplitude_bits_per_token)?;
+    out.set_item(
+        "atom_code_bits_per_token",
+        dl.atom_code_bits_per_token.clone(),
+    )?;
+    out.set_item(
+        "gate_amplitude_bits_per_token",
+        dl.gate_amplitude_bits_per_token,
+    )?;
     out.set_item("dictionary_code", dl.dictionary_code.as_str())?;
     out.set_item("dictionary_header_bits", dl.dictionary_header_bits)?;
     out.set_item("dictionary_distortion", dl.dictionary_distortion)?;
@@ -616,7 +628,10 @@ fn sae_eq4_description_length<'py>(
         out.set_item(format!("bits_at_r2_{suffix}"), row.bits)?;
         out.set_item(format!("code_bits_at_r2_{suffix}"), row.code_bits)?;
         out.set_item(format!("resid_bits_at_r2_{suffix}"), row.resid_bits)?;
-        out.set_item(format!("truncation_bits_at_r2_{suffix}"), row.truncation_bits)?;
+        out.set_item(
+            format!("truncation_bits_at_r2_{suffix}"),
+            row.truncation_bits,
+        )?;
     }
     if let Some(native) = dl.native_bits_per_token {
         out.set_item("native_bits_per_token", native)?;
@@ -1364,10 +1379,7 @@ fn response_geometry_fit_curvature<'py>(
     out.set_item("verdict", verdict)?;
     out.set_item("flatness_lr", fit.flatness.lr_stat)?;
     out.set_item("flatness_pvalue", fit.flatness.p_value)?;
-    out.set_item(
-        "railed_at_resolution_limit",
-        fit.railed_at_resolution_limit,
-    )?;
+    out.set_item("railed_at_resolution_limit", fit.railed_at_resolution_limit)?;
     out.set_item(
         "railed_at_hyperbolic_resolution_limit",
         fit.railed_at_hyperbolic_resolution_limit,
@@ -4583,40 +4595,118 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("GamfitError", module.py().get_type::<GamfitError>())?;
     module.add("FormulaError", module.py().get_type::<FormulaError>())?;
     module.add("DataError", module.py().get_type::<DataError>())?;
-    module.add("ConvergenceError", module.py().get_type::<ConvergenceError>())?;
+    module.add(
+        "ConvergenceError",
+        module.py().get_type::<ConvergenceError>(),
+    )?;
     module.add("NotFittedError", module.py().get_type::<NotFittedError>())?;
     module.add("InternalError", module.py().get_type::<InternalError>())?;
-    module.add("ColumnNotFoundError", module.py().get_type::<ColumnNotFoundError>())?;
-    module.add("InvalidSpecificationError", module.py().get_type::<InvalidSpecificationError>())?;
-    module.add("InvalidConfigurationError", module.py().get_type::<InvalidConfigurationError>())?;
+    module.add(
+        "ColumnNotFoundError",
+        module.py().get_type::<ColumnNotFoundError>(),
+    )?;
+    module.add(
+        "InvalidSpecificationError",
+        module.py().get_type::<InvalidSpecificationError>(),
+    )?;
+    module.add(
+        "InvalidConfigurationError",
+        module.py().get_type::<InvalidConfigurationError>(),
+    )?;
     module.add("BasisError", module.py().get_type::<BasisError>())?;
-    module.add("MissingDependencyError", module.py().get_type::<MissingDependencyError>())?;
-    module.add("SchemaMismatchError", module.py().get_type::<SchemaMismatchError>())?;
+    module.add(
+        "MissingDependencyError",
+        module.py().get_type::<MissingDependencyError>(),
+    )?;
+    module.add(
+        "SchemaMismatchError",
+        module.py().get_type::<SchemaMismatchError>(),
+    )?;
     module.add("PredictionError", module.py().get_type::<PredictionError>())?;
-    module.add("PredictInputError", module.py().get_type::<PredictInputError>())?;
-    module.add("PerfectSeparationError", module.py().get_type::<PerfectSeparationError>())?;
-    module.add("ModelOverparameterizedError", module.py().get_type::<ModelOverparameterizedError>())?;
-    module.add("IllConditionedError", module.py().get_type::<IllConditionedError>())?;
-    module.add("InvalidInputError", module.py().get_type::<InvalidInputError>())?;
+    module.add(
+        "PredictInputError",
+        module.py().get_type::<PredictInputError>(),
+    )?;
+    module.add(
+        "PerfectSeparationError",
+        module.py().get_type::<PerfectSeparationError>(),
+    )?;
+    module.add(
+        "ModelOverparameterizedError",
+        module.py().get_type::<ModelOverparameterizedError>(),
+    )?;
+    module.add(
+        "IllConditionedError",
+        module.py().get_type::<IllConditionedError>(),
+    )?;
+    module.add(
+        "InvalidInputError",
+        module.py().get_type::<InvalidInputError>(),
+    )?;
     module.add("GeometryError", module.py().get_type::<GeometryError>())?;
     module.add("FitInputError", module.py().get_type::<FitInputError>())?;
-    module.add("FitConvergenceError", module.py().get_type::<FitConvergenceError>())?;
-    module.add("PirlsConvergenceError", module.py().get_type::<PirlsConvergenceError>())?;
-    module.add("RemlConvergenceError", module.py().get_type::<RemlConvergenceError>())?;
-    module.add("InnerModeConvergenceError", module.py().get_type::<InnerModeConvergenceError>())?;
+    module.add(
+        "FitConvergenceError",
+        module.py().get_type::<FitConvergenceError>(),
+    )?;
+    module.add(
+        "PirlsConvergenceError",
+        module.py().get_type::<PirlsConvergenceError>(),
+    )?;
+    module.add(
+        "RemlConvergenceError",
+        module.py().get_type::<RemlConvergenceError>(),
+    )?;
+    module.add(
+        "InnerModeConvergenceError",
+        module.py().get_type::<InnerModeConvergenceError>(),
+    )?;
     module.add("FitSeedError", module.py().get_type::<FitSeedError>())?;
-    module.add("FitNumericalError", module.py().get_type::<FitNumericalError>())?;
-    module.add("LinearSystemSolveError", module.py().get_type::<LinearSystemSolveError>())?;
-    module.add("EigendecompositionError", module.py().get_type::<EigendecompositionError>())?;
-    module.add("PenaltySpectrumError", module.py().get_type::<PenaltySpectrumError>())?;
-    module.add("ParameterConstraintError", module.py().get_type::<ParameterConstraintError>())?;
-    module.add("HessianNotPositiveDefiniteError", module.py().get_type::<HessianNotPositiveDefiniteError>())?;
-    module.add("MonotoneRootError", module.py().get_type::<MonotoneRootError>())?;
-    module.add("IntegrationError", module.py().get_type::<IntegrationError>())?;
+    module.add(
+        "FitNumericalError",
+        module.py().get_type::<FitNumericalError>(),
+    )?;
+    module.add(
+        "LinearSystemSolveError",
+        module.py().get_type::<LinearSystemSolveError>(),
+    )?;
+    module.add(
+        "EigendecompositionError",
+        module.py().get_type::<EigendecompositionError>(),
+    )?;
+    module.add(
+        "PenaltySpectrumError",
+        module.py().get_type::<PenaltySpectrumError>(),
+    )?;
+    module.add(
+        "ParameterConstraintError",
+        module.py().get_type::<ParameterConstraintError>(),
+    )?;
+    module.add(
+        "HessianNotPositiveDefiniteError",
+        module.py().get_type::<HessianNotPositiveDefiniteError>(),
+    )?;
+    module.add(
+        "MonotoneRootError",
+        module.py().get_type::<MonotoneRootError>(),
+    )?;
+    module.add(
+        "IntegrationError",
+        module.py().get_type::<IntegrationError>(),
+    )?;
     module.add("CalibratorError", module.py().get_type::<CalibratorError>())?;
-    module.add("DictionaryConvergenceError", module.py().get_type::<DictionaryConvergenceError>())?;
-    module.add("FitInvariantError", module.py().get_type::<FitInvariantError>())?;
-    module.add("GradientUnavailableError", module.py().get_type::<GradientUnavailableError>())?;
+    module.add(
+        "DictionaryConvergenceError",
+        module.py().get_type::<DictionaryConvergenceError>(),
+    )?;
+    module.add(
+        "FitInvariantError",
+        module.py().get_type::<FitInvariantError>(),
+    )?;
+    module.add(
+        "GradientUnavailableError",
+        module.py().get_type::<GradientUnavailableError>(),
+    )?;
     module.add("LayoutError", module.py().get_type::<LayoutError>())?;
 
     // #773: `create_exception!` stamps every gamfit exception with
@@ -4706,13 +4796,12 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(flat_to_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(extract_row_ids, module)?)?;
-    module.add_function(wrap_pyfunction!(default_survival_time_grid, module)?)?;
     module.add_function(wrap_pyfunction!(torch_from_fitted, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
     module.add_class::<PyFittedModel>()?;
     module.add_function(wrap_pyfunction!(compile_model, module)?)?;
-    module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
+    module.add_function(wrap_pyfunction!(evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_kind, module)?)?;
     module.add_function(wrap_pyfunction!(write_saved_model_file, module)?)?;
@@ -4796,6 +4885,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(duchon_function_norm_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_operator_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis, module)?)?;
+    module.add_function(wrap_pyfunction!(sphere_basis_size, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis_with_centers, module)?)?;
     module.add_function(wrap_pyfunction!(
         sphere_select_farthest_point_centers,
@@ -5619,20 +5709,38 @@ fn linear_dictionary_error_to_pyerr(py: Python<'_>, error: LinearDictionaryError
 }
 
 /// Out-of-sample encode: route held-out rows `x` (`M x P`) through a fitted
-/// linear dictionary `atoms` (`K x P`) via the Rust top-`top_k` ridge solve,
-/// returning the `(M, K)` code matrix.
-#[pyfunction(signature = (x, atoms, top_k, code_ridge = 1.0e-8))]
+/// linear dictionary `atoms` (`K x P`) with the fitted model's assignment rule
+/// (`"top_k"` ridge solve or `"softmax"` at `temperature`), returning the
+/// `(M, K)` code matrix.
+#[pyfunction(signature = (
+    x,
+    atoms,
+    top_k,
+    code_ridge = 1.0e-8,
+    assignment = "top_k",
+    temperature = 0.25
+))]
 fn linear_dictionary_transform_ffi<'py>(
     py: Python<'py>,
     x: PyReadonlyArray2<'py, f64>,
     atoms: PyReadonlyArray2<'py, f64>,
     top_k: usize,
     code_ridge: f64,
+    assignment: &str,
+    temperature: f64,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let x_values = x.as_array().to_owned();
     let atoms_values = atoms.as_array().to_owned();
+    let assignment_kind = LinearDictionaryAssignment::parse(assignment).map_err(py_value_error)?;
     let codes = detach_py_result(py, "linear_dictionary_transform", move || {
-        linear_dictionary_transform(x_values.view(), atoms_values.view(), top_k, code_ridge)
+        linear_dictionary_transform(
+            x_values.view(),
+            atoms_values.view(),
+            top_k,
+            assignment_kind,
+            temperature,
+            code_ridge,
+        )
     })?;
     Ok(codes.into_pyarray(py).unbind())
 }
@@ -6863,7 +6971,10 @@ fn load_model_impl(
     Ok(model)
 }
 
-fn extend_model_with_group_impl(model: &FittedModel, request_json: &str) -> Result<Vec<u8>, String> {
+fn extend_model_with_group_impl(
+    model: &FittedModel,
+    request_json: &str,
+) -> Result<Vec<u8>, String> {
     let mut model = model.clone();
     // Refuse non-standard model classes here rather than leaning on the core
     // guard, so the Python error keeps naming the fine-grained saved-family
@@ -6891,9 +7002,8 @@ fn validate_formula_dataset_json_impl(
 ) -> Result<String, String> {
     let mut fit_config = parse_fit_config(config_json)?;
     if fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some() {
-        (dataset, fit_config) = gam::inference::ctn::structural_inputs(
-            &formula, &dataset, &fit_config,
-        )?;
+        (dataset, fit_config) =
+            gam::inference::ctn::structural_inputs(&formula, &dataset, &fit_config)?;
     }
     // Structural-only: validate must NOT fit. The survival baseline-θ resolution
     // (a real BFGS-over-`fit_model` inner fit for location-scale / latent modes)
@@ -7286,7 +7396,7 @@ fn predict_columns(
     )?;
     let predictor = model
         .predictor()
-        .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
+        .map_err(|reason| format!("saved model could not construct a predictor: {reason}"))?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
 
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
@@ -7478,12 +7588,19 @@ fn predict_encoded_table_conformal_impl(
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let calibration = dataset_with_model_schema_from_encoded(&model, &calibration_source)?;
     let test_col_map = dataset.column_map();
-    let test_offset = resolve_offset_column(&dataset, &test_col_map, model.offset_column.as_deref())?;
-    let test_noise_offset =
-        resolve_offset_column(&dataset, &test_col_map, model.noise_offset_column.as_deref())?;
+    let test_offset =
+        resolve_offset_column(&dataset, &test_col_map, model.offset_column.as_deref())?;
+    let test_noise_offset = resolve_offset_column(
+        &dataset,
+        &test_col_map,
+        model.noise_offset_column.as_deref(),
+    )?;
     let calibration_col_map = calibration.column_map();
-    let calibration_offset =
-        resolve_offset_column(&calibration, &calibration_col_map, model.offset_column.as_deref())?;
+    let calibration_offset = resolve_offset_column(
+        &calibration,
+        &calibration_col_map,
+        model.offset_column.as_deref(),
+    )?;
     let calibration_noise_offset = resolve_offset_column(
         &calibration,
         &calibration_col_map,
@@ -7550,11 +7667,14 @@ fn predict_encoded_table_full_conformal_impl(
     let test_col_map = dataset.column_map();
     let training_col_map = training.column_map();
     let test_offset =
-        resolve_offset_column(&dataset, &test_col_map, model.offset_column.as_deref())
-            .map_err(|err| FullConformalPredictError::Predict(PredictError::Other(err.to_string())))?;
+        resolve_offset_column(&dataset, &test_col_map, model.offset_column.as_deref()).map_err(
+            |err| FullConformalPredictError::Predict(PredictError::Other(err.to_string())),
+        )?;
     let training_offset =
         resolve_offset_column(&training, &training_col_map, model.offset_column.as_deref())
-            .map_err(|err| FullConformalPredictError::Predict(PredictError::Other(err.to_string())))?;
+            .map_err(|err| {
+                FullConformalPredictError::Predict(PredictError::Other(err.to_string()))
+            })?;
     let columns = gam_predict::conformal_routes::full_conformal_prediction_columns(
         model,
         &gam_predict::conformal_routes::DesignRows {
@@ -7575,17 +7695,20 @@ fn predict_encoded_table_full_conformal_impl(
         format!(
             "full-conformal with REML re-selection of the smoothing strength on the \
              augmented rows (finite-sample ≥{:.0}% coverage wherever \
-             conformal_certificate ≥ 0; a negative code is a typed refusal carrying \
-             the frozen-ρ set)",
+             conformal_certificate ≥ 0 under exchangeable supplied rows and a symmetric \
+             fitting map; numerical enclosures can over-cover; a negative code refuses \
+             that guarantee. Empty sets retain NaN bounds and zero components; finite \
+             endpoint membership is conformal_lower_closed/conformal_upper_closed)",
             conformal_level * 100.0
         )
     } else {
         format!(
             "full-conformal at frozen smoothing parameters by certified augmented refits \
-             (exact ≥{:.0}% set given the frozen penalty, score |∂ℓ/∂η|, seeded tie \
-             randomization; a union of conformal_set_components intervals whose envelope is \
-             posterior_mean_lower/upper; conformal_certificate 0 when the fit selected no \
-             smoothing parameter, -7 glm_frozen_penalty otherwise)",
+             (conservative numerical enclosure at nominal {:.0}% marginal coverage under \
+             exchangeable supplied rows and a fixed symmetric fitting map; independent tie \
+             randomization; conformal_certificate 2 when no strength was selected, \
+             -7 glm_frozen_penalty otherwise; endpoint membership is reported by \
+             conformal_lower_closed/conformal_upper_closed)",
             conformal_level * 100.0
         )
     };
@@ -7606,7 +7729,7 @@ fn predict_encoded_table_full_conformal_impl(
 /// Full-conformal prediction intervals — no held-out calibration fold required
 /// (#1098 / #942 Layers 1 and 3).
 ///
-/// Routes `predict(interval='conformal', training_data=...)` to the exact
+/// Routes `predict(interval='conformal', training_data=...)` to a certified
 /// full-conformal set: the saved model carries only the frozen `p x p` penalty
 /// `Sλ`, and the labeled `(training_headers, training_rows)` — which must
 /// contain the response column — supply the design and responses the set
@@ -7616,9 +7739,13 @@ fn predict_encoded_table_full_conformal_impl(
 /// the smoothing strength by REML on the augmented rows, which carries the
 /// distribution-free finite-sample ≥`conformal_level` marginal-coverage
 /// theorem; a GLM row's set is the certified augmented refit at the frozen
-/// penalty. The returned `conformal_certificate` column is `0` (exact_frozen)
-/// or `1` (honest_refit) for guaranteed rows and a negative refusal code
-/// otherwise (`-7` glm_frozen_penalty for a GLM that selected λ or θ). Returns
+/// penalty. The returned `conformal_certificate` column is `0` (exact_frozen:
+/// representable-f64 membership for the stored affine coefficients), `1`
+/// (honest_refit enclosure), or `2` (conservative_frozen enclosure), with
+/// negative refusal codes otherwise. Layer-1 coordinates do not claim exact
+/// real-valued roots; endpoint flags define membership at their f64 values.
+/// Coverage statements require exchangeability and a symmetric fixed basis
+/// and penalty construction. Returns
 /// the same column payload as `predict_table` plus `conformal_set_components`
 /// and that column.
 ///
@@ -7646,7 +7773,9 @@ fn predict_table_full_conformal(
     let payload = detach_typed_py_result(
         py,
         "predict_table_full_conformal",
-        move || predict_encoded_table_full_conformal_impl(&model, dataset, training, conformal_level),
+        move || {
+            predict_encoded_table_full_conformal_impl(&model, dataset, training, conformal_level)
+        },
         |_, err| match err {
             FullConformalPredictError::Predict(err) => predict_error_to_pyerr(err),
             FullConformalPredictError::Conformal(
@@ -7715,9 +7844,8 @@ fn generative_replicate_chunk(
     let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
-    let result = py.detach(|| {
-        generative_replicates_encoded_impl(&model, dataset, draw_start, n_draws, seed)
-    });
+    let result = py
+        .detach(|| generative_replicates_encoded_impl(&model, dataset, draw_start, n_draws, seed));
     match result {
         Ok((flat, n_rows)) => {
             let array = ndarray::Array2::<f64>::from_shape_vec((n_draws, n_rows), flat).map_err(
@@ -8045,8 +8173,14 @@ fn model_partial_effect<'py>(
     out.set_item("se", bands.se.into_pyarray(py))?;
     out.set_item("lower", bands.lower.into_pyarray(py))?;
     out.set_item("upper", bands.upper.into_pyarray(py))?;
-    out.set_item("simultaneous_lower", bands.simultaneous_lower.into_pyarray(py))?;
-    out.set_item("simultaneous_upper", bands.simultaneous_upper.into_pyarray(py))?;
+    out.set_item(
+        "simultaneous_lower",
+        bands.simultaneous_lower.into_pyarray(py),
+    )?;
+    out.set_item(
+        "simultaneous_upper",
+        bands.simultaneous_upper.into_pyarray(py),
+    )?;
     out.set_item("level", record.level)?;
     out.set_item("pointwise_critical", record.pointwise_critical)?;
     out.set_item("simultaneous_critical", record.simultaneous_critical)?;

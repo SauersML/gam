@@ -1901,7 +1901,7 @@ impl SaeManifoldTerm {
         // jet supplies no operator and falls back to the data residual — never an
         // error. Magic-by-default either way: the choice is derived from the fit,
         // never a flag.
-        let views = self.atom_parameter_views();
+        let views = self.atom_parameter_views(isometry_pin_active)?;
         let ops: Vec<Option<crate::identifiability::OrbitPenaltyOperator>> = if isometry_pin_active
         {
             views
@@ -2179,9 +2179,16 @@ impl SaeManifoldTerm {
     /// path), as does any atom whose coordinate chart width disagrees with its
     /// latent dimension (a structurally inconsistent atom must not masquerade
     /// as exactly certified).
+    ///
+    /// `with_second_jet` requests `Φ''`, which only the pin-active orbit
+    /// operator reads. An evaluator with no analytic Hessian supplies none; one
+    /// whose Hessian evaluation FAILS is an error, not an absent jet — dropping
+    /// it would silently certify the atom's orbits on the data residual alone,
+    /// with the installed pin's curvature missing from the verdict.
     pub(crate) fn atom_parameter_views(
         &self,
-    ) -> Vec<Option<crate::identifiability::AtomParameterView>> {
+        with_second_jet: bool,
+    ) -> Result<Vec<Option<crate::identifiability::AtomParameterView>>, String> {
         let assignments = self.assignment.assignments();
         let n = self.n_obs();
         self.atoms
@@ -2189,11 +2196,11 @@ impl SaeManifoldTerm {
             .enumerate()
             .map(|(k, atom)| {
                 if matches!(atom.basis_kind(), SaeAtomBasisKind::Sphere) {
-                    return None;
+                    return Ok(None);
                 }
                 let coords = self.assignment.coords[k].as_matrix().to_owned();
                 if coords.nrows() != n || coords.ncols() != atom.latent_dim() {
-                    return None;
+                    return Ok(None);
                 }
                 let mut activations = Array1::<f64>::zeros(n);
                 for row in 0..n {
@@ -2202,22 +2209,29 @@ impl SaeManifoldTerm {
                 // Second jet Φ'' (#998): supplied when the atom's evaluator
                 // exposes an analytic Hessian, so a pin-active fit can lower its
                 // orbit-space isometry penalty operator (the metric-change of the
-                // pullback gram differentiates Φ' through t). Absent ⇒ the orbit
-                // verdict stays on the data residual / no-pin path, never an
-                // error.
-                let basis_second_jet = atom
-                    .basis_evaluator
-                    .as_ref()
-                    .and_then(|evaluator| evaluator.second_jet_dyn(coords.view()))
-                    .and_then(|res| res.ok());
-                Some(crate::identifiability::AtomParameterView {
+                // pullback gram differentiates Φ' through t). An evaluator with
+                // no analytic Hessian leaves the orbit verdict on the data
+                // residual; a failed evaluation propagates.
+                let basis_second_jet = match atom.basis_evaluator.as_ref() {
+                    Some(evaluator) if with_second_jet => evaluator
+                        .second_jet_dyn(coords.view())
+                        .transpose()
+                        .map_err(|err| {
+                            format!(
+                                "atom_parameter_views: atom {k} ({}) second jet failed: {err}",
+                                atom.name
+                            )
+                        })?,
+                    _ => None,
+                };
+                Ok(Some(crate::identifiability::AtomParameterView {
                     basis_values: atom.basis_values.clone(),
                     basis_jacobian: atom.basis_jacobian.clone(),
                     decoder: atom.decoder_coefficients().clone(),
                     coords,
                     activations,
                     basis_second_jet,
-                })
+                }))
             })
             .collect()
     }
@@ -4528,8 +4542,7 @@ impl SaeManifoldTerm {
         // Magic-by-default offline bounds, auto-derived from the fit so no caller
         // supplies a knob. `target_norm_bound` is the largest target row L2 norm
         // (bounds `‖x‖` over the corpus); `amplitude_bound[k]` is the largest
-        // fitted assignment mass for atom `k` (bounds `|z_k|`), with a strictly
-        // positive floor so a near-inactive atom still certifies a finite radius.
+        // fitted assignment mass for atom `k` (bounds `|z_k|`).
         let mut target_norm_bound = 0.0_f64;
         for row in 0..n {
             let norm = targets.row(row).dot(&targets.row(row)).sqrt();
@@ -4546,10 +4559,15 @@ impl SaeManifoldTerm {
                     bound = z;
                 }
             }
-            // A strictly positive amplitude floor keeps the offline Lipschitz
-            // scaling finite for atoms with no active row in this corpus (those
-            // rows encode to the chart center via the certificate anyway).
-            amplitude_bound[atom_idx] = bound.max(1.0);
+            // The sup itself, with no floor. The encode `L`
+            // (`hessian_lipschitz_constant`) is nondecreasing in `|z|`, so the sup
+            // bounds it for every row of this corpus. Any larger bound only inflates
+            // each row's Kantorovich `h = β·η·L` and flags certifiable starts.
+            // Posterior gates lie in `[0, 1]`, so a floor at 1 would replace every
+            // atom's bound by 1. An atom with no active row gets the exact `L` of
+            // its zero-amplitude objective (the data term's part vanishes), which
+            // is the only amplitude this corpus encodes it at.
+            amplitude_bound[atom_idx] = bound;
         }
 
         let atlas = crate::encode::EncodeAtlas::build(

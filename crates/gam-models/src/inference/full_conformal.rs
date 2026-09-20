@@ -1,4 +1,4 @@
-//! Exact full-conformal prediction for penalized GAMs — including the
+//! Full-conformal prediction for penalized GAMs — including the
 //! smoothing-parameter response (#942).
 //!
 //! # What this is
@@ -13,21 +13,17 @@
 //!
 //! ```text
 //!   e_i(z) = |y_i − μ̂^z(x_i)| ,  e_*(z) = |z − μ̂^z(x_*)|
-//!   C_α = { z :  #{ i : e_i(z) > e_*(z) } + U·(1 + #{ i : e_i(z) = e_*(z) })  >  α (n+1) }
+//!   C_α = { z : #{i : e_i(z) > e_*(z)} + U (1 + #{i : e_i(z) = e_*(z)}) > α (n+1) }
 //! ```
 //!
 //! Validity needs ONLY exchangeability of the n+1 points and SYMMETRY of
 //! the fitting map (it must treat the augmented row like any other row).
-//! No model correctness, no asymptotics, no held-out fold.
-//!
-//! `U ~ Uniform(0, 1)` is drawn once per test row ([`conformal_tie_uniform`])
-//! and makes the rank p-value exactly uniform: the test point's rank among
-//! the n+1 exchangeable scores is uniform on `{1, …, n+1}`, and spreading
-//! its own unit of rank mass by `U` turns that discrete law into
-//! `Uniform(0, 1)`, so `P(y_* ∈ C_α) = 1 − α` for every n and α. The plain
-//! p-value `(1 + #{e_i ≥ e_*})/(n+1)` is super-uniform: its set covers with
-//! probability `1 − ⌊α(n+1)⌋/(n+1)`, which is the whole line whenever
-//! `α(n+1) < 1` (#4514).
+//! No model correctness, no asymptotics, no held-out fold. One independent
+//! `U ~ Uniform[0,1)` is shared across the entire inversion. For a symmetric
+//! fitting map on exchangeable supplied rows, ideal smoothed ranks give exact
+//! marginal coverage. This is not conditional-on-features coverage. Numerical
+//! enclosures in Layers 2 and 3 can over-cover, and learned training-only
+//! bases/penalties do not automatically satisfy augmented-row symmetry.
 //!
 //! The field treats this as computationally infeasible because it seems to
 //! require refitting at a continuum of `z` — solved exactly only for ridge
@@ -38,24 +34,28 @@
 //! looking at y but not at z — the augmented row is treated differently)
 //! with unquantified effect on coverage. This module closes both gaps:
 //!
-//! - **Layer 1 (implemented below, exact):** Gaussian identity at fixed ρ.
-//!   The augmented fit is affine in `z`, so every score is piecewise
-//!   linear in `z` and the EXACT set is computable from one factorization
-//!   and ≤ 2n linear breakpoints — the ridge result generalized to
-//!   arbitrary penalized smooths (any Sλ, any basis).
-//! - **Layer 2 — continuous GLM (implemented below, certified):**
-//!   predictor–corrector homotopy in `z` ([`GlmHomotopyFullConformal`]) —
-//!   exact at corrector points because each correction is a Newton solve of
-//!   the SAME symmetric KKT system a cold fit would solve, with the step
-//!   size CERTIFIED by a computed third-derivative contraction bound and a
-//!   cold-refit fallback whenever the certificate refuses.
-//! - **Layer 3 (implemented in [`honest`], exact up to breakpoint
-//!   resolution):** the Gaussian-identity map that RE-SELECTS the smoothing
+//! - **Layer 1 (implemented below):** Gaussian identity at fixed ρ.
+//!   The augmented fit is affine in `z`; one factorization gives the stored
+//!   affine coefficients. The event sweep certifies membership for finite
+//!   representable f64 candidates using exact dyadic comparisons of those
+//!   coefficients. Returned coordinates encode that discrete candidate set;
+//!   they are not exact real-valued roots or an exact-real fitting guarantee.
+//! - **Layer 2 — GLM families (implemented in
+//!   [`super::full_conformal_glm`], certified):** Binomial, Poisson,
+//!   negative binomial and Gamma at the frozen penalty. Discrete supports
+//!   are searched with certified tails for count families, and the Gamma
+//!   continuum is walked with certified Newton refits. Discrete ties use
+//!   independent smoothed-rank randomization. Unresolved comparisons are
+//!   retained as a conservative numerical enclosure: its coverage need not
+//!   equal `1 − α`. Marginal coverage assumes exchangeable supplied rows and
+//!   a fixed symmetric basis/penalty construction, not arbitrary learned bases.
+//! - **Layer 3 (implemented in [`honest`], conservative numerical enclosure):** the Gaussian-identity map that RE-SELECTS the smoothing
 //!   strength by REML on every augmented data set — the first
 //!   full-conformal procedure whose fitting map treats the test row like a
 //!   training row all the way up to ρ̂. A proven bound on where the global
 //!   REML minimizer can lie, plus cold local refits at the set's endpoints.
 //!   Every row carries a [`ConformalCertificate`]: `exact_frozen`,
+//!   `conservative_frozen`,
 //!   `honest_refit`, or `refused:<reason>` with the frozen set.
 //!
 //! # Layer 1 math (what the code below implements)
@@ -78,47 +78,34 @@
 //! ```
 //!
 //! with `1 − x_*ᵀb = 1/(1 + h_*) > 0` for `h_* = x_*ᵀ(XᵀX+Sλ)⁻¹x_*` by
-//! Sherman–Morrison — the test residual's slope never vanishes, so e_*(z)
+//! Sherman–Morrison when the training normal is SPD — the test residual's
+//! slope is positive, so e_*(z)
 //! is genuinely V-shaped and the rank function is well-defined everywhere.
 //!
 //! The comparison `e_i(z) ≥ e_*(z)` ⟺ `(r_i−r_*)(r_i+r_*) ≥ 0` flips only
 //! at roots of two LINEAR equations per i. Collect ≤ 2n roots, sort, and
 //! the rank of e_* is constant on each open interval between consecutive
-//! roots: evaluate the smoothed rank at interval midpoints and at the roots
-//! themselves, and assemble the closure of the member set as a union of
-//! closed intervals. The closure differs from the set by at most the
-//! finitely many roots, where a row's score ties the test score — a null
-//! event for a continuous response. EXACT — no grid, no tolerance, no
-//! refits.
+//! roots: a root-event sweep tracks strict and tied comparisons on each open
+//! gap and at each root. Endpoint-inclusion flags preserve excluded roots and
+//! isolated member points; taking the closure would change the randomized set
+//! for atomic response laws. The sweep costs O(n log n), without refits.
 //!
 //! Unboundedness is honest, not an error: if `|slope(r_*)| ≤ |slope(r_i)|`
 //! for enough i, far-out candidates are never extreme and the set is a
 //! half-line or ℝ (low-information / high-leverage regimes). We return the
-//! interval list as-is, ±∞ endpoints included — same honesty convention as
+//! interval list as-is, with ±∞ as open bounds — same honesty convention as
 //! the split module's `+∞` multiplier.
 //!
-//! # Layer 2: GLM homotopy (implemented below)
+//! # Layer 2: GLM families (see [`super::full_conformal_glm`])
 //!
-//! `β̂(z)` solves the augmented penalized score equation
-//! `F(β; z) = Σ_i x_i (μ(η_i) − y_i) + x_*(μ(η_*) − z) + Sλβ = 0`
-//! (canonical link form). The z-derivative is one sensitivity solve:
-//!
-//! ```text
-//!   dβ̂/dz = H_pen⁻¹ x_*          (canonical: ∂F/∂z = −x_*)
-//! ```
-//!
-//! Predictor–corrector walk over z with Newton correction of the SAME
-//! KKT system the cold fit solves: exactness at corrector points is
-//! convergence of Newton, not ODE integration accuracy. The step size is
-//! CERTIFIED by the third-derivative data the tree already has (the PIRLS
-//! `c`-array bounds ‖D_βH\[v\]‖ along the step, giving a computable Newton
-//! attraction radius) — the corrector cannot silently skip a basin. Score
-//! crossings between steps are localized by bisection on the corrected
-//! path. Discrete families (Binomial, Poisson, negative binomial) are
-//! FINITE or have a provable tail: full conformal is exact by enumerating the
-//! response support. That arm, together with the certified Gamma walk, lives
-//! in [`super::full_conformal_glm`]; the predict route uses it for every
-//! non-Gaussian fit.
+//! `β̂(z)` solves the augmented penalized score equation of the family at
+//! the frozen Sλ. Discrete families (Binomial, Poisson, negative binomial)
+//! have finite support or use a certified tail when one is available. The
+//! numerical engine encloses unresolved candidates conservatively, including
+//! the full support if a tail cannot be certified. Gamma is continuous and
+//! is walked with certified refits and conservative bounds. The
+//! predict route and the Python `glm_full_conformal` instrument both call
+//! that one engine.
 //!
 //! # Layer 3: the honest map (see [`honest`])
 //!
@@ -148,16 +135,11 @@
 //! unsupported regimes are refused with a typed error naming split conformal,
 //! never silently — an invalid guarantee is worse than a wider valid one.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use faer::Side;
 use ndarray::{Array1, Array2};
-use rand::{RngExt, SeedableRng};
+use rand::RngExt;
 
-use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_av};
-
-use opt::{BacktrackConfig, backtracking_line_search};
+use gam_linalg::faer_ndarray::{FaerCholesky, fast_av};
 
 pub mod honest;
 pub use honest::{
@@ -168,17 +150,39 @@ pub use honest::{
 #[cfg(test)]
 mod test_support;
 
-/// One maximal interval of candidate values retained in the prediction set.
+/// One maximal interval encoding candidate values retained in the prediction set.
+/// For Layer 1, membership is certified only for finite representable f64
+/// candidates and the stored affine coefficients, not exact real-valued roots.
 /// Endpoints may be infinite (honest unboundedness in low-information /
 /// high-leverage regimes).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConformalInterval {
     pub lo: f64,
     pub hi: f64,
+    pub lo_closed: bool,
+    pub hi_closed: bool,
+}
+
+impl ConformalInterval {
+    /// Closed finite endpoints; infinities are bounds, never members.
+    pub fn closed(lo: f64, hi: f64) -> Self {
+        Self {
+            lo,
+            hi,
+            lo_closed: lo.is_finite(),
+            hi_closed: hi.is_finite(),
+        }
+    }
+
+    pub fn contains(&self, value: f64) -> bool {
+        value.is_finite()
+            && (value > self.lo || (self.lo_closed && value == self.lo))
+            && (value < self.hi || (self.hi_closed && value == self.hi))
+    }
 }
 
 /// The rank threshold `τ = α(n + 1)` a conformal p-value is compared with
-/// (member iff `(1 + #dominating) > τ`).
+/// (membership compares strict-plus-randomized-tie rank mass with τ).
 ///
 /// `α` arrives as `1 − level` from a decimal level, and neither the level nor
 /// the subtraction is exact in binary: at the nominal `level = 0.9` the product
@@ -197,7 +201,9 @@ pub fn conformal_rank_threshold(alpha: f64, n_augmented: usize) -> f64 {
     }
 }
 
-/// A full-conformal prediction set: a finite union of closed intervals.
+/// A full-conformal prediction set with explicit finite-endpoint membership.
+/// Layer-1 coordinates encode the representable-f64 candidate set; other
+/// certificates can denote conservative numerical enclosures.
 #[derive(Clone, Debug)]
 pub struct FullConformalSet {
     /// Maximal intervals, sorted, disjoint.
@@ -236,48 +242,38 @@ fn validate_inputs(
     Ok(())
 }
 
-/// The tie-break uniform `U` of the smoothed conformal p-value
-/// `(#{s_i > s_*} + U·(1 + #{s_i = s_*}))/(n + 1)`, drawn once per test row.
-///
-/// Seeded from a hash of the labeled responses, the test row's covariates and
-/// its offset, so the same inputs give the same set in every front end, and a
-/// new data set or test row draws a fresh `U`.
-pub(crate) fn conformal_tie_uniform<'a>(
-    labels: impl IntoIterator<Item = &'a f64>,
-    test_row: impl IntoIterator<Item = &'a f64>,
-    offset: f64,
-) -> f64 {
-    let mut hasher = DefaultHasher::new();
-    for v in labels.into_iter().chain(test_row) {
-        v.to_bits().hash(&mut hasher);
+pub(crate) fn validate_tie_uniform(value: f64) -> Result<(), String> {
+    if value.is_finite() && (0.0..1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "full conformal: tie uniform must be in [0, 1), got {value}"
+        ))
     }
-    offset.to_bits().hash(&mut hasher);
-    rand::rngs::StdRng::seed_from_u64(hasher.finish()).random::<f64>()
 }
 
-/// The smallest count `k` of training rows strictly dominating the test score
-/// with `k + U > α(n + 1)` — the smoothed p-value's threshold off ties — or
-/// `n + 1` when no count of `n` training rows reaches it. `0` exactly when
-/// `α(n + 1) < U`: the whole line, with probability `1 − α(n + 1)` over `U`
-/// when `n + 1 < 1/α`, never with certainty.
+/// The smallest strict-dominating count k with k+U > α(n+1), or n+1.
+/// Counting uncertain ties as possible strict dominators gives a conservative
+/// upper bound for the honest numerical enclosure.
 fn required_dominating_count(n: usize, alpha: f64, tie_uniform: f64) -> usize {
     let threshold = conformal_rank_threshold(alpha, n + 1);
     (0..=n)
-        .find(|&count| count as f64 + tie_uniform > threshold)
+        .find(|&count| tie_uniform + count as f64 > threshold)
         .unwrap_or(n + 1)
 }
 
-/// Exact Gaussian-identity full-conformal engine at fixed Sλ (Layer 1).
+/// Gaussian-identity full-conformal engine at fixed Sλ (Layer 1).
 ///
-/// One factorization of `M = XᵀX + x_*x_*ᵀ + Sλ`; every candidate-z
-/// quantity is affine in z thereafter. See the module doc for the math.
+/// One factorization of the SPD training normal `A = XᵀX + Sλ`; every
+/// candidate-z quantity is affine thereafter. Exact inversion refers to
+/// representable f64 candidates and the stored dyadic affine coefficients.
+/// Rounded interval coordinates do not claim exact real-valued boundaries.
 pub struct ExactGaussianFullConformal {
     /// Affine residual coefficients: `r_i(z) = u[i] + w[i]·z` for the n
     /// training rows, and the test residual in the LAST slot.
     u: Array1<f64>,
     w: Array1<f64>,
     n: usize,
-    /// The test row's tie-break uniform ([`conformal_tie_uniform`]).
     tie_uniform: f64,
 }
 
@@ -300,45 +296,53 @@ impl ExactGaussianFullConformal {
         s_lambda: &Array2<f64>,
         x_star: &Array1<f64>,
     ) -> Result<Self, String> {
+        Self::new_with_uniform(x, y, prior_weights, s_lambda, x_star, rand::rng().random())
+    }
+
+    /// Construct one inversion with an externally supplied independent U.
+    pub fn new_with_uniform(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        prior_weights: &Array1<f64>,
+        s_lambda: &Array2<f64>,
+        x_star: &Array1<f64>,
+        tie_uniform: f64,
+    ) -> Result<Self, String> {
+        validate_tie_uniform(tie_uniform)?;
         validate_inputs(x, y, prior_weights, s_lambda, x_star)?;
         let n = x.nrows();
-        let p = x.ncols();
 
-        // M = XᵀX + x_*x_*ᵀ + Sλ — the augmented penalized normal matrix.
-        let mut m = x.t().dot(x) + s_lambda;
-        for i in 0..p {
-            for j in 0..p {
-                m[[i, j]] += x_star[i] * x_star[j];
-            }
-        }
-        let chol = m
+        // Positive exact test-residual slope requires the training normal A
+        // to be SPD (augmented SPD alone is insufficient). Sherman–Morrison
+        // avoids subtracting nearly equal leverage values in 1-x'M_aug^-1 x.
+        let normal = x.t().dot(x) + s_lambda;
+        let chol = normal
             .cholesky(Side::Lower)
-            .map_err(|e| format!("full conformal: augmented normal matrix not SPD: {e:?}"))?;
-        let xty = x.t().dot(y);
-        let a = chol.solvevec(&xty);
-        let b = chol.solvevec(&x_star.to_owned());
-
-        // Affine residuals r_i(z) = u_i + w_i z; test residual last.
+            .map_err(|e| format!("full conformal: training normal matrix not SPD: {e:?}"))?;
+        let beta = chol.solvevec(&x.t().dot(y));
+        let direction = chol.solvevec(x_star);
+        let leverage = x_star.dot(&direction);
+        let denominator = 1.0 + leverage;
+        if !(leverage.is_finite() && leverage >= 0.0 && denominator.is_finite()) {
+            return Err("full conformal: test leverage or 1+leverage is not representable".into());
+        }
         let mut u = Array1::<f64>::zeros(n + 1);
         let mut w = Array1::<f64>::zeros(n + 1);
-        let xa = fast_av(x, &a);
-        let xb = fast_av(x, &b);
+        u[n] = -x_star.dot(&beta) / denominator;
+        w[n] = denominator.recip();
+        let fitted = fast_av(x, &beta);
+        let influence = fast_av(x, &direction);
         for i in 0..n {
-            u[i] = y[i] - xa[i];
-            w[i] = -xb[i];
+            u[i] = y[i] - fitted[i] - influence[i] * u[n];
+            w[i] = -influence[i] / denominator;
         }
-        let mu_a_star = x_star.dot(&a);
-        let h_frac = x_star.dot(&b); // = h/(1+h) ∈ [0, 1)
-        u[n] = -mu_a_star;
-        w[n] = 1.0 - h_frac; // strictly positive by Sherman–Morrison
-        if w[n] <= 0.0 {
+        if w[n] <= 0.0 || u.iter().chain(w.iter()).any(|v| !v.is_finite()) {
             return Err(
-                "full conformal: test-residual slope 1 − x_*ᵀM⁻¹x_* must be positive; \
-                 non-SPD or numerically broken augmented system"
+                "full conformal: reciprocal 1/(1+training leverage) must be positive; \
+                 residual coefficients and reciprocal must be representable"
                     .to_string(),
             );
         }
-        let tie_uniform = conformal_tie_uniform(y, x_star, 0.0);
         Ok(Self {
             u,
             w,
@@ -347,136 +351,271 @@ impl ExactGaussianFullConformal {
         })
     }
 
-    /// Membership at candidate z: the smoothed conformal p-value
-    /// `(#{e_i > e_*} + U·(1 + #{e_i = e_*}))/(n+1) > α`.
-    fn member(&self, z: f64, alpha: f64) -> bool {
-        let e_star = (self.u[self.n] + self.w[self.n] * z).abs();
-        let (mut greater, mut tied) = (0usize, 0usize);
-        for i in 0..self.n {
-            let e_i = (self.u[i] + self.w[i] * z).abs();
-            if e_i > e_star {
-                greater += 1;
-            } else if e_i == e_star {
-                tied += 1;
-            }
-        }
-        greater as f64 + self.tie_uniform * (1.0 + tied as f64)
-            > conformal_rank_threshold(alpha, self.n + 1)
-    }
-
-    /// The test row's tie-break uniform `U`.
-    pub(crate) fn tie_uniform(&self) -> f64 {
-        self.tie_uniform
-    }
-
     /// The frozen plug-in mean `x_*ᵀ(XᵀX + Sλ)⁻¹Xᵀy`: the candidate at which
     /// the test residual vanishes.
     pub fn plug_in_mean(&self) -> f64 {
         -self.u[self.n] / self.w[self.n]
     }
 
-    fn push_finite_root(points: &mut Vec<f64>, numerator: f64, denominator: f64) {
-        if denominator.abs() > 0.0 {
-            let z = numerator / denominator;
-            if z.is_finite() {
-                points.push(z);
-            }
+    /// Error-free product of two finite dyadic values. A product requiring
+    /// bits below the subnormal quantum cannot be represented by an expansion
+    /// of f64 values, so the endpoint certificate refuses it explicitly.
+    fn endpoint_product(a: f64, b: f64) -> Result<(f64, f64), String> {
+        if a == 0.0 || b == 0.0 {
+            return Ok((0.0, 0.0));
         }
+        let lowest_exponent = |value: f64| {
+            let bits = value.to_bits() & 0x7fff_ffff_ffff_ffff;
+            let encoded = (bits >> 52) as i32;
+            let significand =
+                (bits & 0x000f_ffff_ffff_ffff) | if encoded == 0 { 0 } else { 1u64 << 52 };
+            let exponent = if encoded == 0 {
+                -1074
+            } else {
+                encoded - 1023 - 52
+            };
+            exponent + significand.trailing_zeros() as i32
+        };
+        if lowest_exponent(a) + lowest_exponent(b) < -1074 {
+            return Err("full conformal: endpoint product underflow cannot be certified".into());
+        }
+        let high = a * b;
+        if !high.is_finite() {
+            return Err("full conformal: endpoint product overflow cannot be certified".into());
+        }
+        Ok((a.mul_add(b, -high), high))
     }
 
-    /// The exact prediction set at miscoverage α.
-    ///
-    /// Breakpoints: for each i, roots of `r_*(z) = ±r_i(z)` — two linear
-    /// equations. Between consecutive roots the comparison pattern (hence
-    /// the rank of e_*) is constant; evaluate membership on midpoints and
-    /// at every root, then merge runs into maximal closed intervals — the
-    /// closure of the member set (a root where a tie drops the smoothed rank
-    /// below the threshold is interior to its closure). Cost O(n log n)
-    /// after the single factorization.
-    pub fn prediction_set(&self, alpha: f64) -> FullConformalSet {
-        let n = self.n;
-        let (us, ws) = (self.u[n], self.w[n]);
-        let mut roots: Vec<f64> = Vec::with_capacity(2 * n);
-        for i in 0..n {
-            // r_* − r_i = (us − u_i) + (ws − w_i) z = 0
-            let d = ws - self.w[i];
-            Self::push_finite_root(&mut roots, self.u[i] - us, d);
-            // r_* + r_i = (us + u_i) + (ws + w_i) z = 0
-            let s = ws + self.w[i];
-            Self::push_finite_root(&mut roots, -(us + self.u[i]), s);
+    /// Exact sign of r_i(z)−r_*(z), or r_i(z)+r_*(z), for the stored dyadic
+    /// coefficients. Six-term error-free expansion avoids calling a rounded
+    /// rational coordinate an exact score tie.
+    fn endpoint_factor_leading(&self, i: usize, z: f64, subtract: bool) -> Result<f64, String> {
+        let (il, ih) = Self::endpoint_product(self.w[i], z)?;
+        let (sl, sh) = Self::endpoint_product(self.w[self.n], z)?;
+        let direction = if subtract { -1.0 } else { 1.0 };
+        let mut expansion = [0.0; 6];
+        let mut length = 0;
+        for scalar in [
+            il,
+            ih,
+            direction * sl,
+            direction * sh,
+            self.u[i],
+            direction * self.u[self.n],
+        ] {
+            let mut q = scalar;
+            let mut next = 0;
+            for j in 0..length {
+                let term = expansion[j];
+                let sum = q + term;
+                if !sum.is_finite() {
+                    return Err(
+                        "full conformal: endpoint expansion overflow cannot be certified".into(),
+                    );
+                }
+                let virtual_term = sum - q;
+                let error = (q - (sum - virtual_term)) + (term - virtual_term);
+                if error != 0.0 {
+                    expansion[next] = error;
+                    next += 1;
+                }
+                q = sum;
+            }
+            if q != 0.0 || next == 0 {
+                expansion[next] = q;
+                next += 1;
+            }
+            length = next;
         }
-        roots.sort_by(|p, q| p.partial_cmp(q).expect("finite breakpoints"));
-        roots.dedup_by(|p, q| *p == *q);
+        Ok(expansion[length - 1])
+    }
 
-        // Witness points: each root, each gap midpoint, and the two open
-        // tails. Membership is constant strictly between consecutive
-        // roots, so one witness per piece decides the set exactly.
-        let mut witnesses: Vec<f64> = Vec::with_capacity(2 * roots.len() + 3);
-        if roots.is_empty() {
-            witnesses.push(0.0);
+    fn endpoint_factor_sign(&self, i: usize, z: f64, subtract: bool) -> Result<i8, String> {
+        let leading = self.endpoint_factor_leading(i, z, subtract)?;
+        Ok(if leading > 0.0 {
+            1
+        } else if leading < 0.0 {
+            -1
         } else {
-            let span = (roots[roots.len() - 1] - roots[0]).max(1.0);
-            witnesses.push(roots[0] - span);
-            for k in 0..roots.len() {
-                witnesses.push(roots[k]);
-                if k + 1 < roots.len() {
-                    witnesses.push(0.5 * (roots[k] + roots[k + 1]));
-                }
-            }
-            witnesses.push(roots[roots.len() - 1] + span);
-        }
+            0
+        })
+    }
 
-        // Scan witnesses into maximal intervals. A member midpoint/tail claims
-        // its whole open gap; member roots close the endpoints, and runs that
-        // meet at a non-member root join into one closed interval.
-        let mut intervals: Vec<ConformalInterval> = Vec::new();
-        let close = |intervals: &mut Vec<ConformalInterval>, lo: f64, hi: f64| match intervals
-            .last_mut()
-        {
-            Some(last) if last.hi == lo => last.hi = hi,
-            _ => intervals.push(ConformalInterval { lo, hi }),
-        };
-        let mut open_lo: Option<f64> = None;
-        let gap_bounds = |idx: usize| -> (f64, f64) {
-            // bounds of the gap a witness at sorted position idx represents
-            if roots.is_empty() {
-                return (f64::NEG_INFINITY, f64::INFINITY);
+    /// Isolate the true linear root between adjacent representable candidates.
+    /// A rounded endpoint itself is ranked separately; it is not presumed tied.
+    fn isolated_score_root(&self, i: usize, subtract: bool, a: f64, b: f64) -> Result<f64, String> {
+        let mut root = -b / a;
+        if !root.is_finite() || (root == 0.0 && b != 0.0) {
+            return Err("full conformal: score breakpoint is not representable".into());
+        }
+        // Rounded coefficient subtraction can displace -b/a by several ulps.
+        // Correct it with the exact expansion residual before certifying the
+        // adjacent representable candidates. Every accepted root is still
+        // checked below; this bounded refinement grants no tolerance band.
+        for _ in 0..4 {
+            let residual = self.endpoint_factor_leading(i, root, subtract)?;
+            if residual == 0.0 {
+                return Ok(root);
             }
-            if idx == 0 {
-                return (f64::NEG_INFINITY, roots[0]);
+            let corrected = root - residual / a;
+            if !corrected.is_finite() {
+                return Err("full conformal: root correction overflow".into());
             }
-            if idx == witnesses.len() - 1 {
-                return (roots[roots.len() - 1], f64::INFINITY);
+            if corrected == root {
+                break;
             }
-            // witnesses alternate root, mid, root, mid, ... after the first
-            let k = (idx - 1) / 2; // gap index for midpoints, root index for roots
-            if idx % 2 == 1 {
-                // a root: zero-width "gap" at the root itself
-                (roots[k], roots[k])
+            root = corrected;
+        }
+        if self.endpoint_factor_sign(i, root, subtract)? == 0 {
+            return Ok(root);
+        }
+        let lower = root.next_down();
+        let upper = root.next_up();
+        if !lower.is_finite() || !upper.is_finite() {
+            return Err("full conformal: score breakpoint neighbors are not representable".into());
+        }
+        let left = self.endpoint_factor_sign(i, lower, subtract)?;
+        let right = self.endpoint_factor_sign(i, upper, subtract)?;
+        if left == 0 {
+            return Ok(lower);
+        }
+        if right == 0 {
+            return Ok(upper);
+        }
+        let slope = if a > 0.0 { 1 } else { -1 };
+        if left != -slope || right != slope {
+            return Err("full conformal: score breakpoint isolation cannot be certified".into());
+        }
+        Ok(root)
+    }
+
+    /// Invert the affine score comparisons for representable f64 candidates.
+    /// Endpoint membership uses exact dyadic signs, including at rounded roots.
+    /// Uncertifiable arithmetic is refused. One U is shared by all candidates.
+    pub fn prediction_set(&self, alpha: f64) -> Result<FullConformalSet, String> {
+        if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
+            return Err(format!(
+                "full conformal: alpha must be in (0, 1), got {alpha}"
+            ));
+        }
+        let n = self.n;
+        let mut relations = Vec::<i8>::with_capacity(n);
+        let mut events = Vec::<(f64, usize)>::with_capacity(2 * n);
+        let sign = |v: f64| {
+            if v > 0.0 {
+                1i8
+            } else if v < 0.0 {
+                -1
             } else {
-                (roots[k], roots[k + 1])
+                0
             }
         };
-        for (idx, &z) in witnesses.iter().enumerate() {
-            let inside = self.member(z, alpha);
-            let (lo, hi) = gap_bounds(idx);
-            if inside {
-                if open_lo.is_none() {
-                    open_lo = Some(lo);
-                }
-                if idx == witnesses.len() - 1 {
-                    close(&mut intervals, open_lo.take().expect("open interval"), hi);
-                }
-            } else if let Some(lo_open) = open_lo.take() {
-                close(&mut intervals, lo_open, lo);
+        for i in 0..n {
+            // e_i²-e_*² is the product of these two linear factors.
+            let factors = [
+                (self.w[i] - self.w[n], self.u[i] - self.u[n]),
+                (self.w[i] + self.w[n], self.u[i] + self.u[n]),
+            ];
+            if factors
+                .iter()
+                .any(|&(a, b)| !a.is_finite() || !b.is_finite())
+            {
+                return Err("full conformal: affine score comparison overflow".into());
             }
+            if factors.iter().any(|&(a, b)| a == 0.0 && b == 0.0) {
+                relations.push(0); // identical absolute scores, for every z
+                continue;
+            }
+            let mut relation = 1;
+            for (factor, (a, b)) in factors.into_iter().enumerate() {
+                relation *= if a != 0.0 { -sign(a) } else { sign(b) };
+                if a != 0.0 {
+                    let z = self.isolated_score_root(i, factor == 0, a, b)?;
+                    events.push((z, i));
+                }
+            }
+            relations.push(relation);
         }
-
-        FullConformalSet {
+        events.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let threshold = conformal_rank_threshold(alpha, n + 1);
+        let member = |greater: usize, tied: usize| {
+            greater as f64 + self.tie_uniform * (1 + tied) as f64 > threshold
+        };
+        let mut greater = relations.iter().filter(|&&r| r > 0).count();
+        let tied = relations.iter().filter(|&&r| r == 0).count();
+        let mut last_root = vec![usize::MAX; n];
+        let mut intervals = Vec::<ConformalInterval>::new();
+        let append = |intervals: &mut Vec<ConformalInterval>, piece: ConformalInterval| {
+            if let Some(last) = intervals.last_mut()
+                && last.hi == piece.lo
+                && (last.hi_closed || piece.lo_closed)
+            {
+                last.hi = piece.hi;
+                last.hi_closed = piece.hi_closed;
+            } else {
+                intervals.push(piece);
+            }
+        };
+        let mut left = f64::NEG_INFINITY;
+        let mut cursor = 0;
+        while cursor < events.len() {
+            let z = events[cursor].0;
+            if left < z && member(greater, tied) {
+                append(
+                    &mut intervals,
+                    ConformalInterval {
+                        lo: left,
+                        hi: z,
+                        lo_closed: false,
+                        hi_closed: false,
+                    },
+                );
+            }
+            let mut end = cursor + 1;
+            while end < events.len() && events[end].0 == z {
+                end += 1;
+            }
+            let (mut root_greater, mut root_tied) = (greater, tied);
+            for &(_, i) in &events[cursor..end] {
+                if last_root[i] != cursor {
+                    root_greater -= usize::from(relations[i] > 0);
+                    let relation = self.endpoint_factor_sign(i, z, true)?
+                        * self.endpoint_factor_sign(i, z, false)?;
+                    root_greater += usize::from(relation > 0);
+                    root_tied += usize::from(relation == 0);
+                    last_root[i] = cursor;
+                }
+            }
+            if member(root_greater, root_tied) {
+                append(&mut intervals, ConformalInterval::closed(z, z));
+            }
+            for &(_, i) in &events[cursor..end] {
+                if relations[i] > 0 {
+                    greater -= 1;
+                } else {
+                    greater += 1;
+                }
+                relations[i] = -relations[i];
+            }
+            left = z;
+            cursor = end;
+        }
+        if member(greater, tied) {
+            append(
+                &mut intervals,
+                ConformalInterval {
+                    lo: left,
+                    hi: f64::INFINITY,
+                    lo_closed: false,
+                    hi_closed: false,
+                },
+            );
+        }
+        Ok(FullConformalSet {
             intervals,
             alpha,
             n_augmented: n + 1,
-        }
+        })
     }
 }
 
@@ -487,9 +626,7 @@ impl ExactGaussianFullConformal {
 /// `n`-terms count the residual sums the penalized RSS is formed from (#2280):
 /// two passes of `X·β` over the rows, with their subtractions, squares and sums.
 fn response_solve_growth(n: usize, p: usize) -> f64 {
-    gam_linalg::roundoff::accumulation_growth(
-        2 * p * p * p + 8 * p * p + 8 * p + 4 * n * p + 8 * n,
-    )
+    gam_linalg::roundoff::accumulation_growth(2 * p * p * p + 8 * p * p + 8 * p + 4 * n * p + 8 * n)
 }
 
 /// `L⁻¹·B` for a lower-triangular `L`, by forward substitution.
@@ -522,902 +659,6 @@ fn solve_lower_triangular_transposed(lower: &Array2<f64>, b: &Array2<f64>) -> Ar
         }
     }
     out
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Layer 2 — continuous-GLM certified predictor–corrector homotopy in z
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Maximum number of certified continuation sub-steps the homotopy may
-/// spend walking between two consecutive candidates before it gives up and
-/// falls back to a cold deterministic refit. A work budget, not a tuning
-/// knob: exceeding it can only cost SPEED (one extra cold fit), never
-/// correctness — the fallback solves the same KKT system to its optimum.
-const GLM_HOMOTOPY_MAX_SUBSTEPS: usize = 1024;
-
-/// Maximum step halvings per sub-step before the certificate's refusal is
-/// treated as final and the cold-refit fallback fires.
-const GLM_HOMOTOPY_MAX_HALVINGS: usize = 24;
-
-/// Maximum chord-corrector iterations per certified sub-step. With the
-/// contraction constant certified below [`GLM_CONTRACTION_ACCEPT`], the
-/// residual shrinks at least geometrically, so this budget is generous.
-const GLM_CORRECTOR_MAX_ITERS: usize = 80;
-
-/// Maximum damped-Newton iterations for a cold augmented GLM fit.
-pub(crate) const GLM_NEWTON_MAX_ITERS: usize = 200;
-
-/// Maximum Armijo backtracking halvings per cold Newton iteration.
-pub(crate) const GLM_NEWTON_MAX_BACKTRACKS: usize = 60;
-
-/// Strict scale-invariant KKT tolerance declaring convergence, applied to the
-/// RAW penalized gradient via [`GlmHomotopyFullConformal::kkt_converged`]
-/// (dimension-scaled OR natural-scale relative — the same certificate the main
-/// P-IRLS solver uses). NOT a tolerance on the preconditioned Newton step.
-pub(crate) const GLM_CONVERGENCE_RTOL: f64 = 1e-12;
-
-/// Near-stationary acceptance tolerance: a stalled iterate sitting at the
-/// floating-point floor of the raw gradient is still accepted when it
-/// certifies KKT stationarity at this looser scale-invariant tolerance. The
-/// COMPUTED error bound carried out of the step uses the actual residual, so
-/// accepting a stall is honest — the bound is simply larger and the downstream
-/// margin gate decides whether a cold refit is needed. Mirrors the main
-/// solver's 10×-band `near_stationary_kkt`.
-const GLM_STALL_ACCEPT_RTOL: f64 = 1e-8;
-
-/// Certified contraction constant below which a predictor step is accepted:
-/// `κ < 1/2` makes the chord-corrector a contraction on the ball
-/// `B(β_pred, 2‖H₀⁻¹F(β_pred)‖)`, which then provably contains the root.
-const GLM_CONTRACTION_ACCEPT: f64 = 0.5;
-
-/// Armijo sufficient-decrease constant for the cold-fit line search —
-/// sourced from the shared optimizer constants so the workspace has exactly
-/// one `c₁`.
-pub(crate) const GLM_ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
-
-/// `η` location of the extrema of the logistic third derivative
-/// `b‴(η) = σ(1−σ)(1−2σ)`: `σ = (3±√3)/6 ⇔ η = ±ln(2+√3)`.
-const LOGIT_THIRD_DERIV_CRITICAL_ETA: f64 = 1.316_957_896_924_816_6;
-
-#[inline]
-pub(crate) fn vec_norm(v: &Array1<f64>) -> f64 {
-    v.dot(v).sqrt()
-}
-
-use gam_linalg::utils::stable_softplus as softplus;
-
-/// Canonical-link GLM families supported by the certified z-homotopy
-/// ([`GlmHomotopyFullConformal`]). Canonical links make the candidate
-/// response enter the augmented penalized score LINEARLY (`∂F/∂z = −x_*`),
-/// so the exact response of the augmented optimum to the candidate is the
-/// single solve `dβ̂/dz = H⁻¹ x_*` — no family-specific cross terms. The
-/// per-η derivative tower `b′ = μ`, `b″ = w`, `b‴` is the K=1 specialization
-/// of the row-kernel channels (`row_kernel` Hessian / `row_third_contracted`
-/// in src/families/row_kernel.rs); it is carried analytically here because
-/// the homotopy must evaluate the tower at MOVING β while a `RowKernel`
-/// evaluates at its internally held coefficients.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CanonicalGlmFamily {
-    /// Bernoulli response, logit link: `b(η) = log(1+eʸ)`, `μ = σ(η)`.
-    BernoulliLogit,
-    /// Poisson response, log link: `b(η) = eʸ`, `μ = eʸ`.
-    PoissonLog,
-}
-
-impl CanonicalGlmFamily {
-    /// `μ(η) = b′(η)` — the canonical mean function.
-    pub fn mean(&self, eta: f64) -> f64 {
-        match self {
-            Self::BernoulliLogit => {
-                if eta >= 0.0 {
-                    1.0 / (1.0 + (-eta).exp())
-                } else {
-                    let e = eta.exp();
-                    e / (1.0 + e)
-                }
-            }
-            Self::PoissonLog => eta.exp(),
-        }
-    }
-
-    /// `w(η) = b″(η)` — the canonical Fisher weight (strictly positive).
-    pub fn weight(&self, eta: f64) -> f64 {
-        match self {
-            Self::BernoulliLogit => {
-                let mu = self.mean(eta);
-                mu * (1.0 - mu)
-            }
-            Self::PoissonLog => eta.exp(),
-        }
-    }
-
-    /// Per-row negative log-likelihood kernel `b(η) − y η` (the y-independent
-    /// normalizer is dropped — it never moves the optimum).
-    fn nll_term(&self, eta: f64, y: f64) -> f64 {
-        match self {
-            Self::BernoulliLogit => softplus(eta) - y * eta,
-            Self::PoissonLog => eta.exp() - y * eta,
-        }
-    }
-
-    /// `sup { b″(η) : η ∈ [lo, hi] }` — COMPUTED interval bound on the
-    /// Fisher weight, used to convert a coefficient-error bound into a
-    /// mean-scale (score) error bound.
-    fn weight_abs_sup(&self, lo: f64, hi: f64) -> f64 {
-        match self {
-            Self::BernoulliLogit => {
-                if lo <= 0.0 && 0.0 <= hi {
-                    0.25
-                } else {
-                    self.weight(lo).max(self.weight(hi))
-                }
-            }
-            Self::PoissonLog => hi.exp(),
-        }
-    }
-
-    /// `sup { |b‴(η)| : η ∈ [lo, hi] }` — COMPUTED interval bound on the
-    /// third-derivative channel (the K=1 `row_third_contracted` value). The
-    /// logistic case checks the interval endpoints and the two interior
-    /// critical points `η = ±ln(2+√3)` where `|b‴|` attains its global
-    /// maximum `1/(6√3)`; the Poisson case is monotone (`b‴ = eʸ`).
-    fn third_abs_sup(&self, lo: f64, hi: f64) -> f64 {
-        match self {
-            Self::BernoulliLogit => {
-                let t = |eta: f64| {
-                    let mu = self.mean(eta);
-                    (mu * (1.0 - mu) * (1.0 - 2.0 * mu)).abs()
-                };
-                let mut sup = t(lo).max(t(hi));
-                for c in [
-                    -LOGIT_THIRD_DERIV_CRITICAL_ETA,
-                    LOGIT_THIRD_DERIV_CRITICAL_ETA,
-                ] {
-                    if lo <= c && c <= hi {
-                        sup = sup.max(t(c));
-                    }
-                }
-                sup
-            }
-            Self::PoissonLog => hi.exp(),
-        }
-    }
-
-    /// Reject a training response outside the family's support — fitting a
-    /// canonical GLM to an impossible response is a caller bug, not a
-    /// numerical regime.
-    fn validate_training_response(&self, y: f64, row: usize) -> Result<(), String> {
-        if !y.is_finite() {
-            return Err(format!("glm homotopy: non-finite response at row {row}"));
-        }
-        match self {
-            Self::BernoulliLogit => {
-                if !(0.0..=1.0).contains(&y) {
-                    return Err(format!(
-                        "glm homotopy: Bernoulli response must lie in [0, 1], got {y} at row {row}"
-                    ));
-                }
-            }
-            Self::PoissonLog => {
-                if y < 0.0 {
-                    return Err(format!(
-                        "glm homotopy: Poisson response must be non-negative, got {y} at row {row}"
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Reject a conformal candidate outside the family's response support —
-    /// the full-conformal set is a subset of the support by definition.
-    fn validate_candidate(&self, z: f64) -> Result<(), String> {
-        if !z.is_finite() {
-            return Err(format!("glm homotopy: non-finite candidate {z}"));
-        }
-        match self {
-            Self::BernoulliLogit => {
-                if !(0.0..=1.0).contains(&z) {
-                    return Err(format!(
-                        "glm homotopy: Bernoulli candidate must lie in [0, 1], got {z}"
-                    ));
-                }
-            }
-            Self::PoissonLog => {
-                if z < 0.0 {
-                    return Err(format!(
-                        "glm homotopy: Poisson candidate must be non-negative, got {z}"
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// One candidate's verdict together with the tracked coefficients and the
-/// COMPUTED bound on their distance to the exact augmented optimum.
-#[derive(Clone, Debug)]
-pub struct GlmHomotopyCandidate {
-    pub z: f64,
-    /// Conformal p-value `(1 + #{i ≤ n : e_i ≥ e_*}) / (n+1)` (ties count
-    /// FOR the candidate — the conservative `≥` convention).
-    pub p_value: f64,
-    pub member: bool,
-    /// The coefficients the verdict was computed from: the homotopy-tracked
-    /// β̂(z) (chord-corrected to the augmented KKT root) or a cold refit.
-    pub beta: Array1<f64>,
-    /// Certified bound on `‖beta − β̂(z)‖₂` (distance to the EXACT augmented
-    /// optimum), computed from the chord-contraction constant: with
-    /// `r = ‖H₀⁻¹F(beta)‖` and certified `κ < ½` on `B(beta, 2r)`, the root
-    /// lies in that ball and `‖beta − β̂(z)‖ ≤ r/(1−κ)`. `+∞` when the
-    /// certificate refuses (the membership gate then forces a cold refit or
-    /// reports the tie unresolved — never a silent guess).
-    pub beta_error_bound: f64,
-    /// Whether this candidate was decided from a cold deterministic refit
-    /// (first candidate, certificate refusal, or margin-forced refit)
-    /// rather than the tracked path.
-    pub cold_refit: bool,
-}
-
-/// The exact full-conformal set for a canonical-link GLM, assembled by the
-/// certified predictor–corrector homotopy with cold-refit fallback.
-#[derive(Clone, Debug)]
-pub struct GlmHomotopyConformalSet {
-    /// Retained candidates, ascending.
-    pub members: Vec<f64>,
-    pub candidates: Vec<GlmHomotopyCandidate>,
-    pub alpha: f64,
-    /// `n + 1`.
-    pub n_augmented: usize,
-    /// Number of candidate transitions where the step certificate refused
-    /// (third-order bound too large within the halving/sub-step budget) and
-    /// the engine fell back to a cold deterministic refit.
-    pub refit_fallbacks: usize,
-    /// Number of cold refits forced by the MEMBERSHIP margin gate: the
-    /// tracked solution was certified, but a rank comparison was decided by
-    /// a margin smaller than the propagated score-error bound, so the
-    /// engine refused to call it from the tracked path.
-    pub margin_refits: usize,
-    /// Number of candidates whose verdict remained margin-ambiguous even
-    /// after a cold refit (a genuine floating-point-level score tie). The
-    /// reported verdict then uses the conservative `≥` tie convention — the
-    /// direction that can only over-cover, never under-cover.
-    pub ties_unresolved: usize,
-    /// Largest certified `‖beta − β̂(z)‖` bound over all reported candidates.
-    pub max_beta_error_bound: f64,
-}
-
-struct GlmCandidateVerdict {
-    p_value: f64,
-    member: bool,
-    decided: bool,
-}
-
-/// Certified predictor–corrector homotopy in the candidate response `z` for
-/// canonical-link GLMs (#942 Layer 2, continuous arm).
-///
-/// # The path being tracked
-///
-/// `β̂(z)` solves the augmented penalized score equation
-///
-/// ```text
-///   F(β; z) = Σᵢ xᵢ (μ(ηᵢ) − yᵢ) + x_* (μ(η_*) − z) + Sλ β = 0 ,
-/// ```
-///
-/// which for a canonical link is the gradient of a STRICTLY convex objective
-/// (Fisher weights `b″ > 0`, `Sλ ⪰ 0`, `H` required SPD), so the root is
-/// unique — there is no basin-tracking failure mode and the homotopy can be
-/// wrong only about SPEED, never about the answer. Since `∂F/∂z = −x_*`,
-///
-/// ```text
-///   dβ̂/dz = H(β̂)⁻¹ x_* ,   H(β) = XᵀW(β)X + w_*(β) x_*x_*ᵀ + Sλ .
-/// ```
-///
-/// # The certified step
-///
-/// From a corrected point `β₀` at `z` with factored `H₀ = H(β₀)`:
-///
-/// 1. **Predictor:** `β_pred = β₀ + h·H₀⁻¹x_*`.
-/// 2. **Certificate:** the corrector is the chord iteration
-///    `β ← β − H₀⁻¹F(β; z+h)` on the already-factored `H₀`. Its contraction
-///    constant on the ball `B(β_pred, R)`, `R = 2‖H₀⁻¹F(β_pred)‖`, is
-///    bounded by the COMPUTED quantity
-///
-///    ```text
-///      κ = [ Σᵢ Tᵢ·devᵢ·‖xᵢ‖² + T_*·dev_*·‖x_*‖² ] / λ_min(H₀) ,
-///      devᵢ = |h·xᵢᵀH₀⁻¹x_*| + ‖xᵢ‖·R ,
-///      Tᵢ   = sup |b‴| over [ηᵢ(β₀) − devᵢ , ηᵢ(β₀) + devᵢ]
-///    ```
-///
-///    (`‖H(β)−H₀‖₂ ≤ Σᵢ |wᵢ(β)−wᵢ(β₀)|·‖xᵢ‖²` and `|Δwᵢ| ≤ Tᵢ·|Δηᵢ|` —
-///    the third-derivative tower bounding the Hessian's Lipschitz drift,
-///    exactly the `row_third_contracted` channel evaluated as an interval
-///    bound). `κ < ½` makes the chord map a contraction of `B(β_pred, R)`
-///    into itself, so the (unique) root lies in the ball and the corrector
-///    converges to it geometrically.
-/// 3. **Refusal:** `κ ≥ ½` halves `h`; exhausting the halving or sub-step
-///    budget abandons the path for this transition and falls back to a COLD
-///    deterministic refit — the homotopy is only an acceleration of the
-///    defined symmetric fitting map, never a redefinition of it.
-/// 4. **Carried bound:** at acceptance the distance to the exact root is
-///    bounded by the computed `r/(1−κ_f)` with `r` the final corrector
-///    residual and `κ_f` re-evaluated at the final iterate.
-///
-/// # Membership with a margin gate
-///
-/// Scores are response-scale absolute residuals. The β-error bound
-/// propagates to each score through the computed interval weight bound
-/// (`|Δμᵢ| ≤ sup b″·‖xᵢ‖·bound`); a rank comparison decided by a margin
-/// smaller than the joint perturbation is NOT trusted: the engine cold-refits
-/// and re-decides, and if the tie survives the refit it applies the
-/// conservative `≥` convention and reports it in `ties_unresolved`.
-/// Exact-or-refuse, end to end.
-///
-/// ρ is frozen at the supplied `s_lambda` by construction — the honest
-/// smoothing re-selection and its certificate are Layer 3's domain.
-pub struct GlmHomotopyFullConformal<'a> {
-    family: CanonicalGlmFamily,
-    x: &'a Array2<f64>,
-    y: &'a Array1<f64>,
-    s_lambda: &'a Array2<f64>,
-    x_star: &'a Array1<f64>,
-    n: usize,
-    p: usize,
-    /// `‖xᵢ‖₂` per training row.
-    row_norm: Array1<f64>,
-    /// `‖xᵢ‖₂²` per training row.
-    row_sq: Array1<f64>,
-    star_norm: f64,
-    star_sq: f64,
-}
-
-impl<'a> GlmHomotopyFullConformal<'a> {
-    /// Build the engine. Rejects non-unit prior weights for the same reason
-    /// as [`ExactGaussianFullConformal::new`]: a reweighted training row is
-    /// not exchangeable with the test row, so the coverage proof would not
-    /// apply.
-    pub fn new(
-        family: CanonicalGlmFamily,
-        x: &'a Array2<f64>,
-        y: &'a Array1<f64>,
-        prior_weights: &Array1<f64>,
-        s_lambda: &'a Array2<f64>,
-        x_star: &'a Array1<f64>,
-    ) -> Result<Self, String> {
-        let n = x.nrows();
-        let p = x.ncols();
-        if y.len() != n || prior_weights.len() != n {
-            return Err("glm homotopy: row-count mismatch".to_string());
-        }
-        if s_lambda.nrows() != p || s_lambda.ncols() != p || x_star.len() != p {
-            return Err("glm homotopy: column-count mismatch".to_string());
-        }
-        if prior_weights.iter().any(|&w| w != 1.0) {
-            return Err(
-                "glm homotopy full conformal requires unit prior weights: a reweighted \
-                 training row is not exchangeable with the test row, so the finite-sample \
-                 coverage proof does not apply; use the split/ALO conformal calibrator instead"
-                    .to_string(),
-            );
-        }
-        for (i, &yi) in y.iter().enumerate() {
-            family.validate_training_response(yi, i)?;
-        }
-        let mut row_norm = Array1::<f64>::zeros(n);
-        let mut row_sq = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let sq = x.row(i).dot(&x.row(i));
-            row_sq[i] = sq;
-            row_norm[i] = sq.sqrt();
-        }
-        let star_sq = x_star.dot(x_star);
-        Ok(Self {
-            family,
-            x,
-            y,
-            s_lambda,
-            x_star,
-            n,
-            p,
-            row_norm,
-            row_sq,
-            star_norm: star_sq.sqrt(),
-            star_sq,
-        })
-    }
-
-    /// Augmented penalized score `F(β; z)`.
-    fn penalized_score(&self, beta: &Array1<f64>, z: f64) -> Array1<f64> {
-        let eta = fast_av(self.x, beta);
-        let mut resid = Array1::<f64>::zeros(self.n);
-        for i in 0..self.n {
-            resid[i] = self.family.mean(eta[i]) - self.y[i];
-        }
-        let mut g = self.x.t().dot(&resid) + self.s_lambda.dot(beta);
-        let r_star = self.family.mean(self.x_star.dot(beta)) - z;
-        for j in 0..self.p {
-            g[j] += self.x_star[j] * r_star;
-        }
-        g
-    }
-
-    /// Natural magnitude of the augmented penalized gradient, mirroring the
-    /// main P-IRLS convergence certificate's `gradient_natural_scale`
-    /// (`src/solver/pirls/state.rs`): `‖Xᵀ(μ − y)‖₂ + ‖Sβ‖₂` plus the test
-    /// row's score contribution `‖x_*‖·|μ̂_* − z|`. The penalized score is a
-    /// difference of these O(√(n+1)) sums, so at the optimum the raw gradient
-    /// floor scales with this quantity, NOT with `(1 + ‖β‖)`. Dividing by
-    /// `1 + this` yields a stationarity residual that is invariant under
-    /// uniform rescaling of the objective and per-observation in meaning.
-    fn gradient_natural_scale(&self, beta: &Array1<f64>, z: f64) -> f64 {
-        let eta = fast_av(self.x, beta);
-        let mut resid = Array1::<f64>::zeros(self.n);
-        for i in 0..self.n {
-            resid[i] = self.family.mean(eta[i]) - self.y[i];
-        }
-        let score = self.x.t().dot(&resid);
-        let r_star = self.family.mean(self.x_star.dot(beta)) - z;
-        vec_norm(&score) + vec_norm(&self.s_lambda.dot(beta)) + self.star_norm * r_star.abs()
-    }
-
-    /// Scale-invariant KKT acceptance on the RAW penalized gradient, exactly
-    /// the `WorkingState::certifies_kkt` certificate the engine's main solver
-    /// uses: the dimensionless residual `‖g‖ / (‖score‖ + ‖S·β‖)` is below
-    /// `tol`. The earlier predicate compared the PRECONDITIONED Newton step
-    /// `‖H⁻¹g‖` against `tol·(1 + ‖β‖)`, whose floating-point floor is
-    /// `~ε·(n+1)/λ_min(H)` — n-dependent and not compensated by `(1 + ‖β‖)`,
-    /// so genuinely-converged fits (e.g. raw gradient floor `3.6e-8` at
-    /// moderate n) were rejected as non-converged.
-    fn kkt_converged(&self, beta: &Array1<f64>, z: f64, tol: f64) -> bool {
-        let g_norm = vec_norm(&self.penalized_score(beta, z));
-        gam_solve::pirls::relative_gradient_residual(g_norm, self.gradient_natural_scale(beta, z))
-            < tol
-    }
-
-    /// Augmented penalized NLL (line-search merit function).
-    fn penalized_nll(&self, beta: &Array1<f64>, z: f64) -> f64 {
-        let eta = fast_av(self.x, beta);
-        let mut nll = 0.0;
-        for i in 0..self.n {
-            nll += self.family.nll_term(eta[i], self.y[i]);
-        }
-        nll += self.family.nll_term(self.x_star.dot(beta), z);
-        nll + 0.5 * beta.dot(&self.s_lambda.dot(beta))
-    }
-
-    /// Augmented penalized Hessian `H(β)` (independent of `z` — the
-    /// candidate enters the score linearly under a canonical link).
-    fn penalized_hessian(&self, beta: &Array1<f64>) -> Array2<f64> {
-        let eta = fast_av(self.x, beta);
-        let mut xw = self.x.to_owned();
-        for i in 0..self.n {
-            let w = self.family.weight(eta[i]);
-            for j in 0..self.p {
-                xw[[i, j]] *= w;
-            }
-        }
-        let mut h = self.x.t().dot(&xw) + self.s_lambda;
-        let w_star = self.family.weight(self.x_star.dot(beta));
-        for a in 0..self.p {
-            for b in 0..self.p {
-                h[[a, b]] += w_star * self.x_star[a] * self.x_star[b];
-            }
-        }
-        h
-    }
-
-    /// The COMPUTED chord-contraction constant `κ` of the module doc: the
-    /// Lipschitz drift of `H` over the stated η-intervals (per-row third
-    /// derivative interval sups), divided by `λ_min(H₀)`. `shift[i]` is the
-    /// known η-displacement of row i between the factorization point and the
-    /// ball center; `radius` the coefficient-space ball radius around it.
-    fn contraction_kappa(
-        &self,
-        eta0: &Array1<f64>,
-        eta0_star: f64,
-        shift: &Array1<f64>,
-        shift_star: f64,
-        radius: f64,
-        lambda_min: f64,
-    ) -> f64 {
-        let mut drift = 0.0_f64;
-        for i in 0..self.n {
-            let dev = shift[i] + self.row_norm[i] * radius;
-            let t_sup = self.family.third_abs_sup(eta0[i] - dev, eta0[i] + dev);
-            drift += t_sup * dev * self.row_sq[i];
-        }
-        let dev_star = shift_star + self.star_norm * radius;
-        drift += self
-            .family
-            .third_abs_sup(eta0_star - dev_star, eta0_star + dev_star)
-            * dev_star
-            * self.star_sq;
-        drift / lambda_min
-    }
-
-    /// Certified bound on `‖beta − β̂(z)‖` at a claimed optimum: fresh
-    /// factorization, one residual solve, contraction certificate on the
-    /// ball `B(beta, 2r)`. `+∞` on refusal — never an assumed zero.
-    fn stationary_error_bound(&self, beta: &Array1<f64>, z: f64) -> f64 {
-        let hess = self.penalized_hessian(beta);
-        let Ok(eigs) = hess.eigh(Side::Lower) else {
-            return f64::INFINITY;
-        };
-        let lambda_min = eigs.0.iter().copied().fold(f64::INFINITY, f64::min);
-        if !(lambda_min > 0.0) {
-            return f64::INFINITY;
-        }
-        let Ok(chol) = hess.cholesky(Side::Lower) else {
-            return f64::INFINITY;
-        };
-        let r0 = vec_norm(&chol.solvevec(&self.penalized_score(beta, z)));
-        let eta0 = fast_av(self.x, beta);
-        let eta0_star = self.x_star.dot(beta);
-        let zero_shift = Array1::<f64>::zeros(self.n);
-        let kappa =
-            self.contraction_kappa(&eta0, eta0_star, &zero_shift, 0.0, 2.0 * r0, lambda_min);
-        if kappa.is_finite() && kappa < GLM_CONTRACTION_ACCEPT {
-            r0 / (1.0 - kappa)
-        } else {
-            f64::INFINITY
-        }
-    }
-
-    /// Cold deterministic fit of the augmented problem at candidate `z`:
-    /// damped Newton (full refactorization per iteration, Armijo
-    /// backtracking on the convex penalized NLL) from `init`, run to the
-    /// tight step tolerance. Returns the solution and its certified error
-    /// bound. This IS the defined symmetric fitting map — the homotopy is
-    /// only an acceleration of it.
-    fn cold_fit(&self, z: f64, init: Array1<f64>) -> Result<(Array1<f64>, f64), String> {
-        let mut beta = init;
-        let mut nll = self.penalized_nll(&beta, z);
-        if !nll.is_finite() {
-            beta = Array1::<f64>::zeros(self.p);
-            nll = self.penalized_nll(&beta, z);
-        }
-        let mut converged = false;
-        for _ in 0..GLM_NEWTON_MAX_ITERS {
-            let g = self.penalized_score(&beta, z);
-            let hess = self.penalized_hessian(&beta);
-            let chol = hess
-                .cholesky(Side::Lower)
-                .map_err(|e| format!("glm homotopy: augmented Hessian not SPD at z={z}: {e:?}"))?;
-            let step = chol.solvevec(&g);
-            if self.kkt_converged(&beta, z, GLM_CONVERGENCE_RTOL) {
-                converged = true;
-                break;
-            }
-            // gᵀH⁻¹g ≥ 0: the Newton direction is a descent direction.
-            let decrease = g.dot(&step);
-            let search = backtracking_line_search::<_, std::convert::Infallible>(
-                BacktrackConfig {
-                    initial_step: 1.0,
-                    contraction: 0.5,
-                    max_steps: GLM_NEWTON_MAX_BACKTRACKS,
-                },
-                |t| {
-                    let mut cand = beta.clone();
-                    cand.scaled_add(-t, &step);
-                    let cand_nll = self.penalized_nll(&cand, z);
-                    Ok(if cand_nll.is_finite() {
-                        Some((cand_nll, cand))
-                    } else {
-                        None
-                    })
-                },
-                |t, cand_nll| cand_nll <= nll - GLM_ARMIJO_C1 * t * decrease,
-            );
-            let accepted = match search {
-                Ok(step) => step,
-                Err(never) => match never {},
-            };
-            match accepted {
-                Some(step) => {
-                    beta = step.payload;
-                    nll = step.value;
-                }
-                None => {
-                    // The Armijo line search could not realize the predicted
-                    // descent `½·gᵀH⁻¹g`. Near the optimum that decrease
-                    // underflows the round-off of `penalized_nll` (`~ε·nll`),
-                    // so a failed line search is the FLOOR of this Newton loop,
-                    // not a true failure — the iterate is
-                    // for-all-practical-purposes stationary. Stop iterating and
-                    // let the certified error bound below decide acceptance
-                    // (rather than rejecting on an un-improvable gradient
-                    // floor).
-                    break;
-                }
-            }
-        }
-        // Acceptance is decided by the COMPUTED coefficient-error bound, not by
-        // a gradient-magnitude band. `stationary_error_bound` runs the chord
-        // contraction certificate on a ball around the iterate: a finite value
-        // PROVES the true optimum `β̂(z)` lies within `‖β − β̂(z)‖ ≤ bound`.
-        // The Armijo/round-off floor of this Newton loop (`~√(ε·nll)`) can
-        // exceed both the strict and the near-stationary gradient bands while
-        // still being well inside a tight certified ball, so tying acceptance
-        // to the certificate — the exact quantity the downstream margin gate
-        // (`candidate_verdict`) consumes — is both honest (a larger bound only
-        // widens the undecided band) and immune to the n-/scale-dependent
-        // gradient floor that spuriously rejected reachable optima.
-        let bound = self.stationary_error_bound(&beta, z);
-        if !converged && !bound.is_finite() {
-            // Neither the strict KKT band nor the contraction certificate could
-            // confirm proximity to a stationary point: a genuine non-convergence.
-            let g_norm = vec_norm(&self.penalized_score(&beta, z));
-            let residual = g_norm / (1.0 + self.gradient_natural_scale(&beta, z));
-            return Err(format!(
-                "glm homotopy: cold fit did not converge at z={z} \
-                 (uncertified; relative gradient residual {residual})"
-            ));
-        }
-        Ok((beta, bound))
-    }
-
-    /// Walk the corrected path from `z_from` (where `beta` solves the
-    /// augmented KKT system) to `z_to` via certified predictor–corrector
-    /// sub-steps. On success `beta` holds the corrected solution at `z_to`
-    /// and the certified `‖beta − β̂(z_to)‖` bound is returned. `None` is a
-    /// certified REFUSAL (budget exhausted, certificate never below ½, or a
-    /// factorization failure) — the caller falls back to a cold refit; the
-    /// refusal can cost speed only, never correctness.
-    fn track(&self, beta: &mut Array1<f64>, z_from: f64, z_to: f64) -> Option<f64> {
-        let mut z = z_from;
-        let mut h = z_to - z_from;
-        let mut arrival_bound = f64::INFINITY;
-        for _ in 0..GLM_HOMOTOPY_MAX_SUBSTEPS {
-            let remaining = z_to - z;
-            if remaining <= 0.0 {
-                return Some(arrival_bound);
-            }
-            h = h.min(remaining);
-            let hess = self.penalized_hessian(beta);
-            let lambda_min = hess
-                .eigh(Side::Lower)
-                .ok()?
-                .0
-                .iter()
-                .copied()
-                .fold(f64::INFINITY, f64::min);
-            if !(lambda_min > 0.0) {
-                return None;
-            }
-            let chol = hess.cholesky(Side::Lower).ok()?;
-            let b_dir = chol.solvevec(self.x_star);
-            let eta0 = fast_av(self.x, beta);
-            let eta0_star = self.x_star.dot(beta);
-            let xb = fast_av(self.x, &b_dir);
-            let xb_star = self.x_star.dot(&b_dir);
-
-            let mut accepted = false;
-            for _ in 0..=GLM_HOMOTOPY_MAX_HALVINGS {
-                let h_eff = h.min(z_to - z);
-                let z_new = if h_eff >= z_to - z { z_to } else { z + h_eff };
-                let mut beta_pred = beta.clone();
-                beta_pred.scaled_add(h_eff, &b_dir);
-                let s0 = chol.solvevec(&self.penalized_score(&beta_pred, z_new));
-                let r0 = vec_norm(&s0);
-                let radius = 2.0 * r0;
-                let shift = xb.mapv(|t| (h_eff * t).abs());
-                let kappa = self.contraction_kappa(
-                    &eta0,
-                    eta0_star,
-                    &shift,
-                    (h_eff * xb_star).abs(),
-                    radius,
-                    lambda_min,
-                );
-                if kappa.is_finite() && kappa < GLM_CONTRACTION_ACCEPT {
-                    // Chord corrector on the already-factored H₀: certified
-                    // geometric contraction toward the unique root.
-                    let mut bcur = beta_pred;
-                    let mut step = s0;
-                    let mut r = r0;
-                    for _ in 0..GLM_CORRECTOR_MAX_ITERS {
-                        if self.kkt_converged(&bcur, z_new, GLM_CONVERGENCE_RTOL) {
-                            break;
-                        }
-                        let mut next = bcur.clone();
-                        next.scaled_add(-1.0, &step);
-                        let next_step = chol.solvevec(&self.penalized_score(&next, z_new));
-                        let r_next = vec_norm(&next_step);
-                        if !(r_next < r) {
-                            // Floating-point floor: stop here; acceptance is
-                            // decided by the residual level below.
-                            break;
-                        }
-                        bcur = next;
-                        step = next_step;
-                        r = r_next;
-                    }
-                    if self.kkt_converged(&bcur, z_new, GLM_STALL_ACCEPT_RTOL) {
-                        // Re-certify at the final iterate and carry the
-                        // COMPUTED distance-to-root bound.
-                        let mut diff = bcur.clone();
-                        diff.scaled_add(-1.0, beta);
-                        let shift_fin = fast_av(self.x, &diff).mapv(f64::abs);
-                        let kappa_fin = self.contraction_kappa(
-                            &eta0,
-                            eta0_star,
-                            &shift_fin,
-                            self.x_star.dot(&diff).abs(),
-                            2.0 * r,
-                            lambda_min,
-                        );
-                        if kappa_fin.is_finite() && kappa_fin < GLM_CONTRACTION_ACCEPT {
-                            arrival_bound = r / (1.0 - kappa_fin);
-                            *beta = bcur;
-                            z = z_new;
-                            // Grow the trial step on an easy acceptance.
-                            h = 2.0 * h_eff;
-                            accepted = true;
-                            break;
-                        }
-                    }
-                }
-                h = 0.5 * h_eff;
-                if !(h > 0.0) {
-                    return None;
-                }
-            }
-            if !accepted {
-                return None;
-            }
-        }
-        if z_to - z <= 0.0 {
-            Some(arrival_bound)
-        } else {
-            None
-        }
-    }
-
-    /// Propagated score-error bound for one row: `|Δe| ≤ |Δμ| ≤
-    /// sup b″ · ‖x‖ · bound`, with the weight sup COMPUTED over the η-interval
-    /// the coefficient ball can reach.
-    fn score_delta(&self, eta: f64, x_norm: f64, beta_error_bound: f64) -> f64 {
-        if beta_error_bound == 0.0 {
-            return 0.0;
-        }
-        if !beta_error_bound.is_finite() {
-            return f64::INFINITY;
-        }
-        let dev = x_norm * beta_error_bound;
-        self.family.weight_abs_sup(eta - dev, eta + dev) * dev
-    }
-
-    /// Rank the candidate with the margin gate: `decided` is true iff every
-    /// possible score perturbation within the certified bound leaves the
-    /// membership verdict unchanged.
-    fn candidate_verdict(
-        &self,
-        z: f64,
-        alpha: f64,
-        beta: &Array1<f64>,
-        beta_error_bound: f64,
-    ) -> GlmCandidateVerdict {
-        let eta = fast_av(self.x, beta);
-        let eta_star = self.x_star.dot(beta);
-        let e_star = (z - self.family.mean(eta_star)).abs();
-        let delta_star = self.score_delta(eta_star, self.star_norm, beta_error_bound);
-        let mut count = 0usize;
-        let mut count_certain = 0usize;
-        let mut count_possible = 0usize;
-        for i in 0..self.n {
-            let e_i = (self.y[i] - self.family.mean(eta[i])).abs();
-            let tol = self.score_delta(eta[i], self.row_norm[i], beta_error_bound) + delta_star;
-            let gap = e_i - e_star;
-            if gap >= 0.0 {
-                count += 1;
-            }
-            if gap >= tol {
-                count_certain += 1;
-            }
-            if gap >= -tol {
-                count_possible += 1;
-            }
-        }
-        let n1 = (self.n + 1) as f64;
-        let tau = conformal_rank_threshold(alpha, self.n + 1);
-        let member = (1.0 + count as f64) > tau;
-        let member_lo = (1.0 + count_certain as f64) > tau;
-        let member_hi = (1.0 + count_possible as f64) > tau;
-        GlmCandidateVerdict {
-            p_value: (1.0 + count as f64) / n1,
-            member,
-            decided: member_lo == member_hi,
-        }
-    }
-
-    /// Assemble the exact full-conformal set over the (strictly increasing)
-    /// candidate list: cold fit at the first candidate, certified homotopy
-    /// tracking between consecutive candidates with cold-refit fallback on
-    /// certificate refusal, and the margin gate on every verdict.
-    pub fn prediction_set(
-        &self,
-        candidates: &[f64],
-        alpha: f64,
-    ) -> Result<GlmHomotopyConformalSet, String> {
-        if candidates.is_empty() {
-            return Err("glm homotopy: empty candidate list".to_string());
-        }
-        if !(0.0..1.0).contains(&alpha) {
-            return Err(format!(
-                "glm homotopy: alpha must be in [0, 1), got {alpha}"
-            ));
-        }
-        if candidates.windows(2).any(|w| !(w[0] < w[1])) {
-            return Err("glm homotopy: candidates must be strictly increasing".to_string());
-        }
-        for &z in candidates {
-            self.family.validate_candidate(z)?;
-        }
-
-        let (mut beta, mut bound) = self.cold_fit(candidates[0], Array1::<f64>::zeros(self.p))?;
-        let mut out: Vec<GlmHomotopyCandidate> = Vec::with_capacity(candidates.len());
-        let mut members: Vec<f64> = Vec::new();
-        let mut refit_fallbacks = 0usize;
-        let mut margin_refits = 0usize;
-        let mut ties_unresolved = 0usize;
-        let mut max_bound = 0.0_f64;
-        let mut prev_z = candidates[0];
-        for (idx, &z) in candidates.iter().enumerate() {
-            let mut cold = idx == 0;
-            if idx > 0 {
-                match self.track(&mut beta, prev_z, z) {
-                    Some(b) => bound = b,
-                    None => {
-                        let (refit_beta, refit_bound) = self.cold_fit(z, beta.clone())?;
-                        beta = refit_beta;
-                        bound = refit_bound;
-                        refit_fallbacks += 1;
-                        cold = true;
-                    }
-                }
-            }
-            let mut verdict = self.candidate_verdict(z, alpha, &beta, bound);
-            if !verdict.decided && !cold {
-                let (refit_beta, refit_bound) = self.cold_fit(z, beta.clone())?;
-                beta = refit_beta;
-                bound = refit_bound;
-                cold = true;
-                margin_refits += 1;
-                verdict = self.candidate_verdict(z, alpha, &beta, bound);
-            }
-            if !verdict.decided {
-                ties_unresolved += 1;
-            }
-            if bound.is_finite() {
-                max_bound = max_bound.max(bound);
-            } else {
-                max_bound = f64::INFINITY;
-            }
-            if verdict.member {
-                members.push(z);
-            }
-            out.push(GlmHomotopyCandidate {
-                z,
-                p_value: verdict.p_value,
-                member: verdict.member,
-                beta: beta.clone(),
-                beta_error_bound: bound,
-                cold_refit: cold,
-            });
-            prev_z = z;
-        }
-        Ok(GlmHomotopyConformalSet {
-            members,
-            candidates: out,
-            alpha,
-            n_augmented: self.n + 1,
-            refit_fallbacks,
-            margin_refits,
-            ties_unresolved,
-            max_beta_error_bound: max_bound,
-        })
-    }
 }
 
 /// Persisted frozen penalty for the Gaussian-identity full-conformal set
@@ -1502,13 +743,15 @@ impl ExactFullConformalPenalty {
     }
 
     /// Join the frozen penalty to labeled rows `(X, y)` for the per-test-row
-    /// exact set. Every row carries unit weight: only models trained without
+    /// rank set or its certified numerical enclosure. Every row carries unit
+    /// weight: only models trained without
     /// prior weights persist this penalty.
     ///
-    /// The rows need not be the training rows. The set is exact for whatever
-    /// labeled rows are supplied; with the training rows it is the frozen-λ
-    /// full-conformal set of the fit, and with rows the penalty was not
-    /// selected on the augmented scores are exchangeable under either map.
+    /// The rows need not be the training rows. Marginal coverage requires
+    /// exchangeable supplied rows and a fitting map symmetric in all augmented
+    /// rows, including the basis and penalty construction. A basis or penalty
+    /// learned on independent data can be held fixed; a training-only learned
+    /// construction does not automatically satisfy that assumption.
     pub fn with_labeled_rows(
         &self,
         x: Array2<f64>,
@@ -1628,6 +871,16 @@ impl ExactFullConformalSubstrate {
         x_star: &Array1<f64>,
         alpha: f64,
     ) -> Result<ExactFullConformalInterval, String> {
+        self.interval_with_uniform(x_star, alpha, rand::rng().random())
+    }
+
+    /// The same outer envelope with an explicitly supplied independent U.
+    pub fn interval_with_uniform(
+        &self,
+        x_star: &Array1<f64>,
+        alpha: f64,
+        tie_uniform: f64,
+    ) -> Result<ExactFullConformalInterval, String> {
         if x_star.len() != self.p() {
             return Err(format!(
                 "exact full conformal: x_* has {} entries but the fit has {} coefficients",
@@ -1636,7 +889,7 @@ impl ExactFullConformalSubstrate {
             ));
         }
         let weights = Array1::<f64>::ones(self.n());
-        let row = honest_full_conformal(
+        let row = honest::honest_full_conformal_with_uniform(
             &self.x,
             &self.y,
             &weights,
@@ -1644,12 +897,13 @@ impl ExactFullConformalSubstrate {
             self.penalty_count,
             x_star,
             alpha,
+            tie_uniform,
         )?;
         let (lo, hi) = match (row.set.intervals.first(), row.set.intervals.last()) {
             (Some(first), Some(last)) => (first.lo, last.hi),
-            // No candidate qualifies (pathological tiny α·(n+1)); collapse to the
-            // plug-in mean — the only honest scalar answer.
-            _ => (row.plug_in_mean, row.plug_in_mean),
+            // An empty randomized set has no envelope. Never substitute a
+            // point that the rank rule excluded.
+            _ => (f64::NAN, f64::NAN),
         };
         Ok(ExactFullConformalInterval {
             lo,
@@ -1693,14 +947,13 @@ mod tests {
         }
 
         let engine =
-            ExactGaussianFullConformal::new(&x, &y, &weights, &s_lambda, &x_star).expect("engine");
+            ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &s_lambda, &x_star, 0.5)
+                .expect("engine");
         let alpha = 0.2;
-        let set = engine.prediction_set(alpha);
+        let set = engine.prediction_set(alpha).expect("prediction set");
         assert!(!set.intervals.is_empty(), "set should be non-empty");
 
-        // Independent oracle: explicit augmented refit per grid z, ranked by
-        // the smoothed p-value with the row's tie-break uniform.
-        let tie_uniform = conformal_tie_uniform(&y, &x_star, 0.0);
+        // Independent oracle: explicit augmented refit per grid z.
         let m_base = x.t().dot(&x) + &s_lambda;
         let oracle = |z: f64| -> bool {
             let mut m = m_base.clone();
@@ -1716,12 +969,13 @@ mod tests {
             }
             let beta = chol.solvevec(&rhs);
             let e_star = (z - x_star.dot(&beta)).abs();
-            let scores: Vec<f64> = (0..n)
-                .map(|i| (y[i] - x.row(i).dot(&beta)).abs())
-                .collect();
-            let greater = scores.iter().filter(|&&e| e > e_star).count();
-            let tied = scores.iter().filter(|&&e| e == e_star).count();
-            greater as f64 + tie_uniform * (1.0 + tied as f64) > alpha * (n as f64 + 1.0)
+            let greater = (0..n)
+                .filter(|&i| {
+                    let mu_i: f64 = x.row(i).dot(&beta);
+                    (y[i] - mu_i).abs() > e_star
+                })
+                .count();
+            (0.5 + greater as f64) > alpha * (n as f64 + 1.0)
         };
 
         let z_lo = set.intervals.first().map(|i| i.lo).unwrap_or(-5.0) - 2.0;
@@ -1731,7 +985,7 @@ mod tests {
         let grid = 4001usize;
         for g in 0..grid {
             let z = z_lo + (z_hi - z_lo) * g as f64 / (grid as f64 - 1.0);
-            let in_set = set.intervals.iter().any(|itv| z >= itv.lo && z <= itv.hi);
+            let in_set = set.intervals.iter().any(|itv| itv.contains(z));
             assert_eq!(
                 in_set,
                 oracle(z),
@@ -1745,142 +999,58 @@ mod tests {
         let beta_unaug = chol.solvevec(&x.t().dot(&y));
         let mu_star = x_star.dot(&beta_unaug);
         assert!(
-            set.intervals
-                .iter()
-                .any(|itv| mu_star >= itv.lo && mu_star <= itv.hi),
+            set.intervals.iter().any(|itv| itv.contains(mu_star)),
             "point prediction should be inside its own conformal set"
         );
     }
 
-    /// One training row whose score is `0` for every z and a test score
-    /// `|z|/2`: the only tie is at `z = 0`, where the smoothed rank is `2U`
-    /// against `τ = 1`. The set is the point `{0}` when `U > 1/2` and empty
-    /// otherwise — never a neighbourhood of it.
     #[test]
-    fn boundary_tie_is_a_point_set_iff_its_smoothed_rank_qualifies() {
+    fn boundary_tie_is_a_closed_point_set() {
         let x = Array2::from_shape_vec((1, 1), vec![0.0]).expect("x");
         let y = Array1::from_vec(vec![0.0]);
         let weights = Array1::ones(1);
         let s_lambda = Array2::from_shape_vec((1, 1), vec![1.0]).expect("s");
         let x_star = Array1::from_vec(vec![1.0]);
         let engine =
-            ExactGaussianFullConformal::new(&x, &y, &weights, &s_lambda, &x_star).expect("engine");
+            ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &s_lambda, &x_star, 0.5)
+                .expect("engine");
 
-        let set = engine.prediction_set(0.5);
-        if 2.0 * engine.tie_uniform() > 1.0 {
-            assert_eq!(set.intervals, vec![ConformalInterval { lo: 0.0, hi: 0.0 }]);
-        } else {
-            assert!(set.intervals.is_empty(), "{:?}", set.intervals);
-        }
+        let set = engine.prediction_set(0.25).expect("prediction set");
+        assert_eq!(set.intervals.len(), 1);
+        assert_eq!(set.intervals[0].lo, 0.0);
+        assert_eq!(set.intervals[0].hi, 0.0);
     }
 
-    /// A training row tied with the test row at every z: the smoothed rank
-    /// `U·(1 + 1)` never changes, so the set is the whole line when
-    /// `2U > α(n+1) = 1` and empty otherwise.
     #[test]
-    fn identically_tied_rows_give_the_whole_line_or_nothing() {
+    fn identically_tied_rows_give_the_whole_line() {
         let x = Array2::from_shape_vec((1, 1), vec![1.0]).expect("x");
         let y = Array1::from_vec(vec![0.0]);
         let weights = Array1::ones(1);
         let s_lambda = Array2::from_shape_vec((1, 1), vec![0.0]).expect("s");
         let x_star = Array1::from_vec(vec![1.0]);
         let engine =
-            ExactGaussianFullConformal::new(&x, &y, &weights, &s_lambda, &x_star).expect("engine");
+            ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &s_lambda, &x_star, 0.5)
+                .expect("engine");
 
-        let set = engine.prediction_set(0.5);
-        if 2.0 * engine.tie_uniform() > 1.0 {
-            assert_eq!(
-                set.intervals,
-                vec![ConformalInterval {
-                    lo: f64::NEG_INFINITY,
-                    hi: f64::INFINITY,
-                }]
-            );
-        } else {
-            assert!(set.intervals.is_empty(), "{:?}", set.intervals);
-        }
+        let set = engine.prediction_set(0.25).expect("prediction set");
+        assert_eq!(set.intervals.len(), 1);
+        assert_eq!(set.intervals[0].lo, f64::NEG_INFINITY);
+        assert_eq!(set.intervals[0].hi, f64::INFINITY);
     }
 
-    /// Both training slopes exceed the test slope, and at every z at least one
-    /// training score strictly dominates (they vanish at `z = ∓1`, where the
-    /// other is `2 > 0.1`). At `α(n+1) = 1` one strict dominator and any
-    /// `U > 0` qualify, so the set is the whole line for every `U`.
     #[test]
     fn strictly_separated_slopes_give_the_whole_line() {
-        for tie_uniform in [1.0e-9, 0.5, 1.0 - 1.0e-9] {
-            let engine = ExactGaussianFullConformal {
-                u: Array1::from_vec(vec![1.0, 1.0, 0.0]),
-                w: Array1::from_vec(vec![1.0, -1.0, 0.1]),
-                n: 2,
-                tie_uniform,
-            };
+        let engine = ExactGaussianFullConformal {
+            u: Array1::from_vec(vec![1.0, 1.0, 0.0]),
+            w: Array1::from_vec(vec![1.0, -1.0, 0.1]),
+            n: 2,
+            tie_uniform: 0.5,
+        };
 
-            let set = engine.prediction_set(1.0 / 3.0);
-            assert_eq!(
-                set.intervals,
-                vec![ConformalInterval {
-                    lo: f64::NEG_INFINITY,
-                    hi: f64::INFINITY,
-                }],
-                "U = {tie_uniform}"
-            );
-        }
-    }
-
-    /// Seeded Monte Carlo at a fixed penalty, where the map is symmetric and
-    /// the smoothed p-value is exactly uniform: coverage is `1 − α` within
-    /// `3·MCSE`, two-sided, at `n = 9` and `α ∈ {0.05, 0.15}`. There
-    /// `α(n+1) ∈ {0.5, 1.5}` is fractional, and the plain p-value would cover
-    /// with probability `1 − ⌊α(n+1)⌋/(n+1) ∈ {1, 0.9}` — the whole line at
-    /// `α = 0.05`, and `0.05` above nominal at `α = 0.15` (#4514).
-    #[test]
-    fn exact_set_coverage_is_nominal_at_a_fractional_rank_threshold() {
-        use rand::rngs::StdRng;
-        use rand::{RngExt, SeedableRng};
-        use rand_distr::{Distribution, Normal};
-
-        let n = 9usize;
-        let p = 3usize;
-        let reps = 4000usize;
-        let noise = Normal::new(0.0, 0.4).expect("normal");
-        let basis = |t: f64| Array1::from_vec(vec![1.0, t, t * t]);
-        let mut s_lambda = Array2::<f64>::zeros((p, p));
-        s_lambda[[2, 2]] = 2.0;
-        let weights = Array1::<f64>::ones(n);
-        for alpha in [0.05, 0.15] {
-            let mut rng = StdRng::seed_from_u64(4514);
-            let mut covered = 0usize;
-            for _ in 0..reps {
-                let draw = |rng: &mut StdRng| {
-                    let t = rng.random::<f64>() * 2.0 - 1.0;
-                    (basis(t), (2.0 * t).sin() + noise.sample(rng))
-                };
-                let mut x = Array2::<f64>::zeros((n, p));
-                let mut y = Array1::<f64>::zeros(n);
-                for i in 0..n {
-                    let (row, yi) = draw(&mut rng);
-                    x.row_mut(i).assign(&row);
-                    y[i] = yi;
-                }
-                let (x_star, y_star) = draw(&mut rng);
-                let set = ExactGaussianFullConformal::new(&x, &y, &weights, &s_lambda, &x_star)
-                    .expect("engine")
-                    .prediction_set(alpha);
-                covered += usize::from(
-                    set.intervals
-                        .iter()
-                        .any(|itv| itv.lo <= y_star && y_star <= itv.hi),
-                );
-            }
-            let coverage = covered as f64 / reps as f64;
-            let mcse = (alpha * (1.0 - alpha) / reps as f64).sqrt();
-            assert!(
-                (coverage - (1.0 - alpha)).abs() <= 3.0 * mcse,
-                "α = {alpha}: coverage {coverage} vs {} ± {}",
-                1.0 - alpha,
-                3.0 * mcse
-            );
-        }
+        let set = engine.prediction_set(0.25).expect("prediction set");
+        assert_eq!(set.intervals.len(), 1);
+        assert_eq!(set.intervals[0].lo, f64::NEG_INFINITY);
+        assert_eq!(set.intervals[0].hi, f64::INFINITY);
     }
 
     /// A smooth Gaussian fixture: cosine basis design (column 0 constant,
@@ -2047,229 +1217,6 @@ mod tests {
         }
     }
 
-    // ── Layer 2 (continuous GLM homotopy) tests ──────────────────────────
-
-    /// Independent damped-Newton refit of the augmented canonical GLM at a
-    /// single candidate z — explicit per-row loops, its own line search, no
-    /// shared assembly with the engine under test.
-    fn oracle_glm_refit(
-        x: &Array2<f64>,
-        y: &Array1<f64>,
-        s: &Array2<f64>,
-        x_star: &Array1<f64>,
-        z: f64,
-        mean: &dyn Fn(f64) -> f64,
-        weight: &dyn Fn(f64) -> f64,
-        nll_term: &dyn Fn(f64, f64) -> f64,
-    ) -> Array1<f64> {
-        let n = x.nrows();
-        let p = x.ncols();
-        let pen_nll = |b: &Array1<f64>| -> f64 {
-            let mut acc = 0.0;
-            for i in 0..n {
-                acc += nll_term(x.row(i).dot(b), y[i]);
-            }
-            acc += nll_term(x_star.dot(b), z);
-            acc + 0.5 * b.dot(&s.dot(b))
-        };
-        let mut beta = Array1::<f64>::zeros(p);
-        let mut cur = pen_nll(&beta);
-        for _ in 0..400 {
-            let mut g = s.dot(&beta);
-            let mut h = s.clone();
-            for i in 0..n {
-                let eta = x.row(i).dot(&beta);
-                let r = mean(eta) - y[i];
-                let w = weight(eta);
-                for a in 0..p {
-                    g[a] += x[[i, a]] * r;
-                    for b in 0..p {
-                        h[[a, b]] += w * x[[i, a]] * x[[i, b]];
-                    }
-                }
-            }
-            let eta_s = x_star.dot(&beta);
-            let r_s = mean(eta_s) - z;
-            let w_s = weight(eta_s);
-            for a in 0..p {
-                g[a] += x_star[a] * r_s;
-                for b in 0..p {
-                    h[[a, b]] += w_s * x_star[a] * x_star[b];
-                }
-            }
-            let chol = h.cholesky(Side::Lower).expect("oracle chol");
-            let step = chol.solvevec(&g);
-            if vec_norm(&step) <= 1e-13 * (1.0 + vec_norm(&beta)) {
-                break;
-            }
-            let search = backtracking_line_search::<_, std::convert::Infallible>(
-                BacktrackConfig::default(),
-                |t| {
-                    let mut cand = beta.clone();
-                    cand.scaled_add(-t, &step);
-                    let cand_nll = pen_nll(&cand);
-                    Ok(if cand_nll.is_finite() {
-                        Some((cand_nll, cand))
-                    } else {
-                        None
-                    })
-                },
-                |_, cand_nll| cand_nll <= cur,
-            );
-            let accepted = match search {
-                Ok(step) => step,
-                Err(never) => match never {},
-            };
-            let step = accepted.unwrap_or_else(|| panic!("oracle line search failed at z={z}"));
-            beta = step.payload;
-            cur = step.value;
-        }
-        beta
-    }
-
-    /// Conformal membership computed directly from an oracle refit.
-    fn oracle_glm_membership(
-        x: &Array2<f64>,
-        y: &Array1<f64>,
-        x_star: &Array1<f64>,
-        z: f64,
-        alpha: f64,
-        beta: &Array1<f64>,
-        mean: &dyn Fn(f64) -> f64,
-    ) -> bool {
-        let n = x.nrows();
-        let e_star = (z - mean(x_star.dot(beta))).abs();
-        let count = (0..n)
-            .filter(|&i| (y[i] - mean(x.row(i).dot(beta))).abs() >= e_star)
-            .count();
-        (1.0 + count as f64) > alpha * (n as f64 + 1.0)
-    }
-
-    /// (#942 Layer 2 test a) The tracked β̂(z) path must match a direct
-    /// augmented refit at every candidate WITHIN THE CERTIFIED corrector
-    /// bound — for both supported families — and the homotopy must have
-    /// actually tracked (not silently cold-refit everything). Membership
-    /// verdicts must agree with the independent oracle exactly.
-    #[test]
-    fn glm_homotopy_tracks_exact_refit_path_within_certified_bound() {
-        use std::f64::consts::PI;
-        let n = 16usize;
-        let p = 3usize;
-        let mut x = Array2::<f64>::zeros((n, p));
-        let mut y = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let t = i as f64 / (n as f64 - 1.0);
-            for j in 0..p {
-                x[[i, j]] = (j as f64 * PI * t).cos();
-            }
-            y[i] = (1.0 + (2.0 * PI * t).sin()).exp().round();
-        }
-        let mut s = Array2::<f64>::eye(p);
-        s *= 1.5;
-        let weights = Array1::<f64>::ones(n);
-        let x_star = cosine_row(p, 0.37);
-        let alpha = 0.2;
-
-        // Poisson-log arm over a count window.
-        let eng = GlmHomotopyFullConformal::new(
-            CanonicalGlmFamily::PoissonLog,
-            &x,
-            &y,
-            &weights,
-            &s,
-            &x_star,
-        )
-        .expect("poisson engine");
-        let candidates: Vec<f64> = (0..=6).map(|k| k as f64).collect();
-        let set = eng.prediction_set(&candidates, alpha).expect("poisson set");
-        assert_eq!(set.candidates.len(), candidates.len());
-        assert_eq!(set.n_augmented, n + 1);
-        assert!(
-            set.candidates.iter().skip(1).any(|c| !c.cold_refit),
-            "the homotopy never tracked a single transition on a benign Poisson fixture \
-             — the certified predictor–corrector path is vacuous"
-        );
-        let mean_p = |eta: f64| eta.exp();
-        let weight_p = |eta: f64| eta.exp();
-        let nll_p = |eta: f64, yv: f64| eta.exp() - yv * eta;
-        for c in &set.candidates {
-            let beta_ref = oracle_glm_refit(&x, &y, &s, &x_star, c.z, &mean_p, &weight_p, &nll_p);
-            let mut diff = c.beta.clone();
-            diff.scaled_add(-1.0, &beta_ref);
-            let err = vec_norm(&diff);
-            assert!(
-                c.beta_error_bound.is_finite(),
-                "certified bound must be finite on a benign fixture (z={})",
-                c.z
-            );
-            assert!(
-                err <= c.beta_error_bound + 1e-7,
-                "tracked β̂({}) is {err} from the oracle refit, exceeding the certified \
-                 corrector bound {} (+ oracle tolerance)",
-                c.z,
-                c.beta_error_bound
-            );
-            assert!(
-                c.beta_error_bound < 1e-6,
-                "certified bound {} at z={} is uselessly loose on a benign fixture",
-                c.beta_error_bound,
-                c.z
-            );
-            let member_ref = oracle_glm_membership(&x, &y, &x_star, c.z, alpha, &beta_ref, &mean_p);
-            assert_eq!(
-                c.member, member_ref,
-                "homotopy membership disagrees with the oracle refit at z={}",
-                c.z
-            );
-        }
-        assert_eq!(
-            set.members.len(),
-            set.candidates.iter().filter(|c| c.member).count()
-        );
-
-        // Bernoulli-logit arm: support {0, 1}, same path-vs-refit contract.
-        let mut yb = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let t = i as f64 / (n as f64 - 1.0);
-            yb[i] = f64::from(u8::from((2.0 * PI * t).sin() > -0.2));
-        }
-        let engb = GlmHomotopyFullConformal::new(
-            CanonicalGlmFamily::BernoulliLogit,
-            &x,
-            &yb,
-            &weights,
-            &s,
-            &x_star,
-        )
-        .expect("bernoulli engine");
-        let setb = engb
-            .prediction_set(&[0.0, 1.0], alpha)
-            .expect("bernoulli set");
-        let mean_b = |eta: f64| 1.0 / (1.0 + (-eta).exp());
-        let weight_b = |eta: f64| {
-            let mu = 1.0 / (1.0 + (-eta).exp());
-            mu * (1.0 - mu)
-        };
-        let nll_b = |eta: f64, yv: f64| eta.max(0.0) + (-eta.abs()).exp().ln_1p() - yv * eta;
-        assert!(
-            !setb.candidates[1].cold_refit,
-            "the logistic third derivative is globally ≤ 1/(6√3); tracking 0→1 must certify"
-        );
-        for c in &setb.candidates {
-            let beta_ref = oracle_glm_refit(&x, &yb, &s, &x_star, c.z, &mean_b, &weight_b, &nll_b);
-            let mut diff = c.beta.clone();
-            diff.scaled_add(-1.0, &beta_ref);
-            assert!(
-                vec_norm(&diff) <= c.beta_error_bound + 1e-7,
-                "Bernoulli tracked path off the refit at z={} beyond the certified bound",
-                c.z
-            );
-            let member_ref =
-                oracle_glm_membership(&x, &yb, &x_star, c.z, alpha, &beta_ref, &mean_b);
-            assert_eq!(c.member, member_ref);
-        }
-    }
-
     /// Exchangeability needs weights that ARE one, not weights near one. A
     /// tolerance test `|w − 1| > tol` is also false for NaN, so it admitted a
     /// weight that is not a number as unity; the exact comparison refuses both.
@@ -2289,216 +1236,18 @@ mod tests {
         for not_one in [1.0 + 1.0e-13, f64::NAN] {
             let mut weights = Array1::<f64>::ones(n);
             weights[2] = not_one;
-            let error = GlmHomotopyFullConformal::new(
-                CanonicalGlmFamily::PoissonLog,
-                &x,
-                &y,
-                &weights,
-                &s,
-                &x_star,
-            )
-            .err()
-            .expect("a prior weight that is not exactly one must be refused");
+            let error =
+                ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &s, &x_star, 0.5)
+                    .err()
+                    .expect("a prior weight that is not exactly one must be refused");
             assert!(error.contains("unit prior weights"), "{error}");
         }
         // Non-vacuity: exact unit weights are admitted.
         let weights = Array1::<f64>::ones(n);
         assert!(
-            GlmHomotopyFullConformal::new(
-                CanonicalGlmFamily::PoissonLog,
-                &x,
-                &y,
-                &weights,
-                &s,
-                &x_star,
-            )
-            .is_ok()
+            ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &s, &x_star, 0.5)
+                .is_ok()
         );
-    }
-
-    /// (#1192) A benign UNPENALIZED Poisson fixture must produce a valid
-    /// conformal set: the cold fit drives the raw penalized gradient down to
-    /// its floating-point round-off floor (~1e-7 at moderate n), where the
-    /// Armijo line search can no longer make sufficient-decrease progress
-    /// because the convex NLL is flat to machine precision. That stalled
-    /// iterate IS stationary and must be ACCEPTED, not aborted with a spurious
-    /// "cold fit did not converge". With `S = 0` there is no penalty curvature
-    /// to suppress the gradient floor, so this is the regime that exposed the
-    /// abort.
-    #[test]
-    fn glm_homotopy_unpenalized_poisson_accepts_roundoff_floor_cold_fit() {
-        use std::f64::consts::PI;
-        let n = 24usize;
-        let p = 3usize;
-        let mut x = Array2::<f64>::zeros((n, p));
-        let mut y = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let t = i as f64 / (n as f64 - 1.0);
-            for j in 0..p {
-                x[[i, j]] = (j as f64 * PI * t).cos();
-            }
-            y[i] = (1.0 + (2.0 * PI * t).sin()).exp().round();
-        }
-        // Unpenalized: no ridge to bound the gradient floor away from ε.
-        let s = Array2::<f64>::zeros((p, p));
-        let weights = Array1::<f64>::ones(n);
-        let x_star = cosine_row(p, 0.37);
-        let alpha = 0.2;
-
-        let eng = GlmHomotopyFullConformal::new(
-            CanonicalGlmFamily::PoissonLog,
-            &x,
-            &y,
-            &weights,
-            &s,
-            &x_star,
-        )
-        .expect("poisson engine");
-        let candidates: Vec<f64> = (0..=6).map(|k| k as f64).collect();
-        let set = eng
-            .prediction_set(&candidates, alpha)
-            .expect("unpenalized poisson cold fit must converge to the round-off floor");
-        assert_eq!(set.candidates.len(), candidates.len());
-
-        // Every accepted cold fit must be a GENUINE stationary point: agree
-        // with an independent oracle refit to within the certified bound.
-        let mean_p = |eta: f64| eta.exp();
-        let weight_p = |eta: f64| eta.exp();
-        let nll_p = |eta: f64, yv: f64| eta.exp() - yv * eta;
-        for c in &set.candidates {
-            let beta_ref = oracle_glm_refit(&x, &y, &s, &x_star, c.z, &mean_p, &weight_p, &nll_p);
-            let mut diff = c.beta.clone();
-            diff.scaled_add(-1.0, &beta_ref);
-            assert!(
-                vec_norm(&diff) <= c.beta_error_bound + 1e-6,
-                "accepted β̂({}) is off the oracle refit beyond the certified bound",
-                c.z
-            );
-            let member_ref = oracle_glm_membership(&x, &y, &x_star, c.z, alpha, &beta_ref, &mean_p);
-            assert_eq!(
-                c.member, member_ref,
-                "unpenalized membership disagrees with oracle at z={}",
-                c.z
-            );
-        }
-        assert_eq!(
-            set.members.len(),
-            set.candidates.iter().filter(|c| c.member).count()
-        );
-    }
-
-    /// (#1192) The round-off-floor acceptance must NOT silently swallow a
-    /// genuinely non-stationary iterate: a fit deliberately truncated far
-    /// from the optimum (gradient orders of magnitude above the round-off
-    /// floor) must still be REJECTED. Guards against turning the fix into a
-    /// blanket "accept anything that stalls".
-    #[test]
-    fn glm_homotopy_truncated_fit_still_rejected() {
-        use std::f64::consts::PI;
-        let n = 24usize;
-        let p = 3usize;
-        let mut x = Array2::<f64>::zeros((n, p));
-        let mut y = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let t = i as f64 / (n as f64 - 1.0);
-            for j in 0..p {
-                x[[i, j]] = (j as f64 * PI * t).cos();
-            }
-            y[i] = (1.0 + (2.0 * PI * t).sin()).exp().round();
-        }
-        let s = Array2::<f64>::zeros((p, p));
-        let weights = Array1::<f64>::ones(n);
-        let x_star = cosine_row(p, 0.37);
-        let eng = GlmHomotopyFullConformal::new(
-            CanonicalGlmFamily::PoissonLog,
-            &x,
-            &y,
-            &weights,
-            &s,
-            &x_star,
-        )
-        .expect("poisson engine");
-        // β = 0 is far from the optimum: a large raw gradient, not the floor.
-        let beta0 = Array1::<f64>::zeros(p);
-        assert!(
-            !eng.kkt_converged(&beta0, 3.0, GLM_STALL_ACCEPT_RTOL),
-            "a far-from-stationary iterate must NOT pass the near-stationary band"
-        );
-    }
-
-    /// (#942 Layer 2 test c) When the third-order bound explodes — a huge
-    /// candidate jump at a high-leverage test row under Poisson-log, where
-    /// `b‴ = eʸ` grows with the candidate — the step certificate must
-    /// REFUSE within its budget and fall back to a cold refit, and the
-    /// fallback must preserve exactness (memberships still equal the
-    /// independent oracle's).
-    #[test]
-    fn glm_homotopy_certificate_refuses_and_falls_back_on_third_order_explosion() {
-        use std::f64::consts::PI;
-        let n = 16usize;
-        let p = 3usize;
-        let mut x = Array2::<f64>::zeros((n, p));
-        let mut y = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let t = i as f64 / (n as f64 - 1.0);
-            for j in 0..p {
-                x[[i, j]] = (j as f64 * PI * t).cos();
-            }
-            y[i] = (1.0 + 2.0 * t).round();
-        }
-        let mut s = Array2::<f64>::eye(p);
-        s *= 0.5;
-        let weights = Array1::<f64>::ones(n);
-        let mut x_star = cosine_row(p, 0.31);
-        x_star.mapv_inplace(|v| 6.0 * v);
-        let eng = GlmHomotopyFullConformal::new(
-            CanonicalGlmFamily::PoissonLog,
-            &x,
-            &y,
-            &weights,
-            &s,
-            &x_star,
-        )
-        .expect("engine");
-        let alpha = 0.2;
-        let set = eng
-            .prediction_set(&[1.0, 2000.0], alpha)
-            .expect("set under extreme jump");
-        assert!(
-            set.refit_fallbacks >= 1,
-            "a 1 → 2000 Poisson candidate jump at ‖x_*‖ = {} must exhaust the certified \
-             step budget (b‴ = eʸ explodes along the path) and fall back to a cold refit; \
-             got {} fallbacks",
-            x_star.dot(&x_star).sqrt(),
-            set.refit_fallbacks
-        );
-        assert!(
-            set.candidates[1].cold_refit,
-            "the candidate decided through the fallback must be marked cold"
-        );
-        // Exactness preserved under fallback: the verdicts and coefficients
-        // still match the independent oracle within the computed bound.
-        let mean_p = |eta: f64| eta.exp();
-        let weight_p = |eta: f64| eta.exp();
-        let nll_p = |eta: f64, yv: f64| eta.exp() - yv * eta;
-        for c in &set.candidates {
-            let beta_ref = oracle_glm_refit(&x, &y, &s, &x_star, c.z, &mean_p, &weight_p, &nll_p);
-            let mut diff = c.beta.clone();
-            diff.scaled_add(-1.0, &beta_ref);
-            assert!(
-                vec_norm(&diff) <= c.beta_error_bound + 1e-6,
-                "fallback coefficients at z={} drifted {} from the oracle refit (bound {})",
-                c.z,
-                vec_norm(&diff),
-                c.beta_error_bound
-            );
-            let member_ref = oracle_glm_membership(&x, &y, &x_star, c.z, alpha, &beta_ref, &mean_p);
-            assert_eq!(
-                c.member, member_ref,
-                "fallback membership at z={} disagrees with the oracle refit",
-                c.z
-            );
-        }
     }
 
     /// A v28 or older payload persisted the training `x` and `y` beside `s_lambda` in the
@@ -2549,6 +1298,338 @@ mod tests {
             row.certificate,
             ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure)
         );
-        assert!(penalty.with_labeled_rows(x.slice(ndarray::s![.., ..2]).to_owned(), y).is_err());
+        assert!(
+            penalty
+                .with_labeled_rows(x.slice(ndarray::s![.., ..2]).to_owned(), y)
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod smoothed_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn ridge_set_keeps_both_boundary_points_excluded() {
+        let engine = ExactGaussianFullConformal::new_with_uniform(
+            &array![[1.0]],
+            &array![1.0],
+            &array![1.0],
+            &array![[1.0]],
+            &array![1.0],
+            0.5,
+        )
+        .unwrap();
+        let set = engine.prediction_set(0.6).unwrap();
+        assert_eq!(set.intervals.len(), 1);
+        let interval = &set.intervals[0];
+        assert_eq!((interval.lo, interval.hi), (-1.0, 1.0));
+        assert!(!interval.lo_closed && !interval.hi_closed);
+        assert!(interval.contains(0.0));
+        assert!(!interval.contains(-1.0) && !interval.contains(1.0));
+    }
+
+    #[test]
+    fn persistent_ties_and_singletons_follow_the_same_uniform() {
+        for u in [0.0, 0.25, 0.5, 0.75, 1.0 - f64::EPSILON] {
+            let engine = ExactGaussianFullConformal::new_with_uniform(
+                &array![[1.0]],
+                &array![0.0],
+                &array![1.0],
+                &array![[0.0]],
+                &array![1.0],
+                u,
+            )
+            .unwrap();
+            let set = engine.prediction_set(0.5).unwrap();
+            assert_eq!(set.intervals.is_empty(), u <= 0.5);
+            if u > 0.5 {
+                assert_eq!(set.intervals.len(), 1);
+                assert_eq!(
+                    (set.intervals[0].lo, set.intervals[0].hi),
+                    (f64::NEG_INFINITY, f64::INFINITY)
+                );
+                assert!(set.intervals[0].contains(0.0));
+                assert!(!set.intervals[0].contains(f64::INFINITY));
+            }
+            let singleton = ExactGaussianFullConformal::new_with_uniform(
+                &array![[0.0]],
+                &array![0.0],
+                &array![1.0],
+                &array![[1.0]],
+                &array![1.0],
+                u,
+            )
+            .unwrap()
+            .prediction_set(0.5)
+            .unwrap();
+            assert_eq!(singleton.intervals.is_empty(), u <= 0.5);
+            if u > 0.5 {
+                assert_eq!(
+                    singleton.intervals,
+                    vec![ConformalInterval::closed(0.0, 0.0)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_uniform_alpha_and_overflow_are_refused() {
+        // Rounding a nonzero root to zero would misclassify an atom at zero.
+        let underflow = ExactGaussianFullConformal {
+            u: array![1e-200, 0.0],
+            w: array![1e200, 1.0],
+            n: 1,
+            tie_uniform: 0.5,
+        };
+        assert!(
+            underflow
+                .prediction_set(0.6)
+                .unwrap_err()
+                .contains("breakpoint")
+        );
+
+        for u in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.0] {
+            assert!(
+                ExactGaussianFullConformal::new_with_uniform(
+                    &array![[1.0]],
+                    &array![0.0],
+                    &array![1.0],
+                    &array![[1.0]],
+                    &array![1.0],
+                    u,
+                )
+                .is_err()
+            );
+        }
+        let engine = ExactGaussianFullConformal::new_with_uniform(
+            &array![[1.0]],
+            &array![0.0],
+            &array![1.0],
+            &array![[0.0]],
+            &array![1e100],
+            0.5,
+        )
+        .unwrap();
+        assert!(engine.w[1] > 0.0);
+        let set = engine.prediction_set(0.6).unwrap();
+        assert_eq!(set.intervals.len(), 2);
+        assert!(set.intervals[0].contains(-1.0) && set.intervals[1].contains(1.0));
+        assert!(!set.intervals.iter().any(|piece| piece.contains(0.0)));
+        for alpha in [0.0, 1.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(engine.prediction_set(alpha).is_err());
+        }
+        assert!(
+            ExactGaussianFullConformal::new_with_uniform(
+                &array![[1.0]],
+                &array![0.0],
+                &array![1.0],
+                &array![[0.0]],
+                &array![1e200],
+                0.5,
+            )
+            .err()
+            .unwrap()
+            .contains("leverage")
+        );
+        // An augmented SPD normal is insufficient when training is singular.
+        assert!(
+            ExactGaussianFullConformal::new_with_uniform(
+                &array![[0.0]],
+                &array![0.0],
+                &array![1.0],
+                &array![[0.0]],
+                &array![1.0],
+                0.5,
+            )
+            .err()
+            .unwrap()
+            .contains("training normal")
+        );
+    }
+
+    #[test]
+    fn affine_inversion_matches_augmented_refits_and_permutations() {
+        let x = array![[1.0, -1.0], [1.0, -0.4], [1.0, 0.1], [1.0, 0.6], [1.0, 1.2]];
+        let y = array![-1.0, 0.5, -0.3, 1.2, 0.7];
+        let penalty = array![[0.4, 0.0], [0.0, 0.8]];
+        let star = array![1.0, 0.35];
+        let weights = Array1::ones(5);
+        let order = [2, 4, 0, 3, 1];
+        let mut normal = x.t().dot(&x) + &penalty;
+        for i in 0..2 {
+            for j in 0..2 {
+                normal[[i, j]] += star[i] * star[j];
+            }
+        }
+        let chol = normal.cholesky(Side::Lower).unwrap();
+        for u in [0.1, 0.5, 0.9] {
+            let engine =
+                ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &penalty, &star, u)
+                    .unwrap();
+            let permuted = ExactGaussianFullConformal::new_with_uniform(
+                &x.select(ndarray::Axis(0), &order),
+                &y.select(ndarray::Axis(0), &order),
+                &weights,
+                &penalty,
+                &star,
+                u,
+            )
+            .unwrap();
+            for alpha in [0.15, 0.4, 0.8] {
+                let set = engine.prediction_set(alpha).unwrap();
+                let reordered = permuted.prediction_set(alpha).unwrap();
+                for k in -32..=32 {
+                    let z = k as f64 / 8.0;
+                    let beta = chol.solvevec(&(x.t().dot(&y) + &star * z));
+                    let test = (z - star.dot(&beta)).abs();
+                    let scores: Vec<_> = x
+                        .rows()
+                        .into_iter()
+                        .zip(y.iter())
+                        .map(|(r, &v)| (v - r.dot(&beta)).abs())
+                        .collect();
+                    let greater = scores.iter().filter(|&&e| e > test).count();
+                    let tied = scores.iter().filter(|&&e| e == test).count();
+                    let expected = greater as f64 + u * (1 + tied) as f64 > alpha * 6.0;
+                    let member = set.intervals.iter().any(|piece| piece.contains(z));
+                    assert_eq!(member, expected, "z={z}, U={u}, alpha={alpha}");
+                    assert_eq!(
+                        member,
+                        reordered.intervals.iter().any(|piece| piece.contains(z))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn honest_frozen_path_preserves_uniform_and_empty_set() {
+        use super::honest::honest_full_conformal_with_uniform;
+        let x = array![[1.0]];
+        let y = array![0.0];
+        let weights = array![1.0];
+        let penalty = array![[0.0]];
+        let star = array![1.0];
+        for u in [0.0, 0.2, 0.8] {
+            let result = honest_full_conformal_with_uniform(
+                &x,
+                &y,
+                &weights,
+                &penalty,
+                Some(0),
+                &star,
+                0.5,
+                u,
+            )
+            .unwrap();
+            let direct =
+                ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &penalty, &star, u)
+                    .unwrap()
+                    .prediction_set(0.5)
+                    .unwrap();
+            assert_eq!(result.set.intervals, direct.intervals);
+        }
+        assert!(
+            honest_full_conformal_with_uniform(
+                &x,
+                &y,
+                &weights,
+                &penalty,
+                Some(0),
+                &star,
+                0.5,
+                1.0
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn empty_randomized_set_has_no_point_envelope() {
+        let substrate = ExactFullConformalSubstrate {
+            x: array![[1.0]],
+            y: array![0.0],
+            s_lambda: array![[0.0]],
+            penalty_count: Some(0),
+        };
+        let empty = substrate
+            .interval_with_uniform(&array![1.0], 0.5, 0.25)
+            .unwrap();
+        assert!(empty.set.intervals.is_empty());
+        assert!(empty.lo.is_nan() && empty.hi.is_nan());
+        let whole = substrate
+            .interval_with_uniform(&array![1.0], 0.5, 0.75)
+            .unwrap();
+        assert_eq!((whole.lo, whole.hi), (f64::NEG_INFINITY, f64::INFINITY));
+        assert!(whole.set.intervals[0].contains(0.0));
+    }
+    #[test]
+    fn rounded_rational_roots_use_actual_endpoint_rank() {
+        // For these exact coefficients, FMA computes each comparison sign
+        // without the false zero produced by separate multiplication/addition.
+        let controls = [(3.0, 0.4, 0.6), (10.0, 0.8, 0.6)];
+        for (slope, uniform, alpha) in controls {
+            let engine = ExactGaussianFullConformal {
+                u: array![1.0, 0.0],
+                w: array![0.0, slope],
+                n: 1,
+                tie_uniform: uniform,
+            };
+            let root = 1.0 / slope;
+            assert_ne!((-slope).mul_add(root, 1.0), 0.0);
+            let set = engine.prediction_set(alpha).unwrap();
+            for z in [root.next_down(), root, root.next_up()] {
+                let difference = (-slope).mul_add(z, 1.0);
+                let sum = slope.mul_add(z, 1.0);
+                let greater = usize::from(difference.signum() == sum.signum());
+                let tied = usize::from(difference == 0.0 || sum == 0.0);
+                let expected = greater as f64 + uniform * (1 + tied) as f64 > alpha * 2.0;
+                assert_eq!(
+                    set.intervals.iter().any(|piece| piece.contains(z)),
+                    expected,
+                    "slope={slope}, z={z:.18e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn colliding_rounded_roots_do_not_create_false_ties() {
+        let root = 1.0f64 / 3.0;
+        let second_intercept = 1.0f64.next_up();
+        let second_denominator = 3.0f64.next_up().next_up();
+        assert_eq!(second_intercept / second_denominator, root);
+        let second_slope = 4.0 - second_denominator;
+        assert!((-3.0f64).mul_add(root, 1.0) > 0.0);
+        assert!((-second_denominator).mul_add(root, second_intercept) < 0.0);
+        for (uniform, alpha) in [(0.2, 0.3), (0.8, 0.7)] {
+            let engine = ExactGaussianFullConformal {
+                u: array![1.0, second_intercept, 0.0],
+                w: array![1.0, second_slope, 4.0],
+                n: 2,
+                tie_uniform: uniform,
+            };
+            let set = engine.prediction_set(alpha).unwrap();
+            for z in [root.next_down(), root, root.next_up()] {
+                let mut greater = 0usize;
+                let mut tied = 0usize;
+                for (intercept, slope) in [(1.0, 1.0), (second_intercept, second_slope)] {
+                    let difference = (slope - 4.0).mul_add(z, intercept);
+                    let sum = (slope + 4.0).mul_add(z, intercept);
+                    tied += usize::from(difference == 0.0 || sum == 0.0);
+                    greater += usize::from(
+                        difference != 0.0 && sum != 0.0 && difference.signum() == sum.signum(),
+                    );
+                }
+                let expected = greater as f64 + uniform * (1 + tied) as f64 > alpha * 3.0;
+                assert_eq!(
+                    set.intervals.iter().any(|piece| piece.contains(z)),
+                    expected,
+                    "U={uniform}, alpha={alpha}, z={z:.18e}"
+                );
+            }
+        }
     }
 }

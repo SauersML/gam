@@ -473,52 +473,52 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
 
             if model.predict_model_class() == PredictModelClass::BernoulliMarginalSlope {
                 let y = ds.values.column(y_col).to_owned();
-                if let Some(predictor) = model.predictor() {
-                    let (report_offset, report_noise_offset) = resolve_predict_offsets(
-                        &model,
-                        &ds,
-                        &col_map,
-                        saved_offset_column,
-                        saved_noise_offset_column,
-                    )?;
-                    let pred_input = build_predict_input_for_model(
-                        &model,
-                        ds.values.view(),
-                        &col_map,
-                        training_headers,
-                        &report_offset,
-                        &report_noise_offset,
-                        saved_noise_offset_column.is_some(),
-                    )?;
-                    let pred = predictor
-                        .predict_plugin_response(&pred_input)
-                        .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
+                let predictor = model.predictor()
+                    .map_err(|reason| format!("prediction for report diagnostics failed: {reason}"))?;
+                let (report_offset, report_noise_offset) = resolve_predict_offsets(
+                    &model,
+                    &ds,
+                    &col_map,
+                    saved_offset_column,
+                    saved_noise_offset_column,
+                )?;
+                let pred_input = build_predict_input_for_model(
+                    &model,
+                    ds.values.view(),
+                    &col_map,
+                    training_headers,
+                    &report_offset,
+                    &report_noise_offset,
+                    saved_noise_offset_column.is_some(),
+                )?;
+                let pred = predictor
+                    .predict_plugin_response(&pred_input)
+                    .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
 
-                    // Bernoulli response: randomized-quantile residuals (the
-                    // raw y − p residual is two-valued and can never track a
-                    // normal Q-Q reference), plus equal-count calibration
-                    // deciles.
-                    let y_vec = y.to_vec();
-                    let p_vec = pred.mean.to_vec();
-                    let leverage = alo_data
-                        .as_ref()
-                        .map(|alo| alo.rows.iter().map(|row| row.leverage).collect::<Vec<_>>());
-                    let residuals = report_residual_diagnostics(
-                        &ResponseFamily::Binomial,
-                        &y_vec,
-                        &p_vec,
-                        leverage.as_deref(),
-                        edf_total,
-                        &mut notes,
-                    )?;
-                    let calibration = binary_calibration_deciles(&y_vec, &p_vec);
-                    diagnostics = Some(report::DiagnosticsInput {
-                        residuals,
-                        y_observed: y_vec,
-                        y_predicted: p_vec,
-                        calibration,
-                    });
-                }
+                // Bernoulli response: randomized-quantile residuals (the
+                // raw y − p residual is two-valued and can never track a
+                // normal Q-Q reference), plus equal-count calibration
+                // deciles.
+                let y_vec = y.to_vec();
+                let p_vec = pred.mean.to_vec();
+                let leverage = alo_data
+                    .as_ref()
+                    .map(|alo| alo.rows.iter().map(|row| row.leverage).collect::<Vec<_>>());
+                let residuals = report_residual_diagnostics(
+                    &ResponseFamily::Binomial,
+                    &y_vec,
+                    &p_vec,
+                    leverage.as_deref(),
+                    edf_total,
+                    &mut notes,
+                )?;
+                let calibration = binary_calibration_deciles(&y_vec, &p_vec);
+                diagnostics = Some(report::DiagnosticsInput {
+                    residuals,
+                    y_observed: y_vec,
+                    y_predicted: p_vec,
+                    calibration,
+                });
             } else if matches!(
                 model.predict_model_class(),
                 PredictModelClass::Standard | PredictModelClass::BinomialLocationScale

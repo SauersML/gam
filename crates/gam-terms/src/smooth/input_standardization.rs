@@ -1,29 +1,8 @@
 //! Isotropic input-scale estimation for Euclidean spatial smooths.
 
 use crate::{IsotropicScale, basis::BasisError};
+use gam_math::sparse_grid::CompensatedSum;
 use ndarray::ArrayView2;
-
-#[derive(Default)]
-struct CompensatedSum {
-    sum: f64,
-    correction: f64,
-}
-
-impl CompensatedSum {
-    fn add(&mut self, value: f64) {
-        let next = self.sum + value;
-        self.correction += if self.sum.abs() >= value.abs() {
-            (self.sum - next) + value
-        } else {
-            (value - next) + self.sum
-        };
-        self.sum = next;
-    }
-
-    fn total(&self) -> f64 {
-        self.sum + self.correction
-    }
-}
 
 /// Compute an **isotropic** input scale for spatial inputs — a single spread
 /// value applied to every covariate axis.
@@ -127,9 +106,9 @@ pub fn estimate_isotropic_scale(x: ArrayView2<'_, f64>) -> Result<IsotropicScale
             mean += delta / count;
             m2.add(delta * (normalized - mean));
         }
-        trace.add(m2.total() / (count - 1.0));
+        trace.add(m2.value() / (count - 1.0));
     }
-    let normalized_trace = trace.total();
+    let normalized_trace = trace.value();
     if !(normalized_trace.is_finite() && normalized_trace > 0.0) {
         return Err(BasisError::InvalidInput(
             "cannot estimate an isotropic scale from a zero-spread cloud".to_string(),

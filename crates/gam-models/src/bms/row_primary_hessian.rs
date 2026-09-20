@@ -386,6 +386,16 @@ impl BernoulliMarginalSlopeFamily {
             "bernoulli marginal-slope intercept",
             || format!("row {row}, q={}, b={slope}", marginal.q),
         )?;
+        // The residual admits a probe whose tail underflowed or whose `P′`
+        // vanished (it only reads its sign), so the root's own `P′` is checked
+        // here: the implicit derivatives divide by it (gam#3216).
+        if !(density.is_finite() && density > 0.0) {
+            return Err(format!(
+                "bernoulli marginal-slope intercept has invalid F_a={density:e} at its root \
+                 (row {row}, q={}, b={slope})",
+                marginal.q
+            ));
+        }
         if let Some(stats) = stats {
             if let Some((residual, resolution)) = seed_residual {
                 stats.record_seed_residual(residual, resolution);

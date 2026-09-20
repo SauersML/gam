@@ -129,6 +129,23 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
 }
 
 #[test]
+fn persistent_fingerprint_refuses_invalid_block_rows_and_tolerance() {
+    let family = test_family_with_intercept_designs(array![0.0, 1.0], array![1.0, 1.0], array![-1.0, 1.0]);
+    let mut options = BlockwiseFitOptions::default();
+    let mut specs = vec![dummy_blockspec(1, 2)];
+    assert!(family.persistent_warm_start_fingerprint(&specs, &options).is_some());
+    assert!(family.persistent_warm_start_fingerprint(&[], &options).is_none());
+    assert!(family.persistent_warm_start_fingerprint(&[dummy_blockspec(1, 1)], &options).is_none());
+    specs[0].offset = Array1::zeros(1);
+    assert!(family.persistent_warm_start_fingerprint(&specs, &options).is_none());
+    specs[0].offset = Array1::zeros(2);
+    for tolerance in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        options.inner_tol = tolerance;
+        assert!(family.persistent_warm_start_fingerprint(&specs, &options).is_none());
+    }
+}
+
+#[test]
 fn bernoulli_marginal_slope_declares_its_certified_multistart_levels() {
     // Every declared start gets its own full certified search in a parallel
     // multistart (gnomon#2359); the family names them, nothing ranks them.
@@ -2515,16 +2532,18 @@ fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
         "Hessian should be finite"
     );
 
-    let dummy_spec = dummy_blockspec(link_dim, seed.len());
+    // Each lookup is posed against a spec as wide as its own block (#3546).
+    let slope_spec = dummy_blockspec(1, seed.len());
     assert!(
         family
-            .block_linear_constraints(&block_states, 1, &dummy_spec)
+            .block_linear_constraints(&block_states, 1, &slope_spec)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "non-link constraint lookup", e))
             .is_none(),
         "non-link block should not expose auxiliary monotonicity constraints"
     );
+    let link_spec = dummy_blockspec(link_dim, seed.len());
     let constraints = family
-        .block_linear_constraints(&block_states, 2, &dummy_spec)
+        .block_linear_constraints(&block_states, 2, &link_spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "link constraint lookup", e))
         .expect("link constraints");
     assert_eq!(constraints.ncols(), link_dim);
@@ -7105,7 +7124,9 @@ fn first_stage_sandwich_is_finite_on_rank_deficient_normal_matrix() {
     let var_basis = Array2::<f64>::ones((n, 1));
     let var_normal = Array2::<f64>::from_elem((1, 1), n as f64);
     let var_residuals: Vec<f64> = residuals.iter().map(|&e| e * e - 0.25).collect();
-    let joint = stacked_first_stage_sandwich_cov(
+    // The production covariance is the Gram of the stacked row influence
+    // (gam#3452), so the test drives that path.
+    let joint = stacked_first_stage_row_influence(
         basis.view(),
         var_basis.view(),
         weights.view(),
@@ -7114,6 +7135,7 @@ fn first_stage_sandwich_is_finite_on_rank_deficient_normal_matrix() {
         &normal_matrix,
         &var_normal,
     )
+    .and_then(|psi| first_stage_covariance_from_row_influence(&psi))
     .unwrap_or_else(|e| {
         panic!(
             "{} failed: {:?}",

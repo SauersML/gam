@@ -78,7 +78,7 @@ impl Scenario {
 }
 
 fn contains(set: &FullConformalSet, z: f64) -> bool {
-    set.intervals.iter().any(|itv| itv.lo <= z && z <= itv.hi)
+    set.intervals.iter().any(|itv| itv.contains(z))
 }
 
 fn unit_weights(n: usize) -> Array1<f64> {
@@ -134,9 +134,8 @@ fn brute_force_rho(response: &GaussianRemlRhoResponse<'_>, z: Option<f64>) -> f6
 }
 
 /// Brute-force membership of `z` in the honest set: the global REML minimizer
-/// over the augmented domain, then the explicit augmented fit and its smoothed
-/// residual rank `#{e_i > e_*} + U·(1 + #{e_i = e_*}) > α(n + 1)`.
-#[allow(clippy::too_many_arguments)]
+/// over the augmented domain, then the explicit augmented fit and its residual
+/// rank.
 fn oracle_member(
     response: &GaussianRemlRhoResponse<'_>,
     x: &Array2<f64>,
@@ -145,7 +144,6 @@ fn oracle_member(
     x_star: &Array1<f64>,
     z: f64,
     alpha: f64,
-    tie_uniform: f64,
 ) -> bool {
     let lambda = brute_force_rho(response, Some(z)).exp();
     let mut normal = x.t().dot(x) + s_lambda * lambda;
@@ -166,9 +164,9 @@ fn oracle_member(
         .zip(y.iter())
         .map(|(row, yi)| (*yi - row.dot(&beta)).abs())
         .collect();
-    let greater = scores.iter().filter(|&&e| e > test_score).count();
-    let tied = scores.iter().filter(|&&e| e == test_score).count();
-    greater as f64 + tie_uniform * (1.0 + tied as f64) > alpha * (x.nrows() + 1) as f64
+    let greater = scores.iter().filter(|&&v| v > test_score).count();
+    let tied = scores.iter().filter(|&&v| v == test_score).count();
+    greater as f64 + 0.5 * (1 + tied) as f64 > alpha * (x.nrows() + 1) as f64
 }
 
 struct OracleReport {
@@ -189,17 +187,27 @@ fn oracle_compare(
     alpha: f64,
 ) -> OracleReport {
     let n = x.nrows();
-    let honest = honest_full_conformal(x, y, &unit_weights(n), s_lambda, Some(1), x_star, alpha)
-        .expect("honest set");
+    let honest = honest_full_conformal_with_uniform(
+        x,
+        y,
+        &unit_weights(n),
+        s_lambda,
+        Some(1),
+        x_star,
+        alpha,
+        0.5,
+    )
+    .expect("honest set");
     assert_eq!(
         honest.certificate,
         ConformalCertificate::HonestRefit,
         "single-penalty Gaussian row must carry the honest certificate"
     );
-    let frozen_engine = ExactGaussianFullConformal::new(x, y, &unit_weights(n), s_lambda, x_star)
-        .expect("frozen engine");
-    let tie_uniform = frozen_engine.tie_uniform();
-    let frozen = frozen_engine.prediction_set(alpha);
+    let frozen =
+        ExactGaussianFullConformal::new_with_uniform(x, y, &unit_weights(n), s_lambda, x_star, 0.5)
+            .expect("frozen engine")
+            .prediction_set(alpha)
+            .expect("prediction set");
     let response = GaussianRemlRhoResponse::new(x, y, s_lambda, x_star).expect("response");
 
     let center = honest.plug_in_mean;
@@ -226,7 +234,7 @@ fn oracle_compare(
         .into_iter()
         .flat_map(|scale| [center - scale * half_width, center + scale * half_width]);
     for z in grid.chain(tails) {
-        let truth = oracle_member(&response, x, y, s_lambda, x_star, z, alpha, tie_uniform);
+        let truth = oracle_member(&response, x, y, s_lambda, x_star, z, alpha);
         let near_breakpoint = endpoints.iter().any(|e| (z - e).abs() <= spacing);
         if contains(&honest.set, z) != truth && !near_breakpoint {
             honest_mismatches.push(z);
@@ -251,9 +259,14 @@ fn honest_set_matches_brute_force_reml_refits() {
     let cases: Vec<(Scenario, usize, u64, f64)> = Scenario::ALL
         .into_iter()
         .flat_map(|scenario| {
-            [(12usize, 11u64, 0.2), (20, 23, 0.1), (30, 37, 0.1), (40, 41, 0.2)]
-                .into_iter()
-                .map(move |(n, seed, alpha)| (scenario, n, seed, alpha))
+            [
+                (12usize, 11u64, 0.2),
+                (20, 23, 0.1),
+                (30, 37, 0.1),
+                (40, 41, 0.2),
+            ]
+            .into_iter()
+            .map(move |(n, seed, alpha)| (scenario, n, seed, alpha))
         })
         .collect();
     let reports: Vec<_> = cases
@@ -301,8 +314,17 @@ fn honest_set_does_not_depend_on_the_stored_strength() {
     let (x, y, x_star, _) = Scenario::Heteroscedastic.sample(25, 5);
     let s = curvature_penalty();
     let set_at = |scale: f64| {
-        honest_full_conformal(&x, &y, &unit_weights(25), &(&s * scale), Some(1), &x_star, 0.1)
-            .expect("honest set")
+        honest_full_conformal_with_uniform(
+            &x,
+            &y,
+            &unit_weights(25),
+            &(&s * scale),
+            Some(1),
+            &x_star,
+            0.1,
+            0.5,
+        )
+        .expect("honest set")
     };
     let base = set_at(1.0);
     assert_eq!(base.certificate, ConformalCertificate::HonestRefit);
@@ -326,16 +348,33 @@ fn honest_set_does_not_depend_on_the_stored_strength() {
 fn unsupported_penalty_structures_are_refused_loudly() {
     let (x, y, x_star, _) = Scenario::HeavyTails.sample(20, 9);
     let s = curvature_penalty();
-    let frozen = ExactGaussianFullConformal::new(&x, &y, &unit_weights(20), &s, &x_star)
-        .expect("frozen")
-        .prediction_set(0.1);
+    let frozen =
+        ExactGaussianFullConformal::new_with_uniform(&x, &y, &unit_weights(20), &s, &x_star, 0.5)
+            .expect("frozen")
+            .prediction_set(0.1)
+            .expect("prediction set");
     for (count, expected) in [
-        (None, ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure)),
-        (Some(2), ConformalCertificate::Refused(ConformalRefusal::MultiPenalty)),
+        (
+            None,
+            ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure),
+        ),
+        (
+            Some(2),
+            ConformalCertificate::Refused(ConformalRefusal::MultiPenalty),
+        ),
         (Some(0), ConformalCertificate::ExactFrozen),
     ] {
-        let row = honest_full_conformal(&x, &y, &unit_weights(20), &s, count, &x_star, 0.1)
-            .expect("row");
+        let row = honest_full_conformal_with_uniform(
+            &x,
+            &y,
+            &unit_weights(20),
+            &s,
+            count,
+            &x_star,
+            0.1,
+            0.5,
+        )
+        .expect("row");
         assert_eq!(row.certificate, expected, "penalty count {count:?}");
         assert_eq!(row.certificate.is_guaranteed(), count == Some(0));
         assert_eq!(row.set.intervals, frozen.intervals, "penalty count {count:?}");
@@ -424,10 +463,7 @@ fn replicate(scenario: Scenario, n: usize, seed: u64) -> Replicate {
 
 /// Coverage of every row class, `n ∈ {20, 50, 200}`, three misspecified noise
 /// laws, `α ∈ {0.1, 0.05}` from the same replicates: `≥ 1 − α − 2·MCSE`, no row
-/// excluded. The symmetric maps — the honest refit and the fixed penalty — are
-/// exact with the smoothed p-value, so their coverage is also `≤ 1 − α +
-/// 3·MCSE`; the refused rows freeze a λ̂ that saw `y` but not `y_*`, and only
-/// the lower bound is claimed for them. Also reports the cost of the honest rows: one factorization each,
+/// excluded. Also reports the cost of the honest rows: one factorization each,
 /// and the median number of local refits.
 #[test]
 fn full_conformal_coverage_holds_for_every_row_class() {
@@ -470,13 +506,6 @@ fn full_conformal_coverage_holds_for_every_row_class() {
                         1.0 - alpha - 2.0 * mcse
                     ));
                 }
-                let symmetric = label == "honest_refit" || label == "exact_frozen";
-                if symmetric && coverage > 1.0 - alpha + 3.0 * mcse {
-                    failures.push(format!(
-                        "{scenario:?} n={n} α={alpha} {label}: {coverage:.4} > {:.4}",
-                        1.0 - alpha + 3.0 * mcse
-                    ));
-                }
             }
             // Every K = 1 row is honest: none silently fell back.
             for a in 0..ALPHAS.len() {
@@ -495,6 +524,6 @@ fn full_conformal_coverage_holds_for_every_row_class() {
         "honest rows: median extra refits {median}, max {}, one factorization each",
         all_refits.last().copied().unwrap_or(0)
     );
-    assert!(failures.is_empty(), "coverage outside its band: {failures:#?}");
+    assert!(failures.is_empty(), "coverage below 1 − α − 2·MCSE: {failures:#?}");
     assert!(median <= 2, "median extra refits per honest row is {median}");
 }

@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use crate::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_linalg::pairwise_reduce::{pairwise_sum, pairwise_sum_max_depth};
+use gam_math::probability::positive_log_sum_exp;
 use gam_math::special::bessel_i0_log_minus_abs_and_ratio;
 
 // ---------------------------------------------------------------------------
@@ -920,16 +921,10 @@ impl GaussianMixtureFit {
         let log_w: Vec<f64> = self.weights.iter().map(|w| w.ln()).collect();
         for i in 0..n {
             let row = data.row(i);
-            let mut log_terms = vec![f64::NEG_INFINITY; self.k];
-            let mut max_term = f64::NEG_INFINITY;
-            for j in 0..self.k {
-                let lt = log_w[j] + comp[j].log_density(row);
-                log_terms[j] = lt;
-                if lt > max_term {
-                    max_term = lt;
-                }
-            }
-            out[i] = log_sum_exp(&log_terms, max_term);
+            let log_terms: Vec<f64> = (0..self.k)
+                .map(|j| log_w[j] + comp[j].log_density(row))
+                .collect();
+            out[i] = positive_log_sum_exp(&log_terms);
         }
         Ok(out)
     }
@@ -1051,18 +1046,6 @@ impl GaussianComponentEval {
         }
         out
     }
-}
-
-#[inline]
-fn log_sum_exp(terms: &[f64], max_term: f64) -> f64 {
-    if !max_term.is_finite() {
-        return f64::NEG_INFINITY;
-    }
-    let mut acc = 0.0_f64;
-    for &t in terms {
-        acc += (t - max_term).exp();
-    }
-    max_term + acc.ln()
 }
 
 fn evidence_matrix_fingerprint(namespace: &str, values: ArrayView2<'_, f64>) -> Fingerprint {
@@ -1535,14 +1518,12 @@ fn mixture_e_step(
     let mut row_log_likelihoods = Vec::with_capacity(n);
     for row in 0..n {
         let observation = data.row(row);
-        let mut log_terms = vec![f64::NEG_INFINITY; k];
-        let mut max_term = f64::NEG_INFINITY;
-        for component in 0..k {
-            let term = log_weights[component] + components[component].log_density(observation);
-            log_terms[component] = term;
-            max_term = max_term.max(term);
-        }
-        let log_mixture = log_sum_exp(&log_terms, max_term);
+        let log_terms: Vec<f64> = (0..k)
+            .map(|component| {
+                log_weights[component] + components[component].log_density(observation)
+            })
+            .collect();
+        let log_mixture = positive_log_sum_exp(&log_terms);
         if !log_mixture.is_finite() {
             return Err(format!(
                 "mixture density is non-finite at training row {row}"
@@ -1849,17 +1830,15 @@ fn ring_mixture_log_terms(
     let mut terms = Array2::<f64>::zeros((data.nrows(), weights.len()));
     let mut row_log_likelihoods = Vec::with_capacity(data.nrows());
     for row in 0..data.nrows() {
-        let mut max_term = f64::NEG_INFINITY;
         for component in 0..weights.len() {
             let dx = data[[row, 0]] - means[[component, 0]];
             let dy = data[[row, 1]] - means[[component, 1]];
             let term =
                 weights[component].ln() + log_normalizer - 0.5 * (dx * dx + dy * dy) / variance;
             terms[[row, component]] = term;
-            max_term = max_term.max(term);
         }
         let values = terms.row(row).to_vec();
-        let log_likelihood = log_sum_exp(&values, max_term);
+        let log_likelihood = positive_log_sum_exp(&values);
         if !log_likelihood.is_finite() {
             return Err(format!(
                 "ring-of-clusters density is non-finite at training row {row}"
@@ -2123,8 +2102,7 @@ fn ring_state_from_parameters(
     }
     let mut logits = parameters.iter().take(k - 1).copied().collect::<Vec<_>>();
     logits.push(0.0);
-    let max_logit = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let log_normalizer = log_sum_exp(&logits, max_logit);
+    let log_normalizer = positive_log_sum_exp(&logits);
     let weights = Array1::from_shape_fn(k, |component| (logits[component] - log_normalizer).exp());
     if weights
         .iter()
