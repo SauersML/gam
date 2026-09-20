@@ -8,6 +8,7 @@ mod bug_hunt_expectile_cli_fit_aborts_on_frailty_guard;
 mod bug_hunt_explicit_family_emits_wrong_inferred_family_note;
 mod latent_measure_request_document_2956;
 mod latent_residual_cli_3016;
+mod observation_interval_prior_weights_4479;
 mod bug_hunt_predict_uncertainty_shifts_point_mean_for_curved_link;
 mod bug_hunt_sas_link_finalize_inner_cap_leak;
 mod bug_hunt_sas_link_outer_inner_cap_guard;
