@@ -925,8 +925,10 @@ pub(crate) use sphere_spectral::{pseudo_s2_truncated_coefficients, sobolev_s2_tr
 /// point value: callers can distinguish an omitted `length_scale` from an
 /// explicit value before and after center planning, and subsequent κ updates
 /// preserve that provenance.  Provenance decides only where the seed comes
-/// from: in either case κ is an outer REML coordinate in every family (#3020),
-/// so an explicit `length_scale=` is the start of that search, not a pin.
+/// from: in either case κ is an outer REML coordinate (#3020), so an explicit
+/// `length_scale=` is the start of that search, not a pin. The one exception
+/// is a Bernoulli marginal-slope fit whose spatial terms all carry explicit
+/// scalar scales, which still pins them until #3430 is fixed.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum MaternLengthScale {
     Auto { resolved: Option<f64> },
@@ -940,6 +942,10 @@ impl MaternLengthScale {
 
     pub const fn fixed(value: f64) -> Self {
         Self::Fixed(value)
+    }
+
+    pub(crate) const fn is_fixed(self) -> bool {
+        matches!(self, Self::Fixed(_))
     }
 
     pub const fn resolved(self) -> Option<f64> {

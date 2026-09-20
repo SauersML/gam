@@ -645,15 +645,17 @@ A Matérn or hybrid-Duchon `length_scale=` is where REML **starts** the kernel
 scale, never a pin: κ = 1/`length_scale` is an outer coordinate searched
 jointly with the smoothing parameters, and which scales are searched is a
 property of the term, decided once for every family (single-surface GAMs,
-location-scale, survival, GAMLSS and Bernoulli marginal-slope alike, #3020).
+location-scale, survival and GAMLSS alike, #3020).
 Omitting it only changes the seed to a data-derived one. Thin-plate has no
 κ coordinate at all (above). `mjs(...)` and `curv(...)` ranges follow the
 mgcv-`sp=` convention instead (an explicit value pins, `learn_length_scale=`
 overrides; [specialized smooths](#specialized-smooths-mjs-curv-pca)).
 
-Two fits hold a scale at its seed rather than searching it: a Bernoulli
-marginal-slope fit with `residual_columns` (the residual row kernel carries
-only smoothing-parameter derivatives, #2924; see
+Three fits hold a scale at its seed rather than searching it: a Bernoulli
+marginal-slope fit whose spatial terms all carry an explicit scalar
+`length_scale=` (its joint κ+ρ outer search stalls there, #3430; the pin goes
+with that fix), a Bernoulli marginal-slope fit with `residual_columns` (the
+residual row kernel carries only smoothing-parameter derivatives, #2924; see
 [marginal-slope.md](marginal-slope.md)), and the measure-jet range on the
 coupled marginal-slope families (below).
 

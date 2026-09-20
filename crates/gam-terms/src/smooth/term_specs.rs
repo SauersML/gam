@@ -3530,6 +3530,35 @@ pub fn set_single_term_constant_curvature_kappa(
     }
 }
 
+/// Returns `true` when a spatial term carries an explicit `length_scale` and
+/// does not enroll REML-side per-axis ψ contrasts. Only the Bernoulli
+/// marginal-slope pin below reads it (#3430).
+fn spatial_term_has_locked_kappa(spec: &TermCollectionSpec, term_idx: usize) -> bool {
+    let explicitly_fixed = spec
+        .smooth_terms
+        .get(term_idx)
+        .is_some_and(|term| match &term.basis {
+            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale.is_fixed(),
+            SmoothBasisSpec::ThinPlate { .. } => true,
+            SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale.is_some(),
+            _ => false,
+        });
+    explicitly_fixed && !spatial_term_uses_per_axis_psi(spec, term_idx)
+}
+
+/// Returns `true` when every spatial term in `spec` carries an explicit scalar
+/// `length_scale=` without anisotropy (vacuously `true` with no spatial term).
+/// Everywhere else an explicit scale seeds its κ coordinate (#3020). The only
+/// reader is the Bernoulli marginal-slope entry point, which still pins such
+/// scales because its joint κ+ρ outer search stalls (#3430); this predicate
+/// goes with that pin.
+pub fn all_spatial_terms_kappa_fixed(spec: &TermCollectionSpec) -> bool {
+    spec.smooth_terms.iter().enumerate().all(|(idx, _)| {
+        !spatial_term_supports_hyper_optimization(spec, idx)
+            || spatial_term_has_locked_kappa(spec, idx)
+    })
+}
+
 pub(crate) fn spatial_identifiability_policy(
     termspec: &SmoothTermSpec,
 ) -> Option<&SpatialIdentifiability> {

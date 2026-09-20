@@ -2302,11 +2302,24 @@ fn fit_bernoulli_marginal_slope_terms_under(
             mjs_frozen_slope
         );
     }
-    // Which kernel scales are outer coordinates is a property of the term spec,
-    // decided once by `spatial_length_scale_term_indices` for every family
-    // (#3020); an explicit `length_scale=` seeds the search here exactly as it
-    // does in the survival, location-scale and single-surface fits.
     let mut effective_kappa_options = kappa_options.clone();
+    // Every other family treats an explicit `length_scale=` as the seed of its
+    // κ coordinate (#3020). This entry point still pins it when every spatial
+    // term in BOTH blocks carries one without anisotropy, because the BMS
+    // joint κ+ρ outer search stalls there (#3430: the n-block ARC ends at an
+    // indefinite point with no progress); the same stall already reds the
+    // omitted-scale BMS Matérn fits. Delete this pin with the #3430 fix.
+    let kappa_locked_marginal =
+        gam_terms::smooth::all_spatial_terms_kappa_fixed(&spec.marginalspec);
+    let kappa_locked_slope =
+        gam_terms::smooth::all_spatial_terms_kappa_fixed(&spec.slopespec);
+    if effective_kappa_options.enabled && kappa_locked_marginal && kappa_locked_slope {
+        log::debug!(
+            "[BMS spatial] disabling κ/ψ optimization: every spatial term has an \
+             explicit length_scale and no anisotropy; user-supplied kernel scale is fixed"
+        );
+        effective_kappa_options.enabled = false;
+    }
     if effective_kappa_options.enabled && spec.residual.is_some() {
         // gam#2924: the residual row kernel differentiates the smoothing
         // coordinates only; a spatial length scale stays at its seed (the
