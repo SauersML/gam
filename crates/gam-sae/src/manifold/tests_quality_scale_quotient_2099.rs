@@ -102,7 +102,9 @@ fn reconstruction_criterion_and_diagnostics_quotient_decoder_scale_2099() {
     let ev0 = term
         .dictionary_reconstruction_ev(target.view(), &rho)
         .unwrap();
-    let uniformity0 = term.coordinate_uniformity_aggregate();
+    let uniformity0 = term
+        .coordinate_uniformity_aggregate()
+        .expect("coordinate uniformity aggregate");
     let occupancy0 = term.per_atom_effective_sample_size();
     let fitted0 = term.try_fitted_for_rho(&rho).unwrap();
     let b0 = term.atoms[0].decoder_coefficients().clone();
@@ -143,7 +145,9 @@ fn reconstruction_criterion_and_diagnostics_quotient_decoder_scale_2099() {
     // Coordinate-uniformity and per-atom occupancy do not read absolute decoder
     // magnitude. The arc-length defect computes a scale-cancelling floating-point
     // ratio, so it is invariant to machine roundoff; occupancy is byte-identical.
-    let uniformity1 = term.coordinate_uniformity_aggregate();
+    let uniformity1 = term
+        .coordinate_uniformity_aggregate()
+        .expect("coordinate uniformity aggregate");
     match (uniformity0, uniformity1) {
         (Some(before), Some(after)) => {
             let roundoff = f64::EPSILON * (1.0 + before.abs().max(after.abs()));
