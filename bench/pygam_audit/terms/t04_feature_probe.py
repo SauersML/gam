@@ -49,7 +49,7 @@ probes = [
     "y ~ s(x, shape=monotone_increasing, knot_placement=uniform)",
     "y ~ s(x, shape=monotone_increasing, bc=clamped)",
     "y ~ s(x, shape=monotone_increasing, identifiability=none)",
-    "y ~ s(x, shape=monotone_increasing, type=duchon)",
+    "y ~ s(x, shape=monotone_increasing, bs=duchon)",
     "y ~ duchon(x, shape=monotone_increasing)",
     "y ~ tps(x, shape=monotone_increasing)",
     "y ~ matern(x, shape=monotone_increasing)",
@@ -58,7 +58,7 @@ probes = [
     # periodic
     "y ~ cyclic(t, period=24)",
     "y ~ s(t, period=24)",
-    "y ~ cp(t, period_start=0, period_end=24)",
+    "y ~ cyclic(t, period_start=0, period_end=24)",
     # by
     "y ~ s(x, by=z)",
     "y ~ s(x, by=g) + g",

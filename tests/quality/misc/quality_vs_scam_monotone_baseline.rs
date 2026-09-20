@@ -180,7 +180,7 @@ fn gam_monotone_baseline_recovers_log_cumhaz_truth() {
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        "Surv(t, event) ~ s(x, bs='tp') + survmodel(spec=net)",
+        "Surv(t, event) ~ s(x, bs='tps') + survmodel(spec=net)",
         &ds,
         &cfg,
     )

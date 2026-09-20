@@ -23,7 +23,6 @@
 //! each smooth term directly from the data.
 
 use crate::estimate::reml::{DirectionalHyperParam, RemlState};
-use std::fmt;
 
 // Crate-level imports
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
@@ -73,6 +72,7 @@ pub mod rho_domain;
 mod penalty;
 mod prefit;
 pub(crate) mod smoothing_correction;
+mod parametric_term_summary;
 mod smooth_term_summary;
 mod summary;
 
@@ -91,7 +91,7 @@ pub use edf_accounting::{
     EdfBundle, EdfRankBound, EdfRankCertificate, collapsed_to_penalty_null_space,
     numerical_rank_bound, penalized_edf_bundle_within_bands, sparse_numerical_rank_bound,
 };
-pub use evaluation::{evaluate_externalcost, evaluate_externalgradient};
+pub use evaluation::{evaluate_externalcost, evaluate_externalgradient, evaluate_externalhessian};
 pub use external_options::{ExternalOptimOptions, ExternalOptimResult};
 pub(crate) use external_options::{
     effective_sas_link_for_family, resolved_external_config, validate_penalty_spec_shape,
@@ -124,11 +124,12 @@ pub use smoothing_correction::{
     EigenClassification, InvertedRhoHessian, invert_identified_rho_hessian,
     invert_identified_rho_hessian_off_railed,
 };
+pub use parametric_term_summary::parametric_term_summary_rows;
 pub use smooth_term_summary::{
     SummaryBlockOffset, smooth_pvalue_unavailable, smooth_term_summary_rows,
 };
 pub use summary::{
-    ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus, ModelSummary,
+    ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus,
     ParametricTermSummary, SmoothPValueUnavailable, SmoothTermSummary,
 };
 

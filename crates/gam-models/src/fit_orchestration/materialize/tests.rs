@@ -456,10 +456,19 @@ fn saved_standard_payload_carries_no_per_row_training_data() {
         .get("full_conformal")
         .and_then(serde_json::Value::as_object)
         .expect("an eligible gaussian fit persists its exact full-conformal penalty");
+    // The field holds the p × p frozen penalty and the fit's smoothing-parameter
+    // count (a scalar, gam#3296), and nothing else: no labeled rows.
     assert_eq!(
         conformal.keys().collect::<Vec<_>>(),
-        vec!["s_lambda"],
-        "the exact full-conformal field must persist only the frozen penalty"
+        vec!["penalty_count", "s_lambda"],
+        "the exact full-conformal field must persist only the frozen penalty and its count"
+    );
+    assert_eq!(
+        conformal.get("penalty_count").and_then(serde_json::Value::as_u64),
+        Some(4),
+        "the conformal penalty count is the fit's four smoothing parameters \
+         (two smooths, each carrying a wiggliness and a null-space penalty under \
+         the default double penalty)"
     );
     assert!(
         longest_array(&large) < small_rows as usize,
@@ -909,7 +918,7 @@ fn competing_risks_weibull_fit_is_reachable_1590() {
 
 /// #1561 incidental bug: the Gaussian location-scale joint fit must not abort
 /// (panic or hard-error) when the scale smooth is requested at a larger basis
-/// size (`bs='tp', k>=20`). The owner's #1561 investigation reported a
+/// size (`bs='tps', k>=20`). The owner's #1561 investigation reported a
 /// joint-Newton crash there (`phantom_multiplier_with_well_conditioned_H`,
 /// carrying-block μ) — a KKT-refusal robustness failure that is independent of
 /// the (research-grade) scale-block λ-selection metric. A valid model spec
@@ -964,12 +973,12 @@ fn issue_1561_locscale_large_scale_basis_does_not_crash_joint_newton() {
     for k in [20usize, 25, 30] {
         let config = FitConfig {
             family: Some("gaussian".to_string()),
-            noise_formula: Some(format!("1 + s(x, bs='tp', k={k})")),
+            noise_formula: Some(format!("1 + s(x, bs='tps', k={k})")),
             ..FitConfig::default()
         };
 
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::fit_orchestration::entry::fit_from_formula("y ~ s(x, bs='tp')", &data, &config)
+            crate::fit_orchestration::entry::fit_from_formula("y ~ s(x, bs='tps')", &data, &config)
         }));
         let result = caught.unwrap_or_else(|payload| {
             // The payload IS the evidence: without it this reports only that
@@ -1022,8 +1031,8 @@ fn issue_1561_secondary_smooth_retains_null_recovery_default() {
         ][col]
     });
     for (noise_formula, expected_double_penalty) in [
-        ("1 + s(z, bs='tp')", true),
-        ("1 + s(z, bs='tp', double_penalty=false)", false),
+        ("1 + s(z, bs='tps')", true),
+        ("1 + s(z, bs='tps', double_penalty=false)", false),
     ] {
         let materialized = materialize(
             "bmi ~ 1",
@@ -1040,7 +1049,7 @@ fn issue_1561_secondary_smooth_retains_null_recovery_default() {
         };
         let basis = &request.spec.log_sigmaspec.smooth_terms[0].basis;
         let SmoothBasisSpec::ThinPlate { spec, .. } = basis else {
-            panic!("bs='tp' scale formula must resolve a thin-plate basis");
+            panic!("bs='tps' scale formula must resolve a thin-plate basis");
         };
         assert_eq!(
             spec.double_penalty, expected_double_penalty,
@@ -3562,8 +3571,8 @@ fn binomial_location_scale_engine_matches_reference_flow() {
 }
 
 #[test]
-fn resolve_family_accepts_mgcv_parenthesized_family_link_syntax() {
-    // mgcv writes GLM families in R as `family(link)` — `binomial(logit)`,
+fn resolve_family_accepts_parenthesized_family_link_syntax() {
+    // A family may carry its link as `family(link)` — `binomial(logit)`,
     // `gaussian(identity)`, `Binomial(Probit)`. Three tests in-repo pass
     // `family: Some("binomial(logit)".to_string())` straight through to the
     // resolver (`sphere_logit_predict_finite_at_pole`, `sphere_binomial_*`),
@@ -3578,7 +3587,6 @@ fn resolve_family_accepts_mgcv_parenthesized_family_link_syntax() {
         "Binomial(Logit)",
         "binomial(LOGIT)",
         "binomial( logit )",
-        "binomial_logit",
         "binomial-logit",
     ] {
         let spec = resolve_family(
@@ -3621,14 +3629,14 @@ fn resolve_family_accepts_mgcv_parenthesized_family_link_syntax() {
     .expect("binomial(cloglog) resolves");
     assert_eq!(cloglog.link.link_function(), LinkFunction::CLogLog);
     let nb = resolve_family(
-        Some("negative_binomial(log)"),
+        Some("negative-binomial(log)"),
         None,
         None,
         ndarray::array![0.0, 1.0, 2.0, 3.0].view(),
         ResponseColumnKind::Numeric,
         "y",
     )
-    .expect("negative_binomial(log) resolves");
+    .expect("negative-binomial(log) resolves");
     assert!(matches!(
         nb.response,
         ResponseFamily::NegativeBinomial { .. }

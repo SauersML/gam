@@ -29,7 +29,7 @@
 use gam_problem::types::{GlmLikelihoodSpec, LikelihoodSpec};
 use gam_solve::estimate::{EstimationError, UnifiedFitResult};
 use gam_solve::inference::information_criteria::information_criteria;
-use gam_solve::psis::pareto_smooth_weights;
+use gam_solve::psis::{WeightTailShape, pareto_smooth_weights};
 use ndarray::{Array1, ArrayView1};
 
 /// ALO predictive-accuracy summary at zero refit cost.
@@ -41,10 +41,10 @@ pub struct AloElpd {
     pub se: Option<f64>,
     /// Per-observation ALO elpd contributions (length `n`).
     pub pointwise: Array1<f64>,
-    /// GPD tail-shape `k̂` of the cross-observation fitted-vs-ALO ratio
-    /// distribution. This is an influence diagnostic, not a PSIS-LOO reliability
-    /// diagnostic.
-    pub k_hat_max: Option<f64>,
+    /// Upper-tail shape of the cross-observation fitted-vs-ALO ratio
+    /// distribution: its GPD `k̂`, or flat when the largest ratios all tie.
+    /// This is an influence diagnostic, not a PSIS-LOO reliability diagnostic.
+    pub k_hat_max: Option<WeightTailShape>,
     /// Number of tail observations flagged when the influence diagnostic exceeds
     /// the `0.7` heavy-tail cutoff.
     pub n_k_bad: usize,
@@ -116,8 +116,11 @@ fn alo_elpd_with_total(
     let (k_hat_max, n_k_bad);
     match pareto_smooth_weights(&raw) {
         Some(psis) => {
-            k_hat_max = Some(psis.k_hat);
-            n_k_bad = if psis.k_hat > 0.7 { psis.tail_count } else { 0 };
+            k_hat_max = Some(psis.shape);
+            n_k_bad = match psis.shape {
+                WeightTailShape::Pareto(k_hat) if k_hat > 0.7 => psis.tail_count,
+                WeightTailShape::Pareto(_) | WeightTailShape::Flat => 0,
+            };
         }
         None => {
             k_hat_max = None;

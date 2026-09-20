@@ -744,6 +744,7 @@ impl<'a> EvidenceProblem<'a> {
             hessian,
             bands: DecrementBands {
                 objective: self.growth * magnitude,
+                tolerance: self.growth * magnitude,
                 gradient: grad_mag * self.growth,
                 hessian: hessian_band,
             },

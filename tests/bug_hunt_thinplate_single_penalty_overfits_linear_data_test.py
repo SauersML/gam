@@ -1,12 +1,12 @@
 """Single-penalty thin-plate smooth over-fits exactly-linear data (issue #1271).
 
 On purely linear data ``y = 2 + 3x + N(0, 0.15)`` a thin-plate regression spline
-``s(x, bs="tp")`` should reduce to the affine fit: an intercept + a linear trend,
+``s(x, bs="tps")`` should reduce to the affine fit: an intercept + a linear trend,
 i.e. an effective degrees of freedom (EDF) of about ``2``.  mgcv's ``bs="tp"`` with
 ``select=TRUE`` lands at ``EDF ~ 2.10`` here; gam's ``bs="ps"`` single-penalty path
 lands near ``EDF ~ 2.56`` (mgcv-consistent).
 
-The defect (#1271): gam's ``bs="tp"`` single-penalty path over-fit the wiggle on
+The defect (#1271): gam's ``bs="tps"`` single-penalty path over-fit the wiggle on
 exactly-linear data, landing at ``EDF ~ 4.87`` (mean over 5 seeds) — REML
 under-penalised the thin-plate bending modes relative to mgcv.  This is
 INDEPENDENT of the double penalty (the null-space ridge is inert for tp on linear
@@ -53,9 +53,9 @@ def _edf(formula: str, seed: int) -> float:
 
 
 def test_thinplate_single_penalty_does_not_overfit_linear_data() -> None:
-    """``s(x, bs="tp")`` on exactly-linear data must collapse to the affine fit
+    """``s(x, bs="tps")`` on exactly-linear data must collapse to the affine fit
     (EDF ~ 2), not over-fit to EDF ~ 4.87."""
-    edfs = [_edf("y ~ s(x, k=20, bs=tp, double_penalty=False)", seed) for seed in SEEDS]
+    edfs = [_edf("y ~ s(x, k=20, bs=tps, double_penalty=False)", seed) for seed in SEEDS]
     mean_edf = float(np.mean(edfs))
     # The true expected value is ~2 (intercept + linear trend); mgcv lands at
     # ~2.10.  A correct fit lands comfortably below 3; the defect produced ~4.87.
@@ -79,7 +79,7 @@ def test_pspline_single_penalty_linear_data_control() -> None:
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke run
     for f in (
-        "y ~ s(x, k=20, bs=tp, double_penalty=False)",
+        "y ~ s(x, k=20, bs=tps, double_penalty=False)",
         "y ~ s(x, k=20, bs=ps, double_penalty=False)",
     ):
         vals = [_edf(f, s) for s in SEEDS]

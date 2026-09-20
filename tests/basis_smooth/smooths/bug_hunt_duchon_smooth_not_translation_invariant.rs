@@ -16,7 +16,7 @@
 //! `{1, x, z}` columns become near-collinear (a constant plus a huge near-constant
 //! ramp), the design ill-conditions, and REML lambda-selection lands in a
 //! different basin -- exactly the defect class fixed for the 1-D / general
-//! `bs="tp"` ThinPlate path in #1269 (which now subtracts the knot-cloud mean in
+//! `bs="tps"` ThinPlate path in #1269 (which now subtracts the knot-cloud mean in
 //! `create_thin_plate_spline_basis_scaledwithworkspace`,
 //! `duchon_thinplate.rs:1279`). The Duchon `bs="ds"` path was left UNCENTERED and
 //! still leaks the absolute coordinate.

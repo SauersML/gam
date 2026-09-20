@@ -140,8 +140,9 @@ feasibility set in every family.
 
 ### `inverse`
 
-Inverse link `1 / eta` (alias `1/mu`), canonical for the Gamma family. The
-mean is only defined on `eta > 0`.
+Inverse link `1 / eta`, canonical for the Gamma family. The mean is only
+defined on `eta > 0`. The other spelling `1/mu` is refused with an error
+naming `inverse`.
 
 ```python
 import numpy as np
@@ -157,9 +158,10 @@ gamfit.fit(df, "y ~ s(x)", family="gamma", link="inverse")
 
 ### `inverse-squared`
 
-Inverse link `eta^(-1/2)` (`eta = 1 / mu^2`, aliases `inv-squared` and
-`1/mu^2`), canonical for the inverse Gaussian family. The mean is only
-defined on `eta > 0`.
+Inverse link `eta^(-1/2)` (`eta = 1 / mu^2`), canonical for the inverse
+Gaussian family. The mean is only defined on `eta > 0`. Other spellings
+(`1/mu^2`, `inv-squared`, `inv_squared`) are refused with an error naming
+`inverse-squared`.
 
 ### Link legality
 
@@ -289,7 +291,7 @@ negative-binomial size parameter when a constant-size model is desired.
 
 ### Student-t
 
-`family="student-t"` (aliases `"student_t"`, `"t"`) is a heavy-tailed
+`family="student-t"` is a heavy-tailed
 alternative to the Gaussian for a continuous response with outliers. The
 link is the identity. The scale `σ` and the degrees of freedom `ν` are
 estimated by LAML jointly with the smoothing parameters. The fitted model
