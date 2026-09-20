@@ -27,7 +27,7 @@ pub use posterior_predict::*;
 use crate::binomial_location_scale::BinomialLocationScalePredictor;
 pub(crate) use crate::dispersion_location_scale::DispersionLocationScalePredictor;
 use crate::gaussian_location_scale::GaussianLocationScalePredictor;
-pub use crate::interval_policy::IntervalReference;
+pub use gam_inference::interval_reference::IntervalReference;
 use crate::interval_policy::{
     EtaInterval, LinearState, MeanBoundMethod, PredictPass, PredictionTransform, ResponseBounds,
     ResponseInterval, assemble_posterior_mean_bounds, predict_full_uncertainty_generic,
@@ -545,11 +545,11 @@ pub trait UncertaintyCovarianceSource {
         family: &LikelihoodSpec,
     ) -> Result<Option<FittedLinkState>, EstimationError>;
     /// Gaussian residual standard deviation used to widen observation
-    /// intervals for `ResponseFamily::Gaussian`. Raw-covariance sources
-    /// report `0.0`, which collapses the observation interval to the mean
-    /// interval (the only safe default when no dispersion is available).
-    fn observation_standard_deviation(&self) -> f64 {
-        0.0
+    /// intervals for `ResponseFamily::Gaussian`. Raw covariance carries no
+    /// residual scale and returns `None`; its Gaussian observation band is
+    /// omitted rather than mislabeled as a mean interval.
+    fn observation_standard_deviation(&self) -> Option<f64> {
+        None
     }
     /// Fitted dispersion/precision hint used to widen observation intervals for
     /// dispersion-bearing families (Tweedie, Gamma, Beta). Raw covariance alone
@@ -595,8 +595,8 @@ impl UncertaintyCovarianceSource for UnifiedFitResult {
     ) -> Result<Option<FittedLinkState>, EstimationError> {
         UnifiedFitResult::fitted_link_state(self, family).map(Some)
     }
-    fn observation_standard_deviation(&self) -> f64 {
-        self.standard_deviation
+    fn observation_standard_deviation(&self) -> Option<f64> {
+        Some(self.standard_deviation)
     }
     fn observation_phi(&self) -> Option<f64> {
         self.likelihood_scale.fixed_phi()
@@ -983,24 +983,24 @@ where
 //  PredictableModel trait — uniform prediction interface for all model types
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Every Gaussian location-scale builder persists this scale alongside its
+// sigma floor. Missing state cannot be replayed as an implicit unit scale.
+fn gaussian_response_scale_for_prediction(model: &FittedModel) -> Result<f64, String> {
+    model.payload().gaussian_response_scale
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .ok_or_else(|| "Gaussian location-scale prediction requires a saved finite positive response standardization scale".to_string())
+}
+
 pub trait FittedModelPredictExt {
-    /// The saved model's canonical predictor, or the reason it cannot be
-    /// rebuilt (a malformed payload, a missing coefficient block, a model
-    /// class with no generic predictor). Callers that report the failure
-    /// should use this so the user sees why prediction is unavailable.
-    fn try_predictor(&self) -> Result<Box<dyn PredictableModel>, String>;
-    /// [`Self::try_predictor`] with the reason discarded, for callers that
-    /// only branch on availability.
-    fn predictor(&self) -> Option<Box<dyn PredictableModel>> {
-        self.try_predictor().ok()
-    }
+    /// Rebuild the canonical predictor, preserving the reason malformed or
+    /// unsupported saved state cannot be replayed.
+    fn predictor(&self) -> Result<Box<dyn PredictableModel>, String>;
     fn bernoulli_marginal_slope_predictor(&self)
     -> Result<BernoulliMarginalSlopePredictor, String>;
-    fn block_roles(&self) -> Option<Vec<BlockRole>>;
 }
 
 impl FittedModelPredictExt for FittedModel {
-    fn try_predictor(&self) -> Result<Box<dyn PredictableModel>, String> {
+    fn predictor(&self) -> Result<Box<dyn PredictableModel>, String> {
         let class = self.predict_model_class();
         let runtime = self
             .saved_prediction_runtime()
@@ -1008,7 +1008,6 @@ impl FittedModelPredictExt for FittedModel {
         let missing_fit = || format!("{class:?} predictor requires a saved fit result");
         let noise_beta = |fit: &UnifiedFitResult| {
             location_scale_noise_beta(fit)
-                .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))
                 .ok_or_else(|| {
                     format!("{class:?} predictor requires a noise (scale) coefficient block")
                 })
@@ -1021,7 +1020,7 @@ impl FittedModelPredictExt for FittedModel {
                         .to_string()
                 })?;
                 let beta_noise = noise_beta(fit)?;
-                let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
+                let response_scale = gaussian_response_scale_for_prediction(self)?;
                 let sigma_floor =
                     gam_models::inference::model::gaussian_location_scale_saved_sigma_floor(
                         self.payload(),
@@ -1048,18 +1047,15 @@ impl FittedModelPredictExt for FittedModel {
                         })?
                         .beta
                         .clone()
-                } else if let Some(unified) = self.unified() {
+                } else {
                     StandardPredictor::from_unified(
-                        unified,
+                        fit,
                         family.clone(),
                         link_kind.clone(),
                         None,
                     )
-                    .ok()
-                    .map(|p| p.beta)
-                    .unwrap_or_else(|| fit.beta.clone())
-                } else {
-                    fit.beta.clone()
+                    .map_err(|reason| format!("standard predictor: {reason}"))?
+                    .beta
                 };
                 let covariance = fit.beta_covariance().cloned();
                 Ok(Box::new(StandardPredictor {
@@ -1203,9 +1199,6 @@ impl FittedModelPredictExt for FittedModel {
         )
     }
 
-    fn block_roles(&self) -> Option<Vec<BlockRole>> {
-        self.predictor().map(|p| p.block_roles())
-    }
 }
 
 fn slice_predict_input(
@@ -1379,11 +1372,6 @@ pub trait PredictableModel {
         options: &PosteriorMeanOptions,
     ) -> Result<PredictPosteriorMeanResult, EstimationError>;
 
-    /// Number of coefficient blocks in the model.
-    fn n_blocks(&self) -> usize;
-
-    /// Roles of each block.
-    fn block_roles(&self) -> Vec<BlockRole>;
 }
 
 // Per-family predictor implementations, split by concern (#1145).
@@ -1555,12 +1543,18 @@ impl PointCovarianceProvenance {
 ///   * `extrapolation_variance` — per-row η-scale variance added to the band's
 ///     `Var(η)`, exactly as [`PredictUncertaintyOptions::extrapolation_variance`].
 ///     The posterior-mean point is unaffected.
+///   * `observation_prior_weights` — per-row analytic prior weights of the
+///     prediction rows, exactly as
+///     [`PredictUncertaintyOptions::observation_prior_weights`]: a weighted
+///     Gaussian observation band carries `σ̂²/w_i` under every link (#2077,
+///     #3957). `None` means unit weights.
 #[derive(Clone, Debug)]
 pub struct PosteriorMeanOptions {
     pub confidence_level: Option<f64>,
     pub covariance_mode: InferenceCovarianceMode,
     pub include_observation_interval: bool,
     pub extrapolation_variance: Option<Array1<f64>>,
+    pub observation_prior_weights: Option<Array1<f64>>,
 }
 
 impl PosteriorMeanOptions {
@@ -1571,6 +1565,7 @@ impl PosteriorMeanOptions {
             covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
             include_observation_interval: false,
             extrapolation_variance: None,
+            observation_prior_weights: None,
         }
     }
 }
@@ -2245,24 +2240,38 @@ where
 ///
 /// `prior_weights` are the per-row weights resolved from the PREDICTION frame
 /// (the same weight column / unit-weight default `sample_replicates` resolves,
-/// via `resolve_weight_column`). `None`, a length mismatch, or a
-/// non-finite / non-positive weight falls back to `w_i = 1` for that row, so an
-/// unweighted fit is byte-identical to the pre-#2077 scalar broadcast.
+/// via `resolve_weight_column`). `None` means unit weights, so an unweighted fit
+/// is byte-identical to the scalar broadcast. A zero or non-finite weight has no
+/// finite observation variance under the analytic-weight model, and a weight
+/// vector that does not span the rows describes other rows: both are refused
+/// with the row named, exactly as the generative sibling refuses them (#3957).
 fn gaussian_observation_variance_per_row(
     obsvar: f64,
     n: usize,
     prior_weights: Option<&Array1<f64>>,
-) -> Array1<f64> {
-    match prior_weights {
-        Some(weights) if weights.len() == n => Array1::from_iter(weights.iter().map(|&w| {
-            if w.is_finite() && w > 0.0 {
-                obsvar / w
-            } else {
-                obsvar
-            }
-        })),
-        _ => Array1::from_elem(n, obsvar),
+) -> Result<Array1<f64>, EstimationError> {
+    let Some(weights) = prior_weights else {
+        return Ok(Array1::from_elem(n, obsvar));
+    };
+    if weights.len() != n {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian observation band: prior weights length {} does not match the {n} \
+             prediction rows",
+            weights.len()
+        )));
     }
+    if let Some((row, w)) = weights
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|&(_, w)| !(w.is_finite() && w > 0.0))
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian observation band: prior weight[{row}] = {w} has no finite \
+             observation variance sigma^2/w; weights must be finite and > 0"
+        )));
+    }
+    Ok(weights.mapv(|w| obsvar / w))
 }
 
 /// Total predictive variance `Var(Y)` of a fresh response, per row, by the law of
@@ -2293,9 +2302,10 @@ fn gaussian_observation_variance_per_row(
 /// The Beta and Bernoulli rows collect `E[μ(1−μ)] = m·c − v` into the sum rather
 /// than evaluate it, and read `m(1 − m)` as `m·c` off the complement the caller
 /// carried: where μ rounds to one, `1 − m` is exactly zero while `c` is not
-/// (#3140). Without that complement those families return `None`, as every family
-/// does without the fitted dispersion its law needs (`observation_phi` /
-/// `observation_theta`).
+/// (#3140). Without that complement those families return `Ok(None)`, as every
+/// family does without the fitted dispersion its law needs (`observation_phi` /
+/// `observation_theta`). An invalid Gaussian prior weight is an error (see
+/// [`gaussian_observation_variance_per_row`]).
 pub(crate) fn family_predictive_variance<S>(
     response: &ResponseFamily,
     mean: &Array1<f64>,
@@ -2303,7 +2313,7 @@ pub(crate) fn family_predictive_variance<S>(
     mean_variance: &Array1<f64>,
     source: &S,
     prior_weights: Option<&Array1<f64>>,
-) -> Option<Array1<f64>>
+) -> Result<Option<Array1<f64>>, EstimationError>
 where
     S: UncertaintyCovarianceSource + ?Sized,
 {
@@ -2312,10 +2322,18 @@ where
     let rows = |term: &dyn Fn(usize, f64) -> f64| {
         Array1::from_iter(mean.iter().enumerate().map(|(i, &m)| term(i, m)))
     };
-    match response {
+    // The only fallible input: a Gaussian prior weight with no finite
+    // observation variance is refused before any family law is evaluated.
+    let gaussian_noise = match response {
+        ResponseFamily::Gaussian => source
+            .observation_standard_deviation()
+            .map(|sd| gaussian_observation_variance_per_row(sd.powi(2), n, prior_weights))
+            .transpose()?,
+        _ => None,
+    };
+    let variance = || match response {
         ResponseFamily::Gaussian => {
-            let obsvar = source.observation_standard_deviation().powi(2);
-            let noise = gaussian_observation_variance_per_row(obsvar, n, prior_weights);
+            let noise = gaussian_noise.as_ref()?;
             Some(rows(&|i, _| noise[i] + v[i]))
         }
         ResponseFamily::Poisson => Some(rows(&|i, m| m + v[i])),
@@ -2366,7 +2384,8 @@ where
         ResponseFamily::StudentT { sigma, nu } => {
             (*nu > 2.0).then(|| rows(&|i, _| sigma * sigma * nu / (nu - 2.0) + v[i]))
         }
-    }
+    };
+    Ok(variance())
 }
 
 #[inline]
@@ -2478,7 +2497,7 @@ where
             // is centred on the response mean with its posterior variance, so it
             // is on the response scale under any link (identity: μ = η), whose
             // support is the whole line.
-            let Some(total_var) = predictive_variance() else {
+            let Some(total_var) = predictive_variance()? else {
                 return Ok((None, None));
             };
             let obs_se = total_var.mapv(f64::sqrt);
@@ -2506,7 +2525,7 @@ where
             // predictive — NOT a continuous moment-matched surrogate, which has
             // no zero atom and would over-cover the lower tail at low rates.
             let total_var =
-                predictive_variance().expect("Poisson has a closed-form conditional variance");
+                predictive_variance()?.expect("Poisson has a closed-form conditional variance");
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
                 poisson_moment_matched_interval(mean[i], total_var, p_lo, p_hi)
             })
@@ -2532,7 +2551,7 @@ where
             // effective dispersion), NOT a continuous moment-matched surrogate —
             // a Gamma has no zero atom and would grossly over-cover the lower
             // tail at low means.
-            let total_var = predictive_variance().expect("theta availability was checked above");
+            let total_var = predictive_variance()?.expect("theta availability was checked above");
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
                 negative_binomial_moment_matched_interval(mean[i], theta, total_var, p_lo, p_hi)
             })
@@ -2549,7 +2568,7 @@ where
             // zero atom and would over-cover the lower tail like the NB
             // surrogate, #1193). Estimation uncertainty is folded into an
             // effective dispersion that matches the inflated total variance.
-            let total_var = predictive_variance().expect("phi availability was checked above");
+            let total_var = predictive_variance()?.expect("phi availability was checked above");
             let power = *p;
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
                 tweedie_moment_matched_interval(mean[i], phi, power, total_var, p_lo, p_hi)
@@ -2560,7 +2579,7 @@ where
             // strongly right-skewed, so the band is built from equal-tailed
             // Gamma quantiles (moment-matched predictive), not a symmetric
             // `μ ± z·σ` band that mis-covers each tail (#817).
-            let Some(total_var) = predictive_variance() else {
+            let Some(total_var) = predictive_variance()? else {
                 return Ok((None, None));
             };
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
@@ -2571,7 +2590,7 @@ where
             // `Var(Y|μ) = φμ³`: heavier right skew than the Gamma, so the band
             // is built from equal-tailed moment-matched inverse-Gaussian
             // quantiles.
-            let Some(total_var) = predictive_variance() else {
+            let Some(total_var) = predictive_variance()? else {
                 return Ok((None, None));
             };
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
@@ -2601,7 +2620,7 @@ where
                         .to_string(),
                 )
             })?;
-            let total_var = predictive_variance().expect("phi and the complement are present");
+            let total_var = predictive_variance()?.expect("phi and the complement are present");
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
                 beta_moment_matched_interval(mean[i], complement[i], total_var, p_lo, p_hi)
             })
@@ -3407,7 +3426,7 @@ where
         &mean_variance,
         source,
         None,
-    )
+    )?
     .ok_or_else(|| {
         EstimationError::InvalidInput(format!(
             "conformal prediction for {} requires fitted observation-scale dispersion; \
@@ -3509,6 +3528,12 @@ mod tests {
             nb_raw.observation_lower.is_none() && nb_raw.observation_upper.is_none(),
             "bare Vb must not build an estimated-NB observation interval from the seed theta"
         );
+    
+        let gaussian = gam_spec::LikelihoodSpec::gaussian_identity();
+        let output = predict_gamwith_uncertainty(x.view(), beta.view(), offset.view(), gaussian.clone(), &covariance, &options).unwrap();
+        assert!(output.observation_lower.is_none() && output.observation_upper.is_none());
+        let error = predictive_standard_error(&gaussian, &array![0.0], &array![0.1], &covariance).expect_err("raw covariance has no Gaussian residual scale");
+        assert!(error.to_string().contains("requires fitted observation-scale dispersion"), "{error}");
     }
 
     #[test]
@@ -3556,7 +3581,7 @@ mod tests {
             .expect("a fit carrying its SAS state predicts");
     }
 
-    fn test_fit_with_covariance(beta: Array1<f64>, covariance: Array2<f64>) -> UnifiedFitResult {
+    pub(super) fn test_fit_with_covariance(beta: Array1<f64>, covariance: Array2<f64>) -> UnifiedFitResult {
         UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
             blocks: vec![FittedBlock {
                 beta: beta.clone(),
@@ -4556,6 +4581,86 @@ mod tests {
         FittedModel::from_payload(payload)
     }
 
+    fn saved_standard_predictor_fixture(fit: Option<UnifiedFitResult>) -> FittedModel {
+        use gam_models::inference::model::{FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind};
+        let mut payload = FittedModelPayload::new(
+            MODEL_PAYLOAD_VERSION, "y ~ 1".to_string(), ModelKind::Standard,
+            FittedFamily::Standard {
+                likelihood: gam_spec::LikelihoodSpec::gaussian_identity(),
+                link: Some(StandardLink::Identity),
+                latent_cloglog_state: None, mixture_state: None, sas_state: None,
+            },
+            "gaussian".to_string(),
+        );
+        payload.unified = fit;
+        FittedModel::from_payload(payload)
+    }
+
+    fn predictor_failure(model: &FittedModel) -> String {
+        match model.predictor() {
+            Ok(_) => panic!("malformed saved state must not construct a predictor"),
+            Err(reason) => reason,
+        }
+    }
+
+    pub(super) fn saved_gaussian_predictor_fixture(scale: Option<f64>) -> FittedModel {
+        use gam_models::inference::model::{FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind};
+        let mut fit = survival_fit_with_covariance(array![2.0], array![0.0], Array2::zeros((2, 2)));
+        fit.blocks[0].role = BlockRole::Location;
+        let mut payload = FittedModelPayload::new(
+            MODEL_PAYLOAD_VERSION, "y ~ 1".to_string(), ModelKind::LocationScale,
+            FittedFamily::LocationScale {
+                likelihood: gam_spec::LikelihoodSpec::gaussian_identity(), base_link: None,
+            },
+            "gaussian-location-scale".to_string(),
+        );
+        payload.unified = Some(fit);
+        payload.gaussian_sigma_floor = Some(0.01);
+        payload.gaussian_response_scale = scale;
+        FittedModel::from_payload(payload)
+    }
+
+    #[test]
+    fn saved_predictor_requires_the_fitted_gaussian_response_scale() {
+        for scale in [None, Some(0.0), Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            let reason = predictor_failure(&saved_gaussian_predictor_fixture(scale));
+            assert!(reason.contains("response standardization scale"), "{reason}");
+        }
+        saved_gaussian_predictor_fixture(Some(3.0)).predictor().expect("explicit fitted response scale");
+    }
+
+    #[test]
+    fn saved_predictor_preserves_missing_fit_and_link_reasons() {
+        let reason = predictor_failure(&saved_standard_predictor_fixture(None));
+        assert!(reason.contains("saved fit result"), "{reason}");
+        let reason = predictor_failure(&saved_survival_location_scale_model(None));
+        assert!(reason.contains("saved fitted link"), "{reason}");
+    }
+
+    #[test]
+    fn saved_predictor_rejects_malformed_unified_blocks_without_beta_substitution() {
+        let mut fit = test_fit_with_covariance(array![2.0], array![[0.25]]);
+        fit.blocks.clear();
+        // The flattened beta is still usable, which used to hide this invalid
+        // block layout when StandardPredictor::from_unified refused it.
+        assert_eq!(fit.beta, array![2.0]);
+        let reason = predictor_failure(&saved_standard_predictor_fixture(Some(fit)));
+        assert!(reason.contains("StandardPredictor only supports single-block"), "{reason}");
+    }
+
+    #[test]
+    fn saved_predictor_valid_standard_model_keeps_its_prediction() {
+        let fit = test_fit_with_covariance(array![2.0], array![[0.25]]);
+        let model = saved_standard_predictor_fixture(Some(fit));
+        let predictor = model.predictor().expect("valid standard predictor");
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0], [3.0]]), offset: array![0.5, -0.5],
+            design_noise: None, offset_noise: None, auxiliary_scalar: None, auxiliary_matrix: None,
+        };
+        let prediction = predictor.predict_plugin_response(&input).unwrap();
+        assert_eq!(prediction.mean, array![2.5, 5.5]);
+    }
+
     #[test]
     fn saved_survival_predictor_uses_the_saved_fitted_link_not_probit() {
         let input = PredictInput {
@@ -4583,18 +4688,8 @@ mod tests {
         assert!(
             saved_survival_location_scale_model(None)
                 .predictor()
-                .is_none(),
+                .is_err(),
             "a survival payload without its fitted link must not predict on a substitute link"
-        );
-        // The refusal carries its reason so the CLI / Python error names the
-        // missing state instead of a bare "could not construct a predictor".
-        let reason = match saved_survival_location_scale_model(None).try_predictor() {
-            Ok(_) => panic!("a survival payload without its fitted link must not predict"),
-            Err(reason) => reason,
-        };
-        assert!(
-            reason.contains("link"),
-            "the predictor refusal must name the missing fitted link, got: {reason}"
         );
     }
 
@@ -5177,6 +5272,92 @@ mod tests {
         }
     }
 
+    /// gam#3957: a weighted Gaussian fit with a curved link reports the
+    /// posterior mean, and its observation band carries `σ̂²/w_i` exactly as the
+    /// identity-link band does (#2077). Three rows share one design row, hence
+    /// one `Var(μ)` and one multiplier `z`, so with weights 1, 2, 4 the squared
+    /// half-widths `z²(σ̂²/w + Var(μ))` satisfy
+    /// `(h₁² − h₂²)/(h₁² − h₄²) = (1 − 1/2)/(1 − 1/4) = 2/3` whatever `z`, `σ̂`
+    /// and `Var(μ)` are. A weight-blind band makes the three rows equal. A weight
+    /// with no finite observation variance is refused, never read as `w = 1`.
+    #[test]
+    fn a_curved_link_weighted_gaussian_band_carries_the_prior_weights_3957() {
+        let beta = array![0.4, -0.3];
+        let mut fit = posterior_band_fixture(beta.clone(), Array2::eye(2) * 0.01);
+        fit.fitted_link = FittedLinkState::Standard(None);
+        let predictor = StandardPredictor {
+            beta,
+            family: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(StandardLink::Log),
+            ),
+            link_kind: None,
+            covariance: None,
+            link_wiggle: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0, 0.5], [1.0, 0.5], [1.0, 0.5]]),
+            offset: Array1::zeros(3),
+            design_noise: None,
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let resolve = |weights: Option<Array1<f64>>| {
+            let request = crate::interval_policy::PredictionRequest {
+                interval: Some(0.95),
+                covariance_mode: InferenceCovarianceMode::Conditional,
+                observation_interval: true,
+                observation_prior_weights: weights,
+                extrapolation_variance: None,
+            };
+            crate::interval_policy::resolve_prediction_request(
+                &predictor, &input, &fit, true, &request,
+            )
+        };
+        let band = |weights: Option<Array1<f64>>| {
+            let columns = resolve(weights).expect("a curved-link Gaussian observation band");
+            assert!(
+                columns.posterior_mean.is_some(),
+                "fixture: a log-link Gaussian reports the posterior mean"
+            );
+            let lower = columns.observation_lower.expect("observation lower edge");
+            let upper = columns.observation_upper.expect("observation upper edge");
+            Array1::from_iter((0..3).map(|row| (0.5 * (upper[row] - lower[row])).powi(2)))
+        };
+        let weighted = band(Some(array![1.0, 2.0, 4.0]));
+        let ratio = (weighted[0] - weighted[1]) / (weighted[0] - weighted[2]);
+        assert!(
+            (ratio - 2.0 / 3.0).abs() <= 1e-10,
+            "squared half-widths {weighted:?} must follow σ̂²/w: ratio {ratio} != 2/3"
+        );
+        let unweighted = band(None);
+        assert!(
+            (weighted[0] - unweighted[0]).abs() <= 1e-12 * unweighted[0],
+            "a unit weight is the unweighted band: {} vs {}",
+            weighted[0],
+            unweighted[0]
+        );
+        for invalid in [0.0, f64::NAN, -1.0, f64::INFINITY] {
+            let error = expect_estimation_error(
+                resolve(Some(array![1.0, invalid, 4.0])),
+                "a weight with no finite observation variance must be refused",
+            );
+            assert!(
+                error.to_string().contains("prior weight[1]"),
+                "the refusal names the row: {error}"
+            );
+        }
+        let error = expect_estimation_error(
+            resolve(Some(array![1.0, 2.0])),
+            "weights that do not span the rows must be refused",
+        );
+        assert!(
+            error.to_string().contains("does not match"),
+            "the refusal names the mismatch: {error}"
+        );
+    }
+
     /// gam#2985: a withheld fit's posterior-mean point is still the posterior
     /// mean, integrated over the penalized Hessian (the posterior conditional on
     /// the fitted latent law), and it says so in a typed note. It is not the
@@ -5659,6 +5840,7 @@ mod tests {
             &fit,
             None,
         )
+        .expect("valid inputs")
         .expect("the Bernoulli predictive variance with its complement");
         assert!(
             predictive[0] > 0.0 && predictive[0] == complement,

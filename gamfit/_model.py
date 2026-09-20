@@ -8,7 +8,6 @@ arguments through the FFI, hands payloads off to ``_survival`` /
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal, Sequence, cast, overload
@@ -1570,8 +1569,9 @@ class Model:
         (``Summary.aic_corrected``) that ``gamfit.compare_models`` ranks on
         (Burnham & Anderson's relative likelihood). Returns ``> 1`` when this
         fit is better supported than ``other`` and ``< 1`` otherwise, agreeing
-        with the winner ``gamfit.compare_models`` reports. Both fits must share
-        the response family and the number of observations.
+        with the winner ``gamfit.compare_models`` reports; ``inf`` / ``0.0``
+        once the ratio leaves the float range (AIC_c gap past ~1419.6). Both
+        fits must share the response family and the number of observations.
 
         This is **not** a Bayes factor: it integrates over no prior and must
         not be read against Jeffreys / Kass-Raftery thresholds.
@@ -1581,10 +1581,9 @@ class Model:
             raise TypeError(
                 f"evidence_ratio_vs expects a gamfit.Model, got {type(other).__name__}"
             )
-        log_ratio = rust_module().log_evidence_ratio(
+        return rust_module().evidence_ratio(
             self._prediction_model, other._prediction_model
         )
-        return math.exp(log_ratio)
 
     def _model_class_from_payload(self) -> str:
         return self._prediction_model.predict_class_name

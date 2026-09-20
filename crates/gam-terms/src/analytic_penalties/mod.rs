@@ -116,7 +116,7 @@
 // through `use super::*;` without re-listing them.
 pub(crate) use faer::Side;
 pub(crate) use ndarray::{
-    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, CowArray, Ix2, Ix3,
+    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, CowArray, Ix2,
 };
 pub(crate) use std::sync::{Arc, RwLock};
 
@@ -124,9 +124,6 @@ pub use self::manifest::PenaltyManifest;
 pub use self::op::PenaltyOp;
 pub(crate) use self::op::ScaledPenaltyOp;
 pub use self::sheaf::{EdgeRestriction, SheafConsistencyPenalty};
-pub(crate) use crate::basis::{
-    BasisError, DuchonNullspaceOrder, radial_basis_cartesian_derivative,
-};
 pub(crate) use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 pub(crate) use gam_problem::{GumbelTemperatureSchedule, ScheduleKind};
 

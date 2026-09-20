@@ -26,6 +26,7 @@ def main() -> None:
         tau_start=1.0,
         tau_min=0.1,
         decay="geometric",
+        steps=8,
     )
     fit = gamfit.sae.sae_manifold_fit(
         y,

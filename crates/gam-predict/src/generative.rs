@@ -549,7 +549,7 @@ pub fn generative_spec_for_saved_model(
         })?;
         let predictor =
             model
-                .try_predictor()
+                .predictor()
                 .map_err(|reason| SavedGenerativeError::MissingSavedState {
                     model_class,
                     reason: format!("canonical predictor could not be reconstructed: {reason}"),

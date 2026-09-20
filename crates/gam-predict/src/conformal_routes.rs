@@ -281,7 +281,7 @@ pub fn full_conformal_prediction_columns(
         false,
     )?;
     let predictor = model
-        .try_predictor()
+        .predictor()
         .map_err(|reason| format!("saved model could not construct a predictor: {reason}"))?;
     let point = resolve_prediction_request(
         predictor.as_ref(),
@@ -363,7 +363,7 @@ pub fn split_conformal_prediction_columns(
         false,
     )?;
     let predictor = model
-        .try_predictor()
+        .predictor()
         .map_err(|reason| format!("saved model could not construct a predictor: {reason}"))?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     let family = model.likelihood();
