@@ -303,7 +303,7 @@ fn divergences(reference: &[ArrayView1<'_, f64>], edited: &Array2<f64>) -> (Vec<
         .zip(edited.outer_iter())
         .map(|(native, moved)| {
             let (lp, lq) = (log_softmax(*native), log_softmax(moved));
-            let kl = lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum();
+            let kl: f64 = lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum();
             (kl, argmax(*native) == argmax(moved))
         })
         .unzip()
