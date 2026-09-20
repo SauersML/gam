@@ -1,4 +1,4 @@
-//! End-to-end quality: gam's cyclic cubic spline (`cc()` / `cyclic()`) must
+//! End-to-end quality: gam's cyclic cubic spline (`cyclic()`) must
 //! **recover the true periodic signal** it was trained on, and must do so at
 //! least as accurately as **mgcv** — the mature, standard GAM implementation.
 //!
@@ -8,7 +8,7 @@
 //! of a smoother is how close its fitted curve lands to that hidden truth.
 //!
 //! mgcv's `bs="cc"` is the canonical cyclic cubic regression spline; gam exposes
-//! the same construction through `cc(t, k=12, period_start=0, period_end=2*pi)`.
+//! the same construction through `cyclic(t, k=12, period_start=0, period_end=2*pi)`.
 //! Both fit by REML against a Gaussian likelihood.
 //!
 //! #2395 K-averaging: the former single seed / single hold-out put the gam-vs-mgcv
@@ -82,7 +82,7 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let formula = format!("h ~ cc(t, k=12, period_start=0, period_end={period:.17})");
+    let formula = format!("h ~ cyclic(t, k=12, period_start=0, period_end={period:.17})");
 
     let mut gam_rmses = Vec::with_capacity(K_SPLITS);
     let mut h_cols: Vec<Vec<f64>> = Vec::with_capacity(K_SPLITS);
@@ -169,7 +169,7 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine() {
     let gam_truth_rmse = panel.gam_mean;
 
     eprintln!(
-        "cyclic cc(t) #2395 K={K_SPLITS}-seed paired: n={n} sigma={sigma} \
+        "cyclic(t) #2395 K={K_SPLITS}-seed paired: n={n} sigma={sigma} \
          gam_edf(split0)={gam_edf_repr:.3} wrap_gap(split0)={wrap_gap_repr:.3e}"
     );
     eprintln!("{}", panel.report("cyclic_cubic::truth"));
@@ -202,7 +202,7 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine() {
     );
 }
 
-/// REAL-DATA arm of the cyclic-cubic capability: the SAME `cc()` periodic smooth,
+/// REAL-DATA arm of the cyclic-cubic capability: the SAME `cyclic()` periodic smooth,
 /// exercised on `nottem` monthly temperatures (no known truth) under #2395 K-split
 /// averaging over K random train/test partitions.
 ///
@@ -237,7 +237,7 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine_on_real_data() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let formula = "temp ~ cc(month, k=12, period_start=1, period_end=13)";
+    let formula = "temp ~ cyclic(month, k=12, period_start=1, period_end=13)";
 
     let mut gam_rmses = Vec::with_capacity(K_SPLITS);
     let mut gam_r2s = Vec::with_capacity(K_SPLITS);
@@ -326,7 +326,7 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine_on_real_data() {
     let gam_test_r2 = mean(&gam_r2s);
 
     eprintln!(
-        "nottem cc(month) #2395 K={K_SPLITS}-split paired: gam_edf(split0)={gam_edf_repr:.3} \
+        "nottem cyclic(month) #2395 K={K_SPLITS}-split paired: gam_edf(split0)={gam_edf_repr:.3} \
          gam_test_R2_avg={gam_test_r2:.4} wrap_gap(split0)={wrap_gap_repr:.3e}"
     );
     eprintln!("{}", panel.report("cyclic_cubic::test"));

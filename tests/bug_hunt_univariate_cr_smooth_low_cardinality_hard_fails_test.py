@@ -1,5 +1,5 @@
-"""Bug hunt (#1541): a univariate cubic-regression smooth ``s(x, bs="cr")`` (and
-its shrinkage sibling ``bs="cs"``) hard-failed the whole fit on a low-cardinality
+"""Bug hunt (#1541): a univariate cubic-regression smooth ``s(x, bs="cr")``
+hard-failed the whole fit on a low-cardinality
 covariate instead of capping the basis to the data support the way mgcv — and
 gam's own *tensor* path (996f829d7) — do.
 
@@ -10,7 +10,7 @@ requires at least 10 distinct values, got 3
 
 A cubic regression spline places exactly one basis function per value-knot, so
 ``select_cr_knots`` cannot place more knots than the covariate has DISTINCT
-values. The univariate ``cr``/``cs`` arm
+values. The univariate ``cr`` arm
 (``src/terms/term_builder.rs``) used to hand ``select_cr_knots`` an unclamped
 ``k`` — so an ordinary low-cardinality predictor (a binary indicator, a 3-level
 ordinal/Likert score, a small integer count) aborted before any coefficients
@@ -89,16 +89,9 @@ def test_univariate_cr_auto_k_caps_to_data_support() -> None:
     assert abs(contrasts[2] - (-1.0)) < 0.35, f"level 2 contrast not recovered: {contrasts}"
 
 
-def test_univariate_cs_shrinkage_smooth_caps_to_data_support() -> None:
-    # The shrinkage sibling bs="cs" reaches the same uncapped select_cr_knots.
-    contrasts = _fit_ternary("y ~ s(x, bs='cs', k=10)")
-    assert abs(contrasts[1] - 2.0) < 0.40, f"level 1 contrast not recovered: {contrasts}"
-    assert abs(contrasts[2] - (-1.0)) < 0.40, f"level 2 contrast not recovered: {contrasts}"
-
-
 def test_univariate_cr_smooth_binary_covariate_degrades_to_bspline() -> None:
     # A BINARY covariate has too few distinct values (2) for ANY cr spline
-    # (needs >= 3). bs="cr"/"cs" must degrade to the linear B-spline marginal the
+    # (needs >= 3). bs="cr" must degrade to the linear B-spline marginal the
     # default basis uses — a hard error here was the issue's headline repro
     # (`s(badh, bs='cr', k=10)` on a 0/1 indicator).
     rng = np.random.default_rng(15411)
@@ -110,7 +103,6 @@ def test_univariate_cr_smooth_binary_covariate_degrades_to_bspline() -> None:
     for formula in (
         "y ~ s(x, bs='cr') + s(z)",
         "y ~ s(x, bs='cr', k=10) + s(z)",
-        "y ~ s(x, bs='cs', k=10) + s(z)",
     ):
         model = gamfit.fit(d, formula)  # must not raise
         contrasts = _predict_at(model, "x", np.array([0.0, 1.0]), extra={"z": 0.5})

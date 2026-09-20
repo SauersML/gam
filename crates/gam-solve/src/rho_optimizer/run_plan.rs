@@ -59,21 +59,31 @@ fn stopped_run_checkpoint(
                 last_solution.final_value,
                 best.value,
             );
-            let mut result = outer_result_with_gradient_norm(
-                best.rho,
-                best.value,
-                // The run spent its whole budget; `best.iterations` is only the index of
-                // the iterate adopted here.
-                last_solution.iterations,
-                Some(best.grad_norm),
-                false,
-                the_plan,
-            );
-            result.origin = OuterResultOrigin::ArcBestIterateSubstitution;
-            result
+            // The run spent its whole budget; `best.iterations` is only the index of
+            // the iterate adopted here.
+            best_iterate_checkpoint(best, last_solution.iterations, the_plan)
         }
         _ => solution_into_outer_result(last_solution, false, the_plan),
     }
+}
+
+/// The cost-stall guard's best feasible accepted iterate as a non-converged
+/// checkpoint of a run that spent `iterations`.
+fn best_iterate_checkpoint(
+    best: CostStallExit,
+    iterations: usize,
+    the_plan: OuterPlan,
+) -> OuterResult {
+    let mut result = outer_result_with_gradient_norm(
+        best.rho,
+        best.value,
+        iterations,
+        Some(best.grad_norm),
+        false,
+        the_plan,
+    );
+    result.origin = OuterResultOrigin::ArcBestIterateSubstitution;
+    result
 }
 
 /// A one-shot reseed retry returns its own outcome, and that outcome knows only
@@ -650,25 +660,23 @@ pub(crate) fn run_outer_with_plan(
         install_matching_initial_inner_seed(obj, config, seed, context)?;
         // Zero-iteration acceptance, decided HERE rather than in the objective.
         //
-        // Whether a start is already stationary is a question about the
-        // stationarity BAND, and the band lives with `OuterConfig`
-        // (`outer_gradient_tolerance`), not with the objective.
+        // Whether a start is already stationary is the outer certificate's
+        // question, judged on the same ladder that minted the prior fit, not
+        // the objective's.
         //
-        // Measured (#2363): a fit resumed from a prior fit's terminal
-        // certificate is stationary where it starts. |Pg| at the resumed rho is
-        // 4.225362e-9 / 6.680405e-8 / 1.369603e-7 on the three estimated-nuisance
-        // fixtures, against a band of 1.61e-5 -- inside by three to four orders
-        // of magnitude. It then takes one outer iteration to go nowhere, which
-        // this skips along with its inner solves.
+        // #2363/#3312: a fit resumed from a prior fit's terminal certificate is
+        // at a point that certificate already accepted for this criterion.
+        // Searching on from it re-derives a point it was handed and lands
+        // somewhere else, so a warm cache would change WHERE the fit landed.
         //
-        // The branch RE-CERTIFIES what it accepts through
+        // The branch CERTIFIES what it claims through
         // `CertifiedOuterCandidate::from_solver_claim` and, when that fails,
         // runs the ordinary search from the same start, so an over-eager
-        // acceptance costs nothing; and it fires only for a rho a previous
-        // outer run already certified as terminal.
+        // claim costs nothing; and it fires only for a rho a previous outer
+        // run already certified as terminal.
         let zero_iteration_cost = match obj.accept_seed_without_outer_iterations(seed)? {
             Some(cost) => Some(cost),
-            None => certified_resume_is_already_stationary(
+            None => claim_prior_terminal_certificate(
                 obj,
                 config,
                 seed,
@@ -1414,7 +1422,32 @@ pub(crate) fn run_outer_with_plan(
                         optimizer = optimizer.with_fallback_policy(OptFallbackPolicy::Never);
                     }
                     match optimizer.run() {
-                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                        Ok(sol) => {
+                            // #3279 — opt's ARC ends on a trial whose projected gradient
+                            // clears its tolerance before that trial meets the ratio test,
+                            // so the point it returns can sit above the iterate the run
+                            // stood on. On the λ→∞ face of a REML criterion the gradient
+                            // vanishes at any height: the enriched Duchon fit stepped from
+                            // an accepted 7857.5 onto the face at 26383.9 and returned it
+                            // as its optimum. The claim stays a claim, but the lower
+                            // iterate the guard kept is an evaluated state of this attempt,
+                            // so it is the attempt's checkpoint, and the dominated-plateau
+                            // adjudication below declines a claim it beats (#2596, #2627)
+                            // and continues the search from it.
+                            let best_exit =
+                                cost_stall_exit.lock().ok().and_then(|slot| slot.clone());
+                            if let Some(best) = best_exit.filter(|best| {
+                                best.value.is_finite()
+                                    && (!sol.final_value.is_finite()
+                                        || best.value < sol.final_value)
+                            }) {
+                                retain_best_outer_checkpoint(
+                                    &mut best_checkpoint,
+                                    best_iterate_checkpoint(best, sol.iterations, *the_plan),
+                                );
+                            }
+                            Ok(solution_into_outer_result(sol, true, *the_plan))
+                        }
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
                             log::debug!(
                                 "[OUTER warning] {context}: ARC hit max_iter={} at final_value={:.6e} |g|={:.3e} | {}",
@@ -2880,15 +2913,16 @@ mod run_fixed_point_continuation_tests;
 #[path = "run_trial_inner_nonconvergence_retreat_2943_tests.rs"]
 mod run_trial_inner_nonconvergence_retreat_2943_tests;
 
-/// Is `seed` a prior fit's terminal certificate that is STILL stationary here?
+/// Is `seed` a prior fit's terminal certificate for THIS search's criterion?
 ///
 /// `Some(cost)` only when all of: the seed is the resumed rho itself; a first
-/// order evaluation succeeds and is finite; on a resume attempt
-/// (`OuterConfig::resume_value`) its value agrees with the recorded one; and the
-/// rail-projected gradient sits inside the band the outer certificate demands. Anything else is `None` and
-/// the ordinary seed cascade runs. This refuses by default and never turns an
-/// evaluation failure into an acceptance.
-fn certified_resume_is_already_stationary(
+/// order evaluation succeeds and is finite; and on a resume attempt
+/// (`OuterConfig::resume_value`) its value agrees with the recorded one.
+/// Anything else is `None` and the ordinary seed cascade runs. `Some` is a claim,
+/// not an acceptance: every caller passes it to the outer certificate, which
+/// judges stationarity on the same ladder that minted the prior fit. This
+/// refuses by default and never turns an evaluation failure into a claim.
+fn claim_prior_terminal_certificate(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     seed: &Array1<f64>,
@@ -2928,18 +2962,20 @@ fn certified_resume_is_already_stationary(
         );
         return None;
     }
+    // Whether the point is still stationary is the certificate's question, and
+    // every caller hands the claim straight to it
+    // (`CertifiedOuterCandidate::from_solver_claim`). A first-order band judged
+    // here would be a second, stricter standard: the prior fit was minted on the
+    // certificate's whole ladder (the Newton-decrement verdict, the
+    // curvature-resolvability rung), and #3312 measured the gamma, Tweedie and
+    // Beta estimated-nuisance fits certified at |Pg| = 1.65e-3 / 3.08e-2 /
+    // 3.55e-2 and then declined here against the absolute band 1.61e-5, so the
+    // warm arm searched on from its own certified optimum and landed elsewhere.
     let projected = rail_projected_gradient_norm(seed, &eval.gradient, Some(bounds_template));
-    let band = outer_gradient_tolerance(config).threshold(eval.cost, projected);
-    if projected > band {
-        log::trace!(
-            "[OUTER] {context}: resumed terminal certificate seed {seed_idx} is not stationary \
-             here (|Pg|={projected:.6e} > band {band:.6e}); running the ordinary cascade"
-        );
-        return None;
-    }
     log::debug!(
-        "[OUTER] {context}: seed {seed_idx} is a prior fit's terminal certificate and is still \
-         stationary (|Pg|={projected:.6e} <= band {band:.6e}); accepting with zero outer iterations"
+        "[OUTER] {context}: seed {seed_idx} is a prior fit's terminal certificate for this \
+         criterion (|Pg|={projected:.6e}); claiming it with zero outer iterations for the \
+         certificate to re-judge"
     );
     Some(eval.cost)
 }
@@ -2949,7 +2985,7 @@ fn certified_resume_is_already_stationary(
 ///
 /// The point is accepted exactly as the seed loop accepts a still-stationary
 /// terminal certificate, with no outer iteration: certified for this search's
-/// criterion (`certified_resume_is_already_stationary`), then screened by the
+/// criterion (`claim_prior_terminal_certificate`), then screened by the
 /// analytic certificate and installed as the terminal state, and `run_outer`
 /// mints it as it mints every plan's winner. Anything else declines with an
 /// error. No plan runs, so no reseed, fallback or retry can search from the
@@ -2975,7 +3011,7 @@ pub(crate) fn resume_prior_certificate(
     obj.reset();
     install_matching_initial_inner_seed(obj, config, &seed, context)?;
     let cost =
-        certified_resume_is_already_stationary(obj, config, &seed, &bounds_template, 0, context)
+        claim_prior_terminal_certificate(obj, config, &seed, &bounds_template, 0, context)
             .ok_or_else(|| {
                 declined("the point is not certified for this search's criterion".to_string())
             })?;

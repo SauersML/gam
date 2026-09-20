@@ -285,7 +285,6 @@ fn gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda() 
     let lambdas = [0.1_f64, 1.0, 10.0];
     let nuts_cfg = NutsConfig {
         n_samples: 1500,
-        target_accept: 0.9,
         seed: 20_260_529,
     };
 

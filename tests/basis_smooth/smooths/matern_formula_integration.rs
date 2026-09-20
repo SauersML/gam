@@ -36,7 +36,7 @@ fn matern_2d_dataset() -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode 2D Matern dataset")
 }
 
-/// #1379 — univariate `matern(x)` / `s(x, bs="gp")` deterministically aborted on
+/// #1379 — univariate `matern(x)` / `s(x, bs="matern")` deterministically aborted on
 /// a large fraction of ordinary 1-D datasets. The outer REML / spatial-κ
 /// optimizer drives a redundant penalty direction's `λ = exp(ρ)` to the finite
 /// ceiling (the Matérn kernel already controls the smoothness a redundant
