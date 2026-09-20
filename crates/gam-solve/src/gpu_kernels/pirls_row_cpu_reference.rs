@@ -10,7 +10,7 @@
 //! in-file makes that a claim the compiler enforces.
 #![cfg(target_os = "linux")]
 
-use gam_math::special::{bd0, bernoulli_kl_from_logits, softplus};
+use gam_math::special::{bd0, bernoulli_kl_from_logits, expm1_minus_x, softplus};
 use gam_problem::EstimationError;
 
 use super::{CurvatureMode, PirlsRowFamily, RowOutput, status_codes};
@@ -484,6 +484,10 @@ fn row_bernoulli_logit(
     )
 }
 
+/// Probit's log-probability jet (gam#3329), the twin of the CUDA
+/// `bernoulli_probit_body`: `μ = Φ(η)` and `μ̄ = Φ(−η)` each from `erfc` on its
+/// own tail, the Mills ratios `a' = φ/Φ(η)` and `b' = −φ/Φ(−η)`, and, from
+/// `φ' = −ηφ`, `a'' = −a'(η + a')` and `b'' = −b'(η + b')`.
 #[inline]
 fn row_bernoulli_probit(
     row: usize,
@@ -491,17 +495,33 @@ fn row_bernoulli_probit(
     mode: CurvatureMode,
 ) -> Result<RowOutput, EstimationError> {
     finite_eta("standard probit inverse link", input.eta)?;
-    let d1 = standard_normal_pdf(input.eta);
-    row_bernoulli_noncanonical(
+    let eta = input.eta;
+    let mu = standard_normal_cdf(eta);
+    let mu_bar = standard_normal_cdf(-eta);
+    let density = standard_normal_pdf(eta);
+    let a1 = density / mu;
+    let b1 = -density / mu_bar;
+    row_bernoulli_log_jet(
         row,
         input,
         mode,
-        standard_normal_cdf(input.eta),
-        d1,
-        -input.eta * d1,
+        BernoulliLogJet {
+            mu,
+            mu_bar,
+            a1,
+            a2: -a1 * (eta + a1),
+            b1,
+            b2: -b1 * (eta + b1),
+        },
     )
 }
 
+/// Complementary log-log's log-probability jet (gam#3329), the twin of the
+/// CUDA `bernoulli_cloglog_body`. With `t = e^η`, `b = log μ̄ = −t` exactly;
+/// `a' = t μ̄ / μ` and `a'' = a'((1 − a') − t)`, whose gap
+/// `1 − a' = (1 − (1 + t)e^{−t}) / μ` is summed from `e^{−t}·(e^t − 1 − t)`
+/// inside the radius where [`expm1_minus_x`] sums its series and read as
+/// `μ − t μ̄` beyond it.
 #[inline]
 fn row_bernoulli_cloglog(
     row: usize,
@@ -509,26 +529,78 @@ fn row_bernoulli_cloglog(
     mode: CurvatureMode,
 ) -> Result<RowOutput, EstimationError> {
     finite_eta("standard complementary-log-log inverse link", input.eta)?;
-    let inner = input.eta.exp();
-    let mu = -(-inner).exp_m1();
-    let complement = (-inner).exp();
-    let d1 = inner * complement;
-    row_bernoulli_noncanonical(row, input, mode, mu, d1, d1 * (1.0 - inner))
+    let t = input.eta.exp();
+    let mu = -(-t).exp_m1();
+    let mu_bar = (-t).exp();
+    let gap = if t <= 0.5 {
+        mu_bar * expm1_minus_x(t)
+    } else {
+        mu - t * mu_bar
+    };
+    let a1 = t * mu_bar / mu;
+    row_bernoulli_log_jet(
+        row,
+        input,
+        mode,
+        BernoulliLogJet {
+            mu,
+            mu_bar,
+            a1,
+            a2: a1 * (gap / mu - t),
+            b1: -t,
+            b2: -t,
+        },
+    )
 }
 
+/// A Bernoulli link's log-probability jet at one η: both probabilities, each
+/// formed directly, and the first two η-derivatives of `a = log μ` and
+/// `b = log μ̄`.
+#[derive(Clone, Copy)]
+struct BernoulliLogJet {
+    mu: f64,
+    mu_bar: f64,
+    a1: f64,
+    a2: f64,
+    b1: f64,
+    b2: f64,
+}
+
+/// The rows of a non-canonical Bernoulli link from its log-probability jet,
+/// the twin of the CUDA `bernoulli_log_jet_rows`: score `y a' + (1 − y) b'`,
+/// Fisher weight `μ a'² + μ̄ b'²`, observed weight `−(y a'' + (1 − y) b'')`.
+/// No variance `μ(1 − μ)` divides anything, so a row is refused only where
+/// one of the two probabilities underflows.
 #[inline]
-fn row_bernoulli_noncanonical(
+fn row_bernoulli_log_jet(
     row: usize,
     input: RowInput,
     mode: CurvatureMode,
-    mu: f64,
-    d1: f64,
-    d2: f64,
+    jet: BernoulliLogJet,
 ) -> Result<RowOutput, EstimationError> {
     let w_prior = prior_weight(row, input)?;
     bernoulli_response(row, input, w_prior)?;
-    if !(mu.is_finite() && mu > 0.0 && mu < 1.0 && d1.is_finite() && d1 > 0.0 && d2.is_finite()) {
-        return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "inverse-link jet", input.eta, mu));
+    let BernoulliLogJet {
+        mu,
+        mu_bar,
+        a1,
+        a2,
+        b1,
+        b2,
+    } = jet;
+    if !(mu > 0.0
+        && mu_bar > 0.0
+        && a1.is_finite()
+        && a2.is_finite()
+        && b1.is_finite()
+        && b2.is_finite())
+    {
+        return Err(EstimationError::pirls_row_geometry_unrepresentable(
+            row,
+            "inverse-link jet",
+            input.eta,
+            mu.min(mu_bar),
+        ));
     }
     if w_prior == 0.0 {
         return certify_output(
@@ -540,12 +612,9 @@ fn row_bernoulli_noncanonical(
             },
         );
     }
-    let v = mu * (1.0 - mu);
-    let fisher_per_prior = d1 * d1 / v;
+    let fisher_per_prior = mu * a1 * a1 + mu_bar * b1 * b1;
     let w_fisher = w_prior * fisher_per_prior;
-    if !(v.is_finite()
-        && v > 0.0
-        && fisher_per_prior.is_finite()
+    if !(fisher_per_prior.is_finite()
         && fisher_per_prior > 0.0
         && w_fisher.is_finite()
         && w_fisher > 0.0)
@@ -557,12 +626,11 @@ fn row_bernoulli_noncanonical(
             w_fisher,
         ));
     }
-    let resid = input.y - mu;
-    let grad_eta = w_prior * resid * d1 / v;
-    let bracket = d2 / v - d1 * d1 * (1.0 - 2.0 * mu) / (v * v);
-    // -d²ℓ/dη² = W_F - prior·(y-μ)·d(h'/V)/dη.
-    let observed_correction = -w_prior * resid * bracket;
-    let w_hessian = select_w_hessian(mode, w_fisher, observed_correction);
+    let y = input.y;
+    let w_hessian = match mode {
+        CurvatureMode::Fisher => w_fisher,
+        CurvatureMode::Observed => -w_prior * (y * a2 + (1.0 - y) * b2),
+    };
     if !w_hessian.is_finite() {
         return Err(EstimationError::pirls_row_geometry_unrepresentable(
             row,
@@ -571,7 +639,8 @@ fn row_bernoulli_noncanonical(
             w_hessian,
         ));
     }
-    let dev = bernoulli_deviance(input.y, mu, w_prior);
+    let grad_eta = w_prior * (y * a1 + (1.0 - y) * b1);
+    let dev = 2.0 * w_prior * (bd0(y, mu) + bd0(1.0 - y, mu_bar));
     certify_output(
         row,
         input.eta,
@@ -597,11 +666,6 @@ fn bernoulli_logit_deviance(y: f64, eta: f64, w: f64) -> f64 {
         bernoulli_kl_from_logits(response_logit, eta)
     };
     2.0 * w * unit
-}
-
-#[inline]
-fn bernoulli_deviance(y: f64, mu: f64, w: f64) -> f64 {
-    2.0 * w * (bd0(y, mu) + bd0(1.0 - y, 1.0 - mu))
 }
 
 /// Stable Φ(x) using the complementary error function with the same identity

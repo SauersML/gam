@@ -2217,7 +2217,130 @@
     "evidence": "At the gate base 4b87357bf0 source_removal_guard.py and public_api_census.py report exactly these two identities (production_occurrences 0 for both). At the head tree git grep -w finds both names only in crates/gam-custom-family/src/test_support.rs (the moved definitions) and in test modules. cargo check --workspace --all-targets rc 0 and cargo build --workspace --lib rc 0 at the gate; the gam-custom-family lib suite passes except the main red a_double_well_fit_publishes_its_uncertified_trace_2901, identical at base."
   },
   {
-    "base": "6521dd1b1a034e21cdf86487d4bb4fbc3d25c066",
+    "base": "b3fbbbab2e0eae7c217bc986ddf46c6e36754731",
+    "items": [
+      "crates/gam-models/src/gamlss/dispersion_family.rs:fn:outer_hyper_hessian_dense_available"
+    ],
+    "reason": "DispersionGlmLocationScaleFamily's override of CustomFamily::outer_hyper_hessian_dense_available returned `specs.len() < 2`. It declined the dense outer Hessian on every two-block fit because the family had no joint second directional derivative D2_beta H_L[u, v], and the trait default for that hook is block-diagonal, which drops the mean/precision cross curvature. The family now implements exact_newton_joint_hessian_second_directional_derivative_with_specs from its contracted fourth row surfaces, so the override is deleted and the trait default (dense outer Hessian available) applies. The trait method and every other family's implementation are unchanged.",
+    "evidence": "Direct gate dy7 run w2tha-g1-predict (direct-dy7-w2tha-g1-predict.log) at 96a81f3bca on this change gave RC_CHECK 0, SCANNER_ERRORS 0 and RC_PYFFI 0. The gam-predict gamma, negbin and tweedie dispersion_location_scale_assembles_covariance_and_is_predictable tests passed 3 of 3; gamma had been red at 64f2129d00 (dy3 w2o-3140-basectl) and at 96a81f3bca (dy6 w2tha-pr1b). The guard's only hit is this override. The name's other occurrences are the trait declaration, its callers and other families' own overrides, none of which change."
+  },
+  {
+    "base": "45d1a4328ec82034e602ca762a1232a27a3934bc",
+    "items": [
+      "crates/gam-custom-family/src/inner_blockwise_fit.rs:const:POLISH_MAX_ITER",
+      "crates/gam-custom-family/src/inner_blockwise_fit.rs:fn:polish_joint_newton_step"
+    ],
+    "reason": "#2973 (comment 5745385706): polish_joint_newton_step was unreachable. Its only call sat under `if use_joint_newton && !converged` after the blockwise loop of inner_blockwise_fit_for_product, and use_joint_newton is an immutable let that, when true, has already returned through fit_exact_joint. The guard was always false, so the function, its POLISH_MAX_ITER iteration bound and its call block are deleted instead of flooring its stationarity test like the two live copies (718f9b6bc2).",
+    "evidence": "At the base both names occur only in inner_blockwise_fit.rs (the call, the fn, and the const inside it); at the head git grep -w finds neither under crates, src or tests. inner_blockwise_fit.rs at this base is byte-identical to the polishdel gate parent 148435843c (blob 210f50eece), where gam-custom-family check --all-targets, the lib suite (365/366, the one red is the main red a_refusal_with_evidence_refits_armed_once_and_publishes_it_2995), laml_inner_accuracy_2668, cargo check --workspace --all-targets and cargo build --workspace --lib all passed. Every helper the deleted body called keeps another caller."
+  },
+  {
+    "base": "5834fb219dc1bd35dd82a4fd874d8f6fd3e95e46",
+    "items": [
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:enum:MixedPrecisionAttempt",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:arrow_factor_slab_to_f32",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:arrow_rhs",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:cholesky_solve_lower_f32",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:mixed_precision_kappa_gate_failure",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:solve_arrow_system_f32",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:try_mixed_precision_arrow_solve",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:DEFAULT_MIXED_PRECISION_CERTIFICATE_TOLERANCE",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:DEFAULT_MIXED_PRECISION_KAPPA_MARGIN",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:DEFAULT_MIXED_PRECISION_MAX_REFINEMENTS",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:F32_UNIT_ROUNDOFF",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:MIXED_PRECISION_CERTIFICATE_EPSILON_MULTIPLIER",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:MIXED_PRECISION_KAPPA_MARGIN_CEILING",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:matrix_inf_norm",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:mixed_precision_reduced_beta",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:enum:ArrowSolvePrecisionPolicy",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:enum:MixedPrecisionStatus",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:certified_mixed",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:default",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:is_enabled",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:with_streaming_solve_precision_default"
+    ],
+    "reason": "#2946 census T10: the arrow-Schur CertifiedMixed solve factored in f64 (factor_dense_reduced_schur and the per-row H_tt factors), copied those factors to f32, and ran f32 triangular solves with f64-residual refinement until a normwise backward-error certificate closed. Because the f64 factor that answers the system in one triangular solve already existed, the f32 path was strictly more work, gated by chosen constants (6 refinements, 1e-11 certificate, kappa*u_f32 margin 0.5 / ceiling 1.0, 64*eps floor). SPEC: 'Unnecessary choices and options should be deleted, not included.' and 'Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible in production code.' Deleted: the policy enum and its Default impl, the status enum, both mixed solves, the kappa gate, the f32 helpers (slab copy, f32 arrow solve, f32 Cholesky solve), arrow_rhs and matrix_inf_norm (used only by the mixed path), the streaming default upgrade and the six constants.",
+    "evidence": "At base 5834fb219d source_removal_guard.py reports exactly these 21 identities. The removed `default` is the one `impl Default for ArrowSolvePrecisionPolicy`; the other Default impls in solve_options.rs are untouched. At head git grep finds no occurrence of ArrowSolvePrecisionPolicy, MixedPrecisionStatus, solve_precision, mixed_precision_status, try_mixed_precision_arrow_solve, mixed_precision_reduced_beta or F32_UNIT_ROUNDOFF outside CHANGELOG.md and the ledgers. Every former caller already fell back to the f64 cholesky_solve_vector / solve_dense_reduced_system on the same factor, which is now the only route. No test constructed CertifiedMixed or read mixed_precision_status. cargo check --workspace --tests rc 0."
+  },
+  {
+    "base": "22739df0373c49b8015d7dace453729a89a0cd21",
+    "items": [
+      "crates/gam-inference/src/truncated_gaussian.rs:const:MAX_BOUNCES_BASE",
+      "crates/gam-inference/src/truncated_gaussian.rs:fn:reflection_budget_exhaustion_refuses_a_partial_trajectory"
+    ],
+    "reason": "Truncated-Gaussian HMC trajectories now end on their travel time, not a reflection cap: MAX_BOUNCES_BASE (the 256 + 8m bounce budget) refused valid trajectories near a narrow cone's apex and was a hard-coded knob standing in for the termination argument, so it is deleted, and reflection_budget_exhaustion_refuses_a_partial_trajectory, which pinned the cap's refusal, goes with it.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3379 (fix-3112-reflection-cap, Fixes #3112) merged as e176a08fd50791d7d396cde35826decb237b61c4 with no source-removal entry. scripts/source_removal_guard.py from e176a08fd50791d7d396cde35826decb237b61c4's own tree, run with --base 22739df0373c49b8015d7dace453729a89a0cd21 --head e176a08fd50791d7d396cde35826decb237b61c4, lists exactly these 2 guarded removals and fails without this entry (audit run 2026-09-20, /scratch.global/sauer354/w2slb/audit2). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. Read-proof: git grep -w -c <name> e176a08fd50791d7d396cde35826decb237b61c4 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "32624c12c632d948277d202217a0f9b1927a4c61",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/asymptote_rail_certify_tests.rs:fn:coupled_coordinate_stationary_before_snap_still_reseeds_2358",
+      "crates/gam-solve/src/rho_optimizer/asymptote_rail_certify_tests.rs:fn:joint_face_fallback_refuses_a_non_face_2349",
+      "crates/gam-solve/src/rho_optimizer/asymptote_rail_certify_tests.rs:fn:joint_face_objective",
+      "crates/gam-solve/src/rho_optimizer/asymptote_rail_certify_tests.rs:fn:joint_face_tail_certifies_where_single_coordinate_law_drifts_2349",
+      "crates/gam-solve/src/rho_optimizer/asymptote_rail_certify_tests.rs:fn:joint_face_with_unsettled_estimand_snaps_for_reoptimization_2349",
+      "crates/gam-solve/src/rho_optimizer/asymptote_rail_certify_tests.rs:fn:tail_snap_refuses_a_psi_coordinate",
+      "crates/gam-solve/src/rho_optimizer/native_coordinate_order_tests.rs:const:DECLINED",
+      "crates/gam-solve/src/rho_optimizer/native_coordinate_order_tests.rs:const:OFFSET",
+      "crates/gam-solve/src/rho_optimizer/native_coordinate_order_tests.rs:const:WEIGHT",
+      "crates/gam-solve/src/rho_optimizer/native_coordinate_order_tests.rs:fn:a_permuted_refusal_names_declined_coordinates_natively_2817",
+      "crates/gam-solve/src/rho_optimizer/native_coordinate_order_tests.rs:fn:criterion",
+      "crates/gam-solve/src/rho_optimizer/native_coordinate_order_tests.rs:fn:criterion_eval",
+      "crates/gam-solve/src/rho_optimizer/native_coordinate_order_tests.rs:fn:permuted_run",
+      "crates/gam-solve/src/rho_optimizer/run.rs:const:PROBE_DELTA",
+      "crates/gam-solve/src/rho_optimizer/run.rs:const:PROBE_DOMAIN_MARGIN",
+      "crates/gam-solve/src/rho_optimizer/run.rs:const:TAIL_SNAP_CURVATURE_BAND",
+      "crates/gam-solve/src/rho_optimizer/run.rs:const:TAIL_SNAP_DRIFT_REL",
+      "crates/gam-solve/src/rho_optimizer/run.rs:enum:TailSnapOutcome",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:probe_joint_tail_window",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:try_tail_snap_to_rail"
+    ],
+    "reason": "The certify-time tail snap is deleted (try_tail_snap_to_rail, probe_joint_tail_window, TAIL_SNAP_CURVATURE_BAND, TAIL_SNAP_DRIFT_REL, which is renamed RAIL_TAIL_DRIFT_REL, TailSnapOutcome, and the probe constants PROBE_DELTA and PROBE_DOMAIN_MARGIN): its fixed ladder of rho offsets with hand-set factors was a grid search with magic constants that never minted a certificate. The removed tests pinned the snap itself: the asymptote-rail joint-face tail tests with their joint_face_objective fixture, and the #2817 native-order refusal test with its fixture (criterion, criterion_eval, permuted_run, DECLINED, OFFSET, WEIGHT), which pinned the tail snap declining end to end.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3343 (issues-outer-cert-b, part of #2348) merged as 11e49efecf7669ee10f880fa2801d312aa4acfe0 with no source-removal entry. scripts/source_removal_guard.py from 11e49efecf7669ee10f880fa2801d312aa4acfe0's own tree, run with --base 32624c12c632d948277d202217a0f9b1927a4c61 --head 11e49efecf7669ee10f880fa2801d312aa4acfe0, lists exactly these 20 guarded removals and fails without this entry (audit run 2026-09-20, /scratch.global/sauer354/w2slb/audit2). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. Read-proof: git grep -w -c <name> 11e49efecf7669ee10f880fa2801d312aa4acfe0 -- <its path> gives 0 for every item except PROBE_DELTA (2, other declarations or uses of the same word), PROBE_DOMAIN_MARGIN (4, other declarations or uses of the same word)."
+  },
+  {
+    "base": "e176a08fd50791d7d396cde35826decb237b61c4",
+    "items": [
+      "crates/gam-solve/src/constrained_posterior/cone_laplace.rs:fn:rates"
+    ],
+    "reason": "ConeLaplace's outer derivatives now price the constraint rows' motion (ConeLaplaceMotion::constraint_rate carries the rows' (A-dot, b-dot)). The removed item is the test fixture's rates helper, which returned (M-dot, g-dot, beta-hat-dot) along a coordinate with the rows held fixed; the fixture's generic rate and pair_rate helpers replace it.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3381 (fix-3171-cone-row-motion, refs #3171) merged as a0c29fac6a4bee9b9383b5500dcff5c569db6de7 with no source-removal entry. scripts/source_removal_guard.py from a0c29fac6a4bee9b9383b5500dcff5c569db6de7's own tree, run with --base e176a08fd50791d7d396cde35826decb237b61c4 --head a0c29fac6a4bee9b9383b5500dcff5c569db6de7, lists exactly these 1 guarded removals and fails without this entry (audit run 2026-09-20, /scratch.global/sauer354/w2slb/audit2). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. Read-proof: git grep -w -c <name> a0c29fac6a4bee9b9383b5500dcff5c569db6de7 -- <its path> gives 0 for every item except rates (4, other declarations or uses of the same word)."
+  },
+  {
+    "base": "7789adcaf56ff1583d1a1e6698b05fd6d658b470",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/bridges.rs:const:PROBE_REFUSAL_FATAL_SENTINEL",
+      "crates/gam-solve/src/rho_optimizer/bridges.rs:const:PROBE_REFUSAL_FATAL_THRESHOLD",
+      "crates/gam-solve/src/rho_optimizer/bridges.rs:const:PROBE_REFUSAL_FATAL_THRESHOLD_NAN_SEED"
+    ],
+    "reason": "The first-order bridge no longer aborts a seed after a fixed count of refused cost probes (150, or 25 from with_initial_sample): the counts had no basis, and the cost-stall guard already judges every refused probe against the seed incumbent's own linear model. PROBE_REFUSAL_FATAL_THRESHOLD, its NaN-seed variant and PROBE_REFUSAL_FATAL_SENTINEL are deleted with the arm that matched the sentinel.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3388 (fix-3219-probe-refusal-derived, Fixes #3219) merged as 8ba204edf71a5fc732ed5cdaba43c1a9f10a6e53 with no source-removal entry. scripts/source_removal_guard.py from 8ba204edf71a5fc732ed5cdaba43c1a9f10a6e53's own tree, run with --base 7789adcaf56ff1583d1a1e6698b05fd6d658b470 --head 8ba204edf71a5fc732ed5cdaba43c1a9f10a6e53, lists exactly these 3 guarded removals and fails without this entry (audit run 2026-09-20, /scratch.global/sauer354/w2slb/audit2). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. Read-proof: git grep -w -c <name> 8ba204edf71a5fc732ed5cdaba43c1a9f10a6e53 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "3f1da8e8f0b878d9fd40f44a615880cde1f85ff4",
+    "items": [
+      "crates/gam-model-kernels/src/cubic_cell_kernel.rs:const:GL_NODES",
+      "crates/gam-model-kernels/src/cubic_cell_kernel.rs:const:GL_NODES_FOR_GPU_KERNEL",
+      "crates/gam-model-kernels/src/cubic_cell_kernel.rs:const:GL_WEIGHTS",
+      "crates/gam-model-kernels/src/cubic_cell_kernel.rs:const:GL_WEIGHTS_FOR_GPU_KERNEL"
+    ],
+    "reason": "The terminal 384-point cubic-cell Gauss-Legendre rule is built once per process from gauss_legendre_certified(TERMINAL_GL_ORDER): the hand-transcribed GL_NODES/GL_WEIGHTS tables carried weights 3.05e-12 relative off the true rule, so they are deleted, and the GPU emitter reads the certified rule through gl_nodes_for_gpu_kernel()/gl_weights_for_gpu_kernel() in place of the GL_*_FOR_GPU_KERNEL re-exports.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3361 (fix-3315-certified-gl-rule, Fixes #3315) merged as b3fbbbab2e0eae7c217bc986ddf46c6e36754731 with no source-removal entry. scripts/source_removal_guard.py from b3fbbbab2e0eae7c217bc986ddf46c6e36754731's own tree, run with --base 3f1da8e8f0b878d9fd40f44a615880cde1f85ff4 --head b3fbbbab2e0eae7c217bc986ddf46c6e36754731, lists exactly these 4 guarded removals and fails without this entry (audit run 2026-09-20, /scratch.global/sauer354/w2slb/audit2). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. Read-proof: git grep -w -c <name> b3fbbbab2e0eae7c217bc986ddf46c6e36754731 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "265ec7bd81604ded27787776e4b0ddf6c60b216e",
+    "items": [
+      "crates/gam-custom-family/src/tests.rs:fn:custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898",
+      "crates/gam-custom-family/src/tests.rs:fn:evaluate",
+      "crates/gam-custom-family/src/tests.rs:fn:exact_newton_hessian_directional_derivative",
+      "crates/gam-custom-family/src/tests.rs:fn:exact_newton_hessian_second_directional_derivative",
+      "crates/gam-custom-family/src/tests.rs:fn:exact_newton_joint_hessian_beta_dependent",
+      "crates/gam-custom-family/src/tests.rs:struct:D2hCountingQuarticFamily"
+    ],
+    "reason": "The #2898 mint-once pin custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898 counted d2H calls across an unarmed custom-family quartic fit on the gradient-only BFGS plan. #3306 makes custom families search gradient-only only when joint_jeffreys_term_required() (the order-five Jeffreys curvature exists only when armed), so the unarmed quartic now runs exact-curvature ARC and legitimately assembles the outer Hessian per step; the pin therefore no longer described the plan it runs. The pin moved to the gam-solve gradient-only lifecycle test a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939, which asserts exactly one Hessian-order request, at the mint. D2hCountingQuarticFamily and its CustomFamily impl methods (evaluate, exact_newton_hessian_directional_derivative, exact_newton_hessian_second_directional_derivative, exact_newton_joint_hessian_beta_dependent) existed only for the removed pin.",
+    "evidence": "Backfill: PR #3405 (claude/fix-3306-fallback-incumbent, Fixes #3306) merged as eaf16b04947ee0c6cc9e7f735a16c141416cf5e7 with no source-removal entry; the removal is in its commit 2c69566f, whose message records the pin move. scripts/source_removal_guard.py run with --base 265ec7bd81604ded27787776e4b0ddf6c60b216e --head eaf16b04947ee0c6cc9e7f735a16c141416cf5e7 lists exactly these 6 guarded removals and fails without this entry. Read-proof: git grep -w -c for custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898 and D2hCountingQuarticFamily finds 1 file at the base and 0 at the merge; the other four names are trait methods still declared elsewhere (declaration count dropped by one each). The replacement pin lives at crates/gam-solve/src/rho_optimizer/run_plan_saddle_escape_tests.rs (#2898 assert in a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939)."
+  },
+  {
+    "base": "1d02ffcb1218e325f5030aa3c767a7967264c05f",
     "items": [
       "crates/gam-cli/src/main/model_summary.rs:fn:build_model_summary",
       "crates/gam-models/src/inference/saved_summary.rs:fn:summary_smooth_terms",

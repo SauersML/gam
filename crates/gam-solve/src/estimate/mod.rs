@@ -91,7 +91,7 @@ pub use edf_accounting::{
     EdfBundle, EdfRankBound, EdfRankCertificate, collapsed_to_penalty_null_space,
     numerical_rank_bound, penalized_edf_bundle_within_bands, sparse_numerical_rank_bound,
 };
-pub use evaluation::{evaluate_externalcost, evaluate_externalgradient};
+pub use evaluation::{evaluate_externalcost, evaluate_externalgradient, evaluate_externalhessian};
 pub use external_options::{ExternalOptimOptions, ExternalOptimResult};
 pub(crate) use external_options::{
     effective_sas_link_for_family, resolved_external_config, validate_penalty_spec_shape,
