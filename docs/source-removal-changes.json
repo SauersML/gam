@@ -2971,5 +2971,13 @@
     ],
     "reason": "Replace a vacuous two-arm eigenvalue test with a direct contract: nonfinite Hessian inputs are refused before a minimum-eigenvalue fold. The replacement also covers both infinities, both matrix triangles and a finite identity control.",
     "evidence": "Exact replacement test passed on MSI against the production gam_linalg FaerEigh implementation: 18 invalid matrix/triangle cases all return SelfAdjointEigenNonFiniteInput; the finite identity remains accepted. The removed test permitted either success or failure and claimed an obsolete fallback."
+  },
+  {
+    "base": "e39f54c730b5e479ec7e7c33c103d6ca02c4b06a",
+    "items": [
+      "crates/gam-models/src/bms/mod.rs:fn:stacked_first_stage_sandwich_cov"
+    ],
+    "reason": "#3452: compute the covariance from joint per-observation first-stage and empirical-grid sampling influences, preserving their cross covariance. The former standalone sandwich production function is replaced by the live row-influence Gram. Tests independently assemble score meat and block inverse bread rather than retain the removed implementation.",
+    "evidence": "MSI: seven numerical checks pass, including builder weight finite differences, independently assembled sandwich covariance, exact opposing-influence cancellation and 4000 grid-only Monte Carlo samples. Two complete BMS fits (Gaussian and heavy-tailed, n=2000) return finite corrected covariance. Complete model unit-source metadata compiles with warnings denied. No 800-fit CI sweep or timeout extension is introduced."
   }
 ]

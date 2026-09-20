@@ -4956,5 +4956,13 @@
     },
     "reason": "#4306: remove the KahanSum type and migrate all live consumers directly to gam_math::sparse_grid::CompensatedSum. The shared Neumaier algorithm preserves low-order bits under a larger addend and folds final compensation into the result; no compatibility wrapper or alias remains.",
     "evidence": "Four exact cancellation/copy/reset/quadrature regressions execute against rebuilt gam-math; complete changed consumer crates and their transitive dependency metadata compile with warnings denied on MSI. Source census enumerates all direct consumers and removed declarations."
+  },
+  {
+    "base": "e39f54c730b5e479ec7e7c33c103d6ca02c4b06a",
+    "removed": {
+      "crates/gam-models/src/bms/mod.rs::stacked_first_stage_sandwich_cov": 1
+    },
+    "reason": "#3452: compute the covariance from joint per-observation first-stage and empirical-grid sampling influences, preserving their cross covariance. The former standalone sandwich production function is replaced by the live row-influence Gram. Tests independently assemble score meat and block inverse bread rather than retain the removed implementation.",
+    "evidence": "MSI: seven numerical checks pass, including builder weight finite differences, independently assembled sandwich covariance, exact opposing-influence cancellation and 4000 grid-only Monte Carlo samples. Two complete BMS fits (Gaussian and heavy-tailed, n=2000) return finite corrected covariance. Complete model unit-source metadata compiles with warnings denied. No 800-fit CI sweep or timeout extension is introduced."
   }
 ]
