@@ -2098,33 +2098,25 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
+    /// The structural monotonicity rows of the score-warp or link-deviation
+    /// block; no other block is constrained. They are a function of the block's
+    /// deviation runtime alone, never of the current state or spec, so this
+    /// answer cannot fail.
     fn block_linear_constraints(
         &self,
-        block_states: &[ParameterBlockState],
+        _block_states: &[ParameterBlockState],
         block_idx: usize,
-        spec: &ParameterBlockSpec,
+        _spec: &ParameterBlockSpec,
     ) -> Result<Option<ConstraintSet>, String> {
-        if block_states.len() == usize::MAX
-            || block_idx == usize::MAX
-            || spec.design.ncols() == usize::MAX
-        {
-            return Err("unreachable bernoulli marginal-slope constraint state".to_string());
-        }
-        if self.score_block_index().is_some_and(|idx| block_idx == idx) {
-            return Ok(self
-                .score_warp
-                .as_ref()
-                .map(DeviationRuntime::structural_monotonicity_constraints)
-                .map(ConstraintSet::Dense));
-        }
-        if self.link_block_index().is_some_and(|idx| block_idx == idx) {
-            return Ok(self
-                .link_dev
-                .as_ref()
-                .map(DeviationRuntime::structural_monotonicity_constraints)
-                .map(ConstraintSet::Dense));
-        }
-        Ok(None)
+        let runtime = if self.score_block_index() == Some(block_idx) {
+            self.score_warp.as_ref()
+        } else if self.link_block_index() == Some(block_idx) {
+            self.link_dev.as_ref()
+        } else {
+            None
+        };
+        Ok(runtime
+            .map(|runtime| ConstraintSet::Dense(runtime.structural_monotonicity_constraints())))
     }
 
     fn post_update_block_beta(
